@@ -18,12 +18,13 @@ const PURGE_BATCH: u32 = 256;
 
 /// The tables that hold rows of a run. Each has an index that leads with
 /// `exec_id`. The execution row goes last.
-const RUN_TABLES: [&str; 6] = [
+const RUN_TABLES: [&str; 7] = [
     "harvest_events",
     "harvest_tasks",
     "harvest_timers",
     "harvest_signals",
     "harvest_activity_attempts",
+    "harvest_llm_ledger",
     "harvest_executions",
 ];
 

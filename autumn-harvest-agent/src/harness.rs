@@ -11,14 +11,17 @@ use std::time::Duration;
 
 use tracing::Instrument;
 
+use crate::agent::AgentProfile;
 use crate::bounds::{exceeds_bytes, json_len};
 use crate::delivery::{Delivery, LogDelivery, Report};
-use crate::error::AgentError;
+use crate::error::{AgentError, ErrorKind};
 use crate::flow::{FlowRules, Released, call_labels};
 use crate::heartbeat::{HeartbeatTask, Precheck};
-use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
+use crate::live::{Coalescer, LiveEvent, LiveSink};
+use crate::memory::{MEMORY_TOOL, MemoryScope, MemorySnapshot, MemoryStore, MemoryTool};
 use crate::mesh::{DELEGATE_TOOL, Peer, delegate_definition, valid_name};
-use crate::message::{ContentPart, RunId, TokenUsage, ToolDefinition};
+use crate::mesh_control::{MESH_BUDGET_EXCEEDED, MeshBudget, MeshBudgetExceeded, MeshSpend};
+use crate::message::{ChatMessage, ContentPart, RunId, TokenUsage, ToolDefinition};
 use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MODEL_ID};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
 use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
@@ -26,10 +29,18 @@ use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 
+use crate::transcript::{InMemoryTranscriptStore, PREFIX_MISSING, TranscriptStore, chain};
 use crate::types::{ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome};
+use crate::workspace::{WorkspaceHandle, WorkspaceMount, WorkspaceRef, WorkspaceStore};
 
 /// The default cap on one tool result, in characters.
 pub const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 8_000;
+
+/// The name of the model that [`AgentHarness::new`] takes (issue #2271).
+///
+/// A task, a peer or a profile with no model name uses it. A mandate
+/// allowlist names it as any other model.
+pub const DEFAULT_MODEL: &str = "default";
 
 /// The default time budget of one model call: 13 minutes.
 ///
@@ -87,6 +98,7 @@ const TRUNCATED: &str = "…[truncated]";
 #[derive(Debug, Clone)]
 pub struct AgentHarness {
     client: Arc<dyn AgentModel>,
+    models: BTreeMap<String, Arc<dyn AgentModel>>,
     tools: Vec<Arc<dyn Tool>>,
     policy: Arc<dyn ToolPolicy>,
     temperature: Option<f32>,
@@ -104,6 +116,12 @@ pub struct AgentHarness {
     cache: Option<ResponseCache>,
     roster: Vec<Peer>,
     flow: FlowRules,
+    profiles: Vec<AgentProfile>,
+    transcripts: Arc<dyn TranscriptStore>,
+    mesh_budgets: Vec<MeshBudget>,
+    mesh_spend: Option<Arc<dyn MeshSpend>>,
+    live: Option<Arc<dyn LiveSink>>,
+    workspace: Option<WorkspaceStore>,
 }
 
 impl AgentHarness {
@@ -112,6 +130,12 @@ impl AgentHarness {
     pub fn new(client: Arc<dyn AgentModel>) -> Self {
         Self {
             client,
+            models: BTreeMap::new(),
+            transcripts: Arc::new(InMemoryTranscriptStore::default()),
+            mesh_budgets: Vec::new(),
+            mesh_spend: None,
+            live: None,
+            workspace: None,
             tools: Vec::new(),
             policy: Arc::new(AllowAll),
             temperature: None,
@@ -129,6 +153,7 @@ impl AgentHarness {
             cache: None,
             roster: Vec::new(),
             flow: FlowRules::new(),
+            profiles: Vec::new(),
         }
     }
 
@@ -254,6 +279,182 @@ impl AgentHarness {
         self
     }
 
+    /// Add the model `name` to the registry (issue #2271).
+    ///
+    /// A task, a peer, a profile or a heartbeat names it. The model-turn
+    /// input records the name, so replay asks the same model. The name
+    /// [`DEFAULT_MODEL`] replaces the model of [`AgentHarness::new`].
+    #[must_use]
+    pub fn model_named(mut self, name: impl Into<String>, model: Arc<dyn AgentModel>) -> Self {
+        let name = name.into();
+        if name == DEFAULT_MODEL {
+            self.client = model;
+        } else {
+            self.models.insert(name, model);
+        }
+        self
+    }
+
+    /// The model `name`. `None` is the [`DEFAULT_MODEL`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable activity error payload when the registry has
+    /// no such model. A retry cannot add it.
+    pub(crate) fn model(&self, name: Option<&str>) -> Result<&Arc<dyn AgentModel>, String> {
+        match name {
+            None | Some(DEFAULT_MODEL) => Ok(&self.client),
+            Some(name) => self.models.get(name).ok_or_else(|| {
+                ActivityFailure::non_retryable(
+                    "UnknownModel",
+                    format!(
+                        "the harness has no model named {:?}; add it with AgentHarness::model_named",
+                        truncate(name, crate::mesh::MAX_NAME_LEN)
+                    ),
+                )
+                .into_error_payload()
+            }),
+        }
+    }
+
+    /// Keep the workspaces of durable agents in `store` (issue #2274). A
+    /// profile turns a workspace on with `AgentProfile::workspace`.
+    #[must_use]
+    pub fn workspace(mut self, store: WorkspaceStore) -> Self {
+        self.workspace = Some(store);
+        self
+    }
+
+    /// Send the live text of every model turn to `sink`, on every backend
+    /// (issue #2268). Pass a model that implements
+    /// [`AgentModel::chat_stream`] to get text while the model writes.
+    #[must_use]
+    pub fn live_sink(mut self, sink: Arc<dyn LiveSink>) -> Self {
+        self.live = Some(sink);
+        self
+    }
+
+    /// Cap the spend of a mesh in each period (issue #2272). A spent budget
+    /// refuses the model turns of the mesh. Set the spend source with
+    /// [`mesh_spend`](Self::mesh_spend).
+    #[must_use]
+    pub fn mesh_budget(mut self, budget: MeshBudget) -> Self {
+        self.mesh_budgets.push(budget);
+        self
+    }
+
+    /// Read the spend of a mesh from `source`, such as the cost ledger.
+    #[must_use]
+    pub fn mesh_spend(mut self, source: Arc<dyn MeshSpend>) -> Self {
+        self.mesh_spend = Some(source);
+        self
+    }
+
+    /// Refuse a turn of `mesh` when a budget of the mesh is spent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable [`MESH_BUDGET_EXCEEDED`] payload with the
+    /// period end. A budget with no spend source fails closed as a config
+    /// error. A failed read is retryable.
+    async fn check_mesh_budget(
+        &self,
+        mesh: Option<&str>,
+        now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+    ) -> Result<(), String> {
+        let Some(mesh) = mesh else {
+            return Ok(());
+        };
+        let budgets = self
+            .mesh_budgets
+            .iter()
+            .filter(|budget| budget.mesh == mesh);
+        for budget in budgets {
+            let Some(source) = &self.mesh_spend else {
+                return Err(ActivityFailure::non_retryable(
+                    "MeshSpendMissing",
+                    "a mesh budget needs a spend source: call AgentHarness::mesh_spend",
+                )
+                .into_error_payload());
+            };
+            let (since, until) = budget.period.window(now);
+            let spend = tokio::time::timeout(self.budget_timeout, source.spent(mesh, since))
+                .await
+                .map_err(|_| "the read took longer than the budget timeout".to_owned())
+                .and_then(|read| read.map_err(|err| err.to_string()))
+                .map_err(|reason| {
+                    autumn_harvest::llm_budget::check_failed(&reason).into_error_payload()
+                })?;
+            if budget.is_spent(&spend) {
+                let details = MeshBudgetExceeded {
+                    mesh: mesh.to_owned(),
+                    until_ms: until.timestamp_millis(),
+                };
+                return Err(ActivityFailure::non_retryable(
+                    MESH_BUDGET_EXCEEDED,
+                    format!("the mesh {mesh:?} has spent its budget for this period"),
+                )
+                .with_details(serde_json::to_value(details).unwrap_or_default())
+                .into_error_payload());
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep the windows of model turns in `store`, so a later turn records
+    /// only the messages it adds (issue #2264). The default is an
+    /// [`InMemoryTranscriptStore`]. A shared store lets a delta hit on every
+    /// worker.
+    #[must_use]
+    pub fn transcript_store(mut self, store: Arc<dyn TranscriptStore>) -> Self {
+        self.transcripts = store;
+        self
+    }
+
+    /// The whole window of `request`: its prefix from the transcript store,
+    /// then its messages. A turn with `remember` keeps the window in the
+    /// store.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable [`PREFIX_MISSING`] payload when the store does
+    /// not hold the prefix. The workflow then sends the full form.
+    fn window(&self, request: &mut ModelTurnRequest) -> Result<Vec<ChatMessage>, String> {
+        let added = std::mem::take(&mut request.messages);
+        let (digest, window) = match &request.prefix {
+            None => (None, added.clone()),
+            Some(prefix) => {
+                // The digest check makes a changed window a miss, so a
+                // shared store cannot put words into a turn.
+                let held = self
+                    .transcripts
+                    .get(&prefix.digest)
+                    .filter(|held| u32::try_from(held.len()).is_ok_and(|len| len == prefix.len))
+                    .filter(|held| chain(None, held) == prefix.digest)
+                    .ok_or_else(|| {
+                        ActivityFailure::non_retryable(
+                            PREFIX_MISSING,
+                            "the transcript store does not hold the prefix of this turn",
+                        )
+                        .into_error_payload()
+                    })?;
+                let mut window = held;
+                window.extend(added.iter().cloned());
+                (Some(prefix.digest.as_str()), window)
+            }
+        };
+        if request.remember {
+            // A chain digest of the prefix and the added messages equals the
+            // digest of the whole window, so one hash pass is enough.
+            let digest = digest.map_or_else(
+                || chain(None, &window),
+                |prefix| chain(Some(prefix), &added),
+            );
+            self.transcripts.put(&digest, &window);
+        }
+        Ok(window)
+    }
+
     /// Add one peer to the roster. A run whose mandate names the peer can
     /// delegate to it. When two peers share a name, the later one wins at
     /// lookup.
@@ -261,6 +462,24 @@ impl AgentHarness {
     pub fn peer(mut self, peer: Peer) -> Self {
         self.roster.push(peer);
         self
+    }
+
+    /// Add the profile of one kind of durable agent. When two profiles share
+    /// a kind, the later one wins.
+    #[must_use]
+    pub fn agent(mut self, profile: AgentProfile) -> Self {
+        self.profiles.push(profile);
+        self
+    }
+
+    /// The profile of the agent kind `kind`, if the harness has one.
+    #[must_use]
+    pub fn agent_profile(&self, kind: &str) -> Option<AgentProfile> {
+        self.profiles
+            .iter()
+            .rev()
+            .find(|profile| profile.kind == kind)
+            .cloned()
     }
 
     /// Install flow rules. They gate each tool call against the labels that
@@ -328,9 +547,12 @@ impl AgentHarness {
     }
 
     /// Whether a turn can use the response cache: the harness has a cache,
-    /// and the model has an id.
+    /// and a model has an id.
     pub(crate) fn cache_active(&self) -> bool {
-        self.cache.is_some() && self.client.model_id().is_some()
+        self.cache.is_some()
+            && std::iter::once(&self.client)
+                .chain(self.models.values())
+                .any(|model| model.model_id().is_some())
     }
 
     /// The time budget of one response-cache call, the tenant read included.
@@ -391,9 +613,15 @@ impl AgentHarness {
         tenant: CacheTenant,
         prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<ModelTurn, String> {
-        self.model_turn_timed_in(request, tenant, prepare)
-            .await
-            .map(|(turn, _latency)| turn)
+        self.model_turn_timed_in(
+            request,
+            tenant,
+            prepare,
+            None,
+            autumn_harvest::chrono::Utc::now(),
+        )
+        .await
+        .map(|(turn, _latency)| turn)
     }
 
     /// [`model_turn_in`](Self::model_turn_in), with the latency of the model
@@ -402,11 +630,19 @@ impl AgentHarness {
     /// The latency covers the model call only, not the cache or the policy.
     /// It is `None` when a cache hit answers the turn, because no model call
     /// ran.
+    ///
+    /// `publish` gets the live events of a turn whose request sets `stream`
+    /// (issue #2268). The live sink of the harness gets them for every turn.
+    ///
+    /// `now` is the clock of the runtime. The mesh budget window uses it, so
+    /// it agrees with the clock of the ledger rows (issue #2272).
     pub(crate) async fn model_turn_timed_in(
         &self,
         request: ModelTurnRequest,
         tenant: CacheTenant,
         prepare: impl FnMut(&mut Vec<ContentPart>),
+        publish: Option<&(dyn Fn(&LiveEvent) + Send + Sync)>,
+        now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
     ) -> Result<(ModelTurn, Option<Duration>), String> {
         let span = tracing::info_span!(
             "agent_model_turn",
@@ -415,23 +651,18 @@ impl AgentHarness {
         if let Some(agent) = &request.agent {
             span.record("gen_ai.agent.name", agent.as_str());
         }
-        self.model_turn_spanned(request, tenant, prepare)
+        self.model_turn_spanned(request, tenant, prepare, publish, now)
             .instrument(span)
             .await
     }
 
-    /// The body of [`model_turn_timed_in`](Self::model_turn_timed_in).
-    async fn model_turn_spanned(
-        &self,
-        request: ModelTurnRequest,
-        tenant: CacheTenant,
-        mut prepare: impl FnMut(&mut Vec<ContentPart>),
-    ) -> Result<(ModelTurn, Option<Duration>), String> {
+    /// The tools of one turn: the built-in tools that the decision checks,
+    /// and the definitions that the model sees.
+    fn turn_tools(&self, request: &ModelTurnRequest) -> (Vec<Arc<dyn Tool>>, Vec<ToolDefinition>) {
         let mut builtins = self.builtins(
             request.memory_scope.as_ref(),
             request.extra_tools.iter().cloned(),
         );
-        let allowed = request.allowed_tools.as_ref();
         // Only a run with a mandate names its acting agent.
         let mandate = request.agent.is_some();
         // Under a mandate with no peer to offer, a `delegate` call is still a
@@ -441,18 +672,44 @@ impl AgentHarness {
         if hidden_delegate {
             builtins.push(Arc::new(WorkflowTool(delegate_definition(&[]))));
         }
-        let tools: Vec<_> = self
-            .permitted(&builtins, allowed)
+        let tools = self
+            .permitted(&builtins, request.allowed_tools.as_ref())
             .filter(|tool| !(hidden_delegate && tool.name() == DELEGATE_TOOL))
             .map(Tool::definition)
             .collect();
+        (builtins, tools)
+    }
+
+    /// The body of [`model_turn_timed_in`](Self::model_turn_timed_in).
+    async fn model_turn_spanned(
+        &self,
+        request: ModelTurnRequest,
+        tenant: CacheTenant,
+        mut prepare: impl FnMut(&mut Vec<ContentPart>),
+        publish: Option<&(dyn Fn(&LiveEvent) + Send + Sync)>,
+        now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+    ) -> Result<(ModelTurn, Option<Duration>), String> {
+        let live = Live {
+            run_id: request.run_id.clone(),
+            step: request.steps_used,
+            publish: publish.filter(|_| request.stream),
+            sink: self.live.as_deref(),
+        };
+        let client = self.model(request.model.as_deref())?;
+        self.check_mesh_budget(request.mesh.as_deref(), now).await?;
+        let mut request = request;
+        let messages = self.window(&mut request)?;
+        let (builtins, tools) = self.turn_tools(&request);
+        let allowed = request.allowed_tools.as_ref();
         let chat = ChatRequest {
-            messages: request.messages,
+            messages,
             tools,
             max_tokens: request.max_output_tokens,
             temperature: self.temperature,
         };
-        let key = self.cache_key(&tenant, &chat);
+        // The key holds the model id, so one model never reads the answer
+        // of another.
+        let key = self.cache_key(client.as_ref(), &tenant, &chat);
         let mut cached = match &key {
             Some(key) => self.cache_lookup(key).await,
             None => None,
@@ -474,7 +731,11 @@ impl AgentHarness {
                 }
             } else {
                 let started = std::time::Instant::now();
-                let response = self.call_model(&chat).await?;
+                let response = if live.is_on() {
+                    self.stream_model(client.as_ref(), &chat, &live).await?
+                } else {
+                    self.call_model(client.as_ref(), &chat).await?
+                };
                 latency = Some(started.elapsed());
                 fresh = key.as_ref().map(|key| (key, response.clone()));
                 response
@@ -490,6 +751,7 @@ impl AgentHarness {
                 labels: Vec::new(),
                 releases: Vec::new(),
                 oversized: false,
+                interruptible: Vec::new(),
             };
             let info = RunInfo {
                 run_id: RunId::new(request.run_id.clone()),
@@ -511,6 +773,9 @@ impl AgentHarness {
                 &mut policy_budget,
             )
             .await;
+            if request.interruptible {
+                turn.interruptible = self.interruptible_calls(&turn, &builtins);
+            }
             // The cache serves and keeps only an answer whose whole turn fits.
             // The check uses the turn before the cut below. A cached turn that
             // exceeds the cap would end every identical run as
@@ -532,22 +797,42 @@ impl AgentHarness {
     /// Record one model call in the agent cost ledger (issue #1996).
     ///
     /// A ledger refusal does not fail the turn, because the reply is already
-    /// paid for. The turn records its tokens even when the model metadata is
-    /// bad:
+    /// paid for. [`ledger_call`](Self::ledger_call) builds the call.
+    pub(crate) fn record_turn(
+        &self,
+        ctx: &autumn_harvest::context::ActivityContext,
+        model: Option<&str>,
+        usage: &TokenUsage,
+        latency: Duration,
+    ) {
+        if let Err(err) = ctx.record_llm_call(self.ledger_call(model, usage, latency)) {
+            tracing::warn!(error = %err, "the agent cost ledger refused a model turn");
+        }
+    }
+
+    /// The cost ledger call of one model turn (issues #1996 and #2275).
+    ///
+    /// Both backends record this call: Postgres through the activity
+    /// context, SQLite through its ledger closure. So one script gives the
+    /// same rows on both. The call keeps its tokens even when the model
+    /// metadata is bad:
     /// - no model id, or one that the ledger refuses, becomes
     ///   [`UNKNOWN_MODEL_ID`];
     /// - a cost that the ledger refuses is dropped, so the call is unpriced.
     ///
     /// Each refusal logs a warning.
-    pub(crate) fn record_turn(
+    pub(crate) fn ledger_call(
         &self,
-        ctx: &autumn_harvest::context::ActivityContext,
+        model: Option<&str>,
         usage: &TokenUsage,
         latency: Duration,
-    ) {
+    ) -> autumn_harvest::llm_ledger::LlmCall {
         use autumn_harvest::llm_ledger::LlmCall;
 
-        let mut model = self.client.model_id().unwrap_or(UNKNOWN_MODEL_ID);
+        // A turn on an unknown model fails before its call, so the default
+        // is never priced for it.
+        let client = self.model(model).unwrap_or(&self.client);
+        let mut model = client.model_id().unwrap_or(UNKNOWN_MODEL_ID);
         if let Err(err) = LlmCall::new(model, 0, 0).validate() {
             tracing::warn!(
                 error = %err,
@@ -555,7 +840,7 @@ impl AgentHarness {
             );
             model = UNKNOWN_MODEL_ID;
         }
-        let cost = self.client.cost_usd_micros(usage).filter(|&cost| {
+        let cost = client.cost_usd_micros(usage).filter(|&cost| {
             let check = LlmCall::new(UNKNOWN_MODEL_ID, 0, 0)
                 .with_cost_usd_micros(cost)
                 .validate();
@@ -576,9 +861,7 @@ impl AgentHarness {
         if let Some(cost) = cost {
             call = call.with_cost_usd_micros(cost);
         }
-        if let Err(err) = ctx.record_llm_call(call) {
-            tracing::warn!(error = %err, "the agent cost ledger refused a model turn");
-        }
+        call
     }
 
     /// Ask the policy about each tool call of `turn`, in order.
@@ -667,9 +950,68 @@ impl AgentHarness {
         *budget = budget.saturating_sub(started.elapsed());
     }
 
-    /// Send `chat` to the model within the model time budget.
-    async fn call_model(&self, chat: &ChatRequest) -> Result<ChatResponse, String> {
-        tokio::time::timeout(self.model_timeout, self.client.chat(chat))
+    /// For each tool call of `turn`, whether its tool opts in to an
+    /// interrupt (issue #2265). An unknown tool does not.
+    fn interruptible_calls(&self, turn: &ModelTurn, builtins: &[Arc<dyn Tool>]) -> Vec<bool> {
+        turn.calls()
+            .iter()
+            .map(|call| {
+                self.visible(builtins)
+                    .find(|tool| tool.name() == call.name)
+                    .is_some_and(Tool::interruptible)
+            })
+            .collect()
+    }
+
+    /// Send `chat` to `client` within the model time budget, and send each
+    /// piece of answer text to `live` while the model writes (issue #2268).
+    async fn stream_model(
+        &self,
+        client: &dyn AgentModel,
+        chat: &ChatRequest,
+        live: &Live<'_>,
+    ) -> Result<ChatResponse, String> {
+        live.send(&LiveEvent::Start {
+            run_id: live.run_id.clone(),
+            step: live.step,
+        });
+        let joined = std::sync::Mutex::new(Coalescer::new());
+        let on_delta = |text: &str| {
+            let ready = joined
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(text);
+            if let Some(text) = ready {
+                live.delta(text);
+            }
+        };
+        let result =
+            tokio::time::timeout(self.model_timeout, client.chat_stream(chat, &on_delta)).await;
+        let rest = joined
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flush();
+        if let Some(text) = rest {
+            live.delta(text);
+        }
+        result
+            .map_err(|_| {
+                ActivityFailure::retryable(
+                    "ModelTimeout",
+                    format!("the model did not answer within {:?}", self.model_timeout),
+                )
+                .into_error_payload()
+            })?
+            .map_err(|err| model_failure(&err))
+    }
+
+    /// Send `chat` to `client` within the model time budget.
+    async fn call_model(
+        &self,
+        client: &dyn AgentModel,
+        chat: &ChatRequest,
+    ) -> Result<ChatResponse, String> {
+        tokio::time::timeout(self.model_timeout, client.chat(chat))
             .await
             .map_err(|_| {
                 ActivityFailure::retryable(
@@ -685,9 +1027,14 @@ impl AgentHarness {
     ///
     /// The turn skips the cache when the harness has no cache, the model has
     /// no id, or the tenant says to skip.
-    fn cache_key(&self, tenant: &CacheTenant, chat: &ChatRequest) -> Option<CacheKey> {
+    fn cache_key(
+        &self,
+        client: &dyn AgentModel,
+        tenant: &CacheTenant,
+        chat: &ChatRequest,
+    ) -> Option<CacheKey> {
         let cache = self.cache.as_ref()?;
-        let model_id = self.client.model_id()?;
+        let model_id = client.model_id()?;
         let tenant = match tenant {
             CacheTenant::None => KeyTenant::None,
             CacheTenant::Verified(name) => KeyTenant::Verified(name),
@@ -755,7 +1102,11 @@ impl AgentHarness {
     /// the activity signature.
     pub async fn tool_call(&self, request: ToolCallRequest) -> Result<ToolOutcome, String> {
         let call = request.call;
-        let builtins = self.builtins(request.memory_scope.as_ref(), std::iter::empty());
+        let builtins = self.builtins_labelled(
+            request.memory_scope.as_ref(),
+            std::iter::empty(),
+            &request.flow_labels,
+        );
         // A second check of the mandate. The decision and the call can run on
         // workers with different tool lists.
         if !permits(&builtins, request.allowed_tools.as_ref(), &call.name) {
@@ -783,19 +1134,37 @@ impl AgentHarness {
             return Ok(self
                 .error_outcome("the tool labels changed after the decision; call the tool again"));
         }
+        // A read-only run can read the files but never moves the head.
+        let keep_files = !request.read_only;
+        // Only a tool that opts in loads the workspace (issue #2274).
+        let mount = request.workspace.filter(|_| tool.uses_workspace());
+        let handle = match &mount {
+            Some(mount) => Some(self.open_workspace(mount).await?),
+            None => None,
+        };
         let ctx = ToolContext {
             run_id: RunId::new(request.run_id),
             call_id: call.id,
             session_id: request.session_id,
             step: request.step,
+            workspace: handle.clone(),
         };
         let execution = tool.execute(call.arguments, &ctx);
         Ok(
             match tokio::time::timeout(self.tool_timeout, execution).await {
-                Ok(Ok(output)) => ToolOutcome::ok(fit_result(
-                    truncate(&output.to_string(), self.tool_output_limit),
-                    self.max_result_bytes,
-                )),
+                Ok(Ok(output)) => {
+                    let mut outcome = ToolOutcome::ok(fit_result(
+                        truncate(&output.to_string(), self.tool_output_limit),
+                        self.max_result_bytes,
+                    ));
+                    if let (Some(mount), Some(handle), true) = (&mount, &handle, keep_files) {
+                        match self.save_workspace(mount, handle).await? {
+                            Ok(head) => outcome.workspace = head,
+                            Err(cap) => outcome = self.error_outcome(&cap),
+                        }
+                    }
+                    outcome
+                }
                 Ok(Err(err)) => {
                     tracing::warn!(tool = %call.name, error = %err, "agent tool call failed");
                     self.error_outcome(err.message())
@@ -806,6 +1175,105 @@ impl AgentHarness {
                 )),
             },
         )
+    }
+
+    /// The workspace store, or a non-retryable error.
+    fn workspace_store(&self) -> Result<&WorkspaceStore, String> {
+        self.workspace.as_ref().ok_or_else(|| {
+            ActivityFailure::non_retryable(
+                "WorkspaceStoreMissing",
+                "the agent has a workspace, but no workspace store is installed: call AgentHarness::workspace",
+            )
+            .into_error_payload()
+        })
+    }
+
+    /// Load the head of `mount` for one tool call (issue #2274).
+    ///
+    /// A store failure retries the activity. A missing or changed snapshot
+    /// fails it, because the head is lost.
+    async fn open_workspace(&self, mount: &WorkspaceMount) -> Result<WorkspaceHandle, String> {
+        let store = self.workspace_store()?;
+        let workspace = tokio::time::timeout(self.tool_timeout, store.load(mount))
+            .await
+            .map_err(|_| workspace_timeout())?
+            .map_err(|err| workspace_failure(&err))?;
+        Ok(WorkspaceHandle::new(workspace))
+    }
+
+    /// Save the workspace of a call that changed it (issue #2274).
+    ///
+    /// `Ok(Ok(None))` means no change. `Ok(Err(text))` is a cap, which the
+    /// model reads. `Err` retries the activity: a new attempt runs the tool
+    /// again from the same head.
+    async fn save_workspace(
+        &self,
+        mount: &WorkspaceMount,
+        handle: &WorkspaceHandle,
+    ) -> Result<Result<Option<WorkspaceRef>, String>, String> {
+        let workspace = handle.snapshot();
+        if !workspace.is_dirty() {
+            return Ok(Ok(None));
+        }
+        let store = self.workspace_store()?;
+        let save = store.save(&mount.scope, mount.generation, &workspace);
+        match tokio::time::timeout(self.tool_timeout, save).await {
+            Err(_) => Err(workspace_timeout()),
+            Ok(Ok(head)) => Ok(Ok(Some(head))),
+            Ok(Err(err)) if err.kind() == ErrorKind::Tool => Ok(Err(err.message().to_owned())),
+            Ok(Err(err)) => Err(workspace_failure(&err)),
+        }
+    }
+
+    /// Delete the snapshots of the scope of `mount` that are older than its
+    /// head (issue #2274). With no head, delete those below the generation
+    /// of `mount`. Returns the number deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable error when no store is installed, and the
+    /// store error otherwise.
+    pub async fn workspace_retain(&self, mount: WorkspaceMount) -> Result<u64, String> {
+        let store = self.workspace_store()?;
+        let deleted = match &mount.head {
+            Some(head) => store.retain(&mount.scope, head).await,
+            None => store.reset(&mount.scope, mount.generation).await,
+        };
+        deleted.map_err(|err| model_failure(&err))
+    }
+
+    /// The highest generation of a key in `scope` (issue #2274), or 0. With
+    /// no store installed it is 0.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error.
+    pub async fn workspace_floor(&self, scope: &str) -> Result<u64, String> {
+        let Some(store) = &self.workspace else {
+            return Ok(0);
+        };
+        store
+            .highest_generation(scope)
+            .await
+            .map_err(|err| model_failure(&err))
+    }
+
+    /// Delete every snapshot of the scope of `mount` below its generation
+    /// (issue #2274). Returns the number deleted. With no store installed
+    /// it deletes nothing, so an erase of an agent with no workspace
+    /// succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error.
+    pub async fn workspace_reset(&self, mount: WorkspaceMount) -> Result<u64, String> {
+        let Some(store) = &self.workspace else {
+            return Ok(0);
+        };
+        store
+            .reset(&mount.scope, mount.generation)
+            .await
+            .map_err(|err| model_failure(&err))
     }
 
     /// An error result whose recorded outcome fits the result cap.
@@ -825,7 +1293,7 @@ impl AgentHarness {
     ///
     /// Returns a non-retryable error when no store is installed, and the
     /// store error otherwise.
-    pub async fn memory_snapshot(&self, scope: MemoryScope) -> Result<String, String> {
+    pub async fn memory_snapshot(&self, scope: MemoryScope) -> Result<MemorySnapshot, String> {
         let Some(store) = &self.memory else {
             return Err(ActivityFailure::non_retryable(
                 "MemoryStoreMissing",
@@ -837,7 +1305,36 @@ impl AgentHarness {
             .await
             .map_err(|_| self.hook_timed_out("MemoryTimeout", "the memory store"))?
             .map_err(|err| model_failure(&err))?;
-        Ok(fit_result(render_snapshot(&blocks), self.max_result_bytes))
+        // The labels go with the text, so a cut text keeps every label.
+        Ok(match MemorySnapshot::of(&blocks) {
+            MemorySnapshot::Text(text) => {
+                MemorySnapshot::Text(fit_result(text, self.max_result_bytes))
+            }
+            MemorySnapshot::Labelled { text, labels } => MemorySnapshot::Labelled {
+                text: fit_result(text, self.max_result_bytes),
+                labels,
+            },
+        })
+    }
+
+    /// Clear the memory of `scope`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable error when no store is installed, and the
+    /// store error otherwise.
+    pub async fn memory_reset(&self, scope: MemoryScope) -> Result<(), String> {
+        let Some(store) = &self.memory else {
+            return Err(ActivityFailure::non_retryable(
+                "MemoryStoreMissing",
+                "the agent has a memory scope, but no memory store is installed: call AgentHarness::memory",
+            )
+            .into_error_payload());
+        };
+        tokio::time::timeout(self.hook_timeout, store.clear(&scope))
+            .await
+            .map_err(|_| self.hook_timed_out("MemoryTimeout", "the memory store"))?
+            .map_err(|err| model_failure(&err))
     }
 
     /// Send one report to the delivery.
@@ -890,10 +1387,21 @@ impl AgentHarness {
         scope: Option<&MemoryScope>,
         extra: impl Iterator<Item = ToolDefinition>,
     ) -> Vec<Arc<dyn Tool>> {
-        let memory =
-            self.memory.as_ref().zip(scope).map(|(store, scope)| {
-                Arc::new(MemoryTool::new(Arc::clone(store), scope.clone())) as _
-            });
+        self.builtins_labelled(scope, extra, &BTreeSet::new())
+    }
+
+    /// [`builtins`](Self::builtins), with the flow labels that a memory
+    /// write keeps (issue #2272).
+    fn builtins_labelled(
+        &self,
+        scope: Option<&MemoryScope>,
+        extra: impl Iterator<Item = ToolDefinition>,
+        labels: &BTreeSet<String>,
+    ) -> Vec<Arc<dyn Tool>> {
+        let memory = self.memory.as_ref().zip(scope).map(|(store, scope)| {
+            Arc::new(MemoryTool::new(Arc::clone(store), scope.clone()).with_labels(labels.clone()))
+                as _
+        });
         memory
             .into_iter()
             .chain(extra.map(|definition| Arc::new(WorkflowTool(definition)) as _))
@@ -1030,10 +1538,71 @@ impl Tool for WorkflowTool {
     }
 }
 
+/// The receivers of the live events of one model call (issue #2268).
+struct Live<'a> {
+    run_id: String,
+    step: u32,
+    /// The publisher of the activity, for a request that streams.
+    publish: Option<&'a (dyn Fn(&LiveEvent) + Send + Sync)>,
+    /// The live sink of the harness.
+    sink: Option<&'a dyn LiveSink>,
+}
+
+impl Live<'_> {
+    const fn is_on(&self) -> bool {
+        self.publish.is_some() || self.sink.is_some()
+    }
+
+    fn send(&self, event: &LiveEvent) {
+        if let Some(publish) = self.publish {
+            publish(event);
+        }
+        if let Some(sink) = self.sink {
+            sink.send(event);
+        }
+    }
+
+    fn delta(&self, text: String) {
+        self.send(&LiveEvent::Delta {
+            run_id: self.run_id.clone(),
+            step: self.step,
+            text,
+        });
+    }
+}
+
 /// Map a provider failure to an activity error payload.
 ///
 /// A rate limit, a transport fault, and a provider outage produced no answer.
 /// A retry can succeed, so they retry. Every other kind fails at once.
+/// The retryable failure of a workspace load or save over its time budget.
+/// The error type of a tool call whose workspace store timed out (issue
+/// #2274). The workflow runs the call again from the same head.
+pub(crate) const WORKSPACE_TIMEOUT: &str = "WorkspaceTimeout";
+
+/// The error type of a tool call whose workspace store failed with an error
+/// that a new try can fix (issue #2274). The workflow runs the call again.
+pub(crate) const WORKSPACE_STORE_FAILED: &str = "WorkspaceStoreFailed";
+
+/// The failure of a workspace store call. A retryable store error gets
+/// [`WORKSPACE_STORE_FAILED`]. Any other keeps its own kind, so the call
+/// does not run again.
+fn workspace_failure(err: &AgentError) -> String {
+    if err.kind().is_retryable() {
+        ActivityFailure::retryable(WORKSPACE_STORE_FAILED, err.to_string()).into_error_payload()
+    } else {
+        model_failure(err)
+    }
+}
+
+fn workspace_timeout() -> String {
+    ActivityFailure::retryable(
+        WORKSPACE_TIMEOUT,
+        "the workspace store did not answer within the tool time budget",
+    )
+    .into_error_payload()
+}
+
 fn model_failure(err: &AgentError) -> String {
     let kind = format!("{:?}", err.kind());
     let message = err.to_string();
@@ -1204,6 +1773,7 @@ mod tests {
             labels: Vec::new(),
             releases: Vec::new(),
             oversized: false,
+            interruptible: Vec::new(),
         }
     }
 
@@ -1319,6 +1889,17 @@ mod tests {
         assert!(json_len(&fitted) <= 1_024);
     }
 
+    // harvest-verify reads a type name that stands alone in a `proptest!`
+    // body as one the macro can declare. It then counts the type, and each
+    // type that holds it, as writable. So the empty values are built here.
+    fn no_content() -> Vec<ContentPart> {
+        Vec::new()
+    }
+
+    fn no_decisions() -> Vec<ToolDecision> {
+        Vec::new()
+    }
+
     proptest::proptest! {
         #[test]
         fn a_fitted_turn_fits_or_is_the_typed_outcome(
@@ -1335,8 +1916,8 @@ mod tests {
             proptest::prop_assert_eq!(&fit_turn(turn.clone(), 0), &turn);
             let fitted = fit_turn(turn.clone(), cap);
             if fitted.oversized {
-                proptest::prop_assert_eq!(&fitted.content, &Vec::<ContentPart>::new());
-                proptest::prop_assert_eq!(&fitted.decisions, &Vec::<ToolDecision>::new());
+                proptest::prop_assert_eq!(&fitted.content, &no_content());
+                proptest::prop_assert_eq!(&fitted.decisions, &no_decisions());
                 proptest::prop_assert_eq!(fitted.usage, turn.usage);
             } else {
                 proptest::prop_assert!(json_len(&fitted) <= cap);

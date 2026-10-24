@@ -21,14 +21,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use autumn_harvest::sandbox::{
-    IDEMPOTENCY_KEY_ENV, IsolationLevel, NetworkPolicy, RunOptions, SandboxError, SandboxOutcome,
-    SandboxRequest, SandboxRuntime,
+    IDEMPOTENCY_KEY_ENV, IsolationLevel, NetworkPolicy, RunOptions, SandboxError, SandboxFile,
+    SandboxOutcome, SandboxRequest, SandboxRuntime,
 };
+use base64::Engine as _;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{AgentError, ErrorKind};
 use crate::model::BoxFuture;
 use crate::tool::{Tool, ToolContext, ToolEffect};
+use crate::workspace::{WorkspaceFile, WorkspaceHandle};
 
 /// The default tool name.
 pub const DEFAULT_TOOL_NAME: &str = "run_code";
@@ -174,12 +176,15 @@ impl Tool for SandboxTool {
         ctx: &'a ToolContext,
     ) -> BoxFuture<'a, Result<serde_json::Value, AgentError>> {
         Box::pin(async move {
-            let request: SandboxRequest = serde_json::from_value(input).map_err(|e| {
+            let mut request: SandboxRequest = serde_json::from_value(input).map_err(|e| {
                 AgentError::new(
                     ErrorKind::Tool,
                     format!("the input is not a valid request: {e}"),
                 )
             })?;
+            if let Some(workspace) = &ctx.workspace {
+                mount(&mut request, workspace);
+            }
             // The run, the step and the call id form an idempotency key.
             let mut engine_env = BTreeMap::new();
             engine_env.insert(
@@ -195,8 +200,17 @@ impl Tool for SandboxTool {
                 .run_with(&request, options, &CancellationToken::new())
                 .await
                 .map_err(|e| tool_error(&e))?;
+            if let Some(workspace) = &ctx.workspace {
+                keep_outputs(workspace, &outcome)?;
+            }
             Ok(model_view(&outcome))
         })
+    }
+
+    /// The sandbox mounts the workspace of the run, when it has one (issue
+    /// #2274).
+    fn uses_workspace(&self) -> bool {
+        true
     }
 
     /// Code in a microVM with no network changes only its own sandbox. Code
@@ -211,6 +225,57 @@ impl Tool for SandboxTool {
             NetworkPolicy::Deny => ToolEffect::Write,
         }
     }
+}
+
+/// Put each workspace file into `request`, and ask for each one back
+/// (issue #2274).
+///
+/// A file of the request wins over a workspace file at the same path. A
+/// run therefore returns the workspace files, and any file it changed, as
+/// outputs.
+fn mount(request: &mut SandboxRequest, workspace: &WorkspaceHandle) {
+    workspace.with(|workspace| {
+        for (path, file) in workspace.files() {
+            if request.files.iter().all(|given| &given.path != path) {
+                request.files.push(SandboxFile {
+                    path: path.clone(),
+                    text: None,
+                    base64: Some(base64::engine::general_purpose::STANDARD.encode(&file.data)),
+                    executable: file.executable,
+                });
+            }
+            if !request.outputs.contains(path) {
+                request.outputs.push(path.clone());
+            }
+        }
+    });
+}
+
+/// Keep each output file of `outcome` in the workspace (issue #2274). A
+/// file keeps its executable flag.
+///
+/// A file that the run deleted leaves the workspace, whatever the run
+/// status. A partial write stays in the same way. A file skipped for
+/// another reason, such as its size, keeps its old content.
+fn keep_outputs(workspace: &WorkspaceHandle, outcome: &SandboxOutcome) -> Result<(), AgentError> {
+    workspace.with(|workspace| {
+        for skipped in outcome.skipped_outputs.iter().filter(|s| s.is_absent()) {
+            workspace.remove(&skipped.path);
+        }
+        for output in &outcome.outputs {
+            let executable = workspace
+                .get(&output.path)
+                .is_some_and(|file| file.executable);
+            workspace.write_file(
+                &output.path,
+                WorkspaceFile {
+                    data: output.content.clone(),
+                    executable,
+                },
+            )?;
+        }
+        Ok(())
+    })
 }
 
 /// The bounded view of `outcome` that the model reads.
@@ -361,7 +426,8 @@ mod tests {
 
     use autumn_harvest::sandbox::runtime::BoxFuture as SandboxFuture;
     use autumn_harvest::sandbox::{
-        OutputFile, RunStatus, SandboxBackend, SandboxJob, SandboxPolicy, SkippedOutput,
+        MISSING_OUTPUT_REASON, NOT_A_DIRECTORY_REASON, OutputFile, RunStatus, SandboxBackend,
+        SandboxJob, SandboxPolicy, SkippedOutput,
     };
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
@@ -427,6 +493,7 @@ mod tests {
             call_id: "call-1".into(),
             session_id: None,
             step: 0,
+            workspace: None,
         }
     }
 
@@ -748,6 +815,169 @@ mod tests {
                 .map(String::as_str),
             Some("run-1:0:call-1")
         );
+    }
+
+    /// A backend that returns each asked output with `!` added.
+    #[derive(Default)]
+    struct ShoutBackend;
+
+    impl SandboxBackend for ShoutBackend {
+        fn isolation(&self) -> IsolationLevel {
+            IsolationLevel::MicroVm
+        }
+
+        fn supports_network(&self) -> bool {
+            false
+        }
+
+        fn execute(
+            &self,
+            job: SandboxJob,
+            _cancel: CancellationToken,
+        ) -> SandboxFuture<'_, Result<SandboxOutcome, SandboxError>> {
+            let outputs = job
+                .plan
+                .outputs
+                .iter()
+                .filter_map(|path| {
+                    let file = job
+                        .plan
+                        .files
+                        .iter()
+                        .find(|f| f.path.ends_with(path.as_str()))?;
+                    let mut content = file.content.clone();
+                    content.push(b'!');
+                    Some(OutputFile {
+                        path: path.clone(),
+                        content,
+                    })
+                })
+                .collect();
+            Box::pin(async move {
+                Ok(SandboxOutcome {
+                    status: RunStatus::Exited { code: 0 },
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    stdout_bytes: 0,
+                    stderr_bytes: 0,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    outputs,
+                    skipped_outputs: Vec::new(),
+                    duration_ms: 1,
+                    isolation: IsolationLevel::MicroVm,
+                    image: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_mounts_the_workspace_and_keeps_its_outputs() {
+        let runtime =
+            SandboxRuntime::new(Arc::new(ShoutBackend), SandboxPolicy::default()).unwrap();
+        let tool = SandboxTool::new(Arc::new(runtime));
+        assert!(tool.uses_workspace());
+        let mut files = crate::workspace::Workspace::default();
+        files.write("notes.txt", "hi").unwrap();
+        let workspace = WorkspaceHandle::new(files);
+        let ctx = ToolContext {
+            workspace: Some(workspace.clone()),
+            ..ctx()
+        };
+        tool.execute(json!({"runtime": "sh", "code": "true"}), &ctx)
+            .await
+            .unwrap();
+        let after = workspace.snapshot();
+        assert_eq!(after.read_text("notes.txt"), Some("hi!"));
+        assert!(after.is_dirty());
+    }
+
+    /// A backend that skips each asked output. `gone.txt` and each path
+    /// under `dir/` no longer exist. Each other path is too large.
+    struct GoneBackend;
+
+    impl SandboxBackend for GoneBackend {
+        fn isolation(&self) -> IsolationLevel {
+            IsolationLevel::MicroVm
+        }
+
+        fn supports_network(&self) -> bool {
+            false
+        }
+
+        fn execute(
+            &self,
+            job: SandboxJob,
+            _cancel: CancellationToken,
+        ) -> SandboxFuture<'_, Result<SandboxOutcome, SandboxError>> {
+            let skipped_outputs =
+                job.plan
+                    .outputs
+                    .iter()
+                    .map(|path| SkippedOutput {
+                        path: path.clone(),
+                        reason: match path.as_str() {
+                            "gone.txt" => MISSING_OUTPUT_REASON.to_owned(),
+                            p if p.starts_with("dir/") => NOT_A_DIRECTORY_REASON.to_owned(),
+                            _ => "the file holds 300000 bytes, over the limit of 262144 bytes"
+                                .to_owned(),
+                        },
+                    })
+                    .collect();
+            Box::pin(async move {
+                Ok(SandboxOutcome {
+                    status: RunStatus::Exited { code: 0 },
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    stdout_bytes: 0,
+                    stderr_bytes: 0,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    outputs: Vec::new(),
+                    skipped_outputs,
+                    duration_ms: 1,
+                    isolation: IsolationLevel::MicroVm,
+                    image: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_that_deletes_a_file_removes_it_and_a_skipped_large_file_stays() {
+        let runtime = SandboxRuntime::new(Arc::new(GoneBackend), SandboxPolicy::default()).unwrap();
+        let tool = SandboxTool::new(Arc::new(runtime));
+        let mut files = crate::workspace::Workspace::default();
+        files.write("gone.txt", "hi").unwrap();
+        files.write("dir/x.txt", "x").unwrap();
+        files.write("big.txt", "old").unwrap();
+        let workspace = WorkspaceHandle::new(files);
+        let ctx = ToolContext {
+            workspace: Some(workspace.clone()),
+            ..ctx()
+        };
+        tool.execute(
+            json!({"runtime": "sh", "code": "rm -r gone.txt dir; touch dir"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let after = workspace.snapshot();
+        assert!(
+            after.get("gone.txt").is_none(),
+            "a deleted file leaves the workspace"
+        );
+        assert!(
+            after.get("dir/x.txt").is_none(),
+            "a file under a replaced directory leaves it"
+        );
+        assert_eq!(
+            after.read_text("big.txt"),
+            Some("old"),
+            "a size skip keeps the old content"
+        );
+        assert!(after.is_dirty());
     }
 
     #[test]

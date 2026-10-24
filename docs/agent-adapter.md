@@ -98,10 +98,14 @@ let built = HarvestBuilder::new()
     .build();
 ```
 
-`workflows()` returns `agent_loop` and `agent_heartbeat`. `activities()`
-returns `agent_model_turn`, `agent_tool_call`, `agent_memory_snapshot`,
-`agent_deliver`, `agent_precheck` and `agent_discover_peers`. The test
-`the_engine_registration_builds` builds this exact registration.
+`workflows()` returns `agent_loop`, `agent_heartbeat` and the durable
+`agent` (section 15). `activities()` returns `agent_model_turn`,
+`agent_tool_call`, `agent_memory_snapshot`, `agent_deliver`,
+`agent_precheck`, `agent_discover_peers`, `agent_profile`,
+`agent_memory_reset`, `agent_workspace_retain`, `agent_workspace_reset` and
+`agent_workspace_floor`.
+The test `the_engine_registration_builds` builds this
+exact registration.
 
 Start a run under the name `agent_loop` with an `AgentTask` as input. To
 decide on a gated call, send a signal to the run, with a serialised
@@ -174,7 +178,7 @@ cannot fail the run.
 
 ### The cost ledger
 
-On Postgres, each model turn writes one row to the
+Each model turn writes one row to the
 [agent cost ledger](llm-cost-ledger.md) (issue #1996). The row holds the
 model id, the tokens, the cost and the call latency. It is outside the
 encrypted turn output, so the usage report can sum it per tenant. Two
@@ -189,6 +193,14 @@ encrypted turn output, so the usage report can sum it per tenant. Two
 
 A response cache hit calls no model and spends no tokens, so it writes no
 ledger row.
+
+The SQLite backend writes the same rows (issue #2275). `sqlite::register`
+registers the model turn with `register_activity_with_ledger`, so the turn
+returns its call with its output. The runtime writes the row in the
+transaction that appends the turn, as Postgres does. A crash before that
+commit writes no row, so a resumed run counts each turn once. Read the rows
+with `SqliteRuntime::llm_ledger(exec)`, or `llm_ledger_between` for a time
+window.
 
 `AgentTask` sets the run. Its bounds are `max_steps` (default 8, per
 segment), `max_total_tokens` (per run), `max_output_tokens`,
@@ -402,21 +414,56 @@ back, so add a field only with `#[serde(default)]`. A new field of an
 activity input also needs `skip_serializing_if` at its default, because a
 strict replay compares each recorded input as it was written.
 
+### 8a. Transcript deltas (issue #2264)
+
+A model turn records only the messages that it adds. Its input names the
+earlier window with a `PrefixRef`: a chained SHA-256 digest of the messages
+and their count. The model-turn activity reads that window from the
+`TranscriptStore` of the harness, adds the new messages, and keeps the
+result for the next turn.
+
+| Case | What happens |
+|---|---|
+| First turn of a run | The full form. The activity keeps the window. |
+| A later turn | A delta on the window that the last turn sent. |
+| A new segment or op | A delta when the window still starts with the last sent window. A trimmed transcript is sent in the full form. |
+| The store misses | The turn fails with `TranscriptPrefixMissing` before any model call. The workflow sends it again in the full form. |
+
+- The model reads the same window in both forms. The response cache key
+  and provider prompt caching do not change.
+- The request cap still measures the whole window, so the full form always
+  fits.
+- `AgentTask::new` turns the delta on. `transcript_delta(false)` turns it
+  off. A task recorded before the change has no flag, so it replays as it
+  ran.
+- The default store is an `InMemoryTranscriptStore` with a 64 MiB bound. A
+  restart empties it, so each run sends the full form once. Set a shared
+  store with `AgentHarness::transcript_store` to hit on every worker.
+- A read checks the digest of the window. A store that hands back a
+  changed window is a miss, and the turn goes in the full form.
+- A store holds transcript text outside history and outside the payload
+  codecs. An erasure does not reach it, because `TranscriptStore` has only
+  `get` and `put`. The app must clear its own store when it erases a run.
+
+A 50-turn run with a 1 KB tool result each turn stores about 86% less
+history (`a_50_turn_run_stores_at_least_80_percent_less_history`).
+
 ## 9. Limits
 
-- **The transcript rides in history.** Each model turn records the whole
-  conversation as its input. A long session should continue as new with the
+- **Each turn records its new messages.** A turn records a prefix
+  reference and the messages that it adds (section 8a). History still
+  grows with each turn, so a long session should continue as new with the
   report's `messages` as `history`.
-- **No streaming.** An activity result is a value, not a stream.
+- **Live text is a side channel.** An activity result is still one value.
+  `AgentTask::stream` sends live text beside it, and nothing stores that
+  text. See "Live tokens" in section 15.
 - **Tool definitions are read at call time.** A deploy that changes the tool
   list changes only later turns. Recorded turns replay as they were.
 - **A follow-up chain shares one workflow history.** Each segment adds to
   it. Keep `max_chain` low, or start a new run from the report.
-- **The session entity is separate.** It is a sibling issue.
-- **All agents share the harness model.** A peer cannot choose its own
-  model. See [the agent mesh guide](agent-mesh.md).
-- **The cost ledger needs Postgres.** The SQLite path calls the model
-  directly, with no activity context, so it writes no ledger rows.
+- **A late reply or approval stays unread.** A durable agent never takes
+  a promise or approval signal whose wait ended, and a checkpoint carries
+  it to the next run. Such signals add bytes for the life of the agent.
 
 ## 10. Always-on agents
 
@@ -499,11 +546,15 @@ let built = HarvestBuilder::new()
     .build();
 ```
 
+On SQLite, pass the same `heartbeat::schedule` to
+`SqliteRuntime::upsert_schedule` (issue #2031). An app can also call
+`sqlite::start_heartbeat` on each tick.
+
 The engine keeps one schedule per workflow name, so a deployment has one
-heartbeat schedule. For one heartbeat per user, start each tick from the
-app, or let one scheduled workflow start the ticks. On SQLite, pass the
-same `heartbeat::schedule` to `SqliteRuntime::upsert_schedule` (issue
-#2031). An app can also call `sqlite::start_heartbeat` on each tick.
+heartbeat schedule. For one heartbeat per agent, use a durable `Agent`
+(section 15). Each agent key has its own heartbeat, driven by its own
+durable timer, and a tick is an op in its inbox. A deployment can run any
+number of them.
 
 ### Follow-ups
 
@@ -522,7 +573,8 @@ that call.
 - The prompt is at most 2 000 characters. The count includes white space,
   because the transcript keeps the prompt as the model wrote it.
 - The delay is at most the `max_delay` of `Followups::new`. The shortest
-  delay is one minute.
+  delay is one minute. A durable agent counts the delay from the end of the
+  segment, so a long segment never books a follow-up that is already due.
 - A chain cap (`Followups::max_chain`, 10 by default) stops an agent that
   wakes itself forever.
 - A segment that ends under any stop other than `completed` runs no
@@ -732,6 +784,7 @@ change.
 | `agent_memory_snapshot` | The recorded snapshot, or an empty one. |
 | `agent_deliver` | A stub. No report leaves the harness. |
 | `agent_discover_peers` | The recorded peers for the same names, or none. The candidate needs no roster. |
+| A child run of a fan-out | The recorded report of an unused child run with the same delegation chain and task text. With no match, the candidate run fails. No child runs live. |
 | Any other activity, such as `agent_precheck` | No mock. The candidate run fails. |
 
 A tool, snapshot or peer-lookup activity that failed the source fails the
@@ -758,6 +811,24 @@ final answers with the same stop reason and different text get `Reworded`.
 That is not a divergence. `end_diverged` compares how the two runs end, for
 example `Completed` and `TokensExhausted`. `diverged()` reads both.
 `stubbed_tool_calls` counts the calls with no recorded outcome.
+
+### Compare two models
+
+`eval::compare` runs two candidates on one source (issue #2271). It returns
+both evaluations and one `TurnDiff` per turn of the two candidates. In that
+diff, `recorded` holds the first candidate.
+
+```rust,ignore
+use autumn_harvest_agent::eval::{Candidate, compare};
+
+let harness = Arc::new(AgentHarness::new(fallback).model_named("a", a).model_named("b", b));
+let first = Candidate::shared(Arc::clone(&harness)).agent_model("planner", "a");
+let second = Candidate::shared(harness).agent_model("planner", "b");
+let comparison = compare(&history, &first, &second).await?;
+```
+
+`Candidate::model` sets the model of every turn. `Candidate::agent_model`
+sets the model of one agent of a delegation tree and wins over it.
 
 Each candidate turn is a live model call. `Candidate::max_turns` caps them.
 The default cap is the recorded turn count plus `DEFAULT_EXTRA_TURNS`. The
@@ -792,6 +863,304 @@ on disk, so a model call whose result a crash lost is not paid twice.
 ## 14. Agent mesh
 
 A run can delegate a task to a peer agent. The peer runs as a sub-agent
-inside the same workflow, with its own prompt, tools and budget. A mandate
-bounds the delegation tree. Flow rules gate a dangerous sequence of tool
-calls across the tree. Read [`agent-mesh.md`](agent-mesh.md).
+inside the same workflow, with its own prompt, tools and budget. With
+`parallel_children`, the delegations of one turn run at the same time, each
+as a child run. They split the token remainder with `bounds::sibling_cap`.
+A mandate bounds the delegation tree. Flow rules gate a dangerous sequence
+of tool calls across the tree. Read [`agent-mesh.md`](agent-mesh.md).
+
+## 15. Durable agents
+
+An `Agent` (issue #2263) is a named, long-lived actor. It owns its state,
+handles one message at a time, and survives a crash. It is the agent loop
+inside a keyed entity (ADR 0006). The design is in
+[`DESIGN-2262.md`](../DESIGN-2262.md).
+
+| Agent concept | Harvest part |
+|---|---|
+| Address | `AgentId`, `<kind>/<name>`. It is the workflow id of the workflow `agent`. |
+| Inbox | `AgentOp` values on the signal `harvest.entity.op` |
+| Config | One `AgentProfile` for each kind, on the harness |
+| One op | One segment of the agent loop, with the whole harness |
+| State | `AgentState`: the transcript, the flow labels and the counters |
+| Checkpoint | Continue-as-new. The state rides in the input. |
+
+```rust
+use autumn_harvest_agent::{AgentHarness, AgentId, AgentOp, AgentProfile, sqlite};
+
+let harness = AgentHarness::new(model)
+    .tool(lookup)
+    .agent(AgentProfile::new("support").system("You answer support mail."));
+sqlite::register(&mut rt, Arc::new(harness));
+
+let id = AgentId::new("support", "acct-42")?;
+sqlite::send(&mut rt, &id, &AgentOp::message_with_id("Where is my order?", "m-1"), Some("m-1"))?;
+sqlite::drive(&mut rt, &id).await?;
+let state = sqlite::state(&rt, &id).await?;
+```
+
+On Postgres, send a signal-with-start to the workflow `agent`. Use the agent
+id as the workflow id, `{}` as the start input, and `Agent::payload(&op)` as
+the signal payload. Pass the message id as the idempotency key.
+
+### The inbox
+
+| Op | Effect |
+|---|---|
+| `user_message` | Runs one segment with the text as the user message. |
+| `control: pause` | Holds each later message in the state. |
+| `control: resume` | Runs the held messages in order, then takes new ones. |
+| `control: reset_memory` | Clears the memory: the scope `agent:<id>`, or the state memory. |
+| `control: clear_transcript` | Clears the transcript. Only the labels of the memory and of the workspace files stay (issues #2272, #2274). |
+| `control: reset_workspace` | Deletes every workspace snapshot of the agent (issue #2274). |
+
+A control op applies at once, also while the agent is paused. The kernel
+`agent::inbox::admit` makes the choice. Verus proves it, see
+`formal/verus/src/agent_inbox.rs`.
+
+### Guarantees
+
+- One op runs at a time. A second message waits for the first reply.
+- An acknowledged message is never lost. A paused agent holds it, and runs
+  it on resume. A full held queue (256 ops) refuses an op and names it in
+  `AgentState::last_error`.
+- Replay rebuilds the transcript. A restart asks no recorded model call
+  again.
+- A failed op keeps the transcript as it was. It keeps the flow labels and
+  the tokens that its tools and turns used.
+- Each segment gets the run id `<incarnation>:s<n>`. The incarnation is a
+  recorded id of this life of the agent, so a delete and a new start never
+  reuse a tool idempotency key. The state carries the tool-round counter, so
+  approval names never repeat.
+- The transcript keeps at most `AgentProfile::window` messages. The cut
+  lands on a user message.
+
+### Heartbeats and follow-ups (issue #2266)
+
+A wake is an op in the inbox, so it never runs at the same time as a
+message. `Entity::run_with_wakes` races the op signal against the next
+deadline of the agent. A due wake runs before a waiting message.
+
+| Wake | Config | Op |
+|---|---|---|
+| Heartbeat | `AgentProfile::heartbeat`, or `Control::SetHeartbeat` for one agent | `HeartbeatTick` |
+| Follow-up | `AgentProfile::followups`, then the model calls `schedule_followup` | `FollowupDue` |
+
+- A tick is unattended. It is read-only unless `AgentHeartbeat::allow_actions`
+  is set. It can ask the harness precheck first. A silent `HEARTBEAT_OK`
+  tick leaves the transcript as it was and delivers nothing.
+- The next tick is due one interval after a tick ends. A late tick never
+  piles up, and a tick that runs longer than its interval lets the waiting
+  ops run first. `agent::wake::next_heartbeat` books it, and a tick always
+  books the next one after the time it ran.
+- `Control::SetHeartbeat` can only narrow the profile, because any client
+  that can signal the agent can send it. A flag holds only when the
+  profile heartbeat sets it. Each bound is at most the profile bound. The
+  interval is at least `MIN_CUSTOM_HEARTBEAT_SECS` (60 s), or the profile
+  interval when that is shorter.
+- A follow-up is a deadline in the state. The chain count is state too, so
+  `Followups::max_chain` holds across a checkpoint. A message from a person
+  starts a new chain.
+- A paused agent skips its ticks, and a booked follow-up waits. On resume,
+  one due tick runs.
+- `HeartbeatTick` and `FollowupDue` do not decode from a signal.
+- A restart during a wait resumes the timer. A tick and its report happen
+  once.
+
+### Lifecycle (issue #2267)
+
+**Idle.** An agent that waits for its inbox or a timer is a row in the
+database. No worker must hold it in memory. A fresh worker, or a fresh
+SQLite runtime, serves its next message and its next wake. With resident
+workflows on, a worker can keep a waiting run as a cache. The cache is
+bounded, and a worker can drop an entry at any time. See `resident.rs` in
+the [module guide](architecture.md).
+
+**Search attributes.** Each op upserts `agent_kind`, `agent_status`
+(`running`, `waiting_approval`, `idle`, `paused` or `parked`),
+`agent_last_active_at`, `agent_next_wake_at`, `agent_wake_reason`,
+`agent_tenant`, `agent_mesh` and `agent_tokens_used`. Times are epoch
+milliseconds. The `filter` grammar of `GET /workflows` lists by them. The
+index `idx_harvest_we_agent_wake` serves a range on `agent_next_wake_at`,
+so a list of the agents due to wake reads only those agents.
+
+**Operate.** `harvest agents` composes the generic management routes:
+
+| Command | Route |
+|---|---|
+| `harvest agents list --status idle --wakes-before <ms>` | `GET /workflows?state=RUNNING&filter=workflow_name = 'agent' AND ...` |
+| `harvest agents describe <kind>/<name>` | `GET /workflows/by-id/agent/{id}/query/harvest.entity.state` |
+| `harvest agents pause <id> --reason <text>` | `POST /workflows/by-id/agent/{id}/signal/harvest.entity.op` |
+| `harvest agents resume <id>` | the same route, with `resume` |
+| `harvest agents erase <id>` | the signal route, then `POST /workflows/{exec}/erase-payloads` for each run |
+
+**Erase.** `harvest agents erase` erases an agent and prints one report.
+It removes the history payloads, the entity state, the memory, the
+workspace, the stream chunks and the cost ledger rows. It does not reach
+a `TranscriptStore` (section 8a) or the response cache (section 11). The
+app must clear those stores itself.
+
+1. The agent gets `pause`, `reset_memory` and `reset_workspace`, then a
+   delete. The pause holds new work and stops the ticks, so nothing writes
+   the stores after the resets. The resets clear a `MemoryStore` scope and
+   every workspace snapshot. An agent that ended gets a new run for them,
+   through `POST /workflows/agent/signal-with-start` on the queue of its
+   last run. The command waits for the run to end.
+2. The command compares the failure count of the final state with the
+   count before the resets. A new failure sets `stores_reset: false`, and
+   `stores_error` names the error.
+3. The command lists each run of each life of the agent with
+   `filter=workflow_name = 'agent' AND workflow_id = '<id>'`.
+4. It erases each run. The erasure tombstones the payloads of history, the
+   entity state and its projection, and deletes the stream chunks and the
+   cost ledger rows. It cascades to each child run of a fan-out.
+5. The report sums each count over every run and child:
+   `events_scrubbed`, `stream_chunks_deleted`, `ledger_rows_deleted`,
+   `entity_states_scrubbed` and the rest. It lists each skipped child and
+   each failure.
+
+The spend of an erased run leaves the LLM budget and mesh budget sums.
+
+### Mid-turn messages (issue #2265)
+
+A message carries an `Urgency`. `sqlite::send` sends the extra signal first,
+then the op. On Postgres, send the signal of `Agent::urgency_signal(&op)` to
+the running run, then the op.
+
+| Urgency | Signal | Effect |
+|---|---|---|
+| `queue` | none | The message runs after the current op. |
+| `steer` | `agent.steer` | A running segment adds the text before its next model turn. The op is then a no-op. With no op running, the op runs the message once. |
+| `interrupt` | `agent.interrupt` | The current op stops. The message runs next. |
+
+What an interrupt does to the work in flight:
+
+| In flight | Effect |
+|---|---|
+| A model turn | The race cancels it. The op ends as `interrupted`. |
+| A tool call whose tool opts in (`Tool::interruptible`) | The race cancels it. The call answers that it was cancelled. |
+| Any other tool call | It runs to its end. No later call of the round runs. |
+| An approval wait | It ends as a rejection. The tool does not run. |
+
+The race records its winner, so replay takes the same branch and asks no
+model again. An interrupt that arrives while no op runs is stale, and the
+next op drops it. On SQLite a running activity never sees a cancel: the
+workflow takes the interrupt, and the activity result is dropped.
+
+### Memory as state (issue #2273)
+
+`AgentProfile::memory(AgentMemory::State)` keeps the memory blocks in
+`AgentState::memory`. The workflow runs the `memory` tool itself. An edit is
+part of the op, so it commits with the op snapshot. A crash replays the op,
+and the edit lands once. No store and no edit key are involved.
+
+- The system prompt of an op holds the memory as it was when the op
+  started. An edit shows from the next op, so a provider prompt cache keeps
+  its prefix.
+- The memory lives in the entity snapshot events and in the
+  `harvest_entity_state` projection. Erasure and codec rotation cover both
+  (issue #2259).
+- `AgentMemory::Store` keeps the `MemoryStore` of the harness for an agent
+  that shares memory with other runs.
+
+`autumn-harvest-agent/examples/agent_session_entity.rs` runs a chat session
+as an agent.
+
+### Workspaces (issue #2274)
+
+A workspace is a set of files, for example a repository checkout and notes.
+It lasts across the ops of a durable agent and across restarts. Turn it on
+for a kind, and install a store:
+
+```rust,ignore
+let store = WorkspaceStore::new(
+    Arc::new(DirWorkspaceBlobs::new("/var/lib/app/workspaces")),
+    builder.payload_codecs().clone(),
+);
+let harness = AgentHarness::new(model)
+    .tool(SandboxTool::new(sandbox).shared())
+    .workspace(store)
+    .agent(AgentProfile::new("coder").workspace());
+```
+
+- **Outside history.** A snapshot of the files lives in a `WorkspaceBlobs`
+  store, the claim-check pattern. History records only its `WorkspaceRef`:
+  a SHA-256 digest, a size, a file count and a generation.
+- **Content-addressed.** The digest of the plain snapshot names its
+  content. A load checks the digest, so a changed blob fails loudly.
+- **Generations.** The key of a snapshot is its generation and its digest.
+  The agent gives each segment and each reset a generation above the last
+  one, and at least the recorded time. The first generation of a life is
+  also above every key and reset marker in the scope. The recorded
+  activity `agent_workspace_floor` reads it. So a new life after a delete
+  starts above the old keys, whatever the clock of a worker reads.
+- **Encrypted.** The payload codecs of the engine encode each snapshot. An
+  active AEAD key therefore encrypts it at rest.
+- **Per call.** A tool that opts in with `Tool::uses_workspace` gets the
+  files in `ToolContext::workspace`. `SandboxTool` opts in: it mounts every
+  file and asks for each one back, so a run keeps the files it changes. A
+  new file joins when the run names it in `outputs`. A file that the run
+  deletes leaves the workspace. So a file that the run moves joins only
+  when the run names its new path. The tool-call activity
+  saves a changed workspace after a call that succeeds, and returns the new
+  reference with the result. A read-only run reads the files, but its
+  changes are not saved.
+- **Run again on a store failure.** The tool-call activity runs once. A
+  workspace store that times out or fails with a retryable error is the one
+  exception: the workflow runs the call again from the same head, up to
+  three times. Only a tool that opts in touches the store. Its effect must
+  stay inside the workspace, or be safe to repeat.
+- **Fenced.** A reference becomes the head only when history records the
+  result that names it. A stale attempt can write a blob, but no recorded
+  result names it, so it never becomes the head.
+- **Labelled.** The state keeps the flow labels of the run that last moved
+  the head. The files can hold what that run read, so
+  `Control::ClearTranscript` keeps those labels.
+- A delegated child has no workspace. A durable peer has its own.
+
+**Size.** A snapshot holds at most 64 MiB of file content and 10,000 files
+by default. Set the caps with `WorkspaceStore::max_bytes` and `max_files`. A
+call that grows the workspace past a cap gets a tool error, and the head
+stays as it was. The sandbox policy also bounds the files that a run can
+mount. A snapshot is JSON with base64 content, so a blob is about a third
+larger than its files.
+
+**Retention.** A workspace keeps one snapshot: its head. The end of each op
+that moved the head deletes every other snapshot of the head generation or
+older, the blobs of stale attempts included. `Control::ResetWorkspace`
+deletes every snapshot below its own generation, and every key in another
+form. It leaves an empty marker at its generation, so a later life starts
+above it. `harvest agents erase` sends it before the delete. The engine can reclaim the lease of either
+activity and start a new attempt, and the old attempt can still run after a
+newer op. It then deletes only older keys, so it never deletes a newer head,
+also when that head has the content of an old one.
+`formal/tla/AgentWorkspaceRetention.tla` checks this. Keep the blobs in a
+store for workspaces only, because retention deletes the blobs of a scope
+that are not newer than its head.
+
+### Live tokens (issue #2268)
+
+`AgentTask::stream` (or `AgentProfile::stream` for a durable agent) streams
+the answer of each model turn in two layers:
+
+| Layer | Sent by | Carries | Stored? | A reader that reconnects gets |
+|---|---|---|---|---|
+| Live | the model-turn activity, with `ActivityContext::publish_progress` | `LiveEvent::Start` and `LiveEvent::Delta` | no | nothing from before |
+| Durable | the workflow, with `publish_durable_progress`, after the turn | one `TurnText` per turn | yes (Postgres only) | each finished turn once |
+
+- A model sends live text from `AgentModel::chat_stream`. The default calls
+  `chat` and sends no delta. The capstone example has a Claude adapter that
+  streams.
+- Small deltas join until 256 bytes wait, or until 50 ms pass and the
+  provider sends its next event. A streaming adapter passes an empty piece
+  at each event with no text, so text goes out while the model thinks.
+- Each model call starts with `LiveEvent::Start`. A retry starts again, so a
+  reader drops the text before it. On Postgres the activity envelope also
+  carries the attempt. See
+  [`streaming-progress.md`](streaming-progress.md#from-an-activity-issue-2268).
+- `AgentHarness::live_sink` gets the live events on every backend, SQLite
+  included.
+- One app route gives both layers: a durable route with `.live().stream()`.
+  See [durable routes](durable-routes.md#live-chunks).
+- The live text is a preview. The `TurnText` and the run result are the
+  answer.

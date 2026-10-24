@@ -597,6 +597,7 @@ fn erase_outcome_serialized_fields_are_all_declared() {
         signals_scrubbed: 1,
         logs_deleted: 1,
         stream_chunks_deleted: 1,
+        ledger_rows_deleted: 1,
         entity_states_scrubbed: 1,
         completion_deliveries_scrubbed: 1,
         dead_letters_scrubbed: 1,

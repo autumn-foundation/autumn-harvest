@@ -101,6 +101,26 @@ pub fn exceeds_activity_input<T: Serialize + ?Sized>(value: &T) -> bool {
     exceeds_bytes(value, DEFAULT_MAX_ACTIVITY_INPUT_BYTES)
 }
 
+/// The token share of child `index` of `siblings` that run at the same
+/// time, from the `remaining` tokens of the parent (issue #2270).
+///
+/// Each child gets `remaining / siblings`, and the first `remaining %
+/// siblings` children get one more. The shares sum to `remaining`, so the
+/// siblings together never pass the cap of the parent.
+/// `formal/verus/src/agent_siblings.rs` proves it for every input.
+#[must_use]
+pub const fn sibling_cap(remaining: u32, siblings: u32, index: u32) -> u32 {
+    if siblings == 0 {
+        return 0;
+    }
+    let base = remaining / siblings;
+    if index < remaining % siblings {
+        base + 1
+    } else {
+        base
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +227,20 @@ mod tests {
         let mut budget = RoundBudget::new(0, u64::MAX, 10);
         assert!(budget.can_run());
         assert!(budget.admit(u64::MAX));
+    }
+
+    #[test]
+    fn sibling_shares_sum_to_the_remainder() {
+        for remaining in [0_u32, 1, 7, 100, 1_000_003] {
+            for siblings in 1_u32..=9 {
+                let sum: u64 = (0..siblings)
+                    .map(|index| u64::from(sibling_cap(remaining, siblings, index)))
+                    .sum();
+                assert_eq!(sum, u64::from(remaining), "{remaining} over {siblings}");
+            }
+        }
+        assert_eq!(sibling_cap(10, 0, 0), 0);
+        assert_eq!(sibling_cap(10, 3, 0), 4);
+        assert_eq!(sibling_cap(10, 3, 2), 3);
     }
 }

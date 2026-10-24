@@ -131,6 +131,7 @@ Returns `text/event-stream`. Frames, in publish order:
 | Frame | `id:` | `data:` | Meaning |
 |---|---|---|---|
 | `event: progress` | the chunk's `seq` | the raw chunk JSON (exactly what you published) | one published chunk |
+| `event: activity` | — | the activity envelope and the chunk | one live chunk from an activity. See [From an activity](#from-an-activity-issue-2268) |
 | `event: end` | — | `{"reason": "<terminal-state>"}` | the workflow reached a terminal state; stream closes |
 | `event: error` | — | `{"error": "listen_connection_closed"}` | the underlying `LISTEN` connection dropped; stream closes |
 
@@ -357,6 +358,79 @@ data: {"reason":"completed"}
 
 In a no-DB test, `TestRunOutcome::recorded_durable_progress()` returns the
 chunks that the run would store.
+
+## From an activity (issue #2268)
+
+An activity can send live chunks while it runs, for example the tokens of a
+model call:
+
+```rust
+#[activity]
+async fn model_turn(ctx: &ActivityContext, prompt: String) -> Result<String, String> {
+    let mut text = String::new();
+    for token in call_model(&prompt).await? {
+        let _ = ctx.publish_progress(serde_json::json!({ "text": token }));
+        text.push_str(&token);
+    }
+    Ok(text)
+}
+```
+
+`ActivityContext::publish_progress` follows the best-effort rules above.
+Nothing is stored: no event and no `harvest_stream_chunks` row. The call
+does not wait for a reader and never fails the activity. A background task
+sends the chunks, so a slow database does not slow the activity. When its
+queue of 256 chunks is full, a chunk drops. The 7000-byte cap and the
+truncation marker apply.
+
+The task sends every chunk that waits in one `pg_notify` statement, so a
+burst of tokens costs one transaction. It takes a worker pool connection
+when a chunk comes, and it gives the connection back when its queue is
+empty. A long model turn thus holds no connection between bursts. When the
+pool has no free connection within its wait bound, every chunk that waits
+drops. The next chunk tries again.
+
+The chunk goes to the progress channel of the run that scheduled the
+activity. `GET /workflows/{id}/stream` sends it as an `activity` frame:
+
+```text
+event: activity
+data: {"_harvest_activity":{"activity_id":"…","activity_type":"agent_model_turn","attempt":2,"index":0},"data":{"text":"Hel"}}
+```
+
+An `activity` frame has no `id:`. Its index restarts at each attempt, so it
+must not move the `seq` of the workflow chunks. A reader uses the envelope:
+
+- `attempt` starts at 1. A higher attempt means a retry. Drop the text of the
+  earlier attempt.
+- `index` is the order of the chunk in its attempt, from 0. A gap means a
+  dropped chunk.
+
+Live chunks are best-effort, and their order against stored chunks is not
+kept. A stored chunk can reach a reader before an older live chunk. A
+reader that shows both layers drops a live chunk of a step after the stored
+text of that step arrives. A durable agent keys both on `run_id` and `step`,
+so the reader drops a `delta` after the `turn` of that step.
+
+**Upgrade order.** Upgrade every API server before a worker sends activity
+chunks. The `activity` flag on the progress payload is new. An older API
+server ignores it and sends an activity chunk as an `event: progress` frame.
+That frame takes the attempt index as its `id:`, so a client sees a `seq`
+gap or a `seq` that goes back.
+
+A live chunk is not the answer. The activity result is. For an answer that
+a reconnecting reader must get whole, publish it from the workflow with
+`publish_durable_progress` when the activity completes. A durable agent does
+this with `AgentTask::stream`. See
+[`agent-adapter.md`](agent-adapter.md#live-tokens-issue-2268).
+
+A durable route gives both layers on one stream: `.stream()` sends the
+durable chunks, and `.live()` adds the `activity` frames. See
+[durable routes](durable-routes.md#live-chunks).
+
+A test or an embedded runtime sets its own sink with
+`ActivityContext::with_progress_sink`. `CaptureProgressSink` keeps every
+chunk. Without a sink and without a database, a chunk drops.
 
 ## Out of scope
 

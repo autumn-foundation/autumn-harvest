@@ -47,6 +47,9 @@
 //!   form a FIFO queue per key. The counter mints each fencing `lock_seq`.
 //! - `harvest_schedules` — cron and interval schedules (issue #2031). One row
 //!   per workflow name, as on Postgres.
+//! - `harvest_llm_ledger` — the agent cost ledger (issue #2275). One row per
+//!   LLM call of a completed activity attempt, keyed `(exec_id, event_seq,
+//!   call_index)`. See [`llm_ledger`](crate::llm_ledger).
 //!
 //! Two triggers keep `harvest_events` append-only (issue #2031). They refuse
 //! every `UPDATE`, and an `INSERT` over a stored `(exec_id, seq)`. See
@@ -339,6 +342,45 @@ CREATE TABLE IF NOT EXISTS harvest_activity_attempts (
 -- #2031), as for `harvest_tasks` above.
 CREATE INDEX IF NOT EXISTS idx_harvest_activity_attempts_exec
     ON harvest_activity_attempts (exec_id);
+
+-- The agent cost ledger (issue #2275), as on Postgres (issue #1996). One row
+-- per LLM call of a completed activity attempt. The runtime writes the rows in
+-- the transaction that appends the completion event. `event_seq` is the
+-- `seq` of that event, as `event_id` is on Postgres. A crash before the
+-- commit writes no row, so a re-run counts each call once. The table is new,
+-- so `CREATE TABLE IF NOT EXISTS` adds it to an older file.
+CREATE TABLE IF NOT EXISTS harvest_llm_ledger (
+    exec_id         TEXT    NOT NULL,
+    event_seq       INTEGER NOT NULL,
+    call_index      INTEGER NOT NULL,
+    activity_name   TEXT    NOT NULL,
+    model           TEXT    NOT NULL,
+    input_tokens    INTEGER NOT NULL,
+    output_tokens   INTEGER NOT NULL,
+    cost_usd_micros INTEGER,               -- millionths of a US dollar. NULL =
+                                           -- unpriced.
+    latency_ms      INTEGER NOT NULL,
+    recorded_at     INTEGER NOT NULL,      -- the epoch millisecond of the
+                                           -- completion
+    PRIMARY KEY (exec_id, event_seq, call_index),
+    -- The bounds match the Postgres table and `llm_ledger.rs` in the core.
+    CHECK (
+        call_index BETWEEN 0 AND 255
+        AND input_tokens BETWEEN 0 AND 1000000000000
+        AND output_tokens BETWEEN 0 AND 1000000000000
+        AND (cost_usd_micros IS NULL OR cost_usd_micros BETWEEN 0 AND 1000000000000000)
+        AND latency_ms BETWEEN 0 AND 10000000000
+    ),
+    -- A model id is a token: no space, no control character, no NUL.
+    CHECK (
+        length(CAST(model AS BLOB)) BETWEEN 1 AND 200
+        AND model NOT GLOB '*[^A-Za-z0-9._:/@+-]*'
+    )
+);
+
+-- A usage report reads the ledger in a window of `recorded_at`.
+CREATE INDEX IF NOT EXISTS idx_harvest_llm_ledger_recorded_at
+    ON harvest_llm_ledger (recorded_at);
 ";
 
 /// The append-only guard on `harvest_events` (issue #2031), the analog of
@@ -426,6 +468,9 @@ use crate::error::SqliteResult;
 ///   time that retention reads. The column is nullable, so an old row is not
 ///   a scheduled run. The indexes are built here, because the base
 ///   [`SCHEMA`] runs before an old table has the columns.
+/// - **issue #2275** — the `harvest_llm_ledger` table and its index. Both are
+///   new, so the base [`SCHEMA`] adds them to an older file. This step does
+///   nothing for them.
 ///
 /// # Errors
 ///

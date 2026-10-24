@@ -85,7 +85,7 @@
           "type": "string",
           "required": false,
           "repeated": true,
-          "description": "Filter expression with AND, OR and parentheses (issue #1982). AND binds tighter than OR. Fields: attrs.<key> (=, !=, >, >=, <, <=, IN, EXISTS), state, workflow_name, owner, severity (=, !=, IN), started_at (>, >=, <, <= with an RFC 3339 string). Values: a quoted string, a number, true or false. <> is the same as !=. A filter with OR must find each row through an index: each OR branch, or the whole filter, holds an attrs.* predicate or workflow_name with = or IN. The parameter is repeatable. Each value joins the query with AND. An empty value is ignored. Limits: 2048 bytes, 8 levels and 100 IN values for each value, and 32 predicates for the request. state = 'MIGRATED' gets 400; use state=MIGRATED. Errors return 400. Example: attrs.phase = 'blocked' OR (workflow_name = 'payment' AND attrs.amount > 10000)."
+          "description": "Filter expression with AND, OR and parentheses (issue #1982). AND binds tighter than OR. Fields: attrs.<key> (=, !=, >, >=, <, <=, IN, EXISTS), state, workflow_name, workflow_id, owner, severity (=, !=, IN), started_at (>, >=, <, <= with an RFC 3339 string). Values: a quoted string, a number, true or false. <> is the same as !=. A filter with OR must find each row through an index: each OR branch, or the whole filter, holds an attrs.* predicate or workflow_name with = or IN. The parameter is repeatable. Each value joins the query with AND. An empty value is ignored. Limits: 2048 bytes, 8 levels and 100 IN values for each value, and 32 predicates for the request. state = 'MIGRATED' gets 400; use state=MIGRATED. Errors return 400. Example: attrs.phase = 'blocked' OR (workflow_name = 'payment' AND attrs.amount > 10000)."
         },
         {
           "name": "limit",
@@ -3034,6 +3034,7 @@
           "signals_scrubbed",
           "logs_deleted",
           "stream_chunks_deleted",
+          "ledger_rows_deleted",
           "entity_states_scrubbed",
           "completion_deliveries_scrubbed",
           "dead_letters_scrubbed",

@@ -5,13 +5,13 @@
 //! scratch file and then a rename. So a crash or a power cut leaves the old
 //! file or the new one, never half of one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use autumn_harvest::payload_store::{PayloadStore, PayloadStoreError, PayloadStoreFuture};
-use autumn_harvest_agent::memory::{MemoryOp, apply_op};
+use autumn_harvest_agent::memory::{MemoryOp, apply_labelled_op};
 use autumn_harvest_agent::{
     AgentError, BoxFuture, CacheIndex, CacheKey, Delivery, EditKey, ErrorKind, HeartbeatTask,
     MemoryBlock, MemoryScope, MemoryStore, Precheck, Report, ReportSource, SessionId,
@@ -93,11 +93,15 @@ impl FileMemoryStore {
         }
     }
 
+    /// Apply `op` from a run with the flow labels `labels`. Each entry keeps
+    /// its labels in the file, so a note keeps its taint across a restart
+    /// (issue #2272).
     fn apply_now(
         &self,
         scope: &MemoryScope,
         op: &MemoryOp,
         key: &EditKey,
+        labels: &BTreeSet<String>,
     ) -> Result<MemoryBlock, AgentError> {
         let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         let mut file = self.read(scope)?;
@@ -125,7 +129,7 @@ impl FileMemoryStore {
                         op.block()
                     )))
                 },
-                |block| apply_op(block, op).map(|()| block.clone()),
+                |block| apply_labelled_op(block, op, labels).map(|()| block.clone()),
             );
         file.applied.insert(
             key.as_str().to_string(),
@@ -157,7 +161,38 @@ impl MemoryStore for FileMemoryStore {
         op: MemoryOp,
         key: &'a EditKey,
     ) -> BoxFuture<'a, Result<MemoryBlock, AgentError>> {
-        Box::pin(std::future::ready(self.apply_now(scope, &op, key)))
+        Box::pin(std::future::ready(self.apply_now(
+            scope,
+            &op,
+            key,
+            &BTreeSet::new(),
+        )))
+    }
+
+    fn apply_labelled<'a>(
+        &'a self,
+        scope: &'a MemoryScope,
+        op: MemoryOp,
+        key: &'a EditKey,
+        labels: &'a BTreeSet<String>,
+    ) -> BoxFuture<'a, Result<MemoryBlock, AgentError>> {
+        Box::pin(std::future::ready(self.apply_now(scope, &op, key, labels)))
+    }
+
+    /// Delete the file of the scope: its entries and its applied keys.
+    fn clear<'a>(&'a self, scope: &'a MemoryScope) -> BoxFuture<'a, Result<(), AgentError>> {
+        let cleared = {
+            let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+            match std::fs::remove_file(self.path(scope)) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(AgentError::new(
+                    ErrorKind::Unavailable,
+                    format!("memory clear: {e}"),
+                )),
+            }
+        };
+        Box::pin(std::future::ready(cleared))
     }
 }
 
@@ -740,6 +775,34 @@ mod tests {
         // A new scope gets the default blocks.
         let other = reopened.load(&MemoryScope::new("other")).await.unwrap();
         assert!(other.iter().all(|b| b.entries.is_empty()));
+    }
+
+    // A note from a run with flow labels keeps them across a new store, and
+    // a clear removes the scope (issue #2272). Before the fix the default
+    // refused every labelled write, so a tainted run kept no note.
+    #[tokio::test]
+    async fn a_labelled_note_keeps_its_labels_and_a_clear_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = MemoryScope::new("autoresearch/oct17");
+        let store = FileMemoryStore::new(dir.path()).unwrap();
+        let labels: BTreeSet<String> = ["untrusted".to_string()].into();
+        store
+            .apply_labelled(&scope, add("tried raise LR"), &EditKey::new("k1"), &labels)
+            .await
+            .unwrap();
+        let reopened = FileMemoryStore::new(dir.path()).unwrap();
+        let blocks = reopened.load(&scope).await.unwrap();
+        let memory = blocks.iter().find(|b| b.label == "memory").unwrap();
+        assert_eq!(memory.entries, vec!["tried raise LR".to_string()]);
+        assert_eq!(memory.labels.get("tried raise LR"), Some(&labels));
+        reopened.clear(&scope).await.unwrap();
+        let cleared = reopened.load(&scope).await.unwrap();
+        assert!(cleared.iter().all(|b| b.entries.is_empty()));
+        // A cleared scope forgets its keys, so the same key applies again.
+        reopened
+            .apply(&scope, add("tried raise LR"), &EditKey::new("k1"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

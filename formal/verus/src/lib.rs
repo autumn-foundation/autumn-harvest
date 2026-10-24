@@ -2,3 +2,7 @@ mod mixers;
 mod jitter;
 mod dlq_spread;
 mod owner_fence;
+mod agent_inbox;
+mod agent_dedupe;
+mod agent_wake;
+mod agent_siblings;

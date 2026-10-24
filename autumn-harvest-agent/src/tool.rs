@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::AgentError;
 use crate::message::{RunId, SessionId, ToolDefinition};
 use crate::model::BoxFuture;
+use crate::workspace::WorkspaceHandle;
 
 /// What a tool can change. A policy uses it to gate calls.
 ///
@@ -43,6 +44,10 @@ pub struct ToolContext {
     /// The tool round (0-based) that made the call, counted across
     /// follow-up segments.
     pub step: u32,
+    /// The workspace of the run, for a tool that opts in with
+    /// [`Tool::uses_workspace`] (issue #2274). A change is saved after the
+    /// call, when the call succeeds.
+    pub workspace: Option<WorkspaceHandle>,
 }
 
 /// A function the agent may call.
@@ -76,6 +81,21 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
         &[]
     }
 
+    /// Whether an interrupt may cancel a call that already started (issue
+    /// #2265). The default is `false`: a side effect may be half done. Opt in
+    /// only for a tool that is safe to stop at any point.
+    fn interruptible(&self) -> bool {
+        false
+    }
+
+    /// Whether the tool reads or writes the workspace of the run (issue
+    /// #2274). The tool-call activity then loads the workspace into
+    /// [`ToolContext::workspace`]. The default is `false`, so a call of
+    /// another tool loads nothing.
+    fn uses_workspace(&self) -> bool {
+        false
+    }
+
     /// The metadata the model sees.
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -102,6 +122,8 @@ pub struct FnTool {
     schema: serde_json::Value,
     effect: ToolEffect,
     labels: Vec<String>,
+    interruptible: bool,
+    workspace: bool,
     run: ToolFn,
 }
 
@@ -132,6 +154,8 @@ impl FnTool {
             schema,
             effect: ToolEffect::Write,
             labels: Vec::new(),
+            interruptible: false,
+            workspace: false,
             run: Box::new(move |input, _ctx| Box::pin(run(input))),
         }
     }
@@ -154,6 +178,8 @@ impl FnTool {
             schema,
             effect: ToolEffect::Write,
             labels: Vec::new(),
+            interruptible: false,
+            workspace: false,
             run: Box::new(move |input, ctx| Box::pin(run(input, ctx))),
         }
     }
@@ -169,6 +195,22 @@ impl FnTool {
     #[must_use]
     pub fn label(mut self, label: impl Into<String>) -> Self {
         self.labels.push(label.into());
+        self
+    }
+
+    /// Let an interrupt cancel a call that already started. See
+    /// [`Tool::interruptible`].
+    #[must_use]
+    pub const fn interruptible(mut self) -> Self {
+        self.interruptible = true;
+        self
+    }
+
+    /// Load the workspace of the run for each call. See
+    /// [`Tool::uses_workspace`].
+    #[must_use]
+    pub const fn uses_workspace(mut self) -> Self {
+        self.workspace = true;
         self
     }
 
@@ -207,6 +249,14 @@ impl Tool for FnTool {
     fn labels(&self) -> &[String] {
         &self.labels
     }
+
+    fn interruptible(&self) -> bool {
+        self.interruptible
+    }
+
+    fn uses_workspace(&self) -> bool {
+        self.workspace
+    }
 }
 
 #[cfg(test)]
@@ -231,6 +281,7 @@ mod tests {
             call_id: "c".into(),
             session_id: None,
             step: 0,
+            workspace: None,
         };
         assert_eq!(tool.execute(json!({}), &ctx).await.unwrap(), json!("r/c"));
         assert_eq!(Tool::effect(&tool), ToolEffect::ReadOnly);

@@ -23,6 +23,7 @@ mod execution_timeout;
 mod fleet_fault_isolation;
 mod freeze_activity_defaults;
 mod history_caps;
+mod llm_ledger;
 mod local_activities;
 mod payload_caps;
 mod payload_depth;

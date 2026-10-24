@@ -101,11 +101,11 @@ pub async fn await_decision<T: DeserializeOwned>(
         .receive_signal_timeout(name, timeout)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(decode(payload))
+    Ok(decode_decision(payload))
 }
 
 /// Decode one received payload. `None` means the deadline passed.
-fn decode<T: DeserializeOwned>(payload: Option<Value>) -> Decision<T> {
+pub(crate) fn decode_decision<T: DeserializeOwned>(payload: Option<Value>) -> Decision<T> {
     payload.map_or(Decision::TimedOut, |value| {
         serde_json::from_value(value).map_or_else(
             |err| Decision::Unreadable(err.to_string()),
@@ -137,11 +137,12 @@ mod tests {
 
     #[test]
     fn a_payload_decodes_or_is_unreadable() {
-        let ok: Decision<Approval> = decode(Some(serde_json::json!({"verdict": "approve"})));
+        let ok: Decision<Approval> =
+            decode_decision(Some(serde_json::json!({"verdict": "approve"})));
         assert_eq!(ok, Decision::Decided(Approval::Approve));
-        let bad: Decision<Approval> = decode(Some(serde_json::json!("approve")));
+        let bad: Decision<Approval> = decode_decision(Some(serde_json::json!("approve")));
         assert!(matches!(bad, Decision::Unreadable(_)));
-        let none: Decision<Approval> = decode(None);
+        let none: Decision<Approval> = decode_decision(None);
         assert_eq!(none, Decision::TimedOut);
     }
 
