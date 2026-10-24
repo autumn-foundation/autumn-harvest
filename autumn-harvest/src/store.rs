@@ -251,13 +251,12 @@ async fn insert_event_rows(
     // inserts nothing, also with the DR fence off.
     //
     // Inside a fenced scope of this connection, the start fence of the
-    // transaction already holds the owner row (issue #2252). With the DR
-    // fence off, the insert then needs no savepoint and no second fence.
+    // transaction already holds the owner row (issue #2252). It also holds
+    // the generation row of the pinned shard (issue #2255). When that row
+    // covers this shard, the insert needs no savepoint and no second fence.
+    let covered = crate::replication::start_fence_covers(conn, exec_id.shard());
     let pinned = crate::decision_owner::pinned_decision();
-    let fenced_here = pinned.as_ref().is_some_and(|tenure| {
-        crate::decision_owner::already_fenced(crate::decision_owner::conn_id(conn), tenure)
-    });
-    if crate::replication::FenceRegistry::is_enabled() || (pinned.is_some() && !fenced_here) {
+    if !covered && (crate::replication::FenceRegistry::is_enabled() || pinned.is_some()) {
         Box::pin(
             conn.transaction::<_, crate::error::HarvestError, _>(async |conn| {
                 crate::replication::assert_fence(conn, exec_id.shard()).await?;

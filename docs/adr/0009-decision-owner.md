@@ -4,7 +4,8 @@
 
 Accepted (issue #2249).
 
-Issues #2250 to #2254 build it. Issue #2253 adds decision 12.
+Issues #2250 to #2255 build it. Issue #2253 adds decision 12. Issue #2255
+adds decision 13.
 [ADR 0010](0010-fenced-owner-lease.md) holds the lease rules R1 to R7 that
 the model forces. The planning record is
 [`DESIGN-2249.md`](../../DESIGN-2249.md). The source is the stage 1 section
@@ -459,12 +460,17 @@ Issue #2253 builds this decision.
   rebalance, or a re-pend after a dead or stuck worker.
 - The post-commit sender of `notify.rs` reads the `workflow_id` of each
   woken run on its own connection. The write path pays nothing.
-- The sender skips each wake to the partition that the writer's decision
-  pinned. The writer owns that partition, and it decides for its entries.
+- The sender skips each evict wake to the partition that the writer's
+  decision pinned. The writer owns that partition, and it decides for its
+  entries.
+- A plain wake to that partition stays (issue #2255). The owner decider
+  then learns of a row that its decision woke again, or of a successor in
+  the same partition.
 - The skip compares the partition number only. A wake to the same number
   on another database is then lost. That costs latency only.
-- An evict wake drops the cache entry and its parked future. A plain wake
-  only ends the idle wait of the claim loop.
+- An evict wake drops the cache entry and its parked future. Each wake
+  names its execution to the owner decider (decision 13). With owner mode
+  off, a wake only ends the idle wait of the claim loop.
 - A foreign append does not evict. The next decision loads the delta, so a
   child terminal written into its parent reaches the parent's owner.
 - A `NOTIFY` can be lost. An evict wake can also come while a decision
@@ -503,6 +509,7 @@ The writer classes, from the inventory of issue #2253:
 | Start and continue-as-new | `execution.rs`: `start_or_load_workflow_execution`, `replace_execution` | `enqueue` | No |
 | Rebalance | `shard_rebalance.rs`: `commit_cutover`, `activate_target_inner` | `notify_owner` on each database | Yes |
 | Dead or stuck worker re-pend | `poison_pill.rs`: `requeue_orphan`, `requeue_stuck_task` | `notify_owner` | No |
+| Claim-held workflow re-pend | `queue.rs`: `requeue_claimed_workflow_task_with_backoff` | `notify_owner` when the row is due now (issue #2255) | No |
 | Queue resume | `queue_pause.rs`: `notify_resumed_queue` | None. The queue wake reaches each claim loop. | No |
 | Partition layout | `partition.rs`: `disable_partitioning`, `drain_default_bounded_inner` | None | No. Each row keeps its id and bytes. |
 | Retention | `retention.rs`: `delete_candidate_execution` | None | No. It deletes terminal runs only. |
@@ -516,6 +523,60 @@ Erasure acts on terminal runs only.
 main writer classes. `owner_wake_db_tests.rs` checks the wake and its evict
 flag on the channel for more classes. Session breaks and the cross-shard
 relay use the chokepoints of an activity failure and a child terminal.
+
+### 13. Owner decider: workflow tasks leave the claim loop
+
+Issue #2255 builds this decision. Stage 1a still claimed each workflow task
+with the shared head scan. Stage 1b moves workflow tasks off the claim loop.
+
+- Each worker runs one owner decider per owned database, beside its claim
+  loops. Where it runs, the claim loops claim activities only.
+- A worker with queue weights or fairness keys runs no decider. It keeps
+  the owned claim of issue #2252, so its workflow tasks follow the weighted
+  queue order and the fairness lags of issue #1976.
+- A decider runs only on a database with an owner wake listener. With no
+  wake, it finds each row by a scan, and a scan with a take costs more than
+  one head claim. The claim loops then keep the owned claim.
+- Open gap: owner takes follow wake order and due time. They do not apply
+  the claim order: priority, ageing and the new-start handicap. Issue #2308
+  tracks it.
+- The decider learns of work from two sources. An owner wake names an
+  execution. A scan reads the pending workflow rows of its partitions by due
+  time, with `idx_harvest_tq_owner_scan`.
+- The scan runs at each tenure change, when a permit frees after a full
+  scan, and at the next due time. With no live wake listener, the gap is
+  at most one poll interval. While a listener receives the owner wakes,
+  the gap is at most 1 s or one poll interval, whichever is longer. A
+  listener that listens again triggers a scan at once.
+- So a lost wake, a due timer and the backlog of a new partition all reach
+  the decider.
+- A take is the owned by-execution claim. Every claim gate, the claim guard
+  and the post-claim rechecks apply. It reads no queue head.
+- Each take runs in its own future, bounded by the workflow permits. The
+  task row serializes the decisions of one execution, so the owner
+  serializes per execution, not per partition.
+- A take that finds nothing backs its execution off. The backoff starts at
+  one poll interval and doubles with each miss, up to 30 s. A wake ends it.
+  So a refused row cannot hold the head of each scan.
+- A scan reads `idx_harvest_tq_owner_scan`, which leads with the partition.
+  It reads a few rows of each owned partition, never the rows of another
+  owner. Takes and scans run beside the loop, so a scan never stalls a take.
+- The decider keeps execution ids only. A hint never acknowledges anything.
+  A signal is a `harvest_signals` row before its acknowledgement
+  (restate#4566).
+- A claim-held re-pend that is due now wakes the owner of its partition.
+  That covers a fenced owner, an unowned row and a deadlock retry. The new
+  owner then learns of the row at once.
+- With a DR pin, the start fence takes the generation row and the owner row
+  in one statement, the migration's `harvest_decision_fence`. The order of
+  decision 6 holds. The generation row waits with no bound, as before. The
+  owner row waits at most 250 ms.
+- Inside the fenced scope, an append checks neither row again when the start
+  fence took the same generation row. The scope records that row. A
+  colocated shard with its own row still checks it.
+- `owner_decider_tests.rs` proves the claim count and the signal case.
+  [`performance-owner-decider.md`](../performance-owner-decider.md) has the
+  measurements.
 
 ## Flows
 
@@ -566,9 +627,9 @@ here.
 | Cache invalidation | How does a foreign write invalidate another owner's cache? | Answered. An append wakes the owner, and its next decision loads the delta. A state change evicts. See decision 12. |
 | Acknowledgement | Can owner memory acknowledge work? | Answered. No. An acknowledgement follows a durable write. `CLAUDE.md` makes this an invariant. |
 | Lease expiry mid-decision | What happens when the lease lapses during a long decision? | Answered. The commit checks the epoch. The transaction aborts only when another worker acquired. See decision 5. |
-| Cost of two fences | What do two fence row locks per commit cost? | Deferred to #2248. Its benchmark gates stage 1b (#2255). |
+| Cost of two fences | What do two fence row locks per commit cost? | Answered. Issue #2248 measured two statements at +17.8%. Issue #2255 takes both rows in one statement. See decision 13. |
 | Mixed fleet | How is a mixed fleet made impossible? | Answered. A per-database switch and a database guard. See decision 11. |
-| Routing | How does the claim find owned work in stages 1a and 1b? | Answered for stage 1a by #2252: the claim filters workflow rows to owned partitions. Stage 1b moves off the claim (#2255). |
+| Routing | How does the claim find owned work in stages 1a and 1b? | Answered. In stage 1a the claim filters workflow rows to owned partitions (#2252). In stage 1b the owner decider takes them by execution. See decision 13. |
 | Group commit | Do decisions of one partition share a commit? | Deferred to #2256. |
 | Serialization unit | Does the owner serialize per partition or per execution? | Answered. Per execution. A single-threaded owner caps throughput, as at Durable Objects. |
 | Model nemeses | Which nemeses do the TLA+ model and the simulator cover? | Deferred to #2250. Stale commit after takeover, lease flap during an append, renewal during commits, and a signal before an epoch bump. |

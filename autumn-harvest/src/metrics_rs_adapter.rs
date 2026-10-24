@@ -109,9 +109,10 @@ use crate::telemetry::{
     SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome, WorkflowStatus,
 };
 use crate::telemetry::{
-    ClaimKind, DbOp, METRIC_DB_PERSIST_PHASE_DURATION, METRIC_DB_POOL_IDLE, METRIC_DB_POOL_IN_USE,
-    METRIC_DB_POOL_WAIT, METRIC_DB_QUERY_DURATION, METRIC_LABEL_DIMENSION, METRIC_LABEL_OP,
-    METRIC_LABEL_PHASE, METRIC_WORKER_OUTLIER, METRIC_WORKER_POLLERS, PersistPhase,
+    ClaimKind, DB_OP_TAKE, DbOp, METRIC_DB_PERSIST_PHASE_DURATION, METRIC_DB_POOL_IDLE,
+    METRIC_DB_POOL_IN_USE, METRIC_DB_POOL_WAIT, METRIC_DB_QUERY_DURATION, METRIC_LABEL_DIMENSION,
+    METRIC_LABEL_OP, METRIC_LABEL_PHASE, METRIC_WORKER_OUTLIER, METRIC_WORKER_POLLERS,
+    PersistPhase,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -600,6 +601,16 @@ impl MetricsRecorder for MetricsRsRecorder {
         histogram!(
             METRIC_DB_QUERY_DURATION,
             METRIC_LABEL_OP => DbOp::Claim.as_str(),
+            METRIC_LABEL_KIND => kind.as_str(),
+            METRIC_LABEL_SHARD => shard.to_string()
+        )
+        .record(seconds);
+    }
+
+    fn record_owner_take_duration(&self, kind: ClaimKind, shard: u16, seconds: f64) {
+        histogram!(
+            METRIC_DB_QUERY_DURATION,
+            METRIC_LABEL_OP => DB_OP_TAKE,
             METRIC_LABEL_KIND => kind.as_str(),
             METRIC_LABEL_SHARD => shard.to_string()
         )
