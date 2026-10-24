@@ -11,6 +11,8 @@
 //! 6. The plan skips an admissible entry only when the batch is full.
 //! 7. Repeated plans drain any queue, so no entry waits forever.
 //! 8. The plan equals `plan` of `formal/verus/src/group_commit.rs`.
+//! 9. A leader's share is between 1 and `max_batch`. Below `max_batch`,
+//!    `width` shares cover the queue.
 
 use std::collections::BTreeSet;
 
@@ -132,6 +134,19 @@ proptest! {
     fn a_batch_of_one_entry_is_a_lone_decision(queue in queue(), own in 0usize..40) {
         let batch = group_commit::plan_batch(&queue, own, 1);
         prop_assert_eq!(batch, if own < queue.len() { vec![own] } else { vec![] });
+    }
+
+    #[test]
+    fn a_share_is_bounded_and_covers_the_queue(
+        queued in 0usize..10_000,
+        width in 0usize..64,
+        max_batch in 1usize..64,
+    ) {
+        let r = group_commit::share(queued, width, max_batch);
+        prop_assert!((1..=max_batch).contains(&r));
+        if r < max_batch {
+            prop_assert!(r * width.max(1) >= queued, "width leaders cover the queue");
+        }
     }
 
     #[test]

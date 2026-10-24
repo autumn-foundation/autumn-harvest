@@ -39,4 +39,6 @@ Tests:
 - `formal/verus/src/group_commit.rs`: the plan rules and the result rule.
 - `group_commit_props.rs`: the planner against the Verus spec model.
 - `benches/group_commit_bench.rs`: throughput at depth and p50 at one
-  writer. See [`performance-group-commit.md`](../performance-group-commit.md).
+  writer. Paired bursts give 1.16x at 16 writers and 1.33x at 64 writers.
+  At one writer, the p50 is 0.998 of the lane with grouping off. See
+  [`performance-group-commit.md`](../performance-group-commit.md).

@@ -723,8 +723,9 @@ impl<'a> Sim<'a> {
                 execution: d.execution,
             })
             .collect();
+        let max_batch = group_commit::share(views.len(), self.config.width, self.config.max_batch);
         if self.config.defect != Defect::SharedExecution {
-            return group_commit::plan_batch(&views, 0, self.config.max_batch);
+            return group_commit::plan_batch(&views, 0, max_batch);
         }
         // The mutant drops the execution rule.
         let Some(head) = views.first() else {
@@ -732,7 +733,7 @@ impl<'a> Sim<'a> {
         };
         (0..views.len())
             .filter(|&at| views[at].tenure == head.tenure)
-            .take(self.config.max_batch)
+            .take(max_batch)
             .collect()
     }
 

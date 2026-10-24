@@ -114,7 +114,9 @@ partition. A lane has `width` slots and a queue.
 2. It then waits for a slot or for its result.
 3. The waiter that gets a slot plans a batch with `plan_batch`. The batch
    holds its own entry first, then the oldest queued entries of the same
-   tenure, at most one per execution, up to `max_batch`.
+   tenure, at most one per execution. It takes at most `share`: the queue
+   over `width`, rounded up, and at most `max_batch`. So the other slots
+   still find work.
 4. When the plan finds that another leader took its entry, it frees the
    slot and waits for its result.
 5. The leader starts the batch on a task of its own. The task runs the
@@ -294,4 +296,23 @@ Accepted as is:
 
 ## 6. Measurements
 
-Filled in after the bench.
+[`performance-group-commit.md`](docs/performance-group-commit.md) has the
+tables. In short, on a 4-CPU host with Postgres on the same host and
+`synchronous_commit = on`:
+
+| Done-when item | Result |
+|---|---|
+| A design note on savepoints and the fence | Pass. Section 1 and ADR 0009 decision 14. |
+| A throughput gain at depth | Pass. 1.16x at 16 writers and 1.33x at 64, from paired bursts. |
+| No p50 regression at low load | Pass. The group p50 is 0.998 of the solo p50 at one writer. |
+| The simulator covers a batch with one failing decision | Pass. `a_batch_with_one_failing_decision_commits_the_others`. |
+
+The first bench run found a defect. One leader took the whole queue, so
+the other slots found no work, and grouping was slower than solo. A leader
+now takes `share`: the queue over `width`, rounded up. Verus proves its
+bounds.
+
+Criterion runs one mode after another, and drift on this host moved the
+modes apart by about 10%, even where they run the same code. So the bench
+also alternates bursts of the two modes, and the figures above come from
+those pairs.

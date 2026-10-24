@@ -2589,3 +2589,8 @@ standalone note rather than part of the claim-path attribution table above:
   workflow tasks by execution, so the claim loops claim 3 tasks per
   3-activity workflow instead of 7. On a 4-CPU host the CPU limits the gain
   to 1.27x at one claim loop. The fused fence result is on the page.
+* [`docs/performance-group-commit.md`](performance-group-commit.md)
+  — group commit of one decision partition (issue #2256). Waiting decisions
+  share one transaction, with a savepoint each. Paired bursts give 1.16x
+  throughput at 16 writers and 1.33x at 64. A lone decision keeps its p50
+  (0.998 of the lane with grouping off).

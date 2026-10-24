@@ -8,16 +8,18 @@
 //!   `width` slots and a queue.
 //! - A decision leads a batch of one at once while a slot is free. So a
 //!   batch of two or more forms only when decisions wait for a slot.
+//! - A leader takes the fair share of one slot, so the other slots stay
+//!   busy.
 //! - The batch fences once. The owner row stays locked `FOR KEY SHARE`
 //!   until the batch commits, so no takeover commits mid-batch.
 //! - Each stage of a batch of two or more runs in its own savepoint. A
 //!   failing stage rolls back alone.
 //! - No result goes out before the batch commits.
 //!
-//! The pure kernels [`plan_batch`], [`accepts`] and [`acknowledges`] carry
-//! the rules. The simulator in `dst::group` calls them.
-//! `formal/verus/src/group_commit.rs` proves `accepts` and `acknowledges`,
-//! and the spec of `plan_batch`.
+//! The pure kernels [`plan_batch`], [`accepts`], [`share`] and
+//! [`acknowledges`] carry the rules. The simulator in `dst::group` calls
+//! them. `formal/verus/src/group_commit.rs` proves `accepts`, `share` and
+//! `acknowledges`, and the spec of `plan_batch`.
 //!
 //! The worker persist paths do not use the lane yet. Each path must first
 //! split its post-commit work from its transaction body (issue #2318).
@@ -88,6 +90,30 @@ pub fn plan_batch<G: PartialEq, K: PartialEq>(
         }
     }
     batch
+}
+
+#[allow(
+    clippy::manual_is_multiple_of,
+    reason = "Verus needs the plain remainder"
+)]
+/// The most entries that one leader takes from a queue of `queued`.
+///
+/// It is the fair share of each of the `width` slots, rounded up, and at
+/// most `max_batch`. A leader that took the whole queue would leave the
+/// other slots idle. `formal/verus/src/group_commit.rs` proves that the
+/// bound is at least 1, at most `max_batch`, and covers the queue with
+/// `width` batches when it is below `max_batch`.
+#[must_use]
+pub const fn share(queued: usize, width: usize, max_batch: usize) -> usize {
+    let slots = if width == 0 { 1 } else { width };
+    let fair = queued / slots + if queued % slots == 0 { 0 } else { 1 };
+    if fair == 0 {
+        1
+    } else if fair < max_batch {
+        fair
+    } else {
+        max_batch
+    }
 }
 
 /// Whether a decision of a batch reports success.
@@ -175,7 +201,7 @@ mod db {
     use futures::future::BoxFuture;
     use tokio::sync::{Semaphore, oneshot};
 
-    use super::{GroupCommitConfig, GroupCommitStats, Queued, acknowledges, plan_batch};
+    use super::{GroupCommitConfig, GroupCommitStats, Queued, acknowledges, plan_batch, share};
     use crate::decision_owner::{self, OwnerKey, OwnerTenure};
     use crate::error::{HarvestError, HarvestResult};
     use crate::types::ExecutionId;
@@ -225,10 +251,12 @@ mod db {
         }
 
         /// Remove the batch that entry `id` leads, or `None` when another
-        /// leader took the entry.
-        fn take(&self, id: u64, max_batch: usize) -> Option<Vec<Entry<T>>> {
+        /// leader took the entry. The batch takes the fair [`share`] of
+        /// one slot.
+        fn take(&self, id: u64, width: usize, max_batch: usize) -> Option<Vec<Entry<T>>> {
             let mut queue = self.queue();
             let own = queue.iter().position(|entry| entry.id == id)?;
+            let max_batch = share(queue.len(), width, max_batch);
             let views: Vec<Queued<&OwnerTenure, ExecutionId>> = queue
                 .iter()
                 .map(|entry| Queued {
@@ -371,7 +399,8 @@ mod db {
                     // A taken entry is no longer in the queue, so the guard
                     // has nothing to remove after this point.
                     waiting.armed = false;
-                    if let Some(batch) = lane.take(id, self.config.max_batch()) {
+                    let (width, max_batch) = (self.config.width(), self.config.max_batch());
+                    if let Some(batch) = lane.take(id, width, max_batch) {
                         // The slots never close, so `permit` holds a slot.
                         let permit = permit.ok();
                         let shared = Arc::clone(&self.shared);

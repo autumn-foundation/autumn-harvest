@@ -588,8 +588,8 @@ Issue #2256 builds this decision.
 - A decision commits alone at once while a slot is free. A batch of two or
   more forms only when decisions wait for a slot. So it engages only under
   queue depth.
-- A batch holds decisions of one tenure only, at most one per execution,
-  up to `max_batch`.
+- A batch holds decisions of one tenure only, at most one per execution.
+  A leader takes the fair share of one slot, up to `max_batch`.
 - The batch takes one owner row. It fences once, first, in the order of
   decision 6. The rest of the batch runs in `fenced_scope`.
 - The owner row stays locked `FOR KEY SHARE` until the batch commits. An

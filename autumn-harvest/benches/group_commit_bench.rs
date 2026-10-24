@@ -16,6 +16,10 @@
 //! After each case the bench prints the p50 and p99 latency of one
 //! decision, and the mean batch size.
 //!
+//! Two last passes cancel drift. At low load, one writer commits through
+//! `direct`, `solo` and `group` in turn and prints the p50 of each mode. At
+//! depth, bursts of `solo` and `group` alternate and print their throughput.
+//!
 //! Each decision models the worker persist with public engine calls, as
 //! `decision_fence_bench` does. It runs the start fence, two appends, one
 //! activity task enqueue and an execution update. The post-commit wake
@@ -38,6 +42,8 @@
 //! `HARVEST_GROUP_BENCH_WIDTH` sets the width. The default is 4.
 //! `HARVEST_GROUP_BENCH_SYNC=off` sets `synchronous_commit = off` on the
 //! bench database. The default keeps the server setting.
+//! `HARVEST_GROUP_BENCH_ORDER` sets the order of the modes as a comma list
+//! of labels. A run in another order shows drift.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -128,7 +134,7 @@ fn main() {
         .measurement_time(Duration::from_secs(6))
         .configure_from_args();
     let width = width();
-    for mode in Mode::ALL {
+    for mode in mode_order() {
         let mut group = criterion.benchmark_group(format!("decision_commit/{}", mode.label()));
         for &writers in &writer_counts() {
             runtime.block_on(bench.reset());
@@ -174,8 +180,23 @@ fn main() {
         }
         group.finish();
     }
+    runtime.block_on(bench.low_load_ab(width));
+    runtime.block_on(bench.depth_ab(width));
     runtime.block_on(bench.teardown());
     criterion.final_summary();
+}
+
+/// The modes to run, in order, from `HARVEST_GROUP_BENCH_ORDER`.
+fn mode_order() -> Vec<Mode> {
+    std::env::var("HARVEST_GROUP_BENCH_ORDER")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|label| Mode::ALL.into_iter().find(|m| m.label() == label.trim()))
+                .collect::<Vec<Mode>>()
+        })
+        .filter(|order| !order.is_empty())
+        .unwrap_or_else(|| Mode::ALL.to_vec())
 }
 
 /// The lane config of `mode`. `direct` uses no lane.
@@ -301,7 +322,10 @@ impl Bench {
                     match mode {
                         Mode::Direct => {
                             let _slot = slots.acquire().await.expect("open semaphore");
-                            self.direct(exec_id).await
+                            let (pool, tenure) = (self.pool.clone(), self.tenure.clone());
+                            tokio::spawn(direct(pool, tenure, exec_id))
+                                .await
+                                .expect("the direct task")
                         }
                         Mode::Solo | Mode::Group => {
                             lanes
@@ -326,24 +350,109 @@ impl Bench {
         wall.mul_f64(iters as f64 / done as f64)
     }
 
-    /// One decision transaction with no lane, as the persist runs today.
-    async fn direct(&self, exec_id: ExecutionId) -> Result<(), HarvestError> {
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| HarvestError::Database(e.to_string()))?;
-        let tenure = self.tenure.clone();
-        decision_owner::scope_decision(async move {
-            let _ = decision_owner::pin_decision(Some(tenure));
-            conn.transaction::<_, HarvestError, _>(async |conn| {
-                autumn_harvest::replication::assert_decision_fence(conn).await?;
-                let id = decision_owner::conn_id(conn);
-                decision_owner::fenced_scope(id, decision_body(conn, exec_id)).await
-            })
-            .await
-        })
-        .await
+    /// One writer commits decisions in turn through `direct`, `solo` and
+    /// `group`, so drift hits each mode alike. Prints the p50 and p99 of
+    /// each mode. `HARVEST_GROUP_BENCH_AB` sets the decisions per mode. The
+    /// default is 1000, and 0 skips the pass.
+    async fn low_load_ab(&self, width: usize) {
+        let rounds: usize = std::env::var("HARVEST_GROUP_BENCH_AB")
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+            .unwrap_or(1000);
+        if rounds == 0 {
+            return;
+        }
+        self.reset().await;
+        let solo = GroupCommit::new(self.pool.clone(), lane_config(Mode::Solo, width));
+        let group = GroupCommit::new(self.pool.clone(), lane_config(Mode::Group, width));
+        let exec_id = self.executions[0];
+        let mut samples: [Samples; 3] = Default::default();
+        for _ in 0..rounds {
+            for (at, mode) in Mode::ALL.into_iter().enumerate() {
+                let began = Instant::now();
+                match mode {
+                    Mode::Direct => {
+                        let (pool, tenure) = (self.pool.clone(), self.tenure.clone());
+                        tokio::spawn(direct(pool, tenure, exec_id))
+                            .await
+                            .expect("the direct task")
+                    }
+                    Mode::Solo => {
+                        solo.commit(self.tenure.clone(), exec_id, decision(exec_id))
+                            .await
+                    }
+                    Mode::Group => {
+                        group
+                            .commit(self.tenure.clone(), exec_id, decision(exec_id))
+                            .await
+                    }
+                }
+                .expect("the decision commits");
+                samples[at].latencies.push(began.elapsed());
+            }
+        }
+        for (at, mode) in Mode::ALL.into_iter().enumerate() {
+            let p50 = samples[at].quantile(0.5);
+            let p99 = samples[at].quantile(0.99);
+            println!(
+                "group_commit_bench: ab mode={} decisions={rounds} p50_ms={:.3} p99_ms={:.3}",
+                mode.label(),
+                p50.as_secs_f64() * 1e3,
+                p99.as_secs_f64() * 1e3,
+            );
+        }
+    }
+
+    /// At each writer count above `width`, bursts of `solo` and `group`
+    /// alternate, so drift hits both alike. Each burst runs 20 decisions
+    /// per writer. Prints the throughput of each burst pair.
+    /// `HARVEST_GROUP_BENCH_DEPTH_AB` sets the pairs per writer count. The
+    /// default is 10, and 0 skips the pass.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "decision counts here are far below 2^52"
+    )]
+    async fn depth_ab(&self, width: usize) {
+        let pairs: usize = std::env::var("HARVEST_GROUP_BENCH_DEPTH_AB")
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+            .unwrap_or(10);
+        for writers in writer_counts().into_iter().filter(|w| *w > width) {
+            self.reset().await;
+            let solo = Arc::new(GroupCommit::new(
+                self.pool.clone(),
+                lane_config(Mode::Solo, width),
+            ));
+            let group = Arc::new(GroupCommit::new(
+                self.pool.clone(),
+                lane_config(Mode::Group, width),
+            ));
+            let samples = Arc::new(Mutex::new(Samples::default()));
+            let decisions = 20 * writers as u64;
+            for pair in 0..pairs {
+                // Alternate which mode runs first in a pair.
+                let order = if pair % 2 == 0 {
+                    [Mode::Solo, Mode::Group]
+                } else {
+                    [Mode::Group, Mode::Solo]
+                };
+                let mut per_second = [0.0; 2];
+                for mode in order {
+                    let lanes = if mode == Mode::Solo { &solo } else { &group };
+                    // `run` returns the wall time of all `decisions`.
+                    let wall = self.run(mode, lanes, &samples, writers, decisions).await;
+                    let at = usize::from(mode == Mode::Group);
+                    per_second[at] = decisions as f64 / wall.as_secs_f64();
+                }
+                println!(
+                    "group_commit_bench: depth_ab writers={writers} pair={pair} \
+                     solo_per_s={:.1} group_per_s={:.1} ratio={:.3}",
+                    per_second[0],
+                    per_second[1],
+                    per_second[1] / per_second[0],
+                );
+            }
+        }
     }
 
     /// Empty the event and task tables and refresh their statistics.
@@ -370,6 +479,31 @@ impl Bench {
                 .await;
         }
     }
+}
+
+/// One decision transaction with no lane, as the persist runs today.
+///
+/// The bench spawns it, as a lane spawns its batch. So both modes run their
+/// queries on a worker thread of the runtime.
+async fn direct(
+    pool: DbPool,
+    tenure: OwnerTenure,
+    exec_id: ExecutionId,
+) -> Result<(), HarvestError> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| HarvestError::Database(e.to_string()))?;
+    decision_owner::scope_decision(async move {
+        let _ = decision_owner::pin_decision(Some(tenure));
+        conn.transaction::<_, HarvestError, _>(async |conn| {
+            autumn_harvest::replication::assert_decision_fence(conn).await?;
+            let id = decision_owner::conn_id(conn);
+            decision_owner::fenced_scope(id, decision_body(conn, exec_id)).await
+        })
+        .await
+    })
+    .await
 }
 
 /// One decision as a lane stage.

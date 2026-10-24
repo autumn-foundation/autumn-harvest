@@ -1,7 +1,9 @@
 //! The plan and the acknowledgement rule of group commit (issue #2256).
 //!
-//! The engine accepts an entry to a batch with `accepts` and reports a
-//! result with `acknowledges`. These copies prove both for every input.
+//! The engine accepts an entry to a batch with `accepts`, bounds a batch
+//! with `share` and reports a result with `acknowledges`. These copies
+//! prove each one for every input. With `share`, a leader takes at most
+//! `max_batch` entries, and `width` leaders cover the queue.
 //! The spec `plan` models `plan_batch` over any queue. It accepts each entry
 //! with the same rule. The theorems show that a batch starts with the
 //! leader, holds at most `max_batch` entries, keeps one tenure, and holds
@@ -44,6 +46,88 @@ pub fn acknowledges(stage_passed: bool, batch_committed: bool) -> (r: bool)
         r ==> stage_passed,
 {
     stage_passed && batch_committed
+}
+
+/// The rounded-up share of `queued` over `width` slots fits in a `usize`
+/// and covers the queue.
+proof fn lemma_share_bounds(queued: int, width: int)
+    requires
+        0 <= queued <= usize::MAX,
+        1 <= width,
+    ensures
+        queued % width != 0 ==> queued / width + 1 <= usize::MAX,
+        (queued / width + if queued % width == 0 { 0int } else { 1int }) * width >= queued,
+{
+    vstd::arithmetic::div_mod::lemma_fundamental_div_mod(queued, width);
+    vstd::arithmetic::div_mod::lemma_mod_pos_bound(queued, width);
+    vstd::arithmetic::div_mod::lemma_div_pos_is_pos(queued, width);
+    let q = queued / width;
+    let m = queued % width;
+    let up = if m == 0 {
+        0int
+    } else {
+        1int
+    };
+    assert((q + up) * width >= queued) by (nonlinear_arith)
+        requires
+            queued == width * q + m,
+            0 <= m < width,
+            0 <= up <= 1,
+            m != 0 ==> up == 1,
+            q >= 0,
+    ;
+    if m != 0 {
+        assert(q * 2 <= queued) by (nonlinear_arith)
+            requires
+                queued == width * q + m,
+                width >= 2,
+                q >= 0,
+                m >= 0,
+        ;
+    }
+}
+
+// mirror: autumn-harvest/src/group_commit.rs share
+pub fn share(queued: usize, width: usize, max_batch: usize) -> (r: usize)
+    requires
+        max_batch >= 1,
+    ensures
+        1 <= r <= max_batch,
+        r < max_batch ==> r * (if width == 0 { 1 } else { width }) >= queued,
+{
+    let slots = if width == 0 {
+        1
+    } else {
+        width
+    };
+    proof {
+        lemma_share_bounds(queued as int, slots as int);
+    }
+    let fair = queued / slots + if queued % slots == 0 {
+        0
+    } else {
+        1
+    };
+    proof {
+        assert(fair * slots >= queued);
+        assert(fair == 0 ==> queued == 0) by (nonlinear_arith)
+            requires
+                fair * slots >= queued,
+                queued >= 0,
+        ;
+        assert(slots == if width == 0 {
+            1
+        } else {
+            width
+        });
+    }
+    if fair == 0 {
+        1
+    } else if fair < max_batch {
+        fair
+    } else {
+        max_batch
+    }
 }
 
 /// One queued decision: the epoch of its tenure and its execution.

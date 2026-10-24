@@ -511,8 +511,9 @@ decisions queue while a batch runs. A batch holds at most 4 decisions.
   pending signal. A tenure keeps at most two decisions of one execution
   in flight. The second decision models a re-take, so the plan rule
   matters.
-- The lane plans each batch with the engine's `group_commit::plan_batch`.
-  Each decision gets its result through `group_commit::acknowledges`.
+- The lane plans each batch with the engine's `group_commit::plan_batch`,
+  bounded by `group_commit::share`. Each decision gets its result through
+  `group_commit::acknowledges`.
 - The start fence checks the holder and the epoch. It holds the owner row
   until the batch ends. An acquisition waits for every held fence.
 - Each stage runs in a savepoint. A failed stage rolls back alone.

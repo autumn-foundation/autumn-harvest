@@ -1,0 +1,83 @@
+Gnuplot not found, using plotters backend
+Benchmarking decision_commit/group/writers/1
+decision_commit/group/writers/1
+                        time:   [3.5178 ms 3.6032 ms 3.6945 ms]
+                        change: [−4.9577% −1.6974% +1.8138%] (p = 0.34 > 0.05)
+                        No change in performance detected.
+group_commit_bench: mode=group writers=1 width=4 p50_ms=3.384 p99_ms=7.533 mean_batch=1.00 largest=1
+Benchmarking decision_commit/group/writers/4
+Warning: Unable to complete 100 samples in 6.0s. You may wish to increase target time to 6.3s, enable flat sampling, or reduce sample count to 60.
+decision_commit/group/writers/4
+                        time:   [1.3020 ms 1.3356 ms 1.3690 ms]
+                        change: [−12.514% −9.8868% −7.0924%] (p = 0.00 < 0.05)
+                        Performance has improved.
+group_commit_bench: mode=group writers=4 width=4 p50_ms=4.759 p99_ms=9.291 mean_batch=1.00 largest=1
+Benchmarking decision_commit/group/writers/16
+decision_commit/group/writers/16
+                        time:   [1.4304 ms 1.4747 ms 1.5139 ms]
+                        change: [+9.8181% +15.885% +23.151%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+group_commit_bench: mode=group writers=16 width=4 p50_ms=19.795 p99_ms=38.505 mean_batch=2.13 largest=4
+Benchmarking decision_commit/group/writers/64
+decision_commit/group/writers/64
+                        time:   [1.4539 ms 1.5134 ms 1.5696 ms]
+                        change: [+24.854% +30.408% +36.346%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+group_commit_bench: mode=group writers=64 width=4 p50_ms=68.873 p99_ms=141.059 mean_batch=5.88 largest=16
+Benchmarking decision_commit/direct/writers/1
+decision_commit/direct/writers/1
+                        time:   [4.1310 ms 4.3025 ms 4.4962 ms]
+                        change: [+9.6051% +15.101% +21.284%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+group_commit_bench: mode=direct writers=1 width=4 p50_ms=3.930 p99_ms=8.645 mean_batch=1.00 largest=0
+Benchmarking decision_commit/direct/writers/4
+Warning: Unable to complete 100 samples in 6.0s. You may wish to increase target time to 6.2s, enable flat sampling, or reduce sample count to 60.
+decision_commit/direct/writers/4
+                        time:   [1.5224 ms 1.5654 ms 1.6086 ms]
+                        change: [+4.1857% +11.967% +24.149%] (p = 0.01 < 0.05)
+                        Performance has regressed.
+group_commit_bench: mode=direct writers=4 width=4 p50_ms=5.387 p99_ms=10.279 mean_batch=1.00 largest=0
+Benchmarking decision_commit/direct/writers/16
+Warning: Unable to complete 100 samples in 6.0s. You may wish to increase target time to 6.6s, enable flat sampling, or reduce sample count to 60.
+decision_commit/direct/writers/16
+                        time:   [1.4897 ms 1.5350 ms 1.5795 ms]
+                        change: [−3.6084% −0.0418% +3.4430%] (p = 0.98 > 0.05)
+                        No change in performance detected.
+group_commit_bench: mode=direct writers=16 width=4 p50_ms=21.013 p99_ms=34.528 mean_batch=1.00 largest=0
+Benchmarking decision_commit/direct/writers/64
+Warning: Unable to complete 100 samples in 6.0s. You may wish to increase target time to 7.4s, enable flat sampling, or reduce sample count to 60.
+decision_commit/direct/writers/64
+                        time:   [1.6644 ms 1.7185 ms 1.7677 ms]
+                        change: [+4.2037% +8.2603% +12.263%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+group_commit_bench: mode=direct writers=64 width=4 p50_ms=73.576 p99_ms=136.343 mean_batch=1.00 largest=0
+Benchmarking decision_commit/solo/writers/1
+decision_commit/solo/writers/1
+                        time:   [4.0454 ms 4.1465 ms 4.2486 ms]
+                        change: [−12.845% −8.8442% −4.8643%] (p = 0.00 < 0.05)
+                        Performance has improved.
+group_commit_bench: mode=solo writers=1 width=4 p50_ms=3.856 p99_ms=7.327 mean_batch=1.00 largest=1
+Benchmarking decision_commit/solo/writers/4
+Warning: Unable to complete 100 samples in 6.0s. You may wish to increase target time to 6.5s, enable flat sampling, or reduce sample count to 60.
+decision_commit/solo/writers/4
+                        time:   [1.5386 ms 1.5869 ms 1.6346 ms]
+                        change: [+3.5363% +7.4794% +11.553%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+group_commit_bench: mode=solo writers=4 width=4 p50_ms=5.359 p99_ms=10.148 mean_batch=1.00 largest=1
+Benchmarking decision_commit/solo/writers/16
+Warning: Unable to complete 100 samples in 6.0s. You may wish to increase target time to 6.5s, enable flat sampling, or reduce sample count to 60.
+decision_commit/solo/writers/16
+                        time:   [1.5385 ms 1.6009 ms 1.6609 ms]
+                        change: [+0.7712% +5.0301% +9.3237%] (p = 0.02 < 0.05)
+                        Change within noise threshold.
+group_commit_bench: mode=solo writers=16 width=4 p50_ms=21.345 p99_ms=37.019 mean_batch=1.00 largest=1
+Benchmarking decision_commit/solo/writers/64
+Warning: Unable to complete 100 samples in 6.0s. You may wish to increase target time to 7.6s, enable flat sampling, or reduce sample count to 60.
+decision_commit/solo/writers/64
+                        time:   [1.5253 ms 1.5760 ms 1.6270 ms]
+                        change: [+4.5899% +8.0533% +11.909%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+group_commit_bench: mode=solo writers=64 width=4 p50_ms=71.953 p99_ms=128.037 mean_batch=1.00 largest=1
+group_commit_bench: ab mode=direct decisions=1000 p50_ms=3.756 p99_ms=8.167
+group_commit_bench: ab mode=solo decisions=1000 p50_ms=3.759 p99_ms=7.711
+group_commit_bench: ab mode=group decisions=1000 p50_ms=3.756 p99_ms=7.954
