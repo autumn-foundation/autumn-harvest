@@ -621,3 +621,14 @@ A review from five angles found these. Each fix has a test.
   long segment never books a follow-up that is already due. Each
   `DirWorkspaceBlobs` put writes its own scratch file. Two attempts that
   save one digest at once then never mix their bytes.
+
+### Advisory RUSTSEC-2026-0387 (crypto-bigint 0.5.5)
+
+The advisory appeared during this PR and fails `cargo deny` on `trunk-dev`
+too. crypto-bigint 0.5.5 comes in through elliptic-curve 0.13, p256 and
+p384, which autumn-web 0.8.0 and jsonwebtoken 11.1.0 pin. Each crate of the
+chain is at its last release, so no bump is possible. `deny.toml` ignores
+the advisory with a verdict of "undetermined from this repo". Code in this
+workspace runs no P-256 or P-384 secret-key operation. The Web Push module
+of autumn-web does, when a host app turns it on. The entry names the revisit
+triggers.
