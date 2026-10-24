@@ -24,13 +24,6 @@ mod workflow;
 /// as a `u64` literal in the generated `WorkflowInfo`/`ActivityInfo`.
 ///
 /// Returns `None` for empty strings or strings with unrecognised suffixes.
-///
-/// Clone-class note: this suffix grammar repeats verbatim in
-/// `autumn_harvest::parse_byte_size`. Apply any change to one copy to both.
-/// A shared crate is not available: this proc-macro crate must not depend
-/// on the runtime crate it expands into. Two instances only, introduced
-/// together by commit 2d903b05 (issue #252), so the merge bar is not met.
-/// See the note on `parse_byte_size`.
 #[allow(clippy::option_if_let_else)]
 pub(crate) fn parse_byte_size_macro(s: &str) -> Option<u64> {
     let s = s.trim();
