@@ -1120,6 +1120,22 @@ jobs:
           cargo run -p autoresearch -- status --lab "$lab"
           cargo run -p autoresearch -- verify --lab "$lab"
           test "$(wc -l < "$lab/results.tsv")" -eq 10
+      # The agent-mesh capstone (issue #2276). The unit, end-to-end and
+      # simulation suites run offline on SQLite. The Postgres suite runs
+      # from its `linux` manifest row.
+      - name: "Run agent-mesh example tests (issue #2276)"
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        run: cargo test -p agent-mesh --lib --bins --test e2e --test simulation
+      # The README demo, as the README runs it, with the offline model.
+      - name: "Run the agent-mesh demo offline (issue #2276)"
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
+        run: |
+          set -euo pipefail
+          desk="$RUNNER_TEMP/desk"
+          cargo run -p agent-mesh -- --dir "$desk" demo | tee "$RUNNER_TEMP/desk.txt"
+          grep -qF "2 open tickets" "$RUNNER_TEMP/desk.txt"
+          grep -qF "I filed the reply to T-1" "$RUNNER_TEMP/desk.txt"
+          test "$(wc -l < "$desk/filed.log")" -eq 1
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
@@ -2198,6 +2214,10 @@ jobs:
       # daemon above: it uses `autumn-harvest` with no default features.
       - name: Clippy autoresearch example
         run: cargo clippy -p autoresearch --all-targets --no-deps -- -D warnings
+      # The agent-mesh capstone (issue #2276). `--no-deps` for the same
+      # reason as the autoresearch step.
+      - name: "Clippy agent-mesh example (issue #2276)"
+        run: cargo clippy -p agent-mesh --all-targets --no-deps -- -D warnings
 
   doc-snippets:
     name: Doc snippets compile
