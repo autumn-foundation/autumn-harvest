@@ -1451,7 +1451,8 @@ impl BuiltHarvest {
         .with_owner_disk_cache(
             self.worker_config.owner_disk_cache.clone(),
             self.worker_config.owner_disk_cache_min_events,
-        );
+        )
+        .with_owner_entity_sql(self.worker_config.owner_entity_sql);
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -1557,7 +1558,8 @@ impl BuiltHarvest {
         .with_owner_disk_cache(
             self.worker_config.owner_disk_cache.clone(),
             self.worker_config.owner_disk_cache_min_events,
-        );
+        )
+        .with_owner_entity_sql(self.worker_config.owner_entity_sql);
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -3975,6 +3977,12 @@ pub struct WorkerConfig {
     /// Default: [`DEFAULT_OWNER_DISK_CACHE_MIN_EVENTS`]. A shorter history
     /// loads faster from Postgres than from the disk and the anchor check.
     pub owner_disk_cache_min_events: usize,
+    /// Whether the owner disk cache keeps an entity projection for SQL
+    /// (issue #2260).
+    ///
+    /// Default: `false`. It needs [`Self::owner_disk_cache`]. See
+    /// [`Self::with_owner_entity_sql`].
+    pub owner_entity_sql: bool,
     /// How long to offer sticky tasks to the sticky worker before fallback.
     ///
     /// Default: [`DEFAULT_STICKY_TIMEOUT`] (5 s). Zero disables sticky
@@ -4517,6 +4525,7 @@ impl Default for WorkerConfig {
             resident_workflows: true,
             owner_disk_cache: None,
             owner_disk_cache_min_events: DEFAULT_OWNER_DISK_CACHE_MIN_EVENTS,
+            owner_entity_sql: false,
             sticky_timeout: DEFAULT_STICKY_TIMEOUT,
             cancellation_grace_period: Duration::from_secs(5),
             shard_assignments: Vec::new(),
@@ -5104,6 +5113,31 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_owner_disk_cache_min_events(mut self, events: usize) -> Self {
         self.owner_disk_cache_min_events = events;
+        self
+    }
+
+    /// Keep an entity projection in the owner disk cache (issue #2260).
+    ///
+    /// After each committed suspension, the owner seals the last state
+    /// snapshot of an entity run into its partition file.
+    /// `Worker::query_entity_sql` reads that row, or history on a miss. The
+    /// row follows every rule of the disk cache. It needs
+    /// [`Self::with_owner_disk_cache`] and owner mode. See
+    /// `docs/adr/0012-owner-disk-cache.md`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default()
+    ///     .with_owner_disk_cache("/var/cache/harvest")
+    ///     .with_owner_entity_sql(true);
+    /// assert!(config.owner_entity_sql);
+    /// ```
+    #[must_use]
+    pub const fn with_owner_entity_sql(mut self, on: bool) -> Self {
+        self.owner_entity_sql = on;
         self
     }
 

@@ -329,6 +329,9 @@ pub mod effective_config;
 pub mod eligibility;
 /// Keyed entity: serialized handlers over durable state for each key (issue #1975).
 pub mod entity;
+/// Read-only SQL over the state of one keyed entity (issue #2260).
+#[cfg(feature = "owner-disk-cache")]
+pub mod entity_sql;
 /// The keyed-entity state projection (issue #2259).
 pub mod entity_state;
 /// Targeted PII erasure for completed workflow executions (issue #495).

@@ -1091,9 +1091,10 @@ jobs:
         run: cargo test -p history-load-gate --lib --bins
       # Issue #2258. The module tests of the owner disk cache need its
       # feature. The worker tests run from their `linux` manifest row.
-      - name: "Run owner disk cache module tests (issue #2258)"
+      # Issue #2260 adds the entity SQL module tests.
+      - name: "Run owner disk cache module tests (issues #2258, #2260)"
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 2
-        run: cargo test -p autumn-harvest --features owner-disk-cache --lib owner_disk_cache
+        run: cargo test -p autumn-harvest --features owner-disk-cache --lib -- owner_disk_cache entity_sql
       # The other OSes compile the feature: the file lock and the directory
       # check have a path of their own there.
       - name: "Check owner disk cache feature (issue #2258)"

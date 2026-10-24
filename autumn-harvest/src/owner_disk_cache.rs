@@ -60,8 +60,9 @@ pub const CACHE_FILE_EXTENSION: &str = "hcache";
 /// The name of the sidecar lock file in the cache directory.
 pub const LOCK_FILE_NAME: &str = "owner-disk-cache.lock";
 
-/// The format version in each file stamp.
-const FORMAT_VERSION: u32 = 1;
+/// The format version in each file stamp. Version 2 adds the entity
+/// projection table (issue #2260).
+const FORMAT_VERSION: u32 = 2;
 
 /// The run state that the cache stores. Only a live run has an entry.
 pub const CACHED_RUN_STATE: &str = "RUNNING";
@@ -87,6 +88,10 @@ CREATE TABLE IF NOT EXISTS harvest_events (
     seq        INTEGER NOT NULL,
     event_json BLOB NOT NULL,
     PRIMARY KEY (exec_id, seq)
+);
+CREATE TABLE IF NOT EXISTS harvest_entity_projection (
+    exec_id TEXT PRIMARY KEY,
+    sealed  BLOB NOT NULL
 );
 ";
 
@@ -165,6 +170,34 @@ pub enum DiskStore {
     Refused,
     /// A write failed. The cache purged the entry.
     Failed,
+}
+
+/// One entity snapshot in the projection table (issue #2260).
+///
+/// The row is sealed. The entity key is not in it, so the disk holds no
+/// key in plaintext.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectedEntity {
+    /// The history position of the snapshot in its run.
+    pub event_id: i32,
+    /// The snapshot ended the entity.
+    pub deleted: bool,
+    /// The decoded state and counters.
+    pub snapshot: crate::entity::EntitySnapshot<serde_json::Value>,
+}
+
+/// The result of [`OwnerDiskCache::load_entity`].
+#[derive(Debug)]
+pub enum EntityLoad {
+    /// The row passed every check.
+    Hit(ProjectedEntity),
+    /// The cache holds no row for the run.
+    Miss,
+    /// A stamp did not match, or the file is gone. The cache purged the
+    /// row or the file.
+    Stale,
+    /// The row did not open or decode. The cache purged it.
+    Corrupt,
 }
 
 /// The file stamp. It is sealed in `harvest_cache_stamp`.
@@ -340,10 +373,31 @@ fn remove_cache_file(path: &Path) {
     }
 }
 
+/// The identity of a file on disk: the device and the inode on Unix.
+type FileIdentity = (u64, u64);
+
+/// The identity of the file at `path`, or `None` when it is gone.
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        Some((0, 0))
+    }
+}
+
 /// One partition file and its connection.
 struct Partition {
     path: PathBuf,
     conn: Option<Connection>,
+    /// The identity of the file that `conn` opened. A deleted or replaced
+    /// file has another identity, or none (issue #2260).
+    identity: Option<FileIdentity>,
     /// A drop sets this. An operation that still holds the partition then
     /// writes nothing.
     closed: bool,
@@ -361,6 +415,9 @@ pub struct OwnerDiskCache {
     partitions: Mutex<HashMap<OwnerKey, Arc<Mutex<Partition>>>>,
     /// The partition of each cached run. It routes a purge by run id.
     index: Mutex<HashMap<Uuid, OwnerKey>>,
+    /// The partition and the snapshot event id of each projected entity
+    /// run (issue #2260).
+    entity_index: Mutex<HashMap<Uuid, (OwnerKey, i32)>>,
     /// The runs that an evict wake purged, and when. A store refuses such a
     /// run for [`EVICT_HOLD`], so an in-flight store cannot write it back.
     evicted: Mutex<HashMap<Uuid, std::time::Instant>>,
@@ -408,6 +465,7 @@ impl OwnerDiskCache {
             sealer: Sealer::new(),
             partitions: Mutex::new(HashMap::new()),
             index: Mutex::new(HashMap::new()),
+            entity_index: Mutex::new(HashMap::new()),
             evicted: Mutex::new(HashMap::new()),
         })
     }
@@ -462,7 +520,7 @@ impl OwnerDiskCache {
         }
         match self.check_file_stamp(&guard, slot) {
             StampCheck::Valid => {}
-            StampCheck::Mismatch => {
+            StampCheck::Mismatch | StampCheck::Gone => {
                 self.close_partition(slot.key, &partition, &mut guard);
                 return DiskLoad::Stale;
             }
@@ -554,6 +612,140 @@ impl OwnerDiskCache {
         })
     }
 
+    /// Store the entity snapshot of `exec` for `slot` (issue #2260).
+    ///
+    /// The row replaces an older row of the run. It never replaces a newer
+    /// one. `still_owned` runs under the partition lock, as in
+    /// [`Self::store`].
+    pub fn store_entity(
+        &self,
+        slot: &DiskSlot,
+        exec: Uuid,
+        entity: &ProjectedEntity,
+        still_owned: impl FnOnce() -> bool,
+    ) -> DiskStore {
+        let previous = lock(&self.entity_index).get(&exec).copied();
+        if previous.is_some_and(|(key, _)| key != slot.key) {
+            self.purge(exec);
+        }
+        let partition = self.partition(slot.key);
+        let mut guard = lock(&partition);
+        if guard.closed || self.held_back(exec) || !still_owned() {
+            let deleted = guard
+                .conn
+                .as_ref()
+                .is_none_or(|conn| self.delete_run(conn, slot.key, exec));
+            if !deleted {
+                self.close_partition(slot.key, &partition, &mut guard);
+            }
+            return DiskStore::Refused;
+        }
+        if lock(&self.entity_index)
+            .get(&exec)
+            .is_some_and(|(key, event_id)| *key == slot.key && *event_id > entity.event_id)
+        {
+            return DiskStore::Refused;
+        }
+        if !self.ensure_file(&mut guard, slot) {
+            return DiskStore::Failed;
+        }
+        let Some(conn) = guard.conn.as_ref() else {
+            return DiskStore::Failed;
+        };
+        if self.write_entity(conn, slot.key, exec, entity).is_some() {
+            lock(&self.entity_index).insert(exec, (slot.key, entity.event_id));
+            drop(guard);
+            return DiskStore::Written { appended: 1 };
+        }
+        if !self.delete_run(conn, slot.key, exec) {
+            self.close_partition(slot.key, &partition, &mut guard);
+        }
+        DiskStore::Failed
+    }
+
+    /// Load the entity snapshot of `exec` for `slot` (issue #2260).
+    ///
+    /// A stamp mismatch or a file that left the directory returns
+    /// [`EntityLoad::Stale`]. A row that does not open returns
+    /// [`EntityLoad::Corrupt`]. Both purge first.
+    #[must_use]
+    pub fn load_entity(&self, slot: &DiskSlot, exec: Uuid) -> EntityLoad {
+        let Some(partition) = self.existing_partition(slot.key) else {
+            return EntityLoad::Miss;
+        };
+        let mut guard = lock(&partition);
+        if guard.closed || guard.conn.is_none() {
+            return EntityLoad::Miss;
+        }
+        match self.check_file_stamp(&guard, slot) {
+            StampCheck::Valid => {}
+            StampCheck::Mismatch | StampCheck::Gone => {
+                self.close_partition(slot.key, &partition, &mut guard);
+                return EntityLoad::Stale;
+            }
+            StampCheck::Broken => {
+                self.close_partition(slot.key, &partition, &mut guard);
+                return EntityLoad::Corrupt;
+            }
+        }
+        let Some(conn) = guard.conn.as_ref() else {
+            return EntityLoad::Miss;
+        };
+        let outcome = self.read_entity(conn, slot.key, exec);
+        if matches!(outcome, EntityLoad::Corrupt) && !self.delete_run(conn, slot.key, exec) {
+            self.close_partition(slot.key, &partition, &mut guard);
+        }
+        drop(guard);
+        outcome
+    }
+
+    /// Delete only the entity row of `exec`, and keep its run rows (issue
+    /// #2260). Returns `true` when the projection held a row.
+    pub fn purge_entity(&self, exec: Uuid) -> bool {
+        let Some((key, _)) = lock(&self.entity_index).get(&exec).copied() else {
+            return false;
+        };
+        if let Some(partition) = self.existing_partition(key) {
+            let mut guard = lock(&partition);
+            let deleted = guard.conn.as_ref().is_none_or(|conn| {
+                conn.execute(
+                    "DELETE FROM harvest_entity_projection WHERE exec_id = ?1",
+                    params![exec.to_string()],
+                )
+                .is_ok()
+            });
+            if !deleted {
+                self.close_partition(key, &partition, &mut guard);
+            }
+            drop(guard);
+        }
+        let mut entities = lock(&self.entity_index);
+        if entities.get(&exec).is_some_and(|(k, _)| *k == key) {
+            entities.remove(&exec);
+        }
+        true
+    }
+
+    /// Whether the projection holds a row for `exec` (issue #2260).
+    #[must_use]
+    pub fn contains_entity(&self, exec: Uuid) -> bool {
+        lock(&self.entity_index).contains_key(&exec)
+    }
+
+    /// The event id of the projected snapshot of `exec`, if any.
+    #[must_use]
+    pub fn entity_event_id(&self, exec: Uuid) -> Option<i32> {
+        lock(&self.entity_index)
+            .get(&exec)
+            .map(|(_, event_id)| *event_id)
+    }
+
+    /// Whether the cache holds a run entry or an entity row for `exec`.
+    #[must_use]
+    pub fn holds(&self, exec: Uuid) -> bool {
+        self.contains(exec) || self.contains_entity(exec)
+    }
+
     /// Delete the entry of `exec`, and refuse to store it for
     /// [`EVICT_HOLD`]. An evict wake calls this. Returns `true` when the
     /// cache held an entry.
@@ -578,7 +770,10 @@ impl OwnerDiskCache {
 
     /// Delete the entry of `exec`. Returns `true` when the cache held one.
     pub fn purge(&self, exec: Uuid) -> bool {
-        let Some(key) = lock(&self.index).get(&exec).copied() else {
+        let run_key = lock(&self.index).get(&exec).copied();
+        let Some(key) =
+            run_key.or_else(|| lock(&self.entity_index).get(&exec).map(|(key, _)| *key))
+        else {
             return false;
         };
         if let Some(partition) = self.existing_partition(key) {
@@ -595,6 +790,11 @@ impl OwnerDiskCache {
         let mut index = lock(&self.index);
         if index.get(&exec) == Some(&key) {
             index.remove(&exec);
+        }
+        drop(index);
+        let mut entities = lock(&self.entity_index);
+        if entities.get(&exec).is_some_and(|(k, _)| *k == key) {
+            entities.remove(&exec);
         }
         true
     }
@@ -645,6 +845,7 @@ impl OwnerDiskCache {
         let all: Vec<OwnerKey> = lock(&self.partitions).keys().copied().collect();
         self.drop_partitions(&all);
         lock(&self.index).clear();
+        lock(&self.entity_index).clear();
         if let Err(err) = wipe_dir(&self.dir) {
             tracing::warn!(error = %err, "owner disk cache: the wipe failed");
         }
@@ -660,6 +861,7 @@ impl OwnerDiskCache {
             Arc::new(Mutex::new(Partition {
                 path,
                 conn: None,
+                identity: None,
                 closed: false,
             }))
         }))
@@ -682,8 +884,9 @@ impl OwnerDiskCache {
         }
         guard.closed = true;
         drop(guard.conn.take());
+        guard.identity = None;
         remove_cache_file(&guard.path);
-        lock(&self.index).retain(|_, k| *k != key);
+        self.forget_partition(key);
         let mut partitions = lock(&self.partitions);
         if partitions
             .get(&key)
@@ -701,13 +904,15 @@ impl OwnerDiskCache {
                 return true;
             }
             drop(guard.conn.take());
+            guard.identity = None;
             remove_cache_file(&guard.path);
-            lock(&self.index).retain(|_, k| *k != slot.key);
+            self.forget_partition(slot.key);
         }
         remove_cache_file(&guard.path);
         match self.create_file(&guard.path, slot) {
             Ok(conn) => {
                 guard.conn = Some(conn);
+                guard.identity = file_identity(&guard.path);
                 true
             }
             Err(err) => {
@@ -738,6 +943,11 @@ impl OwnerDiskCache {
         let Some(conn) = guard.conn.as_ref() else {
             return StampCheck::Broken;
         };
+        // On Unix an open connection still reads a deleted file. A file
+        // that left the directory is gone for the cache (issue #2260).
+        if guard.identity.is_none() || file_identity(&guard.path) != guard.identity {
+            return StampCheck::Gone;
+        }
         match self.read_file_stamp(conn, slot.key) {
             None => StampCheck::Broken,
             Some(stamp) if stamp == FileStamp::of(slot) => StampCheck::Valid,
@@ -915,6 +1125,55 @@ impl OwnerDiskCache {
         Some(state.events.len() - start)
     }
 
+    /// Seal and upsert the entity row of `exec`. `None` on any failure.
+    fn write_entity(
+        &self,
+        conn: &Connection,
+        key: OwnerKey,
+        exec: Uuid,
+        entity: &ProjectedEntity,
+    ) -> Option<()> {
+        let plain = serde_json::to_vec(entity).ok()?;
+        let sealed = self
+            .sealer
+            .seal(&aad("entity", key, Some(exec), None), &plain)?;
+        conn.execute(
+            "INSERT INTO harvest_entity_projection (exec_id, sealed) VALUES (?1, ?2) \
+             ON CONFLICT (exec_id) DO UPDATE SET sealed = excluded.sealed",
+            params![exec.to_string(), sealed],
+        )
+        .ok()?;
+        Some(())
+    }
+
+    /// Read and open the entity row of `exec`.
+    fn read_entity(&self, conn: &Connection, key: OwnerKey, exec: Uuid) -> EntityLoad {
+        let sealed: Option<Vec<u8>> = match conn
+            .query_row(
+                "SELECT sealed FROM harvest_entity_projection WHERE exec_id = ?1",
+                params![exec.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+        {
+            Ok(sealed) => sealed,
+            Err(_) => return EntityLoad::Corrupt,
+        };
+        let Some(sealed) = sealed else {
+            return EntityLoad::Miss;
+        };
+        self.sealer
+            .open(&aad("entity", key, Some(exec), None), &sealed)
+            .and_then(|plain| serde_json::from_slice::<ProjectedEntity>(&plain).ok())
+            .map_or(EntityLoad::Corrupt, EntityLoad::Hit)
+    }
+
+    /// Forget every run and entity row of partition `key`.
+    fn forget_partition(&self, key: OwnerKey) {
+        lock(&self.index).retain(|_, k| *k != key);
+        lock(&self.entity_index).retain(|_, (k, _)| *k != key);
+    }
+
     /// Delete the rows of `exec`. Returns `false` when the delete failed.
     /// The caller then closes the partition, which deletes the whole file.
     fn delete_run(&self, conn: &Connection, key: OwnerKey, exec: Uuid) -> bool {
@@ -929,12 +1188,23 @@ impl OwnerDiskCache {
                     "DELETE FROM harvest_cache_runs WHERE exec_id = ?1",
                     params![exec_text],
                 )
+            })
+            .and_then(|_| {
+                conn.execute(
+                    "DELETE FROM harvest_entity_projection WHERE exec_id = ?1",
+                    params![exec_text],
+                )
             });
         let mut index = lock(&self.index);
         if index.get(&exec) == Some(&key) {
             index.remove(&exec);
         }
         drop(index);
+        let mut entities = lock(&self.entity_index);
+        if entities.get(&exec).is_some_and(|(k, _)| *k == key) {
+            entities.remove(&exec);
+        }
+        drop(entities);
         if let Err(err) = &deleted {
             tracing::warn!(error = %err, "owner disk cache: a purge failed; the file is deleted");
         }
@@ -955,6 +1225,8 @@ enum StampCheck {
     Valid,
     Mismatch,
     Broken,
+    /// The file left the directory, or another file took its path.
+    Gone,
 }
 
 /// The result of a run stamp read.
@@ -1078,6 +1350,163 @@ fn anchors(tail: &crate::store::EventHistory, anchor: i32, last_event_hash: &[u8
             .is_some_and(|event| event_hash(event).is_ok_and(|hash| &hash == last_event_hash))
 }
 
+/// Find the snapshot of the entity `(workflow_name, workflow_id)` for a
+/// query (issue #2260).
+///
+/// A hit reads the projection file of a held tenure. A miss reads the
+/// snapshot event from history, and an owner seals it into the file.
+///
+/// # Errors
+///
+/// [`EntitySqlError::NotFound`], [`EntitySqlError::Erased`],
+/// [`EntitySqlError::NotRecorded`], or a database or codec error.
+///
+/// [`EntitySqlError::NotFound`]: crate::entity_sql::EntitySqlError::NotFound
+/// [`EntitySqlError::Erased`]: crate::entity_sql::EntitySqlError::Erased
+/// [`EntitySqlError::NotRecorded`]: crate::entity_sql::EntitySqlError::NotRecorded
+pub(crate) async fn entity_record(
+    disk: Option<&DiskTier>,
+    conn: &mut diesel_async::AsyncPgConnection,
+    owned: Arc<crate::decision_owner::OwnedPartitions>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> Result<
+    (
+        crate::entity_sql::EntityRecord,
+        crate::entity_sql::EntitySqlSource,
+    ),
+    crate::entity_sql::EntitySqlError,
+> {
+    use crate::entity_sql::{EntityRecord, EntitySqlError, EntitySqlSource};
+    use crate::entity_state::ProjectedSnapshot;
+
+    let not_found = || EntitySqlError::NotFound {
+        workflow_name: workflow_name.to_string(),
+        workflow_id: workflow_id.to_string(),
+    };
+    let pointer = crate::entity_state::pointer(conn, workflow_name, workflow_id)
+        .await?
+        .ok_or_else(not_found)?;
+    let exec = pointer.execution_id;
+    let record = |entity: ProjectedEntity| {
+        EntityRecord::new(
+            workflow_name,
+            workflow_id,
+            exec,
+            entity.event_id,
+            entity.deleted,
+            entity.snapshot,
+        )
+    };
+    // Only a live run of a held tenure reads or writes the file.
+    let slot = disk
+        .filter(|_| pointer.run_state == CACHED_RUN_STATE)
+        .and_then(|tier| {
+            tier.entity_slot(&owned, workflow_id)
+                .map(|(key, epoch)| (tier, key, epoch))
+        });
+    if let Some((tier, key, epoch)) = slot
+        && tier.cache.contains_entity(exec.as_uuid())
+    {
+        let at = tier.slot(key, epoch);
+        let cache = Arc::clone(&tier.cache);
+        let exec_uuid = exec.as_uuid();
+        let loaded = tokio::task::spawn_blocking(move || cache.load_entity(&at, exec_uuid))
+            .await
+            .unwrap_or(EntityLoad::Miss);
+        match loaded {
+            EntityLoad::Hit(entity) if entity.event_id == pointer.event_id => {
+                return Ok((record(entity), EntitySqlSource::File));
+            }
+            EntityLoad::Hit(_) => {
+                let cache = Arc::clone(&tier.cache);
+                let _ = tokio::task::spawn_blocking(move || cache.purge_entity(exec_uuid)).await;
+            }
+            EntityLoad::Miss | EntityLoad::Stale | EntityLoad::Corrupt => {}
+        }
+    }
+    let snapshot =
+        crate::entity_state::snapshot_at(conn, codecs, offloader, exec, pointer.event_id).await?;
+    let entity = match snapshot.ok_or_else(not_found)? {
+        ProjectedSnapshot::Current(snapshot) => ProjectedEntity {
+            event_id: pointer.event_id,
+            deleted: pointer.deleted,
+            snapshot,
+        },
+        ProjectedSnapshot::Erased => return Err(EntitySqlError::Erased),
+        ProjectedSnapshot::Omitted => {
+            return Err(EntitySqlError::NotRecorded(
+                "the state was past a payload cap".to_string(),
+            ));
+        }
+        ProjectedSnapshot::Offloaded => {
+            return Err(EntitySqlError::NotRecorded(
+                "the payload store holds the state, and no store is set".to_string(),
+            ));
+        }
+    };
+    if let Some((tier, key, epoch)) = slot {
+        let at = tier.slot(key, epoch);
+        let cache = Arc::clone(&tier.cache);
+        let exec_uuid = exec.as_uuid();
+        let stored = entity.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            cache.store_entity(&at, exec_uuid, &stored, || {
+                owned.may_cache(key, Some(epoch))
+            })
+        })
+        .await;
+        if matches!(written, Ok(DiskStore::Written { .. })) {
+            lock(&tier.written).insert(key);
+        }
+    }
+    Ok((record(entity), EntitySqlSource::History))
+}
+
+/// The last entity snapshot in `events` after the event id `stored`.
+///
+/// Returns its event id, and the row to store, or `None` when the snapshot
+/// holds no state. Event `i` must be at index `i`.
+fn latest_entity(
+    events: &[WorkflowEvent],
+    stored: Option<i32>,
+) -> Option<(i32, Option<ProjectedEntity>)> {
+    use crate::entity_state::ProjectedSnapshot;
+    use crate::event::SideEffectKind;
+
+    events
+        .iter()
+        .enumerate()
+        .rev()
+        .map_while(|(index, event)| {
+            let event_id = i32::try_from(index).ok()?;
+            stored
+                .is_none_or(|id| event_id > id)
+                .then_some((event_id, event))
+        })
+        .find_map(|(event_id, event)| match event {
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::EntityState,
+                name,
+                value,
+            } => {
+                let deleted = name.as_deref() == Some(crate::entity::ENTITY_DELETED_SIDE_EFFECT);
+                let entity = match crate::entity_state::classify_decoded(value.clone()) {
+                    Ok(ProjectedSnapshot::Current(snapshot)) => Some(ProjectedEntity {
+                        event_id,
+                        deleted,
+                        snapshot,
+                    }),
+                    _ => None,
+                };
+                Some((event_id, entity))
+            }
+            _ => None,
+        })
+}
+
 /// How often an owner checks its cached runs against Postgres.
 ///
 /// The check is the backstop for a lost evict wake. It purges each cached
@@ -1103,6 +1532,8 @@ pub(crate) struct DiskTier {
     /// The fewest events that a run needs before the tier keeps it. A
     /// shorter history loads faster from Postgres.
     min_events: usize,
+    /// Whether the tier keeps an entity projection (issue #2260).
+    entity_sql: bool,
 }
 
 /// What a disk read gives a decision.
@@ -1130,6 +1561,97 @@ impl DiskTier {
             last_reconcile: Arc::default(),
             written: Arc::default(),
             min_events,
+            entity_sql: false,
+        }
+    }
+
+    /// Keep an entity projection (issue #2260).
+    #[must_use]
+    pub(crate) const fn with_entity_sql(mut self, on: bool) -> Self {
+        self.entity_sql = on;
+        self
+    }
+
+    /// Seal the last entity snapshot in `events` into the projection
+    /// (issue #2260).
+    ///
+    /// Call it after a committed suspension of a held tenure. A run with no
+    /// snapshot, or with the same snapshot as the row, writes nothing.
+    pub(crate) async fn apply_entity(
+        &self,
+        key: OwnerKey,
+        epoch: OwnerEpoch,
+        exec: Uuid,
+        state: &CachedWorkflowState,
+        owned: Arc<crate::decision_owner::OwnedPartitions>,
+    ) {
+        if !self.entity_sql {
+            return;
+        }
+        // Event `i` is at index `i` only in a full history.
+        let aligned =
+            usize::try_from(state.next_event_id).is_ok_and(|next| next == state.events.len());
+        if !aligned {
+            return;
+        }
+        let stored = self.cache.entity_event_id(exec);
+        let Some((event_id, entity)) = latest_entity(&state.events, stored) else {
+            return;
+        };
+        let cache = Arc::clone(&self.cache);
+        let Some(entity) = entity else {
+            // A snapshot that holds no state, such as an omitted one. The
+            // row would be stale, so it goes.
+            if let Err(err) = tokio::task::spawn_blocking(move || cache.purge_entity(exec)).await {
+                tracing::warn!(error = %err, "owner disk cache: an entity purge task died");
+            }
+            return;
+        };
+        let slot = self.slot(key, epoch);
+        let stored = tokio::task::spawn_blocking(move || {
+            cache.store_entity(&slot, exec, &entity, || owned.may_cache(key, Some(epoch)))
+        })
+        .await;
+        match stored {
+            Ok(DiskStore::Written { .. }) => {
+                lock(&self.written).insert(key);
+            }
+            Ok(DiskStore::Failed) => {
+                tracing::warn!(%key, event_id, "owner disk cache: an entity write failed");
+            }
+            Ok(DiskStore::Refused) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, "owner disk cache: an entity write task died");
+                self.purge(exec).await;
+            }
+        }
+    }
+
+    /// The held tenure of the partition of `workflow_id`, if exactly one
+    /// shard has a live one (issue #2260).
+    fn entity_slot(
+        &self,
+        owned: &crate::decision_owner::OwnedPartitions,
+        workflow_id: &str,
+    ) -> Option<(OwnerKey, OwnerEpoch)> {
+        use crate::decision_owner::{DecisionPartition, DecisionPin};
+        if !self.entity_sql {
+            return None;
+        }
+        let partition = DecisionPartition::for_workflow_id(workflow_id);
+        let mut held = owned
+            .tenures()
+            .into_iter()
+            .filter(|tenure| tenure.partition() == partition);
+        let tenure = held.next()?;
+        if held.next().is_some() {
+            return None;
+        }
+        match owned.pin_for(tenure.key()) {
+            DecisionPin::Owned(live) if live.epoch() == tenure.epoch() => {
+                Some((live.key(), live.epoch()))
+            }
+            _ => None,
         }
     }
 
@@ -1272,7 +1794,7 @@ impl DiskTier {
 
     /// Delete the entry of `exec`. Returns `true` when the cache held one.
     pub(crate) async fn purge(&self, exec: Uuid) -> bool {
-        if !self.cache.contains(exec) {
+        if !self.cache.holds(exec) {
             return false;
         }
         let cache = Arc::clone(&self.cache);
@@ -1353,11 +1875,20 @@ impl DiskTier {
                 "owner disk cache: the codec key set changed; files deleted"
             );
         }
-        let cached: Vec<Uuid> = lock(&self.cache.index)
+        let mut cached: Vec<Uuid> = lock(&self.cache.index)
             .iter()
             .filter(|(_, key)| shard.is_none_or(|s| key.shard == s))
             .map(|(exec, _)| *exec)
             .collect();
+        // Issue #2260: the entity rows follow the same rule.
+        cached.extend(
+            lock(&self.cache.entity_index)
+                .iter()
+                .filter(|(_, (key, _))| shard.is_none_or(|s| key.shard == s))
+                .map(|(exec, _)| *exec),
+        );
+        cached.sort_unstable();
+        cached.dedup();
         let mut doomed = Vec::new();
         for chunk in cached.chunks(RECONCILE_CHUNK) {
             let live: Vec<Uuid> = runs::table
@@ -1925,6 +2456,226 @@ mod tests {
         assert!(cache.contains(long), "a history at the bound goes to disk");
     }
 
+    fn entity(event_id: i32) -> ProjectedEntity {
+        ProjectedEntity {
+            event_id,
+            deleted: false,
+            snapshot: crate::entity::EntitySnapshot {
+                state: json!({"secret": MARKER, "n": event_id}),
+                stats: crate::entity::EntityStats::default(),
+            },
+        }
+    }
+
+    fn entity_rows(cache: &OwnerDiskCache, partition: u16) -> Vec<Vec<u8>> {
+        let conn = Connection::open(cache.file_path(key(partition))).expect("open");
+        let mut stmt = conn
+            .prepare("SELECT sealed FROM harvest_entity_projection")
+            .expect("prepare");
+        stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .expect("query")
+            .map(|row| row.expect("row"))
+            .collect()
+    }
+
+    /// Issue #2260: a stored snapshot loads back, and a newer one replaces
+    /// it.
+    #[test]
+    fn a_stored_entity_loads_back() {
+        let dir = private_dir();
+        let cache = OwnerDiskCache::open(dir.path()).expect("open");
+        let exec = Uuid::new_v4();
+        assert!(matches!(
+            cache.load_entity(&slot(1), exec),
+            EntityLoad::Miss
+        ));
+        assert_eq!(
+            cache.store_entity(&slot(1), exec, &entity(3), owned),
+            DiskStore::Written { appended: 1 }
+        );
+        assert!(cache.contains_entity(exec));
+        assert!(!cache.contains(exec), "the run index stays apart");
+        assert_eq!(cache.entity_event_id(exec), Some(3));
+        let EntityLoad::Hit(loaded) = cache.load_entity(&slot(1), exec) else {
+            panic!("expected a hit");
+        };
+        assert_eq!(loaded, entity(3));
+
+        let _ = cache.store_entity(&slot(1), exec, &entity(5), owned);
+        assert_eq!(entity_rows(&cache, 1).len(), 1, "one row for each run");
+        let EntityLoad::Hit(loaded) = cache.load_entity(&slot(1), exec) else {
+            panic!("expected a hit");
+        };
+        assert_eq!(loaded.event_id, 5);
+        assert_eq!(cache.entity_event_id(exec), Some(5));
+    }
+
+    /// Issue #2260: the state is sealed. No plaintext reaches the disk.
+    #[test]
+    fn an_entity_row_holds_no_plaintext() {
+        let dir = private_dir();
+        let cache = OwnerDiskCache::open(dir.path()).expect("open");
+        let _ = cache.store_entity(&slot(1), Uuid::new_v4(), &entity(2), owned);
+        let raw = cache_bytes(&cache);
+        assert!(!raw.is_empty());
+        assert!(!contains(&raw, MARKER.as_bytes()));
+        assert!(!contains(&raw, b"secret"));
+    }
+
+    /// Issue #2260: a purge deletes the entity row and the run rows, and
+    /// leaves none of their bytes.
+    #[test]
+    fn a_purge_deletes_the_entity_row() {
+        let dir = private_dir();
+        let cache = OwnerDiskCache::open(dir.path()).expect("open");
+        let exec = Uuid::new_v4();
+        let _ = cache.store(&slot(1), exec, &state(3), owned);
+        let _ = cache.store_entity(&slot(1), exec, &entity(2), owned);
+        let rows = entity_rows(&cache, 1);
+        assert_eq!(rows.len(), 1);
+        assert!(cache.purge(exec));
+        assert!(!cache.contains_entity(exec));
+        assert!(!cache.contains(exec));
+        assert!(entity_rows(&cache, 1).is_empty());
+        let raw = cache_bytes(&cache);
+        assert!(!contains(&raw, &rows[0]), "the sealed row is gone");
+        assert!(!contains(&raw, exec.to_string().as_bytes()));
+
+        // A run with only an entity row purges too.
+        let other = Uuid::new_v4();
+        let _ = cache.store_entity(&slot(1), other, &entity(4), owned);
+        assert!(cache.purge(other));
+        assert!(!cache.contains_entity(other));
+        assert!(!cache.purge(other), "a second purge finds nothing");
+    }
+
+    /// Issue #2260: an evict wake holds back a late entity store.
+    #[test]
+    fn an_evicted_entity_is_held_back() {
+        let dir = private_dir();
+        let cache = OwnerDiskCache::open(dir.path()).expect("open");
+        let exec = Uuid::new_v4();
+        let _ = cache.store_entity(&slot(1), exec, &entity(2), owned);
+        assert!(cache.purge_evicted(exec));
+        assert_eq!(
+            cache.store_entity(&slot(1), exec, &entity(3), owned),
+            DiskStore::Refused
+        );
+        assert!(!cache.contains_entity(exec));
+    }
+
+    /// Issue #2260: an ended tenure refuses the store and purges the row.
+    #[test]
+    fn an_ended_tenure_refuses_an_entity_store() {
+        let dir = private_dir();
+        let cache = OwnerDiskCache::open(dir.path()).expect("open");
+        let exec = Uuid::new_v4();
+        let _ = cache.store_entity(&slot(1), exec, &entity(2), owned);
+        assert_eq!(
+            cache.store_entity(&slot(1), exec, &entity(3), || false),
+            DiskStore::Refused
+        );
+        assert!(!cache.contains_entity(exec));
+        assert!(entity_rows(&cache, 1).is_empty());
+    }
+
+    /// Issue #2260: a new epoch or codec generation finds the row stale and
+    /// deletes the file.
+    #[test]
+    fn a_new_slot_finds_the_entity_stale() {
+        let dir = private_dir();
+        let cache = OwnerDiskCache::open(dir.path()).expect("open");
+        let exec = Uuid::new_v4();
+        let _ = cache.store_entity(&slot(1), exec, &entity(2), owned);
+        let next = DiskSlot {
+            epoch: OwnerEpoch::new(2),
+            ..slot(1)
+        };
+        assert!(matches!(cache.load_entity(&next, exec), EntityLoad::Stale));
+        assert!(!cache.contains_entity(exec));
+        assert!(!cache.file_path(key(1)).exists());
+
+        let _ = cache.store_entity(&slot(1), exec, &entity(2), owned);
+        assert_eq!(cache.retain_codec_generation(7), 1);
+        assert!(!cache.contains_entity(exec));
+        assert_eq!(cache_bytes(&cache).len(), 0);
+    }
+
+    /// Issue #2260: a changed row fails its seal. The load purges it.
+    #[test]
+    fn a_flipped_entity_byte_is_corrupt() {
+        let dir = private_dir();
+        let cache = OwnerDiskCache::open(dir.path()).expect("open");
+        let exec = Uuid::new_v4();
+        let _ = cache.store_entity(&slot(1), exec, &entity(2), owned);
+        let mut row = entity_rows(&cache, 1).remove(0);
+        let at = row.len() / 2;
+        row[at] ^= 0x5a;
+        let outside = Connection::open(cache.file_path(key(1))).expect("open");
+        outside
+            .execute(
+                "UPDATE harvest_entity_projection SET sealed = ?1",
+                params![row],
+            )
+            .expect("tamper");
+        drop(outside);
+        assert!(matches!(
+            cache.load_entity(&slot(1), exec),
+            EntityLoad::Corrupt
+        ));
+        assert!(!cache.contains_entity(exec));
+        assert!(entity_rows(&cache, 1).is_empty());
+    }
+
+    /// Issue #2260: a file that left the directory reads as stale, for a run
+    /// and for an entity. The next store makes a new file.
+    #[test]
+    fn a_deleted_file_reads_as_stale_and_a_store_rebuilds_it() {
+        let dir = private_dir();
+        let cache = OwnerDiskCache::open(dir.path()).expect("open");
+        let exec = Uuid::new_v4();
+        let _ = cache.store(&slot(1), exec, &state(3), owned);
+        let _ = cache.store_entity(&slot(1), exec, &entity(2), owned);
+        let path = cache.file_path(key(1));
+        std::fs::remove_file(&path).expect("delete the file");
+
+        assert!(matches!(
+            cache.load_entity(&slot(1), exec),
+            EntityLoad::Stale
+        ));
+        assert!(!cache.contains_entity(exec));
+        assert!(!cache.contains(exec), "the file held the run rows too");
+        assert!(matches!(cache.load(&slot(1), exec), DiskLoad::Miss));
+
+        let _ = cache.store_entity(&slot(1), exec, &entity(2), owned);
+        assert!(path.exists(), "the store makes a new file");
+        assert!(matches!(
+            cache.load_entity(&slot(1), exec),
+            EntityLoad::Hit(_)
+        ));
+
+        // A run load sees a deleted file too.
+        let _ = cache.store(&slot(1), exec, &state(3), owned);
+        std::fs::remove_file(&path).expect("delete the file again");
+        assert!(matches!(cache.load(&slot(1), exec), DiskLoad::Stale));
+        assert!(!cache.contains_entity(exec));
+    }
+
+    /// Issue #2260: a store into a deleted file makes a new file, so the
+    /// row is not lost in the deleted inode.
+    #[test]
+    fn a_store_after_a_deleted_file_makes_a_new_file() {
+        let dir = private_dir();
+        let cache = OwnerDiskCache::open(dir.path()).expect("open");
+        let exec = Uuid::new_v4();
+        let _ = cache.store_entity(&slot(1), exec, &entity(2), owned);
+        let path = cache.file_path(key(1));
+        std::fs::remove_file(&path).expect("delete the file");
+        let _ = cache.store_entity(&slot(1), exec, &entity(3), owned);
+        assert!(path.exists());
+        assert_eq!(entity_rows(&cache, 1).len(), 1);
+    }
+
     /// AC 3 at the module level. The cache stores decoded events, so no
     /// codec ciphertext reaches the disk. A key change makes each file
     /// stale.
@@ -2005,7 +2756,11 @@ mod tests {
             return;
         };
         let cache = OwnerDiskCache::open(&dir).expect("open");
-        let _ = cache.store(&slot(1), Uuid::new_v4(), &state(4), owned);
+        let exec = Uuid::new_v4();
+        let _ = cache.store(&slot(1), exec, &state(4), owned);
+        // Issue #2260: an entity row with the marker in its state.
+        let _ = cache.store_entity(&slot(1), exec, &entity(3), owned);
+        assert!(cache.contains_entity(exec), "the entity row is on disk");
         // The terminal commit happened. The purge never runs.
         let mut out = std::io::stdout();
         writeln!(out, "CHILD-READY").expect("write");
