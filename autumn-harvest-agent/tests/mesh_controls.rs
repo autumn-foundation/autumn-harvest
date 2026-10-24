@@ -17,8 +17,9 @@ use autumn_harvest_agent::flow::labels;
 use autumn_harvest_agent::memory::{EditKey, MEMORY_TOOL, MemoryBlock, MemoryOp, MemoryStore};
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentHeartbeat, AgentId, AgentMemory, AgentOp, AgentProfile,
-    AgentState, AgentStatus, AgentStop, AgentTask, BoxFuture, FlowRules, FnTool,
-    InMemoryMemoryStore, MemoryScope, MeshBudget, Rule, ToolEffect, sqlite,
+    AgentState, AgentStatus, AgentStop, AgentTask, BoxFuture, ChatMessage, ChatRole, ContentPart,
+    Control, FlowRules, FnTool, InMemoryMemoryStore, MemoryScope, MeshBudget, Rule, ToolEffect,
+    sqlite,
 };
 use autumn_harvest_sqlite::SqliteRuntime;
 use common::{Reply, ScriptedModel, answer, calls, report, runtime};
@@ -42,6 +43,30 @@ fn state(rt: &SqliteRuntime, agent: &AgentId) -> impl Future<Output = AgentState
 async fn say(rt: &mut SqliteRuntime, agent: &AgentId, text: &str) {
     sqlite::send(rt, agent, &AgentOp::message(text), None).unwrap();
     sqlite::drive(rt, agent).await.unwrap();
+}
+
+/// The texts of the held user messages of `state`, in order.
+fn held_texts(state: &AgentState) -> Vec<String> {
+    state
+        .held
+        .iter()
+        .filter_map(|op| match op {
+            AgentOp::UserMessage(message) => Some(message.text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The user texts of `messages`, in order.
+fn user_texts(messages: &[ChatMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|message| message.role == ChatRole::User)
+        .filter_map(|message| match message.content.first() {
+            Some(ContentPart::Text(text)) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -85,16 +110,42 @@ async fn a_mesh_over_its_daily_budget_parks_every_agents_next_turn() {
     // The refused message waits for the next period, first in line. A
     // parked agent holds new work too, instead of running it.
     say(&mut rt, &b, "later").await;
-    let held: Vec<String> = state(&rt, &b)
-        .await
-        .held
-        .iter()
-        .filter_map(|op| match op {
-            AgentOp::UserMessage(message) => Some(message.text.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(held, ["hello", "later"]);
+    assert_eq!(held_texts(&state(&rt, &b).await), ["hello", "later"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_message_leaves_the_transcript_as_it_was() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::named("model-1", vec![answer("first", 12)]);
+    let budget = MeshBudget::daily("support").max_tokens(10);
+    let mut rt = runtime(&db, budget_harness(&db, model.clone(), budget));
+    let a = id("a");
+    say(&mut rt, &a, "spend").await;
+    let before = state(&rt, &a).await.transcript;
+    assert_eq!(user_texts(&before), ["spend"]);
+
+    // The mesh spent 12 of its 10 tokens, so the budget refuses the next
+    // turn. A resume in the same period runs the held message again, and
+    // the budget refuses it again.
+    say(&mut rt, &a, "wait").await;
+    sqlite::send(&mut rt, &a, &AgentOp::Control(Control::Resume), None).unwrap();
+    sqlite::drive(&mut rt, &a).await.unwrap();
+    let after = state(&rt, &a).await;
+    assert!(
+        matches!(after.status, AgentStatus::Parked { .. }),
+        "{:?}",
+        after.status
+    );
+    assert_eq!(model.calls(), 1, "no model reads the refused message");
+    assert_eq!(
+        held_texts(&after),
+        ["wait"],
+        "the message waits, first in line"
+    );
+    // No model read the input. The retry appends it once, so the
+    // transcript must keep no copy of it.
+    assert_eq!(user_texts(&after.transcript), ["spend"]);
+    assert_eq!(after.transcript, before);
 }
 
 #[tokio::test(flavor = "multi_thread")]

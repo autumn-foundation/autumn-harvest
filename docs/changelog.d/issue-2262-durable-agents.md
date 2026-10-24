@@ -654,6 +654,12 @@ A review from five angles found these. Each fix has a test.
   fails the candidate with `eval::NO_CHILD_RUN`. The tests
   `a_reordered_fan_out_answers_each_child_from_its_own_recorded_run` and
   `a_fan_out_child_with_no_recorded_run_fails_the_candidate` cover it.
+- **Budget refusal.** A mesh budget that refused the first turn of an op
+  still kept its input in the transcript. A requeued message then reached
+  the model twice, and each `Control::Resume` in the spent period added a
+  copy. A refused first turn now keeps the transcript as it was, and a steer
+  that it took runs later as its own op. The test
+  `a_refused_message_leaves_the_transcript_as_it_was` covers it.
 
 ### Advisory RUSTSEC-2026-0387 (crypto-bigint 0.5.5)
 

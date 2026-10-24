@@ -552,6 +552,8 @@ let harness = AgentHarness::new(model)
   any of them records can all pass the check.
 - A refused message runs again only when no tool ran in its op. Any other
   op ends as `budget_exceeded`.
+- A refused first turn leaves the transcript as it was, because no model
+  read the input. A message that runs again then holds its input once.
 - An interrupt stops an op in flight, such as an approval wait. A paused
   agent takes the pause before its held work.
 - A store that cannot keep labels refuses a write from a run with labels,

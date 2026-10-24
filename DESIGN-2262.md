@@ -351,7 +351,8 @@ Every steer and every op is a staged signal before it is acknowledged.
 - Memory entries carry the labels of the run that wrote them. A read adds
   them to the run.
 - **Changed in the build.** A refused message whose op ran no tool waits
-  for the next period, first in line. `MemoryStore::apply_labelled` refuses
+  for the next period, first in line. Its refused first turn keeps the
+  transcript as it was, so the retry holds the input once (PR review). `MemoryStore::apply_labelled` refuses
   a labelled write by default, so a store with no labels fails closed.
   `Control::ClearTranscript` keeps only the labels of the memory.
 

@@ -1580,7 +1580,7 @@ impl AgentRun<'_> {
                 let mut state = self.segment(state, &message.text, Mode::Attended).await;
                 // A mesh budget refused the first turn, so no tool ran. The
                 // message waits for the next period, first in line.
-                if matches!(state.status, AgentStatus::Parked { .. }) && state.rounds == rounds {
+                if refused_untouched(&state, rounds) {
                     hold_first(&mut state, AgentOp::UserMessage(retry));
                 }
                 state
@@ -1788,7 +1788,7 @@ impl AgentRun<'_> {
         progress.sent = state.sent.take();
         progress.chain = state.chain;
         // A steer counts as handled only when its segment keeps its turns.
-        let steered_before = state.steer.steered.clone();
+        let (steered_before, rounds) = (state.steer.steered.clone(), state.rounds);
         progress.steer = Some(std::mem::take(&mut state.steer));
         progress.workspace.clone_from(&task.workspace);
         let waiting = peer
@@ -1807,6 +1807,7 @@ impl AgentRun<'_> {
         };
         let result = run_segment(self.ctx, run, &mut progress, &mut tree, input).await;
         fold_segment(&mut state, &mut progress, tree);
+        let refused = refused_untouched(&state, rounds);
         if state.workspace != head {
             self.retain_workspace(&mut state).await;
         }
@@ -1815,10 +1816,12 @@ impl AgentRun<'_> {
         match result {
             Ok(stop) => {
                 let answer = progress.delivered_text(&progress.last_text).to_owned();
-                // A silent tick leaves the conversation as it was.
+                // A silent tick leaves the conversation as it was. So does a
+                // budget refusal: no model read the input. A requeued user
+                // message appends it again when it runs.
                 let silent = matches!(mode, Mode::Heartbeat(_)) && is_silent(&answer);
-                kept = !silent;
-                if !silent {
+                kept = !silent && !refused;
+                if kept {
                     let messages = crate::types::without_system(&progress.messages);
                     state.transcript = trim_window(messages, profile.window);
                 }
@@ -1975,6 +1978,14 @@ fn open_memory(
     tree.exercised
         .extend(crate::memory::snapshot_labels(&state.memory));
     state.memory.clone()
+}
+
+/// Whether a mesh budget refused the first turn of a segment (issue
+/// #2272). The refusal parks the agent, and no tool round ran since
+/// `rounds`. A segment runs only while the agent is open, so a park after
+/// it comes from that segment.
+const fn refused_untouched(state: &AgentState, rounds: u32) -> bool {
+    matches!(state.status, AgentStatus::Parked { .. }) && state.rounds == rounds
 }
 
 /// Hold `op` first in line, within the bound of the inbox.
