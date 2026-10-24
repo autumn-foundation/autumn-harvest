@@ -3592,20 +3592,39 @@ pub async fn claim_workflow_task_of_execution(
 /// What one [`owner_scan`] found (issue #2255).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OwnerScan {
-    /// The executions whose workflow task is due, by due time.
-    pub due: Vec<Uuid>,
+    /// The executions whose workflow task is due, in claim order.
+    pub due: Vec<OwnerRow>,
     /// The time until the next row of the scan is due. `None` when the scan
     /// found no row that is not due yet.
     pub next_due: Option<std::time::Duration>,
 }
 
+/// A due workflow task with its claim-order key (issue #2308).
+///
+/// Sort by `priority` descending, then `due_at` ascending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerRow {
+    /// The execution of the task.
+    pub exec_id: Uuid,
+    /// The task priority.
+    pub priority: i32,
+    /// The claim-order due time, with the new-start handicap.
+    pub due_at: DateTime<Utc>,
+}
+
 /// One row of [`owner_scan`].
+///
+/// `exec_id` is `NULL` on the one row that gives the next due time.
 #[derive(diesel::QueryableByName)]
 struct OwnerScanRow {
-    #[diesel(sql_type = diesel::sql_types::Uuid)]
-    exec_id: Uuid,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    exec_id: Option<Uuid>,
     #[diesel(sql_type = diesel::sql_types::Double)]
     wait_secs: f64,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    eff_priority: i32,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    due_at: DateTime<Utc>,
 }
 
 /// The row filter of [`OWNER_SCAN_SQL`], in each branch.
@@ -3627,37 +3646,101 @@ macro_rules! owner_scan_filter {
     };
 }
 
-/// Read the pending workflow tasks of an owner's partitions, by due time.
+/// One head of [`OWNER_SCAN_SQL`]: the first rows of one partition and one
+/// start kind, in claim order inside the head.
 ///
-/// `idx_harvest_tq_owner_scan` leads with the partition. One branch reads
-/// the first rows of each owned partition in index order. The other reads
-/// the first unstamped rows. So a scan reads at most `limit` rows per owned
-/// partition, never the rows of another owner and never a whole backlog.
+/// A head is one ordered range of `idx_harvest_tq_owner_order`. The claim
+/// reads its heads the same way (issue #1971). Inside a head the due time
+/// follows `scheduled_at`, so a head holds the first rows of the claim order.
+/// The merge of all heads is then exact for its first `$4` rows.
+///
+/// The scan has no ageing term. Ageing reorders every pending row, so a head
+/// cannot be cut. A worker with `priority_aging_secs` runs no decider.
+macro_rules! owner_scan_head {
+    ($partition:literal) => {
+        concat!(
+            "SELECT t.workflow_exec_id AS exec_id, t.priority, t.scheduled_at, ",
+            claim_order_due_sql!(),
+            " AS due_at \
+             FROM harvest_task_queue t, paused \
+             WHERE ",
+            $partition,
+            " AND (t.new_start AND t.attempt = 0) = k.new_start_head \
+             AND t.scheduled_at <= NOW() AND ",
+            owner_scan_filter!(),
+            "ORDER BY t.priority DESC, t.scheduled_at \
+             LIMIT $4::bigint"
+        )
+    };
+}
+
+/// The probe for the first row of a partition that is not due yet.
+macro_rules! owner_scan_next {
+    ($partition:literal) => {
+        concat!(
+            "SELECT t.scheduled_at FROM harvest_task_queue t, paused \
+             WHERE ",
+            $partition,
+            " AND t.scheduled_at > NOW() AND ",
+            owner_scan_filter!(),
+            "ORDER BY t.scheduled_at LIMIT 1"
+        )
+    };
+}
+
+/// Read the pending workflow tasks of an owner's partitions, in claim order.
+///
+/// `idx_harvest_tq_owner_order` leads with the partition. Each owned
+/// partition and the unstamped rows give two heads, new starts and
+/// continuations. The merge sorts the heads by effective priority, then by
+/// the claim-order due time ([`CLAIM_ORDER_DUE_SQL`]), and keeps `$4` rows.
+/// So a scan reads at most `$4` rows per head, never the rows of another
+/// owner and never a whole backlog. `idx_harvest_tq_owner_scan` gives the
+/// next due time with one probe per partition. That row sorts last, with a
+/// `NULL` execution.
 const OWNER_SCAN_SQL: &str = concat!(
     "WITH paused AS MATERIALIZED ( \
          SELECT COALESCE(array_agg(queue_name), ARRAY[]::text[]) AS names \
          FROM harvest_queue_pauses WHERE queue_name = ANY($1) \
-     ) \
-     SELECT s.exec_id, \
-         GREATEST(EXTRACT(EPOCH FROM (s.scheduled_at - NOW())), 0)::float8 AS wait_secs \
-     FROM ( \
-         ( SELECT r.exec_id, r.scheduled_at \
-           FROM unnest($2::int2[]) AS owned(partition) \
-           CROSS JOIN LATERAL ( \
-               SELECT t.workflow_exec_id AS exec_id, t.scheduled_at \
-               FROM harvest_task_queue t, paused \
-               WHERE t.decision_partition = owned.partition AND ",
-    owner_scan_filter!(),
-    "ORDER BY t.scheduled_at LIMIT $4 ) r ) \
+     ), \
+     heads AS ( \
+         SELECT r.exec_id, r.priority, r.scheduled_at, r.due_at \
+         FROM unnest($2::int2[]) AS owned(partition) \
+         CROSS JOIN (VALUES (FALSE), (TRUE)) AS k(new_start_head) \
+         CROSS JOIN LATERAL ( ",
+    owner_scan_head!("t.decision_partition = owned.partition"),
+    " ) r \
          UNION ALL \
-         ( SELECT t.workflow_exec_id, t.scheduled_at \
-           FROM harvest_task_queue t, paused \
-           WHERE t.decision_partition IS NULL AND ",
-    owner_scan_filter!(),
-    "ORDER BY t.scheduled_at LIMIT $4 ) \
-     ) s \
-     ORDER BY s.scheduled_at \
-     LIMIT $4"
+         SELECT r.exec_id, r.priority, r.scheduled_at, r.due_at \
+         FROM (VALUES (FALSE), (TRUE)) AS k(new_start_head) \
+         CROSS JOIN LATERAL ( ",
+    owner_scan_head!("t.decision_partition IS NULL"),
+    " ) r \
+     ), \
+     next_due AS ( \
+         SELECT MIN(n.scheduled_at) AS at FROM ( \
+             SELECT p.scheduled_at \
+             FROM unnest($2::int2[]) AS owned(partition) \
+             CROSS JOIN LATERAL ( ",
+    owner_scan_next!("t.decision_partition = owned.partition"),
+    " ) p \
+             UNION ALL \
+             ( ",
+    owner_scan_next!("t.decision_partition IS NULL"),
+    " ) \
+         ) n \
+     ) \
+     SELECT u.exec_id, u.eff_priority, u.due_at, u.wait_secs FROM ( \
+         ( SELECT h.exec_id, h.priority AS eff_priority, h.due_at, \
+                  0::float8 AS wait_secs, FALSE AS is_next \
+           FROM heads h \
+           ORDER BY h.priority DESC, h.due_at LIMIT $4::bigint ) \
+         UNION ALL \
+         SELECT NULL::uuid, 0, d.at, \
+                GREATEST(EXTRACT(EPOCH FROM (d.at - NOW())), 0)::float8, TRUE \
+         FROM next_due d WHERE d.at IS NOT NULL \
+     ) u \
+     ORDER BY u.is_next, u.eff_priority DESC, u.due_at"
 );
 
 /// Scan the pending workflow tasks of an owner's partitions (issue #2255).
@@ -3669,8 +3752,9 @@ const OWNER_SCAN_SQL: &str = concat!(
 /// new partition. An unstamped row passes too. The take then stamps it and
 /// re-pends it to its owner.
 ///
-/// The scan returns at most `limit` due executions. The first row that is
-/// not due gives [`OwnerScan::next_due`].
+/// The scan returns at most `limit` due executions in claim order (issue
+/// #2308): priority, then the due time with the new-start handicap. The
+/// first row that is not due gives [`OwnerScan::next_due`].
 ///
 /// # Errors
 ///
@@ -3686,24 +3770,66 @@ pub async fn owner_scan(
         .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
         .bind::<diesel::sql_types::Array<diesel::sql_types::SmallInt>, _>(&owned.partitions)
         .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(skip)
-        .bind::<diesel::sql_types::BigInt, _>(
-            i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX),
-        )
+        .bind::<diesel::sql_types::BigInt, _>(i64::try_from(limit).unwrap_or(i64::MAX))
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
     let mut scan = OwnerScan::default();
     for row in rows {
-        if row.wait_secs > 0.0 {
-            scan.next_due = std::time::Duration::try_from_secs_f64(row.wait_secs).ok();
-            break;
-        }
-        if scan.due.len() < limit {
-            scan.due.push(row.exec_id);
+        match row.exec_id {
+            Some(exec_id) => scan.due.push(OwnerRow {
+                exec_id,
+                priority: row.eff_priority,
+                due_at: row.due_at,
+            }),
+            None => scan.next_due = std::time::Duration::try_from_secs_f64(row.wait_secs).ok(),
         }
     }
     Ok(scan)
 }
+
+/// Read the claim-order keys of the due workflow tasks of `execs` (issue
+/// #2308).
+///
+/// A wake names an execution only. The owner decider calls this to rank
+/// hints against each other and against the scan. It reads one row per
+/// execution through `idx_harvest_tq_workflow`. A row that is not `PENDING`
+/// and due gives no key.
+///
+/// # Errors
+///
+/// [`crate::error::HarvestError::Database`] on a query failure.
+pub async fn owner_keys(
+    conn: &mut AsyncPgConnection,
+    execs: &[Uuid],
+) -> HarvestResult<Vec<OwnerRow>> {
+    let rows: Vec<OwnerScanRow> = diesel::sql_query(OWNER_KEYS_SQL)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(execs)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            Some(OwnerRow {
+                exec_id: row.exec_id?,
+                priority: row.eff_priority,
+                due_at: row.due_at,
+            })
+        })
+        .collect())
+}
+
+/// SQL for [`owner_keys`].
+const OWNER_KEYS_SQL: &str = concat!(
+    "SELECT workflow_exec_id AS exec_id, 0::float8 AS wait_secs, \
+            priority AS eff_priority, ",
+    claim_order_due_sql!(),
+    " AS due_at \
+     FROM harvest_task_queue \
+     WHERE workflow_exec_id = ANY($1) AND state = 'PENDING' \
+       AND task_type = 'workflow' AND scheduled_at <= NOW()"
+);
 
 /// What a dispatch reference's row looks like right now (issue #1312).
 #[derive(Debug, Clone, PartialEq, Eq)]
