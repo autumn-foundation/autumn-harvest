@@ -2584,3 +2584,13 @@ standalone note rather than part of the claim-path attribution table above:
   a criterion bench of the second fence row. Owner mode with DR on adds
   two statements and about 20% to the persist at one writer, so it fails
   the stage 1b bar of 10%.
+* [`docs/performance-analyzer-large-payload.md`](performance-analyzer-large-payload.md)
+  — `LargePayloadRule` in `HistoryAnalyzer::analyze` measured each payload
+  with `value.to_string().len()`, which built and dropped a `String`. It now
+  counts the bytes without building the text (instructions -77.5%,
+  allocation bytes -97.6%, PR #2287).
+* [`docs/performance-debug-diff-redaction-probe.md`](performance-debug-diff-redaction-probe.md)
+  — `debugger::is_redacted_export`, called by `harvest debug diff` for each
+  snapshot file, parsed the whole file to read one top-level key. It now
+  probes that key without building the document (instructions -23.7%,
+  allocations -16.5%, PR #2292).
