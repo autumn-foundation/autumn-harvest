@@ -18,6 +18,9 @@ workflow against seeded delivery orders, with no database. See
 Issue #2250 adds a harness for the fenced owner lease of a decision
 partition. See [The owner-lease simulation](#the-owner-lease-simulation).
 
+Issue #2256 adds a harness for group commit in one decision partition. See
+[The group commit simulation](#the-group-commit-simulation).
+
 ## What it simulates
 
 The module is `autumn_harvest::dst`. It is test infrastructure, not a
@@ -166,7 +169,8 @@ test.
 `.github/workflows/dst-nightly.yml` runs every night:
 
 - `sweep`: 4,000,000 oracle seeds in release mode, in 4 shards. Each shard
-  then runs the owner-lease sweep on the same seeds.
+  then runs the owner-lease sweep on the same seeds, and the group commit
+  sweep on the first tenth of them.
 - `differential`: 2,000 seeds against Postgres, in 4 shards.
 - `world`: 1,000 world seeds on Postgres, in 4 shards.
 - `autoresearch`: the workflow sweeps of the autoresearch example, 5,000
@@ -490,6 +494,95 @@ A failure prints the replay command. It runs `owner::replay_one_owner_seed`
 and prints the trace. The sweep and the replay use the same verdict,
 `OwnerReport::failure`. So the replay also fails a run that does not
 consume every signal. Before issue #2294, it failed on an invariant only.
+
+## The group commit simulation
+
+Issue #2256. `autumn_harvest::dst::group` models the lanes of
+`autumn_harvest::group_commit`. [`DESIGN-2256.md`](../../DESIGN-2256.md)
+is the design note.
+
+### The model
+
+Two workers share one decision partition with 4 executions. Each
+execution has 3 signals. Each worker has one lane with one slot, so its
+decisions queue while a batch runs. A batch holds at most 4 decisions.
+
+- A decision reads the history length of its execution and the first
+  pending signal. A tenure keeps at most two decisions of one execution
+  in flight. The second decision models a re-take, so the plan rule
+  matters.
+- The lane plans each batch with the engine's `group_commit::plan_batch`.
+  Each decision gets its result through `group_commit::acknowledges`.
+- The start fence checks the holder and the epoch. It holds the owner row
+  until the batch ends. An acquisition waits for every held fence.
+- Each stage runs in a savepoint. A failed stage rolls back alone.
+- The event-id backstop fails a stage whose decision read an old history.
+- A stage waits while another open batch holds an uncommitted write of its
+  execution, as Postgres waits on the unique index. A wait cycle fails one
+  stage as a deadlock victim.
+
+Three nemeses bias the scheduler:
+
+| Nemesis | Trigger | Fault |
+|---|---|---|
+| `fail-decision` | A batch runs its stages. | The next stage writes, then fails. |
+| `fail-commit` | A batch has run every stage. | Its `COMMIT` fails. |
+| `takeover` | The holder has work in its lane. | End the lease, so the other worker can take over. |
+
+A run has a fault phase of 300 steps and a drain of at most 600 steps. The
+drain injects no fault and is weakly fair. A run must consume every signal
+before the drain ends.
+
+### The invariants
+
+| Invariant | Meaning |
+|---|---|
+| `FailedDecisionWritesNothing` | No durable event comes from a failed stage. |
+| `FailureIsolated` | A batch with no fence or commit fault commits each stage that passed. |
+| `AckAfterCommit` | Each acknowledged decision has a durable event. |
+| `CommitAtPinnedEpoch` | Each event commits at the epoch and under the holder that its decision pinned. |
+| `OneDecisionPerExecution` | No batch holds two decisions of one execution. |
+| `NoConflictInsideABatch` | No stage fails on a write of its own batch. |
+| `NoDuplicateEvent` | No two events consume one signal. |
+
+### The mutants
+
+Each mutant must fail on its invariant within seeds 0 to 299. The design
+must pass the same seed.
+
+| Defect | Rule it breaks | Invariant |
+|---|---|---|
+| `no-rollback` | A failed stage keeps its writes. | `FailedDecisionWritesNothing` |
+| `abort-on-failure` | A failed stage rolls the whole batch back. | `FailureIsolated` |
+| `early-ack` | A decision reports success when its savepoint is released. | `AckAfterCommit` |
+| `no-fence` | The batch does not check the owner row. | `CommitAtPinnedEpoch` |
+| `unlocked-fence` | The batch checks the owner row but does not lock it. | `CommitAtPinnedEpoch` |
+| `shared-execution` | The plan admits two decisions of one execution. | `OneDecisionPerExecution` and `NoConflictInsideABatch` |
+
+`a_batch_with_one_failing_decision_commits_the_others` finds a seed in
+which `fail-decision` fails one stage of a batch, and the batch commits the
+others. `the_design_passes_at_every_width` sweeps widths 1, 2 and 4. At
+width 2 and 4, batches of one lane overlap, stages wait, and a cycle fails
+a deadlock victim. `the_simulator_plans_and_acknowledges_with_the_engine_kernels`
+checks that the simulator calls the engine's kernels.
+
+| Variable | Meaning |
+|---|---|
+| `HARVEST_DST_GROUP_SEED` | Run this one seed only. |
+| `HARVEST_DST_GROUP_SEEDS` | The number of seeds. The default is 300. |
+| `HARVEST_DST_GROUP_SEED_BASE` | The first seed. The default is 0. |
+| `HARVEST_DST_GROUP_DEFECT` | `none` (the default) or a defect name. |
+| `HARVEST_DST_GROUP_NEMESES` | A comma list of nemesis names. The default is all. |
+| `HARVEST_DST_GROUP_CHECKS` | A comma list of invariant names. The default is all. |
+
+```sh
+HARVEST_DST_GROUP_SEEDS=100000 \
+  cargo test --release -p autumn-harvest --no-default-features --test dst \
+  group::group_sweep -- --nocapture
+```
+
+A failure prints the replay command. It runs `group::replay_one_group_seed`
+and prints the trace.
 
 ## The speculation model
 

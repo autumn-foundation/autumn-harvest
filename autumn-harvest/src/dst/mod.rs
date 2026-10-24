@@ -23,6 +23,9 @@
 //! partition (issue #2250). It drives the four nemeses of
 //! `formal/tla/OwnerLease.tla`.
 //!
+//! The [`group`] module models group commit of one decision partition
+//! (issue #2256). A batch holds the decisions of several executions.
+//!
 //! The [`speculate`] module models speculative decisions over an in-flight
 //! commit (issue #2011). It is an R&D spike with no database.
 //!
@@ -37,6 +40,7 @@
 mod named;
 
 mod fair;
+pub mod group;
 mod invariant;
 pub mod owner;
 mod rng;

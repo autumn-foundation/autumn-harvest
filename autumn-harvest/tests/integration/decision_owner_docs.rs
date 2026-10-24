@@ -727,6 +727,57 @@ fn decider_page_and_decision_13_cite_real_tests() {
     );
 }
 
+/// The group commit suite of issue #2256.
+const GROUP_SUITE: &str = "autumn-harvest/tests/integration/group_commit_db_tests.rs";
+
+/// The design note of issue #2256.
+const GROUP_DESIGN: &str = "DESIGN-2256.md";
+
+/// The group commit tests that the design note cites.
+const GROUP_TESTS: &[&str] = &[
+    "a_failing_decision_rolls_back_alone",
+    "no_result_goes_out_before_the_batch_commits",
+    "a_stale_batch_commits_nothing",
+    "the_fence_holds_the_owner_row_for_the_whole_batch",
+    "a_lone_decision_runs_with_no_savepoint",
+    "one_execution_never_shares_a_batch",
+    "a_decision_whose_caller_leaves_before_its_batch_never_runs",
+    "a_fence_error_from_a_stage_rolls_the_batch_back",
+    "a_batch_survives_its_leader_caller_leaving",
+    "a_failed_pool_checkout_fails_the_batch",
+];
+
+/// Decision 14 links the design note, the suite and the proof. The design
+/// note cites each group commit test, and each test exists (issue #2256).
+#[test]
+fn group_commit_decision_14_cites_real_tests() {
+    let adr = read(ADR);
+    let decision = section(&adr, "\n### 14. Group commit", "\n## ")
+        .unwrap_or_else(|| panic!("{ADR} has no decision 14"));
+    for link in [
+        "DESIGN-2256.md",
+        "group_commit_db_tests.rs",
+        "formal/verus/src/group_commit.rs",
+    ] {
+        assert!(
+            decision.contains(link),
+            "{ADR} decision 14 must cite {link}"
+        );
+    }
+    let design = read(GROUP_DESIGN);
+    let suite = read(GROUP_SUITE);
+    for test in GROUP_TESTS {
+        assert!(
+            design.contains(&format!("`{test}`")) || design.contains(&format!("::{test}`")),
+            "{GROUP_DESIGN} must cite `{test}`"
+        );
+        assert!(
+            suite.contains(&format!("async fn {test}(")),
+            "{GROUP_SUITE} lacks `{test}`"
+        );
+    }
+}
+
 #[test]
 fn helpers_parse_their_inputs() {
     let table = "| Key | Question | Answer |\n|---|---|---|\n| A | q? | Answered. |\n";

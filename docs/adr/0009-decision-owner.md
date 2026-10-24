@@ -4,8 +4,8 @@
 
 Accepted (issue #2249).
 
-Issues #2250 to #2255 build it. Issue #2253 adds decision 12. Issue #2255
-adds decision 13.
+Issues #2250 to #2256 build it. Issue #2253 adds decision 12. Issue #2255
+adds decision 13. Issue #2256 adds decision 14.
 [ADR 0010](0010-fenced-owner-lease.md) holds the lease rules R1 to R7 that
 the model forces. The planning record is
 [`DESIGN-2249.md`](../../DESIGN-2249.md). The source is the stage 1 section
@@ -578,6 +578,36 @@ with the shared head scan. Stage 1b moves workflow tasks off the claim loop.
   [`performance-owner-decider.md`](../performance-owner-decider.md) has the
   measurements.
 
+### 14. Group commit: one transaction for several executions
+
+Issue #2256 builds this decision.
+[`DESIGN-2256.md`](../../DESIGN-2256.md) section 1 is the design note.
+
+- `group_commit::GroupCommit` keeps one lane per shard and partition. A
+  lane has `width` slots and a queue.
+- A decision commits alone at once while a slot is free. A batch of two or
+  more forms only when decisions wait for a slot. So it engages only under
+  queue depth.
+- A batch holds decisions of one tenure only, at most one per execution,
+  up to `max_batch`.
+- The batch takes one owner row. It fences once, first, in the order of
+  decision 6. The rest of the batch runs in `fenced_scope`.
+- The owner row stays locked `FOR KEY SHARE` until the batch commits. An
+  acquisition waits for the whole batch. A renewal does not wait.
+- Each stage of a batch of two or more runs in a savepoint. A failing stage
+  rolls back to it, and the other stages commit.
+- A fence error inside a stage rolls the whole batch back.
+- No result goes out before the batch commits. A failed `COMMIT` fails
+  each decision of the batch.
+- A batch runs on a task of its own. A leader whose caller leaves does
+  not cancel it.
+- A batch of one sends no savepoint. At low load the transaction is the
+  same as before.
+- `group_commit_db_tests.rs` proves the rules on Postgres. The `group`
+  simulator and `formal/verus/src/group_commit.rs` check them too.
+- The worker persist paths do not use the lane yet. Issue #2318 tracks
+  that wiring.
+
 ## Flows
 
 ```mermaid
@@ -630,7 +660,7 @@ here.
 | Cost of two fences | What do two fence row locks per commit cost? | Answered. Issue #2248 measured two statements at +17.8%. Issue #2255 takes both rows in one statement. See decision 13. |
 | Mixed fleet | How is a mixed fleet made impossible? | Answered. A per-database switch and a database guard. See decision 11. |
 | Routing | How does the claim find owned work in stages 1a and 1b? | Answered. In stage 1a the claim filters workflow rows to owned partitions (#2252). In stage 1b the owner decider takes them by execution. See decision 13. |
-| Group commit | Do decisions of one partition share a commit? | Deferred to #2256. |
+| Group commit | Do decisions of one partition share a commit? | Answered. Yes, under queue depth, with a savepoint per decision. The worker wiring is #2318. See decision 14. |
 | Serialization unit | Does the owner serialize per partition or per execution? | Answered. Per execution. A single-threaded owner caps throughput, as at Durable Objects. |
 | Model nemeses | Which nemeses do the TLA+ model and the simulator cover? | Deferred to #2250. Stale commit after takeover, lease flap during an append, renewal during commits, and a signal before an epoch bump. |
 | Frozen-owner test | Does Harvest port Golem's frozen-owner test? | Answered. Yes. `owner_failover_tests.rs` stops an owner with `SIGSTOP` in a decision and in an open commit. See [`performance-owner-failover.md`](../performance-owner-failover.md). |
