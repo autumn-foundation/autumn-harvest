@@ -17309,6 +17309,10 @@ impl ActivityContext {
 
     /// The sink of a context with no sink set: `pg_notify` when the context
     /// has a database pool and a Tokio runtime runs, else none.
+    #[cfg_attr(
+        not(feature = "db"),
+        allow(clippy::unused_self, clippy::missing_const_for_fn)
+    )]
     fn default_progress_sink(
         &self,
     ) -> Option<std::sync::Arc<dyn crate::activity_progress::ActivityProgressSink>> {

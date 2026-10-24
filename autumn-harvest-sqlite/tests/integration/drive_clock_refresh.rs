@@ -213,9 +213,9 @@ async fn two_clock_reads(ctx: &WorkflowContext, _n: i64) -> Result<Vec<i64>, Str
 }
 
 // A clock read takes the clock of its cycle, as the timers do (issue #2276).
-// An `_as_of` drive therefore keeps one clock. Before the fix `system_now`
-// read the wall clock, so a durable agent that compared a deadline with it
-// could see the deadline pass while the drive clock had not reached it.
+// An `_as_of` drive therefore keeps one clock. Before the fix, `system_now`
+// read the wall clock. A durable agent then compared a deadline with the wall
+// clock and saw it pass before the drive clock reached it.
 #[tokio::test]
 async fn a_clock_read_takes_the_clock_of_its_cycle() {
     let (_dir, path) = temp_db();

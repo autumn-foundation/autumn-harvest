@@ -216,23 +216,22 @@ struct TestPg {
 }
 
 async fn setup_db(max_size: usize) -> TestPg {
-    let (url, container) = match std::env::var("HARVEST_TEST_DATABASE_URL") {
-        Ok(url) => (url, None),
-        Err(_) => {
-            let container = Postgres::default()
-                .with_init_sql(autumn_harvest::test_init_sql().into_bytes())
-                .with_tag("16")
-                .start()
-                .await
-                .expect("failed to start Postgres container");
-            let host = container.get_host().await.expect("container host");
-            let port = container
-                .get_host_port_ipv4(5432)
-                .await
-                .expect("container port");
-            let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-            (url, Some(container))
-        }
+    let (url, container) = if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        (url, None)
+    } else {
+        let container = Postgres::default()
+            .with_init_sql(autumn_harvest::test_init_sql().into_bytes())
+            .with_tag("16")
+            .start()
+            .await
+            .expect("failed to start Postgres container");
+        let host = container.get_host().await.expect("container host");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("container port");
+        let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+        (url, Some(container))
     };
     autumn_web::migrate::run_pending(&url, autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .expect("failed to run framework migrations");
