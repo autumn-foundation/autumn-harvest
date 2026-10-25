@@ -249,8 +249,11 @@ The `harvest_events_append_only_trg` trigger rejects history rewrites on both
 layouts. `LIKE` copies no triggers, so each conversion reinstalls it. On the
 partitioned layout it sits on the parent, and Postgres clones it onto each
 partition. The legacy table drops its own copy before `ATTACH`, because
-`ATTACH` fails on a trigger name that the partition already has. The
-operator-trigger refusal exempts the guard by its exact shape.
+`ATTACH` fails on a trigger name that the partition already has. Each
+conversion also reinstalls the entity projection trigger
+`harvest_entity_state_projection_trg` (issue #2259). The legacy table drops
+its copy of that trigger before `ATTACH` too. The operator-trigger refusal
+exempts both triggers by their exact shape.
 
 The guard also rejects a `cohort` change. The fast drop gate assumes that no
 row's cohort predates its execution, so a moved row could be dropped while its

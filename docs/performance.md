@@ -26,6 +26,15 @@ the PAUSED skip. The other six are present in the query and held constant, so
 this page says nothing about what they cost in *that* table; see
 [known limitations](#known-limitations).
 
+Three later gates are not in the table. They are the expired-run gate
+(#1824), the saturated-activity gate (#1836) and the owner gate of owner
+mode (#2252).
+[The expired-run section](#the-continuation-band-and-the-expired-run-gate-issue-1824)
+measures the first.
+[What the seek window does not establish](#what-the-seek-window-does-not-establish)
+gives a buffer count for the owner gate. No section measures the
+saturated-activity gate.
+
 > **Looking for end-to-end numbers?** This page measures the claim and enqueue
 > path in isolation. [`benchmarks.md`](benchmarks.md) publishes what the engine
 > does end to end — workflows/sec, dispatch and signal latency, replay
@@ -1108,6 +1117,13 @@ Docker daemon for its testcontainer fallback — not both.
 
 ### Known limitation: cost scales with distinct concurrency-key cardinality
 
+> **Follow-up (issue #1971):** this limit now applies to the full scan only.
+> The default claim reads `concurrency_running_counts` only when it falls
+> back. Its window scan runs the same per-row lookup on `seek_running_counts`.
+> That CTE counts the `RUNNING` rows of the window keys only. A fair claim
+> and an ageing claim still run the full scan. See
+> [when the window falls back](#when-the-window-falls-back).
+
 The committed hot-contention fixture above uses 256 distinct concurrency
 keys — the harness's fixed `KEY_CARDINALITY` constant
 (`tests/integration/claim_bench_support.rs`) — and at that cardinality the
@@ -1568,6 +1584,12 @@ without a capped key pay nothing.
   at the head until a peer acquires its partitions, so each claim reads
   them until then. A review run on PG16 read 381 buffers against 119 for
   the legacy claim, with 4,900 foreign rows ahead of 100 owned ones.
+  Issue #2255 moves the workflow take to the owner decider. Where it runs,
+  the claim loops claim activities only and read no workflow head. The
+  decider scan never reads the rows of another owner. The owned claim and
+  this cost remain on a worker with queue weights, fairness keys or
+  priority ageing on. They also remain on a worker with no LISTEN/NOTIFY
+  URL for the database, which runs no owner wake.
 - **A large live pin set.** The pin head reads every live pin of this
   worker. More than 32 of them that pass the gates also make every rank-0
   row wait for the fallback.
@@ -2624,7 +2646,8 @@ standalone note rather than part of the claim-path attribution table above:
   task kind on the assay #14 shape, the phases of the decision persist, and
   a criterion bench of the second fence row. Owner mode with DR on adds
   two statements and about 20% to the persist at one writer, so it fails
-  the stage 1b bar of 10%.
+  the stage 1b bar of 10%. Issue #2255 fuses the two into one statement.
+  The persist then passes the bar, at 9.3% faster than DR alone.
 * [`docs/performance-owner-failover.md`](performance-owner-failover.md)
   — owner failover on real Postgres (issue #2254): a frozen owner, `kill -9`
   and a scale-out from 4 to 8 workers. All four tests pass. After a kill,

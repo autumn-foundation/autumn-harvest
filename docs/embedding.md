@@ -68,15 +68,19 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ```
 
 `autumn-web` is still a dependency, because `autumn-harvest-plugin` uses its
-types. Your code does not call `AppBuilder`. Issue #1615 tracks an embedding
-with no `autumn-web` in its `Cargo.toml`.
+types. Your code does not call `AppBuilder`.
+[`examples/standalone-runner`](../examples/standalone-runner/) names no
+`autumn-web` in its `Cargo.toml` (issue #1615). A unit test fails if its
+manifest names `autumn-web`.
 
 **A database pool.** `HarvestRunnerResources::new` takes an
 `autumn_harvest::worker::DbPool`. The fork chapter builds one through the
 `diesel_async` re-export of the core crate, with a size cap of 10. See its
 [`main.rs`](getting-started/standalone-axum.md#3-the-server). A production pool
-also needs timeouts and TLS. `autumn_web::db::create_pool` sets both, and
-[`examples/standalone-runner`](../examples/standalone-runner/) uses it.
+also needs timeouts and TLS. `autumn_web::db::create_pool` sets both.
+[`examples/standalone-runner`](../examples/standalone-runner/) sets both
+without `autumn-web`. Its `db.rs` bounds each checkout and opens every
+connection through `autumn_harvest::pg_tls`.
 
 **A runtime config in code.** `HarvestPlugin` loads all of `[harvest]` from
 `autumn.toml` and the environment. `HarvestEmbedding` reads only

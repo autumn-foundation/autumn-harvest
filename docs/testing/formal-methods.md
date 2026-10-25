@@ -46,7 +46,7 @@ java -cp "$TLA2TOOLS_JAR" tlc2.TLC -metadir /tmp/tlc \
 `-metadir` keeps TLC's `states/` directory out of the tree.
 
 The `formal-models` job in `.github/workflows/ci.yml` runs the script. Like
-`lint`, it skips draft PRs and docs-only changes.
+`msrv`, it skips draft PRs and docs-only changes.
 
 ### The manifest
 
@@ -80,7 +80,7 @@ fails in these cases:
 | `ActivityClaim` | Activity claim epoch (issue #1789) | fixed, pre-fix, reachability |
 | `WorkflowTaskClaim` | Workflow-task terminal-write ownership (issues #1184, #1806, #1917) | fixed, pre-fix, reachability, capability-miss pre-fix |
 | `CodecRotation` | Codec re-encryption against PII erasure (issues #948, #495) | CAS, blind write, reachability |
-| `OwnerLease` | Fenced owner lease of a decision partition (issue #2250) | design, six defects, reachability |
+| `OwnerLease` | Fenced owner lease of a decision partition (issue #2250) | design, eight defects, reachability |
 | `AgentMesh` | Durable peer send between two agents (issue #2269) | design, three single-layer configs, four defects, reachability |
 | `AgentWorkspace` | Workspace head of a durable agent (issue #2274) | design, two defects, reachability |
 | `AgentWorkspaceRetention` | Workspace retention across the ops and lives of a durable agent (issue #2274) | design, three defects, reachability |
@@ -226,7 +226,7 @@ The prose spec is [ADR 0010](../adr/0010-fenced-owner-lease.md). Stage 1a
 needs a live lease, as in the code. The model has one
 partition, one owner row and the history of one execution. Its actions:
 
-| Action | Planned code |
+| Action | Code |
 |---|---|
 | `Acquire` | The takeover: `SELECT ... FOR UPDATE`, then the write. Adds 1 to the epoch. Waits for every fence lock. Then loads the resident state. |
 | `Release` | The graceful release. Ends the lease, keeps the holder and the epoch, and unloads the worker. |
@@ -328,7 +328,7 @@ an outbox row, and a relay delivers it at least once, in any order. One
 deployment takes one path for sends by workflow id. The model lets each
 send take either path, so it covers both deployments. Its actions:
 
-| Action | Planned code |
+| Action | Code |
 |---|---|
 | `Decide` | A picks its next send: seq + 1, a path, and `Mandate::outbound`. |
 | `SendCommit` | The decision of A commits `signal_external_workflow_by_id_with_idempotency`. The inline path inserts the signal row of B. The outbox path writes an outbox row. |
@@ -757,7 +757,7 @@ verifies fewer proofs than the source holds.
 
 To run one proof, call `cargo kani` with the same flags and
 `--harness <name>`. The `kani` job in `.github/workflows/ci.yml` runs the
-script. It skips draft PRs and docs-only changes, like `lint`. The compile
+script. It skips draft PRs and docs-only changes, like `msrv`. The compile
 takes most of the time. The proofs take about 1 minute together.
 
 ### The proofs
@@ -864,7 +864,7 @@ use a local binary, set `VERUS=/path/to/verus`. The release names the Rust
 toolchain that it links against, and the script installs that toolchain
 with rustup. The proofs take about 2 seconds. The `verus` job in
 `.github/workflows/ci.yml` runs the script. It skips draft PRs and
-docs-only changes, like `lint`.
+docs-only changes, like `msrv`.
 
 The script fails when Verus reports an error, or when it verifies nothing.
 

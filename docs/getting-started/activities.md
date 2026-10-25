@@ -93,8 +93,10 @@ timeout cannot stop it. Give such an activity its own `start_to_close`.
 When an operator calls `cancel_workflow_execution`, harvest:
 
 1. Marks the workflow execution `CANCELLED` and appends a
-   `WorkflowCancellationRequested` event.
-2. Transitions the in-flight task queue rows to `CANCELLED` so worker polling
+   `WorkflowCancelled` event. Harvest defers the cancel while a `RUNNING`
+   execution has an open non-cancellable block (issue #1984). It appends
+   `WorkflowCancelRequested` and cancels when the last open block closes.
+2. Transitions the in-flight task queue rows to `FAILED` so worker polling
    stops scheduling them.
 3. Sets the worker's `CancellationToken` so the next `heartbeat()` or
    `check_cancellation()` call inside the running activity returns

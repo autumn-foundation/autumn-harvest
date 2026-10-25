@@ -239,7 +239,7 @@ workflow/activity metrics" section of `docs/telemetry.md` and
 | **Disallowed** | `ctx.await_condition(|| rand::random())` |
 | **Allowed** | `ctx.await_condition(|| local_approvals_count >= 2)` |
 
-Predicates evaluated inside `await_condition` and `await_condition_timeout` must be purely deterministic projections of workflow local state (variables rehydrated by replaying events). Using non-deterministic values (like the current system time `Instant::now()` or random numbers) inside these closures will yield different results during replay than in the original execution, leading to early/late completion or early/late timer triggers, which causes `NonDeterminismError` during history matching.
+Predicates evaluated inside `await_condition` and `await_condition_timeout` must be purely deterministic projections of workflow local state (variables rehydrated by replaying events). Using non-deterministic values (like the current system time `Instant::now()` or random numbers) inside these closures will yield different results during replay than in the original execution, leading to early/late completion or early/late timer triggers. The engine detects this mismatch as a replay divergence (`HarvestError::NonDeterministic`) during history matching.
 
 **Migration example:**
 

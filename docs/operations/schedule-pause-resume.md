@@ -33,7 +33,7 @@ curl https://<host>/api/harvest/admin/schedules         # lists all schedules
   new workflow executions or DAG runs are dispatched** after the pause takes
   effect.
 - p95 time from the pause API call returning 200 to the first tick that does not
-  fire is ≤ one scheduler tick interval (default ≤ 5 s).
+  fire is ≤ one scheduler tick interval (default 1 s).
 
 ### What pause does NOT do
 
@@ -49,9 +49,11 @@ claimed by a worker — those tasks run to completion normally.
 
 - Clears `is_paused`, `paused_at`, `paused_by`, and `pause_reason` (all set to
   `NULL`/`false`).
-- For `catchup = false` schedules: the schedule resumes from the next natural
-  tick after the resume time. Ticks that fell due while the schedule was paused
-  are skipped and not replayed.
+- For `catchup = false` schedules: resume does not change `next_run_at`, so it
+  still holds the oldest missed slot. The first scheduler tick after the resume
+  fires one run for that slot. The schedule then moves to its next natural tick.
+  The other ticks that fell due while the schedule was paused are skipped and
+  not replayed.
 - For `catchup = true` schedules: the scheduler's normal catchup mechanism
   applies. On the first tick after resume, the scheduler will dispatch all
   missed slots between the stale `next_run_at` value and the current time.
@@ -63,10 +65,15 @@ claimed by a worker — those tasks run to completion normally.
 ### No explicit backfill on resume
 
 The resume endpoint does not add an explicit backfill action. Whether missed
-ticks are dispatched depends entirely on the schedule's `catchup` setting:
+ticks are dispatched depends on the schedule's `catchup` setting:
 
-- `catchup = false` (default): missed ticks are silently dropped.
+- `catchup = false` (default): the next scheduler tick fires the oldest missed
+  slot once and silently drops the rest.
 - `catchup = true`: the standard catchup path runs on the next scheduler tick.
+
+A stored `catchup_policy` (issue #484) takes precedence over the `catchup`
+bool. The `catchup_policy_effective` field of `GET /admin/schedules/{id}` shows
+the policy that applies.
 
 If you need to recover specific missed runs on a `catchup = false` schedule,
 use the backfill endpoint (issue #177):

@@ -21,15 +21,17 @@ ownership-change seam:
   applying the log.
 
 The research report, `reports/Actor ownership prior art for Harvest.md`,
-proposes the protocol. Issue #2250 asks for a spec before the code. Two
+proposes the protocol. Issue #2250 asks for a spec before the code. Three
 models check it:
 
 - `formal/tla/OwnerLease.tla`, with TLC. See
   [`formal-methods.md`](../testing/formal-methods.md).
 - `autumn_harvest::dst::owner`, a seeded simulator. See
   [`simulation.md`](../testing/simulation.md).
+- `autumn-harvest/tests/stateright/owner_lease.rs`, with Stateright. See
+  [`stateright.md`](../testing/stateright.md).
 
-Both run four nemeses:
+All three run four nemeses:
 
 1. A stale owner commits after a takeover.
 2. The lease flaps during an append.

@@ -22,7 +22,12 @@ inputs that the formula did not have:
 - **The second fence row fails the stage 1b pass condition.** Owner mode
   with DR on adds two statements to each decision: a second check of the
   generation row and the owner fence. Together they add 20% to the persist
-  at one writer. The condition is under 10%.
+  at one writer. The condition is under 10%. Issue #2255 meets it. One
+  statement now fences both rows. An append checks neither row again when
+  the start fence took its generation row. At one writer, an owner decision
+  with DR on now persists 9.3% faster than a DR-only decision, in the
+  median of six runs. See
+  [`performance-owner-decider.md`](performance-owner-decider.md#3-the-fence-cost).
 
 ## The workload and the host
 
@@ -233,8 +238,10 @@ proves it: a decision with two appends made 3 fence calls before, and makes
 
 ## What stage 1b can do
 
-These are proposals, not measured fixes. Stage 1b needs the first two
-together to remove both added statements.
+These are proposals from stage 1, not fixes that this page measures.
+Stage 1b needs the first two together to remove both added statements.
+Issue #2255 ships both, and
+[`performance-owner-decider.md`](performance-owner-decider.md) measures them.
 
 1. **Fence both rows in one statement.** One function can check the
    generation row and the owner row. That removes the second check of the

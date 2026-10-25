@@ -13,8 +13,9 @@ surfaces and the rules that apply to all of them.
 | Vantage "Reset to event N" | `RUNNING`, `PAUSED` | Calls the same engine. See [Vantage UI](vantage-ui.md). |
 | `POST /workflows/batch_reset` (issue #538) | `RUNNING`, `PAUSED`, `FAILED`, `CANCELLED`, `TIMED_OUT` | A cohort. Each run gets an outcome. `preview: true` forks nothing. |
 | `POST /dags/{dag_name}/runs/{run_exec_id}/retry` (issue #366) | `FAILED`, `CANCELLED`, `TIMED_OUT` | See [DAG retry](runbooks/dag-retry-from-failed-node.md). |
+| `POST /workflows/{id}/fork` (issue #2000) | Any state | Non-destructive. The source does not change. See the [fork runbook](runbooks/fork-a-run.md). |
 
-No surface forks a run in any other state, or a child run.
+No reset surface forks a run in any other state, or a child run.
 
 ## A fork never uses a PII-erased source
 
@@ -22,8 +23,9 @@ Erasure (issue #495) replaces each payload field with the
 `{"_harvest_erased": true}` tombstone. It applies to terminal runs only.
 
 The engine refuses an erased source on every fork path (issue #1999). The
-check runs under the `FOR UPDATE` row lock that the fork takes, before the
-fork copies an event. An erasure either commits before that lock, and the fork
+check runs under the row lock that the fork takes, before the fork copies an
+event. The reset engine takes it `FOR UPDATE`. The non-destructive fork takes
+it `FOR SHARE`. An erasure either commits before that lock, and the fork
 refuses, or it waits behind the lock, and the fork copies intact events.
 
 A dry run returns the same refusal for an erasure that committed before it. A
@@ -35,6 +37,7 @@ it, and the real reset then refuses. Only the locked check is a guarantee.
 | Single reset | `409` from the state gate, because erasure applies to terminal runs only. The erasure check is a second defense. |
 | Batch reset | The item is `skipped` with `skip_reason: {"type": "erased_source"}`. The other runs in the cohort still reset. |
 | DAG retry | `409` that tells you to start a fresh DAG run. |
+| Fork | `409`. The fork also refuses a source whose fork lineage reaches an erased run. |
 
 There is no opt-out. To run the work again, start a fresh run with new input.
 `POST /workflows/{id}/rerun` does this when you give it an explicit `input`.
@@ -58,10 +61,12 @@ state gate already refuses an erased run. Four facts outweigh that reason:
   never clears an erasure.
 
 So the engine now refuses an erased source without a flag, and the flag is
-gone. A new fork path that calls `reset_workflow_execution`, such as the
-non-destructive fork of issue #2000, gets the refusal from the engine. A new
-path that does not call it must call `erase::execution_input_is_erased` under
-its own row lock. It must also add a row to the tables above.
+gone. A new fork path that calls `reset_workflow_execution` gets the refusal
+from the engine. A new path that does not call it must call
+`erase::execution_input_is_erased` under its own row lock. It must also add a
+row to the tables above. The non-destructive fork of issue #2000 is such a
+path. It also calls `fork::erased_fork_ancestor` to refuse an erased run in
+its fork lineage.
 
 ## Batch skip reasons
 

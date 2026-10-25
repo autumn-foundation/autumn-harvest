@@ -111,7 +111,9 @@ What can close the gap, each as its own change:
   rechecks.
 - Eager activity dispatch, B5 of `docs/design/DESIGN-claim-concurrency.md`. A decision
   then claims its own new activity rows, and the claim count falls below 3.
-- Group commit across executions of one partition, issue #2256.
+- Group commit across executions of one partition. Issue #2256 builds the
+  lane. [`performance-group-commit.md`](performance-group-commit.md)
+  measures it. Issue #2318 wires the lane into the worker.
 
 ## 3. The fence cost
 
@@ -186,6 +188,11 @@ partition that it acquires. Two tests drive the case of restate#4566:
   own partitions. This page does not measure that.
 - `fsync=off` hides the commit cost of a durable server.
 - The clock includes the acquisition of 512 partitions at the start.
+- The sweep predates issues #2296 and #2308. Issue #2296 takes each
+  acquisition chunk in one transaction, not one transaction per partition.
+  Issue #2308 adds a batched key lookup when free permits cannot cover
+  every hint. A seeded backlog keeps the 8 workflow slots full, so this
+  shape runs that lookup.
 
 ## Reproduce
 

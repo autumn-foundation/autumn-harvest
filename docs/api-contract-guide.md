@@ -52,9 +52,9 @@ Each route entry:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `method` | string | HTTP method: `GET`, `POST`, `PATCH`, or `DELETE` |
+| `method` | string | HTTP method: `GET`, `POST`, `PUT`, `PATCH`, or `DELETE` |
 | `path` | string | Path template using `{param}` placeholders |
-| `category` | string | Route group: `workflow`, `dag`, `dlq`, `external_activity`, `worker`, `batch`, `schedule`, `admin`, `health`, `audit` |
+| `category` | string | Route group, such as `workflow`, `dag`, `dlq` or `admin`. The command below this table lists every group. |
 | `read_only` | bool | `true` for GET endpoints; `false` for mutating operations |
 | `description` | string | Human-readable description |
 | `params` | array | Query and path parameters with name, location, required flag, and description |
@@ -62,6 +62,12 @@ Each route entry:
 | `success_response` | object | HTTP status and response schema description |
 | `error_responses` | array | Documented error status codes and conditions |
 | `idempotency` | string | (Optional) Idempotency semantics for the route |
+
+To list every route group:
+
+```bash
+jq '[.routes[].category] | unique' docs/api-contract.json
+```
 
 ### Field lists
 
@@ -166,8 +172,8 @@ one's `content_type`:
 
 The `harvest` CLI uses `api_request()` to translate every subcommand into an
 `(method, path, body)` triple.  The contract coverage test in
-`autumn-harvest-cli/tests/contract_coverage.rs` asserts that every CLI
-subcommand maps to a documented contract route.
+`autumn-harvest-cli/tests/integration/contract_coverage.rs` asserts that
+every CLI subcommand maps to a documented contract route.
 
 To verify a specific CLI command manually:
 
@@ -208,7 +214,7 @@ live route set registered in `harvest_api_router` against `docs/api-contract.jso
 3. Update `docs/api-contract.json` to reflect the new route or schema change.
 4. Run `scripts/regenerate-openapi.sh`. It rewrites both generated OpenAPI
    copies from the contract (issue #694). Skipping it fails CI.
-5. Add a CHANGELOG entry under the current version marking the change as
+5. Add a changelog fragment in `docs/changelog.d/` that marks the change as
    breaking or non-breaking per the compatibility rules above.
 6. Run `cargo test -p autumn-harvest-plugin --test contract_regression --test openapi_spec`
    to confirm the regression tests pass.

@@ -7,11 +7,15 @@ Harvest can spread workflow state across N independent Postgres databases (shard
 For the full sharding architecture, see [`docs/architecture.md`](architecture.md#sharding) §Sharding and `autumn-harvest/src/shard.rs`.
 
 **When should you shard?** [`performance.md`](performance.md) publishes measured
-task-claim latency against pending-backlog depth. Claim cost grows superlinearly
-with backlog depth and every worker pays the full scan, so beyond a certain depth
-adding workers stops helping and sharding (or shedding the backlog) is the
-answer. Measure your own steady-state backlog against that table before
-provisioning a second shard.
+task-claim latency against pending-backlog depth. Since issue #1971, the default
+claim reads a bounded [seek window](performance.md#the-seek-window-issue-1971)
+first. Its cost stays nearly flat from 1K to 1M pending rows. The full scan
+still runs as a fallback. Its cost grows superlinearly with backlog depth. A
+blocked queue head can send a claim to it. With `priority_aging_secs` set or
+fairness keys on, every claim runs it. Every worker pays that cost on each such
+claim, so past a certain depth adding workers stops helping. Sharding (or
+shedding the backlog) is then the answer. Measure your own steady-state backlog
+against that table before provisioning a second shard.
 
 ## Glossary
 

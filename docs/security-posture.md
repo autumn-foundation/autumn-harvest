@@ -1151,7 +1151,8 @@ by its stable `(workflow_name, workflow_id)` business key instead of its
 ## Keyed entities (issue #1975)
 
 [ADR 0006](./adr/0006-keyed-entity.md) records the design. An entity adds no
-route and no table.
+route. The `harvest_entity_state` table holds the latest state of each key
+(issue #2259).
 
 - **Any signal route sends an operation.** Signal-with-start, the signal
   routes by execution id and by business id, and batch signal jobs all reach
@@ -1185,8 +1186,12 @@ route and no table.
 - **State is stored in clear unless you encrypt it.** Each operation is a
   `SignalReceived` payload. Each checkpoint writes the full state to the
   continue-as-new event and to the `input` column of the next run. The
-  payload codec covers event payloads. Encrypt sensitive state in the
-  handler if a column must not hold it in clear.
+  entity loop also records a state snapshot event at the start of each run
+  and after each op (issue #2259). A trigger copies the stored value of the
+  latest snapshot to `harvest_entity_state.snapshot`, byte for byte. The
+  payload codec covers event payloads, so that column holds the same encoded
+  bytes. Encrypt sensitive state in the handler if a column must not hold it
+  in clear.
 - **Erasure is per run.** Erasure acts on one terminal run. It does not walk
   the continue-as-new chain, and it cannot act on a live entity. A delete
   operation erases nothing.

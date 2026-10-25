@@ -8,6 +8,16 @@ fixture was production-shaped. This page re-runs Ledger against such a fixture.
 No engine code, query, index or migration changes here. See
 [why no fix ships](#why-no-fix-ships).
 
+> **Follow-up (issues #1971 and #2212):** this page measures the full scan.
+> Its capture predates the seek window. The default claim now reads a bounded
+> seek window first, and runs the full scan only as a fallback. On the same
+> generator, with seed 1971, over 64 queues at 1M pending rows, the window
+> reads 8,700 buffers in 185 ms. The full scan reads 986,040 buffers in 18 s.
+> That sweep runs `EXPLAIN` with JIT off, so compare ratios only. See
+> [claim cost against backlog depth](performance.md#claim-cost-against-backlog-depth).
+> Since issue #2212, the partial index `idx_harvest_we_paused` serves the
+> PAUSED-execution skip.
+
 ## TL;DR
 
 * **Claim cost grows with backlog depth, not with work done.** On one seed and
@@ -21,11 +31,13 @@ No engine code, query, index or migration changes here. See
   bitmap heap scan costs about 136k buffers per claim. An index scan on
   `idx_harvest_tq_poll` costs about 986k. The time per claim is close for both:
   15 to 20 s. This capture took the bitmap heap scan. See [two plans, one fixture](#two-plans-one-fixture).
-* **The PAUSED-execution skip scans every execution on every claim.** In the
+* **The PAUSED-execution skip scanned every execution on every claim.** In the
   plan, `harvest_workflow_executions` gets a `Seq Scan` with `state = 'PAUSED'`
   as its filter. At 1M rows it reads all 250k executions per claim. The e2e
   hook shows the same scan on the issue's own workload: 56,075 sequential scans
-  and 35.4M tuples read for 1,440 executions.
+  and 35.4M tuples read for 1,440 executions. Issue #2212 has since added the
+  partial index `idx_harvest_we_paused` for this gate. The captures on this
+  page predate it.
 * **The claim CTE is 99.3% of shared buffers at depth** (86.3% at 4k). The FK
   `FOR KEY SHARE` lead from the issue is real but small at both depths.
 * **JIT costs 2.5 s of a 15.9 s claim.** The plan cost is above
@@ -114,7 +126,8 @@ From `deep-claim.explain.txt` (one claim, 15.9 s):
    scan that `pg_stat_user_tables` shows.
 3. **The PAUSED-execution skip.** A `Seq Scan` on `harvest_workflow_executions`
    with `Filter: (state = 'PAUSED')` removes all 250,000 rows (5,320 buffers).
-   `idx_harvest_we_state` covers only `RUNNING`, so no index serves it.
+   `idx_harvest_we_state` covers only `RUNNING`, so no index served it in this
+   capture. Issue #2212 later added `idx_harvest_we_paused` for this skip.
 4. **JIT.** 2.5 s of the 15.9 s.
 
 At 4k rows the same plan sorts 3,573 rows in memory and runs in 19 ms.
@@ -164,6 +177,20 @@ writing after `fleet.stop()` until teardown ends them. That is an e2e harness
 lifetime gap, outside this issue. The header of each file names the sessions.
 
 ## 💡 Leads (unproven, each needs a decision)
+
+> **Follow-up (issues #1971 and #2212):** this capture measures the claim as
+> it was before issue #1971. Issues #1971 and #2212 take four of these leads.
+> Issue #2212 adds `idx_harvest_we_paused`, the partial index on `PAUSED` runs
+> that the first lead proposes. Issue #1971 makes the default claim read a
+> bounded seek window first. When the window decides, the claim runs neither
+> the full candidate scan nor the `concurrency_pending_keys` scan. So the
+> two-plan choice of this page does not arise. Stale statistics do not change
+> the window plan either. A fallback, an ageing claim and a fair claim still
+> run the full scan. The `queue::claim_task` transaction also sets `jit = off`
+> with `SET LOCAL`. The issue #1971 design rejects `queue::claim_task_batched`
+> as the default claim, because its candidate scan is still a full scan and
+> sort. So the default claim does not use it. See
+> [the seek window](performance.md#the-seek-window-issue-1971).
 
 * **Index the PAUSED skip.** A partial index on `harvest_workflow_executions`
   `WHERE state = 'PAUSED'` would turn the per-claim sequential scan into an

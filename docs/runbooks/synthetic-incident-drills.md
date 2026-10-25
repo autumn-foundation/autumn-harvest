@@ -52,17 +52,18 @@ fresh active coverage for the required queue and shard.
 
 ## missed-schedule
 
-Create a staging workflow schedule with a short interval, then pause it or set
-`max_active_runs` low enough that a previous synthetic run blocks the next
-firing.
+Create a staging workflow schedule with a short interval and the default `Skip`
+overlap policy. Set `max_active_runs` low enough that a previous synthetic run
+blocks the next firing. Do not pause the schedule. A paused schedule is never
+due or overdue, so neither the overdue gauge nor the skipped counter fires.
 
 Expected alert: `harvest_schedule_missed_runs`.
 
 Runbook step: `harvest_schedule_missed_runs` -> `### Triage steps`, especially
 `harvest schedule list --output json` and `harvest preflight --output json`.
 
-Resolution target: resume the schedule or clear the synthetic active run, then
-verify `harvest_schedule_runs_total` increases on the next interval.
+Resolution target: clear the synthetic active run, then verify
+`harvest_schedule_runs_total` increases on the next interval.
 
 ## runaway-execution-containment
 

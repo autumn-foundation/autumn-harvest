@@ -169,6 +169,10 @@ commit first. ADR 0009 decision 9 calls that the drain.
   fewer of them.
 - The frozen-commit test uses a test trigger to stop inside the
   transaction. The trigger runs only on the test database.
+- The measured seconds predate issue #2296. Each acquisition then took
+  one partition in its own transaction. Since then, the worker takes the
+  partitions of a scan in one transaction. CI still runs the tests on the
+  current engine, so it still checks each pass condition.
 
 ## Reproduce
 
