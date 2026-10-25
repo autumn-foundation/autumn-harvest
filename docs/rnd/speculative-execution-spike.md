@@ -18,7 +18,7 @@ The prototype files are:
 - `autumn-harvest/tests/dst/speculate.rs`, its tests.
 - `HARVEST_BENCH_COMMIT_PROBE` in
   `autumn-harvest/tests/integration/e2e_bench_support.rs`, the probe.
-- `DESIGN-2011.md`, the plan and the go criteria.
+- `docs/design/DESIGN-2011.md`, the plan and the go criteria.
 
 ---
 
@@ -355,7 +355,7 @@ The saving does not carry over to Harvest for three reasons:
 
 **Verdict: no-go** for speculative decisions and for asymmetric logging.
 
-`DESIGN-2011.md` fixed three go criteria before the measurement.
+`docs/design/DESIGN-2011.md` fixed three go criteria before the measurement.
 
 | Criterion | Result |
 |---|---|

@@ -33,4 +33,4 @@ No new `WorkflowEvent` variant. No schema change. Tests:
 tests in `autumn-harvest-sqlite/src/update.rs`. The tests replay accepted,
 failed, declarative and body-driven histories on the core `WorkflowReplayer`.
 A parity test matches the events of `WorkflowTestEnv`. Design:
-`DESIGN-2025.md`.
+`docs/design/DESIGN-2025.md`.

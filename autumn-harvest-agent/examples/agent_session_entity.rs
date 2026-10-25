@@ -3,7 +3,7 @@
 //! Each session is one agent: the agent id is `session/<name>`. A user
 //! message is one op. The op runs one segment of the agent loop with the whole
 //! harness: tools, policy, approvals, budgets, memory, the loop guard and
-//! delivery. See `DESIGN-2262.md`.
+//! delivery. See `docs/design/DESIGN-2262.md`.
 //!
 //! ## Why an agent
 //!

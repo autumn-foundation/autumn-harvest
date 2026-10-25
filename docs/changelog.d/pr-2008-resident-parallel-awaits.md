@@ -39,7 +39,7 @@ report `multi_await`. Races still replay, and report `race`.
 - The DST world sweep, seeds 0 to 11: 33 warm decisions and 30 cache hits
   that replayed before, 44 and 19 after. Every invariant holds.
 
-`DESIGN-2008.md` records the method and the outcome sequences.
+`docs/design/DESIGN-2008.md` records the method and the outcome sequences.
 
 **Known limit.** A join branch that runs a command after its own await
 fails a cold replay when a later branch has a command event. When the

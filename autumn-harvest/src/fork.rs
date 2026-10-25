@@ -2,7 +2,7 @@
 //!
 //! A fork copies a history prefix of a source run to a new execution with a
 //! new workflow id. It never writes a source row, so it accepts a run in any
-//! state. See `DESIGN-2000.md`.
+//! state. See `docs/design/DESIGN-2000.md`.
 //!
 //! # Effects
 //!

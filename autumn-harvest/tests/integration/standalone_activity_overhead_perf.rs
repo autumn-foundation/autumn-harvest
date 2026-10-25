@@ -3,14 +3,14 @@
 //!
 //! Harvest has no standalone-activity start path. A user wraps one activity
 //! in a one-step workflow. This harness measures what that wrapper costs.
-//! `DESIGN-1987.md` fixes the arms and the decision rule.
+//! `docs/design/DESIGN-1987.md` fixes the arms and the decision rule.
 //!
 //! * Arm A: a one-step workflow that runs a regular activity.
 //! * Arm B: a one-step workflow that runs a local activity.
 //! * Arm C: the bare floor. It inserts one task row with no workflow,
 //!   claims it and completes it through the `queue` API. No worker path
 //!   runs such a row.
-//! * Arm D: the realistic floor (`DESIGN-1987.md` §0.6). It adds a job
+//! * Arm D: the realistic floor (`docs/design/DESIGN-1987.md` §0.6). It adds a job
 //!   record and the handler-start marker to arm C, and writes no events.
 //!
 //! The structural tests assert events, task rows and claims per job. Those

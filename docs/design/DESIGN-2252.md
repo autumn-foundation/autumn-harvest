@@ -1,6 +1,6 @@
 # Design: issue #2252, owned workflow-task claims and the owner-mode switch
 
-Stage 1a of epic #2247. [ADR 0009](docs/adr/0009-decision-owner.md) fixes the
+Stage 1a of epic #2247. [ADR 0009](../adr/0009-decision-owner.md) fixes the
 protocol. Issue #2251 added the owner rows, the lease statements and the
 commit fence. This issue turns owner mode on: a per-database switch, the
 owned claim, a database guard on the legacy claim and the acquisition loop.

@@ -48,7 +48,7 @@ is stored outside the event log until the run ends. The core gains one seam,
 `ctx.cancellation_reason()` on each decision cycle while the request is
 pending. A recorded `WorkflowCancelled` wins. The update replay calls the public
 `WorkflowContext::with_pending_cancellation` for the same effect. Every other caller passes
-`None`, so Postgres behavior does not change. See `DESIGN-2021.md`.
+`None`, so Postgres behavior does not change. See `docs/design/DESIGN-2021.md`.
 
 **Breaking changes.** `WorkflowExecuteSpanMeta` has a new public field.
 `RunState` has two new variants, so an exhaustive `match` needs new arms.

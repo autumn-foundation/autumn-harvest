@@ -1,6 +1,6 @@
 # Design: issue #2255, take workflow tasks off the contended claim path
 
-Stage 1b of epic #2247. [ADR 0009](docs/adr/0009-decision-owner.md) fixes the
+Stage 1b of epic #2247. [ADR 0009](../adr/0009-decision-owner.md) fixes the
 owner protocol. Issues #2251 to #2254 built the lease, the owned claim, the
 owner wakes and the failover tests. Issue #2248 measured the baseline. This
 issue moves workflow tasks off the shared claim loop.
@@ -218,7 +218,7 @@ now runs only on a database with an owner wake listener.
 
 ## 5. Measurements
 
-[`performance-owner-decider.md`](docs/performance-owner-decider.md) has the
+[`performance-owner-decider.md`](../performance-owner-decider.md) has the
 tables. In short, on a 4-CPU host with Postgres on the same host:
 
 | Done-when item | Result |

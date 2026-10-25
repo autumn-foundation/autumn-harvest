@@ -3,7 +3,7 @@
 Issue #2249 asks for an ADR. The ADR records the choices of the stage 1
 owner model that are hard to change later. This file is the planning
 record. The decision is in
-[ADR 0009](docs/adr/0009-decision-owner.md).
+[ADR 0009](../adr/0009-decision-owner.md).
 
 **No engine code change. No new `WorkflowEvent` variant. No migration.**
 The change adds an ADR, a glossary, a terms note, one engine invariant, a

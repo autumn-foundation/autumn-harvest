@@ -21,7 +21,7 @@
 //!    by body. A changed body that the run may still execute needs review.
 //!
 //! The verdict is the worst finding: pin, then review, then migrate.
-//! `DESIGN-1995.md` holds the full rules and the proof that a changed helper
+//! `docs/design/DESIGN-1995.md` holds the full rules and the proof that a changed helper
 //! is "passed".
 //!
 //! **Trust boundary.** The check decodes payloads in memory with the
@@ -1195,7 +1195,7 @@ fn changed_bodies(old: &WorkflowStructure, new: &WorkflowStructure) -> Vec<Strin
 
 /// Whether the changed body `id` is behind the run for good.
 ///
-/// `DESIGN-1995.md` §3 lists the conditions and why they suffice.
+/// `docs/design/DESIGN-1995.md` §3 lists the conditions and why they suffice.
 fn is_passed(graph: &WorkflowStructure, id: &str, facts: &HistoryFacts) -> bool {
     if id == graph.root || !runs_at_most_once(graph, id, &mut BTreeSet::new()) {
         return false;

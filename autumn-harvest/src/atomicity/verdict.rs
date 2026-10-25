@@ -1,6 +1,6 @@
 //! The pre-registered go or no-go criteria (issue #2012).
 //!
-//! Section 3 of `DESIGN-2012.md` fixed the criteria before the measurement.
+//! Section 3 of `docs/design/DESIGN-2012.md` fixed the criteria before the measurement.
 //! Section 3.1 added the overlap rule, also before any data. [`judge`]
 //! applies both to measured cells, so the verdict is a function of the data
 //! and not a judgement made after it.

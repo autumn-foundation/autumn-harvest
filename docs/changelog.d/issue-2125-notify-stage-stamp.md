@@ -23,6 +23,6 @@ All calls drop from 66,436 to 62,595. WAL does not change. Tests:
 `an_append_in_a_transaction_sends_no_stage_probe`,
 `an_enqueue_in_a_transaction_sends_no_stage_probe` and
 `a_coalesced_scope_stages_with_the_stamp_of_its_append`. Design:
-`DESIGN-2125.md`.
+`docs/design/DESIGN-2125.md`.
 
 No new `WorkflowEvent` variant, no new migration, no replay impact.

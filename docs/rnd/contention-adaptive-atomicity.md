@@ -2,7 +2,7 @@
 
 **Status:** R&D spike, behind the `atomicity-spike` feature.
 **Measured:** 2026-10-11, code at revision `f6893ac`.
-**Plan:** [`DESIGN-2012.md`](../../DESIGN-2012.md). Commit `62f99f0` added
+**Plan:** [`docs/design/DESIGN-2012.md`](../design/DESIGN-2012.md). Commit `62f99f0` added
 its rule and its criteria before the code.
 
 ## Question
@@ -152,7 +152,7 @@ of the ones above. Its low, 20 ms cell had overlapping `backout` and
 
 ## The selection rule
 
-Section 2.3 of `DESIGN-2012.md` fixed the rule before the measurement.
+Section 2.3 of `docs/design/DESIGN-2012.md` fixed the rule before the measurement.
 Section 3.1 later amended the text of one input, `hold_after_hot_step`, to
 match the code. The amendment changes no pick. The first matching branch
 wins.

@@ -2,7 +2,7 @@
 (***************************************************************************)
 (* The durable peer send of an agent mesh (issue #2269).                   *)
 (*                                                                         *)
-(* DESIGN-2262.md section 7 is the prose spec.                             *)
+(* docs/design/DESIGN-2262.md section 7 is the prose spec.                             *)
 (* docs/testing/formal-methods.md says how to run this model.              *)
 (*                                                                         *)
 (* Agent A sends PeerMessage ops to agent B by workflow id. Both agents    *)

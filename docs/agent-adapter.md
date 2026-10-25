@@ -874,7 +874,7 @@ of tool calls across the tree. Read [`agent-mesh.md`](agent-mesh.md).
 An `Agent` (issue #2263) is a named, long-lived actor. It owns its state,
 handles one message at a time, and survives a crash. It is the agent loop
 inside a keyed entity (ADR 0006). The design is in
-[`DESIGN-2262.md`](../DESIGN-2262.md).
+[`docs/design/DESIGN-2262.md`](design/DESIGN-2262.md).
 
 | Agent concept | Harvest part |
 |---|---|

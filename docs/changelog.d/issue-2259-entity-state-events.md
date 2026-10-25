@@ -1,7 +1,7 @@
 ## Engine — Keyed-entity state as history events with a Postgres projection (issue #2259)
 
 Stage 3a of epic #2247. [ADR 0006](../adr/0006-keyed-entity.md) records the
-amendment. The design record is [`DESIGN-2259.md`](../../DESIGN-2259.md).
+amendment. The design record is [`docs/design/DESIGN-2259.md`](../design/DESIGN-2259.md).
 
 **Event.** The entity loop records a state snapshot as
 `SideEffectRecorded` with the new kind `SideEffectKind::EntityState`. It

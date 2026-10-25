@@ -260,6 +260,15 @@ have homes:
   record. Two guard suites read it as data, so treat it as load-bearing.
 - [`docs/changelog.d/README.md`](docs/changelog.d/README.md) — where a feature
   PR's changelog entry goes (a fragment file, never the shared phase list).
+- [`docs/design/README.md`](docs/design/README.md) — where a design record
+  (`DESIGN-<issue>.md`), a plan, an ADR or an R&D note goes.
+
+### Never write a document at the repository root
+
+A design record goes in `docs/design/`, not the root. So does any other
+planning or scratch document. `docs/audits/root-files.py` fails the `lint`
+job on a root file that is not in its allow list. Do not add an entry to
+make a document pass. Move the document.
 
 ### Keep docs guards from becoming conflict magnets
 

@@ -33,7 +33,7 @@ JSON-RPC route at `{tools prefix}/tasks`, default `/api/harvest/mcp/tasks`.
   `application/json` only.
 
 **No migration. No new `WorkflowEvent` variant.** The change is HTTP-edge
-only, behind the `mcp` cargo feature. The plan is in `DESIGN-2005.md`.
+only, behind the `mcp` cargo feature. The plan is in `docs/design/DESIGN-2005.md`.
 
 Tests: `mcp_tasks` unit tests pin the status mapping and the spec transition
 table. `tests/mcp_tasks_http_tests.rs` pins the JSON-RPC contract and the auth

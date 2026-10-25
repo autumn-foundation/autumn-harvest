@@ -3,7 +3,7 @@
 //! Issue #1987 is done when two things exist: a measurement of the one-step
 //! workflow overhead, and a recorded decision. These tests pin both. They
 //! also check that the decision follows the pre-registered line in
-//! `DESIGN-1987.md` §0.6, read from the published table. The §0.4 verdict
+//! `docs/design/DESIGN-1987.md` §0.6, read from the published table. The §0.4 verdict
 //! must stay on record too.
 //!
 //! Pure: no database, no async. Runs on every OS.
@@ -354,7 +354,7 @@ fn the_perf_page_names_its_harness() {
     for needle in [
         "autumn-harvest/tests/integration/standalone_activity_overhead_perf.rs",
         "zz_capture_standalone_activity_overhead_evidence",
-        "DESIGN-1987.md",
+        "docs/design/DESIGN-1987.md",
     ] {
         assert!(doc.contains(needle), "the perf page must name `{needle}`");
     }

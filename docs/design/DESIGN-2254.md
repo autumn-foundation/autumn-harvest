@@ -1,6 +1,6 @@
 # Design: issue #2254, owner failover tests
 
-Stage 1a of epic #2247. [ADR 0009](docs/adr/0009-decision-owner.md) fixes the
+Stage 1a of epic #2247. [ADR 0009](../adr/0009-decision-owner.md) fixes the
 protocol. Issues #2251 to #2253 built it. This issue proves failover against
 real Postgres before an operator turns owner mode on.
 

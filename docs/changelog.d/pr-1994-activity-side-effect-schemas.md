@@ -45,4 +45,4 @@ shape. `schema_check_cli` has the issue's red-first test,
 side-effect break, the bare-body guard, an acknowledged removal, the version
 upgrade and the escape hatch. The `schema_feature_tests` unit tests cover
 both `with_schemas` methods and a derived activity type end to end.
-Design record: `DESIGN-1994.md`.
+Design record: `docs/design/DESIGN-1994.md`.

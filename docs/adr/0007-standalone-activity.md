@@ -28,7 +28,7 @@ Per job:
 | C | Bare floor: one task row | 3.00 | 2326 |
 | D | Realistic floor: task row, job record, handler-start marker | 6.00 | 5073 |
 
-`DESIGN-1987.md` fixed two lines, each before its floor ran. Both use
+`docs/design/DESIGN-1987.md` fixed two lines, each before its floor ran. Both use
 **2.0x**: a new start path is worth its surface only if it at least halves
 the write cost of the cheapest existing pattern.
 

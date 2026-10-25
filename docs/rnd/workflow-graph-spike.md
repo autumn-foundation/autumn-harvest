@@ -2,7 +2,7 @@
 
 **Status: R&D spike, shipped in `autumn-harvest-verify`.** This report is the
 "done when" of issue #2010. Design and planning record:
-[`DESIGN-2010.md`](../../DESIGN-2010.md). User guide:
+[`docs/design/DESIGN-2010.md`](../design/DESIGN-2010.md). User guide:
 [`docs/harvest-verify.md`](../harvest-verify.md#saga-compensation-coverage).
 
 **Verdict: go** for the step graph as data, and for model checks of user

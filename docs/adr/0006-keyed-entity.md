@@ -177,7 +177,7 @@ A native primitive stays at rank 13, behind customer pull.
 
 ## Amendment: state as history events (issue #2259)
 
-The design record is [`DESIGN-2259.md`](../../DESIGN-2259.md).
+The design record is [`docs/design/DESIGN-2259.md`](../design/DESIGN-2259.md).
 
 ### Context
 
@@ -299,7 +299,7 @@ When it gains queries:
 
 ## Amendment: wakes (issue #2266)
 
-The design record is section 4 of `DESIGN-2262.md` (epic #2262).
+The design record is section 4 of `docs/design/DESIGN-2262.md` (epic #2262).
 
 ### Context
 

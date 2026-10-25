@@ -116,7 +116,7 @@ and `…_admits_established_session_with_configured_key` (AC3 both ways),
 pre-existing `eris_*` suite is unmodified and green — 108/108 in `security.rs`,
 1030/1030 in the plugin lib.
 
-**Planning record.** `DESIGN-1284.md` carries the derived AC table, a
+**Planning record.** `docs/design/DESIGN-1284.md` carries the derived AC table, a
 nine-candidate brainstorm with the elimination reasoning (including why a
 loopback-only restriction is not implementable here — no `ConnectInfo` reaches a
 nested plugin router), a reverse-brainstorm risk table (R1–R9), a six-hats pass,

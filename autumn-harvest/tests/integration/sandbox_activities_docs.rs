@@ -1,7 +1,7 @@
 //! Guards for the sandboxed code activity docs.
 //!
 //! `docs/sandbox-activities.md` is the guide, and
-//! `DESIGN-sandbox-activities.md` is the design record. These guards read the
+//! `docs/design/DESIGN-sandbox-activities.md` is the design record. These guards read the
 //! sources and check that the docs agree with them:
 //!
 //! * The guide has one failure row per sandbox error type, and each retry
@@ -23,7 +23,7 @@ use super::docs_guard_support::{check_stanza, prose_sentences, section, step_sta
 const GUIDE: &str = "docs/sandbox-activities.md";
 const IMAGE_SCRIPT: &str = "scripts/sandbox/build-guest-image.sh";
 const PUBLISH_SCRIPT: &str = "scripts/sandbox/publish-image.sh";
-const DESIGN: &str = "DESIGN-sandbox-activities.md";
+const DESIGN: &str = "docs/design/DESIGN-sandbox-activities.md";
 const FILTER: &str = "--test integration sandbox_activities_docs::";
 const MAX_SENTENCE_WORDS: usize = 25;
 

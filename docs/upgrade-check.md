@@ -19,7 +19,7 @@ The check covers three failure modes:
 
 The verdicts are conservative. A change that the check cannot place gives
 `review`, never `migrate`. The design and its proofs are in
-[`DESIGN-1995.md`](../DESIGN-1995.md).
+[`docs/design/DESIGN-1995.md`](design/DESIGN-1995.md).
 
 ---
 

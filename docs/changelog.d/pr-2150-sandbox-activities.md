@@ -4,7 +4,7 @@ The new `sandbox-activities` feature lets an activity run code that an agent
 writes at run time. The code can be Python, Node, shell or any program in the
 guest image. It is off by default. The guide is
 `docs/sandbox-activities.md`, and the design record is
-`DESIGN-sandbox-activities.md`.
+`docs/design/DESIGN-sandbox-activities.md`.
 
 - **The request and the outcome.** An agent sends a `SandboxRequest` as JSON:
   a runtime, the code, files, stdin, arguments, variables, output paths and

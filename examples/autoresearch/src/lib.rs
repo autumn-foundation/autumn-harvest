@@ -10,7 +10,7 @@
 //! - [`rules`] holds the keep rule. [`results`] holds the `results.tsv` format.
 //! - [`runtime`] registers everything on the SQLite backend and drives it.
 //!
-//! See `README.md` for the guide and `DESIGN-autoresearch.md` for the plan.
+//! See `README.md` for the guide and `docs/design/DESIGN-autoresearch.md` for the plan.
 
 pub mod activities;
 pub mod agent;

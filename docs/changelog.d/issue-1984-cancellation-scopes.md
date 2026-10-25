@@ -74,4 +74,4 @@ scope cancels gets the generic parent-cancel reason (#2194).
   the deferred cancel, the inline and continue-as-new paths, a paused run
   and a replay of each recorded history.
 
-Design record: `DESIGN-1984.md`.
+Design record: `docs/design/DESIGN-1984.md`.

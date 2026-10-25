@@ -37,5 +37,5 @@ both workflows; SQLite end-to-end tests for each acceptance criterion; CLI
 tests. CI runs them, the clippy step and an offline demo. A nightly job runs
 5000 seeds per sweep. The sweeps found a real bug while the example was
 written: the reserved search attribute `status`. The design record,
-`DESIGN-autoresearch.md`, has the acceptance criteria, their evidence and
+`docs/design/DESIGN-autoresearch.md`, has the acceptance criteria, their evidence and
 the review record.

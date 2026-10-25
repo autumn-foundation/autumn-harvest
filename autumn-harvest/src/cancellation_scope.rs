@@ -2,7 +2,7 @@
 //!
 //! A [`CancellationScope`] cancels a group of in-flight operations as a unit.
 //! [`WorkflowContext::non_cancellable`] shields a block from a workflow
-//! cancel. See `DESIGN-1984.md` for the design record.
+//! cancel. See `docs/design/DESIGN-1984.md` for the design record.
 
 use std::future::Future;
 use std::pin::Pin;

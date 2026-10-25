@@ -30,7 +30,7 @@ token. Then it suspends until a poll or a push resolves the token.
 - `ActivityContext::idempotency_key()` is the same on each retry of one
   activity.
 - MCP Tasks (extension `io.modelcontextprotocol/tasks`, revision
-  `2026-07-28`) is in `DESIGN-2005.md`. A client declares the extension in
+  `2026-07-28`) is in `docs/design/DESIGN-2005.md`. A client declares the extension in
   `params._meta`. A `tools/call` then returns `resultType: "task"` with a
   `taskId`. `tasks/get` returns the status. A tool result with
   `isError: true` is `completed`. `failed` is for a JSON-RPC error only.

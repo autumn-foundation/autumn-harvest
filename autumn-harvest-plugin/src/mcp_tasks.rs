@@ -11,7 +11,7 @@
 //!
 //! The task is the run. The task id is the execution id that the start
 //! returns, and each read derives the task from the execution row. So no task
-//! state is stored, and a restart loses nothing. See `DESIGN-2005.md`.
+//! state is stored, and a restart loses nothing. See `docs/design/DESIGN-2005.md`.
 //!
 //! - A retried `tools/call` with the same start key returns the same task.
 //!   The key comes from the `Idempotency-Key` header or from

@@ -200,4 +200,4 @@ lock on the real rows, so a claim never waits for it.
 - [Claim order under overload](operations/claim-order.md)
 - [Tenant cells](sharding.md#tenant-cells-issue-1837)
 - ADR: [0008](adr/0008-fairness-keys-start-time-fair-queuing.md)
-- Design record: `DESIGN-1976.md`
+- Design record: `docs/design/DESIGN-1976.md`

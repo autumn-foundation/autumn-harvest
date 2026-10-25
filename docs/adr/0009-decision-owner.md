@@ -8,7 +8,7 @@ Issues #2250 to #2255 build it. Issue #2253 adds decision 12. Issue #2255
 adds decision 13.
 [ADR 0010](0010-fenced-owner-lease.md) holds the lease rules R1 to R7 that
 the model forces. The planning record is
-[`DESIGN-2249.md`](../../DESIGN-2249.md). The source is the stage 1 section
+[`docs/design/DESIGN-2249.md`](../design/DESIGN-2249.md). The source is the stage 1 section
 of `reports/Actor ownership prior art for Harvest.md`.
 
 ## Context

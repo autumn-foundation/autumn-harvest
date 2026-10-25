@@ -1,7 +1,7 @@
 //! The `filter` grammar of `GET /workflows` and the Vantage list (issue #1982).
 //!
 //! A filter joins predicates with `AND`, `OR` and parentheses. `AND` binds
-//! tighter than `OR`. `DESIGN-1982.md` holds the full grammar.
+//! tighter than `OR`. `docs/design/DESIGN-1982.md` holds the full grammar.
 //!
 //! The compiler binds every key and every value. Operator text comes from a
 //! closed set, so no caller text reaches the SQL. Each branch of each `OR` must

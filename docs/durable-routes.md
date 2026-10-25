@@ -11,7 +11,7 @@ HTTP `Idempotency-Key` header keys the run.
 
 The run commits before the route waits. A crash, a deploy or a dropped
 connection loses nothing. Inngest calls this pattern "durable endpoints". The
-design record is [`DESIGN-durable-routes.md`](../DESIGN-durable-routes.md).
+design record is [`docs/design/DESIGN-durable-routes.md`](design/DESIGN-durable-routes.md).
 
 ## Write a durable route
 
@@ -155,7 +155,7 @@ A live run waits for up to the budget.
 `.stream()` answers with a resumable Server-Sent Events (SSE) stream in
 place of one JSON answer. Use it for LLM token streaming and other long
 output. The design record is
-[`DESIGN-durable-streaming.md`](../DESIGN-durable-streaming.md).
+[`docs/design/DESIGN-durable-streaming.md`](design/DESIGN-durable-streaming.md).
 
 ```rust,ignore
 use autumn_harvest_plugin::durable_route::{DurableRoute, DurableStream};

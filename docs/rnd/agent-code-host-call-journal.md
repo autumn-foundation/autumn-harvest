@@ -3,7 +3,7 @@
 **Status: R&D spike, behind the `wasm-activities` Cargo feature.** This page
 answers issue #2014. It describes a working prototype and gives a go / no-go
 verdict. The prototype is `autumn-harvest/src/wasm_journal.rs`. The plan and
-its risk analysis are in `DESIGN-2014.md`.
+its risk analysis are in `docs/design/DESIGN-2014.md`.
 
 ## The question
 

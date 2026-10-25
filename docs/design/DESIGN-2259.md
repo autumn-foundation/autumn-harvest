@@ -1,6 +1,6 @@
 # Design: issue #2259, keyed-entity state as history events with a Postgres projection
 
-Stage 3a of epic #2247. [ADR 0006](docs/adr/0006-keyed-entity.md) defines the
+Stage 3a of epic #2247. [ADR 0006](../adr/0006-keyed-entity.md) defines the
 keyed entity. Its amendment records this change.
 
 **One migration. One new `SideEffectKind` variant. One new trigger on

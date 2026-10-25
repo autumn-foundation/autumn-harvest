@@ -190,14 +190,15 @@ fn ac_table_names_existing_tests(note: &str, row_prefix: &str) -> usize {
 // AC-47
 #[test]
 fn design_note_ac_table_names_existing_tests() {
-    let checked = ac_table_names_existing_tests("DESIGN-durable-routes.md", "| AC-");
+    let checked = ac_table_names_existing_tests("docs/design/DESIGN-durable-routes.md", "| AC-");
     assert!(checked >= 40, "only {checked} test names checked");
 }
 
 // SAC-37
 #[test]
 fn stream_design_note_ac_table_names_existing_tests() {
-    let checked = ac_table_names_existing_tests("DESIGN-durable-streaming.md", "| SAC-");
+    let checked =
+        ac_table_names_existing_tests("docs/design/DESIGN-durable-streaming.md", "| SAC-");
     assert!(checked >= 38, "only {checked} test names checked");
 }
 
@@ -214,7 +215,7 @@ fn numbered_rows<'a>(text: &'a str, prefix: &str) -> Vec<&'a str> {
 // SAC-37
 #[test]
 fn stream_design_note_keeps_its_planning_sections() {
-    let design = read("DESIGN-durable-streaming.md");
+    let design = read("docs/design/DESIGN-durable-streaming.md");
     for heading in [
         "### 0.1 Facts found before the plan",
         "### 0.2 Brainstorm",
@@ -310,7 +311,7 @@ fn streaming_section_states_the_client_contract() {
 // AC-47
 #[test]
 fn design_note_keeps_its_planning_sections() {
-    let design = read("DESIGN-durable-routes.md");
+    let design = read("docs/design/DESIGN-durable-routes.md");
     for heading in [
         "### 0.1 Facts found before the plan",
         "### 0.2 Brainstorm",

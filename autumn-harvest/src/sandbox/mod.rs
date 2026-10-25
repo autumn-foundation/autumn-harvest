@@ -31,7 +31,7 @@
 //! use `HARVEST_IDEMPOTENCY_KEY`.
 //!
 //! See `docs/sandbox-activities.md` for the guide and
-//! `DESIGN-sandbox-activities.md` for the design record.
+//! `docs/design/DESIGN-sandbox-activities.md` for the design record.
 
 pub mod activity;
 pub mod capture;
