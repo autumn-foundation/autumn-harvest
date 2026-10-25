@@ -27,7 +27,7 @@
 //!   after [`MAX_QUERY_TIME`], or when SQLite memory grows by more than
 //!   [`MAX_QUERY_MEMORY`]. A result stops past [`MAX_ROWS`] rows or
 //!   [`MAX_RESULT_BYTES`] bytes. A string or blob holds at most
-//!   [`MAX_VALUE_BYTES`] bytes.
+//!   [`MAX_VALUE_BYTES`] bytes, or the size of a larger snapshot.
 //! - **One statement.** A second statement is refused.
 //! - **Blobs as hex.** A blob result is a lowercase hex string.
 //!
@@ -62,6 +62,9 @@ pub const MAX_STEPS: u64 = 50_000_000;
 pub const MAX_SQL_BYTES: i32 = 100_000;
 
 /// The longest string or blob that a query makes, in bytes.
+///
+/// A snapshot larger than this raises the limit to its own size, so a query
+/// can still read it.
 pub const MAX_VALUE_BYTES: i32 = 1024 * 1024;
 
 /// The most bytes of text and blobs that one result holds.
@@ -350,6 +353,7 @@ fn open(record: &EntityRecord) -> Result<Connection, EntitySqlError> {
     let state_json = serde_json::to_string(&record.snapshot.state).map_err(HarvestError::from)?;
     let counters_json =
         serde_json::to_string(&record.snapshot.stats).map_err(HarvestError::from)?;
+    let (state_bytes, counters_bytes) = (state_json.len(), counters_json.len());
     conn.execute(
         "INSERT INTO entity VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
@@ -365,10 +369,15 @@ fn open(record: &EntityRecord) -> Result<Connection, EntitySqlError> {
     .map_err(|e| sql_error(&e))?;
     conn.execute_batch("PRAGMA query_only = ON;")
         .map_err(|e| sql_error(&e))?;
+    // A valid snapshot can be larger than the value cap. SQLite must still
+    // read it, so the length limit grows to the largest stored value.
+    let value_limit = i32::try_from(state_bytes.max(counters_bytes))
+        .unwrap_or(i32::MAX)
+        .max(MAX_VALUE_BYTES);
     for (limit, value) in [
         (Limit::SQLITE_LIMIT_ATTACHED, 0),
         (Limit::SQLITE_LIMIT_SQL_LENGTH, MAX_SQL_BYTES),
-        (Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES),
+        (Limit::SQLITE_LIMIT_LENGTH, value_limit),
     ] {
         conn.set_limit(limit, value).map_err(|e| sql_error(&e))?;
     }
@@ -712,6 +721,41 @@ mod tests {
     #[test]
     fn a_huge_value_is_refused() {
         match query("SELECT zeroblob(?1)", &[json!(MAX_VALUE_BYTES + 1)]) {
+            Err(EntitySqlError::Sql(_)) => {}
+            other => panic!("expected a size error, got {other:?}"),
+        }
+    }
+
+    /// Codex review on issue #2260: a state past the value cap is still
+    /// valid, so a query reads it. A new value past the cap is refused.
+    #[test]
+    fn a_state_past_the_value_cap_stays_queryable() {
+        let cap = usize::try_from(MAX_VALUE_BYTES).expect("positive");
+        let mut large = record();
+        large.snapshot.state = json!({"owner": "ada", "blob": "x".repeat(cap + cap / 2)});
+        let small = run(
+            &large,
+            "SELECT json_extract(state, '$.owner'), length(state) > ?1 FROM entity",
+            &[json!(cap)],
+            EntitySqlSource::File,
+        )
+        .expect("a small field of a large state");
+        assert_eq!(small.rows, vec![vec![json!("ada"), json!(1)]]);
+        let whole = run(
+            &large,
+            "SELECT state FROM entity",
+            &[],
+            EntitySqlSource::File,
+        )
+        .expect("the whole state");
+        assert_eq!(whole.rows.len(), 1);
+        // A new value larger than the state is refused.
+        match run(
+            &large,
+            "SELECT state || state || state FROM entity",
+            &[],
+            EntitySqlSource::File,
+        ) {
             Err(EntitySqlError::Sql(_)) => {}
             other => panic!("expected a size error, got {other:?}"),
         }
