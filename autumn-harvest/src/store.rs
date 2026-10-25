@@ -3224,6 +3224,25 @@ pub async fn delete_stream_chunks(
         .map_err(crate::error::database_error)
 }
 
+/// Delete the agent cost ledger rows of `exec_id` (issue #2267).
+///
+/// The PII erasure path calls it. Returns the number of deleted rows.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the delete fails.
+pub async fn delete_llm_ledger(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_llm_ledger::dsl;
+
+    diesel::delete(dsl::harvest_llm_ledger.filter(dsl::workflow_exec_id.eq(exec_id.as_uuid())))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
 /// Guarded exactly-once stamp for the operator early-warning soft threshold
 /// on workflow history bloat (issue #704).
 ///

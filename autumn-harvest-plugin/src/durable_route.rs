@@ -336,6 +336,7 @@ impl ScopedDurableRoute {
             failures: Vec::new(),
             expose_id: false,
             stream_for: DEFAULT_STREAM_FOR,
+            live: false,
         }
     }
 }
@@ -352,6 +353,7 @@ pub struct DurableCall {
     failures: Vec<(String, StatusCode)>,
     expose_id: bool,
     stream_for: Duration,
+    live: bool,
 }
 
 impl DurableCall {
@@ -408,6 +410,19 @@ impl DurableCall {
     /// chunks and does not wait.
     pub const fn stream_for(mut self, budget: Duration) -> Self {
         self.stream_for = budget;
+        self
+    }
+
+    /// Also send the live chunks of the activities of the run on
+    /// [`Self::stream`] (issue #2268). The default is off.
+    ///
+    /// An activity sends them with `ActivityContext::publish_progress`, for
+    /// example the tokens of a model call. Each one is an `activity` frame
+    /// with no `id:`. It is not stored, so a resume does not send it again.
+    /// Turn this on only when the caller of the route may see every live
+    /// chunk of the run. It has no effect on [`Self::send`].
+    pub const fn live(mut self) -> Self {
+        self.live = true;
         self
     }
 
@@ -541,6 +556,7 @@ impl DurableCall {
             success: self.success,
             failures: self.failures,
             expose_id: self.expose_id,
+            live: self.live,
         };
         Ok((start, prepared))
     }
@@ -626,6 +642,8 @@ struct Prepared {
     success: StatusCode,
     failures: Vec<(String, StatusCode)>,
     expose_id: bool,
+    /// The stream also sends live activity chunks.
+    live: bool,
 }
 
 impl Prepared {

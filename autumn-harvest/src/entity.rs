@@ -13,6 +13,7 @@
 //! | Read state | The query [`ENTITY_STATE_QUERY`](crate::entity::ENTITY_STATE_QUERY) |
 //! | State change | A snapshot event, [`ENTITY_STATE_SIDE_EFFECT`](crate::entity::ENTITY_STATE_SIDE_EFFECT) |
 //! | Read state without replay | The projection, [`crate::entity_state`] |
+//! | Run an op at a deadline | A [`Wake`](crate::entity::Wake) from the hook of [`Entity::run_with_wakes`](crate::entity::Entity::run_with_wakes) (issue #2266) |
 //!
 //! # Guarantees
 //!
@@ -34,6 +35,12 @@
 //!   done. The copy is `S::clone`, so `clone` must copy the whole value. A
 //!   state that shares interior mutability, such as an `Arc<Mutex<_>>`,
 //!   loses this guarantee.
+//! - **A due wake runs first.** The hook of
+//!   [`Entity::run_with_wakes`](crate::entity::Entity::run_with_wakes) gives a
+//!   deadline and an op. A due wake runs before a waiting op. Otherwise the
+//!   loop races the op signal against a durable timer.
+//! - **No hook, no new events.** [`Entity::run`](crate::entity::Entity::run)
+//!   reads no clock and starts no timer. Its histories replay as before.
 //!
 //! # Limits
 //!
@@ -51,6 +58,12 @@
 //!   [`ENTITY_LAST_ERROR_MAX_BYTES`](crate::entity::ENTITY_LAST_ERROR_MAX_BYTES)
 //!   bytes of the error text.
 //! - A handler panic fails the run, as in any workflow.
+//! - The wake hook must be a pure function of the state, because replay
+//!   calls it again. A failed wake op keeps the old state, so the hook gives
+//!   the same wake, which is now due. The loop then runs it again at once.
+//! - Each step with a wake records one clock read. A wait for a wake also
+//!   records a timer. The timer counts whole seconds, so a wake can run up to
+//!   one second late.
 //!
 //! # Example
 //!
@@ -82,11 +95,26 @@
 //!     TypedSignalWithStartOptions { idempotency_key: Some(op_id), ..Default::default() },
 //! ).await?;
 //! ```
+//!
+//! A session that beats at a deadline in its state. The beat op moves the
+//! deadline, so the hook gives the next beat:
+//!
+//! ```rust,ignore
+//! use autumn_harvest::entity::{Entity, Wake};
+//!
+//! Entity::<Session>::from_input(ctx, input)
+//!     .run_with_wakes(
+//!         |session, op: SessionOp| async move { Ok(session.apply(op)) },
+//!         |session: &Session| Some(Wake::new(session.next_beat_at, SessionOp::Beat)),
+//!     )
+//!     .await
+//! ```
 
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -292,6 +320,27 @@ pub struct EntitySnapshot<S> {
     pub stats: EntityStats,
 }
 
+/// A deadline and the op that the loop runs at it (issue #2266).
+///
+/// [`Entity::run_with_wakes`] asks its hook for a wake before each step. The
+/// op of a wake goes through the handler, as a decoded op does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Wake<O> {
+    /// When the op is due.
+    pub at: DateTime<Utc>,
+    /// The op that the loop runs at `at`.
+    pub op: O,
+}
+
+impl<O> Wake<O> {
+    /// A wake that runs `op` at `at`.
+    #[must_use]
+    pub const fn new(at: DateTime<Utc>, op: O) -> Self {
+        Self { at, op }
+    }
+}
+
 /// The handler loop of one entity run.
 pub struct Entity<'a, S> {
     ctx: &'a WorkflowContext,
@@ -397,11 +446,63 @@ where
     /// [`HarvestError::Cancelled`]: crate::error::HarvestError::Cancelled
     /// [`HarvestError::PayloadTooLarge`]: crate::error::HarvestError::PayloadTooLarge
     /// [`HarvestError::Serialization`]: crate::error::HarvestError::Serialization
-    pub async fn run<O, H, Fut>(self, mut handler: H) -> HarvestResult<S>
+    pub async fn run<O, H, Fut>(self, handler: H) -> HarvestResult<S>
     where
         O: DeserializeOwned,
         H: FnMut(S, O) -> Fut,
         Fut: Future<Output = Result<S, String>>,
+    {
+        // No hook means no clock read and no timer, so old histories replay.
+        self.run_loop(handler, |_: &S| None::<Wake<O>>).await
+    }
+
+    /// Run the loop like [`run`](Self::run), and also run the op of `wake` at
+    /// its deadline (issue #2266).
+    ///
+    /// Before each step, the loop calls `wake` with the committed state:
+    ///
+    /// - `None` gives the step of `run`: a waiting op, else a wait for an op
+    ///   signal.
+    /// - `Some(wake)` makes the loop read the clock with
+    ///   [`WorkflowContext::system_now`]. A due wake runs first, before any
+    ///   waiting op. Otherwise a waiting op runs.
+    /// - With no waiting op, the loop races the op signal against a durable
+    ///   timer at the deadline. A signal that wins runs as usual. A timer that
+    ///   fires runs the op of the wake.
+    ///
+    /// The op of a wake does not decode. The handler, the `Ok` and `Err`
+    /// rules, the snapshot and the checkpoint check apply to it as to a
+    /// decoded op. A delete keeps its rules.
+    ///
+    /// `wake` must be a pure function of the state, because replay calls it
+    /// again. A failed wake op keeps the old state, so `wake` gives the same
+    /// wake again. That wake is due, so the loop runs it again at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`run`](Self::run), and the engine error of a
+    /// clock read or a timer race.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `continue_as_new` resolves. The engine never resolves it.
+    pub async fn run_with_wakes<O, H, Fut, W>(self, handler: H, wake: W) -> HarvestResult<S>
+    where
+        O: DeserializeOwned,
+        H: FnMut(S, O) -> Fut,
+        Fut: Future<Output = Result<S, String>>,
+        W: FnMut(&S) -> Option<Wake<O>>,
+    {
+        self.run_loop(handler, wake).await
+    }
+
+    /// The loop of [`run`](Self::run) and [`run_with_wakes`](Self::run_with_wakes).
+    async fn run_loop<O, H, Fut, W>(self, mut handler: H, mut wake: W) -> HarvestResult<S>
+    where
+        O: DeserializeOwned,
+        H: FnMut(S, O) -> Fut,
+        Fut: Future<Output = Result<S, String>>,
+        W: FnMut(&S) -> Option<Wake<O>>,
     {
         let Self {
             ctx,
@@ -432,12 +533,15 @@ where
         register_queries(ctx, &published);
 
         loop {
-            let raw = match waiting.pop_front() {
-                Some(raw) => raw,
-                None => ctx.wait_for_signal(ENTITY_OP_SIGNAL).await?,
+            let message = match next_step(ctx, &mut waiting, wake(&checkpoint.state)).await? {
+                Step::Message(raw) => {
+                    run.op_bytes += json_len(&raw)?;
+                    serde_json::from_value::<EntityMessage<O>>(raw)
+                }
+                // A wake op is typed. It does not decode and adds no op bytes.
+                Step::Wake(op) => Ok(EntityMessage::op(op)),
             };
-            run.op_bytes += json_len(&raw)?;
-            match serde_json::from_value::<EntityMessage<O>>(raw) {
+            match message {
                 Ok(EntityMessage::Op { op }) => match handler(checkpoint.state.clone(), op).await {
                     Ok(next) => {
                         checkpoint.state = next;
@@ -485,6 +589,60 @@ where
             }
         }
     }
+}
+
+/// What the loop runs next.
+enum Step<O> {
+    /// A raw message: a carried op or an op signal.
+    Message(Value),
+    /// The op of a wake.
+    Wake(O),
+}
+
+/// Take the next step of the loop (issue #2266).
+///
+/// With no wake, take a waiting op, else wait for an op signal. This path
+/// reads no clock and starts no timer. With a wake, a due wake comes first,
+/// so a backlog cannot starve it.
+async fn next_step<O>(
+    ctx: &WorkflowContext,
+    waiting: &mut VecDeque<Value>,
+    wake: Option<Wake<O>>,
+) -> HarvestResult<Step<O>> {
+    let Some(wake) = wake else {
+        return match waiting.pop_front() {
+            Some(raw) => Ok(Step::Message(raw)),
+            None => ctx
+                .wait_for_signal(ENTITY_OP_SIGNAL)
+                .await
+                .map(Step::Message),
+        };
+    };
+    let now = ctx.system_now();
+    if wake.at <= now {
+        return Ok(Step::Wake(wake.op));
+    }
+    if let Some(raw) = waiting.pop_front() {
+        return Ok(Step::Message(raw));
+    }
+    let remaining = time_until(wake.at, now);
+    let raw = ctx
+        .wait_for_signal_timeout(ENTITY_OP_SIGNAL, remaining)
+        .await?;
+    // No signal came before the deadline, so the wake is due.
+    Ok(match raw {
+        Some(raw) => Step::Message(raw),
+        None => Step::Wake(wake.op),
+    })
+}
+
+/// The time from `now` to `at`, rounded up to whole milliseconds.
+///
+/// The result is at least 1 ms, so the race always arms a timer.
+fn time_until(at: DateTime<Utc>, now: DateTime<Utc>) -> std::time::Duration {
+    let delta = (at - now).to_std().unwrap_or_default();
+    let millis = delta.as_millis() + u128::from(!delta.subsec_nanos().is_multiple_of(1_000_000));
+    std::time::Duration::from_millis(u64::try_from(millis.max(1)).unwrap_or(u64::MAX))
 }
 
 /// Counters for one run. They reset at each checkpoint.
@@ -740,7 +898,7 @@ mod tests {
     use crate::context::{WorkflowCommand, WorkflowHistoryPolicy};
     use crate::event::{SideEffectKind, WorkflowEvent};
     use crate::executor::{WorkflowOutcome, drive_workflow};
-    use crate::testing::{ReplayStatus, WorkflowReplayer, WorkflowTestEnv};
+    use crate::testing::{ReplayStatus, TestRunStatus, WorkflowReplayer, WorkflowTestEnv};
     use crate::types::{ExecutionId, StartProvenance, StartSource};
 
     type BoxedRun<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
@@ -2250,5 +2408,346 @@ mod tests {
             signal_name: ENTITY_OP_SIGNAL.to_string(),
             payload,
         }
+    }
+
+    /// The op of the wake tests (issue #2266). Only the wake hook sends
+    /// `Tick`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum WakeOp {
+        Add(i64),
+        Tick,
+    }
+
+    /// The state of the wake tests. The log keeps the order of the ops.
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    struct Ticker {
+        count: i64,
+        ticks: u32,
+        log: Vec<String>,
+    }
+
+    fn apply_wake_op(mut ticker: Ticker, op: WakeOp) -> Ticker {
+        match op {
+            WakeOp::Add(n) => {
+                ticker.count += n;
+                ticker.log.push(format!("add {n}"));
+            }
+            WakeOp::Tick => {
+                ticker.ticks += 1;
+                ticker.log.push("tick".to_string());
+            }
+        }
+        ticker
+    }
+
+    /// A ticker entity. Its wake is due `offset` after the start of the run.
+    /// The hook returns a wake while the state has fewer than `max_ticks`
+    /// ticks.
+    fn ticker(
+        ctx: &WorkflowContext,
+        input: Value,
+        offset: chrono::Duration,
+        max_ticks: u32,
+        max_ops: Option<u64>,
+    ) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let checkpoint: EntityCheckpoint<Ticker> =
+                serde_json::from_value(input).map_err(|e| e.to_string())?;
+            let at = ctx.now() + offset;
+            let mut entity = Entity::new(ctx, checkpoint);
+            if let Some(n) = max_ops {
+                entity = entity.max_ops_per_run(n);
+            }
+            let state = entity
+                .run_with_wakes(
+                    |state, op: WakeOp| async move { Ok(apply_wake_op(state, op)) },
+                    move |state: &Ticker| {
+                        (state.ticks < max_ticks).then(|| Wake::new(at, WakeOp::Tick))
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    /// One wake, one minute after the start of the run.
+    fn late_ticker(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        ticker(ctx, input, chrono::Duration::minutes(1), 1, None)
+    }
+
+    /// One wake, one minute before the start of the run. It is due at once.
+    fn due_ticker(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        ticker(ctx, input, chrono::Duration::minutes(-1), 1, None)
+    }
+
+    /// Two wakes in all, with a checkpoint after each op.
+    fn chained_ticker(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        ticker(ctx, input, chrono::Duration::minutes(1), 2, Some(1))
+    }
+
+    /// A counter entity on the wake path with a hook that never wakes.
+    fn sleepless_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .run_with_wakes(
+                    |count, op: CounterOp| async move { apply(count, &op) },
+                    |_: &i64| None,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    /// Drive `handler` until it blocks, then send a delete and finish.
+    async fn finish_with_delete(
+        env: &WorkflowTestEnv,
+        handler: crate::info::WorkflowHandlerFn,
+        input: Value,
+    ) -> crate::testing::TestRunOutcome {
+        let mut run = env.start(handler, input);
+        assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
+        run.signal(ENTITY_OP_SIGNAL, delete()).unwrap();
+        run.finish().await
+    }
+
+    /// The clock reads of `system_now` in `events`.
+    fn clock_reads(events: &[WorkflowEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    WorkflowEvent::SideEffectRecorded {
+                        kind: SideEffectKind::Now,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    /// The timers that `events` start.
+    fn timers(events: &[WorkflowEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TimerStarted { .. }))
+            .count()
+    }
+
+    fn final_ticker(outcome: &crate::testing::TestRunOutcome) -> Ticker {
+        serde_json::from_value(outcome.result.clone().expect("a final state")).unwrap()
+    }
+
+    fn carried_ticker(outcome: &crate::testing::TestRunOutcome) -> EntityCheckpoint<Ticker> {
+        serde_json::from_value(outcome.result.clone().expect("a checkpoint")).unwrap()
+    }
+
+    async fn assert_replays(
+        outcome: &crate::testing::TestRunOutcome,
+        handler: crate::info::WorkflowHandlerFn,
+    ) {
+        let report = outcome.replay_check(handler).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    /// With no op to run, the loop waits on a timer. The timer fires, and
+    /// the op of the wake runs through the handler.
+    #[tokio::test]
+    async fn a_wake_fires_when_no_op_waits() {
+        let outcome = finish_with_delete(&WorkflowTestEnv::new(), late_ticker, json!({})).await;
+        let ticker = final_ticker(&outcome);
+        assert_eq!(ticker.ticks, 1);
+        assert_eq!(ticker.log, ["tick"]);
+        assert_eq!(timers(outcome.events()), 1, "the loop waits on one timer");
+        assert!(
+            outcome
+                .events()
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+            "the timer fires"
+        );
+        assert_eq!(
+            clock_reads(outcome.events()),
+            1,
+            "one clock read for each wake"
+        );
+        let (_, last) = snapshots(outcome.events()).pop().expect("a snapshot");
+        let last: EntitySnapshot<Ticker> = serde_json::from_value(last).unwrap();
+        assert_eq!(last.stats.applied, 1, "the wake op counts as an applied op");
+        assert_replays(&outcome, late_ticker).await;
+    }
+
+    /// An op that waits runs before a wake that is not due. The wake then
+    /// fires.
+    #[tokio::test]
+    async fn a_queued_op_runs_before_a_wake_that_is_not_due() {
+        let outcome = finish_with_delete(&env_with(&[op(1)]), late_ticker, json!({})).await;
+        let ticker = final_ticker(&outcome);
+        assert_eq!(ticker.log, ["add 1", "tick"]);
+        assert_eq!(ticker.count, 1);
+        assert_eq!(
+            timers(outcome.events()),
+            1,
+            "only the second step waits on a timer"
+        );
+        assert_eq!(
+            clock_reads(outcome.events()),
+            2,
+            "each step with a wake reads the clock"
+        );
+        assert_replays(&outcome, late_ticker).await;
+    }
+
+    /// A due wake runs before a carried op and before an op signal.
+    #[tokio::test]
+    async fn a_due_wake_runs_before_a_backlog() {
+        let input = json!({"pending": [op(1)]});
+        let outcome = env_with(&[op(2), delete()]).run(due_ticker, input).await;
+        let ticker = final_ticker(&outcome);
+        assert_eq!(ticker.log, ["tick", "add 1", "add 2"]);
+        assert_eq!(timers(outcome.events()), 0, "a due wake does not wait");
+        assert_eq!(clock_reads(outcome.events()), 1);
+        assert_replays(&outcome, due_ticker).await;
+    }
+
+    /// A hook that returns `None` stops the wakes. The loop then waits on the
+    /// op signal only.
+    #[tokio::test]
+    async fn a_wake_that_returns_none_never_fires_again() {
+        let env = WorkflowTestEnv::new();
+        let mut run = env.start(late_ticker, json!({}));
+        assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
+        assert_eq!(timers(run.events()), 1);
+        assert_eq!(clock_reads(run.events()), 1);
+
+        run.signal(ENTITY_OP_SIGNAL, op(5)).unwrap();
+        assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
+        assert_eq!(timers(run.events()), 1, "no new timer after the wake ran");
+        assert_eq!(clock_reads(run.events()), 1, "no clock read without a wake");
+
+        run.signal(ENTITY_OP_SIGNAL, delete()).unwrap();
+        let outcome = run.finish().await;
+        let ticker = final_ticker(&outcome);
+        assert_eq!(ticker.log, ["tick", "add 5"]);
+        assert_eq!(timers(outcome.events()), 1);
+        assert_replays(&outcome, late_ticker).await;
+    }
+
+    /// The shape of `events`: the variant, and the kind and name of a side
+    /// effect.
+    fn shape(events: &[WorkflowEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| match e {
+                WorkflowEvent::SideEffectRecorded { kind, name, .. } => {
+                    format!("{}:{}", kind.as_str(), name.as_deref().unwrap_or(""))
+                }
+                other => serde_json::to_value(other).unwrap()["type"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+            .collect()
+    }
+
+    /// `run` records the same commands as before issue #2266. It reads no
+    /// clock and starts no timer. A hook that never wakes records the same
+    /// events as `run`.
+    #[tokio::test]
+    async fn run_records_no_clock_read_and_no_timer() {
+        let messages = [op(1), op(2), delete()];
+        let plain = env_with(&messages).run(counter, json!({})).await;
+        assert_eq!(plain.result, Ok(json!(3)));
+        assert_eq!(
+            shape(plain.events()),
+            [
+                "WorkflowStarted",
+                "SignalReceived",
+                "SignalReceived",
+                "SignalReceived",
+                "entity_state:harvest.entity.state",
+                "entity_state:harvest.entity.state",
+                "custom:harvest.entity.checkpoint",
+                "entity_state:harvest.entity.state",
+                "custom:harvest.entity.checkpoint",
+                "entity_state:harvest.entity.deleted",
+                "WorkflowCompleted",
+            ]
+        );
+        assert_eq!(clock_reads(plain.events()), 0);
+        assert_eq!(timers(plain.events()), 0);
+
+        let sleepless = env_with(&messages).run(sleepless_counter, json!({})).await;
+        assert_eq!(sleepless.result, Ok(json!(3)));
+        assert_eq!(
+            serde_json::to_value(&sleepless.events()[1..]).unwrap(),
+            serde_json::to_value(&plain.events()[1..]).unwrap(),
+            "a hook that never wakes records the events of `run`"
+        );
+        assert_replays(&sleepless, sleepless_counter).await;
+    }
+
+    /// A checkpoint carries the state. The next run computes its wake from
+    /// the carried state.
+    #[tokio::test]
+    async fn a_checkpoint_carries_the_state_that_the_hook_reads() {
+        let continued = StartProvenance::continued_from(ExecutionId::new());
+        let first = WorkflowTestEnv::new().run(chained_ticker, json!({})).await;
+        let carried = carried_ticker(&first);
+        assert_eq!(carried.state.ticks, 1);
+        assert_eq!(carried.stats.checkpoints, 1);
+        assert_eq!(timers(first.events()), 1);
+        assert_replays(&first, chained_ticker).await;
+
+        let second = WorkflowTestEnv::new()
+            .with_start_provenance(continued)
+            .run(chained_ticker, json!(carried))
+            .await;
+        let carried = carried_ticker(&second);
+        assert_eq!(
+            carried.state.ticks, 2,
+            "the carried state still asks for a wake"
+        );
+        assert_eq!(carried.state.log, ["tick", "tick"]);
+        assert_eq!(carried.stats.checkpoints, 2);
+        assert_eq!(timers(second.events()), 1);
+        assert_replays(&second, chained_ticker).await;
+
+        let third = env_with(&[delete()])
+            .with_start_provenance(continued)
+            .run(chained_ticker, json!(carried))
+            .await;
+        assert_eq!(final_ticker(&third).ticks, 2);
+        assert_eq!(
+            timers(third.events()),
+            0,
+            "the carried state asks for no wake"
+        );
+        assert_eq!(clock_reads(third.events()), 0);
+        assert_replays(&third, chained_ticker).await;
+    }
+
+    /// The wait rounds up to whole milliseconds and is at least 1 ms.
+    #[test]
+    fn the_wait_for_a_wake_rounds_up_to_a_millisecond() {
+        let now = DateTime::UNIX_EPOCH;
+        let wait = |delta: chrono::Duration| time_until(now + delta, now);
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(wait(chrono::Duration::milliseconds(2)), ms(2));
+        assert_eq!(wait(chrono::Duration::microseconds(1500)), ms(2));
+        assert_eq!(wait(chrono::Duration::nanoseconds(1)), ms(1));
+        assert_eq!(wait(chrono::Duration::zero()), ms(1), "never a zero wait");
+        assert_eq!(
+            wait(chrono::Duration::seconds(-5)),
+            ms(1),
+            "never a negative wait"
+        );
+        assert_eq!(wait(chrono::Duration::days(400)), ms(400 * 86_400_000));
     }
 }

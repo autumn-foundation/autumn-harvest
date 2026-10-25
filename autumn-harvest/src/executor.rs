@@ -390,6 +390,10 @@ pub struct WorkflowExecuteSpanMeta {
     pub shard_id: i64,
     /// Task queue name (recorded as `harvest.queue`).
     pub queue_name: String,
+    /// The clock of the cycle, when the runtime fixes one (issue #2276). A
+    /// live `system_now` then returns it. The SQLite runtime sets it, so the
+    /// clock reads of a workflow agree with its timers.
+    pub drive_clock: Option<chrono::DateTime<chrono::Utc>>,
     /// Whether this cycle is a deterministic replay (recorded as `harvest.replay`).
     pub is_replay: bool,
     /// W3C traceparent linking back to the original trace, present only on
@@ -1999,6 +2003,7 @@ pub(crate) fn advancing_clock_context(
     // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
     // the timeout scanner rather than a stale start+timeout recompute.
     .with_deadline(span_meta.and_then(|m| m.deadline_at))
+    .with_drive_clock(span_meta.and_then(|m| m.drive_clock))
     // Issue #2021: a cancel request the history does not hold yet.
     .with_pending_cancellation(span_meta.and_then(|m| m.cancellation_reason.clone()))
     // Issue #1405: thread the row's current shard. A `ParentShard` child
@@ -2197,6 +2202,7 @@ pub(crate) fn build_task_context(
     // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
     // the timeout scanner rather than a stale start+timeout recompute.
     .with_deadline(span_meta.and_then(|m| m.deadline_at))
+    .with_drive_clock(span_meta.and_then(|m| m.drive_clock))
     // Issue #1405: thread the row's current shard (`span_meta.shard_id` is
     // read live from the execution row, see worker.rs). A `ParentShard`
     // child then places where this run actually lives, not the origin bits
@@ -3547,6 +3553,7 @@ mod tests {
             workflow_id: String::new(),
             shard_id: 0,
             queue_name: queue_name.to_owned(),
+            drive_clock: None,
             is_replay: false,
             link_traceparent: None,
             build_id: None,

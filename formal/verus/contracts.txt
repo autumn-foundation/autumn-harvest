@@ -8,6 +8,67 @@
 #   UPDATE_VERUS_CONTRACTS=1 cargo test -p autumn-harvest --test integration \
 #     verus_proofs_coverage::every_verus_contract_matches_the_stored_list
 
+## formal/verus/src/agent_dedupe.rs
+pub open spec fn spec_is_new(floor: int, seq: int, in_above: bool) -> bool { seq > floor &&! in_above }
+pub open spec fn spec_next_floor(floor: int, next_in_above: bool) -> int { if next_in_above && floor < u64::MAX { floor + 1 } else { floor } }
+pub fn is_new(floor: u64, seq: u64, in_above: bool) -> (r: bool) ensures r == spec_is_new(floor as int, seq as int, in_above), seq <= floor ==>! r, in_above ==>! r,
+pub fn next_floor(floor: u64, next_in_above: bool) -> (r: u64) ensures r == spec_next_floor(floor as int, next_in_above), floor <= r <= floor + 1, r == floor + 1 <==> (next_in_above && floor < u64::MAX),
+pub open spec fn contains(floor: int, above: Set < int >, s: int) -> bool { ! spec_is_new(floor, s, above.contains(s)) }
+pub open spec fn encodes(floor: int, above: Set < int >, applied: Set < int >) -> bool { forall | s: int | 1 <= s ==> (#[trigger] applied.contains(s) == contains(floor, above, s)) }
+pub open spec fn sound(floor: int, above: Set < int >, applied: Set < int >) -> bool { forall | s: int | 1 <= s && #[trigger] contains(floor, above, s) ==> applied.contains(s) }
+pub open spec fn fold(floor: int, above: Set < int >) -> (int, Set < int >) decreases u64::MAX - floor, { let next = spec_next_floor(floor, above.contains(floor + 1)); if next == floor { (floor, above) } else { fold(next, above.remove(next)) } }
+pub open spec fn apply(floor: int, above: Set < int >, seq: int) -> (int, Set < int >) { if spec_is_new(floor, seq, above.contains(seq)) { fold(floor, above.insert(seq)) } else { (floor, above) } }
+pub open spec fn apply_all(floor: int, above: Set < int >, seqs: Seq < int >) -> (int, Set < int >) decreases seqs.len(), { if seqs.len() == 0 { (floor, above) } else { let next = apply(floor, above, seqs [0]); apply_all(next.0, next.1, seqs.drop_first()) } }
+pub proof fn theorem_a_fold_keeps_the_applied_set(floor: int, above: Set < int >, s: int) ensures contains(fold(floor, above).0, fold(floor, above).1, s) == contains(floor, above, s), decreases u64::MAX - floor,
+pub proof fn theorem_the_floor_never_moves_over_a_gap(floor: int, above: Set < int >, s: int) ensures floor <= fold(floor, above).0, floor < s <= fold(floor, above).0 ==> above.contains(s), decreases u64::MAX - floor,
+pub proof fn theorem_an_apply_is_the_plain_insert(floor: int, above: Set < int >, applied: Set < int >, seq: int,) requires encodes(floor, above, applied), 1 <= seq, ensures spec_is_new(floor, seq, above.contains(seq)) ==! applied.contains(seq), encodes(apply(floor, above, seq).0, apply(floor, above, seq).1, applied.insert(seq)),
+proof fn lemma_apply_all_is_the_union(floor: int, above: Set < int >, applied: Set < int >, seqs: Seq < int >,) requires encodes(floor, above, applied), forall | i: int | 0 <= i < seqs.len() ==> 1 <= #[trigger] seqs [i], ensures encodes(apply_all(floor, above, seqs).0, apply_all(floor, above, seqs).1, applied.union(seqs.to_set()),), decreases seqs.len(),
+pub proof fn theorem_each_number_applies_once(seqs: Seq < int >, i: int) requires forall | j: int | 0 <= j < seqs.len() ==> 1 <= #[trigger] seqs [j], 0 <= i < seqs.len(), ensures ({ let before = apply_all(0, Set::empty(), seqs.take(i)); spec_is_new(before.0, seqs [i], before.1.contains(seqs [i])) ==! seqs.take(i).contains(seqs [i],) }), encodes(apply_all(0, Set::empty(), seqs).0, apply_all(0, Set::empty(), seqs).1, seqs.to_set(),),
+pub proof fn theorem_the_bound_makes_no_false_duplicate(floor: int, above: Set < int >, applied: Set < int >, seq: int, forgot: int,) requires sound(floor, above, applied), 1 <= seq, ensures ! spec_is_new(floor, seq, above.contains(seq)) ==> applied.contains(seq), sound(apply(floor, above, seq).0, apply(floor, above, seq).1, applied.insert(seq)), sound(floor, above.remove(forgot), applied),
+
+## formal/verus/src/agent_inbox.rs
+pub enum InboxStatus { Open, Paused, Parked, }
+pub enum OpClass { Work, Control, Tick, }
+pub enum Admit { Run, Hold, Apply, Skip, }
+pub open spec fn decision(status: InboxStatus, class: OpClass) -> Admit { match class { OpClass::Control => Admit::Apply, OpClass::Work => match status { InboxStatus::Open => Admit::Run, _ => Admit::Hold, }, OpClass::Tick => match status { InboxStatus::Open => Admit::Run, _ => Admit::Skip, }, } }
+pub fn decide(status: InboxStatus, class: OpClass) -> (r: Admit) ensures r == decision(status, class), class == OpClass::Control <==> r == Admit::Apply, class == OpClass::Work ==> r != Admit::Skip, class == OpClass::Work ==> (r == Admit::Run <==> status == InboxStatus::Open), class == OpClass::Tick ==> r != Admit::Hold, r == Admit::Hold ==> class == OpClass::Work,
+pub enum InboxOp { Work(int), Tick, Pause, Park, Resume, Other, }
+pub open spec fn class_of(op: InboxOp) -> OpClass { match op { InboxOp::Work(_) => OpClass::Work, InboxOp::Tick => OpClass::Tick, _ => OpClass::Control, } }
+pub struct Inbox { pub status: InboxStatus, pub held: Seq < int >, pub ran: Seq < int >, }
+pub open spec fn fresh() -> Inbox { Inbox { status: InboxStatus::Open, held: Seq::empty(), ran: Seq::empty() } }
+pub open spec fn inv(inbox: Inbox) -> bool { inbox.status == InboxStatus::Open ==> inbox.held.len() == 0 }
+pub open spec fn apply_control(inbox: Inbox, op: InboxOp) -> Inbox { match op { InboxOp::Pause => Inbox { status: InboxStatus::Paused, held: inbox.held, ran: inbox.ran }, InboxOp::Park => Inbox { status: InboxStatus::Parked, held: inbox.held, ran: inbox.ran }, InboxOp::Resume => Inbox { status: InboxStatus::Open, held: Seq::empty(), ran: inbox.ran + inbox.held, }, _ => inbox, } }
+pub open spec fn step(inbox: Inbox, op: InboxOp) -> Inbox { match decision(inbox.status, class_of(op)) { Admit::Run => match op { InboxOp::Work(id) => Inbox { status: inbox.status, held: inbox.held, ran: inbox.ran.push(id) }, _ => inbox, }, Admit::Hold => match op { InboxOp::Work(id) => Inbox { status: inbox.status, held: inbox.held.push(id), ran: inbox.ran }, _ => inbox, }, Admit::Apply => apply_control(inbox, op), Admit::Skip => inbox, } }
+pub open spec fn run(inbox: Inbox, ops: Seq < InboxOp >) -> Inbox decreases ops.len(), { if ops.len() == 0 { inbox } else { run(step(inbox, ops [0]), ops.drop_first()) } }
+pub open spec fn work_ids(ops: Seq < InboxOp >) -> Seq < int > decreases ops.len(), { if ops.len() == 0 { Seq::empty() } else { let head = match ops [0] { InboxOp::Work(id) => seq ! [id], _ => Seq::empty(), }; head + work_ids(ops.drop_first()) } }
+proof fn lemma_step_keeps_the_order(inbox: Inbox, op: InboxOp) requires inv(inbox), ensures inv(step(inbox, op)), step(inbox, op).ran + step(inbox, op).held == inbox.ran + inbox.held + work_ids(seq ! [op]),
+proof fn lemma_run_keeps_the_order(inbox: Inbox, ops: Seq < InboxOp >) requires inv(inbox), ensures inv(run(inbox, ops)), run(inbox, ops).ran + run(inbox, ops).held == inbox.ran + inbox.held + work_ids(ops), decreases ops.len(),
+pub proof fn theorem_an_acknowledged_op_is_never_lost(ops: Seq < InboxOp >) ensures run(fresh(), ops).ran + run(fresh(), ops).held == work_ids(ops),
+pub proof fn theorem_an_open_inbox_has_run_every_op(ops: Seq < InboxOp >) ensures run(fresh(), ops).status == InboxStatus::Open ==> run(fresh(), ops).held.len() == 0, run(fresh(), ops).status == InboxStatus::Open ==> run(fresh(), ops).ran == work_ids(ops),
+pub proof fn theorem_a_resume_runs_every_held_op(ops: Seq < InboxOp >) requires ops.len() > 0, ops.last() == InboxOp::Resume, ensures run(fresh(), ops).status == InboxStatus::Open, run(fresh(), ops).ran == work_ids(ops),
+proof fn lemma_run_ends_with_its_last_step(inbox: Inbox, ops: Seq < InboxOp >) requires ops.len() > 0, ensures run(inbox, ops) == step(run(inbox, ops.drop_last()), ops.last()), decreases ops.len(),
+
+## formal/verus/src/agent_siblings.rs
+pub open spec fn share(remaining: int, siblings: int, index: int) -> int { if index < remaining % siblings { remaining / siblings + 1 } else { remaining / siblings } }
+pub open spec fn total(remaining: int, siblings: int, n: int) -> int decreases n, { if n <= 0 { 0 } else { total(remaining, siblings, n - 1) + share(remaining, siblings, n - 1) } }
+proof fn lemma_a_share_fits(remaining: int, siblings: int, index: int) requires 0 <= remaining, 0 < siblings, 0 <= index, ensures 0 <= remaining / siblings <= remaining, 0 <= remaining % siblings < siblings, index < remaining % siblings ==> remaining / siblings + 1 <= remaining,
+pub fn sibling_cap(remaining: u32, siblings: u32, index: u32) -> (r: u32) ensures siblings == 0 ==> r == 0, siblings > 0 ==> r == share(remaining as int, siblings as int, index as int), siblings > 0 ==> (r == remaining / siblings || r == remaining / siblings + 1), r <= remaining,
+pub open spec fn extras(remaining: int, siblings: int, n: int) -> int { if n < remaining % siblings { n } else { remaining % siblings } }
+proof fn lemma_total_of_the_first(remaining: int, siblings: int, n: int) requires 0 <= remaining, 0 < siblings, 0 <= n, ensures total(remaining, siblings, n) == n * (remaining / siblings) + extras(remaining, siblings, n), decreases n,
+pub proof fn theorem_the_shares_sum_to_the_remainder(remaining: int, siblings: int) requires 0 <= remaining, 0 < siblings, ensures total(remaining, siblings, siblings) == remaining,
+pub proof fn theorem_no_first_children_pass_the_cap(remaining: int, siblings: int, n: int) requires 0 <= remaining, 0 < siblings, 0 <= n <= siblings, ensures total(remaining, siblings, n) <= remaining,
+pub proof fn theorem_each_share_is_the_base_or_one_more(remaining: int, siblings: int, i: int, j: int,) requires 0 <= remaining, 0 < siblings, ensures share(remaining, siblings, i) == remaining / siblings || share(remaining, siblings, i) == remaining / siblings + 1, i <= j ==> share(remaining, siblings, i) >= share(remaining, siblings, j),
+
+## formal/verus/src/agent_wake.rs
+pub open spec fn interval(every: i64) -> int { if every < 1 { 1 } else { every as int } }
+pub open spec fn booked(now: i64, every: i64) -> i64 { if now + interval(every) > i64::MAX { i64::MAX } else { (now + interval(every)) as i64 } }
+pub open spec fn spec_next_heartbeat(current: Option < i64 >, every_ms: Option < i64 >, now: i64, ticked: bool,) -> Option < i64 > { match every_ms { None => None, Some(every) => if current.is_some() &&! ticked { current } else { Some(booked(now, every)) }, } }
+pub fn next_heartbeat(current: Option < i64 >, every_ms: Option < i64 >, now: i64, ticked: bool,) -> (r: Option < i64 >) ensures r == spec_next_heartbeat(current, every_ms, now, ticked), every_ms.is_none() ==> r.is_none(), every_ms.is_some() ==> r.is_some(), every_ms.is_some() &&! ticked && current.is_some() ==> r == current, every_ms.is_some() && (ticked || current.is_none()) ==> r == Some(booked(now, every_ms.unwrap()),), every_ms.is_some() && ticked && now < i64::MAX ==> r.unwrap() > now,
+pub open spec fn due(booking: Option < i64 >, now: i64) -> bool { booking.is_some() && booking.unwrap() <= now }
+pub proof fn theorem_a_tick_is_never_due_again_at_once(every: i64, now: i64) requires now < i64::MAX, ensures ! due(Some(booked(now, every)), now), now < booked(now, every) <= now + interval(every), now + interval(every) <= i64::MAX ==> booked(now, every) == now + interval(every),
+pub open spec fn messages(current: Option < i64 >, every_ms: Option < i64 >, nows: Seq < i64 >) -> Option < i64, > decreases nows.len(), { if nows.len() == 0 { current } else { messages(spec_next_heartbeat(current, every_ms, nows [0], false), every_ms, nows.drop_first()) } }
+pub proof fn theorem_messages_never_starve_the_heartbeat(at: i64, every: i64, nows: Seq < i64 >) ensures messages(Some(at), Some(every), nows) == Some(at), decreases nows.len(),
+
 ## formal/verus/src/dlq_spread.rs
 pub open spec fn two64() -> int { 0x1_0000_0000_0000_0000 }
 pub open spec fn spec_jitter(slot: int, mix: int) -> int { (slot * mix) / two64() }

@@ -783,10 +783,13 @@ async fn two_result_round(cap: Option<u64>) -> (autumn_harvest_agent::AgentRepor
     let model = ScriptedModel::new(vec![big_calls(2), answer("done", 1)]);
     let harness = AgentHarness::new(model.clone()).tool(counted_big_tool(300, &runs));
     let mut rt = runtime(&db, harness);
-    // The follow-up tool adds a tool definition to every request.
+    // The follow-up tool adds a tool definition to every request. The cap
+    // measures the whole window, so the test records the full form to read
+    // that size back (issue #2264).
     let mut task = AgentTask::new("go")
         .followups(Followups::new(Duration::from_secs(3_600)))
-        .loop_guard(no_guard());
+        .loop_guard(no_guard())
+        .transcript_delta(false);
     if let Some(cap) = cap {
         task = task.max_request_bytes(cap);
     }

@@ -36,6 +36,7 @@ use std::task::Poll;
 
 use autumn_harvest::builder::{DEFAULT_MAX_ACTIVITY_RESULT_BYTES, DEFAULT_RETRY_AFTER_CEILING};
 use autumn_harvest::context::{ActivityIdentity, empty_shared_state};
+use autumn_harvest::llm_ledger::LlmCall;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::{
     ActivityContext, ActivityExecId, ActivityHandlerFn, ExecutionId, TimeoutType, TimerId,
@@ -48,7 +49,7 @@ use tokio::sync::mpsc;
 
 use crate::error::SqliteResult;
 use crate::queue::{self, ClaimedTask};
-use crate::runtime::{ActivityRunner, ActivitySpec};
+use crate::runtime::{ActivityRunner, ActivitySpec, LedgerActivityBody};
 use crate::store;
 
 /// Run all currently-ready work for `exec_id` at logical time `now`: drain ready
@@ -236,7 +237,11 @@ pub async fn drain_ready(
         // Measure the body's REAL wall-clock runtime (`Instant`, NOT the logical
         // `now` — start-to-close is a real budget for real execution) so a body
         // that overran its start-to-close budget records a timeout below.
+        //
+        // The LLM calls of the attempt (issue #2275) come from a ledger
+        // closure or from the `ActivityContext`. Only a completion writes them.
         let started = std::time::Instant::now();
+        let mut llm_calls = Vec::new();
         let result = match &spec.body {
             ActivityRunner::Closure(body) => {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(task.input.clone())))
@@ -264,12 +269,20 @@ pub async fn drain_ready(
                         ))
                     })
             }
+            ActivityRunner::Ledger(body) => {
+                let (result, calls) = run_ledger_body(body, &task.input, claim_now);
+                llm_calls = calls;
+                result
+            }
             ActivityRunner::Handler(handler) => {
                 let ctx = activity_context(exec_id, owner, &task, claim_now, max_attempts);
-                run_handler(conn, *handler, ctx, &task).await
+                let (result, calls) = run_handler(conn, *handler, ctx, &task).await;
+                llm_calls = calls;
+                result
             }
         };
         let elapsed = started.elapsed();
+        let llm_calls = crate::llm_ledger::fill_unset_latency(llm_calls, elapsed);
 
         // Enforce the activity's start-to-close timeout (issue #1069 P2), when the
         // scheduling command carried one (`start_to_close_override`, persisted on the
@@ -349,6 +362,7 @@ pub async fn drain_ready(
             now,
             finalize_now,
             result,
+            &llm_calls,
         )? {
             produced = true;
             // A terminal event was appended for this branch. Under an unsettled
@@ -460,6 +474,9 @@ fn attempt_deadline(
 /// heartbeat before a return is on the row before the finalize. A panic, in
 /// the handler call or in a poll, becomes the typed `HandlerPanic` envelope,
 /// as for a closure body.
+///
+/// It also returns the LLM calls that the body recorded on its context
+/// (issue #2275). The finalize writes them only for a completion.
 // The `&mut` is load-bearing: `&mut Connection` is `Send`, `&Connection` is not.
 #[allow(clippy::needless_pass_by_ref_mut)]
 async fn run_handler(
@@ -467,7 +484,7 @@ async fn run_handler(
     handler: ActivityHandlerFn,
     (ctx, mut heartbeats): (ActivityContext, mpsc::Receiver<Value>),
     task: &ClaimedTask,
-) -> Result<Value, String> {
+) -> (Result<Value, String>, Vec<LlmCall>) {
     let panicked = |payload| {
         Err(handler_panic_activity_envelope(
             autumn_harvest::error::panic_message(payload),
@@ -478,17 +495,38 @@ async fn run_handler(
     }));
     let mut body = match call {
         Ok(body) => body,
-        Err(payload) => return panicked(payload),
+        Err(payload) => return (panicked(payload), Vec::new()),
     };
     // `move` takes the `&mut Connection` itself. A shared capture needs
     // `Connection: Sync`, so the drive future would not be `Send`.
-    std::future::poll_fn(move |cx| {
+    let result = std::future::poll_fn(move |cx| {
         let polled =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body.as_mut().poll(cx)));
         persist_heartbeats(conn, &task.task_id, &mut heartbeats);
         polled.unwrap_or_else(|payload| Poll::Ready(panicked(payload)))
     })
-    .await
+    .await;
+    (result, ctx.llm_calls())
+}
+
+/// Run a ledger closure (issue #2275). A panic becomes the retryable
+/// `HandlerPanic` failure, as for a plain closure. A failure keeps no call.
+fn run_ledger_body(
+    body: &LedgerActivityBody,
+    input: &Value,
+    claim_ms: i64,
+) -> (Result<Value, String>, Vec<LlmCall>) {
+    let at = DateTime::<Utc>::from_timestamp_millis(claim_ms).unwrap_or_else(Utc::now);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(input.clone(), at)))
+        .unwrap_or_else(|payload| {
+            Err(handler_panic_activity_envelope(
+                autumn_harvest::error::panic_message(payload),
+            ))
+        });
+    match result {
+        Ok((output, calls)) => (Ok(output), calls),
+        Err(error) => (Err(error), Vec::new()),
+    }
 }
 
 /// Write the latest queued heartbeat of `task_id` to its row (issue #2024).
@@ -905,6 +943,10 @@ impl SignalIngest {
 /// Returns `true` if a terminal event was appended (i.e. the run may progress).
 /// A crash before this commits leaves the task `RUNNING` for orphan reclaim; a
 /// crash after leaves a clean `DONE` row and a terminal-only history.
+///
+/// A completion also writes `llm_calls` to the cost ledger in the same
+/// transaction (issue #2275). Any other outcome drops them.
+#[allow(clippy::too_many_arguments)]
 pub fn finalize_activity_result(
     conn: &mut Connection,
     exec_id: ExecutionId,
@@ -913,9 +955,19 @@ pub fn finalize_activity_result(
     now: i64,
     failure_now: i64,
     result: Result<serde_json::Value, String>,
+    llm_calls: &[LlmCall],
 ) -> SqliteResult<bool> {
     let tx = conn.transaction()?;
-    let produced = finalize_within_tx(&tx, exec_id, task, max_attempts, now, failure_now, result)?;
+    let produced = finalize_within_tx(
+        &tx,
+        exec_id,
+        task,
+        max_attempts,
+        now,
+        failure_now,
+        result,
+        llm_calls,
+    )?;
     tx.commit()?;
     Ok(produced)
 }
@@ -925,6 +977,7 @@ pub fn finalize_activity_result(
 /// directly inside a caller-owned transaction — the finalize atomicity tests
 /// invoke this and then *drop the transaction without committing* to prove the
 /// three writes roll back together.
+#[allow(clippy::too_many_arguments)]
 pub fn finalize_within_tx(
     conn: &Connection,
     exec_id: ExecutionId,
@@ -933,6 +986,7 @@ pub fn finalize_within_tx(
     now: i64,
     failure_now: i64,
     result: Result<serde_json::Value, String>,
+    llm_calls: &[LlmCall],
 ) -> SqliteResult<bool> {
     // Enforce the activity-result cap (issue #252, Codex #1069 `worker.rs:340`).
     // Mirror the Postgres worker's `handle_activity_result` normalization: an
@@ -975,7 +1029,7 @@ pub fn finalize_within_tx(
 
     match result {
         Ok(output) => {
-            store::append_event(
+            let seq = store::append_event_seq(
                 conn,
                 exec_id,
                 &WorkflowEvent::ActivityCompleted {
@@ -983,6 +1037,9 @@ pub fn finalize_within_tx(
                     output,
                 },
             )?;
+            // The ledger rows commit with the completion event, as on
+            // Postgres (issue #2275). The key is the `seq` of that event.
+            crate::llm_ledger::insert_rows(conn, exec_id, seq, &task.name, llm_calls, failure_now)?;
             queue::finish_task(conn, &task.task_id)?;
             Ok(true)
         }
@@ -1296,6 +1353,11 @@ impl LocalRun {
 /// dropped under a Tokio runtime. A closure body cannot be stopped, so its
 /// budget is checked after it returns. As on Postgres, the result has no
 /// size cap here. The history byte cap still bounds it.
+///
+/// It also returns the LLM calls of the attempt (issue #2275). A failure
+/// returns none. `now_ms` is the clock of the runtime, which a ledger body
+/// gets (issue #2272).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_local_attempt(
     exec_id: ExecutionId,
     owner: &RunOwner<'_>,
@@ -1304,10 +1366,12 @@ pub async fn run_local_attempt(
     attempt: u32,
     previous_failure: Option<String>,
     deadline_left: Option<std::time::Duration>,
-) -> Result<Value, String> {
+    now_ms: i64,
+) -> (Result<Value, String>, Vec<LlmCall>) {
     // The workflow deadline bounds the attempt too (issue #2029).
     let budget = deadline_left.map_or_else(|| run.budget(), |left| run.budget().min(left));
     let started = std::time::Instant::now();
+    let mut llm_calls = Vec::new();
     let result = match &spec.body {
         ActivityRunner::Closure(body) => {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(run.input.clone())))
@@ -1316,6 +1380,11 @@ pub async fn run_local_attempt(
                         autumn_harvest::error::panic_message(payload),
                     ))
                 })
+        }
+        ActivityRunner::Ledger(body) => {
+            let (result, calls) = run_ledger_body(body, &run.input, now_ms);
+            llm_calls = calls;
+            result
         }
         ActivityRunner::Handler(handler) => {
             let identity = ActivityIdentity::new(
@@ -1334,16 +1403,57 @@ pub async fn run_local_attempt(
                 .with_deadline(deadline)
                 .with_previous_failure(previous_failure);
             let body = run_local_handler(*handler, &ctx, run.input.clone());
-            match within_budget(body, budget).await {
-                Some(result) => result,
-                None => return Err(local_timeout_error(run, budget)),
-            }
+            let Some(result) = within_budget(body, budget).await else {
+                return (Err(local_timeout_error(run, budget)), Vec::new());
+            };
+            llm_calls = ctx.llm_calls();
+            result
         }
     };
-    if started.elapsed() > budget {
-        return Err(local_timeout_error(run, budget));
+    let elapsed = started.elapsed();
+    if elapsed > budget {
+        return (Err(local_timeout_error(run, budget)), Vec::new());
     }
-    result
+    if result.is_err() {
+        llm_calls.clear();
+    }
+    (
+        result,
+        crate::llm_ledger::fill_unset_latency(llm_calls, elapsed),
+    )
+}
+
+/// Append the events of one local attempt (issue #2275).
+///
+/// A `LocalActivityCompleted` event also writes `llm_calls` to the cost
+/// ledger, keyed by its `seq`. Call it in the transaction that holds the
+/// attempt, so the rows commit with the event.
+///
+/// # Errors
+///
+/// Returns a persistence error if an append or an insert fails.
+pub fn append_local_events(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    events: &[WorkflowEvent],
+    activity_name: &str,
+    llm_calls: &[LlmCall],
+    recorded_at_ms: i64,
+) -> SqliteResult<()> {
+    for event in events {
+        let seq = store::append_event_seq(conn, exec_id, event)?;
+        if matches!(event, WorkflowEvent::LocalActivityCompleted { .. }) {
+            crate::llm_ledger::insert_rows(
+                conn,
+                exec_id,
+                seq,
+                activity_name,
+                llm_calls,
+                recorded_at_ms,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// The Postgres error text of a local attempt that ran past `budget`.
@@ -1611,8 +1721,17 @@ mod tests {
         let mut task = seed_running_task(&conn, exec, "act");
         task.retry_policy = policy;
         let tx = conn.transaction().unwrap();
-        let produced =
-            finalize_within_tx(&tx, exec, &task, 3, now, failure_now, Err("boom".into())).unwrap();
+        let produced = finalize_within_tx(
+            &tx,
+            exec,
+            &task,
+            3,
+            now,
+            failure_now,
+            Err("boom".into()),
+            &[],
+        )
+        .unwrap();
         tx.commit().unwrap();
         assert!(!produced, "a retryable failure requeues (not terminal)");
         conn.query_row(
@@ -1698,7 +1817,17 @@ mod tests {
 
         {
             let tx = conn.transaction().unwrap();
-            finalize_within_tx(&tx, exec, &task, 1, 0, 0, Ok(serde_json::json!("done"))).unwrap();
+            finalize_within_tx(
+                &tx,
+                exec,
+                &task,
+                1,
+                0,
+                0,
+                Ok(serde_json::json!("done")),
+                &[],
+            )
+            .unwrap();
             // Drop `tx` WITHOUT commit → rollback.
         }
 
@@ -1731,7 +1860,17 @@ mod tests {
 
         {
             let tx = conn.transaction().unwrap();
-            finalize_within_tx(&tx, exec, &task, 1, 0, 0, Ok(serde_json::json!("done"))).unwrap();
+            finalize_within_tx(
+                &tx,
+                exec,
+                &task,
+                1,
+                0,
+                0,
+                Ok(serde_json::json!("done")),
+                &[],
+            )
+            .unwrap();
             tx.commit().unwrap();
         }
 
@@ -1763,9 +1902,17 @@ mod tests {
         .unwrap();
         let task = seed_running_task(&conn, exec, "act");
 
-        let produced =
-            super::finalize_activity_result(&mut conn, exec, &task, 3, 0, 0, Err("boom".into()))
-                .unwrap();
+        let produced = super::finalize_activity_result(
+            &mut conn,
+            exec,
+            &task,
+            3,
+            0,
+            0,
+            Err("boom".into()),
+            &[],
+        )
+        .unwrap();
 
         assert!(!produced, "a retry is not workflow-visible progress");
         assert!(
@@ -1778,6 +1925,110 @@ mod tests {
             "a retryable failure requeues the task"
         );
         assert_eq!(store::load_attempts(&conn, exec, "act").unwrap().len(), 1);
+    }
+
+    fn two_calls() -> Vec<autumn_harvest::llm_ledger::LlmCall> {
+        vec![
+            autumn_harvest::llm_ledger::LlmCall::new("m-1", 10, 2).with_cost_usd_micros(30),
+            autumn_harvest::llm_ledger::LlmCall::new("m-1", 12, 4),
+        ]
+    }
+
+    fn seeded(conn: &Connection) -> (ExecutionId, ClaimedTask) {
+        let exec = ExecutionId::new();
+        store::insert_execution(
+            conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
+        let task = seed_running_task(conn, exec, "think");
+        (exec, task)
+    }
+
+    // Issue #2275: the ledger rows commit with the completion event, keyed by
+    // its `seq`. A rolled-back finalize leaves no row, so a re-run counts once.
+    #[test]
+    fn a_completion_writes_its_ledger_rows_in_the_finalize_transaction() {
+        let mut conn = open();
+        let (exec, task) = seeded(&conn);
+        {
+            let tx = conn.transaction().unwrap();
+            let done = Ok(serde_json::json!("done"));
+            finalize_within_tx(&tx, exec, &task, 1, 0, 7, done, &two_calls()).unwrap();
+        }
+        assert_eq!(
+            crate::llm_ledger::rows_of(&conn, exec).unwrap(),
+            Vec::new(),
+            "a rolled-back finalize writes no ledger row"
+        );
+
+        let done = Ok(serde_json::json!("done"));
+        assert!(
+            super::finalize_activity_result(&mut conn, exec, &task, 1, 0, 7, done, &two_calls())
+                .unwrap()
+        );
+        let rows = crate::llm_ledger::rows_of(&conn, exec).unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!((rows[0].event_seq, rows[0].call_index), (0, 0));
+        assert_eq!((rows[1].event_seq, rows[1].call_index), (0, 1));
+        assert_eq!(rows[0].activity_name, "think");
+        assert_eq!(rows[0].cost_usd_micros, Some(30));
+        assert_eq!(rows[1].input_tokens, 12);
+        assert_eq!(rows[0].recorded_at.timestamp_millis(), 7);
+        assert!(matches!(
+            store::load_history(&conn, exec).unwrap()[..],
+            [autumn_harvest::WorkflowEvent::ActivityCompleted { .. }]
+        ));
+    }
+
+    // Issue #2275: only a completion writes rows, as on Postgres. A retryable
+    // failure, a terminal failure and an oversized result write none.
+    #[test]
+    fn a_failed_attempt_writes_no_ledger_row() {
+        let mut conn = open();
+        let (exec, task) = seeded(&conn);
+        let retried = super::finalize_activity_result(
+            &mut conn,
+            exec,
+            &task,
+            3,
+            0,
+            0,
+            Err("boom".into()),
+            &two_calls(),
+        )
+        .unwrap();
+        assert!(!retried, "the first failure retries");
+        let terminal = super::finalize_activity_result(
+            &mut conn,
+            exec,
+            &task,
+            1,
+            0,
+            0,
+            Err("boom".into()),
+            &two_calls(),
+        )
+        .unwrap();
+        assert!(terminal, "the last failure ends the activity");
+        assert_eq!(crate::llm_ledger::rows_of(&conn, exec).unwrap(), Vec::new());
+
+        // A fresh file: the seed claims the first task row of the file.
+        let mut conn = open();
+        let (exec, task) = seeded(&conn);
+        let cap =
+            usize::try_from(autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES).unwrap();
+        let oversized = Ok(serde_json::json!("x".repeat(cap + 1)));
+        super::finalize_activity_result(&mut conn, exec, &task, 1, 0, 0, oversized, &two_calls())
+            .unwrap();
+        assert!(matches!(
+            store::load_history(&conn, exec).unwrap()[..],
+            [autumn_harvest::WorkflowEvent::ActivityFailed { .. }]
+        ));
+        assert_eq!(crate::llm_ledger::rows_of(&conn, exec).unwrap(), Vec::new());
     }
 
     // A due timer fire is atomic on commit: the TimerFired event and the `fired`
@@ -2320,7 +2571,7 @@ mod tests {
         // max_attempts = 3, yet the non-retryable normalization fails terminally
         // on the FIRST attempt (produced = true, a workflow-visible terminal event).
         let produced =
-            super::finalize_activity_result(&mut conn, exec, &task, 3, 0, 0, Ok(oversized))
+            super::finalize_activity_result(&mut conn, exec, &task, 3, 0, 0, Ok(oversized), &[])
                 .unwrap();
         assert!(
             produced,
@@ -2380,6 +2631,7 @@ mod tests {
             0,
             0,
             Ok(serde_json::json!({"ok": true})),
+            &[],
         )
         .unwrap();
         assert!(produced);
@@ -2426,7 +2678,8 @@ mod tests {
         let deep = nested(crate::MAX_PAYLOAD_DEPTH + 1);
 
         let produced =
-            super::finalize_activity_result(&mut conn, exec, &task, 3, 0, 0, Ok(deep)).unwrap();
+            super::finalize_activity_result(&mut conn, exec, &task, 3, 0, 0, Ok(deep), &[])
+                .unwrap();
         assert!(produced, "a deep result is a terminal event, not a retry");
 
         let history = store::load_history(&conn, exec).unwrap();
@@ -2511,7 +2764,7 @@ mod tests {
             value = serde_json::Value::Array(vec![value]);
         }
 
-        super::finalize_activity_result(&mut conn, exec, &task, 1, 0, 0, Ok(value)).unwrap();
+        super::finalize_activity_result(&mut conn, exec, &task, 1, 0, 0, Ok(value), &[]).unwrap();
         match &store::load_history(&conn, exec).unwrap()[..] {
             [autumn_harvest::WorkflowEvent::ActivityFailed { error_type, .. }] => {
                 assert_eq!(error_type, crate::PAYLOAD_TOO_DEEP_ERROR_TYPE);
