@@ -638,6 +638,8 @@ pub struct HandlerRegistry {
     owner_disk_cache_dir: Option<std::path::PathBuf>,
     /// The fewest events that a run needs before the disk cache keeps it.
     owner_disk_cache_min_events: usize,
+    /// Whether the disk cache keeps an entity projection (issue #2260).
+    owner_entity_sql: bool,
     /// The open disk cache. The workers of this registry share it, because
     /// a process can lock a directory only once.
     #[cfg(feature = "owner-disk-cache")]
@@ -903,6 +905,7 @@ impl HandlerRegistry {
             decision_owner: Arc::default(),
             owner_disk_cache_dir: None,
             owner_disk_cache_min_events: crate::builder::DEFAULT_OWNER_DISK_CACHE_MIN_EVENTS,
+            owner_entity_sql: false,
             #[cfg(feature = "owner-disk-cache")]
             owner_disk_cache: std::sync::Mutex::new(None),
             max_workflow_attempts_ceiling: None,
@@ -1544,6 +1547,13 @@ impl HandlerRegistry {
         self
     }
 
+    /// Keep an entity projection in the owner disk cache (issue #2260).
+    #[must_use]
+    pub const fn with_owner_entity_sql(mut self, on: bool) -> Self {
+        self.owner_entity_sql = on;
+        self
+    }
+
     /// The directory of the owner-local disk cache, if set (issue #2258).
     #[must_use]
     pub fn owner_disk_cache_dir(&self) -> Option<&std::path::Path> {
@@ -1915,6 +1925,7 @@ impl std::fmt::Debug for HandlerRegistry {
             "owner_disk_cache_min_events",
             &self.owner_disk_cache_min_events,
         );
+        d.field("owner_entity_sql", &self.owner_entity_sql);
         #[cfg(feature = "owner-disk-cache")]
         d.field(
             "owner_disk_cache_open",
@@ -22778,6 +22789,19 @@ const fn final_miss(hot_swapped: bool, reason: ResidentOutcome) -> crate::reside
     })
 }
 
+/// Sets its flag when it drops (issue #2260). An entity query holds one, so
+/// a dropped caller stops the query thread.
+#[cfg(feature = "owner-disk-cache")]
+#[derive(Default)]
+struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(feature = "owner-disk-cache")]
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The cache entry of a disk hit (issue #2258): the state, no resident
 /// workflow, the byte mark and the owner key.
 #[cfg(feature = "owner-disk-cache")]
@@ -22837,6 +22861,7 @@ async fn read_disk_entry(
 /// the state for the memory cache, or `None` when the write task died.
 #[cfg(feature = "owner-disk-cache")]
 async fn write_disk_entry(
+    conn: &mut AsyncPgConnection,
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     exec_uuid: uuid::Uuid,
     suspended: bool,
@@ -22849,6 +22874,10 @@ async fn write_disk_entry(
     };
     match owner.pinned {
         Some(epoch) if suspended && owner.may_cache() => {
+            // Issue #2260: the entity projection first. The commit wrote its
+            // Postgres row, so one read finds the new snapshot.
+            disk.apply_entity(conn, owner.key, epoch, exec_uuid, Arc::clone(owner.owned))
+                .await;
             disk.write(
                 owner.key,
                 epoch,
@@ -29213,6 +29242,7 @@ async fn process_workflow_task(
             // snapshot moves into the cache; nothing reads `history_events`
             // after this point.
             store_cache_entry(
+                conn,
                 &workflow_cache,
                 prepared.exec_id.as_uuid(),
                 cache_update_after_persist(pending_cache_update, deferred_cancel_ended_run),
@@ -29464,7 +29494,15 @@ const fn cache_update_after_persist(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+// Only the disk tier uses `conn`, and it needs it mutably.
+#[cfg_attr(
+    not(feature = "owner-disk-cache"),
+    allow(unused_variables, clippy::needless_pass_by_ref_mut)
+)]
 async fn store_cache_entry(
+    // Issue #2260: the entity projection reads the committed row with it.
+    conn: &mut AsyncPgConnection,
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     exec_uuid: uuid::Uuid,
     suspended: Option<bool>,
@@ -29482,6 +29520,7 @@ async fn store_cache_entry(
     // A terminal run, or an ended tenure, purges the disk entry.
     #[cfg(feature = "owner-disk-cache")]
     let Some(state) = write_disk_entry(
+        conn,
         workflow_cache,
         exec_uuid,
         suspended,
@@ -36284,6 +36323,7 @@ impl Worker {
                     registry.payload_codecs().clone(),
                     registry.owner_disk_cache_min_events,
                 )
+                .with_entity_sql(registry.owner_entity_sql)
             }));
         #[cfg(not(feature = "owner-disk-cache"))]
         if let Some(dir) = registry.owner_disk_cache_dir() {
@@ -36292,6 +36332,14 @@ impl Worker {
                  `owner-disk-cache` feature (issue #2258)",
                 dir.display()
             )));
+        }
+        // Issue #2260: the entity projection lives in the disk cache files.
+        if registry.owner_entity_sql && registry.owner_disk_cache_dir().is_none() {
+            return Err(HarvestError::Config(
+                "the owner entity SQL projection needs an owner disk cache directory \
+                 (issue #2260)"
+                    .to_string(),
+            ));
         }
         let workflow_cache = Arc::new(tokio::sync::Mutex::new(workflow_cache));
         // The window keeps each outcome until a heartbeat can publish it.
@@ -36420,6 +36468,117 @@ impl Worker {
             .await
             .disk()
             .is_some_and(|disk| disk.cache().contains(exec_id.as_uuid()))
+    }
+
+    /// Whether the owner disk cache holds an entity projection row for
+    /// `exec_id` (issue #2260). Tests use it.
+    #[cfg(feature = "owner-disk-cache")]
+    #[doc(hidden)]
+    pub async fn has_entity_projection(&self, exec_id: ExecutionId) -> bool {
+        self.workflow_cache
+            .lock()
+            .await
+            .disk()
+            .is_some_and(|disk| disk.cache().contains_entity(exec_id.as_uuid()))
+    }
+
+    /// The event id of the entity projection row of `exec_id`, if any
+    /// (issue #2260). Tests use it to see the apply after a commit.
+    #[cfg(feature = "owner-disk-cache")]
+    #[doc(hidden)]
+    pub async fn entity_projection_event(&self, exec_id: ExecutionId) -> Option<i32> {
+        self.workflow_cache
+            .lock()
+            .await
+            .disk()
+            .and_then(|disk| disk.cache().entity_event_id(exec_id.as_uuid()))
+    }
+
+    /// Run read-only SQL over the state of one keyed entity (issue #2260).
+    ///
+    /// The query reads the last state snapshot of the entity
+    /// `(workflow_name, workflow_id)`. On the owner of its partition, with
+    /// [`WorkerConfig::with_owner_entity_sql`] on, it reads the sealed row
+    /// of the projection file. Otherwise, or on a miss, it reads the
+    /// snapshot event from history in `pool`. An owner then seals that
+    /// snapshot into the file. `params` bind to `?1`, `?2` and so on.
+    ///
+    /// [`crate::entity_sql`] describes the table and the rules.
+    ///
+    /// [`WorkerConfig::with_owner_entity_sql`]: crate::builder::WorkerConfig::with_owner_entity_sql
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`EntitySqlError`](crate::entity_sql::EntitySqlError).
+    #[cfg(feature = "owner-disk-cache")]
+    pub async fn query_entity_sql(
+        &self,
+        pool: &DbPool,
+        workflow_name: &str,
+        workflow_id: &str,
+        sql: &str,
+        params: &[serde_json::Value],
+    ) -> Result<crate::entity_sql::EntitySqlRows, crate::entity_sql::EntitySqlError> {
+        // A permit bounds the queries of this process, the snapshot load
+        // included. It moves into the query thread, so it lives until the
+        // query stops.
+        let permit = crate::entity_sql::QUERY_SLOTS
+            .acquire()
+            .await
+            .map_err(|e| crate::entity_sql::EntitySqlError::Sql(e.to_string()))?;
+        let mut conn = pool
+            .get()
+            .await
+            .map_err(|e| HarvestError::Database(e.to_string()))?;
+        // Clone the tier first. The cache lock must not span the disk work.
+        let disk = self.workflow_cache.lock().await.disk();
+        let (record, source) = crate::owner_disk_cache::entity_record(
+            disk.as_ref(),
+            &mut conn,
+            self.entity_sql_owner_shard(),
+            // The tenures of this worker. Workers that share a registry each
+            // hold their own set.
+            Arc::clone(&self.decision_owner),
+            self.registry.payload_codecs(),
+            self.registry.payload_offloader(),
+            workflow_name,
+            workflow_id,
+        )
+        .await?;
+        drop(conn);
+        // A dropped caller cancels the query at its next progress check.
+        let cancel = CancelOnDrop::default();
+        let flag = Arc::clone(&cancel.0);
+        let sql = sql.to_string();
+        let params = params.to_vec();
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            crate::entity_sql::run_cancellable(&record, &sql, &params, source, &flag)
+        })
+        .await
+        .map_err(|e| crate::entity_sql::EntitySqlError::Sql(format!("the query task died: {e}")))?;
+        drop(cancel);
+        result
+    }
+
+    /// The owner shard of the database that an entity query reads (issue
+    /// #2260).
+    ///
+    /// A worker with one claim target knows it. A worker with several
+    /// cannot tell which one a pool serves, so it returns `None`. A query
+    /// then reads history and writes no file.
+    #[cfg(feature = "owner-disk-cache")]
+    fn entity_sql_owner_shard(&self) -> Option<crate::types::ShardId> {
+        let targets = self
+            .claim_targets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match targets.as_slice() {
+            [] => Some(self.owner_shard_of(None)),
+            [only] => Some(self.owner_shard_of(*only)),
+            _ => None,
+        }
     }
 
     /// Drop the memory entry of `exec_id` and keep its disk entry (issue
@@ -46326,6 +46485,7 @@ mod tests {
             resident_workflows: true,
             owner_disk_cache: None,
             owner_disk_cache_min_events: crate::builder::DEFAULT_OWNER_DISK_CACHE_MIN_EVENTS,
+            owner_entity_sql: false,
             sticky_timeout: Duration::from_secs(3),
             cancellation_grace_period: Duration::from_secs(10),
             shard_assignments: vec![crate::types::ShardId::new(0)],

@@ -116,7 +116,25 @@ fn decode_snapshot(codecs: &PayloadCodecs, stored: &Value) -> HarvestResult<Proj
     if crate::payload_store::is_offload_envelope(stored) {
         return Ok(ProjectedSnapshot::Offloaded);
     }
-    let decoded = codecs.decode_column(stored)?;
+    classify_decoded(codecs.decode_column(stored)?)
+}
+
+/// Classify one decoded snapshot value.
+///
+/// The worker holds decoded events after a commit. It calls this on the
+/// value of each snapshot event (issue #2260).
+///
+/// # Errors
+///
+/// A snapshot that is not `{"state", "stats"}`.
+#[cfg(feature = "db")]
+pub(crate) fn classify_decoded(decoded: Value) -> HarvestResult<ProjectedSnapshot> {
+    if crate::erase::is_erasure_tombstone(&decoded) {
+        return Ok(ProjectedSnapshot::Erased);
+    }
+    if crate::payload_store::is_offload_envelope(&decoded) {
+        return Ok(ProjectedSnapshot::Offloaded);
+    }
     if decoded.get(ENTITY_SNAPSHOT_OMITTED_KEY).is_some() {
         return Ok(ProjectedSnapshot::Omitted);
     }
@@ -234,6 +252,112 @@ pub async fn read_for_execution(
         .next()
         .map(|row| row.decode(codecs))
         .transpose()
+}
+
+/// Where the latest snapshot of one entity is (issue #2260).
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EntityPointer {
+    /// The run that wrote the row.
+    pub execution_id: ExecutionId,
+    /// The history position of the snapshot in that run.
+    pub event_id: i32,
+    /// The snapshot ended the entity.
+    pub deleted: bool,
+    /// The state of that run, for example `RUNNING`.
+    pub run_state: String,
+}
+
+/// Read where the latest snapshot of `(workflow_name, workflow_id)` is.
+///
+/// It reads the projection row and the state of its run. It decodes no
+/// snapshot.
+///
+/// # Errors
+///
+/// [`crate::error::HarvestError::Database`] on a query failure.
+#[cfg(feature = "db")]
+pub async fn pointer(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> HarvestResult<Option<EntityPointer>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = SqlUuid)]
+        execution_id: uuid::Uuid,
+        #[diesel(sql_type = Integer)]
+        event_id: i32,
+        #[diesel(sql_type = Bool)]
+        deleted: bool,
+        #[diesel(sql_type = Text)]
+        run_state: String,
+    }
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT s.execution_id, s.event_id, s.deleted, x.state AS run_state \
+           FROM harvest_entity_state s \
+           JOIN harvest_workflow_executions x ON x.id = s.execution_id \
+          WHERE s.workflow_name = $1 AND s.workflow_id = $2",
+    )
+    .bind::<Text, _>(workflow_name)
+    .bind::<Text, _>(workflow_id)
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows.into_iter().next().map(|row| EntityPointer {
+        execution_id: ExecutionId::from_uuid(row.execution_id),
+        event_id: row.event_id,
+        deleted: row.deleted,
+        run_state: row.run_state,
+    }))
+}
+
+/// Read the snapshot event `event_id` of the run `exec_id` from history.
+///
+/// It reads one event row, inflates an offloaded value when `offloader` is
+/// set, and decodes it. Returns `None` when the row is not a snapshot.
+///
+/// # Errors
+///
+/// [`crate::error::HarvestError::Database`] on a query failure, or an
+/// offload or codec error.
+#[cfg(feature = "db")]
+pub async fn snapshot_at(
+    conn: &mut AsyncPgConnection,
+    codecs: &PayloadCodecs,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+    exec_id: ExecutionId,
+    event_id: i32,
+) -> HarvestResult<Option<ProjectedSnapshot>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Jsonb)]
+        event_data: Value,
+    }
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT event_data FROM harvest_events \
+          WHERE workflow_exec_id = $1 AND event_id = $2 \
+            AND event_type = 'SideEffectRecorded' \
+            AND (event_data -> 'data' ->> 'kind') = 'EntityState'",
+    )
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .bind::<Integer, _>(event_id)
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+    let Some(mut event_data) = rows.into_iter().next().map(|row| row.event_data) else {
+        return Ok(None);
+    };
+    if let Some(offloader) = offloader {
+        offloader.inflate_event_value(&mut event_data).await?;
+    }
+    let value = event_data
+        .get("data")
+        .and_then(|data| data.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    decode_snapshot(codecs, &value).map(Some)
 }
 
 /// The largest page that [`list`] returns.

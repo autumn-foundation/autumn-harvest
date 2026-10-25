@@ -246,6 +246,7 @@ mod otel_semconv_docs;
 mod otel_workflow_semconv_docs;
 mod owner_decider_tests;
 mod owner_disk_cache_db_tests;
+mod owner_entity_sql_db_tests;
 mod owner_failover_tests;
 mod owner_wake_db_tests;
 mod owner_wake_worker_tests;

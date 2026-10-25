@@ -177,7 +177,7 @@ libc = { version = "0.2", optional = true }
 ed25519-dalek = { version = "3.0", optional = true }
 # The owner-local disk cache (issue #2258): one SQLite file per partition and
 # an exclusive lock on a sidecar file.
-rusqlite = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true, features = ["hooks", "limits"] }
 fs4 = { version = "1.1", default-features = false, features = ["sync"], optional = true }
 
 [[test]]
