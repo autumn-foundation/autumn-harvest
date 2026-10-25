@@ -2,14 +2,15 @@
 //!
 //! The worker runs this function on every successful activity result. The
 //! harness calls it on a fixed mix of results that all pass the cap. Each call
-//! takes an owned clone of the value, as the worker does.
+//! takes an owned clone of the value. The worker passes its own result and
+//! does not clone.
 //!
 //! Wall-clock time is not valid evidence on a shared machine. Use instruction
 //! counts from callgrind and allocation counts from dhat. The workload has no
 //! randomness, so the counts repeat.
 //!
-//! The harness clones each value. The clone and drop cost most of the
-//! instructions. Subtract that share before you judge the walk. See
+//! The harness clones each value. The clone costs most of the instructions.
+//! Subtract that share before you judge the walk. See
 //! `docs/performance-payload-depth.md`.
 //!
 //! # Running
@@ -92,7 +93,7 @@ fn main() {
     let mut accepted = 0_usize;
     for _ in 0..passes {
         for value in &mix {
-            if refuse_deep_result("charge", Ok(black_box(value.clone()))).is_ok() {
+            if black_box(refuse_deep_result("charge", Ok(black_box(value.clone())))).is_ok() {
                 accepted += 1;
             }
         }
