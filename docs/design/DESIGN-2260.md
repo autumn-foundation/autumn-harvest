@@ -2,7 +2,7 @@
 
 Stage 3b of epic #2247. It builds on the keyed-entity state events of stage
 3a (#2259) and the owner disk cache of stage 2 (#2258).
-[ADR 0012](docs/adr/0012-owner-disk-cache.md) records the amendment.
+[ADR 0012](../adr/0012-owner-disk-cache.md) records the amendment.
 
 **No migration. No new event. Off by default.** The projection needs the
 `owner-disk-cache` feature, a cache directory, owner mode and

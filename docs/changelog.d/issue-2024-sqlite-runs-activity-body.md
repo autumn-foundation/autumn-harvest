@@ -45,4 +45,4 @@ panic containment. `portable_fixture.rs` holds one `#[activity]` fn.
 `portable_activity.rs` runs it on SQLite, and the core suite
 `sqlite_portable_activity_tests` runs it on Postgres. Both assert the same
 report. Every raw-closure test passes. The two-argument tests changed only the
-method name. Design record: `DESIGN-2024.md`.
+method name. Design record: `docs/design/DESIGN-2024.md`.

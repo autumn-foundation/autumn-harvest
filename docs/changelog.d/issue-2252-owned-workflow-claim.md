@@ -66,7 +66,7 @@ worker persist transaction uses it. At four claim loops, the extra round
 trips had cost owner mode about 10% of its throughput. After the change,
 owner mode ran 2.6%, 2.0% and 4.9% below legacy at 1, 2 and 4 claim
 loops. The 1 and 2 loop results are within the effect of run order.
-`DESIGN-2252.md` section 4 has the runs.
+`docs/design/DESIGN-2252.md` section 4 has the runs.
 
 **Evidence.** Unit tests for the splice, the balance plan, the local
 deadline and the colocated groups. Postgres tests for the guard, the owned

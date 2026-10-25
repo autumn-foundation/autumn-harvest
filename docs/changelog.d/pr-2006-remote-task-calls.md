@@ -32,7 +32,7 @@ restart loses nothing.
 `harvest-verify` classifies `call_remote_task` as a sink.
 
 **No migration. No new `WorkflowEvent` variant. No new route.** The plan is
-in `DESIGN-2006.md`. The guide is `docs/remote-tasks.md`.
+in `docs/design/DESIGN-2006.md`. The guide is `docs/remote-tasks.md`.
 
 **Fix for every external activity.** `external_task::complete_externally`
 and `fail_externally`, and so the `/activities/external/{token}/complete`

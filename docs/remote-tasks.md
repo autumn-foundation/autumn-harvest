@@ -171,7 +171,7 @@ another server.
 - A failed remote read leaves the token pending. The poller backs off, and
   the timeout still ends the wait.
 - A Harvest server answers with a plain run handle when it cannot read the
-  run just after the start (`DESIGN-2005.md`, R14). The call then completes
+  run just after the start (`docs/design/DESIGN-2005.md`, R14). The call then completes
   with that handle as its result. A Harvest server also reports a refused
   start, such as a quota refusal, as a tool error. The call then completes
   with `is_error: true`.

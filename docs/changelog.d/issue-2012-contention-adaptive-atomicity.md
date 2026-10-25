@@ -13,7 +13,7 @@ workflow from contention. The write-up is
   backout). Each cell checks two invariants after the drain and measures
   the hot-lock hold.
 - **Rule and verdict.** `rule::choose` and `verdict::judge` implement the
-  rule and criteria that `DESIGN-2012.md` fixed before the measurement.
+  rule and criteria that `docs/design/DESIGN-2012.md` fixed before the measurement.
   Each criterion holds, fails or is inconclusive when the ranges overlap.
 - **Results.** Backout gives 1.55x the saga's goodput on a cold key with
   short steps. On a hot key with 20 ms steps, the saga and the hybrid give

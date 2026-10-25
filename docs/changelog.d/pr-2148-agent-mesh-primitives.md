@@ -4,7 +4,7 @@
 can delegate a task to a peer agent. The peer runs as a sub-agent inside the
 same workflow, on Postgres and on SQLite. `docs/agent-mesh.md` shows them end
 to end. `docs/rnd/2026-10-13-agent-mesh-primitives.md` holds the research,
-and `DESIGN-agent-mesh.md` the plan.
+and `docs/design/DESIGN-agent-mesh.md` the plan.
 
 **Design.**
 

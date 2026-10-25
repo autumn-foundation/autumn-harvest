@@ -1,7 +1,7 @@
 //! The durable agent on the SQLite backend (issue #2263).
 //!
 //! Each test drives the `agent` workflow through its inbox. The tests cover
-//! the guarantees of `DESIGN-2262.md` section 1. One op runs at a time, no op
+//! the guarantees of `docs/design/DESIGN-2262.md` section 1. One op runs at a time, no op
 //! is lost, replay asks no model twice, and labels survive a checkpoint.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

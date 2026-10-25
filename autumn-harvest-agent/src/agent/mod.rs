@@ -1,7 +1,7 @@
 //! A durable agent: the agent loop as a keyed entity (issue #2263).
 //!
 //! An [`Agent`] is a named, long-lived actor. It owns its state, handles one
-//! op at a time, and survives a crash. The design is in `DESIGN-2262.md`.
+//! op at a time, and survives a crash. The design is in `docs/design/DESIGN-2262.md`.
 //!
 //! | Agent concept | Harvest part |
 //! |---|---|

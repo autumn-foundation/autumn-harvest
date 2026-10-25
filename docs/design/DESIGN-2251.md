@@ -1,7 +1,7 @@
 # Design: issue #2251, the owner lease table and the commit fence
 
-Stage 1a of epic #2247. [ADR 0009](docs/adr/0009-decision-owner.md) fixes the
-protocol. [The lease ADR](docs/adr/0010-fenced-owner-lease.md) fixes the
+Stage 1a of epic #2247. [ADR 0009](../adr/0009-decision-owner.md) fixes the
+protocol. [The lease ADR](../adr/0010-fenced-owner-lease.md) fixes the
 rules R1 to R7. This issue adds the table, the lease code and the fence in
 the decision commit.
 

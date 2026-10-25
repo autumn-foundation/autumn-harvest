@@ -8,7 +8,7 @@ across the whole tree.
 These primitives are in `autumn-harvest-agent`, modules `mesh` and `flow`.
 They work on Postgres and on SQLite. The research behind them is in
 [`rnd/2026-10-13-agent-mesh-primitives.md`](rnd/2026-10-13-agent-mesh-primitives.md).
-The plan is in [`DESIGN-agent-mesh.md`](../DESIGN-agent-mesh.md).
+The plan is in [`docs/design/DESIGN-agent-mesh.md`](design/DESIGN-agent-mesh.md).
 
 ## 1. The primitives
 

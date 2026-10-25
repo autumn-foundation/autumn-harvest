@@ -2,7 +2,7 @@
 
 **Status: R&D spike. No engine code.** The prototype lives in
 `autumn-harvest/tests/integration/typed_snapshot_spike_tests.rs`. The plan
-and its brainstorms are in `DESIGN-2013.md`.
+and its brainstorms are in `docs/design/DESIGN-2013.md`.
 
 ## 1. The question
 

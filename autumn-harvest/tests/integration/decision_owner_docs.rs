@@ -290,7 +290,7 @@ fn adr_records_an_accepted_decision() {
         );
     }
     assert!(
-        adr.contains("DESIGN-2249.md"),
+        adr.contains("../design/DESIGN-2249.md"),
         "{ADR} must link its planning record"
     );
 }

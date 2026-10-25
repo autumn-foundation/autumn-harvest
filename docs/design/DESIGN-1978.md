@@ -2,7 +2,7 @@
 
 Issue #1978 asks where SSO lives. It also asks for custom roles and optional
 mTLS on the management API. The decision record is
-[ADR 0006](docs/adr/0006-oidc-sso-and-custom-roles.md).
+[ADR 0006](../adr/0006-oidc-sso-and-custom-roles.md).
 
 **No migration. No new `WorkflowEvent` variant. No change to
 `harvest_events`. No new route in `CLASSIFIED_ROUTES`.**

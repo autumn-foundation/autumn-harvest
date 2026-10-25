@@ -1732,7 +1732,7 @@ impl<'a, 'env> SimRun<'a, 'env> {
 
     /// Land a seed-chosen part of the held set at the next task boundary.
     ///
-    /// The rules are in `DESIGN-2033.md` section 2. Results land first, in
+    /// The rules are in `docs/design/DESIGN-2033.md` section 2. Results land first, in
     /// a seeded order. The ingest of signals and due fires follows.
     fn deliver(&mut self) -> Delivery {
         let clock = fired_timer_duration_secs(&self.history);

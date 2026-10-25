@@ -8,7 +8,7 @@ workflow task, but no engine code ran the handler. A caller with
 **Where an update runs.** An update runs after the workflow body, at the end of
 the same decision cycle, in history order. Replay never runs the handler. It
 returns the recorded result. Update events are transparent to command matching,
-so the order cannot cause a divergence. `DESIGN-2035.md` holds the planning
+so the order cannot cause a divergence. `docs/design/DESIGN-2035.md` holds the planning
 record.
 
 **Mechanism.** `WorkflowContext::with_update_dispatch` marks a context for

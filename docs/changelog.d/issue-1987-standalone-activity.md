@@ -16,7 +16,7 @@ compares four arms per job:
 | C | Bare task row | 3 | 2326 |
 | D | Task row, job record, handler-start marker | 6 | 5073 |
 
-`DESIGN-1987.md` fixed a 2.0x line before each floor ran. Against arm C,
+`docs/design/DESIGN-1987.md` fixed a 2.0x line before each floor ran. Against arm C,
 arm B is 3.33x, and that line gives "build". Review showed that the line
 could not fail, so a re-charter against arm D decides. Arm B is 1.67x on
 rows and 1.56x on WAL against arm D, so that line gives "document". The

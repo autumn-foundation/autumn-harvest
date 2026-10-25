@@ -10,7 +10,7 @@ database and no migration, and it adds no history event. A sandbox run is an
 ordinary activity, so history records the request and the outcome. Replay
 reads the outcome and never runs the code again.
 
-The design record is [`DESIGN-sandbox-activities.md`](../DESIGN-sandbox-activities.md).
+The design record is [`docs/design/DESIGN-sandbox-activities.md`](design/DESIGN-sandbox-activities.md).
 
 ## When to use it
 

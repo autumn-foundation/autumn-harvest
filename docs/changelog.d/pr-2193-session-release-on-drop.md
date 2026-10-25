@@ -21,7 +21,7 @@ reap its session. Deploy the new build to every worker before a workflow
 drops a session. An older build cannot run the new name. See the 0.8.0
 upgrade guide, section 1.11.
 
-Design record, with brainstorm, reverse brainstorm and six hats: `DESIGN-2193.md`.
+Design record, with brainstorm, reverse brainstorm and six hats: `docs/design/DESIGN-2193.md`.
 
 Tests: `dropping_a_session_issues_one_pinned_release`,
 `a_dropped_complete_future_releases_the_session`,

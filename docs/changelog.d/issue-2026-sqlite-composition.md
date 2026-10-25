@@ -127,4 +127,4 @@ strikes of runs that another run seals: by a cancel, a terminate cascade, an
 unsupported seal or an error-path cancel. A unit test checks that a hard cancel removes a task
 that a dropped drive left `RUNNING`. The core test
 `match_external_await_resolves_past_a_sibling_child` pins the replay fix. The
-design record is `DESIGN-2026.md`.
+design record is `docs/design/DESIGN-2026.md`.

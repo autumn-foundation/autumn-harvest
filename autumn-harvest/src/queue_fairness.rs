@@ -33,7 +33,7 @@
 /// key on each task does. [`FairClock`] is the pure model of the fair claim:
 /// start-time fair queuing (SFQ) across the keys of one queue. The fair claim
 /// splice in `queue.rs` is the SQL form of the same rules. See
-/// `DESIGN-1976.md` and `tests/property/fairness_key_props.rs`.
+/// `docs/design/DESIGN-1976.md` and `tests/property/fairness_key_props.rs`.
 use std::collections::{BTreeMap, HashMap};
 
 use crate::error::{HarvestError, HarvestResult};

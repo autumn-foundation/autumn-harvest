@@ -35,7 +35,7 @@ once. **No SQL change. No migration. No new `WorkflowEvent` variant.**
 | B4 | Start the next claim before the dispatch of the last one. | Rejected. `dispatch_task` already spawns. Nothing waits between claims except the claim. |
 | B5 | Eager activity dispatch: a workflow task claims its own new activity rows. | Deferred. It changes claim ownership and needs its own fence review. |
 | B6 | Scale the loop count with load, as Temporal does. | Partly adopted. B2 is demand-driven. The cap stays a static setting. |
-| B7 | Cut the claim latency again. | Out of scope. See DESIGN-1971.md §4. |
+| B7 | Cut the claim latency again. | Out of scope. See docs/design/DESIGN-1971.md §4. |
 
 ### 0.3 Reverse brainstorm — how can this change do harm?
 

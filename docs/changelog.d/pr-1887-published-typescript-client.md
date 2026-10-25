@@ -52,7 +52,7 @@ the crate version. It exports these:
 **`examples/typescript-client`** now reads `execution_id` and
 `execution.state` through the generated types, with no casts.
 
-**harvest-server.** `DESIGN-1616.md` evaluates a standalone binary. It
+**harvest-server.** `docs/design/DESIGN-1616.md` evaluates a standalone binary. It
 recommends against a prebuilt binary. Workflows are Rust code, so the same
 build must compile the binary and the workflows. A `dylib` plugin has no
 stable ABI. The `hot-code-swap` spike (#967) rules out WASM workflows with full

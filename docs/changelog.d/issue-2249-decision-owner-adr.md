@@ -27,5 +27,5 @@ Tests: `decision_owner_docs` guards the ADR facts.
 Postgres 16, including `a_plain_epoch_update_does_not_wait_for_a_commit`
 and `a_commit_does_not_queue_behind_a_waiting_acquisition`.
 
-`DESIGN-2249.md` holds the design record, with brainstorm, reverse
+`docs/design/DESIGN-2249.md` holds the design record, with brainstorm, reverse
 brainstorm and six hats.

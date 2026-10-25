@@ -314,7 +314,7 @@ See [`simulation.md`](simulation.md#the-owner-lease-simulation).
 
 #### `AgentMesh` — model (f)
 
-The prose spec is section 7 of `DESIGN-2262.md`. Issue #2269 asks for this
+The prose spec is section 7 of `docs/design/DESIGN-2262.md`. Issue #2269 asks for this
 model before the code. Agent A sends `PeerMessage` ops to agent B by
 workflow id. Both agents are keyed entities. The send key is
 `<from>:<seq>`. A durable sender sets `from` to

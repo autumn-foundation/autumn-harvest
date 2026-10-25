@@ -371,5 +371,5 @@ analyzer solves that cycle as a fixpoint.
   while the alert is written get no alert of their own. The next crash
   alerts again.
 
-See [`DESIGN-autoresearch.md`](../../DESIGN-autoresearch.md) for the plan and
+See [`docs/design/DESIGN-autoresearch.md`](../../docs/design/DESIGN-autoresearch.md) for the plan and
 the acceptance criteria.

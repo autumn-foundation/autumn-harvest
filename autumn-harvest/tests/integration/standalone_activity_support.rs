@@ -24,7 +24,7 @@ pub const ARTIFACT_DIR: &str = "docs/perf-artifacts/standalone-activity-overhead
 /// Jobs per arm in the evidence capture.
 pub const JOBS_PER_ARM: usize = 50;
 
-/// The decision line from `DESIGN-1987.md` §0.4 and §0.6.
+/// The decision line from `docs/design/DESIGN-1987.md` §0.4 and §0.6.
 ///
 /// Arm B at or below this multiple of the floor, on both deciders, means
 /// "document the pattern". Above it on either means "build". §0.4 used arm

@@ -1,7 +1,7 @@
 //! The selection rule: physical backout, saga or hybrid (issue #2012).
 //!
 //! The rule is a sketch. It takes model inputs, not live metrics. Section
-//! 2.3 of `DESIGN-2012.md` fixed it before the measurement.
+//! 2.3 of `docs/design/DESIGN-2012.md` fixed it before the measurement.
 
 use std::time::Duration;
 

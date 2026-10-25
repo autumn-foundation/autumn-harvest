@@ -27,8 +27,8 @@
 //! The attempt counts the runs of the lineage: the run that the key gives,
 //! then each retry attempt and each continue-as-new successor.
 //!
-//! See `docs/durable-routes.md` for the guide. `DESIGN-durable-routes.md`
-//! and `DESIGN-durable-streaming.md` are the design records.
+//! See `docs/durable-routes.md` for the guide. `docs/design/DESIGN-durable-routes.md`
+//! and `docs/design/DESIGN-durable-streaming.md` are the design records.
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;

@@ -1,7 +1,7 @@
 ## Phase X.Y — durable agents and agent meshes (epic #2262)
 
 The agent loop (#1973), the keyed entity (#1975) and the agent mesh join into
-one durable `Agent`. `DESIGN-2262.md` is the spec. Each sub-issue below has
+one durable `Agent`. `docs/design/DESIGN-2262.md` is the spec. Each sub-issue below has
 its own red tests.
 
 ### A first-class durable `Agent` (issue #2263)
@@ -190,7 +190,7 @@ late.
 
 ### The agent cost ledger on SQLite (issue #2275)
 
-Section 13 of the design note `DESIGN-2262.md` of epic #2262. The SQLite
+Section 13 of the design note `docs/design/DESIGN-2262.md` of epic #2262. The SQLite
 backend now writes the agent cost ledger of issue #1996. Before
 this change, the SQLite agent path called the model with no activity
 context, so it wrote no ledger rows.
@@ -314,7 +314,7 @@ from `docs/agent-adapter.md`.
 
 ### Verus proofs of the agent kernels (epic #2262)
 
-The blue-team step of `DESIGN-2262.md` asks for Verus proofs of the pure
+The blue-team step of `docs/design/DESIGN-2262.md` asks for Verus proofs of the pure
 kernels. Four new files in `formal/verus/src/` mirror them:
 
 - `agent_inbox.rs` proves `agent::inbox::admit`. A spec models the inbox
