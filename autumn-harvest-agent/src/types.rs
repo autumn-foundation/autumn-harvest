@@ -169,6 +169,11 @@ pub struct AgentTask {
     /// fails as a deadlock.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting: Vec<String>,
+    /// End a failed run with a report of stop [`AgentStop::Failed`], not an
+    /// error (issue #2328). A parent sets it on a fan-out child, so the
+    /// parent keeps the usage and the labels of the failed run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub report_failure: bool,
 }
 
 /// Where the run id of a task comes from.
@@ -217,6 +222,7 @@ impl AgentTask {
             model: None,
             workspace: None,
             waiting: Vec::new(),
+            report_failure: false,
         }
     }
 
@@ -707,6 +713,10 @@ pub enum AgentStop {
     LoopDetected,
     /// A person interrupted a durable agent mid-op (issue #2265).
     Interrupted,
+    /// The run failed. The report holds the error and what the run spent
+    /// before it failed (issue #2328). Only a task with `report_failure`
+    /// ends under it.
+    Failed,
 }
 
 /// The workflow output: how the run ended and what it produced.
@@ -750,6 +760,9 @@ pub struct AgentReport {
     /// The head of the workspace when the run ended (issue #2274).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceRef>,
+    /// The error of a run that ended under [`AgentStop::Failed`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// The transcript without system messages.
@@ -777,6 +790,17 @@ mod tests {
         assert_eq!(task.input, "hi");
         assert_eq!(task.history, Vec::new());
         assert_eq!(task.max_total_tokens, None);
+    }
+
+    #[test]
+    fn the_failure_flag_is_off_by_default_and_not_written_when_off() {
+        let task = AgentTask::new("hi");
+        assert!(!task.report_failure);
+        assert!(json!(task).get("report_failure").is_none());
+        let mut flagged = task;
+        flagged.report_failure = true;
+        let back: AgentTask = serde_json::from_value(json!(flagged)).unwrap();
+        assert!(back.report_failure);
     }
 
     #[test]
@@ -819,6 +843,7 @@ mod tests {
         assert_eq!(json!(AgentStop::TranscriptFull), json!("transcript_full"));
         assert_eq!(json!(AgentStop::BudgetExceeded), json!("budget_exceeded"));
         assert_eq!(json!(AgentStop::ReplyTooLarge), json!("reply_too_large"));
+        assert_eq!(json!(AgentStop::Failed), json!("failed"));
     }
 
     #[test]

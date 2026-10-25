@@ -460,6 +460,7 @@ fn child_report(input: &Value) -> Value {
         flow_labels: labels,
         run_id: Some(format!("child-{}", task.input.replace(' ', "-"))),
         workspace: None,
+        error: None,
     })
 }
 
@@ -779,4 +780,106 @@ async fn the_first_failure_in_input_order_names_the_error() {
     assert!(error.contains("flights refused"), "{error}");
     assert!(!error.contains("visas refused"), "{error}");
     assert_eq!(state.tokens_used, 1 + 2, "the middle sibling stays counted");
+}
+
+/// A tool that the failing children call once, so they pay for a turn.
+fn note_tool() -> Arc<dyn autumn_harvest_agent::Tool> {
+    FnTool::new("note", "Notes.", json!({"type": "object"}), |_| async {
+        Ok(json!("noted"))
+    })
+    .effect(ToolEffect::ReadOnly)
+    .shared()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_fan_out_slot_keeps_its_own_usage() {
+    use autumn_harvest_agent::{AgentId, AgentOp, AgentProfile};
+
+    let (_dir, db) = fresh_db();
+    // The flights child sits in slot 0. It pays for one turn, then it fails.
+    let model = TryFnModel::new(|request| {
+        let input = first_user(request);
+        if input == ROOT_INPUT {
+            return Ok(three_delegations(1));
+        }
+        if input == "find flights" {
+            return if results(request).is_empty() {
+                Ok(tool_calls(&[("n1", "note", json!({}))], 2))
+            } else {
+                Err(AgentError::new(ErrorKind::Provider, "flights refused"))
+            };
+        }
+        Ok(text("answered", 2))
+    });
+    let harness = trip_harness(model).tool(note_tool()).agent(
+        AgentProfile::new("planner")
+            .mandate(Mandate::new("planner").peers(["flights", "hotels", "visas"]))
+            .parallel_children(3),
+    );
+    let mut rt = runtime(&db, harness);
+    let planner = AgentId::new("planner", "p1").unwrap();
+    sqlite::send(&mut rt, &planner, &AgentOp::message(ROOT_INPUT), None).unwrap();
+    sqlite::drive(&mut rt, &planner).await.unwrap();
+
+    let state = sqlite::state(&rt, &planner).await.unwrap().unwrap();
+    assert_eq!(state.failures, 1);
+    let error = state.last_error.unwrap_or_default();
+    assert!(error.contains("flights refused"), "{error}");
+    // Root 1, flights 2 (the paid turn), hotels 2, visas 2.
+    assert_eq!(state.tokens_used, 1 + 2 + 2 + 2, "the failed slot is paid");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nested_failure_keeps_the_usage_of_the_whole_subtree() {
+    use autumn_harvest_agent::{AgentId, AgentOp, AgentProfile};
+
+    let (_dir, db) = fresh_db();
+    // The flights child delegates to rail. Rail pays for one turn, then it
+    // fails, so the flights child fails too.
+    let model = TryFnModel::new(|request| {
+        let input = first_user(request);
+        if input == ROOT_INPUT {
+            return Ok(three_delegations(1));
+        }
+        if input == "find flights" {
+            return Ok(tool_calls(
+                &[(
+                    "r1",
+                    DELEGATE_TOOL,
+                    json!({"agent": "rail", "task": "check rail"}),
+                )],
+                2,
+            ));
+        }
+        if input == "check rail" {
+            return if results(request).is_empty() {
+                Ok(tool_calls(&[("n1", "note", json!({}))], 2))
+            } else {
+                Err(AgentError::new(ErrorKind::Provider, "rail refused"))
+            };
+        }
+        Ok(text("answered", 2))
+    });
+    let harness = AgentHarness::new(model)
+        .peer(Peer::new("flights", "Finds flights.").peers(["rail"]))
+        .peer(Peer::new("hotels", "Finds hotels."))
+        .peer(Peer::new("visas", "Checks visas."))
+        .peer(Peer::new("rail", "Checks rail."))
+        .tool(note_tool())
+        .agent(
+            AgentProfile::new("planner")
+                .mandate(Mandate::new("planner").peers(["flights", "hotels", "visas", "rail"]))
+                .parallel_children(3),
+        );
+    let mut rt = runtime(&db, harness);
+    let planner = AgentId::new("planner", "p1").unwrap();
+    sqlite::send(&mut rt, &planner, &AgentOp::message(ROOT_INPUT), None).unwrap();
+    sqlite::drive(&mut rt, &planner).await.unwrap();
+
+    let state = sqlite::state(&rt, &planner).await.unwrap().unwrap();
+    assert_eq!(state.failures, 1);
+    let error = state.last_error.unwrap_or_default();
+    assert!(error.contains("rail refused"), "{error}");
+    // Root 1, flights 2, rail 2 (the paid turn), hotels 2, visas 2.
+    assert_eq!(state.tokens_used, 1 + 2 + 2 + 2 + 2, "the subtree is paid");
 }
