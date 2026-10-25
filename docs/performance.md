@@ -2408,7 +2408,9 @@ standalone note rather than part of the claim-path attribution table above:
   — `reconcile_quota_keys_from` candidate-scan cost under mixed-deployment
   skew (issue #1226 follow-up); confirms the scaling risk is a permanent
   per-tick cost, not a rollout expense, and diagnoses a planner
-  cardinality misestimate as the cause. No fix ships in this pass.
+  cardinality misestimate as the cause. That pass shipped no fix. Issue #1631
+  (PR #1855) later made the scan seek once per registered name. A tick now
+  reads at most `batch_size` rows per name.
 * [`docs/performance-codec-rotation-reencrypt.md`](performance-codec-rotation-reencrypt.md)
   — skipping a JSON round-trip in the codec-key-rotation re-encryption sweep
   (issue #948).

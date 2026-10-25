@@ -137,6 +137,12 @@ Rust at the same point the pre-fix code read it -- after the row lock,
 immediately before issuing the combined statement -- and uses that bound
 value for both `scheduled_at` and the cutoff, instead of SQL `NOW()`.
 
+> **Since issue #1807**, `scheduled_at` is `clock_timestamp()`, the
+> database clock that `claim_task` reads. A host clock that differs from
+> the database clock no longer skews the requeue. Only the liveness
+> cutoff still uses the bound `$6`. `clock_timestamp()` reads the time
+> when the statement runs, so the backdating bug stays fixed.
+
 ## 💡 Hypothesis (revised)
 
 A plain `SELECT ... FOR UPDATE` naming only `harvest_task_queue` absorbs

@@ -23,9 +23,9 @@ evaluator below loads its row from `harvest_workflow_executions`, which an
 activity has none of):
 
 * `evaluate_triggers_for_execution_collecting_with_codecs`
-  (`completion_trigger.rs:1539`) — fires on complete/cancel/terminate/
+  (`completion_trigger.rs`) — fires on complete/cancel/terminate/
   timeout/poison-pill, and on fail **only when no workflow-level retry is
-  committed**. `persist_workflow_failure` (`worker.rs:8294-8440`) marks the
+  committed**. `persist_workflow_failure` (`worker.rs`) marks the
   failing execution `FAILED` first, then starts the retry attempt; only once
   that succeeds does it set `retry_committed = true` and gate the evaluator
   call behind `if !retry_committed`. So a `FAILED` predecessor whose retry
@@ -42,8 +42,9 @@ activity has none of):
   not at the retry decision), out of scope to fix from a Ledger performance
   pass — noted here only because this page's own table_present() accounting
   must not misstate what the surrounding function actually does.
-* continue-as-new sealing (`worker.rs:18719`)
-* workflow reset (`reset.rs:1335`)
+* continue-as-new sealing
+  (`persist_workflow_continue_as_new_with_verdict`, `worker.rs`)
+* workflow reset (`terminate_source_execution`, `reset.rs`)
 
 Still a high-frequency chokepoint — most workflow terminal transitions,
 including every plain success/cancel/terminate/timeout/poison-pill and every
