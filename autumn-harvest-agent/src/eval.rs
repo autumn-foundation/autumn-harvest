@@ -1727,6 +1727,7 @@ mod tests {
                 flow_labels: std::collections::BTreeSet::new(),
                 run_id: None,
                 workspace: None,
+                error: None,
             })
         };
         let done = report(crate::AgentStop::Completed);

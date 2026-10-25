@@ -101,7 +101,8 @@ pub fn report_text(source: ReportSource, stop: AgentStop, text: &str) -> Option<
         | AgentStop::ReplyTooLarge
         | AgentStop::BudgetExceeded
         | AgentStop::LoopDetected
-        | AgentStop::Interrupted => {
+        | AgentStop::Interrupted
+        | AgentStop::Failed => {
             let notice = format!("The agent stopped early: {}.", stop_name(stop));
             Some(if text.is_empty() {
                 notice
