@@ -163,10 +163,17 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
   (`continue_as_new_as_type`) — a workflow reaching one of these is rejected
   **loudly, by name**, never silently dropped. The run then ends
   `FAILED` with `error_type = "UnsupportedFeature"` (issue #1834).
+- A batch that breaks a solo rule (issue #2029): a mutex acquire beside
+  another awaitable, or a local activity beside a durable awaitable or a
+  second local activity. It is rejected the same way.
 
 Since issue #2026, the backend supports child workflows and signal, cancel and
 await between runs. See
 [§9 of the docs guide](../docs/sqlite-backend.md#9-child-workflows-and-commands-between-runs).
+
+The `autumn-harvest-conformance` crate runs one corpus of workflows on this
+backend and on Postgres, and checks that the outcomes match (issue #2030). See
+[`autumn-harvest-conformance/README.md`](../autumn-harvest-conformance/README.md).
 
 ## Learn more
 
