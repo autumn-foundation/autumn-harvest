@@ -65,8 +65,8 @@ use autumn_harvest::entity::{ENTITY_OP_SIGNAL, EntityMessage};
 /// The replay gate of the final-turn delivery and the raw follow-up length.
 const FINAL_TURN_PATCH: &str = "agent_final_turn_rules";
 
-/// Gates `report_failure` on fan-out children (issue #2328). The flag is part
-/// of the recorded child input, so a history from before the gate replays
+/// The gate for `report_failure` on fan-out children (issue #2328). The flag is
+/// part of the recorded child input. A history from before the gate replays
 /// with the old input.
 const CHILD_FAILURE_REPORT_PATCH: &str = "agent_child_failure_report";
 
@@ -1848,9 +1848,9 @@ async fn fan_out(
         .mandate
         .max_delegations
         .saturating_sub(tree.delegations.saturating_add(count));
-    // A child reports its failure, so the parent keeps its usage. The flag
-    // is only asked when a child can start, so replay asks it at the same
-    // point (issue #2328).
+    // A child reports its failure, so the parent keeps its usage. The gate
+    // runs only when a child starts. Replay reaches it at the same point
+    // (issue #2328).
     let report_failure = !siblings.is_empty() && ctx.patched(CHILD_FAILURE_REPORT_PATCH);
     let mut children = Vec::new();
     for (index, sibling) in (0_u32..).zip(siblings) {
@@ -1898,20 +1898,8 @@ async fn fan_out(
     // failure in input order fails the batch.
     let mut failed = None;
     for ((position, peer, child), output) in children.into_iter().zip(ended) {
-        let report = output.and_then(|value| {
-            serde_json::from_value::<AgentReport>(value).map_err(|err| err.to_string())
-        });
-        match report {
-            Ok(report) => {
-                let outcome = merge_child(progress, tree, peer, child, &report);
-                // A failed child still joins the parent. Then it fails the
-                // batch like any other failure.
-                if let (AgentStop::Failed, Some(error)) = (report.stop, report.error) {
-                    failed.get_or_insert(error);
-                } else {
-                    outcomes[position] = Some(outcome);
-                }
-            }
+        match merge_ended(progress, tree, peer, child, output) {
+            Ok(outcome) => outcomes[position] = Some(outcome),
             Err(err) => {
                 failed.get_or_insert(err);
             }
@@ -1924,6 +1912,29 @@ async fn fan_out(
         .into_iter()
         .map(|outcome| outcome.unwrap_or_else(|| ToolOutcome::error(NOT_RUN_FULL)))
         .collect())
+}
+
+/// Merge the end of one fan-out child into the parent.
+///
+/// A child that reported its failure still joins the parent. Then it counts
+/// as a failure like any other (issue #2328).
+fn merge_ended(
+    progress: &mut Progress,
+    tree: &mut Tree,
+    peer: &Peer,
+    child: AgentTask,
+    output: Result<serde_json::Value, String>,
+) -> Result<ToolOutcome, String> {
+    let report = output.and_then(|value| {
+        serde_json::from_value::<AgentReport>(value).map_err(|err| err.to_string())
+    })?;
+    let outcome = merge_child(progress, tree, peer, child, &report);
+    if report.stop == AgentStop::Failed {
+        return Err(report
+            .error
+            .unwrap_or_else(|| "the child run failed".to_owned()));
+    }
+    Ok(outcome)
 }
 
 /// The mandate checks of one sibling. Returns its mandate and its peer.

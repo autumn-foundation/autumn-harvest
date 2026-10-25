@@ -278,6 +278,7 @@ A bound is a normal end, not an error. `AgentReport.stop` names it:
 | `reply_too_large` | The model reply exceeds the result cap, even with its decision reasons cut. The activity drops the reply. |
 | `budget_exceeded` | A run or tenant LLM budget refused the next model call. The call was not sent. See [LLM budgets](#llm-budgets-issue-1997). |
 | `loop_detected` | The loop guard saw the same call, with the same result, too many times. |
+| `failed` | The run failed. `AgentReport.error` holds the error. Only a fan-out child ends so, because a parent keeps its usage and labels (issue #2328). |
 
 A turn that ends the run before its tool calls run is left out of
 `AgentReport.messages`. Its text is not the answer either. A round that ends

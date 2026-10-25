@@ -788,6 +788,7 @@ fn note_tool() -> Arc<dyn autumn_harvest_agent::Tool> {
         Ok(json!("noted"))
     })
     .effect(ToolEffect::ReadOnly)
+    .label("ledger")
     .shared()
 }
 
@@ -811,11 +812,19 @@ async fn a_failed_fan_out_slot_keeps_its_own_usage() {
         }
         Ok(text("answered", 2))
     });
-    let harness = trip_harness(model).tool(note_tool()).agent(
-        AgentProfile::new("planner")
-            .mandate(Mandate::new("planner").peers(["flights", "hotels", "visas"]))
-            .parallel_children(3),
+    // A rule that never fires turns the labels on.
+    let rules = FlowRules::new().forbid(
+        ["ledger", labels::UNTRUSTED_INPUT],
+        Rule::Deny("never".into()),
     );
+    let harness = trip_harness(model)
+        .tool(note_tool())
+        .flow_rules(rules)
+        .agent(
+            AgentProfile::new("planner")
+                .mandate(Mandate::new("planner").peers(["flights", "hotels", "visas"]))
+                .parallel_children(3),
+        );
     let mut rt = runtime(&db, harness);
     let planner = AgentId::new("planner", "p1").unwrap();
     sqlite::send(&mut rt, &planner, &AgentOp::message(ROOT_INPUT), None).unwrap();
@@ -827,6 +836,11 @@ async fn a_failed_fan_out_slot_keeps_its_own_usage() {
     assert!(error.contains("flights refused"), "{error}");
     // Root 1, flights 2 (the paid turn), hotels 2, visas 2.
     assert_eq!(state.tokens_used, 1 + 2 + 2 + 2, "the failed slot is paid");
+    assert!(
+        state.flow_labels.contains("ledger"),
+        "the failed child read a labelled tool: {:?}",
+        state.flow_labels
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
