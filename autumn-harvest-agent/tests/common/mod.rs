@@ -91,6 +91,43 @@ impl AgentModel for ScriptedModel {
     }
 }
 
+/// A model that answers each request with a function of the request. The
+/// function may return an error, so one child of a fan-out can fail.
+pub struct TryFnModel {
+    answer: Box<dyn Fn(&ChatRequest) -> Reply + Send + Sync>,
+    requests: Mutex<Vec<ChatRequest>>,
+}
+
+impl std::fmt::Debug for TryFnModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TryFnModel")
+    }
+}
+
+impl TryFnModel {
+    pub fn new(answer: impl Fn(&ChatRequest) -> Reply + Send + Sync + 'static) -> Arc<Self> {
+        Arc::new(Self {
+            answer: Box::new(answer),
+            requests: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn requests(&self) -> Vec<ChatRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl AgentModel for TryFnModel {
+    fn chat<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse, AgentError>> + Send + 'a>> {
+        self.requests.lock().unwrap().push(request.clone());
+        let reply = (self.answer)(request);
+        Box::pin(async move { reply })
+    }
+}
+
 /// A payload store in memory that counts its reads. A broken store fails
 /// each put and get. A store with broken reads fails each get only.
 #[derive(Default)]

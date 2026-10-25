@@ -1694,14 +1694,19 @@ async fn delegate(
         agent: Some(&child_agent),
         live: run.live,
     };
-    let stop = Box::pin(run_segment(
+    let ended = Box::pin(run_segment(
         ctx,
         child_run,
         &mut child,
         tree,
         &child_task.input,
     ))
-    .await?;
+    .await;
+    // A failed child paid for its turns, so the parent counts them.
+    if ended.is_err() {
+        progress.usage = progress.usage.saturating_add(child.usage);
+    }
+    let stop = ended?;
     // An interrupt that ended the child ends the round of the parent too.
     if child.interrupted {
         progress.interrupted = true;
@@ -1776,6 +1781,9 @@ struct Sibling<'a> {
 /// the tree with [`sibling_cap`], so the batch never spends more than one
 /// child could. Each child starts with the labels of the tree. Its labels
 /// join the tree when the batch ends.
+///
+/// A failed child fails the batch. The reports of the other children still
+/// join the parent first. The batch returns the first error in input order.
 ///
 /// Returns one outcome per call, in order.
 async fn fan_out(
@@ -1860,9 +1868,24 @@ async fn fan_out(
         .spawn_child_workflow_fan_out_collect_raw(inputs)
         .await
         .map_err(|err| err.to_string())?;
+    // Each sibling ended, so every report joins the parent. The first
+    // failure in input order fails the batch.
+    let mut failed = None;
     for ((position, peer, child), output) in children.into_iter().zip(ended) {
-        let report: AgentReport = serde_json::from_value(output?).map_err(|err| err.to_string())?;
-        outcomes[position] = Some(merge_child(progress, tree, peer, child, &report));
+        let report = output.and_then(|value| {
+            serde_json::from_value::<AgentReport>(value).map_err(|err| err.to_string())
+        });
+        match report {
+            Ok(report) => {
+                outcomes[position] = Some(merge_child(progress, tree, peer, child, &report));
+            }
+            Err(err) => {
+                failed.get_or_insert(err);
+            }
+        }
+    }
+    if let Some(err) = failed {
+        return Err(err);
     }
     Ok(outcomes
         .into_iter()

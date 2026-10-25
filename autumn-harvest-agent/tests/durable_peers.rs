@@ -24,7 +24,7 @@ use autumn_harvest_agent::{
     TokenUsage, ToolEffect, sqlite,
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
-use common::{Recorder, ScriptedModel, recorded_tool, runtime};
+use common::{Recorder, ScriptedModel, TryFnModel, recorded_tool, runtime};
 use serde_json::{Value, json};
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {
@@ -886,6 +886,108 @@ async fn a_fan_out_child_that_asks_its_waiting_parent_gets_a_deadlock_error_at_o
     let answer = planner.last_answer.expect("the op ends");
     assert!(answer.contains("deadlock"), "{answer}");
     assert_eq!(fired_timers(&rt, &triage()), 0, "no reply deadline fired");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_segment_with_a_failed_fan_out_child_keeps_its_later_sibling() {
+    let (_dir, db) = fresh_db();
+    let model = TryFnModel::new(|request| {
+        let results = tool_results(request);
+        if from_peer(request) && results.is_empty() {
+            // The researcher fans out to two inline children at once.
+            return Ok(ChatResponse {
+                content: vec![
+                    ContentPart::ToolCall {
+                        id: "d1".to_owned(),
+                        name: DELEGATE_TOOL.to_owned(),
+                        arguments: json!({"agent": "flights", "task": "find flights"}),
+                    },
+                    ContentPart::ToolCall {
+                        id: "d2".to_owned(),
+                        name: DELEGATE_TOOL.to_owned(),
+                        arguments: json!({"agent": "hotels", "task": "find hotels"}),
+                    },
+                ],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::new(1, 1),
+            });
+        }
+        match (first_user(request).as_str(), results.is_empty()) {
+            ("find flights", _) => Err(AgentError::new(
+                ErrorKind::Provider,
+                "the flights provider refused",
+            )),
+            ("find hotels", true) => Ok(call("h1", "find_hotels", json!({}))),
+            ("find hotels", false) => Ok(text("hotels found")),
+            (_, true) => Ok(call(
+                "r1",
+                DELEGATE_TOOL,
+                json!({"agent": "researcher", "task": "plan the trip"}),
+            )),
+            (_, false) => Ok(text("done")),
+        }
+    });
+    let find_hotels = FnTool::new(
+        "find_hotels",
+        "Reads.",
+        json!({"type": "object"}),
+        |_| async { Ok(json!("data")) },
+    )
+    .effect(ToolEffect::ReadOnly)
+    .label("hotel")
+    .shared();
+    // A rule that never fires turns the labels on.
+    let rules = FlowRules::new().forbid(
+        ["hotel", labels::UNTRUSTED_INPUT],
+        Rule::Deny("never".into()),
+    );
+    let harness = AgentHarness::new(model)
+        .tool(find_hotels)
+        .flow_rules(rules)
+        .peer(Peer::new("flights", "Finds flights."))
+        .peer(Peer::new("hotels", "Finds hotels."))
+        .peer(Peer::agent("researcher", "Plans trips.", &research()).peers(["flights", "hotels"]))
+        .agent(
+            AgentProfile::new("triage").mandate(Mandate::new("triage").peers([
+                "researcher",
+                "flights",
+                "hotels",
+            ])),
+        )
+        .agent(
+            AgentProfile::new("research")
+                .mandate(Mandate::new("researcher").peers(["flights", "hotels"]))
+                .parallel_children(2),
+        );
+    let mut rt = runtime(&db, harness);
+    start(&mut rt, &research()).await;
+    sqlite::send(&mut rt, &triage(), &AgentOp::message("plan it"), None).unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+
+    let receiver = state(&rt, &research()).await;
+    assert_eq!(
+        receiver.failures, 1,
+        "the failed child fails the peer segment"
+    );
+    // The researcher turn spent 2 tokens. Each turn of the hotels child spent 2.
+    assert_eq!(
+        receiver.tokens_used,
+        2 + 2 + 2,
+        "the reply counts the tokens of the sibling"
+    );
+    assert!(
+        receiver.flow_labels.contains("hotel"),
+        "{:?}",
+        receiver.flow_labels
+    );
+    let sender = state(&rt, &triage()).await;
+    assert!(
+        sender.flow_labels.contains("hotel"),
+        "the reply carries the taint of the sibling: {:?}",
+        sender.flow_labels
+    );
 }
 
 /// Drive `agent` at the drive clock `at`, through each checkpoint.
