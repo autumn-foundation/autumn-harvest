@@ -1120,6 +1120,11 @@ async fn a_fan_out_child_of_a_read_only_sender_cannot_write_through_a_durable_pe
     sqlite::drive(&mut rt, &research()).await.unwrap();
     sqlite::drive(&mut rt, &triage()).await.unwrap();
 
+    let ran_hotels = model
+        .requests()
+        .iter()
+        .any(|request| first_user(request) == "find hotels");
+    assert!(ran_hotels, "both children ran");
     assert_read_only(&rt, &model, &recorder);
 }
 
@@ -1226,4 +1231,11 @@ async fn a_read_only_receiver_keeps_the_next_durable_hop_read_only() {
     assert_eq!(received.len(), 1, "one delivery");
     assert!(received[0].mandate.read_only, "the second hop is read-only");
     assert!(recorder.runs().is_empty(), "the write tool never runs");
+    let refused = model.requests().iter().any(|request| {
+        first_user(request).starts_with("[A message from the agent \"researcher\"]")
+            && tool_results(request)
+                .iter()
+                .any(|result| result.contains("only read"))
+    });
+    assert!(refused, "the critic reads the refusal");
 }
