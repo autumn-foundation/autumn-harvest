@@ -524,6 +524,27 @@ async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
     );
 }
 
+/// A blank reason must not suppress, on either comment form (issue #2314).
+#[test]
+fn suppression_rejects_a_whitespace_only_reason() {
+    for blank in [" ", "   ", "\t"] {
+        let same_line = wf(&format!(
+            "let _id = uuid::Uuid::new_v4(); // harvest-suppress: DET003 \"{blank}\""
+        ));
+        let prev_line = wf(&format!(
+            "// harvest-suppress: DET003 \"{blank}\"\n    let _id = uuid::Uuid::new_v4();"
+        ));
+        for src in [same_line, prev_line] {
+            let report = check_source(&src, "test.rs");
+            assert!(
+                report.has_hard_blockers(),
+                "{blank:?} suppressed: {report:?}"
+            );
+            assert!(report.suppressions.is_empty(), "{blank:?}: {report:?}");
+        }
+    }
+}
+
 #[test]
 fn suppression_is_reported_in_output() {
     let src = r#"
