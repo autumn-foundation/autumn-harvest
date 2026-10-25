@@ -527,6 +527,15 @@ jobs:
           python3 docs/audits/tracked-artifacts.py --self-test
           python3 docs/audits/tracked-artifacts.py
 
+      # Issue #2341: the authz.rs/tenant.rs tenant-header-validation clone
+      # class is linked, not merged (2 instances, below the rule-of-three
+      # merge bar). This substitutes for the abstraction the numerosity gate
+      # did not clear: a fix landing in one copy and not the other fails here.
+      - name: Tenant-header-validation sync (docs/audits/tenant-header-validation-sync.py)
+        run: |
+          python3 docs/audits/tenant-header-validation-sync.py --self-test
+          python3 docs/audits/tenant-header-validation-sync.py
+
       # Issue #1831: a doc claim that shipped code made false fails the build.
       - name: Doc claim drift (docs/audits/doc-claim-drift.py)
         run: |
