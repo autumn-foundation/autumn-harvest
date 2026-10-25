@@ -24,11 +24,12 @@ use autumn_harvest_agent::mesh::DELEGATE_TOOL;
 use autumn_harvest_agent::workflow::agent_loop_info;
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentModel, AgentReport, AgentStop, AgentTask, BoxFuture,
-    ChatRequest, ChatResponse, ChatRole, ContentPart, FlowRules, FnTool, Mandate, ModelTurn,
-    ModelTurnRequest, Peer, Rule, StopReason, TokenUsage, ToolDecision, ToolEffect, sqlite,
+    ChatRequest, ChatResponse, ChatRole, ContentPart, ErrorKind, FlowRules, FnTool, Mandate,
+    ModelTurn, ModelTurnRequest, Peer, Rule, StopReason, TokenUsage, ToolDecision, ToolEffect,
+    sqlite,
 };
 use autumn_harvest_sqlite::SqliteRuntime;
-use common::{report, runtime};
+use common::{TryFnModel, report, runtime};
 use serde_json::{Value, json};
 
 fn fresh_db() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -165,7 +166,7 @@ fn trip_model() -> Arc<FnModel> {
     })
 }
 
-fn trip_harness(model: Arc<FnModel>) -> AgentHarness {
+fn trip_harness(model: Arc<dyn AgentModel>) -> AgentHarness {
     AgentHarness::new(model)
         .peer(Peer::new("flights", "Finds flights."))
         .peer(Peer::new("hotels", "Finds hotels."))
@@ -618,4 +619,128 @@ async fn a_child_starts_with_the_labels_of_its_parent() {
     for (agent, answer) in answers {
         assert!(answer.contains("denied"), "{agent} wrote: {answer}");
     }
+}
+
+/// The root delegates to three peers. The `flights` child fails for good.
+/// Each other child reads one labelled tool, then answers.
+fn one_failed_sibling_model() -> Arc<TryFnModel> {
+    TryFnModel::new(|request| {
+        let input = first_user(request);
+        if input == ROOT_INPUT {
+            return Ok(if results(request).is_empty() {
+                three_delegations(1)
+            } else {
+                text("trip planned", 1)
+            });
+        }
+        if input == "find flights" {
+            return Err(AgentError::new(
+                ErrorKind::Provider,
+                "the flights provider refused",
+            ));
+        }
+        Ok(if results(request).is_empty() {
+            let tool = input.replace(' ', "_");
+            tool_calls(&[("t1", &tool, json!({}))], 1)
+        } else {
+            text("read", 1)
+        })
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_fan_out_child_keeps_the_usage_and_labels_of_its_later_siblings() {
+    use autumn_harvest_agent::{AgentId, AgentOp, AgentProfile};
+
+    let (_dir, db) = fresh_db();
+    let tool = |name: &'static str, label: &'static str| {
+        FnTool::new(name, "Reads.", json!({"type": "object"}), |_| async {
+            Ok(json!("data"))
+        })
+        .effect(ToolEffect::ReadOnly)
+        .label(label)
+        .shared()
+    };
+    // A rule that never fires turns the labels on.
+    let rules = FlowRules::new().forbid(
+        ["hotel", "government", labels::UNTRUSTED_INPUT],
+        Rule::Deny("never".into()),
+    );
+    let harness = trip_harness(one_failed_sibling_model())
+        .tool(tool("find_hotels", "hotel"))
+        .tool(tool("check_visas", "government"))
+        .flow_rules(rules)
+        .agent(
+            AgentProfile::new("planner")
+                .mandate(Mandate::new("planner").peers(["flights", "hotels", "visas"]))
+                .parallel_children(3),
+        );
+    let mut rt = runtime(&db, harness);
+    let planner = AgentId::new("planner", "p1").unwrap();
+    sqlite::send(&mut rt, &planner, &AgentOp::message(ROOT_INPUT), None).unwrap();
+    sqlite::drive(&mut rt, &planner).await.unwrap();
+
+    let exec = sqlite::current_run(&rt, &planner).unwrap().unwrap();
+    assert_eq!(children_started(&rt, exec).len(), 3, "every sibling ran");
+    let state = sqlite::state(&rt, &planner).await.unwrap().unwrap();
+    assert_eq!(state.failures, 1, "the failed child fails the op");
+    // The root turn spent 1 token. The hotels and visas children spent 2 each.
+    assert_eq!(
+        state.tokens_used,
+        1 + 2 + 2,
+        "the paid sibling turns stay counted"
+    );
+    for label in ["hotel", "government"] {
+        assert!(
+            state.flow_labels.contains(label),
+            "a later sibling read {label}, so its taint stays: {:?}",
+            state.flow_labels
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_inline_child_keeps_its_paid_turns() {
+    use autumn_harvest_agent::{AgentId, AgentOp, AgentProfile};
+
+    let (_dir, db) = fresh_db();
+    // Without a bound, each child runs inline. The flights child pays for one
+    // turn and then fails for good, so no later child runs.
+    let model = TryFnModel::new(|request| {
+        if first_user(request) == ROOT_INPUT {
+            return Ok(three_delegations(3));
+        }
+        if results(request).is_empty() {
+            Ok(tool_calls(&[("n1", "note", json!({}))], 2))
+        } else {
+            Err(AgentError::new(ErrorKind::Provider, "the provider refused"))
+        }
+    });
+    let note = FnTool::new("note", "Notes.", json!({"type": "object"}), |_| async {
+        Ok(json!("noted"))
+    })
+    .effect(ToolEffect::ReadOnly)
+    .shared();
+    let harness = trip_harness(model).tool(note).agent(
+        AgentProfile::new("planner")
+            .mandate(Mandate::new("planner").peers(["flights", "hotels", "visas"])),
+    );
+    let mut rt = runtime(&db, harness);
+    let planner = AgentId::new("planner", "p1").unwrap();
+    sqlite::send(&mut rt, &planner, &AgentOp::message(ROOT_INPUT), None).unwrap();
+    sqlite::drive(&mut rt, &planner).await.unwrap();
+
+    let exec = sqlite::current_run(&rt, &planner).unwrap().unwrap();
+    assert!(
+        children_started(&rt, exec).is_empty(),
+        "the child ran inline"
+    );
+    let state = sqlite::state(&rt, &planner).await.unwrap().unwrap();
+    assert_eq!(state.failures, 1);
+    // The root turn spent 3 tokens. The first turn of the flights child spent 2.
+    assert_eq!(
+        state.tokens_used,
+        3 + 2,
+        "the paid child turn stays counted"
+    );
 }
