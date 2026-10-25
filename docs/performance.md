@@ -2595,5 +2595,6 @@ standalone note rather than part of the claim-path attribution table above:
   to 1.27x at one claim loop. The fused fence result is on the page.
 * [`docs/performance-payload-depth.md`](performance-payload-depth.md)
   — the depth walk that the worker runs on every activity result (issue
-  #2312). The walk is 10.6% of a harness that only clones and checks. A real
-  completion is expected to make it far smaller. A negative result.
+  #2312). The walk is 10.6% of a harness that only clones and checks. The one
+  idea saves at most 18.5% of the walk, so it stays unbuilt. The production
+  impact is undetermined. A negative result.

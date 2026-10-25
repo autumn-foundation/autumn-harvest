@@ -4,9 +4,10 @@ This page records a profile of the depth walk that the worker runs on every
 successful activity result (issue #2312). The walk is `nests_past_cap`, called
 through `refuse_deep_result`.
 
-**Outcome: no code change.** The walk is 10.57% of a harness that does nothing
-else. In a real completion, serialization, the event append and a database
-round trip surround it. Its share there is expected to be far below the 5% impact floor. No profile of a real completion exists.
+**Outcome: not pursued. The production impact is undetermined.** No profile of
+a real completion exists. The one idea that the profile suggests can save at
+most 18.5% of the walk's own cost. The walk is 10.6% of this harness. The note
+below gives the bound and the point at which it matters.
 
 ## 🎯 Workload
 
@@ -48,16 +49,32 @@ by doubling.
 ## 💡 Hypothesis
 
 Reserve the walk stack up front. A nested value then costs 1 allocation, not 2.
-The saving is at most one allocation per call on this mix. Even a free walk would remove
-10.6% of this harness, and much less of a real completion.
 
-The walk already makes one pass and does not recurse. The cap bounds its
-memory. The walk has no other cost large enough to win back.
+`grow_one` is the only growth call inside the walk. It runs 6,003 times, once
+for each of the 3 nested values in each pass. Its inclusive cost is 26,191,833
+Ir. The direct `alloc` and `dealloc` calls cost 1.8M Ir. The rest is allocator
+work that the harness clone also causes, so the 26.2M Ir figure is an upper
+bound.
+
+| Bound | Value |
+|---|---|
+| Saving, as a share of the walk | at most 18.5% |
+| Saving, as a share of this harness | at most 2.0% |
+| Saving per call, on average | at most 1,870 Ir |
+
+The harness share is not the measure, because the clone and drop inflate the
+denominator. The per-call figure does not depend on the harness. A saving of 5%
+of a completion needs a completion that runs 37,000 Ir or fewer, on average.
+Serialization, the event append and the database round trip are expected to
+exceed that. This is not measured.
+
+The walk already makes one pass and does not recurse. The walk has no other cost
+large enough to win back.
 
 ## 📊 Decision
 
-Expected below the floor, so the walk stays as it is. Do not profile it again unless the
-walk changes or a measurement shows it beside the real completion path.
+The idea stays unbuilt, because its upper bound is small. Reopen it if a profile
+of a real completion shows the walk above 27% of that completion.
 
 The walk must not recurse, because a refused value can be very deep (issue
 #2225). Any future change must keep that property.
