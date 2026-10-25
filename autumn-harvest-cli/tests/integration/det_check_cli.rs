@@ -185,6 +185,34 @@ async fn sup_wf(ctx: &WorkflowContext) -> Result<(), String> {
     );
 }
 
+/// A blank-reason comment is not audited and the gate stays shut (issue #2314).
+#[test]
+fn blank_reason_suppression_is_not_listed_and_still_gates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("blank.rs"),
+        "\
+#[workflow]
+async fn blank_wf(ctx: &WorkflowContext) -> Result<(), String> {
+    let _id = Uuid::new_v4(); // harvest-suppress: DET003 \"   \"
+    Ok(())
+}
+",
+    )
+    .unwrap();
+
+    let paths = vec![dir.path().to_path_buf()];
+    let report = det_check_report_for_paths(&paths).expect("report should build");
+    assert!(report.suppressions.is_empty(), "{report:?}");
+    assert!(det_check_gate(&report, false).is_some());
+    assert!(!format_det_suppressions_list(&report).contains("DET003"));
+
+    match run_det_check(&paths, DetCheckFormat::Text, false, false) {
+        Err(err) => assert_eq!(err.exit_code(), 1),
+        Ok(()) => panic!("a blank reason must not suppress DET003"),
+    }
+}
+
 #[test]
 fn hard_blocker_run_returns_findings_error() {
     let dir = transitive_tree();

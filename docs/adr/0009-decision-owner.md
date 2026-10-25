@@ -531,18 +531,28 @@ with the shared head scan. Stage 1b moves workflow tasks off the claim loop.
 
 - Each worker runs one owner decider per owned database, beside its claim
   loops. Where it runs, the claim loops claim activities only.
-- A worker with queue weights or fairness keys runs no decider. It keeps
-  the owned claim of issue #2252, so its workflow tasks follow the weighted
-  queue order and the fairness lags of issue #1976.
+- A worker with queue weights, fairness keys or `priority_aging_secs` runs
+  no decider. It keeps the owned claim of issue #2252. Its workflow tasks
+  then follow the weighted queue order, the fairness lags of issue #1976 and
+  the ageing boost. Ageing reorders every pending row. No bounded scan can
+  sort it (issue #2308).
 - A decider runs only on a database with an owner wake listener. With no
   wake, it finds each row by a scan, and a scan with a take costs more than
   one head claim. The claim loops then keep the owned claim.
-- Open gap: owner takes follow wake order and due time. They do not apply
-  the claim order: priority, ageing and the new-start handicap. Issue #2308
-  tracks it.
+- The decider takes workflow tasks in claim order (issue #2308). Priority
+  comes first. The due time follows, with the 30 s new-start handicap of
+  issue #1824. The decider keeps the ready set sorted by that key. A freed permit goes to the best
+  ready execution, not to the oldest wake.
 - The decider learns of work from two sources. An owner wake names an
-  execution. A scan reads the pending workflow rows of its partitions by due
-  time, with `idx_harvest_tq_owner_scan`.
+  execution. A scan reads the pending workflow rows of its partitions in
+  claim order, with `idx_harvest_tq_owner_order`.
+- A wake carries no key. When the free permits cannot cover every hint, one
+  statement reads the keys of the hinted rows. With enough free permits, the
+  decider takes the hints at once and skips that statement, because order
+  cannot matter. A failed lookup queues the hints unranked. The scan then
+  corrects them.
+- A full ready set drops its worst entry for a better one. It never drops a
+  better entry for a worse one.
 - The scan runs at each tenure change, when a permit frees after a full
   scan, and at the next due time. With no live wake listener, the gap is
   at most one poll interval. While a listener receives the owner wakes,
@@ -558,9 +568,13 @@ with the shared head scan. Stage 1b moves workflow tasks off the claim loop.
 - A take that finds nothing backs its execution off. The backoff starts at
   one poll interval and doubles with each miss, up to 30 s. A wake ends it.
   So a refused row cannot hold the head of each scan.
-- A scan reads `idx_harvest_tq_owner_scan`, which leads with the partition.
-  It reads a few rows of each owned partition, never the rows of another
-  owner. Takes and scans run beside the loop, so a scan never stalls a take.
+- A scan reads two heads of each owned partition, new starts and
+  continuations, in `idx_harvest_tq_owner_order`. It reads at most the scan
+  limit from each head, never the rows of another owner and never a whole
+  backlog. The merge of the heads is exact for its first rows, as the claim's
+  seek window is. `idx_harvest_tq_owner_scan` gives the next due time with
+  one probe per partition. Takes and scans run beside the loop, so a scan
+  never stalls a take.
 - The decider keeps execution ids only. A hint never acknowledges anything.
   A signal is a `harvest_signals` row before its acknowledgement
   (restate#4566).

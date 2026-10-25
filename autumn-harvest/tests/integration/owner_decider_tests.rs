@@ -75,6 +75,23 @@ async fn decider_signal_flow(ctx: &WorkflowContext, input: String) -> Result<Val
     ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
 }
 
+/// Completes in its first decision.
+#[workflow]
+async fn decider_instant(_ctx: &WorkflowContext, input: String) -> Result<String, String> {
+    tokio::task::yield_now().await;
+    Ok(input)
+}
+
+/// Opens the slow run. The test notifies it once the backlog is queued.
+static SLOW_GATE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Holds its workflow permit until the test opens [`SLOW_GATE`].
+#[workflow]
+async fn decider_slow(_ctx: &WorkflowContext, input: String) -> Result<String, String> {
+    SLOW_GATE.notified().await;
+    Ok(input)
+}
+
 /// Counts the claims and the owner takes of one worker by kind.
 #[derive(Default, Clone)]
 struct Claims(Arc<Mutex<BTreeMap<(&'static str, &'static str), u64>>>);
@@ -157,12 +174,25 @@ impl Node {
 
     /// A node that listens for wakes on `url` only when `listen` holds.
     fn with_listener(url: &str, config: WorkerConfig, claim_loops: usize, listen: bool) -> Self {
+        Self::with_slots(url, config, claim_loops, listen, 8)
+    }
+
+    /// A node with `workflow_slots` workflow permits.
+    fn with_slots(
+        url: &str,
+        config: WorkerConfig,
+        claim_loops: usize,
+        listen: bool,
+        workflow_slots: usize,
+    ) -> Self {
         let claims = Claims::default();
         let built = HarvestBuilder::new()
             .workflows(workflows![
                 decider_three_steps,
                 decider_signal_flow,
-                decider_timer_flow
+                decider_timer_flow,
+                decider_instant,
+                decider_slow
             ])
             .activities(activities![decider_step_a, decider_step_b, decider_step_c])
             .worker(config)
@@ -176,7 +206,7 @@ impl Node {
         let mut runtime: WorkerRuntimeConfig = worker_config.into();
         runtime.worker_id = unique("decider-worker");
         runtime.poll_interval = Duration::from_millis(100);
-        runtime.max_concurrent_workflows = 8;
+        runtime.max_concurrent_workflows = workflow_slots;
         runtime.max_concurrent_activities = 16;
         runtime.max_concurrent_claims = claim_loops;
         runtime.worker_heartbeat_interval = Duration::from_secs(1);
@@ -503,6 +533,19 @@ async fn seed_task(
     partition: Option<u16>,
     due_in_secs: i64,
 ) -> uuid::Uuid {
+    seed_ranked(conn, queue, state, partition, due_in_secs, 0, false).await
+}
+
+/// Seed one execution and its workflow task with a priority and a start kind.
+async fn seed_ranked(
+    conn: &mut AsyncPgConnection,
+    queue: &str,
+    state: &str,
+    partition: Option<u16>,
+    due_in_secs: i64,
+    priority: i32,
+    new_start: bool,
+) -> uuid::Uuid {
     let exec = uuid::Uuid::new_v4();
     diesel::sql_query(
         "INSERT INTO harvest_workflow_executions \
@@ -524,6 +567,8 @@ async fn seed_task(
     params.workflow_exec_id = Some(exec);
     params.decision_partition = partition.map(|p| DecisionPartition::new(p).expect("in range"));
     params.scheduled_at = chrono::Utc::now() + chrono::Duration::seconds(due_in_secs);
+    params.priority = priority;
+    params.new_start = new_start;
     autumn_harvest::queue::enqueue(conn, &params)
         .await
         .expect("enqueue");
@@ -551,7 +596,7 @@ async fn the_owner_scan_reads_owned_and_unstamped_due_rows_only() {
     let scan = autumn_harvest::queue::owner_scan(&mut conn, &queues, &owned, &[], 8)
         .await
         .expect("scan");
-    let mut due = scan.due.clone();
+    let mut due = execs(&scan);
     due.sort_unstable();
     let mut want = vec![mine, unstamped];
     want.sort_unstable();
@@ -566,12 +611,114 @@ async fn the_owner_scan_reads_owned_and_unstamped_due_rows_only() {
     let skipped = autumn_harvest::queue::owner_scan(&mut conn, &queues, &owned, &[mine], 8)
         .await
         .expect("scan");
-    assert_eq!(skipped.due, vec![unstamped], "the skip list holds");
+    assert_eq!(execs(&skipped), vec![unstamped], "the skip list holds");
     let one = autumn_harvest::queue::owner_scan(&mut conn, &queues, &owned, &[], 1)
         .await
         .expect("scan");
     assert_eq!(one.due.len(), 1, "the limit holds");
     db.drop_db().await;
+}
+
+/// The executions of a scan, in scan order.
+fn execs(scan: &autumn_harvest::queue::OwnerScan) -> Vec<uuid::Uuid> {
+    scan.due.iter().map(|row| row.exec_id).collect()
+}
+
+/// An owner of partition 3 for the scan tests.
+fn owner_of_three() -> autumn_harvest::queue::OwnedClaim {
+    autumn_harvest::queue::OwnedClaim {
+        holder: "decider-order".to_string(),
+        partitions: vec![3],
+    }
+}
+
+/// The scan sorts by priority before age (issue #2308). With a backlog past
+/// the limit, a newer high-priority row still comes first.
+#[tokio::test]
+async fn the_owner_scan_returns_a_high_priority_row_before_an_older_backlog() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let queue = unique("decider-prio");
+    for age in (60..70).rev() {
+        seed_ranked(&mut conn, &queue, "RUNNING", Some(3), -age, 0, false).await;
+    }
+    let high = seed_ranked(&mut conn, &queue, "RUNNING", Some(3), -1, 5, false).await;
+    let queues = [queue.clone()];
+    let scan = autumn_harvest::queue::owner_scan(&mut conn, &queues, &owner_of_three(), &[], 2)
+        .await
+        .expect("scan");
+    assert_eq!(scan.due.len(), 2);
+    assert_eq!(scan.due[0].exec_id, high, "high priority first");
+    assert_eq!(scan.due[0].priority, 5);
+    db.drop_db().await;
+}
+
+/// At equal priority, a continuation goes before a new start (rule 1 of
+/// issue #1824), until the new start is 30 s older.
+#[tokio::test]
+async fn the_owner_scan_returns_a_continuation_before_a_new_start() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let queue = unique("decider-start");
+    let start = seed_ranked(&mut conn, &queue, "RUNNING", Some(3), -20, 0, true).await;
+    let follow_up = seed_ranked(&mut conn, &queue, "RUNNING", Some(3), -5, 0, false).await;
+    let old_start = seed_ranked(&mut conn, &queue, "RUNNING", Some(3), -90, 0, true).await;
+    let queues = [queue.clone()];
+    let scan = autumn_harvest::queue::owner_scan(&mut conn, &queues, &owner_of_three(), &[], 8)
+        .await
+        .expect("scan");
+    assert_eq!(
+        execs(&scan),
+        vec![old_start, follow_up, start],
+        "the 90 s start is FIFO again; the 20 s start yields to the continuation"
+    );
+    let limited = autumn_harvest::queue::owner_scan(&mut conn, &queues, &owner_of_three(), &[], 2)
+        .await
+        .expect("scan");
+    assert_eq!(
+        execs(&limited),
+        vec![old_start, follow_up],
+        "the limit keeps order"
+    );
+    db.drop_db().await;
+}
+
+/// A hint names an execution only. The key lookup gives its rank, and skips
+/// a row that is not due, not `PENDING` or not a workflow task.
+#[tokio::test]
+async fn the_key_lookup_ranks_hinted_executions() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let queue = unique("decider-keys");
+    let low = seed_ranked(&mut conn, &queue, "RUNNING", Some(3), -9, 0, false).await;
+    let high = seed_ranked(&mut conn, &queue, "RUNNING", Some(3), -1, 5, true).await;
+    let later = seed_ranked(&mut conn, &queue, "RUNNING", Some(3), 60, 5, false).await;
+    let unknown = uuid::Uuid::new_v4();
+    let rows = autumn_harvest::queue::owner_keys(&mut conn, &[low, high, later, unknown])
+        .await
+        .expect("keys");
+    let mut got: Vec<_> = rows.iter().map(|r| (r.exec_id, r.priority)).collect();
+    got.sort_unstable();
+    let mut want = vec![(low, 0), (high, 5)];
+    want.sort_unstable();
+    assert_eq!(got, want, "due workflow rows only");
+    let handicap = rows.iter().find(|r| r.exec_id == high).expect("high");
+    let plain = rows.iter().find(|r| r.exec_id == low).expect("low");
+    assert!(handicap.due_at > chrono::Utc::now() + chrono::Duration::seconds(20));
+    assert!(plain.due_at < chrono::Utc::now());
+    db.drop_db().await;
+}
+
+/// A worker with priority ageing keeps the owned claim (issue #2308). Ageing
+/// reorders every pending row, so only the claim sorts it at a bounded cost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_with_priority_ageing_keeps_the_owned_claim() {
+    assert_keeps_the_owned_claim(
+        "decider-ageing",
+        |config, _| config.with_priority_aging_secs(30),
+        true,
+    )
+    .await;
 }
 
 /// A worker with queue weights keeps the owned claim of issue #2252. Its
@@ -721,4 +868,121 @@ async fn an_owner_takes_workflow_tasks_off_the_claim_path() {
         "four owner takes per run"
     );
     db.drop_db().await;
+}
+
+/// With one workflow permit the owner is saturated. It must take a newer
+/// high-priority run before an older low-priority backlog (issue #2308). The
+/// wakes of the backlog are hints. The ready set ranks them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saturated_owner_takes_a_high_priority_run_first() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    enable(&mut conn).await;
+    let pool: DbPool = build_test_pool(&db.url);
+    let queue = unique("decider-saturated");
+    let client = WorkflowHandleClient::single(pool.clone(), db.url.clone());
+    let mut node = Node::with_slots(
+        &db.url,
+        WorkerConfig::default().with_queues([queue.as_str()]),
+        1,
+        true,
+        1,
+    );
+    node.run(&pool);
+    eventually("the owner owns every partition", async || {
+        live_partitions(&mut conn).await == 512
+    })
+    .await;
+    // A slow run holds the one permit. The backlog and the high-priority run
+    // arrive behind it, as wakes. The next take frees the best of them.
+    let slow = DeciderSlowStub::start_with_options(
+        &mut conn,
+        &client,
+        &unique("decider-slow-wf"),
+        String::new(),
+        TypedStartOptions {
+            queue_name: Some(queue.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("start")
+    .exec_id();
+    eventually("the slow run holds the permit", async || {
+        running_workflow_tasks(&mut conn, &queue).await == 1
+    })
+    .await;
+    let mut normal = Vec::new();
+    for _ in 0..8 {
+        normal.push(start_instant(&mut conn, &client, &queue, None).await);
+    }
+    let high = start_instant(&mut conn, &client, &queue, Some(Priority::High)).await;
+    // Free the permit at once, while the key lookups of the hints may still
+    // run. A ready row of lower rank must not take the permit first.
+    SLOW_GATE.notify_one();
+    wait_for_execution_state_with_timeout(&db.url, slow, "COMPLETED", WAIT).await;
+    for exec in normal.iter().copied().chain([high]) {
+        wait_for_execution_state_with_timeout(&db.url, exec, "COMPLETED", WAIT).await;
+    }
+    node.stop().await;
+    let first = first_started(&mut conn, &queue).await;
+    assert_eq!(first, high.as_uuid(), "the high-priority run decides first");
+    assert_eq!(node.claims.count(ClaimKind::Workflow), 0, "all by take");
+    db.drop_db().await;
+}
+
+/// Start one instant run on `queue`.
+async fn start_instant(
+    conn: &mut AsyncPgConnection,
+    client: &WorkflowHandleClient,
+    queue: &str,
+    priority: Option<Priority>,
+) -> ExecutionId {
+    DeciderInstantStub::start_with_options(
+        conn,
+        client,
+        &unique("decider-instant-wf"),
+        String::new(),
+        TypedStartOptions {
+            queue_name: Some(queue.to_string()),
+            priority,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("start")
+    .exec_id()
+}
+
+/// The workflow tasks of `queue` that run now.
+async fn running_workflow_tasks(conn: &mut AsyncPgConnection, queue: &str) -> i64 {
+    let row: Count = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_task_queue \
+         WHERE queue_name = $1 AND task_type = 'workflow' AND state = 'RUNNING'",
+    )
+    .bind::<Text, _>(queue)
+    .get_result(conn)
+    .await
+    .expect("count");
+    row.n
+}
+
+#[derive(QueryableByName)]
+struct Started {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    exec: uuid::Uuid,
+}
+
+/// The run whose workflow task started second on `queue`, after the slow run.
+async fn first_started(conn: &mut AsyncPgConnection, queue: &str) -> uuid::Uuid {
+    let row: Started = diesel::sql_query(
+        "SELECT workflow_exec_id AS exec FROM harvest_task_queue \
+         WHERE queue_name = $1 AND task_type = 'workflow' \
+         ORDER BY started_at OFFSET 1 LIMIT 1",
+    )
+    .bind::<Text, _>(queue)
+    .get_result(conn)
+    .await
+    .expect("first started");
+    row.exec
 }

@@ -1,0 +1,8 @@
+-- before: durable stream append, full lifetime replay in 10-chunk appends, cap 10000
+execs | vacuumed | appends | statements | all buffers | count calls | count buffers | WAL bytes | chunks inserted | stored chunks | table md5
+100 | true | 3937 | 31506 | 778629 | 3937 | 204136 | 15809001 | 38888 | 38890 | c3eb8de5ac9813d3d716a0b2240c31e8
+300 | true | 12641 | 101142 | 3237402 | 12641 | 1160493 | 46738798 | 124891 | 124897 | a765b5b71ee99c5dc60ddce5f411e78b
+1000 | true | 45438 | 363519 | 11700024 | 45438 | 4332498 | 168229686 | 449478 | 449498 | b8d995d2fe4e94de67b362af945eb64b
+100 | false | 3937 | 31496 | 1909869 | 3937 | 678937 | 14503271 | 38888 | 38890 | c3eb8de5ac9813d3d716a0b2240c31e8
+300 | false | 12641 | 101128 | 10766957 | 12641 | 4375815 | 46623064 | 124891 | 124897 | a765b5b71ee99c5dc60ddce5f411e78b
+1000 | false | 45438 | 363504 | 40848609 | 45438 | 16853503 | 167894398 | 449478 | 449498 | b8d995d2fe4e94de67b362af945eb64b

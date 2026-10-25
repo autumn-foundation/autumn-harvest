@@ -158,6 +158,8 @@ pub struct WorkerConfigView {
     pub owner_disk_cache: bool,
     /// The fewest events that a run needs before the disk cache keeps it.
     pub owner_disk_cache_min_events: usize,
+    /// Whether the disk cache keeps an entity projection (issue #2260).
+    pub owner_entity_sql: bool,
     /// Whether sticky cross-worker routing is enabled (`sticky_timeout > 0`).
     pub sticky_routing_enabled: bool,
     /// Sticky routing lease TTL, milliseconds (0 = disabled).
@@ -425,6 +427,7 @@ impl WorkerConfigView {
             // Presence only. The path is a local detail of the node.
             owner_disk_cache,
             owner_disk_cache_min_events,
+            owner_entity_sql,
             sticky_timeout,
             cancellation_grace_period,
             shard_assignments,
@@ -480,6 +483,7 @@ impl WorkerConfigView {
             resident_workflows: *resident_workflows && !sticky_timeout.is_zero(),
             owner_disk_cache: owner_disk_cache.is_some(),
             owner_disk_cache_min_events: *owner_disk_cache_min_events,
+            owner_entity_sql: *owner_entity_sql,
             sticky_routing_enabled: !sticky_timeout.is_zero(),
             sticky_timeout_ms: dur_ms(*sticky_timeout),
             cancellation_grace_period_ms: dur_ms(*cancellation_grace_period),

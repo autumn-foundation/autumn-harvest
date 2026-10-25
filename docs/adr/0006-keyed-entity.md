@@ -50,6 +50,7 @@ amendment.
 | Read state | The queries `harvest.entity.state` and `harvest.entity.stats` |
 | Durable state | The workflow input, rebuilt by replay |
 | State events and projection | `SideEffectKind::EntityState` and `harvest_entity_state` (issue #2259) |
+| SQL over one entity | `Worker::query_entity_sql`, an owner-local projection (issue #2260, ADR 0012) |
 
 ### 2. How state is stored and replayed
 

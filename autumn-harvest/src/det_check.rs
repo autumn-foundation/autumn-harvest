@@ -2914,7 +2914,8 @@ fn find_suppression(rule_id: &str, line: &str, prev_line: &str) -> Option<String
 /// Parses `// harvest-suppress: RULE_ID "reason string"` from a line.
 /// The marker may appear anywhere in the line (supports both standalone comment
 /// lines and trailing inline comments such as `let x = foo(); // harvest-suppress: …`).
-/// Returns the reason string if valid and non-empty, `None` otherwise.
+/// Returns the reason string if it has a non-blank character, `None` otherwise.
+/// A whitespace-only reason is blank (issue #2314).
 fn parse_suppression_comment(rule_id: &str, line: &str) -> Option<String> {
     let comment_start = line_comment_start(line)?;
     let rest = line[comment_start + 2..].trim_start();
@@ -2924,7 +2925,7 @@ fn parse_suppression_comment(rule_id: &str, line: &str) -> Option<String> {
     let inner = rest.strip_prefix('"')?;
     let end = inner.find('"')?;
     let reason = &inner[..end];
-    if reason.is_empty() {
+    if reason.trim().is_empty() {
         None
     } else {
         Some(reason.to_string())
@@ -3111,6 +3112,28 @@ mod tests {
         assert_eq!(
             parse_suppression_comment("DET002", "// harvest-suppress: DET001 \"reason\""),
             None
+        );
+    }
+
+    /// A blank reason is no reason (issue #2314).
+    #[test]
+    fn parse_suppression_comment_rejects_a_whitespace_only_reason() {
+        for blank in [" ", "   ", "\t", " \t ", "\u{a0}", "\u{3000}"] {
+            let line = format!("let id = x(); // harvest-suppress: DET003 \"{blank}\"");
+            assert_eq!(
+                parse_suppression_comment("DET003", &line),
+                None,
+                "{blank:?}"
+            );
+        }
+    }
+
+    /// The stored reason keeps its inner text; only the blank check trims.
+    #[test]
+    fn parse_suppression_comment_keeps_a_padded_reason() {
+        assert_eq!(
+            parse_suppression_comment("DET001", "// harvest-suppress: DET001 \" ok \""),
+            Some(" ok ".to_string())
         );
     }
 
