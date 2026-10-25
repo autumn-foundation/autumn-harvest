@@ -35421,6 +35421,9 @@ type ReadyKey = (std::cmp::Reverse<i32>, chrono::DateTime<chrono::Utc>);
 ///
 /// It holds execution ids and their claim keys only. The task rows hold the
 /// work.
+// struct_excessive_bools: each flag is an independent condition of the loop.
+// An enum of their product would have more states than the loop can reach.
+#[allow(clippy::struct_excessive_bools)]
 struct DeciderState {
     poll: Duration,
     /// Owner mode is on, and the decider runs.
@@ -35434,6 +35437,10 @@ struct DeciderState {
     /// The executions of the key lookup in flight. A lookup runs while this
     /// set is not empty.
     keying_execs: HashSet<uuid::Uuid>,
+    /// A finished lookup grants one take pass. No new lookup starts and no
+    /// unkeyed hint blocks a take until [`Self::end_pass`]. So a steady
+    /// stream of hints cannot starve dispatch (issue #2308).
+    pass_granted: bool,
     /// The executions with a take in flight.
     in_flight: HashSet<uuid::Uuid>,
     /// The executions that a wake named while their take ran.
@@ -35460,6 +35467,7 @@ impl DeciderState {
             queued: HashMap::new(),
             unkeyed: HashSet::new(),
             keying_execs: HashSet::new(),
+            pass_granted: false,
             in_flight: HashSet::new(),
             rewake: HashSet::new(),
             backoff: HashMap::new(),
@@ -35484,6 +35492,7 @@ impl DeciderState {
         self.ready.clear();
         self.queued.clear();
         self.unkeyed.clear();
+        self.pass_granted = false;
         self.rewake.clear();
         self.backoff.clear();
     }
@@ -35537,7 +35546,7 @@ impl DeciderState {
 
     /// Start a key lookup for the unkeyed hints. Empty while one runs.
     fn begin_keying(&mut self) -> Vec<uuid::Uuid> {
-        if !self.keying_execs.is_empty() || self.unkeyed.is_empty() {
+        if self.pass_granted || !self.keying_execs.is_empty() || self.unkeyed.is_empty() {
             return Vec::new();
         }
         let execs: Vec<_> = self.unkeyed.drain().collect();
@@ -35553,6 +35562,7 @@ impl DeciderState {
         for exec in requested {
             self.keying_execs.remove(exec);
         }
+        self.pass_granted = true;
         if !self.active {
             return;
         }
@@ -35582,7 +35592,12 @@ impl DeciderState {
     /// Whether a hint waits for its key. A take must wait too. Else a ready
     /// row of lower rank would take the permit that the hint should have.
     fn ranking(&self) -> bool {
-        !self.unkeyed.is_empty() || !self.keying_execs.is_empty()
+        !self.keying_execs.is_empty() || (!self.unkeyed.is_empty() && !self.pass_granted)
+    }
+
+    /// The take pass of a finished lookup is over. The next lookup may start.
+    const fn end_pass(&mut self) {
+        self.pass_granted = false;
     }
 
     /// Queue `exec` with the key of a row that is due now at normal
@@ -41153,6 +41168,7 @@ impl Worker {
                         )
                     }));
                 }
+                state.end_pass();
                 if blocked {
                     // The slot tuner reads a refused kind as backlog (#548).
                     AtomicBool::store(&self.gate_refused.workflow, true, Ordering::Relaxed);
@@ -58038,6 +58054,32 @@ mod tests {
             state.permits_cover_all(1),
             "the lookup ended; one hint is left"
         );
+    }
+
+    /// Each finished lookup grants one take pass. Else a steady stream of
+    /// new hints would start lookup after lookup and starve dispatch (issue
+    /// #2308).
+    #[test]
+    fn decider_state_grants_a_take_pass_between_lookups() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        state.activate(now);
+        let ranked = row(5, 1, false);
+        let first = ranked.exec_id;
+        state.hint(first);
+        let requested = state.begin_keying();
+        state.keyed(&requested, Some(vec![ranked]));
+        let late = uuid::Uuid::new_v4();
+        state.hint(late);
+        assert!(
+            state.begin_keying().is_empty(),
+            "no new lookup before a pass"
+        );
+        assert!(!state.ranking(), "the ranked set may take");
+        assert_eq!(state.pop(now).map(|(e, _)| e), Some(first));
+        state.end_pass();
+        assert_eq!(state.begin_keying(), vec![late], "the next lookup follows");
+        assert!(state.ranking());
     }
 
     /// A miss doubles the backoff up to its cap (issue #2255).
