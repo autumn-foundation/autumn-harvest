@@ -3109,16 +3109,13 @@ async fn append_stream_chunks_in_tx(
     // fills: only offsets above the highest stored real offset are new. This
     // also drops a re-driven offset, which is already stored. Only new
     // offsets use the budget. The marker is not a real offset.
-    let stored: i64 = dsl::harvest_stream_chunks
-        .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
-        .count()
-        .get_result(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-    let highest: Option<i64> = dsl::harvest_stream_chunks
+    let (lowest, highest): (Option<i64>, Option<i64>) = dsl::harvest_stream_chunks
         .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
         .filter(dsl::stream_offset.lt(DURABLE_STREAM_TRUNCATION_OFFSET))
-        .select(diesel::dsl::max(dsl::stream_offset))
+        .select((
+            diesel::dsl::min(dsl::stream_offset),
+            diesel::dsl::max(dsl::stream_offset),
+        ))
         .get_result(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -3128,10 +3125,14 @@ async fn append_stream_chunks_in_tx(
         .collect();
     new_chunks.sort_by_key(|c| c.offset);
     new_chunks.dedup_by_key(|c| c.offset);
-    let remaining = i64::from(max_chunks).saturating_sub(stored).max(0);
-    let admit = usize::try_from(remaining)
-        .unwrap_or(usize::MAX)
-        .min(new_chunks.len());
+    let admit = admitted_count(
+        conn,
+        exec_id,
+        max_chunks,
+        (lowest, highest),
+        new_chunks.len(),
+    )
+    .await?;
 
     let mut inserted = 0usize;
     for batch in new_chunks[..admit].chunks(STREAM_CHUNK_INSERT_BATCH) {
@@ -3173,6 +3174,42 @@ async fn append_stream_chunks_in_tx(
     }
 
     Ok(inserted)
+}
+
+/// How many of `new` new chunks the cap admits for a run (issue #2083).
+///
+/// `bounds` holds the lowest and highest stored real offsets. The stored
+/// offsets are distinct and lie in that span. The marker is absent, since its
+/// presence returned earlier. So the stored row count cannot exceed the span.
+/// Suppose the span plus the new chunks fits the cap. Then the room is at least
+/// the new chunks, whatever the count is. So the count read would change
+/// nothing. That read touches every stored chunk of the run. A long stream
+/// therefore skips it until the span nears the cap.
+async fn admitted_count(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    max_chunks: u32,
+    bounds: (Option<i64>, Option<i64>),
+    new: usize,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_stream_chunks::dsl;
+
+    let span = match bounds {
+        (Some(low), Some(high)) => i128::from(high) - i128::from(low) + 1,
+        _ => 0,
+    };
+    let new_wide = i128::try_from(new).unwrap_or(i128::MAX);
+    if span.saturating_add(new_wide) <= i128::from(max_chunks) {
+        return Ok(new);
+    }
+    let stored: i64 = dsl::harvest_stream_chunks
+        .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    let remaining = i64::from(max_chunks).saturating_sub(stored).max(0);
+    Ok(usize::try_from(remaining).unwrap_or(usize::MAX).min(new))
 }
 
 /// Load up to `limit` durable stream chunks above `after`, in offset order.
@@ -3219,6 +3256,25 @@ pub async fn delete_stream_chunks(
     use crate::schema::harvest_stream_chunks::dsl;
 
     diesel::delete(dsl::harvest_stream_chunks.filter(dsl::workflow_exec_id.eq(exec_id.as_uuid())))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// Delete the agent cost ledger rows of `exec_id` (issue #2267).
+///
+/// The PII erasure path calls it. Returns the number of deleted rows.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the delete fails.
+pub async fn delete_llm_ledger(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_llm_ledger::dsl;
+
+    diesel::delete(dsl::harvest_llm_ledger.filter(dsl::workflow_exec_id.eq(exec_id.as_uuid())))
         .execute(conn)
         .await
         .map_err(crate::error::database_error)

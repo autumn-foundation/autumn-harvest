@@ -19,6 +19,7 @@ use crate::message::{
     ChatMessage, ChatRole, ContentPart, SessionId, StopReason, TokenUsage, ToolCall,
 };
 use crate::policy::ToolDecision;
+use crate::workspace::{WorkspaceMount, WorkspaceRef};
 use serde::{Deserialize, Serialize};
 
 /// The default bound on tool rounds.
@@ -26,6 +27,10 @@ pub const DEFAULT_MAX_STEPS: u32 = 8;
 
 /// The default time a gated call waits for a decision: one hour.
 pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 3_600;
+
+/// The bound on [`AgentTask::parallel_children`]. A larger value counts as
+/// this one.
+pub const MAX_PARALLEL_CHILDREN: u32 = 16;
 
 /// The input of one agent run: the workflow input.
 // The flags are independent switches on a recorded payload. A flat bool per
@@ -124,6 +129,46 @@ pub struct AgentTask {
     /// the history. See [`flow`](crate::flow).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub flow_labels: BTreeSet<String>,
+    /// Stream the text of each model turn (issue #2268): live chunks while
+    /// the model writes, and the durable text of each finished turn. See
+    /// [`live`](crate::live).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stream: bool,
+    /// The mesh of the run (issue #2272). Each model turn carries it, so a
+    /// mesh budget applies to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<String>,
+    /// The memory lives in the state of a durable agent (issue #2273). The
+    /// workflow runs the `memory` tool itself.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub memory_in_state: bool,
+    /// Record only the messages that each model turn adds (issue #2264).
+    /// [`AgentTask::new`] turns it on. A recorded task with no field sends
+    /// the whole transcript, so a run started before the change replays as
+    /// it ran. See [`transcript`](crate::transcript).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transcript_delta: bool,
+    /// The most delegations of one model turn that run at the same time
+    /// (issue #2270). Each runs as a child `agent_loop` run. Zero or one runs
+    /// them one after another, inline. The bound is
+    /// [`MAX_PARALLEL_CHILDREN`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub parallel_children: u32,
+    /// The name of the harness model that runs this task (issue #2271).
+    /// `None` is [`DEFAULT_MODEL`](crate::DEFAULT_MODEL). A delegated child
+    /// keeps it unless its peer names a model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The workspace of the run and its head (issue #2274). A tool that
+    /// opts in reads and writes its files. A delegated child has none. See
+    /// [`workspace`](crate::workspace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceMount>,
+    /// The workflow ids that wait on this run (issue #2269). A fan-out
+    /// child gets the chain of its parent, so a send back up the chain
+    /// fails as a deadlock.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting: Vec<String>,
 }
 
 /// Where the run id of a task comes from.
@@ -164,7 +209,57 @@ impl AgentTask {
             tenant: None,
             mandate: None,
             flow_labels: BTreeSet::new(),
+            stream: false,
+            mesh: None,
+            memory_in_state: false,
+            transcript_delta: true,
+            parallel_children: 0,
+            model: None,
+            workspace: None,
+            waiting: Vec::new(),
         }
+    }
+
+    /// Give the run the workspace `scope`, from its head `head` (issue
+    /// #2274).
+    #[must_use]
+    pub fn workspace(mut self, scope: impl Into<String>, head: Option<WorkspaceRef>) -> Self {
+        self.workspace = Some(WorkspaceMount {
+            scope: scope.into(),
+            head,
+            generation: 0,
+        });
+        self
+    }
+
+    /// Record only the messages that each model turn adds, or the whole
+    /// transcript. See [`transcript_delta`](Self::transcript_delta).
+    #[must_use]
+    pub const fn transcript_delta(mut self, on: bool) -> Self {
+        self.transcript_delta = on;
+        self
+    }
+
+    /// Stream the text of each model turn. See [`stream`](Self::stream).
+    #[must_use]
+    pub const fn stream(mut self) -> Self {
+        self.stream = true;
+        self
+    }
+
+    /// Run up to `n` delegations of one model turn at the same time. See
+    /// [`parallel_children`](Self::parallel_children).
+    #[must_use]
+    pub const fn parallel_children(mut self, n: u32) -> Self {
+        self.parallel_children = n;
+        self
+    }
+
+    /// Run the task on the harness model `name`. See [`model`](Self::model).
+    #[must_use]
+    pub fn model(mut self, name: impl Into<String>) -> Self {
+        self.model = Some(name.into());
+        self
     }
 
     /// Start with the flow labels that earlier runs exercised. See
@@ -231,11 +326,15 @@ impl AgentTask {
 
     /// The memory scope whose `memory` tool this task offers, if any.
     pub(crate) fn memory_tool_scope(&self) -> Option<MemoryScope> {
-        if (self.read_only || self.unattended) && !self.unattended_memory_writes {
-            None
-        } else {
-            self.memory_scope.clone()
-        }
+        self.memory_writable()
+            .then(|| self.memory_scope.clone())
+            .flatten()
+    }
+
+    /// Whether this run may write its memory. A read-only or unattended
+    /// segment writes only with `unattended_memory_writes`.
+    pub(crate) const fn memory_writable(&self) -> bool {
+        !(self.read_only || self.unattended) || self.unattended_memory_writes
     }
 
     /// Mark the run as one that no person watches.
@@ -331,6 +430,9 @@ impl AgentTask {
 }
 
 /// The input of one model-turn activity.
+// The flags are independent switches on a recorded payload, as in
+// `AgentTask`.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnRequest {
     /// The execution id. Tools and the policy see it as the run id.
@@ -375,6 +477,30 @@ pub struct ModelTurnRequest {
     /// turn. See [`Recheck::UntilApproved`](crate::Recheck::UntilApproved).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub flow_released: Released,
+    /// Record which tool calls opt in to an interrupt (issue #2265). Only a
+    /// durable agent sets it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interruptible: bool,
+    /// The mesh of the run (issue #2272). A mesh budget checks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<String>,
+    /// Publish the live text of this turn from the activity (issue #2268).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stream: bool,
+    /// The prefix of the window that `messages` follow (issue #2264). With
+    /// a prefix, `messages` holds only the messages after it. The activity
+    /// reads the prefix from the transcript store of the harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<crate::transcript::PrefixRef>,
+    /// Keep the window of this turn in the transcript store, so the next
+    /// turn can send a delta.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub remember: bool,
+    /// The name of the harness model for this turn (issue #2271). `None` is
+    /// [`DEFAULT_MODEL`](crate::DEFAULT_MODEL). The input records it, so
+    /// replay asks the same model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// The recorded result of one model-turn activity.
@@ -411,6 +537,10 @@ pub struct ModelTurn {
     /// [`AgentStop::ReplyTooLarge`].
     #[serde(default, skip_serializing_if = "is_false")]
     pub oversized: bool,
+    /// For each tool call, whether an interrupt may cancel it (issue #2265).
+    /// Empty unless the request set `interruptible`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interruptible: Vec<bool>,
 }
 
 impl ModelTurn {
@@ -429,6 +559,7 @@ impl ModelTurn {
             labels: Vec::new(),
             releases: Vec::new(),
             oversized: true,
+            interruptible: Vec::new(),
         }
     }
 
@@ -494,11 +625,23 @@ pub struct ToolCallRequest {
     /// when the decision had no flow rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<BTreeSet<String>>,
+    /// The flow labels of the run tree, for a `memory` call. A note keeps
+    /// them (issue #2272).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
+    /// The workspace of the run, for a tool that opts in (issue #2274).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceMount>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
 pub(crate) const fn is_false(value: &bool) -> bool {
     !*value
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) const fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// The recorded result of one tool call.
@@ -508,6 +651,10 @@ pub struct ToolOutcome {
     pub content: String,
     /// `true` when the call failed, or was denied, rejected, or not decided.
     pub is_error: bool,
+    /// The new head of the workspace, when the call changed it (issue
+    /// #2274). History records it, so it becomes the head of the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceRef>,
 }
 
 impl ToolOutcome {
@@ -517,6 +664,7 @@ impl ToolOutcome {
         Self {
             content: content.into(),
             is_error: false,
+            workspace: None,
         }
     }
 
@@ -526,6 +674,7 @@ impl ToolOutcome {
         Self {
             content: serde_json::json!({ "error": message }).to_string(),
             is_error: true,
+            workspace: None,
         }
     }
 }
@@ -556,6 +705,8 @@ pub enum AgentStop {
     BudgetExceeded,
     /// The model repeated the same tool call with the same result too often.
     LoopDetected,
+    /// A person interrupted a durable agent mid-op (issue #2265).
+    Interrupted,
 }
 
 /// The workflow output: how the run ended and what it produced.
@@ -592,6 +743,13 @@ pub struct AgentReport {
     /// task. Pass them to the next run of this conversation.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub flow_labels: BTreeSet<String>,
+    /// The run id of the run, as tools and the policy saw it. A parent reads
+    /// it from the report of a child run (issue #2270).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// The head of the workspace when the run ended (issue #2274).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceRef>,
 }
 
 /// The transcript without system messages.
@@ -679,6 +837,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&decoded).unwrap(), turn);
         let dropped = ModelTurn {
             oversized: true,
+            interruptible: Vec::new(),
             ..decoded
         };
         let value = serde_json::to_value(&dropped).unwrap();
@@ -728,6 +887,7 @@ mod tests {
             labels: Vec::new(),
             releases: Vec::new(),
             oversized: false,
+            interruptible: Vec::new(),
         };
         assert_eq!(turn.text(), "ab");
         let calls = turn.calls();

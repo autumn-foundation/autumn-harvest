@@ -193,6 +193,8 @@ rt.register_activity(&reserve_inventory_info());
   `max_concurrent`, …). This keeps a declared setting from taking
   silently-wrong effect. A `local = true` activity runs inline as a local
   activity (issue #2029). Like Postgres, it cannot declare `schedule_to_close`.
+  A call to `ctx.record_llm_call` writes a cost ledger row when the attempt
+  completes (issue #2275).
 - **`register_activity_with_body(&ActivityInfo, body)`** runs the same audit,
   but runs a synchronous `Fn(Value) -> Result<Value, String>` closure in place of
   the `#[activity]` body. The closure gets no `ActivityContext`. Use it to stub an
@@ -202,6 +204,24 @@ rt.register_activity(&reserve_inventory_info());
 rt.register_activity_with_body(&reserve_inventory_info(), |input| {
     let order: Order = serde_json::from_value(input).map_err(|e| e.to_string())?;
     Ok(serde_json::json!(format!("stub: {}", order.id)))
+});
+```
+
+- **`register_activity_with_ledger(&ActivityInfo, body)`** is the same, but the
+  closure returns `Ok((output, calls))` (issue #2275). `calls` is a
+  `Vec<LlmCall>`. The runtime writes one
+  [cost ledger](llm-cost-ledger.md#on-the-sqlite-backend-issue-2275) row per
+  call, in the transaction that appends the completion. A failed or timed-out
+  attempt writes no row. `SqliteRuntime::llm_ledger(exec)` reads the rows:
+
+```rust,ignore
+use autumn_harvest_sqlite::LlmCall;
+
+rt.register_activity_with_ledger(&summarise_info(), |input| {
+    let reply = call_my_model(&input)?;
+    let call = LlmCall::new("claude-sonnet-5-5", reply.input_tokens, reply.output_tokens)
+        .with_latency(reply.latency);
+    Ok((serde_json::json!(reply.text), vec![call]))
 });
 ```
 
@@ -355,6 +375,11 @@ list or a generic `SQLite` error.
 Timers use the real wall clock (read once per decision cycle), so a run blocked
 on a `ctx.timer(...)` that is not yet due returns `WaitingTimer`; drive it again
 after the deadline passes and it proceeds.
+
+A live `ctx.system_now()` returns the clock of its decision cycle, as the
+timers do (issue #2276). A `run_until_blocked_as_of` drive therefore keeps one
+clock: the timers, the activities, the ledger rows and the clock reads all use
+the time that the call names.
 
 ### Cancel and terminate
 
@@ -624,8 +649,8 @@ loop {
   `all_writable_shards`, `dag_name` and a `queue_name` other than `default`.
 
 **Retention.** `purge_terminal(older_than)` removes each terminal run closed
-more than `older_than` ago, with its events, tasks, timers, signals and
-activity attempts. It returns the number of runs removed. It works in batches
+more than `older_than` ago, with its events, tasks, timers, signals,
+activity attempts and cost ledger rows. It returns the number of runs removed. It works in batches
 of 256 runs, one short transaction each. Indexes on `closed_at` and on each
 table's `exec_id` keep each batch a set of seeks. A damaged row is skipped.
 

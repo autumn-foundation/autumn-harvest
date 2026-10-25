@@ -64,6 +64,12 @@ fn turn_request() -> ModelTurnRequest {
         allowed_tools: None,
         flow_labels: std::collections::BTreeSet::new(),
         flow_released: autumn_harvest_agent::Released::new(),
+        interruptible: false,
+        model: None,
+        mesh: None,
+        prefix: None,
+        remember: false,
+        stream: false,
     }
 }
 
@@ -152,11 +158,13 @@ async fn the_tool_handler_runs_the_named_tool_with_its_context() {
         read_only: false,
         allowed_tools: None,
         labels: None,
+        flow_labels: std::collections::BTreeSet::new(),
         call: ToolCall {
             id: "c1".into(),
             name: "read".into(),
             arguments: json!({"k": 1}),
         },
+        workspace: None,
     };
 
     let info = agent_tool_call_info();
@@ -241,7 +249,7 @@ fn the_engine_registration_builds() {
         .activities(activities())
         .state(AgentHarness::new(ScriptedModel::new(Vec::new())))
         .build();
-    assert_eq!(built.workflow_count(), 2);
+    assert_eq!(built.workflow_count(), 3);
     assert!(built.state::<AgentHarness>().is_some());
     let names: Vec<&str> = activities().iter().map(|a| a.name).collect();
     assert_eq!(
@@ -253,6 +261,11 @@ fn the_engine_registration_builds() {
             "agent_deliver",
             "agent_precheck",
             "agent_discover_peers",
+            "agent_profile",
+            "agent_memory_reset",
+            "agent_workspace_retain",
+            "agent_workspace_reset",
+            "agent_workspace_floor",
         ]
     );
     let flows: Vec<&str> = workflows().iter().map(|w| w.name).collect();
@@ -261,6 +274,7 @@ fn the_engine_registration_builds() {
         [
             autumn_harvest_agent::WORKFLOW_NAME,
             autumn_harvest_agent::heartbeat::HEARTBEAT_WORKFLOW_NAME,
+            autumn_harvest_agent::AGENT_WORKFLOW_NAME,
         ]
     );
 }
@@ -363,11 +377,13 @@ async fn a_huge_tool_error_still_fits_the_result_cap() {
             read_only: false,
             allowed_tools: None,
             labels: None,
+            flow_labels: std::collections::BTreeSet::new(),
             call: ToolCall {
                 id: "c".into(),
                 name: "fail".into(),
                 arguments: json!({}),
             },
+            workspace: None,
         })
         .await
         .unwrap();
@@ -590,11 +606,13 @@ async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
             read_only: true,
             allowed_tools: None,
             labels: None,
+            flow_labels: std::collections::BTreeSet::new(),
             call: ToolCall {
                 id: "c".into(),
                 name: "write".into(),
                 arguments: json!({}),
             },
+            workspace: None,
         })
         .await
         .unwrap();
@@ -720,11 +738,13 @@ async fn a_zero_result_cap_leaves_a_big_reply_and_a_big_tool_result_alone() {
             read_only: false,
             allowed_tools: None,
             labels: None,
+            flow_labels: std::collections::BTreeSet::new(),
             call: ToolCall {
                 id: "c".into(),
                 name: "big".into(),
                 arguments: json!({}),
             },
+            workspace: None,
         })
         .await
         .unwrap();

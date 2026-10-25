@@ -835,6 +835,53 @@ async fn the_listener_wakes_on_commit_only_and_merges_wakes() {
     );
 }
 
+/// A live listener keeps the activity chunks of the run, in order, and
+/// drops its workflow chunks. A stored-chunk wake comes first (issue #2268).
+#[tokio::test]
+async fn a_live_listener_keeps_activity_chunks_and_puts_a_stored_wake_first() {
+    use autumn_harvest::notify::{DurableStreamListener, DurableStreamLiveWait};
+
+    let (url, _c) = setup_database().await;
+    let exec_id = ExecutionId::new();
+    let listener = DurableStreamListener::connect_live(&url, exec_id.as_uuid())
+        .await
+        .expect("listen");
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let id = exec_id.as_uuid();
+
+    autumn_harvest::notify::notify_workflow_progress(&mut conn, id, 9, &json!("workflow"))
+        .await
+        .expect("notify");
+    autumn_harvest::notify::notify_activity_progress(&mut conn, id, 0, &json!("a"))
+        .await
+        .expect("notify");
+    autumn_harvest::notify::notify_activity_progress(&mut conn, id, 1, &json!("b"))
+        .await
+        .expect("notify");
+    autumn_harvest::notify::notify_durable_stream(&mut conn, id)
+        .await
+        .expect("notify");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        listener.wait_or_live_timeout(Duration::from_secs(5)).await,
+        DurableStreamLiveWait::Stored,
+        "a stored-chunk wake comes before the live chunks"
+    );
+    assert_eq!(
+        listener.wait_or_live_timeout(Duration::from_secs(5)).await,
+        DurableStreamLiveWait::Live
+    );
+    assert_eq!(listener.take_live(), vec![json!("a"), json!("b")]);
+    assert_eq!(
+        listener
+            .wait_or_live_timeout(Duration::from_millis(500))
+            .await,
+        DurableStreamLiveWait::TimedOut,
+        "a workflow chunk is not a live activity chunk"
+    );
+}
+
 /// SQL that installs a `pg_notify` that always fails (issue #1796 pattern).
 const FAILING_NOTIFY_SQL: &str = "CREATE SCHEMA IF NOT EXISTS notify_fail; \
     CREATE OR REPLACE FUNCTION notify_fail.pg_notify(text, text) RETURNS void \

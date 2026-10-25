@@ -5,7 +5,8 @@
 //! collects the whole body, so each test reads a stream after it ends. A
 //! short stream budget ends a stream of a live run.
 //!
-//! Requires Docker. Each test uses a multi-thread runtime, because
+//! Requires Docker, or `HARVEST_TEST_DATABASE_URL` set to a migrated
+//! Postgres. Each test uses a multi-thread runtime, because
 //! `TestApp::plugin` blocks on plugin startup.
 
 #![allow(clippy::unused_async, clippy::used_underscore_binding)]
@@ -133,6 +134,39 @@ async fn ds_refused(ctx: &WorkflowContext, _input: Value) -> Result<Value, Workf
         .with_details(json!({"why": "policy"})))
 }
 
+/// Set when the live stream of `ds_live` is open.
+static LIVE_GO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Waits for `LIVE_GO`, then sends two live chunks and returns their text.
+#[activity]
+async fn ds_speak(ctx: &ActivityContext, _input: Value) -> Result<String, String> {
+    let until = Instant::now() + Duration::from_secs(30);
+    while !std::sync::atomic::AtomicBool::load(&LIVE_GO, std::sync::atomic::Ordering::SeqCst)
+        && Instant::now() < until
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for part in ["hel", "lo"] {
+        ctx.publish_progress(json!({"text": part}))
+            .map_err(|e| e.to_string())?;
+    }
+    // The live chunks go out before the activity completes.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    Ok("hello".to_owned())
+}
+
+/// Runs `ds_speak`, then stores its whole text once (issue #2268).
+#[workflow]
+async fn ds_live(ctx: &WorkflowContext, _input: Value) -> Result<Value, String> {
+    let text = ctx
+        .execute_activity_raw("ds_speak", Value::Null, "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    ctx.publish_durable_progress(json!({"turn": text}))
+        .map_err(|e| e.to_string())?;
+    Ok(json!({"text": text}))
+}
+
 // ── Route ─────────────────────────────────────────────────────────────────────
 
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -166,6 +200,9 @@ async fn stream(
     if headers.contains_key("x-expose") {
         call = call.expose_execution_id();
     }
+    if headers.contains_key("x-live") {
+        call = call.live();
+    }
     call.stream().await
 }
 
@@ -173,24 +210,29 @@ async fn stream(
 
 /// A migrated Postgres 16 container for one test.
 struct TestPg {
-    _container: ContainerAsync<Postgres>,
+    _container: Option<ContainerAsync<Postgres>>,
     url: String,
     pool: Pool<AsyncPgConnection>,
 }
 
 async fn setup_db(max_size: usize) -> TestPg {
-    let container = Postgres::default()
-        .with_init_sql(autumn_harvest::test_init_sql().into_bytes())
-        .with_tag("16")
-        .start()
-        .await
-        .expect("failed to start Postgres container");
-    let host = container.get_host().await.expect("container host");
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("container port");
-    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    let (url, container) = if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        (url, None)
+    } else {
+        let container = Postgres::default()
+            .with_init_sql(autumn_harvest::test_init_sql().into_bytes())
+            .with_tag("16")
+            .start()
+            .await
+            .expect("failed to start Postgres container");
+        let host = container.get_host().await.expect("container host");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("container port");
+        let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+        (url, Some(container))
+    };
     autumn_web::migrate::run_pending(&url, autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .expect("failed to run framework migrations");
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
@@ -218,8 +260,9 @@ fn base_plugin() -> HarvestPlugin {
             ),
             __autumn_workflow_info_ds_chain(),
             __autumn_workflow_info_ds_refused(),
+            __autumn_workflow_info_ds_live(),
         ])
-        .activities(activities![ds_record])
+        .activities(activities![ds_record, ds_speak])
         .worker(WorkerConfig::default())
         .api("/api/harvest")
         .allow_unauthenticated_mutations()
@@ -517,6 +560,65 @@ async fn live_stream_delivers_chunks_published_after_connect() {
         after < Duration::from_secs(5),
         "the stream took {after:?} after the signal"
     );
+}
+
+/// One route gives both layers (issue #2268). The live chunks of the
+/// activity come as `activity` frames with no id. A resume after the turn
+/// gets the stored text once and no live chunk.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_stream_gives_the_live_chunks_and_the_stored_text_once() {
+    let db = setup_db(8).await;
+    let client = build_app(&db).await;
+    let body = json!({"tag": "live"});
+    let extra = [
+        ("x-user", "ada"),
+        ("x-workflow", "ds_live"),
+        ("x-stream-ms", "15000"),
+        ("x-live", "1"),
+    ];
+    let stream = post(&client, Some("key-live"), &extra, &body);
+    let go = async {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        LIVE_GO.store(true, std::sync::atomic::Ordering::SeqCst);
+    };
+    let (response, ()) = tokio::join!(stream, go);
+    let got = frames(&response);
+    let live: Vec<&Frame> = got.iter().filter(|f| f.event == "activity").collect();
+    let text: Vec<&Value> = live.iter().map(|f| &f.data["data"]["text"]).collect();
+    assert_eq!(text, [&json!("hel"), &json!("lo")], "{got:?}");
+    assert!(live.iter().all(|f| f.id.is_none()), "{got:?}");
+    let envelope = &live[0].data["_harvest_activity"];
+    assert_eq!(envelope["activity_type"], "ds_speak");
+    assert_eq!(envelope["attempt"], 1);
+    assert_eq!(envelope["index"], 0);
+    assert_eq!(progress_ids(&got), ["0.0"]);
+    assert_eq!(last(&got).data, json!({"text": "hello"}));
+
+    let resumed = post(
+        &client,
+        Some("key-live"),
+        &[&extra[..], &[("last-event-id", "0.0")]].concat(),
+        &body,
+    )
+    .await;
+    let resumed = frames(&resumed);
+    assert!(resumed.iter().all(|f| f.event != "activity"), "{resumed:?}");
+    assert!(progress_ids(&resumed).is_empty(), "{resumed:?}");
+    assert_eq!(last(&resumed).event, "result");
+
+    let all = until_final(
+        &client,
+        "key-live",
+        &[("x-user", "ada"), ("x-workflow", "ds_live")],
+        &body,
+    )
+    .await;
+    let turns: Vec<&Value> = all
+        .iter()
+        .filter(|f| f.event == "progress")
+        .map(|f| &f.data["turn"])
+        .collect();
+    assert_eq!(turns, [&json!("hello")], "a reconnect gets the text once");
 }
 
 // SAC-25

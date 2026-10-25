@@ -199,6 +199,8 @@ pub fn test_partitioned_layout_requested() -> bool {
 
 /// Per-activity-type pause/resume for surgical outage containment (issue #807).
 pub mod activity_pause;
+/// Live progress from inside an activity (issue #2268).
+pub mod activity_progress;
 /// Adaptive concurrency limit per activity type (issue #1836).
 pub mod adaptive_limit;
 /// Admission gate primitive for incident-response operators (issue #377).
@@ -329,6 +331,9 @@ pub mod effective_config;
 pub mod eligibility;
 /// Keyed entity: serialized handlers over durable state for each key (issue #1975).
 pub mod entity;
+/// Read-only SQL over the state of one keyed entity (issue #2260).
+#[cfg(feature = "owner-disk-cache")]
+pub mod entity_sql;
 /// The keyed-entity state projection (issue #2259).
 pub mod entity_state;
 /// Targeted PII erasure for completed workflow executions (issue #495).

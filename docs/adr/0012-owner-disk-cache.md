@@ -98,6 +98,54 @@ passed the check finishes before the delete, and a later write is refused.
 - A core dump or swap can write the key and decoded events to disk. Turn
   off core dumps on an owner host, or encrypt its swap.
 
+## Amendment: the entity SQL projection (issue #2260)
+
+Epic #2247, stage 3b. Some users want SQL over the state of one entity.
+Stage 3a (#2259) records each state change as a snapshot event. The
+projection keeps the last one of each live entity run in the partition
+file, for SQL that user code runs read-only.
+
+1. **One more table.** `harvest_entity_projection(exec_id, sealed)` lives
+   in the partition file. So the node key, the wipe, the tenure end and
+   the stamp cover it. An entity index in memory routes the purges and the
+   reconcile pass to the row. The format version is 2.
+2. **Sealed, with no key.** The row holds the event id, the deleted flag
+   and the decoded snapshot. The associated data binds the partition and
+   the run. The entity key is not in the row.
+3. **Applied after the commit.** After each committed suspension of a held
+   tenure, the owner reads the run's row of `harvest_entity_state`. The
+   trigger wrote it in the commit, and the index on `execution_id` serves
+   the read. The cached history of the decision does not hold the new
+   events, so the owner cannot read the snapshot from memory. The owner
+   seals a newer snapshot into the file. A row never moves back to an
+   older event.
+4. **Checked on read.** A hit needs the run and the event id of the
+   Postgres row `harvest_entity_state`. Otherwise the query reads that
+   snapshot event from history. An owner with a live tenure on the owner
+   shard of the query then writes the row again. A worker with several
+   claim targets cannot tell that shard, so it writes nothing. A file that
+   left the directory reads as stale. A store then makes a new file. The
+   check needs a local file system with stable inode numbers.
+5. **SQL in memory.** A query copies the snapshot into a fresh in-memory
+   SQLite database. An authorizer allows reads and functions only. The
+   attach limit is 0, and temporary data stays in memory. So user SQL
+   cannot change data or write a file. A step budget, a 5 s deadline, a
+   memory budget, a row cap and a result byte cap bound each query. At
+   most four queries run at a time. A dropped caller stops its query.
+6. **Opt-in.** `WorkerConfig::with_owner_entity_sql` turns it on. It needs
+   the disk cache directory.
+
+Consequences:
+
+- A deleted file costs one history read on the next query. The answer is
+  the same.
+- An erased or retired-key run leaves no row, by the rules above.
+- A query that rebuilds a row writes it only within the evict hold of its
+  pointer read. A later evict wake therefore always finds the row.
+- With the switch on, each committed suspension of an owned run costs one
+  indexed Postgres read. A new snapshot also costs one local write. A run
+  with no snapshot writes nothing.
+
 ## Alternatives
 
 - **Store the stored rows.** Rejected. Retired-key ciphertext would stay on

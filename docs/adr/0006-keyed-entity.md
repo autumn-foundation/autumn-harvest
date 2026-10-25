@@ -12,6 +12,9 @@ projection. See [the amendment](#amendment-state-as-history-events-issue-2259).
 The amendment replaces decision 1's "no event variant, no migration" and the
 first alternative below.
 
+Amended by issue #2266: an opt-in wake hook runs an op at a deadline. See
+[the amendment](#amendment-wakes-issue-2266).
+
 ## Context
 
 - Restate virtual objects and Azure durable entities give each key
@@ -47,6 +50,7 @@ amendment.
 | Read state | The queries `harvest.entity.state` and `harvest.entity.stats` |
 | Durable state | The workflow input, rebuilt by replay |
 | State events and projection | `SideEffectKind::EntityState` and `harvest_entity_state` (issue #2259) |
+| SQL over one entity | `Worker::query_entity_sql`, an owner-local projection (issue #2260, ADR 0012) |
 
 ### 2. How state is stored and replayed
 
@@ -293,3 +297,41 @@ When it gains queries:
 - **An upsert in Rust at each insert site.** Rejected: a new insert path can
   forget it. The shard move inserts with raw SQL.
 
+## Amendment: wakes (issue #2266)
+
+The design record is section 4 of `DESIGN-2262.md` (epic #2262).
+
+### Context
+
+An agent needs a heartbeat and a booked follow-up. Before this change, an
+entity ran an op only when a signal came. A timer outside the entity had to
+send that signal.
+
+### Decision
+
+- `Entity::run_with_wakes(handler, wake)` adds an opt-in hook. Before each
+  step, the loop calls `wake(&state)`. A `Wake { at, op }` gives a deadline
+  and an op. `None` gives the step of `Entity::run`.
+- With a wake, the loop reads the clock once with `ctx.system_now()`. A due
+  wake runs before any waiting op, so a backlog cannot starve it.
+- A wake that is not due lets a waiting op run first. With no waiting op,
+  the loop races the op signal against the deadline with
+  `wait_for_signal_timeout`. A signal that wins runs as usual. A timer that
+  fires runs the wake op.
+- A wake op is typed, so it does not decode and adds no op bytes. The
+  handler, the `Ok` and `Err` rules, the snapshot and the checkpoint check
+  apply to it as to a decoded op. A delete keeps its rules.
+- `Entity::run` calls the same loop with no hook. It reads no clock and
+  starts no timer, so its histories replay with no change.
+
+### Consequences
+
+- No new event variant and no migration. A step with a wake records one
+  `SideEffectRecorded` event of kind `Now`. A wait also records a timer.
+- The hook must be a pure function of the state, because replay calls it
+  again. Keep the deadline in the state. A checkpoint carries the state, so
+  the next run computes the same wake.
+- A failed wake op keeps the old state. The hook then gives the same wake,
+  which is now due, and the loop runs it again at once. Make a wake op
+  return `Ok`.
+- The timer counts whole seconds, so a wake can run up to one second late.

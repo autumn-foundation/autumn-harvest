@@ -739,6 +739,20 @@
 //! issue #1817 does. They refuse every `UPDATE`, and an `INSERT OR REPLACE`
 //! of a stored event. `DELETE` stays open for retention.
 //!
+//! # The agent cost ledger (issue #2275)
+//!
+//! The runtime writes one `harvest_llm_ledger` row per LLM call of a
+//! completed activity attempt, as the Postgres engine does (issue #1996). An
+//! `#[activity]` body records a call with `ActivityContext::record_llm_call`.
+//! A closure that [`SqliteRuntime::register_activity_with_ledger`] registers
+//! returns its calls with its output. The rows commit in the transaction that
+//! appends the completion event, so a crash before the commit writes no row.
+//! A failed or timed-out attempt writes no row.
+//!
+//! [`SqliteRuntime::llm_ledger`] reads the rows of one run.
+//! [`SqliteRuntime::llm_ledger_between`] reads a window of `recorded_at`.
+//! [`SqliteReader`] has both reads. Retention removes the rows with their run.
+//!
 //! # Deterministic side effects
 //!
 //! `ctx.system_now()`, `ctx.new_uuid()`, `ctx.random_*()`, and `ctx.side_effect()`
@@ -759,6 +773,7 @@ pub mod append_only;
 mod composition;
 mod error;
 mod history_cap;
+mod llm_ledger;
 mod lock;
 mod mutex;
 mod query;
@@ -772,14 +787,16 @@ mod update;
 mod visibility;
 mod worker;
 
+pub use autumn_harvest::llm_ledger::LlmCall;
 pub use autumn_harvest::{ExecutionId, WorkflowEvent};
 
 pub use crate::error::{SqliteError, SqliteResult};
 pub use crate::history_cap::HistoryCapReason;
+pub use crate::llm_ledger::LlmLedgerRow;
 pub use crate::query::DEFAULT_QUERY_TIMEOUT;
 pub use crate::runtime::{
-    ActivityBody, ActivitySpec, ExecutionOutcome, RunState, SignalDelivery, SignalWithStart,
-    SignalWithStartOutcome, SqliteRuntime, StartOptions, StartOutcome,
+    ActivityBody, ActivitySpec, ExecutionOutcome, LedgerActivityBody, RunState, SignalDelivery,
+    SignalWithStart, SignalWithStartOutcome, SqliteRuntime, StartOptions, StartOutcome,
     UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
 // The depth cap is shared with the Postgres backend (issue #2225).

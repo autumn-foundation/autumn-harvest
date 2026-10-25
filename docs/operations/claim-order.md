@@ -60,6 +60,10 @@ therefore not identical.
 - The handicap is a constant. No setting changes it.
 - The dispatch channel (issue #1312) orders its hints by `priority` and
   `scheduled_at`. It ignores the handicap.
+- In [owner mode](../adr/0009-decision-owner.md), the owner decider takes
+  workflow tasks in this order. It ignores sticky affinity. A worker with
+  `priority_aging_secs`, fairness keys or queue weights runs no decider.
+  Its claim loops apply the full order (issue #2308).
 - The SQLite and Redis-queue backends do not use this order.
 - The order term costs about 18 ms per claim at a 20k-row backlog. See
   [`performance.md`](../performance.md#the-continuation-band-and-the-expired-run-gate-issue-1824).

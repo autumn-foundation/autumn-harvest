@@ -493,6 +493,8 @@ let json = serde_json::to_string_pretty(&finding).unwrap();
 
 Suppressions require an explicit, non-empty reason string and a non-empty rule ID. Empty or whitespace-only values are rejected at construction time so suppressions are always auditable.
 
+The `// harvest-suppress: RULE_ID "reason"` comment follows the same rule. `harvest det-check` ignores a comment with an empty or whitespace-only reason. The finding stays.
+
 ```rust
 use autumn_harvest::guardrail::{GuardrailSuppression, GuardrailSuppressionError};
 

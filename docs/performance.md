@@ -2573,6 +2573,10 @@ standalone note rather than part of the claim-path attribution table above:
   — before issue #2126, the four task-timeout lanes read one page of live
   rows four times per pass. Lanes at one position now share one refill
   statement (refill buffers -75% at 100,000 live rows, `pg_stat_statements`).
+* [`docs/performance-stream-append-count.md`](performance-stream-append-count.md)
+  — `append_stream_chunks` counted every stored chunk of a run on each append.
+  It now skips the count while the offset span plus the new chunks fits the cap
+  (count buffers -99.8%, total buffers -35.5% over full stream lifetimes).
 * [`docs/performance-sla-breach-scan.md`](performance-sla-breach-scan.md)
   — the soft-SLA breach scan read the whole executions table on every timeout
   tick, because the planner could not prove its predicate implies the partial
@@ -2589,3 +2593,8 @@ standalone note rather than part of the claim-path attribution table above:
   workflow tasks by execution, so the claim loops claim 3 tasks per
   3-activity workflow instead of 7. On a 4-CPU host the CPU limits the gain
   to 1.27x at one claim loop. The fused fence result is on the page.
+* [`docs/performance-payload-depth.md`](performance-payload-depth.md)
+  — the depth walk that the worker runs on every activity result (issue
+  #2312). The walk is 10.6% of a harness that only clones and checks. The one
+  idea saves at most 18.5% of the walk, so it stays unbuilt. The production
+  impact is undetermined. A negative result.

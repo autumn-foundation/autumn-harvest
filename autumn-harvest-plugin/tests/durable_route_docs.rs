@@ -277,6 +277,8 @@ fn streaming_section_states_the_client_contract() {
         "event: result",
         "event: problem",
         "event: pending",
+        "event: activity",
+        ".live()",
         "`stream-cursor-invalid`",
         "durable_route_max_streams",
         "EventSource",

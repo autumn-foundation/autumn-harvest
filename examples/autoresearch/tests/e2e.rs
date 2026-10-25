@@ -768,7 +768,10 @@ async fn memory_notes_survive_a_restart() {
         .memory_snapshot(MemoryScope::new(session_id("mem")))
         .await
         .unwrap();
-    assert!(snapshot.contains("tried raise MATRIX_LR"), "{snapshot}");
+    assert!(
+        snapshot.text().contains("tried raise MATRIX_LR"),
+        "{snapshot:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

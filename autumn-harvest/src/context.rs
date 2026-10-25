@@ -413,7 +413,7 @@ impl WorkflowHistoryPolicy {
 }
 
 #[cfg(feature = "db")]
-type ActivityCancellationPool =
+pub(crate) type ActivityCancellationPool =
     diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>;
 
 #[cfg(feature = "db")]
@@ -3377,6 +3377,10 @@ pub struct WorkflowContext {
     /// reads them, so a seed replays.
     #[cfg(any(test, feature = "testing"))]
     side_effect_rng: Option<Arc<(Mutex<crate::dst::SplitMix64>, i64)>>,
+    /// The clock of the decision cycle in epoch milliseconds, when the
+    /// runtime fixes one (issue #2276). A live clock read then returns it.
+    /// The SQLite runtime sets it, so its timers and clock reads agree.
+    drive_clock_ms: Option<i64>,
     /// Metrics recorder for user-emitted custom business metrics (issue #532).
     /// Defaults to [`NoOpMetrics`](crate::telemetry::NoOpMetrics) when the
     /// worker has no telemetry configured.  Workflow metrics are replay-safe:
@@ -3941,6 +3945,7 @@ impl WorkflowContext {
             timer_clock_elapsed_secs: None,
             #[cfg(any(test, feature = "testing"))]
             side_effect_rng: None,
+            drive_clock_ms: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             parent_execution_id: None,
             start_provenance: StartProvenance::default(),
@@ -4140,6 +4145,7 @@ impl WorkflowContext {
             timer_clock_elapsed_secs: None,
             #[cfg(any(test, feature = "testing"))]
             side_effect_rng: None,
+            drive_clock_ms: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             parent_execution_id: None,
             start_provenance: StartProvenance::default(),
@@ -4229,6 +4235,7 @@ impl WorkflowContext {
             timer_clock_elapsed_secs: None,
             #[cfg(any(test, feature = "testing"))]
             side_effect_rng: None,
+            drive_clock_ms: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             parent_execution_id: None,
             start_provenance: StartProvenance::default(),
@@ -4284,8 +4291,25 @@ impl WorkflowContext {
 
     /// The live value of a clock read: the virtual time in a simulation run.
     fn live_now_millis(&self) -> i64 {
-        self.seeded_draw()
-            .map_or_else(|| Utc::now().timestamp_millis(), |(_, now)| now)
+        self.seeded_draw().map_or_else(
+            || {
+                self.drive_clock_ms
+                    .unwrap_or_else(|| Utc::now().timestamp_millis())
+            },
+            |(_, now)| now,
+        )
+    }
+
+    /// Fix the clock of this decision cycle (issue #2276).
+    ///
+    /// A live `system_now` then returns `now`, as the timers of the cycle do.
+    /// A recorded read still replays its recorded value. `None` reads the
+    /// wall clock. The SQLite runtime sets it on each cycle.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_drive_clock(mut self, now: Option<DateTime<Utc>>) -> Self {
+        self.drive_clock_ms = now.map(|now| now.timestamp_millis());
+        self
     }
 
     /// The live value of `new_uuid`. In a simulation run it is a seeded v7
@@ -16835,6 +16859,13 @@ pub struct ActivityContext {
     /// The engine takes them when the attempt completes and writes them to
     /// `harvest_llm_ledger` in the completion transaction.
     llm_calls: crate::llm_ledger::LlmCallSlot,
+    /// Where the live chunks of [`Self::publish_progress`] go (issue #2268).
+    /// Set once: by [`Self::with_progress_sink`], or at the first chunk.
+    progress_sink: std::sync::OnceLock<
+        Option<std::sync::Arc<dyn crate::activity_progress::ActivityProgressSink>>,
+    >,
+    /// The index of the next live chunk of this attempt.
+    progress_index: std::sync::atomic::AtomicU64,
 }
 
 /// RAII guard returned by [`ActivityContext::start_auto_heartbeat`] /
@@ -16932,6 +16963,8 @@ impl ActivityContext {
             heartbeat_timeout: None,
             last_heartbeat_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
             llm_calls: crate::llm_ledger::LlmCallSlot::new(),
+            progress_sink: std::sync::OnceLock::new(),
+            progress_index: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -16989,6 +17022,8 @@ impl ActivityContext {
             heartbeat_timeout: None,
             last_heartbeat_payload,
             llm_calls: crate::llm_ledger::LlmCallSlot::new(),
+            progress_sink: std::sync::OnceLock::new(),
+            progress_index: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -17028,6 +17063,8 @@ impl ActivityContext {
             heartbeat_timeout: None,
             last_heartbeat_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
             llm_calls: crate::llm_ledger::LlmCallSlot::new(),
+            progress_sink: std::sync::OnceLock::new(),
+            progress_index: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -17216,6 +17253,78 @@ impl ActivityContext {
     pub const fn with_attempt(mut self, attempt: u32) -> Self {
         self.attempt = Some(attempt);
         self
+    }
+
+    /// Send the live chunks of [`Self::publish_progress`] to `sink` (issue
+    /// #2268). A test or an embedded runtime sets it. On Postgres the
+    /// default sink sends each chunk with `pg_notify`.
+    #[must_use]
+    pub fn with_progress_sink(
+        self,
+        sink: std::sync::Arc<dyn crate::activity_progress::ActivityProgressSink>,
+    ) -> Self {
+        let _ = self.progress_sink.set(Some(sink));
+        self
+    }
+
+    /// Publish a live, best-effort chunk while the activity runs (issue
+    /// #2268), for example a model token.
+    ///
+    /// Nothing is stored: no event, no `harvest_stream_chunks` row. The
+    /// call does not wait for a reader and never fails the activity. A chunk
+    /// with no sink, or over a full queue, drops. Each chunk carries the
+    /// activity, the attempt and its index in the attempt, so a reader can
+    /// drop the partial output of a failed attempt. A chunk over
+    /// [`PROGRESS_CHUNK_MAX_BYTES`] becomes a truncation marker.
+    ///
+    /// On Postgres the chunk goes to the progress channel of the run, which
+    /// `GET /workflows/{id}/stream` reads. See
+    /// [`activity_progress`](crate::activity_progress).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `chunk` cannot be
+    /// serialized.
+    pub fn publish_progress(&self, chunk: impl serde::Serialize) -> HarvestResult<()> {
+        let value = cap_progress_chunk(&chunk)?;
+        let sink = self
+            .progress_sink
+            .get_or_init(|| self.default_progress_sink());
+        let Some(sink) = sink else {
+            return Ok(());
+        };
+        let index = self
+            .progress_index
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        sink.publish(crate::activity_progress::ActivityProgress {
+            execution_id: self.identity.execution_id,
+            activity_id: self.identity.activity_id,
+            activity_type: self.identity.activity_type.clone(),
+            attempt: self.attempt.unwrap_or(1),
+            index,
+            chunk: value,
+        });
+        Ok(())
+    }
+
+    /// The sink of a context with no sink set: `pg_notify` when the context
+    /// has a database pool and a Tokio runtime runs, else none.
+    #[cfg_attr(
+        not(feature = "db"),
+        allow(clippy::unused_self, clippy::missing_const_for_fn)
+    )]
+    fn default_progress_sink(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::activity_progress::ActivityProgressSink>> {
+        #[cfg(feature = "db")]
+        if let Some(state) = self.transactional_state.as_ref()
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
+            return Some(std::sync::Arc::new(
+                crate::activity_progress::NotifyProgressSink::spawn(state.pool.clone()),
+            ));
+        }
+        None
     }
 
     /// Set the error message from the most recent failed attempt.

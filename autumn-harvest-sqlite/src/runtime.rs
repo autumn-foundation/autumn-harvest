@@ -16,6 +16,7 @@ use autumn_harvest::executor::{
     QueryReplayOutcome, WorkflowExecuteSpanMeta, drive_query_replay_async,
     run_workflow_with_state_history_policy_and_caps,
 };
+use autumn_harvest::llm_ledger::LlmCall;
 use autumn_harvest::payload_depth::{
     MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE, nests_past_cap,
 };
@@ -31,12 +32,14 @@ use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
 use crate::history_cap::{CapCheck, HistoryCapReason};
+use crate::llm_ledger::LlmLedgerRow;
 use crate::lock::WriterLock;
 use crate::query::{DEFAULT_QUERY_TIMEOUT, QueryReplay};
 use crate::schedule::ScheduleSummary;
 use crate::visibility::{ExecutionDescription, ExecutionFilter, ExecutionPage, ListCursor};
 use crate::{
-    composition, lock, mutex, queue, retention, schedule, schema, store, update, visibility, worker,
+    composition, llm_ledger, lock, mutex, queue, retention, schedule, schema, store, update,
+    visibility, worker,
 };
 
 /// A synchronous activity body, keyed by name.
@@ -48,12 +51,21 @@ use crate::{
 /// `#[activity]` body instead (issue #2024).
 pub type ActivityBody = Box<dyn Fn(Value) -> Result<Value, String> + Send + Sync>;
 
+/// A synchronous activity body that returns its LLM calls with its output
+/// (issue #2275). See
+/// [`register_activity_with_ledger`](SqliteRuntime::register_activity_with_ledger).
+pub type LedgerActivityBody =
+    Box<dyn Fn(Value, DateTime<Utc>) -> Result<(Value, Vec<LlmCall>), String> + Send + Sync>;
+
 /// What runs for one registered activity (issue #2024).
 // Crate-internal like the `ActivitySpec` fields that hold it.
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) enum ActivityRunner {
     /// A synchronous closure. It runs inline and gets no `ActivityContext`.
     Closure(ActivityBody),
+    /// A synchronous closure that also returns the LLM calls of the attempt
+    /// (issue #2275). The completion writes them to the cost ledger.
+    Ledger(LedgerActivityBody),
     /// The `#[activity]` handler. The drain awaits it with an `ActivityContext`.
     Handler(ActivityHandlerFn),
 }
@@ -734,6 +746,43 @@ impl SqliteRuntime {
         body: impl Fn(Value) -> Result<Value, String> + Send + Sync + 'static,
     ) {
         self.register_audited_activity(info, ActivityRunner::Closure(Box::new(body)));
+    }
+
+    /// Register an activity from its [`ActivityInfo`], and run a synchronous
+    /// `body` that returns its LLM calls with its output (issue #2275).
+    ///
+    /// The runtime writes one cost ledger row per call. The write is in the
+    /// transaction that appends the completion event, as on Postgres. So a
+    /// crash before the commit writes no row, and a re-run counts each call
+    /// once. A failed or timed-out attempt writes no row. Read the rows with
+    /// [`llm_ledger`](Self::llm_ledger).
+    ///
+    /// The closure also gets the clock of the runtime at the claim. A ledger
+    /// row carries the same clock, so a budget window over the ledger uses it.
+    /// A drive with `run_until_blocked_as_of` sets that clock (issue #2272).
+    ///
+    /// The closure gets no `ActivityContext`. An `#[activity]` body that
+    /// [`register_activity`](Self::register_activity) runs records its calls
+    /// with `ActivityContext::record_llm_call` instead.
+    ///
+    /// A call with no latency gets the run time of the attempt if it is the
+    /// first call, and zero if it is not. A call that fails
+    /// [`LlmCall::validate`] is skipped with a warning. So is each call past
+    /// [`MAX_LLM_CALLS_PER_ATTEMPT`](autumn_harvest::llm_ledger::MAX_LLM_CALLS_PER_ATTEMPT).
+    ///
+    /// # Panics
+    ///
+    /// Panics on the same unsupported features as
+    /// [`register_activity`](Self::register_activity).
+    pub fn register_activity_with_ledger(
+        &mut self,
+        info: &ActivityInfo,
+        body: impl Fn(Value, DateTime<Utc>) -> Result<(Value, Vec<LlmCall>), String>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        self.register_audited_activity(info, ActivityRunner::Ledger(Box::new(body)));
     }
 
     /// Audit `info` and register `body` under its name with its declared
@@ -1839,6 +1888,40 @@ impl SqliteRuntime {
         activity_name: &str,
     ) -> SqliteResult<Vec<store::ActivityAttempt>> {
         self.known_or_not_found(exec, store::load_attempts(&self.conn, exec, activity_name)?)
+    }
+
+    /// The cost ledger rows of `exec`, in completion order, then call order
+    /// (issue #2275).
+    ///
+    /// Each row is one LLM call of a completed activity attempt. A known
+    /// execution with no recorded call returns an empty list. Sum the rows
+    /// for the tokens and the cost of a run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
+    /// [`SqliteError::Sqlite`] if the read fails, and
+    /// [`SqliteError::Corrupt`] for a row that does not parse.
+    pub fn llm_ledger(&self, exec: ExecutionId) -> SqliteResult<Vec<LlmLedgerRow>> {
+        self.known_or_not_found(exec, llm_ledger::rows_of(&self.conn, exec)?)
+    }
+
+    /// The cost ledger rows recorded at or after `from` and before `until`,
+    /// oldest first, across every run (issue #2275).
+    ///
+    /// `recorded_at` is the drive clock at the completion. An index on it
+    /// serves the window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if the read fails, and
+    /// [`SqliteError::Corrupt`] for a row that does not parse.
+    pub fn llm_ledger_between(
+        &self,
+        from: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> SqliteResult<Vec<LlmLedgerRow>> {
+        llm_ledger::rows_between(&self.conn, from, until)
     }
 
     /// Returns `rows`, or [`SqliteError::ExecutionNotFound`] when `rows` is
@@ -3080,8 +3163,13 @@ impl SqliteRuntime {
         // `span_meta.workflow_id`, so build a minimal meta carrying it (see
         // [`drive_span_meta`]).
         let parent = store::parent_link(&self.conn, exec)?.map(|(parent, _)| parent);
-        let mut span_meta =
-            drive_span_meta(&workflow_name, &workflow_id, cancel_reason.clone(), parent);
+        let mut span_meta = drive_span_meta(
+            &workflow_name,
+            &workflow_id,
+            cancel_reason.clone(),
+            parent,
+            now,
+        );
         // Issue #2029: `ctx.deadline()` reports the stored deadline.
         (span_meta.execution_timeout, span_meta.deadline_at) = config.context_deadline();
         let declarative = self.declarative_updates(&workflow_name);
@@ -3770,9 +3858,17 @@ impl SqliteRuntime {
                 )),
                 None => None,
             };
-            let result =
-                worker::run_local_attempt(exec, owner, spec, &run, attempt, previous_failure, left)
-                    .await;
+            let (result, llm_calls) = worker::run_local_attempt(
+                exec,
+                owner,
+                spec,
+                &run,
+                attempt,
+                previous_failure,
+                left,
+                failure_now(),
+            )
+            .await;
             if let Some(at) = deadline.filter(|at| failure_now() >= *at) {
                 return self.seal_timed_out(exec, at, failure_now()).map(Some);
             }
@@ -3787,10 +3883,10 @@ impl SqliteRuntime {
             let retry_at = backoff
                 .filter(|delay| !delay.is_zero())
                 .map(|delay| failure_now().saturating_add(duration_to_millis_ceil(delay)));
+            // A completion writes its LLM calls in this transaction (issue
+            // #2275).
             let tx = self.conn.transaction()?;
-            for event in &events {
-                store::append_event(&tx, exec, event)?;
-            }
+            worker::append_local_events(&tx, exec, &events, &run.name, &llm_calls, failure_now())?;
             if let Some(at) = retry_at {
                 store::set_local_retry_at(&tx, exec, at)?;
             }
@@ -3801,7 +3897,14 @@ impl SqliteRuntime {
                 // the cap. A pending cancel wins over a cap, as on the drive.
                 if let Some(first) = events.first() {
                     let tx = self.conn.transaction()?;
-                    store::append_event(&tx, exec, first)?;
+                    worker::append_local_events(
+                        &tx,
+                        exec,
+                        std::slice::from_ref(first),
+                        &run.name,
+                        &llm_calls,
+                        failure_now(),
+                    )?;
                     tx.commit()?;
                 }
                 // The attempt ran, so the close reads the clock again (issue
@@ -5536,17 +5639,23 @@ fn duration_to_millis_ceil(d: std::time::Duration) -> i64 {
 /// It is `None` for a top-level run. The Postgres worker sets the same value,
 /// so `ctx.info().parent_execution_id` agrees on both backends. The recorded
 /// span fields are inert here (no `OTel` worker/subscriber on this backend).
+///
+/// `now` is the clock of the cycle. A live `system_now` reads it, so a clock
+/// read agrees with the timers and the activities of the cycle. A
+/// `run_until_blocked_as_of` drive then keeps one clock (issue #2276).
 fn drive_span_meta(
     workflow_name: &str,
     workflow_id: &str,
     cancel_reason: Option<String>,
     parent_execution_id: Option<ExecutionId>,
+    now: i64,
 ) -> WorkflowExecuteSpanMeta {
     WorkflowExecuteSpanMeta {
         workflow_name: workflow_name.to_string(),
         workflow_id: workflow_id.to_string(),
         shard_id: 0,
         queue_name: String::new(),
+        drive_clock: DateTime::<Utc>::from_timestamp_millis(now),
         is_replay: false,
         link_traceparent: None,
         build_id: None,

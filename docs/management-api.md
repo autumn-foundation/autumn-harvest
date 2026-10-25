@@ -643,7 +643,7 @@ predicate = field op value
           | attr "EXISTS"
 field     = attr | system
 attr      = "attrs." ( key | quoted-string )
-system    = "state" | "workflow_name" | "owner" | "severity" | "started_at"
+system    = "state" | "workflow_name" | "workflow_id" | "owner" | "severity" | "started_at"
 key       = a letter or "_", then letters, digits, "_" or "-"
 op        = "=" | "!=" | "<>" | ">" | ">=" | "<" | "<="
 value     = quoted-string | number | "true" | "false"
@@ -654,7 +654,7 @@ value     = quoted-string | number | "true" | "false"
 | `attrs.<key>` | `=`, `!=`, `IN`, `EXISTS` | string, number or boolean |
 | `attrs.<key>` | `>`, `>=`, `<`, `<=` | number |
 | `state` | `=`, `!=`, `IN` | a state name, for example `'RUNNING'` |
-| `workflow_name`, `owner`, `severity` | `=`, `!=`, `IN` | string |
+| `workflow_name`, `workflow_id`, `owner`, `severity` | `=`, `!=`, `IN` | string |
 | `started_at` | `>`, `>=`, `<`, `<=` | RFC 3339 string |
 
 **Types.** Quotes decide the type. `attrs.n = 100` matches the number `100`.
