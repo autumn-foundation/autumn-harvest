@@ -475,6 +475,8 @@ pub mod remote_task;
 // flat (`sqlite_feasibility_docs`).
 #[cfg(feature = "db")]
 mod remote_task_db;
+// The position index of the activity terminal scan (issue #2330).
+mod activity_scan_index;
 pub mod replay;
 /// Stratified in-flight history sampling for the replay-drift gate (issue #798).
 ///

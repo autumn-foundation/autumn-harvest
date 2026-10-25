@@ -912,6 +912,15 @@ The guard suite fails in these cases:
 - `ci.yml` does not run the script on every PR.
 - This page does not name a Verus file or a mirrored function.
 
+A Verus loop states its `invariant`, `invariant_except_break`, `ensures`
+and `decreases` clauses in its header, before its body. The guard drops
+each clause from its keyword to the `{` of the loop body, so a mirror can
+hold a loop (issue #2330). Verus erases a clause, as it erases a
+`proof { }` block. The guard drops a clause only inside a `loop` or
+`while` header. A clause keyword anywhere else stays, so a Verus copy
+cannot hide code behind it. An engine body that holds a clause keyword
+fails the guard, so the drop changes only the Verus copy.
+
 A change to a mirrored function therefore fails the no-DB suite until the
 copy matches. Port the change, then run the script.
 
@@ -927,6 +936,7 @@ copy matches. Port the change, then run the script.
 | `agent_dedupe.rs` | `is_new` and `next_floor` in `agent/dedupe.rs` of the agent crate | The floor and the set above it hold exactly the applied numbers. An apply and its fold equal the plain set insert, in any order and with any repeats. So the receiver takes no new message for a duplicate. The floor never moves over a gap, and the bound on the set forgets only an applied number (issue #2269). |
 | `agent_wake.rs` | `next_heartbeat` in `agent/wake.rs` of the agent crate | With no heartbeat, the function books nothing. A tick books the next tick strictly after the time that it ran, so a tick never runs in a loop. Any other op keeps the booked tick, so messages never starve the heartbeat (issue #2266). |
 | `agent_siblings.rs` | `sibling_cap` in `bounds.rs` of the agent crate | No step overflows. Each share is the base share or one more. The shares of all siblings sum to the remaining tokens, so concurrent children never pass the cap of the parent (issue #2270). |
+| `scan_skip.rs` | `first_live` in `activity_scan_index.rs` | The query returns the first live entry at or after its start, or the end slot. It never skips a live entry. Each call keeps the skip links sound. A new list, an added entry and more dead entries keep them sound too. So a skip-list query finds the same entry as a plain walk of that list (issue #2330). The proptest `the_indexed_scan_matches_the_oracle` checks the role of each event. |
 
 **The mixer inverse.** Each step of the `SplitMix64` finalizer has an
 inverse. A right xor-shift by `s` bits is undone by shifts of `s` and
