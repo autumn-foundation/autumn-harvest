@@ -318,6 +318,7 @@ mod tests {
                 lab.root().display().to_string(),
             )),
             step: 0,
+            workspace: None,
         }
     }
 

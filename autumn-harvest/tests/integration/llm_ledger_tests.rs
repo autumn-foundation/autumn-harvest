@@ -631,6 +631,44 @@ async fn the_worker_path_writes_one_row_per_call_outside_the_ciphertext() {
     );
 }
 
+/// An erasure deletes the ledger rows of the run and counts them (issue
+/// #2267). The rows name the run and its models.
+#[tokio::test]
+async fn an_erase_deletes_the_ledger_rows_of_the_run() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs();
+    let queue = unique_queue("llm-erase");
+    let registry = registry(
+        vec![wf_info("llm_erase_wf", wf_remote)],
+        vec![activity_info(
+            "llm_remote_step",
+            queue,
+            false,
+            None,
+            llm_remote_step,
+        )],
+        &codecs,
+    );
+    let exec_id = run_to_completion(
+        &url,
+        &codecs,
+        queue,
+        registry,
+        "llm_erase_wf",
+        &[&Uuid::new_v4().to_string()],
+    )
+    .await[0];
+    let mut conn = connect(&url).await;
+    assert_eq!(ledger_rows(&mut conn, exec_id).await.len(), 2);
+
+    let outcome = autumn_harvest::erase::erase_workflow_payloads(&mut conn, exec_id, "gdpr-ledger")
+        .await
+        .expect("erase a terminal run");
+    assert_eq!(outcome.ledger_rows_deleted, 2, "{outcome:?}");
+    let left = ledger_rows(&mut conn, exec_id).await;
+    assert_eq!(left.len(), 0, "no ledger row of the run is left");
+}
+
 #[tokio::test]
 async fn a_local_activity_writes_its_calls_with_its_completion_event() {
     let (url, _c) = setup_test_database_url_or_env().await;

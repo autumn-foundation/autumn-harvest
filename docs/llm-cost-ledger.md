@@ -74,6 +74,26 @@ In a `run_transactional` activity, record the calls before the commit. The
 commit writes the calls that exist at that time. The engine logs a warning
 for a call recorded after the commit and drops it.
 
+### On the SQLite backend (issue #2275)
+
+`autumn-harvest-sqlite` writes the same rows to its own
+`harvest_llm_ledger` table, in the transaction that appends the
+`ActivityCompleted` or `LocalActivityCompleted` event. A failed or timed-out
+attempt writes no row. An activity gives its calls in one of two ways:
+
+- An `#[activity]` body that `register_activity` registers calls
+  `ctx.record_llm_call`, as on Postgres.
+- A closure that `register_activity_with_ledger` registers returns
+  `Ok((output, calls))`. The closure gets no context, so set each latency.
+  An unset latency is the run time of the attempt for the first call, and
+  zero for a later one.
+
+The table names the run `exec_id` and the completion event `event_seq`, the
+`seq` of the event in `harvest_events`. `recorded_at` is the drive clock at
+the completion, in epoch milliseconds. Read the rows with
+`SqliteRuntime::llm_ledger(exec)` or `llm_ledger_between(from, until)`.
+`SqliteReader` has both reads. Retention removes the rows with the run.
+
 ## 3. Read the ledger
 
 `GET /admin/usage` adds six fields to each group:
@@ -118,7 +138,7 @@ SELECT l.model, SUM(l.input_tokens), SUM(l.output_tokens), SUM(l.cost_usd_micros
 ## 4. The agent adapter
 
 The `agent_model_turn` activity of `autumn-harvest-agent` records one call
-per model call. Implement `AgentModel::model_id` to name the model, and
+per model call, on both backends. Implement `AgentModel::model_id` to name the model, and
 `AgentModel::cost_usd_micros` to price a call. The defaults are no id and
 unpriced. The ledger records no id, or an id that it refuses, as
 `"unknown"`, so the tokens still count.
@@ -138,7 +158,9 @@ spends no tokens, so it records no call. See
   commits, both shards count the run. If the second commit fails, the
   window lasts until migration recovery ends it.
 - **Reset.** A fork copies events, not ledger rows. The cost counts once.
-- **Erasure.** Erasure keeps the rows. They hold no payload. The model id
+- **Erasure.** Erasure deletes the rows of the run (issue #2267). It
+  reports the count in `ledger_rows_deleted`. A row names the run and its
+  models. The spend of an erased run leaves the budget sums. The model id
   is the only free-form text, and it must not hold PII.
 - **Cross-region DR.** The `FOR ALL TABLES` publication copies the table to
   the standby.
@@ -148,8 +170,6 @@ spends no tokens, so it records no call. See
 - A failed attempt writes no row. So does an attempt that loses its lease,
   or that returns a result over the result cap. Tokens that such an attempt
   spent are not counted.
-- A SQLite activity has no `ActivityContext`, so it cannot record a call.
-  The SQLite agent path writes no ledger rows.
 - The ledger has no columns for cached prompt tokens.
 - The report has no per-model dimension. Query the table for that.
 - Quota checks do not read the ledger.

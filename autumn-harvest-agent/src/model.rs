@@ -81,6 +81,25 @@ pub trait AgentModel: Send + Sync + std::fmt::Debug {
         let _ = usage;
         None
     }
+
+    /// Send one request, and pass each piece of answer text to `on_delta`
+    /// while the model writes it (issue #2268).
+    ///
+    /// The deltas are a preview. The response is the answer that counts, so
+    /// return the whole answer, as [`chat`](Self::chat) does. The default
+    /// calls `chat` and passes no delta. A provider with a streaming API
+    /// overrides it.
+    ///
+    /// Pass `""` at each provider event that has no text, for example a
+    /// thinking delta. The harness then sends the text that waits.
+    fn chat_stream<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+        on_delta: &'a (dyn Fn(&str) + Send + Sync),
+    ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
+        let _ = on_delta;
+        self.chat(request)
+    }
 }
 
 /// The ledger model id of a model that does not name itself.

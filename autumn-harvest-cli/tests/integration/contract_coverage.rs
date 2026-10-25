@@ -367,6 +367,29 @@ fn legal_hold_release_is_covered() {
     ]);
 }
 
+// ── harvest agents (issue #2267) ───────────────────────────────────────────
+
+#[test]
+fn agents_list_is_covered() {
+    assert_covered(&["agents", "list", "--status", "idle", "--wakes-before", "1"]);
+}
+
+#[test]
+fn agents_describe_is_covered() {
+    assert_covered(&["agents", "describe", "support/ada"]);
+}
+
+#[test]
+fn agents_pause_and_resume_are_covered() {
+    for args in [
+        &["agents", "pause", "support/ada", "--reason", "audit"][..],
+        &["agents", "resume", "support/ada"][..],
+    ] {
+        assert_covered(args);
+        assert_body_fields_documented(args);
+    }
+}
+
 #[test]
 fn workflow_start_is_covered() {
     assert_covered(&["workflow", "start", "my_workflow"]);

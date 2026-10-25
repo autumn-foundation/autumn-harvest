@@ -13,7 +13,7 @@ use std::time::Duration;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::eval::{
     Candidate, DEFAULT_EXTRA_TURNS, Divergence, EvalError, Evaluation, RunEnd, Side, Verdict,
-    evaluate,
+    compare, evaluate,
 };
 use autumn_harvest_agent::followup::FOLLOWUP_TOOL;
 use autumn_harvest_agent::memory::{MEMORY_TOOL, MemoryStore};
@@ -1605,4 +1605,228 @@ async fn another_peer_at_the_same_ordinal_takes_no_recorded_approval() {
         after_pay.contains("no approval arrived"),
         "researcher's approval must not release critic's call: {after_pay}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Two models for one agent (issue #2271)
+// ---------------------------------------------------------------------------
+
+/// A shared candidate harness with two named models and a `lookup` tool.
+fn two_models(
+    a: Arc<ScriptedModel>,
+    b: Arc<ScriptedModel>,
+) -> (Arc<AgentHarness>, Arc<ScriptedModel>) {
+    let fallback = ScriptedModel::new(vec![]);
+    let recorder = Arc::new(Recorder::default());
+    let harness = AgentHarness::new(fallback.clone())
+        .model_named("a", a)
+        .model_named("b", b)
+        .tool(recorded_tool("lookup", ToolEffect::ReadOnly, &recorder));
+    (Arc::new(harness), fallback)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_models_are_compared_on_one_source() {
+    let source = one_lookup().await;
+    let a = ScriptedModel::named(
+        "model-a",
+        vec![
+            calls(&[("a1", "lookup", json!({"q": "x"}))], 5),
+            answer("done", 5),
+        ],
+    );
+    let b = ScriptedModel::named(
+        "model-b",
+        vec![
+            calls(&[("b1", "lookup", json!({"q": "y"}))], 5),
+            answer("done", 5),
+        ],
+    );
+    let (harness, fallback) = two_models(a.clone(), b.clone());
+    let first = Candidate::shared(Arc::clone(&harness)).model("a");
+    let second = Candidate::shared(harness).model("b");
+
+    let comparison = compare(&source, &first, &second).await.unwrap();
+
+    assert!(!comparison.first.diverged(), "model a repeats the source");
+    assert_eq!(
+        comparison.second.first_divergence,
+        Some(0),
+        "model b looks up another key"
+    );
+    assert_eq!(comparison.first_divergence, Some(0));
+    assert_eq!(
+        comparison.turns[0].verdict,
+        Verdict::Diverged(Divergence::Calls)
+    );
+    assert!(!comparison.end_diverged, "both complete");
+    assert_eq!((a.calls(), b.calls(), fallback.calls()), (2, 2, 0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_agent_of_a_tree_runs_on_another_model() {
+    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
+    use autumn_harvest_agent::{Mandate, Peer};
+
+    let delegate = || {
+        calls(
+            &[(
+                "d1",
+                DELEGATE_TOOL,
+                json!({"agent": "planner", "task": "plan"}),
+            )],
+            2,
+        )
+    };
+    let (_dir, db) = fresh_db();
+    let harness = AgentHarness::new(ScriptedModel::new(vec![
+        delegate(),
+        answer("the plan", 2),
+        answer("done", 2),
+    ]))
+    .peer(Peer::new("planner", "Plans."));
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("go").mandate(Mandate::new("triage").peers(["planner"]));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    let source = rt.load_history(exec).unwrap();
+
+    let root = ScriptedModel::new(vec![delegate(), answer("done", 2)]);
+    let planner = ScriptedModel::named("planner-b", vec![answer("another plan", 2)]);
+    let candidate = AgentHarness::new(root.clone()).model_named("b", planner.clone());
+    let evaluation = evaluate(
+        &source,
+        &Candidate::new(candidate).agent_model("planner", "b"),
+    )
+    .await
+    .unwrap();
+
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!((root.calls(), planner.calls()), (2, 1));
+}
+
+/// Two delegations of one turn, as `(peer, task)` pairs (issue #2270).
+fn fan(a: (&str, &str), b: (&str, &str)) -> Reply {
+    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
+
+    calls(
+        &[
+            ("d1", DELEGATE_TOOL, json!({"agent": a.0, "task": a.1})),
+            ("d2", DELEGATE_TOOL, json!({"agent": b.0, "task": b.1})),
+        ],
+        2,
+    )
+}
+
+/// A completed source whose root fans out to `flights` with "fly" and to
+/// `hotels` with "stay". Each peer runs on its own model, so the answer of
+/// each child is fixed.
+async fn fan_out_source() -> Vec<WorkflowEvent> {
+    use autumn_harvest_agent::{Mandate, Peer};
+
+    let (_dir, db) = fresh_db();
+    let harness = AgentHarness::new(ScriptedModel::new(vec![
+        fan(("flights", "fly"), ("hotels", "stay")),
+        answer("booked", 1),
+    ]))
+    .model_named("f", ScriptedModel::named("f", vec![answer("a flight", 1)]))
+    .model_named("h", ScriptedModel::named("h", vec![answer("a hotel", 1)]))
+    .peer(Peer::new("flights", "Flies.").model("f"))
+    .peer(Peer::new("hotels", "Stays.").model("h"));
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("book")
+        .mandate(Mandate::new("planner").peers(["flights", "hotels"]))
+        .parallel_children(2);
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    rt.load_history(exec).unwrap()
+}
+
+/// The `agent` and `answer` fields of each delegation result of `end`.
+fn child_answers(end: &RunEnd) -> Vec<(String, String)> {
+    let RunEnd::Completed(report) = end else {
+        panic!("the candidate completes: {end:?}");
+    };
+    tool_results(report)
+        .iter()
+        .map(|text| {
+            let result: Value = serde_json::from_str(text).expect("a delegation result is JSON");
+            let field = |name: &str| result[name].as_str().unwrap_or_default().to_owned();
+            (field("agent"), field("answer"))
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fan_out_source_answers_each_child_from_its_recorded_run() {
+    let source = fan_out_source().await;
+
+    // The candidate asks only for the root turns. The children answer from
+    // the recorded runs.
+    let model = ScriptedModel::new(vec![
+        fan(("flights", "fly"), ("hotels", "stay")),
+        answer("booked", 1),
+    ]);
+    let evaluation = evaluate(&source, &Candidate::new(AgentHarness::new(model.clone())))
+        .await
+        .unwrap();
+
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!(model.calls(), 2, "no child turn runs live");
+    assert_eq!(
+        child_answers(&evaluation.candidate),
+        [
+            ("flights".to_owned(), "a flight".to_owned()),
+            ("hotels".to_owned(), "a hotel".to_owned())
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reordered_fan_out_answers_each_child_from_its_own_recorded_run() {
+    let source = fan_out_source().await;
+
+    // The candidate delegates the same tasks in the other order. Each child
+    // still gets the run of its own peer and task.
+    let model = ScriptedModel::new(vec![
+        fan(("hotels", "stay"), ("flights", "fly")),
+        answer("booked", 1),
+    ]);
+    let evaluation = evaluate(&source, &Candidate::new(AgentHarness::new(model.clone())))
+        .await
+        .unwrap();
+
+    assert_eq!(model.calls(), 2, "no child turn runs live");
+    assert_eq!(
+        child_answers(&evaluation.candidate),
+        [
+            ("hotels".to_owned(), "a hotel".to_owned()),
+            ("flights".to_owned(), "a flight".to_owned())
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fan_out_child_with_no_recorded_run_fails_the_candidate() {
+    use autumn_harvest_agent::eval::NO_CHILD_RUN;
+
+    let source = fan_out_source().await;
+
+    // The candidate changes the task of one child. No recorded run answers
+    // it, so the candidate fails and does not read the answer of another.
+    let model = ScriptedModel::new(vec![
+        fan(("flights", "fly"), ("hotels", "stay near the airport")),
+        answer("booked", 1),
+    ]);
+    let evaluation = evaluate(&source, &Candidate::new(AgentHarness::new(model.clone())))
+        .await
+        .unwrap();
+
+    let RunEnd::Failed(error) = &evaluation.candidate else {
+        panic!("the candidate fails: {:?}", evaluation.candidate);
+    };
+    assert!(error.contains(NO_CHILD_RUN), "{error}");
+    assert!(evaluation.diverged(), "{evaluation:#?}");
 }
