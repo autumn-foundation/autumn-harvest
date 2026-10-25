@@ -102,9 +102,46 @@ fn strip_proof_blocks(mut body: Vec<String>) -> Vec<String> {
     body
 }
 
-/// The tokens of a body, without comments, ghost blocks or whitespace.
+/// The keywords that open a Verus loop clause (issue #2330).
+///
+/// A clause states a spec of the loop. Verus erases it, so it cannot
+/// change what the copy computes. An engine body must hold none of them.
+const LOOP_CLAUSES: &[&str] = &[
+    "invariant",
+    "invariant_except_break",
+    "ensures",
+    "decreases",
+];
+
+/// Drops each loop clause. A clause runs from its keyword to the `{` that
+/// opens the loop body. A `{` inside parentheses or brackets does not end
+/// it.
+fn strip_loop_clauses(body: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut tokens = body.into_iter().peekable();
+    while let Some(t) = tokens.next() {
+        if !LOOP_CLAUSES.contains(&t.as_str()) {
+            out.push(t);
+            continue;
+        }
+        let mut depth = 0_i32;
+        while let Some(next) = tokens.peek() {
+            match next.as_str() {
+                "(" | "[" => depth += 1,
+                ")" | "]" => depth -= 1,
+                "{" if depth == 0 => break,
+                _ => {}
+            }
+            tokens.next();
+        }
+    }
+    out
+}
+
+/// The tokens of a body, without comments, ghost blocks, loop clauses or
+/// whitespace.
 fn normalize(body: &[String]) -> Vec<String> {
-    strip_proof_blocks(body.to_vec())
+    strip_loop_clauses(strip_proof_blocks(body.to_vec()))
 }
 
 fn read(rel: &str) -> String {
@@ -179,6 +216,22 @@ fn normalize_drops_comments_ghost_blocks_and_whitespace() {
 }
 
 #[test]
+fn normalize_drops_loop_clauses() {
+    let verus = "fn f(v: &mut [u8]) {\n    let mut i = 0;\n    while i < v.len()\n        \
+                 invariant\n            i <= v.len(),\n            ({ let n = v.len(); i <= n }),\n        \
+                 decreases v.len() - i,\n    {\n        i += 1;\n    }\n}";
+    let engine = "fn f(v: &mut [u8]) { let mut i = 0; while i < v.len() { i += 1; } }";
+    assert_eq!(norm(verus), norm(engine));
+    let looped = "fn f() { loop invariant x < 3, decreases 3 - x, { x += 1; } }";
+    assert_eq!(norm(looped).concat(), "{loop{x+=1;}}");
+    // A clause ends at the loop body, so the body still counts.
+    assert_ne!(
+        norm("fn f() { loop invariant x < 3, { x += 1; } }"),
+        norm("fn f() { loop invariant x < 3, { x += 2; } }")
+    );
+}
+
+#[test]
 fn fn_body_skips_blocks_inside_an_ensures_clause() {
     let body = |src: &str, name: &str| fn_body(&code_tokens(src), name).map(|b| b.concat());
     let text = "fn f(x: u8) -> (r: u8)\n    ensures ({ let y = x; r == y }),\n{\n    x\n}\n";
@@ -210,6 +263,15 @@ fn every_verus_mirror_matches_its_engine_source() {
                 m.verus_file, m.source_file, m.source_fn
             )
         });
+        // A loop clause in the engine body would vanish from both sides.
+        let clause = body.iter().find(|t| LOOP_CLAUSES.contains(&t.as_str()));
+        assert!(
+            clause.is_none(),
+            "{}: `fn {}` holds the loop clause keyword {clause:?}. The guard drops \
+             loop clauses, so it cannot compare this body",
+            m.source_file,
+            m.source_fn
+        );
         assert_eq!(
             normalize(&body),
             m.verus_body,

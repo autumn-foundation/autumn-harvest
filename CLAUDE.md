@@ -242,9 +242,9 @@ of the instructions are the harness building its own history and payloads, and
 the freeing of owned events. The strict matching code is spread over many
 functions, each under 6%. `docs/performance-replay.md` records the one fix that
 was available. That harness never runs the non-strict `match_activity` path that
-ordinary workers use, so that path stays unmeasured. Pick a different path, and
-check `docs/performance-*.md` first so you do not repeat one that is already
-measured.
+ordinary workers use. `docs/performance-match-activity-fanout.md` measures that
+path (issue #2330). Pick a different path, and check `docs/performance-*.md`
+first so you do not repeat one that is already measured.
 
 ## Project Documentation
 

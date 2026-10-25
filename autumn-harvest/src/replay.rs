@@ -13,6 +13,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 
+use crate::activity_scan_index::{ActivityScanIndex, ScanRole};
 use crate::error::TimeoutType;
 use crate::event::{SideEffectKind, WorkflowEvent};
 use crate::types::{
@@ -52,6 +53,14 @@ impl Hasher for EventIndexHasher {
 
 /// A set of event indices, hashed with [`EventIndexHasher`].
 type EventIndexSet = HashSet<usize, BuildHasherDefault<EventIndexHasher>>;
+
+/// The events that an activity terminal scan walks one by one before it
+/// reads the activity scan index (issue #2330).
+///
+/// A short walk costs less than an index build. A terminal more than this
+/// many events past its schedule is in a wide fan-out, where the index pays
+/// off.
+const LINEAR_SCAN_BUDGET: usize = 16;
 
 /// Result of matching a workflow command against the event history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -845,6 +854,9 @@ pub struct HistoryMatcher {
     /// drift. A signal that no code examined still flags. The exemption
     /// travels with the event index, as `late_race_signal_events` does.
     predicate_rejected_signal_events: HashSet<usize>,
+    /// The positions that the activity terminal scan reads (issue #2330).
+    /// The first scan builds it, and each later scan adds new events.
+    activity_scan_index: ActivityScanIndex,
 }
 
 /// A signal predicate over `(event index, payload)` (issue #1985).
@@ -999,6 +1011,7 @@ impl HistoryMatcher {
             terminal_failure_tail,
             frontier_probed_signals: HashSet::new(),
             predicate_rejected_signal_events: HashSet::new(),
+            activity_scan_index: ActivityScanIndex::default(),
         }
     }
 
@@ -1476,6 +1489,8 @@ impl HistoryMatcher {
 
     /// Returns `true` if the event at `index` has already been consumed out-of-order.
     fn is_consumed(&self, index: usize) -> bool {
+        #[cfg(test)]
+        activity_scan_tests::count_probe();
         self.consumed_out_of_order_events.contains(&index)
             || self.consumed_signal_events.contains(&index)
             || self.transparent_events.contains(&index)
@@ -1737,189 +1752,230 @@ impl HistoryMatcher {
         }
     }
 
-    /// Prepares for matching by advancing past consumed events and draining early signals.
-    /// Returns `true` if there are still events to replay.
-    #[allow(clippy::too_many_lines)]
+    /// The role of `event` in an activity terminal scan (issue #2330).
+    ///
+    /// The scan reads only the positions that the activity scan index holds.
+    /// This function sorts each event into its role. Each arm keeps one rule
+    /// of the plain walk that the index replaced. The differential test
+    /// `the_indexed_scan_matches_the_oracle` checks the index against that
+    /// walk.
+    const fn activity_scan_role(event: &WorkflowEvent) -> ScanRole {
+        match event {
+            // Other activities may be scheduled and complete while this
+            // activity is still running. Keep their scheduled event as the
+            // next replay cursor, but scan past it to find this activity's
+            // terminal event. A second schedule of the scanned activity
+            // itself stops the scan.
+            WorkflowEvent::ActivityScheduled { activity_id, .. } => {
+                ScanRole::Scheduled(*activity_id)
+            }
+            WorkflowEvent::ActivityCompleted { activity_id, .. }
+            | WorkflowEvent::ActivityFailed { activity_id, .. }
+            | WorkflowEvent::ActivityTimedOut { activity_id, .. } => {
+                ScanRole::Terminal(*activity_id)
+            }
+            // Skip heartbeats and started events for this activity.
+            WorkflowEvent::ActivityStarted { activity_id, .. }
+            | WorkflowEvent::ActivityHeartbeat { activity_id, .. } => {
+                ScanRole::Progress(*activity_id)
+            }
+            // Child workflows can run concurrently with activities.
+            // Preserve replay by scanning past interleaved child starts.
+            //
+            // Fan-out markers (and any other MarkerRecorded) can be
+            // interleaved when a fan-out runs concurrently with this
+            // activity (e.g. via tokio::join!). Track as an interleaved
+            // command so the cursor returns to it after matching the
+            // terminal event. Deterministic side-effect captures (issue
+            // #384) are cursor-ordered like markers and treated the same. A
+            // cancellable-timer arm/cancel (issue #768, e.g. a concurrent
+            // `start_timer()`/`handle.cancel()`/`reset()` — a reset emits
+            // both) is likewise an interleaved command: the rewind keeps it
+            // at the cursor for its own claimer (`match_timer_arm` /
+            // `match_timer_cancel`) to re-scan. `TimerStarted` is included
+            // here for symmetry with `TimerCancelled` so a `reset`'s
+            // `[TimerCancelled, TimerStarted]` pair doesn't break the scan
+            // mid-way (the sibling scan loops already tolerate both).
+            WorkflowEvent::ChildWorkflowStarted { .. }
+            | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+            | WorkflowEvent::MarkerRecorded { .. }
+            | WorkflowEvent::SideEffectRecorded { .. }
+            | WorkflowEvent::TimerStarted { .. }
+            | WorkflowEvent::TimerCancelled { .. }
+            | WorkflowEvent::LocalActivityScheduled { .. } => ScanRole::Interleaved,
+            // Progress/terminal events of concurrent siblings from a mixed
+            // suspension batch — a sibling timer's fire (an expired timer
+            // firing before this activity's terminal, e.g.
+            // `tokio::join!(activity, ctx.timer(...))`), a child workflow's
+            // terminal, or a local activity's terminal — are transparent to
+            // this activity's terminal scan. Cross them NON-CONSUMINGLY,
+            // leaving each for its own matcher to claim after the rewind
+            // (issue #1071 manifestation #2). Keep this sibling-terminal set
+            // in sync with `match_signal_or_timer`'s and
+            // `match_timer_strict`'s (issue #1071).
+            WorkflowEvent::TimerFired { .. }
+            | WorkflowEvent::ChildWorkflowCompleted { .. }
+            | WorkflowEvent::ChildWorkflowFailed { .. }
+            | WorkflowEvent::LocalActivityCompleted { .. }
+            | WorkflowEvent::LocalActivityFailed { .. } => ScanRole::Pass,
+            // Update events are transparent to the activity scan.
+            ev if Self::is_update_event(ev) => ScanRole::Pass,
+            // Signals, and ExternalSignal/ExternalCancel/ExternalAwait event
+            // triplets, can be interleaved with an in-flight activity (e.g.
+            // tokio::join!(signal, activity)). Stash them so their own
+            // matchers can find them later (issue #492, issue #757).
+            //
+            // Any other event type is unexpected mid-activity
+            _ => ScanRole::Barrier,
+        }
+    }
+
+    /// Scans for the terminal event of `activity_id` from `scan_cursor`.
+    ///
+    /// The scan steps over each event that [`Self::activity_scan_role`]
+    /// passes or marks interleaved. It stashes each signal and external
+    /// event on its way, in history order. It stops at any other barrier, at
+    /// a second schedule of the activity, or at the end. Then the cursor
+    /// goes back to the first interleaved command, if any.
+    ///
+    /// The scan reads the activity scan index, not each event (issue
+    /// #2330). A replay of a fan-out of N activities then costs about
+    /// O(N log N), not O(N²).
     fn scan_activity_terminal(
         &mut self,
         activity_id: ActivityExecId,
-        mut scan_cursor: usize,
+        scan_cursor: usize,
     ) -> HistoryMatch {
-        let mut first_interleaved_command = None;
+        let (terminal, first_interleaved_command) =
+            self.find_activity_terminal(activity_id, scan_cursor);
+        let Some(terminal_cursor) = terminal else {
+            return self.rewind_open_activity(activity_id, first_interleaved_command);
+        };
+        let result = match &mut self.events[terminal_cursor] {
+            // Take the recorded output. Do not clone it. No later read of a
+            // matched `ActivityCompleted` uses its `output`, so a clone is
+            // waste. See `docs/performance-replay.md`.
+            WorkflowEvent::ActivityCompleted { output, .. } => HistoryMatch::Matched {
+                output: std::mem::take(output),
+            },
+            WorkflowEvent::ActivityFailed {
+                error,
+                attempt,
+                error_type,
+                details,
+                non_retryable,
+                ..
+            } => HistoryMatch::Failed {
+                error: error.clone(),
+                attempt: *attempt,
+                error_type: error_type.clone(),
+                details: details.clone(),
+                non_retryable: *non_retryable,
+            },
+            WorkflowEvent::ActivityTimedOut { timeout_type, .. } => HistoryMatch::TimedOut {
+                timeout_type: timeout_type.clone(),
+            },
+            // A second schedule of the activity stops the scan.
+            _ => return self.rewind_open_activity(activity_id, first_interleaved_command),
+        };
+        self.settle_terminal(terminal_cursor, first_interleaved_command, result)
+    }
 
-        // Scan forward for Completed or Failed with matching activity_id,
-        // skipping Started, Heartbeat, and other intermediate events.
-        while scan_cursor < self.events.len() {
-            if self.is_consumed(scan_cursor) {
-                scan_cursor += 1;
+    /// Finds the stop of a scan for `activity_id` from `from`.
+    ///
+    /// The stop is the first unconsumed schedule or terminal event of the
+    /// activity. The result is `None` when a barrier or the end comes first.
+    /// The second value is the first interleaved command before that point.
+    /// The scan stashes each signal and external event before that point.
+    ///
+    /// The scan walks the first [`LINEAR_SCAN_BUDGET`] events one by one.
+    /// Most terminals are near their schedule, so most scans end there and
+    /// build no index. A longer scan continues on the activity scan index.
+    fn find_activity_terminal(
+        &mut self,
+        activity_id: ActivityExecId,
+        from: usize,
+    ) -> (Option<usize>, Option<usize>) {
+        let len = self.events.len();
+        let walk_end = from.saturating_add(LINEAR_SCAN_BUDGET).min(len);
+        let mut first_interleaved = None;
+        for at in from..walk_end {
+            if self.is_consumed(at) {
                 continue;
             }
-
-            match &self.events[scan_cursor] {
-                WorkflowEvent::ActivityCompleted {
-                    activity_id: id, ..
-                } if *id == activity_id => {
-                    // Take rather than clone the recorded output. This is the
-                    // only production read of an already-matched
-                    // `ActivityCompleted`'s `output` anywhere in this matcher
-                    // -- `settle_terminal` below re-reads only `activity_id`
-                    // from this same event, never `output` -- so once matched,
-                    // the recorded payload is never observed again and cloning
-                    // it (a deep clone for an arbitrary-shape `Value`, e.g. a
-                    // `BTreeMap`-backed object) is pure waste. Re-indexed
-                    // mutably here (rather than converting the whole match's
-                    // scrutinee, which would force every other arm below to
-                    // separately satisfy the borrow checker for no benefit):
-                    // the shared borrow above ends at the guard check, since
-                    // `id` is the only field bound from it. See
-                    // `docs/performance-replay.md`.
-                    let WorkflowEvent::ActivityCompleted { output, .. } =
-                        &mut self.events[scan_cursor]
-                    else {
-                        unreachable!("just matched ActivityCompleted above")
-                    };
-                    let result = HistoryMatch::Matched {
-                        output: std::mem::take(output),
-                    };
-                    return self.settle_terminal(scan_cursor, first_interleaved_command, result);
+            match Self::activity_scan_role(&self.events[at]) {
+                ScanRole::Scheduled(id) | ScanRole::Terminal(id) if id == activity_id => {
+                    return (Some(at), first_interleaved);
                 }
-                WorkflowEvent::ActivityFailed {
-                    activity_id: id,
-                    error,
-                    attempt,
-                    error_type,
-                    details,
-                    non_retryable,
-                    ..
-                } if *id == activity_id => {
-                    let result = HistoryMatch::Failed {
-                        error: error.clone(),
-                        attempt: *attempt,
-                        error_type: error_type.clone(),
-                        details: details.clone(),
-                        non_retryable: *non_retryable,
-                    };
-                    return self.settle_terminal(scan_cursor, first_interleaved_command, result);
+                ScanRole::Scheduled(_) | ScanRole::Interleaved => {
+                    first_interleaved.get_or_insert(at);
                 }
-                WorkflowEvent::ActivityTimedOut {
-                    activity_id: id,
-                    timeout_type,
-                } if *id == activity_id => {
-                    let result = HistoryMatch::TimedOut {
-                        timeout_type: timeout_type.clone(),
-                    };
-                    return self.settle_terminal(scan_cursor, first_interleaved_command, result);
+                ScanRole::Barrier if Self::is_transparent_external_event(&self.events[at]) => {
+                    self.stash_transparent_external_event(at);
                 }
-                // Skip heartbeats and started events for this activity.
-                WorkflowEvent::ActivityHeartbeat {
-                    activity_id: id, ..
-                }
-                | WorkflowEvent::ActivityStarted {
-                    activity_id: id, ..
-                } if *id == activity_id => {
-                    scan_cursor += 1;
-                }
-                // Other activities may be scheduled and complete while this
-                // activity is still running. Keep their scheduled event as the
-                // next replay cursor, but scan past it to find this activity's
-                // terminal event.
-                WorkflowEvent::ActivityScheduled {
-                    activity_id: id, ..
-                } if *id != activity_id => {
-                    first_interleaved_command.get_or_insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                WorkflowEvent::ActivityCompleted {
-                    activity_id: id, ..
-                }
-                | WorkflowEvent::ActivityFailed {
-                    activity_id: id, ..
-                }
-                | WorkflowEvent::ActivityTimedOut {
-                    activity_id: id, ..
-                }
-                | WorkflowEvent::ActivityHeartbeat {
-                    activity_id: id, ..
-                }
-                | WorkflowEvent::ActivityStarted {
-                    activity_id: id, ..
-                } if *id != activity_id => {
-                    scan_cursor += 1;
-                }
-                // Child workflows can run concurrently with activities.
-                // Preserve replay by scanning past interleaved child starts.
-                WorkflowEvent::ChildWorkflowStarted { .. }
-                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. } => {
-                    first_interleaved_command.get_or_insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                // Signals, and ExternalSignal/ExternalCancel/ExternalAwait event
-                // triplets, can be interleaved with an in-flight activity (e.g.
-                // tokio::join!(signal, activity)). Stash them so their own
-                // matchers can find them later (issue #492, issue #757).
-                WorkflowEvent::SignalReceived { .. }
-                | WorkflowEvent::ExternalSignalRequested { .. }
-                | WorkflowEvent::ExternalSignalDelivered { .. }
-                | WorkflowEvent::ExternalSignalFailed { .. }
-                | WorkflowEvent::ExternalCancelRequested { .. }
-                | WorkflowEvent::ExternalCancelDelivered { .. }
-                | WorkflowEvent::ExternalCancelFailed { .. }
-                | WorkflowEvent::ExternalAwaitRequested { .. }
-                | WorkflowEvent::ExternalAwaitResolved { .. }
-                | WorkflowEvent::ExternalAwaitFailed { .. } => {
-                    self.stash_transparent_external_event(scan_cursor);
-                    scan_cursor += 1;
-                }
-                // Update events are transparent to the activity scan.
-                ev if Self::is_update_event(ev) => {
-                    scan_cursor += 1;
-                }
-                // Fan-out markers (and any other MarkerRecorded) can be
-                // interleaved when a fan-out runs concurrently with this
-                // activity (e.g. via tokio::join!). Track as an interleaved
-                // command so the cursor returns to it after matching the
-                // terminal event. Deterministic side-effect captures (issue
-                // #384) are cursor-ordered like markers and treated the same. A
-                // cancellable-timer arm/cancel (issue #768, e.g. a concurrent
-                // `start_timer()`/`handle.cancel()`/`reset()` — a reset emits
-                // both) is likewise an interleaved command: the rewind keeps it
-                // at the cursor for its own claimer (`match_timer_arm` /
-                // `match_timer_cancel`) to re-scan. `TimerStarted` is included
-                // here for symmetry with `TimerCancelled` so a `reset`'s
-                // `[TimerCancelled, TimerStarted]` pair doesn't break the scan
-                // mid-way (the sibling scan loops already tolerate both).
-                WorkflowEvent::MarkerRecorded { .. }
-                | WorkflowEvent::SideEffectRecorded { .. }
-                | WorkflowEvent::TimerStarted { .. }
-                | WorkflowEvent::TimerCancelled { .. }
-                | WorkflowEvent::LocalActivityScheduled { .. } => {
-                    first_interleaved_command.get_or_insert(scan_cursor);
-                    scan_cursor += 1;
-                }
-                // Progress/terminal events of concurrent siblings from a mixed
-                // suspension batch — a sibling timer's fire (an expired timer
-                // firing before this activity's terminal, e.g.
-                // `tokio::join!(activity, ctx.timer(...))`), a child workflow's
-                // terminal, or a local activity's terminal — are transparent to
-                // this activity's terminal scan. Cross them NON-CONSUMINGLY,
-                // leaving each for its own matcher to claim after the rewind
-                // (issue #1071 manifestation #2). Keep this sibling-terminal set
-                // in sync with `match_signal_or_timer`'s and
-                // `match_timer_strict`'s (issue #1071).
-                WorkflowEvent::TimerFired { .. }
-                | WorkflowEvent::ChildWorkflowCompleted { .. }
-                | WorkflowEvent::ChildWorkflowFailed { .. }
-                | WorkflowEvent::LocalActivityCompleted { .. }
-                | WorkflowEvent::LocalActivityFailed { .. } => {
-                    scan_cursor += 1;
-                }
-                // Any other event type is unexpected mid-activity
-                _ => break,
+                ScanRole::Barrier => return (None, first_interleaved),
+                ScanRole::Terminal(_) | ScanRole::Progress(_) | ScanRole::Pass => {}
             }
         }
+        if walk_end == len {
+            return (None, first_interleaved);
+        }
+        let mut index = std::mem::take(&mut self.activity_scan_index);
+        index.extend(&self.events, Self::activity_scan_role);
+        let found =
+            self.find_indexed_terminal(&mut index, activity_id, walk_end, first_interleaved);
+        self.activity_scan_index = index;
+        found
+    }
 
-        // We found the Scheduled event but no terminal event — treat as
-        // incomplete history (the activity was scheduled but never finished).
+    /// Continues [`Self::find_activity_terminal`] from `from` on the
+    /// activity scan index.
+    ///
+    /// Each step jumps to the next unconsumed barrier before the stop. A
+    /// stash consumes a barrier only, so the stop stays the same.
+    fn find_indexed_terminal(
+        &mut self,
+        index: &mut ActivityScanIndex,
+        activity_id: ActivityExecId,
+        mut from: usize,
+        mut first_interleaved: Option<usize>,
+    ) -> (Option<usize>, Option<usize>) {
+        // A cut view hides the tail, so no position at or past `len` counts.
+        let len = self.events.len();
+        let stop = index
+            .first_stop(activity_id, from, |p| self.is_consumed(p))
+            .filter(|&p| p < len);
+        let end = stop.unwrap_or(len);
+        loop {
+            let barrier = index
+                .first_barrier(from, |p| self.is_consumed(p))
+                .filter(|&p| p < end);
+            if first_interleaved.is_none() {
+                let limit = barrier.unwrap_or(end);
+                first_interleaved = index
+                    .first_interleaved(from, |p| self.is_consumed(p))
+                    .filter(|&p| p < limit);
+            }
+            match barrier {
+                Some(at) if Self::is_transparent_external_event(&self.events[at]) => {
+                    self.stash_transparent_external_event(at);
+                    from = at + 1;
+                }
+                Some(_) => return (None, first_interleaved),
+                None => return (stop, first_interleaved),
+            }
+        }
+    }
+
+    /// Ends a scan that found no terminal event.
+    ///
+    /// The activity was scheduled but never finished, so the history is
+    /// incomplete. The cursor goes back to the first interleaved command.
+    fn rewind_open_activity(
+        &mut self,
+        activity_id: ActivityExecId,
+        first_interleaved_command: Option<usize>,
+    ) -> HistoryMatch {
         if let Some(command_cursor) = first_interleaved_command {
             self.cursor = command_cursor;
             self.advance_to_next_unconsumed_event();
@@ -2707,18 +2763,21 @@ impl HistoryMatcher {
                 | WorkflowEvent::ActivityTimedOut { activity_id, .. } => Some(*activity_id),
                 _ => None,
             };
+            // A long range reads the activity scan index, so the settle
+            // does not walk it (issue #2330).
             if let Some(aid) = activity_id {
-                for idx in command_cursor..terminal_cursor {
-                    match &self.events[idx] {
-                        WorkflowEvent::ActivityStarted {
-                            activity_id: id, ..
-                        }
-                        | WorkflowEvent::ActivityHeartbeat {
-                            activity_id: id, ..
-                        } if *id == aid => {
+                let range = command_cursor..terminal_cursor;
+                if range.len() <= LINEAR_SCAN_BUDGET {
+                    for idx in range {
+                        if Self::activity_scan_role(&self.events[idx]) == ScanRole::Progress(aid) {
                             self.consumed_out_of_order_events.insert(idx);
                         }
-                        _ => {}
+                    }
+                } else {
+                    self.activity_scan_index
+                        .extend(&self.events, Self::activity_scan_role);
+                    for &idx in self.activity_scan_index.progress(aid, range) {
+                        self.consumed_out_of_order_events.insert(idx);
                     }
                 }
             }
@@ -15333,5 +15392,789 @@ mod tests {
         );
         assert_eq!(matcher.unfinished_update_handler_count_at_index(3), 1);
         assert!(!matcher.all_handlers_finished_at_index(3));
+    }
+}
+
+/// Tests of the indexed activity terminal scan (issue #2330).
+#[cfg(test)]
+mod activity_scan_tests {
+    use super::*;
+    use crate::error::TimeoutType;
+    use crate::types::{ExecutionId, TimerId, WorkerId};
+    use proptest::prelude::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// The calls of `HistoryMatcher::is_consumed` on this thread.
+        static PROBES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Counts one call of `HistoryMatcher::is_consumed`.
+    pub(super) fn count_probe() {
+        PROBES.with(|probes| probes.set(probes.get() + 1));
+    }
+
+    /// The consumed-set probes that `run` makes.
+    fn probes_of(run: impl FnOnce()) -> u64 {
+        let before = PROBES.with(Cell::get);
+        run();
+        PROBES.with(Cell::get) - before
+    }
+
+    // The scan and settle code before issue #2330, as the test oracle.
+    // Comments are dropped. The code is unchanged.
+    #[allow(clippy::too_many_lines)]
+    fn oracle_scan_activity_terminal(
+        m: &mut HistoryMatcher,
+        activity_id: ActivityExecId,
+        mut scan_cursor: usize,
+    ) -> HistoryMatch {
+        let mut first_interleaved_command = None;
+
+        while scan_cursor < m.events.len() {
+            if m.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+
+            match &m.events[scan_cursor] {
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: id, ..
+                } if *id == activity_id => {
+                    let WorkflowEvent::ActivityCompleted { output, .. } =
+                        &mut m.events[scan_cursor]
+                    else {
+                        unreachable!("just matched ActivityCompleted above")
+                    };
+                    let result = HistoryMatch::Matched {
+                        output: std::mem::take(output),
+                    };
+                    return oracle_settle_terminal(
+                        m,
+                        scan_cursor,
+                        first_interleaved_command,
+                        result,
+                    );
+                }
+                WorkflowEvent::ActivityFailed {
+                    activity_id: id,
+                    error,
+                    attempt,
+                    error_type,
+                    details,
+                    non_retryable,
+                    ..
+                } if *id == activity_id => {
+                    let result = HistoryMatch::Failed {
+                        error: error.clone(),
+                        attempt: *attempt,
+                        error_type: error_type.clone(),
+                        details: details.clone(),
+                        non_retryable: *non_retryable,
+                    };
+                    return oracle_settle_terminal(
+                        m,
+                        scan_cursor,
+                        first_interleaved_command,
+                        result,
+                    );
+                }
+                WorkflowEvent::ActivityTimedOut {
+                    activity_id: id,
+                    timeout_type,
+                } if *id == activity_id => {
+                    let result = HistoryMatch::TimedOut {
+                        timeout_type: timeout_type.clone(),
+                    };
+                    return oracle_settle_terminal(
+                        m,
+                        scan_cursor,
+                        first_interleaved_command,
+                        result,
+                    );
+                }
+                WorkflowEvent::ActivityHeartbeat {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityStarted {
+                    activity_id: id, ..
+                } if *id == activity_id => {
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: id, ..
+                } if *id != activity_id => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityFailed {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityTimedOut {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityHeartbeat {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityStarted {
+                    activity_id: id, ..
+                } if *id != activity_id => {
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. } => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::SignalReceived { .. }
+                | WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    m.stash_transparent_external_event(scan_cursor);
+                    scan_cursor += 1;
+                }
+                ev if HistoryMatcher::is_update_event(ev) => {
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::TimerCancelled { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. } => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::TimerFired { .. }
+                | WorkflowEvent::ChildWorkflowCompleted { .. }
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. } => {
+                    scan_cursor += 1;
+                }
+                _ => break,
+            }
+        }
+
+        if let Some(command_cursor) = first_interleaved_command {
+            m.cursor = command_cursor;
+            m.advance_to_next_unconsumed_event();
+        }
+        HistoryMatch::ActivityInProgress { activity_id }
+    }
+
+    fn oracle_settle_terminal(
+        m: &mut HistoryMatcher,
+        terminal_cursor: usize,
+        first_interleaved_command: Option<usize>,
+        result: HistoryMatch,
+    ) -> HistoryMatch {
+        if let Some(command_cursor) = first_interleaved_command {
+            m.consumed_out_of_order_events.insert(terminal_cursor);
+            let activity_id = match &m.events[terminal_cursor] {
+                WorkflowEvent::ActivityCompleted { activity_id, .. }
+                | WorkflowEvent::ActivityFailed { activity_id, .. }
+                | WorkflowEvent::ActivityTimedOut { activity_id, .. } => Some(*activity_id),
+                _ => None,
+            };
+            if let Some(aid) = activity_id {
+                for idx in command_cursor..terminal_cursor {
+                    match &m.events[idx] {
+                        WorkflowEvent::ActivityStarted {
+                            activity_id: id, ..
+                        }
+                        | WorkflowEvent::ActivityHeartbeat {
+                            activity_id: id, ..
+                        } if *id == aid => {
+                            m.consumed_out_of_order_events.insert(idx);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            m.cursor = command_cursor;
+        } else {
+            m.cursor = terminal_cursor + 1;
+        }
+        m.advance_to_next_unconsumed_event();
+        result
+    }
+
+    /// `match_activity`, with the oracle scan.
+    fn oracle_match_activity(m: &mut HistoryMatcher, activity_name: &str) -> HistoryMatch {
+        if !m.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+        let WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: recorded_name,
+            ..
+        } = &m.events[m.cursor]
+        else {
+            return HistoryMatch::Diverged {
+                expected: format!("ActivityScheduled({activity_name})"),
+                actual: HistoryMatcher::actual_event_name(&m.events[m.cursor]),
+                event_index: i32::try_from(m.cursor).ok(),
+            };
+        };
+        let activity_id = *activity_id;
+        if recorded_name != activity_name {
+            return HistoryMatch::Diverged {
+                expected: format!("ActivityScheduled({activity_name})"),
+                actual: format!("ActivityScheduled({recorded_name})"),
+                event_index: i32::try_from(m.cursor).ok(),
+            };
+        }
+        m.cursor += 1;
+        oracle_scan_activity_terminal(m, activity_id, m.cursor)
+    }
+
+    fn scheduled(id: ActivityExecId, name: &str) -> WorkflowEvent {
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id,
+            name: name.into(),
+            input: Value::Null,
+            queue: "default".into(),
+        }
+    }
+
+    fn completed(id: ActivityExecId, output: Value) -> WorkflowEvent {
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id,
+            output,
+        }
+    }
+
+    fn signal(name: &str, payload: Value) -> WorkflowEvent {
+        WorkflowEvent::SignalReceived {
+            signal_name: name.into(),
+            payload,
+        }
+    }
+
+    /// A recorded history of `n` activities.
+    #[derive(Debug, Clone, Copy)]
+    enum Shape {
+        /// All schedules, then the completions in order.
+        FanOut,
+        /// All schedules, then the completions in reverse order.
+        FanOutReversed,
+        /// All schedules, then one signal per activity, then the completions.
+        FanOutWithSignals,
+        /// Each schedule is followed by its completion.
+        Sequential,
+    }
+
+    fn history(shape: Shape, n: usize) -> Vec<WorkflowEvent> {
+        let ids: Vec<ActivityExecId> = (0..n).map(|_| ActivityExecId::new()).collect();
+        let done = |i: usize| completed(ids[i], serde_json::json!(i));
+        let mut events: Vec<WorkflowEvent> = Vec::with_capacity(3 * n);
+        if matches!(shape, Shape::Sequential) {
+            for (i, id) in ids.iter().enumerate() {
+                events.push(scheduled(*id, "charge"));
+                events.push(done(i));
+            }
+            return events;
+        }
+        events.extend(ids.iter().map(|id| scheduled(*id, "charge")));
+        if matches!(shape, Shape::FanOutWithSignals) {
+            events.extend((0..n).map(|i| signal("tick", serde_json::json!(i))));
+        }
+        if matches!(shape, Shape::FanOutReversed) {
+            events.extend((0..n).rev().map(done));
+        } else {
+            events.extend((0..n).map(done));
+        }
+        events
+    }
+
+    /// The probes of a full replay of `shape` with `n` activities.
+    fn replay_probes(shape: Shape, n: usize) -> u64 {
+        let mut matcher = HistoryMatcher::new(history(shape, n));
+        probes_of(|| {
+            for _ in 0..n {
+                let result = matcher.match_activity("charge");
+                assert!(
+                    matches!(result, HistoryMatch::Matched { .. }),
+                    "{shape:?}: {result:?}"
+                );
+            }
+        })
+    }
+
+    /// A replay of N activities costs O(N log N) probes or less, not O(N²).
+    /// A doubling of N then costs less than 2.5 times the probes. A
+    /// quadratic scan costs about 4 times.
+    #[test]
+    fn replay_probes_grow_near_linearly_with_the_fan_out() {
+        for shape in [
+            Shape::FanOut,
+            Shape::FanOutReversed,
+            Shape::FanOutWithSignals,
+            Shape::Sequential,
+        ] {
+            let small = replay_probes(shape, 256);
+            let large = replay_probes(shape, 512);
+            assert!(
+                large * 2 < small * 5,
+                "{shape:?}: {small} probes at N=256, {large} at N=512"
+            );
+        }
+    }
+
+    /// The scan finds each terminal of a wide fan-out in history order.
+    #[test]
+    fn a_fan_out_replays_every_output_in_order() {
+        for shape in [
+            Shape::FanOut,
+            Shape::FanOutReversed,
+            Shape::FanOutWithSignals,
+        ] {
+            let mut matcher = HistoryMatcher::new(history(shape, 64));
+            for i in 0..64 {
+                assert_eq!(
+                    matcher.match_activity("charge"),
+                    HistoryMatch::Matched {
+                        output: serde_json::json!(i)
+                    },
+                    "{shape:?}"
+                );
+            }
+            if matches!(shape, Shape::FanOutWithSignals) {
+                for i in 0..64 {
+                    assert_eq!(
+                        matcher.match_signal("tick"),
+                        HistoryMatch::Matched {
+                            output: serde_json::json!(i)
+                        }
+                    );
+                }
+            }
+            assert!(!matcher.is_replaying(), "{shape:?}");
+        }
+    }
+
+    /// A second `ActivityScheduled` with the same id stops the scan.
+    #[test]
+    fn a_repeated_schedule_of_the_same_id_stops_the_scan() {
+        let a = ActivityExecId::new();
+        let mut matcher = HistoryMatcher::new(vec![
+            scheduled(a, "x"),
+            scheduled(a, "x"),
+            completed(a, Value::Null),
+        ]);
+        assert_eq!(
+            matcher.match_activity("x"),
+            HistoryMatch::ActivityInProgress { activity_id: a }
+        );
+        assert_eq!(matcher.cursor, 1);
+    }
+
+    /// An unexpected event stops the scan. The cursor goes back to the first
+    /// interleaved command.
+    #[test]
+    fn an_unexpected_event_stops_the_scan_and_rewinds() {
+        let a = ActivityExecId::new();
+        let b = ActivityExecId::new();
+        let mut matcher = HistoryMatcher::new(vec![
+            scheduled(a, "x"),
+            scheduled(b, "y"),
+            WorkflowEvent::WorkflowCompleted {
+                output: Value::Null,
+            },
+            completed(a, Value::Null),
+        ]);
+        assert_eq!(
+            matcher.match_activity("x"),
+            HistoryMatch::ActivityInProgress { activity_id: a }
+        );
+        assert_eq!(matcher.cursor, 1);
+    }
+
+    /// The scan stashes signals before the terminal, in history order. It
+    /// leaves signals after the terminal in place.
+    #[test]
+    fn the_scan_stashes_only_the_signals_before_the_terminal() {
+        let a = ActivityExecId::new();
+        let mut matcher = HistoryMatcher::new(vec![
+            scheduled(a, "x"),
+            signal("s", serde_json::json!(1)),
+            signal("s", serde_json::json!(2)),
+            completed(a, serde_json::json!("done")),
+            signal("s", serde_json::json!(3)),
+        ]);
+        assert_eq!(
+            matcher.match_activity("x"),
+            HistoryMatch::Matched {
+                output: serde_json::json!("done")
+            }
+        );
+        let stashed: Vec<usize> = matcher.pending_signals.iter().map(|s| s.2).collect();
+        assert_eq!(stashed, vec![1, 2]);
+        for want in 1..=3 {
+            assert_eq!(
+                matcher.match_signal("s"),
+                HistoryMatch::Matched {
+                    output: serde_json::json!(want)
+                }
+            );
+        }
+    }
+
+    /// A scan inside a cut view does not see the hidden tail. A scan after
+    /// the restore sees it.
+    #[test]
+    fn a_scan_sees_the_events_that_a_restore_brings_back() {
+        let a = ActivityExecId::new();
+        let b = ActivityExecId::new();
+        let mut matcher = HistoryMatcher::new(vec![
+            scheduled(a, "x"),
+            completed(a, serde_json::json!("a")),
+            scheduled(b, "y"),
+            completed(b, serde_json::json!("b")),
+        ]);
+        let cut = matcher.cut_view(3).expect("the cut hides an event");
+        assert_eq!(
+            matcher.match_activity("x"),
+            HistoryMatch::Matched {
+                output: serde_json::json!("a")
+            }
+        );
+        matcher.restore_view(cut);
+        assert_eq!(
+            matcher.match_activity("y"),
+            HistoryMatch::Matched {
+                output: serde_json::json!("b")
+            }
+        );
+    }
+
+    /// A settle marks the progress events of its activity that sit between
+    /// the interleaved command and the terminal.
+    #[test]
+    fn a_settle_consumes_the_progress_events_of_its_activity() {
+        let a = ActivityExecId::new();
+        let b = ActivityExecId::new();
+        let mut matcher = HistoryMatcher::new(vec![
+            scheduled(a, "x"),
+            scheduled(b, "y"),
+            WorkflowEvent::ActivityStarted {
+                activity_id: a,
+                worker_id: WorkerId::new("w"),
+            },
+            WorkflowEvent::ActivityHeartbeat {
+                activity_id: a,
+                details: Value::Null,
+            },
+            WorkflowEvent::ActivityHeartbeat {
+                activity_id: b,
+                details: Value::Null,
+            },
+            completed(a, Value::Null),
+            completed(b, Value::Null),
+        ]);
+        assert!(matches!(
+            matcher.match_activity("x"),
+            HistoryMatch::Matched { .. }
+        ));
+        let mut consumed: Vec<usize> = matcher
+            .consumed_out_of_order_events
+            .iter()
+            .copied()
+            .collect();
+        consumed.sort_unstable();
+        assert_eq!(consumed, vec![2, 3, 5]);
+        assert!(matches!(
+            matcher.match_activity("y"),
+            HistoryMatch::Matched { .. }
+        ));
+        assert!(!matcher.is_replaying());
+    }
+
+    /// One recorded event, over small pools of ids.
+    #[derive(Debug, Clone)]
+    enum Ev {
+        Scheduled(usize, bool),
+        Started(usize),
+        Heartbeat(usize),
+        Completed(usize),
+        Failed(usize),
+        TimedOut(usize),
+        ChildStarted(usize),
+        ChildCompleted(usize),
+        Marker,
+        SideEffect,
+        TimerStarted(usize),
+        TimerCancelled(usize),
+        TimerFired(usize),
+        LocalScheduled(usize),
+        LocalCompleted(usize),
+        Signal(bool),
+        CancelRequested(usize),
+        CancelDelivered(usize),
+        Update,
+        Paused,
+        Completion,
+    }
+
+    fn ev() -> impl Strategy<Value = Ev> {
+        let id = || 0..3_usize;
+        prop_oneof![
+            6 => (id(), any::<bool>()).prop_map(|(i, y)| Ev::Scheduled(i, y)),
+            1 => id().prop_map(Ev::Started),
+            1 => id().prop_map(Ev::Heartbeat),
+            5 => id().prop_map(Ev::Completed),
+            1 => id().prop_map(Ev::Failed),
+            1 => id().prop_map(Ev::TimedOut),
+            1 => id().prop_map(Ev::ChildStarted),
+            1 => id().prop_map(Ev::ChildCompleted),
+            1 => Just(Ev::Marker),
+            1 => Just(Ev::SideEffect),
+            1 => id().prop_map(Ev::TimerStarted),
+            1 => id().prop_map(Ev::TimerCancelled),
+            1 => id().prop_map(Ev::TimerFired),
+            1 => id().prop_map(Ev::LocalScheduled),
+            1 => id().prop_map(Ev::LocalCompleted),
+            2 => any::<bool>().prop_map(Ev::Signal),
+            1 => id().prop_map(Ev::CancelRequested),
+            1 => id().prop_map(Ev::CancelDelivered),
+            1 => Just(Ev::Update),
+            1 => Just(Ev::Paused),
+            1 => Just(Ev::Completion),
+        ]
+    }
+
+    /// The fixed ids that one generated history uses.
+    struct Pools {
+        activities: Vec<ActivityExecId>,
+        children: Vec<ExecutionId>,
+        cancels: Vec<ExternalCancelId>,
+        targets: Vec<crate::types::ExternalTarget>,
+    }
+
+    impl Pools {
+        fn new() -> Self {
+            let children: Vec<ExecutionId> = (0..3).map(|_| ExecutionId::new()).collect();
+            Self {
+                activities: (0..3).map(|_| ActivityExecId::new()).collect(),
+                targets: children
+                    .iter()
+                    .map(|c| crate::types::ExternalTarget::ExecutionId(*c))
+                    .collect(),
+                children,
+                cancels: (0..3).map(|_| ExternalCancelId::new()).collect(),
+            }
+        }
+
+        fn event(&self, ev: &Ev, at: usize) -> WorkflowEvent {
+            let a = |i: usize| self.activities[i];
+            let payload = serde_json::json!(at);
+            match ev {
+                Ev::Scheduled(i, y) => scheduled(a(*i), if *y { "y" } else { "x" }),
+                Ev::Started(i) => WorkflowEvent::ActivityStarted {
+                    activity_id: a(*i),
+                    worker_id: WorkerId::new("w"),
+                },
+                Ev::Heartbeat(i) => WorkflowEvent::ActivityHeartbeat {
+                    activity_id: a(*i),
+                    details: payload,
+                },
+                Ev::Completed(i) => completed(a(*i), payload),
+                Ev::Failed(i) => WorkflowEvent::ActivityFailed {
+                    activity_id: a(*i),
+                    error: format!("e{at}"),
+                    attempt: 1,
+                    error_type: "Error".into(),
+                    non_retryable: false,
+                    details: None,
+                },
+                Ev::TimedOut(i) => WorkflowEvent::ActivityTimedOut {
+                    activity_id: a(*i),
+                    timeout_type: TimeoutType::StartToClose,
+                },
+                Ev::ChildStarted(i) => WorkflowEvent::ChildWorkflowStarted {
+                    child_id: self.children[*i],
+                    workflow_name: "child".into(),
+                    input: Value::Null,
+                },
+                Ev::ChildCompleted(i) => WorkflowEvent::ChildWorkflowCompleted {
+                    child_id: self.children[*i],
+                    output: payload,
+                },
+                Ev::Marker => WorkflowEvent::MarkerRecorded {
+                    name: "m".into(),
+                    details: payload,
+                },
+                Ev::SideEffect => WorkflowEvent::SideEffectRecorded {
+                    kind: SideEffectKind::Random,
+                    name: None,
+                    value: payload,
+                },
+                Ev::TimerStarted(i) => WorkflowEvent::TimerStarted {
+                    timer_id: TimerId::new(format!("t{i}")),
+                    duration_secs: 1,
+                },
+                Ev::TimerCancelled(i) => WorkflowEvent::TimerCancelled {
+                    timer_id: TimerId::new(format!("t{i}")),
+                },
+                Ev::TimerFired(i) => WorkflowEvent::TimerFired {
+                    timer_id: TimerId::new(format!("t{i}")),
+                },
+                Ev::LocalScheduled(i) => WorkflowEvent::LocalActivityScheduled {
+                    activity_id: a(*i),
+                    name: "local".into(),
+                    input: Value::Null,
+                    resolved: false,
+                    retry_policy: None,
+                    start_to_close_nanos: None,
+                },
+                Ev::LocalCompleted(i) => WorkflowEvent::LocalActivityCompleted {
+                    activity_id: a(*i),
+                    output: payload,
+                },
+                Ev::Signal(t) => signal(if *t { "t" } else { "s" }, payload),
+                Ev::CancelRequested(i) => WorkflowEvent::ExternalCancelRequested {
+                    cancel_id: self.cancels[*i],
+                    target: self.targets[*i].clone(),
+                },
+                Ev::CancelDelivered(i) => WorkflowEvent::ExternalCancelDelivered {
+                    cancel_id: self.cancels[*i],
+                },
+                Ev::Update => WorkflowEvent::UpdateAdmitted {
+                    update_id: UpdateId::new(),
+                    name: "u".into(),
+                    input: Value::Null,
+                    timestamp: chrono::DateTime::UNIX_EPOCH,
+                },
+                Ev::Paused => WorkflowEvent::WorkflowExecutionPaused {
+                    paused_at: chrono::DateTime::UNIX_EPOCH,
+                    reason: None,
+                    actor: "op".into(),
+                },
+                Ev::Completion => WorkflowEvent::WorkflowCompleted { output: payload },
+            }
+        }
+    }
+
+    /// One matcher call.
+    #[derive(Debug, Clone)]
+    enum Op {
+        Activity(bool),
+        Signal(bool),
+        Timer(usize),
+        Local,
+        Child,
+        Cancel(usize),
+        Cut(usize),
+        Restore,
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            8 => any::<bool>().prop_map(Op::Activity),
+            1 => any::<bool>().prop_map(Op::Signal),
+            1 => (0..3_usize).prop_map(Op::Timer),
+            1 => Just(Op::Local),
+            1 => Just(Op::Child),
+            1 => (0..3_usize).prop_map(Op::Cancel),
+            1 => (0..80_usize).prop_map(Op::Cut),
+            1 => Just(Op::Restore),
+        ]
+    }
+
+    /// Every field that a scan or a settle can change.
+    fn state(m: &HistoryMatcher) -> String {
+        let sorted = |set: &EventIndexSet| {
+            let mut v: Vec<usize> = set.iter().copied().collect();
+            v.sort_unstable();
+            v
+        };
+        format!(
+            "cursor={} ooo={:?} sig={:?} pending={:?} ext_sig={:?} ext_cancel={:?} \
+             ext_await={:?} events={:?}",
+            m.cursor,
+            sorted(&m.consumed_out_of_order_events),
+            sorted(&m.consumed_signal_events),
+            m.pending_signals,
+            m.pending_external_signals,
+            m.pending_external_cancels,
+            m.pending_external_awaits,
+            m.events,
+        )
+    }
+
+    /// Applies `op` to `m`. `oracle` picks the scan that `Op::Activity` uses.
+    fn apply(
+        m: &mut HistoryMatcher,
+        cut: &mut Option<ViewCut>,
+        pools: &Pools,
+        op: &Op,
+        oracle: bool,
+    ) -> String {
+        let result = match op {
+            Op::Activity(y) => {
+                let name = if *y { "y" } else { "x" };
+                if oracle {
+                    oracle_match_activity(m, name)
+                } else {
+                    m.match_activity(name)
+                }
+            }
+            Op::Signal(t) => m.match_signal(if *t { "t" } else { "s" }),
+            Op::Timer(i) => m.match_timer(&format!("t{i}")),
+            Op::Local => m.match_local_activity("local"),
+            Op::Child => m.match_child_workflow("child", &Value::Null),
+            Op::Cancel(i) => m.match_external_cancel(&pools.targets[*i]),
+            Op::Cut(horizon) => {
+                if cut.is_none() {
+                    *cut = m.cut_view(*horizon);
+                }
+                return format!("cut={}", cut.is_some());
+            }
+            Op::Restore => {
+                if let Some(view) = cut.take() {
+                    m.restore_view(view);
+                }
+                return "restored".into();
+            }
+        };
+        format!("{result:?}")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        /// The indexed scan gives the same result and the same matcher state
+        /// as the oracle scan, after every call.
+        #[test]
+        fn the_indexed_scan_matches_the_oracle(
+            evs in proptest::collection::vec(ev(), 0..80),
+            ops in proptest::collection::vec(op(), 1..60),
+        ) {
+            let pools = Pools::new();
+            let events: Vec<WorkflowEvent> = evs
+                .iter()
+                .enumerate()
+                .map(|(at, ev)| pools.event(ev, at))
+                .collect();
+            let mut indexed = HistoryMatcher::new(events.clone());
+            let mut oracle = HistoryMatcher::new(events);
+            let mut indexed_cut = None;
+            let mut oracle_cut = None;
+            for (step, op) in ops.iter().enumerate() {
+                let got = apply(&mut indexed, &mut indexed_cut, &pools, op, false);
+                let want = apply(&mut oracle, &mut oracle_cut, &pools, op, true);
+                prop_assert_eq!(&got, &want, "step {} {:?}", step, op);
+                prop_assert_eq!(state(&indexed), state(&oracle), "step {} {:?}", step, op);
+            }
+        }
     }
 }
