@@ -7992,7 +7992,8 @@ pub const fn management_api_response_fields()
         ),
         // Ephemeral workflow progress SSE stream (issue #791): text/event-stream,
         // no JSON body. Frames: `event: progress` (data = the chunk JSON, `id:` =
-        // monotonic seq), a terminal `event: end`, or `event: error`.
+        // monotonic seq), a terminal `event: end`, or `event: error`. An
+        // activity chunk is an `event: activity` frame with no `id:` (issue #2268).
         ("GET", "/workflows/{id}/stream", None),
         // Durable output stream (issue #1974): text/event-stream, free-form.
         ("GET", "/workflows/{id}/stream/durable", None),
@@ -8127,6 +8128,7 @@ pub const fn management_api_response_fields()
                 "signals_scrubbed",
                 "logs_deleted",
                 "stream_chunks_deleted",
+                "ledger_rows_deleted",
                 "entity_states_scrubbed",
                 "completion_deliveries_scrubbed",
                 "dead_letters_scrubbed",
@@ -46768,6 +46770,61 @@ async fn progress_stream_end_reason(
     }
 }
 
+/// The SSE frame of one chunk on the progress channel.
+///
+/// A workflow chunk is a `progress` frame. Its `id:` is the `seq`, and its
+/// data is the chunk as published, with no envelope. An activity chunk (issue
+/// #2268) is an `activity` frame with no `id:`. Its `seq` restarts at each
+/// attempt, so it must not reach the `id:` of the workflow chunks.
+///
+/// axum writes the fields in the order of the calls. Each frame thus sends
+/// `event:`, then `data:`, then `id:`.
+fn progress_stream_event(
+    payload: &autumn_harvest::notify::ProgressNotifyPayload,
+) -> axum::response::sse::Event {
+    let event = axum::response::sse::Event::default();
+    if payload.activity {
+        event.event("activity").data(payload.chunk.to_string())
+    } else {
+        event
+            .event("progress")
+            .data(payload.chunk.to_string())
+            .id(payload.seq.to_string())
+    }
+}
+
+/// Re-resolves the shard of a progress stream at most once per interval.
+///
+/// A resolve takes a pool connection and runs a query. An activity sends a
+/// chunk per model token (issue #2268). So one resolve before each wait would
+/// cost one checkout per token.
+struct ShardRecheck {
+    every: std::time::Duration,
+    last: tokio::time::Instant,
+}
+
+impl ShardRecheck {
+    /// The handler resolved the shard just now, so the first recheck waits
+    /// one interval.
+    fn new(every: std::time::Duration) -> Self {
+        Self {
+            every,
+            last: tokio::time::Instant::now(),
+        }
+    }
+
+    /// True when one interval has passed since the last resolve. It then
+    /// starts the next interval.
+    fn due(&mut self) -> bool {
+        let now = tokio::time::Instant::now();
+        if now.duration_since(self.last) < self.every {
+            return false;
+        }
+        self.last = now;
+        true
+    }
+}
+
 /// `GET /workflows/{id}/stream`
 ///
 /// Ephemeral, best-effort **live-output side channel** (issue #791). Streams the
@@ -46790,6 +46847,10 @@ async fn progress_stream_end_reason(
 /// data: <chunk JSON>   (compact, single-line)
 ///
 /// ```
+/// An activity of the run can send live chunks too (issue #2268). Each one is
+/// an `event: activity` frame with no `id:`. Its data holds the attempt, the
+/// index in the attempt and the chunk. See `docs/streaming-progress.md`.
+///
 /// A final `event: end` frame is emitted when the execution reaches a terminal
 /// state, and the stream then closes. `event: error` is sent if the LISTEN
 /// connection drops. It is also sent if the run leaves the request's shard
@@ -46925,14 +46986,7 @@ async fn stream_workflow_progress(
             >,
                               payload: autumn_harvest::notify::ProgressNotifyPayload|
              -> bool {
-                // `chunk` is already an inner JSON value — serialize it compactly
-                // (single line) and DO NOT re-wrap it in the adjacently-tagged
-                // envelope; `id:` carries the seq.
-                let event = Event::default()
-                    .id(payload.seq.to_string())
-                    .event("progress")
-                    .data(payload.chunk.to_string());
-                match tx.try_send(Ok(event)) {
+                match tx.try_send(Ok(progress_stream_event(&payload))) {
                     Ok(()) => true,
                     // Slow consumer: drop this chunk, keep the stream alive.
                     Err(e) if e.is_full() => true,
@@ -46943,6 +46997,7 @@ async fn stream_workflow_progress(
 
             let mut listener = listener;
             let mut listener_shard = shard;
+            let mut recheck = ShardRecheck::new(keepalive);
             loop {
                 // Shard-residence rebind (issue #1317 review, P2 follow-up).
                 // Unlike the events stream above, this loop had no rebind
@@ -46951,18 +47006,28 @@ async fn stream_workflow_progress(
                 // finishing, not new chunks published elsewhere. A
                 // migration mid-stream would silently and permanently
                 // stop chunk delivery until the workflow finished on its
-                // new shard. Re-resolving here before every wait catches
-                // that promptly instead.
+                // new shard. Re-resolving here catches that within one
+                // keepalive instead.
+                //
+                // The loop re-resolves at most once per keepalive, not
+                // before every wait. An activity sends a chunk per model
+                // token (issue #2268), and each resolve costs a pool
+                // checkout and a query. After a move, the old channel is
+                // silent, so the wait times out and the next pass resolves.
                 //
                 // A fenced miss ends the stream (issue #1803). The run moved
                 // to a shard the policy never saw.
-                let current_shard = match stream_live_shard(&api_clone, exec_id).await {
-                    FencedCheckout::Ready(shard) => Some(shard),
-                    FencedCheckout::Retry => None,
-                    FencedCheckout::LeftFence => {
-                        let _ = tx.send(Ok(shard_fence_error_event())).await;
-                        break;
+                let current_shard = if recheck.due() {
+                    match stream_live_shard(&api_clone, exec_id).await {
+                        FencedCheckout::Ready(shard) => Some(shard),
+                        FencedCheckout::Retry => None,
+                        FencedCheckout::LeftFence => {
+                            let _ = tx.send(Ok(shard_fence_error_event())).await;
+                            break;
+                        }
                     }
+                } else {
+                    None
                 };
                 if let Some(current_shard) = current_shard
                     && current_shard != listener_shard
@@ -62598,5 +62663,65 @@ mod health_probe_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod progress_stream_event_tests {
+    use autumn_web::reexports::axum;
+    use axum::response::IntoResponse as _;
+
+    use super::{ShardRecheck, progress_stream_event};
+    use autumn_harvest::notify::ProgressNotifyPayload;
+
+    #[tokio::test(start_paused = true)]
+    async fn the_progress_stream_resolves_its_shard_at_most_once_per_interval() {
+        let every = std::time::Duration::from_secs(15);
+        let mut recheck = ShardRecheck::new(every);
+        // A burst of chunks within one interval costs no resolve.
+        for _ in 0..100 {
+            assert!(!recheck.due());
+        }
+        tokio::time::advance(every).await;
+        assert!(recheck.due(), "one interval has passed");
+        assert!(!recheck.due(), "the next interval starts");
+        tokio::time::advance(every / 2).await;
+        assert!(!recheck.due());
+        tokio::time::advance(every / 2).await;
+        assert!(recheck.due());
+    }
+
+    #[tokio::test]
+    async fn an_activity_chunk_never_takes_the_id_of_a_workflow_chunk() {
+        let frames = [
+            ProgressNotifyPayload {
+                seq: 42,
+                chunk: serde_json::json!({"step": 0}),
+                activity: false,
+            },
+            ProgressNotifyPayload {
+                seq: 0,
+                chunk: serde_json::json!({"data": "tok"}),
+                activity: true,
+            },
+        ];
+        let events: Vec<Result<axum::response::sse::Event, std::convert::Infallible>> = frames
+            .iter()
+            .map(|f| Ok(progress_stream_event(f)))
+            .collect();
+        let body = axum::response::sse::Sse::new(futures::stream::iter(events)).into_response();
+        let bytes = axum::body::to_bytes(body.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf-8");
+        assert!(
+            text.contains("event: progress\ndata: {\"step\":0}\nid: 42\n\n"),
+            "{text:?}"
+        );
+        assert!(
+            text.contains("event: activity\ndata: {\"data\":\"tok\"}\n\n"),
+            "{text:?}"
+        );
+        assert_eq!(text.matches("id:").count(), 1, "{text:?}");
     }
 }

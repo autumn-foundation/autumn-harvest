@@ -47,6 +47,8 @@ pub enum ReportSource {
     Heartbeat,
     /// A follow-up that the agent scheduled.
     Followup,
+    /// A message from another durable agent (issue #2269).
+    Peer,
 }
 
 /// One answer to deliver.
@@ -98,7 +100,8 @@ pub fn report_text(source: ReportSource, stop: AgentStop, text: &str) -> Option<
         | AgentStop::TranscriptFull
         | AgentStop::ReplyTooLarge
         | AgentStop::BudgetExceeded
-        | AgentStop::LoopDetected => {
+        | AgentStop::LoopDetected
+        | AgentStop::Interrupted => {
             let notice = format!("The agent stopped early: {}.", stop_name(stop));
             Some(if text.is_empty() {
                 notice

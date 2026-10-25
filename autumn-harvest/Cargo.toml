@@ -287,9 +287,6 @@ name = "business_day_escalation"
 name = "long_lived_entity_deadline"
 
 [[example]]
-name = "agent_session_entity"
-
-[[example]]
 name = "cancellable_timer_sla"
 
 [[example]]
@@ -698,5 +695,14 @@ harness = false
 # static DAG tooling: `DagLinter`, `DagProfiler` and `export_chrome_trace`.
 [[bench]]
 name = "dag_tooling_profile"
+required-features = ["testing"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `HistoryMatcher::match_activity`, the non-strict activity matcher.
+# Drive it under `valgrind --tool=callgrind` / `--tool=dhat`. See
+# `benches/match_activity_profile.rs`.
+[[bench]]
+name = "match_activity_profile"
 required-features = ["testing"]
 harness = false

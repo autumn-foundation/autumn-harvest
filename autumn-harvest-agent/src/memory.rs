@@ -11,8 +11,13 @@
 //!
 //! A tool call that was in flight at a crash runs again. Each edit therefore
 //! carries an [`EditKey`], and a store applies a key once.
+//!
+//! An entry keeps the flow labels of the run that wrote it (issue #2272). A
+//! run that reads the snapshot takes those labels, so a note written after
+//! untrusted input keeps its taint. A store that cannot keep labels refuses
+//! a write from a labelled run, so no taint is lost.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -61,6 +66,10 @@ pub struct MemoryBlock {
     pub entries: Vec<String>,
     /// The most characters the entries may hold together.
     pub limit_chars: usize,
+    /// The flow labels of each entry, by entry text (issue #2272). An entry
+    /// with no labels has no key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl MemoryBlock {
@@ -76,6 +85,7 @@ impl MemoryBlock {
             description: description.into(),
             entries: Vec::new(),
             limit_chars,
+            labels: BTreeMap::new(),
         }
     }
 
@@ -172,6 +182,103 @@ pub fn apply_op(block: &mut MemoryBlock, op: &MemoryOp) -> Result<(), AgentError
         }
     }
     Ok(())
+}
+
+/// Apply one edit, and keep the flow labels of each entry (issue #2272).
+///
+/// An entry that the edit adds or changes takes `labels`, the labels of the
+/// run that wrote it. A changed entry keeps its own labels too. So an edit
+/// never removes a taint from a note. A removed entry takes its labels with
+/// it.
+///
+/// # Errors
+///
+/// The errors of [`apply_op`].
+pub fn apply_labelled_op(
+    block: &mut MemoryBlock,
+    op: &MemoryOp,
+    labels: &BTreeSet<String>,
+) -> Result<(), AgentError> {
+    let old_text = match op {
+        MemoryOp::Replace { old, .. } | MemoryOp::Remove { old, .. } => find_unique(block, old)
+            .ok()
+            .and_then(|index| block.entries.get(index).cloned()),
+        MemoryOp::Add { .. } => None,
+    };
+    apply_op(block, op)?;
+    let carried = old_text
+        .and_then(|old| block.labels.get(&old).cloned())
+        .unwrap_or_default();
+    if let MemoryOp::Add { text, .. } | MemoryOp::Replace { text, .. } = op {
+        let entry = block.labels.entry(text.trim().to_owned()).or_default();
+        entry.extend(carried);
+        entry.extend(labels.iter().cloned());
+    }
+    let present: BTreeSet<&String> = block.entries.iter().collect();
+    block
+        .labels
+        .retain(|entry, set| present.contains(entry) && !set.is_empty());
+    Ok(())
+}
+
+/// The flow labels of every entry of `blocks`. A run that reads the blocks
+/// takes them.
+#[must_use]
+pub fn snapshot_labels(blocks: &[MemoryBlock]) -> BTreeSet<String> {
+    blocks
+        .iter()
+        .flat_map(|block| block.labels.values().flatten())
+        .cloned()
+        .collect()
+}
+
+/// The recorded output of the snapshot activity (issue #2272).
+///
+/// A snapshot with no labels records as plain text, as before. A history
+/// from before labels therefore still reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MemorySnapshot {
+    /// The rendered blocks, with no labels.
+    Text(String),
+    /// The rendered blocks and the labels of their entries.
+    Labelled {
+        /// The rendered blocks.
+        text: String,
+        /// The labels of every entry.
+        labels: BTreeSet<String>,
+    },
+}
+
+impl MemorySnapshot {
+    /// The snapshot of `blocks`.
+    #[must_use]
+    pub fn of(blocks: &[MemoryBlock]) -> Self {
+        let text = render_snapshot(blocks);
+        let labels = snapshot_labels(blocks);
+        if labels.is_empty() {
+            Self::Text(text)
+        } else {
+            Self::Labelled { text, labels }
+        }
+    }
+
+    /// The rendered blocks.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Text(text) | Self::Labelled { text, .. } => text,
+        }
+    }
+
+    /// The labels of every entry.
+    #[must_use]
+    pub fn labels(&self) -> BTreeSet<String> {
+        match self {
+            Self::Text(_) => BTreeSet::new(),
+            Self::Labelled { labels, .. } => labels.clone(),
+        }
+    }
 }
 
 fn non_empty(text: &str) -> Result<&str, AgentError> {
@@ -356,6 +463,52 @@ pub trait MemoryStore: Send + Sync + std::fmt::Debug {
         op: MemoryOp,
         key: &'a EditKey,
     ) -> BoxFuture<'a, Result<MemoryBlock, AgentError>>;
+
+    /// Remove every entry of a scope and every applied key of it.
+    ///
+    /// A durable agent calls it on `Control::ResetMemory` and on an erase.
+    /// The default refuses, so a store that cannot clear never reports a
+    /// clear that did not happen.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot clear.
+    fn clear<'a>(&'a self, scope: &'a MemoryScope) -> BoxFuture<'a, Result<(), AgentError>> {
+        let _ = scope;
+        Box::pin(std::future::ready(Err(AgentError::new(
+            ErrorKind::Config,
+            "this memory store cannot clear a scope: implement MemoryStore::clear",
+        ))))
+    }
+
+    /// Apply one edit from a run with the flow labels `labels`, and keep
+    /// them with the entry (issue #2272). Call [`apply_labelled_op`] so the
+    /// rules are the same in every store.
+    ///
+    /// The default calls [`apply`](Self::apply) for a run with no labels,
+    /// and refuses any other write. A store that cannot keep labels then
+    /// never holds a note that lost its taint.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`apply`](Self::apply), and a `Tool` error that the
+    /// model reads when the store cannot keep labels.
+    fn apply_labelled<'a>(
+        &'a self,
+        scope: &'a MemoryScope,
+        op: MemoryOp,
+        key: &'a EditKey,
+        labels: &'a BTreeSet<String>,
+    ) -> BoxFuture<'a, Result<MemoryBlock, AgentError>> {
+        if labels.is_empty() {
+            return self.apply(scope, op, key);
+        }
+        Box::pin(std::future::ready(Err(AgentError::new(
+            ErrorKind::Tool,
+            "this memory store cannot keep flow labels, so it refuses a write from a run with \
+             labels: implement MemoryStore::apply_labelled",
+        ))))
+    }
 }
 
 /// A [`MemoryStore`] in process memory. Its contents go when the process
@@ -428,6 +581,42 @@ impl MemoryStore for InMemoryMemoryStore {
         op: MemoryOp,
         key: &'a EditKey,
     ) -> BoxFuture<'a, Result<MemoryBlock, AgentError>> {
+        Box::pin(std::future::ready(self.apply_now(
+            scope,
+            &op,
+            key,
+            &BTreeSet::new(),
+        )))
+    }
+
+    fn apply_labelled<'a>(
+        &'a self,
+        scope: &'a MemoryScope,
+        op: MemoryOp,
+        key: &'a EditKey,
+        labels: &'a BTreeSet<String>,
+    ) -> BoxFuture<'a, Result<MemoryBlock, AgentError>> {
+        Box::pin(std::future::ready(self.apply_now(scope, &op, key, labels)))
+    }
+
+    fn clear<'a>(&'a self, scope: &'a MemoryScope) -> BoxFuture<'a, Result<(), AgentError>> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.scopes.remove(scope);
+        state.applied.retain(|(applied, _), _| applied != scope);
+        drop(state);
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+impl InMemoryMemoryStore {
+    /// Apply one edit with `labels`, once for each key.
+    fn apply_now(
+        &self,
+        scope: &MemoryScope,
+        op: &MemoryOp,
+        key: &EditKey,
+        labels: &BTreeSet<String>,
+    ) -> Result<MemoryBlock, AgentError> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let State { scopes, applied } = &mut *state;
         let blocks = scopes
@@ -436,15 +625,15 @@ impl MemoryStore for InMemoryMemoryStore {
         let done = (scope.clone(), key.clone());
         let result = match applied.get(&done) {
             Some(Some(error)) => Err(error.clone()),
-            Some(None) => current(blocks, &op),
+            Some(None) => current(blocks, op),
             None => {
-                let result = apply_to(blocks, &op);
+                let result = apply_to(blocks, op, labels);
                 applied.insert(done, result.as_ref().err().cloned());
                 result
             }
         };
         drop(state);
-        Box::pin(std::future::ready(result))
+        result
     }
 }
 
@@ -457,12 +646,22 @@ fn current(blocks: &[MemoryBlock], op: &MemoryOp) -> Result<MemoryBlock, AgentEr
         .ok_or_else(|| unknown_block(op.block(), blocks))
 }
 
-/// Apply `op` to the block it names. Returns the block after the edit.
-fn apply_to(blocks: &mut [MemoryBlock], op: &MemoryOp) -> Result<MemoryBlock, AgentError> {
+/// Apply `op` to the block it names, with the labels of the writing run.
+/// Returns the block after the edit.
+///
+/// # Errors
+///
+/// Returns a `Tool` error for an unknown block, and the errors of
+/// [`apply_op`].
+pub fn apply_to(
+    blocks: &mut [MemoryBlock],
+    op: &MemoryOp,
+    labels: &BTreeSet<String>,
+) -> Result<MemoryBlock, AgentError> {
     let Some(block) = blocks.iter_mut().find(|block| block.label == op.block()) else {
         return Err(unknown_block(op.block(), blocks));
     };
-    apply_op(block, op)?;
+    apply_labelled_op(block, op, labels)?;
     Ok(block.clone())
 }
 
@@ -482,14 +681,65 @@ fn unknown_block(label: &str, blocks: &[MemoryBlock]) -> AgentError {
 pub struct MemoryTool {
     store: Arc<dyn MemoryStore>,
     scope: MemoryScope,
+    labels: BTreeSet<String>,
 }
 
 impl MemoryTool {
     /// Bind the tool to a store and a scope.
     #[must_use]
     pub fn new(store: Arc<dyn MemoryStore>, scope: MemoryScope) -> Self {
-        Self { store, scope }
+        Self {
+            store,
+            scope,
+            labels: BTreeSet::new(),
+        }
     }
+
+    /// Keep `labels`, the flow labels of the writing run, with each entry
+    /// that the tool writes (issue #2272).
+    #[must_use]
+    pub fn with_labels(mut self, labels: BTreeSet<String>) -> Self {
+        self.labels = labels;
+        self
+    }
+
+    /// The definition of the tool, for a workflow that runs it itself.
+    #[must_use]
+    pub fn definition() -> crate::message::ToolDefinition {
+        crate::message::ToolDefinition {
+            name: MEMORY_TOOL.to_owned(),
+            description: MEMORY_DESCRIPTION.to_owned(),
+            input_schema: memory_schema(),
+        }
+    }
+}
+
+const MEMORY_DESCRIPTION: &str = "Edit your memory. action=add adds `text` to `block`. action=replace \
+     changes the entry that contains `old` to `text`. action=remove deletes \
+     the entry that contains `old`. Keep facts and lessons, not logs.";
+
+fn memory_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["add", "replace", "remove"]},
+            "block": {"type": "string", "description": "The block label, for example memory or user."},
+            "text": {"type": "string", "description": "The new entry text (add, replace)."},
+            "old": {"type": "string", "description": "Text from the entry to change (replace, remove)."}
+        },
+        "required": ["action", "block"]
+    })
+}
+
+/// The answer of the memory tool to one edit.
+#[must_use]
+pub fn edit_result(block: &MemoryBlock) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "block": block.label,
+        "used": block.used_chars(),
+        "limit": block.limit_chars,
+    })
 }
 
 impl Tool for MemoryTool {
@@ -498,22 +748,11 @@ impl Tool for MemoryTool {
     }
 
     fn description(&self) -> &'static str {
-        "Edit your memory. action=add adds `text` to `block`. action=replace \
-         changes the entry that contains `old` to `text`. action=remove deletes \
-         the entry that contains `old`. Keep facts and lessons, not logs."
+        MEMORY_DESCRIPTION
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["add", "replace", "remove"]},
-                "block": {"type": "string", "description": "The block label, for example memory or user."},
-                "text": {"type": "string", "description": "The new entry text (add, replace)."},
-                "old": {"type": "string", "description": "Text from the entry to change (replace, remove)."}
-            },
-            "required": ["action", "block"]
-        })
+        memory_schema()
     }
 
     fn effect(&self) -> ToolEffect {
@@ -530,13 +769,11 @@ impl Tool for MemoryTool {
                 AgentError::new(ErrorKind::Tool, format!("not a valid memory edit: {err}"))
             })?;
             let key = EditKey::for_call(ctx);
-            let block = self.store.apply(&self.scope, op, &key).await?;
-            Ok(serde_json::json!({
-                "ok": true,
-                "block": block.label,
-                "used": block.used_chars(),
-                "limit": block.limit_chars,
-            }))
+            let block = self
+                .store
+                .apply_labelled(&self.scope, op, &key, &self.labels)
+                .await?;
+            Ok(edit_result(&block))
         })
     }
 }
@@ -758,6 +995,7 @@ mod tests {
             call_id: "c".into(),
             session_id: None,
             step: 3,
+            workspace: None,
         };
         assert_eq!(EditKey::for_call(&ctx).as_str(), "r:3:c");
     }

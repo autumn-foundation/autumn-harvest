@@ -26921,6 +26921,7 @@ async fn process_workflow_task(
             workflow_id: prepared.execution.workflow_id.clone(),
             shard_id: i64::from(prepared.execution.shard_id),
             queue_name: task.queue_name.clone(),
+            drive_clock: None,
             is_replay,
             link_traceparent: trace_carrier
                 .as_ref()

@@ -6766,6 +6766,7 @@ impl WorkflowTestEnv {
             workflow_id: self.workflow_id.clone(),
             shard_id: 0,
             queue_name: self.queue_name.clone(),
+            drive_clock: None,
             is_replay: false,
             link_traceparent: None,
             // Issue #798: thread the configured build id so `ctx.build_id()`

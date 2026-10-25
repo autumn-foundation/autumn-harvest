@@ -51,6 +51,10 @@
 //! its name. The lane alone is a delegation ordinal, so another peer can hold
 //! it.
 //!
+//! A child run of a fan-out takes the result of the first unused recorded
+//! child with the same delegation chain and task text. With no such child,
+//! the candidate fails with [`NO_CHILD_RUN`].
+//!
 //! A candidate call that equals the recorded call at the same turn and
 //! position, of the same agent, takes the recorded id. The ids change before
 //! the policy runs. Approval signal names hold the id, so the recorded
@@ -84,7 +88,7 @@
 //! async, so the harness blocks in place. Blocking in place needs a
 //! multi-thread Tokio runtime.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -99,6 +103,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::harness::{AgentHarness, fit_turn};
+use crate::memory::MemorySnapshot;
 use crate::mesh::Peer;
 use crate::message::{ContentPart, StopReason, ToolCall};
 use crate::policy::ToolDecision;
@@ -114,6 +119,11 @@ use crate::workflow::{
 /// outcome gets it.
 pub const NOT_RUN: &str =
     "not run: the evaluation has no recorded output for this call, and it runs no tool";
+
+/// The error of a child run of a fan-out that no recorded child answers
+/// (issue #2270). The candidate run fails with it.
+pub const NO_CHILD_RUN: &str =
+    "not run: the source has no child run with this delegation chain and task";
 
 /// The default number of live turns past the recorded turn count.
 pub const DEFAULT_EXTRA_TURNS: usize = 8;
@@ -141,6 +151,8 @@ pub struct Candidate {
     harness: Arc<AgentHarness>,
     system: Option<String>,
     max_turns: Option<usize>,
+    model: Option<String>,
+    agent_models: BTreeMap<String, String>,
 }
 
 impl Candidate {
@@ -157,7 +169,33 @@ impl Candidate {
             harness,
             system: None,
             max_turns: None,
+            model: None,
+            agent_models: BTreeMap::new(),
         }
+    }
+
+    /// Ask the harness model `name` for every model turn (issue #2271).
+    ///
+    /// Without it, each turn asks the model that its recorded input names.
+    #[must_use]
+    pub fn model(mut self, name: impl Into<String>) -> Self {
+        self.model = Some(name.into());
+        self
+    }
+
+    /// Ask the harness model `name` for each turn of the agent `agent` of a
+    /// delegation tree. It wins over [`model`](Self::model) for that agent.
+    #[must_use]
+    pub fn agent_model(mut self, agent: impl Into<String>, name: impl Into<String>) -> Self {
+        self.agent_models.insert(agent.into(), name.into());
+        self
+    }
+
+    /// The model name that this candidate sets for a turn of `agent`, if any.
+    fn model_for(&self, agent: Option<&str>) -> Option<&String> {
+        agent
+            .and_then(|agent| self.agent_models.get(agent))
+            .or(self.model.as_ref())
     }
 
     /// Replace the system prompt of the recorded task.
@@ -407,7 +445,7 @@ pub async fn evaluate(
         stubbed: 0,
     }));
 
-    let model = model_mock(&session, &candidate.harness, &recording, handle);
+    let model = model_mock(&session, candidate, &recording, handle);
     let tool = {
         let session = Arc::clone(&session);
         move |input: Value| -> Result<Value, String> {
@@ -420,7 +458,7 @@ pub async fn evaluate(
         let session = Arc::clone(&session);
         move |_scope: Value| -> Result<Value, String> {
             let snapshot = lock(&session).snapshots.pop_front();
-            encode(&snapshot.unwrap_or_else(|| Ok(String::new()))?)
+            encode(&snapshot.unwrap_or_else(|| Ok(MemorySnapshot::Text(String::new())))?)
         }
     };
 
@@ -429,7 +467,24 @@ pub async fn evaluate(
         move |names: Value| -> Result<Value, String> { encode(&lock(&session).lookup(&names)?) }
     };
 
+    // A child run of a fan-out takes the result of the first unused recorded
+    // child that it matches. No child runs live.
+    let children = {
+        let recorded = Mutex::new(recording.children.clone());
+        move |task: Value| -> Result<Value, String> {
+            let result = lock(&recorded)
+                .iter_mut()
+                .find(|child| !child.used && child.answers(&task))
+                .and_then(|child| {
+                    child.used = true;
+                    child.result.clone()
+                });
+            result.unwrap_or_else(|| Err(NO_CHILD_RUN.to_owned()))
+        }
+    };
+
     let mut env = engine()
+        .mock_child_workflow(WORKFLOW_NAME, children)
         .mock_activity(agent_discover_peers_info().name, peers)
         .mock_activity(agent_model_turn_info().name, model)
         .mock_activity(agent_tool_call_info().name, tool)
@@ -467,6 +522,83 @@ pub async fn evaluate(
     })
 }
 
+/// Two candidates on one source, such as two models for one agent (issue
+/// #2271).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Comparison {
+    /// The first candidate against the source.
+    pub first: Evaluation,
+    /// The second candidate against the source.
+    pub second: Evaluation,
+    /// One comparison per model turn of the two candidates.
+    ///
+    /// In each [`TurnDiff`], `recorded` holds the decision of the first
+    /// candidate, and `candidate` holds the decision of the second.
+    /// [`Side::Recorded`] names the first candidate.
+    pub turns: Vec<TurnDiff>,
+    /// The index of the first turn where the candidates diverge.
+    pub first_divergence: Option<usize>,
+    /// `true` when the two candidates end in different ways, by the rule of
+    /// [`Evaluation::end_diverged`].
+    pub end_diverged: bool,
+}
+
+impl Comparison {
+    /// `true` when a turn diverges or the run ends differ.
+    #[must_use]
+    pub const fn diverged(&self) -> bool {
+        self.first_divergence.is_some() || self.end_diverged
+    }
+}
+
+/// Evaluate `first` and `second` against one recorded `history`, then
+/// compare the two candidates turn by turn (issue #2271).
+///
+/// Give both candidates one harness with two named models, and set
+/// [`Candidate::model`] or [`Candidate::agent_model`] on each. The two
+/// evaluations run one after the other, each with its own live model calls.
+///
+/// # Errors
+///
+/// The errors of [`evaluate`]. A refused history costs no model call.
+pub async fn compare(
+    history: &[WorkflowEvent],
+    first: &Candidate,
+    second: &Candidate,
+) -> Result<Comparison, EvalError> {
+    let first = evaluate(history, first).await?;
+    let second = evaluate(history, second).await?;
+    let decision = |evaluation: &Evaluation, turn: usize| {
+        evaluation
+            .turns
+            .get(turn)
+            .and_then(|diff| diff.candidate.clone())
+    };
+    let turns: Vec<TurnDiff> = (0..first.turns.len().max(second.turns.len()))
+        .filter_map(|turn| {
+            let (one, two) = (decision(&first, turn), decision(&second, turn));
+            // A turn that only the source has is not a candidate turn.
+            (one.is_some() || two.is_some()).then(|| TurnDiff {
+                turn,
+                verdict: verdict(one.as_ref(), two.as_ref()),
+                recorded: one,
+                candidate: two,
+            })
+        })
+        .collect();
+    let first_divergence = turns
+        .iter()
+        .position(|turn| matches!(turn.verdict, Verdict::Diverged(_)));
+    let end_diverged = ends_differ(&first.candidate, &second.candidate);
+    Ok(Comparison {
+        first,
+        second,
+        turns,
+        first_divergence,
+        end_diverged,
+    })
+}
+
 /// What the source run recorded.
 struct Recording {
     task: AgentTask,
@@ -476,13 +608,15 @@ struct Recording {
     tools: Vec<RecordedTool>,
     /// The recorded snapshots, and the error of a snapshot that failed for
     /// good.
-    snapshots: Vec<Result<String, String>>,
+    snapshots: Vec<Result<MemorySnapshot, String>>,
     /// Signals for waits that the source opened, received in time, in order.
     signals: Vec<(String, Value)>,
     /// The recorded peer lookups: the names asked and the peers found.
     peers: Vec<RecordedPeers>,
     /// The agent of each recorded model turn, in order.
     turn_agents: Vec<AgentKey>,
+    /// The child runs of the fan-outs, in start order (issue #2270).
+    children: Vec<RecordedChild>,
     end: RunEnd,
 }
 
@@ -520,6 +654,7 @@ impl Recording {
         let mut opened: HashSet<&str> = HashSet::new();
         let mut timed_out: HashSet<&str> = HashSet::new();
         let mut signals = Vec::new();
+        let mut children = Children::default();
         let mut end = None;
         // The last tool or snapshot failure with no later completion. A
         // failed source can end on it.
@@ -527,6 +662,9 @@ impl Recording {
         for event in history {
             if matches!(event, WorkflowEvent::ActivityCompleted { .. }) {
                 last_failure = None;
+            }
+            if children.read(event) {
+                continue;
             }
             match event {
                 WorkflowEvent::ActivityScheduled {
@@ -604,16 +742,7 @@ impl Recording {
         signals.retain(|(name, _)| opened.contains(name.as_str()));
         let turns = model_turns(history)?;
         let turn_agents = model_turn_agents(history, run_id.as_deref())?;
-        // One lane holds one agent in a run, so its model turns name it.
-        let names: HashMap<&str, &Option<String>> = turn_agents
-            .iter()
-            .map(|agent| (agent.lane.as_str(), &agent.name))
-            .collect();
-        for tool in &mut effects.tools {
-            tool.agent.name = names
-                .get(tool.agent.lane.as_str())
-                .and_then(|name| (*name).clone());
-        }
+        name_tool_agents(&mut effects.tools, &turn_agents);
         Ok(Self {
             task,
             run_id,
@@ -623,8 +752,87 @@ impl Recording {
             signals,
             peers: effects.peers,
             turn_agents,
+            children: children.results,
             end: end.ok_or(EvalError::InFlightSource)?,
         })
+    }
+}
+
+/// Name the agent of each recorded tool call from the model turns of its
+/// lane. One lane holds one agent in a run, so its model turns name it.
+fn name_tool_agents(tools: &mut [RecordedTool], turn_agents: &[AgentKey]) {
+    let names: HashMap<&str, &Option<String>> = turn_agents
+        .iter()
+        .map(|agent| (agent.lane.as_str(), &agent.name))
+        .collect();
+    for tool in tools {
+        tool.agent.name = names
+            .get(tool.agent.lane.as_str())
+            .and_then(|name| (*name).clone());
+    }
+}
+
+/// One child run of a fan-out of a source run (issue #2270).
+#[derive(Clone)]
+struct RecordedChild {
+    /// The child task, as history records it.
+    input: Value,
+    /// The result, or `None` for a child that has no result yet.
+    result: Option<Result<Value, String>>,
+    /// Whether a candidate child took the result. Each result answers one
+    /// child.
+    used: bool,
+}
+
+impl RecordedChild {
+    /// Whether this child answers the candidate child `task`.
+    ///
+    /// The two must have the same delegation chain and task text. The chain
+    /// names the delegating agents and the peer. The token share, the model
+    /// and the flow labels can differ.
+    fn answers(&self, task: &Value) -> bool {
+        ["/input", "/mandate/chain"]
+            .iter()
+            .all(|at| self.input.pointer(at) == task.pointer(at))
+    }
+}
+
+/// The child runs of the fan-outs of a source run (issue #2270).
+#[derive(Default)]
+struct Children {
+    /// Each child run, in start order.
+    results: Vec<RecordedChild>,
+    /// The place of each child run in `results`, by child id.
+    index: HashMap<String, usize>,
+}
+
+impl Children {
+    /// Read one event. Returns `true` when it is a child-run event.
+    fn read(&mut self, event: &WorkflowEvent) -> bool {
+        let (child_id, result) = match event {
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id, input, ..
+            } => {
+                self.index.insert(child_id.to_string(), self.results.len());
+                self.results.push(RecordedChild {
+                    input: input.clone(),
+                    result: None,
+                    used: false,
+                });
+                return true;
+            }
+            WorkflowEvent::ChildWorkflowCompleted { child_id, output } => {
+                (child_id, Ok(output.clone()))
+            }
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id, error, ..
+            } => (child_id, Err(error.clone())),
+            _ => return false,
+        };
+        if let Some(&at) = self.index.get(&child_id.to_string()) {
+            self.results[at].result = Some(result);
+        }
+        true
     }
 }
 
@@ -634,7 +842,7 @@ struct Effects {
     tools: Vec<RecordedTool>,
     /// The recorded snapshots, and the error of a snapshot that failed for
     /// good.
-    snapshots: Vec<Result<String, String>>,
+    snapshots: Vec<Result<MemorySnapshot, String>>,
     peers: Vec<RecordedPeers>,
 }
 
@@ -796,7 +1004,7 @@ struct Session {
     max_turns: usize,
     cap_reached: bool,
     tools: Vec<RecordedTool>,
-    snapshots: VecDeque<Result<String, String>>,
+    snapshots: VecDeque<Result<MemorySnapshot, String>>,
     peers: Vec<RecordedPeers>,
     /// The run id of the candidate root agent: the run id of its first model
     /// request.
@@ -932,12 +1140,13 @@ fn engine() -> WorkflowTestEnv {
 /// The mock of the model activity: the live candidate turn.
 fn model_mock(
     session: &Arc<Mutex<Session>>,
-    harness: &Arc<AgentHarness>,
+    candidate: &Candidate,
     recording: &Recording,
     handle: tokio::runtime::Handle,
 ) -> impl Fn(Value) -> Result<Value, String> + Send + Sync + 'static {
     let session = Arc::clone(session);
-    let harness = Arc::clone(harness);
+    let harness = Arc::clone(&candidate.harness);
+    let models = candidate.clone();
     let run_id = recording.run_id.clone();
     let taken: HashSet<String> = recording
         .turns
@@ -950,6 +1159,9 @@ fn model_mock(
         .unwrap_or_default();
     move |input: Value| -> Result<Value, String> {
         let mut request: ModelTurnRequest = decode(input)?;
+        if let Some(name) = models.model_for(request.agent.as_deref()) {
+            request.model = Some(name.clone());
+        }
         let (index, recorded) = {
             let mut session = lock(&session);
             // The root agent makes the first model request.
@@ -1292,6 +1504,7 @@ mod tests {
             labels: Vec::new(),
             releases: Vec::new(),
             oversized: false,
+            interruptible: Vec::new(),
         }
     }
 
@@ -1512,6 +1725,8 @@ mod tests {
                 followup_dropped: false,
                 delegations: Vec::new(),
                 flow_labels: std::collections::BTreeSet::new(),
+                run_id: None,
+                workspace: None,
             })
         };
         let done = report(crate::AgentStop::Completed);

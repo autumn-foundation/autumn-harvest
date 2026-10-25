@@ -176,6 +176,7 @@ async fn a_turn_over_the_cap_with_its_decisions_is_not_cached() {
         labels: Vec::new(),
         releases: Vec::new(),
         oversized: false,
+        interruptible: Vec::new(),
     };
     let cap = u64::try_from(serde_json::to_vec(&bare).unwrap().len()).unwrap() + 100;
     let policy = CountingPolicy::new(ToolDecision::Deny {

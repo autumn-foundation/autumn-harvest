@@ -862,6 +862,22 @@ pub enum CliError {
         context: String,
     },
 
+    /// `agents erase` timed out before the agent run ended (issue #2267).
+    #[error(
+        "agent '{agent_id}' did not end within {seconds} s; its inbox may hold work, so run \
+         the command again"
+    )]
+    AgentEraseTimeout {
+        /// The agent id.
+        agent_id: String,
+        /// The wait in seconds.
+        seconds: u64,
+    },
+
+    /// `agents erase` sends several requests, so it has no single request.
+    #[error("`agents erase` has no single API request")]
+    AgentEraseIsMultiStep,
+
     /// `--wait` timed out before the worker reached `Stopped`.
     #[error("timed out waiting for worker '{worker_id}' to stop (last status: {last_status})")]
     DrainWaitTimeout {
@@ -1170,6 +1186,12 @@ enum Commands {
     Shard {
         #[command(subcommand)]
         command: ShardCommand,
+    },
+    /// List, describe, pause, resume and erase durable agents (issue #2267).
+    #[command(alias = "agent")]
+    Agents {
+        #[command(subcommand)]
+        command: agents::AgentCommand,
     },
     /// Manage workflow executions.
     #[command(alias = "workflows")]
@@ -3665,6 +3687,7 @@ impl Cli {
             Commands::Health => Ok(ApiRequest::get("/health")),
             Commands::Preflight => Ok(ApiRequest::get("/admin/preflight")),
             Commands::Shard { command } => Ok(shard_request(command)),
+            Commands::Agents { command } => agents::agent_request(command),
             Commands::Workflow { command } => workflow_request(command),
             Commands::History { command } => Ok(history_request(command)),
             Commands::LegalHold { command } => Ok(legal_hold_request(command)),
@@ -3808,6 +3831,7 @@ impl ApiRequest {
     }
 }
 
+mod agents;
 pub mod debug;
 pub mod debug_tui;
 pub mod tui;
@@ -4024,6 +4048,20 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     } = &cli.command
     {
         return run_events_tail(&cli, execution_id, *last_event_id).await;
+    }
+
+    // `agents erase` sends several requests (issue #2267).
+    if let Commands::Agents {
+        command:
+            agents::AgentCommand::Erase {
+                agent_id,
+                reason,
+                wait_timeout_secs,
+            },
+    } = &cli.command
+    {
+        return agents::run_agent_erase(&cli, agent_id, reason.as_deref(), *wait_timeout_secs)
+            .await;
     }
 
     // --wait mode: issue drain then poll until Stopped or timeout.
@@ -8317,7 +8355,15 @@ fn print_new_next_steps(names: &ScaffoldNames, target: &Path) {
 /// Returns an error if request construction fails, the HTTP request fails, the
 /// API returns a non-success status, or the response body is not valid JSON.
 pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
-    let request = cli.api_request()?;
+    execute_request(cli, &cli.api_request()?).await
+}
+
+/// Send `request` with the settings of `cli`, and parse the JSON response.
+///
+/// # Errors
+///
+/// As [`execute`].
+pub(crate) async fn execute_request(cli: &Cli, request: &ApiRequest) -> Result<Value, CliError> {
     let timeout = cli.request_timeout();
     let client = http_client(timeout)?;
     let url = format!("{}{}", cli.base_url.trim_end_matches('/'), request.path);
