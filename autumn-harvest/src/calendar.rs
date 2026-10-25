@@ -623,14 +623,16 @@ pub fn next_business_day_at_or_after(
 
 /// Rebase a `DateTime<Utc>` to a different date, preserving the time-of-day.
 ///
-/// For `CronInTimezone` schedules the wall-clock time in the schedule's timezone
-/// is preserved across DST boundaries instead of the raw UTC clock time. Falls
-/// back to naive UTC rebasing for plain `Cron`/`Interval`/`None` schedules.
+/// For `CronInTimezone` schedules `date` is a date in the schedule's timezone.
+/// The wall-clock time in that timezone is preserved across DST boundaries
+/// instead of the raw UTC clock time. A time inside a DST gap does not exist.
+/// It moves forward to the first time that exists, on the same local day.
+/// Other schedules rebase on the UTC date and time.
 ///
-/// Returns the original datetime if the date cannot be combined with the time.
+/// Returns the UTC rebase when the local time cannot be built within two hours.
 #[cfg(feature = "db")]
 #[must_use]
-fn rebase_to_date(
+pub(crate) fn rebase_to_date(
     ts: chrono::DateTime<chrono::Utc>,
     date: NaiveDate,
     schedule: Option<&crate::policy::Schedule>,
@@ -638,13 +640,14 @@ fn rebase_to_date(
     if let Some(crate::policy::Schedule::CronInTimezone { tz, .. }) = schedule
         && let Ok(tz) = tz.parse::<chrono_tz::Tz>()
     {
-        let local_ts = ts.with_timezone(&tz);
-        if let Some(local_dt) = date
-            .and_time(local_ts.time())
-            .and_local_timezone(tz)
-            .earliest()
-        {
-            return local_dt.with_timezone(&chrono::Utc);
+        let wanted = date.and_time(ts.with_timezone(&tz).time());
+        for hours in 0..=2 {
+            if let Some(local_dt) = (wanted + chrono::Duration::hours(hours))
+                .and_local_timezone(tz)
+                .earliest()
+            {
+                return local_dt.with_timezone(&chrono::Utc);
+            }
         }
     }
     let naive = date.and_time(ts.time());
@@ -1964,6 +1967,17 @@ mod tests {
         }
 
         // Issue #2332: the calendar tests the schedule's local date.
+        #[test]
+        fn rebase_into_a_dst_gap_keeps_the_target_local_day() {
+            // Sydney skips 02:00 to 03:00 on Sun 2026-10-04.
+            let s = tz_cron("30 2 * * *", "Australia/Sydney");
+            let slot = utc("2026-10-02T16:30:00Z"); // Sat 3 Oct 02:30 AEST
+            let shifted = rebase_to_date(slot, date("2026-10-04"), Some(&s));
+            let local = shifted.with_timezone(&chrono_tz::Australia::Sydney);
+            assert_eq!(local.date_naive(), date("2026-10-04"));
+            assert_eq!(local.format("%H:%M").to_string(), "03:30");
+        }
+
         #[test]
         fn preview_weekday_tokyo_cron_is_not_skipped_by_weekends_off() {
             let s = tz_cron("0 8 * * 1-5", "Asia/Tokyo");

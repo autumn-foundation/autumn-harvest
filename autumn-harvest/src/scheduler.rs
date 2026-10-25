@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
@@ -4705,7 +4705,7 @@ async fn tick_one_workflow_schedule(
             if adjusted == slot_date {
                 *original_slot
             } else {
-                rebase_logical_date(*original_slot, adjusted, parsed_schedule)
+                crate::calendar::rebase_to_date(*original_slot, adjusted, parsed_schedule)
             }
         } else {
             *original_slot
@@ -5341,32 +5341,6 @@ fn schedule_expr(schedule: Option<&Schedule>) -> Option<String> {
     }
 }
 
-/// Rebase a `DateTime<Utc>` to a different date while preserving the time-of-day.
-/// Used by the calendar check to shift `logical_date` when a skip policy defers
-/// the fire to a different day.
-fn rebase_logical_date(
-    ts: DateTime<Utc>,
-    date: chrono::NaiveDate,
-    schedule: Option<&Schedule>,
-) -> DateTime<Utc> {
-    // For timezone-aware schedules preserve the wall-clock time in the schedule's
-    // timezone so DST transitions don't shift the effective dispatch hour.
-    if let Some(Schedule::CronInTimezone { tz, .. }) = schedule
-        && let Ok(tz) = tz.parse::<chrono_tz::Tz>()
-    {
-        let local_ts = ts.with_timezone(&tz);
-        if let Some(local_dt) = date
-            .and_time(local_ts.time())
-            .and_local_timezone(tz)
-            .earliest()
-        {
-            return local_dt.with_timezone(&Utc);
-        }
-    }
-    let naive = date.and_time(ts.time());
-    chrono::Utc.from_utc_datetime(&naive)
-}
-
 fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
     schedule.and_then(|schedule| crate::schedule_plan::next_fire_after(schedule, reference))
 }
@@ -5785,7 +5759,11 @@ pub fn resolve_effective_fire_at_pure(
         // Not excluded: no rebasing.
         Some(adjusted) if adjusted == slot_date => None,
         // Rebased to a business day: the effective fire is at the adjusted slot.
-        Some(adjusted) => Some(rebase_logical_date(slot, adjusted, Some(&parsed))),
+        Some(adjusted) => Some(crate::calendar::rebase_to_date(
+            slot,
+            adjusted,
+            Some(&parsed),
+        )),
     }
 }
 
@@ -5807,7 +5785,7 @@ pub fn resolve_effective_fire_at_pure(
 ///   schedule the tick is deliberately holding for a future business-day fire is
 ///   not flagged overdue.
 ///
-/// Reuses the **same** `calendar::apply_skip_policy` + [`rebase_logical_date`]
+/// Reuses the **same** `calendar::apply_skip_policy` + [`crate::calendar::rebase_to_date`]
 /// helpers the tick uses (`tick_one_workflow_schedule`'s dispatch loop), so there
 /// is no second calendar implementation to drift. The calendar's exclusion set is
 /// loaded on `conn` (shard-local), keeping the pure predicate DB-free (AC2).
@@ -5826,30 +5804,17 @@ pub async fn resolve_effective_fire_at(
     else {
         return Ok(None);
     };
-    let Some(parsed) = parse_schedule_from_expr(expr) else {
+    if parse_schedule_from_expr(expr).is_none() {
         return Ok(None);
-    };
+    }
     let excluded = crate::calendar::load_exclusions_for_calendar(conn, cal_name).await?;
-    let exclude_weekends = crate::calendar::calendar_excludes_weekends(cal_name);
-    let skip_policy = crate::policy::SkipPolicy::from_db(skip_policy_db);
-    let slot_date = crate::calendar::schedule_local_date(slot, Some(&parsed));
-    Ok(
-        match crate::calendar::apply_skip_policy(
-            slot_date,
-            skip_policy,
-            &excluded,
-            exclude_weekends,
-        ) {
-            // `SkipPolicy::Skip` on an excluded day: the tick drops the slot and
-            // advances, so there is no adjusted fire to defer to. Keep the raw
-            // anchor so a tick genuinely wedged before advancing is still flagged.
-            None => None,
-            // Not excluded: the tick fires the original slot; no rebasing.
-            Some(adjusted) if adjusted == slot_date => None,
-            // Rebased to a business day: the effective fire is at the adjusted slot.
-            Some(adjusted) => Some(rebase_logical_date(slot, adjusted, Some(&parsed))),
-        },
-    )
+    Ok(resolve_effective_fire_at_pure(
+        &excluded,
+        crate::calendar::calendar_excludes_weekends(cal_name),
+        skip_policy_db,
+        Some(expr),
+        Some(slot),
+    ))
 }
 
 /// One shard's overdue sampling pass (issue #696).
@@ -7528,6 +7493,7 @@ pub(crate) async fn maybe_reset_schedule_failure_counter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     /// Documents (and pins) the exact hazard `load_schedule_overdue_aux_by_shard`
     /// (in `autumn-harvest-plugin/src/api.rs`) must avoid when a batched
