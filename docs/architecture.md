@@ -33,7 +33,7 @@ autumn-harvest/          <- workspace root
       models.rs          <- Phase 1, db feature only
       store.rs           <- Phase 2: event store (append/load history)
       replay.rs          <- Phase 2: deterministic replay engine
-      activity_scan_index.rs  <- issue #2330: activity terminal scan index
+      activity_scan_index.rs  <- issues #2330, #2338: terminal scan index
       executor.rs        <- Phase 2: workflow executor (replay + suspension)
       queue.rs           <- Phase 2: Postgres task queue (SKIP LOCKED)
       notify.rs          <- Phase 2: LISTEN/NOTIFY wrapper
@@ -428,7 +428,7 @@ An agent loop can spend without limit. A budget caps the LLM tokens or the cost 
 | `timeline.rs` | 3.50 | Per-execution timeline read model (issue #739): pure `db`-free `derive_timeline(...) -> Timeline`; `Timeline`/`TimelineStep`/`TimelineRollup`/`SlowestStep`/`StepKind`/`StepOutcome`/`TimelineEventRow` (re-exported from `lib.rs`). Reconstructs a run's wall-clock breakdown (per-step wait/exec split where derivable, busy/wait totals, slowest step) purely from recorded `harvest_events` timestamps. No new event variant, no migration, no write path. Route `GET /workflows/{id}/timeline`. |
 | `stall_diagnosis.rs` | 3.51 | Per-execution stall diagnosis — the pure root-cause classifier (issue #809): `ExecutionHealth`, the discriminated `BlockedOn` enum, `PendingActivityFacts`/`ExternalHandoffFacts`/`PendingChildFacts`/`AwaitedSignalFacts`/`PendingTimerFacts`/`WorkflowTaskFacts`/`ReplayWaitFacts`/`NdBlockFacts`/`DiagnosisInputs`, `classify_pending_activity`, `classify_execution`, `classify_workflow_task`, `workflow_task_hard_impediment`, `workflow_wake_was_missed`, `activity_precedence`, `summarize`, `TIMER_OVERDUE_GRACE_SECONDS` (all re-exported from `lib.rs`). No `db` feature, no DB access, no event variant, no migration. Route `GET /workflows/{id}/diagnose`. |
 | `replay.rs` | 2 | Deterministic replay engine: `HistoryMatcher` walks event history, detects non-determinism |
-| `activity_scan_index.rs` | 2 | The position index of the activity terminal scan in `replay.rs`. A scan reads only the positions that can change its result, so a fan-out replay is not quadratic (issue #2330) |
+| `activity_scan_index.rs` | 2 | The position index of the terminal scans in `replay.rs`: the activity scan (issue #2330), and the timer fire, child terminal and external stash scans (issue #2338). A scan reads only the positions that can change its result, so a fan-out replay is not quadratic |
 | `executor.rs` | 2 | Workflow executor: `run_workflow` drives replay + live execution, detects suspension by readiness (issue #1797) |
 | `queue.rs` | 2 | Postgres task queue: `enqueue`, `claim` (FOR UPDATE SKIP LOCKED), `complete`, `fail` |
 | `notify.rs` | 2 | LISTEN/NOTIFY wrapper: `Listener` (async stream), `Notifier` (pg_notify), channel naming. `sslmode=require` selects verified TLS (issue #1717). Wakes for appends and enqueues go after commit, from a per-pool sender on its own connection (issue #1796). |

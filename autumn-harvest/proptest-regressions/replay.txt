@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d3c4df3cd5221701258f096ee2c8351f7e09b1c4c3225c0d3a98004568428b5c # shrinks to first = Scheduled(1, false), evs = [Scheduled(1, false), CancelRequested(0), Completed(1), Scheduled(0, false), AwaitResolved(0), CancelDelivered(0)], ops = [Activity(false), AtCursor, Activity(true)], budget = Some(0)
+cc f0546f80b7f76759a880e8d7b491848c175dd0605a48172ba64d25fb994670fd # shrinks to first = TimerStarted(0), evs = [TimerFired(1)], ops = [AtCursor], budget = None
+cc 98f37a8ce878dec7698d613543e55e0a2db57245c82b354fb4d730262a83591b # shrinks to first = Scheduled(0, false), evs = [AwaitRequested(1), Completion, AwaitFailed(1), AwaitResolved(1)], ops = [AtCursor, Timer(0)], budget = None
+cc 48d93a831d68b578729ad305bf23d373377749eae2299fc435ba4a8829afb0d8 # shrinks to first = ChildStarted(1), evs = [Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), ChildFailed(1)], ops = [AtCursor], budget = Some(3)
+cc 036827b7d13b85420ed725d47e737b80b14dc95f0ab5b67c42d81c53f0cbf022 # shrinks to first = ChildStarted(2), evs = [ChildStarted(2), ChildFailed(2)], ops = [AtCursor, AtCursor], budget = Some(1)
