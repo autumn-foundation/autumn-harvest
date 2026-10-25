@@ -2294,6 +2294,11 @@ from the benchmark are directly comparable.
   [the concurrency-key gate fix](#the-concurrency-key-gate-fix).
 * `autumn-harvest/scripts/concurrency_key_claim_perf_repro.sh` — regenerates
   that evidence from a clean checkout.
+* `docs/perf-artifacts/claim-paused-gate/` — the PAUSED-run gate after the
+  `idx_harvest_we_paused` partial index (issue #2212, PR #2215). With 50
+  PAUSED-run tasks at the queue head, claim buffers fall from 6,515 to 1,289
+  at 1,000,000 executions. The claimed ids are identical. Its `run.sh`
+  regenerates the evidence.
 * [`docs/performance-capability-labels.md`](performance-capability-labels.md) — the capability-labels claim
   predicate (#382) measurement referenced above.
 * `docs/perf-artifacts/capability-labels-claim-predicate/` — committed
@@ -2378,6 +2383,11 @@ standalone note rather than part of the claim-path attribution table above:
   (issue #1194).
 * [`docs/performance-workflow-children-traversal.md`](performance-workflow-children-traversal.md)
   — batching the N+1 in `GET /workflows/{id}/children?depth=N` (issue #786-adjacent).
+* [`docs/performance-history-bloat-filter.md`](performance-history-bloat-filter.md)
+  — the `min_history_events` and `history_bloat_min_events` filters of three
+  `autumn-harvest-plugin/src/api.rs` queries. `COUNT(*) >= N` counted every
+  event of a run. A bounded `EXISTS (... OFFSET N-1 LIMIT 1)` reads at most N
+  rows (buffers 3,976 → 94 on a 448,175-event run, -97.6%). Shipped.
 * [`docs/performance-schedule-overdue-aux.md`](performance-schedule-overdue-aux.md)
   — the same N+1 shape in `GET /admin/schedules`'s overdue-aux computation
   (issue #696).
@@ -2490,10 +2500,6 @@ standalone note rather than part of the claim-path attribution table above:
   `shard_rebalance::history_fingerprint`, the replay-determinism check a
   shard migration runs on both sides of a copy (`docs/sharding.md`), fixed
   by reusing one buffer across events (alloc bytes -16.45%).
-* [`docs/performance-timeline-acckey-hash.md`](performance-timeline-acckey-hash.md)
-  — SipHash over `AccKey` in `timeline::derive_timeline`, the read model behind
-  `GET /workflows/{id}/timeline` (issue #739), replaced by one 128-bit hash
-  write per key (instructions -8.3%).
 * [`docs/performance-lineage.md`](performance-lineage.md) — the `visited`/
   `next`/`node.children` vecs in `lineage::LineageWalk`/
   `LineageTreeReport::finish`, the in-memory half of
@@ -2552,7 +2558,7 @@ standalone note rather than part of the claim-path attribution table above:
   400→4 at a 400-child fixture, 100 executions per chunk).
 * [`docs/performance-timeline-acckey-hash.md`](performance-timeline-acckey-hash.md)
   — the three-write derived `Hash` for `timeline::AccKey`, the lookup key of
-  `derive_timeline` behind `GET /workflows/{id}/timeline` (PR #1894);
+  `derive_timeline` behind `GET /workflows/{id}/timeline` (issue #739, PR #1894);
   replaced by a manual impl that writes one 128-bit value (instructions
   -8.3%, callgrind).
 * [`docs/performance-metrics-rs-labels.md`](performance-metrics-rs-labels.md)
@@ -2582,12 +2588,33 @@ standalone note rather than part of the claim-path attribution table above:
   tick, because the planner could not prove its predicate implies the partial
   index's. It now repeats the index clause and uses the index (buffers
   19,887 → 1 at 1,000,000 executions, `EXPLAIN (ANALYZE, BUFFERS)`).
+* [`docs/performance-analyzer-large-payload.md`](performance-analyzer-large-payload.md)
+  — `LargePayloadRule` in `HistoryAnalyzer::analyze` built the JSON text of
+  each payload to measure it. A counting writer now measures it with no text
+  (instructions -77.5%, allocated bytes -97.6%, PR #2287).
+* [`docs/performance-debug-diff-redaction-probe.md`](performance-debug-diff-redaction-probe.md)
+  — `debugger::is_redacted_export` in `harvest debug diff` parsed each
+  snapshot into a `Value` tree to read one key. A map visitor now reads the
+  key with no tree (pipeline instructions -23.7%, allocation blocks -16.5%,
+  PR #2292).
+* [`docs/performance-chrome-trace-export.md`](performance-chrome-trace-export.md)
+  — `trace_export::export_chrome_trace` returned `json!(events)`, which
+  copied the finished event tree. It now moves the vector into
+  `Value::Array` (instructions -34.8%, allocation blocks -35.4%, PR #2279).
+* [`docs/performance-fork-scheduled-occurrence.md`](performance-fork-scheduled-occurrence.md)
+  — `fork::scheduled_occurrence` hashed every scheduled activity name to
+  count one name. Two passes with no map replace it (instructions -49.2% at
+  K=1000, PR #2214). The cost stays quadratic in K.
 * [`docs/performance-decision-owner-baseline.md`](performance-decision-owner-baseline.md)
   — the baseline for the decision owner (issue #2248): claim latency by
   task kind on the assay #14 shape, the phases of the decision persist, and
   a criterion bench of the second fence row. Owner mode with DR on adds
   two statements and about 20% to the persist at one writer, so it fails
   the stage 1b bar of 10%.
+* [`docs/performance-owner-failover.md`](performance-owner-failover.md)
+  — owner failover on real Postgres (issue #2254): a frozen owner, `kill -9`
+  and a scale-out from 4 to 8 workers. All four tests pass. After a kill,
+  the next decision runs in 10.2 s to 10.3 s, inside the 11 s bound.
 * [`docs/performance-owner-decider.md`](performance-owner-decider.md)
   — stage 1b of the decision owner (issue #2255). The owner decider takes
   workflow tasks by execution, so the claim loops claim 3 tasks per
@@ -2597,7 +2624,8 @@ standalone note rather than part of the claim-path attribution table above:
   — `HistoryMatcher::match_activity` on a fan-out history (issue #2330). The
   terminal scan reads a position index, so a fan-out replay is no longer
   quadratic. At N=1000 it costs 72% fewer instructions. A sequential history
-  costs 0.7% more. Shipped.
+  costs 0.7% more. Shipped. Before it, PR #2303 hashed event positions
+  without `SipHash` (instructions -61.6% at N=1000).
 * [`docs/performance-payload-depth.md`](performance-payload-depth.md)
   — the depth walk that the worker runs on every activity result (issue
   #2312). The walk is 10.6% of a harness that only clones and checks. The one

@@ -23,8 +23,9 @@ record as input and output. `MATCH_ACTIVITY_PROFILE_SHAPE` picks the shape:
 event of its activity. In a fan-out, activity k stepped over the N−k later
 schedules and the k−1 consumed completions. `settle_terminal` then walked the
 same range again, to consume the progress events of the activity. Each
-activity cost O(N), so the replay cost O(N²). Issue #2303 cut the cost of each
-step, but not the number of steps.
+activity cost O(N), so the replay cost O(N²). PR #2303 cut the cost of each
+step, but not the number of steps. See
+[the earlier change](#the-earlier-change-pr-2303).
 
 ## 🔧 Change
 
@@ -135,6 +136,34 @@ Two other matcher paths stay quadratic. Issue #2338 tracks both:
   fan-out after one external signal still costs O(N²).
 - `scan_local_activity_terminal`, and the child, timer and external scans,
   keep the plain walk. A fan-out of local activities is likely still O(N²).
+
+## The earlier change (PR #2303)
+
+PR #2303 added `match_activity_profile`. Its `fanout` profile at N=1000 put
+62.0% of the instructions in the `SipHash` of event positions.
+`is_consumed` runs once per scanned event, and it probed three index sets
+with the default hasher.
+
+The change gives those three sets `EventIndexHasher`, a multiplicative
+hasher in `replay.rs`. An event index is a history position, not data that
+an attacker chooses, so `SipHash` protects nothing there. No code iterates
+the sets, so the hasher cannot change behavior.
+
+Callgrind, total `Ir` of the harness:
+
+| Shape | N | Before | After | Change |
+|---|---|---|---|---|
+| `fanout` | 250 | 18,395,861 | 9,480,027 | −48.5% |
+| `fanout` | 500 | 62,353,728 | 26,850,984 | −56.9% |
+| `fanout` | 1000 | 228,281,482 | 87,688,451 | −61.6% |
+| `fanout_rev` | 250 | 19,222,238 | 10,556,684 | −45.1% |
+| `fanout_rev` | 500 | 65,476,976 | 31,575,854 | −51.8% |
+| `fanout_rev` | 1000 | 241,115,115 | 105,086,035 | −56.4% |
+| `sequential` | 1000 | 18,658,519 | 18,693,757 | +0.2% |
+
+The scan stayed O(N²). Only the cost of each step fell. The "Before" column
+of [the main table](#-measurement) is this "After" column, measured again on
+`caa8c01`.
 
 ## 🧪 Tests
 
