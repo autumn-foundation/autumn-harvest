@@ -5775,7 +5775,7 @@ pub const fn oldest_pending_ages_query() -> &'static str {
          ) \
          SELECT s.queue_name, \
                 GREATEST( \
-                    EXTRACT(EPOCH FROM (NOW() - COALESCE(r.oldest, f.oldest))), \
+                    EXTRACT(EPOCH FROM (NOW() - COALESCE(f.oldest, r.oldest))), \
                     0 \
                 )::DOUBLE PRECISION AS age_secs \
          FROM seen s \
@@ -5792,7 +5792,7 @@ pub const fn oldest_pending_ages_query() -> &'static str {
                AND scheduled_at <= NOW() ",
         oldest_pending_gate_sql!(),
         "     ) f ON TRUE \
-         WHERE COALESCE(r.oldest, f.oldest) IS NOT NULL"
+         WHERE COALESCE(f.oldest, r.oldest) IS NOT NULL"
     )
 }
 

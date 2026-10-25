@@ -455,7 +455,9 @@ async fn age_gauge_matches_the_reference_query() {
     both(&mut conn, &queues, &["x".to_owned()]).await;
 
     // Large queues. Row `n` of a queue is due `n` minutes ago, oldest first.
-    let large: Vec<String> = ["j", "k", "l", "m", "n", "o"].map(String::from).to_vec();
+    let large: Vec<String> = ["j", "k", "l", "m", "n", "o", "p"]
+        .map(String::from)
+        .to_vec();
     conn.batch_execute(
         "INSERT INTO harvest_workflow_executions \
              (id, workflow_name, workflow_id, shard_id, state, input, queue_name) \
@@ -492,7 +494,16 @@ async fn age_gauge_matches_the_reference_query() {
          INSERT INTO harvest_task_queue (queue_name, task_type, input, state, scheduled_at, created_at) \
          SELECT 'o', 'activity', '{}', 'PENDING', now() - interval '10 minutes', \
                 now() - interval '10 minutes' \
-         FROM generate_series(1, 100) g;",
+         FROM generate_series(1, 100) g; \
+         /* p: 32 rows due 10 minutes ago but created 1 minute ago fill the window. \
+            A later row due and created 5 minutes ago is the true oldest value. */ \
+         INSERT INTO harvest_task_queue (queue_name, task_type, input, state, scheduled_at, created_at) \
+         SELECT 'p', 'activity', '{}', 'PENDING', now() - interval '10 minutes', \
+                now() - interval '1 minute' \
+         FROM generate_series(1, 32) g; \
+         INSERT INTO harvest_task_queue (queue_name, task_type, input, state, scheduled_at, created_at) \
+         VALUES ('p', 'activity', '{}', 'PENDING', now() - interval '5 minutes', \
+                 now() - interval '5 minutes');",
     )
     .await
     .expect("large fixture");
