@@ -16187,6 +16187,7 @@ mod activity_scan_tests {
             events
         }
 
+        #[allow(clippy::too_many_lines)]
         fn event(&self, ev: &Ev, at: usize) -> WorkflowEvent {
             let a = |i: usize| self.activities[i];
             let payload = serde_json::json!(at);
