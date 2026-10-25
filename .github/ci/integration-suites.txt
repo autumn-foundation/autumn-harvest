@@ -152,6 +152,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          fanout_result_writer_db_tests
 linux        autumn-harvest         integration                      -                          force_fail
 linux        autumn-harvest         integration                      -                          fork_tests
+linux        autumn-harvest         integration                      -                          group_commit_db_tests
 linux        autumn-harvest         integration                      -                          history_ceiling_claim_tests
 linux        autumn-harvest         integration                      -                          history_crash_tests
 linux        autumn-harvest         integration                      -                          history_default_caps_tests
