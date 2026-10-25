@@ -2,10 +2,10 @@
 
 This page records the fix for issue #2330. The non-strict activity matcher
 replayed a fan-out of N activities in O(N²) instructions. It now replays
-one in about O(N log N). A sequential history costs about the same (+0.8%).
+one in about O(N log N). A sequential history costs about the same (+0.7%).
 
-**Outcome: shipped.** At N=1000 the fan-out replay costs 73% fewer
-instructions. At N=2000 it costs 85% fewer.
+**Outcome: shipped.** At N=1000 the fan-out bench costs 72% fewer
+instructions. At N=2000 it costs 84% fewer.
 
 ## 🎯 Workload
 
@@ -53,15 +53,32 @@ unconsumed, so a link never goes stale. `formal/verus/src/scan_skip.rs`
 proves that `first_live` returns the first live entry and keeps the links
 sound.
 
-The scan walks its first 16 events (`LINEAR_SCAN_BUDGET`) one by one, with the
-same roles. Most terminals are near their schedule, so a sequential
-history builds no index. A settle over a range of 16 events or fewer walks it
-too.
+### When a scan uses the index
 
-The first scan or settle that passes the budget builds the index. Each later
-use adds the new events. A cut view hides a tail, so a query ignores each
-position past the visible end. `restore_view` brings back the same tail, so
-the indexed prefix never changes.
+A scan walks events one by one, with the same roles, until all three of
+these hold:
+
+1. It walked at least `LINEAR_SCAN_BUDGET` (4) events.
+2. It passed an interleaved command. With none, the cursor moves past every
+   walked event after the scan. No later scan walks them again, so the walk
+   stays linear over the replay.
+3. The index pays off. Until the index exists, the walks of the matcher must
+   have cost more than a build would: 16 walk steps for each event of the
+   history (`BUILD_COST_IN_WALK_STEPS`).
+
+Rule 3 is a ski-rental rule. A small fan-out keeps its old cost, because its
+walks never cost as much as a build. A large fan-out builds the index once,
+and the walk before the build is at most a constant factor of the build. A
+sequential history with long gaps, for example many retries or heartbeats,
+never builds an index, because rule 2 never holds.
+
+A settle walks its range when the range is 4 events or fewer, or when no
+index exists. Otherwise it reads the progress positions from the index.
+
+The first scan that leaves its walk builds the index. Each later use adds the
+new events. A cut view hides a tail, so the scan ignores each position past
+the visible end. `restore_view` brings back the same tail, so the indexed
+prefix never changes.
 
 ## 📊 Measurement
 
@@ -69,27 +86,55 @@ Callgrind, total instructions (`Ir`) of the harness. "Before" is `caa8c01`.
 
 | Shape | N | Before | After | Change |
 |---|---|---|---|---|
-| `fanout` | 250 | 9,488,535 | 6,256,427 | −34.1% |
-| `fanout` | 500 | 26,858,748 | 12,076,024 | −55.0% |
-| `fanout` | 1000 | 87,694,713 | 23,654,947 | −73.0% |
-| `fanout` | 2000 | 307,061,590 | 46,798,702 | −84.8% |
-| `fanout_rev` | 1000 | 105,092,333 | 23,668,178 | −77.5% |
-| `fanout_rev` | 2000 | 376,781,638 | 46,869,264 | −87.6% |
-| `sequential` | 1000 | 18,700,031 | 18,847,912 | +0.8% |
-| `sequential` | 2000 | 35,161,711 | 35,459,584 | +0.8% |
+| `fanout` | 250 | 9,488,535 | 6,383,811 | −32.7% |
+| `fanout` | 500 | 26,858,748 | 12,345,160 | −54.0% |
+| `fanout` | 1000 | 87,694,713 | 24,281,928 | −72.3% |
+| `fanout` | 2000 | 307,061,590 | 47,924,432 | −84.4% |
+| `fanout_rev` | 1000 | 105,092,333 | 24,203,647 | −77.0% |
+| `fanout_rev` | 2000 | 376,781,638 | 47,935,720 | −87.3% |
+| `sequential` | 1000 | 18,700,031 | 18,825,429 | +0.7% |
+| `sequential` | 2000 | 35,161,711 | 35,412,341 | +0.7% |
 
-The fan-out cost now grows 1.93 to 1.98 times per doubling of N, so it is
-linear in this range. The sequential history costs about 148 `Ir` more per
-activity. Inside the matcher, `match_activity` costs about 40 `Ir` more per
-activity, for the role lookup in the walk.
+The fan-out cost now grows 1.93 to 1.97 times per doubling of N, so it is
+linear in this range. Inside the matcher, `match_activity` at N=1000 drops
+from 69.0M to 5.3M `Ir` (−92%) for `fanout`. For `sequential` it rises from
+330K to 345K `Ir` (+4.6%), about 15 `Ir` per activity.
 
-Dhat at N=1000: the `fanout` index adds 330,844 bytes in 1,028 blocks, 10.2% of
-the total. The peak grows by 228,763 bytes. The `sequential` history builds no
-index, so its allocations are unchanged.
+A second bench, written for the review, measured the matcher alone on more
+shapes. "Before" is `caa8c01`:
 
-At N=1000 the matcher is now 20.1% of the `fanout` harness. The `SipHash` of
-the activity id in the index map costs 3.9%. That is the next lever. A cheaper
+| Shape | Before | After |
+|---|---|---|
+| fan-out, N=17 | 28.9K | 33.6K |
+| fan-out, N=32 | 86.2K | 130.8K |
+| fan-out, N=64 | 320.8K | 286.2K |
+| fan-out, N=128 | 1.19M | 590K |
+| sequential, 17 progress events per activity, N=1000 | 996K | 1.04M |
+| sequential, 64 progress events per activity, N=1000 | 2.73M | 2.87M |
+| fan-out with 17 progress events per activity, N=1000 | 546M | 25.8M |
+| 5,000 sequential activities, then a fan-out of 20 | 1.99M | 2.07M |
+
+A fan-out of about 32 is the worst case of the ski-rental rule. It costs 52%
+more than before, which is about 45K `Ir`. From N=64 up, a fan-out costs less
+than before.
+
+Dhat at N=1000: the `fanout` index adds 330,844 bytes in 1,038 blocks, about
+10% of the total. The peak grows by 205,804 bytes. The `sequential` history
+builds no index, so its allocations are unchanged. The index lives as long as
+the matcher.
+
+The `SipHash` of the activity id in the index map is the next lever. A cheaper
 hasher needs its own argument about adversarial ids.
+
+### Not fixed here
+
+Two other matcher paths stay quadratic. Issue #2338 tracks both:
+
+- `scan_ahead_for_external_signal_terminals` walks the rest of the history on
+  each `match_*` call while an external signal, cancel or await is stashed. A
+  fan-out after one external signal still costs O(N²).
+- `scan_local_activity_terminal`, and the child, timer and external scans,
+  keep the plain walk. A fan-out of local activities is likely still O(N²).
 
 ## 🧪 Tests
 
@@ -101,10 +146,12 @@ hasher needs its own argument about adversarial ids.
   runs random histories and random matcher calls, cut views included, through
   the new scan and through a copy of the old one. The copy keeps the logic and
   changes only the receiver and the names. The test compares each result and
-  every field that a scan or a settle can change. Each case picks a walk
-  budget of 0, 1, 3 or 16, so most scans reach the index. The generator holds
-  every event class that the old scan treated in its own way. Mutants of the
-  walk, the index and the roles fail it.
+  every field that a scan or a settle can change. Each case uses the
+  production rule or forces every scan onto the index after 0, 1 or 3 walked
+  events. The generator holds every event class that the old scan treated in
+  its own way. Mutants of the walk, the index and the roles fail it.
+- The edge tests run each case with and without padding, and with the
+  production rule and a forced index.
 - `activity_scan_index::tests::a_query_matches_a_plain_walk` checks the skip
   list against a plain walk.
 
