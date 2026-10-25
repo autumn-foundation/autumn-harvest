@@ -4118,7 +4118,7 @@ async fn tick_one_workflow_schedule(
         let exclude_weekends = crate::calendar::calendar_excludes_weekends(cal_name);
         let skip_policy = crate::policy::SkipPolicy::from_db(&schedule.skip_policy);
 
-        let fire_date = logical_date.date_naive();
+        let fire_date = crate::calendar::schedule_local_date(logical_date, parsed_schedule);
         match crate::calendar::apply_skip_policy(
             fire_date,
             skip_policy,
@@ -4692,7 +4692,7 @@ async fn tick_one_workflow_schedule(
         // Apply calendar filtering for every slot (including the first one, since
         // the pre-loop check no longer rebases `logical_date`).
         let effective_scheduled_for = if schedule.calendar_name.is_some() {
-            let slot_date = original_slot.date_naive();
+            let slot_date = crate::calendar::schedule_local_date(*original_slot, parsed_schedule);
             let Some(adjusted) = crate::calendar::apply_skip_policy(
                 slot_date,
                 calendar_skip_policy,
@@ -5778,7 +5778,7 @@ pub fn resolve_effective_fire_at_pure(
     };
     let parsed = parse_schedule_from_expr(expr)?;
     let skip_policy = crate::policy::SkipPolicy::from_db(skip_policy_db);
-    let slot_date = slot.date_naive();
+    let slot_date = crate::calendar::schedule_local_date(slot, Some(&parsed));
     match crate::calendar::apply_skip_policy(slot_date, skip_policy, excluded, exclude_weekends) {
         // `SkipPolicy::Skip` on an excluded day: no adjusted fire to defer to.
         None => None,
@@ -5832,7 +5832,7 @@ pub async fn resolve_effective_fire_at(
     let excluded = crate::calendar::load_exclusions_for_calendar(conn, cal_name).await?;
     let exclude_weekends = crate::calendar::calendar_excludes_weekends(cal_name);
     let skip_policy = crate::policy::SkipPolicy::from_db(skip_policy_db);
-    let slot_date = slot.date_naive();
+    let slot_date = crate::calendar::schedule_local_date(slot, Some(&parsed));
     Ok(
         match crate::calendar::apply_skip_policy(
             slot_date,
@@ -7564,6 +7564,21 @@ mod tests {
              proving a caller cannot treat a failed exclusions load as 'no exclusions' \
              without risking exactly this silent rebase, got {rebased:?}"
         );
+    }
+
+    // Issue #2332: the calendar tests the schedule's local date.
+    #[test]
+    fn resolve_effective_fire_at_pure_tests_the_schedule_local_date() {
+        // Mon 5 Jan 2026 08:00 JST is Sun 4 Jan 23:00 UTC.
+        let slot = Utc.with_ymd_and_hms(2026, 1, 4, 23, 0, 0).unwrap();
+        let rebased = resolve_effective_fire_at_pure(
+            &[],
+            true,
+            "run_next_business_day",
+            Some("cron_tz:Asia/Tokyo:0 8 * * 1-5"),
+            Some(slot),
+        );
+        assert_eq!(rebased, None, "a local weekday must not rebase");
     }
 
     /// A representative workflow-schedule row for `merge_schedule_patch` unit

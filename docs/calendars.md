@@ -190,6 +190,14 @@ This is separate from `reason="overlap"` skips (overlap policy) so dashboards ca
 
 ---
 
+## Which date a calendar tests
+
+A calendar tests the **local date** of the fire time. For a `CronInTimezone` schedule, that is the date in the schedule's timezone. For every other schedule, it is the UTC date.
+
+A Mon–Fri `0 8 * * 1-5` schedule in `Asia/Tokyo` fires at 23:00 UTC on the day before. The calendar still tests the Tokyo date, so `weekends-off` never suppresses a local weekday. A holiday date means that day in the schedule's timezone.
+
+An unknown timezone falls back to the UTC date.
+
 ## Notes
 
 - Calendar filtering happens **after** jitter is applied and **before** overlap policy evaluation. The effective fire time shown in the preview already includes jitter.
