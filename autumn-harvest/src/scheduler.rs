@@ -10070,4 +10070,613 @@ mod tests {
         assert_eq!(backoff.failure_count(&key), 0);
         assert!(backoff.should_attempt(&key, t0));
     }
+
+    // ── Pure helper branch coverage (issue #2333) ────────────────────────────
+    //
+    // The nightly ratchet gates the branch coverage of this module. The DB
+    // suites reach some branches only on some nights. These lib tests take each
+    // branch of the pure helpers on every run.
+
+    #[test]
+    fn resolve_effective_fire_at_pure_needs_a_slot_and_a_cadence() {
+        let slot = parse_utc("2026-06-13T12:00:00Z");
+        let policy = "run_next_business_day";
+        assert_eq!(
+            resolve_effective_fire_at_pure(&[], true, policy, None, Some(slot)),
+            None
+        );
+        assert_eq!(
+            resolve_effective_fire_at_pure(&[], true, policy, Some("interval:3600"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_effective_fire_at_pure_does_not_defer_a_business_day_slot() {
+        // 2026-06-15 is a Monday.
+        let monday = parse_utc("2026-06-15T12:00:00Z");
+        assert_eq!(
+            resolve_effective_fire_at_pure(
+                &[],
+                true,
+                "run_next_business_day",
+                Some("interval:3600"),
+                Some(monday),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn scheduled_workflow_id_adds_microseconds_only_when_the_slot_has_them() {
+        let id = uuid::Uuid::nil();
+        let whole = parse_utc("2026-01-01T00:00:00Z");
+        let fraction = whole + chrono::Duration::microseconds(42);
+        assert_eq!(
+            scheduled_workflow_id(id, "wf", whole),
+            format!("sched:{id}:wf:{}", whole.timestamp())
+        );
+        assert_eq!(
+            scheduled_workflow_id(id, "wf", fraction),
+            format!("sched:{id}:wf:{}.000042", whole.timestamp())
+        );
+        assert_eq!(
+            scheduled_workflow_id_pub(id, "wf", fraction),
+            scheduled_workflow_id(id, "wf", fraction)
+        );
+    }
+
+    /// A start result with a fixed execution id.
+    fn started(created: bool) -> StartedWorkflowExecution {
+        StartedWorkflowExecution {
+            exec_id: ExecutionId::from_uuid(uuid::Uuid::from_u128(7)),
+            workflow_name: "wf".to_string(),
+            workflow_id: "sched:wf".to_string(),
+            state: "RUNNING".to_string(),
+            created,
+        }
+    }
+
+    #[test]
+    fn scheduled_start_outcome_tells_a_new_run_from_a_duplicate() {
+        let created = scheduled_start_outcome(Ok(started(true))).expect("created");
+        assert!(created.created());
+        assert_eq!(created.exec_id(), started(true).exec_id);
+        assert_eq!(created.state(), "RUNNING");
+
+        let duplicate = scheduled_start_outcome(Ok(started(false))).expect("duplicate");
+        assert!(!duplicate.created());
+        assert_eq!(duplicate.exec_id(), started(false).exec_id);
+    }
+
+    #[test]
+    fn scheduled_start_outcome_passes_other_errors_through() {
+        let outcome = scheduled_start_outcome(Err(HarvestError::Config("boom".to_string())));
+        assert!(matches!(outcome, Err(HarvestError::Config(message)) if message == "boom"));
+    }
+
+    #[test]
+    fn const_str_eq_compares_every_byte() {
+        assert!(const_str_eq("dag", "dag"));
+        assert!(!const_str_eq("dag", "dags"));
+        assert!(!const_str_eq("dag", "dog"));
+    }
+
+    #[test]
+    fn scheduler_fence_key_pins_a_single_pool_to_the_default_shard() {
+        let shard = ShardId::new(3);
+        assert_eq!(scheduler_fence_key(shard, true), ShardId::UNENCODED);
+        assert_eq!(scheduler_fence_key(shard, false), shard);
+    }
+
+    #[test]
+    fn plan_backfill_timestamps_caps_a_cron_window() {
+        let hourly = Schedule::Cron("0 * * * *".to_string());
+        let from = parse_utc("2026-01-01T00:00:00Z");
+        let to = from + chrono::Duration::hours(10);
+        assert_eq!(
+            plan_backfill_timestamps(Some(&hourly), from, to, 3),
+            Err(BackfillPlanError::LimitExceeded { limit: 3 })
+        );
+    }
+
+    #[test]
+    fn plan_backfill_timestamps_with_a_cron_that_never_fires_is_empty() {
+        // An unknown zone never fires.
+        let never = Schedule::CronInTimezone {
+            expr: "0 * * * *".to_string(),
+            tz: "Mars/Olympus_Mons".to_string(),
+        };
+        let from = parse_utc("2026-01-01T00:00:00Z");
+        let to = from + chrono::Duration::hours(10);
+        assert_eq!(
+            plan_backfill_timestamps(Some(&never), from, to, 100),
+            Ok(vec![])
+        );
+    }
+
+    // ── exhaustion_reconciliation_is_noop (issue #2333) ──────────────────────
+
+    #[test]
+    fn an_exhausted_row_stays_exhausted_while_a_bound_still_holds() {
+        let now = parse_utc("2026-06-01T00:00:00Z");
+        let (mut row, mut ws) = converged_pair();
+        row.exhausted_at = Some(now);
+
+        // The end has passed, so the exhaustion stays.
+        ws.end_at = Some(now - chrono::Duration::hours(1));
+        assert!(exhaustion_reconciliation_is_noop(&row, &ws, now));
+
+        // A manual schedule compares the end with now.
+        ws.schedule = Schedule::Manual;
+        assert!(exhaustion_reconciliation_is_noop(&row, &ws, now));
+        ws.end_at = Some(now + chrono::Duration::hours(1));
+        assert!(!exhaustion_reconciliation_is_noop(&row, &ws, now));
+
+        // The run budget is spent, so the exhaustion stays.
+        ws.end_at = None;
+        ws.max_runs = Some(3);
+        row.runs_started = 3;
+        assert!(exhaustion_reconciliation_is_noop(&row, &ws, now));
+        row.runs_started = 2;
+        assert!(!exhaustion_reconciliation_is_noop(&row, &ws, now));
+    }
+
+    #[test]
+    fn a_live_row_becomes_exhausted_when_its_budget_is_spent() {
+        let now = parse_utc("2026-06-01T00:00:00Z");
+        let (mut row, mut ws) = converged_pair();
+        ws.max_runs = Some(2);
+        row.runs_started = 2;
+        assert!(!exhaustion_reconciliation_is_noop(&row, &ws, now));
+        row.runs_started = 1;
+        assert!(exhaustion_reconciliation_is_noop(&row, &ws, now));
+
+        // A zero budget means no limit.
+        ws.max_runs = Some(0);
+        row.runs_started = 50;
+        assert!(exhaustion_reconciliation_is_noop(&row, &ws, now));
+    }
+
+    #[test]
+    fn a_live_row_becomes_exhausted_when_no_slot_is_left_before_the_end() {
+        let now = parse_utc("2026-06-01T00:00:00Z");
+        let (mut row, mut ws) = converged_pair();
+        // `ws` fires every 60 s.
+        ws.end_at = Some(now + chrono::Duration::hours(1));
+
+        // The pending slot is before the end.
+        row.next_run_at = Some(now + chrono::Duration::seconds(60));
+        assert!(exhaustion_reconciliation_is_noop(&row, &ws, now));
+
+        // The pending slot is past the end, but the next slot from now is not.
+        row.next_run_at = Some(now + chrono::Duration::hours(2));
+        assert!(exhaustion_reconciliation_is_noop(&row, &ws, now));
+
+        // No slot from now is before the end.
+        ws.end_at = Some(now + chrono::Duration::seconds(30));
+        assert!(!exhaustion_reconciliation_is_noop(&row, &ws, now));
+
+        // A manual schedule compares the end with now.
+        ws.schedule = Schedule::Manual;
+        assert!(exhaustion_reconciliation_is_noop(&row, &ws, now));
+        ws.end_at = Some(now);
+        assert!(!exhaustion_reconciliation_is_noop(&row, &ws, now));
+    }
+
+    // ── Convergence under a buffering policy (issue #2333) ───────────────────
+
+    /// A `buffered_runs` value with `count` hourly runs.
+    fn buffered(count: usize) -> serde_json::Value {
+        let first = parse_utc("2026-01-01T00:00:00Z");
+        let runs: Vec<_> = (0..count)
+            .map(|i| first + chrono::Duration::hours(i64::try_from(i).expect("small")))
+            .collect();
+        buffered_runs_to_json(&runs)
+    }
+
+    #[test]
+    fn a_buffer_one_row_converges_only_with_at_most_one_buffered_run() {
+        let (mut row, mut ws) = converged_pair();
+        ws.overlap_policy = OverlapPolicy::BufferOne;
+        row.overlap_policy = OverlapPolicy::BufferOne.as_str().to_string();
+        row.buffered_runs = buffered(1);
+        assert!(workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+        row.buffered_runs = buffered(2);
+        assert!(!workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+    }
+
+    #[test]
+    fn a_buffer_all_row_converges_only_within_its_cap() {
+        let (mut row, mut ws) = converged_pair();
+        ws.overlap_policy = OverlapPolicy::BufferAll;
+        ws.buffer_all_max = 2;
+        row.overlap_policy = OverlapPolicy::BufferAll.as_str().to_string();
+        row.buffer_all_max = 2;
+        row.buffered_runs = buffered(2);
+        assert!(workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+        row.buffered_runs = buffered(3);
+        assert!(!workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+    }
+
+    #[test]
+    fn an_auto_paused_row_stays_converged_while_the_failure_limit_is_on() {
+        let (mut row, mut ws) = converged_pair();
+        ws.consecutive_failure_limit = Some(3);
+        row.consecutive_failure_limit = Some(3);
+        row.auto_paused_at = Some(Utc::now());
+        assert!(workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+    }
+
+    #[test]
+    fn a_buffering_dag_row_converges_only_within_its_cap() {
+        let (mut row, mut dag) = converged_dag_pair();
+        dag.overlap_policy = OverlapPolicy::BufferOne;
+        row.overlap_policy = OverlapPolicy::BufferOne.as_str().to_string();
+        row.buffered_runs = buffered(1);
+        assert!(dag_schedule_row_is_converged(&row, &dag, Utc::now()));
+        row.buffered_runs = buffered(2);
+        assert!(!dag_schedule_row_is_converged(&row, &dag, Utc::now()));
+
+        dag.overlap_policy = OverlapPolicy::BufferAll;
+        dag.buffer_all_max = 2;
+        row.overlap_policy = OverlapPolicy::BufferAll.as_str().to_string();
+        row.buffer_all_max = 2;
+        assert!(dag_schedule_row_is_converged(&row, &dag, Utc::now()));
+        row.buffered_runs = buffered(3);
+        assert!(!dag_schedule_row_is_converged(&row, &dag, Utc::now()));
+    }
+
+    // ── stored_schedule_input_matches (issue #2333) ──────────────────────────
+
+    /// A codec that encodes by reversing the bytes.
+    struct ReverseCodec;
+
+    impl crate::payload_codec::PayloadCodec for ReverseCodec {
+        fn codec_id(&self) -> &'static str {
+            "reverse"
+        }
+
+        fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, crate::payload_codec::CodecError> {
+            Ok(raw.iter().rev().copied().collect())
+        }
+
+        fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, crate::payload_codec::CodecError> {
+            Ok(encoded.iter().rev().copied().collect())
+        }
+    }
+
+    /// A registry with one key that encodes the codec columns.
+    fn encrypting_codecs() -> crate::payload_codec::PayloadCodecs {
+        let codecs = crate::payload_codec::PayloadCodecs::default();
+        codecs
+            .register_key("k1", Arc::new(ReverseCodec))
+            .expect("register the codec");
+        codecs.set_column_encoding(true);
+        codecs
+    }
+
+    #[test]
+    fn stored_input_in_clear_matches_by_value() {
+        let codecs = crate::payload_codec::PayloadCodecs::default();
+        let id = uuid::Uuid::nil();
+        let configured = serde_json::json!({"env": "A"});
+        assert!(stored_schedule_input_matches(
+            Some(&configured),
+            id,
+            &configured,
+            &codecs
+        ));
+        assert!(!stored_schedule_input_matches(
+            Some(&serde_json::json!({"env": "B"})),
+            id,
+            &configured,
+            &codecs
+        ));
+        assert!(!stored_schedule_input_matches(
+            None,
+            id,
+            &configured,
+            &codecs
+        ));
+    }
+
+    #[test]
+    fn stored_input_under_an_encrypting_codec_matches_by_plaintext() {
+        let codecs = encrypting_codecs();
+        let id = uuid::Uuid::nil();
+        let configured = serde_json::json!({"env": "A"});
+        let stored = codecs.encode_column(&configured).expect("encode");
+        assert!(crate::payload_codec::is_codec_envelope(&stored));
+        assert!(stored_schedule_input_matches(
+            Some(&stored),
+            id,
+            &configured,
+            &codecs
+        ));
+        // A clear-text cell reads as drift. Registration then stores it encoded.
+        assert!(!stored_schedule_input_matches(
+            Some(&configured),
+            id,
+            &configured,
+            &codecs
+        ));
+    }
+
+    #[test]
+    fn stored_input_that_does_not_decode_reads_as_drift() {
+        let writer = encrypting_codecs();
+        let configured = serde_json::json!({"env": "A"});
+        let stored = writer.encode_column(&configured).expect("encode");
+        // This reader has no key for the envelope.
+        let reader = crate::payload_codec::PayloadCodecs::default();
+        assert!(!stored_schedule_input_matches(
+            Some(&stored),
+            uuid::Uuid::nil(),
+            &configured,
+            &reader
+        ));
+    }
+
+    #[test]
+    fn stored_input_in_clear_matches_when_no_key_encrypts() {
+        // Column encoding is on, but no key is active, so clear text is no drift.
+        let codecs = crate::payload_codec::PayloadCodecs::default();
+        codecs.set_column_encoding(true);
+        let configured = serde_json::json!({"env": "A"});
+        assert!(stored_schedule_input_matches(
+            Some(&configured),
+            uuid::Uuid::nil(),
+            &configured,
+            &codecs
+        ));
+    }
+
+    // ── Catchup slot arithmetic (issue #2333) ────────────────────────────────
+
+    #[test]
+    fn last_eligible_step_stops_at_now_and_before_the_end() {
+        assert_eq!(last_eligible_step(-1, 10, None), None);
+        assert_eq!(last_eligible_step(25, 10, None), Some(2));
+        assert_eq!(last_eligible_step(25, 10, Some(0)), None);
+    }
+
+    #[test]
+    fn eligible_slot_summary_walks_when_the_end_is_out_of_range() {
+        // 400 years does not fit in i64 nanoseconds, so the summary walks.
+        let hourly = Schedule::Interval(Duration::from_secs(3600));
+        let first_due = parse_utc("2026-01-01T00:00:00Z");
+        let now = first_due + chrono::Duration::hours(3);
+        let far_end = first_due + chrono::Duration::days(400 * 365);
+        let walked = eligible_slot_summary(Some(&hourly), first_due, now, Some(far_end));
+        let arithmetic = eligible_slot_summary(Some(&hourly), first_due, now, None);
+        assert_eq!(walked.eligible_count, 4);
+        assert_eq!(walked.eligible_count, arithmetic.eligible_count);
+        assert_eq!(walked.last_eligible, arithmetic.last_eligible);
+        assert_eq!(walked.next_run_at, arithmetic.next_run_at);
+    }
+
+    #[test]
+    fn eligible_slot_summary_of_a_cron_stops_counting_at_the_end() {
+        let hourly = Schedule::Cron("0 * * * *".to_string());
+        let first_due = parse_utc("2026-01-01T00:00:00Z");
+        let now = first_due + chrono::Duration::hours(3);
+        let end_at = first_due + chrono::Duration::minutes(90);
+        let summary = eligible_slot_summary(Some(&hourly), first_due, now, Some(end_at));
+        assert_eq!(summary.eligible_count, 2);
+        assert_eq!(
+            summary.last_eligible,
+            Some(first_due + chrono::Duration::hours(1))
+        );
+        assert_eq!(
+            summary.next_run_at,
+            Some(first_due + chrono::Duration::hours(4))
+        );
+    }
+
+    #[test]
+    fn window_eligible_slots_is_empty_before_the_first_slot() {
+        let hourly = Schedule::Interval(Duration::from_secs(3600));
+        let first_due = parse_utc("2026-01-01T00:00:00Z");
+        let now = first_due - chrono::Duration::minutes(1);
+        assert_eq!(
+            window_eligible_slots(Some(&hourly), first_due, now, None, first_due),
+            Vec::<DateTime<Utc>>::new()
+        );
+    }
+
+    #[test]
+    fn window_eligible_slots_between_two_slots_is_empty() {
+        let hourly = Schedule::Interval(Duration::from_secs(3600));
+        let first_due = parse_utc("2026-01-01T00:00:00Z");
+        let now = first_due + chrono::Duration::minutes(150);
+        let cutoff = first_due + chrono::Duration::minutes(135);
+        assert_eq!(
+            window_eligible_slots(Some(&hourly), first_due, now, None, cutoff),
+            Vec::<DateTime<Utc>>::new()
+        );
+    }
+
+    #[test]
+    fn window_eligible_slots_walks_when_the_end_is_out_of_range() {
+        let hourly = Schedule::Interval(Duration::from_secs(3600));
+        let first_due = parse_utc("2026-01-01T00:00:00Z");
+        let now = first_due + chrono::Duration::hours(2);
+        let far_end = first_due + chrono::Duration::days(400 * 365);
+        let walked = window_eligible_slots(Some(&hourly), first_due, now, Some(far_end), first_due);
+        assert_eq!(
+            walked,
+            vec![
+                first_due,
+                first_due + chrono::Duration::hours(1),
+                first_due + chrono::Duration::hours(2),
+            ]
+        );
+        assert_eq!(
+            walked,
+            window_eligible_slots(Some(&hourly), first_due, now, None, first_due)
+        );
+    }
+
+    #[test]
+    fn window_eligible_slots_of_a_cron_stops_at_the_end() {
+        let hourly = Schedule::Cron("0 * * * *".to_string());
+        let first_due = parse_utc("2026-01-01T00:00:00Z");
+        let now = first_due + chrono::Duration::hours(3);
+        let end_at = first_due + chrono::Duration::minutes(90);
+        assert_eq!(
+            window_eligible_slots(Some(&hourly), first_due, now, Some(end_at), first_due),
+            vec![first_due, first_due + chrono::Duration::hours(1)]
+        );
+    }
+
+    #[test]
+    fn window_eligible_slots_of_an_interval_past_the_end_of_time_is_empty() {
+        // The period has no nanosecond value, and its first step leaves the
+        // range of chrono. The walk stops at once.
+        let huge = Schedule::Interval(Duration::from_secs(9_000_000_000_000_000));
+        let first_due = parse_utc("2026-01-01T00:00:00Z");
+        let now = first_due + chrono::Duration::hours(2);
+        let cutoff = first_due + chrono::Duration::hours(1);
+        assert_eq!(
+            window_eligible_slots(Some(&huge), first_due, now, None, cutoff),
+            Vec::<DateTime<Utc>>::new()
+        );
+    }
+
+    #[test]
+    fn overdue_with_budget_left_is_flagged() {
+        let sched = Schedule::Interval(Duration::from_secs(300));
+        let now = dt(2026, 1, 1, 0, 10, 0);
+        let next_run_at = now - chrono::Duration::seconds(400);
+        let verdict = schedule_overdue(&OverdueInputs {
+            max_runs: Some(5),
+            runs_started: 2,
+            ..base(Some(&sched), Some(next_run_at), now)
+        });
+        assert!(
+            verdict.overdue,
+            "a schedule with runs left is not bounded out"
+        );
+    }
+
+    // ── buffered_drain_gated (issue #2333) ───────────────────────────────────
+
+    /// A recorder that logs the skip and block metrics.
+    #[cfg(feature = "db")]
+    #[derive(Default)]
+    struct GateLog(Mutex<Vec<String>>);
+
+    #[cfg(feature = "db")]
+    impl crate::telemetry::MetricsRecorder for GateLog {
+        fn record_schedule_skipped(&self, kind: &str, name: &str, reason: &str) {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(format!("skipped:{kind}:{name}:{reason}"));
+        }
+
+        fn record_admission_blocked(&self, scope_kind: &str, reason_hash: &str) {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(format!("blocked:{scope_kind}:{reason_hash}"));
+        }
+    }
+
+    /// An admission gate with no expiry.
+    #[cfg(feature = "db")]
+    fn gate(scope: crate::admission_gate::GateScope) -> crate::admission_gate::AdmissionGate {
+        crate::admission_gate::AdmissionGate {
+            id: uuid::Uuid::from_u128(1).into(),
+            scope,
+            reason: "maintenance".to_string(),
+            message: None,
+            created_by: "operator".to_string(),
+            created_at: Utc::now(),
+            expires_at: None,
+        }
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn buffered_drain_gated_blocks_only_under_a_matching_gate() {
+        use crate::admission_gate::GateScope;
+        let mut row = merge_base_row();
+        row.dag_name = Some("owned_dag".to_string());
+        let mut dag = dag_with_schedule("owned_dag", None);
+        dag.owner = Some("team-a".to_string());
+        let dags = DagCatalog::from([("owned_dag".to_string(), dag)]);
+        let registry = HandlerRegistry::new(vec![], vec![]);
+        let log = Arc::new(GateLog::default());
+        let metrics: Arc<dyn crate::telemetry::MetricsRecorder> = log.clone();
+        let shard = ShardId::new(0);
+
+        let open = [gate(GateScope::Owner("team-b".to_string()))];
+        assert!(!buffered_drain_gated(
+            &row, "merge_wf", shard, &dags, &registry, &metrics, &open
+        ));
+        assert!(
+            log.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
+
+        // The DAG catalog supplies the owner.
+        let closed = [gate(GateScope::Owner("team-a".to_string()))];
+        assert!(buffered_drain_gated(
+            &row, "merge_wf", shard, &dags, &registry, &metrics, &closed
+        ));
+        let entries = log.0.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0], "skipped:workflow:merge_wf:admission_blocked");
+        assert!(entries[1].starts_with("blocked:owner:"), "{entries:?}");
+    }
+
+    // ── compile_dag_catalog (issue #2333) ────────────────────────────────────
+
+    /// A trigger-only DAG that team-a owns.
+    fn plain_dag_info(name: &'static str) -> DagInfo {
+        fn build(_dag: &mut crate::dag::DagBuilder) {}
+
+        DagInfo {
+            name,
+            module: "tests",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: build,
+            workflow_handler: None,
+            jitter: Duration::ZERO,
+            overlap_policy: OverlapPolicy::Skip,
+            buffer_all_max: 0,
+            owner: Some("team-a"),
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+            execution_timeout: None,
+            sla: None,
+        }
+    }
+
+    #[test]
+    fn compile_dag_catalog_keys_each_dag_by_name() {
+        let catalog = compile_dag_catalog(vec![plain_dag_info("a"), plain_dag_info("b")])
+            .expect("two names compile");
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog["a"].owner.as_deref(), Some("team-a"));
+        assert!(!catalog["b"].is_unified);
+    }
+
+    #[test]
+    fn compile_dag_catalog_rejects_a_duplicate_name() {
+        let error = compile_dag_catalog(vec![plain_dag_info("a"), plain_dag_info("a")])
+            .expect_err("a name registers once");
+        assert!(
+            matches!(&error, HarvestError::Config(message) if message.contains("'a'")),
+            "{error:?}"
+        );
+    }
 }
