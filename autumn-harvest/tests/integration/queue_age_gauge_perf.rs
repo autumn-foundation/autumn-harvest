@@ -183,6 +183,7 @@ struct Point {
     ages: Vec<(String, i64)>,
 }
 
+#[allow(clippy::cast_possible_truncation)]
 async fn measure(admin: &str, label: &str, pending: i64) -> (Point, String) {
     let db = ThrowawayDb::create_on(admin, "queue_age_gauge_perf").await;
     let db_name = db.name().to_owned();

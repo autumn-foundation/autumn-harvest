@@ -5647,23 +5647,28 @@ pub async fn queue_depths(
 
     Ok(rows.into_iter().map(|r| (r.queue_name, r.depth)).collect())
 }
-/// The `oldest_pending_ages` gauge query — extracted so its claim-gate mirror
-/// (including the issue #619 queue-pause anti-join) is shape-testable.
+/// Number of oldest eligible rows per queue that the age gauge reads first.
 ///
-/// Binds: `$1` queue names, `$2` circuit-breaker-tracked activities.
-#[must_use]
-pub const fn oldest_pending_ages_query() -> &'static str {
-    concat!(
-        "SELECT queue_name, \
-                GREATEST( \
-                    EXTRACT(EPOCH FROM (NOW() - MIN(GREATEST(scheduled_at, COALESCE(created_at, scheduled_at))))), \
-                    0 \
-                )::DOUBLE PRECISION AS age_secs \
-         FROM harvest_task_queue \
-         WHERE queue_name = ANY($1) \
-           AND state = 'PENDING' \
-           AND scheduled_at <= NOW() \
-           AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
+/// The SQL embeds the same number through `oldest_pending_seek_window!`. The test
+/// `oldest_pending_ages_query_embeds_the_seek_window` pins the two together.
+pub const OLDEST_PENDING_SEEK_WINDOW: usize = 32;
+
+macro_rules! oldest_pending_seek_window {
+    () => {
+        "32"
+    };
+}
+
+/// The claim gates that the age gauge mirrors, for a row aliased
+/// `harvest_task_queue`.
+///
+/// Two scans embed it. The refine step reads it over the seek window. The
+/// fallback reads it over the whole table. One text keeps both scans on the
+/// same gates.
+macro_rules! oldest_pending_gate_sql {
+    () => {
+        concat!(
+            "AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
          WHERE qp.queue_name = harvest_task_queue.queue_name) \
            AND NOT EXISTS (SELECT 1 FROM harvest_activity_pauses ap \
          WHERE ap.activity_name = harvest_task_queue.activity_name \
@@ -5699,11 +5704,95 @@ pub const fn oldest_pending_ages_query() -> &'static str {
                    SELECT 1 FROM harvest_rate_limit_buckets b \
                    WHERE b.key = harvest_task_queue.rate_limit_key \
                      AND ",
-        rate_limit_available_sql!(),
-        " >= 1.0 \
+            rate_limit_available_sql!(),
+            " >= 1.0 \
                ) \
            ) \
-         GROUP BY queue_name"
+        "
+        )
+    };
+}
+
+/// The `oldest_pending_ages` gauge query — extracted so its claim-gate mirror
+/// (including the issue #619 queue-pause anti-join) is shape-testable.
+///
+/// The age of a queue is the age of its oldest claimable row. The query does
+/// not read every eligible row to find it (issue #2339).
+///
+/// 1. **Seek.** For each queue, an ordered walk of `idx_harvest_tq_coverage_sample`
+///    reads the oldest [`OLDEST_PENDING_SEEK_WINDOW`] eligible rows by
+///    `scheduled_at`, with no gate.
+/// 2. **Refine.** The claim gates run over those rows only. Their minimum
+///    `GREATEST(scheduled_at, created_at)` is the candidate answer.
+/// 3. **Check.** Every row outside the window has a `scheduled_at` no earlier
+///    than the last window row. Its age value is at least that. So a candidate
+///    that is not later than the last window row is exact. The same holds when
+///    the window holds fewer rows than its size, since it then holds the whole
+///    queue.
+/// 4. **Fallback.** A queue that fails the check reads the whole queue under
+///    the same gates. This happens when the oldest rows are all gated or when
+///    `created_at` is later than `scheduled_at` by more than the window spans.
+///
+/// The result is the same as one aggregate over every eligible row. Only a
+/// queue with at least one claimable row appears.
+///
+/// Binds: `$1` queue names, `$2` circuit-breaker-tracked activities.
+#[must_use]
+pub const fn oldest_pending_ages_query() -> &'static str {
+    concat!(
+        "WITH queues AS ( \
+             SELECT DISTINCT queue_name FROM unnest($1::text[]) AS u(queue_name) \
+         ), \
+         seek AS ( \
+             SELECT q.queue_name, c.scheduled_at, c.created_at, c.activity_name, \
+                    c.task_type, c.schedule_to_close_at, c.workflow_exec_id, \
+                    c.concurrency_key, c.concurrency_cap, c.rate_limit_key \
+             FROM queues q \
+             CROSS JOIN LATERAL ( \
+                 SELECT t.scheduled_at, t.created_at, t.activity_name, t.task_type, \
+                        t.schedule_to_close_at, t.workflow_exec_id, t.concurrency_key, \
+                        t.concurrency_cap, t.rate_limit_key \
+                 FROM harvest_task_queue t \
+                 WHERE t.queue_name = q.queue_name \
+                   AND t.state = 'PENDING' \
+                   AND t.scheduled_at <= NOW() \
+                 ORDER BY t.scheduled_at, t.id \
+                 LIMIT ",
+        oldest_pending_seek_window!(),
+        " \
+             ) c \
+         ), \
+         seen AS ( \
+             SELECT queue_name, COUNT(*) AS n, MAX(scheduled_at) AS last_scheduled_at \
+             FROM seek GROUP BY queue_name \
+         ), \
+         refined AS ( \
+             SELECT queue_name, MIN(GREATEST(scheduled_at, COALESCE(created_at, scheduled_at))) AS oldest \
+             FROM seek harvest_task_queue \
+             WHERE TRUE ",
+        oldest_pending_gate_sql!(),
+        "     GROUP BY queue_name \
+         ) \
+         SELECT s.queue_name, \
+                GREATEST( \
+                    EXTRACT(EPOCH FROM (NOW() - COALESCE(r.oldest, f.oldest))), \
+                    0 \
+                )::DOUBLE PRECISION AS age_secs \
+         FROM seen s \
+         LEFT JOIN refined r ON r.queue_name = s.queue_name \
+         LEFT JOIN LATERAL ( \
+             SELECT MIN(GREATEST(scheduled_at, COALESCE(created_at, scheduled_at))) AS oldest \
+             FROM harvest_task_queue \
+             WHERE s.n >= ",
+        oldest_pending_seek_window!(),
+        " \
+               AND NOT (r.oldest IS NOT NULL AND r.oldest <= s.last_scheduled_at) \
+               AND queue_name = s.queue_name \
+               AND state = 'PENDING' \
+               AND scheduled_at <= NOW() ",
+        oldest_pending_gate_sql!(),
+        "     ) f ON TRUE \
+         WHERE COALESCE(r.oldest, f.oldest) IS NOT NULL"
     )
 }
 
@@ -12946,6 +13035,28 @@ mod tests {
             oldest_pending_ages_query().contains(&effective_available_tokens_expr("b")),
             "oldest_pending_ages must mirror the effective-rate-limit override, \
              or the gauge reads stale post-override numbers"
+        );
+    }
+
+    /// The Rust constant and the SQL literal name one window (issue #2339).
+    /// The gate text must also appear twice: once over the window and once in
+    /// the fallback over the whole queue.
+    #[test]
+    fn oldest_pending_ages_query_embeds_the_seek_window() {
+        let sql = oldest_pending_ages_query();
+        assert!(
+            sql.contains(&format!("LIMIT {OLDEST_PENDING_SEEK_WINDOW} ")),
+            "the seek LIMIT must equal OLDEST_PENDING_SEEK_WINDOW"
+        );
+        assert!(
+            sql.contains(&format!("s.n >= {OLDEST_PENDING_SEEK_WINDOW} ")),
+            "the fallback test must use OLDEST_PENDING_SEEK_WINDOW"
+        );
+        let gate = crate::queue_pause::queue_pause_anti_join("harvest_task_queue");
+        assert_eq!(
+            sql.matches(&gate).count(),
+            2,
+            "the refine step and the fallback must each carry every gate"
         );
     }
 

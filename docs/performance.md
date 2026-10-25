@@ -2573,6 +2573,11 @@ standalone note rather than part of the claim-path attribution table above:
   — before issue #2126, the four task-timeout lanes read one page of live
   rows four times per pass. Lanes at one position now share one refill
   statement (refill buffers -75% at 100,000 live rows, `pg_stat_statements`).
+* [`docs/performance-queue-age-gauge.md`](performance-queue-age-gauge.md)
+  — before issue #2339, `oldest_pending_ages` read every eligible pending row
+  on each sampler tick. It now seeks the oldest 32 rows per queue and falls back
+  to the full read only when it cannot settle the answer (age buffers -88.8%,
+  -98.6% and -99.5% at 20k, 100k and 300k pending rows, `pg_stat_statements`).
 * [`docs/performance-stream-append-count.md`](performance-stream-append-count.md)
   — `append_stream_chunks` counted every stored chunk of a run on each append.
   It now skips the count while the offset span plus the new chunks fits the cap
