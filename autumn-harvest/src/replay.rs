@@ -54,8 +54,8 @@ impl Hasher for EventIndexHasher {
 /// A set of event indices, hashed with [`EventIndexHasher`].
 type EventIndexSet = HashSet<usize, BuildHasherDefault<EventIndexHasher>>;
 
-/// The number of events that an activity terminal scan walks one by one,
-/// at least, before it can move to the activity scan index (issue #2330).
+/// The fewest events that an activity terminal scan walks one by one before
+/// it can move to the activity scan index (issue #2330).
 ///
 /// A settle walks a range up to this length too. It reads the index for a
 /// longer range, once the index exists.
