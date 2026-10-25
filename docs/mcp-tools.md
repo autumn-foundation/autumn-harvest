@@ -204,11 +204,13 @@ An already-terminal run yields the result frame immediately.
   for workflows: autumn-web's `expose_all_as_mcp` hatch is read-only
   (GET-only) by design and never picks up the mutating workflow tools.
 - **Annotations.** Read tools (`_status`) carry `readOnlyHint: true`; the
-  mutating tools carry `readOnlyHint: false`. Known inherited gap: autumn-web
-  (still as of 0.7) derives annotations from the HTTP verb and only emits
-  `destructiveHint: true` for DELETE routes, so the mutating workflow tools
-  cannot yet carry a literal `destructiveHint` — flagged for an autumn-web
-  follow-up.
+  mutating tools carry `readOnlyHint: false`. Known gap: the mutating
+  workflow tools carry no literal `destructiveHint`. autumn-web (still as of
+  0.8) derives it from the HTTP verb unless a route carries an
+  `#[agent_operable]` authority grant. Without a grant, only DELETE routes
+  get `destructiveHint: true`. The generated tool routes are POST and attach
+  no grant: `ApiDoc::agent_authority` stays `None`. A `compensable` or
+  `irreversible` grant would emit the hint.
 - **Auth principal.** `tools/call` forwards the caller's credentials
   (authorization/cookie headers, resolved client identity) into the replayed
   in-process request, so the tools run under the same authenticated principal

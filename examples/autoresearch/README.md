@@ -268,9 +268,10 @@ $ cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- harvest-verif
     -p autoresearch -p autumn-harvest-agent --lib --strict --report
 proven-deterministic  autoresearch::workflows::experiment
 proven-deterministic  autoresearch::workflows::research_session
+proven-deterministic  autumn_harvest_agent::agent::agent
 proven-deterministic  autumn_harvest_agent::heartbeat::agent_heartbeat
 proven-deterministic  autumn_harvest_agent::workflow::agent_loop
-analyzed 4: proven 4, unknown 0, found 0, allowed 0
+analyzed 5: proven 5, unknown 0, found 0, allowed 0
 ```
 
 `proven-deterministic` means that the analyzer found no source of
@@ -346,8 +347,11 @@ analyzer solves that cycle as a fixpoint.
   there. Its exclusion matters on a Postgres fleet.
 - **A taint covers one session.** Rows in `results.tsv` stay visible to
   later sessions in the lab.
-- **LLM budgets and the cost ledger need Postgres.** `runtime::postgres`
-  builds that registration with a budget on `agent_loop`.
+- **LLM budgets need Postgres.** The SQLite backend refuses a quota policy.
+  `runtime::postgres` builds the Postgres registration, with a budget on
+  `agent_loop`. The cost ledger works on both backends. On SQLite, a
+  completed model turn writes one `harvest_llm_ledger` row per model call
+  (issue #2275).
 - **`purge` cleans the database only.** The response cache, the memory notes,
   the reports, the saved runs and the Claude turns stay in `.autoresearch`.
   Delete `.autoresearch/cache` and `.autoresearch/cache-index` when no

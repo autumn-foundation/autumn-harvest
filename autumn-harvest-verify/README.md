@@ -18,9 +18,10 @@ to command-emitting **sinks**. Every `#[workflow]` fn gets one of three verdicts
 * `unknown` — with the analysis boundary named. One of fourteen
   (`cargo harvest-verify --list-boundaries`), all fourteen reachable.
 
-The knowledge is **data, not code**: `harvest-verify.model.toml` classifies all
-160 public `WorkflowContext` methods, and `--model extra.toml` overlays new rows
-without a tool release.
+The knowledge is **data, not code**: `harvest-verify.model.toml` classifies
+every public `WorkflowContext` method, and `--model extra.toml` overlays new
+rows without a tool release. A test fails when a public method has no row in
+the built-in model.
 
 ## Quick start
 
@@ -103,7 +104,7 @@ trimmed parameter, an inherent float method, a derived `ne`/`lt`, a trusted
 | `src/resolve/` | Call-target resolution: impl bodies by source span via `syn`, closures, async bodies, generic substitution, RTA-lite devirtualization. |
 | `src/analysis/` | Taint, summaries, control dependence and verdicts. |
 | `src/model/`, `harvest-verify.model.toml` | The sanctioned/source/sink model, as data. |
-| `corpus/` | Five crates: 29 seeded bugs the syntactic layer provably misses, 13 clean cases, 4 boundary cases, plus two helper crates for real cross-crate hops. `corpus/expectations.toml` is the oracle. **Deliberately pathological code**: the corpus crates carry no `[lints] workspace = true` and are not clippy-clean, and they are only ever built as rlibs (or `cargo check`ed) on Linux CI — never linked, and never built on macOS or Windows. |
+| `corpus/` | Five crates: seeded bugs the syntactic layer provably misses, clean cases and boundary cases, plus two helper crates for real cross-crate hops. `corpus/expectations.toml` is the oracle. It has one row per case, with its expected verdict. **Deliberately pathological code**: the corpus crates carry no `[lints] workspace = true` and are not clippy-clean, and they are only ever built as rlibs (or `cargo check`ed) on Linux CI — never linked, and never built on macOS or Windows. |
 
 ## Docs
 
