@@ -2593,3 +2593,13 @@ standalone note rather than part of the claim-path attribution table above:
   workflow tasks by execution, so the claim loops claim 3 tasks per
   3-activity workflow instead of 7. On a 4-CPU host the CPU limits the gain
   to 1.27x at one claim loop. The fused fence result is on the page.
+* [`docs/performance-analyzer-large-payload.md`](performance-analyzer-large-payload.md)
+  — `LargePayloadRule` measured each payload with `value.to_string().len()`,
+  which builds and drops the JSON text. It now counts bytes with a counting
+  writer (instructions in `analyze` -77.5%, bytes allocated per call
+  11,176,347 → 264,499, callgrind and dhat).
+* [`docs/performance-debug-diff-redaction-probe.md`](performance-debug-diff-redaction-probe.md)
+  — `harvest debug diff` parsed each snapshot file twice, once only to read
+  the `payload_policy` key. The probe now reads that key without building a
+  `Value` tree (`is_redacted_export` instructions -81.9%, whole process
+  -16.1%, callgrind).
