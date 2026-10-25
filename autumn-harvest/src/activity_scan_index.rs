@@ -6,8 +6,8 @@
 //! later schedules and the consumed completions, so a replay costs O(N²).
 //!
 //! This index keeps the positions that can change the result of a scan.
-//! After its first `LINEAR_SCAN_BUDGET` events, the scan reads only those
-//! positions. All other events are steps that have no effect. `HistoryMatcher::activity_scan_role` sorts each
+//! Once a scan leaves its walk, it reads only those positions. All other
+//! events are steps that have no effect. `HistoryMatcher::activity_scan_role` sorts each
 //! event into one role, and `docs/performance-match-activity-fanout.md`
 //! records the measurement.
 
@@ -16,6 +16,12 @@ use std::ops::Range;
 
 use crate::event::WorkflowEvent;
 use crate::types::ActivityExecId;
+
+/// The cost of indexing one event, in walk steps.
+///
+/// Callgrind gives about 400 instructions to index an activity event, and
+/// about 50 to walk one event.
+const BUILD_COST_IN_WALK_STEPS: usize = 8;
 
 /// What one event means to the activity terminal scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +59,8 @@ struct ActivityPositions {
 pub struct ActivityScanIndex {
     /// The length of the history prefix that the index holds.
     indexed: usize,
+    /// The events that scans and settles walked one by one.
+    walked: usize,
     activities: HashMap<ActivityExecId, ActivityPositions>,
     interleaved: SkipList,
     barriers: SkipList,
@@ -95,6 +103,26 @@ impl ActivityScanIndex {
             }
         }
         self.indexed = self.indexed.max(events.len());
+    }
+
+    /// Counts one event that a scan or a settle walked one by one.
+    pub const fn note_walk(&mut self) {
+        self.walked = self.walked.saturating_add(1);
+    }
+
+    /// Whether the index exists.
+    pub const fn is_built(&self) -> bool {
+        self.indexed > 0
+    }
+
+    /// Whether the index pays off for a history of `len` events.
+    ///
+    /// An index build costs about [`BUILD_COST_IN_WALK_STEPS`] walk steps for
+    /// each event. Until the walks cost that much, a walk is cheaper. This
+    /// rule keeps a small fan-out on the walk, at its old cost. It also
+    /// bounds the extra cost of a large fan-out by a constant factor.
+    pub const fn pays_off(&self, len: usize) -> bool {
+        self.is_built() || self.walked >= len.saturating_mul(BUILD_COST_IN_WALK_STEPS)
     }
 
     /// The first unconsumed `ActivityScheduled` or terminal event of `id`

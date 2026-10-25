@@ -54,18 +54,16 @@ impl Hasher for EventIndexHasher {
 /// A set of event indices, hashed with [`EventIndexHasher`].
 type EventIndexSet = HashSet<usize, BuildHasherDefault<EventIndexHasher>>;
 
-/// The number of events that an activity terminal scan walks one by one
-/// before it reads the activity scan index (issue #2330).
+/// The number of events that an activity terminal scan walks one by one,
+/// at least, before it can move to the activity scan index (issue #2330).
 ///
-/// A short walk costs less than an index build. A terminal past this
-/// distance is usually in a wide fan-out, where the index pays off. A
-/// settle walks a range up to this length too, and reads the index for a
-/// longer one.
-const LINEAR_SCAN_BUDGET: usize = 16;
+/// A settle walks a range up to this length too. It reads the index for a
+/// longer range, once the index exists.
+const LINEAR_SCAN_BUDGET: usize = 4;
 
 /// The walk budget of an activity scan or settle.
 ///
-/// A test can lower it. A budget of 0 sends every scan to the index.
+/// A test can lower it.
 fn scan_budget() -> usize {
     #[cfg(test)]
     if let Some(budget) = activity_scan_tests::budget_override() {
@@ -867,8 +865,8 @@ pub struct HistoryMatcher {
     /// travels with the event index, as `late_race_signal_events` does.
     predicate_rejected_signal_events: HashSet<usize>,
     /// The positions that the activity terminal scan reads (issue #2330).
-    /// The first scan or settle that passes `LINEAR_SCAN_BUDGET` builds it.
-    /// Each later use adds the new events.
+    /// The first scan that leaves its walk builds it. Each later use adds
+    /// the new events.
     activity_scan_index: ActivityScanIndex,
 }
 
@@ -1767,9 +1765,9 @@ impl HistoryMatcher {
 
     /// The role of `event` in an activity terminal scan (issue #2330).
     ///
-    /// The scan walks its first `LINEAR_SCAN_BUDGET` events with these roles.
-    /// After that, it reads only the positions that the activity scan index
-    /// holds, and the index sorts each event with this function. Each arm
+    /// The scan walks events with these roles. Once it leaves the walk, it
+    /// reads only the positions that the activity scan index holds, and the
+    /// index sorts each event with this function. Each arm
     /// keeps one rule of the plain walk that the scan replaced. The
     /// differential test `the_indexed_scan_matches_the_oracle` checks the
     /// scan against that walk.
@@ -1854,9 +1852,9 @@ impl HistoryMatcher {
     /// barrier, at a second schedule of the activity, or at the end. Then
     /// the cursor goes back to the first interleaved command, if any.
     ///
-    /// After its first `LINEAR_SCAN_BUDGET` events, the scan reads the
-    /// activity scan index, not each event (issue #2330). A replay of a
-    /// fan-out of N activities then costs about O(N log N), not O(N²).
+    /// In a wide fan-out, the scan leaves its walk and reads the activity
+    /// scan index, not each event (issue #2330). A replay of a fan-out of N
+    /// activities then costs about O(N log N), not O(N²).
     fn scan_activity_terminal(
         &mut self,
         activity_id: ActivityExecId,
@@ -1906,19 +1904,25 @@ impl HistoryMatcher {
     /// The second value is the first interleaved command before that point.
     /// The scan stashes each signal and external event before that point.
     ///
-    /// The scan walks the first [`LINEAR_SCAN_BUDGET`] events one by one.
-    /// Most terminals are near their schedule, so most scans end there and
-    /// build no index. A longer scan continues on the activity scan index.
+    /// The scan walks events one by one until [`Self::leaves_walk`] says to
+    /// move. Most terminals are near their schedule, so most scans end on
+    /// the walk and build no index. A scan in a wide fan-out continues on
+    /// the activity scan index.
     fn find_activity_terminal(
         &mut self,
         activity_id: ActivityExecId,
         from: usize,
     ) -> (Option<usize>, Option<usize>) {
         let len = self.events.len();
-        let walk_end = from.saturating_add(scan_budget()).min(len);
         let mut first_interleaved = None;
-        for at in from..walk_end {
+        let mut at = from;
+        while at < len {
+            if self.leaves_walk(at - from, first_interleaved.is_some()) {
+                break;
+            }
+            self.activity_scan_index.note_walk();
             if self.is_consumed(at) {
+                at += 1;
                 continue;
             }
             match Self::activity_scan_role(&self.events[at]) {
@@ -1934,16 +1938,35 @@ impl HistoryMatcher {
                 ScanRole::Barrier => return (None, first_interleaved),
                 ScanRole::Terminal(_) | ScanRole::Progress(_) | ScanRole::Pass => {}
             }
+            at += 1;
         }
-        if walk_end == len {
+        if at == len {
             return (None, first_interleaved);
         }
         let mut index = std::mem::take(&mut self.activity_scan_index);
         index.extend(&self.events, Self::activity_scan_role);
-        let found =
-            self.find_indexed_terminal(&mut index, activity_id, walk_end, first_interleaved);
+        let found = self.find_indexed_terminal(&mut index, activity_id, at, first_interleaved);
         self.activity_scan_index = index;
         found
+    }
+
+    /// Whether a scan that walked `walked` events moves to the index.
+    ///
+    /// The scan needs an interleaved command first. With none, the cursor
+    /// moves past every walked event after the scan. So no later scan walks
+    /// them again, and the walk stays linear over the replay.
+    ///
+    /// The scan also needs the index to pay off. Until the index exists,
+    /// the walks of this matcher must cost more than a build would. A small
+    /// fan-out then builds no index, and a large one builds it once.
+    fn leaves_walk(&self, walked: usize, interleaved: bool) -> bool {
+        #[cfg(test)]
+        if let Some(budget) = activity_scan_tests::budget_override() {
+            return walked >= budget;
+        }
+        interleaved
+            && walked >= LINEAR_SCAN_BUDGET
+            && self.activity_scan_index.pays_off(self.events.len())
     }
 
     /// Continues [`Self::find_activity_terminal`] from `from` on the
@@ -2786,10 +2809,11 @@ impl HistoryMatcher {
             // and does not walk the range (issue #2330).
             if let Some(aid) = activity_id {
                 let range = command_cursor..terminal_cursor;
-                if range.len() <= scan_budget() {
+                if range.len() <= scan_budget() || !self.activity_scan_index.is_built() {
                     for idx in range {
                         #[cfg(test)]
                         crate::activity_scan_index::steps::count();
+                        self.activity_scan_index.note_walk();
                         if Self::activity_scan_role(&self.events[idx]) == ScanRole::Progress(aid) {
                             self.consumed_out_of_order_events.insert(idx);
                         }
@@ -15435,9 +15459,11 @@ mod activity_scan_tests {
         BUDGET.with(Cell::get)
     }
 
-    /// Runs `run` with the walk budget `budget`.
-    fn with_budget<R>(budget: usize, run: impl FnOnce() -> R) -> R {
-        let before = BUDGET.with(|b| b.replace(Some(budget)));
+    /// Runs `run` with the walk budget `budget`. A budget moves every scan
+    /// to the index after that many events. `None` keeps the production
+    /// rule.
+    fn with_budget<R>(budget: Option<usize>, run: impl FnOnce() -> R) -> R {
+        let before = BUDGET.with(|b| b.replace(budget));
         let result = run();
         BUDGET.with(|b| b.set(before));
         result
@@ -15794,8 +15820,19 @@ mod activity_scan_tests {
     }
 
     /// Paddings for the edge tests. With no padding, the scan ends inside
-    /// its walk. With 20 passed events, it ends on the index.
+    /// its walk. With 20 passed events and a forced budget, it ends on the
+    /// index.
     const PADDINGS: [usize; 2] = [0, 20];
+
+    /// Runs `run` for each padding, with the production walk rule and with
+    /// every scan forced onto the index.
+    fn each_mode(mut run: impl FnMut(usize)) {
+        for pad in PADDINGS {
+            for budget in [None, Some(0)] {
+                with_budget(budget, || run(pad));
+            }
+        }
+    }
 
     /// `n` events that every activity scan steps over.
     fn padding(n: usize) -> Vec<WorkflowEvent> {
@@ -15817,7 +15854,7 @@ mod activity_scan_tests {
     /// A second `ActivityScheduled` with the same id stops the scan.
     #[test]
     fn a_repeated_schedule_of_the_same_id_stops_the_scan() {
-        for pad in PADDINGS {
+        each_mode(|pad| {
             let a = ActivityExecId::new();
             let mut matcher = HistoryMatcher::new(join(vec![
                 vec![scheduled(a, "x")],
@@ -15830,14 +15867,14 @@ mod activity_scan_tests {
                 "pad {pad}"
             );
             assert_eq!(matcher.cursor, 1, "pad {pad}");
-        }
+        });
     }
 
     /// An unexpected event stops the scan. The cursor goes back to the first
     /// interleaved command.
     #[test]
     fn an_unexpected_event_stops_the_scan_and_rewinds() {
-        for pad in PADDINGS {
+        each_mode(|pad| {
             let a = ActivityExecId::new();
             let b = ActivityExecId::new();
             let mut matcher = HistoryMatcher::new(join(vec![
@@ -15856,14 +15893,14 @@ mod activity_scan_tests {
                 "pad {pad}"
             );
             assert_eq!(matcher.cursor, 1, "pad {pad}");
-        }
+        });
     }
 
     /// The scan stashes signals before the terminal, in history order. It
     /// leaves signals after the terminal in place.
     #[test]
     fn the_scan_stashes_only_the_signals_before_the_terminal() {
-        for pad in PADDINGS {
+        each_mode(|pad| {
             let a = ActivityExecId::new();
             let mut matcher = HistoryMatcher::new(join(vec![
                 vec![scheduled(a, "x")],
@@ -15893,14 +15930,14 @@ mod activity_scan_tests {
                     "pad {pad}"
                 );
             }
-        }
+        });
     }
 
     /// A scan inside a cut view does not see the hidden tail. A scan after
     /// the restore sees it, even when the index was built during the cut.
     #[test]
     fn a_scan_sees_the_events_that_a_restore_brings_back() {
-        for pad in PADDINGS {
+        each_mode(|pad| {
             let a = ActivityExecId::new();
             let b = ActivityExecId::new();
             let events = join(vec![
@@ -15929,14 +15966,14 @@ mod activity_scan_tests {
                 },
                 "pad {pad}"
             );
-        }
+        });
     }
 
     /// A settle marks the progress events of its activity that sit between
     /// the interleaved command and the terminal.
     #[test]
     fn a_settle_consumes_the_progress_events_of_its_activity() {
-        for pad in PADDINGS {
+        each_mode(|pad| {
             let a = ActivityExecId::new();
             let b = ActivityExecId::new();
             let mut matcher = HistoryMatcher::new(join(vec![
@@ -15975,13 +16012,19 @@ mod activity_scan_tests {
                 HistoryMatch::Matched { .. }
             ));
             assert!(!matcher.is_replaying(), "pad {pad}");
-        }
+        });
     }
 
     /// An interleaved schedule past the walk becomes the cursor after the
     /// scan. Only the index can find it.
     #[test]
     fn an_interleaved_schedule_past_the_walk_becomes_the_cursor() {
+        for budget in [None, Some(0)] {
+            with_budget(budget, interleaved_schedule_past_the_walk);
+        }
+    }
+
+    fn interleaved_schedule_past_the_walk() {
         let a = ActivityExecId::new();
         let b = ActivityExecId::new();
         let mut matcher = HistoryMatcher::new(join(vec![
@@ -16395,7 +16438,7 @@ mod activity_scan_tests {
             first in (0..3_usize, any::<bool>()).prop_map(|(i, y)| Ev::Scheduled(i, y)),
             evs in proptest::collection::vec(ev(), 0..60),
             ops in proptest::collection::vec(op(), 1..60),
-            budget in proptest::sample::select(vec![0_usize, 1, 3, LINEAR_SCAN_BUDGET]),
+            budget in proptest::sample::select(vec![None, Some(0_usize), Some(1), Some(3)]),
         ) {
             let pools = Pools::new();
             let mut all = vec![first];
