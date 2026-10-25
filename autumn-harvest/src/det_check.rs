@@ -3118,7 +3118,7 @@ mod tests {
     /// A blank reason is no reason (issue #2314).
     #[test]
     fn parse_suppression_comment_rejects_a_whitespace_only_reason() {
-        for blank in [" ", "   ", "\t", " \t "] {
+        for blank in [" ", "   ", "\t", " \t ", "\u{a0}", "\u{3000}"] {
             let line = format!("let id = x(); // harvest-suppress: DET003 \"{blank}\"");
             assert_eq!(
                 parse_suppression_comment("DET003", &line),
