@@ -574,10 +574,9 @@ A review from five angles found these. Each fix has a test.
 - **Mandates.** A read-only inbound mandate makes a durable receiver
   read-only. A peer segment books no follow-up. A `memory` call in a segment
   that may not write memory gets an error, whatever the policy says.
-- **Read-only delegation (issue #2319).** A `delegate` call to a durable peer
-  sends the read-only flag of the sending segment. A heartbeat tick, a
-  follow-up and a read-only agent can no longer write through a writable
-  peer. Eight tests cover each path.
+- **Read-only delegation.** A `delegate` call to a durable peer sends the
+  read-only flag of the sending segment. A writable peer cannot write for a
+  tick, a follow-up or a read-only agent. Eight tests cover the paths.
 - **Peer replies.** Only the segment of a message answers it. A failed
   segment sends an error and no text. A full held queue answers a waiting
   sender at once.
