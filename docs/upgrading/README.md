@@ -109,16 +109,28 @@ roll.
 - **API token scopes.** A 0.6 API server reads an `admin` token as `read`.
   It also lets a `mutate` token reach admin routes (issue #1803 is 0.7
   only). Mint `admin` tokens after the roll.
+- **Codec key rotation, shard rebalancing, DR fencing and
+  `harvest partition enable`.** 0.6 does not know these features. Start
+  them after the roll. The codec fleet gate above enforces this for key
+  rotation.
+
+### Known limits for 0.7 and 0.8
+
+These 0.8 behaviors break the contract. Avoid each one during the roll.
+
 - **Non-cancellable blocks (issue #1984).** A cancel that finds an open
   `ctx.non_cancellable` block writes the new `WorkflowCancelRequested`
   event. A worker of an earlier version cannot read it. Only a run whose
   code calls `ctx.non_cancellable` gets the event, and that code needs the
   new version. Deploy such code after the roll. A rollback strands a run
   that already holds the event, so finish or terminate those runs first.
-- **Codec key rotation, shard rebalancing, DR fencing and
-  `harvest partition enable`.** 0.6 does not know these features. Start
-  them after the roll. The codec fleet gate above enforces this for key
-  rotation.
+- **Session drop release (issue #2193).** A 0.8 run that drops a `Session`
+  before `complete()` records a reserved release activity. A 0.7 worker
+  cannot run it. If that worker hosts the session, it fails the run. A 0.7
+  replay of that history reports non-determinism. So upgrade every worker
+  before a workflow drops a session, and do not roll back after a release
+  is recorded. See
+  [0.8.0 §1.11](0.8.0.md#111-a-dropped-session-releases-its-slot).
 
 ## Rolling deploy order
 

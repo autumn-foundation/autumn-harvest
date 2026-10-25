@@ -426,7 +426,8 @@ let builder = HarvestBuilder::new()
         "nightly_report",
         Schedule::Cron("0 0 * * *".to_string()), // daily at midnight
     ))
-    // Interval scheduling, from the end of the previous run
+    // Interval scheduling: each slot counts from the previous fire, not from
+    // the end of the previous run. `max_active_runs` (default 1) bounds overlap.
     .workflow_schedule(WorkflowSchedule::new(
         "hourly_sync",
         Schedule::Interval(Duration::from_secs(3600)), // one hour
