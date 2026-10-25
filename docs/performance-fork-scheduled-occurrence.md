@@ -49,6 +49,18 @@ Callgrind, total `Ir` of the harness, same machine and session:
 | 500 | 69,230,881 | 39,931,363 | -42.3% |
 | 1000 | 237,104,348 | 120,448,049 | -49.2% |
 
+### Re-measured on `trunk-dev` (2026-10-25)
+
+The same harness ran again on `572c7ff`, with rustc 1.99.0 and valgrind
+3.22.0. `fork.rs` has not changed since the fix. Each cell is within 1.2%
+of the "After" column:
+
+| K | After (PR #2214) | `572c7ff` |
+|---|---:|---:|
+| 250 | 15,289,295 | 15,231,372 |
+| 500 | 39,931,363 | 39,619,458 |
+| 1000 | 120,448,049 | 119,062,038 |
+
 ## Not addressed
 
 Both columns are quadratic in K, because each `resolve_activity` call still

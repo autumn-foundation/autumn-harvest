@@ -127,6 +127,21 @@ the matcher.
 The `SipHash` of the activity id in the index map is the next lever. A cheaper
 hasher needs its own argument about adversarial ids.
 
+### Re-measured on `trunk-dev` (2026-10-25)
+
+The same harness ran again on `572c7ff`, with rustc 1.99.0 and valgrind
+3.22.0 on a 4-vCPU host. Every cell stays within 0.03% of the "After"
+column:
+
+| Shape | N | After (PR #2340) | `572c7ff` |
+|---|---|---|---|
+| `fanout` | 1000 | 24,281,928 | 24,286,146 |
+| `fanout` | 2000 | 47,924,432 | 47,933,569 |
+| `fanout_rev` | 1000 | 24,203,647 | 24,210,879 |
+| `fanout_rev` | 2000 | 47,935,720 | 47,944,448 |
+| `sequential` | 1000 | 18,825,429 | 18,828,713 |
+| `sequential` | 2000 | 35,412,341 | 35,416,385 |
+
 ### Not fixed here
 
 Two other matcher paths stay quadratic. Issue #2338 tracks both:

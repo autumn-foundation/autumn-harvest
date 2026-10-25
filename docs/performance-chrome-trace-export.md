@@ -48,6 +48,18 @@ exists. The output is identical, and the existing test passes unchanged.
 | Blocks allocated (dhat) | 79,009 | 51,008 | -35.4% |
 | Bytes allocated (dhat) | 10,563,366 | 7,879,766 | -25.4% |
 
+### Re-measured on `trunk-dev` (2026-10-25)
+
+The same harness ran again on `572c7ff`, with rustc 1.99.0 and valgrind
+3.22.0. `trace_export.rs` has not changed since the fix. The allocation
+counts are identical, and total `Ir` is 1.1% below the "After" column:
+
+| Counter (tool) | After (PR #2279) | `572c7ff` |
+|---|---:|---:|
+| Total Ir (callgrind) | 36,922,937 | 36,529,341 |
+| Blocks allocated (dhat) | 51,008 | 51,008 |
+| Bytes allocated (dhat) | 7,879,766 | 7,879,766 |
+
 ## Not addressed
 
 The linter and the profiler are about 8% and 7% of the workload. Neither has
