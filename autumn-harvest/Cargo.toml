@@ -673,6 +673,14 @@ harness = false
 name = "payload_codec_profile"
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `payload_depth::refuse_deep_result`, which the worker runs on every
+# successful activity result. No feature requirement: the module is pure. See
+# `benches/payload_depth_profile.rs`.
+[[bench]]
+name = "payload_depth_profile"
+harness = false
+
 [lints]
 workspace = true
 
