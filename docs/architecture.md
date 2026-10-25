@@ -33,7 +33,7 @@ autumn-harvest/          <- workspace root
       models.rs          <- Phase 1, db feature only
       store.rs           <- Phase 2: event store (append/load history)
       replay.rs          <- Phase 2: deterministic replay engine
-      activity_scan_index.rs <- issue #2330: activity terminal scan index
+      activity_scan_index.rs  <- issue #2330: activity terminal scan index
       executor.rs        <- Phase 2: workflow executor (replay + suspension)
       queue.rs           <- Phase 2: Postgres task queue (SKIP LOCKED)
       notify.rs          <- Phase 2: LISTEN/NOTIFY wrapper

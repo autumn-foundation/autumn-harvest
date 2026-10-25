@@ -54,12 +54,13 @@ impl Hasher for EventIndexHasher {
 /// A set of event indices, hashed with [`EventIndexHasher`].
 type EventIndexSet = HashSet<usize, BuildHasherDefault<EventIndexHasher>>;
 
-/// The events that an activity terminal scan walks one by one before it
-/// reads the activity scan index (issue #2330).
+/// The number of events that an activity terminal scan walks one by one
+/// before it reads the activity scan index (issue #2330).
 ///
-/// A short walk costs less than an index build. A terminal more than this
-/// many events past its schedule is in a wide fan-out, where the index pays
-/// off.
+/// A short walk costs less than an index build. A terminal past this
+/// distance is usually in a wide fan-out, where the index pays off. A
+/// settle walks a range up to this length too, and reads the index for a
+/// longer one.
 const LINEAR_SCAN_BUDGET: usize = 16;
 
 /// Result of matching a workflow command against the event history.
@@ -855,7 +856,8 @@ pub struct HistoryMatcher {
     /// travels with the event index, as `late_race_signal_events` does.
     predicate_rejected_signal_events: HashSet<usize>,
     /// The positions that the activity terminal scan reads (issue #2330).
-    /// The first scan builds it, and each later scan adds new events.
+    /// The first scan or settle that passes `LINEAR_SCAN_BUDGET` builds it.
+    /// Each later use adds the new events.
     activity_scan_index: ActivityScanIndex,
 }
 
@@ -1754,11 +1756,12 @@ impl HistoryMatcher {
 
     /// The role of `event` in an activity terminal scan (issue #2330).
     ///
-    /// The scan reads only the positions that the activity scan index holds.
-    /// This function sorts each event into its role. Each arm keeps one rule
-    /// of the plain walk that the index replaced. The differential test
-    /// `the_indexed_scan_matches_the_oracle` checks the index against that
-    /// walk.
+    /// The scan walks its first `LINEAR_SCAN_BUDGET` events with these roles.
+    /// After that, it reads only the positions that the activity scan index
+    /// holds, and the index sorts each event with this function. Each arm
+    /// keeps one rule of the plain walk that the scan replaced. The
+    /// differential test `the_indexed_scan_matches_the_oracle` checks the
+    /// scan against that walk.
     const fn activity_scan_role(event: &WorkflowEvent) -> ScanRole {
         match event {
             // Other activities may be scheduled and complete while this
@@ -1774,7 +1777,8 @@ impl HistoryMatcher {
             | WorkflowEvent::ActivityTimedOut { activity_id, .. } => {
                 ScanRole::Terminal(*activity_id)
             }
-            // Skip heartbeats and started events for this activity.
+            // Skip heartbeats and started events. A settle consumes those
+            // of its own activity.
             WorkflowEvent::ActivityStarted { activity_id, .. }
             | WorkflowEvent::ActivityHeartbeat { activity_id, .. } => {
                 ScanRole::Progress(*activity_id)
@@ -1832,15 +1836,16 @@ impl HistoryMatcher {
 
     /// Scans for the terminal event of `activity_id` from `scan_cursor`.
     ///
-    /// The scan steps over each event that [`Self::activity_scan_role`]
-    /// passes or marks interleaved. It stashes each signal and external
-    /// event on its way, in history order. It stops at any other barrier, at
-    /// a second schedule of the activity, or at the end. Then the cursor
-    /// goes back to the first interleaved command, if any.
+    /// The scan steps over the events of other activities, progress events,
+    /// interleaved commands and passed events, as
+    /// [`Self::activity_scan_role`] sorts them. It stashes each signal and
+    /// external event on its way, in history order. It stops at any other
+    /// barrier, at a second schedule of the activity, or at the end. Then
+    /// the cursor goes back to the first interleaved command, if any.
     ///
-    /// The scan reads the activity scan index, not each event (issue
-    /// #2330). A replay of a fan-out of N activities then costs about
-    /// O(N log N), not O(N²).
+    /// After its first `LINEAR_SCAN_BUDGET` events, the scan reads the
+    /// activity scan index, not each event (issue #2330). A replay of a
+    /// fan-out of N activities then costs about O(N log N), not O(N²).
     fn scan_activity_terminal(
         &mut self,
         activity_id: ActivityExecId,
@@ -1852,9 +1857,11 @@ impl HistoryMatcher {
             return self.rewind_open_activity(activity_id, first_interleaved_command);
         };
         let result = match &mut self.events[terminal_cursor] {
-            // Take the recorded output. Do not clone it. No later read of a
-            // matched `ActivityCompleted` uses its `output`, so a clone is
-            // waste. See `docs/performance-replay.md`.
+            // Take the recorded output. Do not clone it. `settle_terminal`
+            // reads only `activity_id` from this event. No other production
+            // code reads the `output` of a matched `ActivityCompleted`. A
+            // clone of a `Value` is a deep copy, so it is waste. See
+            // `docs/performance-replay.md`.
             WorkflowEvent::ActivityCompleted { output, .. } => HistoryMatch::Matched {
                 output: std::mem::take(output),
             },
@@ -1970,7 +1977,8 @@ impl HistoryMatcher {
     /// Ends a scan that found no terminal event.
     ///
     /// The activity was scheduled but never finished, so the history is
-    /// incomplete. The cursor goes back to the first interleaved command.
+    /// incomplete. The cursor goes back to the first interleaved command, if
+    /// any.
     fn rewind_open_activity(
         &mut self,
         activity_id: ActivityExecId,
@@ -2763,8 +2771,8 @@ impl HistoryMatcher {
                 | WorkflowEvent::ActivityTimedOut { activity_id, .. } => Some(*activity_id),
                 _ => None,
             };
-            // A long range reads the activity scan index, so the settle
-            // does not walk it (issue #2330).
+            // For a long range, the settle reads the activity scan index
+            // and does not walk the range (issue #2330).
             if let Some(aid) = activity_id {
                 let range = command_cursor..terminal_cursor;
                 if range.len() <= LINEAR_SCAN_BUDGET {
@@ -15422,7 +15430,8 @@ mod activity_scan_tests {
     }
 
     // The scan and settle code before issue #2330, as the test oracle.
-    // Comments are dropped. The code is unchanged.
+    // Comments are dropped. The logic is unchanged. Only the receiver and
+    // the names change.
     #[allow(clippy::too_many_lines)]
     fn oracle_scan_activity_terminal(
         m: &mut HistoryMatcher,
@@ -15762,141 +15771,189 @@ mod activity_scan_tests {
         }
     }
 
+    /// Paddings for the edge tests. With no padding, the scan ends inside
+    /// its walk. With 20 passed events, it ends on the index.
+    const PADDINGS: [usize; 2] = [0, 20];
+
+    /// `n` events that every activity scan steps over.
+    fn padding(n: usize) -> Vec<WorkflowEvent> {
+        (0..n)
+            .map(|_| WorkflowEvent::UpdateAdmitted {
+                update_id: UpdateId::new(),
+                name: "u".into(),
+                input: Value::Null,
+                timestamp: chrono::DateTime::UNIX_EPOCH,
+            })
+            .collect()
+    }
+
+    /// Joins history parts in order.
+    fn join(parts: Vec<Vec<WorkflowEvent>>) -> Vec<WorkflowEvent> {
+        parts.into_iter().flatten().collect()
+    }
+
     /// A second `ActivityScheduled` with the same id stops the scan.
     #[test]
     fn a_repeated_schedule_of_the_same_id_stops_the_scan() {
-        let a = ActivityExecId::new();
-        let mut matcher = HistoryMatcher::new(vec![
-            scheduled(a, "x"),
-            scheduled(a, "x"),
-            completed(a, Value::Null),
-        ]);
-        assert_eq!(
-            matcher.match_activity("x"),
-            HistoryMatch::ActivityInProgress { activity_id: a }
-        );
-        assert_eq!(matcher.cursor, 1);
+        for pad in PADDINGS {
+            let a = ActivityExecId::new();
+            let mut matcher = HistoryMatcher::new(join(vec![
+                vec![scheduled(a, "x")],
+                padding(pad),
+                vec![scheduled(a, "x"), completed(a, Value::Null)],
+            ]));
+            assert_eq!(
+                matcher.match_activity("x"),
+                HistoryMatch::ActivityInProgress { activity_id: a },
+                "pad {pad}"
+            );
+            assert_eq!(matcher.cursor, 1, "pad {pad}");
+        }
     }
 
     /// An unexpected event stops the scan. The cursor goes back to the first
     /// interleaved command.
     #[test]
     fn an_unexpected_event_stops_the_scan_and_rewinds() {
-        let a = ActivityExecId::new();
-        let b = ActivityExecId::new();
-        let mut matcher = HistoryMatcher::new(vec![
-            scheduled(a, "x"),
-            scheduled(b, "y"),
-            WorkflowEvent::WorkflowCompleted {
-                output: Value::Null,
-            },
-            completed(a, Value::Null),
-        ]);
-        assert_eq!(
-            matcher.match_activity("x"),
-            HistoryMatch::ActivityInProgress { activity_id: a }
-        );
-        assert_eq!(matcher.cursor, 1);
+        for pad in PADDINGS {
+            let a = ActivityExecId::new();
+            let b = ActivityExecId::new();
+            let mut matcher = HistoryMatcher::new(join(vec![
+                vec![scheduled(a, "x"), scheduled(b, "y")],
+                padding(pad),
+                vec![
+                    WorkflowEvent::WorkflowCompleted {
+                        output: Value::Null,
+                    },
+                    completed(a, Value::Null),
+                ],
+            ]));
+            assert_eq!(
+                matcher.match_activity("x"),
+                HistoryMatch::ActivityInProgress { activity_id: a },
+                "pad {pad}"
+            );
+            assert_eq!(matcher.cursor, 1, "pad {pad}");
+        }
     }
 
     /// The scan stashes signals before the terminal, in history order. It
     /// leaves signals after the terminal in place.
     #[test]
     fn the_scan_stashes_only_the_signals_before_the_terminal() {
-        let a = ActivityExecId::new();
-        let mut matcher = HistoryMatcher::new(vec![
-            scheduled(a, "x"),
-            signal("s", serde_json::json!(1)),
-            signal("s", serde_json::json!(2)),
-            completed(a, serde_json::json!("done")),
-            signal("s", serde_json::json!(3)),
-        ]);
-        assert_eq!(
-            matcher.match_activity("x"),
-            HistoryMatch::Matched {
-                output: serde_json::json!("done")
-            }
-        );
-        let stashed: Vec<usize> = matcher.pending_signals.iter().map(|s| s.2).collect();
-        assert_eq!(stashed, vec![1, 2]);
-        for want in 1..=3 {
+        for pad in PADDINGS {
+            let a = ActivityExecId::new();
+            let mut matcher = HistoryMatcher::new(join(vec![
+                vec![scheduled(a, "x")],
+                padding(pad),
+                vec![
+                    signal("s", serde_json::json!(1)),
+                    signal("s", serde_json::json!(2)),
+                    completed(a, serde_json::json!("done")),
+                    signal("s", serde_json::json!(3)),
+                ],
+            ]));
             assert_eq!(
-                matcher.match_signal("s"),
+                matcher.match_activity("x"),
                 HistoryMatch::Matched {
-                    output: serde_json::json!(want)
-                }
+                    output: serde_json::json!("done")
+                },
+                "pad {pad}"
             );
+            let stashed: Vec<usize> = matcher.pending_signals.iter().map(|s| s.2).collect();
+            assert_eq!(stashed, vec![1 + pad, 2 + pad], "pad {pad}");
+            for want in 1..=3 {
+                assert_eq!(
+                    matcher.match_signal("s"),
+                    HistoryMatch::Matched {
+                        output: serde_json::json!(want)
+                    },
+                    "pad {pad}"
+                );
+            }
         }
     }
 
     /// A scan inside a cut view does not see the hidden tail. A scan after
-    /// the restore sees it.
+    /// the restore sees it, even when the index was built during the cut.
     #[test]
     fn a_scan_sees_the_events_that_a_restore_brings_back() {
-        let a = ActivityExecId::new();
-        let b = ActivityExecId::new();
-        let mut matcher = HistoryMatcher::new(vec![
-            scheduled(a, "x"),
-            completed(a, serde_json::json!("a")),
-            scheduled(b, "y"),
-            completed(b, serde_json::json!("b")),
-        ]);
-        let cut = matcher.cut_view(3).expect("the cut hides an event");
-        assert_eq!(
-            matcher.match_activity("x"),
-            HistoryMatch::Matched {
-                output: serde_json::json!("a")
-            }
-        );
-        matcher.restore_view(cut);
-        assert_eq!(
-            matcher.match_activity("y"),
-            HistoryMatch::Matched {
-                output: serde_json::json!("b")
-            }
-        );
+        for pad in PADDINGS {
+            let a = ActivityExecId::new();
+            let b = ActivityExecId::new();
+            let events = join(vec![
+                vec![scheduled(a, "x"), scheduled(b, "y")],
+                padding(pad),
+                vec![
+                    completed(a, serde_json::json!("a")),
+                    completed(b, serde_json::json!("b")),
+                ],
+            ]);
+            let horizon = events.len() - 1;
+            let mut matcher = HistoryMatcher::new(events);
+            let cut = matcher.cut_view(horizon).expect("the cut hides an event");
+            assert_eq!(
+                matcher.match_activity("x"),
+                HistoryMatch::Matched {
+                    output: serde_json::json!("a")
+                },
+                "pad {pad}"
+            );
+            matcher.restore_view(cut);
+            assert_eq!(
+                matcher.match_activity("y"),
+                HistoryMatch::Matched {
+                    output: serde_json::json!("b")
+                },
+                "pad {pad}"
+            );
+        }
     }
 
     /// A settle marks the progress events of its activity that sit between
     /// the interleaved command and the terminal.
     #[test]
     fn a_settle_consumes_the_progress_events_of_its_activity() {
-        let a = ActivityExecId::new();
-        let b = ActivityExecId::new();
-        let mut matcher = HistoryMatcher::new(vec![
-            scheduled(a, "x"),
-            scheduled(b, "y"),
-            WorkflowEvent::ActivityStarted {
-                activity_id: a,
-                worker_id: WorkerId::new("w"),
-            },
-            WorkflowEvent::ActivityHeartbeat {
-                activity_id: a,
-                details: Value::Null,
-            },
-            WorkflowEvent::ActivityHeartbeat {
-                activity_id: b,
-                details: Value::Null,
-            },
-            completed(a, Value::Null),
-            completed(b, Value::Null),
-        ]);
-        assert!(matches!(
-            matcher.match_activity("x"),
-            HistoryMatch::Matched { .. }
-        ));
-        let mut consumed: Vec<usize> = matcher
-            .consumed_out_of_order_events
-            .iter()
-            .copied()
-            .collect();
-        consumed.sort_unstable();
-        assert_eq!(consumed, vec![2, 3, 5]);
-        assert!(matches!(
-            matcher.match_activity("y"),
-            HistoryMatch::Matched { .. }
-        ));
-        assert!(!matcher.is_replaying());
+        for pad in PADDINGS {
+            let a = ActivityExecId::new();
+            let b = ActivityExecId::new();
+            let mut matcher = HistoryMatcher::new(join(vec![
+                vec![
+                    scheduled(a, "x"),
+                    scheduled(b, "y"),
+                    WorkflowEvent::ActivityStarted {
+                        activity_id: a,
+                        worker_id: WorkerId::new("w"),
+                    },
+                    WorkflowEvent::ActivityHeartbeat {
+                        activity_id: a,
+                        details: Value::Null,
+                    },
+                    WorkflowEvent::ActivityHeartbeat {
+                        activity_id: b,
+                        details: Value::Null,
+                    },
+                ],
+                padding(pad),
+                vec![completed(a, Value::Null), completed(b, Value::Null)],
+            ]));
+            assert!(matches!(
+                matcher.match_activity("x"),
+                HistoryMatch::Matched { .. }
+            ));
+            let mut consumed: Vec<usize> = matcher
+                .consumed_out_of_order_events
+                .iter()
+                .copied()
+                .collect();
+            consumed.sort_unstable();
+            assert_eq!(consumed, vec![2, 3, 5 + pad], "pad {pad}");
+            assert!(matches!(
+                matcher.match_activity("y"),
+                HistoryMatch::Matched { .. }
+            ));
+            assert!(!matcher.is_replaying(), "pad {pad}");
+        }
     }
 
     /// One recorded event, over small pools of ids.

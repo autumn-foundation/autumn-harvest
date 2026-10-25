@@ -6,8 +6,8 @@
 //! later schedules and the consumed completions, so a replay costs O(N²).
 //!
 //! This index keeps the positions that can change the result of a scan.
-//! The scan then reads only those positions. All other events are steps
-//! that have no effect. `HistoryMatcher::activity_scan_role` sorts each
+//! After its first `LINEAR_SCAN_BUDGET` events, the scan reads only those
+//! positions. All other events are steps that have no effect. `HistoryMatcher::activity_scan_role` sorts each
 //! event into one role, and `docs/performance-match-activity-fanout.md`
 //! records the measurement.
 
@@ -51,7 +51,7 @@ struct ActivityPositions {
 /// The positions of the events that can change an activity scan.
 #[derive(Debug, Default)]
 pub struct ActivityScanIndex {
-    /// The number of events that the index holds.
+    /// The length of the history prefix that the index holds.
     indexed: usize,
     activities: HashMap<ActivityExecId, ActivityPositions>,
     interleaved: SkipList,
@@ -64,7 +64,7 @@ impl ActivityScanIndex {
     /// The events of a matcher change in two ways. `append_consumed` adds
     /// consumed events at the end. `cut_view` hides a tail, and
     /// `restore_view` brings back the same tail. So the prefix that the
-    /// index holds never changes. A query ignores a position at or after
+    /// index holds never changes. The caller ignores a position at or after
     /// the visible length, which covers a cut.
     pub fn extend(
         &mut self,
@@ -151,7 +151,8 @@ impl ActivityScanIndex {
 #[derive(Debug, Default)]
 struct SkipList {
     positions: Vec<usize>,
-    /// Empty until the first push. Then one slot longer than `positions`.
+    /// It is empty until the first push. It then holds one slot more than
+    /// `positions`.
     next: Vec<usize>,
 }
 

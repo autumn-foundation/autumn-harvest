@@ -3,13 +3,13 @@
 //!
 //! The activity terminal scan asks for the first unconsumed position in a
 //! sorted list. `SkipList::first_unconsumed` answers through `first_live`.
-//! Each entry holds a link to a later entry. Every entry that a link jumps
-//! over is dead. A dead entry is a consumed event, and it never comes back
+//! Each entry holds a link to itself or to a later entry. Every entry that
+//! a link jumps over is dead. A dead entry is a consumed event, and it never comes back
 //! to life.
 //!
 //! The copy below proves that `first_live` returns the first live entry at
 //! or after its start, or the end. It also proves that each call keeps the
-//! links sound. The lemmas prove that a new list is sound, that an added
+//! links sound. The theorems prove that a new list is sound, that an added
 //! entry keeps it sound, and that more dead entries keep it sound. So the
 //! links stay sound for the life of the index.
 
