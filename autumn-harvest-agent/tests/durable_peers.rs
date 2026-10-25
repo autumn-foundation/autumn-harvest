@@ -12,14 +12,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use autumn_harvest::chrono::{self, DateTime, Utc};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::agent::MAX_HELD_OPS;
 use autumn_harvest_agent::flow::labels;
 use autumn_harvest_agent::mesh::DELEGATE_TOOL;
 use autumn_harvest_agent::{
-    AgentError, AgentHarness, AgentId, AgentModel, AgentOp, AgentProfile, AgentState, BoxFuture,
-    ChatRequest, ChatResponse, ChatRole, ContentPart, Control, ErrorKind, FlowRules, FnTool,
-    Followups, Mandate, Peer, PeerEnvelope, Rule, StopReason, TokenUsage, ToolEffect, sqlite,
+    AgentError, AgentHarness, AgentHeartbeat, AgentId, AgentModel, AgentOp, AgentProfile,
+    AgentState, AgentTask, BoxFuture, ChatRequest, ChatResponse, ChatRole, ContentPart, Control,
+    ErrorKind, FlowRules, FnTool, Followups, Mandate, Peer, PeerEnvelope, Rule, StopReason,
+    TokenUsage, ToolEffect, sqlite,
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{Recorder, ScriptedModel, recorded_tool, runtime};
@@ -884,4 +886,344 @@ async fn a_fan_out_child_that_asks_its_waiting_parent_gets_a_deadlock_error_at_o
     let answer = planner.last_answer.expect("the op ends");
     assert!(answer.contains("deadlock"), "{answer}");
     assert_eq!(fired_timers(&rt, &triage()), 0, "no reply deadline fired");
+}
+
+/// Drive `agent` at the drive clock `at`, through each checkpoint.
+async fn drive_at(rt: &mut SqliteRuntime, agent: &AgentId, at: DateTime<Utc>) -> RunState {
+    let mut exec = sqlite::current_run(rt, agent).unwrap().unwrap();
+    loop {
+        match rt.run_until_blocked_as_of(exec, at).await.unwrap() {
+            RunState::ContinuedAsNew(next) => exec = next,
+            other => return other,
+        }
+    }
+}
+
+/// A model in which each peer message calls `write` once. `sender` answers
+/// every other request.
+fn writer_model(
+    sender: impl Fn(&ChatRequest) -> ChatResponse + Send + Sync + 'static,
+) -> Arc<FnModel> {
+    FnModel::new(move |request| {
+        if !from_peer(request) {
+            return sender(request);
+        }
+        let results = tool_results(request);
+        if results.is_empty() {
+            call("w1", "write", json!({}))
+        } else {
+            text(&format!("write said: {}", results[0]))
+        }
+    })
+}
+
+/// The call that asks the researcher to write.
+fn ask_call() -> ChatResponse {
+    call(
+        "d1",
+        DELEGATE_TOOL,
+        json!({"agent": "researcher", "task": "write it"}),
+    )
+}
+
+/// The sender asks the researcher once, then ends.
+fn ask_researcher(request: &ChatRequest) -> ChatResponse {
+    if tool_results(request).is_empty() {
+        ask_call()
+    } else {
+        text("done")
+    }
+}
+
+/// The sender books one follow-up. The follow-up asks the researcher once.
+fn ask_on_wake(request: &ChatRequest) -> ChatResponse {
+    let results = tool_results(request);
+    let woken = last_user(request).starts_with("[Scheduled follow-up]");
+    let asked = results
+        .iter()
+        .any(|result| result.contains("\"agent\":\"researcher\""));
+    match (woken, results.is_empty(), asked) {
+        (false, true, _) => call(
+            "f1",
+            "schedule_followup",
+            json!({"prompt": "ask the researcher", "delay_minutes": 1}),
+        ),
+        (false, false, _) => text("booked"),
+        (true, _, false) => ask_call(),
+        (true, _, true) => text("done"),
+    }
+}
+
+/// A mesh with `sender` and a durable researcher that may write on its own.
+fn writable_researcher(
+    model: &Arc<FnModel>,
+    recorder: &Arc<Recorder>,
+    sender: AgentProfile,
+) -> AgentHarness {
+    AgentHarness::new(model.clone())
+        .tool(recorded_tool("write", ToolEffect::Write, recorder))
+        .peer(Peer::agent("researcher", "Writes.", &research()))
+        .agent(sender)
+        .agent(AgentProfile::new("research").mandate(Mandate::new("researcher")))
+}
+
+/// The envelope is read-only, the write never runs, and the researcher
+/// reads the refusal.
+fn assert_read_only(rt: &SqliteRuntime, model: &FnModel, recorder: &Recorder) {
+    let received = peer_messages(rt, &research());
+    assert_eq!(received.len(), 1, "one delivery");
+    assert!(received[0].mandate.read_only, "the envelope is read-only");
+    assert!(recorder.runs().is_empty(), "the write tool never runs");
+    let results = peer_tool_results(model);
+    assert!(
+        results.iter().any(|result| result.contains("only read")),
+        "{results:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_sender_cannot_write_through_a_durable_peer() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = writer_model(ask_researcher);
+    let sender = AgentProfile::new("triage")
+        .read_only()
+        .mandate(Mandate::new("triage").peers(["researcher"]));
+    let mut rt = runtime(&db, writable_researcher(&model, &recorder, sender));
+    start(&mut rt, &research()).await;
+    sqlite::send(&mut rt, &triage(), &AgentOp::message("go"), None).unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+
+    assert_read_only(&rt, &model, &recorder);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_heartbeat_tick_cannot_write_through_a_durable_peer() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = writer_model(ask_researcher);
+    // The tick has no allow_actions, so it is read-only.
+    let sender = AgentProfile::new("triage")
+        .heartbeat(AgentHeartbeat::every(Duration::from_secs(60)))
+        .mandate(Mandate::new("triage").peers(["researcher"]));
+    let mut rt = runtime(&db, writable_researcher(&model, &recorder, sender));
+    start(&mut rt, &research()).await;
+    let begin = Utc::now();
+    sqlite::send(&mut rt, &triage(), &AgentOp::Control(Control::Resume), None).unwrap();
+    drive_at(&mut rt, &triage(), begin).await;
+    // The tick is due at 60 seconds. It sends to the researcher and waits.
+    drive_at(&mut rt, &triage(), begin + chrono::Duration::seconds(90)).await;
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    drive_at(&mut rt, &triage(), begin + chrono::Duration::seconds(91)).await;
+
+    assert_eq!(state(&rt, &triage()).await.ticks, 1);
+    assert_read_only(&rt, &model, &recorder);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_followup_segment_cannot_write_through_a_durable_peer() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = writer_model(ask_on_wake);
+    // The follow-up has no allow_actions, so it is read-only.
+    let sender = AgentProfile::new("triage")
+        .followups(Followups::new(Duration::from_secs(3_600)))
+        .mandate(Mandate::new("triage").peers(["researcher"]));
+    let mut rt = runtime(&db, writable_researcher(&model, &recorder, sender));
+    start(&mut rt, &research()).await;
+    let begin = Utc::now();
+    sqlite::send(&mut rt, &triage(), &AgentOp::message("go"), None).unwrap();
+    drive_at(&mut rt, &triage(), begin).await;
+    let woken = begin + chrono::Duration::minutes(3);
+    drive_at(&mut rt, &triage(), woken).await;
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    drive_at(&mut rt, &triage(), woken + chrono::Duration::seconds(1)).await;
+
+    assert_eq!(state(&rt, &triage()).await.chain, 1, "the follow-up ran");
+    assert_read_only(&rt, &model, &recorder);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inline_child_of_a_read_only_sender_cannot_write_through_a_durable_peer() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = writer_model(|request| {
+        let results = tool_results(request);
+        match first_user(request).as_str() {
+            "go" if results.is_empty() => call(
+                "d1",
+                DELEGATE_TOOL,
+                json!({"agent": "helper", "task": "ask the researcher"}),
+            ),
+            "ask the researcher" if results.is_empty() => ask_researcher(request),
+            _ => text("done"),
+        }
+    });
+    let sender = AgentProfile::new("triage")
+        .read_only()
+        .mandate(Mandate::new("triage").peers(["helper", "researcher"]));
+    // The helper runs inline. Its own mandate is not read-only.
+    let harness = writable_researcher(&model, &recorder, sender)
+        .peer(Peer::new("helper", "Asks the researcher.").peers(["researcher"]));
+    let mut rt = runtime(&db, harness);
+    start(&mut rt, &research()).await;
+    sqlite::send(&mut rt, &triage(), &AgentOp::message("go"), None).unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+
+    assert_read_only(&rt, &model, &recorder);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fan_out_child_of_a_read_only_sender_cannot_write_through_a_durable_peer() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = writer_model(|request| {
+        let results = tool_results(request);
+        match first_user(request).as_str() {
+            // Two delegations in one turn run as two child runs.
+            "go" if results.is_empty() => ChatResponse {
+                content: vec![
+                    ContentPart::ToolCall {
+                        id: "d1".to_owned(),
+                        name: DELEGATE_TOOL.to_owned(),
+                        arguments: json!({"agent": "helper", "task": "ask the researcher"}),
+                    },
+                    ContentPart::ToolCall {
+                        id: "d2".to_owned(),
+                        name: DELEGATE_TOOL.to_owned(),
+                        arguments: json!({"agent": "hotels", "task": "find hotels"}),
+                    },
+                ],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::new(1, 1),
+            },
+            "ask the researcher" if results.is_empty() => ask_researcher(request),
+            _ => text("done"),
+        }
+    });
+    let sender = AgentProfile::new("triage")
+        .read_only()
+        .mandate(Mandate::new("triage").peers(["helper", "hotels", "researcher"]))
+        .parallel_children(2);
+    let harness = writable_researcher(&model, &recorder, sender)
+        .peer(Peer::new("helper", "Asks the researcher.").peers(["researcher"]))
+        .peer(Peer::new("hotels", "Finds hotels."));
+    let mut rt = runtime(&db, harness);
+    start(&mut rt, &research()).await;
+    sqlite::send(&mut rt, &triage(), &AgentOp::message("go"), None).unwrap();
+    // The helper child run sends to the researcher and waits on the reply.
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+
+    assert_read_only(&rt, &model, &recorder);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_agent_loop_cannot_write_through_a_durable_peer() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = writer_model(ask_researcher);
+    let harness = writable_researcher(&model, &recorder, AgentProfile::new("triage"));
+    let mut rt = runtime(&db, harness);
+    start(&mut rt, &research()).await;
+    let task = AgentTask::new("go")
+        .read_only()
+        .mandate(Mandate::new("triage").peers(["researcher"]));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    let ended = rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(matches!(ended, RunState::Completed(_)), "{ended:?}");
+    assert_read_only(&rt, &model, &recorder);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_woken_agent_loop_segment_cannot_write_through_a_durable_peer() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = writer_model(ask_on_wake);
+    let harness = writable_researcher(&model, &recorder, AgentProfile::new("triage"));
+    let mut rt = runtime(&db, harness);
+    start(&mut rt, &research()).await;
+    // The task is writable. Its follow-up has no allow_actions.
+    let task = AgentTask::new("go")
+        .followups(Followups::new(Duration::from_secs(3_600)))
+        .mandate(Mandate::new("triage").peers(["researcher"]));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let begin = Utc::now();
+    rt.run_until_blocked_as_of(exec, begin).await.unwrap();
+    let woken = begin + chrono::Duration::minutes(3);
+    rt.run_until_blocked_as_of(exec, woken).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    let ended = rt
+        .run_until_blocked_as_of(exec, woken + chrono::Duration::seconds(1))
+        .await
+        .unwrap();
+
+    assert!(matches!(ended, RunState::Completed(_)), "{ended:?}");
+    assert_read_only(&rt, &model, &recorder);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_receiver_keeps_the_next_durable_hop_read_only() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = FnModel::new(|request| {
+        let results = tool_results(request);
+        if first_user(request).starts_with("[A message from the agent \"researcher\"]") {
+            return if results.is_empty() {
+                call("w1", "write", json!({}))
+            } else {
+                text(&format!("write said: {}", results[0]))
+            };
+        }
+        if from_peer(request) {
+            return if results.is_empty() {
+                call(
+                    "d2",
+                    DELEGATE_TOOL,
+                    json!({"agent": "critic", "task": "write it"}),
+                )
+            } else {
+                text("passed on")
+            };
+        }
+        ask_researcher(request)
+    });
+    // Triage is writable. The researcher profile is read-only. The critic
+    // may write on its own.
+    let harness = AgentHarness::new(model.clone())
+        .tool(recorded_tool("write", ToolEffect::Write, &recorder))
+        .peer(Peer::agent("researcher", "Passes work on.", &research()).peers(["critic"]))
+        .peer(Peer::agent("critic", "Writes.", &critic()))
+        .agent(
+            AgentProfile::new("triage")
+                .mandate(Mandate::new("triage").peers(["researcher", "critic"])),
+        )
+        .agent(
+            AgentProfile::new("research")
+                .read_only()
+                .mandate(Mandate::new("researcher").peers(["critic"])),
+        )
+        .agent(AgentProfile::new("critic").mandate(Mandate::new("critic")));
+    let mut rt = runtime(&db, harness);
+    start(&mut rt, &research()).await;
+    start(&mut rt, &critic()).await;
+    sqlite::send(&mut rt, &triage(), &AgentOp::message("go"), None).unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    sqlite::drive(&mut rt, &critic()).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+
+    let received = peer_messages(&rt, &critic());
+    assert_eq!(received.len(), 1, "one delivery");
+    assert!(received[0].mandate.read_only, "the second hop is read-only");
+    assert!(recorder.runs().is_empty(), "the write tool never runs");
 }

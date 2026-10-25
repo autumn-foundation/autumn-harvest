@@ -1953,13 +1953,16 @@ async fn durable_peer(
     if target_id == tree.outbox.self_id || tree.outbox.waiting.iter().any(|id| id == target_id) {
         return Ok(refuse(agent, tree, Refusal::Deadlock, &peer.name));
     }
-    let mandate = match agent
+    let mut mandate = match agent
         .mandate
         .outbound(peer, tree.delegations, &tree.exercised)
     {
         Ok(mandate) => mandate,
         Err(refusal) => return Ok(refuse(agent, tree, refusal, &peer.name)),
     };
+    // A read-only segment sends a read-only mandate, as an inline child
+    // inherits it (issue #2319).
+    mandate.read_only |= run.task.read_only;
     tree.delegations = tree.delegations.saturating_add(1);
     let seq = tree.outbox.next_seq(target_id);
     let mut promise = ctx.new_promise().map_err(|err| err.to_string())?;
