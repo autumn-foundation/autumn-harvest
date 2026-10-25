@@ -744,3 +744,39 @@ async fn a_failed_inline_child_keeps_its_paid_turns() {
         "the paid child turn stays counted"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_failure_in_input_order_names_the_error() {
+    use autumn_harvest_agent::{AgentId, AgentOp, AgentProfile};
+
+    let (_dir, db) = fresh_db();
+    // The flights and visas children fail. The hotels child sits between
+    // them and answers, so its report must join the parent.
+    let model = TryFnModel::new(|request| {
+        let input = first_user(request);
+        if input == ROOT_INPUT {
+            return Ok(three_delegations(1));
+        }
+        match input.as_str() {
+            "find flights" => Err(AgentError::new(ErrorKind::Provider, "flights refused")),
+            "check visas" => Err(AgentError::new(ErrorKind::Provider, "visas refused")),
+            _ => Ok(text("hotels found", 2)),
+        }
+    });
+    let harness = trip_harness(model).agent(
+        AgentProfile::new("planner")
+            .mandate(Mandate::new("planner").peers(["flights", "hotels", "visas"]))
+            .parallel_children(3),
+    );
+    let mut rt = runtime(&db, harness);
+    let planner = AgentId::new("planner", "p1").unwrap();
+    sqlite::send(&mut rt, &planner, &AgentOp::message(ROOT_INPUT), None).unwrap();
+    sqlite::drive(&mut rt, &planner).await.unwrap();
+
+    let state = sqlite::state(&rt, &planner).await.unwrap().unwrap();
+    assert_eq!(state.failures, 1);
+    let error = state.last_error.unwrap_or_default();
+    assert!(error.contains("flights refused"), "{error}");
+    assert!(!error.contains("visas refused"), "{error}");
+    assert_eq!(state.tokens_used, 1 + 2, "the middle sibling stays counted");
+}

@@ -11,5 +11,7 @@ as `fold_segment` promises.
 The fix issues no command and adds no patch gate. It changes only the
 in-memory usage and labels of the parent.
 
-Tests: `fan_out.rs` (fan-out and inline), `durable_peers.rs` (peer segment).
-The failed slot itself still loses its usage. A separate issue tracks it.
+Tests: `fan_out.rs` (fan-out, inline, two failures) and `durable_peers.rs`
+(peer segment).
+
+Known limit: the failed slot itself still loses its usage. Issue #2328 tracks it.

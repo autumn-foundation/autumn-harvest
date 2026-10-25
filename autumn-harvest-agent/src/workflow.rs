@@ -1782,8 +1782,8 @@ struct Sibling<'a> {
 /// child could. Each child starts with the labels of the tree. Its labels
 /// join the tree when the batch ends.
 ///
-/// A failed child fails the batch after the reports of the other children
-/// join the parent.
+/// A failed child fails the batch. The reports of the other children still
+/// join the parent first. The batch returns the first error in input order.
 ///
 /// Returns one outcome per call, in order.
 async fn fan_out(
@@ -1868,8 +1868,8 @@ async fn fan_out(
         .spawn_child_workflow_fan_out_collect_raw(inputs)
         .await
         .map_err(|err| err.to_string())?;
-    // Each sibling ran to its end, so every report joins the parent. The
-    // first failure in input order then fails the batch.
+    // Each sibling ended, so every report joins the parent. The first
+    // failure in input order fails the batch.
     let mut failed = None;
     for ((position, peer, child), output) in children.into_iter().zip(ended) {
         let report = output.and_then(|value| {

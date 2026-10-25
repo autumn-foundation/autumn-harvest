@@ -973,7 +973,7 @@ async fn a_peer_segment_with_a_failed_fan_out_child_keeps_its_later_sibling() {
     assert_eq!(
         receiver.tokens_used,
         2 + 2 + 2,
-        "the reply counts the sibling"
+        "the reply counts the tokens of the sibling"
     );
     assert!(
         receiver.flow_labels.contains("hotel"),
