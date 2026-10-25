@@ -115,6 +115,10 @@ pub struct HeartbeatTask {
     /// the old measure, so a tick in flight replays as it ran.
     #[serde(default, skip_serializing_if = "crate::types::is_false")]
     pub whole_request_budget: bool,
+    /// The harness model of each tick, such as a cheap one (issue #2271).
+    /// `None` is [`DEFAULT_MODEL`](crate::DEFAULT_MODEL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 fn default_prompt() -> String {
@@ -155,7 +159,15 @@ impl HeartbeatTask {
             tenant: None,
             flow_labels: BTreeSet::new(),
             whole_request_budget: true,
+            model: None,
         }
+    }
+
+    /// Run each tick on the harness model `name`.
+    #[must_use]
+    pub fn model(mut self, name: impl Into<String>) -> Self {
+        self.model = Some(name.into());
+        self
     }
 
     /// Set the prompt. Tell the model to reply with exactly
@@ -271,6 +283,7 @@ impl HeartbeatTask {
         task.tenant.clone_from(&self.tenant);
         task.flow_labels.clone_from(&self.flow_labels);
         task.whole_request_budget = self.whole_request_budget;
+        task.model.clone_from(&self.model);
         task
     }
 }
@@ -326,9 +339,8 @@ pub async fn agent_heartbeat(
 /// `Schedule::Interval(Duration::from_secs(1_800))` for a tick every 30
 /// minutes.
 ///
-/// The engine keeps one schedule per workflow name, so a deployment has one
-/// heartbeat schedule. For one heartbeat per user, start each tick from the
-/// app, or let one scheduled workflow start the ticks.
+/// For one heartbeat per agent, use a durable [`Agent`](crate::Agent) with
+/// [`AgentProfile::heartbeat`](crate::AgentProfile::heartbeat) instead.
 ///
 /// # Errors
 ///

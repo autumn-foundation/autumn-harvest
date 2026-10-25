@@ -12,6 +12,7 @@ use rusqlite::{Connection, OpenFlags, Row, ToSql};
 use serde_json::{Map, Value};
 
 use crate::error::{SqliteError, SqliteResult};
+use crate::llm_ledger::LlmLedgerRow;
 
 /// The page size when [`ExecutionFilter::limit`] is `None`.
 pub const DEFAULT_LIST_LIMIT: u32 = 100;
@@ -323,6 +324,40 @@ impl SqliteReader {
     /// [`SqliteError::Sqlite`] if the query fails.
     pub fn describe(&self, exec: ExecutionId) -> SqliteResult<ExecutionDescription> {
         describe(&self.conn, exec)
+    }
+
+    /// The cost ledger rows of `exec` (issue #2275). See
+    /// [`SqliteRuntime::llm_ledger`](crate::SqliteRuntime::llm_ledger).
+    ///
+    /// A file from before issue #2275 has no ledger table, and the reader
+    /// cannot add it. Its runs read as having no rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
+    /// [`SqliteError::Sqlite`] if the query fails, and
+    /// [`SqliteError::Corrupt`] for a row that does not parse.
+    pub fn llm_ledger(&self, exec: ExecutionId) -> SqliteResult<Vec<LlmLedgerRow>> {
+        let rows = crate::llm_ledger::rows_of(&self.conn, exec)?;
+        if rows.is_empty() && !crate::store::execution_exists(&self.conn, exec)? {
+            return Err(SqliteError::ExecutionNotFound(exec));
+        }
+        Ok(rows)
+    }
+
+    /// The cost ledger rows in a window of `recorded_at` (issue #2275). See
+    /// [`SqliteRuntime::llm_ledger_between`](crate::SqliteRuntime::llm_ledger_between).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if the query fails, and
+    /// [`SqliteError::Corrupt`] for a row that does not parse.
+    pub fn llm_ledger_between(
+        &self,
+        from: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> SqliteResult<Vec<LlmLedgerRow>> {
+        crate::llm_ledger::rows_between(&self.conn, from, until)
     }
 }
 

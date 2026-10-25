@@ -153,6 +153,9 @@ pub(super) enum Frame {
     Problem(Value),
     /// The stream budget ended first. The client resumes.
     Pending,
+    /// A live chunk of an activity of the run (issue #2268). It is not
+    /// stored and has no id, so it never moves the cursor.
+    Live(Value),
 }
 
 impl Frame {
@@ -163,7 +166,7 @@ impl Frame {
                 attempt, offset, ..
             } => Some(format!("{attempt}.{offset}")),
             Self::Attempt { attempt, .. } => Some(attempt.to_string()),
-            Self::Result(_) | Self::Problem(_) | Self::Pending => None,
+            Self::Result(_) | Self::Problem(_) | Self::Pending | Self::Live(_) => None,
         }
     }
 
@@ -181,6 +184,7 @@ impl Frame {
                 .event("pending")
                 .data(json!({"state": "pending"}).to_string())
                 .retry(RESUME_RETRY),
+            Self::Live(chunk) => Event::default().event("activity").data(chunk.to_string()),
         };
         match self.id() {
             Some(id) => event.id(id),
@@ -259,8 +263,14 @@ pub(super) trait StreamReads: Send {
     ) -> impl Future<Output = HarvestResult<Option<(ExecutionId, Cause)>>> + Send;
     /// The final answer of the call, with no wait.
     fn outcome(&mut self) -> impl Future<Output = DurableOutcome> + Send;
-    /// Wait for a wake of `exec_id`, or for at most `timeout`.
-    fn wake(&mut self, exec_id: ExecutionId, timeout: Duration) -> impl Future<Output = ()> + Send;
+    /// Wait for a wake of `exec_id`, or for at most `timeout`. Returns the
+    /// live activity chunks that came, if any. An empty list is a stored
+    /// chunk wake or the end of the wait.
+    fn wake(
+        &mut self,
+        exec_id: ExecutionId,
+        timeout: Duration,
+    ) -> impl Future<Output = Vec<Value>> + Send;
 }
 
 /// How a stream ended.
@@ -464,6 +474,9 @@ async fn drain(
 
 /// Wait for a wake or one tick. `Some` ends the stream: the budget is spent,
 /// or the client is gone.
+///
+/// Live chunks that come during the wait go out at once. The wait then goes
+/// on to the end of the tick, so a live chunk costs no table read.
 async fn pause(
     reads: &mut impl StreamReads,
     sink: &mut impl FrameSink,
@@ -474,7 +487,24 @@ async fn pause(
     if remaining.is_zero() {
         return Some(send_pending(sink).await);
     }
-    reads.wake(exec_id, remaining.min(TICK)).await;
+    let tick_end = Instant::now() + remaining.min(TICK);
+    loop {
+        let wait = tick_end.saturating_duration_since(Instant::now());
+        let live = reads.wake(exec_id, wait).await;
+        if live.is_empty() {
+            break;
+        }
+        for chunk in live {
+            match send_frame(sink, Frame::Live(chunk), until).await {
+                Sent::Delivered => {}
+                Sent::Expired => return Some(send_pending(sink).await),
+                Sent::ClientGone => return Some(StreamEnd::ClientGone),
+            }
+        }
+        if Instant::now() >= tick_end {
+            break;
+        }
+    }
     sink.is_closed().then_some(StreamEnd::ClientGone)
 }
 
@@ -781,6 +811,7 @@ fn spawn_producer(
     use tracing::instrument::WithSubscriber as _;
     let root = started.exec_id;
     let max_steps = prepared.runtime.max_chain_steps;
+    let live = prepared.live;
     let task = async move {
         // A panic drops the slot with the task.
         let _permit = permit;
@@ -788,6 +819,7 @@ fn spawn_producer(
             prepared,
             started,
             listen,
+            live,
             listener: None,
         };
         let mut sink = SseSink(tx);
@@ -821,6 +853,8 @@ struct PgReads {
     /// `false` for an ended lineage, which polls and opens no `LISTEN`. A
     /// failed connect also sets it to `false`, so the stream polls.
     listen: bool,
+    /// The stream also sends live activity chunks (issue #2268).
+    live: bool,
     /// The `LISTEN` connection of the current run.
     listener: Option<(ExecutionId, autumn_harvest::notify::DurableStreamListener)>,
 }
@@ -909,19 +943,25 @@ impl StreamReads for PgReads {
         Box::pin(self.prepared.answer_within(&self.started, Duration::ZERO)).await
     }
 
-    async fn wake(&mut self, exec_id: ExecutionId, timeout: Duration) {
-        use autumn_harvest::notify::{DurableStreamListener, DurableStreamWait};
+    async fn wake(&mut self, exec_id: ExecutionId, timeout: Duration) -> Vec<Value> {
+        use autumn_harvest::notify::{DurableStreamListener, DurableStreamLiveWait};
         if self.listen && self.listener.as_ref().is_none_or(|(id, _)| *id != exec_id) {
             self.listener = None;
             if let Some(url) = &self.prepared.runtime.notify_url {
-                let connect = DurableStreamListener::connect(url, exec_id.as_uuid());
+                let connect = async {
+                    if self.live {
+                        DurableStreamListener::connect_live(url, exec_id.as_uuid()).await
+                    } else {
+                        DurableStreamListener::connect(url, exec_id.as_uuid()).await
+                    }
+                };
                 if let Ok(Ok(listener)) =
                     tokio::time::timeout(LISTEN_CONNECT.min(timeout), connect).await
                 {
                     self.listener = Some((exec_id, listener));
                     // A chunk can commit before the `LISTEN` starts, so the
                     // stream reads the table once more before it waits.
-                    return;
+                    return Vec::new();
                 }
             }
             // A connect retry on each tick would load a busy server. The
@@ -930,15 +970,18 @@ impl StreamReads for PgReads {
             self.listen = false;
         }
         match &self.listener {
-            Some((_, listener)) => {
-                if listener.wait_timeout(timeout).await == DurableStreamWait::ChannelClosed {
+            Some((_, listener)) => match listener.wait_or_live_timeout(timeout).await {
+                DurableStreamLiveWait::Live => return listener.take_live(),
+                DurableStreamLiveWait::ChannelClosed => {
                     self.listener = None;
                     self.listen = false;
                     tokio::time::sleep(timeout).await;
                 }
-            }
+                DurableStreamLiveWait::Stored | DurableStreamLiveWait::TimedOut => {}
+            },
             None => tokio::time::sleep(timeout).await,
         }
+        Vec::new()
     }
 }
 
@@ -1145,6 +1188,8 @@ mod tests {
         read_delay: Duration,
         wakes: usize,
         reads: usize,
+        /// Batches of live chunks. Each wake takes one batch first.
+        live: std::collections::VecDeque<Vec<Value>>,
     }
 
     impl Fake {
@@ -1160,6 +1205,7 @@ mod tests {
                 read_delay: Duration::ZERO,
                 wakes: 0,
                 reads: 0,
+                live: std::collections::VecDeque::new(),
             }
         }
 
@@ -1229,12 +1275,16 @@ mod tests {
             std::future::ready(outcome)
         }
 
-        async fn wake(&mut self, _exec_id: ExecutionId, timeout: Duration) {
+        async fn wake(&mut self, _exec_id: ExecutionId, timeout: Duration) -> Vec<Value> {
             self.wakes += 1;
+            if let Some(batch) = self.live.pop_front() {
+                return batch;
+            }
             match self.scripts.pop_front() {
                 Some(script) => script(&mut self.runs),
                 None => tokio::time::sleep(timeout).await,
             }
+            Vec::new()
         }
     }
 
@@ -1627,6 +1677,51 @@ mod tests {
             frames,
             vec![progress(0, 0), progress(0, 1), Frame::Result(json!("done"))]
         );
+    }
+
+    /// A live run whose next wake commits chunk 1 and ends the run.
+    fn live_run_that_ends(fake: &mut Fake) -> ExecutionId {
+        let root = fake.run(false, 1, None);
+        fake.scripts.push_back(Box::new(move |runs| {
+            let run = runs.get_mut(&root).expect("root");
+            run.chunks.push((1, json!({"o": 1})));
+            run.ended = true;
+        }));
+        root
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_chunks_go_out_between_stored_chunks_and_never_move_the_cursor() {
+        let mut quiet = Fake::new(completed(json!("done")));
+        let root = live_run_that_ends(&mut quiet);
+        run_fake(&mut quiet, root, Cursor::default()).await;
+
+        let mut fake = Fake::new(completed(json!("done")));
+        let root = live_run_that_ends(&mut fake);
+        fake.live
+            .push_back(vec![json!({"t": "a"}), json!({"t": "b"})]);
+        fake.live.push_back(vec![json!({"t": "c"})]);
+        let (end, frames) = run_fake(&mut fake, root, Cursor::default()).await;
+        assert_eq!(end, StreamEnd::Final);
+        assert_eq!(
+            frames,
+            vec![
+                progress(0, 0),
+                Frame::Live(json!({"t": "a"})),
+                Frame::Live(json!({"t": "b"})),
+                Frame::Live(json!({"t": "c"})),
+                progress(0, 1),
+                Frame::Result(json!("done")),
+            ]
+        );
+        assert!(
+            frames
+                .iter()
+                .filter(|f| matches!(f, Frame::Live(_)))
+                .all(|f| f.id().is_none())
+        );
+        // A live wake sends its chunks and waits again. It reads no table.
+        assert_eq!(fake.reads, quiet.reads, "a live chunk costs no read");
     }
 
     // SAC-19
@@ -2066,6 +2161,7 @@ mod tests {
             Frame::Result(json!({"a": 1})),
             Frame::Problem(json!({"status": 500})),
             Frame::Pending,
+            Frame::Live(json!({"t": "x"})),
         ];
         let events: Vec<Result<Event, Infallible>> = frames.iter().map(|f| Ok(f.event())).collect();
         let body = axum::response::sse::Sse::new(futures::stream::iter(events)).into_response();
@@ -2079,6 +2175,7 @@ mod tests {
             "event: result\ndata: {\"a\":1}\n\n",
             "event: problem\ndata: {\"status\":500}\n\n",
             "event: pending\ndata: {\"state\":\"pending\"}\nretry: 1000\n\n",
+            "event: activity\ndata: {\"t\":\"x\"}\n\n",
         ] {
             assert!(text.contains(needle), "{needle:?} not in {text:?}");
         }

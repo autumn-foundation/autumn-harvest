@@ -81,6 +81,9 @@ fails in these cases:
 | `WorkflowTaskClaim` | Workflow-task terminal-write ownership (issues #1184, #1806, #1917) | fixed, pre-fix, reachability, capability-miss pre-fix |
 | `CodecRotation` | Codec re-encryption against PII erasure (issues #948, #495) | CAS, blind write, reachability |
 | `OwnerLease` | Fenced owner lease of a decision partition (issue #2250) | design, six defects, reachability |
+| `AgentMesh` | Durable peer send between two agents (issue #2269) | design, three single-layer configs, four defects, reachability |
+| `AgentWorkspace` | Workspace head of a durable agent (issue #2274) | design, two defects, reachability |
+| `AgentWorkspaceRetention` | Workspace retention across the ops and lives of a durable agent (issue #2274) | design, three defects, reachability |
 
 **Ghost sequence numbers.** Each claim in the two claim models gets a ghost
 `seq`. The code has no such column. An invariant that compared
@@ -308,6 +311,227 @@ one behaviour of the design that reaches all four nemeses:
 
 `autumn_harvest::dst::owner` runs the same defects and nemeses from a seed.
 See [`simulation.md`](simulation.md#the-owner-lease-simulation).
+
+#### `AgentMesh` — model (f)
+
+The prose spec is section 7 of `DESIGN-2262.md`. Issue #2269 asks for this
+model before the code. Agent A sends `PeerMessage` ops to agent B by
+workflow id. Both agents are keyed entities. The send key is
+`<from>:<seq>`. A durable sender sets `from` to
+`<agent id>@<incarnation>`. An `agent_loop` sender sets it to its run id.
+The seq is durable state of A. It moves only when the send commits with
+the decision of A. The model has one sender, so the seq is the key.
+
+A send takes one of two paths. On one shard, the decision of A inserts the
+signal row of B in its own transaction. Across shards, the decision writes
+an outbox row, and a relay delivers it at least once, in any order. One
+deployment takes one path for sends by workflow id. The model lets each
+send take either path, so it covers both deployments. Its actions:
+
+| Action | Planned code |
+|---|---|
+| `Decide` | A picks its next send: seq + 1, a path, and `Mandate::outbound`. |
+| `SendCommit` | The decision of A commits `signal_external_workflow_by_id_with_idempotency`. The inline path inserts the signal row of B. The outbox path writes an outbox row. |
+| `Crash` | A loses its decision in flight. Its durable seq stays, so the next decision sends the same key. |
+| `Relay` | `enforce_external_signals_outbox` delivers a row. A records `ExternalSignalDelivered`. |
+| `RelayAgain` | The relay delivers a row but loses the outcome. The row stays, so the relay delivers it again. |
+| `Begin` | The owner of B reads the head of its inbox. |
+| `Commit` | The fenced commit of B consumes the op, applies it and updates the dedupe state of B. A fenced commit aborts and changes nothing. |
+| `OwnerChange` | A new owner takes B, so the epoch moves. The new owner replays B. |
+| `Checkpoint` | B continues as new. It carries its state and its waiting ops. |
+
+B dedupes in two layers. Each layer is a constant, so a config can turn it
+off:
+
+| Constant | Values | Meaning |
+|---|---|---|
+| `EngineDedupe` | `"chain"`, `"run"`, `"off"` | The engine refuses a signal key that it took before. `"chain"` keeps the keys across continue-as-new, as the engine does. `"run"` keeps the keys of one run only. |
+| `SeqDedupe` | `"applied_set"`, `"last_seq"`, `"off"` | The agent layer of B dedupes by seq. `"applied_set"` is the design: B skips a seq that it applied. `"last_seq"` was the first design: B skips each seq up to the highest seq that it applied. |
+| `Accept` | `"meet"`, `"join"` | `"meet"` is `local.accept(inbound)`. `"join"` takes the union, which widens. |
+| `MaxInFlight` | 1, 2 | The bound on sends of A that wait for their delivery. The design allows 2. |
+
+**The applied set.** B keeps it in its state as `floor` and `above`. Each
+seq up to `floor` is applied. `above` holds the applied seqs over `floor`.
+A message is a duplicate when its seq is at most `floor`, or in `above`. To
+apply seq s, B adds s to `above`. Then `floor` moves up while `floor + 1`
+is in `above`, and those seqs leave `above`. When messages arrive in order,
+`above` stays empty.
+
+The fence is taken as given: a decision of B commits only at the epoch that
+it read. `OwnerLease` proves that rule. The outbound mandate is the meet of
+the mandate of A and the tools of the peer entry of B, as
+`Mandate::outbound` computes it.
+
+Invariants:
+
+- `AtMostOnce`: B applies each seq at most once.
+- `NoLostAck`: a message whose delivery A recorded is applied, or it still
+  waits in the inbox of B.
+- `MandateNarrows`: B runs each message within its local mandate, the
+  inbound mandate and the mandate of A. A replay and a duplicate run under
+  the same rule.
+- `ConsumesTheHead`: the decision of the current owner holds the head of
+  the inbox. Its commit therefore consumes the op that it read.
+- `AppliedSetExact`: `floor` and `above` encode the applied seqs exactly.
+  `above` holds no seq at `floor + 1` or lower, so `floor` is as high as it
+  can be. A mutant that keeps the absorbed seqs in `above` fails it.
+
+The pass configs check every invariant above. They also check the liveness
+property `EventuallyApplied`: B applies each committed send. They use
+`LiveSpec`, which adds weak fairness for the commit of A, the relay and B.
+The nemeses have bounds, so each behaviour runs out of them.
+`EventuallyApplied` with `AtMostOnce` is exactly-once delivery.
+
+The table gives what each config changes from the design. A red config
+lists only the invariant that it must break:
+
+| Config | Change from the design | Result |
+|---|---|---|
+| `AgentMesh.cfg` | None: `EngineDedupe = "chain"`, `SeqDedupe = "applied_set"`, `MaxInFlight = 2`. | Pass. |
+| `AgentMeshEngineOnly.cfg` | `SeqDedupe = "off"` | Pass. |
+| `AgentMeshSeqOnly.cfg` | `EngineDedupe = "off"` | Pass. |
+| `AgentMeshLastSeqSerial.cfg` | `EngineDedupe = "off"`, `SeqDedupe = "last_seq"`, `MaxInFlight = 1` | Pass. |
+| `AgentMeshNoDedupe.cfg` | `EngineDedupe = "off"`, `SeqDedupe = "off"` | Violates `AtMostOnce`. |
+| `AgentMeshRunScope.cfg` | `EngineDedupe = "run"`, `SeqDedupe = "off"` | Violates `AtMostOnce`. |
+| `AgentMeshLastSeq.cfg` | `SeqDedupe = "last_seq"` | Violates `NoLostAck`. |
+| `AgentMeshWiden.cfg` | `Accept = "join"` | Violates `MandateNarrows`. |
+| `AgentMeshReach.cfg` | None. | Violates `SomeNemesisUnseen`. |
+
+Each dedupe layer alone keeps delivery exactly once with two sends in
+flight. In `AgentMesh.cfg` the engine refuses every duplicate, so the
+applied set never skips a message. `AgentMeshSeqOnly.cfg` turns the engine
+dedupe off. There the applied set skips each duplicate, in any order of
+arrival. Turn both layers off, and the relay duplicate runs twice.
+`AgentMeshRunScope.cfg` shows why the engine keeps the keys of the whole
+chain:
+
+1. A sends seq 1 through the outbox. The relay delivers it and loses the
+   outcome.
+2. B applies seq 1.
+3. B continues as new. A dedupe of one run forgets key 1.
+4. The relay delivers seq 1 again, and B applies it again.
+
+**Why the design uses an applied set.** The first design kept only the
+highest applied seq, `lastSeq`. The model found that this loses a message
+when two sends are in flight. `AgentMeshLastSeq.cfg` gives this trace:
+
+1. A sends seq 1 through the outbox.
+2. A sends seq 2 on the inline path, so B gets it first.
+3. The relay delivers seq 1, and A records the delivery.
+4. B applies seq 2. `lastSeq` is now 2.
+5. B skips seq 1, because `1 <= lastSeq`. `NoLostAck` fails.
+
+Two outbox rows can lose a message in the same way. A sweep retries a row
+on a later tick, after a newer row. Concurrent children (issue #2270) can
+put two sends to one peer in one decision.
+
+The applied set keeps seq 1. After step 4, `floor` is 0 and `above` is
+{2}. Seq 1 is not a duplicate, so B applies it. `floor` moves to 2, and
+`above` is empty again. `AgentMeshLastSeqSerial.cfg` shows that `last_seq`
+is safe only with one send in flight.
+
+The code must keep two rules that the model has no room to show:
+
+- A seq counts the sends of one sender to one receiver. With one counter
+  for all peers, each receiver sees gaps. Then `floor` stops, and `above`
+  grows with each send.
+- B keys the applied set by `from`. For a durable sender, `from` is
+  `<agent id>@<incarnation>`. A new incarnation of the sender starts its
+  seq at 1 again, so the key holds the incarnation.
+
+`AgentMesh.cfg` checks 2 sends, 2 crashes of A, 3 epochs of B, one lost
+relay outcome and one checkpoint. TLC finds 60,603 distinct states and no
+error, in under 15 seconds on 4 cores.
+
+`AgentMeshReach.cfg` must violate `SomeNemesisUnseen`. The violation is
+one behaviour of the design that reaches every tag:
+
+| Tag | Nemesis |
+|---|---|
+| `crash-before-commit` | A crashes with a send that it did not commit. |
+| `crash-before-delivery` | A crashes with its send in the outbox. |
+| `crash-after-delivery` | A crashes with its message delivered and waiting at B. |
+| `relay-duplicate` | The relay delivers one row twice. |
+| `owner-change-abort` | The fence aborts a decision of an old owner of B. |
+| `replay-after-abort` | The new owner runs that message again. |
+| `checkpoint-in-flight` | B continues as new with a message in flight. |
+| `out-of-order-apply` | B applies a seq below one that it applied before. |
+
+The model has these limits:
+
+- It has one sender and one receiver, and no reply. The reply is a durable
+  promise that A races against a deadline. The deadline ends only the wait
+  of A.
+- A send needs a running target. The model has no `target_unknown` and no
+  `not_running` outcome.
+- A crash of A drops only its decision in flight. A stale writer of A is
+  the `OwnerLease` case.
+- The mandate is a set of tools. Flow labels and budgets are not modelled.
+
+#### `AgentWorkspace` — model (g)
+
+`formal/tla/AgentWorkspace.tla` models the head of a workspace (issue
+#2274). One op runs `Calls` tool calls in order. Each call can run as
+several attempts. An attempt writes a snapshot, and a stale attempt of an
+earlier call can still write. History records the result of one attempt of
+each call. Retention keeps the head and deletes every other snapshot.
+
+| Action | Code |
+|---|---|
+| `Write` | `WorkspaceStore::save` in the tool-call activity. |
+| `Record` | The engine records the result. `adopt_workspace` moves the head. |
+| `Retain` | The activity `agent_workspace_retain` at the end of the op. |
+
+| Config | Switch | Result |
+|---|---|---|
+| `AgentWorkspace.cfg` | None: `AdoptOn = "record"`, `RetainWhen = "op_end"`. | Pass. |
+| `AgentWorkspaceAdoptOnWrite.cfg` | `AdoptOn = "write"` | Violates `HeadIsRecorded`. |
+| `AgentWorkspaceRetainAnyTime.cfg` | `RetainWhen = "any_time"` | Violates `HeadPresent`. |
+| `AgentWorkspaceReach.cfg` | None. | Violates `SomeStaleWriteUnseen`. |
+
+`HeadIsRecorded` says that the head is the snapshot of a recorded result.
+`HeadPresent` says that the head is in the store, so the next call can load
+it. A retention that runs while a call runs can delete a snapshot that
+history then records. So retention runs only after the last call of an op.
+
+The model has one op, and the store never loses a blob on its own.
+
+#### `AgentWorkspaceRetention` — model (h)
+
+`formal/tla/AgentWorkspaceRetention.tla` models retention across ops and
+lives. Each op commits a snapshot, which becomes the head, resets the
+workspace, or ends the life. The op end runs a retention activity with the
+head as its input, or a reset activity. The workflow waits for the first
+completed attempt. An older attempt can still run at any later time. A
+stale attempt whose lease the engine reclaimed is such a late attempt.
+
+| Action | Code |
+|---|---|
+| `Commit` | `WorkspaceStore::save` in the tool-call activity, then `adopt_workspace`. |
+| `Reset` | `Control::ResetWorkspace`, which runs `agent_workspace_reset`. |
+| `NewLife` | A delete, then a new run. `agent_workspace_floor` gives the floor. |
+| `Complete` | The first completed attempt of an activity. |
+| `Run` | A later attempt of `agent_workspace_retain` or `agent_workspace_reset`. |
+
+| Config | Switch | Result |
+|---|---|---|
+| `AgentWorkspaceRetention.cfg` | None: `KeyBy = "generation"`, `FloorBy = "store"`, `MarkReset = TRUE`. | Pass. |
+| `AgentWorkspaceRetentionContentKeys.cfg` | `KeyBy = "content"` | Violates `HeadPresent`. |
+| `AgentWorkspaceRetentionClockFloor.cfg` | `FloorBy = "clock"` | Violates `HeadPresent`. |
+| `AgentWorkspaceRetentionNoMarker.cfg` | `MarkReset = FALSE` | Violates `HeadPresent`. |
+| `AgentWorkspaceRetentionReach.cfg` | None. | Violates `NoStaleRun`. |
+
+With content keys, a stale retention keeps its old input head and deletes
+every other key, the newer head too. A key that holds the generation of
+its op fixes it within one life. Retention deletes only the keys of the
+head generation or older, so a newer head survives, also when it has the
+same content as an old one.
+
+A new life starts with no state, so its generation needs a floor. A clock
+can read low, and the new life then reuses old generations. A late attempt
+of the old life deletes the new head. The design reads the floor from the
+store: the highest key, or the marker that a reset leaves at its bound.
+Without the marker, a reset that empties the store gives a floor of 0.
 
 ### Extend a model
 
@@ -648,7 +872,8 @@ The script fails when Verus reports an error, or when it verifies nothing.
 
 Verus cannot compile the engine crate, so each proof checks a copy of an
 engine function in `formal/verus/src/`. A `// mirror: <path> <fn>` line
-marks each copy. The guard suite
+marks each copy. A mirror can copy a function of `autumn-harvest/src` or
+of `autumn-harvest-agent/src`. The guard suite
 `autumn-harvest/tests/integration/verus_proofs_coverage.rs` removes
 comments, whitespace and `proof { }` blocks from both bodies. The bodies
 must then be equal. A `proof { }` block is ghost code. Verus erases it, so
@@ -698,6 +923,10 @@ copy matches. Port the change, then run the script.
 | `jitter.rs` | `uniform_inclusive`, `full_jitter_nanos`, `equal_jitter_nanos` in `policy.rs` | The jitter stays in its range for every input, with the real mixer. |
 | `dlq_spread.rs` | `spread_offset_nanos` in `dlq.rs` | No step overflows. The jitter is exact and below one slot. Row `index` of `count` stays in its slot and in the window. |
 | `owner_fence.rs` | `next_epoch` and `fence_passes` in `decision_owner.rs` | The next epoch is the epoch + 1 and never wraps. The fence passes a commit only at the epoch of the row, so never at an older one. Only an acquisition moves the epoch, so after a takeover the fence refuses every commit of the old tenure (issue #2251). A batch acquisition moves each locked row by one acquisition and leaves each other row (issue #2296). |
+| `agent_inbox.rs` | `admit` in `agent/inbox.rs` of the agent crate | A control op always applies. Work is never skipped, and runs only when the inbox is open. A tick is never held. Under any sequence of ops, the ops that ran and then the held ops are exactly the work ops received, in arrival order. So an acknowledged op is never lost, and none runs twice (issue #2263). |
+| `agent_dedupe.rs` | `is_new` and `next_floor` in `agent/dedupe.rs` of the agent crate | The floor and the set above it hold exactly the applied numbers. An apply and its fold equal the plain set insert, in any order and with any repeats. So the receiver takes no new message for a duplicate. The floor never moves over a gap, and the bound on the set forgets only an applied number (issue #2269). |
+| `agent_wake.rs` | `next_heartbeat` in `agent/wake.rs` of the agent crate | With no heartbeat, the function books nothing. A tick books the next tick strictly after the time that it ran, so a tick never runs in a loop. Any other op keeps the booked tick, so messages never starve the heartbeat (issue #2266). |
+| `agent_siblings.rs` | `sibling_cap` in `bounds.rs` of the agent crate | No step overflows. Each share is the base share or one more. The shares of all siblings sum to the remaining tokens, so concurrent children never pass the cap of the parent (issue #2270). |
 
 **The mixer inverse.** Each step of the `SplitMix64` finalizer has an
 inverse. A right xor-shift by `s` bits is undone by shifts of `s` and
@@ -705,6 +934,20 @@ inverse. A right xor-shift by `s` bits is undone by shifts of `s` and
 lemmas prove the shifts. Integer lemmas prove the multiplies. The Kani
 jitter proofs stub the mixer with any `u64`, and the bijection shows
 that the stub loses no case.
+
+**The agent kernels.** The durable agent of epic #2262 keeps its
+decisions in pure kernels, so Verus proves them as it proves the engine
+kernels. Each agent spec models the state that its kernel acts on. The
+inbox is a status, a held queue and a run list. The applied set is a plain
+set of numbers. The theorems hold for every sequence of ops. The
+inbox model has no bound on the held queue. A full queue refuses an op and
+names it in the agent state.
+
+**The heartbeat saturation.** Verus has no spec of `i64::saturating_add`,
+and the guard bans `assume_specification`. `next_heartbeat` therefore
+saturates by hand. Its step is at least 1, so only the top bound applies,
+and the result is the result of `saturating_add`. The unit test
+`the_booking_saturates_and_the_step_is_at_least_one` pins the case.
 
 **The jitter without a stub.** The Kani proofs of `uniform_inclusive`
 stub the mixer. The Verus proofs call the verified copy of `mix64`

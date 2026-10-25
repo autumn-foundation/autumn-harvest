@@ -667,12 +667,22 @@ pub fn append_event(
     exec_id: ExecutionId,
     event: &WorkflowEvent,
 ) -> SqliteResult<()> {
+    append_event_seq(conn, exec_id, event).map(|_| ())
+}
+
+/// [`append_event`], and return the `seq` of the new event. The LLM ledger
+/// keys its rows by it (issue #2275).
+pub fn append_event_seq(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    event: &WorkflowEvent,
+) -> SqliteResult<i64> {
     let seq = next_seq(conn, exec_id)?;
     conn.execute(
         "INSERT INTO harvest_events (exec_id, seq, event_json) VALUES (?1, ?2, ?3)",
         params![exec_id.to_string(), seq, serde_json::to_string(event)?],
     )?;
-    Ok(())
+    Ok(seq)
 }
 
 /// Load the full ordered history — the exact `Vec<WorkflowEvent>` handed to

@@ -25,7 +25,7 @@
 #     <(grep    -E '^[[:space:]]*#' .github/ci/integration-suites.txt) \
 #     <(grep -vE '^[[:space:]]*(#|$)' .github/ci/integration-suites.txt | LC_ALL=C sort -u)
 #   LC_ALL=C sort -o .github/ci/integration-suites.txt \
-#   crate    = autumn-harvest | autumn-harvest-conformance | autumn-harvest-plugin | autumn-harvest-redis | history-load-gate | standalone-runner
+#   crate    = agent-mesh | autumn-harvest | autumn-harvest-conformance | autumn-harvest-plugin | autumn-harvest-redis | history-load-gate | standalone-runner
 #   features = comma-list passed as `--features <v>`, or `-`.
 #   filter   = positional filter after `--`, or `-` for the whole target. A
 #   osclass   crate                    target       features            filter
@@ -84,6 +84,7 @@ allos        autumn-harvest-plugin  standalone_mount                 -          
 allos        autumn-harvest-plugin  standalone_webhook_mount         webhooks                   -
 compileonly  autumn-harvest-plugin  dev_runtime_managed              dev-runtime-managed        -
 compileonly  autumn-harvest-plugin  status_summary_localpg           -                          -
+linux        agent-mesh             postgres                         -                          -
 linux        autumn-harvest         integration                      -                          active_workflow_gauge_tests
 linux        autumn-harvest         integration                      -                          activity_claim_epoch_tests
 linux        autumn-harvest         integration                      -                          activity_default_floor_tests
@@ -264,6 +265,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      atomicity-spike            atomicity_spike_tests
 linux        autumn-harvest         integration                      hot-code-swap,testing      hot_code_swap_tests
 linux        autumn-harvest         integration                      owner-disk-cache           owner_disk_cache_db_tests
+linux        autumn-harvest         integration                      testing                    activity_progress_db_tests
 linux        autumn-harvest         integration                      testing                    backup_verify_refs_batch_perf
 linux        autumn-harvest         integration                      testing                    backup_verify_retention_batch_perf
 linux        autumn-harvest         integration                      testing                    backup_verify_tests

@@ -6,6 +6,12 @@
 //! fallback. The mapping functions are pure, so the tests need no network
 //! and no key.
 //!
+//! `chat_stream` sends the same request with `"stream": true` and reads the
+//! Server-Sent Events (issue #2268). It passes each text delta to the caller,
+//! builds the message that a plain request returns, and maps that message
+//! with the same code. Each tool asks for eager input streaming, so the
+//! adapter parses each tool input in full and refuses one that is not JSON.
+//!
 //! The adapter's `ChatMessage` carries text, tool calls and tool results. It
 //! has no place for a thinking block, and the API wants each thinking block
 //! back unchanged in a tool loop. So the model keeps each raw assistant turn.
@@ -29,8 +35,9 @@ use serde_json::{Value, json};
 pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
 /// The Messages API endpoint.
 pub const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
-/// The API version header value.
-pub const API_VERSION: &str = "2023-06-01";
+/// The API version header value. The requests send no sampling setting
+/// and no document block, so the version changes nothing else.
+pub const API_VERSION: &str = "2026-10-21";
 /// The beta that turns on the server-side refusal fallback.
 pub const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 /// The output cap of one turn when the task sets none.
@@ -128,6 +135,44 @@ fn model_id(model: &str) -> String {
     }
 }
 
+impl ClaudeModel {
+    /// Send `body` and return the response, or the API error.
+    async fn send(&self, body: &Value) -> Result<reqwest::Response, AgentError> {
+        let mut call = self
+            .client
+            .post(ENDPOINT)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", API_VERSION);
+        if self.model == DEFAULT_MODEL {
+            call = call.header("anthropic-beta", FALLBACK_BETA);
+        }
+        let response =
+            call.json(body).send().await.map_err(|e| {
+                AgentError::new(ErrorKind::Transport, format!("request failed: {e}"))
+            })?;
+        let status = response.status().as_u16();
+        if (200..300).contains(&status) {
+            return Ok(response);
+        }
+        // The body names the error. It holds no secret: the key is a header.
+        let text = Self::body(response).await?;
+        let detail: String = text.chars().take(500).collect();
+        Err(AgentError::new(
+            error_kind(status),
+            format!("HTTP {status}: {detail}"),
+        ))
+    }
+
+    /// Map a whole message body, and keep its raw turn for a replay.
+    fn finish(&self, request: &ChatRequest, body: &Value) -> Result<ChatResponse, AgentError> {
+        let response = parse_response(body)?;
+        if let Some((key, raw)) = replayable(&turn_context(request), body) {
+            self.turns.put(key, raw)?;
+        }
+        Ok(response)
+    }
+}
+
 impl AgentModel for ClaudeModel {
     fn chat<'a>(
         &'a self,
@@ -137,40 +182,319 @@ impl AgentModel for ClaudeModel {
             let body = request_body(request, &self.model, |before, visible| {
                 self.turns.get(before, visible)
             });
-            let mut call = self
-                .client
-                .post(ENDPOINT)
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", API_VERSION);
-            if self.model == DEFAULT_MODEL {
-                call = call.header("anthropic-beta", FALLBACK_BETA);
-            }
-            let response = call.json(&body).send().await.map_err(|e| {
-                AgentError::new(ErrorKind::Transport, format!("request failed: {e}"))
-            })?;
-            let status = response.status().as_u16();
-            let text = Self::body(response).await?;
-            if !(200..300).contains(&status) {
-                // The body names the error. It holds no secret: the key is a header.
-                let detail: String = text.chars().take(500).collect();
-                return Err(AgentError::new(
-                    error_kind(status),
-                    format!("HTTP {status}: {detail}"),
-                ));
-            }
+            let text = Self::body(self.send(&body).await?).await?;
             let body: Value = serde_json::from_str(&text)
                 .map_err(|e| AgentError::new(ErrorKind::Decode, format!("not JSON: {e}")))?;
-            let response = parse_response(&body)?;
-            if let Some((key, raw)) = replayable(&turn_context(request), &body) {
-                self.turns.put(key, raw)?;
+            self.finish(request, &body)
+        })
+    }
+
+    fn chat_stream<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+        on_delta: &'a (dyn Fn(&str) + Send + Sync),
+    ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
+        Box::pin(async move {
+            let body = streaming_body(request_body(request, &self.model, |before, visible| {
+                self.turns.get(before, visible)
+            }));
+            let mut response = self.send(&body).await?;
+            let mut stream = StreamAssembler::default();
+            let mut frames = SseFrames::default();
+            let mut read = 0_usize;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|e| AgentError::new(ErrorKind::Transport, format!("stream lost: {e}")))?
+            {
+                read = read.saturating_add(chunk.len());
+                if read > MAX_BODY_BYTES {
+                    return Err(AgentError::new(
+                        ErrorKind::Decode,
+                        format!("the stream is over {MAX_BODY_BYTES} bytes"),
+                    ));
+                }
+                for data in frames.push(&chunk) {
+                    stream.event(&data, on_delta)?;
+                }
             }
-            Ok(response)
+            for data in frames.end() {
+                stream.event(&data, on_delta)?;
+            }
+            let body = stream.finish()?;
+            self.finish(request, &body)
         })
     }
 
     fn model_id(&self) -> Option<&str> {
         Some(&self.id)
     }
+}
+
+/// The streamed form of `body`: `"stream": true`, and eager input streaming
+/// on each tool. The assembler parses each tool input in full.
+#[must_use]
+pub fn streaming_body(mut body: Value) -> Value {
+    body["stream"] = json!(true);
+    if let Some(tools) = body["tools"].as_array_mut() {
+        for tool in tools {
+            tool["eager_input_streaming"] = json!(true);
+        }
+    }
+    body
+}
+
+/// Splits a Server-Sent Events byte stream into the `data` of each event.
+///
+/// An event ends at a blank line. A line ends at `\r\n`, `\n` or `\r`. A
+/// network chunk can end inside a line, inside a `\r\n` pair or inside a
+/// multi-byte character. So the parser keeps bytes, and it decodes a line
+/// only when the line is whole. The rest waits for the next chunk.
+#[derive(Debug, Default)]
+pub struct SseFrames {
+    /// The bytes of a line that is not whole yet.
+    pending: Vec<u8>,
+    /// The `data` lines of the event that is not whole yet.
+    data: Vec<String>,
+    /// The last chunk ended with `\r`. A `\n` at the start of the next
+    /// chunk is the rest of that line end.
+    after_cr: bool,
+}
+
+impl SseFrames {
+    /// Add `bytes`. Returns the data of each event that they complete.
+    pub fn push(&mut self, mut bytes: &[u8]) -> Vec<String> {
+        if self.after_cr && !bytes.is_empty() {
+            self.after_cr = false;
+            bytes = bytes.strip_prefix(b"\n").unwrap_or(bytes);
+        }
+        self.pending.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        let mut start = 0;
+        while let Some(at) = self.pending[start..]
+            .iter()
+            .position(|byte| matches!(byte, b'\n' | b'\r'))
+        {
+            let end = start + at;
+            let mut next = end + 1;
+            if self.pending[end] == b'\r' {
+                match self.pending.get(next) {
+                    Some(b'\n') => next += 1,
+                    Some(_) => {}
+                    // The `\n` of a `\r\n` pair can come in the next chunk.
+                    None => self.after_cr = true,
+                }
+            }
+            let line = String::from_utf8_lossy(&self.pending[start..end]).into_owned();
+            self.line(&line, &mut out);
+            start = next;
+        }
+        self.pending.drain(..start);
+        out
+    }
+
+    /// The data of an event that the stream ended without a blank line.
+    pub fn end(&mut self) -> Vec<String> {
+        let rest = std::mem::take(&mut self.pending);
+        self.after_cr = false;
+        let mut out = Vec::new();
+        if !rest.is_empty() {
+            self.line(&String::from_utf8_lossy(&rest), &mut out);
+        }
+        self.line("", &mut out);
+        out
+    }
+
+    /// Apply one whole line. A blank line ends the event.
+    fn line(&mut self, line: &str, out: &mut Vec<String>) {
+        if line.is_empty() {
+            if !self.data.is_empty() {
+                out.push(self.data.join("\n"));
+                self.data.clear();
+            }
+        } else if let Some(data) = line.strip_prefix("data:") {
+            self.data
+                .push(data.strip_prefix(' ').unwrap_or(data).to_owned());
+        }
+    }
+}
+
+/// Builds the message of a streamed response from its events.
+///
+/// The result has the shape of a plain response body, so
+/// [`parse_response`] and [`replayable`] read it.
+#[derive(Debug, Default)]
+pub struct StreamAssembler {
+    message: Option<Value>,
+    blocks: Vec<Value>,
+    /// The input text of each tool-use block, by index.
+    inputs: HashMap<usize, String>,
+    stopped: bool,
+}
+
+impl StreamAssembler {
+    /// Apply the data of one event. Pass each text delta to `on_delta`.
+    ///
+    /// Every other event passes `""` to `on_delta`. The harness joins small
+    /// deltas, and it sends the text that waits only when `on_delta` runs.
+    /// So the empty piece lets the text go out while the model thinks or
+    /// writes a tool input.
+    ///
+    /// # Errors
+    ///
+    /// An `error` event is the error of its type. Data that is not JSON, or
+    /// a delta for no block, is a `Decode` error.
+    pub fn event(&mut self, data: &str, on_delta: &dyn Fn(&str)) -> Result<(), AgentError> {
+        let event: Value = serde_json::from_str(data).map_err(|e| {
+            AgentError::new(ErrorKind::Decode, format!("an event is not JSON: {e}"))
+        })?;
+        let is_text =
+            event["type"] == "content_block_delta" && event["delta"]["type"] == "text_delta";
+        self.apply(&event, on_delta)?;
+        if !is_text {
+            on_delta("");
+        }
+        Ok(())
+    }
+
+    /// Apply one parsed event.
+    fn apply(&mut self, event: &Value, on_delta: &dyn Fn(&str)) -> Result<(), AgentError> {
+        match event["type"].as_str() {
+            Some("message_start") => self.message = Some(event["message"].clone()),
+            Some("content_block_start") => {
+                let index = block_index(event)?;
+                if self.blocks.len() <= index {
+                    self.blocks.resize(index + 1, Value::Null);
+                }
+                self.blocks[index] = event["content_block"].clone();
+            }
+            Some("content_block_delta") => self.delta(event, on_delta)?,
+            Some("content_block_stop") => self.close_block(block_index(event)?)?,
+            Some("message_delta") => {
+                let message = self.message.get_or_insert_with(|| json!({}));
+                if let Some(delta) = event["delta"].as_object() {
+                    for (key, value) in delta {
+                        message[key] = value.clone();
+                    }
+                }
+                if let Some(usage) = event["usage"].as_object() {
+                    for (key, value) in usage {
+                        message["usage"][key] = value.clone();
+                    }
+                }
+            }
+            Some("message_stop") => self.stopped = true,
+            Some("error") => {
+                let kind = match event["error"]["type"].as_str() {
+                    Some("overloaded_error" | "api_error") => ErrorKind::Unavailable,
+                    Some("rate_limit_error") => ErrorKind::RateLimited,
+                    _ => ErrorKind::Provider,
+                };
+                let detail: String = event["error"]["message"]
+                    .as_str()
+                    .unwrap_or("no message")
+                    .chars()
+                    .take(500)
+                    .collect();
+                return Err(AgentError::new(kind, format!("stream error: {detail}")));
+            }
+            // A ping, and any later event type, changes nothing.
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn delta(&mut self, event: &Value, on_delta: &dyn Fn(&str)) -> Result<(), AgentError> {
+        let index = block_index(event)?;
+        let block = self
+            .blocks
+            .get_mut(index)
+            .filter(|block| !block.is_null())
+            .ok_or_else(|| AgentError::new(ErrorKind::Decode, "a delta for no block"))?;
+        let delta = &event["delta"];
+        let append = |block: &mut Value, key: &str, piece: &str| {
+            let text = format!("{}{piece}", block[key].as_str().unwrap_or_default());
+            block[key] = json!(text);
+        };
+        match delta["type"].as_str() {
+            Some("text_delta") => {
+                let piece = delta["text"].as_str().unwrap_or_default();
+                append(block, "text", piece);
+                on_delta(piece);
+            }
+            Some("thinking_delta") => {
+                append(
+                    block,
+                    "thinking",
+                    delta["thinking"].as_str().unwrap_or_default(),
+                );
+            }
+            Some("signature_delta") => {
+                append(
+                    block,
+                    "signature",
+                    delta["signature"].as_str().unwrap_or_default(),
+                );
+            }
+            Some("input_json_delta") => {
+                self.inputs
+                    .entry(index)
+                    .or_default()
+                    .push_str(delta["partial_json"].as_str().unwrap_or_default());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Parse the whole input of a tool-use block. Eager input streaming
+    /// leaves the check to the client, so input that is not JSON fails.
+    fn close_block(&mut self, index: usize) -> Result<(), AgentError> {
+        let Some(text) = self.inputs.remove(&index) else {
+            return Ok(());
+        };
+        let input: Value = if text.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&text).map_err(|e| {
+                AgentError::new(
+                    ErrorKind::Decode,
+                    format!("a streamed tool input is not JSON: {e}"),
+                )
+            })?
+        };
+        if let Some(block) = self.blocks.get_mut(index) {
+            block["input"] = input;
+        }
+        Ok(())
+    }
+
+    /// The whole message body.
+    ///
+    /// # Errors
+    ///
+    /// A stream with no `message_start` or no `message_stop` is a
+    /// `Transport` error: it ended early, so a retry asks again.
+    pub fn finish(self) -> Result<Value, AgentError> {
+        let (Some(mut message), true) = (self.message, self.stopped) else {
+            return Err(AgentError::new(
+                ErrorKind::Transport,
+                "the stream ended before the message",
+            ));
+        };
+        message["content"] =
+            Value::Array(self.blocks.into_iter().filter(|b| !b.is_null()).collect());
+        Ok(message)
+    }
+}
+
+/// The `index` of a content-block event.
+fn block_index(event: &Value) -> Result<usize, AgentError> {
+    event["index"]
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+        .filter(|index| *index < 4096)
+        .ok_or_else(|| AgentError::new(ErrorKind::Decode, "a content-block event has no index"))
 }
 
 /// The raw assistant turns that hold more than text and tool calls.
@@ -739,6 +1063,189 @@ mod tests {
         assert_eq!(refused.kind(), ErrorKind::Provider);
         let junk = parse_response(&json!({"type": "error"})).unwrap_err();
         assert_eq!(junk.kind(), ErrorKind::Decode);
+    }
+
+    /// One SSE event with `data`.
+    fn sse(data: &Value) -> String {
+        format!("event: x\ndata: {data}\n\n")
+    }
+
+    fn streamed(events: &[Value]) -> Result<(Value, Vec<String>), AgentError> {
+        streamed_in(events, 7)
+    }
+
+    /// Stream `events` in network chunks of `size` bytes.
+    fn streamed_in(events: &[Value], size: usize) -> Result<(Value, Vec<String>), AgentError> {
+        let wire: String = events.iter().map(sse).collect();
+        let mut frames = SseFrames::default();
+        let mut stream = StreamAssembler::default();
+        let seen = Mutex::new(Vec::new());
+        let on_delta = |piece: &str| seen.lock().unwrap().push(piece.to_owned());
+        // Split the wire in odd places, as a network does.
+        for chunk in wire.as_bytes().chunks(size) {
+            for data in frames.push(chunk) {
+                stream.event(&data, &on_delta)?;
+            }
+        }
+        for data in frames.end() {
+            stream.event(&data, &on_delta)?;
+        }
+        Ok((stream.finish()?, seen.into_inner().unwrap()))
+    }
+
+    fn start() -> Value {
+        json!({"type": "message_start", "message": {"type": "message", "role": "assistant",
+            "content": [], "stop_reason": null, "usage": {"input_tokens": 40, "output_tokens": 1}}})
+    }
+
+    #[test]
+    fn a_stream_builds_the_message_of_a_plain_response() {
+        let (body, deltas) = streamed(&[
+            start(),
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "signature_delta", "signature": "sig"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1,
+                   "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 1,
+                   "delta": {"type": "text_delta", "text": "Hel"}}),
+            json!({"type": "ping"}),
+            json!({"type": "content_block_delta", "index": 1,
+                   "delta": {"type": "text_delta", "text": "lo"}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "content_block_start", "index": 2,
+                   "content_block": {"type": "tool_use", "id": "toolu_1", "name": "search",
+                                     "input": {}}}),
+            json!({"type": "content_block_delta", "index": 2,
+                   "delta": {"type": "input_json_delta", "partial_json": "{\"q\": \"a"}}),
+            json!({"type": "content_block_delta", "index": 2,
+                   "delta": {"type": "input_json_delta", "partial_json": "b\"}"}}),
+            json!({"type": "content_block_stop", "index": 2}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+                   "usage": {"output_tokens": 12}}),
+            json!({"type": "message_stop"}),
+        ])
+        .unwrap();
+        let text: Vec<&String> = deltas.iter().filter(|d| !d.is_empty()).collect();
+        assert_eq!(text, ["Hel", "lo"]);
+        let response = parse_response(&body).unwrap();
+        assert_eq!(response.stop_reason, StopReason::ToolUse);
+        assert_eq!(response.content[0], ContentPart::Text("Hello".into()));
+        assert!(matches!(&response.content[1],
+            ContentPart::ToolCall { arguments, .. } if arguments["q"] == "ab"));
+        assert_eq!(
+            (response.usage.input_tokens, response.usage.output_tokens),
+            (40, 12)
+        );
+        // The thinking block keeps its signature for the replay.
+        let (_, raw) = replayable(&[], &body).unwrap();
+        assert_eq!(raw[0]["signature"], "sig");
+    }
+
+    #[test]
+    fn a_stream_that_breaks_off_or_fails_is_an_error() {
+        let early = streamed(&[start()]).unwrap_err();
+        assert_eq!(early.kind(), ErrorKind::Transport);
+        let overloaded = streamed(&[
+            start(),
+            json!({"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}),
+        ])
+        .unwrap_err();
+        assert_eq!(overloaded.kind(), ErrorKind::Unavailable);
+        let bad_input = streamed(&[
+            start(),
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "tool_use", "id": "t", "name": "n", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "input_json_delta", "partial_json": "{\"q\": "}}),
+            json!({"type": "content_block_stop", "index": 0}),
+        ])
+        .unwrap_err();
+        assert_eq!(bad_input.kind(), ErrorKind::Decode);
+        let orphan = streamed(&[
+            start(),
+            json!({"type": "content_block_delta", "index": 3,
+                   "delta": {"type": "text_delta", "text": "x"}}),
+        ])
+        .unwrap_err();
+        assert_eq!(orphan.kind(), ErrorKind::Decode);
+    }
+
+    #[test]
+    fn a_streamed_request_asks_for_eager_tool_input() {
+        let body = streaming_body(request_body(&request(), DEFAULT_MODEL, |_, _| None));
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["tools"][0]["eager_input_streaming"], true);
+        assert_eq!(API_VERSION, "2026-10-21");
+    }
+
+    #[test]
+    fn sse_frames_join_data_lines_and_skip_comments() {
+        let mut frames = SseFrames::default();
+        assert_eq!(
+            frames.push(b": ping\n\nevent: a\r\ndata: 1"),
+            Vec::<String>::new()
+        );
+        assert_eq!(frames.push(b"\r\ndata: 2\r\n\r\n"), ["1\n2"]);
+        assert_eq!(frames.push(b"data: 3"), Vec::<String>::new());
+        assert_eq!(frames.end(), ["3"]);
+    }
+
+    #[test]
+    fn a_line_end_split_across_chunks_or_a_bare_cr_ends_a_line_once() {
+        let mut frames = SseFrames::default();
+        // A `\r\n` pair split over two chunks is one line end.
+        assert_eq!(frames.push(b"data: 1\r"), Vec::<String>::new());
+        assert_eq!(frames.push(b"\ndata: 2\r"), Vec::<String>::new());
+        assert_eq!(frames.push(b"\n\r"), ["1\n2"]);
+        assert_eq!(frames.push(b"\n"), Vec::<String>::new());
+        // A bare `\r` ends a line, and a blank one ends the event.
+        assert_eq!(frames.push(b"data: 3\rdata: 4\r\r"), ["3\n4"]);
+        assert_eq!(frames.end(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_character_split_across_chunks_stays_whole() {
+        let text = "h\u{e9}llo \u{1f642}";
+        let events = [
+            start(),
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "text_delta", "text": text}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+            json!({"type": "message_stop"}),
+        ];
+        // One byte per chunk splits each character of more than one byte.
+        let (body, deltas) = streamed_in(&events, 1).unwrap();
+        assert_eq!(deltas.concat(), text);
+        assert_eq!(body["content"][0]["text"], text);
+    }
+
+    #[test]
+    fn every_event_that_is_not_text_passes_an_empty_piece() {
+        let (_, deltas) = streamed(&[
+            start(),
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "text_delta", "text": "a"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1,
+                   "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            json!({"type": "content_block_delta", "index": 1,
+                   "delta": {"type": "thinking_delta", "thinking": "hm"}}),
+            json!({"type": "ping"}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+            json!({"type": "message_stop"}),
+        ])
+        .unwrap();
+        // The harness sends the text that waits at each empty piece.
+        assert_eq!(deltas, ["", "", "a", "", "", "", "", "", "", ""]);
     }
 
     #[test]

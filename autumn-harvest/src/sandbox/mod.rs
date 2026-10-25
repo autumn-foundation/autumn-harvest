@@ -55,7 +55,10 @@ pub use activity::{
     ATTEMPT_ENV, IDEMPOTENCY_KEY_ENV, SandboxActivities, SandboxActivity, run_sandbox_activity,
 };
 pub use error::SandboxError;
-pub use outcome::{OutputFile, RunStatus, SandboxOutcome, SkippedOutput};
+pub use outcome::{
+    MISSING_OUTPUT_REASON, NOT_A_DIRECTORY_REASON, OutputFile, RunStatus, SandboxOutcome,
+    SkippedOutput,
+};
 pub use policy::{
     IsolationLevel, NetworkPolicy, RuntimeSpec, SandboxLimits, SandboxPolicy, SizeBounds,
 };

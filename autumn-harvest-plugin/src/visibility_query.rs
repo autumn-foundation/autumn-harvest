@@ -49,6 +49,9 @@ pub enum Leaf {
 pub enum SystemField {
     State,
     WorkflowName,
+    /// The business id of a run (issue #2267). With `workflow_name =`, it
+    /// lists every run of one id, such as every life of an agent.
+    WorkflowId,
     Owner,
     Severity,
     StartedAt,
@@ -467,13 +470,15 @@ impl Parser {
         let system = match field.to_ascii_lowercase().as_str() {
             "state" => SystemField::State,
             "workflow_name" => SystemField::WorkflowName,
+            "workflow_id" => SystemField::WorkflowId,
             "owner" => SystemField::Owner,
             "severity" => SystemField::Severity,
             "started_at" => SystemField::StartedAt,
             _ => {
                 return Err(format!(
                     "unknown field '{field}' at byte {at}; use attrs.<key> for a search \
-                     attribute, or one of state, workflow_name, owner, severity, started_at"
+                     attribute, or one of state, workflow_name, workflow_id, owner, severity, \
+                     started_at"
                 ));
             }
         };
@@ -864,6 +869,7 @@ impl SqlFilter {
         self.sql(match field {
             SystemField::State => "harvest_workflow_executions.state",
             SystemField::WorkflowName => "harvest_workflow_executions.workflow_name",
+            SystemField::WorkflowId => "harvest_workflow_executions.workflow_id",
             SystemField::Owner => "harvest_workflow_executions.owner",
             SystemField::Severity => "harvest_workflow_executions.severity",
             SystemField::StartedAt => "harvest_workflow_executions.started_at",
@@ -1061,6 +1067,10 @@ mod tests {
             "State:In([\"RUNNING\", \"FAILED\"])"
         );
         assert_eq!(parsed("workflow_name != 'x'"), "WorkflowName:Ne(\"x\")");
+        assert_eq!(
+            parsed("workflow_id = 'support/ada'"),
+            "WorkflowId:Eq(\"support/ada\")"
+        );
         assert_eq!(parsed("owner = 'ops'"), "Owner:Eq(\"ops\")");
         assert_eq!(parsed("severity = 'high'"), "Severity:Eq(\"high\")");
         assert!(parsed("started_at >= '2026-01-01T00:00:00Z'").starts_with("StartedAt:Cmp(Gte"));
