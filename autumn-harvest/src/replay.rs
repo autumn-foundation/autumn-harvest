@@ -64,6 +64,10 @@ const LINEAR_SCAN_BUDGET: usize = 4;
 /// The walk budget of an activity scan or settle.
 ///
 /// A test can lower it.
+#[allow(
+    clippy::missing_const_for_fn,
+    reason = "a test build reads a thread-local override"
+)]
 fn scan_budget() -> usize {
     #[cfg(test)]
     if let Some(budget) = activity_scan_tests::budget_override() {
@@ -1967,6 +1971,10 @@ impl HistoryMatcher {
     /// The scan also needs the index to pay off. Until the index exists,
     /// the walks of this matcher must cost more than a build would. A small
     /// fan-out then builds no index, and a large one builds it once.
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "a test build reads a thread-local override"
+    )]
     fn leaves_walk(&self, walked: usize, interleaved: bool) -> bool {
         #[cfg(test)]
         if let Some(budget) = activity_scan_tests::budget_override() {
