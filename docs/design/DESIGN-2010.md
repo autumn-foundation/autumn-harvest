@@ -10,7 +10,7 @@ The spike answers with three parts:
   lists the signal, update and query handlers of each workflow.
 - A **saga compensation coverage** check runs over the manifest alone. It
   reads no MIR.
-- A write-up, [`docs/rnd/workflow-graph-spike.md`](docs/rnd/workflow-graph-spike.md),
+- A write-up, [`docs/rnd/workflow-graph-spike.md`](../rnd/workflow-graph-spike.md),
   gives the verdict and the `unknown` rate on the examples.
 
 **No engine change. No migration. No new `WorkflowEvent` variant.** The

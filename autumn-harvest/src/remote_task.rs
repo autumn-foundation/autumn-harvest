@@ -1,7 +1,7 @@
 //! Durable outbound calls to a remote MCP or A2A task (issue #2006).
 //!
 //! A workflow starts a remote task and suspends until the task ends. The
-//! wait holds no worker slot and no open connection. See `DESIGN-2006.md`
+//! wait holds no worker slot and no open connection. See `docs/design/DESIGN-2006.md`
 //! and `docs/remote-tasks.md`.
 //!
 //! [`WorkflowContext::call_remote_task`] runs two durable steps:

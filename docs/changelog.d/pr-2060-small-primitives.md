@@ -2,7 +2,7 @@
 
 Issue #1985 asked for a decision on four primitives that peer engines ship.
 Three shipped. This change declines the counting semaphore and gives the
-reason in `docs/comparison.md`. The design record is `DESIGN-1985.md`.
+reason in `docs/comparison.md`. The design record is `docs/design/DESIGN-1985.md`.
 
 **No migration. No new `WorkflowEvent` variant. No new route.**
 

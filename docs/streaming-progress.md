@@ -262,7 +262,7 @@ same transaction as the decision cycle. The table is not `harvest_events`.
   run of its own tenant. The route is in `TENANT_SCOPED_ROUTES`. Another
   tenant's run answers `404`.
 
-[`DESIGN-1974.md`](../DESIGN-1974.md) records the decision.
+[`docs/design/DESIGN-1974.md`](design/DESIGN-1974.md) records the decision.
 
 ### Offsets
 

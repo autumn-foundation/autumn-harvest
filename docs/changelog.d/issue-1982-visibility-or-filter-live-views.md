@@ -14,7 +14,7 @@
   `assets/live.js` reads the change stream (list) or the #324 execution stream
   (detail), fetches the page again and swaps the marked regions.
 
-**Design.** `DESIGN-1982.md` holds the planning record. A filter with `OR`
+**Design.** `docs/design/DESIGN-1982.md` holds the planning record. A filter with `OR`
 must find each row through an index: each `OR` branch, or the whole filter,
 holds an `attrs.*` predicate or `workflow_name` with `=` or `IN`. Postgres
 then joins GIN index scans with `BitmapOr`. A filter that breaks the rule

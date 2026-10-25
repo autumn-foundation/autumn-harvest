@@ -41,4 +41,4 @@ of a fork and a reset of a fork keep their lineage. A 65-link lineage keeps
 its root. Two race tests cover the delete re-check. In one, the archiver
 forks the source after the gate. In the other, a fork holds the source lock
 until the delete waits, under a `REPEATABLE READ` session default. Design
-record: `DESIGN-2122.md`.
+record: `docs/design/DESIGN-2122.md`.

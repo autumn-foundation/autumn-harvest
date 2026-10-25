@@ -109,7 +109,7 @@ What can close the gap, each as its own change:
   the limit. The formula then predicts more than 2x at 1 loop.
 - A cheaper take. Each take still runs the full claim statement and its
   rechecks.
-- Eager activity dispatch, B5 of `DESIGN-claim-concurrency.md`. A decision
+- Eager activity dispatch, B5 of `docs/design/DESIGN-claim-concurrency.md`. A decision
   then claims its own new activity rows, and the claim count falls below 3.
 - Group commit across executions of one partition, issue #2256.
 

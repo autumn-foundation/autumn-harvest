@@ -9,7 +9,7 @@
 //! attempt and each continue-as-new successor. A retry of the request with
 //! `Last-Event-ID` resumes after that id. The id holds no execution id.
 //!
-//! See `docs/durable-routes.md` and `DESIGN-durable-streaming.md`.
+//! See `docs/durable-routes.md` and `docs/design/DESIGN-durable-streaming.md`.
 
 use std::collections::HashSet;
 use std::convert::Infallible;

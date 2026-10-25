@@ -2,7 +2,7 @@
 
 Stage 2 of epic #2247. A decision owner keeps the histories of its runs in a
 local file. A cold decision then reads the file and the Postgres delta, not
-the full Postgres history. [ADR 0012](docs/adr/0012-owner-disk-cache.md)
+the full Postgres history. [ADR 0012](../adr/0012-owner-disk-cache.md)
 records the decision.
 
 **No migration. No new `WorkflowEvent` variant. Off by default.** The cache

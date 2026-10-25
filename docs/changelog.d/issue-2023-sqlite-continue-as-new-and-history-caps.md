@@ -39,4 +39,4 @@ Tests: `tests/integration/continue_as_new.rs` and
 `history_cap` unit tests, and
 `history_cap_reasons_keep_the_bytes_the_sqlite_backend_mirrors` in
 `autumn-harvest/src/dlq.rs`. Both histories of a continued run replay on the
-core `WorkflowReplayer`. The plan is in `DESIGN-2023.md`.
+core `WorkflowReplayer`. The plan is in `docs/design/DESIGN-2023.md`.

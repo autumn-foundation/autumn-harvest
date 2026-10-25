@@ -42,7 +42,7 @@ write to `harvest_events`. Chunks do not count toward the history caps, and
 replay never reads them. New `WorkflowCommand::PublishDurableProgress`
 bookkeeping variant. The SQLite runtime ignores it.
 
-**Design.** `DESIGN-1974.md`. Docs: `docs/streaming-progress.md`.
+**Design.** `docs/design/DESIGN-1974.md`. Docs: `docs/streaming-progress.md`.
 
 **Tests.**
 

@@ -3,7 +3,7 @@
 **Status: research note.** This page surveys the primitives that the term
 "agent mesh" names in 2026. It maps each primitive to what Harvest ships. It
 picks the primitives that Harvest adopts now. The plan for that work is in
-[`DESIGN-agent-mesh.md`](../../DESIGN-agent-mesh.md). The user guide is
+[`docs/design/DESIGN-agent-mesh.md`](../design/DESIGN-agent-mesh.md). The user guide is
 [`docs/agent-mesh.md`](../agent-mesh.md).
 
 ## 1. The question

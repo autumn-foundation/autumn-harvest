@@ -62,7 +62,7 @@ partial index `idx_harvest_we_fork_source` from #2000 serves the lookup.
 | B3 | Add a `NOT EXISTS` to the candidate scan SQL. | Rejected. A correlated recursive query per scanned row. The per-candidate gate is the existing seam for a dependency. |
 | B4 | Pin only the source that the marker names. | Rejected. A reset of the running fork walks the whole lineage. A gap above the record source makes that reset fail. |
 | B5 | Place a legal hold on the source at fork time. | Rejected. A hold is an operator record. Retention would also need to release it. |
-| B6 | Snapshot the source outcomes into the fork. | Rejected in `DESIGN-2000.md` (B3). Nested payloads would skip the codec and erasure. |
+| B6 | Snapshot the source outcomes into the fork. | Rejected in `docs/design/DESIGN-2000.md` (B3). Nested payloads would skip the codec and erasure. |
 | B7 | One open-fork predicate for retention and rebalance. | **Adopted.** Both guards then mean the same "open fork". |
 | B8 | Read the markers in a second query, only for open forks. | **Adopted.** A run with no fork never reads `harvest_events`. |
 

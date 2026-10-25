@@ -21,7 +21,7 @@ follows from it.
   standalone-activity API must also write: a job record and the
   handler-start marker. Arm B writes **1.67x** the rows and **1.56x** the
   WAL of arm D.
-* `DESIGN-1987.md` §0.6 fixed a 2.0x line against arm D before arm D ran.
+* `docs/design/DESIGN-1987.md` §0.6 fixed a 2.0x line against arm D before arm D ran.
   Verdict: **Document the one-step-workflow pattern.**
 * The verdict covers jobs that fit a local activity. A job that needs a
   regular activity uses arm A, which is **2.83x** the rows and **2.65x**

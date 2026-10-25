@@ -1,6 +1,6 @@
 # Design: issue #2253, owner wakes and cache eviction for foreign writers
 
-Stage 1a of epic #2247. [ADR 0009](docs/adr/0009-decision-owner.md) fixes the
+Stage 1a of epic #2247. [ADR 0009](../adr/0009-decision-owner.md) fixes the
 owner protocol. Issue #2251 added the lease and the commit fence. This issue
 routes the writes of other processes to the owner of the partition.
 

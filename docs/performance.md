@@ -1301,7 +1301,7 @@ No index can remove the sort. The sticky `CASE` key already forces it. See
 The sections above measure the full scan. Since issue #1971, the default
 claim runs that scan only as a fallback. It first reads a bounded **seek
 window** from the head of each polled queue. The claim order does not
-change. Design record: [`DESIGN-1971.md`](../DESIGN-1971.md).
+change. Design record: [`docs/design/DESIGN-1971.md`](design/DESIGN-1971.md).
 
 ### Mechanism
 
@@ -1553,7 +1553,7 @@ without a capped key pay nothing.
 
 - **A blocked head is still O(backlog).** A fully blocked head falls back
   to the full scan. Moving parked rows out of the ready index would remove
-  that. See the follow-ups in [`DESIGN-1971.md`](../DESIGN-1971.md).
+  that. See the follow-ups in [`docs/design/DESIGN-1971.md`](design/DESIGN-1971.md).
 - **Ageing is still O(backlog).** With `priority_aging_secs` set, every
   claim runs the full scan, as before.
 - **A long run of skipped rows.** A head scan reads past each row that a
@@ -1659,7 +1659,7 @@ Assay #14 measured the claim-loop occupancy of one worker: claims per second
 times the mean claim time. It read 0.91 to 0.99 in every harvest run. That
 fits one claim in flight at a time. A worker now runs up to
 `max_concurrent_claims` claims at once, 2 by default. Design record:
-[`DESIGN-claim-concurrency.md`](../DESIGN-claim-concurrency.md).
+[`docs/design/DESIGN-claim-concurrency.md`](design/DESIGN-claim-concurrency.md).
 
 ### Mechanism
 
@@ -2319,7 +2319,7 @@ from the benchmark are directly comparable.
   per RUNNING execution on every timeout-scanner tick.
 * Issue #1177 — reproduction and full `EXPLAIN` captures for
   [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
-* [`DESIGN-1971.md`](../DESIGN-1971.md) — the planning record and design of
+* [`docs/design/DESIGN-1971.md`](design/DESIGN-1971.md) — the planning record and design of
   [the seek window](#the-seek-window-issue-1971).
 * [`docs/performance-claim-batched-seek-and-refine.md`](performance-claim-batched-seek-and-refine.md) —
   issue #1340's batched seek-and-refine claim (`queue::claim_task_batched`,

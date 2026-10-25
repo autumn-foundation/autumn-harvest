@@ -5,7 +5,7 @@ candidate build: `migrate`, `review` or `pin`. It runs inside the candidate
 build, because only that build holds its workflow types and codec keys.
 `autumn_harvest::upgrade_check::run_command` is the command. The
 `upgrade_check` example is a complete binary. Guide: `docs/upgrade-check.md`.
-Design: `DESIGN-1995.md`.
+Design: `docs/design/DESIGN-1995.md`.
 
 One check per failure mode:
 

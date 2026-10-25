@@ -41111,7 +41111,7 @@ impl Worker {
     /// Assay #14 measured claim-loop occupancy at 0.94, which fits one claim
     /// in flight. That loop capped throughput. A follower adds a claim in flight only while claims return
     /// work. The leader alone still guarantees progress, so a follower needs
-    /// no timer and no listener. See `DESIGN-claim-concurrency.md`.
+    /// no timer and no listener. See `docs/design/DESIGN-claim-concurrency.md`.
     ///
     /// The caller joins this future with the leader. The drain therefore
     /// starts only after every claim loop returns.

@@ -3,7 +3,7 @@
 //!
 //! Assay #14 measured claim-loop occupancy at 0.94, which fits one claim in
 //! flight. That loop capped throughput. These tests pin the fix and its
-//! safety rules. See `DESIGN-claim-concurrency.md`.
+//! safety rules. See `docs/design/DESIGN-claim-concurrency.md`.
 //!
 //! A test trigger makes each claim of one queue sleep, so claims of one
 //! worker overlap only if the worker runs them at once. The trigger records

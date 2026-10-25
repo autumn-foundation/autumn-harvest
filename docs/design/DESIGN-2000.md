@@ -163,7 +163,7 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | The history cap does not see the copied prefix. | Add the prefix bytes to the usage before the insert. |
 | The history cap misses a new input and the appended events. | Measure the stored fork rows after the insert with `pg_column_size`. A fork over a cap rolls back. |
 | A held race loser gets no loser terminal, so its `ActivityScheduled` stays open. | Mark the held task; `cancel_activity_task` treats the mark as open. |
-| Retention can delete a record source while a recorded fork runs. | Fixed in issue #2122. Retention keeps each run in the fork lineage of an open recorded fork. See `DESIGN-2122.md`. |
+| Retention can delete a record source while a recorded fork runs. | Fixed in issue #2122. Retention keeps each run in the fork lineage of an open recorded fork. See `docs/design/DESIGN-2122.md`. |
 | A shard migration can move a record source away from its live fork. | The `LiveFork` quiescence blocker keeps each run in the fork lineage of a live fork on its shard. The walk reaches past a fork that a reset sealed. |
 | A fork history at the worker event cap or byte cap dead-letters on its first task. | Refuse the fork with `409`. The check reads the stored rows, and the refusal rolls the fork back. |
 | A loser is held beside a served sibling of an enclosing join, so nothing cancels it. | Hold only for the provable winner of the same race: the one sibling that resolved before the cancel. |

@@ -65,6 +65,11 @@ use autumn_harvest::entity::{ENTITY_OP_SIGNAL, EntityMessage};
 /// The replay gate of the final-turn delivery and the raw follow-up length.
 const FINAL_TURN_PATCH: &str = "agent_final_turn_rules";
 
+/// The gate for `report_failure` on fan-out children (issue #2328). The flag is
+/// part of the recorded child input. A history from before the gate replays
+/// with the old input.
+const CHILD_FAILURE_REPORT_PATCH: &str = "agent_child_failure_report";
+
 /// The registered workflow name.
 pub const WORKFLOW_NAME: &str = "agent_loop";
 
@@ -221,6 +226,16 @@ impl Progress {
             flow_labels: tree.exercised.clone(),
             run_id: Some(self.run_id.clone()),
             workspace: self.workspace.as_ref().and_then(|mount| mount.head.clone()),
+            error: None,
+        }
+    }
+
+    /// The report of a run that failed with `error`. It keeps what the run
+    /// spent before it failed (issue #2328).
+    fn failure(&self, error: String, tree: &Tree) -> AgentReport {
+        AgentReport {
+            error: Some(error),
+            ..self.report(AgentStop::Failed, tree)
         }
     }
 }
@@ -484,7 +499,13 @@ pub(crate) async fn drive(
             agent: agent.as_ref(),
             live: false,
         };
-        let stop = run_segment(ctx, run, &mut progress, &mut tree, input).await?;
+        let stop = match run_segment(ctx, run, &mut progress, &mut tree, input).await {
+            Ok(stop) => stop,
+            Err(error) if task.report_failure => {
+                return Ok((progress.failure(error, &tree), delivered));
+            }
+            Err(error) => return Err(error),
+        };
         let mut report = progress.report(stop, &tree);
         if task.deliver {
             let source = if woken {
@@ -1827,6 +1848,10 @@ async fn fan_out(
         .mandate
         .max_delegations
         .saturating_sub(tree.delegations.saturating_add(count));
+    // A child reports its failure, so the parent keeps its usage. The gate
+    // runs only when a child starts. Replay reaches it at the same point
+    // (issue #2328).
+    let report_failure = !siblings.is_empty() && ctx.patched(CHILD_FAILURE_REPORT_PATCH);
     let mut children = Vec::new();
     for (index, sibling) in (0_u32..).zip(siblings) {
         let share = tokens_left.map(|left| sibling_cap(left, count, index));
@@ -1847,6 +1872,7 @@ async fn fan_out(
         tree.delegations = tree.delegations.saturating_add(1);
         let mut child = child_task(task, sibling.peer, sibling.input, mandate, cap);
         child.run_id_source = RunIdSource::ExecutionId;
+        child.report_failure = report_failure;
         child.flow_labels.clone_from(&tree.exercised);
         // The parent waits on the child run, so a send from the child back
         // up the chain is a deadlock. Only a durable agent can get such a
@@ -1872,13 +1898,8 @@ async fn fan_out(
     // failure in input order fails the batch.
     let mut failed = None;
     for ((position, peer, child), output) in children.into_iter().zip(ended) {
-        let report = output.and_then(|value| {
-            serde_json::from_value::<AgentReport>(value).map_err(|err| err.to_string())
-        });
-        match report {
-            Ok(report) => {
-                outcomes[position] = Some(merge_child(progress, tree, peer, child, &report));
-            }
+        match merge_ended(progress, tree, peer, child, output) {
+            Ok(outcome) => outcomes[position] = Some(outcome),
             Err(err) => {
                 failed.get_or_insert(err);
             }
@@ -1891,6 +1912,29 @@ async fn fan_out(
         .into_iter()
         .map(|outcome| outcome.unwrap_or_else(|| ToolOutcome::error(NOT_RUN_FULL)))
         .collect())
+}
+
+/// Merge the end of one fan-out child into the parent.
+///
+/// A child that reported its failure still joins the parent. Then it counts
+/// as a failure like any other (issue #2328).
+fn merge_ended(
+    progress: &mut Progress,
+    tree: &mut Tree,
+    peer: &Peer,
+    child: AgentTask,
+    output: Result<serde_json::Value, String>,
+) -> Result<ToolOutcome, String> {
+    let report = output.and_then(|value| {
+        serde_json::from_value::<AgentReport>(value).map_err(|err| err.to_string())
+    })?;
+    let outcome = merge_child(progress, tree, peer, child, &report);
+    if report.stop == AgentStop::Failed {
+        return Err(report
+            .error
+            .unwrap_or_else(|| "the child run failed".to_owned()));
+    }
+    Ok(outcome)
 }
 
 /// The mandate checks of one sibling. Returns its mandate and its peer.
@@ -1976,13 +2020,16 @@ async fn durable_peer(
     if target_id == tree.outbox.self_id || tree.outbox.waiting.iter().any(|id| id == target_id) {
         return Ok(refuse(agent, tree, Refusal::Deadlock, &peer.name));
     }
-    let mandate = match agent
+    let mut mandate = match agent
         .mandate
         .outbound(peer, tree.delegations, &tree.exercised)
     {
         Ok(mandate) => mandate,
         Err(refusal) => return Ok(refuse(agent, tree, refusal, &peer.name)),
     };
+    // A read-only segment sends a read-only mandate, as an inline child
+    // inherits it (issue #2319).
+    mandate.read_only |= run.task.read_only;
     tree.delegations = tree.delegations.saturating_add(1);
     let seq = tree.outbox.next_seq(target_id);
     let mut promise = ctx.new_promise().map_err(|err| err.to_string())?;
@@ -2187,6 +2234,8 @@ fn child_task(
         // (issue #2274).
         workspace: None,
         waiting: Vec::new(),
+        // Only a fan-out sets it, after its gate.
+        report_failure: false,
     }
 }
 

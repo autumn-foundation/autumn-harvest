@@ -1,7 +1,7 @@
 # Design: issue #2308, the owner decider takes tasks in claim order
 
-[ADR 0009](docs/adr/0009-decision-owner.md) decision 13 describes the decider.
-[`claim-order.md`](docs/operations/claim-order.md) defines the order. This
+[ADR 0009](../adr/0009-decision-owner.md) decision 13 describes the decider.
+[`claim-order.md`](../operations/claim-order.md) defines the order. This
 change gives the decider that order.
 
 **One migration (an index). No new `WorkflowEvent` variant. No replay impact.**

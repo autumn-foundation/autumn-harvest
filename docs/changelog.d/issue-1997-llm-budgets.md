@@ -30,7 +30,7 @@ turn in the cost ledger as before. The check has a 10-second budget,
 ends the run under the new stop `budget_exceeded`.
 
 The limiter question of issue #1997 is settled. `adaptive_limit.rs` (#1935)
-is the current design. No token-keyed limit ships. See `DESIGN-1997.md`
+is the current design. No token-keyed limit ships. See `docs/design/DESIGN-1997.md`
 §0.5.
 
 **Breaking changes.**

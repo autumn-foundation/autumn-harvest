@@ -83,7 +83,7 @@ seeded simulator, each with the four nemeses of the issue.
 ## 1. The model-forced rules
 
 The rules R1 to R7 and their mutants are in the table of
-[ADR 0010](docs/adr/0010-fenced-owner-lease.md#decision).
+[ADR 0010](../adr/0010-fenced-owner-lease.md#decision).
 
 ## 2. Review findings
 

@@ -27,7 +27,7 @@ outcome and the same update results. Each history must replay on the core
 - CI runs the suite from a `linux` row in `test-db-linux`. A
   `ci_run_coverage` guard requires the row. A clippy step lints the crate.
 - On the code before the #2020 fix, the three #2020 scenarios fail and the
-  rest pass. `DESIGN-2030.md` section 3 has the output.
+  rest pass. `docs/design/DESIGN-2030.md` section 3 has the output.
 - The suite found three Postgres defects. Three tests carry `#[ignore]` and
   reproduce them. Two send a signal or a cancel to a detached child in the
   cycle that spawns it. The third waits with no command.

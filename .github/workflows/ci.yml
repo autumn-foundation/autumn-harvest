@@ -536,6 +536,13 @@ jobs:
           python3 docs/audits/tenant-header-validation-sync.py --self-test
           python3 docs/audits/tenant-header-validation-sync.py
 
+      # Only listed files sit at the repository root. A design record goes in
+      # docs/design/. The script lists each root file with a reason.
+      - name: Root files (docs/audits/root-files.py)
+        run: |
+          python3 docs/audits/root-files.py --self-test
+          python3 docs/audits/root-files.py
+
       # Issue #1831: a doc claim that shipped code made false fails the build.
       - name: Doc claim drift (docs/audits/doc-claim-drift.py)
         run: |

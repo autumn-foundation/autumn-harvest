@@ -568,7 +568,7 @@ async fn a_join_of_activities_hits_on_every_tool_result() {
 ///
 /// Three rounds of one model call and four tool calls. Every decision after
 /// the first must hit. The printed line is the measurement in
-/// `DESIGN-2008.md`.
+/// `docs/design/DESIGN-2008.md`.
 #[tokio::test]
 async fn an_agent_loop_with_parallel_tool_calls_hits_after_the_first_decision() {
     let (url, _container) = setup_test_database_url_or_env().await;

@@ -4,7 +4,7 @@
 //! a row in it. With a [`PartitionArchiver`] set, the sweep first exports the
 //! partition, reads the export back, and checks it. The drop then computes a
 //! row checksum under its `SHARE` lock. It drops only when the checksum and
-//! the row count match the manifest. See `DESIGN-2009.md`.
+//! the row count match the manifest. See `docs/design/DESIGN-2009.md`.
 //!
 //! # Guards
 //!

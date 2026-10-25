@@ -71,8 +71,8 @@ Usage:
 Exit code is 1 if a broken link is found in the reader corpus (orphans are
 reported but do not fail the run — an orphan is a findability defect to
 triage, not a hard error). A broken link inside a process/working-artifact
-subtree (docs/plans/, docs/changelog.d/, docs/rnd/, docs/assays/,
-docs/perf-artifacts/ — see PROCESS_ARTIFACT_PREFIXES) is still reported but
+subtree (docs/plans/, docs/design/, docs/changelog.d/, docs/rnd/,
+docs/assays/, docs/perf-artifacts/ — see PROCESS_ARTIFACT_PREFIXES) is still reported but
 does NOT fail the run, UNLESS a reader can actually reach that page by
 following crosslinks from the real corpus (transitively) — a page under one
 of those prefixes that a corpus page cites as required reading (e.g.
@@ -96,7 +96,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TOP_LEVEL_SOURCES = ["README.md", "CHANGELOG.md", "RELEASE_NOTES.md"]
 
 # Subtrees under docs/ that are process/working artifacts, not indexed
-# reader reference pages: engineering plans (docs/plans/), the changelog
+# reader reference pages: engineering plans (docs/plans/), per-issue design
+# records (docs/design/, which keep rejected options on purpose), the changelog
 # fragment inbox (docs/changelog.d/ — CLAUDE.md calls this "a fragment
 # file, never the shared phase list", i.e. write-only until release),
 # R&D writeups (docs/rnd/), and dated performance investigations
@@ -109,6 +110,7 @@ TOP_LEVEL_SOURCES = ["README.md", "CHANGELOG.md", "RELEASE_NOTES.md"]
 # pruning pass.
 PROCESS_ARTIFACT_PREFIXES = (
     "docs/plans/",
+    "docs/design/",
     "docs/changelog.d/",
     "docs/rnd/",
     "docs/assays/",
@@ -615,7 +617,7 @@ def main():
         for s, t, r in broken_corpus:
             print(f"  {rel(s)}: ({t}) — {r}")
         print(
-            f"\nBroken links (process artifacts — plans/changelog.d/rnd/assays/"
+            f"\nBroken links (process artifacts — plans/design/changelog.d/rnd/assays/"
             f"perf-artifacts, reported only): {len(broken_process)}"
         )
         for s, t, r in broken_process:

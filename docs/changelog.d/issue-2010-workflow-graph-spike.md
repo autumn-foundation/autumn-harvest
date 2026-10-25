@@ -3,7 +3,7 @@
 `harvest-verify` now emits each workflow's step, signal, update and
 compensation graph as data. A model check runs over that data alone.
 Write-up and verdict: `docs/rnd/workflow-graph-spike.md`. Design:
-`DESIGN-2010.md`.
+`docs/design/DESIGN-2010.md`.
 
 What shipped, all in `autumn-harvest-verify`:
 
