@@ -107,6 +107,8 @@ Content-Type: application/json
 
 Response: `204 No Content`. The call **replaces** the full set; omitting a date removes it.
 
+For a timezone schedule, each date is a date in the schedule's timezone. See [Which date a calendar tests](#which-date-a-calendar-tests).
+
 ### Delete a calendar
 
 ```http
