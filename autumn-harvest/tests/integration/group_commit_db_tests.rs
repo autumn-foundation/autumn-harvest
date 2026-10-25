@@ -1,7 +1,7 @@
 //! Group commit of one decision partition on Postgres (issue #2256).
 //!
-//! `DESIGN-2256.md` section 1 gives the rules. These tests prove them on a
-//! real database:
+//! `docs/design/DESIGN-2256.md` section 1 gives the rules. These tests prove
+//! them on a real database:
 //!
 //! * A failing decision rolls back alone. The rest of its batch commits.
 //! * No result goes out before the batch commits.

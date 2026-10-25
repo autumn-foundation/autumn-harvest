@@ -2,7 +2,7 @@
 
 Issue #2256. An owner commits the decisions of several executions of one
 decision partition in one transaction, with a savepoint per decision.
-[`DESIGN-2256.md`](../DESIGN-2256.md) section 1 is the design note.
+[`DESIGN-2256.md`](design/DESIGN-2256.md) section 1 is the design note.
 [ADR 0009](adr/0009-decision-owner.md) decision 14 records it. This page
 measures the bench item of the issue.
 
