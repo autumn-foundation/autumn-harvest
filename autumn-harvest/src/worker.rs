@@ -35448,18 +35448,38 @@ enum DeciderEvent {
     Scanned(HarvestResult<queue::OwnerScan>),
     /// The take of one execution ended.
     Taken(uuid::Uuid, OwnerTake),
+    /// A key lookup of hinted executions ended (issue #2308).
+    Keyed(Vec<uuid::Uuid>, HarvestResult<Vec<queue::OwnerRow>>),
 }
+
+/// The claim-order key of a ready execution (issue #2308): the higher
+/// effective priority first, then the earlier claim-order due time.
+type ReadyKey = (std::cmp::Reverse<i32>, chrono::DateTime<chrono::Utc>);
 
 /// The local state of one owner decider (issue #2255).
 ///
-/// It holds execution ids only. The task rows hold the work.
+/// It holds execution ids and their claim keys only. The task rows hold the
+/// work.
+// struct_excessive_bools: each flag is an independent condition of the loop.
+// An enum of their product would have more states than the loop can reach.
+#[allow(clippy::struct_excessive_bools)]
 struct DeciderState {
     poll: Duration,
     /// Owner mode is on, and the decider runs.
     active: bool,
-    /// The executions to take, in arrival order. `queued` dedupes them.
-    ready: std::collections::VecDeque<uuid::Uuid>,
-    queued: HashSet<uuid::Uuid>,
+    /// The executions to take, best claim key first (issue #2308). `queued`
+    /// maps each one to its key.
+    ready: std::collections::BTreeSet<(ReadyKey, uuid::Uuid)>,
+    queued: HashMap<uuid::Uuid, ReadyKey>,
+    /// The hinted executions that wait for a key.
+    unkeyed: HashSet<uuid::Uuid>,
+    /// The executions of the key lookup in flight. A lookup runs while this
+    /// set is not empty.
+    keying_execs: HashSet<uuid::Uuid>,
+    /// A finished lookup grants one take pass. No new lookup starts and no
+    /// unkeyed hint blocks a take until [`Self::end_pass`]. So a steady
+    /// stream of hints cannot starve dispatch (issue #2308).
+    pass_granted: bool,
     /// The executions with a take in flight.
     in_flight: HashSet<uuid::Uuid>,
     /// The executions that a wake named while their take ran.
@@ -35482,8 +35502,11 @@ impl DeciderState {
         Self {
             poll,
             active: false,
-            ready: std::collections::VecDeque::new(),
-            queued: HashSet::new(),
+            ready: std::collections::BTreeSet::new(),
+            queued: HashMap::new(),
+            unkeyed: HashSet::new(),
+            keying_execs: HashSet::new(),
+            pass_granted: false,
             in_flight: HashSet::new(),
             rewake: HashSet::new(),
             backoff: HashMap::new(),
@@ -35507,6 +35530,8 @@ impl DeciderState {
         self.active = false;
         self.ready.clear();
         self.queued.clear();
+        self.unkeyed.clear();
+        self.pass_granted = false;
         self.rewake.clear();
         self.backoff.clear();
     }
@@ -35518,43 +35543,128 @@ impl DeciderState {
         self.backoff.clear();
     }
 
-    /// Queue `exec` at the back, once. A full queue drops it: the scan
-    /// finds the row.
-    fn queue(&mut self, exec: uuid::Uuid) {
-        if self.ready.len() < OWNER_HINTS_MAX && self.queued.insert(exec) {
-            self.ready.push_back(exec);
-        }
+    /// Queue a ranked row. A new key replaces the old one. A full queue
+    /// drops its worst entry for a better row, and drops a row that is not
+    /// better: the scan finds it again.
+    fn queue(&mut self, row: queue::OwnerRow) {
+        self.insert(row.exec_id, (std::cmp::Reverse(row.priority), row.due_at));
     }
 
-    /// Put back an execution that found no permit.
-    fn queue_front(&mut self, exec: uuid::Uuid) {
-        if self.queued.insert(exec) {
-            self.ready.push_front(exec);
+    /// Queue `exec` with `key`. See [`Self::queue`].
+    fn insert(&mut self, exec: uuid::Uuid, key: ReadyKey) {
+        self.unkeyed.remove(&exec);
+        if let Some(old) = self.queued.remove(&exec) {
+            self.ready.remove(&(old, exec));
+        } else if self.ready.len() >= OWNER_HINTS_MAX {
+            let Some(&(worst_key, worst)) = self.ready.last() else {
+                return;
+            };
+            if key >= worst_key {
+                return;
+            }
+            self.ready.remove(&(worst_key, worst));
+            self.queued.remove(&worst);
         }
+        self.queued.insert(exec, key);
+        self.ready.insert((key, exec));
     }
 
-    /// A wake named `exec`. A wake is news, so it ends the backoff. A wake
-    /// during a take queues the execution again after the take.
+    /// A wake named `exec`. A wake is news, so it ends the backoff. The
+    /// hint has no key yet. A wake during a take queues the execution again
+    /// after the take. A wake during a key lookup keeps the hint, because the
+    /// lookup may have read the row before the commit of the wake. A full
+    /// set drops the hint: the scan finds the row.
     fn hint(&mut self, exec: uuid::Uuid) {
         self.backoff.remove(&exec);
         if self.in_flight.contains(&exec) {
             self.rewake.insert(exec);
-        } else {
-            self.queue(exec);
+        } else if !self.queued.contains_key(&exec) && self.unkeyed.len() < OWNER_HINTS_MAX {
+            self.unkeyed.insert(exec);
         }
     }
 
-    /// The next execution to take, skipping one that is in flight or backs
+    /// Start a key lookup for the unkeyed hints. Empty while one runs.
+    fn begin_keying(&mut self) -> Vec<uuid::Uuid> {
+        if self.pass_granted || !self.keying_execs.is_empty() || self.unkeyed.is_empty() {
+            return Vec::new();
+        }
+        let execs: Vec<_> = self.unkeyed.drain().collect();
+        self.keying_execs.extend(execs.iter().copied());
+        execs
+    }
+
+    /// A key lookup of `requested` ended. `None` is a failed lookup: queue
+    /// the hints unranked, so a wake is not lost. A scan key stays. A row that
+    /// the lookup did not return is not due, or it is gone. A wake that came
+    /// during the lookup keeps its hint. The scan finds the rest later.
+    fn keyed(&mut self, requested: &[uuid::Uuid], rows: Option<Vec<queue::OwnerRow>>) {
+        for exec in requested {
+            self.keying_execs.remove(exec);
+        }
+        self.pass_granted = true;
+        if !self.active {
+            return;
+        }
+        match rows {
+            Some(rows) => {
+                for row in rows {
+                    self.queue(row);
+                }
+            }
+            None => {
+                for exec in requested {
+                    if !self.queued.contains_key(exec) {
+                        self.insert_unranked(*exec);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether `free` permits cover every ready row, every hint and every
+    /// execution of the lookup in flight. Only then can the take order not
+    /// matter, so the lookup is skipped.
+    fn permits_cover_all(&self, free: usize) -> bool {
+        free >= self.ready.len() + self.unkeyed.len() + self.keying_execs.len()
+    }
+
+    /// Whether a hint waits for its key. A take must wait too. Else a ready
+    /// row of lower rank would take the permit that the hint should have.
+    fn ranking(&self) -> bool {
+        !self.keying_execs.is_empty() || (!self.unkeyed.is_empty() && !self.pass_granted)
+    }
+
+    /// The take pass of a finished lookup is over. The next lookup may start.
+    const fn end_pass(&mut self) {
+        self.pass_granted = false;
+    }
+
+    /// Queue `exec` with the key of a row that is due now at normal
+    /// priority.
+    fn insert_unranked(&mut self, exec: uuid::Uuid) {
+        self.insert(exec, (std::cmp::Reverse(0), chrono::Utc::now()));
+    }
+
+    /// Queue every unkeyed hint unranked. Free permits cover all of them, so
+    /// their order cannot matter and the lookup would only cost a statement.
+    fn rank_unkeyed_unranked(&mut self) {
+        let execs: Vec<_> = self.unkeyed.drain().collect();
+        for exec in execs {
+            self.insert_unranked(exec);
+        }
+    }
+
+    /// The best execution to take, skipping one that is in flight or backs
     /// off.
-    fn pop(&mut self, now: std::time::Instant) -> Option<uuid::Uuid> {
-        while let Some(exec) = self.ready.pop_front() {
+    fn pop(&mut self, now: std::time::Instant) -> Option<(uuid::Uuid, ReadyKey)> {
+        while let Some((key, exec)) = self.ready.pop_first() {
             self.queued.remove(&exec);
             let backs_off = self
                 .backoff
                 .get(&exec)
                 .is_some_and(|(until, _)| *until > now);
             if !self.in_flight.contains(&exec) && !backs_off {
-                return Some(exec);
+                return Some((exec, key));
             }
         }
         None
@@ -35571,7 +35681,7 @@ impl DeciderState {
     fn missed(&mut self, exec: uuid::Uuid, now: std::time::Instant) {
         self.in_flight.remove(&exec);
         if self.rewake.remove(&exec) {
-            self.queue(exec);
+            self.hint(exec);
             return;
         }
         let misses = self.backoff.get(&exec).map_or(0, |(_, misses)| misses + 1);
@@ -35623,7 +35733,9 @@ impl DeciderState {
         self.backoff
             .retain(|_, (until, _)| now.saturating_duration_since(*until) < horizon);
         self.queued
-            .iter()
+            .keys()
+            .chain(self.unkeyed.iter())
+            .chain(self.keying_execs.iter())
             .chain(self.in_flight.iter())
             .copied()
             .chain(
@@ -40644,12 +40756,16 @@ impl Worker {
 
     /// Whether this worker runs owner deciders at all (issue #2255).
     ///
-    /// A worker with queue weights or fairness keys keeps the owned claim of
-    /// issue #2252. Its claim loops then take workflow tasks in the weighted
-    /// queue order and by the fairness lags of issue #1976. A decider takes
-    /// them by due time, so it ignores both.
+    /// A worker with queue weights, fairness keys or priority ageing keeps
+    /// the owned claim of issue #2252. Its claim loops then take workflow
+    /// tasks in the weighted queue order. They apply the fairness lags of
+    /// issue #1976 and the ageing boost (issue #2308). A decider ignores all
+    /// three. Ageing reorders every pending row, so no bounded scan can sort
+    /// it.
     fn deciders_enabled(&self) -> bool {
-        self.config.queue_weights.is_empty() && !self.config.fairness_keys
+        self.config.queue_weights.is_empty()
+            && !self.config.fairness_keys
+            && self.config.priority_aging_secs.is_none_or(|secs| secs == 0)
     }
 
     /// Whether an owner decider runs for the claim target `shard` (issue
@@ -41167,7 +41283,24 @@ impl Worker {
                         )
                     }));
                 }
-                while !state.ready.is_empty() {
+                // Order matters only when the hints compete for permits. With
+                // enough free permits, take them at once and skip the lookup.
+                let free =
+                    Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow);
+                if state.permits_cover_all(free) {
+                    state.rank_unkeyed_unranked();
+                } else {
+                    let execs = state.begin_keying();
+                    if !execs.is_empty() {
+                        events.push(Box::pin(async move {
+                            let keys = self.owner_keys_once(target, &execs).await;
+                            DeciderEvent::Keyed(execs, keys)
+                        }));
+                    }
+                }
+                // A lookup in flight can name a row that outranks the ready
+                // ones, so no take starts until the hints have keys.
+                while !state.ready.is_empty() && !state.ranking() {
                     if Self::free_permits(
                         &self.workflow_semaphore,
                         &self.dispatch_reserved_workflow,
@@ -41176,12 +41309,12 @@ impl Worker {
                         blocked = true;
                         break;
                     }
-                    let Some(exec) = state.pop(now) else {
+                    let Some((exec, key)) = state.pop(now) else {
                         break;
                     };
                     let Ok(permit) = Arc::clone(&self.workflow_semaphore).try_acquire_owned()
                     else {
-                        state.queue_front(exec);
+                        state.insert(exec, key);
                         blocked = true;
                         break;
                     };
@@ -41194,6 +41327,7 @@ impl Worker {
                         )
                     }));
                 }
+                state.end_pass();
                 if blocked {
                     // The slot tuner reads a refused kind as backlog (#548).
                     AtomicBool::store(&self.gate_refused.workflow, true, Ordering::Relaxed);
@@ -41243,6 +41377,18 @@ impl Worker {
             .acquire_timed(target.pool, target.acquire_bound, target.shard)
             .await?;
         queue::owner_scan(&mut conn, &self.config.queues, owned, skip, limit).await
+    }
+
+    /// The claim-order keys of hinted executions (issue #2308).
+    async fn owner_keys_once(
+        &self,
+        target: &DeciderTarget<'_>,
+        execs: &[uuid::Uuid],
+    ) -> HarvestResult<Vec<queue::OwnerRow>> {
+        let mut conn = self
+            .acquire_timed(target.pool, target.acquire_bound, target.shard)
+            .await?;
+        queue::owner_keys(&mut conn, execs).await
     }
 
     /// One owner take of the workflow task of `exec` (issue #2255).
@@ -41327,8 +41473,8 @@ impl Worker {
         match event {
             DeciderEvent::Scanned(Ok(scan)) => {
                 let full = scan.due.len() >= limit;
-                for exec in scan.due {
-                    state.queue(exec);
+                for row in scan.due {
+                    state.queue(row);
                 }
                 state.scanned(now, full, scan.next_due);
             }
@@ -41339,6 +41485,17 @@ impl Worker {
                         worker_id = %self.config.worker_id,
                         error = %error,
                         "owner decider scan failed"
+                    );
+                }
+            }
+            DeciderEvent::Keyed(execs, Ok(rows)) => state.keyed(&execs, Some(rows)),
+            DeciderEvent::Keyed(execs, Err(error)) => {
+                state.keyed(&execs, None);
+                if state.may_warn(now) {
+                    tracing::warn!(
+                        worker_id = %self.config.worker_id,
+                        error = %error,
+                        "owner decider key lookup failed"
                     );
                 }
             }
@@ -57813,6 +57970,20 @@ mod tests {
         assert_eq!(decider_gate(PollAdmission::Any), PollAdmission::Any);
     }
 
+    /// A ranked row of the decider (issue #2308).
+    fn row(priority: i32, age_secs: i64, new_start: bool) -> crate::queue::OwnerRow {
+        let handicap = if new_start {
+            i64::from(crate::queue::NEW_START_HANDICAP_SECS)
+        } else {
+            0
+        };
+        crate::queue::OwnerRow {
+            exec_id: uuid::Uuid::new_v4(),
+            priority,
+            due_at: chrono::Utc::now() - chrono::Duration::seconds(age_secs - handicap),
+        }
+    }
+
     /// The decider state skips an in-flight or backing-off execution, and a
     /// wake during a take queues it again (issue #2255).
     #[test]
@@ -57820,23 +57991,255 @@ mod tests {
         let poll = Duration::from_millis(25);
         let now = std::time::Instant::now();
         let mut state = DeciderState::new(poll);
-        let exec = uuid::Uuid::new_v4();
-        state.queue(exec);
-        state.queue(exec);
+        let row = row(0, 5, false);
+        let exec = row.exec_id;
+        state.queue(row);
+        state.queue(row);
         assert_eq!(state.ready.len(), 1, "a queued execution is queued once");
-        assert_eq!(state.pop(now), Some(exec));
+        assert_eq!(state.pop(now).map(|(e, _)| e), Some(exec));
         state.in_flight.insert(exec);
         state.hint(exec);
-        assert!(state.ready.is_empty(), "a wake during a take waits for it");
+        assert!(
+            state.unkeyed.is_empty(),
+            "a wake during a take waits for it"
+        );
         state.missed(exec, now);
-        assert_eq!(state.pop(now), Some(exec), "the wake queues it again");
+        assert!(
+            state.unkeyed.contains(&exec),
+            "the wake asks for a key again"
+        );
+        state.unkeyed.clear();
         state.in_flight.insert(exec);
         state.missed(exec, now);
         assert!(state.skip(now).contains(&exec), "a miss backs off");
-        state.queue(exec);
+        state.queue(row);
         assert_eq!(state.pop(now), None, "a backing-off execution is skipped");
         state.hint(exec);
-        assert_eq!(state.pop(now), Some(exec), "a wake ends the backoff");
+        state.queue(row);
+        assert_eq!(
+            state.pop(now).map(|(e, _)| e),
+            Some(exec),
+            "a wake ends the backoff"
+        );
+    }
+
+    /// The ready set pops in claim order (issue #2308): priority, then the
+    /// due time with the new-start handicap.
+    #[test]
+    fn decider_state_pops_in_claim_order() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        let old_low = row(0, 100, false);
+        let new_high = row(5, 1, false);
+        let continuation = row(0, 40, false);
+        let fresh_start = row(0, 50, true);
+        for r in [old_low, fresh_start, continuation, new_high] {
+            state.queue(r);
+        }
+        let order: Vec<_> = std::iter::from_fn(|| state.pop(now).map(|(e, _)| e)).collect();
+        assert_eq!(
+            order,
+            vec![
+                new_high.exec_id,
+                old_low.exec_id,
+                continuation.exec_id,
+                fresh_start.exec_id
+            ],
+            "a 50 s start sorts as 20 s old: after a 40 s continuation"
+        );
+    }
+
+    /// A fresher key replaces the old one, and a full queue drops its worst
+    /// entry for a better row, never the reverse (issue #2308).
+    #[test]
+    fn decider_state_keeps_the_best_rows_when_full() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        let mut moved = row(0, 10, false);
+        state.queue(moved);
+        moved.priority = 9;
+        state.queue(moved);
+        assert_eq!(state.ready.len(), 1, "one entry per execution");
+        assert_eq!(state.pop(now).map(|(_, k)| k.0), Some(std::cmp::Reverse(9)));
+        for _ in 0..OWNER_HINTS_MAX {
+            state.queue(row(0, 10, false));
+        }
+        let worse = row(-1, 10, false);
+        state.queue(worse);
+        assert!(
+            !state.queued.contains_key(&worse.exec_id),
+            "worse is dropped"
+        );
+        let better = row(7, 1, false);
+        state.queue(better);
+        assert_eq!(state.ready.len(), OWNER_HINTS_MAX, "the bound holds");
+        assert_eq!(state.pop(now).map(|(e, _)| e), Some(better.exec_id));
+    }
+
+    /// A hint has no key. It waits in the unkeyed set, which scans skip, until
+    /// a lookup ranks it (issue #2308).
+    #[test]
+    fn decider_state_holds_a_hint_until_it_has_a_key() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        state.activate(now);
+        let exec = uuid::Uuid::new_v4();
+        state.hint(exec);
+        state.hint(exec);
+        assert!(state.ready.is_empty());
+        assert!(state.skip(now).contains(&exec), "a scan skips a hint");
+        assert_eq!(state.begin_keying(), vec![exec], "one lookup, once");
+        assert!(!state.keying_execs.is_empty());
+        assert!(state.begin_keying().is_empty(), "one lookup at a time");
+        let ranked = crate::queue::OwnerRow {
+            exec_id: exec,
+            ..row(3, 1, false)
+        };
+        let gone = uuid::Uuid::new_v4();
+        state.keyed(&[exec, gone], Some(vec![ranked]));
+        assert!(state.keying_execs.is_empty());
+        assert_eq!(state.pop(now).map(|(e, _)| e), Some(exec));
+        assert!(
+            !state.skip(now).contains(&gone),
+            "a vanished row is forgotten"
+        );
+        state.hint(gone);
+        state.begin_keying();
+        state.keyed(&[gone], None);
+        assert_eq!(
+            state.pop(now).map(|(e, _)| e),
+            Some(gone),
+            "a failed lookup queues the hint unranked"
+        );
+    }
+
+    /// A wake during a key lookup keeps its hint, and the hint set is bounded
+    /// (issue #2308).
+    #[test]
+    fn decider_state_keeps_a_wake_that_comes_during_a_lookup() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        state.activate(now);
+        let exec = uuid::Uuid::new_v4();
+        state.hint(exec);
+        let requested = state.begin_keying();
+        state.hint(exec);
+        state.keyed(&requested, Some(Vec::new()));
+        assert!(
+            state.unkeyed.contains(&exec),
+            "the lookup missed the new row"
+        );
+        for _ in 0..OWNER_HINTS_MAX + 10 {
+            state.hint(uuid::Uuid::new_v4());
+        }
+        assert_eq!(state.unkeyed.len(), OWNER_HINTS_MAX, "the set is bounded");
+    }
+
+    /// A failed lookup does not downgrade a key that a scan gave (issue
+    /// #2308).
+    #[test]
+    fn decider_state_keeps_a_scan_key_when_the_lookup_fails() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        state.activate(now);
+        let ranked = row(9, 1, false);
+        state.hint(ranked.exec_id);
+        let requested = state.begin_keying();
+        state.queue(ranked);
+        state.keyed(&requested, None);
+        assert_eq!(
+            state.pop(now).map(|(_, key)| key.0),
+            Some(std::cmp::Reverse(9)),
+            "the scan key stays"
+        );
+    }
+
+    /// Free permits cover every hint: queue them unranked at once (issue
+    /// #2308).
+    #[test]
+    fn decider_state_ranks_hints_unranked_when_permits_are_free() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        state.hint(a);
+        state.hint(b);
+        state.rank_unkeyed_unranked();
+        assert!(state.unkeyed.is_empty() && state.begin_keying().is_empty());
+        assert!(state.pop(now).is_some() && state.pop(now).is_some());
+    }
+
+    /// A take waits while a hint has no key. Else a ready row of lower rank
+    /// would take the permit that the hint should have (issue #2308).
+    #[test]
+    fn decider_state_defers_takes_while_hints_wait_for_a_key() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        state.activate(now);
+        state.queue(row(0, 10, false));
+        assert!(!state.ranking(), "a ranked set may take");
+        let exec = uuid::Uuid::new_v4();
+        state.hint(exec);
+        assert!(state.ranking(), "an unkeyed hint blocks a take");
+        let requested = state.begin_keying();
+        assert!(state.ranking(), "a lookup in flight blocks a take");
+        state.keyed(
+            &requested,
+            Some(vec![crate::queue::OwnerRow {
+                exec_id: exec,
+                ..row(5, 1, false)
+            }]),
+        );
+        assert!(!state.ranking(), "a ranked hint ends the wait");
+        assert_eq!(
+            state.pop(now).map(|(e, _)| e),
+            Some(exec),
+            "the best goes first"
+        );
+    }
+
+    /// Free permits cover the ready rows, the hints and the lookup in flight.
+    /// Only then does the take order not matter (issue #2308).
+    #[test]
+    fn decider_state_counts_a_lookup_in_flight_against_free_permits() {
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        state.activate(std::time::Instant::now());
+        let first = uuid::Uuid::new_v4();
+        state.hint(first);
+        let requested = state.begin_keying();
+        state.hint(uuid::Uuid::new_v4());
+        assert!(!state.permits_cover_all(1), "one permit, two executions");
+        assert!(state.permits_cover_all(2));
+        state.keyed(&requested, Some(Vec::new()));
+        assert!(
+            state.permits_cover_all(1),
+            "the lookup ended; one hint is left"
+        );
+    }
+
+    /// Each finished lookup grants one take pass. Else a steady stream of
+    /// new hints would start lookup after lookup and starve dispatch (issue
+    /// #2308).
+    #[test]
+    fn decider_state_grants_a_take_pass_between_lookups() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        state.activate(now);
+        let ranked = row(5, 1, false);
+        let first = ranked.exec_id;
+        state.hint(first);
+        let requested = state.begin_keying();
+        state.keyed(&requested, Some(vec![ranked]));
+        let late = uuid::Uuid::new_v4();
+        state.hint(late);
+        assert!(
+            state.begin_keying().is_empty(),
+            "no new lookup before a pass"
+        );
+        assert!(!state.ranking(), "the ranked set may take");
+        assert_eq!(state.pop(now).map(|(e, _)| e), Some(first));
+        state.end_pass();
+        assert_eq!(state.begin_keying(), vec![late], "the next lookup follows");
+        assert!(state.ranking());
     }
 
     /// A miss doubles the backoff up to its cap (issue #2255).
@@ -57861,8 +58264,8 @@ mod tests {
         state.scanning = true;
         assert!(!state.may_scan(now, 2), "one scan at a time");
         state.scanning = false;
-        state.queue(uuid::Uuid::new_v4());
-        state.queue(uuid::Uuid::new_v4());
+        state.queue(row(0, 1, false));
+        state.queue(row(0, 2, false));
         assert!(!state.may_scan(now, 2), "a full queue scans no more");
         state.deactivate();
         assert!(state.ready.is_empty() && !state.active);
