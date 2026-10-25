@@ -186,6 +186,7 @@ mod fork_tests;
 mod formal_models_coverage;
 mod formal_trace_coverage;
 mod fuzz_nightly_wiring;
+mod group_commit_db_tests;
 mod guardrail_catalog_tests;
 mod havoc_reentrancy;
 mod havoc_tests;

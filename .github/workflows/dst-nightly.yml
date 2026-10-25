@@ -2,7 +2,8 @@
 #
 # - `sweep`: the oracle seed sweep of the `dst` target, in release mode.
 #   Four shards run 1000000 seeds each. The owner-lease sweep of issue
-#   #2250 then runs on the same seeds.
+#   #2250 then runs on the same seeds. The group commit sweep of issue
+#   #2256 runs on the first tenth of them.
 # - `differential`: replays oracle runs on Postgres. Four shards run 500
 #   seeds each.
 # - `world`: the world simulation of issue #2002. It runs the real worker
@@ -60,7 +61,7 @@ jobs:
   sweep:
     name: Oracle sweep (shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -100,8 +101,8 @@ jobs:
         timeout-minutes: 40
         run: cargo test --release -p autumn-harvest --no-default-features --test dst seed_sweep -- --nocapture
       # Issue #2250: the owner-lease simulation runs on the same seeds.
-      # 1000000 seeds take about 3 minutes. The two step timeouts sum to
-      # less than the job timeout.
+      # 1000000 seeds take about 3 minutes. The step timeouts sum to less
+      # than the job timeout.
       # It runs even when the sweep above fails, so both results show.
       - name: Run the owner-lease sweep
         if: ${{ !cancelled() }}
@@ -110,6 +111,15 @@ jobs:
           HARVEST_DST_OWNER_SEED_BASE: ${{ env.HARVEST_DST_SEED_BASE }}
           HARVEST_DST_OWNER_SEEDS: ${{ env.HARVEST_DST_SEEDS }}
         run: cargo test --release -p autumn-harvest --no-default-features --test dst owner_sweep -- --nocapture
+      # Issue #2256: the group commit simulation. A group seed takes longer
+      # than an owner seed, so this step runs one tenth of the seeds.
+      - name: Run the group commit sweep
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: |
+          HARVEST_DST_GROUP_SEED_BASE="$HARVEST_DST_SEED_BASE" \
+          HARVEST_DST_GROUP_SEEDS="$(( HARVEST_DST_SEEDS >= 10 ? HARVEST_DST_SEEDS / 10 : 1 ))" \
+            cargo test --release -p autumn-harvest --no-default-features --test dst group_sweep -- --nocapture
 
   differential:
     name: Postgres differential (shard ${{ matrix.shard }})

@@ -1,0 +1,35 @@
+group_commit_bench: mode=direct writers=1 width=4 p50_ms=0.000 p99_ms=0.000 mean_batch=1.00 largest=0
+group_commit_bench: mode=direct writers=4 width=4 p50_ms=0.000 p99_ms=0.000 mean_batch=1.00 largest=0
+group_commit_bench: mode=direct writers=16 width=4 p50_ms=0.000 p99_ms=0.000 mean_batch=1.00 largest=0
+group_commit_bench: mode=direct writers=64 width=4 p50_ms=0.000 p99_ms=0.000 mean_batch=1.00 largest=0
+group_commit_bench: mode=solo writers=1 width=4 p50_ms=0.000 p99_ms=0.000 mean_batch=1.00 largest=0
+group_commit_bench: mode=solo writers=4 width=4 p50_ms=0.000 p99_ms=0.000 mean_batch=1.00 largest=0
+group_commit_bench: mode=solo writers=16 width=4 p50_ms=0.000 p99_ms=0.000 mean_batch=1.00 largest=0
+group_commit_bench: mode=solo writers=64 width=4 p50_ms=0.000 p99_ms=0.000 mean_batch=1.00 largest=0
+group_commit_bench: mode=group writers=1 width=4 p50_ms=0.000 p99_ms=0.000 mean_batch=1.00 largest=0
+group_commit_bench: mode=group writers=4 width=4 p50_ms=0.000 p99_ms=0.000 mean_batch=1.00 largest=0
+group_commit_bench: mode=group writers=16 width=4 p50_ms=0.000 p99_ms=0.000 mean_batch=1.00 largest=0
+group_commit_bench: mode=group writers=64 width=4 p50_ms=0.000 p99_ms=0.000 mean_batch=1.00 largest=0
+group_commit_bench: ab mode=direct decisions=1000 p50_ms=2.777 p99_ms=5.260
+group_commit_bench: ab mode=solo decisions=1000 p50_ms=2.844 p99_ms=5.321
+group_commit_bench: ab mode=group decisions=1000 p50_ms=2.802 p99_ms=5.100
+group_commit_bench: depth_ab writers=16 pair=0 solo_per_s=904.1 group_per_s=879.9 ratio=0.973
+group_commit_bench: depth_ab writers=16 pair=1 solo_per_s=816.2 group_per_s=1040.5 ratio=1.275
+group_commit_bench: depth_ab writers=16 pair=2 solo_per_s=879.7 group_per_s=991.3 ratio=1.127
+group_commit_bench: depth_ab writers=16 pair=3 solo_per_s=882.8 group_per_s=871.8 ratio=0.988
+group_commit_bench: depth_ab writers=16 pair=4 solo_per_s=836.8 group_per_s=831.0 ratio=0.993
+group_commit_bench: depth_ab writers=16 pair=5 solo_per_s=820.1 group_per_s=871.1 ratio=1.062
+group_commit_bench: depth_ab writers=16 pair=6 solo_per_s=745.1 group_per_s=768.2 ratio=1.031
+group_commit_bench: depth_ab writers=16 pair=7 solo_per_s=705.4 group_per_s=640.7 ratio=0.908
+group_commit_bench: depth_ab writers=16 pair=8 solo_per_s=759.4 group_per_s=719.1 ratio=0.947
+group_commit_bench: depth_ab writers=16 pair=9 solo_per_s=648.6 group_per_s=798.8 ratio=1.231
+group_commit_bench: depth_ab writers=64 pair=0 solo_per_s=948.4 group_per_s=1132.6 ratio=1.194
+group_commit_bench: depth_ab writers=64 pair=1 solo_per_s=824.8 group_per_s=970.6 ratio=1.177
+group_commit_bench: depth_ab writers=64 pair=2 solo_per_s=690.3 group_per_s=853.2 ratio=1.236
+group_commit_bench: depth_ab writers=64 pair=3 solo_per_s=732.3 group_per_s=925.6 ratio=1.264
+group_commit_bench: depth_ab writers=64 pair=4 solo_per_s=613.3 group_per_s=707.1 ratio=1.153
+group_commit_bench: depth_ab writers=64 pair=5 solo_per_s=552.8 group_per_s=721.3 ratio=1.305
+group_commit_bench: depth_ab writers=64 pair=6 solo_per_s=531.6 group_per_s=620.0 ratio=1.166
+group_commit_bench: depth_ab writers=64 pair=7 solo_per_s=488.5 group_per_s=597.4 ratio=1.223
+group_commit_bench: depth_ab writers=64 pair=8 solo_per_s=498.4 group_per_s=493.0 ratio=0.989
+group_commit_bench: depth_ab writers=64 pair=9 solo_per_s=428.5 group_per_s=535.9 ratio=1.251

@@ -475,6 +475,10 @@ harness = false
 name = "decision_fence_bench"
 required-features = ["db"]
 harness = false
+[[bench]]
+name = "group_commit_bench"
+required-features = ["db"]
+harness = false
 
 # Claim latency after 1M terminal task rows, before and after the task-queue
 # hygiene fix (issue #1811). `harness = false` for the same reason as

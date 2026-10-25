@@ -2603,3 +2603,8 @@ standalone note rather than part of the claim-path attribution table above:
   #2312). The walk is 10.6% of a harness that only clones and checks. The one
   idea saves at most 18.5% of the walk, so it stays unbuilt. The production
   impact is undetermined. A negative result.
+* [`docs/performance-group-commit.md`](performance-group-commit.md)
+  — group commit of one decision partition (issue #2256). Waiting decisions
+  share one transaction, with a savepoint each. Paired bursts give 1.16x
+  throughput at 16 writers and 1.33x at 64. A lone decision keeps its p50
+  (0.998 of the lane with grouping off).

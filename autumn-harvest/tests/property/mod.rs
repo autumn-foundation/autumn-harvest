@@ -7,6 +7,7 @@
 //! - Pure, non-`db`-gated suites (run under `--no-default-features`):
 //!   `policy_props`, `queue_fairness_props`, `fairness_key_props`, `task_duration_props`,
 //!   `completion_trigger_props`, `completion_callback_props`, `event_serde_props`,
+//!   `group_commit_props`,
 //!   `retry_budget_props`, `aead_codec_props`, `business_day_props`.
 //! - `db`-gated suites (only compiled with the `db` feature, because their
 //!   target modules live in `#[cfg(feature = "db")]` modules): `build_routing_props`,
@@ -22,6 +23,7 @@ mod completion_callback_props;
 mod completion_trigger_props;
 mod event_serde_props;
 mod fairness_key_props;
+mod group_commit_props;
 mod policy_props;
 mod queue_fairness_props;
 mod retry_budget_props;
