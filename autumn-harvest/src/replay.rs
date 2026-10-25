@@ -1771,6 +1771,7 @@ impl HistoryMatcher {
     /// keeps one rule of the plain walk that the scan replaced. The
     /// differential test `the_indexed_scan_matches_the_oracle` checks the
     /// scan against that walk.
+    #[inline]
     const fn activity_scan_role(event: &WorkflowEvent) -> ScanRole {
         match event {
             // Other activities may be scheduled and complete while this
@@ -1915,30 +1916,37 @@ impl HistoryMatcher {
     ) -> (Option<usize>, Option<usize>) {
         let len = self.events.len();
         let mut first_interleaved = None;
+        // `Some(stop)` once the walk ends the scan.
+        let mut ended = None;
         let mut at = from;
         while at < len {
             if self.leaves_walk(at - from, first_interleaved.is_some()) {
                 break;
             }
-            self.activity_scan_index.note_walk();
-            if self.is_consumed(at) {
-                at += 1;
-                continue;
-            }
-            match Self::activity_scan_role(&self.events[at]) {
-                ScanRole::Scheduled(id) | ScanRole::Terminal(id) if id == activity_id => {
-                    return (Some(at), first_interleaved);
+            if !self.is_consumed(at) {
+                match Self::activity_scan_role(&self.events[at]) {
+                    ScanRole::Scheduled(id) | ScanRole::Terminal(id) if id == activity_id => {
+                        ended = Some(Some(at));
+                        break;
+                    }
+                    ScanRole::Scheduled(_) | ScanRole::Interleaved => {
+                        first_interleaved.get_or_insert(at);
+                    }
+                    ScanRole::Barrier if Self::is_transparent_external_event(&self.events[at]) => {
+                        self.stash_transparent_external_event(at);
+                    }
+                    ScanRole::Barrier => {
+                        ended = Some(None);
+                        break;
+                    }
+                    ScanRole::Terminal(_) | ScanRole::Progress(_) | ScanRole::Pass => {}
                 }
-                ScanRole::Scheduled(_) | ScanRole::Interleaved => {
-                    first_interleaved.get_or_insert(at);
-                }
-                ScanRole::Barrier if Self::is_transparent_external_event(&self.events[at]) => {
-                    self.stash_transparent_external_event(at);
-                }
-                ScanRole::Barrier => return (None, first_interleaved),
-                ScanRole::Terminal(_) | ScanRole::Progress(_) | ScanRole::Pass => {}
             }
             at += 1;
+        }
+        self.activity_scan_index.note_walk(at - from);
+        if let Some(stop) = ended {
+            return (stop, first_interleaved);
         }
         if at == len {
             return (None, first_interleaved);
@@ -2810,10 +2818,10 @@ impl HistoryMatcher {
             if let Some(aid) = activity_id {
                 let range = command_cursor..terminal_cursor;
                 if range.len() <= scan_budget() || !self.activity_scan_index.is_built() {
+                    self.activity_scan_index.note_walk(range.len());
                     for idx in range {
                         #[cfg(test)]
                         crate::activity_scan_index::steps::count();
-                        self.activity_scan_index.note_walk();
                         if Self::activity_scan_role(&self.events[idx]) == ScanRole::Progress(aid) {
                             self.consumed_out_of_order_events.insert(idx);
                         }

@@ -19,9 +19,10 @@ use crate::types::ActivityExecId;
 
 /// The cost of indexing one event, in walk steps.
 ///
-/// Callgrind gives about 400 instructions to index an activity event, and
-/// about 50 to walk one event.
-const BUILD_COST_IN_WALK_STEPS: usize = 8;
+/// Callgrind gives about 1,100 instructions to index an event and later
+/// drop its entry. A walk step costs about 90. The factor rounds up, so a
+/// small fan-out stays on the walk.
+const BUILD_COST_IN_WALK_STEPS: usize = 16;
 
 /// What one event means to the activity terminal scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,11 +75,7 @@ impl ActivityScanIndex {
     /// `restore_view` brings back the same tail. So the prefix that the
     /// index holds never changes. The caller ignores a position at or after
     /// the visible length, which covers a cut.
-    pub fn extend(
-        &mut self,
-        events: &[WorkflowEvent],
-        role: impl Fn(&WorkflowEvent) -> ScanRole,
-    ) {
+    pub fn extend(&mut self, events: &[WorkflowEvent], role: impl Fn(&WorkflowEvent) -> ScanRole) {
         for (position, event) in events.iter().enumerate().skip(self.indexed) {
             #[cfg(test)]
             steps::count();
@@ -105,9 +102,9 @@ impl ActivityScanIndex {
         self.indexed = self.indexed.max(events.len());
     }
 
-    /// Counts one event that a scan or a settle walked one by one.
-    pub const fn note_walk(&mut self) {
-        self.walked = self.walked.saturating_add(1);
+    /// Counts `events` that a scan or a settle walked one by one.
+    pub const fn note_walk(&mut self, events: usize) {
+        self.walked = self.walked.saturating_add(events);
     }
 
     /// Whether the index exists.
