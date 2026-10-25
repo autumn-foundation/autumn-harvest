@@ -2202,6 +2202,10 @@ from the benchmark are directly comparable.
     dropping this predicate alone would not recover the cheap plan, while
     this page measures what it costs to keep it, holding the already-collapsed
     plan shape fixed.
+    **Follow-up (issue #1971):** these figures predate the seek window and
+    the fillfactor of 80 that issue #1811 set. The default claim now runs the
+    full scan measured here only as a fallback. See
+    [the seek window](#the-seek-window-issue-1971).
   * **Worker sessions (#606)** — measured directly, on a genuinely different
     axis from issue #1177 just below: `docs/performance-worker-sessions.md`
     seeds `session_id` and `sticky_worker_id`/`sticky_until`/`sticky_timeout`
@@ -2224,6 +2228,10 @@ from the benchmark are directly comparable.
     sessions' predicate, like `schedule_to_close`'s and sticky routing's,
     independently defeats sort-elision (see immediately below); the two are
     answers to different questions about the same predicate.
+    **Follow-up (issue #1971):** these figures predate the seek window and
+    the fillfactor of 80 that issue #1811 set. The default claim now runs the
+    full scan measured here only as a fallback. See
+    [the seek window](#the-seek-window-issue-1971).
   * **Sticky routing (#235)** — measured directly:
     [`docs/performance-sticky-routing.md`](performance-sticky-routing.md)
     seeds `sticky_worker_id`/`sticky_until`/`sticky_timeout` (session_id left
@@ -2262,6 +2270,10 @@ from the benchmark are directly comparable.
     replacing one unsupported cost claim with another would have been no
     improvement, which is why all three now carry a real measurement
     instead.
+    **Follow-up (issue #1971):** these figures predate the seek window and
+    the fillfactor of 80 that issue #1811 set. The default claim now runs the
+    full scan measured here only as a fallback. See
+    [the seek window](#the-seek-window-issue-1971).
 * **Queue count is a parameter, but it is not swept.** `Scenario.queues`
   parameterizes how many distinct queues the backlog spreads across, and every
   published row holds it at 4. Backlog depth and claimer count *are* varied.

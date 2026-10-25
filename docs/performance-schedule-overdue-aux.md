@@ -53,8 +53,9 @@ shipped recently enough that it had not yet been profiled.
   original single-item functions (`schedule_running_basis`,
   `resolve_effective_fire_at`, `pending_throttle_count_for_workflow`,
   `load_exclusions_for_calendar`) are untouched and still used by every other
-  caller (the single-schedule `GET /admin/schedules/{id}` read, the schedule
-  tick's own `overdue_schedule_pass` sampler).
+  caller, such as the single-schedule `GET /admin/schedules/{id}` read. The
+  scheduler tick's `overdue_schedule_pass` sampler used them too, until
+  PR #1433 moved it to the batched functions.
 * **Result-equivalence is exact, verified two ways**: a direct function-level
   comparison (the batched functions' output against the original functions'
   output, schedule-by-schedule, same fixture, same run) and the three
@@ -178,10 +179,11 @@ The original single-item functions
 (`schedule_running_basis`, `resolve_effective_fire_at`,
 `pending_throttle_count_for_workflow`, `load_exclusions_for_calendar`) are
 **not modified** — they are still used, unchanged, by the single-schedule
-`GET /admin/schedules/{id}` read and by the scheduler tick's own
-`overdue_schedule_pass` sampler (a separate, not-yet-profiled per-schedule
-loop on a periodic background pass rather than a per-HTTP-request path — out
-of scope for this change; see "Known limitations" below).
+`GET /admin/schedules/{id}` read. When this change shipped, the scheduler
+tick's own `overdue_schedule_pass` sampler used them too. At that time it
+was a separate, unprofiled per-schedule loop on a periodic background pass,
+not a per-HTTP-request path. It was out of scope for this change; see "Known
+limitations" below. PR #1433 later batched it with the same functions.
 
 ## Measurement
 
@@ -255,7 +257,9 @@ existing lookups are batched.
   per-HTTP-request path, so it was out of scope for this investigation
   (different workload, different profile), but it could use the same batched
   functions this change adds. Left as a follow-up rather than folded in here
-  — this change is scoped to one measured workload.
+  — this change is scoped to one measured workload. **Resolved by
+  PR #1433.** The sampler now uses these batched functions. See
+  `docs/performance-schedule-overdue-pass.md` for its profile.
 * The fixture's calendar/throttle/running-basis distributions (every 10th /
   7th / 4th schedule) are synthetic, chosen to exercise every code path
   non-trivially, not fit to a specific production fleet's shape. The O(n)

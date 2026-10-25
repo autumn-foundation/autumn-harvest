@@ -180,11 +180,11 @@ figure is not reproducible to the digit, in either direction. The pre-change
 form varies because `synchronize_seqscans` moves where a sequential scan
 starts. The as-shipped form varies because each claim walks the requests
 earlier claims resolved, so its cost depends on what is already cached. Ranges
-below are the spread over three runs on an otherwise idle server. The
+below are the spread over four runs on an otherwise idle server. The
 per-claim *plan* is stable in a way the totals are not: the as-shipped cold
 claim measured 6 to 8 buffers in every run of every fixture on this page.
 
-| scenario | buffers (3 runs) |
+| scenario | buffers (4 runs) |
 |:--|--:|
 | baseline -- no index, legacy query | ~299,000 -- ~1,079,000 |
 | this change's outer index only, legacy query | ~277,400 -- ~277,800 |

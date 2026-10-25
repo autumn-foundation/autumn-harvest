@@ -4,7 +4,7 @@
 (issue #606), alongside `schedule_to_close` (#378) and sticky routing (#235),
 as claim-path predicates left unmeasured by the earlier passes: "cheap inline
 column tests, against columns the seed leaves null." PR #1339 closed that gap
-for `schedule_to_close`, confirming it cheap (+3.6% to +5.7% buffers, well
+for `schedule_to_close`, confirming it cheap (+3.6% to +7.5% buffers, well
 under the impact floor), and narrowed the remaining unmeasured set to worker
 sessions and sticky routing. This page is the worker-sessions measurement.
 
@@ -23,6 +23,21 @@ inline test on a row the scan reads regardless. Per the acceptable-outcomes
 rule ("optimization PR, findings issue, negative result -- all are successful
 runs"), this ships as a measured, reproducible finding with no code change to
 `queue.rs`.
+
+> **Follow-up (issue #1971):** the claim plans and buffer deltas on this page
+> measure the full scan. The default claim now reads a seek window from the
+> queue heads first, and runs the full scan only as a fallback. The window
+> applies the same session test to each row it reads. Its pin head also
+> reads every live pin of the claiming worker. The `worker-session` label
+> pins every row to that worker. So the window does not bound the read for
+> this label. See
+> [a large live pin set](performance.md#what-the-seek-window-does-not-establish).
+> Migration `20261003201739` (issue #1811) later set the table's fillfactor
+> to 80. It also dropped `harvest_task_queue_session_id_pending`, which the
+> write-side cost on this page includes. Issue #2069 later added
+> `idx_harvest_tq_session_active`, which session rows also enter. The
+> captures on this page predate these changes. See
+> [the seek window](performance.md#the-seek-window-issue-1971).
 
 ## Harness corrections (four review rounds)
 
@@ -198,7 +213,8 @@ Every successful claim also runs the authoritative queue-pause recheck
 (`queue_pause::release_claim_if_queue_paused`), and, for an activity task,
 the authoritative activity-pause recheck
 (`activity_pause::release_claim_if_activity_paused`) too -- both separate
-statements, each taking its own fresh snapshot (`queue.rs:1150-1193`). A
+statements, each taking its own fresh snapshot
+(`queue::apply_post_claim_rechecks`). A
 review finding (round 19) correctly caught that an earlier revision of this
 table counted only the main statement, undercounting the real per-call cost.
 Both rechecks run on every claim in this fixture (every seeded row is an
@@ -269,6 +285,13 @@ that insert, because its `sticky_worker_id` stays `NULL`. The preceding
 session_id IS NOT NULL`), a second partial index the `no-session` control
 also never touches.
 
+Migration `20261003201739` (issue #1811) later dropped that index. Migration
+`20261008170951` (issue #2069) added `idx_harvest_tq_session_active` (`WHERE
+session_id IS NOT NULL AND state IN ('PENDING', 'RUNNING')`). A session row
+stays in that index after its claim. The claim `UPDATE` changes `state`, so
+it cannot be a HOT update. It therefore adds a new entry for the row to that
+index too. The figures on this page predate both changes.
+
 **Correction (review round 6):** an earlier revision of this section called
 this a "one-time cost... unlike capability-labels' finding of write cost
 recurring on every subsequent `UPDATE`" -- a review finding correctly caught
@@ -317,12 +340,12 @@ around:
   reasoning that a member activity's host worker is not known until the
   session's acquire step resolves it. A review finding correctly caught
   that this does not hold for `queue::enqueue()`'s actual caller:
-  `build_activity_enqueue_plan` (`worker.rs:9247-9252`) already has
+  `build_activity_enqueue_plan` (its session-member block) already has
   `session_id`, `sticky_worker_id`, and `sticky_timeout` all resolved
   *before* it calls `enqueue()`. The two-statement split is
   `queue::enqueue()`'s own choice -- `NewTaskQueueItem` hardcodes the three
-  sticky columns to `NULL` at `INSERT` time unconditionally
-  (`queue.rs:457-459`), regardless of what `EnqueueParams` already carries
+  sticky columns to `NULL` at `INSERT` time unconditionally (the literal in
+  `queue::enqueue()`), regardless of what `EnqueueParams` already carries
   -- not something the caller's control flow forces. A single `INSERT` that
   computes `sticky_until` as `NOW() + $timeout` inline, rather than through
   the follow-up `UPDATE`, looks possible in principle. This page does not
@@ -362,9 +385,11 @@ only) -- this pass did not separately measure CPU cost.
 - **The seeding fixture assumes one activity enqueued per transaction; a
   real fan-out from one workflow decision does not.** A review finding
   (round 5) correctly caught that `worker.rs::persist_scheduled_activities`
-  wraps its ENTIRE `for params in &enqueued { queue::enqueue(conn,
-  params).await? }` loop -- every scheduled activity from one decision,
-  worker-session or not -- inside a single `conn.transaction(...)`. This
+  wraps its ENTIRE fan-out -- every scheduled activity from one decision,
+  worker-session or not -- inside a single `conn.transaction(...)`. Since
+  PR #1447, one `queue::enqueue_batch` call enqueues that fan-out, not a loop
+  of single-row `queue::enqueue` calls. The call sends one multi-row `INSERT`
+  for each chunk of rows, then one sticky `UPDATE` for each pinned row. This
   page's per-row-committed procedure instead commits after every individual
   row, which understates the physical bloat a decision that schedules
   several session-member activities at once would produce: none of a

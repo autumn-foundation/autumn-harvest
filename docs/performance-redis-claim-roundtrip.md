@@ -2,7 +2,9 @@
 
 This note documents a syscall-count profiling pass over
 `autumn_harvest_redis::RedisTaskQueue`'s `claim` -- the `TaskQueueAdapter`
-entry point every worker embedding this crate calls in a tight poll loop.
+entry point that a worker built on this standalone adapter calls in a tight
+poll loop. The Harvest worker does not call it. Its optional Redis dispatch
+channel (issue #1312) uses `RedisDispatch` instead.
 Wall-clock timing is not admissible evidence on this (shared-vCPU) machine,
 and this workload is dominated by network round trips to Redis rather than
 CPU instructions, so it is not measured with `cargo bench` / criterion
@@ -24,7 +26,7 @@ sections below.
 single queue in steady state: `CLAIM_PROFILE_N` tasks (1,000 for the numbers
 below) are enqueued via the public `enqueue` entry point, then `claim` is
 called `CLAIM_PROFILE_N` times against that same queue -- the exact call
-sequence a production worker's poll loop performs once its backlog is
+sequence a poll loop on this standalone adapter performs once its backlog is
 non-empty. This is the real public entry point end-to-end (`enqueue` +
 `claim`, not a synthetic microbenchmark of an internal helper picked in
 isolation): every `claim` call pays for whatever round trips the production

@@ -26,6 +26,19 @@ from populating previously-`NULL` columns, compounded by the MVCC cost of
 There is no query-shape fix, because the `WHERE` clause already evaluates
 the predicate as a plain inline test on a row the scan reads regardless.
 
+> **Follow-up (issue #1971):** the claim plans and buffer deltas on this page
+> measure the full scan. The default claim now reads a seek window from the
+> queue heads first, and runs the full scan only as a fallback. The window
+> applies the same sticky test to each row it reads. Its pin head also reads
+> every live pin of the claiming worker. The `sticky-routing` label pins
+> every row to that worker. So the window does not bound the read for this
+> label. See
+> [a large live pin set](performance.md#what-the-seek-window-does-not-establish).
+> Migration `20261003201739` (issue #1811) later set the table's fillfactor
+> to 80. That migration and later ones also changed the table's indexes. The
+> captures on this page predate these changes. See
+> [the seek window](performance.md#the-seek-window-issue-1971).
+
 **An earlier revision of this page reported a plan-shape crossover at
 100,000 rows instead** (sticky-routing reading *fewer* buffers than
 no-sticky). Codex review on this page's own PR traced that to a seeding
@@ -311,11 +324,13 @@ measure CPU cost.
 - **The seeding fixture assumes one activity enqueued per transaction; a
   real fan-out from one workflow decision does not.**
   `worker.rs::persist_scheduled_activities` wraps its entire per-decision
-  enqueue loop in one `conn.transaction(...)`, unlike this page's
-  per-row-committed procedure. `docs/performance-worker-sessions.md`'s
-  identical limitation, and its correction on what direction batching would
-  move the write-side figure (unknown, not "at or above"), applies here
-  unchanged -- this page does not re-run that analysis independently.
+  enqueue in one `conn.transaction(...)`, unlike this page's per-row-committed
+  procedure. Since PR #1447, that enqueue is one `queue::enqueue_batch` call,
+  not a loop of single-row `queue::enqueue` calls.
+  `docs/performance-worker-sessions.md`'s identical limitation, and its
+  correction on what direction batching would move the write-side figure
+  (unknown, not "at or above"), applies here unchanged -- this page does not
+  re-run that analysis independently.
 - **The write-side `+158.9%` figure is not decomposed across its
   contributing mechanisms** (statement count, MVCC tuple version, partial
   index maintenance), for the same reason `docs/performance-worker-sessions.md`
