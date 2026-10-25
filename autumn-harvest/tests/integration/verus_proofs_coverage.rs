@@ -113,26 +113,38 @@ const LOOP_CLAUSES: &[&str] = &[
     "decreases",
 ];
 
-/// Drops each loop clause. A clause runs from its keyword to the `{` that
-/// opens the loop body. A `{` inside parentheses or brackets does not end
-/// it.
+/// Drops each loop clause.
+///
+/// A clause sits in a loop header, after `loop` or after the condition of a
+/// `while`. It runs from its keyword to the `{` that opens the loop body. A
+/// `{` inside parentheses or brackets does not end it. A clause keyword
+/// anywhere else stays, so it fails the comparison with the engine body.
 fn strip_loop_clauses(body: Vec<String>) -> Vec<String> {
     let mut out = Vec::with_capacity(body.len());
-    let mut tokens = body.into_iter().peekable();
+    let mut tokens = body.into_iter();
     while let Some(t) = tokens.next() {
-        if !LOOP_CLAUSES.contains(&t.as_str()) {
-            out.push(t);
+        let header = t == "loop" || t == "while";
+        out.push(t);
+        if !header {
             continue;
         }
         let mut depth = 0_i32;
-        while let Some(next) = tokens.peek() {
-            match next.as_str() {
+        let mut in_clause = false;
+        for t in tokens.by_ref() {
+            match t.as_str() {
                 "(" | "[" => depth += 1,
                 ")" | "]" => depth -= 1,
-                "{" if depth == 0 => break,
                 _ => {}
             }
-            tokens.next();
+            assert!(depth >= 0, "unbalanced loop header near `{t}`");
+            if depth == 0 && t == "{" {
+                out.push(t);
+                break;
+            }
+            in_clause |= depth == 0 && LOOP_CLAUSES.contains(&t.as_str());
+            if !in_clause {
+                out.push(t);
+            }
         }
     }
     out
@@ -229,6 +241,23 @@ fn normalize_drops_loop_clauses() {
         norm("fn f() { loop invariant x < 3, { x += 1; } }"),
         norm("fn f() { loop invariant x < 3, { x += 2; } }")
     );
+    // A clause keyword outside a loop header is code, so it stays.
+    for (engine, verus) in [
+        (
+            "fn f() { let r = g({ i + 1 }); }",
+            "fn f() { let r = g(invariant) + h({ i + 1 }); }",
+        ),
+        (
+            "fn f() { let r = { i + 1 }; }",
+            "fn f() { let r = decreases(i) * { i + 1 }; }",
+        ),
+        (
+            "fn f() { match x { Some(i) => { i } } }",
+            "fn f() { match x { Some(i) => ensures(i) + { i } } }",
+        ),
+    ] {
+        assert_ne!(norm(engine), norm(verus), "{verus}");
+    }
 }
 
 #[test]

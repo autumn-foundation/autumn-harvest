@@ -72,6 +72,8 @@ impl ActivityScanIndex {
         role: impl Fn(&WorkflowEvent) -> ScanRole,
     ) {
         for (position, event) in events.iter().enumerate().skip(self.indexed) {
+            #[cfg(test)]
+            steps::count();
             match role(event) {
                 ScanRole::Scheduled(id) => {
                     self.activities.entry(id).or_default().stops.push(position);
@@ -201,6 +203,28 @@ fn first_live(next: &mut [usize], from: usize, is_dead: impl Fn(usize) -> bool) 
     }
 }
 
+/// A count of the steps that activity scans take on this thread (issue
+/// #2330). A scaling test reads it. A step is a consumed-set probe, a settle
+/// step or an index build step.
+#[cfg(test)]
+pub mod steps {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STEPS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Counts one step.
+    pub fn count() {
+        STEPS.with(|steps| steps.set(steps.get() + 1));
+    }
+
+    /// The steps counted on this thread.
+    pub fn total() -> u64 {
+        STEPS.with(Cell::get)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,22 +272,28 @@ mod tests {
         /// gives the result of a plain walk.
         #[test]
         fn a_query_matches_a_plain_walk(
-            steps in proptest::collection::vec((0..4_u8, 0..64_usize), 1..200),
+            steps in proptest::collection::vec((0..4_u8, 0..1024_usize), 1..300),
         ) {
             let mut list = SkipList::default();
-            let mut positions = Vec::new();
+            let mut positions: Vec<usize> = Vec::new();
             let mut consumed = Vec::new();
             for (kind, value) in steps {
+                // Consume and query inside the pushed range, so that long
+                // dead runs form.
+                let span = positions.last().map_or(1, |last| last + 2);
                 match kind {
                     0 => {
-                        let position = positions.last().map_or(value, |last| last + 1 + value);
+                        let position = positions.last().map_or(0, |last| last + 1 + value % 3);
                         positions.push(position);
                         list.push(position);
                     }
-                    1 => consumed.push(value),
+                    1 if !positions.is_empty() => {
+                        consumed.push(positions[value % positions.len()]);
+                    }
                     _ => {
-                        let got = list.first_unconsumed(value, |p| consumed.contains(&p));
-                        proptest::prop_assert_eq!(got, first_by_walk(&positions, value, &consumed));
+                        let from = value % span;
+                        let got = list.first_unconsumed(from, |p| consumed.contains(&p));
+                        proptest::prop_assert_eq!(got, first_by_walk(&positions, from, &consumed));
                     }
                 }
             }

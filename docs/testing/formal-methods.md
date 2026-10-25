@@ -913,9 +913,12 @@ The guard suite fails in these cases:
 - This page does not name a Verus file or a mirrored function.
 
 A Verus loop states its `invariant`, `invariant_except_break`, `ensures`
-and `decreases` clauses before its body. The guard drops each clause from the keyword to the `{` of the loop
-body, so a mirror can hold a loop (issue #2330). Verus erases a clause, as
-it erases a `proof { }` block. An engine body that holds a clause keyword
+and `decreases` clauses in its header, before its body. The guard drops
+each clause from its keyword to the `{` of the loop body, so a mirror can
+hold a loop (issue #2330). Verus erases a clause, as it erases a
+`proof { }` block. The guard drops a clause only inside a `loop` or
+`while` header. A clause keyword anywhere else stays, so a Verus copy
+cannot hide code behind it. An engine body that holds a clause keyword
 fails the guard, so the drop changes only the Verus copy.
 
 A change to a mirrored function therefore fails the no-DB suite until the

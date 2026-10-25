@@ -93,15 +93,18 @@ hasher needs its own argument about adversarial ids.
 
 ## 🧪 Tests
 
-- `replay_probes_grow_near_linearly_with_the_fan_out` counts the consumed-set
-  probes of a full replay at N=256 and N=512, for four shapes. The old scan
-  failed it with a ratio of 3.98.
+- `replay_steps_grow_near_linearly_with_the_fan_out` counts the scan steps of
+  a full replay at N=256 and N=512, for four shapes. A step is a consumed-set
+  probe, a settle step or an index build step. The old scan failed it with a
+  ratio of 3.98.
 - `the_indexed_scan_matches_the_oracle` is a differential property test. It
   runs random histories and random matcher calls, cut views included, through
   the new scan and through a copy of the old one. The copy keeps the logic and
   changes only the receiver and the names. The test compares each result and
-  every field that a scan or a settle can change. A wrong role in either the walk or the
-  index fails it.
+  every field that a scan or a settle can change. Each case picks a walk
+  budget of 0, 1, 3 or 16, so most scans reach the index. The generator holds
+  every event class that the old scan treated in its own way. Mutants of the
+  walk, the index and the roles fail it.
 - `activity_scan_index::tests::a_query_matches_a_plain_walk` checks the skip
   list against a plain walk.
 

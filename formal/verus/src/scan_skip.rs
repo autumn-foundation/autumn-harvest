@@ -12,6 +12,9 @@
 //! links sound. The theorems prove that a new list is sound, that an added
 //! entry keeps it sound, and that more dead entries keep it sound. So the
 //! links stay sound for the life of the index.
+//!
+//! The query calls `is_dead` only on a real entry, never on the end slot. So
+//! the engine closure never reads past its list.
 
 use vstd::prelude::*;
 
@@ -104,7 +107,7 @@ pub fn first_live(
     requires
         links(old(next)@, dead),
         from < old(next).len(),
-        forall|j: usize| is_dead.requires((j,)),
+        forall|j: usize| j + 1 < old(next).len() ==> is_dead.requires((j,)),
         forall|j: usize, b: bool| is_dead.ensures((j,), b) ==> b == dead.contains(j as int),
     ensures
         links(final(next)@, dead),
@@ -120,7 +123,7 @@ pub fn first_live(
             next.len() == old(next).len(),
             from <= i < next.len(),
             forall|m: int| from <= m < i ==> #[trigger] dead.contains(m),
-            forall|j: usize| is_dead.requires((j,)),
+            forall|j: usize| j + 1 < next.len() ==> is_dead.requires((j,)),
             forall|j: usize, b: bool| is_dead.ensures((j,), b) ==> b == dead.contains(j as int),
         decreases next.len() - i,
     {

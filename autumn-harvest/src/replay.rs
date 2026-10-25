@@ -63,6 +63,17 @@ type EventIndexSet = HashSet<usize, BuildHasherDefault<EventIndexHasher>>;
 /// longer one.
 const LINEAR_SCAN_BUDGET: usize = 16;
 
+/// The walk budget of an activity scan or settle.
+///
+/// A test can lower it. A budget of 0 sends every scan to the index.
+fn scan_budget() -> usize {
+    #[cfg(test)]
+    if let Some(budget) = activity_scan_tests::budget_override() {
+        return budget;
+    }
+    LINEAR_SCAN_BUDGET
+}
+
 /// Result of matching a workflow command against the event history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryMatch {
@@ -1492,7 +1503,7 @@ impl HistoryMatcher {
     /// Returns `true` if the event at `index` has already been consumed out-of-order.
     fn is_consumed(&self, index: usize) -> bool {
         #[cfg(test)]
-        activity_scan_tests::count_probe();
+        crate::activity_scan_index::steps::count();
         self.consumed_out_of_order_events.contains(&index)
             || self.consumed_signal_events.contains(&index)
             || self.transparent_events.contains(&index)
@@ -1904,7 +1915,7 @@ impl HistoryMatcher {
         from: usize,
     ) -> (Option<usize>, Option<usize>) {
         let len = self.events.len();
-        let walk_end = from.saturating_add(LINEAR_SCAN_BUDGET).min(len);
+        let walk_end = from.saturating_add(scan_budget()).min(len);
         let mut first_interleaved = None;
         for at in from..walk_end {
             if self.is_consumed(at) {
@@ -2775,8 +2786,10 @@ impl HistoryMatcher {
             // and does not walk the range (issue #2330).
             if let Some(aid) = activity_id {
                 let range = command_cursor..terminal_cursor;
-                if range.len() <= LINEAR_SCAN_BUDGET {
+                if range.len() <= scan_budget() {
                     for idx in range {
+                        #[cfg(test)]
+                        crate::activity_scan_index::steps::count();
                         if Self::activity_scan_role(&self.events[idx]) == ScanRole::Progress(aid) {
                             self.consumed_out_of_order_events.insert(idx);
                         }
@@ -15413,20 +15426,29 @@ mod activity_scan_tests {
     use std::cell::Cell;
 
     thread_local! {
-        /// The calls of `HistoryMatcher::is_consumed` on this thread.
-        static PROBES: Cell<u64> = const { Cell::new(0) };
+        /// The walk budget that `scan_budget` returns on this thread.
+        static BUDGET: Cell<Option<usize>> = const { Cell::new(None) };
     }
 
-    /// Counts one call of `HistoryMatcher::is_consumed`.
-    pub(super) fn count_probe() {
-        PROBES.with(|probes| probes.set(probes.get() + 1));
+    /// The walk budget that a test set on this thread, if any.
+    pub(super) fn budget_override() -> Option<usize> {
+        BUDGET.with(Cell::get)
     }
 
-    /// The consumed-set probes that `run` makes.
-    fn probes_of(run: impl FnOnce()) -> u64 {
-        let before = PROBES.with(Cell::get);
+    /// Runs `run` with the walk budget `budget`.
+    fn with_budget<R>(budget: usize, run: impl FnOnce() -> R) -> R {
+        let before = BUDGET.with(|b| b.replace(Some(budget)));
+        let result = run();
+        BUDGET.with(|b| b.set(before));
+        result
+    }
+
+    /// The scan steps that `run` takes. A step is a consumed-set probe, a
+    /// settle step or an index build step.
+    fn steps_of(run: impl FnOnce()) -> u64 {
+        let before = crate::activity_scan_index::steps::total();
         run();
-        PROBES.with(Cell::get) - before
+        crate::activity_scan_index::steps::total() - before
     }
 
     // The scan and settle code before issue #2330, as the test oracle.
@@ -15705,10 +15727,10 @@ mod activity_scan_tests {
         events
     }
 
-    /// The probes of a full replay of `shape` with `n` activities.
-    fn replay_probes(shape: Shape, n: usize) -> u64 {
+    /// The scan steps of a full replay of `shape` with `n` activities.
+    fn replay_steps(shape: Shape, n: usize) -> u64 {
         let mut matcher = HistoryMatcher::new(history(shape, n));
-        probes_of(|| {
+        steps_of(|| {
             for _ in 0..n {
                 let result = matcher.match_activity("charge");
                 assert!(
@@ -15719,22 +15741,22 @@ mod activity_scan_tests {
         })
     }
 
-    /// A replay of N activities costs O(N log N) probes or less, not O(N²).
-    /// A doubling of N then costs less than 2.5 times the probes. A
+    /// A replay of N activities costs O(N log N) steps or less, not O(N²).
+    /// A doubling of N then costs less than 2.5 times the steps. A
     /// quadratic scan costs about 4 times.
     #[test]
-    fn replay_probes_grow_near_linearly_with_the_fan_out() {
+    fn replay_steps_grow_near_linearly_with_the_fan_out() {
         for shape in [
             Shape::FanOut,
             Shape::FanOutReversed,
             Shape::FanOutWithSignals,
             Shape::Sequential,
         ] {
-            let small = replay_probes(shape, 256);
-            let large = replay_probes(shape, 512);
+            let small = replay_steps(shape, 256);
+            let large = replay_steps(shape, 512);
             assert!(
                 large * 2 < small * 5,
-                "{shape:?}: {small} probes at N=256, {large} at N=512"
+                "{shape:?}: {small} steps at N=256, {large} at N=512"
             );
         }
     }
@@ -15956,6 +15978,36 @@ mod activity_scan_tests {
         }
     }
 
+    /// An interleaved schedule past the walk becomes the cursor after the
+    /// scan. Only the index can find it.
+    #[test]
+    fn an_interleaved_schedule_past_the_walk_becomes_the_cursor() {
+        let a = ActivityExecId::new();
+        let b = ActivityExecId::new();
+        let mut matcher = HistoryMatcher::new(join(vec![
+            vec![scheduled(a, "x")],
+            padding(20),
+            vec![
+                scheduled(b, "y"),
+                completed(a, serde_json::json!("a")),
+                completed(b, serde_json::json!("b")),
+            ],
+        ]));
+        assert_eq!(
+            matcher.match_activity("x"),
+            HistoryMatch::Matched {
+                output: serde_json::json!("a")
+            }
+        );
+        assert_eq!(matcher.cursor, 21);
+        assert_eq!(
+            matcher.match_activity("y"),
+            HistoryMatch::Matched {
+                output: serde_json::json!("b")
+            }
+        );
+    }
+
     /// One recorded event, over small pools of ids.
     #[derive(Debug, Clone)]
     enum Ev {
@@ -15980,6 +16032,21 @@ mod activity_scan_tests {
         Update,
         Paused,
         Completion,
+        Detached(usize),
+        ChildFailed(usize),
+        LocalFailed(usize),
+        SignalRequested(usize),
+        SignalDelivered(usize),
+        SignalFailed(usize),
+        CancelFailed(usize),
+        AwaitRequested(usize),
+        AwaitResolved(usize),
+        AwaitFailed(usize),
+        UpdateCompleted,
+        UpdateFailed,
+        Failure,
+        /// A run of update events that every scan steps over.
+        Pad(usize),
     }
 
     fn ev() -> impl Strategy<Value = Ev> {
@@ -16006,6 +16073,20 @@ mod activity_scan_tests {
             1 => Just(Ev::Update),
             1 => Just(Ev::Paused),
             1 => Just(Ev::Completion),
+            1 => id().prop_map(Ev::Detached),
+            1 => id().prop_map(Ev::ChildFailed),
+            1 => id().prop_map(Ev::LocalFailed),
+            1 => id().prop_map(Ev::SignalRequested),
+            1 => id().prop_map(Ev::SignalDelivered),
+            1 => id().prop_map(Ev::SignalFailed),
+            1 => id().prop_map(Ev::CancelFailed),
+            1 => id().prop_map(Ev::AwaitRequested),
+            1 => id().prop_map(Ev::AwaitResolved),
+            1 => id().prop_map(Ev::AwaitFailed),
+            1 => Just(Ev::UpdateCompleted),
+            1 => Just(Ev::UpdateFailed),
+            1 => Just(Ev::Failure),
+            3 => (1..24_usize).prop_map(Ev::Pad),
         ]
     }
 
@@ -16014,6 +16095,8 @@ mod activity_scan_tests {
         activities: Vec<ActivityExecId>,
         children: Vec<ExecutionId>,
         cancels: Vec<ExternalCancelId>,
+        signals: Vec<ExternalSignalId>,
+        awaits: Vec<ExternalAwaitId>,
         targets: Vec<crate::types::ExternalTarget>,
     }
 
@@ -16028,7 +16111,21 @@ mod activity_scan_tests {
                     .collect(),
                 children,
                 cancels: (0..3).map(|_| ExternalCancelId::new()).collect(),
+                signals: (0..3).map(|_| ExternalSignalId::new()).collect(),
+                awaits: (0..3).map(|_| ExternalAwaitId::new()).collect(),
             }
+        }
+
+        /// The events of `evs`, in order. A pad becomes several events.
+        fn history(&self, evs: &[Ev]) -> Vec<WorkflowEvent> {
+            let mut events = Vec::new();
+            for ev in evs {
+                match ev {
+                    Ev::Pad(n) => events.extend((0..*n).map(|_| self.event(&Ev::Update, 0))),
+                    other => events.push(self.event(other, events.len())),
+                }
+            }
+            events
         }
 
         fn event(&self, ev: &Ev, at: usize) -> WorkflowEvent {
@@ -16117,6 +16214,73 @@ mod activity_scan_tests {
                     actor: "op".into(),
                 },
                 Ev::Completion => WorkflowEvent::WorkflowCompleted { output: payload },
+                Ev::Detached(i) => WorkflowEvent::ChildWorkflowSpawnedDetached {
+                    child_id: self.children[*i],
+                    workflow_name: "child".into(),
+                    input: Value::Null,
+                    parent_close_policy: ParentClosePolicy::Abandon,
+                },
+                Ev::ChildFailed(i) => WorkflowEvent::ChildWorkflowFailed {
+                    child_id: self.children[*i],
+                    error: format!("e{at}"),
+                    error_type: None,
+                    details: None,
+                    non_retryable: None,
+                },
+                Ev::LocalFailed(i) => WorkflowEvent::LocalActivityFailed {
+                    activity_id: a(*i),
+                    error: format!("e{at}"),
+                    attempt: 1,
+                },
+                Ev::SignalRequested(i) => WorkflowEvent::ExternalSignalRequested {
+                    signal_id: self.signals[*i],
+                    target: self.targets[*i].clone(),
+                    signal_name: "go".into(),
+                    payload,
+                    idempotency_key: None,
+                },
+                Ev::SignalDelivered(i) => WorkflowEvent::ExternalSignalDelivered {
+                    signal_id: self.signals[*i],
+                },
+                Ev::SignalFailed(i) => WorkflowEvent::ExternalSignalFailed {
+                    signal_id: self.signals[*i],
+                    reason_code: "gone".into(),
+                },
+                Ev::CancelFailed(i) => WorkflowEvent::ExternalCancelFailed {
+                    cancel_id: self.cancels[*i],
+                    reason_code: "gone".into(),
+                },
+                Ev::AwaitRequested(i) => WorkflowEvent::ExternalAwaitRequested {
+                    await_id: self.awaits[*i],
+                    target: self.children[*i],
+                },
+                Ev::AwaitResolved(i) => WorkflowEvent::ExternalAwaitResolved {
+                    await_id: self.awaits[*i],
+                    output: payload,
+                },
+                Ev::AwaitFailed(i) => WorkflowEvent::ExternalAwaitFailed {
+                    await_id: self.awaits[*i],
+                    reason_code: "gone".into(),
+                    message: None,
+                    error_type: None,
+                    details: None,
+                    non_retryable: None,
+                },
+                Ev::UpdateCompleted => WorkflowEvent::UpdateCompleted {
+                    update_id: UpdateId::new(),
+                    output: payload,
+                },
+                Ev::UpdateFailed => WorkflowEvent::UpdateFailed {
+                    update_id: UpdateId::new(),
+                    error: format!("e{at}"),
+                },
+                Ev::Failure => WorkflowEvent::WorkflowFailed {
+                    error: format!("e{at}"),
+                    error_type: None,
+                    details: None,
+                    non_retryable: None,
+                },
+                Ev::Pad(_) => unreachable!("`history` expands a pad"),
             }
         }
     }
@@ -16125,6 +16289,8 @@ mod activity_scan_tests {
     #[derive(Debug, Clone)]
     enum Op {
         Activity(bool),
+        /// Matches the activity name at the cursor, so that the scan runs.
+        AtCursor,
         Signal(bool),
         Timer(usize),
         Local,
@@ -16136,7 +16302,8 @@ mod activity_scan_tests {
 
     fn op() -> impl Strategy<Value = Op> {
         prop_oneof![
-            8 => any::<bool>().prop_map(Op::Activity),
+            4 => any::<bool>().prop_map(Op::Activity),
+            6 => Just(Op::AtCursor),
             1 => any::<bool>().prop_map(Op::Signal),
             1 => (0..3_usize).prop_map(Op::Timer),
             1 => Just(Op::Local),
@@ -16176,9 +16343,21 @@ mod activity_scan_tests {
         op: &Op,
         oracle: bool,
     ) -> String {
+        let at_cursor = || {
+            let at = (m.cursor..m.events.len()).find(|&i| !m.is_consumed(i))?;
+            match &m.events[at] {
+                WorkflowEvent::ActivityScheduled { name, .. } => Some(name == "y"),
+                _ => None,
+            }
+        };
+        let activity = match op {
+            Op::Activity(y) => Some(*y),
+            Op::AtCursor => Some(at_cursor().unwrap_or(false)),
+            _ => None,
+        };
         let result = match op {
-            Op::Activity(y) => {
-                let name = if *y { "y" } else { "x" };
+            Op::Activity(_) | Op::AtCursor => {
+                let name = if activity == Some(true) { "y" } else { "x" };
                 if oracle {
                     oracle_match_activity(m, name)
                 } else {
@@ -16213,21 +16392,23 @@ mod activity_scan_tests {
         /// as the oracle scan, after every call.
         #[test]
         fn the_indexed_scan_matches_the_oracle(
-            evs in proptest::collection::vec(ev(), 0..80),
+            first in (0..3_usize, any::<bool>()).prop_map(|(i, y)| Ev::Scheduled(i, y)),
+            evs in proptest::collection::vec(ev(), 0..60),
             ops in proptest::collection::vec(op(), 1..60),
+            budget in proptest::sample::select(vec![0_usize, 1, 3, LINEAR_SCAN_BUDGET]),
         ) {
             let pools = Pools::new();
-            let events: Vec<WorkflowEvent> = evs
-                .iter()
-                .enumerate()
-                .map(|(at, ev)| pools.event(ev, at))
-                .collect();
+            let mut all = vec![first];
+            all.extend(evs);
+            let events = pools.history(&all);
             let mut indexed = HistoryMatcher::new(events.clone());
             let mut oracle = HistoryMatcher::new(events);
             let mut indexed_cut = None;
             let mut oracle_cut = None;
             for (step, op) in ops.iter().enumerate() {
-                let got = apply(&mut indexed, &mut indexed_cut, &pools, op, false);
+                let got = with_budget(budget, || {
+                    apply(&mut indexed, &mut indexed_cut, &pools, op, false)
+                });
                 let want = apply(&mut oracle, &mut oracle_cut, &pools, op, true);
                 prop_assert_eq!(&got, &want, "step {} {:?}", step, op);
                 prop_assert_eq!(state(&indexed), state(&oracle), "step {} {:?}", step, op);
