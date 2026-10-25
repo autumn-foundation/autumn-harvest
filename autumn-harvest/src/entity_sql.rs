@@ -27,7 +27,8 @@
 //!   after [`MAX_QUERY_TIME`], or when SQLite memory grows by more than
 //!   [`MAX_QUERY_MEMORY`]. A result stops past [`MAX_ROWS`] rows or
 //!   [`MAX_RESULT_BYTES`] bytes. A string or blob holds at most
-//!   [`MAX_VALUE_BYTES`] bytes, or the size of a larger snapshot.
+//!   [`MAX_VALUE_BYTES`] bytes. A larger snapshot raises that limit to a
+//!   few times its row, and the checks then run more often.
 //! - **One statement.** A second statement is refused.
 //! - **Blobs as hex.** A blob result is a lowercase hex string.
 //!
@@ -63,8 +64,8 @@ pub const MAX_SQL_BYTES: i32 = 100_000;
 
 /// The longest string or blob that a query makes, in bytes.
 ///
-/// A snapshot larger than this raises the limit to its own size, so a query
-/// can still read it.
+/// A larger snapshot raises the limit with its row, so a query can still
+/// read and sort it.
 pub const MAX_VALUE_BYTES: i32 = 1024 * 1024;
 
 /// The most bytes of text and blobs that one result holds.
@@ -229,16 +230,16 @@ pub(crate) fn run_cancellable(
     source: EntitySqlSource,
     cancel: &Arc<AtomicBool>,
 ) -> Result<EntitySqlRows, EntitySqlError> {
-    let conn = open(record)?;
+    let (conn, budget) = open(record)?;
     let deadline = Instant::now() + MAX_QUERY_TIME;
     let memory_at_start = sqlite_memory_used();
     let cancel = Arc::clone(cancel);
     let mut ticks: u64 = 0;
     conn.progress_handler(
-        STEP_INTERVAL,
+        budget.step_interval,
         Some(move || {
             ticks += 1;
-            ticks > MAX_TICKS
+            ticks > budget.max_ticks
                 || Instant::now() >= deadline
                 || cancel.load(Ordering::Relaxed)
                 || sqlite_memory_used().saturating_sub(memory_at_start) > MAX_QUERY_MEMORY
@@ -293,15 +294,53 @@ pub(crate) fn run_cancellable(
     })
 }
 
-/// How often the progress handler runs, in virtual machine steps.
+/// How often the progress handler runs, in virtual machine steps, at the
+/// default length limit.
 ///
 /// One step can make a value of [`MAX_VALUE_BYTES`]. A short interval keeps
 /// the memory growth between two checks small.
 const STEP_INTERVAL: i32 = 100;
 
-/// The progress handler calls that [`MAX_STEPS`] allows. The divisor is
-/// [`STEP_INTERVAL`]. A unit test checks that the two agree.
-const MAX_TICKS: u64 = MAX_STEPS / 100;
+/// The length limit is at least this many times the stored row. A sort or a
+/// `DISTINCT` encodes whole records, and a record can hold a value twice.
+const RECORD_FACTOR: usize = 4;
+
+/// Room for the record headers on top of [`RECORD_FACTOR`].
+const RECORD_SLACK: usize = 64 * 1024;
+
+/// The limits of one query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Budget {
+    /// `SQLITE_LIMIT_LENGTH`: the longest string, blob or record.
+    value_limit: i32,
+    /// The steps between two progress checks.
+    step_interval: i32,
+    /// The progress checks that [`MAX_STEPS`] allows.
+    max_ticks: u64,
+}
+
+/// The budget of a query over a row of `row_bytes` bytes.
+///
+/// A valid snapshot can be larger than [`MAX_VALUE_BYTES`]. SQLite must
+/// still read and sort it, so the length limit grows with the row. The
+/// check interval shrinks by the same factor. The memory growth between
+/// two checks then stays near its value at the default limit.
+fn budget(row_bytes: usize) -> Budget {
+    let wanted = row_bytes
+        .saturating_mul(RECORD_FACTOR)
+        .saturating_add(RECORD_SLACK);
+    let value_limit = i32::try_from(wanted)
+        .unwrap_or(i32::MAX)
+        .max(MAX_VALUE_BYTES);
+    let scaled = i64::from(STEP_INTERVAL) * i64::from(MAX_VALUE_BYTES) / i64::from(value_limit);
+    let step_interval = i32::try_from(scaled.max(1)).unwrap_or(STEP_INTERVAL);
+    let max_ticks = MAX_STEPS / u64::try_from(step_interval).unwrap_or(1);
+    Budget {
+        value_limit,
+        step_interval,
+        max_ticks,
+    }
+}
 
 /// The bytes that every value costs in the result budget, on top of its
 /// text or blob.
@@ -345,7 +384,7 @@ const DENIED_FUNCTIONS: &[&str] = &["load_extension", "fts3_tokenizer"];
 ///
 /// The setup runs before the authorizer. After it, only reads and functions
 /// pass.
-fn open(record: &EntityRecord) -> Result<Connection, EntitySqlError> {
+fn open(record: &EntityRecord) -> Result<(Connection, Budget), EntitySqlError> {
     let conn = Connection::open_in_memory().map_err(|e| sql_error(&e))?;
     conn.execute_batch("PRAGMA temp_store = MEMORY;")
         .map_err(|e| sql_error(&e))?;
@@ -353,7 +392,15 @@ fn open(record: &EntityRecord) -> Result<Connection, EntitySqlError> {
     let state_json = serde_json::to_string(&record.snapshot.state).map_err(HarvestError::from)?;
     let counters_json =
         serde_json::to_string(&record.snapshot.stats).map_err(HarvestError::from)?;
-    let (state_bytes, counters_bytes) = (state_json.len(), counters_json.len());
+    let row_bytes = [
+        record.workflow_name.len(),
+        record.workflow_id.len(),
+        state_json.len(),
+        counters_json.len(),
+    ]
+    .iter()
+    .fold(0_usize, |sum, len| sum.saturating_add(*len));
+    let budget = budget(row_bytes);
     conn.execute(
         "INSERT INTO entity VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
@@ -369,21 +416,16 @@ fn open(record: &EntityRecord) -> Result<Connection, EntitySqlError> {
     .map_err(|e| sql_error(&e))?;
     conn.execute_batch("PRAGMA query_only = ON;")
         .map_err(|e| sql_error(&e))?;
-    // A valid snapshot can be larger than the value cap. SQLite must still
-    // read it, so the length limit grows to the largest stored value.
-    let value_limit = i32::try_from(state_bytes.max(counters_bytes))
-        .unwrap_or(i32::MAX)
-        .max(MAX_VALUE_BYTES);
     for (limit, value) in [
         (Limit::SQLITE_LIMIT_ATTACHED, 0),
         (Limit::SQLITE_LIMIT_SQL_LENGTH, MAX_SQL_BYTES),
-        (Limit::SQLITE_LIMIT_LENGTH, value_limit),
+        (Limit::SQLITE_LIMIT_LENGTH, budget.value_limit),
     ] {
         conn.set_limit(limit, value).map_err(|e| sql_error(&e))?;
     }
     conn.authorizer(Some(authorize))
         .map_err(|e| sql_error(&e))?;
-    Ok(conn)
+    Ok((conn, budget))
 }
 
 /// Allow reads and functions. Deny every other action.
@@ -749,16 +791,50 @@ mod tests {
         )
         .expect("the whole state");
         assert_eq!(whole.rows.len(), 1);
-        // A new value larger than the state is refused.
-        match run(
-            &large,
-            "SELECT state || state || state FROM entity",
-            &[],
-            EntitySqlSource::File,
-        ) {
+        // Sorts and DISTINCT encode whole records, so they need room too.
+        for sql in [
+            "SELECT DISTINCT state FROM entity",
+            "SELECT state FROM entity ORDER BY state",
+            "SELECT state, workflow_id FROM entity ORDER BY 1, 2",
+        ] {
+            let rows = run(&large, sql, &[], EntitySqlSource::File)
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(rows.rows.len(), 1, "{sql}");
+        }
+        // A new value far larger than the row is refused.
+        let mut grow = String::from("SELECT state");
+        for _ in 0..RECORD_FACTOR {
+            grow.push_str(" || state");
+        }
+        grow.push_str(" FROM entity");
+        match run(&large, &grow, &[], EntitySqlSource::File) {
             Err(EntitySqlError::Sql(_)) => {}
             other => panic!("expected a size error, got {other:?}"),
         }
+    }
+
+    /// A larger length limit gets a shorter check interval, so the memory
+    /// growth between two checks stays the same. The step budget holds.
+    #[test]
+    fn the_budget_scales_with_the_row() {
+        let small = budget(1_000);
+        assert_eq!(small.value_limit, MAX_VALUE_BYTES);
+        assert_eq!(small.step_interval, STEP_INTERVAL);
+        assert_eq!(
+            small.max_ticks * u64::try_from(STEP_INTERVAL).expect("positive"),
+            MAX_STEPS
+        );
+        let cap = usize::try_from(MAX_VALUE_BYTES).expect("positive");
+        let large = budget(cap * 2);
+        assert!(large.value_limit >= i32::try_from(cap * 2 * RECORD_FACTOR).expect("fits"));
+        assert!(large.step_interval < STEP_INTERVAL);
+        assert!(large.step_interval >= 1);
+        let interval = u64::try_from(large.step_interval).expect("positive");
+        assert!(large.max_ticks * interval <= MAX_STEPS);
+        assert!(large.max_ticks * interval > MAX_STEPS - interval);
+        let huge = budget(usize::MAX / 2);
+        assert_eq!(huge.value_limit, i32::MAX);
+        assert_eq!(huge.step_interval, 1);
     }
 
     #[test]
@@ -844,12 +920,6 @@ mod tests {
     #[test]
     fn a_pragma_function_is_refused() {
         refused("SELECT * FROM pragma_table_info('entity')");
-    }
-
-    #[test]
-    fn the_step_budget_matches_the_interval() {
-        let interval = u64::try_from(STEP_INTERVAL).expect("positive");
-        assert_eq!(MAX_TICKS * interval, MAX_STEPS);
     }
 
     #[test]
