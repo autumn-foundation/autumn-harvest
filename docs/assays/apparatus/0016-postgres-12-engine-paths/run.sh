@@ -3,13 +3,13 @@
 # usage: run.sh <pg-bin-dir> <port> <outdir> <label> <runs> [module-regex]
 set -u
 BIN=$1; PORT=$2; OUT=$3; LABEL=$4; RUNS=$5; ONLY=${6:-.}
-HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(git rev-parse --show-toplevel)
+HERE=$(cd "$(dirname "$0")" && pwd); ROOT=${ROOT:?repo root}
 TESTBIN=${TESTBIN:?path to the integration test binary}
 MIG=$ROOT/autumn-harvest/migrations
 mkdir -p "$OUT"; D=$OUT/data; rm -rf "$D"; export LD_LIBRARY_PATH=$BIN/../lib
 "$BIN/initdb" -D "$D" -U postgres -A trust >/dev/null
 "$BIN/pg_ctl" -D "$D" -o "-p $PORT -k /tmp -c listen_addresses=127.0.0.1 -c max_connections=300" -l "$OUT/pg.log" -w start >/dev/null || exit 2
-P="psql -h 127.0.0.1 -p $PORT -U postgres -X -q"
+P="$BIN/psql -h 127.0.0.1 -p $PORT -U postgres -X -q"
 $P -d postgres -Atc "select version()" > "$OUT/version.txt"
 FILTERS=$(grep -E "$ONLY" "$HERE/modules.txt" | sed 's/$/::/' | tr '\n' ' ')
 for run in $(seq 1 "$RUNS"); do
