@@ -4,8 +4,8 @@
 #
 # The depth gauge stops at 10,000. Below the cap the rule fires on depth
 # growth. At the cap it fires when the oldest pending age grows, or when the
-# age stays 0, because then no row is claimable. Each case has one series of
-# each gauge for queue `default`.
+# age stays 0 on a queue that is not paused, because then no row is
+# claimable. Each case has one series of each gauge for queue `default`.
 # Series values use promtool notation: 'a+bxn' is a, a+b, ..., a+n*b.
 # 'axn' is a, n+1 times. '_xn' is n missing samples. The interval is 1m.
 
@@ -40,6 +40,8 @@ tests:
         alertname: harvest_queue_backlog_growth
         exp_alerts: []
 
+  # A large burst that drains slowly looks the same at the cap: its oldest
+  # task waits longer while the depth falls unseen. Both fire.
   - name: at the cap, a growing oldest pending age fires
     interval: 1m
     input_series:
@@ -53,7 +55,7 @@ tests:
         exp_alerts:
           - exp_labels: {severity: ticket, queue: default}
 
-  - name: at the cap, a draining queue stays silent
+  - name: at the cap, a queue whose oldest task waits less stays silent
     interval: 1m
     input_series:
       - series: 'harvest_queue_depth{queue="default"}'
@@ -91,6 +93,21 @@ tests:
         alertname: harvest_queue_backlog_growth
         exp_alerts:
           - exp_labels: {severity: ticket, queue: default}
+
+  # A deliberate queue pause has its own alert, harvest_queue_paused_too_long.
+  - name: at the cap, a paused queue with no claimable row stays silent
+    interval: 1m
+    input_series:
+      - series: 'harvest_queue_depth{queue="default"}'
+        values: '10000x40'
+      - series: 'harvest_queue_oldest_pending_age{queue="default"}'
+        values: '0x40'
+      - series: 'harvest_queue_paused{queue="default"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: harvest_queue_backlog_growth
+        exp_alerts: []
 
   - name: below the cap, a steady backlog with no claimable row stays silent
     interval: 1m

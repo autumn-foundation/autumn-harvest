@@ -1,0 +1,1099 @@
+Pager usage is off.
+ALTER TABLE
+=== fifo: exact, walk as planned, walk with sorts off, shipped query (each twice)
+TRUNCATE TABLE
+ setseed 
+---------
+ 
+(1 row)
+
+INSERT 0 300000
+INSERT 0 300000
+ANALYZE
+                                                                                              QUERY PLAN                                                                                              
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize GroupAggregate (actual rows=20 loops=1)
+   Group Key: queue_name
+   Buffers: shared hit=9456 read=4696 written=58
+   ->  Gather Merge (actual rows=60 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=9456 read=4696 written=58
+         ->  Sort (actual rows=20 loops=3)
+               Sort Key: queue_name
+               Sort Method: quicksort  Memory: 25kB
+               Buffers: shared hit=9456 read=4696 written=58
+               Worker 0:  Sort Method: quicksort  Memory: 25kB
+               Worker 1:  Sort Method: quicksort  Memory: 25kB
+               ->  Partial HashAggregate (actual rows=20 loops=3)
+                     Group Key: queue_name
+                     Batches: 1  Memory Usage: 24kB
+                     Buffers: shared hit=9440 read=4696 written=58
+                     Worker 0:  Batches: 1  Memory Usage: 24kB
+                     Worker 1:  Batches: 1  Memory Usage: 24kB
+                     ->  Parallel Seq Scan on harvest_task_queue (actual rows=95000 loops=3)
+                           Filter: ((state = 'PENDING'::text) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (scheduled_at <= now()))
+                           Rows Removed by Filter: 105000
+                           Buffers: shared hit=9440 read=4696 written=58
+ Planning:
+   Buffers: shared hit=205 read=45
+ Planning Time: 0.969 ms
+ Execution Time: 51.914 ms
+(27 rows)
+
+                                                                                              QUERY PLAN                                                                                              
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize GroupAggregate (actual rows=20 loops=1)
+   Group Key: queue_name
+   Buffers: shared hit=9552 read=4600 written=96
+   ->  Gather Merge (actual rows=60 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=9552 read=4600 written=96
+         ->  Sort (actual rows=20 loops=3)
+               Sort Key: queue_name
+               Sort Method: quicksort  Memory: 25kB
+               Buffers: shared hit=9552 read=4600 written=96
+               Worker 0:  Sort Method: quicksort  Memory: 25kB
+               Worker 1:  Sort Method: quicksort  Memory: 25kB
+               ->  Partial HashAggregate (actual rows=20 loops=3)
+                     Group Key: queue_name
+                     Batches: 1  Memory Usage: 24kB
+                     Buffers: shared hit=9536 read=4600 written=96
+                     Worker 0:  Batches: 1  Memory Usage: 24kB
+                     Worker 1:  Batches: 1  Memory Usage: 24kB
+                     ->  Parallel Seq Scan on harvest_task_queue (actual rows=95000 loops=3)
+                           Filter: ((state = 'PENDING'::text) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (scheduled_at <= now()))
+                           Rows Removed by Filter: 105000
+                           Buffers: shared hit=9536 read=4600 written=96
+ Planning:
+   Buffers: shared hit=12
+ Planning Time: 0.390 ms
+ Execution Time: 47.039 ms
+(27 rows)
+
+                                                           QUERY PLAN                                                            
+---------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop (actual rows=20 loops=1)
+   Buffers: shared hit=84604 read=15225 written=8588
+   ->  HashAggregate (actual rows=20 loops=1)
+         Group Key: u.queue_name
+         Batches: 1  Memory Usage: 24kB
+         ->  Function Scan on unnest u (actual rows=20 loops=1)
+   ->  Aggregate (actual rows=1 loops=20)
+         Filter: (count(*) > 0)
+         Buffers: shared hit=84604 read=15225 written=8588
+         ->  Limit (actual rows=7737 loops=20)
+               Buffers: shared hit=84604 read=15225 written=8588
+               ->  Sort (actual rows=7737 loops=20)
+                     Sort Key: t.scheduled_at, t.id
+                     Sort Method: quicksort  Memory: 742kB
+                     Buffers: shared hit=84604 read=15225 written=8588
+                     ->  Bitmap Heap Scan on harvest_task_queue t (actual rows=14250 loops=20)
+                           Recheck Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()) AND (state = 'PENDING'::text))
+                           Heap Blocks: exact=97260
+                           Buffers: shared hit=84604 read=15225 written=8588
+                           ->  Bitmap Index Scan on idx_harvest_tq_poll (actual rows=14250 loops=20)
+                                 Index Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()))
+                                 Buffers: shared hit=37 read=2532 written=2197
+ Planning:
+   Buffers: shared hit=15
+ Planning Time: 0.326 ms
+ Execution Time: 272.152 ms
+(26 rows)
+
+                                                           QUERY PLAN                                                            
+---------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop (actual rows=20 loops=1)
+   Buffers: shared hit=99662 read=167 written=167
+   ->  HashAggregate (actual rows=20 loops=1)
+         Group Key: u.queue_name
+         Batches: 1  Memory Usage: 24kB
+         ->  Function Scan on unnest u (actual rows=20 loops=1)
+   ->  Aggregate (actual rows=1 loops=20)
+         Filter: (count(*) > 0)
+         Buffers: shared hit=99662 read=167 written=167
+         ->  Limit (actual rows=7737 loops=20)
+               Buffers: shared hit=99662 read=167 written=167
+               ->  Sort (actual rows=7737 loops=20)
+                     Sort Key: t.scheduled_at, t.id
+                     Sort Method: quicksort  Memory: 742kB
+                     Buffers: shared hit=99662 read=167 written=167
+                     ->  Bitmap Heap Scan on harvest_task_queue t (actual rows=14250 loops=20)
+                           Recheck Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()) AND (state = 'PENDING'::text))
+                           Heap Blocks: exact=97260
+                           Buffers: shared hit=99662 read=167 written=167
+                           ->  Bitmap Index Scan on idx_harvest_tq_poll (actual rows=14250 loops=20)
+                                 Index Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()))
+                                 Buffers: shared hit=2402 read=167 written=167
+ Planning:
+   Buffers: shared read=12 written=12
+ Planning Time: 0.453 ms
+ Execution Time: 173.250 ms
+(26 rows)
+
+BEGIN
+SET
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Nested Loop (actual rows=20 loops=1)
+   Buffers: shared hit=79784 read=1695 written=1496
+   ->  HashAggregate (actual rows=20 loops=1)
+         Group Key: u.queue_name
+         Batches: 1  Memory Usage: 24kB
+         ->  Function Scan on unnest u (actual rows=20 loops=1)
+   ->  Aggregate (actual rows=1 loops=20)
+         Filter: (count(*) > 0)
+         Buffers: shared hit=79784 read=1695 written=1496
+         ->  Limit (actual rows=7737 loops=20)
+               Buffers: shared hit=79784 read=1695 written=1496
+               ->  Index Only Scan using idx_harvest_tq_coverage_sample on harvest_task_queue t (actual rows=7737 loops=20)
+                     Index Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()))
+                     Heap Fetches: 154744
+                     Buffers: shared hit=79784 read=1695 written=1496
+ Planning:
+   Buffers: shared hit=12
+ Planning Time: 0.346 ms
+ Execution Time: 179.279 ms
+(19 rows)
+
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Nested Loop (actual rows=20 loops=1)
+   Buffers: shared hit=81479
+   ->  HashAggregate (actual rows=20 loops=1)
+         Group Key: u.queue_name
+         Batches: 1  Memory Usage: 24kB
+         ->  Function Scan on unnest u (actual rows=20 loops=1)
+   ->  Aggregate (actual rows=1 loops=20)
+         Filter: (count(*) > 0)
+         Buffers: shared hit=81479
+         ->  Limit (actual rows=7737 loops=20)
+               Buffers: shared hit=81479
+               ->  Index Only Scan using idx_harvest_tq_coverage_sample on harvest_task_queue t (actual rows=7737 loops=20)
+                     Index Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()))
+                     Heap Fetches: 154744
+                     Buffers: shared hit=81479
+ Planning:
+   Buffers: shared hit=12
+ Planning Time: 0.356 ms
+ Execution Time: 119.095 ms
+(19 rows)
+
+                                                                                                 QUERY PLAN                                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Append (actual rows=20 loops=1)
+   Buffers: shared hit=10061 read=4078
+   CTE queues
+     ->  HashAggregate (actual rows=20 loops=1)
+           Group Key: u.queue_name
+           Batches: 1  Memory Usage: 24kB
+           ->  Function Scan on unnest u (actual rows=20 loops=1)
+   CTE walk
+     ->  Result (actual rows=1 loops=1)
+           Buffers: shared hit=3
+           InitPlan 3 (returns $2)
+             ->  Index Scan using pg_class_oid_index on pg_class c (actual rows=1 loops=1)
+                   Index Cond: (oid = '56160'::oid)
+                   Buffers: shared hit=3
+                   InitPlan 2 (returns $1)
+                     ->  Aggregate (actual rows=1 loops=1)
+                           ->  CTE Scan on queues (actual rows=20 loops=1)
+   ->  Result (actual rows=0 loops=1)
+         One-Time Filter: $4
+         Buffers: shared hit=3
+         InitPlan 5 (returns $4)
+           ->  CTE Scan on walk (actual rows=1 loops=1)
+                 Buffers: shared hit=3
+         ->  Nested Loop (never executed)
+               ->  CTE Scan on queues q (never executed)
+               ->  Aggregate (never executed)
+                     Filter: (count(*) > 0)
+                     ->  Limit (never executed)
+                           ->  Index Only Scan using idx_harvest_tq_coverage_sample on harvest_task_queue t (never executed)
+                                 Index Cond: ((queue_name = q.queue_name) AND (scheduled_at <= now()))
+                                 Heap Fetches: 0
+   ->  Finalize HashAggregate (actual rows=20 loops=1)
+         Group Key: t_1.queue_name
+         Batches: 1  Memory Usage: 24kB
+         Buffers: shared hit=10058 read=4078
+         InitPlan 6 (returns $6)
+           ->  CTE Scan on walk walk_1 (actual rows=1 loops=1)
+         ->  Gather (actual rows=20 loops=1)
+               Workers Planned: 2
+               Params Evaluated: $6
+               Workers Launched: 2
+               Buffers: shared hit=10058 read=4078
+               ->  Partial HashAggregate (actual rows=7 loops=3)
+                     Group Key: t_1.queue_name
+                     Batches: 1  Memory Usage: 24kB
+                     Buffers: shared hit=10058 read=4078
+                     Worker 0:  Batches: 1  Memory Usage: 24kB
+                     Worker 1:  Batches: 1  Memory Usage: 24kB
+                     ->  Result (actual rows=95000 loops=3)
+                           One-Time Filter: (NOT $6)
+                           Buffers: shared hit=10058 read=4078
+                           ->  Parallel Seq Scan on harvest_task_queue t_1 (actual rows=95000 loops=3)
+                                 Filter: ((state = 'PENDING'::text) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (scheduled_at <= now()))
+                                 Rows Removed by Filter: 105000
+                                 Buffers: shared hit=10058 read=4078
+ Planning:
+   Buffers: shared hit=42 read=13 dirtied=3 written=13
+ Planning Time: 0.754 ms
+ Execution Time: 324.786 ms
+(59 rows)
+
+                                                                                                 QUERY PLAN                                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Append (actual rows=20 loops=1)
+   Buffers: shared hit=10093 read=4046
+   CTE queues
+     ->  HashAggregate (actual rows=20 loops=1)
+           Group Key: u.queue_name
+           Batches: 1  Memory Usage: 24kB
+           ->  Function Scan on unnest u (actual rows=20 loops=1)
+   CTE walk
+     ->  Result (actual rows=1 loops=1)
+           Buffers: shared hit=3
+           InitPlan 3 (returns $2)
+             ->  Index Scan using pg_class_oid_index on pg_class c (actual rows=1 loops=1)
+                   Index Cond: (oid = '56160'::oid)
+                   Buffers: shared hit=3
+                   InitPlan 2 (returns $1)
+                     ->  Aggregate (actual rows=1 loops=1)
+                           ->  CTE Scan on queues (actual rows=20 loops=1)
+   ->  Result (actual rows=0 loops=1)
+         One-Time Filter: $4
+         Buffers: shared hit=3
+         InitPlan 5 (returns $4)
+           ->  CTE Scan on walk (actual rows=1 loops=1)
+                 Buffers: shared hit=3
+         ->  Nested Loop (never executed)
+               ->  CTE Scan on queues q (never executed)
+               ->  Aggregate (never executed)
+                     Filter: (count(*) > 0)
+                     ->  Limit (never executed)
+                           ->  Index Only Scan using idx_harvest_tq_coverage_sample on harvest_task_queue t (never executed)
+                                 Index Cond: ((queue_name = q.queue_name) AND (scheduled_at <= now()))
+                                 Heap Fetches: 0
+   ->  Finalize HashAggregate (actual rows=20 loops=1)
+         Group Key: t_1.queue_name
+         Batches: 1  Memory Usage: 24kB
+         Buffers: shared hit=10090 read=4046
+         InitPlan 6 (returns $6)
+           ->  CTE Scan on walk walk_1 (actual rows=1 loops=1)
+         ->  Gather (actual rows=20 loops=1)
+               Workers Planned: 2
+               Params Evaluated: $6
+               Workers Launched: 2
+               Buffers: shared hit=10090 read=4046
+               ->  Partial HashAggregate (actual rows=7 loops=3)
+                     Group Key: t_1.queue_name
+                     Batches: 1  Memory Usage: 24kB
+                     Buffers: shared hit=10090 read=4046
+                     Worker 0:  Batches: 1  Memory Usage: 24kB
+                     Worker 1:  Batches: 1  Memory Usage: 24kB
+                     ->  Result (actual rows=95000 loops=3)
+                           One-Time Filter: (NOT $6)
+                           Buffers: shared hit=10090 read=4046
+                           ->  Parallel Seq Scan on harvest_task_queue t_1 (actual rows=95000 loops=3)
+                                 Filter: ((state = 'PENDING'::text) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (scheduled_at <= now()))
+                                 Rows Removed by Filter: 105000
+                                 Buffers: shared hit=10090 read=4046
+ Planning:
+   Buffers: shared hit=24
+ Planning Time: 0.668 ms
+ Execution Time: 350.342 ms
+(59 rows)
+
+COMMIT
+=== mixed: exact, walk as planned, walk with sorts off, shipped query (each twice)
+TRUNCATE TABLE
+ setseed 
+---------
+ 
+(1 row)
+
+INSERT 0 300000
+INSERT 0 300000
+ANALYZE
+                                                                                              QUERY PLAN                                                                                              
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize GroupAggregate (actual rows=20 loops=1)
+   Group Key: queue_name
+   Buffers: shared hit=10052 read=4100 written=65
+   ->  Gather Merge (actual rows=60 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=10052 read=4100 written=65
+         ->  Sort (actual rows=20 loops=3)
+               Sort Key: queue_name
+               Sort Method: quicksort  Memory: 25kB
+               Buffers: shared hit=10052 read=4100 written=65
+               Worker 0:  Sort Method: quicksort  Memory: 25kB
+               Worker 1:  Sort Method: quicksort  Memory: 25kB
+               ->  Partial HashAggregate (actual rows=20 loops=3)
+                     Group Key: queue_name
+                     Batches: 1  Memory Usage: 24kB
+                     Buffers: shared hit=10037 read=4099 written=64
+                     Worker 0:  Batches: 1  Memory Usage: 24kB
+                     Worker 1:  Batches: 1  Memory Usage: 24kB
+                     ->  Parallel Seq Scan on harvest_task_queue (actual rows=95000 loops=3)
+                           Filter: ((state = 'PENDING'::text) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (scheduled_at <= now()))
+                           Rows Removed by Filter: 105000
+                           Buffers: shared hit=10037 read=4099 written=64
+ Planning:
+   Buffers: shared hit=133 read=44
+ Planning Time: 0.954 ms
+ Execution Time: 70.440 ms
+(27 rows)
+
+                                                                                              QUERY PLAN                                                                                              
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize GroupAggregate (actual rows=20 loops=1)
+   Group Key: queue_name
+   Buffers: shared hit=10149 read=4003
+   ->  Gather Merge (actual rows=60 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=10149 read=4003
+         ->  Sort (actual rows=20 loops=3)
+               Sort Key: queue_name
+               Sort Method: quicksort  Memory: 25kB
+               Buffers: shared hit=10149 read=4003
+               Worker 0:  Sort Method: quicksort  Memory: 25kB
+               Worker 1:  Sort Method: quicksort  Memory: 25kB
+               ->  Partial HashAggregate (actual rows=20 loops=3)
+                     Group Key: queue_name
+                     Batches: 1  Memory Usage: 24kB
+                     Buffers: shared hit=10133 read=4003
+                     Worker 0:  Batches: 1  Memory Usage: 24kB
+                     Worker 1:  Batches: 1  Memory Usage: 24kB
+                     ->  Parallel Seq Scan on harvest_task_queue (actual rows=95000 loops=3)
+                           Filter: ((state = 'PENDING'::text) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (scheduled_at <= now()))
+                           Rows Removed by Filter: 105000
+                           Buffers: shared hit=10133 read=4003
+ Planning:
+   Buffers: shared hit=12
+ Planning Time: 0.331 ms
+ Execution Time: 61.146 ms
+(27 rows)
+
+                                                           QUERY PLAN                                                            
+---------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop (actual rows=20 loops=1)
+   Buffers: shared hit=85508 read=13619 written=8423
+   ->  HashAggregate (actual rows=20 loops=1)
+         Group Key: u.queue_name
+         Batches: 1  Memory Usage: 24kB
+         ->  Function Scan on unnest u (actual rows=20 loops=1)
+   ->  Aggregate (actual rows=1 loops=20)
+         Filter: (count(*) > 0)
+         Buffers: shared hit=85508 read=13619 written=8423
+         ->  Limit (actual rows=7727 loops=20)
+               Buffers: shared hit=85508 read=13619 written=8423
+               ->  Sort (actual rows=7727 loops=20)
+                     Sort Key: t.scheduled_at, t.id
+                     Sort Method: quicksort  Memory: 736kB
+                     Buffers: shared hit=85508 read=13619 written=8423
+                     ->  Bitmap Heap Scan on harvest_task_queue t (actual rows=14250 loops=20)
+                           Recheck Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()) AND (state = 'PENDING'::text))
+                           Heap Blocks: exact=96905
+                           Buffers: shared hit=85508 read=13619 written=8423
+                           ->  Bitmap Index Scan on idx_harvest_tq_poll (actual rows=14250 loops=20)
+                                 Index Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()))
+                                 Buffers: shared hit=38 read=2184 written=1939
+ Planning:
+   Buffers: shared hit=17
+ Planning Time: 0.342 ms
+ Execution Time: 346.212 ms
+(26 rows)
+
+                                                           QUERY PLAN                                                            
+---------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop (actual rows=20 loops=1)
+   Buffers: shared hit=98984 read=143 written=114
+   ->  HashAggregate (actual rows=20 loops=1)
+         Group Key: u.queue_name
+         Batches: 1  Memory Usage: 24kB
+         ->  Function Scan on unnest u (actual rows=20 loops=1)
+   ->  Aggregate (actual rows=1 loops=20)
+         Filter: (count(*) > 0)
+         Buffers: shared hit=98984 read=143 written=114
+         ->  Limit (actual rows=7727 loops=20)
+               Buffers: shared hit=98984 read=143 written=114
+               ->  Sort (actual rows=7727 loops=20)
+                     Sort Key: t.scheduled_at, t.id
+                     Sort Method: quicksort  Memory: 736kB
+                     Buffers: shared hit=98984 read=143 written=114
+                     ->  Bitmap Heap Scan on harvest_task_queue t (actual rows=14250 loops=20)
+                           Recheck Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()) AND (state = 'PENDING'::text))
+                           Heap Blocks: exact=96905
+                           Buffers: shared hit=98984 read=143 written=114
+                           ->  Bitmap Index Scan on idx_harvest_tq_poll (actual rows=14250 loops=20)
+                                 Index Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()))
+                                 Buffers: shared hit=2079 read=143 written=114
+ Planning:
+   Buffers: shared read=12
+ Planning Time: 0.324 ms
+ Execution Time: 194.019 ms
+(26 rows)
+
+BEGIN
+SET
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Nested Loop (actual rows=20 loops=1)
+   Buffers: shared hit=106757 read=1445 written=1345
+   ->  HashAggregate (actual rows=20 loops=1)
+         Group Key: u.queue_name
+         Batches: 1  Memory Usage: 24kB
+         ->  Function Scan on unnest u (actual rows=20 loops=1)
+   ->  Aggregate (actual rows=1 loops=20)
+         Filter: (count(*) > 0)
+         Buffers: shared hit=106757 read=1445 written=1345
+         ->  Limit (actual rows=7727 loops=20)
+               Buffers: shared hit=106757 read=1445 written=1345
+               ->  Index Only Scan using idx_harvest_tq_coverage_sample on harvest_task_queue t (actual rows=7727 loops=20)
+                     Index Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()))
+                     Heap Fetches: 154540
+                     Buffers: shared hit=106757 read=1445 written=1345
+ Planning:
+   Buffers: shared hit=12
+ Planning Time: 0.351 ms
+ Execution Time: 146.660 ms
+(19 rows)
+
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Nested Loop (actual rows=20 loops=1)
+   Buffers: shared hit=108202
+   ->  HashAggregate (actual rows=20 loops=1)
+         Group Key: u.queue_name
+         Batches: 1  Memory Usage: 24kB
+         ->  Function Scan on unnest u (actual rows=20 loops=1)
+   ->  Aggregate (actual rows=1 loops=20)
+         Filter: (count(*) > 0)
+         Buffers: shared hit=108202
+         ->  Limit (actual rows=7727 loops=20)
+               Buffers: shared hit=108202
+               ->  Index Only Scan using idx_harvest_tq_coverage_sample on harvest_task_queue t (actual rows=7727 loops=20)
+                     Index Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()))
+                     Heap Fetches: 154540
+                     Buffers: shared hit=108202
+ Planning:
+   Buffers: shared hit=12
+ Planning Time: 0.284 ms
+ Execution Time: 142.923 ms
+(19 rows)
+
+                                                                                                 QUERY PLAN                                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Append (actual rows=20 loops=1)
+   Buffers: shared hit=10400 read=3740 dirtied=1
+   CTE queues
+     ->  HashAggregate (actual rows=20 loops=1)
+           Group Key: u.queue_name
+           Batches: 1  Memory Usage: 24kB
+           ->  Function Scan on unnest u (actual rows=20 loops=1)
+   CTE walk
+     ->  Result (actual rows=1 loops=1)
+           Buffers: shared hit=4 dirtied=1
+           InitPlan 3 (returns $2)
+             ->  Index Scan using pg_class_oid_index on pg_class c (actual rows=1 loops=1)
+                   Index Cond: (oid = '56160'::oid)
+                   Buffers: shared hit=4 dirtied=1
+                   InitPlan 2 (returns $1)
+                     ->  Aggregate (actual rows=1 loops=1)
+                           ->  CTE Scan on queues (actual rows=20 loops=1)
+   ->  Result (actual rows=0 loops=1)
+         One-Time Filter: $4
+         Buffers: shared hit=4 dirtied=1
+         InitPlan 5 (returns $4)
+           ->  CTE Scan on walk (actual rows=1 loops=1)
+                 Buffers: shared hit=4 dirtied=1
+         ->  Nested Loop (never executed)
+               ->  CTE Scan on queues q (never executed)
+               ->  Aggregate (never executed)
+                     Filter: (count(*) > 0)
+                     ->  Limit (never executed)
+                           ->  Index Only Scan using idx_harvest_tq_coverage_sample on harvest_task_queue t (never executed)
+                                 Index Cond: ((queue_name = q.queue_name) AND (scheduled_at <= now()))
+                                 Heap Fetches: 0
+   ->  Finalize HashAggregate (actual rows=20 loops=1)
+         Group Key: t_1.queue_name
+         Batches: 1  Memory Usage: 24kB
+         Buffers: shared hit=10396 read=3740
+         InitPlan 6 (returns $6)
+           ->  CTE Scan on walk walk_1 (actual rows=1 loops=1)
+         ->  Gather (actual rows=20 loops=1)
+               Workers Planned: 2
+               Params Evaluated: $6
+               Workers Launched: 2
+               Buffers: shared hit=10396 read=3740
+               ->  Partial HashAggregate (actual rows=7 loops=3)
+                     Group Key: t_1.queue_name
+                     Batches: 1  Memory Usage: 24kB
+                     Buffers: shared hit=10396 read=3740
+                     Worker 0:  Batches: 1  Memory Usage: 24kB
+                     Worker 1:  Batches: 1  Memory Usage: 24kB
+                     ->  Result (actual rows=95000 loops=3)
+                           One-Time Filter: (NOT $6)
+                           Buffers: shared hit=10396 read=3740
+                           ->  Parallel Seq Scan on harvest_task_queue t_1 (actual rows=95000 loops=3)
+                                 Filter: ((state = 'PENDING'::text) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (scheduled_at <= now()))
+                                 Rows Removed by Filter: 105000
+                                 Buffers: shared hit=10396 read=3740
+ Planning:
+   Buffers: shared hit=24
+ Planning Time: 0.661 ms
+ Execution Time: 332.459 ms
+(59 rows)
+
+                                                                                                 QUERY PLAN                                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Append (actual rows=20 loops=1)
+   Buffers: shared hit=10431 read=3708
+   CTE queues
+     ->  HashAggregate (actual rows=20 loops=1)
+           Group Key: u.queue_name
+           Batches: 1  Memory Usage: 24kB
+           ->  Function Scan on unnest u (actual rows=20 loops=1)
+   CTE walk
+     ->  Result (actual rows=1 loops=1)
+           Buffers: shared hit=3
+           InitPlan 3 (returns $2)
+             ->  Index Scan using pg_class_oid_index on pg_class c (actual rows=1 loops=1)
+                   Index Cond: (oid = '56160'::oid)
+                   Buffers: shared hit=3
+                   InitPlan 2 (returns $1)
+                     ->  Aggregate (actual rows=1 loops=1)
+                           ->  CTE Scan on queues (actual rows=20 loops=1)
+   ->  Result (actual rows=0 loops=1)
+         One-Time Filter: $4
+         Buffers: shared hit=3
+         InitPlan 5 (returns $4)
+           ->  CTE Scan on walk (actual rows=1 loops=1)
+                 Buffers: shared hit=3
+         ->  Nested Loop (never executed)
+               ->  CTE Scan on queues q (never executed)
+               ->  Aggregate (never executed)
+                     Filter: (count(*) > 0)
+                     ->  Limit (never executed)
+                           ->  Index Only Scan using idx_harvest_tq_coverage_sample on harvest_task_queue t (never executed)
+                                 Index Cond: ((queue_name = q.queue_name) AND (scheduled_at <= now()))
+                                 Heap Fetches: 0
+   ->  Finalize HashAggregate (actual rows=20 loops=1)
+         Group Key: t_1.queue_name
+         Batches: 1  Memory Usage: 24kB
+         Buffers: shared hit=10428 read=3708
+         InitPlan 6 (returns $6)
+           ->  CTE Scan on walk walk_1 (actual rows=1 loops=1)
+         ->  Gather (actual rows=20 loops=1)
+               Workers Planned: 2
+               Params Evaluated: $6
+               Workers Launched: 2
+               Buffers: shared hit=10428 read=3708
+               ->  Partial HashAggregate (actual rows=7 loops=3)
+                     Group Key: t_1.queue_name
+                     Batches: 1  Memory Usage: 24kB
+                     Buffers: shared hit=10428 read=3708
+                     Worker 0:  Batches: 1  Memory Usage: 24kB
+                     Worker 1:  Batches: 1  Memory Usage: 24kB
+                     ->  Result (actual rows=95000 loops=3)
+                           One-Time Filter: (NOT $6)
+                           Buffers: shared hit=10428 read=3708
+                           ->  Parallel Seq Scan on harvest_task_queue t_1 (actual rows=95000 loops=3)
+                                 Filter: ((state = 'PENDING'::text) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (scheduled_at <= now()))
+                                 Rows Removed by Filter: 105000
+                                 Buffers: shared hit=10428 read=3708
+ Planning:
+   Buffers: shared hit=24
+ Planning Time: 0.547 ms
+ Execution Time: 327.005 ms
+(59 rows)
+
+COMMIT
+=== random: exact, walk as planned, walk with sorts off, shipped query (each twice)
+TRUNCATE TABLE
+ setseed 
+---------
+ 
+(1 row)
+
+INSERT 0 300000
+INSERT 0 300000
+ANALYZE
+                                                                                              QUERY PLAN                                                                                              
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize GroupAggregate (actual rows=20 loops=1)
+   Group Key: queue_name
+   Buffers: shared hit=9750 read=4402 written=64
+   ->  Gather Merge (actual rows=60 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=9750 read=4402 written=64
+         ->  Sort (actual rows=20 loops=3)
+               Sort Key: queue_name
+               Sort Method: quicksort  Memory: 25kB
+               Buffers: shared hit=9750 read=4402 written=64
+               Worker 0:  Sort Method: quicksort  Memory: 25kB
+               Worker 1:  Sort Method: quicksort  Memory: 25kB
+               ->  Partial HashAggregate (actual rows=20 loops=3)
+                     Group Key: queue_name
+                     Batches: 1  Memory Usage: 24kB
+                     Buffers: shared hit=9735 read=4401 written=64
+                     Worker 0:  Batches: 1  Memory Usage: 24kB
+                     Worker 1:  Batches: 1  Memory Usage: 24kB
+                     ->  Parallel Seq Scan on harvest_task_queue (actual rows=95000 loops=3)
+                           Filter: ((state = 'PENDING'::text) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (scheduled_at <= now()))
+                           Rows Removed by Filter: 105000
+                           Buffers: shared hit=9735 read=4401 written=64
+ Planning:
+   Buffers: shared hit=130 read=43
+ Planning Time: 1.283 ms
+ Execution Time: 61.165 ms
+(27 rows)
+
+                                                                                              QUERY PLAN                                                                                              
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize GroupAggregate (actual rows=20 loops=1)
+   Group Key: queue_name
+   Buffers: shared hit=9847 read=4305 written=96
+   ->  Gather Merge (actual rows=60 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=9847 read=4305 written=96
+         ->  Sort (actual rows=20 loops=3)
+               Sort Key: queue_name
+               Sort Method: quicksort  Memory: 25kB
+               Buffers: shared hit=9847 read=4305 written=96
+               Worker 0:  Sort Method: quicksort  Memory: 25kB
+               Worker 1:  Sort Method: quicksort  Memory: 25kB
+               ->  Partial HashAggregate (actual rows=20 loops=3)
+                     Group Key: queue_name
+                     Batches: 1  Memory Usage: 24kB
+                     Buffers: shared hit=9831 read=4305 written=96
+                     Worker 0:  Batches: 1  Memory Usage: 24kB
+                     Worker 1:  Batches: 1  Memory Usage: 24kB
+                     ->  Parallel Seq Scan on harvest_task_queue (actual rows=95000 loops=3)
+                           Filter: ((state = 'PENDING'::text) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (scheduled_at <= now()))
+                           Rows Removed by Filter: 105000
+                           Buffers: shared hit=9831 read=4305 written=96
+ Planning:
+   Buffers: shared hit=12
+ Planning Time: 0.336 ms
+ Execution Time: 58.899 ms
+(27 rows)
+
+                                                           QUERY PLAN                                                            
+---------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop (actual rows=20 loops=1)
+   Buffers: shared hit=85418 read=13519 written=8124
+   ->  HashAggregate (actual rows=20 loops=1)
+         Group Key: u.queue_name
+         Batches: 1  Memory Usage: 24kB
+         ->  Function Scan on unnest u (actual rows=20 loops=1)
+   ->  Aggregate (actual rows=1 loops=20)
+         Filter: (count(*) > 0)
+         Buffers: shared hit=85418 read=13519 written=8124
+         ->  Limit (actual rows=7732 loops=20)
+               Buffers: shared hit=85418 read=13519 written=8124
+               ->  Sort (actual rows=7732 loops=20)
+                     Sort Key: t.scheduled_at, t.id
+                     Sort Method: quicksort  Memory: 742kB
+                     Buffers: shared hit=85418 read=13519 written=8124
+                     ->  Bitmap Heap Scan on harvest_task_queue t (actual rows=14250 loops=20)
+                           Recheck Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()) AND (state = 'PENDING'::text))
+                           Heap Blocks: exact=97010
+                           Buffers: shared hit=85418 read=13519 written=8124
+                           ->  Bitmap Index Scan on idx_harvest_tq_poll (actual rows=14250 loops=20)
+                                 Index Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()))
+                                 Buffers: shared hit=32 read=1895 written=1726
+ Planning:
+   Buffers: shared hit=15
+ Planning Time: 0.332 ms
+ Execution Time: 274.253 ms
+(26 rows)
+
+                                                           QUERY PLAN                                                            
+---------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop (actual rows=20 loops=1)
+   Buffers: shared hit=98817 read=120 written=120
+   ->  HashAggregate (actual rows=20 loops=1)
+         Group Key: u.queue_name
+         Batches: 1  Memory Usage: 24kB
+         ->  Function Scan on unnest u (actual rows=20 loops=1)
+   ->  Aggregate (actual rows=1 loops=20)
+         Filter: (count(*) > 0)
+         Buffers: shared hit=98817 read=120 written=120
+         ->  Limit (actual rows=7732 loops=20)
+               Buffers: shared hit=98817 read=120 written=120
+               ->  Sort (actual rows=7732 loops=20)
+                     Sort Key: t.scheduled_at, t.id
+                     Sort Method: quicksort  Memory: 742kB
+                     Buffers: shared hit=98817 read=120 written=120
+                     ->  Bitmap Heap Scan on harvest_task_queue t (actual rows=14250 loops=20)
+                           Recheck Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()) AND (state = 'PENDING'::text))
+                           Heap Blocks: exact=97010
+                           Buffers: shared hit=98817 read=120 written=120
+                           ->  Bitmap Index Scan on idx_harvest_tq_poll (actual rows=14250 loops=20)
+                                 Index Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()))
+                                 Buffers: shared hit=1807 read=120 written=120
+ Planning:
+   Buffers: shared read=12 written=12
+ Planning Time: 0.427 ms
+ Execution Time: 288.376 ms
+(26 rows)
+
+BEGIN
+SET
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Nested Loop (actual rows=20 loops=1)
+   Buffers: shared hit=154644 read=1234 written=1035
+   ->  HashAggregate (actual rows=20 loops=1)
+         Group Key: u.queue_name
+         Batches: 1  Memory Usage: 24kB
+         ->  Function Scan on unnest u (actual rows=20 loops=1)
+   ->  Aggregate (actual rows=1 loops=20)
+         Filter: (count(*) > 0)
+         Buffers: shared hit=154644 read=1234 written=1035
+         ->  Limit (actual rows=7732 loops=20)
+               Buffers: shared hit=154644 read=1234 written=1035
+               ->  Index Only Scan using idx_harvest_tq_coverage_sample on harvest_task_queue t (actual rows=7732 loops=20)
+                     Index Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()))
+                     Heap Fetches: 154638
+                     Buffers: shared hit=154644 read=1234 written=1035
+ Planning:
+   Buffers: shared hit=12
+ Planning Time: 0.295 ms
+ Execution Time: 139.032 ms
+(19 rows)
+
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Nested Loop (actual rows=20 loops=1)
+   Buffers: shared hit=155878
+   ->  HashAggregate (actual rows=20 loops=1)
+         Group Key: u.queue_name
+         Batches: 1  Memory Usage: 24kB
+         ->  Function Scan on unnest u (actual rows=20 loops=1)
+   ->  Aggregate (actual rows=1 loops=20)
+         Filter: (count(*) > 0)
+         Buffers: shared hit=155878
+         ->  Limit (actual rows=7732 loops=20)
+               Buffers: shared hit=155878
+               ->  Index Only Scan using idx_harvest_tq_coverage_sample on harvest_task_queue t (actual rows=7732 loops=20)
+                     Index Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()))
+                     Heap Fetches: 154638
+                     Buffers: shared hit=155878
+ Planning:
+   Buffers: shared hit=12
+ Planning Time: 0.293 ms
+ Execution Time: 139.786 ms
+(19 rows)
+
+                                                                                                 QUERY PLAN                                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Append (actual rows=20 loops=1)
+   Buffers: shared hit=10697 read=3442
+   CTE queues
+     ->  HashAggregate (actual rows=20 loops=1)
+           Group Key: u.queue_name
+           Batches: 1  Memory Usage: 24kB
+           ->  Function Scan on unnest u (actual rows=20 loops=1)
+   CTE walk
+     ->  Result (actual rows=1 loops=1)
+           Buffers: shared hit=3
+           InitPlan 3 (returns $2)
+             ->  Index Scan using pg_class_oid_index on pg_class c (actual rows=1 loops=1)
+                   Index Cond: (oid = '56160'::oid)
+                   Buffers: shared hit=3
+                   InitPlan 2 (returns $1)
+                     ->  Aggregate (actual rows=1 loops=1)
+                           ->  CTE Scan on queues (actual rows=20 loops=1)
+   ->  Result (actual rows=0 loops=1)
+         One-Time Filter: $4
+         Buffers: shared hit=3
+         InitPlan 5 (returns $4)
+           ->  CTE Scan on walk (actual rows=1 loops=1)
+                 Buffers: shared hit=3
+         ->  Nested Loop (never executed)
+               ->  CTE Scan on queues q (never executed)
+               ->  Aggregate (never executed)
+                     Filter: (count(*) > 0)
+                     ->  Limit (never executed)
+                           ->  Index Only Scan using idx_harvest_tq_coverage_sample on harvest_task_queue t (never executed)
+                                 Index Cond: ((queue_name = q.queue_name) AND (scheduled_at <= now()))
+                                 Heap Fetches: 0
+   ->  Finalize HashAggregate (actual rows=20 loops=1)
+         Group Key: t_1.queue_name
+         Batches: 1  Memory Usage: 24kB
+         Buffers: shared hit=10694 read=3442
+         InitPlan 6 (returns $6)
+           ->  CTE Scan on walk walk_1 (actual rows=1 loops=1)
+         ->  Gather (actual rows=20 loops=1)
+               Workers Planned: 2
+               Params Evaluated: $6
+               Workers Launched: 2
+               Buffers: shared hit=10694 read=3442
+               ->  Partial HashAggregate (actual rows=7 loops=3)
+                     Group Key: t_1.queue_name
+                     Batches: 1  Memory Usage: 24kB
+                     Buffers: shared hit=10694 read=3442
+                     Worker 0:  Batches: 1  Memory Usage: 24kB
+                     Worker 1:  Batches: 1  Memory Usage: 24kB
+                     ->  Result (actual rows=95000 loops=3)
+                           One-Time Filter: (NOT $6)
+                           Buffers: shared hit=10694 read=3442
+                           ->  Parallel Seq Scan on harvest_task_queue t_1 (actual rows=95000 loops=3)
+                                 Filter: ((state = 'PENDING'::text) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (scheduled_at <= now()))
+                                 Rows Removed by Filter: 105000
+                                 Buffers: shared hit=10694 read=3442
+ Planning:
+   Buffers: shared hit=24
+ Planning Time: 0.560 ms
+ Execution Time: 314.796 ms
+(59 rows)
+
+                                                                                                 QUERY PLAN                                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Append (actual rows=20 loops=1)
+   Buffers: shared hit=10729 read=3410
+   CTE queues
+     ->  HashAggregate (actual rows=20 loops=1)
+           Group Key: u.queue_name
+           Batches: 1  Memory Usage: 24kB
+           ->  Function Scan on unnest u (actual rows=20 loops=1)
+   CTE walk
+     ->  Result (actual rows=1 loops=1)
+           Buffers: shared hit=3
+           InitPlan 3 (returns $2)
+             ->  Index Scan using pg_class_oid_index on pg_class c (actual rows=1 loops=1)
+                   Index Cond: (oid = '56160'::oid)
+                   Buffers: shared hit=3
+                   InitPlan 2 (returns $1)
+                     ->  Aggregate (actual rows=1 loops=1)
+                           ->  CTE Scan on queues (actual rows=20 loops=1)
+   ->  Result (actual rows=0 loops=1)
+         One-Time Filter: $4
+         Buffers: shared hit=3
+         InitPlan 5 (returns $4)
+           ->  CTE Scan on walk (actual rows=1 loops=1)
+                 Buffers: shared hit=3
+         ->  Nested Loop (never executed)
+               ->  CTE Scan on queues q (never executed)
+               ->  Aggregate (never executed)
+                     Filter: (count(*) > 0)
+                     ->  Limit (never executed)
+                           ->  Index Only Scan using idx_harvest_tq_coverage_sample on harvest_task_queue t (never executed)
+                                 Index Cond: ((queue_name = q.queue_name) AND (scheduled_at <= now()))
+                                 Heap Fetches: 0
+   ->  Finalize HashAggregate (actual rows=20 loops=1)
+         Group Key: t_1.queue_name
+         Batches: 1  Memory Usage: 24kB
+         Buffers: shared hit=10726 read=3410
+         InitPlan 6 (returns $6)
+           ->  CTE Scan on walk walk_1 (actual rows=1 loops=1)
+         ->  Gather (actual rows=20 loops=1)
+               Workers Planned: 2
+               Params Evaluated: $6
+               Workers Launched: 2
+               Buffers: shared hit=10726 read=3410
+               ->  Partial HashAggregate (actual rows=7 loops=3)
+                     Group Key: t_1.queue_name
+                     Batches: 1  Memory Usage: 24kB
+                     Buffers: shared hit=10726 read=3410
+                     Worker 0:  Batches: 1  Memory Usage: 24kB
+                     Worker 1:  Batches: 1  Memory Usage: 24kB
+                     ->  Result (actual rows=95000 loops=3)
+                           One-Time Filter: (NOT $6)
+                           Buffers: shared hit=10726 read=3410
+                           ->  Parallel Seq Scan on harvest_task_queue t_1 (actual rows=95000 loops=3)
+                                 Filter: ((state = 'PENDING'::text) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (scheduled_at <= now()))
+                                 Rows Removed by Filter: 105000
+                                 Buffers: shared hit=10726 read=3410
+ Planning:
+   Buffers: shared hit=24
+ Planning Time: 0.593 ms
+ Execution Time: 371.887 ms
+(59 rows)
+
+COMMIT
+=== mixed, vacuumed: exact, shipped query (each twice)
+TRUNCATE TABLE
+ setseed 
+---------
+ 
+(1 row)
+
+INSERT 0 300000
+INSERT 0 300000
+ANALYZE
+VACUUM
+                                                                              QUERY PLAN                                                                              
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize GroupAggregate (actual rows=20 loops=1)
+   Group Key: queue_name
+   Buffers: shared hit=55 read=2174 written=1986
+   ->  Gather Merge (actual rows=22 loops=1)
+         Workers Planned: 1
+         Workers Launched: 1
+         Buffers: shared hit=55 read=2174 written=1986
+         ->  Partial GroupAggregate (actual rows=11 loops=2)
+               Group Key: queue_name
+               Buffers: shared hit=55 read=2174 written=1986
+               ->  Parallel Index Only Scan using idx_harvest_tq_poll on harvest_task_queue (actual rows=142500 loops=2)
+                     Index Cond: ((queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (scheduled_at <= now()))
+                     Heap Fetches: 0
+                     Buffers: shared hit=55 read=2174 written=1986
+ Planning:
+   Buffers: shared hit=69
+ Planning Time: 0.521 ms
+ Execution Time: 58.897 ms
+(18 rows)
+
+                                                                              QUERY PLAN                                                                              
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize GroupAggregate (actual rows=20 loops=1)
+   Group Key: queue_name
+   Buffers: shared hit=2219 read=9 written=9
+   ->  Gather Merge (actual rows=21 loops=1)
+         Workers Planned: 1
+         Workers Launched: 1
+         Buffers: shared hit=2219 read=9 written=9
+         ->  Partial GroupAggregate (actual rows=10 loops=2)
+               Group Key: queue_name
+               Buffers: shared hit=2219 read=9 written=9
+               ->  Parallel Index Only Scan using idx_harvest_tq_poll on harvest_task_queue (actual rows=142500 loops=2)
+                     Index Cond: ((queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (scheduled_at <= now()))
+                     Heap Fetches: 0
+                     Buffers: shared hit=2219 read=9 written=9
+ Planning:
+   Buffers: shared hit=12
+ Planning Time: 0.336 ms
+ Execution Time: 48.237 ms
+(18 rows)
+
+BEGIN
+SET
+                                                                                    QUERY PLAN                                                                                    
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Append (actual rows=20 loops=1)
+   Buffers: shared hit=33 read=1447 written=1315
+   CTE queues
+     ->  HashAggregate (actual rows=20 loops=1)
+           Group Key: u.queue_name
+           Batches: 1  Memory Usage: 24kB
+           ->  Function Scan on unnest u (actual rows=20 loops=1)
+   CTE walk
+     ->  Result (actual rows=1 loops=1)
+           Buffers: shared hit=3
+           InitPlan 3 (returns $2)
+             ->  Index Scan using pg_class_oid_index on pg_class c (actual rows=1 loops=1)
+                   Index Cond: (oid = '56160'::oid)
+                   Buffers: shared hit=3
+                   InitPlan 2 (returns $1)
+                     ->  Aggregate (actual rows=1 loops=1)
+                           ->  CTE Scan on queues (actual rows=20 loops=1)
+   ->  Result (actual rows=20 loops=1)
+         One-Time Filter: $4
+         Buffers: shared hit=33 read=1447 written=1315
+         InitPlan 5 (returns $4)
+           ->  CTE Scan on walk (actual rows=1 loops=1)
+                 Buffers: shared hit=3
+         ->  Nested Loop (actual rows=20 loops=1)
+               Buffers: shared hit=30 read=1447 written=1315
+               ->  CTE Scan on queues q (actual rows=20 loops=1)
+               ->  Aggregate (actual rows=1 loops=20)
+                     Filter: (count(*) > 0)
+                     Buffers: shared hit=30 read=1447 written=1315
+                     ->  Limit (actual rows=7727 loops=20)
+                           Buffers: shared hit=30 read=1447 written=1315
+                           ->  Index Only Scan using idx_harvest_tq_coverage_sample on harvest_task_queue t (actual rows=7727 loops=20)
+                                 Index Cond: ((queue_name = q.queue_name) AND (scheduled_at <= now()))
+                                 Heap Fetches: 0
+                                 Buffers: shared hit=30 read=1447 written=1315
+   ->  Finalize GroupAggregate (actual rows=0 loops=1)
+         Group Key: t_1.queue_name
+         InitPlan 6 (returns $6)
+           ->  CTE Scan on walk walk_1 (actual rows=1 loops=1)
+         ->  Gather Merge (actual rows=0 loops=1)
+               Workers Planned: 1
+               Params Evaluated: $6
+               Workers Launched: 1
+               ->  Partial GroupAggregate (actual rows=0 loops=2)
+                     Group Key: t_1.queue_name
+                     ->  Result (actual rows=0 loops=2)
+                           One-Time Filter: (NOT $6)
+                           ->  Parallel Index Only Scan using idx_harvest_tq_poll on harvest_task_queue t_1 (never executed)
+                                 Index Cond: ((queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (scheduled_at <= now()))
+                                 Heap Fetches: 0
+ Planning:
+   Buffers: shared hit=27
+ Planning Time: 0.654 ms
+ Execution Time: 47.561 ms
+(54 rows)
+
+                                                                                    QUERY PLAN                                                                                    
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Append (actual rows=20 loops=1)
+   Buffers: shared hit=1480
+   CTE queues
+     ->  HashAggregate (actual rows=20 loops=1)
+           Group Key: u.queue_name
+           Batches: 1  Memory Usage: 24kB
+           ->  Function Scan on unnest u (actual rows=20 loops=1)
+   CTE walk
+     ->  Result (actual rows=1 loops=1)
+           Buffers: shared hit=3
+           InitPlan 3 (returns $2)
+             ->  Index Scan using pg_class_oid_index on pg_class c (actual rows=1 loops=1)
+                   Index Cond: (oid = '56160'::oid)
+                   Buffers: shared hit=3
+                   InitPlan 2 (returns $1)
+                     ->  Aggregate (actual rows=1 loops=1)
+                           ->  CTE Scan on queues (actual rows=20 loops=1)
+   ->  Result (actual rows=20 loops=1)
+         One-Time Filter: $4
+         Buffers: shared hit=1480
+         InitPlan 5 (returns $4)
+           ->  CTE Scan on walk (actual rows=1 loops=1)
+                 Buffers: shared hit=3
+         ->  Nested Loop (actual rows=20 loops=1)
+               Buffers: shared hit=1477
+               ->  CTE Scan on queues q (actual rows=20 loops=1)
+               ->  Aggregate (actual rows=1 loops=20)
+                     Filter: (count(*) > 0)
+                     Buffers: shared hit=1477
+                     ->  Limit (actual rows=7727 loops=20)
+                           Buffers: shared hit=1477
+                           ->  Index Only Scan using idx_harvest_tq_coverage_sample on harvest_task_queue t (actual rows=7727 loops=20)
+                                 Index Cond: ((queue_name = q.queue_name) AND (scheduled_at <= now()))
+                                 Heap Fetches: 0
+                                 Buffers: shared hit=1477
+   ->  Finalize GroupAggregate (actual rows=0 loops=1)
+         Group Key: t_1.queue_name
+         InitPlan 6 (returns $6)
+           ->  CTE Scan on walk walk_1 (actual rows=1 loops=1)
+         ->  Gather Merge (actual rows=0 loops=1)
+               Workers Planned: 1
+               Params Evaluated: $6
+               Workers Launched: 1
+               ->  Partial GroupAggregate (actual rows=0 loops=2)
+                     Group Key: t_1.queue_name
+                     ->  Result (actual rows=0 loops=2)
+                           One-Time Filter: (NOT $6)
+                           ->  Parallel Index Only Scan using idx_harvest_tq_poll on harvest_task_queue t_1 (never executed)
+                                 Index Cond: ((queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (scheduled_at <= now()))
+                                 Heap Fetches: 0
+ Planning:
+   Buffers: shared hit=24
+ Planning Time: 0.582 ms
+ Execution Time: 41.297 ms
+(54 rows)
+
+COMMIT
+TRUNCATE TABLE
+ALTER TABLE

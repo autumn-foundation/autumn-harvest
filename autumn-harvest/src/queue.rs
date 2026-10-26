@@ -5655,15 +5655,24 @@ pub async fn queue_depths(
 
 /// The SQL of [`bounded_queue_depths`].
 ///
-/// A `LATERAL` subquery per distinct queue name holds the `LIMIT`, so the scan
-/// of each queue stops after `$2` rows. A `LIMIT` on the outer query would cap
-/// the number of queues instead.
+/// The query holds two ways to count. Statistics in `pg_class` pick one per
+/// run, and the planner skips the other one.
 ///
-/// The `ORDER BY` is the key order of `idx_harvest_tq_coverage_sample`. It
-/// makes the planner walk that index from the oldest row, and the walk ends at
-/// `NOW()`. Without it, the planner can pick a sequential scan or an index that
-/// also reads future rows. A queue below the cap then reads the whole table.
-/// `bounded_depth_scan_stops_at_the_cap` checks the plan.
+/// 1. **Walk.** A `LATERAL` subquery per distinct queue name walks
+///    `idx_harvest_tq_coverage_sample` in key order. Its `LIMIT` stops the
+///    walk after `$2` rows. A `LIMIT` on the outer query would cap the number
+///    of queues instead. The walk ends at `NOW()`, so it never reads future
+///    rows.
+/// 2. **Pass.** One aggregate over every eligible row, capped with `LEAST`.
+///    It reads each heap page once.
+///
+/// The walk reads at most `queues × $2` rows. Each row on a page that the
+/// visibility map does not cover costs a heap visit. Queues share heap pages,
+/// so each such visit can be a different page. The walk runs when its worst
+/// case, `(1 − all-visible share) × queues × $2` page visits, is below the
+/// page count of the table. Otherwise the pass runs. So a run reads no more
+/// than the smaller of the two bounds. After a vacuum the share is high and
+/// the walk runs. After an enqueue burst the share is low and the pass runs.
 ///
 /// The count keeps the alias `depth`, because the poll-tick harness
 /// `queue_age_gauge_perf` selects the statement by it.
@@ -5671,8 +5680,19 @@ pub async fn queue_depths(
 /// Binds: `$1` queue names, `$2` the cap.
 #[must_use]
 pub const fn bounded_queue_depths_query() -> &'static str {
-    "SELECT q.queue_name, c.depth \
-     FROM (SELECT DISTINCT queue_name FROM unnest($1::text[]) AS u(queue_name)) q \
+    "WITH queues AS ( \
+         SELECT DISTINCT queue_name FROM unnest($1::text[]) AS u(queue_name) \
+     ), \
+     walk AS ( \
+         SELECT COALESCE(( \
+             SELECT (1 - c.relallvisible::float8 / GREATEST(c.relpages, 1)) \
+                    * (SELECT count(*) FROM queues) * $2 < c.relpages \
+             FROM pg_class c \
+             WHERE c.oid = 'harvest_task_queue'::regclass \
+         ), true) AS chosen \
+     ) \
+     SELECT q.queue_name, b.depth \
+     FROM queues q \
      CROSS JOIN LATERAL ( \
          SELECT COUNT(*)::BIGINT AS depth \
          FROM ( \
@@ -5684,17 +5704,41 @@ pub const fn bounded_queue_depths_query() -> &'static str {
              ORDER BY t.scheduled_at, t.id \
              LIMIT $2 \
          ) bounded \
-     ) c \
-     WHERE c.depth > 0"
+     ) b \
+     WHERE b.depth > 0 AND (SELECT chosen FROM walk) \
+     UNION ALL \
+     SELECT t.queue_name, LEAST(COUNT(*), $2)::BIGINT AS depth \
+     FROM harvest_task_queue t \
+     WHERE t.queue_name = ANY($1) \
+       AND t.state = 'PENDING' \
+       AND t.scheduled_at <= NOW() \
+       AND NOT (SELECT chosen FROM walk) \
+     GROUP BY t.queue_name"
 }
+
+/// The planner setting of [`bounded_queue_depths`] (issue #2356).
+///
+/// A walk must read `idx_harvest_tq_coverage_sample` in key order and stop at
+/// the cap. A plan that sorts first reads every eligible row of the queue,
+/// once per queue. The planner can pick such a plan for a queue near the cap.
+/// It then sorts the output of a bitmap scan or of a sequential scan. With
+/// sorts off, the ordered walk is the plan left. The pass needs no sort.
+/// `SET LOCAL` ends with the transaction, so the session keeps its settings.
+pub const BOUNDED_DEPTH_PLAN_SETTINGS_SQL: &str = "SET LOCAL enable_sort = off";
 
 /// Count pending tasks per queue, up to `cap` for each queue (issue #2356).
 ///
 /// A queue reads `min(count, cap)`, where `count` is the value that
-/// [`queue_depths`] returns. The scan of each queue stops after `cap` rows,
-/// so the cost does not grow with the backlog. A queue with no eligible row
-/// is omitted. A repeated name gives one row. The depth sampler calls this
-/// with [`crate::telemetry::QUEUE_DEPTH_CAP`].
+/// [`queue_depths`] returns. A queue with no eligible row is omitted. A
+/// repeated name gives one row. The depth sampler calls this with
+/// [`crate::telemetry::QUEUE_DEPTH_CAP`].
+///
+/// A run reads no more than the smaller of two bounds: one pass over the
+/// table, and `cap` rows per queue. So a deep backlog costs no more than the
+/// cap. [`bounded_queue_depths_query`] states the choice.
+///
+/// The count runs in its own transaction under
+/// [`BOUNDED_DEPTH_PLAN_SETTINGS_SQL`].
 ///
 /// # Errors
 ///
@@ -5704,12 +5748,24 @@ pub async fn bounded_queue_depths(
     queues: &[String],
     cap: std::num::NonZeroU32,
 ) -> HarvestResult<Vec<(String, i64)>> {
-    let rows: Vec<DepthRow> = diesel::sql_query(bounded_queue_depths_query())
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-        .bind::<diesel::sql_types::BigInt, _>(i64::from(cap.get()))
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    use diesel_async::AsyncConnection as _;
+
+    let rows: Vec<DepthRow> = conn
+        .transaction::<_, crate::error::HarvestError, _>(async |conn| {
+            diesel_async::SimpleAsyncConnection::batch_execute(
+                conn,
+                BOUNDED_DEPTH_PLAN_SETTINGS_SQL,
+            )
+            .await
+            .map_err(crate::error::database_error)?;
+            diesel::sql_query(bounded_queue_depths_query())
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+                .bind::<diesel::sql_types::BigInt, _>(i64::from(cap.get()))
+                .load(conn)
+                .await
+                .map_err(crate::error::database_error)
+        })
+        .await?;
 
     Ok(rows.into_iter().map(|r| (r.queue_name, r.depth)).collect())
 }
@@ -13179,9 +13235,20 @@ mod tests {
         }
     }
 
+    /// The depth count turns sorts off for its own transaction only (issue
+    /// #2356).
+    #[test]
+    fn bounded_depth_plan_settings_are_transaction_scoped() {
+        for setting in BOUNDED_DEPTH_PLAN_SETTINGS_SQL.split("; ") {
+            assert!(setting.starts_with("SET LOCAL "), "{setting}");
+        }
+        assert!(BOUNDED_DEPTH_PLAN_SETTINGS_SQL.contains("enable_sort = off"));
+    }
+
     /// The `LIMIT` sits inside the per-queue subquery. On the outer query it
     /// would cap the number of queues, not the rows of each queue. The
-    /// `ORDER BY` keeps the scan on the index walk.
+    /// `ORDER BY` keeps the scan on the index walk. The pass caps its count,
+    /// and one choice gates both ways to count.
     #[test]
     fn bounded_queue_depths_query_limits_each_queue() {
         let sql = bounded_queue_depths_query();
@@ -13195,7 +13262,21 @@ mod tests {
             "a repeated queue name must count once: {sql}"
         );
         assert!(
-            sql.contains("AS depth"),
+            sql.contains("LEAST(COUNT(*), $2)"),
+            "the pass must cap its count: {sql}"
+        );
+        assert!(
+            sql.contains("AND (SELECT chosen FROM walk)")
+                && sql.contains("AND NOT (SELECT chosen FROM walk)"),
+            "exactly one way to count must run: {sql}"
+        );
+        assert!(
+            sql.contains("c.relallvisible::float8 / GREATEST(c.relpages, 1)"),
+            "the choice must read the visibility map share: {sql}"
+        );
+        assert_eq!(
+            sql.matches("AS depth").count(),
+            2,
             "the poll-tick harness selects the statement by this alias"
         );
     }

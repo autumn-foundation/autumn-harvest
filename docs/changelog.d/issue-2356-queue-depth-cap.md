@@ -2,10 +2,15 @@
 
 The `harvest.queue.depth` sampler no longer counts every eligible pending row.
 `queue::bounded_queue_depths` counts each queue up to
-`telemetry::QUEUE_DEPTH_CAP` (10,000). A `LATERAL` subquery per queue walks
-`idx_harvest_tq_coverage_sample` in key order and stops at the cap. The sampler
-sums the shards with `add_bounded_depth` and caps the sum again. Below 10,000
-the gauge is exact. A value of 10,000 means 10,000 or more.
+`telemetry::QUEUE_DEPTH_CAP` (10,000). Statistics in `pg_class` pick one of
+two ways to count. The walk runs a `LATERAL` subquery per queue that walks
+`idx_harvest_tq_coverage_sample` in key order and stops at the cap. The pass
+counts every eligible row once and caps the count. The walk runs when its
+worst-case heap visits stay below one pass over the table. So a run costs no
+more than the smaller of the two, and an empty visibility map costs what the
+exact count costs. The count runs with sorts off. The sampler sums the shards
+with `add_bounded_depth` and caps the sum again. Below 10,000 the gauge is
+exact. A value of 10,000 means 10,000 or more.
 `queue::queue_depths` stays exact. There is no migration, no new index and no
 new write.
 
@@ -13,7 +18,9 @@ new write.
 fire. The starter rule `harvest_queue_backlog_growth` keys on growth, and a
 gauge at the cap shows none. While the gauge holds at the cap, the rule now
 reads growth from `harvest.queue.oldest_pending_age`, which has no cap. It also
-fires when that age stays 0, because then a gate blocks every row. promtool
+fires when that age stays 0 on a queue that is not paused, because then a gate
+blocks every row. At the cap it cannot tell growth from a large burst that
+drains slowly, so both fire. promtool
 cases in `docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml` test the
 rule in the `lint` job. For an exact count, scrape `harvest_queue_backlog`
 from `GET /admin/queues/scaling?format=prometheus`. Autoscaling reads that metric,
@@ -25,6 +32,8 @@ does not change either.
 exact counts at ten caps, each cap in one transaction.
 `bounded_depth_scan_stops_at_the_cap` checks that each queue scan walks the
 index and reads at most the cap, with no visibility map and with future rows.
+`bounded_depth_counts_in_one_pass_until_a_vacuum` checks the pass with an empty
+map and the walk after a vacuum.
 `queue_depth_gauge_caps_the_sum_of_the_shards` runs a worker on two shards of
 6,000 rows each and expects 10,000. `queue_depth_alerts_sit_below_the_gauge_cap`
 keeps the starter thresholds within reach of the gauge.

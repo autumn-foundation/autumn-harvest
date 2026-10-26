@@ -35,6 +35,11 @@ stays exact below the bound.
   primary capacity page.
 - `idx_harvest_tq_coverage_sample` holds `(queue_name, scheduled_at, id)` for
   pending rows. A walk in that order can stop after a fixed number of rows.
+- An index-only scan visits the heap for each row on a page that the
+  visibility map does not cover. Queues share heap pages, so a walk of one
+  queue can visit a new page for each row. An enqueue burst leaves such pages
+  until autovacuum runs. The table runs autovacuum at 2% dead rows
+  (issue #1811).
 - Eligibility depends on `scheduled_at <= NOW()`. A row becomes eligible as
   time passes, with no write.
 - About 50 test files build `WorkerRuntimeConfig` as a struct literal. A new
@@ -58,6 +63,10 @@ stays exact below the bound.
 | B12 | At the cap, read growth from the oldest pending age. | **Adopted.** Without it the backlog alert clears when the backlog is largest. A clause on the level alone would fire on a healthy drain. |
 | B15 | At the cap, also fire when the age stays 0 for the whole window. | **Adopted.** The age gauge applies the claim gates. When a gate blocks every row, it reads 0 and shows no growth. |
 | B16 | Test the rule with promtool. | **Adopted.** A loadable copy of the rule and promtool cases run in the `lint` job. A guard keeps the copy equal to the pack. |
+| B17 | Force the walk in every state. | Rejected. With an empty visibility map the walk visits a heap page per row. On the 300,000-row fixture it read 81,479 to 155,878 buffers. One pass read 14,152. |
+| B18 | Pick the walk or one pass from `pg_class`. Walk only when its worst case, `(1 − all-visible share) × queues × cap` heap visits, is below the page count of the table. | **Adopted.** A run then costs no more than the smaller of the two bounds. With an empty map it costs what the exact count costs. |
+| B19 | Turn sorts off for the count. | **Adopted.** A walk near the cap can otherwise sort every eligible row. The claim path turns bitmap scans off for the same reason (issue #1956). |
+| B20 | Leave a paused queue out of the clause for a zero age. | **Adopted.** A deliberate pause of a deep queue would ticket. `harvest_queue_paused_too_long` covers a pause. |
 | B13 | Order the bounded scan by the index key. | **Adopted.** It pins the plan to the ordered index walk. |
 | B14 | Keep the cap in `telemetry`. | **Adopted.** It is the contract of the gauge. The alert guard then runs in the CI leg without the `db` feature. |
 
@@ -69,7 +78,9 @@ stays exact below the bound.
 | R11 | A gate blocks every row of a deep queue. The age gauge reads 0, so the age clause sees no growth either. | At the cap, an age of 0 for the whole window fires the rule. A promtool case covers it. |
 | R2 | A cap at or below an alert threshold. The alert can never fire. | The cap is 10,000. The largest strict starter threshold is 1,000. A guard test fails when a starter threshold cannot fire under the cap. |
 | R3 | `LIMIT` after `GROUP BY` caps the number of queues, not the rows. | The limit sits in a `LATERAL` subquery per queue. A shape test checks it. |
-| R4 | A `LIMIT` with no order lets the planner pick a sequential scan, or an index that reads future rows. A shallow queue then reads the whole table on each tick. | The subquery orders by `scheduled_at, id`. A test with an empty visibility map and future rows checks that each scan walks the index and reads at most the cap. |
+| R4 | A `LIMIT` with no order lets the planner pick a sequential scan, or an index that reads future rows. A shallow queue then reads the whole table on each tick. | The subquery orders by `scheduled_at, id`, and the count turns sorts off. A test with an empty visibility map and future rows checks that each scan walks the index and reads at most the cap. |
+| R12 | An empty visibility map makes the walk visit a heap page per row, once per queue. It then costs more than the exact count. | The query makes one pass instead. A test checks the pass before a vacuum and the walk after it. |
+| R13 | A deliberate pause of a deep queue tickets through the clause for a zero age. | The clause leaves out a queue with `harvest_queue_paused` at 1. A promtool case covers it. |
 | R5 | The shard sum reports `shards × cap`. | The sampler caps the sum. A Verus proof, a proptest and a two-shard worker test cover it. |
 | R6 | A duplicate queue name in the input counts twice. | The query takes `DISTINCT` names. A test covers it. |
 | R7 | The bounded value differs from the exact count below the cap. | A test compares both functions at ten caps, each cap in one transaction. |
@@ -105,16 +116,20 @@ means "10,000 or more".
 
 - `telemetry::QUEUE_DEPTH_CAP` is 10,000.
 - `queue::bounded_queue_depths(conn, queues, cap)` counts each queue up to
-  `cap`. A `LATERAL` subquery per distinct queue name walks
+  `cap`. Statistics in `pg_class` pick one of two ways to count. The walk
+  runs a `LATERAL` subquery per distinct queue name. Each walks
   `idx_harvest_tq_coverage_sample` in key order and stops after `cap` rows.
-  `bounded_queue_depths_query()` returns the SQL, so tests can read its plan.
+  The pass counts every eligible row once and caps the count. The count runs
+  with sorts off, in its own transaction. `bounded_queue_depths_query()`
+  returns the SQL, so tests can read its plan.
 - `queue::queue_depths` stays exact. It is the oracle of the tests.
 - `queue::add_bounded_depth` adds one shard value to a running total and
   caps the result. The sampler folds the shards with it.
   `formal/verus/src/depth_cap.rs` proves that the fold equals the capped
   total.
 - `harvest_queue_backlog_growth` fires at the cap when the oldest pending age
-  grows over the window, or stays 0 for the whole window.
+  grows over the window. It also fires when the age stays 0 for the whole
+  window on a queue that is not paused.
   `docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml` tests the rule
   with promtool in the `lint` job.
 
@@ -124,9 +139,16 @@ means "10,000 or more".
   `harvest.queue.oldest_pending_age` and schedule-to-start. The age gauge
   reads 0 for a paused queue.
 - A custom alert on a depth above 10,000 can no longer fire.
-- The bound per call is the number of queues times the cap, not the backlog.
-  A queue at the cap reads 10,000 index entries, plus heap pages that the
-  visibility map does not cover.
+- A run costs no more than the smaller of one pass over the table and
+  `queues × cap` row visits. With a full visibility map it walks, and its cost
+  does not grow with the backlog. With an empty map it costs what the exact
+  count costs, until autovacuum runs.
+- The choice reads `relpages` and `relallvisible`, which a vacuum or an
+  analyze sets. Between two runs of autovacuum the choice can lag the table.
+- At the cap the backlog rule cannot tell growth from a burst larger than the
+  cap that drains slowly. In both, the oldest task waits longer, so both fire.
+- The clause for a zero age leaves out a queue pause only. Another deliberate
+  hold, such as an activity pause, still fires it.
 
 ## 3. Tests and acceptance criteria
 
@@ -134,8 +156,9 @@ means "10,000 or more".
 |----|------|
 | Below the cap, the bounded depth equals the exact depth. At or above the cap, it equals the cap. | `bounded_depths_match_the_exact_count_up_to_the_cap` |
 | Each queue scan walks the index and reads at most the cap, with no visibility map and with future rows. | `bounded_depth_scan_stops_at_the_cap` |
+| With an empty visibility map at the gauge cap, the count makes one pass. After a vacuum it walks and reads the cap of each queue. | `bounded_depth_counts_in_one_pass_until_a_vacuum` |
 | The sampler caps the sum of the shards. | `queue_depth_gauge_caps_the_sum_of_the_shards` |
 | The capped shard sum equals the capped total. | `add_bounded_depth_caps_the_sum_of_the_shards`, `a_fold_of_bounded_shards_is_the_capped_total` and `formal/verus/src/depth_cap.rs` |
 | Each starter depth threshold can fire under the cap, and the backlog rule fires at the cap. | `queue_depth_alerts_sit_below_the_gauge_cap` |
-| The backlog rule fires on growth and on a fully gated backlog at the cap, and stays silent on a drain and a steady queue. | promtool cases in `docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml` and `the_backlog_rule_file_matches_the_starter_pack` |
+| The backlog rule fires on growth and on a fully gated backlog at the cap. It stays silent on a queue that catches up, a steady queue and a paused queue. | promtool cases in `docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml` and `the_backlog_rule_file_matches_the_starter_pack` |
 | Depth buffers drop at 100,000 and 300,000 pending rows. | `queue_age_gauge_perf`, see `docs/performance-queue-depth-gauge.md` |

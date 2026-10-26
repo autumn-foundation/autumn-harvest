@@ -9,7 +9,7 @@ groups:
   - name: harvest-starter-backlog-growth
     rules:
       - alert: harvest_queue_backlog_growth
-        expr: 'max_over_time(harvest_queue_depth{queue="default"}[10m]) > 100 and (deriv(harvest_queue_depth{queue="default"}[10m]) > 0 or (min_over_time(harvest_queue_depth{queue="default"}[10m]) >= 10000 and (deriv(harvest_queue_oldest_pending_age{queue="default"}[10m]) > 0 or max_over_time(harvest_queue_oldest_pending_age{queue="default"}[10m]) == 0)))'
+        expr: 'max_over_time(harvest_queue_depth{queue="default"}[10m]) > 100 and (deriv(harvest_queue_depth{queue="default"}[10m]) > 0 or (min_over_time(harvest_queue_depth{queue="default"}[10m]) >= 10000 and (deriv(harvest_queue_oldest_pending_age{queue="default"}[10m]) > 0 or (max_over_time(harvest_queue_oldest_pending_age{queue="default"}[10m]) == 0 unless on (queue) max by (queue) (harvest_queue_paused{queue="default"}) > 0))))'
         for: 10m
         labels:
           severity: ticket

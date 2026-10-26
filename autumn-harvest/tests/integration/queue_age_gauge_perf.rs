@@ -372,18 +372,24 @@ async fn zz_capture_queue_age_gauge_plans() {
             let _ = writeln!(out, "{}", line.line);
         }
         out.push('\n');
+        // The bounded count runs under its own planner settings, as in
+        // `queue::bounded_queue_depths`.
         let depth = [
-            ("exact queue_depths", EXACT_DEPTH_SQL.to_owned()),
+            ("exact queue_depths", EXACT_DEPTH_SQL.to_owned(), ""),
             (
                 "bounded_queue_depths",
                 queue::bounded_queue_depths_query().replace(
                     "$2",
                     &autumn_harvest::telemetry::QUEUE_DEPTH_CAP.get().to_string(),
                 ),
+                queue::BOUNDED_DEPTH_PLAN_SETTINGS_SQL,
             ),
         ];
-        for (name, sql) in depth {
+        for (name, sql, settings) in depth {
             let _ = writeln!(out, "=== {label}: {name}, pending={pending}");
+            conn.batch_execute(&format!("BEGIN; {settings}"))
+                .await
+                .expect("begin");
             let plan: Vec<PlanLine> = diesel::sql_query(format!(
                 "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) {}",
                 sql.replace("$1::text[]", &format!("'{queues}'::text[]"))
@@ -392,6 +398,7 @@ async fn zz_capture_queue_age_gauge_plans() {
             .load(&mut conn)
             .await
             .expect("explain depth");
+            conn.batch_execute("COMMIT").await.expect("commit");
             for line in plan {
                 let _ = writeln!(out, "{}", line.line);
             }

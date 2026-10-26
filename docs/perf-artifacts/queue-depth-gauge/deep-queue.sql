@@ -37,10 +37,24 @@ FROM harvest_task_queue
 WHERE queue_name = ANY('{default}') AND state = 'PENDING' AND scheduled_at <= NOW()
 GROUP BY queue_name;
 
--- The bounded count of queue::bounded_queue_depths, at the gauge cap.
+-- The shipped query of queue::bounded_queue_depths, at the gauge cap, with
+-- sorts off. After the vacuum it walks the index.
+BEGIN;
+SET LOCAL enable_sort = off;
 EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF)
-SELECT q.queue_name, c.depth
-FROM (SELECT DISTINCT queue_name FROM unnest('{default}'::text[]) AS u(queue_name)) q
+WITH queues AS (
+    SELECT DISTINCT queue_name FROM unnest('{default}'::text[]) AS u(queue_name)
+),
+walk AS (
+    SELECT COALESCE((
+        SELECT (1 - c.relallvisible::float8 / GREATEST(c.relpages, 1))
+               * (SELECT count(*) FROM queues) * 10000 < c.relpages
+        FROM pg_class c
+        WHERE c.oid = 'harvest_task_queue'::regclass
+    ), true) AS chosen
+)
+SELECT q.queue_name, b.depth
+FROM queues q
 CROSS JOIN LATERAL (
     SELECT COUNT(*)::BIGINT AS depth
     FROM (
@@ -52,5 +66,14 @@ CROSS JOIN LATERAL (
         ORDER BY t.scheduled_at, t.id
         LIMIT 10000
     ) bounded
-) c
-WHERE c.depth > 0;
+) b
+WHERE b.depth > 0 AND (SELECT chosen FROM walk)
+UNION ALL
+SELECT t.queue_name, LEAST(COUNT(*), 10000)::BIGINT AS depth
+FROM harvest_task_queue t
+WHERE t.queue_name = ANY('{default}')
+  AND t.state = 'PENDING'
+  AND t.scheduled_at <= NOW()
+  AND NOT (SELECT chosen FROM walk)
+GROUP BY t.queue_name;
+COMMIT;
