@@ -142,15 +142,14 @@ column:
 | `sequential` | 1000 | 18,825,429 | 18,828,713 |
 | `sequential` | 2000 | 35,412,341 | 35,416,385 |
 
-### Not fixed here
+Issue #2338 shipped after this run. It adds about 1.4% to `fanout` and 0.8%
+to `sequential`. [Its own table](#measurement) gives the new numbers.
 
-Two other matcher paths stay quadratic. Issue #2338 tracks both:
+### Follow-up (issue #2338)
 
-- `scan_ahead_for_external_signal_terminals` walks the rest of the history on
-  each `match_*` call while an external signal, cancel or await is stashed. A
-  fan-out after one external signal still costs O(N²).
-- `scan_local_activity_terminal`, and the child, timer and external scans,
-  keep the plain walk. A fan-out of local activities is likely still O(N²).
+Issue #2338 found three more quadratic matcher paths. The section
+[Issue #2338](#issue-2338-the-external-timer-and-child-scans) below fixes
+them.
 
 ## The earlier change (PR #2303)
 
@@ -214,3 +213,135 @@ for shape in fanout fanout_rev sequential; do
 done
 MATCH_ACTIVITY_PROFILE_N=1000 valgrind --tool=dhat --dhat-out-file=dhat.json "$BIN"
 ```
+
+## Issue #2338: the external, timer and child scans
+
+**Outcome: shipped.** Three more scans now read the same index. At N=1000 the
+`fanout_extsig` bench costs 80% fewer instructions, the `timers`
+bench 79% fewer and the `children` bench 68% fewer.
+`docs/design/DESIGN-2338.md` records the plan.
+
+### Cause
+
+- `scan_ahead_for_external_signal_terminals` runs in `prepare_match`, before
+  each `match_*` call. While an external signal, cancel or await is stashed, it
+  walked from the cursor to the end of history. One stashed signal made each
+  call of a fan-out cost the rest of the history.
+- The fire scan of `match_timer_strict` stepped over the later `TimerStarted`
+  events and the consumed fires of earlier timers, as the activity scan did.
+- The terminal scan of `match_child_workflow` stepped over every later child
+  start.
+
+Two other scans that the issue named are linear. They need no change:
+
+- `scan_local_activity_terminal` stops at the first event of any other local
+  activity. A worker runs a local activity inline, so its events are always
+  adjacent.
+- The external signal, cancel and await scans stop at the first command
+  event, so they never step over a sibling of their own kind.
+
+`replay_steps_grow_near_linearly_for_every_shape` keeps all five as guards.
+
+One quadratic shape remains. The external scan visits an external terminal
+that matches no stash entry again on each call. Issue #2346 tracks it.
+
+### Change
+
+- Three roles are new. `Fired(id)` marks a `TimerFired`, `ChildTerminal(id)` a
+  child terminal, and `ExternalTerminal` the six external terminal events. An
+  activity scan treats them as before: a step, a step and a stash.
+- The external scan visits only the unconsumed external terminals at or after
+  the cursor, in history order. It resolves each with the code of the old
+  walk. Every other event was a no-op for that walk.
+- The timer scan runs through the activity scan code. A `ScanTarget` picks the
+  stop: an activity schedule or terminal, or the fire of one timer. The old
+  timer rules and the activity roles agree on every event class.
+- The child scan reads the terminal positions of its child. Like the old scan,
+  it does not skip a consumed terminal.
+
+All three use the ski-rental rule above. A walk moves to the index only after
+the walks of the matcher cost more than a build.
+
+### Measurement
+
+Callgrind, total instructions (`Ir`) of the harness. "Before" is `e2c7bfb`.
+
+| Bench | Shape | N | Before | After | Change |
+|---|---|---|---|---|---|
+| `match_activity_profile` | `fanout` | 500 | 12,320,261 | 12,488,526 | +1.4% |
+| `match_activity_profile` | `fanout` | 1000 | 24,234,173 | 24,569,705 | +1.4% |
+| `match_activity_profile` | `fanout` | 2000 | 47,833,937 | 48,508,146 | +1.4% |
+| `match_activity_profile` | `fanout_extsig` | 500 | 38,623,150 | 13,057,175 | −66.2% |
+| `match_activity_profile` | `fanout_extsig` | 1000 | 129,798,172 | 25,616,229 | −80.3% |
+| `match_activity_profile` | `fanout_extsig` | 2000 | 465,940,560 | 50,739,416 | −89.1% |
+| `match_activity_profile` | `sequential` | 500 | 9,624,003 | 9,703,530 | +0.8% |
+| `match_activity_profile` | `sequential` | 1000 | 18,821,993 | 18,980,895 | +0.8% |
+| `match_activity_profile` | `sequential` | 2000 | 35,407,161 | 35,724,799 | +0.9% |
+| `timer_child_fanout_profile` | `timers` | 500 | 13,427,715 | 5,407,186 | −59.7% |
+| `timer_child_fanout_profile` | `timers` | 1000 | 49,383,239 | 10,432,040 | −78.9% |
+| `timer_child_fanout_profile` | `timers` | 2000 | 185,700,506 | 20,355,658 | −89.0% |
+| `timer_child_fanout_profile` | `timers_rev` | 500 | 20,032,969 | 5,708,005 | −71.5% |
+| `timer_child_fanout_profile` | `timers_rev` | 1000 | 74,281,950 | 10,988,155 | −85.2% |
+| `timer_child_fanout_profile` | `timers_rev` | 2000 | 285,438,552 | 21,490,427 | −92.5% |
+| `timer_child_fanout_profile` | `timers_seq` | 500 | 2,263,765 | 2,281,281 | +0.8% |
+| `timer_child_fanout_profile` | `timers_seq` | 1000 | 4,094,835 | 4,127,351 | +0.8% |
+| `timer_child_fanout_profile` | `timers_seq` | 2000 | 7,664,012 | 7,726,528 | +0.8% |
+| `timer_child_fanout_profile` | `children` | 500 | 5,022,614 | 2,843,721 | −43.4% |
+| `timer_child_fanout_profile` | `children` | 1000 | 16,272,109 | 5,258,871 | −67.7% |
+| `timer_child_fanout_profile` | `children` | 2000 | 58,114,910 | 10,093,580 | −82.6% |
+| `timer_child_fanout_profile` | `children_rev` | 500 | 5,030,074 | 2,919,336 | −42.0% |
+| `timer_child_fanout_profile` | `children_rev` | 1000 | 16,271,824 | 5,405,844 | −66.8% |
+| `timer_child_fanout_profile` | `children_rev` | 2000 | 58,121,515 | 10,393,662 | −82.1% |
+| `timer_child_fanout_profile` | `children_seq` | 500 | 1,806,955 | 1,834,980 | +1.6% |
+| `timer_child_fanout_profile` | `children_seq` | 1000 | 3,293,786 | 3,347,291 | +1.6% |
+| `timer_child_fanout_profile` | `children_seq` | 2000 | 6,162,328 | 6,266,833 | +1.7% |
+
+The quadratic shapes now grow about 2 times per doubling of N.
+
+The shapes with no fan-out cost a little more. A sequential history costs
+0.8% more, a sequential timer history 0.8% and a sequential child history
+1.6%. Inside the matcher (the inclusive cost of `match_activity`,
+`match_timer_strict` or `match_child_workflow`), that is about 21 instructions
+for each activity, 43 for each timer and 40 for each child. A plain activity
+fan-out with no stashed external call costs 1.4% more. Inside the matcher, that
+is about 200 instructions for each activity. Most of it is in the inlined scan
+walk. #2330 accepted a cost of the same size.
+
+The scans no longer move the index out of the matcher and back. A move
+copied the index twice and built an empty one, which created a `RandomState`
+for each of its hash maps. With the larger index of this change, that cost
+about 300 instructions for each indexed scan. A split borrow of the index and
+the consumed sets now replaces it.
+
+### Tests
+
+- `replay_steps_grow_near_linearly_for_every_shape` counts the scan steps at
+  N=256 and N=512 for nine shapes. The old code failed it for seven of them,
+  with ratios from 3.79 to 3.98.
+- `the_indexed_scan_matches_the_oracle` now also runs copies of the old
+  external, timer and child scans as the oracle. It drives external signal and
+  await calls, and it matches the timer or child at the cursor. Mutants of
+  the new external, timer and child code fail it.
+- Edge tests in `scan_fanout_tests` cover a second terminal of one signal or
+  await, foreign and consumed fires, and a consumed child terminal. They also
+  cover cut views, with the hidden position in the index and not.
+- Five mutants were checked by hand: an external scan that skips a terminal,
+  a timer target that stops at any fire, an off-by-one child query, a child
+  walk that skips consumed terminals, and an await rule without the open
+  check. The tests above fail each one.
+
+### Reproduce
+
+```bash
+BIN=$(cargo bench -p autumn-harvest --no-default-features --features testing \
+  --bench timer_child_fanout_profile --no-run --message-format=json 2>/dev/null \
+  | jq -r 'select(.reason=="compiler-artifact" and .target.name=="timer_child_fanout_profile") | .executable')
+for shape in timers timers_rev timers_seq children children_rev children_seq; do
+  TIMER_CHILD_PROFILE_SHAPE=$shape TIMER_CHILD_PROFILE_N=1000 \
+    valgrind --tool=callgrind --branch-sim=no --cache-sim=no \
+    --callgrind-out-file="cg.$shape" "$BIN"
+done
+```
+
+Use `MATCH_ACTIVITY_PROFILE_SHAPE=fanout_extsig` with the `match_activity_profile`
+command above for the external scan.

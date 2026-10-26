@@ -718,3 +718,11 @@ harness = false
 name = "match_activity_profile"
 required-features = ["testing"]
 harness = false
+
+# Deterministic (non-criterion) instruction-count profiling harness for the
+# timer fire scan and the child terminal scan (issue #2338). Drive it under
+# `valgrind --tool=callgrind`. See `benches/timer_child_fanout_profile.rs`.
+[[bench]]
+name = "timer_child_fanout_profile"
+required-features = ["testing"]
+harness = false

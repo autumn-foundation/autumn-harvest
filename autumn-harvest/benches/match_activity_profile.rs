@@ -13,6 +13,9 @@
 //!   complete in scheduling order. Workflow code awaits them in order.
 //! - `fanout_rev`: as `fanout`, but the completions arrive in reverse order.
 //! - `sequential`: schedule, complete, schedule, complete, `N` times.
+//! - `fanout_extsig`: as `fanout`, after one `ExternalSignalRequested` and
+//!   `ExternalSignalDelivered` pair. The harness matches the signal after the
+//!   fan-out, so the stash holds it for the whole fan-out (issue #2338).
 //!
 //! The harness replays the history through the public `HistoryMatcher::new`
 //! and `match_activity` entry points, once per activity. Each activity carries
@@ -33,7 +36,7 @@
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::replay::{HistoryMatch, HistoryMatcher};
-use autumn_harvest::types::ActivityExecId;
+use autumn_harvest::types::{ActivityExecId, ExecutionId, ExternalSignalId, ExternalTarget};
 use serde_json::{Value, json};
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -70,9 +73,25 @@ fn completed(i: usize, id: ActivityExecId) -> WorkflowEvent {
     }
 }
 
+/// The target of the external signal in the `fanout_extsig` shape.
+fn signal_target() -> ExternalTarget {
+    ExternalTarget::ExecutionId(ExecutionId::from_uuid(uuid::Uuid::from_u128(2338)))
+}
+
 fn history(shape: &str, n: usize) -> Vec<WorkflowEvent> {
     let ids: Vec<ActivityExecId> = (0..n).map(|_| ActivityExecId::new()).collect();
-    let mut events = Vec::with_capacity(2 * n);
+    let mut events = Vec::with_capacity(2 * n + 2);
+    if shape == "fanout_extsig" {
+        let signal_id = ExternalSignalId::new();
+        events.push(WorkflowEvent::ExternalSignalRequested {
+            signal_id,
+            target: signal_target(),
+            signal_name: "go".into(),
+            payload: Value::Null,
+            idempotency_key: None,
+        });
+        events.push(WorkflowEvent::ExternalSignalDelivered { signal_id });
+    }
     match shape {
         "sequential" => {
             for (i, id) in ids.iter().enumerate() {
@@ -80,9 +99,9 @@ fn history(shape: &str, n: usize) -> Vec<WorkflowEvent> {
                 events.push(completed(i, *id));
             }
         }
-        "fanout" | "fanout_rev" => {
+        "fanout" | "fanout_rev" | "fanout_extsig" => {
             events.extend(ids.iter().enumerate().map(|(i, id)| scheduled(i, *id)));
-            if shape == "fanout" {
+            if shape != "fanout_rev" {
                 events.extend(ids.iter().enumerate().map(|(i, id)| completed(i, *id)));
             } else {
                 events.extend(
@@ -114,6 +133,13 @@ fn main() {
                 }
                 other => panic!("expected Matched, got {other:?}"),
             }
+        }
+        if shape == "fanout_extsig" {
+            let signal = matcher.match_external_signal(&signal_target(), "go");
+            assert!(
+                matches!(signal, HistoryMatch::Matched { .. }),
+                "expected the stashed signal, got {signal:?}"
+            );
         }
     }
     println!("match_activity_profile: shape={shape} n={n} reps={reps} matched={hits}");

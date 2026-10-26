@@ -1,9 +1,12 @@
-//! A position index for the activity terminal scan (issue #2330).
+//! A position index for the terminal scans of `HistoryMatcher` (issues
+//! #2330 and #2338).
 //!
 //! `HistoryMatcher::scan_activity_terminal` looks for the terminal event of
 //! one activity. A plain walk visits every event between the schedule and
 //! the terminal. In a fan-out of N activities, each walk steps over the
 //! later schedules and the consumed completions, so a replay costs O(N²).
+//! The timer fire scan, the child terminal scan and the external stash scan
+//! have the same problem.
 //!
 //! This index keeps the positions that can change the result of a scan.
 //! Once a scan leaves its walk, it reads only those positions. All other
@@ -15,7 +18,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use crate::event::WorkflowEvent;
-use crate::types::ActivityExecId;
+use crate::types::{ActivityExecId, ExecutionId, TimerId};
 
 /// The cost of indexing one event, in walk steps.
 ///
@@ -24,25 +27,57 @@ use crate::types::ActivityExecId;
 /// small fan-out stays on the walk.
 const BUILD_COST_IN_WALK_STEPS: usize = 16;
 
-/// What one event means to the activity terminal scan.
+/// What one event means to the terminal scans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScanRole {
+pub enum ScanRole<'e> {
     /// An `ActivityScheduled`. It stops the scan for its own activity. For
-    /// any other activity, it is an interleaved command.
+    /// any other scan, it is an interleaved command.
     Scheduled(ActivityExecId),
-    /// A terminal event. It ends the scan for its own activity. Any other
-    /// scan steps over it.
+    /// An activity terminal event. It ends the scan for its own activity.
+    /// Any other scan steps over it.
     Terminal(ActivityExecId),
     /// An `ActivityStarted` or `ActivityHeartbeat`. Every scan steps over
     /// it. A settle of its own activity consumes it.
     Progress(ActivityExecId),
+    /// A `TimerFired`. It ends the scan for its own timer. Any other scan
+    /// steps over it.
+    Fired(&'e TimerId),
+    /// A `ChildWorkflowCompleted` or `ChildWorkflowFailed`. The child scan
+    /// ends at it for its own child. Any other scan steps over it.
+    ChildTerminal(ExecutionId),
     /// A command that the scan steps over. The first one becomes the
     /// cursor after the scan.
     Interleaved,
+    /// A terminal event of an external signal, cancel or await. A scan
+    /// stashes it, as a barrier. The external stash scan resolves it.
+    ExternalTerminal,
     /// An event that the scan stashes, or an event that stops it.
     Barrier,
     /// An event that the scan steps over.
     Pass,
+}
+
+/// What an activity or timer scan looks for (issue #2338).
+#[derive(Debug, Clone, Copy)]
+pub enum ScanTarget<'t> {
+    /// The schedule or the terminal event of this activity.
+    Activity(ActivityExecId),
+    /// The fire of the timer with this id.
+    Timer(&'t str),
+}
+
+impl ScanTarget<'_> {
+    /// Whether an event with `role` ends a scan for this target.
+    #[inline]
+    pub fn stops_at(self, role: ScanRole<'_>) -> bool {
+        match (self, role) {
+            (Self::Activity(target), ScanRole::Scheduled(id) | ScanRole::Terminal(id)) => {
+                id == target
+            }
+            (Self::Timer(target), ScanRole::Fired(id)) => id.as_str() == target,
+            _ => false,
+        }
+    }
 }
 
 /// The positions of one activity.
@@ -55,7 +90,7 @@ struct ActivityPositions {
     progress: Vec<usize>,
 }
 
-/// The positions of the events that can change an activity scan.
+/// The positions of the events that can change a terminal scan.
 #[derive(Debug, Default)]
 pub struct ActivityScanIndex {
     /// The length of the history prefix that the index holds.
@@ -63,8 +98,16 @@ pub struct ActivityScanIndex {
     /// The events that scans and settles walked one by one.
     walked: usize,
     activities: HashMap<ActivityExecId, ActivityPositions>,
+    /// The `TimerFired` events of each timer. A workflow can reuse a timer
+    /// id, so one timer can have many fires. A skip list then passes over
+    /// the consumed ones.
+    fires: HashMap<String, SkipList>,
+    /// The terminal events of each child, in history order.
+    children: HashMap<ExecutionId, Vec<usize>>,
     interleaved: SkipList,
     barriers: SkipList,
+    /// The external terminal events. Each one is a barrier too.
+    external_terminals: SkipList,
 }
 
 impl ActivityScanIndex {
@@ -75,7 +118,11 @@ impl ActivityScanIndex {
     /// `restore_view` brings back the same tail. So the prefix that the
     /// index holds never changes. The caller ignores a position at or after
     /// the visible length, which covers a cut.
-    pub fn extend(&mut self, events: &[WorkflowEvent], role: impl Fn(&WorkflowEvent) -> ScanRole) {
+    pub fn extend(
+        &mut self,
+        events: &[WorkflowEvent],
+        role: impl for<'e> Fn(&'e WorkflowEvent) -> ScanRole<'e>,
+    ) {
         for (position, event) in events.iter().enumerate().skip(self.indexed) {
             #[cfg(test)]
             steps::count();
@@ -94,7 +141,21 @@ impl ActivityScanIndex {
                         .progress
                         .push(position);
                 }
+                ScanRole::Fired(id) => {
+                    if let Some(fires) = self.fires.get_mut(id.as_str()) {
+                        fires.push(position);
+                    } else {
+                        let mut fires = SkipList::default();
+                        fires.push(position);
+                        self.fires.insert(id.as_str().to_owned(), fires);
+                    }
+                }
+                ScanRole::ChildTerminal(id) => self.children.entry(id).or_default().push(position),
                 ScanRole::Interleaved => self.interleaved.push(position),
+                ScanRole::ExternalTerminal => {
+                    self.barriers.push(position);
+                    self.external_terminals.push(position);
+                }
                 ScanRole::Barrier => self.barriers.push(position),
                 ScanRole::Pass => {}
             }
@@ -122,19 +183,46 @@ impl ActivityScanIndex {
         self.is_built() || self.walked >= len.saturating_mul(BUILD_COST_IN_WALK_STEPS)
     }
 
-    /// The first unconsumed `ActivityScheduled` or terminal event of `id`
-    /// at or after `from`.
+    /// The first unconsumed stop of `target` at or after `from`.
     ///
-    /// One activity has few such events, so a plain walk is enough.
+    /// The stops of an activity are its `ActivityScheduled` and terminal
+    /// events. Activity ids are unique, so an activity has few stops, and a
+    /// plain walk is enough. The stops of a timer are its fires. Their skip
+    /// list passes over the consumed fires of a reused timer id.
     pub fn first_stop(
-        &self,
-        id: ActivityExecId,
+        &mut self,
+        target: ScanTarget<'_>,
         from: usize,
         consumed: impl Fn(usize) -> bool,
     ) -> Option<usize> {
-        let stops = &self.activities.get(&id)?.stops;
-        let start = stops.partition_point(|&p| p < from);
-        stops[start..].iter().copied().find(|&p| !consumed(p))
+        match target {
+            ScanTarget::Activity(id) => {
+                let stops = &self.activities.get(&id)?.stops;
+                let start = stops.partition_point(|&p| p < from);
+                stops[start..].iter().copied().find(|&p| !consumed(p))
+            }
+            ScanTarget::Timer(id) => self.fires.get_mut(id)?.first_unconsumed(from, consumed),
+        }
+    }
+
+    /// The first terminal event of `child` at or after `from`.
+    ///
+    /// The child scan does not skip a consumed terminal, so this query does
+    /// not either.
+    pub fn first_child_terminal(&self, child: ExecutionId, from: usize) -> Option<usize> {
+        let terminals = self.children.get(&child)?;
+        terminals
+            .get(terminals.partition_point(|&p| p < from))
+            .copied()
+    }
+
+    /// The first unconsumed external terminal event at or after `from`.
+    pub fn first_external_terminal(
+        &mut self,
+        from: usize,
+        consumed: impl Fn(usize) -> bool,
+    ) -> Option<usize> {
+        self.external_terminals.first_unconsumed(from, consumed)
     }
 
     /// The first unconsumed interleaved command at or after `from`.
@@ -228,9 +316,9 @@ fn first_live(next: &mut [usize], from: usize, is_dead: impl Fn(usize) -> bool) 
     }
 }
 
-/// A count of the steps that activity scans take on this thread (issue
-/// #2330). A scaling test reads it. A step is a consumed-set probe, a settle
-/// step or an index build step.
+/// A count of the steps that the terminal scans take on this thread (issues
+/// #2330 and #2338). A scaling test reads it. A step is a consumed-set
+/// probe, a child scan step, a settle step or an index build step.
 #[cfg(test)]
 pub mod steps {
     use std::cell::Cell;
@@ -329,16 +417,100 @@ mod tests {
     fn progress_returns_the_positions_inside_the_range() {
         let id = ActivityExecId::new();
         let mut index = ActivityScanIndex::default();
-        let progress = |_: &WorkflowEvent| ScanRole::Progress(id);
         let events: Vec<WorkflowEvent> = (0..6)
             .map(|_| WorkflowEvent::ActivityHeartbeat {
                 activity_id: id,
                 details: serde_json::Value::Null,
             })
             .collect();
-        index.extend(&events, progress);
+        index.extend(&events, |_| ScanRole::Progress(id));
         assert_eq!(index.progress(id, 1..4), &[1, 2, 3]);
         assert_eq!(index.progress(id, 4..4), &[] as &[usize]);
         assert_eq!(index.progress(ActivityExecId::new(), 0..6), &[] as &[usize]);
+    }
+
+    /// A role function for the tests below. It sorts the events that the
+    /// tests use.
+    fn test_role(event: &WorkflowEvent) -> ScanRole<'_> {
+        match event {
+            WorkflowEvent::TimerFired { timer_id } => ScanRole::Fired(timer_id),
+            WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
+            | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
+                ScanRole::ChildTerminal(*child_id)
+            }
+            WorkflowEvent::ExternalSignalDelivered { .. } => ScanRole::ExternalTerminal,
+            _ => ScanRole::Barrier,
+        }
+    }
+
+    fn fired(id: &str) -> WorkflowEvent {
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new(id),
+        }
+    }
+
+    #[test]
+    fn the_index_keeps_the_fires_of_each_timer() {
+        let mut index = ActivityScanIndex::default();
+        index.extend(&[fired("t"), fired("u"), fired("t")], test_role);
+        let t = ScanTarget::Timer("t");
+        assert_eq!(index.first_stop(t, 0, |_| false), Some(0));
+        assert_eq!(index.first_stop(t, 1, |_| false), Some(2));
+        assert_eq!(index.first_stop(t, 0, |p| p == 0), Some(2));
+        assert_eq!(index.first_stop(ScanTarget::Timer("v"), 0, |_| false), None);
+    }
+
+    #[test]
+    fn a_child_query_returns_each_terminal_in_order() {
+        let child = ExecutionId::new();
+        let events = [
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: child,
+                error: "e".into(),
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: child,
+                output: serde_json::Value::Null,
+            },
+        ];
+        let mut index = ActivityScanIndex::default();
+        index.extend(&events, test_role);
+        assert_eq!(index.first_child_terminal(child, 0), Some(0));
+        assert_eq!(index.first_child_terminal(child, 1), Some(1));
+        assert_eq!(index.first_child_terminal(child, 2), None);
+        assert_eq!(index.first_child_terminal(ExecutionId::new(), 0), None);
+    }
+
+    #[test]
+    fn an_external_terminal_is_a_barrier_too() {
+        let delivered = WorkflowEvent::ExternalSignalDelivered {
+            signal_id: crate::types::ExternalSignalId::new(),
+        };
+        let mut index = ActivityScanIndex::default();
+        index.extend(&[fired("t"), delivered.clone(), delivered], test_role);
+        assert_eq!(index.first_external_terminal(0, |_| false), Some(1));
+        assert_eq!(index.first_external_terminal(0, |p| p == 1), Some(2));
+        assert_eq!(index.first_barrier(0, |_| false), Some(1));
+        assert_eq!(index.first_external_terminal(3, |_| false), None);
+    }
+
+    #[test]
+    fn a_target_stops_at_its_own_events_only() {
+        let a = ActivityExecId::new();
+        let timer = TimerId::new("t");
+        let other = TimerId::new("u");
+        let activity = ScanTarget::Activity(a);
+        assert!(activity.stops_at(ScanRole::Scheduled(a)));
+        assert!(activity.stops_at(ScanRole::Terminal(a)));
+        assert!(!activity.stops_at(ScanRole::Progress(a)));
+        assert!(!activity.stops_at(ScanRole::Terminal(ActivityExecId::new())));
+        assert!(!activity.stops_at(ScanRole::Fired(&timer)));
+        let t = ScanTarget::Timer("t");
+        assert!(t.stops_at(ScanRole::Fired(&timer)));
+        assert!(!t.stops_at(ScanRole::Fired(&other)));
+        assert!(!t.stops_at(ScanRole::Terminal(a)));
     }
 }

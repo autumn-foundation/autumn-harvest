@@ -112,20 +112,20 @@ No behavior change: the recorded event's `activity_id` (the only field any
 other code path reads from a matched `ActivityCompleted`) is untouched;
 `output` is left as `Value::Null`, but nothing reads it again.
 
-Issue #2330 (PR #2340) later rewrote this scan. `find_activity_terminal` now
-finds where the scan stops. It also stashes each signal and external event on
-the way. So no arm of the match passes data from the event to a `&mut self`
-method. `scan_activity_terminal` now matches on
+Issue #2330 (PR #2340) later rewrote this scan. `find_activity_terminal`
+found where the scan stops, and issue #2338 renamed it `find_scan_stop`. The
+finder also stashes each signal and external event on the way. So no arm of
+the match passes data from the event to a `&mut self` method. `scan_activity_terminal` now matches on
 `&mut self.events[terminal_cursor]` in every arm. The `ActivityCompleted` arm
 keeps `std::mem::take(output)`.
 
-PR #2303 and issue #2330 changed code that `match_activity_strict` shares with
-`match_activity`. Neither PR #2303 nor PR #2340 records a run of this harness.
-The counts on this page predate both changes. On a sequential history,
-`match_activity_profile.rs` counted 0.2% more instructions after PR #2303 and
-0.7% more after issue #2330.
+PR #2303, issue #2330 and issue #2338 changed code that `match_activity_strict`
+shares with `match_activity`. None of them records a run of this harness. The
+counts on this page predate all three changes. On a sequential history,
+`match_activity_profile.rs` counted 0.2% more instructions after PR #2303,
+0.7% more after issue #2330 and 0.8% more after issue #2338.
 [`performance-match-activity-fanout.md`](performance-match-activity-fanout.md)
-records both runs.
+records the three runs.
 
 ## Measurement
 
