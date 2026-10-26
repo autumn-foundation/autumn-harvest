@@ -1,0 +1,54 @@
+                                                               QUERY PLAN                                                               
+----------------------------------------------------------------------------------------------------------------------------------------
+ Finalize GroupAggregate (actual rows=1 loops=1)
+   Group Key: queue_name
+   Buffers: shared hit=3845 read=18899 written=50
+   ->  Gather Merge (actual rows=3 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=3845 read=18899 written=50
+         ->  Sort (actual rows=1 loops=3)
+               Sort Key: queue_name
+               Sort Method: quicksort  Memory: 25kB
+               Buffers: shared hit=3845 read=18899 written=50
+               Worker 0:  Sort Method: quicksort  Memory: 25kB
+               Worker 1:  Sort Method: quicksort  Memory: 25kB
+               ->  Partial HashAggregate (actual rows=1 loops=3)
+                     Group Key: queue_name
+                     Batches: 1  Memory Usage: 24kB
+                     Buffers: shared hit=3829 read=18899 written=50
+                     Worker 0:  Batches: 1  Memory Usage: 24kB
+                     Worker 1:  Batches: 1  Memory Usage: 24kB
+                     ->  Parallel Seq Scan on harvest_task_queue (actual rows=333333 loops=3)
+                           Filter: ((queue_name = ANY ('{default}'::text[])) AND (state = 'PENDING'::text) AND (scheduled_at <= now()))
+                           Rows Removed by Filter: 333333
+                           Buffers: shared hit=3829 read=18899 written=50
+ Planning:
+   Buffers: shared hit=69 read=3
+ Planning Time: 0.316 ms
+ Execution Time: 127.428 ms
+(27 rows)
+
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Nested Loop (actual rows=1 loops=1)
+   Buffers: shared hit=111
+   ->  HashAggregate (actual rows=1 loops=1)
+         Group Key: u.queue_name
+         Batches: 1  Memory Usage: 24kB
+         ->  Function Scan on unnest u (actual rows=1 loops=1)
+   ->  Aggregate (actual rows=1 loops=1)
+         Filter: (count(*) > 0)
+         Buffers: shared hit=111
+         ->  Limit (actual rows=10000 loops=1)
+               Buffers: shared hit=111
+               ->  Index Only Scan using idx_harvest_tq_coverage_sample on harvest_task_queue t (actual rows=10000 loops=1)
+                     Index Cond: ((queue_name = u.queue_name) AND (scheduled_at <= now()))
+                     Heap Fetches: 0
+                     Buffers: shared hit=111
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.200 ms
+ Execution Time: 1.576 ms
+(19 rows)
+

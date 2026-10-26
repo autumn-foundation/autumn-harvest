@@ -5611,11 +5611,24 @@ pub async fn delete_pending_timer(
     Ok(())
 }
 
+/// One row of a depth count: a queue name and its count of eligible pending
+/// rows.
+#[derive(diesel::QueryableByName)]
+struct DepthRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    queue_name: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    depth: i64,
+}
+
 /// Count pending tasks per queue for observability / metrics.
 ///
 /// Returns one row per queue name (unseen queues are omitted). Only tasks in
 /// state `PENDING` that are already eligible (`scheduled_at <= NOW()`) are
 /// counted — this matches the slice that [`claim_task`] competes over.
+///
+/// The count is exact, so it reads every eligible row. The depth sampler
+/// calls [`bounded_queue_depths`] instead (issue #2356).
 ///
 /// # Errors
 ///
@@ -5624,15 +5637,7 @@ pub async fn queue_depths(
     conn: &mut AsyncPgConnection,
     queues: &[String],
 ) -> HarvestResult<Vec<(String, i64)>> {
-    #[derive(diesel::QueryableByName)]
-    struct Row {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        queue_name: String,
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        depth: i64,
-    }
-
-    let rows: Vec<Row> = diesel::sql_query(
+    let rows: Vec<DepthRow> = diesel::sql_query(
         "SELECT queue_name, COUNT(*)::BIGINT AS depth \
          FROM harvest_task_queue \
          WHERE queue_name = ANY($1) \
@@ -5647,6 +5652,83 @@ pub async fn queue_depths(
 
     Ok(rows.into_iter().map(|r| (r.queue_name, r.depth)).collect())
 }
+
+/// The SQL of [`bounded_queue_depths`].
+///
+/// A `LATERAL` subquery per distinct queue name holds the `LIMIT`, so the scan
+/// of each queue stops after `$2` rows. A `LIMIT` on the outer query would cap
+/// the number of queues instead.
+///
+/// The `ORDER BY` is the key order of `idx_harvest_tq_coverage_sample`. It
+/// makes the planner walk that index from the oldest row, and the walk ends at
+/// `NOW()`. Without it, the planner can pick a sequential scan or an index that
+/// also reads future rows. A queue below the cap then reads the whole table.
+/// `bounded_depth_scan_stops_at_the_cap` checks the plan.
+///
+/// The count keeps the alias `depth`, because the poll-tick harness
+/// `queue_age_gauge_perf` selects the statement by it.
+///
+/// Binds: `$1` queue names, `$2` the cap.
+#[must_use]
+pub const fn bounded_queue_depths_query() -> &'static str {
+    "SELECT q.queue_name, c.depth \
+     FROM (SELECT DISTINCT queue_name FROM unnest($1::text[]) AS u(queue_name)) q \
+     CROSS JOIN LATERAL ( \
+         SELECT COUNT(*)::BIGINT AS depth \
+         FROM ( \
+             SELECT 1 \
+             FROM harvest_task_queue t \
+             WHERE t.queue_name = q.queue_name \
+               AND t.state = 'PENDING' \
+               AND t.scheduled_at <= NOW() \
+             ORDER BY t.scheduled_at, t.id \
+             LIMIT $2 \
+         ) bounded \
+     ) c \
+     WHERE c.depth > 0"
+}
+
+/// Count pending tasks per queue, up to `cap` for each queue (issue #2356).
+///
+/// A queue reads `min(count, cap)`, where `count` is the value that
+/// [`queue_depths`] returns. The scan of each queue stops after `cap` rows,
+/// so the cost does not grow with the backlog. A queue with no eligible row
+/// is omitted. A repeated name gives one row. The depth sampler calls this
+/// with [`crate::telemetry::QUEUE_DEPTH_CAP`].
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn bounded_queue_depths(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    cap: std::num::NonZeroU32,
+) -> HarvestResult<Vec<(String, i64)>> {
+    let rows: Vec<DepthRow> = diesel::sql_query(bounded_queue_depths_query())
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+        .bind::<diesel::sql_types::BigInt, _>(i64::from(cap.get()))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(rows.into_iter().map(|r| (r.queue_name, r.depth)).collect())
+}
+
+/// The depth total after one more shard (issue #2356).
+///
+/// `total` is the sum so far. `shard_depth` is the bounded depth of one
+/// shard. The result is the new sum, or `cap` when the sum is larger.
+/// `formal/verus/src/depth_cap.rs` proves that no step overflows. It also
+/// proves that a fold over the shards gives the capped sum of the true counts.
+#[must_use]
+pub(crate) fn add_bounded_depth(total: u64, shard_depth: u64, cap: u32) -> u64 {
+    let cap = u64::from(cap);
+    let total = if total > cap { cap } else { total };
+    let part = if shard_depth > cap { cap } else { shard_depth };
+    let sum = total + part;
+    if sum > cap { cap } else { sum }
+}
+
 /// Number of oldest eligible rows per queue that the age gauge reads first.
 ///
 /// The SQL embeds the same number through `oldest_pending_seek_window!`. The test
@@ -13057,6 +13139,64 @@ mod tests {
             sql.matches(&gate).count(),
             2,
             "the refine step and the fallback must each carry every gate"
+        );
+    }
+
+    // ── Bounded queue depth (issue #2356) ───────────────────────────────────
+
+    #[test]
+    fn add_bounded_depth_caps_the_sum_of_the_shards() {
+        assert_eq!(add_bounded_depth(0, 5, 10), 5);
+        assert_eq!(add_bounded_depth(4, 5, 10), 9);
+        assert_eq!(add_bounded_depth(3, 0, 10), 3);
+        assert_eq!(
+            add_bounded_depth(6, 6, 10),
+            10,
+            "two shards below the cap can pass it together"
+        );
+        assert_eq!(add_bounded_depth(10, 10, 10), 10);
+        assert_eq!(add_bounded_depth(0, u64::MAX, 10), 10);
+        assert_eq!(
+            add_bounded_depth(u64::MAX, u64::MAX, u32::MAX),
+            u64::from(u32::MAX),
+            "no step overflows"
+        );
+    }
+
+    proptest::proptest! {
+        /// The fold over the bounded shard depths is the capped total. The
+        /// Verus proof covers every input. This test runs the real function.
+        #[test]
+        fn a_fold_of_bounded_shards_is_the_capped_total(
+            counts in proptest::collection::vec(0_u64..50_000, 0..8),
+            cap in 1_u32..20_000,
+        ) {
+            let bound = u64::from(cap);
+            let gauge = counts
+                .iter()
+                .fold(0, |sum, &n| add_bounded_depth(sum, n.min(bound), cap));
+            proptest::prop_assert_eq!(gauge, counts.iter().sum::<u64>().min(bound));
+        }
+    }
+
+    /// The `LIMIT` sits inside the per-queue subquery. On the outer query it
+    /// would cap the number of queues, not the rows of each queue. The
+    /// `ORDER BY` keeps the scan on the index walk.
+    #[test]
+    fn bounded_queue_depths_query_limits_each_queue() {
+        let sql = bounded_queue_depths_query();
+        assert!(sql.contains("CROSS JOIN LATERAL"), "one subquery per queue");
+        assert!(
+            sql.contains("ORDER BY t.scheduled_at, t.id LIMIT $2 ) bounded"),
+            "an index-order LIMIT must close the per-queue subquery: {sql}"
+        );
+        assert!(
+            sql.contains("SELECT DISTINCT queue_name FROM unnest($1::text[])"),
+            "a repeated queue name must count once: {sql}"
+        );
+        assert!(
+            sql.contains("AS depth"),
+            "the poll-tick harness selects the statement by this alias"
         );
     }
 

@@ -317,7 +317,7 @@
           }
         }
       ],
-      "description": "Alert: harvest_queue_backlog_growth (docs/runbooks/harvest-alerts.md#harvest_queue_backlog_growth) Pending tasks per queue. max by (queue) avoids double-counting when several worker replicas sample the same cross-shard depth. Secondary capacity signal \u2014 the schedule-to-start p99 panel is the primary page."
+      "description": "Alert: harvest_queue_backlog_growth (docs/runbooks/harvest-alerts.md#harvest_queue_backlog_growth) Pending tasks per queue, exact below 10,000. The gauge stops at 10,000, so a flat line at 10K means 10,000 or more (issue #2356). max by (queue) avoids double-counting when several worker replicas sample the same cross-shard depth. Secondary capacity signal \u2014 the schedule-to-start p99 panel is the primary page."
     },
     {
       "id": 6,

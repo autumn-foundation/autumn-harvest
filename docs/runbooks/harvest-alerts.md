@@ -419,7 +419,8 @@ means the worker itself is the bottleneck — not the queue or the database.
 3. Run `harvest concurrency status --output json` (`GET /api/harvest/admin/concurrency`)
    to check whether per-key concurrency limits are deferring work on top of the
    slot pressure.
-4. Compare `harvest.queue.depth` for the same queue:
+4. Compare `harvest.queue.depth` for the same queue. The gauge stops at
+   10,000, so above that read the trend of `harvest.queue.oldest_pending_age`:
    - **Slots saturated AND backlog growing** → worker is the bottleneck; raise
      `max_concurrent_workflows` / `max_concurrent_activities` or add workers.
    - **Backlog growing but slots are free** → bottleneck is downstream
@@ -503,6 +504,12 @@ added, or if the queue backs a customer-facing workflow with a breached SLA.
 `harvest_queue_schedule_to_start_high` (#501). Use this as a corroborating
 signal or as a fallback when histogram metrics are not yet wired.
 
+The depth gauge stops at 10,000 (#2356). Above that value it shows no growth.
+While the gauge holds at 10,000 for the whole window, the rule reads growth
+from `harvest_queue_oldest_pending_age` instead. That gauge has no cap. It
+reads 0 for a paused queue. For an exact count above the cap, scrape
+`harvest_queue_backlog` from `GET /admin/queues/scaling?format=prometheus`.
+
 ### Triage steps
 
 1. Check the alert labels for the queue.
@@ -519,7 +526,10 @@ routing for part of the fleet.
 ### False positives
 
 Batch windows can create expected short spikes. Alert only when depth stays
-high and growth remains positive for the rule window.
+high and growth remains positive for the rule window. At the cap, growth is
+the growth of the oldest pending age. A queue that normally holds more than
+10,000 tasks stays at the cap. For such a queue, drop the depth rule and rely
+on the schedule-to-start alert.
 
 ### Safe actions
 
@@ -1790,7 +1800,8 @@ value. Alert on `max by (queue) (harvest_queue_paused) > 0` with `for: 1h`
 
 5. **Confirm the thaw.** `harvest queue list-paused` should now be empty and the
    `harvest_queue_depth` / `harvest_queue_oldest_pending_age` panels should
-   start falling.
+   start falling. A held backlog above 10,000 keeps the depth panel flat at the
+   cap until it drains below 10,000 (#2356). The age panel shows the drain first.
 
 ### Likely causes
 
@@ -3250,7 +3261,8 @@ This is a health signal, not a durability one. Nothing is lost.
    change means a burst; a steady climb means sustained saturation.
 3. Compare against `harvest.queue.depth` for the queues that process
    serves. A rising backlog alongside dropped hints confirms the publisher
-   cannot keep up with the enqueue rate.
+   cannot keep up with the enqueue rate. The depth gauge stops at 10,000, so
+   above that read `harvest.queue.oldest_pending_age`.
 4. Check the Redis endpoint's own latency and error rate. A slow or
    degraded Redis backs up the publisher queue from the other end.
 

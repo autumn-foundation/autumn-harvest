@@ -9,9 +9,10 @@
 //! answer, which is one timestamp per queue.
 //!
 //! The harness replays worker poll ticks against a seeded backlog. One tick
-//! runs, for each of four workers: `queue_depths`, `oldest_pending_ages` and one
-//! `claim_task` with its `complete_claimed_task`. That is the shape of the
-//! worker loop with a metrics recorder configured.
+//! runs, for each of four workers: `bounded_queue_depths`, `oldest_pending_ages`
+//! and one `claim_task` with its `complete_claimed_task`. That is the shape of
+//! the worker loop with a metrics recorder configured. Before issue #2356 the
+//! depth step was the exact `queue_depths`.
 //!
 //! The fixture is skewed. It has 20 queues with a cubic skew and 40% workflow
 //! tasks. It has 1% paused executions and 5% future-scheduled rows. It has 10%
@@ -22,8 +23,8 @@
 //! waited out a backoff, so it was created up to 30 minutes before.
 //!
 //! The harness reads `pg_stat_statements`. Evidence is call counts and buffers.
-//! Wall-clock is not evidence. Output goes to
-//! `docs/perf-artifacts/queue-age-gauge/` under the label in `PERF_LABEL`.
+//! Wall-clock is not evidence. Output goes to `docs/perf-artifacts/`, in the
+//! directory that `PERF_ARTIFACT_DIR` names, under the label in `PERF_LABEL`.
 //!
 //! Two tests:
 //! - [`zz_capture_queue_age_gauge_evidence`] is the `#[ignore]`d evidence
@@ -57,12 +58,31 @@ const TICKS: usize = 10;
 /// The query as it stood before issue #2339. It is the equivalence oracle.
 const REFERENCE_SQL: &str = "SELECT queue_name, GREATEST( EXTRACT(EPOCH FROM (NOW() - MIN(GREATEST(scheduled_at, COALESCE(created_at, scheduled_at))))), 0 )::DOUBLE PRECISION AS age_secs FROM harvest_task_queue WHERE queue_name = ANY($1) AND state = 'PENDING' AND scheduled_at <= NOW() AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp WHERE qp.queue_name = harvest_task_queue.queue_name) AND NOT EXISTS (SELECT 1 FROM harvest_activity_pauses ap WHERE ap.activity_name = harvest_task_queue.activity_name AND harvest_task_queue.task_type = 'activity') AND ( schedule_to_close_at IS NULL OR schedule_to_close_at > NOW() ) AND ( task_type <> 'workflow' OR workflow_exec_id IS NULL OR NOT EXISTS ( SELECT 1 FROM harvest_workflow_executions e WHERE e.id = harvest_task_queue.workflow_exec_id AND e.state = 'PAUSED' ) ) AND ( concurrency_key IS NULL OR concurrency_cap IS NULL OR ( SELECT COUNT(*) FROM harvest_task_queue inner_q WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key AND inner_q.task_type = harvest_task_queue.task_type AND inner_q.state = 'RUNNING' AND inner_q.worker_id IS NOT NULL ) < harvest_task_queue.concurrency_cap ) AND ( rate_limit_key IS NULL OR activity_name = ANY($2) OR EXISTS ( SELECT 1 FROM harvest_rate_limit_buckets b WHERE b.key = harvest_task_queue.rate_limit_key AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= 1.0 ) ) GROUP BY queue_name";
 
+/// The output directory under `docs/perf-artifacts/`.
+///
+/// `PERF_ARTIFACT_DIR` names it. The default is `queue-age-gauge`. Issue #2356
+/// writes to `queue-depth-gauge`.
+fn artifact_dir() -> std::path::PathBuf {
+    let name = std::env::var("PERF_ARTIFACT_DIR").unwrap_or_else(|_| "queue-age-gauge".to_owned());
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("docs/perf-artifacts")
+        .join(name);
+    std::fs::create_dir_all(&dir).expect("create artifact dir");
+    dir
+}
+
+/// The exact depth count, verbatim from `queue::queue_depths`. The plans show it
+/// beside the bounded count.
+const EXACT_DEPTH_SQL: &str = "SELECT queue_name, COUNT(*)::BIGINT AS depth FROM harvest_task_queue WHERE queue_name = ANY($1) AND state = 'PENDING' AND scheduled_at <= NOW() GROUP BY queue_name";
+
 fn queue_names() -> Vec<String> {
     (0..QUEUES).map(|i| format!("q{i}")).collect()
 }
 
 /// Prefer an operator-supplied server and fall back to testcontainers.
-async fn setup_server() -> (String, Option<ContainerAsync<Postgres>>) {
+pub async fn setup_server() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         return (url, None);
     }
@@ -206,9 +226,13 @@ async fn measure(admin: &str, label: &str, pending: i64) -> (Point, String) {
     let mut last_ages = Vec::new();
     for tick in 0..TICKS {
         for worker in 0..WORKERS {
-            queue::queue_depths(&mut conn, &queues)
-                .await
-                .expect("depths");
+            queue::bounded_queue_depths(
+                &mut conn,
+                &queues,
+                autumn_harvest::telemetry::QUEUE_DEPTH_CAP,
+            )
+            .await
+            .expect("depths");
             last_ages = queue::oldest_pending_ages(&mut conn, &queues, &[])
                 .await
                 .expect("ages")
@@ -272,11 +296,7 @@ async fn measure(admin: &str, label: &str, pending: i64) -> (Point, String) {
 async fn zz_capture_queue_age_gauge_evidence() {
     let (admin, _guard) = setup_server().await;
     let label = std::env::var("PERF_LABEL").unwrap_or_else(|_| "after".to_owned());
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workspace root")
-        .join("docs/perf-artifacts/queue-age-gauge");
-    std::fs::create_dir_all(&dir).expect("create artifact dir");
+    let dir = artifact_dir();
     let mut table = format!(
         "-- {label}: depth + age + claim per worker tick, {TICKS} ticks x {WORKERS} workers\n\
          pending | statements | all buffers | age calls | age buffers | age share | \
@@ -314,19 +334,19 @@ struct PlanLine {
     line: String,
 }
 
-/// Writes `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)` of both gauge queries
+/// Writes `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)` of the gauge queries
 /// at each backlog size, under the label in `PERF_LABEL`.
+///
+/// The depth plans show the exact count of `queue::queue_depths` and the
+/// bounded count of `queue::bounded_queue_depths` on the same table (issue
+/// #2356).
 #[tokio::test]
 #[ignore = "evidence generator, not a CI assertion -- see \
             docs/performance-queue-age-gauge.md"]
 async fn zz_capture_queue_age_gauge_plans() {
     let (admin, _guard) = setup_server().await;
     let label = std::env::var("PERF_LABEL").unwrap_or_else(|_| "after".to_owned());
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workspace root")
-        .join("docs/perf-artifacts/queue-age-gauge");
-    std::fs::create_dir_all(&dir).expect("create artifact dir");
+    let dir = artifact_dir();
     let queues = format!("{{{}}}", queue_names().join(","));
     let mut out = String::new();
     for pending in [20_000, 100_000, 300_000] {
@@ -352,6 +372,31 @@ async fn zz_capture_queue_age_gauge_plans() {
             let _ = writeln!(out, "{}", line.line);
         }
         out.push('\n');
+        let depth = [
+            ("exact queue_depths", EXACT_DEPTH_SQL.to_owned()),
+            (
+                "bounded_queue_depths",
+                queue::bounded_queue_depths_query().replace(
+                    "$2",
+                    &autumn_harvest::telemetry::QUEUE_DEPTH_CAP.get().to_string(),
+                ),
+            ),
+        ];
+        for (name, sql) in depth {
+            let _ = writeln!(out, "=== {label}: {name}, pending={pending}");
+            let plan: Vec<PlanLine> = diesel::sql_query(format!(
+                "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) {}",
+                sql.replace("$1::text[]", &format!("'{queues}'::text[]"))
+                    .replace("ANY($1)", &format!("ANY('{queues}'::text[])"))
+            ))
+            .load(&mut conn)
+            .await
+            .expect("explain depth");
+            for line in plan {
+                let _ = writeln!(out, "{}", line.line);
+            }
+            out.push('\n');
+        }
     }
     std::fs::write(dir.join(format!("{label}-explain.txt")), out).expect("write plans");
 }

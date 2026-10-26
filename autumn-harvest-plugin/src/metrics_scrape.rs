@@ -781,7 +781,7 @@ fn push_catalogue_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
     push_gauge(
         families,
         "harvest_queue_depth",
-        "Current pending task count per queue",
+        "Current pending task count per queue, capped at 10000",
         &[METRIC_LABEL_QUEUE],
         inner.queue_depth.snapshot(),
     );

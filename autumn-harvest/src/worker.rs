@@ -31589,11 +31589,11 @@ async fn escalate_capability_miss(
 ///
 /// The sampler skips work entirely when the recorder is the default no-op
 /// implementation (`is_enabled() == false`), so unconfigured deployments pay no
-/// DB cost. This matters because the per-tick queries are not free: `queue_depths`
-/// is a `GROUP BY` aggregate and `oldest_pending_ages` scans eligible pending rows
-/// with correlated concurrency / rate-limit checks. Both feed gauges that are
-/// discarded by the no-op recorder, so issuing them would be pure waste (issue #501
-/// review).
+/// DB cost. This matters because the per-tick queries are not free.
+/// `bounded_queue_depths` reads up to `QUEUE_DEPTH_CAP` index entries per
+/// queue. `oldest_pending_ages` runs correlated concurrency / rate-limit checks.
+/// Both feed gauges that are discarded by the no-op recorder, so issuing them
+/// would be pure waste (issue #501 review).
 ///
 /// Stops when the cancellation token fires. Queues with zero pending rows are
 /// also reported (as depth 0) so gauges reset cleanly after drains.
@@ -31624,7 +31624,9 @@ fn spawn_queue_depth_sampler(
 
             // Aggregate across every shard: depth is summed (total backlog),
             // oldest-pending-age is the max (the single oldest task fleet-wide).
-            let mut depth_by_queue: std::collections::HashMap<String, i64> =
+            // The depth sum stops at `QUEUE_DEPTH_CAP`, as each shard count does
+            // (issue #2356).
+            let mut depth_by_queue: std::collections::HashMap<String, u64> =
                 std::collections::HashMap::new();
             let mut age_by_queue: std::collections::HashMap<String, f64> =
                 std::collections::HashMap::new();
@@ -31660,10 +31662,21 @@ fn spawn_queue_depth_sampler(
                         continue;
                     }
                 };
-                match queue::queue_depths(&mut conn, &queues).await {
+                match queue::bounded_queue_depths(
+                    &mut conn,
+                    &queues,
+                    crate::telemetry::QUEUE_DEPTH_CAP,
+                )
+                .await
+                {
                     Ok(depths) => {
                         for (queue_name, depth) in depths {
-                            *depth_by_queue.entry(queue_name).or_insert(0) += depth;
+                            let total = depth_by_queue.entry(queue_name).or_insert(0);
+                            *total = queue::add_bounded_depth(
+                                *total,
+                                u64::try_from(depth).unwrap_or(0),
+                                crate::telemetry::QUEUE_DEPTH_CAP.get(),
+                            );
                         }
                     }
                     Err(error) => {
@@ -31700,9 +31713,7 @@ fn spawn_queue_depth_sampler(
             // and age queries are scoped to `queues`, so no other queue appears.
             for queue_name in &queues {
                 let depth = depth_by_queue.get(queue_name).copied().unwrap_or(0);
-                telemetry
-                    .metrics
-                    .record_queue_depth(queue_name, u64::try_from(depth).unwrap_or(0));
+                telemetry.metrics.record_queue_depth(queue_name, depth);
                 let age = age_by_queue.get(queue_name).copied().unwrap_or(0.0);
                 telemetry
                     .metrics
