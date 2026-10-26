@@ -1200,6 +1200,10 @@ type SignalPredicate<'a> = &'a dyn Fn(usize, &Value) -> bool;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignalCandidateCursor {
     /// The next push number in `pending_signals` (issue #2349).
+    ///
+    /// A push number stays with its entry. So a remove between two lookups
+    /// skips no entry. A push can give every entry a new number, so the
+    /// stash must not take a push between two lookups.
     Buffered(usize),
     /// The next event index.
     Recorded(usize),
@@ -2114,7 +2118,8 @@ impl HistoryMatcher {
     ///
     /// The activity and timer scans walk events with these roles. Once a
     /// scan leaves the walk, it reads only the positions that the scan index
-    /// holds, and the index sorts each event with this function. Each arm
+    /// holds, and the index sorts each event with this function. The signal
+    /// scan reads the same barrier and interleaved lists (issue #2349). Each arm
     /// keeps one rule of the plain walks that the scans replaced. The
     /// differential test `the_indexed_scan_matches_the_oracle` checks the
     /// scans against those walks.
@@ -4678,10 +4683,11 @@ impl HistoryMatcher {
     /// event index and the payload.
     ///
     /// The scan walks events one by one. [`Self::signal_scan_step`] holds the
-    /// rule for each event. In a wide fan-out, a plain wait leaves the walk by
-    /// the rule of [`Self::leaves_walk`] and continues on the scan index
-    /// (issue #2349). A race branch keeps the walk. It must stop at its own
-    /// settle marker, and the index has no lookup by marker name.
+    /// rule for each event. In a wide fan-out, a wait that is not a race
+    /// branch leaves the walk by the rule of [`Self::leaves_walk`]. It then
+    /// continues on the scan index (issue #2349). A race branch keeps the
+    /// walk. It must stop at its own settle marker, and the index has no
+    /// lookup by marker name.
     fn match_signal_inner(
         &mut self,
         signal_name: &str,
@@ -5126,9 +5132,9 @@ impl HistoryMatcher {
         self.note_signal_probe(signal_name);
 
         let reserved = &self.race_reserved_signal_events;
-        let matched = self.pending_signals.take_of_name(signal_name, |entry| {
-            stash_probe(!reserved.contains(&entry.index))
-        });
+        let matched = self
+            .pending_signals
+            .take_of_name(signal_name, |entry| !reserved.contains(&entry.index));
         // Every stashed entry already has its index in `consumed_signal_events`
         // (set by `stash_signal` at stash time), but re-asserting it here makes
         // the no-double-delivery invariant explicit at the point of use rather
@@ -5173,9 +5179,7 @@ impl HistoryMatcher {
         let (push, _) = self
             .pending_signals
             .of_name(signal_name)
-            .find(|(_, entry)| {
-                stash_probe(!self.race_reserved_signal_events.contains(&entry.index))
-            })?;
+            .find(|(_, entry)| !self.race_reserved_signal_events.contains(&entry.index))?;
         let entry = self.pending_signals.remove(push)?;
         // Already inserted by `stash_signal`, but re-asserting here makes the
         // no-double-delivery invariant explicit at the point of use (mirrors
@@ -5199,7 +5203,7 @@ impl HistoryMatcher {
         let (push, _) = self
             .pending_signals
             .of_name(signal_name)
-            .find(|(_, entry)| stash_probe(entry.index == at))?;
+            .find(|(_, entry)| entry.index == at)?;
         self.pending_signals.remove(push).map(|entry| entry.payload)
     }
 
@@ -5269,7 +5273,7 @@ impl HistoryMatcher {
         let early = self
             .pending_signals
             .of_name(signal_name)
-            .find(|(_, entry)| stash_probe(entry.index < race_pos))
+            .find(|(_, entry)| entry.index < race_pos)
             .map(|(push, _)| push);
         if let Some(push) = early
             && let Some(entry) = self.pending_signals.remove(push)
@@ -7162,7 +7166,6 @@ impl HistoryMatcher {
             SignalCandidateCursor::Buffered(from) => {
                 let buffered = self.pending_signals.of_name_from(signal_name, from).next();
                 if let Some((push, entry)) = buffered {
-                    stash_probe(true);
                     return Some((
                         SignalCandidateCursor::Buffered(push + 1),
                         entry.index,
@@ -7232,7 +7235,6 @@ impl HistoryMatcher {
         }
         let mut claimed = None;
         for (push, entry) in self.pending_signals.of_name(signal_name) {
-            stash_probe(true);
             match predicate {
                 Some(accepts) if !accepts(entry.index, &entry.payload) => {
                     self.predicate_rejected_signal_events.insert(entry.index);
@@ -16250,7 +16252,9 @@ mod activity_scan_tests {
     }
 
     // The signal stash searches and the signal scan before issue #2349, as
-    // the test oracle. The same rules as above apply.
+    // the test oracle. Comments are dropped, and the logic is unchanged. Each
+    // search walks every entry in push order, as the old `VecDeque` search
+    // did. It uses the `SignalStash` API in place of the deque.
     fn oracle_claim_buffered_signal_position(
         m: &mut HistoryMatcher,
         signal_name: &str,
@@ -16639,6 +16643,73 @@ mod activity_scan_tests {
                 _ => None,
             });
         buffered.chain(recorded).collect()
+    }
+
+    fn oracle_unconsumed_signals_by_name(
+        m: &HistoryMatcher,
+    ) -> std::collections::BTreeMap<String, u64> {
+        let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        let mut cursor = m.cursor;
+        while cursor < m.events.len() {
+            if let WorkflowEvent::SignalReceived { signal_name, .. } = &m.events[cursor]
+                && !m.is_consumed(cursor)
+                && !m.late_race_signal_events.contains(&cursor)
+            {
+                *counts.entry(signal_name.clone()).or_insert(0) += 1;
+            }
+            cursor += 1;
+        }
+        for entry in m.pending_signals.iter() {
+            if !m.late_race_signal_events.contains(&entry.index) {
+                *counts.entry(entry.name.clone()).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    // The cut and the restore of a view before issue #2349. The old deque
+    // operations become plain stash calls. The cut takes the hidden entries
+    // in push order. The restore takes every entry out, adds the hidden
+    // entries, runs a stable sort by event index and pushes all of them.
+    fn oracle_cut_view(m: &mut HistoryMatcher, horizon: usize) -> Option<ViewCut> {
+        if horizon >= m.events.len() {
+            return None;
+        }
+        let tail = m.events.split_off(horizon);
+        let hidden: Vec<usize> = m
+            .pending_signals
+            .numbered()
+            .filter(|(_, entry)| entry.index >= horizon)
+            .map(|(push, _)| push)
+            .collect();
+        let mut hidden_signals = Vec::new();
+        for push in hidden {
+            hidden_signals.extend(m.pending_signals.remove(push));
+        }
+        Some(ViewCut {
+            tail,
+            hidden_signals,
+            cursor: m.cursor,
+        })
+    }
+
+    fn oracle_restore_view(m: &mut HistoryMatcher, cut: ViewCut) {
+        let horizon = m.events.len();
+        m.events.extend(cut.tail);
+        let kept: Vec<usize> = m.pending_signals.numbered().map(|(push, _)| push).collect();
+        let mut all = Vec::new();
+        for push in kept {
+            all.extend(m.pending_signals.remove(push));
+        }
+        all.extend(cut.hidden_signals);
+        all.sort_by_key(|entry| entry.index);
+        for entry in all {
+            m.pending_signals
+                .push(entry.name, entry.payload, entry.index);
+        }
+        if cut.cursor > horizon {
+            m.cursor = cut.cursor;
+        }
     }
 
     fn scheduled(id: ActivityExecId, name: &str) -> WorkflowEvent {
@@ -17516,7 +17587,7 @@ mod activity_scan_tests {
                          where={} by_name={:?}",
                         oracle_has_unconsumed_signal(m, name),
                         candidates.iter().any(|(_, payload)| even(payload)),
-                        m.unconsumed_signals_by_name(),
+                        oracle_unconsumed_signals_by_name(m),
                     );
                 }
                 let mut walked = Vec::new();
@@ -17543,13 +17614,21 @@ mod activity_scan_tests {
             Op::Await(i) => m.match_external_await(pools.children[*i]),
             Op::Cut(horizon) => {
                 if cut.is_none() {
-                    *cut = m.cut_view(*horizon);
+                    *cut = if oracle {
+                        oracle_cut_view(m, *horizon)
+                    } else {
+                        m.cut_view(*horizon)
+                    };
                 }
                 return format!("cut={}", cut.is_some());
             }
             Op::Restore => {
                 if let Some(view) = cut.take() {
-                    m.restore_view(view);
+                    if oracle {
+                        oracle_restore_view(m, view);
+                    } else {
+                        m.restore_view(view);
+                    }
                 }
                 return "restored".into();
             }
@@ -17661,40 +17740,81 @@ mod activity_scan_tests {
         Ev::RaceMarker,
     ];
 
-    /// The signal scan acts only on the events that the scan index lists
-    /// (issue #2349). On any other event, `signal_scan_step` changes no
-    /// state and sets no rewind target. An interleaved command becomes the
-    /// rewind target, unless it is a deadline timer of the awaited signal.
-    #[test]
-    fn the_signal_step_acts_only_on_indexed_events() {
-        let pools = Pools::new();
-        for kind in &EVENT_KINDS {
-            for name in ["s", "t"] {
-                let event = pools.event(kind, 0);
-                let role = HistoryMatcher::activity_scan_role(&event);
+    /// Checks `signal_scan_step` on `event` against its scan role (issue
+    /// #2349), and returns whether the role puts the event outside the
+    /// barrier list.
+    ///
+    /// On an event outside the barrier list, the step changes no state. An
+    /// interleaved command becomes the rewind target, unless it is a deadline
+    /// timer of the awaited signal. Any other event sets no rewind target.
+    fn check_signal_step(event: &WorkflowEvent, name: &str) -> bool {
+        let want_first = match HistoryMatcher::activity_scan_role(event) {
+            ScanRole::Barrier | ScanRole::ExternalTerminal => return false,
+            ScanRole::Scheduled(_) | ScanRole::Interleaved => {
                 let own_deadline = matches!(
-                    &event,
+                    event,
                     WorkflowEvent::TimerStarted { timer_id, .. }
                         if HistoryMatcher::signal_timeout_race_name(timer_id.as_str()) == Some(name)
                 );
-                let mut m = HistoryMatcher::new(vec![event.clone()]);
-                let before = state(&m);
-                let mut first_interleaved = None;
-                let result = m.signal_scan_step(0, name, None, None, &mut first_interleaved);
-                let want_first = match role {
-                    ScanRole::Barrier | ScanRole::ExternalTerminal => continue,
-                    ScanRole::Scheduled(_) | ScanRole::Interleaved => (!own_deadline).then_some(0),
-                    ScanRole::Terminal(_)
-                    | ScanRole::Progress(_)
-                    | ScanRole::Fired(_)
-                    | ScanRole::ChildTerminal(_)
-                    | ScanRole::Pass => None,
-                };
-                assert_eq!(result, None, "{name} {event:?}");
-                assert_eq!(state(&m), before, "{name} {event:?}");
-                assert_eq!(first_interleaved, want_first, "{name} {event:?}");
+                (!own_deadline).then_some(0)
+            }
+            ScanRole::Terminal(_)
+            | ScanRole::Progress(_)
+            | ScanRole::Fired(_)
+            | ScanRole::ChildTerminal(_)
+            | ScanRole::Pass => None,
+        };
+        let mut m = HistoryMatcher::new(vec![event.clone()]);
+        let before = state(&m);
+        let mut first_interleaved = None;
+        let result = m.signal_scan_step(0, name, None, None, &mut first_interleaved);
+        assert_eq!(result, None, "{name} {event:?}");
+        assert_eq!(state(&m), before, "{name} {event:?}");
+        assert_eq!(first_interleaved, want_first, "{name} {event:?}");
+        true
+    }
+
+    /// The signal scan acts only on the events that the scan index lists
+    /// (issue #2349). The index files every other event kind of the
+    /// differential test as a step or an interleaved command.
+    #[test]
+    fn the_signal_step_acts_only_on_indexed_events() {
+        let pools = Pools::new();
+        let mut checked = 0;
+        for kind in &EVENT_KINDS {
+            for name in ["s", "t"] {
+                checked += usize::from(check_signal_step(&pools.event(kind, 0), name));
             }
         }
+        assert_eq!(checked, 2 * 24, "the kinds outside the barrier list");
+    }
+
+    /// [`check_signal_step`] over random events of every `WorkflowEvent`
+    /// variant (issue #2349). It guards a new variant that `EVENT_KINDS`
+    /// lacks. The `fuzzing` feature gives the events an `Arbitrary` form.
+    #[cfg(feature = "fuzzing")]
+    #[test]
+    fn the_signal_step_acts_only_on_indexed_events_of_any_variant() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut seed: u64 = 0x2349;
+        let mut bytes = vec![0_u8; 512];
+        let mut variants = HashSet::new();
+        for _ in 0..4096 {
+            for byte in &mut bytes {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *byte = seed.to_le_bytes()[0];
+            }
+            let Ok(event) = WorkflowEvent::arbitrary(&mut Unstructured::new(&bytes)) else {
+                continue;
+            };
+            variants.insert(event.type_name());
+            for name in ["s", "t"] {
+                check_signal_step(&event, name);
+            }
+        }
+        assert_eq!(variants.len(), 54, "every WorkflowEvent variant");
     }
 
     /// The scan role and the external key agree on each event kind of the
@@ -19436,5 +19556,51 @@ mod scan_fanout_tests {
             assert!(m.has_unconsumed_signal("go"), "{mode}");
             assert_eq!(m.match_signal("go"), matched(1), "{mode}");
         });
+    }
+
+    /// A cut hides a stashed signal, and the restore puts it back after the
+    /// kept entries (issue #2349).
+    #[test]
+    fn a_cut_hides_a_stashed_signal_until_the_restore() {
+        for small in [None, Some(0)] {
+            crate::signal_stash::tests::with_small_stash(small, || {
+                each_mode(|mode| {
+                    let mut events = vec![scheduled(ActivityExecId::new())];
+                    events.extend(padding(20));
+                    events.extend([signal("go", 1), signal("x", 2), signal("go", 3)]);
+                    let mut m = HistoryMatcher::new(events);
+                    assert_eq!(m.match_signal("y"), HistoryMatch::NoMatch, "{mode}");
+                    assert_eq!(stashed(&m), vec![21, 22, 23], "{mode}");
+                    let cut = m.cut_view(23).expect("the cut hides an event");
+                    assert_eq!(stashed(&m), vec![21, 22], "{mode}");
+                    assert_eq!(m.match_signal("go"), matched(1), "{mode}");
+                    assert_eq!(m.match_signal("go"), HistoryMatch::NoMatch, "{mode}");
+                    m.restore_view(cut);
+                    assert_eq!(stashed(&m), vec![22, 23], "{mode}");
+                    assert_eq!(m.match_signal("go"), matched(3), "{mode}");
+                    assert_eq!(m.match_signal("x"), matched(2), "{mode}");
+                    m.pending_signals.check();
+                });
+            });
+        }
+    }
+
+    /// A candidate cursor holds a push number. A remove between two lookups
+    /// then skips no candidate (issue #2349).
+    #[test]
+    fn a_candidate_lookup_skips_no_signal_after_a_remove() {
+        let mut events = vec![scheduled(ActivityExecId::new())];
+        events.extend([signal("s", 1), signal("s", 2)]);
+        let mut m = HistoryMatcher::new(events);
+        assert_eq!(m.match_signal("y"), HistoryMatch::NoMatch);
+        let (cursor, index, _) = m
+            .next_signal_candidate("s", SignalCandidateCursor::default())
+            .expect("a first candidate");
+        assert_eq!(index, 1);
+        assert_eq!(m.try_claim_pending_signal("s"), Some(serde_json::json!(1)));
+        let next = m
+            .next_signal_candidate("s", cursor)
+            .map(|(_, index, _)| index);
+        assert_eq!(next, Some(2));
     }
 }

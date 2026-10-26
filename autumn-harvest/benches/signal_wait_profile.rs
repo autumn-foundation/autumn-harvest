@@ -7,7 +7,8 @@
 //! # Workload
 //!
 //! `SIGNAL_PROFILE_SHAPE` picks the recorded history. Each signal has its own
-//! name `sig-<i>`, as in a workflow that waits on one approval per item:
+//! name `sig-<i>`, except in `loop`. That is a workflow that waits on one
+//! approval per item:
 //!
 //! - `fwd` (default): `N` signals arrive. The workflow waits in arrival order.
 //! - `rev`: `N` signals arrive. The workflow waits in reverse order.
@@ -21,7 +22,7 @@
 //! - `loop_named`: `loop`, with a name per signal.
 //!
 //! The harness replays through the public `HistoryMatcher::new`,
-//! `match_activity` and `match_signal` entry points. The history is built
+//! `match_activity` and `match_signal` entry points. It builds the history
 //! once per rep, inside the measured run. `SIGNAL_PROFILE_REPS` (default 1)
 //! repeats the replay.
 //!

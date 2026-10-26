@@ -549,16 +549,20 @@ the plan.
 
 ### Change
 
-- `SignalStash` keeps the stashed signals in push order. A stash with more
-  than 16 slots also keeps a queue of push numbers for each name. A search
+- `SignalStash` keeps the stashed signals in push order. A stash that grows
+  past 16 slots also keeps a queue of push numbers for each name. A search
   then walks one queue. A smaller stash scans its slots. Either way, a
   search visits the entries of one name in push order, as the old search
   did.
+- A push compacts the stash when its empty slots outnumber its entries. A
+  cut removes the hidden entries from the last one back. A restore of a
+  sorted stash only pushes the hidden entries back. A cancelled scope cuts
+  and restores on each poll, so these keep the poll cost near the old one.
 - A stash entry names its own event. So the race scan searches the stash
   only at a consumed signal of the same name.
-- `signal_scan_step` holds the rule of the old walk for one event. A plain
-  wait leaves the walk by the rule of #2330 and continues on the scan
-  index. It visits each unconsumed barrier and runs the same step on it.
+- `signal_scan_step` holds the rule of the old walk for one event. A wait
+  that is not a race branch leaves the walk by the rule of #2330 and
+  continues on the scan index. It visits each unconsumed barrier and runs the same step on it.
   Between two barriers, it looks up the first interleaved command once. It
   skips a deadline timer of its own signal, as the walk does.
 - A race branch keeps the walk. It must stop at its own settle marker, and
@@ -566,7 +570,7 @@ the plan.
 
 A name map on every stash made the `loop` shape cost 12.6% more. Each stash
 paid a SipHash, and a clone of a new name. A stash usually holds one or two
-signals, so the map now exists only above 16 slots.
+signals, so only a stash that grows past 16 slots builds the map.
 
 ### Measurement
 
@@ -578,21 +582,21 @@ build of the history. "Before" is `a9048c9`, with the bench of this change.
 | `signal_wait_profile` | `fwd` | 500 | 2,490,395 | 2,498,721 | +0.3% |
 | `signal_wait_profile` | `fwd` | 1000 | 4,740,181 | 4,759,007 | +0.4% |
 | `signal_wait_profile` | `fwd` | 2000 | 8,983,478 | 9,023,304 | +0.4% |
-| `signal_wait_profile` | `rev` | 500 | 7,927,824 | 4,319,340 | −45.5% |
-| `signal_wait_profile` | `rev` | 1000 | 25,935,642 | 8,200,405 | −68.4% |
-| `signal_wait_profile` | `rev` | 2000 | 91,149,488 | 14,821,110 | −83.7% |
-| `signal_wait_profile` | `after_fanout` | 500 | 21,813,577 | 5,695,323 | −73.9% |
-| `signal_wait_profile` | `after_fanout` | 1000 | 77,990,601 | 10,879,118 | −86.1% |
-| `signal_wait_profile` | `after_fanout` | 2000 | 294,715,202 | 21,284,073 | −92.8% |
-| `signal_wait_profile` | `loop` | 500 | 3,830,926 | 3,863,263 | +0.8% |
-| `signal_wait_profile` | `loop` | 1000 | 6,741,836 | 6,815,647 | +1.1% |
-| `signal_wait_profile` | `loop` | 2000 | 14,018,564 | 14,168,375 | +1.1% |
-| `signal_wait_profile` | `loop_named` | 500 | 4,563,883 | 4,596,234 | +0.7% |
-| `signal_wait_profile` | `loop_named` | 1000 | 8,200,672 | 8,274,497 | +0.9% |
-| `signal_wait_profile` | `loop_named` | 2000 | 16,866,405 | 17,016,230 | +0.9% |
-| `match_activity_profile` | `sequential` | 1000 | 18,221,261 | 18,190,324 | −0.2% |
-| `match_activity_profile` | `fanout` | 1000 | 23,730,128 | 23,698,901 | −0.1% |
-| `match_activity_profile` | `fanout_extsig` | 1000 | 24,327,184 | 24,295,015 | −0.1% |
+| `signal_wait_profile` | `rev` | 500 | 7,927,824 | 4,333,149 | −45.3% |
+| `signal_wait_profile` | `rev` | 1000 | 25,935,642 | 8,232,823 | −68.3% |
+| `signal_wait_profile` | `rev` | 2000 | 91,149,488 | 14,885,284 | −83.7% |
+| `signal_wait_profile` | `after_fanout` | 500 | 21,813,577 | 5,695,527 | −73.9% |
+| `signal_wait_profile` | `after_fanout` | 1000 | 77,990,601 | 10,877,899 | −86.1% |
+| `signal_wait_profile` | `after_fanout` | 2000 | 294,715,202 | 21,281,310 | −92.8% |
+| `signal_wait_profile` | `loop` | 500 | 3,830,926 | 3,866,255 | +0.9% |
+| `signal_wait_profile` | `loop` | 1000 | 6,741,836 | 6,821,647 | +1.2% |
+| `signal_wait_profile` | `loop` | 2000 | 14,018,564 | 14,180,375 | +1.2% |
+| `signal_wait_profile` | `loop_named` | 500 | 4,563,883 | 4,599,226 | +0.8% |
+| `signal_wait_profile` | `loop_named` | 1000 | 8,200,672 | 8,280,497 | +1.0% |
+| `signal_wait_profile` | `loop_named` | 2000 | 16,866,405 | 17,028,230 | +1.0% |
+| `match_activity_profile` | `sequential` | 1000 | 18,221,261 | 18,188,054 | −0.2% |
+| `match_activity_profile` | `fanout` | 1000 | 23,730,128 | 23,697,737 | −0.1% |
+| `match_activity_profile` | `fanout_extsig` | 1000 | 24,327,184 | 24,290,983 | −0.1% |
 
 Inside the matcher (the inclusive cost of `match_activity` and
 `match_signal`), at N=1000:
@@ -600,13 +604,13 @@ Inside the matcher (the inclusive cost of `match_activity` and
 | Shape | Before | After | Change |
 |---|---|---|---|
 | `fwd` | 724,974 | 731,975 | +1.0% |
-| `rev` | 21,598,746 | 4,039,961 | −81.3% |
-| `after_fanout` | 71,923,616 | 4,578,270 | −93.6% |
-| `loop` | 1,489,030 | 1,523,030 | +2.3% |
-| `loop_named` | 1,486,093 | 1,520,093 | +2.3% |
+| `rev` | 21,598,746 | 4,070,979 | −81.2% |
+| `after_fanout` | 71,923,616 | 4,577,093 | −93.6% |
+| `loop` | 1,489,030 | 1,529,030 | +2.7% |
+| `loop_named` | 1,486,093 | 1,526,093 | +2.7% |
 
 A wait with no stash costs about 7 instructions more. A loop step costs
-about 34 more, in the stash push and the claim. #2338 and #2346 accepted a
+about 40 more, in the stash push and the claim. #2338 and #2346 accepted a
 cost of the same size.
 
 ### Step counts
@@ -640,8 +644,14 @@ each stash entry that a signal search visits.
 - `the_signal_step_acts_only_on_indexed_events` checks that the signal step
   changes nothing on an event that the scan index does not list.
 - Edge tests in `scan_fanout_tests` cover a deadline timer as the rewind
-  target, an unexpected event, a predicate, a cut and a race branch, on the
-  walk and on the index.
+  target, an unexpected event, a predicate, a cut and a race branch. Each
+  runs on the walk and on the index. Another cut test hides a stashed
+  signal, and a cursor test removes a candidate between two lookups.
+- Stash tests run 10,000 steps behind an entry that never leaves, and
+  10,000 distinct names. The empty slots and the empty keys stay bounded. A
+  restore of a sorted stash keeps every push number.
+- With the `fuzzing` feature, `check_signal_step` also runs over random
+  events of all 54 `WorkflowEvent` variants.
 - Seven mutants, each made by hand, fail the tests above:
   - no skip of a deadline timer of the awaited signal,
   - no interleaved lookup on the index,

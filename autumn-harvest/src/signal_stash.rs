@@ -15,11 +15,11 @@ use serde_json::Value;
 ///
 /// A stash usually holds one or two signals. A name map costs a hash, and
 /// often a clone of the name, for each push and each remove. That made a
-/// loop of one activity and one signal cost 12% more. A scan of 16 short
+/// loop of one activity and one signal cost 12.6% more. A scan of 16 short
 /// names costs about as much as one hash.
 const SMALL_STASH: usize = 16;
 
-/// The slot count above which a stash keeps a name map.
+/// The slot count above which a stash builds a name map.
 #[allow(
     clippy::missing_const_for_fn,
     reason = "a test build reads a thread-local override"
@@ -52,6 +52,9 @@ type NameQueues = HashMap<String, VecDeque<usize>>;
 /// search visits the entries of one name in push order. That is the order of
 /// the old linear search. A small stash scans its slots. A large one walks
 /// the queue of the name.
+///
+/// A push can compact the slots, and a compaction gives every entry a new
+/// push number. Hold a push number only until the next push.
 #[derive(Default)]
 pub struct SignalStash {
     /// The entries in push order. A remove leaves `None`. The deque drops
@@ -61,11 +64,15 @@ pub struct SignalStash {
     front: usize,
     /// The number of entries.
     live: usize,
-    /// The queue of each name, once the stash has more than
-    /// [`SMALL_STASH`] slots. The stash drops it when it empties.
+    /// Whether an entry comes after an entry with a larger event index. A
+    /// remove never makes it true. A rebuild makes it false.
+    unsorted: bool,
+    /// The queue of each name. The first push past [`SMALL_STASH`] slots
+    /// builds it. A remove drops it at half that many slots.
     ///
     /// An empty queue keeps its key. A loop that stashes and takes one name
-    /// then allocates no new key for each signal.
+    /// then allocates no new key for each signal. A compaction drops the
+    /// empty keys.
     names: Option<NameQueues>,
 }
 
@@ -83,22 +90,93 @@ impl SignalStash {
         reason = "callgrind: a call costs about 50 instructions on each stash"
     )]
     pub fn push(&mut self, name: String, payload: Value, index: usize) {
-        let push = self.front + self.slots.len();
-        if let Some(names) = &mut self.names {
-            queue_push(names, &name, push);
+        if self.needs_compaction() {
+            self.compact();
         }
-        self.slots.push_back(Some(StashedSignal {
+        self.push_entry(StashedSignal {
             name,
             payload,
             index,
-        }));
+        });
+    }
+
+    /// Adds `entry` at the end, with no compaction.
+    #[inline(always)]
+    #[allow(
+        clippy::inline_always,
+        reason = "the hot half of `push`, which is inlined for the same reason"
+    )]
+    fn push_entry(&mut self, entry: StashedSignal) {
+        let push = self.front + self.slots.len();
+        if let Some(Some(back)) = self.slots.back()
+            && back.index > entry.index
+        {
+            self.unsorted = true;
+        }
+        if let Some(names) = &mut self.names {
+            queue_push(names, &entry.name, push);
+        }
+        self.slots.push_back(Some(entry));
         self.live += 1;
         if self.names.is_none() && self.slots.len() > small_stash() {
-            let mut names = NameQueues::new();
-            for (push, entry) in self.numbered() {
-                queue_push(&mut names, &entry.name, push);
-            }
-            self.names = Some(names);
+            self.build_names();
+        }
+    }
+
+    /// Builds the name map from the slots.
+    #[cold]
+    fn build_names(&mut self) {
+        let mut names = NameQueues::new();
+        for (push, entry) in self.numbered() {
+            queue_push(&mut names, &entry.name, push);
+        }
+        self.names = Some(names);
+    }
+
+    /// Whether the empty slots or the empty name keys outnumber the entries.
+    ///
+    /// A remove in the middle leaves an empty slot. An entry that never
+    /// leaves keeps the slots behind it, so the empty slots can pile up. A
+    /// compaction costs O(n). It runs after at least n/2 removes or new keys,
+    /// so its cost is O(1) for each of them.
+    ///
+    /// The test runs before a push that would pass [`SMALL_STASH`] slots.
+    /// A stash with few entries then never builds a map for its empty slots.
+    #[inline]
+    fn needs_compaction(&self) -> bool {
+        let small = small_stash();
+        let slots = self.slots.len();
+        (slots >= small && slots - self.live > self.live)
+            || self
+                .names
+                .as_ref()
+                .is_some_and(|names| names.len() > 2 * self.live + small)
+    }
+
+    /// Drops the empty slots and the empty name keys.
+    #[cold]
+    fn compact(&mut self) {
+        let entries = self.take_entries();
+        self.refill(entries);
+    }
+
+    /// Takes every entry out, in push order.
+    ///
+    /// The next push number skips every old one. A stale push number then
+    /// finds no entry.
+    fn take_entries(&mut self) -> Vec<StashedSignal> {
+        self.front += self.slots.len();
+        self.slots.drain(..).flatten().collect()
+    }
+
+    /// Clears the stash, then pushes `entries` in order.
+    fn refill(&mut self, entries: Vec<StashedSignal>) {
+        self.slots.clear();
+        self.names = None;
+        self.live = 0;
+        self.unsorted = false;
+        for entry in entries {
+            self.push_entry(entry);
         }
     }
 
@@ -117,6 +195,7 @@ impl SignalStash {
     }
 
     /// Whether the stash has an entry of `name`.
+    #[inline]
     pub fn contains_name(&self, name: &str) -> bool {
         self.of_name(name).next().is_some()
     }
@@ -195,7 +274,7 @@ impl SignalStash {
         while matches!(self.slots.back(), Some(None)) {
             self.slots.pop_back();
         }
-        if self.slots.is_empty() {
+        if self.names.is_some() && self.slots.len() <= small_stash() / 2 {
             self.names = None;
         }
         Some(entry)
@@ -203,13 +282,19 @@ impl SignalStash {
 
     /// Removes and returns every entry with an event index of `horizon` or
     /// more, in push order.
+    ///
+    /// The removes run from the last entry back. In a sorted stash, each one
+    /// then pops the back of its queue and of the slots.
     pub fn split_off_from(&mut self, horizon: usize) -> Vec<StashedSignal> {
-        let hidden = self
+        let mut hidden: Vec<usize> = self
             .numbered()
             .filter(|(_, entry)| entry.index >= horizon)
             .map(|(push, _)| push)
             .collect();
-        self.remove_all(hidden)
+        hidden.reverse();
+        let mut taken = self.remove_all(hidden);
+        taken.reverse();
+        taken
     }
 
     /// Removes and returns every entry of `name` that `take` accepts, in
@@ -240,19 +325,29 @@ impl SignalStash {
     /// index.
     ///
     /// The sort is stable, so this is the order of the old
-    /// `VecDeque::extend` and `sort_by_key`. The push numbers start again.
+    /// `VecDeque::extend` and `sort_by_key`.
+    ///
+    /// A cancelled scope cuts and restores on each poll of its body. The
+    /// stash is then sorted, and each hidden entry comes after every kept
+    /// entry. So the restore only pushes the hidden entries, and the other
+    /// push numbers stay. Any other stash is rebuilt, with new push numbers.
     pub fn restore(&mut self, hidden: Vec<StashedSignal>) {
-        let mut all: Vec<StashedSignal> = std::mem::take(&mut self.slots)
-            .into_iter()
-            .flatten()
-            .collect();
+        let in_order = !self.unsorted
+            && hidden.is_sorted_by_key(|entry| entry.index)
+            && match (self.slots.back(), hidden.first()) {
+                (Some(Some(back)), Some(first)) => back.index <= first.index,
+                _ => true,
+            };
+        if in_order {
+            for entry in hidden {
+                self.push_entry(entry);
+            }
+            return;
+        }
+        let mut all = self.take_entries();
         all.extend(hidden);
         all.sort_by_key(|entry| entry.index);
-        self.names = None;
-        self.live = 0;
-        for entry in all {
-            self.push(entry.name, entry.payload, entry.index);
-        }
+        self.refill(all);
     }
 
     /// Panics if the queues and the slots disagree.
@@ -263,6 +358,11 @@ impl SignalStash {
             "an end slot is empty"
         );
         assert_eq!(self.live, self.iter().count(), "the entry count");
+        let indices: Vec<usize> = self.iter().map(|entry| entry.index).collect();
+        assert!(
+            self.unsorted || indices.is_sorted(),
+            "a stash out of order is not marked"
+        );
         let Some(names) = &self.names else {
             assert!(
                 self.slots.len() <= small_stash(),
@@ -270,7 +370,10 @@ impl SignalStash {
             );
             return;
         };
-        assert!(!self.slots.is_empty(), "an empty stash keeps its map");
+        assert!(
+            self.slots.len() > small_stash() / 2,
+            "a small stash keeps its map"
+        );
         let mut queued = 0;
         for (name, queue) in names {
             assert!(
@@ -320,10 +423,14 @@ impl<'s> Iterator for OfName<'s> {
         match &mut self.walk {
             Walk::Queue(queue) => {
                 let push = *queue.as_mut()?.next()?;
+                #[cfg(test)]
+                crate::activity_scan_index::steps::count();
                 Some((push, self.stash.entry(push)?))
             }
             Walk::Scan(at) => {
                 while let Some(slot) = self.stash.slots.get(*at) {
+                    #[cfg(test)]
+                    crate::activity_scan_index::steps::count();
                     let push = self.stash.front + *at;
                     *at += 1;
                     if let Some(entry) = slot
@@ -550,7 +657,7 @@ pub mod tests {
 
         /// The stash gives the same entries as a plain `VecDeque` with linear
         /// searches, after every call. Each case runs with a scan, with a
-        /// name map, and with a switch between them.
+        /// name map, or with a switch between them.
         #[test]
         fn the_signal_stash_matches_a_plain_deque(
             ops in proptest::collection::vec(op(), 1..80),
@@ -582,8 +689,77 @@ pub mod tests {
         }
     }
 
+    /// An entry that never leaves does not make the empty slots pile up
+    /// behind it. A first-in-first-out backlog of another name removes from
+    /// the middle of the slots.
+    #[test]
+    fn empty_slots_stay_bounded_behind_an_entry_that_never_leaves() {
+        let mut stash = SignalStash::default();
+        stash.push("stays".into(), Value::Null, 0);
+        stash.push("tick".into(), Value::Null, 1);
+        for index in 2..10_000 {
+            stash.push("tick".into(), Value::Null, index);
+            let first = stash.of_name("tick").next().map(|(push, _)| push);
+            assert_eq!(
+                first.and_then(|push| stash.remove(push)).map(|e| e.index),
+                Some(index - 1)
+            );
+            stash.check();
+            assert!(
+                stash.slots.len() <= SMALL_STASH,
+                "{} slots",
+                stash.slots.len()
+            );
+            assert!(stash.names.is_none(), "a stash of two entries has no map");
+        }
+    }
+
+    /// Distinct names that come and go do not pile up empty keys in the map.
+    #[test]
+    fn empty_name_keys_stay_bounded() {
+        let mut stash = SignalStash::default();
+        for index in 0..=SMALL_STASH {
+            stash.push("stays".into(), Value::Null, index);
+        }
+        for index in 0..10_000 {
+            let name = format!("n{index}");
+            stash.push(name.clone(), Value::Null, SMALL_STASH + 1 + index);
+            let push = stash.of_name(&name).next().map(|(push, _)| push);
+            assert!(push.and_then(|push| stash.remove(push)).is_some());
+            stash.check();
+            let keys = stash.names.as_ref().map_or(0, HashMap::len);
+            assert!(keys <= 2 * stash.live + SMALL_STASH + 1, "{keys} keys");
+        }
+    }
+
+    /// A restore of a sorted stash pushes the hidden entries only. Every push
+    /// number stays the same.
+    #[test]
+    fn a_sorted_restore_keeps_the_push_numbers() {
+        for limit in [None, Some(0)] {
+            with_small_stash(limit, || {
+                let mut stash = SignalStash::default();
+                for index in 0..6 {
+                    stash.push(format!("n{}", index % 2), Value::Null, index);
+                }
+                let before: Vec<(usize, usize)> =
+                    stash.numbered().map(|(push, e)| (push, e.index)).collect();
+                let hidden = stash.split_off_from(3);
+                assert_eq!(
+                    hidden.iter().map(|e| e.index).collect::<Vec<_>>(),
+                    vec![3, 4, 5]
+                );
+                stash.restore(hidden);
+                stash.check();
+                let after: Vec<(usize, usize)> =
+                    stash.numbered().map(|(push, e)| (push, e.index)).collect();
+                assert_eq!(after, before, "{limit:?}");
+            });
+        }
+    }
+
     /// A stash builds its name map when it outgrows the scan, and drops it
-    /// when it empties.
+    /// when it shrinks to half the limit.
     #[test]
     fn a_stash_builds_and_drops_its_name_map() {
         let mut stash = SignalStash::default();
@@ -601,8 +777,9 @@ pub mod tests {
                 Some(i)
             );
             stash.check();
+            let left = SMALL_STASH - i;
+            assert_eq!(stash.names.is_some(), left > SMALL_STASH / 2, "{left} left");
         }
         assert!(stash.is_empty());
-        assert!(stash.names.is_none());
     }
 }

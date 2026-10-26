@@ -12,23 +12,25 @@
 
 The fix:
 
-- `SignalStash` keeps the stashed signals in push order. A stash with more
-  than 16 slots also keeps a queue for each name. A search then walks one
+- `SignalStash` keeps the stashed signals in push order. A stash that grows
+  past 16 slots also keeps a queue for each name. A search then walks one
   queue, in push order, as the old search did. A smaller stash scans its
-  slots, at about the old cost.
+  slots, at about the old cost. A push compacts the stash when its empty
+  slots outnumber its entries. A cut and a restore keep the order and the
+  cost of the old deque.
 - The race scan searched the stash at each consumed event. A stash entry
   names its own event, so only a consumed signal of the same name needs a
   search now.
-- `signal_scan_step` holds the rule of the old walk for one event. A plain
-  wait leaves the walk by the rule of #2330 and continues on the scan
-  index. It visits each unconsumed barrier and runs the same step on it. A
+- `signal_scan_step` holds the rule of the old walk for one event. A wait
+  that is not a race branch leaves the walk by the rule of #2330 and
+  continues on the scan index. It visits each unconsumed barrier and runs the same step on it. A
   race branch keeps the walk, because it must stop at its own settle
   marker.
 
 At N=2000, the new `signal_wait_profile` bench costs 84% fewer
 instructions for `rev` and 93% fewer for `after_fanout`. Both now grow
 about 2 times per doubling. The `fwd` shape costs 0.4% more, and a loop
-that stashes one signal at a time costs 0.9% to 1.1% more. See
+that stashes one signal at a time costs 1.0% to 1.2% more. See
 `docs/performance-match-activity-fanout.md` and
 `docs/design/DESIGN-2349.md`.
 
