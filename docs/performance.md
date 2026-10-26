@@ -2658,7 +2658,8 @@ standalone note rather than part of the claim-path attribution table above:
   — stage 1b of the decision owner (issue #2255). The owner decider takes
   workflow tasks by execution, so the claim loops claim 3 tasks per
   3-activity workflow instead of 7. On a 4-CPU host the CPU limits the gain
-  to 1.27x at one claim loop. The fused fence result is on the page.
+  to 1.27x at one claim loop. The fused fence result is on the page. A
+  re-run after issues #2296 and #2308 gives 1.28x at one claim loop.
 * [`docs/performance-match-activity-fanout.md`](performance-match-activity-fanout.md)
   — `HistoryMatcher::match_activity` on a fan-out history (issue #2330). The
   terminal scan reads a position index, so a fan-out replay is no longer

@@ -188,11 +188,40 @@ partition that it acquires. Two tests drive the case of restate#4566:
   own partitions. This page does not measure that.
 - `fsync=off` hides the commit cost of a durable server.
 - The clock includes the acquisition of 512 partitions at the start.
-- The sweep predates issues #2296 and #2308. Issue #2296 takes each
+- The first sweep predates issues #2296 and #2308. Issue #2296 takes each
   acquisition chunk in one transaction, not one transaction per partition.
   Issue #2308 adds a batched key lookup when free permits cannot cover
   every hint. A seeded backlog keeps the 8 workflow slots full, so this
   shape runs that lookup.
+  [Section 5](#5-re-measured-after-issues-2296-and-2308) runs the sweep
+  again with both changes.
+
+## 5. Re-measured after issues #2296 and #2308
+
+The same sweep ran again on 2026-10-26, 00:39 to 01:08 UTC, on the engine
+at `572c7ff`. Issues #2296 and #2308 had landed by then. The host and the
+Postgres settings match the section above: 4 logical CPUs, PostgreSQL 16.15
+with `fsync=off`, `synchronous_commit=off` and `max_connections=400`. All 54
+runs are valid. Raw output:
+[`results-2026-10-26/raw/`](perf-artifacts/owner-decider/results-2026-10-26/raw/).
+Graded:
+[`results-2026-10-26/graded.md`](perf-artifacts/owner-decider/results-2026-10-26/graded.md).
+
+| claim loops | legacy wf/s | owner wf/s | owner / legacy | before |
+|--:|--:|--:|--:|--:|
+| 1 | 28.76 | 36.93 | 1.28x | 1.27x |
+| 2 | 38.95 | 44.83 | 1.15x | 1.19x |
+| 4 | 43.15 | 42.02 | 0.97x | 1.05x |
+
+- **The claim count still drops from 7 to 3.** Each mode and cap gives
+  3.00 task claims per workflow. Owner mode adds 4.00 takes and 0.01 to
+  0.06 empty takes.
+- **The ratios hold at 1 and 2 claim loops.** At 4 loops both modes meet
+  the CPU ceiling of the host, as before. Single runs spread from 37.6/s to
+  45.2/s for legacy and from 38.9/s to 45.3/s for owner mode. So 0.97x is
+  within the spread of the first sweep's 1.05x.
+- **This host is slower.** Legacy runs about 15% below the first sweep at
+  each cap. Compare ratios, not rates.
 
 ## Reproduce
 
