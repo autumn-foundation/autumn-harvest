@@ -1555,12 +1555,14 @@ fn depth_comparisons(expr: &str) -> Vec<(&'static str, u64)> {
 /// The gauge reads the cap for any deeper queue. A `>` threshold at or above
 /// the cap, or a `>=` threshold above it, can never fire. The backlog rule
 /// keys on growth, and a gauge at the cap shows none. So the rule needs a
-/// clause for a gauge at the cap. That clause reads the trend of the age
-/// gauge, which has no cap.
+/// clause for a gauge at the cap. That clause reads the age gauge, which has
+/// no cap. The promtool cases in
+/// `docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml` test its
+/// behaviour.
 #[test]
 fn queue_depth_alerts_sit_below_the_gauge_cap() {
     let cap = u64::from(autumn_harvest::telemetry::QUEUE_DEPTH_CAP.get());
-    let saturated = format!("[10m]) >= {cap} and deriv(harvest_queue_oldest_pending_age");
+    let saturated = format!("[10m]) >= {cap} and (deriv(harvest_queue_oldest_pending_age");
     let pack = read_pack();
     let rules = pack["rules"].as_array().expect("rules must be an array");
     let mut backlog_rule_fires_at_the_cap = false;
@@ -1596,4 +1598,70 @@ fn queue_depth_alerts_sit_below_the_gauge_cap() {
         backlog_rule_fires_at_the_cap,
         "harvest_queue_backlog_growth must also fire while the gauge holds at {cap}"
     );
+}
+
+/// The promtool copy of `harvest_queue_backlog_growth` matches the pack, and
+/// the lint job tests it (issue #2356).
+///
+/// The pack is JSON, so promtool cannot load it. The rule file is a copy that
+/// promtool can load. A copy that drifts would test a rule that no operator
+/// runs.
+#[test]
+fn the_backlog_rule_file_matches_the_starter_pack() {
+    const RULES: &str = "docs/alerts/starter-pack-v0.1.0.backlog-growth.rules.yml";
+    const TESTS: &str = "docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml";
+    let pack = read_pack();
+    let rule = pack["rules"]
+        .as_array()
+        .expect("rules must be an array")
+        .iter()
+        .find(|rule| rule["id"] == "harvest_queue_backlog_growth")
+        .expect("the pack must hold harvest_queue_backlog_growth");
+    let expr = rule["prometheus"]["expressions"][0]["expr"]
+        .as_str()
+        .expect("the backlog rule must have an expression");
+    let file: serde_yaml::Value = serde_yaml::from_str(&read_doc(RULES))
+        .unwrap_or_else(|error| panic!("{RULES} must be valid YAML: {error}"));
+    let alert = &file["groups"][0]["rules"][0];
+    assert_eq!(
+        alert["alert"].as_str(),
+        Some("harvest_queue_backlog_growth")
+    );
+    assert_eq!(
+        alert["expr"].as_str(),
+        Some(expr),
+        "{RULES} must copy the pack expression"
+    );
+    assert_eq!(
+        alert["for"].as_str(),
+        Some("10m"),
+        "the pack note pairs the rule with for: 10m"
+    );
+    assert_eq!(
+        alert["labels"]["severity"].as_str(),
+        rule["severity"].as_str()
+    );
+
+    let ci: serde_yaml::Value = serde_yaml::from_str(&read_doc(".github/workflows/ci.yml"))
+        .expect("ci.yml must be valid YAML");
+    let steps = ci["jobs"]["lint"]["steps"]
+        .as_sequence()
+        .expect("ci.yml must have a lint job with steps");
+    for required in [
+        format!("check rules {RULES}"),
+        format!("test rules {TESTS}"),
+    ] {
+        let step = steps
+            .iter()
+            .find(|step| {
+                step["run"]
+                    .as_str()
+                    .is_some_and(|run| run.contains(&required))
+            })
+            .unwrap_or_else(|| panic!("no lint step runs {required:?}"));
+        assert!(
+            step.get("if").is_none(),
+            "the lint step that runs {required:?} must not be conditional"
+        );
+    }
 }

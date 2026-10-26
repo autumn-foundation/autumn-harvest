@@ -507,8 +507,12 @@ signal or as a fallback when histogram metrics are not yet wired.
 The depth gauge stops at 10,000 (#2356). Above that value it shows no growth.
 While the gauge holds at 10,000 for the whole window, the rule reads growth
 from `harvest_queue_oldest_pending_age` instead. That gauge has no cap. It
-reads 0 for a paused queue. For an exact count above the cap, scrape
+applies the claim gates, so it reads 0 when a pause, a concurrency cap or a
+rate limit blocks every row. At the cap, a 0 for the whole window also fires
+the rule, because no row can move. For an exact count above the cap, scrape
 `harvest_queue_backlog` from `GET /admin/queues/scaling?format=prometheus`.
+`docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml` tests each case
+with promtool.
 
 ### Triage steps
 

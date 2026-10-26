@@ -56,6 +56,8 @@ stays exact below the bound.
 | B10 | Keep `queue_depths` exact and add a bounded function. | **Adopted.** The public contract does not change. The exact function is the test oracle. |
 | B11 | Sum the shards, then cap the sum. | **Adopted.** Each shard value is `min(count, cap)`. So the capped sum is `min(total, cap)`. Verus proves it. |
 | B12 | At the cap, read growth from the oldest pending age. | **Adopted.** Without it the backlog alert clears when the backlog is largest. A clause on the level alone would fire on a healthy drain. |
+| B15 | At the cap, also fire when the age stays 0 for the whole window. | **Adopted.** The age gauge applies the claim gates. When a gate blocks every row, it reads 0 and shows no growth. |
+| B16 | Test the rule with promtool. | **Adopted.** A loadable copy of the rule and promtool cases run in the `lint` job. A guard keeps the copy equal to the pack. |
 | B13 | Order the bounded scan by the index key. | **Adopted.** It pins the plan to the ordered index walk. |
 | B14 | Keep the cap in `telemetry`. | **Adopted.** It is the contract of the gauge. The alert guard then runs in the CI leg without the `db` feature. |
 
@@ -64,6 +66,7 @@ stays exact below the bound.
 | # | How to make it harmful | Mitigation |
 |---|------------------------|------------|
 | R1 | The gauge goes flat at the cap. `deriv` is 0, so the backlog alert clears during the worst backlog. | At the cap the rule fires on the growth of the oldest pending age. A guard test pins the clause to the constant. |
+| R11 | A gate blocks every row of a deep queue. The age gauge reads 0, so the age clause sees no growth either. | At the cap, an age of 0 for the whole window fires the rule. A promtool case covers it. |
 | R2 | A cap at or below an alert threshold. The alert can never fire. | The cap is 10,000. The largest strict starter threshold is 1,000. A guard test fails when a starter threshold cannot fire under the cap. |
 | R3 | `LIMIT` after `GROUP BY` caps the number of queues, not the rows. | The limit sits in a `LATERAL` subquery per queue. A shape test checks it. |
 | R4 | A `LIMIT` with no order lets the planner pick a sequential scan, or an index that reads future rows. A shallow queue then reads the whole table on each tick. | The subquery orders by `scheduled_at, id`. A test with an empty visibility map and future rows checks that each scan walks the index and reads at most the cap. |
@@ -111,7 +114,9 @@ means "10,000 or more".
   `formal/verus/src/depth_cap.rs` proves that the fold equals the capped
   total.
 - `harvest_queue_backlog_growth` fires at the cap when the oldest pending age
-  grows over the window.
+  grows over the window, or stays 0 for the whole window.
+  `docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml` tests the rule
+  with promtool in the `lint` job.
 
 ## 2. Known limits
 
@@ -132,4 +137,5 @@ means "10,000 or more".
 | The sampler caps the sum of the shards. | `queue_depth_gauge_caps_the_sum_of_the_shards` |
 | The capped shard sum equals the capped total. | `add_bounded_depth_caps_the_sum_of_the_shards`, `a_fold_of_bounded_shards_is_the_capped_total` and `formal/verus/src/depth_cap.rs` |
 | Each starter depth threshold can fire under the cap, and the backlog rule fires at the cap. | `queue_depth_alerts_sit_below_the_gauge_cap` |
+| The backlog rule fires on growth and on a fully gated backlog at the cap, and stays silent on a drain and a steady queue. | promtool cases in `docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml` and `the_backlog_rule_file_matches_the_starter_pack` |
 | Depth buffers drop at 100,000 and 300,000 pending rows. | `queue_age_gauge_perf`, see `docs/performance-queue-depth-gauge.md` |

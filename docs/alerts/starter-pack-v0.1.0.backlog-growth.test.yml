@@ -1,0 +1,122 @@
+# promtool unit tests for harvest_queue_backlog_growth (issue #2356).
+#
+# Run: promtool test rules docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml
+#
+# The depth gauge stops at 10,000. Below the cap the rule fires on depth
+# growth. At the cap it fires when the oldest pending age grows, or when the
+# age stays 0, because then no row is claimable. Each case has one series of
+# each gauge for queue `default`.
+# Series values use promtool notation: 'a+bxn' is a, a+b, ..., a+n*b.
+# 'axn' is a, n+1 times. '_xn' is n missing samples. The interval is 1m.
+
+rule_files:
+  - starter-pack-v0.1.0.backlog-growth.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: depth growth below the cap fires
+    interval: 1m
+    input_series:
+      - series: 'harvest_queue_depth{queue="default"}'
+        values: '0+100x40'
+      - series: 'harvest_queue_oldest_pending_age{queue="default"}'
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: harvest_queue_backlog_growth
+        exp_alerts:
+          - exp_labels: {severity: ticket, queue: default}
+
+  - name: a steady depth below the cap stays silent
+    interval: 1m
+    input_series:
+      - series: 'harvest_queue_depth{queue="default"}'
+        values: '5000x40'
+      - series: 'harvest_queue_oldest_pending_age{queue="default"}'
+        values: '60x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: harvest_queue_backlog_growth
+        exp_alerts: []
+
+  - name: at the cap, a growing oldest pending age fires
+    interval: 1m
+    input_series:
+      - series: 'harvest_queue_depth{queue="default"}'
+        values: '10000x40'
+      - series: 'harvest_queue_oldest_pending_age{queue="default"}'
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: harvest_queue_backlog_growth
+        exp_alerts:
+          - exp_labels: {severity: ticket, queue: default}
+
+  - name: at the cap, a draining queue stays silent
+    interval: 1m
+    input_series:
+      - series: 'harvest_queue_depth{queue="default"}'
+        values: '10000x40'
+      - series: 'harvest_queue_oldest_pending_age{queue="default"}'
+        values: '3000-60x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: harvest_queue_backlog_growth
+        exp_alerts: []
+
+  - name: at the cap, a steady throttled queue stays silent
+    interval: 1m
+    input_series:
+      - series: 'harvest_queue_depth{queue="default"}'
+        values: '10000x40'
+      - series: 'harvest_queue_oldest_pending_age{queue="default"}'
+        values: '120x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: harvest_queue_backlog_growth
+        exp_alerts: []
+
+  # A saturated concurrency key, a rate limit or a pause blocks every row.
+  # The age gauge applies those gates, so it reads 0 (issue #2356 review).
+  - name: at the cap, a backlog with no claimable row fires
+    interval: 1m
+    input_series:
+      - series: 'harvest_queue_depth{queue="default"}'
+        values: '10000x40'
+      - series: 'harvest_queue_oldest_pending_age{queue="default"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: harvest_queue_backlog_growth
+        exp_alerts:
+          - exp_labels: {severity: ticket, queue: default}
+
+  - name: below the cap, a steady backlog with no claimable row stays silent
+    interval: 1m
+    input_series:
+      - series: 'harvest_queue_depth{queue="default"}'
+        values: '5000x40'
+      - series: 'harvest_queue_oldest_pending_age{queue="default"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: harvest_queue_backlog_growth
+        exp_alerts: []
+
+  # A new series, as after a rollout, holds the cap for 5 minutes only.
+  - name: a new series at the cap waits out the for clause
+    interval: 1m
+    input_series:
+      - series: 'harvest_queue_depth{queue="default"}'
+        values: '_x30 10000x10'
+      - series: 'harvest_queue_oldest_pending_age{queue="default"}'
+        values: '_x30 0x10'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: harvest_queue_backlog_growth
+        exp_alerts: []
+      - eval_time: 41m
+        alertname: harvest_queue_backlog_growth
+        exp_alerts:
+          - exp_labels: {severity: ticket, queue: default}

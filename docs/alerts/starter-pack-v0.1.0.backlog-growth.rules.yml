@@ -1,0 +1,15 @@
+# The starter rule harvest_queue_backlog_growth as a loadable rule (issue #2356).
+#
+# docs/alerts/starter-pack-v0.1.0.json is the source of the rule. The expr
+# below is a copy of it. The guard
+# alert_pack_docs::the_backlog_rule_file_matches_the_starter_pack keeps the
+# two equal. Tests: starter-pack-v0.1.0.backlog-growth.test.yml.
+
+groups:
+  - name: harvest-starter-backlog-growth
+    rules:
+      - alert: harvest_queue_backlog_growth
+        expr: 'max_over_time(harvest_queue_depth{queue="default"}[10m]) > 100 and (deriv(harvest_queue_depth{queue="default"}[10m]) > 0 or (min_over_time(harvest_queue_depth{queue="default"}[10m]) >= 10000 and (deriv(harvest_queue_oldest_pending_age{queue="default"}[10m]) > 0 or max_over_time(harvest_queue_oldest_pending_age{queue="default"}[10m]) == 0)))'
+        for: 10m
+        labels:
+          severity: ticket
