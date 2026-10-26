@@ -11,7 +11,7 @@
 FROM rust:1.99.1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29 AS build
 # rust-toolchain.toml also asks for rustfmt and clippy. The build uses
 # neither, so name the toolchain here and skip that download.
-ENV RUSTUP_TOOLCHAIN=1.99.0 \
+ENV RUSTUP_TOOLCHAIN=1.99.1 \
     CARGO_TERM_COLOR=never
 RUN cargo install cargo-auditable --version 0.7.7 --locked
 WORKDIR /src

@@ -1111,7 +1111,7 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 ## Requirements
 
 - Rust 1.88.0 or newer (MSRV). A checkout of this repository builds with the
-  release pinned in `rust-toolchain.toml` (currently 1.99.0); `rustup`
+  release pinned in `rust-toolchain.toml` (currently 1.99.1); `rustup`
   installs it on the first `cargo` call. CI uses the same pin, so a new
   stable release changes CI only when that file changes.
 - Postgres 12+ — except for `cargo dev`, whose `dev-runtime-managed` tier
