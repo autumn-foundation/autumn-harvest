@@ -73,6 +73,19 @@ impl ConsumedView<'_> {
     }
 }
 
+/// Returns `hit`. A test build counts one scan step for each stash entry
+/// that a search visits (issue #2346).
+#[inline]
+#[allow(
+    clippy::missing_const_for_fn,
+    reason = "a test build counts the probe in a thread-local"
+)]
+fn stash_probe(hit: bool) -> bool {
+    #[cfg(test)]
+    crate::activity_scan_index::steps::count();
+    hit
+}
+
 /// The fewest events that an activity terminal scan walks one by one before
 /// it can move to the activity scan index (issue #2330).
 ///
@@ -1631,7 +1644,7 @@ impl HistoryMatcher {
         if let Some(pending) = self
             .pending_external_signals
             .iter_mut()
-            .find(|pending| pending.signal_id == signal_id)
+            .find(|pending| stash_probe(pending.signal_id == signal_id))
         {
             pending.terminal = Some(terminal);
         }
@@ -1665,7 +1678,7 @@ impl HistoryMatcher {
         if let Some(pending) = self
             .pending_external_cancels
             .iter_mut()
-            .find(|pending| pending.cancel_id == cancel_id)
+            .find(|pending| stash_probe(pending.cancel_id == cancel_id))
         {
             pending.terminal = Some(terminal);
         }
@@ -1699,7 +1712,7 @@ impl HistoryMatcher {
         if let Some(pending) = self
             .pending_external_awaits
             .iter_mut()
-            .find(|pending| pending.await_id == await_id)
+            .find(|pending| stash_probe(pending.await_id == await_id))
         {
             pending.terminal = Some(terminal);
         }
@@ -2610,15 +2623,15 @@ impl HistoryMatcher {
             WorkflowEvent::ExternalSignalRequested { signal_id, .. } => self
                 .pending_external_signals
                 .iter()
-                .any(|p| p.signal_id == *signal_id),
+                .any(|p| stash_probe(p.signal_id == *signal_id)),
             WorkflowEvent::ExternalCancelRequested { cancel_id, .. } => self
                 .pending_external_cancels
                 .iter()
-                .any(|p| p.cancel_id == *cancel_id),
+                .any(|p| stash_probe(p.cancel_id == *cancel_id)),
             WorkflowEvent::ExternalAwaitRequested { await_id, .. } => self
                 .pending_external_awaits
                 .iter()
-                .any(|p| p.await_id == *await_id),
+                .any(|p| stash_probe(p.await_id == *await_id)),
             _ => false,
         }
     }
@@ -2906,7 +2919,7 @@ impl HistoryMatcher {
                 if let Some(p) = self
                     .pending_external_signals
                     .iter_mut()
-                    .find(|p| p.signal_id == id)
+                    .find(|p| stash_probe(p.signal_id == id))
                 {
                     p.terminal = Some(StashedSignalTerminal::Delivered);
                     self.consumed_signal_events.insert(at);
@@ -2921,7 +2934,7 @@ impl HistoryMatcher {
                 if let Some(p) = self
                     .pending_external_signals
                     .iter_mut()
-                    .find(|p| p.signal_id == id)
+                    .find(|p| stash_probe(p.signal_id == id))
                 {
                     p.terminal = Some(StashedSignalTerminal::Failed(code));
                     self.consumed_signal_events.insert(at);
@@ -2932,7 +2945,7 @@ impl HistoryMatcher {
                 if let Some(p) = self
                     .pending_external_cancels
                     .iter_mut()
-                    .find(|p| p.cancel_id == id)
+                    .find(|p| stash_probe(p.cancel_id == id))
                 {
                     p.terminal = Some(StashedCancelTerminal::Delivered);
                     self.consumed_signal_events.insert(at);
@@ -2947,7 +2960,7 @@ impl HistoryMatcher {
                 if let Some(p) = self
                     .pending_external_cancels
                     .iter_mut()
-                    .find(|p| p.cancel_id == id)
+                    .find(|p| stash_probe(p.cancel_id == id))
                 {
                     p.terminal = Some(StashedCancelTerminal::Failed(code));
                     self.consumed_signal_events.insert(at);
@@ -2958,7 +2971,7 @@ impl HistoryMatcher {
                     && let Some(p) = self
                         .pending_external_awaits
                         .iter_mut()
-                        .find(|p| p.await_id == id && p.terminal.is_none())
+                        .find(|p| stash_probe(p.await_id == id && p.terminal.is_none()))
                 {
                     p.terminal = Some(terminal);
                     self.consumed_signal_events.insert(at);
@@ -3334,7 +3347,7 @@ impl HistoryMatcher {
         let try_stash = |pending: &mut VecDeque<StashedExternalSignal>| {
             let pos = pending
                 .iter()
-                .position(|p| p.target == *target && p.signal_name == signal_name)?;
+                .position(|p| stash_probe(p.target == *target && p.signal_name == signal_name))?;
             let stashed = pending.remove(pos)?;
             Some(match stashed.terminal {
                 Some(StashedSignalTerminal::Delivered) => HistoryMatch::Matched {
@@ -3549,7 +3562,7 @@ impl HistoryMatcher {
         if let Some(stashed) = self
             .pending_external_cancels
             .iter()
-            .position(|s| s.target == *target)
+            .position(|s| stash_probe(s.target == *target))
             .and_then(|pos| self.pending_external_cancels.remove(pos))
         {
             return match stashed.terminal {
@@ -3721,7 +3734,7 @@ impl HistoryMatcher {
         if let Some(stashed) = self
             .pending_external_awaits
             .iter()
-            .position(|s| s.target == target)
+            .position(|s| stash_probe(s.target == target))
             .and_then(|pos| self.pending_external_awaits.remove(pos))
         {
             return match stashed.terminal {
@@ -16782,10 +16795,10 @@ mod scan_fanout_tests {
         ChildrenReversed,
         /// Its completion comes just after each local activity schedule.
         LocalActivities,
-        /// All external signal requests, then the deliveries. A control: the
-        /// drain at the cursor stashes every event, so the external scan has
-        /// no work.
-        ExternalSignals,
+        /// All requests of an external call, then the terminals. With `true`,
+        /// an activity comes between them, so the drain stops at it. The
+        /// workflow matches the calls in request order (issue #2346).
+        ExternalFanOut(Call, bool),
         /// A loop of an activity and an external call. With a first call,
         /// that call comes before the loop, ends last, and the workflow
         /// matches it last. A loop terminal matches no stash entry until the
@@ -16804,7 +16817,7 @@ mod scan_fanout_tests {
         Await,
     }
 
-    const SHAPES: [Shape; 14] = [
+    const SHAPES: [Shape; 19] = [
         Shape::SignalThenActivities,
         Shape::OpenAwaitThenActivities,
         Shape::CancelThenActivities,
@@ -16813,7 +16826,12 @@ mod scan_fanout_tests {
         Shape::Children,
         Shape::ChildrenReversed,
         Shape::LocalActivities,
-        Shape::ExternalSignals,
+        Shape::ExternalFanOut(Call::Signal, false),
+        Shape::ExternalFanOut(Call::Signal, true),
+        Shape::ExternalFanOut(Call::Cancel, false),
+        Shape::ExternalFanOut(Call::Cancel, true),
+        Shape::ExternalFanOut(Call::Await, false),
+        Shape::ExternalFanOut(Call::Await, true),
         Shape::ExternalLoop(None, Call::Signal),
         Shape::ExternalLoop(Some(Call::Await), Call::Signal),
         Shape::ExternalLoop(Some(Call::Signal), Call::Await),
@@ -16945,6 +16963,50 @@ mod scan_fanout_tests {
             }
             if let Some(call) = first {
                 match_external(&mut m, call, opener, n);
+            }
+            assert!(!m.is_replaying());
+        })
+    }
+
+    /// Replays `n` requests of an external call, then their terminals. With
+    /// `past_command`, an activity schedule comes before the terminals and
+    /// its completion after them.
+    fn replay_external_fan_out(call: Call, n: usize, past_command: bool) -> u64 {
+        let callees: Vec<ExecutionId> = (0..n).map(|_| ExecutionId::new()).collect();
+        let pairs: Vec<[WorkflowEvent; 2]> = callees
+            .iter()
+            .enumerate()
+            .map(|(i, callee)| external_pair(call, *callee, i))
+            .collect();
+        let activity_id = ActivityExecId::new();
+        let mut events: Vec<WorkflowEvent> = pairs.iter().map(|[r, _]| r.clone()).collect();
+        if past_command {
+            events.push(WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            });
+        }
+        events.extend(pairs.into_iter().map(|[_, terminal]| terminal));
+        if past_command {
+            events.push(WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: Value::Null,
+            });
+        }
+        let mut m = HistoryMatcher::new(events);
+        steps_of(|| {
+            for (i, callee) in callees.iter().enumerate() {
+                match_external(&mut m, call, *callee, i);
+            }
+            if past_command {
+                assert_eq!(
+                    m.match_activity("charge"),
+                    HistoryMatch::Matched {
+                        output: Value::Null
+                    }
+                );
             }
             assert!(!m.is_replaying());
         })
@@ -17115,38 +17177,8 @@ mod scan_fanout_tests {
                     assert!(!m.is_replaying());
                 })
             }
-            Shape::ExternalSignals => {
-                let targets: Vec<ExternalTarget> = (0..n)
-                    .map(|_| ExternalTarget::ExecutionId(ExecutionId::new()))
-                    .collect();
-                let ids: Vec<ExternalSignalId> = (0..n).map(|_| ExternalSignalId::new()).collect();
-                let mut events: Vec<WorkflowEvent> = ids
-                    .iter()
-                    .zip(&targets)
-                    .map(|(id, t)| WorkflowEvent::ExternalSignalRequested {
-                        signal_id: *id,
-                        target: t.clone(),
-                        signal_name: "go".into(),
-                        payload: Value::Null,
-                        idempotency_key: None,
-                    })
-                    .collect();
-                events.extend(
-                    ids.iter()
-                        .map(|id| WorkflowEvent::ExternalSignalDelivered { signal_id: *id }),
-                );
-                let mut m = HistoryMatcher::new(events);
-                steps_of(|| {
-                    for t in &targets {
-                        assert_eq!(
-                            m.match_external_signal(t, "go"),
-                            HistoryMatch::Matched {
-                                output: Value::Null
-                            }
-                        );
-                    }
-                    assert!(!m.is_replaying());
-                })
+            Shape::ExternalFanOut(call, past_command) => {
+                replay_external_fan_out(call, n, past_command)
             }
             Shape::ExternalLoop(first, body) => replay_external_loop(first, body, n, true),
             Shape::ExternalPairs => replay_external_loop(Some(Call::Await), Call::Signal, n, false),
