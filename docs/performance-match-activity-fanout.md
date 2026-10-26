@@ -196,9 +196,9 @@ Two other scans that the issue named are linear. They need no change:
 `replay_steps_grow_near_linearly_for_every_shape` keeps all five as guards.
 
 One quadratic shape remained. The external scan visited an external terminal
-that matches no stash entry again on each call. The section
-[Issue #2346](#issue-2346-the-external-stash-scan-and-the-stash-removal)
-below fixes it.
+that matches no stash entry again on each call. Issue #2346 fixes it. The
+section [Issue #2346](#issue-2346-the-external-stash-scan-and-the-stash-search)
+below records the fix.
 
 ### Change
 
@@ -301,97 +301,137 @@ done
 Use `MATCH_ACTIVITY_PROFILE_SHAPE=fanout_extsig` with the `match_activity_profile`
 command above for the external scan.
 
-## Issue #2346: the external stash scan and the stash removal
+## Issue #2346: the external stash scan and the stash search
 
 **Outcome: shipped.** At N=2000 the `loop` bench of `external_stash_profile`
-costs 94% fewer instructions, `loop_seq` 89% fewer and `fanout` 89% fewer.
+costs 96% fewer instructions, `loop_seq` 92% fewer and `fanout` 93% fewer.
 `docs/design/DESIGN-2346.md` records the plan.
 
 ### Cause
 
-- The external stash scan visits each unconsumed external terminal at or
+- The external stash scan visited each unconsumed external terminal at or
   after the cursor. A terminal that matches no stash entry stays unconsumed.
   So each later call visited it again.
 - A command between the external calls makes this happen. The drain at the
   cursor then stops at each command, and a later request stays out of the
   stash. A plain loop of an activity and an external signal is enough. The
   drain stashes each request just before the scan of its own call, so that
-  scan visits every later terminal.
-- `try_stash` removed a matched entry with `Vec::remove`. A fan-out matches
-  its entries in stash order, so each remove shifted the rest of the stash.
-  At P=2000 the `memmove` was 90% of the `fanout` replay.
+  scan visited every later terminal.
+- A terminal found its stash entry with a linear search. In a fan-out, the
+  search for terminal k stepped over the k earlier entries. A plain loop of
+  external signals, and the literal shape of the issue, cost the same. The
+  drift check `first_unconsumed_command_event` also searched the stash once
+  for each event.
+- The three external matchers removed a matched entry with `Vec::remove`. A
+  fan-out matches its entries in stash order, so each remove shifted the rest
+  of the stash. At P=2000 the `memmove` was 90% of the `fanout` replay.
 
-The literal shape of the issue, an await and then signal pairs with no
-command between them, is linear already. The drain stashes it at the first
-call. `ExternalPairs` keeps it as a control.
+The first scaling test did not count stash probes. So it found the scan
+problem, but it called the literal shape of the issue linear. A review of
+the first fix found the stash search.
 
 ### Change
 
 - A terminal changes the stash only when its key has an eligible entry. The
   key is the kind and the id of the call. Only a push can add an eligible
-  entry, so each stash helper notes the key of its entry.
-- After a scan, no unconsumed terminal in the covered range matches an entry,
-  except a terminal of a new key. The next scan reads the new keys there
-  through a per-key list in the index. It reads every terminal outside the
-  range. A call with no new key and no rewind or restore does no work.
+  entry, so each request helper notes the key of its entry.
+- From one scan with work to the next, no unconsumed terminal inside the
+  covered range matches an eligible entry, unless its key is new. A scan
+  reads the new keys there. It reads every terminal outside the range, after
+  a rewind or a restore. With no new key, rewind or restore, the scan returns
+  at once.
+- `ExternalTerminalIndex` holds the external terminals, in one skip list and
+  per key. The first scan with work builds it, with one cheap test for each
+  event. The external scan no longer walks the history.
+- `ExternalStash` keeps its entries in push order, with a map from each id to
+  its first entry. A terminal finds its entry in O(1) in a fan-out, and a
+  remove from the front costs O(1). The drift check reads the map.
 - `match_external_cancel` and `match_external_await` kept their own copies of
-  the stash code. They now call `stash_transparent_external_event`, so every
-  push notes its key in one place.
-- The three stashes are `VecDeque`s, so a remove at the front costs O(1).
-- `ScanRole::ExternalTerminal` carries no key. The index reads the key from
-  the event. A key in the role made the activity scan walk of a fan-out cost
-  about 4% more.
+  the stash code. They now call `stash_transparent_external_event`, as the
+  drain does. That code cannot run today (DESIGN-2346 §0.1).
+- `ScanRole::ExternalTerminal` carries no key. The external index reads the
+  key from the event. A key in the role made the activity scan walk cost
+  more: at N=1000, the inclusive cost of `match_activity` in the `fanout`
+  shape was 5,618,970 with a key and 5,424,041 without it.
+
+### Step counts
+
+The scaling test counts scan steps at N=256 and N=512. A step is a
+consumed-set probe, a stash probe, a settle step or an index build step.
+
+| Shape | Before | After | Ratio after |
+|---|---|---|---|
+| `ExternalLoop(None, Signal)` | 48,309 → 162,613 | 3,584 → 7,168 | 2.00 |
+| `ExternalLoop(Some(Await), Signal)` | 81,471 → 294,207 | 3,592 → 7,176 | 2.00 |
+| `ExternalFanOut(Signal, false)` | 33,921 → 133,377 | 1,793 → 3,585 | 2.00 |
+| `ExternalFanOut(Signal, true)` | 34,438 → 134,406 | 2,310 → 4,614 | 2.00 |
+| `ExternalPairs` | 33,926 → 133,382 | 1,800 → 3,592 | 2.00 |
+
+The other loop and fan-out shapes give the same counts as the rows above.
+The "Before" column of the loop shapes is the first RED, which did not count
+stash probes. The "Before" column of the fan-out shapes and `ExternalPairs`
+is the second RED, after the scan fix. The nine shapes of #2338 gain about
+one step for each event, for the build of the external index.
 
 ### Measurement
 
-Callgrind, total instructions (`Ir`) of the harness. "Before" is `38209c8`.
+Callgrind, total instructions (`Ir`) of the harness. The totals include the
+build of the history. "Before" is `38209c8`.
 
 | Bench | Shape | N | Before | After | Change |
 |---|---|---|---|---|---|
-| `external_stash_profile` | `loop` | 500 | 68,133,423 | 15,158,762 | −77.8% |
-| `external_stash_profile` | `loop` | 1000 | 257,620,889 | 29,916,358 | −88.4% |
-| `external_stash_profile` | `loop` | 2000 | 1,006,382,535 | 59,118,320 | −94.1% |
-| `external_stash_profile` | `loop_seq` | 500 | 41,019,656 | 15,149,135 | −63.1% |
-| `external_stash_profile` | `loop_seq` | 1000 | 144,444,619 | 29,906,679 | −79.3% |
-| `external_stash_profile` | `loop_seq` | 2000 | 542,057,986 | 59,116,108 | −89.1% |
-| `external_stash_profile` | `fanout` | 500 | 27,729,647 | 6,987,899 | −74.8% |
-| `external_stash_profile` | `fanout` | 1000 | 99,353,150 | 15,704,053 | −84.2% |
-| `external_stash_profile` | `fanout` | 2000 | 375,130,982 | 39,728,527 | −89.4% |
+| `external_stash_profile` | `loop` | 500 | 68,133,423 | 11,650,006 | −82.9% |
+| `external_stash_profile` | `loop` | 1000 | 257,620,889 | 22,859,520 | −91.1% |
+| `external_stash_profile` | `loop` | 2000 | 1,006,382,535 | 45,164,061 | −95.5% |
+| `external_stash_profile` | `loop_seq` | 500 | 41,019,656 | 11,638,573 | −71.6% |
+| `external_stash_profile` | `loop_seq` | 1000 | 144,444,619 | 22,828,346 | −84.2% |
+| `external_stash_profile` | `loop_seq` | 2000 | 542,057,986 | 45,115,677 | −91.7% |
+| `external_stash_profile` | `fanout` | 500 | 27,729,647 | 6,991,868 | −74.8% |
+| `external_stash_profile` | `fanout` | 1000 | 99,353,150 | 13,549,106 | −86.4% |
+| `external_stash_profile` | `fanout` | 2000 | 375,130,982 | 26,462,468 | −92.9% |
 
-The `loop` and `loop_seq` shapes now grow about 2 times per doubling of N.
-
-The `fanout` shape grows 2.25 and 2.53 times. A terminal still finds its
-stash entry with a linear `find`. The drain stashes P requests, then P
-terminals, so each terminal finds its entry after the earlier ones. At P=2000
-that is 18.1M instructions, 46% of the replay. The old code costs the same.
-A stash keyed by id removes it.
+All three shapes now grow about 1.95 times per doubling of N.
 
 Inside the matcher (the inclusive cost of `match_activity`), at N=1000:
 
 | `match_activity_profile` shape | Before | After | Change |
 |---|---|---|---|
-| `sequential` | 366,236 | 369,494 | +0.9% |
-| `fanout` | 5,498,859 | 5,424,041 | −1.4% |
-| `fanout_extsig` | 6,618,848 | 6,072,423 | −8.3% |
+| `sequential` | 366,236 | 369,998 | +1.0% |
+| `fanout` | 5,498,859 | 5,425,393 | −1.3% |
+| `fanout_extsig` | 6,618,848 | 6,098,692 | −7.9% |
 
-A sequential history costs about 3 instructions more for each call. That is
-the reset of the memo on an empty stash. The total of this harness drops 3%
-to 5%, but most of that drop is a change in the inlining of the payload code
-of the harness. It is not a change in the matcher.
+A sequential history costs about 4 instructions more for each call. That is
+the reset of the memo on an empty stash. The harness totals drop 3.4% to
+5.0%. Most of that drop comes from other inlining of the harness payload
+code, not from the matcher:
+
+| `match_activity_profile` shape | Before | After |
+|---|---|---|
+| `sequential` | 18,980,926 | 18,228,917 |
+| `fanout` | 24,566,919 | 23,738,795 |
+| `fanout_extsig` | 25,611,380 | 24,337,304 |
 
 ### Tests
 
-- `replay_steps_grow_near_linearly_for_every_shape` now counts fourteen
-  shapes. The old code failed it for the four `ExternalLoop` shapes, with
-  ratios of 3.37 and 3.61.
-- `the_indexed_scan_matches_the_oracle` gains a cursor rewind. The rewind is
-  the only call that reaches the range below the covered range.
-- Edge tests in `scan_fanout_tests` cover the order of one key across a
-  restore, a terminal below the covered range, and two awaits with one id.
-- Five mutants were checked by hand: no pass for the new keys, no range below
-  the covered range, no range above it, an await push that notes no key, and
-  the range above the covered range before the new keys. The tests above fail
-  each one.
+- `replay_steps_grow_near_linearly_for_every_shape` now counts stash probes.
+  The old code fails it for the four `ExternalLoop` shapes, the six
+  `ExternalFanOut` shapes and `ExternalPairs`.
+- `the_indexed_scan_matches_the_oracle` gains three calls: a cursor rewind,
+  a forward skip and a bare `prepare_match`. The failure reason codes now
+  carry their position, so the order of two failures of one key shows.
+- `the_stash_matches_a_plain_search` compares `ExternalStash` with a plain
+  `VecDeque` search after every push, search and remove.
+- `the_scan_role_and_the_external_key_agree` checks that the external index
+  holds every event that the activity scan treats as an external terminal.
+- Edge tests in `scan_fanout_tests` cover each terminal kind in a per-key
+  pass, the order of one key across a restore and across a rewind, a
+  terminal below the covered range, several awaits with one id, and a cut.
+- Five mutants, each made by hand, fail the tests above:
+  - no pass for the new keys,
+  - no range below the covered range,
+  - no range above it,
+  - an await push that notes no key,
+  - the range above the covered range before the new keys.
 
 ### Reproduce
 
