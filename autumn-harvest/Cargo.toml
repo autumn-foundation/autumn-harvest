@@ -765,3 +765,10 @@ harness = false
 name = "external_stash_profile"
 required-features = ["testing"]
 harness = false
+
+# Deterministic profiling harness for the signal wait scan
+# (`HistoryMatcher::match_signal`). See `benches/signal_wait_profile.rs`.
+[[bench]]
+name = "signal_wait_profile"
+required-features = ["testing"]
+harness = false
