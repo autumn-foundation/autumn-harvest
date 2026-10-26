@@ -15,7 +15,7 @@ This change moves three scans onto the position index of #2330
 3. The terminal scan of `match_child_workflow`.
 
 **Replay semantics do not change.** A differential property test compares
-each new scan with a verbatim copy of the old one. No migration, no new
+each new scan with a copy of the old code. No migration, no new
 `WorkflowEvent` variant and no `harvest_events` change.
 
 ---
@@ -55,7 +55,8 @@ The issue named five scans. The code and the test give this result:
   guessed O(N²) from the code. The test refutes it, and stays as a guard.
 - **External signal, cancel and await scans.** Linear. Each scan stops at
   the first command event, so it never steps over a sibling of its own kind.
-  A fan-out of external signals is drained into the stash at the cursor.
+  `prepare_match` drains a fan-out of external signals into the stash at
+  the cursor.
 
 ### 0.2 Brainstorm — how can these scans become linear?
 
@@ -80,7 +81,7 @@ The issue named five scans. The code and the test give this result:
 | R4 | The timer scan now stops where the old one did not, or the reverse. | §1.2 lists the old timer rules next to the activity roles. The differential test drives timer calls on both paths. |
 | R5 | The child scan now skips a consumed terminal. | The old scan matched a consumed terminal. The index keeps every child terminal, and the query does not filter consumed positions. |
 | R6 | A cut view lets a scan see a hidden position. | Every query drops a position at or past the visible end, as #2330 does. The differential test cuts and restores views. |
-| R7 | A skip link goes stale. | A consumed event never becomes unconsumed. The code has no call that removes an index from a consumed set. `scan_skip.rs` proves the links sound under that rule. |
+| R7 | A skip link goes stale. | A consumed event never becomes unconsumed. The code has no call that removes an index from a consumed set. `formal/verus/src/scan_skip.rs` proves the links sound under that rule. |
 | R8 | The new roles change the activity scan. | A timer fire, a child terminal and an external terminal keep their old effect on an activity scan: a step, a step and a stash. The #2330 oracle test still runs. |
 
 ### 0.4 Six thinking hats
@@ -96,7 +97,7 @@ The issue named five scans. The code and the test give this result:
   built at most once per matcher.
 - **Green (alternatives).** §0.2. A per-id external index also works, but
   it walks the stash on each call, and a stash can hold N entries.
-- **Blue (process).** RED: the scaling test fails for three shapes. GREEN:
+- **Blue (process).** RED: the scaling test fails for seven shapes. GREEN:
   move the three scans. REFACTOR: share the walk code and the roles. Then
   measure with callgrind, and review from several angles.
 
@@ -110,8 +111,8 @@ The old walk visits each unconsumed event from the cursor to the end. Only a
 signal, cancel or await terminal can change state. The index keeps the
 positions of those terminals in one skip list. The new scan asks for the
 first unconsumed terminal at or after the cursor, resolves it with the old
-per-event code, and continues after it. A resolved terminal is consumed, so
-the skip links pass over it on later calls.
+per-event code, and continues after it. The scan consumes a resolved
+terminal, so the skip links pass over it on later calls.
 
 The scan uses the walk until the ski-rental rule of #2330 says that the
 index pays off. A small history keeps its old cost.
@@ -162,7 +163,8 @@ costs nothing.
 ## 2. Acceptance criteria
 
 - `replay_steps_grow_near_linearly_for_every_shape` passes for all nine
-  shapes. It fails on the old code for three of them.
+  shapes. It fails on the old code for seven of them: every shape of the
+  three quadratic scans.
 - `the_indexed_scan_matches_the_oracle` compares the old and new external,
   timer and child scans, with every scan forced onto the index or not.
 - The #2330 scaling and edge tests pass unchanged.
@@ -174,5 +176,13 @@ See `docs/performance-match-activity-fanout.md`, section "Issue #2338".
 
 ## 4. Out of scope
 
-- The race scans (§0.2 B7). A follow-up issue records them.
+- The race scans (§0.2 B7).
 - A cheaper hasher for the index (§0.2 B8).
+- The external scan still visits an external terminal that matches no stash
+  entry on each call. A shape such as `join!(await_external_workflow, a loop
+  of signal_external)` then costs O(K²) visits, fewer than the old walk.
+  Issue #2346 tracks it.
+- A timer id that repeats in one fan-out. The worker records one
+  `TimerStarted` for a live timer id, so this shape does not replay. The fire
+  list of each timer is a skip list anyway, so a reused id costs no extra
+  probes.

@@ -126,7 +126,7 @@ the matcher.
 The `SipHash` of the activity id in the index map is the next lever. A cheaper
 hasher needs its own argument about adversarial ids.
 
-### Not fixed here
+### Follow-up (issue #2338)
 
 Issue #2338 found three more quadratic matcher paths. The section
 [Issue #2338](#issue-2338-the-external-timer-and-child-scans) below fixes
@@ -195,6 +195,9 @@ Two other scans that the issue named are linear. They need no change:
 
 `replay_steps_grow_near_linearly_for_every_shape` keeps all five as guards.
 
+One quadratic shape remains. The external scan visits an external terminal
+that matches no stash entry again on each call. Issue #2346 tracks it.
+
 ### Change
 
 - Three roles are new. `Fired(id)` marks a `TimerFired`, `ChildTerminal(id)` a
@@ -250,10 +253,12 @@ The quadratic shapes now grow about 2 times per doubling of N.
 
 The shapes with no fan-out cost a little more. A sequential history costs
 0.8% more, a sequential timer history 0.8% and a sequential child history
-1.6%. Inside the matcher, that is about 21 instructions for each activity, 43
-for each timer and 40 for each child. A plain activity fan-out with no stashed
-external call costs 1.4% more, about 200 instructions for each activity. Most
-of it is in the inlined scan walk. #2330 accepted a cost of the same size.
+1.6%. Inside the matcher (the inclusive cost of `match_activity`,
+`match_timer_strict` or `match_child_workflow`), that is about 21 instructions
+for each activity, 43 for each timer and 40 for each child. A plain activity
+fan-out with no stashed external call costs 1.4% more. Inside the matcher, that
+is about 200 instructions for each activity. Most of it is in the inlined scan
+walk. #2330 accepted a cost of the same size.
 
 The scans no longer move the index out of the matcher and back. A move
 copied the index twice and built an empty one, which created a `RandomState`
@@ -271,7 +276,12 @@ the consumed sets now replaces it.
   await calls, and it matches the timer or child at the cursor. Mutants of
   the new external, timer and child code fail it.
 - Edge tests in `scan_fanout_tests` cover a second terminal of one signal or
-  await, cut views, foreign and consumed fires, and a consumed child terminal.
+  await, foreign and consumed fires, and a consumed child terminal. They also
+  cover cut views, with the hidden position in the index and not.
+- Five mutants were checked by hand: an external scan that skips a terminal,
+  a timer target that stops at any fire, an off-by-one child query, a child
+  walk that skips consumed terminals, and an await rule without the open
+  check. The tests above fail each one.
 
 ### Reproduce
 

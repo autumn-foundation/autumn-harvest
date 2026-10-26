@@ -98,8 +98,10 @@ pub struct ActivityScanIndex {
     /// The events that scans and settles walked one by one.
     walked: usize,
     activities: HashMap<ActivityExecId, ActivityPositions>,
-    /// The `TimerFired` events of each timer, in history order.
-    fires: HashMap<String, Vec<usize>>,
+    /// The `TimerFired` events of each timer. A workflow can reuse a timer
+    /// id, so one timer can have many fires. A skip list then passes over
+    /// the consumed ones.
+    fires: HashMap<String, SkipList>,
     /// The terminal events of each child, in history order.
     children: HashMap<ExecutionId, Vec<usize>>,
     interleaved: SkipList,
@@ -143,7 +145,9 @@ impl ActivityScanIndex {
                     if let Some(fires) = self.fires.get_mut(id.as_str()) {
                         fires.push(position);
                     } else {
-                        self.fires.insert(id.as_str().to_owned(), vec![position]);
+                        let mut fires = SkipList::default();
+                        fires.push(position);
+                        self.fires.insert(id.as_str().to_owned(), fires);
                     }
                 }
                 ScanRole::ChildTerminal(id) => self.children.entry(id).or_default().push(position),
@@ -182,20 +186,23 @@ impl ActivityScanIndex {
     /// The first unconsumed stop of `target` at or after `from`.
     ///
     /// The stops of an activity are its `ActivityScheduled` and terminal
-    /// events. The stops of a timer are its fires. One target has few
-    /// stops, so a plain walk is enough.
+    /// events. Activity ids are unique, so an activity has few stops, and a
+    /// plain walk is enough. The stops of a timer are its fires. Their skip
+    /// list passes over the consumed fires of a reused timer id.
     pub fn first_stop(
-        &self,
+        &mut self,
         target: ScanTarget<'_>,
         from: usize,
         consumed: impl Fn(usize) -> bool,
     ) -> Option<usize> {
-        let stops = match target {
-            ScanTarget::Activity(id) => &self.activities.get(&id)?.stops,
-            ScanTarget::Timer(id) => self.fires.get(id)?,
-        };
-        let start = stops.partition_point(|&p| p < from);
-        stops[start..].iter().copied().find(|&p| !consumed(p))
+        match target {
+            ScanTarget::Activity(id) => {
+                let stops = &self.activities.get(&id)?.stops;
+                let start = stops.partition_point(|&p| p < from);
+                stops[start..].iter().copied().find(|&p| !consumed(p))
+            }
+            ScanTarget::Timer(id) => self.fires.get_mut(id)?.first_unconsumed(from, consumed),
+        }
     }
 
     /// The first terminal event of `child` at or after `from`.
@@ -454,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn a_child_query_does_not_skip_a_consumed_terminal() {
+    fn a_child_query_returns_each_terminal_in_order() {
         let child = ExecutionId::new();
         let events = [
             WorkflowEvent::ChildWorkflowFailed {

@@ -2,7 +2,7 @@
 //! timer fire scan (`HistoryMatcher::match_timer`) and the child terminal scan
 //! (`HistoryMatcher::match_child_workflow`), issue #2338.
 //!
-//! Wall-clock timing is not admissible on this machine. Drive the binary under
+//! Wall-clock timing is too noisy for this comparison. Drive the binary under
 //! `valgrind --tool=callgrind` or `valgrind --tool=dhat`.
 //!
 //! # Workload
