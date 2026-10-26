@@ -183,7 +183,7 @@ aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio",
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
 # Base64 for the Vault Transit wire format (`vault-transit` feature). It is
 # already in the lockfile through the core crate.
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 
 [[bin]]
 # Zero-setup local dev runtime (issue #525). `cargo dev` is the workspace alias
@@ -217,7 +217,7 @@ jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_c
 ed25519-dalek = "3.0"
 # The KMS binding tests also use `base64` for the fake wire formats (issue
 # #1981).
-base64 = "0.22"
+base64 = "0.23"
 sha2 = "0.11"
 
 # Deterministic (non-criterion) instruction/allocation-count profiling
