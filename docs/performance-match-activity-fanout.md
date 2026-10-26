@@ -396,15 +396,15 @@ build of the history. "Before" is `38209c8`.
 
 | Bench | Shape | N | Before | After | Change |
 |---|---|---|---|---|---|
-| `external_stash_profile` | `loop` | 500 | 68,133,423 | 11,650,006 | −82.9% |
-| `external_stash_profile` | `loop` | 1000 | 257,620,889 | 22,859,520 | −91.1% |
-| `external_stash_profile` | `loop` | 2000 | 1,006,382,535 | 45,164,061 | −95.5% |
-| `external_stash_profile` | `loop_seq` | 500 | 41,019,656 | 11,638,573 | −71.6% |
-| `external_stash_profile` | `loop_seq` | 1000 | 144,444,619 | 22,828,346 | −84.2% |
-| `external_stash_profile` | `loop_seq` | 2000 | 542,057,986 | 45,115,677 | −91.7% |
-| `external_stash_profile` | `fanout` | 500 | 27,729,647 | 6,991,868 | −74.8% |
-| `external_stash_profile` | `fanout` | 1000 | 99,353,150 | 13,549,106 | −86.4% |
-| `external_stash_profile` | `fanout` | 2000 | 375,130,982 | 26,462,468 | −92.9% |
+| `external_stash_profile` | `loop` | 500 | 68,133,423 | 11,637,294 | −82.9% |
+| `external_stash_profile` | `loop` | 1000 | 257,620,889 | 22,845,680 | −91.1% |
+| `external_stash_profile` | `loop` | 2000 | 1,006,382,535 | 45,138,999 | −95.5% |
+| `external_stash_profile` | `loop_seq` | 500 | 41,019,656 | 11,624,485 | −71.7% |
+| `external_stash_profile` | `loop_seq` | 1000 | 144,444,619 | 22,812,710 | −84.2% |
+| `external_stash_profile` | `loop_seq` | 2000 | 542,057,986 | 45,082,309 | −91.7% |
+| `external_stash_profile` | `fanout` | 500 | 27,729,647 | 6,997,288 | −74.8% |
+| `external_stash_profile` | `fanout` | 1000 | 99,353,150 | 13,560,251 | −86.4% |
+| `external_stash_profile` | `fanout` | 2000 | 375,130,982 | 26,483,386 | −92.9% |
 
 All three shapes now grow about 1.95 times per doubling of N.
 
@@ -412,20 +412,20 @@ Inside the matcher (the inclusive cost of `match_activity`), at N=1000:
 
 | `match_activity_profile` shape | Before | After | Change |
 |---|---|---|---|
-| `sequential` | 366,236 | 369,998 | +1.0% |
-| `fanout` | 5,498,859 | 5,425,393 | −1.3% |
-| `fanout_extsig` | 6,618,848 | 6,098,692 | −7.9% |
+| `sequential` | 366,236 | 371,486 | +1.4% |
+| `fanout` | 5,498,859 | 5,428,060 | −1.3% |
+| `fanout_extsig` | 6,618,848 | 6,097,036 | −7.9% |
 
-A sequential history costs about 4 instructions more for each call. That is
-the reset of the memo on an empty stash. The harness totals drop 3.4% to
-5.0%. Most of that drop comes from other inlining of the harness payload
+A sequential history costs about 5 instructions more for each call. That is
+the reset of the memo on an empty stash, behind the box of the external
+state. The harness totals drop 3.3% to 5.0%. Most of that drop comes from other inlining of the harness payload
 code, not from the matcher:
 
 | `match_activity_profile` shape | Before | After |
 |---|---|---|
-| `sequential` | 18,980,926 | 18,228,917 |
-| `fanout` | 24,566,919 | 23,738,795 |
-| `fanout_extsig` | 25,611,380 | 24,337,304 |
+| `sequential` | 18,980,926 | 18,233,299 |
+| `fanout` | 24,566,919 | 23,744,149 |
+| `fanout_extsig` | 25,611,380 | 24,338,503 |
 
 ### Tests
 
