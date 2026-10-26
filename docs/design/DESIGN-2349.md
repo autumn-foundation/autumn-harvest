@@ -8,8 +8,8 @@
    command, and the cursor goes back to the first one. N waits beside N
    unclaimed commands then cost O(N²) steps.
 
-This change gives the signal stash a queue per name, and moves the signal
-scan onto the scan index of #2330.
+This change gives a large signal stash a queue per name, and moves the
+signal scan onto the scan index of #2330.
 
 **Replay semantics do not change.** A differential property test compares
 the new code with a copy of the old code. No migration, no new
@@ -33,9 +33,9 @@ These facts describe the code before this change.
   | `after_fanout` | 6,396,744 | 21,799,574 | 77,965,084 | 294,666,685 |
 
 - **The stash has 15 use sites.** `pending_signals` is a
-  `VecDeque<(String, Value, usize)>`. Five sites search it by name with a
+  `VecDeque<(String, Value, usize)>`. Six sites search it by name with a
   linear scan: the wait, `claim_pending_signal`, `try_claim_pending_signal`,
-  `has_unconsumed_signal` and the candidate lookups of a predicate wait.
+  `has_unconsumed_signal` and the two candidate lookups of a predicate wait.
   `match_signal_or_timer` searches it by name twice. One of those searches
   runs once for each consumed event that the race scan crosses.
 - **The stash keeps push order.** Each search takes the first entry in that
@@ -53,6 +53,9 @@ These facts describe the code before this change.
   holds every command that the signal scan crosses. Every other event is a
   step for both scans.
 - **The consumed sets only grow.** A skip list link never goes stale.
+- **A stash is usually small.** The drain and the scans stash a signal
+  just before its wait takes it. A loop of an activity and a signal holds
+  one entry at a time.
 
 ### 0.2 Brainstorm — how can the signal wait stop costing O(N²)?
 
@@ -68,6 +71,9 @@ These facts describe the code before this change.
 | B8 | Use the index for the candidate lookups of a predicate wait. | Deferred. Those lookups are pure reads with `&self`. A skip list query must shorten its links. |
 | B9 | Check the event in front of the stash search of the race scan. | **Adopted.** A stashed entry names its own event. Only a consumed signal of the same name needs a search. |
 | B10 | Prove the stash invariant in Verus. | Rejected. Verus here proves integer kernels against a mirrored copy. The stash is a map of queues. A proptest model and an invariant check cover it. The reused skip list is proven already. |
+| B11 | Build the name map only for a stash with more than 16 slots. A smaller stash scans its slots. | **Adopted** after the first measurement. A map on every stash made the `loop` shape cost 12.6% more. §1.1 gives the numbers. |
+| B12 | Keep the old `VecDeque` for a small stash, and switch to the slots at the limit. | Rejected. Two layouts double every search and every remove. B11 gives the same cost with one layout. |
+| B13 | A cheaper hasher for the name map. | Deferred. #2338 and #2346 deferred it too. A signal name comes from a client, so it needs its own argument about adversarial names. |
 
 ### 0.3 Reverse brainstorm — how can this change do harm?
 
@@ -78,9 +84,9 @@ These facts describe the code before this change.
 | R3 | The indexed scan skips an event that the walk acts on. | The scan visits every barrier in order. A test checks that the step function is a no-op for each event class outside the barrier and interleaved lists. |
 | R4 | The rewind target changes. A reserved deadline timer of the same name is in the interleaved list, but the walk does not rewind to it. | The interleaved lookup skips that timer and asks again. An edge test runs it on the walk and on the index. |
 | R5 | A race branch crosses its settle marker on the index. | A race branch never leaves the walk. An edge test forces every scan onto the index and checks the bound. |
-| R6 | The fast paths pay for the new state. `fwd` never stashes a signal. | An empty stash skips the name lookup. The walk adds one budget test per event. The `fwd` shape measures it. |
+| R6 | The fast paths pay for the new state. `fwd` never stashes a signal. A loop stashes one signal at a time. | An empty stash skips the name lookup. A small stash has no name map (B11). The hot stash calls and the step function are inlined. The `fwd`, `loop` and `loop_named` shapes measure it. |
 | R7 | A cut view hides an entry, and the restore puts it back in the wrong place. | The cut takes the hidden entries out in push order. The restore merges and sorts them, as the old code did. The differential test cuts and restores. |
-| R8 | The new fields grow `HistoryMatcher` past the `clippy::large_futures` limit. | Clippy runs on the whole workspace. The stash adds one map and one counter. |
+| R8 | The new fields grow `HistoryMatcher` past the `clippy::large_futures` limit. | The stash adds two counters and an optional map, 64 bytes in all. Clippy runs with every feature, and it passes. |
 | R9 | A predicate rejects a payload. The indexed scan then stashes in another order. | The scan visits barriers in history order, as the walk does. The differential test drives payload predicates. |
 
 ### 0.4 Six thinking hats
@@ -101,8 +107,9 @@ These facts describe the code before this change.
 - **Blue (process).** RED: the scaling test gains signal shapes, and counts
   stash probes in the old searches. The differential test gains the old
   signal code as its oracle. GREEN: the name queues, then the indexed scan.
-  REFACTOR: one step function, docs, callgrind. Then review from several
-  angles.
+  Measure: a map on every stash costs too much in a loop, so the map comes
+  only above 16 slots. REFACTOR: one step function, inlined hot calls, docs,
+  callgrind. Then review from several angles.
 
 ---
 
@@ -112,22 +119,30 @@ These facts describe the code before this change.
 
 `SignalStash` holds the stashed signals:
 
-- `slots` holds the entries in push order. A remove leaves `None`. The
-  deque drops each `None` that reaches its front or its back.
+- `slots` holds the entries in push order. A remove at an end pops the
+  slot. A remove in the middle leaves `None`, and the deque drops it when it
+  reaches an end.
 - `front` is the push number of the first slot. The slot of push number `p`
   is `p - front`.
 - `names` maps each name to the push numbers of its entries, in push order.
-  A name with no entry has no key.
+  It exists only while the stash has more than 16 slots. The first push past
+  that limit builds it. The stash drops it when it empties. An empty queue
+  keeps its key.
 
-The invariant: the queue of each name holds exactly the push numbers of the
-live entries with that name, in ascending order. Every search walks one
-queue. So it visits the entries of one name in push order, as the old scan
-did.
+Without `names`, a search scans at most 16 slots. With `names`, the
+invariant is: the queue of each name holds exactly the push numbers of the
+live entries with that name, in ascending order. Either way, a search
+visits the entries of one name in push order, as the old scan did.
 
 A wait removes the first entry of its name. In a fan-out in order, that is
 the front of the queue and of the deque, so it costs O(1). In reverse order,
-it is the back of the deque, which costs O(1) too. A remove in the middle
-leaves a slot, and the slot goes when an end passes it.
+it is the back of the deque, which costs O(1) too.
+
+The first version kept `names` for every stash. Each stash then paid a
+SipHash, and a clone of a new name. Callgrind on the `loop` shape at N=1000:
+the matcher cost 3,033,533 instructions before, and 3,195,822 with a map on
+every stash. With no map below 16 slots and the hot calls inlined, it costs
+3,104,572. That is 71 instructions, or 2.3%, more for each loop step.
 
 `restore_view` takes every entry out, adds the hidden entries, sorts by event
 index and pushes them back. That is the order of the old sort. The cost is
@@ -156,6 +171,10 @@ cursor and stash.
 
 A race branch keeps the walk (§0.2 B7).
 
+The walk calls `signal_scan_step` once for each event, so the step is
+inlined. Out of line, the call and the move of its `Option<HistoryMatch>`
+made the `fwd` shape cost 1.3% more.
+
 ## 2. Acceptance criteria
 
 - `replay_steps_grow_near_linearly_for_every_shape` passes for the new
@@ -166,7 +185,8 @@ A race branch keeps the walk (§0.2 B7).
 - Edge tests cover a reserved deadline timer, an unexpected event, a
   predicate, a cut and a race branch, on the walk and on the index.
 - Callgrind shows a linear cost for the `rev` and `after_fanout` shapes of
-  `signal_wait_profile`. The `fwd` shape costs about the same.
+  `signal_wait_profile`. The `fwd`, `loop` and `loop_named` shapes cost
+  about the same.
 
 ## 3. Measurement
 
@@ -180,3 +200,7 @@ See `docs/performance-match-activity-fanout.md`, section "Issue #2349".
 - The walk of `match_signal_or_timer` crosses unclaimed sibling commands, as
   the old signal walk did. A race starts at its own `TimerStarted`, so a
   sibling fan-out before it is claimed first.
+- The race scan searches the queue of its own name at each consumed signal
+  of that name. A stash with many entries of the race name can still cost
+  O(k) for each of them.
+- The cheap hasher (§0.2 B13).

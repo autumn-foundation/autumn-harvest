@@ -4709,10 +4709,7 @@ impl HistoryMatcher {
         // of the cycle.
         let mut first_interleaved_command = None;
         let mut at = from;
-        let found = loop {
-            if at == len {
-                break None;
-            }
+        while at < len {
             if tolerate_interleaved.is_none()
                 && self.leaves_walk(at - from, first_interleaved_command.is_some())
             {
@@ -4735,15 +4732,16 @@ impl HistoryMatcher {
                     &mut first_interleaved_command,
                 )
             {
-                break Some(result);
+                self.activity_scan_index.note_walk(at - from);
+                return result;
             }
             at += 1;
-        };
+        }
         self.activity_scan_index.note_walk(at - from);
 
-        // With no result, the signal scan reached the end of history without
-        // finding the signal: the awaited signal has not arrived yet, so this
-        // wait parks. The indexed scan ends the same way.
+        // The signal scan reached the end of history without finding the
+        // signal: the awaited signal has not arrived yet, so this wait parks.
+        // The indexed scan ends the same way.
         //
         // Any interleaved command crossed on the way (a sibling's
         // `ActivityScheduled`/`ChildWorkflowStarted`, or a `TimerStarted`/
@@ -4766,7 +4764,7 @@ impl HistoryMatcher {
         // before the sibling branches of the same decision are polled — which is
         // exactly how an advertised `join!(wait_for_signal, ctx.timer)` came to
         // be nd-blocked on its first wake (Codex round 3 on PR #1245).
-        found.unwrap_or(HistoryMatch::NoMatch)
+        HistoryMatch::NoMatch
     }
 
     /// The rule of the signal scan for the unconsumed event at `at` (issue
@@ -4776,8 +4774,12 @@ impl HistoryMatcher {
     /// [`Self::match_signal_inner`] calls it for each unconsumed event.
     /// [`Self::match_indexed_signal`] calls it for each barrier only. For any
     /// other event, it at most sets `first_interleaved_command`.
-    #[inline]
-    #[allow(clippy::too_many_lines)]
+    #[inline(always)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::inline_always,
+        reason = "one arm per event class; callgrind: a call costs about 60 instructions on each wait"
+    )]
     fn signal_scan_step(
         &mut self,
         at: usize,
@@ -5123,18 +5125,10 @@ impl HistoryMatcher {
         self.prepare_match();
         self.note_signal_probe(signal_name);
 
-        let claimable: Vec<usize> = self
-            .pending_signals
-            .of_name(signal_name)
-            .filter(|(_, entry)| {
-                stash_probe(!self.race_reserved_signal_events.contains(&entry.index))
-            })
-            .map(|(push, _)| push)
-            .collect();
-        let matched: Vec<StashedSignal> = claimable
-            .into_iter()
-            .filter_map(|push| self.pending_signals.remove(push))
-            .collect();
+        let reserved = &self.race_reserved_signal_events;
+        let matched = self.pending_signals.take_of_name(signal_name, |entry| {
+            stash_probe(!reserved.contains(&entry.index))
+        });
         // Every stashed entry already has its index in `consumed_signal_events`
         // (set by `stash_signal` at stash time), but re-asserting it here makes
         // the no-double-delivery invariant explicit at the point of use rather
@@ -16409,7 +16403,7 @@ mod activity_scan_tests {
         m.prepare_match();
         m.note_signal_probe(signal_name);
 
-        let pushes: Vec<usize> = m
+        let pushes = m
             .pending_signals
             .numbered()
             .filter(|(_, entry)| {
@@ -16417,10 +16411,7 @@ mod activity_scan_tests {
             })
             .map(|(push, _)| push)
             .collect();
-        let matched: Vec<StashedSignal> = pushes
-            .into_iter()
-            .filter_map(|push| m.pending_signals.remove(push))
-            .collect();
+        let matched = m.pending_signals.remove_all(pushes);
         for entry in &matched {
             m.consumed_signal_events.insert(entry.index);
         }
@@ -17433,6 +17424,7 @@ mod activity_scan_tests {
         with_oracle(oracle, || apply_op(m, cut, pools, op, appended, oracle))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_op(
         m: &mut HistoryMatcher,
         cut: &mut Option<ViewCut>,
@@ -17598,7 +17590,9 @@ mod activity_scan_tests {
             evs in proptest::collection::vec(ev(), 0..60),
             ops in proptest::collection::vec(op(), 1..60),
             budget in proptest::sample::select(vec![None, Some(0_usize), Some(1), Some(3), Some(4)]),
+            small in proptest::sample::select(vec![None, Some(0_usize), Some(2)]),
         ) {
+            crate::signal_stash::tests::with_small_stash(small, || {
             let pools = Pools::new();
             let mut all = vec![first];
             all.extend(evs);
@@ -17621,6 +17615,85 @@ mod activity_scan_tests {
                 prop_assert_eq!(state(&indexed), state(&oracle), "step {} {:?}", step, op);
                 indexed.pending_signals.check();
             }
+            Ok(())
+            })?;
+        }
+    }
+
+    /// One event of each kind that the differential test generates.
+    const EVENT_KINDS: [Ev; 37] = [
+        Ev::Scheduled(0, false),
+        Ev::Started(0),
+        Ev::Heartbeat(0),
+        Ev::Completed(0),
+        Ev::Failed(0),
+        Ev::TimedOut(0),
+        Ev::ChildStarted(0),
+        Ev::ChildCompleted(0),
+        Ev::Marker,
+        Ev::SideEffect,
+        Ev::TimerStarted(0),
+        Ev::TimerCancelled(0),
+        Ev::TimerFired(0),
+        Ev::LocalScheduled(0),
+        Ev::LocalCompleted(0),
+        Ev::Signal(false),
+        Ev::CancelRequested(0),
+        Ev::CancelDelivered(0),
+        Ev::Update,
+        Ev::Paused,
+        Ev::Completion,
+        Ev::Detached(0),
+        Ev::ChildFailed(0),
+        Ev::LocalFailed(0),
+        Ev::SignalRequested(0),
+        Ev::SignalDelivered(0),
+        Ev::SignalFailed(0),
+        Ev::CancelFailed(0),
+        Ev::AwaitRequested(0),
+        Ev::AwaitResolved(0),
+        Ev::AwaitFailed(0),
+        Ev::UpdateCompleted,
+        Ev::UpdateFailed,
+        Ev::Failure,
+        Ev::ReservedTimer(0, false),
+        Ev::ReservedFired(0, false),
+        Ev::RaceMarker,
+    ];
+
+    /// The signal scan acts only on the events that the scan index lists
+    /// (issue #2349). On any other event, `signal_scan_step` changes no
+    /// state and sets no rewind target. An interleaved command becomes the
+    /// rewind target, unless it is a deadline timer of the awaited signal.
+    #[test]
+    fn the_signal_step_acts_only_on_indexed_events() {
+        let pools = Pools::new();
+        for kind in &EVENT_KINDS {
+            for name in ["s", "t"] {
+                let event = pools.event(kind, 0);
+                let role = HistoryMatcher::activity_scan_role(&event);
+                let own_deadline = matches!(
+                    &event,
+                    WorkflowEvent::TimerStarted { timer_id, .. }
+                        if HistoryMatcher::signal_timeout_race_name(timer_id.as_str()) == Some(name)
+                );
+                let mut m = HistoryMatcher::new(vec![event.clone()]);
+                let before = state(&m);
+                let mut first_interleaved = None;
+                let result = m.signal_scan_step(0, name, None, None, &mut first_interleaved);
+                let want_first = match role {
+                    ScanRole::Barrier | ScanRole::ExternalTerminal => continue,
+                    ScanRole::Scheduled(_) | ScanRole::Interleaved => (!own_deadline).then_some(0),
+                    ScanRole::Terminal(_)
+                    | ScanRole::Progress(_)
+                    | ScanRole::Fired(_)
+                    | ScanRole::ChildTerminal(_)
+                    | ScanRole::Pass => None,
+                };
+                assert_eq!(result, None, "{name} {event:?}");
+                assert_eq!(state(&m), before, "{name} {event:?}");
+                assert_eq!(first_interleaved, want_first, "{name} {event:?}");
+            }
         }
     }
 
@@ -17631,47 +17704,8 @@ mod activity_scan_tests {
     #[test]
     fn the_scan_role_and_the_external_key_agree() {
         let pools = Pools::new();
-        let kinds = [
-            Ev::Scheduled(0, false),
-            Ev::Started(0),
-            Ev::Heartbeat(0),
-            Ev::Completed(0),
-            Ev::Failed(0),
-            Ev::TimedOut(0),
-            Ev::ChildStarted(0),
-            Ev::ChildCompleted(0),
-            Ev::Marker,
-            Ev::SideEffect,
-            Ev::TimerStarted(0),
-            Ev::TimerCancelled(0),
-            Ev::TimerFired(0),
-            Ev::LocalScheduled(0),
-            Ev::LocalCompleted(0),
-            Ev::Signal(false),
-            Ev::CancelRequested(0),
-            Ev::CancelDelivered(0),
-            Ev::Update,
-            Ev::Paused,
-            Ev::Completion,
-            Ev::Detached(0),
-            Ev::ChildFailed(0),
-            Ev::LocalFailed(0),
-            Ev::SignalRequested(0),
-            Ev::SignalDelivered(0),
-            Ev::SignalFailed(0),
-            Ev::CancelFailed(0),
-            Ev::AwaitRequested(0),
-            Ev::AwaitResolved(0),
-            Ev::AwaitFailed(0),
-            Ev::UpdateCompleted,
-            Ev::UpdateFailed,
-            Ev::Failure,
-            Ev::ReservedTimer(0, false),
-            Ev::ReservedFired(0, false),
-            Ev::RaceMarker,
-        ];
         let mut terminals = 0;
-        for kind in &kinds {
+        for kind in &EVENT_KINDS {
             let event = pools.event(kind, 0);
             let role = HistoryMatcher::activity_scan_role(&event) == ScanRole::ExternalTerminal;
             assert_eq!(
@@ -18374,6 +18408,7 @@ mod scan_fanout_tests {
 
     /// Replays a signal shape of issue #2349 with `n` signals, checks every
     /// result and returns the scan steps.
+    #[allow(clippy::too_many_lines)]
     fn replay_signals(shape: Shape, n: usize) -> u64 {
         match shape {
             Shape::Signals(reversed) | Shape::SignalsAfterFanOut(reversed) => {
