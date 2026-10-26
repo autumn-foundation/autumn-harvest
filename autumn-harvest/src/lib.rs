@@ -669,6 +669,7 @@ pub use calendar::{
     BusinessCalendars, BusinessDayRejection, BusinessDayResolution, Calendar, MAX_BUSINESS_DAYS,
     ScheduleFirePreview, add_business_days, add_business_days_bounded, apply_skip_policy,
     calendar_excludes_weekends, is_business_day, is_excluded_date, next_business_day_at_or_after,
+    schedule_local_date,
 };
 pub use canary::{
     CANARY_ACTIVITY_NAME, CANARY_WORKFLOW_NAME_PREFIX, is_canary_workflow, is_reserved_canary_name,

@@ -107,6 +107,8 @@ Content-Type: application/json
 
 Response: `204 No Content`. The call **replaces** the full set; omitting a date removes it.
 
+For a timezone schedule, each date is a date in the schedule's timezone. See [Which date a calendar tests](#which-date-a-calendar-tests).
+
 ### Delete a calendar
 
 ```http
@@ -189,6 +191,14 @@ harvest.schedule.skipped{workflow="generate_payroll", queue="default", reason="c
 This is separate from `reason="overlap"` skips (overlap policy) so dashboards can distinguish holiday-driven suppression from concurrency-driven suppression.
 
 ---
+
+## Which date a calendar tests
+
+A calendar tests the **local date** of the fire time. For a `CronInTimezone` schedule, that is the date in the schedule's timezone. For every other schedule, it is the UTC date.
+
+A Mon–Fri `0 8 * * 1-5` schedule in `Asia/Tokyo` fires at 23:00 UTC on the day before. The calendar still tests the Tokyo date, so `weekends-off` never suppresses a local weekday. A holiday date means that day in the schedule's timezone.
+
+An unknown timezone falls back to the UTC date.
 
 ## Notes
 
