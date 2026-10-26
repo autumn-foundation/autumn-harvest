@@ -23,6 +23,13 @@ with the code each one needs.
   array, so no unzeroized copy is made. A nonce or tag of the wrong length
   is an error, never a panic.
 
+- **zstd advisories.** cargo-deny began failing on RUSTSEC-2026-0391,
+  -0395 to -0406 and -0410 in `zstd` 0.13 and `zstd-safe` 7. The only path
+  to them is wasmtime's `cache` feature, and no wasmtime release uses the
+  patched `zstd` 0.14. Harvest never reads wasmtime's on-disk cache, so
+  `wasmtime` now takes its default features minus `cache`, and `zstd`
+  leaves the lockfile.
+
 The stored format does not change: a nonce, the ciphertext and a 16-byte
 tag, as before. The existing codec round-trip, tamper and wrong-key tests
 pass unchanged.
