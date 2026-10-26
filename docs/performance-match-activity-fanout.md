@@ -195,8 +195,10 @@ Two other scans that the issue named are linear. They need no change:
 
 `replay_steps_grow_near_linearly_for_every_shape` keeps all five as guards.
 
-One quadratic shape remains. The external scan visits an external terminal
-that matches no stash entry again on each call. Issue #2346 tracks it.
+One quadratic shape remained. The external scan visited an external terminal
+that matches no stash entry again on each call. The section
+[Issue #2346](#issue-2346-the-external-stash-scan-and-the-stash-removal)
+below fixes it.
 
 ### Change
 

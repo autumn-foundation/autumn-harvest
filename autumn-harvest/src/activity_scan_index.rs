@@ -52,7 +52,7 @@ pub enum ScanRole<'e> {
     Interleaved,
     /// A terminal event of an external signal, cancel or await. A scan
     /// stashes it, as a barrier. The external stash scan resolves it.
-    ExternalTerminal(ExternalKey),
+    ExternalTerminal,
     /// An event that the scan stashes, or an event that stops it.
     Barrier,
     /// An event that the scan steps over.
@@ -67,6 +67,30 @@ pub enum ExternalKey {
     Signal(ExternalSignalId),
     Cancel(ExternalCancelId),
     Await(ExternalAwaitId),
+}
+
+impl ExternalKey {
+    /// The key of an external terminal event, or `None` for any other
+    /// event.
+    ///
+    /// [`ScanRole::ExternalTerminal`] does not carry the key. A key in the
+    /// role made the role larger, and the activity scan walk of a fan-out
+    /// cost about 4% more (issue #2346).
+    pub const fn of_terminal(event: &WorkflowEvent) -> Option<Self> {
+        match event {
+            WorkflowEvent::ExternalSignalDelivered { signal_id }
+            | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
+                Some(Self::Signal(*signal_id))
+            }
+            WorkflowEvent::ExternalCancelDelivered { cancel_id }
+            | WorkflowEvent::ExternalCancelFailed { cancel_id, .. } => {
+                Some(Self::Cancel(*cancel_id))
+            }
+            WorkflowEvent::ExternalAwaitResolved { await_id, .. }
+            | WorkflowEvent::ExternalAwaitFailed { await_id, .. } => Some(Self::Await(*await_id)),
+            _ => None,
+        }
+    }
 }
 
 /// What an activity or timer scan looks for (issue #2338).
@@ -167,10 +191,12 @@ impl ActivityScanIndex {
                 }
                 ScanRole::ChildTerminal(id) => self.children.entry(id).or_default().push(position),
                 ScanRole::Interleaved => self.interleaved.push(position),
-                ScanRole::ExternalTerminal(key) => {
+                ScanRole::ExternalTerminal => {
                     self.barriers.push(position);
                     self.external_terminals.push(position);
-                    self.external_by_key.entry(key).or_default().push(position);
+                    if let Some(key) = ExternalKey::of_terminal(event) {
+                        self.external_by_key.entry(key).or_default().push(position);
+                    }
                 }
                 ScanRole::Barrier => self.barriers.push(position),
                 ScanRole::Pass => {}
@@ -467,9 +493,7 @@ mod tests {
             | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
                 ScanRole::ChildTerminal(*child_id)
             }
-            WorkflowEvent::ExternalSignalDelivered { signal_id } => {
-                ScanRole::ExternalTerminal(ExternalKey::Signal(*signal_id))
-            }
+            WorkflowEvent::ExternalSignalDelivered { .. } => ScanRole::ExternalTerminal,
             _ => ScanRole::Barrier,
         }
     }

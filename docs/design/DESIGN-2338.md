@@ -181,7 +181,7 @@ See `docs/performance-match-activity-fanout.md`, section "Issue #2338".
 - The external scan still visits an external terminal that matches no stash
   entry on each call. A shape such as `join!(await_external_workflow, a loop
   of signal_external)` then costs O(K²) visits, fewer than the old walk.
-  Issue #2346 tracks it.
+  Issue #2346 fixes it. See `docs/design/DESIGN-2346.md`.
 - A timer id that repeats in one fan-out. The worker records one
   `TimerStarted` for a live timer id, so this shape does not replay. The fire
   list of each timer is a skip list anyway, so a reused id costs no extra

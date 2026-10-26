@@ -78,7 +78,7 @@ The code and the test give these facts:
 
 | # | How to make it harmful | Mitigation |
 |---|------------------------|------------|
-| R1 | A push site does not note its key. The scan then skips a terminal that the old walk resolved. | Every push goes through one of three helpers, and each helper notes the key. The four inline pushes in `match_external_cancel` and `match_external_await` now call the helpers. The differential test runs those scans. |
+| R1 | A push site does not note its key. The scan then skips a terminal that the old walk resolved. | Every push goes through one of three helpers, and each helper notes the key. `match_external_cancel` and `match_external_await` had their own copies of the stash code, with four inline pushes. They now call `stash_transparent_external_event`. The differential test runs those scans. |
 | R2 | The cursor goes back below the covered range. A terminal in the gap is skipped. | The scan does a full pass over the part of `[cursor, len)` below the covered range. A unit test rewinds the cursor by hand. |
 | R3 | A restore or an append brings back events past the covered range. | The scan does a full pass over the part above the covered range. The differential test cuts, restores and appends. |
 | R4 | The scan resolves two terminals of one key in the wrong order. A signal keeps the terminal of the last resolve, so the result changes. | The scan runs its three ranges in position order. Each range runs in position order. Two keys never touch the same entry or event. |

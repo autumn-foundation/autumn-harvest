@@ -57,12 +57,12 @@ fn payload(i: usize) -> Value {
 }
 
 /// The execution that external call `i` targets.
-fn callee(i: usize) -> ExecutionId {
+const fn callee(i: usize) -> ExecutionId {
     ExecutionId::from_uuid(uuid::Uuid::from_u128(i as u128 + 1))
 }
 
 /// The execution that the `loop` shape awaits.
-fn awaited() -> ExecutionId {
+const fn awaited() -> ExecutionId {
     ExecutionId::from_uuid(uuid::Uuid::from_u128(2346))
 }
 
