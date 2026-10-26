@@ -2651,7 +2651,9 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-owner-failover.md`](performance-owner-failover.md)
   — owner failover on real Postgres (issue #2254): a frozen owner, `kill -9`
   and a scale-out from 4 to 8 workers. All four tests pass. After a kill,
-  the next decision runs in 10.2 s to 10.3 s, inside the 11 s bound.
+  the next decision runs in 10.2 s to 10.3 s, inside the 11 s bound. After
+  issue #2296, a re-run settles the scale-out in 5.3 s to 5.5 s, not 8.4 s
+  to 9.8 s.
 * [`docs/performance-owner-decider.md`](performance-owner-decider.md)
   — stage 1b of the decision owner (issue #2255). The owner decider takes
   workflow tasks by execution, so the claim loops claim 3 tasks per
