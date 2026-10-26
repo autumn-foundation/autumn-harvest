@@ -731,7 +731,7 @@ fn decider_page_and_decision_13_cite_real_tests() {
 const GROUP_SUITE: &str = "autumn-harvest/tests/integration/group_commit_db_tests.rs";
 
 /// The design note of issue #2256.
-const GROUP_DESIGN: &str = "DESIGN-2256.md";
+const GROUP_DESIGN: &str = "docs/design/DESIGN-2256.md";
 
 /// The group commit tests that the design note cites.
 const GROUP_TESTS: &[&str] = &[
@@ -755,7 +755,7 @@ fn group_commit_decision_14_cites_real_tests() {
     let decision = section(&adr, "\n### 14. Group commit", "\n## ")
         .unwrap_or_else(|| panic!("{ADR} has no decision 14"));
     for link in [
-        "DESIGN-2256.md",
+        "../design/DESIGN-2256.md",
         "group_commit_db_tests.rs",
         "formal/verus/src/group_commit.rs",
     ] {

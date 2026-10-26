@@ -26,7 +26,7 @@
 //! drain injects no fault and is weakly fair. A run must consume every
 //! signal before the drain ends.
 //!
-//! See `docs/testing/simulation.md` and `DESIGN-2256.md`.
+//! See `docs/testing/simulation.md` and `docs/design/DESIGN-2256.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
