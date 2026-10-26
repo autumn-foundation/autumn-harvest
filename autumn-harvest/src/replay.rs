@@ -11,7 +11,7 @@
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::ops::Range;
 
 use crate::activity_scan_index::{ActivityScanIndex, ExternalKey, ScanRole, ScanTarget};
@@ -773,6 +773,206 @@ impl ExternalScanMemo {
     }
 }
 
+/// A stash entry with an id. A terminal event finds its entry by that id.
+trait StashEntry {
+    type Id: Copy + Eq + Hash;
+
+    fn id(&self) -> Self::Id;
+}
+
+impl StashEntry for StashedExternalSignal {
+    type Id = ExternalSignalId;
+
+    fn id(&self) -> ExternalSignalId {
+        self.signal_id
+    }
+}
+
+impl StashEntry for StashedExternalCancel {
+    type Id = ExternalCancelId;
+
+    fn id(&self) -> ExternalCancelId {
+        self.cancel_id
+    }
+}
+
+impl StashEntry for StashedExternalAwait {
+    type Id = ExternalAwaitId;
+
+    fn id(&self) -> ExternalAwaitId {
+        self.await_id
+    }
+}
+
+/// The first entry of one id in an [`ExternalStash`], and the number of
+/// entries with that id.
+#[derive(Debug, Clone, Copy)]
+struct IdEntries {
+    /// The push number of the first entry.
+    first: u64,
+    count: usize,
+}
+
+/// The stashed calls of one external kind, in push order (issue #2346).
+///
+/// A terminal event finds the first entry of its id. A linear search costs
+/// O(n), so a fan-out of n calls cost O(n²). A map from each id to its first
+/// entry makes the search cost O(1) for a fan-out in order, and O(log n)
+/// otherwise. A workflow gives each call a new id. A history with a repeated
+/// id still replays, but a search for it walks the entries of that id.
+///
+/// A remove from the front costs O(1). A fan-out matches its entries in
+/// push order, so it removes them from the front.
+struct ExternalStash<T: StashEntry> {
+    /// Each entry with its push number. The numbers grow, so the deque stays
+    /// sorted by them.
+    entries: VecDeque<(u64, T)>,
+    /// The push number of the next entry.
+    next: u64,
+    /// The first entry and the entry count of each id in the stash.
+    ids: HashMap<T::Id, IdEntries>,
+}
+
+impl<T: StashEntry> ExternalStash<T> {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            next: 0,
+            ids: HashMap::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Adds `entry` at the end.
+    fn push_back(&mut self, entry: T) {
+        let push = self.next;
+        self.next += 1;
+        self.ids
+            .entry(entry.id())
+            .and_modify(|ids| ids.count += 1)
+            .or_insert(IdEntries {
+                first: push,
+                count: 1,
+            });
+        self.entries.push_back((push, entry));
+    }
+
+    /// Whether an entry with `id` is in the stash.
+    fn contains(&self, id: T::Id) -> bool {
+        stash_probe(true);
+        self.ids.contains_key(&id)
+    }
+
+    /// The position of the entry with push number `push`.
+    ///
+    /// With no remove before the end, the push numbers have no gaps, so the
+    /// first guess is right. Otherwise a binary search finds the entry.
+    fn position(&self, push: u64) -> Option<usize> {
+        stash_probe(true);
+        let front = self.entries.front()?.0;
+        let guess = usize::try_from(push.checked_sub(front)?).ok()?;
+        if self.entries.get(guess).is_some_and(|(at, _)| *at == push) {
+            return Some(guess);
+        }
+        self.entries
+            .binary_search_by(|(at, _)| {
+                stash_probe(true);
+                at.cmp(&push)
+            })
+            .ok()
+    }
+
+    /// The first entry with `id` that `accept` takes.
+    fn first_mut(&mut self, id: T::Id, accept: impl Fn(&T) -> bool) -> Option<&mut T> {
+        let ids = *self.ids.get(&id)?;
+        let start = self.position(ids.first)?;
+        let at = if ids.count == 1 {
+            accept(&self.entries[start].1).then_some(start)?
+        } else {
+            // A repeated id walks from its first entry.
+            (start..self.entries.len()).find(|&at| {
+                let entry = &self.entries[at].1;
+                stash_probe(entry.id() == id && accept(entry))
+            })?
+        };
+        Some(&mut self.entries[at].1)
+    }
+
+    /// Removes and returns the first entry that `accept` takes.
+    fn remove_first(&mut self, accept: impl Fn(&T) -> bool) -> Option<T> {
+        let at = self
+            .entries
+            .iter()
+            .position(|(_, entry)| stash_probe(accept(entry)))?;
+        let (push, entry) = self.entries.remove(at)?;
+        let id = entry.id();
+        let next_of_id = || {
+            self.entries
+                .range(at..)
+                .find(|(_, other)| stash_probe(other.id() == id))
+                .map(|(other, _)| *other)
+        };
+        match self.ids.get(&id).copied() {
+            Some(ids) if ids.count > 1 => {
+                let first = if ids.first == push {
+                    next_of_id()
+                } else {
+                    Some(ids.first)
+                };
+                match first {
+                    Some(first) => {
+                        self.ids.insert(
+                            id,
+                            IdEntries {
+                                first,
+                                count: ids.count - 1,
+                            },
+                        );
+                    }
+                    None => {
+                        self.ids.remove(&id);
+                    }
+                }
+            }
+            _ => {
+                self.ids.remove(&id);
+            }
+        }
+        Some(entry)
+    }
+
+    /// The entries in push order, for a test that reads or sets a terminal.
+    #[cfg(test)]
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.entries.iter_mut().map(|(_, entry)| entry)
+    }
+}
+
+impl<T: StashEntry> std::ops::Index<usize> for ExternalStash<T> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &T {
+        &self.entries[index].1
+    }
+}
+
+/// Prints the entries only. The push numbers and the id map follow from
+/// them, and the map has no fixed order.
+impl<T: StashEntry + std::fmt::Debug> std::fmt::Debug for ExternalStash<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.entries.iter().map(|(_, entry)| entry))
+            .finish()
+    }
+}
+
 /// The frozen resolution recorded on a `LocalActivityScheduled` event
 /// (issue #620, AC8; Codex P2). Returned by
 /// [`HistoryMatcher::recorded_local_activity_resolution`].
@@ -818,13 +1018,15 @@ pub struct HistoryMatcher {
     /// e.g. when signal events appear before `ActivityScheduled` or
     /// `TimerStarted` events in a mixed-batch history.
     ///
-    /// The three stashes are `VecDeque`s. A fan-out matches its entries in
-    /// stash order, and a remove at the front then costs O(1) (issue #2346).
-    pending_external_signals: VecDeque<StashedExternalSignal>,
+    ///
+    /// Push an entry only through a `stash_external_*_request` helper. The
+    /// helper notes its key in `external_scan_memo`. A push without the note
+    /// makes the external scan skip a terminal (issue #2346).
+    pending_external_signals: ExternalStash<StashedExternalSignal>,
     /// External cancels drained before their natural cursor position (issue #492).
-    pending_external_cancels: VecDeque<StashedExternalCancel>,
+    pending_external_cancels: ExternalStash<StashedExternalCancel>,
     /// External awaits drained before their natural cursor position (issue #757).
-    pending_external_awaits: VecDeque<StashedExternalAwait>,
+    pending_external_awaits: ExternalStash<StashedExternalAwait>,
     /// Indices of events that are transparent to command-dispatch replay and
     /// therefore pre-marked consumed (issue #383: `WorkflowExecutionPaused` /
     /// `WorkflowExecutionResumed`). These are pure operator-lifecycle no-ops:
@@ -1088,9 +1290,9 @@ impl HistoryMatcher {
             consumed_out_of_order_events: EventIndexSet::default(),
             consumed_signal_events: EventIndexSet::default(),
             pending_signals: VecDeque::new(),
-            pending_external_signals: VecDeque::new(),
-            pending_external_cancels: VecDeque::new(),
-            pending_external_awaits: VecDeque::new(),
+            pending_external_signals: ExternalStash::new(),
+            pending_external_cancels: ExternalStash::new(),
+            pending_external_awaits: ExternalStash::new(),
             transparent_events,
             late_race_signal_events: HashSet::new(),
             race_reserved_signal_events,
@@ -1641,11 +1843,7 @@ impl HistoryMatcher {
         signal_id: ExternalSignalId,
         terminal: StashedSignalTerminal,
     ) {
-        if let Some(pending) = self
-            .pending_external_signals
-            .iter_mut()
-            .find(|pending| stash_probe(pending.signal_id == signal_id))
-        {
+        if let Some(pending) = self.pending_external_signals.first_mut(signal_id, |_| true) {
             pending.terminal = Some(terminal);
         }
         self.consumed_signal_events.insert(cursor);
@@ -1675,11 +1873,7 @@ impl HistoryMatcher {
         cancel_id: ExternalCancelId,
         terminal: StashedCancelTerminal,
     ) {
-        if let Some(pending) = self
-            .pending_external_cancels
-            .iter_mut()
-            .find(|pending| stash_probe(pending.cancel_id == cancel_id))
-        {
+        if let Some(pending) = self.pending_external_cancels.first_mut(cancel_id, |_| true) {
             pending.terminal = Some(terminal);
         }
         self.consumed_signal_events.insert(cursor);
@@ -1709,11 +1903,7 @@ impl HistoryMatcher {
         await_id: ExternalAwaitId,
         terminal: StashedAwaitTerminal,
     ) {
-        if let Some(pending) = self
-            .pending_external_awaits
-            .iter_mut()
-            .find(|pending| stash_probe(pending.await_id == await_id))
-        {
+        if let Some(pending) = self.pending_external_awaits.first_mut(await_id, |_| true) {
             pending.terminal = Some(terminal);
         }
         self.consumed_signal_events.insert(cursor);
@@ -2620,18 +2810,15 @@ impl HistoryMatcher {
     /// still in an external stash.
     fn is_unclaimed_stashed_request(&self, event: &WorkflowEvent) -> bool {
         match event {
-            WorkflowEvent::ExternalSignalRequested { signal_id, .. } => self
-                .pending_external_signals
-                .iter()
-                .any(|p| stash_probe(p.signal_id == *signal_id)),
-            WorkflowEvent::ExternalCancelRequested { cancel_id, .. } => self
-                .pending_external_cancels
-                .iter()
-                .any(|p| stash_probe(p.cancel_id == *cancel_id)),
-            WorkflowEvent::ExternalAwaitRequested { await_id, .. } => self
-                .pending_external_awaits
-                .iter()
-                .any(|p| stash_probe(p.await_id == *await_id)),
+            WorkflowEvent::ExternalSignalRequested { signal_id, .. } => {
+                self.pending_external_signals.contains(*signal_id)
+            }
+            WorkflowEvent::ExternalCancelRequested { cancel_id, .. } => {
+                self.pending_external_cancels.contains(*cancel_id)
+            }
+            WorkflowEvent::ExternalAwaitRequested { await_id, .. } => {
+                self.pending_external_awaits.contains(*await_id)
+            }
             _ => false,
         }
     }
@@ -2916,11 +3103,7 @@ impl HistoryMatcher {
         match &self.events[at] {
             WorkflowEvent::ExternalSignalDelivered { signal_id } => {
                 let id = *signal_id;
-                if let Some(p) = self
-                    .pending_external_signals
-                    .iter_mut()
-                    .find(|p| stash_probe(p.signal_id == id))
-                {
+                if let Some(p) = self.pending_external_signals.first_mut(id, |_| true) {
                     p.terminal = Some(StashedSignalTerminal::Delivered);
                     self.consumed_signal_events.insert(at);
                 }
@@ -2931,22 +3114,14 @@ impl HistoryMatcher {
             } => {
                 let id = *signal_id;
                 let code = reason_code.clone();
-                if let Some(p) = self
-                    .pending_external_signals
-                    .iter_mut()
-                    .find(|p| stash_probe(p.signal_id == id))
-                {
+                if let Some(p) = self.pending_external_signals.first_mut(id, |_| true) {
                     p.terminal = Some(StashedSignalTerminal::Failed(code));
                     self.consumed_signal_events.insert(at);
                 }
             }
             WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
                 let id = *cancel_id;
-                if let Some(p) = self
-                    .pending_external_cancels
-                    .iter_mut()
-                    .find(|p| stash_probe(p.cancel_id == id))
-                {
+                if let Some(p) = self.pending_external_cancels.first_mut(id, |_| true) {
                     p.terminal = Some(StashedCancelTerminal::Delivered);
                     self.consumed_signal_events.insert(at);
                 }
@@ -2957,11 +3132,7 @@ impl HistoryMatcher {
             } => {
                 let id = *cancel_id;
                 let code = reason_code.clone();
-                if let Some(p) = self
-                    .pending_external_cancels
-                    .iter_mut()
-                    .find(|p| stash_probe(p.cancel_id == id))
-                {
+                if let Some(p) = self.pending_external_cancels.first_mut(id, |_| true) {
                     p.terminal = Some(StashedCancelTerminal::Failed(code));
                     self.consumed_signal_events.insert(at);
                 }
@@ -2970,8 +3141,7 @@ impl HistoryMatcher {
                 if let Some((id, terminal)) = Self::await_terminal_of(event)
                     && let Some(p) = self
                         .pending_external_awaits
-                        .iter_mut()
-                        .find(|p| stash_probe(p.await_id == id && p.terminal.is_none()))
+                        .first_mut(id, |p| p.terminal.is_none())
                 {
                     p.terminal = Some(terminal);
                     self.consumed_signal_events.insert(at);
@@ -3344,11 +3514,9 @@ impl HistoryMatcher {
         signal_name: &str,
     ) -> HistoryMatch {
         // Helper: drain a matching entry from the stash and return its result.
-        let try_stash = |pending: &mut VecDeque<StashedExternalSignal>| {
-            let pos = pending
-                .iter()
-                .position(|p| stash_probe(p.target == *target && p.signal_name == signal_name))?;
-            let stashed = pending.remove(pos)?;
+        let try_stash = |pending: &mut ExternalStash<StashedExternalSignal>| {
+            let stashed =
+                pending.remove_first(|p| p.target == *target && p.signal_name == signal_name)?;
             Some(match stashed.terminal {
                 Some(StashedSignalTerminal::Delivered) => HistoryMatch::Matched {
                     output: serde_json::Value::Null,
@@ -3561,9 +3729,7 @@ impl HistoryMatcher {
         // Check the stash (which now includes any newly drained events).
         if let Some(stashed) = self
             .pending_external_cancels
-            .iter()
-            .position(|s| stash_probe(s.target == *target))
-            .and_then(|pos| self.pending_external_cancels.remove(pos))
+            .remove_first(|s| s.target == *target)
         {
             return match stashed.terminal {
                 Some(StashedCancelTerminal::Delivered) => HistoryMatch::Matched {
@@ -3733,9 +3899,7 @@ impl HistoryMatcher {
         // Check the stash (which now includes any newly drained events).
         if let Some(stashed) = self
             .pending_external_awaits
-            .iter()
-            .position(|s| stash_probe(s.target == target))
-            .and_then(|pos| self.pending_external_awaits.remove(pos))
+            .remove_first(|s| s.target == target)
         {
             return match stashed.terminal {
                 Some(StashedAwaitTerminal::Resolved(output)) => HistoryMatch::Matched { output },
