@@ -800,6 +800,13 @@ fn body_field_shard(field: &str, form: bool, is_form: bool, body: &[u8]) -> Opti
 ///
 /// A repeated header is refused, because two layers could each read a
 /// different value.
+///
+/// Sibling of `tenant.rs`'s `declared_tenant` (clone class, tracked in issue
+/// #2341). The two bodies differ only in the one spelling `MAX_TENANT_KEY_LEN`
+/// forces (that constant is itself `autumn_harvest::tenant::MAX_TENANT_LEN`).
+/// `docs/audits/tenant-header-validation-sync.py` normalizes that one name and
+/// gates CI on the rest staying byte-identical. A fix here must land in both
+/// files in the same change.
 fn tenant_key(request: &Request) -> Result<Option<String>, ()> {
     let mut values = request.headers().get_all(HEADER_TENANT).iter();
     let Some(raw) = values.next() else {

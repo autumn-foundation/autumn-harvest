@@ -302,6 +302,14 @@ async fn audit_refusal(api_state: &HarvestApiState, fields: &AuditFields, summar
 }
 
 /// The declared tenant header. `Err` means it is present but unusable.
+///
+/// Sibling of `authz.rs`'s `tenant_key` (clone class, tracked in issue
+/// #2341). The two bodies differ only in the one spelling
+/// `autumn_harvest::tenant::MAX_TENANT_LEN` forces (`authz.rs`'s
+/// `MAX_TENANT_KEY_LEN` is that same constant, read through a local alias).
+/// `docs/audits/tenant-header-validation-sync.py` normalizes that one name
+/// and gates CI on the rest staying byte-identical. A fix here must land in
+/// both files in the same change.
 fn declared_tenant(request: &Request) -> Result<Option<String>, ()> {
     let mut values = request.headers().get_all(HEADER_TENANT).iter();
     let Some(raw) = values.next() else {
