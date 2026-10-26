@@ -24,11 +24,13 @@ code.
 
 | Shape | Before, N=256 | Before, N=512 | Ratio | After, N=256 | After, N=512 | Ratio |
 |---|---|---|---|---|---|---|
-| `ExternalLoop(None, Signal)` | 48,309 | 162,613 | 3.37 | see §3 | see §3 | see §3 |
-| `ExternalLoop(Some(Await), Signal)` | 81,471 | 294,207 | 3.61 | see §3 | see §3 | see §3 |
-| `ExternalLoop(Some(Signal), Await)` | 81,471 | 294,207 | 3.61 | see §3 | see §3 | see §3 |
-| `ExternalLoop(Some(Await), Cancel)` | 81,471 | 294,207 | 3.61 | see §3 | see §3 | see §3 |
-| `ExternalPairs` | 772 | 1,540 | 1.99 | see §3 | see §3 | see §3 |
+| `ExternalLoop(None, Signal)` | 48,309 | 162,613 | 3.37 | 19,868 | 40,348 | 2.03 |
+| `ExternalLoop(Some(Await), Signal)` | 81,471 | 294,207 | 3.61 | 19,958 | 40,438 | 2.03 |
+| `ExternalLoop(Some(Signal), Await)` | 81,471 | 294,207 | 3.61 | 19,958 | 40,438 | 2.03 |
+| `ExternalLoop(Some(Await), Cancel)` | 81,471 | 294,207 | 3.61 | 19,958 | 40,438 | 2.03 |
+| `ExternalPairs` | 772 | 1,540 | 1.99 | 772 | 1,540 | 1.99 |
+
+The nine shapes of #2338 keep their counts or lose a few steps.
 
 `ExternalLoop(first, body)` runs a loop of an activity and a `body` call. A
 `first` call comes before the loop. It ends last, and the workflow matches it
@@ -171,8 +173,9 @@ then O(1).
 - `the_indexed_scan_matches_the_oracle` passes. Its oracle is the old walk.
 - Edge tests cover a rewind below `covered`, two awaits with one id, a
   second terminal of one signal, a cut and a restore.
-- Callgrind shows a linear cost for the `loop`, `loop_seq` and `fanout`
-  shapes of `external_stash_profile`.
+- Callgrind shows a linear cost for the `loop` and `loop_seq` shapes of
+  `external_stash_profile`. The `fanout` shape loses the O(P²) memmove. Its
+  linear `find` stays (§4).
 
 ## 3. Measurement
 
@@ -180,7 +183,9 @@ See `docs/performance-match-activity-fanout.md`, section "Issue #2346".
 
 ## 4. Out of scope
 
-- A resolve still runs a linear `find` over its stash (§0.2 B7). A scan that
-  resolves P terminals against P entries then costs O(P²) compares. The old
-  walk costs the same.
+- A terminal still finds its stash entry with a linear `find` (§0.2 B7). In
+  the `fanout` shape, the drain stashes P requests, then P terminals. Each
+  terminal finds its entry after the earlier ones, so the drain costs O(P²)
+  compares. At P=2000 that is 18.1M instructions, 46% of the replay. The old
+  code costs the same. A stash keyed by id removes it.
 - The race scans and the hasher of the index stay as #2338 left them.

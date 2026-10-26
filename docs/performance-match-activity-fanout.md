@@ -300,3 +300,110 @@ done
 
 Use `MATCH_ACTIVITY_PROFILE_SHAPE=fanout_extsig` with the `match_activity_profile`
 command above for the external scan.
+
+## Issue #2346: the external stash scan and the stash removal
+
+**Outcome: shipped.** At N=2000 the `loop` bench of `external_stash_profile`
+costs 94% fewer instructions, `loop_seq` 89% fewer and `fanout` 89% fewer.
+`docs/design/DESIGN-2346.md` records the plan.
+
+### Cause
+
+- The external stash scan visits each unconsumed external terminal at or
+  after the cursor. A terminal that matches no stash entry stays unconsumed.
+  So each later call visited it again.
+- A command between the external calls makes this happen. The drain at the
+  cursor then stops at each command, and a later request stays out of the
+  stash. A plain loop of an activity and an external signal is enough. The
+  drain stashes each request just before the scan of its own call, so that
+  scan visits every later terminal.
+- `try_stash` removed a matched entry with `Vec::remove`. A fan-out matches
+  its entries in stash order, so each remove shifted the rest of the stash.
+  At P=2000 the `memmove` was 90% of the `fanout` replay.
+
+The literal shape of the issue, an await and then signal pairs with no
+command between them, is linear already. The drain stashes it at the first
+call. `ExternalPairs` keeps it as a control.
+
+### Change
+
+- A terminal changes the stash only when its key has an eligible entry. The
+  key is the kind and the id of the call. Only a push can add an eligible
+  entry, so each stash helper notes the key of its entry.
+- After a scan, no unconsumed terminal in the covered range matches an entry,
+  except a terminal of a new key. The next scan reads the new keys there
+  through a per-key list in the index. It reads every terminal outside the
+  range. A call with no new key and no rewind or restore does no work.
+- `match_external_cancel` and `match_external_await` kept their own copies of
+  the stash code. They now call `stash_transparent_external_event`, so every
+  push notes its key in one place.
+- The three stashes are `VecDeque`s, so a remove at the front costs O(1).
+- `ScanRole::ExternalTerminal` carries no key. The index reads the key from
+  the event. A key in the role made the activity scan walk of a fan-out cost
+  about 4% more.
+
+### Measurement
+
+Callgrind, total instructions (`Ir`) of the harness. "Before" is `38209c8`.
+
+| Bench | Shape | N | Before | After | Change |
+|---|---|---|---|---|---|
+| `external_stash_profile` | `loop` | 500 | 68,133,423 | 15,158,762 | −77.8% |
+| `external_stash_profile` | `loop` | 1000 | 257,620,889 | 29,916,358 | −88.4% |
+| `external_stash_profile` | `loop` | 2000 | 1,006,382,535 | 59,118,320 | −94.1% |
+| `external_stash_profile` | `loop_seq` | 500 | 41,019,656 | 15,149,135 | −63.1% |
+| `external_stash_profile` | `loop_seq` | 1000 | 144,444,619 | 29,906,679 | −79.3% |
+| `external_stash_profile` | `loop_seq` | 2000 | 542,057,986 | 59,116,108 | −89.1% |
+| `external_stash_profile` | `fanout` | 500 | 27,729,647 | 6,987,899 | −74.8% |
+| `external_stash_profile` | `fanout` | 1000 | 99,353,150 | 15,704,053 | −84.2% |
+| `external_stash_profile` | `fanout` | 2000 | 375,130,982 | 39,728,527 | −89.4% |
+
+The `loop` and `loop_seq` shapes now grow about 2 times per doubling of N.
+
+The `fanout` shape grows 2.25 and 2.53 times. A terminal still finds its
+stash entry with a linear `find`. The drain stashes P requests, then P
+terminals, so each terminal finds its entry after the earlier ones. At P=2000
+that is 18.1M instructions, 46% of the replay. The old code costs the same.
+A stash keyed by id removes it.
+
+Inside the matcher (the inclusive cost of `match_activity`), at N=1000:
+
+| `match_activity_profile` shape | Before | After | Change |
+|---|---|---|---|
+| `sequential` | 366,236 | 369,494 | +0.9% |
+| `fanout` | 5,498,859 | 5,424,041 | −1.4% |
+| `fanout_extsig` | 6,618,848 | 6,072,423 | −8.3% |
+
+A sequential history costs about 3 instructions more for each call. That is
+the reset of the memo on an empty stash. The total of this harness drops 3%
+to 5%, but most of that drop is a change in the inlining of the payload code
+of the harness. It is not a change in the matcher.
+
+### Tests
+
+- `replay_steps_grow_near_linearly_for_every_shape` now counts fourteen
+  shapes. The old code failed it for the four `ExternalLoop` shapes, with
+  ratios of 3.37 and 3.61.
+- `the_indexed_scan_matches_the_oracle` gains a cursor rewind. The rewind is
+  the only call that reaches the range below the covered range.
+- Edge tests in `scan_fanout_tests` cover the order of one key across a
+  restore, a terminal below the covered range, and two awaits with one id.
+- Five mutants were checked by hand: no pass for the new keys, no range below
+  the covered range, no range above it, an await push that notes no key, and
+  the range above the covered range before the new keys. The tests above fail
+  each one.
+
+### Reproduce
+
+```bash
+BIN=$(cargo bench -p autumn-harvest --no-default-features --features testing \
+  --bench external_stash_profile --no-run --message-format=json 2>/dev/null \
+  | jq -r 'select(.reason=="compiler-artifact" and .target.name=="external_stash_profile") | .executable')
+for shape in loop loop_seq fanout; do
+  for n in 500 1000 2000; do
+    EXTERNAL_STASH_PROFILE_SHAPE=$shape EXTERNAL_STASH_PROFILE_N=$n \
+      valgrind --tool=callgrind --branch-sim=no --cache-sim=no \
+      --callgrind-out-file="cg.$shape.$n" "$BIN"
+  done
+done
+```
