@@ -179,9 +179,9 @@ See `docs/performance-match-activity-fanout.md`, section "Issue #2338".
 - The race scans (§0.2 B7).
 - A cheaper hasher for the index (§0.2 B8).
 - The external scan still visits an external terminal that matches no stash
-  entry on each call. A shape such as `join!(await_external_workflow, a loop
-  of signal_external)` then costs O(K²) visits, fewer than the old walk.
-  Issue #2346 tracks it.
+  entry on each call. Issue #2346 found that a loop of an activity and an
+  external call is quadratic. The shape that the issue named is linear in the
+  scan. Issue #2346 fixes the loop. See `docs/design/DESIGN-2346.md`.
 - A timer id that repeats in one fan-out. The worker records one
   `TimerStarted` for a live timer id, so this shape does not replay. The fire
   list of each timer is a skip list anyway, so a reused id costs no extra
