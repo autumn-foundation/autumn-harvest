@@ -32,8 +32,9 @@ See `docs/performance-match-activity-fanout.md` and
 `docs/design/DESIGN-2346.md`.
 
 Tests: the scaling test gains four `ExternalLoop` shapes, six
-`ExternalFanOut` shapes and `ExternalPairs`. It now counts stash probes. The
-old code fails it for all eleven. A proptest compares `ExternalStash` with a
+`ExternalFanOut` shapes, `ExternalPairs` and a fan-out after a middle remove.
+It now counts stash probes and runs the drift check. The old code fails it
+for the first eleven. A proptest compares `ExternalStash` with a
 plain `VecDeque` search. The differential test gains a rewind, a forward skip
 and a bare `prepare_match`, and edge tests cover each terminal kind, a rewind
 and a restore.

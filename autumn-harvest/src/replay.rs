@@ -826,7 +826,8 @@ struct IdEntries {
 /// O(n), so a fan-out of n calls cost O(n²). A map from each id to its first
 /// entry makes the search cost O(1) for a fan-out in order, and O(log n)
 /// otherwise. A workflow gives each call a new id. A history with a repeated
-/// id still replays, but a search for it walks the entries of that id.
+/// id still replays. A search for that id walks every entry after the first
+/// entry of the id, so it costs up to the number of later entries.
 ///
 /// A remove from the front costs O(1). A fan-out matches its entries in
 /// push order, so it removes them from the front.
@@ -879,8 +880,9 @@ impl<T: StashEntry> ExternalStash<T> {
 
     /// The position of the entry with push number `push`.
     ///
-    /// With no remove before the end, the push numbers have no gaps, so the
-    /// first guess is right. Otherwise a binary search finds the entry.
+    /// While every remove takes the front entry, the push numbers have no
+    /// gaps, so the first guess is right. A remove anywhere else leaves a
+    /// gap, and a binary search then finds the entry.
     fn position(&self, push: u64) -> Option<usize> {
         stash_probe(true);
         let front = self.entries.front()?.0;
@@ -903,7 +905,7 @@ impl<T: StashEntry> ExternalStash<T> {
         let at = if ids.count == 1 {
             accept(&self.entries[start].1).then_some(start)?
         } else {
-            // A repeated id walks from its first entry.
+            // A repeated id walks every later entry, of any id.
             (start..self.entries.len()).find(|&at| {
                 let entry = &self.entries[at].1;
                 stash_probe(entry.id() == id && accept(entry))
@@ -15589,7 +15591,7 @@ mod activity_scan_tests {
     }
 
     /// The scan steps that `run` takes. A step is a consumed-set probe, a
-    /// settle step or an index build step.
+    /// stash probe, a settle step or an index build step.
     fn steps_of(run: impl FnOnce()) -> u64 {
         let before = crate::activity_scan_index::steps::total();
         run();
@@ -16957,22 +16959,61 @@ mod activity_scan_tests {
         }
     }
 
-    proptest! {
-        /// The scan role and the external key agree on every event (issue
-        /// #2346). The external index files only an event with a key. The
-        /// activity scan stashes an event with the external terminal role.
-        #[test]
-        fn the_scan_role_and_the_external_key_agree(
-            ev in ev().prop_filter("a pad is not one event", |e| !matches!(e, Ev::Pad(_))),
-        ) {
-            let event = Pools::new().event(&ev, 0);
-            prop_assert_eq!(
-                HistoryMatcher::activity_scan_role(&event) == ScanRole::ExternalTerminal,
+    /// The scan role and the external key agree on each event kind of the
+    /// differential test (issue #2346). The external index files only an
+    /// event with a key. The activity scan stashes an event with the external
+    /// terminal role.
+    #[test]
+    fn the_scan_role_and_the_external_key_agree() {
+        let pools = Pools::new();
+        let kinds = [
+            Ev::Scheduled(0, false),
+            Ev::Started(0),
+            Ev::Heartbeat(0),
+            Ev::Completed(0),
+            Ev::Failed(0),
+            Ev::TimedOut(0),
+            Ev::ChildStarted(0),
+            Ev::ChildCompleted(0),
+            Ev::Marker,
+            Ev::SideEffect,
+            Ev::TimerStarted(0),
+            Ev::TimerCancelled(0),
+            Ev::TimerFired(0),
+            Ev::LocalScheduled(0),
+            Ev::LocalCompleted(0),
+            Ev::Signal(false),
+            Ev::CancelRequested(0),
+            Ev::CancelDelivered(0),
+            Ev::Update,
+            Ev::Paused,
+            Ev::Completion,
+            Ev::Detached(0),
+            Ev::ChildFailed(0),
+            Ev::LocalFailed(0),
+            Ev::SignalRequested(0),
+            Ev::SignalDelivered(0),
+            Ev::SignalFailed(0),
+            Ev::CancelFailed(0),
+            Ev::AwaitRequested(0),
+            Ev::AwaitResolved(0),
+            Ev::AwaitFailed(0),
+            Ev::UpdateCompleted,
+            Ev::UpdateFailed,
+            Ev::Failure,
+        ];
+        let mut terminals = 0;
+        for kind in &kinds {
+            let event = pools.event(kind, 0);
+            let role = HistoryMatcher::activity_scan_role(&event) == ScanRole::ExternalTerminal;
+            assert_eq!(
+                role,
                 ExternalKey::of_terminal(&event).is_some(),
-                "{:?}",
-                event
+                "{event:?}"
             );
+            terminals += usize::from(role);
         }
+        assert_eq!(terminals, 6, "the six external terminal kinds");
     }
 }
 
@@ -17137,7 +17178,7 @@ mod scan_fanout_tests {
     use crate::types::{ExecutionId, ExternalTarget, TimerId};
 
     /// The scan steps that `run` takes. A step is a consumed-set probe, a
-    /// child scan step, a settle step or an index build step.
+    /// stash probe, a child scan step, a settle step or an index build step.
     fn steps_of(run: impl FnOnce()) -> u64 {
         let before = crate::activity_scan_index::steps::total();
         run();
@@ -17173,12 +17214,18 @@ mod scan_fanout_tests {
         /// matches it last. A loop terminal matches no stash entry until the
         /// drain stashes its request (issue #2346).
         ExternalLoop(Option<Call>, Call),
-        /// An external await, then signal pairs, then the await terminal. A
-        /// control: the drain stashes every event at the first call.
+        /// Two signal requests, an activity, then a fan-out of signals. The
+        /// match of the second request removes an entry from the middle of
+        /// the stash. So each later search misses the position guess and
+        /// takes the binary search (issue #2346).
+        ExternalFanOutAfterMiddleRemove,
+        /// An external await, then signal pairs, then the await terminal. The
+        /// drain stashes every event at the first call, so the scan has no
+        /// work. Each terminal searched the old stash in a linear way.
         ExternalPairs,
     }
 
-    /// An external call of the loop shapes.
+    /// An external call of the loop and fan-out shapes.
     #[derive(Debug, Clone, Copy)]
     enum Call {
         Signal,
@@ -17186,7 +17233,7 @@ mod scan_fanout_tests {
         Await,
     }
 
-    const SHAPES: [Shape; 19] = [
+    const SHAPES: [Shape; 20] = [
         Shape::SignalThenActivities,
         Shape::OpenAwaitThenActivities,
         Shape::CancelThenActivities,
@@ -17206,6 +17253,7 @@ mod scan_fanout_tests {
         Shape::ExternalLoop(Some(Call::Signal), Call::Await),
         Shape::ExternalLoop(Some(Call::Await), Call::Cancel),
         Shape::ExternalPairs,
+        Shape::ExternalFanOutAfterMiddleRemove,
     ];
 
     fn activity_fan_out(n: usize) -> Vec<WorkflowEvent> {
@@ -17369,6 +17417,12 @@ mod scan_fanout_tests {
         steps_of(|| {
             for (i, callee) in callees.iter().enumerate() {
                 match_external(&mut m, call, *callee, i);
+                if i == 0 && n > 1 {
+                    // The drift check reads the stash once for each event.
+                    // The request of the second call is still in the stash.
+                    let drift = m.first_unconsumed_command_event().map(|(at, _)| at);
+                    assert_eq!(drift, Some(1), "{call:?}");
+                }
             }
             if past_command {
                 assert_eq!(
@@ -17378,6 +17432,55 @@ mod scan_fanout_tests {
                     }
                 );
             }
+            assert!(!m.is_replaying());
+        })
+    }
+
+    /// Replays the `ExternalFanOutAfterMiddleRemove` shape with `n` fan-out
+    /// signals, and returns the scan steps.
+    fn replay_fan_out_after_middle_remove(n: usize) -> u64 {
+        let first = ExecutionId::new();
+        let middle = ExecutionId::new();
+        let callees: Vec<ExecutionId> = (0..n).map(|_| ExecutionId::new()).collect();
+        let [first_request, first_terminal] = external_pair(Call::Signal, first, 0);
+        let [middle_request, middle_terminal] = external_pair(Call::Signal, middle, 0);
+        let pairs: Vec<[WorkflowEvent; 2]> = callees
+            .iter()
+            .enumerate()
+            .map(|(i, callee)| external_pair(Call::Signal, *callee, i))
+            .collect();
+        let activity_id = ActivityExecId::new();
+        let mut events = vec![
+            first_request,
+            middle_request,
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: Value::Null,
+            },
+        ];
+        events.extend(pairs.iter().map(|[request, _]| request.clone()));
+        events.extend(pairs.into_iter().map(|[_, terminal]| terminal));
+        events.push(middle_terminal);
+        events.push(first_terminal);
+        let mut m = HistoryMatcher::new(events);
+        steps_of(|| {
+            match_external(&mut m, Call::Signal, middle, 0);
+            assert_eq!(
+                m.match_activity("charge"),
+                HistoryMatch::Matched {
+                    output: Value::Null
+                }
+            );
+            for (i, callee) in callees.iter().enumerate() {
+                match_external(&mut m, Call::Signal, *callee, i);
+            }
+            match_external(&mut m, Call::Signal, first, 0);
             assert!(!m.is_replaying());
         })
     }
@@ -17552,6 +17655,7 @@ mod scan_fanout_tests {
             }
             Shape::ExternalLoop(first, body) => replay_external_loop(first, body, n, true),
             Shape::ExternalPairs => replay_external_loop(Some(Call::Await), Call::Signal, n, false),
+            Shape::ExternalFanOutAfterMiddleRemove => replay_fan_out_after_middle_remove(n),
         }
     }
 

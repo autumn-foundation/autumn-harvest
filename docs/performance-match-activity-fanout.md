@@ -349,6 +349,10 @@ the first fix found the stash search.
 - `match_external_cancel` and `match_external_await` kept their own copies of
   the stash code. They now call `stash_transparent_external_event`, as the
   drain does. That code cannot run today (DESIGN-2346 §0.1).
+- `ExternalCalls` holds the three stashes, the memo and the external index
+  behind one `Box`. `HistoryMatcher` then shrinks to 736 bytes, so the
+  workflow futures that hold a context stay under the
+  `clippy::large_futures` limit.
 - `ScanRole::ExternalTerminal` carries no key. The external index reads the
   key from the event. A key in the role made the activity scan walk cost
   more: at N=1000, the inclusive cost of `match_activity` in the `fanout`
@@ -357,21 +361,33 @@ the first fix found the stash search.
 ### Step counts
 
 The scaling test counts scan steps at N=256 and N=512. A step is a
-consumed-set probe, a stash probe, a settle step or an index build step.
+consumed-set probe, a stash probe, a child scan step, a settle step or an
+index build step.
 
 | Shape | Before | After | Ratio after |
 |---|---|---|---|
 | `ExternalLoop(None, Signal)` | 48,309 → 162,613 | 3,584 → 7,168 | 2.00 |
 | `ExternalLoop(Some(Await), Signal)` | 81,471 → 294,207 | 3,592 → 7,176 | 2.00 |
-| `ExternalFanOut(Signal, false)` | 33,921 → 133,377 | 1,793 → 3,585 | 2.00 |
-| `ExternalFanOut(Signal, true)` | 34,438 → 134,406 | 2,310 → 4,614 | 2.00 |
+| `ExternalFanOut(Signal, false)` | 33,921 → 133,377 | 2,049 → 4,097 | 2.00 |
+| `ExternalFanOut(Signal, true)` | 34,438 → 134,406 | 2,567 → 5,127 | 2.00 |
 | `ExternalPairs` | 33,926 → 133,382 | 1,800 → 3,592 | 2.00 |
+| `ExternalFanOutAfterMiddleRemove` | — | 4,633 → 9,753 | 2.11 |
 
 The other loop and fan-out shapes give the same counts as the rows above.
 The "Before" column of the loop shapes is the first RED, which did not count
 stash probes. The "Before" column of the fan-out shapes and `ExternalPairs`
-is the second RED, after the scan fix. The nine shapes of #2338 gain about
-one step for each event, for the build of the external index.
+is the second RED, after the scan fix. The "Before" counts of the fan-out
+shapes come before the drift check that each fan-out replay now runs once.
+
+`ExternalFanOutAfterMiddleRemove` removes a stash entry from the middle, so
+each later search misses the position guess and takes the binary search. A
+linear search in its place fails the test.
+
+`SignalThenActivities`, `OpenAwaitThenActivities` and
+`CancelThenActivities` keep an external call stashed. They gain about one
+step for each event, for the build of the external index. The timer, child
+and local activity shapes of #2338 do not change. `ExternalFanOut(Signal,
+false)` replaces the `ExternalSignals` control of #2338.
 
 ### Measurement
 
@@ -415,14 +431,16 @@ code, not from the matcher:
 
 - `replay_steps_grow_near_linearly_for_every_shape` now counts stash probes.
   The old code fails it for the four `ExternalLoop` shapes, the six
-  `ExternalFanOut` shapes and `ExternalPairs`.
+  `ExternalFanOut` shapes and `ExternalPairs`. Each fan-out replay also runs
+  the drift check once, so a linear drift check fails it too.
 - `the_indexed_scan_matches_the_oracle` gains three calls: a cursor rewind,
   a forward skip and a bare `prepare_match`. The failure reason codes now
   carry their position, so the order of two failures of one key shows.
 - `the_stash_matches_a_plain_search` compares `ExternalStash` with a plain
   `VecDeque` search after every push, search and remove.
-- `the_scan_role_and_the_external_key_agree` checks that the external index
-  holds every event that the activity scan treats as an external terminal.
+- `the_scan_role_and_the_external_key_agree` checks each event kind of the
+  differential test. The external index holds every event that the activity
+  scan treats as an external terminal.
 - Edge tests in `scan_fanout_tests` cover each terminal kind in a per-key
   pass, the order of one key across a restore and across a rewind, a
   terminal below the covered range, several awaits with one id, and a cut.

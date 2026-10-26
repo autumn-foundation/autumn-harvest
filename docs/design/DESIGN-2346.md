@@ -78,7 +78,7 @@ The code and the tests give these facts:
 | B4 | Park an unmatched terminal: drop it from the shared skip list, and keep it per key. | Rejected. A skip list needs a dead entry to stay dead. A parked terminal comes back when its request arrives, or after a rewind. That is B1 with more state. |
 | B5 | Resolve the terminals of a request when the code stashes it. | Rejected. The old scan resolves at the next `prepare_match`, from that cursor. An eager pass would use another range. |
 | B6 | Use a `VecDeque` for the three stashes. | **Adopted**, inside B7. An in-order removal then costs O(1). |
-| B7 | Key the stash by id. A map holds the first entry and the entry count of each id. | **Adopted.** A terminal finds its entry in O(1) in a fan-out, and in O(log n) after a remove in the middle. A repeated id walks the entries of that id. |
+| B7 | Key the stash by id. A map holds the first entry and the entry count of each id. | **Adopted.** A terminal finds its entry in O(1) in a fan-out, and in O(log n) after a remove in the middle. A repeated id walks every entry after its first entry, as the old search did. |
 | B8 | Give the external scan its own index of the external terminals, with no walk. | **Adopted.** The scan had to walk the rest of the history until the activity index paid off, then build all of it. A build that tests each event once costs less. |
 | B9 | A cheaper hasher for the id maps. | Deferred. #2338 deferred it too. It needs its own argument about adversarial ids. |
 | B10 | Delete the forward scans that cannot run (§0.1). | Deferred. The code is dead, but it predates this change. A separate change can remove it. |
@@ -177,10 +177,11 @@ terminal that matched nothing still matches nothing at the end of the pass.
 push number. A map holds the first entry and the entry count of each id.
 
 - A search for the first entry of an id guesses its position from the push
-  numbers. With no remove before the end, the guess is right. Otherwise a
-  binary search finds it.
-- A repeated id walks the entries of that id from its first entry. A workflow
-  gives each call a new id, so only an unusual history pays this.
+  numbers. While every remove takes the front entry, the guess is right. A
+  remove anywhere else leaves a gap, and a binary search then finds it.
+- A repeated id walks every entry after the first entry of that id. A
+  workflow gives each call a new id, so only an unusual history pays this.
+  The old search walked the stash from the front for every id.
 - A remove keeps the order of the other entries. A remove from the front
   costs O(1).
 
@@ -192,13 +193,23 @@ test for each event. A key with one terminal stores it with no allocation.
 The external scan no longer walks, so the walk rule of #2330 governs only the
 activity, timer and child scans.
 
+### 1.6 One box for the external state
+
+`ExternalCalls` holds the three stashes, the memo and the external index
+behind one `Box`. A `WorkflowContext` holds its matcher inline, and some
+workflow futures hold a context. Inline, the new state made 29 agent test
+futures pass the `clippy::large_futures` limit of 16,384 bytes. With the box,
+`HistoryMatcher` is 736 bytes, smaller than before this change. A matcher
+pays one allocation when it starts.
+
 ---
 
 ## 2. Acceptance criteria
 
 - `replay_steps_grow_near_linearly_for_every_shape` passes for every shape.
   The first RED failed it for the four `ExternalLoop` shapes. The second RED
-  failed it for the six `ExternalFanOut` shapes and `ExternalPairs`.
+  failed it for the six `ExternalFanOut` shapes and `ExternalPairs`. The test
+  also guards the drift check and the binary search of the keyed stash.
 - `the_indexed_scan_matches_the_oracle` passes. Its oracle is the old walk.
 - `the_stash_matches_a_plain_search` passes. Its model is a plain `VecDeque`.
 - Edge tests cover a rewind below `covered`, the order of one key across a

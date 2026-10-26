@@ -15,8 +15,10 @@
 //! records the measurement.
 //!
 //! [`ExternalTerminalIndex`] keeps the external terminal events apart, per
-//! [`ExternalKey`]. The external stash scan reads it with no walk, because
-//! that scan reads only the terminals of a new stash key (issue #2346).
+//! [`ExternalKey`]. The external stash scan reads it with no walk, because a
+//! build tests each event once. The scan reads the terminals of the new
+//! stash keys, and every terminal outside the range of its last scan (issue
+//! #2346).
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -430,8 +432,9 @@ fn first_live(next: &mut [usize], from: usize, is_dead: impl Fn(usize) -> bool) 
 }
 
 /// A count of the steps that the terminal scans take on this thread (issues
-/// #2330 and #2338). A scaling test reads it. A step is a consumed-set
-/// probe, a child scan step, a settle step or an index build step.
+/// #2330, #2338 and #2346). A scaling test reads it. A step is a
+/// consumed-set probe, a stash probe, a child scan step, a settle step or an
+/// index build step.
 #[cfg(test)]
 pub mod steps {
     use std::cell::Cell;
