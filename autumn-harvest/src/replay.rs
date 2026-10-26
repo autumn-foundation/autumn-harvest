@@ -5007,7 +5007,9 @@ impl HistoryMatcher {
             std::mem::take(&mut self.pending_signals)
                 .into_iter()
                 .partition(|(name, _, idx)| {
-                    name == signal_name && !self.race_reserved_signal_events.contains(idx)
+                    stash_probe(
+                        name == signal_name && !self.race_reserved_signal_events.contains(idx),
+                    )
                 });
         self.pending_signals = remaining;
         // Every stashed entry already has its index in `consumed_signal_events`
@@ -5052,7 +5054,7 @@ impl HistoryMatcher {
         self.prepare_match();
         self.note_signal_probe(signal_name);
         let index = self.pending_signals.iter().position(|(name, _, idx)| {
-            name == signal_name && !self.race_reserved_signal_events.contains(idx)
+            stash_probe(name == signal_name && !self.race_reserved_signal_events.contains(idx))
         })?;
         let (_name, payload, idx) = self.pending_signals.remove(index)?;
         // Already inserted by `stash_signal`, but re-asserting here makes the
@@ -5128,7 +5130,7 @@ impl HistoryMatcher {
         if let Some(index) = self
             .pending_signals
             .iter()
-            .position(|(name, _, idx)| name == signal_name && *idx < race_pos)
+            .position(|(name, _, idx)| stash_probe(name == signal_name && *idx < race_pos))
             && let Some((_name, payload, _idx)) = self.pending_signals.remove(index)
         {
             return SignalOrTimerMatch::SignalWon { payload };
@@ -5182,11 +5184,9 @@ impl HistoryMatcher {
                 // still undelivered in the pending buffer) competes at its
                 // recorded position: if it precedes the race's TimerFired in
                 // history, the signal branch wins.
-                if let Some(index) = self
-                    .pending_signals
-                    .iter()
-                    .position(|(name, _, idx)| *idx == scan_cursor && name == signal_name)
-                    && let Some((_name, payload, _idx)) = self.pending_signals.remove(index)
+                if let Some(index) = self.pending_signals.iter().position(|(name, _, idx)| {
+                    stash_probe(*idx == scan_cursor && name == signal_name)
+                }) && let Some((_name, payload, _idx)) = self.pending_signals.remove(index)
                 {
                     self.settle_race_signal_won(scan_cursor, first_interleaved_command, timer_id);
                     return SignalOrTimerMatch::SignalWon { payload };
@@ -6951,7 +6951,7 @@ impl HistoryMatcher {
         if self
             .pending_signals
             .iter()
-            .any(|(name, _, _)| name == signal_name)
+            .any(|(name, _, _)| stash_probe(name == signal_name))
         {
             return true;
         }
@@ -7029,7 +7029,7 @@ impl HistoryMatcher {
                     .iter()
                     .enumerate()
                     .skip(position)
-                    .find(|(_, (name, _, _))| name == signal_name);
+                    .find(|(_, (name, _, _))| stash_probe(name == signal_name));
                 if let Some((offset, (_, payload, index))) = buffered {
                     return Some((
                         SignalCandidateCursor::Buffered(offset + 1),
@@ -7067,7 +7067,7 @@ impl HistoryMatcher {
         let buffered = self
             .pending_signals
             .iter()
-            .filter(move |(name, _, _)| name == signal_name)
+            .filter(move |(name, _, _)| stash_probe(name == signal_name))
             .map(|(_, payload, index)| (*index, payload));
         let recorded =
             self.events
@@ -7096,7 +7096,7 @@ impl HistoryMatcher {
         predicate: Option<SignalPredicate<'_>>,
     ) -> Option<usize> {
         for (position, (name, payload, index)) in self.pending_signals.iter().enumerate() {
-            if name != signal_name {
+            if !stash_probe(name == signal_name) {
                 continue;
             }
             match predicate {
@@ -16117,6 +16117,386 @@ mod activity_scan_tests {
         HistoryMatch::ChildInProgress { child_id }
     }
 
+    // The signal stash searches and the signal scan before issue #2349, as
+    // the test oracle. The same rules as above apply.
+    fn oracle_claim_buffered_signal_position(
+        m: &mut HistoryMatcher,
+        signal_name: &str,
+        predicate: Option<SignalPredicate<'_>>,
+    ) -> Option<usize> {
+        for (position, (name, payload, index)) in m.pending_signals.iter().enumerate() {
+            if name != signal_name {
+                continue;
+            }
+            match predicate {
+                Some(accepts) if !accepts(*index, payload) => {
+                    m.predicate_rejected_signal_events.insert(*index);
+                }
+                _ => return Some(position),
+            }
+        }
+        None
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn oracle_match_signal_inner(
+        m: &mut HistoryMatcher,
+        signal_name: &str,
+        tolerate_interleaved: Option<&str>,
+        predicate: Option<SignalPredicate<'_>>,
+    ) -> HistoryMatch {
+        if let Some(index) = oracle_claim_buffered_signal_position(m, signal_name, predicate)
+            && let Some((_name, payload, _idx)) = m.pending_signals.remove(index)
+        {
+            return HistoryMatch::Matched { output: payload };
+        }
+
+        m.advance_to_next_unconsumed_event();
+        if !m.is_replaying() {
+            return HistoryMatch::NoMatch;
+        }
+
+        let mut scan_cursor = m.cursor;
+        let mut first_interleaved_command = None;
+        while scan_cursor < m.events.len() {
+            if m.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+
+            match &m.events[scan_cursor] {
+                WorkflowEvent::SignalReceived {
+                    signal_name: recorded_name,
+                    payload,
+                } if recorded_name == signal_name
+                    && predicate.is_some_and(|accepts| !accepts(scan_cursor, payload)) =>
+                {
+                    m.predicate_rejected_signal_events.insert(scan_cursor);
+                    m.stash_transparent_external_event(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::SignalReceived {
+                    signal_name: recorded_name,
+                    payload,
+                } if recorded_name == signal_name => {
+                    let output = payload.clone();
+                    m.consumed_signal_events.insert(scan_cursor);
+                    m.cursor =
+                        first_interleaved_command.unwrap_or_else(|| scan_cursor.saturating_add(1));
+                    m.advance_to_next_unconsumed_event();
+
+                    return HistoryMatch::Matched { output };
+                }
+                WorkflowEvent::SignalReceived { .. } => {
+                    m.stash_transparent_external_event(scan_cursor);
+                    scan_cursor += 1;
+                }
+                ev if HistoryMatcher::is_update_event(ev) => {
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::TimerStarted { timer_id, .. }
+                    if HistoryMatcher::signal_timeout_race_name(timer_id.as_str())
+                        == Some(signal_name) =>
+                {
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::MarkerRecorded { name, .. }
+                    if tolerate_interleaved == Some(name.as_str()) =>
+                {
+                    return HistoryMatch::NoMatch;
+                }
+                WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                | WorkflowEvent::TimerCancelled { .. }
+                | WorkflowEvent::TimerStarted { .. } => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ActivityStarted { .. }
+                | WorkflowEvent::ActivityHeartbeat { .. }
+                | WorkflowEvent::ActivityCompleted { .. }
+                | WorkflowEvent::ActivityFailed { .. }
+                | WorkflowEvent::ActivityTimedOut { .. }
+                | WorkflowEvent::ChildWorkflowCompleted { .. }
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. }
+                | WorkflowEvent::TimerFired { .. } => {
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    m.stash_transparent_external_event(scan_cursor);
+                    scan_cursor += 1;
+                }
+                other => {
+                    if tolerate_interleaved.is_some() {
+                        first_interleaved_command.get_or_insert(scan_cursor);
+                        scan_cursor += 1;
+                        continue;
+                    }
+                    if first_interleaved_command.is_some() {
+                        return HistoryMatch::NoMatch;
+                    }
+                    return HistoryMatch::Diverged {
+                        expected: format!("SignalReceived({signal_name})"),
+                        actual: HistoryMatcher::actual_event_name(other),
+
+                        event_index: i32::try_from(m.cursor).ok(),
+                    };
+                }
+            }
+        }
+
+        HistoryMatch::NoMatch
+    }
+
+    fn oracle_claim_pending_signal(
+        m: &mut HistoryMatcher,
+        signal_name: &str,
+    ) -> Vec<(usize, Value)> {
+        m.prepare_match();
+        m.note_signal_probe(signal_name);
+
+        let (matched, remaining): (VecDeque<_>, VecDeque<_>) =
+            std::mem::take(&mut m.pending_signals)
+                .into_iter()
+                .partition(|(name, _, idx)| {
+                    name == signal_name && !m.race_reserved_signal_events.contains(idx)
+                });
+        m.pending_signals = remaining;
+        for (_, _, idx) in &matched {
+            m.consumed_signal_events.insert(*idx);
+        }
+        matched
+            .into_iter()
+            .map(|(_, payload, idx)| (idx, payload))
+            .collect()
+    }
+
+    fn oracle_try_claim_pending_signal(m: &mut HistoryMatcher, signal_name: &str) -> Option<Value> {
+        m.prepare_match();
+        m.note_signal_probe(signal_name);
+        let index = m.pending_signals.iter().position(|(name, _, idx)| {
+            name == signal_name && !m.race_reserved_signal_events.contains(idx)
+        })?;
+        let (_name, payload, idx) = m.pending_signals.remove(index)?;
+        m.consumed_signal_events.insert(idx);
+        Some(payload)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn oracle_match_signal_or_timer(
+        m: &mut HistoryMatcher,
+        signal_name: &str,
+        timer_id: &str,
+        expected_duration: Option<u64>,
+    ) -> SignalOrTimerMatch {
+        let replaying = m.prepare_match();
+
+        let race_pos = m.cursor;
+        if let Some(index) = m
+            .pending_signals
+            .iter()
+            .position(|(name, _, idx)| name == signal_name && *idx < race_pos)
+            && let Some((_name, payload, _idx)) = m.pending_signals.remove(index)
+        {
+            return SignalOrTimerMatch::SignalWon { payload };
+        }
+
+        if !replaying {
+            return SignalOrTimerMatch::NoMatch;
+        }
+
+        let WorkflowEvent::TimerStarted {
+            timer_id: recorded_id,
+            duration_secs: recorded_duration,
+        } = &m.events[m.cursor]
+        else {
+            return SignalOrTimerMatch::Diverged {
+                expected: format!("TimerStarted({timer_id})"),
+                actual: HistoryMatcher::actual_event_name(&m.events[m.cursor]),
+
+                event_index: i32::try_from(m.cursor).ok(),
+            };
+        };
+
+        if recorded_id.as_str() != timer_id {
+            return SignalOrTimerMatch::Diverged {
+                expected: format!("TimerStarted({timer_id})"),
+                actual: format!("TimerStarted({recorded_id})"),
+
+                event_index: i32::try_from(m.cursor).ok(),
+            };
+        }
+
+        if let Some(expected) = expected_duration
+            && *recorded_duration != expected
+        {
+            return SignalOrTimerMatch::Diverged {
+                expected: format!("TimerStarted({timer_id}, duration={expected}s)"),
+                actual: format!("TimerStarted({recorded_id}, duration={recorded_duration}s)"),
+
+                event_index: i32::try_from(m.cursor).ok(),
+            };
+        }
+
+        m.cursor += 1;
+        let mut scan_cursor = m.cursor;
+        let mut first_interleaved_command = None;
+
+        while scan_cursor < m.events.len() {
+            if m.is_consumed(scan_cursor) {
+                if let Some(index) = m
+                    .pending_signals
+                    .iter()
+                    .position(|(name, _, idx)| *idx == scan_cursor && name == signal_name)
+                    && let Some((_name, payload, _idx)) = m.pending_signals.remove(index)
+                {
+                    m.settle_race_signal_won(scan_cursor, first_interleaved_command, timer_id);
+                    return SignalOrTimerMatch::SignalWon { payload };
+                }
+                scan_cursor += 1;
+                continue;
+            }
+
+            match &m.events[scan_cursor] {
+                WorkflowEvent::SignalReceived {
+                    signal_name: recorded_name,
+                    payload,
+                } if recorded_name == signal_name => {
+                    let payload = payload.clone();
+                    m.settle_race_signal_won(scan_cursor, first_interleaved_command, timer_id);
+                    return SignalOrTimerMatch::SignalWon { payload };
+                }
+
+                WorkflowEvent::TimerFired { timer_id: id } if id.as_str() == timer_id => {
+                    let loser_index = (scan_cursor + 1..m.events.len()).find(|idx| {
+                        !m.late_race_signal_events.contains(idx)
+                            && matches!(
+                                &m.events[*idx],
+                                WorkflowEvent::SignalReceived { signal_name: n, .. } if n == signal_name
+                            )
+                    });
+                    if let Some(idx) = loser_index {
+                        m.late_race_signal_events.insert(idx);
+                    }
+                    if let Some(command_cursor) = first_interleaved_command {
+                        m.consumed_out_of_order_events.insert(scan_cursor);
+                        m.cursor = command_cursor;
+                    } else {
+                        m.cursor = scan_cursor + 1;
+                    }
+                    m.advance_to_next_unconsumed_event();
+                    return SignalOrTimerMatch::TimerWon;
+                }
+
+                WorkflowEvent::SignalReceived { .. } => {
+                    m.stash_transparent_external_event(scan_cursor);
+                    scan_cursor += 1;
+                }
+
+                ev if HistoryMatcher::is_update_event(ev) => {
+                    scan_cursor += 1;
+                }
+
+                WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                | WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::TimerCancelled { .. } => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+
+                WorkflowEvent::ActivityStarted { .. }
+                | WorkflowEvent::ActivityHeartbeat { .. }
+                | WorkflowEvent::ActivityCompleted { .. }
+                | WorkflowEvent::ActivityFailed { .. }
+                | WorkflowEvent::ActivityTimedOut { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. }
+                | WorkflowEvent::ChildWorkflowCompleted { .. }
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::TimerFired { .. } => {
+                    scan_cursor += 1;
+                }
+
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    m.stash_transparent_external_event(scan_cursor);
+                    scan_cursor += 1;
+                }
+
+                _ => break,
+            }
+        }
+
+        if let Some(command_cursor) = first_interleaved_command {
+            m.cursor = command_cursor;
+            m.advance_to_next_unconsumed_event();
+        }
+        SignalOrTimerMatch::InProgress
+    }
+
+    fn oracle_has_unconsumed_signal(m: &HistoryMatcher, signal_name: &str) -> bool {
+        if m.pending_signals
+            .iter()
+            .any(|(name, _, _)| name == signal_name)
+        {
+            return true;
+        }
+        m.events.iter().enumerate().skip(m.cursor).any(|(i, e)| {
+            !m.is_consumed(i)
+                && matches!(
+                    e,
+                    WorkflowEvent::SignalReceived { signal_name: n, .. } if n == signal_name
+                )
+        })
+    }
+
+    fn oracle_signal_candidates(m: &HistoryMatcher, signal_name: &str) -> Vec<(usize, Value)> {
+        let buffered = m
+            .pending_signals
+            .iter()
+            .filter(|(name, _, _)| name == signal_name)
+            .map(|(_, payload, index)| (*index, payload.clone()));
+        let recorded = m
+            .events
+            .iter()
+            .enumerate()
+            .skip(m.cursor)
+            .filter_map(|(index, event)| match event {
+                WorkflowEvent::SignalReceived {
+                    signal_name: name,
+                    payload,
+                } if name == signal_name && !m.is_consumed(index) => Some((index, payload.clone())),
+                _ => None,
+            });
+        buffered.chain(recorded).collect()
+    }
+
     fn scheduled(id: ActivityExecId, name: &str) -> WorkflowEvent {
         WorkflowEvent::ActivityScheduled {
             activity_id: id,
@@ -16511,6 +16891,13 @@ mod activity_scan_tests {
         UpdateCompleted,
         UpdateFailed,
         Failure,
+        /// The deadline timer of a signal race, for the signal `t` or `s`
+        /// (issue #2349).
+        ReservedTimer(usize, bool),
+        /// The fire of that deadline timer.
+        ReservedFired(usize, bool),
+        /// The settle marker of race 0, which bounds a race branch scan.
+        RaceMarker,
         /// A run of update events that every scan steps over.
         Pad(usize),
     }
@@ -16533,7 +16920,7 @@ mod activity_scan_tests {
             1 => id().prop_map(Ev::TimerFired),
             1 => id().prop_map(Ev::LocalScheduled),
             1 => id().prop_map(Ev::LocalCompleted),
-            2 => any::<bool>().prop_map(Ev::Signal),
+            4 => any::<bool>().prop_map(Ev::Signal),
             1 => id().prop_map(Ev::CancelRequested),
             1 => id().prop_map(Ev::CancelDelivered),
             1 => Just(Ev::Update),
@@ -16552,8 +16939,27 @@ mod activity_scan_tests {
             1 => Just(Ev::UpdateCompleted),
             1 => Just(Ev::UpdateFailed),
             1 => Just(Ev::Failure),
+            1 => (id(), any::<bool>()).prop_map(|(i, t)| Ev::ReservedTimer(i, t)),
+            1 => (id(), any::<bool>()).prop_map(|(i, t)| Ev::ReservedFired(i, t)),
+            1 => Just(Ev::RaceMarker),
             3 => (1..24_usize).prop_map(Ev::Pad),
         ]
+    }
+
+    /// The signal name of a signal event or call.
+    const fn signal_name(t: bool) -> &'static str {
+        if t { "t" } else { "s" }
+    }
+
+    /// The id of the deadline timer of signal race `seq` for the signal `t`
+    /// or `s`.
+    fn reserved_timer(seq: usize, t: bool) -> String {
+        format!("__signal_timeout:{seq}:{}", signal_name(t))
+    }
+
+    /// The payload test of a predicate wait: an even payload.
+    fn even(payload: &Value) -> bool {
+        payload.as_u64().is_some_and(|n| n % 2 == 0)
     }
 
     /// The fixed ids that one generated history uses.
@@ -16661,7 +17067,7 @@ mod activity_scan_tests {
                     activity_id: a(*i),
                     output: payload,
                 },
-                Ev::Signal(t) => signal(if *t { "t" } else { "s" }, payload),
+                Ev::Signal(t) => signal(signal_name(*t), payload),
                 Ev::CancelRequested(i) => WorkflowEvent::ExternalCancelRequested {
                     cancel_id: self.cancels[*i],
                     target: self.targets[*i].clone(),
@@ -16747,6 +17153,17 @@ mod activity_scan_tests {
                     details: None,
                     non_retryable: None,
                 },
+                Ev::ReservedTimer(i, t) => WorkflowEvent::TimerStarted {
+                    timer_id: TimerId::new(reserved_timer(*i, *t)),
+                    duration_secs: 1,
+                },
+                Ev::ReservedFired(i, t) => WorkflowEvent::TimerFired {
+                    timer_id: TimerId::new(reserved_timer(*i, *t)),
+                },
+                Ev::RaceMarker => WorkflowEvent::MarkerRecorded {
+                    name: "race_winner:0".into(),
+                    details: payload,
+                },
                 Ev::Pad(_) => unreachable!("`history` expands a pad"),
             }
         }
@@ -16781,6 +17198,18 @@ mod activity_scan_tests {
         /// Runs `prepare_match` only. The state is then compared right after
         /// the external scan, before another scan can stash a terminal.
         Prepare,
+        /// A payload-matching wait for an even payload (issue #2349).
+        SignalWhere(bool),
+        /// The signal branch of race 0 (issue #2349).
+        RaceSignal(bool),
+        /// A non-blocking receive (issue #2349).
+        TryClaim(bool),
+        /// A push handler claim (issue #2349).
+        ClaimAll(bool),
+        /// A signal-or-deadline race with this sequence number (issue #2349).
+        SignalOrTimer(usize, bool),
+        /// The pure signal reads, which change no state (issue #2349).
+        Probe(bool),
     }
 
     fn op() -> impl Strategy<Value = Op> {
@@ -16800,6 +17229,12 @@ mod activity_scan_tests {
             1 => (1..30_usize).prop_map(Op::Rewind),
             1 => (1..30_usize).prop_map(Op::Skip),
             2 => Just(Op::Prepare),
+            2 => any::<bool>().prop_map(Op::SignalWhere),
+            1 => any::<bool>().prop_map(Op::RaceSignal),
+            1 => any::<bool>().prop_map(Op::TryClaim),
+            1 => any::<bool>().prop_map(Op::ClaimAll),
+            1 => (0..3_usize, any::<bool>()).prop_map(|(i, t)| Op::SignalOrTimer(i, t)),
+            1 => any::<bool>().prop_map(Op::Probe),
         ]
     }
 
@@ -16810,13 +17245,20 @@ mod activity_scan_tests {
             v.sort_unstable();
             v
         };
+        let sorted_std = |set: &HashSet<usize>| {
+            let mut v: Vec<usize> = set.iter().copied().collect();
+            v.sort_unstable();
+            v
+        };
         format!(
-            "cursor={} ooo={:?} sig={:?} pending={:?} ext_sig={:?} ext_cancel={:?} \
-             ext_await={:?} events={:?}",
+            "cursor={} ooo={:?} sig={:?} pending={:?} rejected={:?} late={:?} ext_sig={:?} \
+             ext_cancel={:?} ext_await={:?} events={:?}",
             m.cursor,
             sorted(&m.consumed_out_of_order_events),
             sorted(&m.consumed_signal_events),
             m.pending_signals,
+            sorted_std(&m.predicate_rejected_signal_events),
+            sorted_std(&m.late_race_signal_events),
             m.external.signals,
             m.external.cancels,
             m.external.awaits,
@@ -16853,7 +17295,13 @@ mod activity_scan_tests {
             match &m.events[at] {
                 WorkflowEvent::ActivityScheduled { name, .. } => Some(Op::Activity(name == "y")),
                 WorkflowEvent::TimerStarted { timer_id, .. } => {
-                    timer_id.as_str()[1..].parse().ok().map(Op::Timer)
+                    match timer_id.as_str().strip_prefix("__signal_timeout:") {
+                        Some(race) => {
+                            let (seq, name) = race.split_once(':')?;
+                            Some(Op::SignalOrTimer(seq.parse().ok()?, name == "t"))
+                        }
+                        None => timer_id.as_str()[1..].parse().ok().map(Op::Timer),
+                    }
                 }
                 WorkflowEvent::ChildWorkflowStarted { .. } => Some(Op::Child),
                 _ => None,
@@ -16876,7 +17324,70 @@ mod activity_scan_tests {
                     m.match_activity(name)
                 }
             }
-            Op::Signal(t) => m.match_signal(if *t { "t" } else { "s" }),
+            Op::Signal(t) if oracle => oracle_match_signal_inner(m, signal_name(*t), None, None),
+            Op::Signal(t) => m.match_signal(signal_name(*t)),
+            Op::SignalWhere(t) if oracle => oracle_match_signal_inner(
+                m,
+                signal_name(*t),
+                None,
+                Some(&|_, payload| even(payload)),
+            ),
+            Op::SignalWhere(t) => m.match_signal_where(signal_name(*t), &even),
+            Op::RaceSignal(t) if oracle => {
+                oracle_match_signal_inner(m, signal_name(*t), Some("race_winner:0"), None)
+            }
+            Op::RaceSignal(t) => m.match_race_signal(signal_name(*t), "race_winner:0"),
+            Op::TryClaim(t) => {
+                let got = if oracle {
+                    oracle_try_claim_pending_signal(m, signal_name(*t))
+                } else {
+                    m.try_claim_pending_signal(signal_name(*t))
+                };
+                return format!("{got:?}");
+            }
+            Op::ClaimAll(t) => {
+                let got = if oracle {
+                    oracle_claim_pending_signal(m, signal_name(*t))
+                } else {
+                    m.claim_pending_signal(signal_name(*t))
+                };
+                return format!("{got:?}");
+            }
+            Op::SignalOrTimer(i, t) => {
+                let (name, timer) = (signal_name(*t), reserved_timer(*i, *t));
+                let got = if oracle {
+                    oracle_match_signal_or_timer(m, name, &timer, None)
+                } else {
+                    m.match_signal_or_timer(name, &timer, None)
+                };
+                return format!("{got:?}");
+            }
+            Op::Probe(t) => {
+                let name = signal_name(*t);
+                if oracle {
+                    let candidates = oracle_signal_candidates(m, name);
+                    return format!(
+                        "has={} candidates={candidates:?} walked={candidates:?} \
+                         where={} by_name={:?}",
+                        oracle_has_unconsumed_signal(m, name),
+                        candidates.iter().any(|(_, payload)| even(payload)),
+                        m.unconsumed_signals_by_name(),
+                    );
+                }
+                let mut walked = Vec::new();
+                let mut from = SignalCandidateCursor::default();
+                while let Some((next, index, payload)) = m.next_signal_candidate(name, from) {
+                    walked.push((index, payload));
+                    from = next;
+                }
+                return format!(
+                    "has={} candidates={:?} walked={walked:?} where={} by_name={:?}",
+                    m.has_unconsumed_signal(name),
+                    m.signal_candidates(name),
+                    m.has_unconsumed_signal_where(name, &even),
+                    m.unconsumed_signals_by_name(),
+                );
+            }
             Op::Timer(i) if oracle => oracle_match_timer_strict(m, &format!("t{i}"), None),
             Op::Timer(i) => m.match_timer(&format!("t{i}")),
             Op::Local => m.match_local_activity("local"),
@@ -17001,6 +17512,9 @@ mod activity_scan_tests {
             Ev::UpdateCompleted,
             Ev::UpdateFailed,
             Ev::Failure,
+            Ev::ReservedTimer(0, false),
+            Ev::ReservedFired(0, false),
+            Ev::RaceMarker,
         ];
         let mut terminals = 0;
         for kind in &kinds {
@@ -17223,6 +17737,23 @@ mod scan_fanout_tests {
         /// drain stashes every event at the first call, so the scan has no
         /// work. Each terminal searched the old stash in a linear way.
         ExternalPairs,
+        /// N signals, each with its own name. The workflow waits for them in
+        /// order, or in reverse order with `true` (issue #2349).
+        Signals(bool),
+        /// N activity schedules, then N signals, each with its own name. The
+        /// workflow waits for the signals in order, or in reverse order with
+        /// `true`. No call claims the activities (issue #2349).
+        SignalsAfterFanOut(bool),
+        /// N signals, each with its own name. A push handler claims each
+        /// name, in order or in reverse order with `true` (issue #2349).
+        SignalHandlers(bool),
+        /// N signals, each with its own name. A non-blocking receive takes
+        /// each name in reverse order (issue #2349).
+        TryReceiveReversed,
+        /// An activity, a deadline race and N signals of other names. The
+        /// activity scan stashes the signals. The race scan then crosses
+        /// them as consumed events (issue #2349).
+        RaceOverStash,
     }
 
     /// An external call of the loop and fan-out shapes.
@@ -17233,7 +17764,7 @@ mod scan_fanout_tests {
         Await,
     }
 
-    const SHAPES: [Shape; 20] = [
+    const SHAPES: [Shape; 28] = [
         Shape::SignalThenActivities,
         Shape::OpenAwaitThenActivities,
         Shape::CancelThenActivities,
@@ -17254,6 +17785,14 @@ mod scan_fanout_tests {
         Shape::ExternalLoop(Some(Call::Await), Call::Cancel),
         Shape::ExternalPairs,
         Shape::ExternalFanOutAfterMiddleRemove,
+        Shape::Signals(false),
+        Shape::Signals(true),
+        Shape::SignalsAfterFanOut(false),
+        Shape::SignalsAfterFanOut(true),
+        Shape::SignalHandlers(false),
+        Shape::SignalHandlers(true),
+        Shape::TryReceiveReversed,
+        Shape::RaceOverStash,
     ];
 
     fn activity_fan_out(n: usize) -> Vec<WorkflowEvent> {
@@ -17656,6 +18195,136 @@ mod scan_fanout_tests {
             Shape::ExternalLoop(first, body) => replay_external_loop(first, body, n, true),
             Shape::ExternalPairs => replay_external_loop(Some(Call::Await), Call::Signal, n, false),
             Shape::ExternalFanOutAfterMiddleRemove => replay_fan_out_after_middle_remove(n),
+            Shape::Signals(_)
+            | Shape::SignalsAfterFanOut(_)
+            | Shape::SignalHandlers(_)
+            | Shape::TryReceiveReversed
+            | Shape::RaceOverStash => replay_signals(shape, n),
+        }
+    }
+
+    /// The name of signal `i` of the signal shapes.
+    fn signal_name(i: usize) -> String {
+        format!("sig-{i}")
+    }
+
+    /// `n` signals. Signal `i` has its own name and the payload `i`.
+    fn named_signals(n: usize) -> Vec<WorkflowEvent> {
+        (0..n)
+            .map(|i| WorkflowEvent::SignalReceived {
+                signal_name: signal_name(i),
+                payload: serde_json::json!(i),
+            })
+            .collect()
+    }
+
+    /// Replays a signal shape of issue #2349 with `n` signals, checks every
+    /// result and returns the scan steps.
+    fn replay_signals(shape: Shape, n: usize) -> u64 {
+        match shape {
+            Shape::Signals(reversed) | Shape::SignalsAfterFanOut(reversed) => {
+                let fan_out = matches!(shape, Shape::SignalsAfterFanOut(_));
+                let mut events: Vec<WorkflowEvent> = if fan_out {
+                    (0..n)
+                        .map(|_| WorkflowEvent::ActivityScheduled {
+                            activity_id: ActivityExecId::new(),
+                            name: "charge".into(),
+                            input: Value::Null,
+                            queue: "default".into(),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                events.extend(named_signals(n));
+                let mut m = HistoryMatcher::new(events);
+                steps_of(|| {
+                    for i in order(n, reversed) {
+                        assert_eq!(
+                            m.match_signal(&signal_name(i)),
+                            HistoryMatch::Matched {
+                                output: serde_json::json!(i)
+                            }
+                        );
+                    }
+                    if fan_out {
+                        assert_eq!(m.cursor, 0, "the first schedule stays the cursor");
+                    } else {
+                        assert!(!m.has_buffered_history());
+                    }
+                })
+            }
+            Shape::SignalHandlers(reversed) => {
+                let mut m = HistoryMatcher::new(named_signals(n));
+                steps_of(|| {
+                    for i in order(n, reversed) {
+                        assert_eq!(
+                            m.claim_pending_signal(&signal_name(i)),
+                            vec![(i, serde_json::json!(i))]
+                        );
+                    }
+                    assert!(!m.has_buffered_history());
+                })
+            }
+            Shape::TryReceiveReversed => {
+                let mut m = HistoryMatcher::new(named_signals(n));
+                steps_of(|| {
+                    for i in order(n, true) {
+                        assert_eq!(
+                            m.try_claim_pending_signal(&signal_name(i)),
+                            Some(serde_json::json!(i))
+                        );
+                    }
+                    assert!(!m.has_buffered_history());
+                })
+            }
+            Shape::RaceOverStash => {
+                let activity_id = ActivityExecId::new();
+                let timer = "__signal_timeout:0:r";
+                let mut events = vec![
+                    WorkflowEvent::ActivityScheduled {
+                        activity_id,
+                        name: "charge".into(),
+                        input: Value::Null,
+                        queue: "default".into(),
+                    },
+                    WorkflowEvent::TimerStarted {
+                        timer_id: TimerId::new(timer),
+                        duration_secs: 1,
+                    },
+                ];
+                events.extend(named_signals(n));
+                events.push(WorkflowEvent::ActivityCompleted {
+                    activity_id,
+                    output: Value::Null,
+                });
+                events.push(WorkflowEvent::TimerFired {
+                    timer_id: TimerId::new(timer),
+                });
+                let mut m = HistoryMatcher::new(events);
+                steps_of(|| {
+                    assert_eq!(
+                        m.match_activity("charge"),
+                        HistoryMatch::Matched {
+                            output: Value::Null
+                        }
+                    );
+                    assert_eq!(
+                        m.match_signal_or_timer("r", timer, None),
+                        SignalOrTimerMatch::TimerWon
+                    );
+                    for i in 0..n {
+                        assert_eq!(
+                            m.match_signal(&signal_name(i)),
+                            HistoryMatch::Matched {
+                                output: serde_json::json!(i)
+                            }
+                        );
+                    }
+                    assert!(!m.has_buffered_history());
+                })
+            }
+            other => unreachable!("{other:?} is not a signal shape"),
         }
     }
 
@@ -18424,6 +19093,162 @@ mod scan_fanout_tests {
                 },
                 "{mode}"
             );
+        });
+    }
+
+    fn scheduled(activity_id: ActivityExecId) -> WorkflowEvent {
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "charge".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        }
+    }
+
+    fn signal(name: &str, payload: u64) -> WorkflowEvent {
+        WorkflowEvent::SignalReceived {
+            signal_name: name.into(),
+            payload: serde_json::json!(payload),
+        }
+    }
+
+    fn matched(payload: u64) -> HistoryMatch {
+        HistoryMatch::Matched {
+            output: serde_json::json!(payload),
+        }
+    }
+
+    /// The event indices of the stashed signals, in stash order.
+    fn stashed(m: &HistoryMatcher) -> Vec<usize> {
+        m.pending_signals
+            .iter()
+            .map(|(_, _, index)| *index)
+            .collect()
+    }
+
+    /// The scan crosses a deadline timer of its own signal, and does not
+    /// rewind to it. It rewinds to a deadline timer of another signal
+    /// (issue #2349).
+    #[test]
+    fn a_wait_rewinds_to_a_foreign_deadline_timer_only() {
+        each_mode(|mode| {
+            for (owner, want) in [("go", 21), ("other", 0)] {
+                let mut events = vec![timer_started(&format!("__signal_timeout:0:{owner}"))];
+                events.extend(padding(20));
+                events.push(scheduled(ActivityExecId::new()));
+                events.push(signal("go", 7));
+                let mut m = HistoryMatcher::new(events);
+                assert_eq!(m.match_signal("go"), matched(7), "{mode} {owner}");
+                assert_eq!(m.cursor, want, "{mode} {owner}");
+            }
+        });
+    }
+
+    /// An unexpected event after a crossed command parks the wait. With no
+    /// crossed command, it is a divergence (issue #2349).
+    #[test]
+    fn an_unexpected_event_parks_or_diverges() {
+        each_mode(|mode| {
+            let unexpected = || WorkflowEvent::WorkflowCompleted {
+                output: Value::Null,
+            };
+            let mut events = vec![scheduled(ActivityExecId::new())];
+            events.extend(padding(20));
+            events.extend([unexpected(), signal("go", 1)]);
+            let mut m = HistoryMatcher::new(events);
+            assert_eq!(m.match_signal("go"), HistoryMatch::NoMatch, "{mode}");
+            assert_eq!(m.cursor, 0, "{mode}");
+
+            let mut events = padding(20);
+            events.extend([unexpected(), signal("go", 1)]);
+            let mut m = HistoryMatcher::new(events);
+            assert_eq!(
+                m.match_signal("go"),
+                HistoryMatch::Diverged {
+                    expected: "SignalReceived(go)".into(),
+                    actual: "WorkflowCompleted".into(),
+                    event_index: Some(0),
+                },
+                "{mode}"
+            );
+        });
+    }
+
+    /// The scan stashes the signals of other names and the payloads that a
+    /// predicate rejects, in history order (issue #2349).
+    #[test]
+    fn a_wait_stashes_the_signals_before_its_match_in_order() {
+        each_mode(|mode| {
+            let mut events = vec![scheduled(ActivityExecId::new())];
+            events.extend(padding(20));
+            events.extend([
+                signal("go", 1),
+                signal("x", 2),
+                signal("go", 3),
+                WorkflowEvent::ExternalCancelRequested {
+                    cancel_id: ExternalCancelId::new(),
+                    target: ExternalTarget::ExecutionId(ExecutionId::new()),
+                },
+                signal("go", 4),
+                signal("go", 6),
+            ]);
+            let mut m = HistoryMatcher::new(events);
+            let even = |payload: &Value| payload.as_u64().is_some_and(|n| n % 2 == 0);
+            assert_eq!(m.match_signal_where("go", &even), matched(4), "{mode}");
+            assert_eq!(m.cursor, 0, "{mode}");
+            assert_eq!(stashed(&m), vec![21, 22, 23], "{mode}");
+            assert_eq!(m.external.cancels.len(), 1, "{mode}");
+            let mut rejected: Vec<usize> =
+                m.predicate_rejected_signal_events.iter().copied().collect();
+            rejected.sort_unstable();
+            assert_eq!(rejected, vec![21, 23], "{mode}");
+            for (name, payload) in [("go", 1), ("go", 3), ("x", 2), ("go", 6)] {
+                assert_eq!(m.match_signal(name), matched(payload), "{mode} {name}");
+            }
+        });
+    }
+
+    /// A wait inside a cut view does not see a hidden signal. After the
+    /// restore, the next wait finds it (issue #2349).
+    #[test]
+    fn a_wait_sees_a_hidden_signal_only_after_the_restore() {
+        each_mode(|mode| {
+            let mut events = vec![scheduled(ActivityExecId::new())];
+            events.extend(padding(20));
+            events.extend([signal("x", 1), signal("go", 2)]);
+            let horizon = events.len() - 1;
+            let mut m = HistoryMatcher::new(events);
+            let cut = m.cut_view(horizon).expect("the cut hides an event");
+            assert_eq!(m.match_signal("go"), HistoryMatch::NoMatch, "{mode}");
+            assert_eq!(stashed(&m), vec![21], "{mode}");
+            m.restore_view(cut);
+            assert_eq!(m.match_signal("go"), matched(2), "{mode}");
+            assert_eq!(m.match_signal("x"), matched(1), "{mode}");
+        });
+    }
+
+    /// A race branch stops at its own settle marker, also when every other
+    /// scan uses the index (issue #2349).
+    #[test]
+    fn a_race_branch_stops_at_its_settle_marker() {
+        each_mode(|mode| {
+            let mut events = vec![scheduled(ActivityExecId::new())];
+            events.extend(padding(20));
+            events.extend([
+                WorkflowEvent::MarkerRecorded {
+                    name: "race_winner:0".into(),
+                    details: Value::Null,
+                },
+                signal("go", 1),
+            ]);
+            let mut m = HistoryMatcher::new(events);
+            assert_eq!(
+                m.match_race_signal("go", "race_winner:0"),
+                HistoryMatch::NoMatch,
+                "{mode}"
+            );
+            assert!(m.has_unconsumed_signal("go"), "{mode}");
+            assert_eq!(m.match_signal("go"), matched(1), "{mode}");
         });
     }
 }
