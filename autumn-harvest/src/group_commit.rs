@@ -1,8 +1,8 @@
 //! Group commit of the decisions of one decision partition (issue #2256).
 //!
 //! An owner can commit the decisions of several executions of one
-//! partition in one Postgres transaction. `DESIGN-2256.md` section 1 is the
-//! design note. In short:
+//! partition in one Postgres transaction. `docs/design/DESIGN-2256.md`
+//! section 1 is the design note. In short:
 //!
 //! - [`GroupCommit`] keeps one lane per shard and partition. A lane has
 //!   `width` slots and a queue.
@@ -318,10 +318,10 @@ mod db {
 
     /// The group commit lanes of one database (issue #2256).
     ///
-    /// `DESIGN-2256.md` section 1 is the design note. Each lane has its own
-    /// slots, and all lanes share one pool. So size `width` times the owned
-    /// partitions against the pool. Do not call [`Self::commit`] while you
-    /// hold a connection of the same pool.
+    /// `docs/design/DESIGN-2256.md` section 1 is the design note. Each lane
+    /// has its own slots, and all lanes share one pool. So size `width` times
+    /// the owned partitions against the pool. Do not call [`Self::commit`]
+    /// while you hold a connection of the same pool.
     pub struct GroupCommit<T> {
         config: GroupCommitConfig,
         lanes: Mutex<HashMap<OwnerKey, Arc<Lane<T>>>>,

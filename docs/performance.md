@@ -2597,7 +2597,9 @@ standalone note rather than part of the claim-path attribution table above:
   — `HistoryMatcher::match_activity` on a fan-out history (issue #2330). The
   terminal scan reads a position index, so a fan-out replay is no longer
   quadratic. At N=1000 it costs 72% fewer instructions. A sequential history
-  costs 0.7% more. Shipped.
+  costs 0.7% more. Issue #2338 moves the external stash, timer fire
+  and child terminal scans onto the same index. At N=1000 a fan-out after one
+  external signal costs 80% fewer instructions. Shipped.
 * [`docs/performance-payload-depth.md`](performance-payload-depth.md)
   — the depth walk that the worker runs on every activity result (issue
   #2312). The walk is 10.6% of a harness that only clones and checks. The one

@@ -2,7 +2,7 @@
 
 `group_commit::GroupCommit` lets an owner commit the decisions of several
 executions of one decision partition in one Postgres transaction.
-[`DESIGN-2256.md`](../../DESIGN-2256.md) section 1 is the design note.
+[`DESIGN-2256.md`](../design/DESIGN-2256.md) section 1 is the design note.
 ADR 0009 decision 14 records it.
 
 - One lane per shard and partition, with `width` slots (default 4). A
