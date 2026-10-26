@@ -2375,6 +2375,11 @@ jobs:
         # and weight builders a reader pastes verbatim. Nothing compiled them.
         # See scripts/check-worker-routing-examples.sh.
         run: ./scripts/check-worker-routing-examples.sh
+      - name: Check chapter 7 reliability-knob snippets compile
+        # Chapter 7 shows retry, timeout, SLA, continue-as-new and versioning
+        # code a reader pastes verbatim. Nothing compiled it.
+        # See scripts/check-reliability-knobs-examples.sh.
+        run: ./scripts/check-reliability-knobs-examples.sh
 
   # One check for branch protection to require in place of every leg above.
   # A skipped leg (a draft PR) counts as a pass, as a skipped job does
