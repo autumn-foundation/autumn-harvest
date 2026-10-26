@@ -1535,7 +1535,7 @@ impl HistoryMatcher {
     /// A scan reads the index with a consumed test. A move of the index out
     /// of the matcher would copy it twice and build an empty one, on each
     /// indexed scan. This split borrow costs nothing.
-    fn index_and_consumed(&mut self) -> (&mut ActivityScanIndex, ConsumedView<'_>) {
+    const fn index_and_consumed(&mut self) -> (&mut ActivityScanIndex, ConsumedView<'_>) {
         (
             &mut self.activity_scan_index,
             ConsumedView {
