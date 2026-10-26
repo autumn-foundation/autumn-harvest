@@ -4196,13 +4196,12 @@ impl HistoryMatcher {
 
         // Timer was started but never fired — incomplete history.
         //
-        // No rewind is needed here even though the scan may have crossed
-        // interleaved sibling commands: `self.cursor` was never advanced past
-        // them (the scan moves no cursor). Only `settle_terminal`, on
-        // an actual win, persists scan progress by moving `self.cursor` — the
-        // no-match path leaves the cursor at this timer's `TimerStarted` so the
-        // suspending `ctx.timer` re-parks correctly and the interleaved siblings
-        // stay claimable by their own matchers in program order.
+        // The scan can cross interleaved sibling commands, but it moves no
+        // cursor. So no rewind is necessary here. Only `settle_terminal` moves
+        // `self.cursor`, on a match. On no match, the cursor stays just after
+        // this timer's `TimerStarted`. The suspending `ctx.timer` then parks
+        // again, and each interleaved sibling stays for its own matcher, in
+        // program order.
         HistoryMatch::NoMatch
     }
 
