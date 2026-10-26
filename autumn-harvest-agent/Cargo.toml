@@ -27,7 +27,7 @@ autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", default-featur
 autumn-harvest-sqlite = { version = "0.7.0", path = "../autumn-harvest-sqlite", optional = true }
 # Workspace snapshots carry file bytes as base64 (issue #2274). The core
 # crate already depends on this version.
-base64 = "0.22"
+base64 = "0.23"
 # `join_all` runs the child runs of a fan-out at the same time (issue #2270).
 futures = { workspace = true }
 serde = { workspace = true }
