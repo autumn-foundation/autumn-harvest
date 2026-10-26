@@ -282,6 +282,8 @@ mod publish_progress_tests;
 mod query_deadlock;
 mod query_terminal_tests;
 mod query_tests;
+#[cfg(feature = "db")]
+mod queue_age_gauge_perf;
 mod queue_fairness_tests;
 mod queue_pause_success_metric_tests;
 mod queue_pause_tests;

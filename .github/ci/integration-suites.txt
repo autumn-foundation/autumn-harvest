@@ -187,6 +187,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          poison_pill_reclaim_perf
 linux        autumn-harvest         integration                      -                          poison_pill_tests
 linux        autumn-harvest         integration                      -                          poll_capacity_gate_tests
+linux        autumn-harvest         integration                      -                          queue_age_gauge_perf
 linux        autumn-harvest         integration                      -                          queue_fairness_tests
 linux        autumn-harvest         integration                      -                          queue_pause_success_metric_tests
 linux        autumn-harvest         integration                      -                          quota_enforcement_tests

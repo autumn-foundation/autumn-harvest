@@ -1,0 +1,6 @@
+before: oldest_pending_ages, pending=20000: buffers=19874 heap_rows_read=18880
+before: oldest_pending_ages, pending=100000: buffers=114478 heap_rows_read=103130
+before: oldest_pending_ages, pending=300000: buffers=448095 heap_rows_read=374244
+after: oldest_pending_ages, pending=20000: buffers=2649 heap_rows_read=640
+after: oldest_pending_ages, pending=100000: buffers=885 heap_rows_read=720
+after: oldest_pending_ages, pending=300000: buffers=2158 heap_rows_read=1309
