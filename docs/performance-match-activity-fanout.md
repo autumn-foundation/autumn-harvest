@@ -554,15 +554,16 @@ the plan.
   then walks one queue. A smaller stash scans its slots. Either way, a
   search visits the entries of one name in push order, as the old search
   did.
-- A push compacts the stash when its empty slots outnumber its entries. A
-  cut removes the hidden entries from the last one back. A restore of a
+- A push or a cut compacts the stash when its empty slots outnumber its
+  entries. A cut removes the hidden entries from the last one back. A restore of a
   sorted stash only pushes the hidden entries back. A cancelled scope cuts
   and restores on each poll, so these keep the poll cost near the old one.
 - A stash entry names its own event. So the race scan searches the stash
   only at a consumed signal of the same name.
 - `signal_scan_step` holds the rule of the old walk for one event. A wait
   that is not a race branch leaves the walk by the rule of #2330 and
-  continues on the scan index. It visits each unconsumed barrier and runs the same step on it.
+  continues on the scan index. It visits each unconsumed barrier and
+  runs the same step on it.
   Between two barriers, it looks up the first interleaved command once. It
   skips a deadline timer of its own signal, as the walk does.
 - A race branch keeps the walk. It must stop at its own settle marker, and
@@ -651,15 +652,19 @@ each stash entry that a signal search visits.
   10,000 distinct names. The empty slots and the empty keys stay bounded. A
   restore of a sorted stash keeps every push number.
 - With the `fuzzing` feature, `check_signal_step` also runs over random
-  events of all 54 `WorkflowEvent` variants.
-- Seven mutants, each made by hand, fail the tests above:
+  events of every `WorkflowEvent` variant.
+- Eleven mutants, each made by hand, fail the tests above:
   - no skip of a deadline timer of the awaited signal,
   - no interleaved lookup on the index,
   - a race branch that leaves the walk,
   - a race search that matches the wrong event,
   - an indexed scan that ignores a cut,
   - a restore with no sort,
-  - a non-blocking receive that claims a reserved signal.
+  - a non-blocking receive that claims a reserved signal,
+  - a stash that always scans its slots,
+  - a stash with no compaction,
+  - a restore fast path that ignores the order across the cut,
+  - a cut that returns the hidden entries in reverse order.
 
 ### Reproduce
 

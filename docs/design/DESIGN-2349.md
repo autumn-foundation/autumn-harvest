@@ -87,11 +87,11 @@ These facts describe the code before this change.
 | R5 | A race branch crosses its settle marker on the index. | A race branch never leaves the walk. An edge test forces every scan onto the index and checks the bound. |
 | R6 | The fast paths pay for the new state. `fwd` never stashes a signal. A loop stashes one signal at a time. | An empty stash skips the name lookup. A small stash has no name map (B11). The compiler inlines the hot stash calls and the step function. The `fwd`, `loop` and `loop_named` shapes measure it. |
 | R7 | A cut view hides an entry, and the restore puts it back in the wrong place. | The cut takes the hidden entries out in push order. The restore merges and sorts them, as the old code did. The differential test cuts and restores. |
-| R8 | The new fields grow `HistoryMatcher` past the `clippy::large_futures` limit. | The stash adds two counters, a flag and an optional map. `HistoryMatcher` grows from 736 to 800 bytes. Clippy runs with every feature, and it passes. |
+| R8 | The new fields grow `HistoryMatcher` past the `clippy::large_futures` limit. | The stash adds two counters, a flag and an optional map. The stash grows from 32 to 104 bytes, so `HistoryMatcher` grows from 736 to 808 bytes. Clippy runs with every feature, and it passes. |
 | R9 | A predicate rejects a payload. The indexed scan then stashes in another order. | The scan visits barriers in history order, as the walk does. The differential test drives payload predicates. |
 | R10 | An entry that never leaves keeps the empty slots behind it. A first-in-first-out backlog of another name then grows the slots without a bound, and the map turns on. | A push compacts the slots when the empty slots outnumber the entries. It also drops the empty name keys when they outnumber the entries. A test runs 10,000 such steps. |
 | R11 | A cancelled scope cuts and restores on each poll of its body. A restore that rebuilds the stash then costs an allocation for each poll. | A sorted stash only pushes the hidden entries back. A test checks that the push numbers stay. |
-| R12 | A cut removes the hidden entries from the middle of their queues. That costs O(h·k) for h hidden and k kept entries of one name. | The cut removes from the last entry back, so each remove pops the back of its queue. |
+| R12 | A cut removes the hidden entries from the middle of their queues. That costs O(h·k) for h hidden and k kept entries of one name. A cut also walks every empty slot. | The cut removes from the last entry back, so each remove pops the back of its queue. It first compacts a stash with many empty slots. A test cuts after 4,000 removes in the middle. |
 | R13 | A candidate cursor held a deque position. It now holds a push number. A predicate that changes the stash between two lookups then sees a different candidate. | A predicate must be a pure function of the payload, so this is out of contract. A remove between two lookups now skips no candidate, and a test pins that. |
 
 ### 0.4 Six thinking hats
@@ -152,7 +152,8 @@ instructions before, and 2,298,520 with a map on every stash. With no map
 up to 16 slots and the hot calls inlined, it costs 1,529,030. That is 40
 instructions, or 2.7%, more for each loop step.
 
-`cut_view` removes the hidden entries from the last one back. In a sorted
+`cut_view` first compacts a stash whose empty slots outnumber its entries.
+It then removes the hidden entries from the last one back. In a sorted
 stash, each remove then pops the back of its queue and of the slots.
 
 `restore_view` keeps the order of the old `extend` and stable sort. A

@@ -285,7 +285,14 @@ impl SignalStash {
     ///
     /// The removes run from the last entry back. In a sorted stash, each one
     /// then pops the back of its queue and of the slots.
+    ///
+    /// The cut first compacts a stash with many empty slots. A cancelled
+    /// scope cuts on each poll, so the cut then costs O(entries), not
+    /// O(slots).
     pub fn split_off_from(&mut self, horizon: usize) -> Vec<StashedSignal> {
+        if self.needs_compaction() {
+            self.compact();
+        }
         let mut hidden: Vec<usize> = self
             .numbered()
             .filter(|(_, entry)| entry.index >= horizon)
@@ -730,6 +737,28 @@ pub mod tests {
             let keys = stash.names.as_ref().map_or(0, HashMap::len);
             assert!(keys <= 2 * stash.live + SMALL_STASH + 1, "{keys} keys");
         }
+    }
+
+    /// A cut compacts a stash with many empty slots. A cancelled scope cuts
+    /// on each poll, so each later cut walks only the entries.
+    #[test]
+    fn a_cut_compacts_a_stash_with_many_empty_slots() {
+        let mut stash = SignalStash::default();
+        stash.push("keep".into(), Value::Null, 0);
+        for index in 1..4000 {
+            stash.push("t".into(), Value::Null, index);
+        }
+        stash.push("keep".into(), Value::Null, 4000);
+        while let Some(push) = stash.of_name("t").next().map(|(push, _)| push) {
+            assert!(stash.remove(push).is_some());
+        }
+        assert!(stash.slots.len() > 3000, "the removes leave empty slots");
+        let hidden = stash.split_off_from(4000);
+        assert_eq!(stash.slots.len(), 1, "the cut compacts the stash");
+        stash.restore(hidden);
+        stash.check();
+        let indices: Vec<usize> = stash.iter().map(|e| e.index).collect();
+        assert_eq!(indices, vec![0, 4000]);
     }
 
     /// A restore of a sorted stash pushes the hidden entries only. Every push
