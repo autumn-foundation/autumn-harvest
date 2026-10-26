@@ -734,3 +734,42 @@ harness = false
 name = "external_stash_profile"
 required-features = ["testing"]
 harness = false
+
+# Deterministic instruction-count harness for `fork::validate_fork` and
+# `reset::resolve_reset_point`, the pure checks of one fork request (issue
+# #2000). Drive it under valgrind. See `benches/fork_validate_profile.rs`.
+[[bench]]
+name = "fork_validate_profile"
+required-features = ["db"]
+harness = false
+
+# Deterministic instruction-count harness for the decision-owner kernels:
+# the partition hash, the owned-claim mask, the group-commit batch plan and
+# the lease-write sort (issues #2249, #2256). Pure, so no feature. See
+# `benches/owner_kernels_profile.rs`.
+[[bench]]
+name = "owner_kernels_profile"
+harness = false
+
+# Deterministic instruction-count harness for `OwnerDiskCache::store` and
+# `load` (issue #2258). It writes a real SQLite file and opens no Postgres
+# connection. See `benches/owner_disk_cache_profile.rs`.
+[[bench]]
+name = "owner_disk_cache_profile"
+required-features = ["owner-disk-cache"]
+harness = false
+
+# Deterministic instruction-count harness for `entity_sql::run`, the SQL
+# query over one entity state (issue #2260). It opens an in-memory SQLite
+# database only. See `benches/entity_sql_profile.rs`.
+[[bench]]
+name = "entity_sql_profile"
+required-features = ["owner-disk-cache"]
+harness = false
+
+# Deterministic instruction-count harness for the replay of entity snapshot
+# events (issue #2259). See `benches/entity_snapshot_replay_profile.rs`.
+[[bench]]
+name = "entity_snapshot_replay_profile"
+required-features = ["testing"]
+harness = false

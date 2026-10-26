@@ -2020,6 +2020,16 @@ jobs:
           cache-on-failure: true
       - name: Clippy autumn-harvest
         run: cargo clippy -p autumn-harvest --all-features --tests -- -D warnings
+      # The deterministic profiles of the 0.8.0 fork, owner and entity paths.
+      # `--tests` builds no bench target, so nothing else compiles them. This
+      # step reuses the lib check of the step above, so it adds little time.
+      - name: Clippy 0.8.0 profile benches
+        run: >-
+          cargo clippy -p autumn-harvest --all-features
+          --bench fork_resolve_profile --bench fork_validate_profile
+          --bench owner_kernels_profile --bench owner_disk_cache_profile
+          --bench entity_sql_profile --bench entity_snapshot_replay_profile
+          -- -D warnings
 
   clippy-plugin:
     name: Clippy (plugin default, mcp, metrics, webhooks, oidc)

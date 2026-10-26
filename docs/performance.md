@@ -2684,3 +2684,54 @@ standalone note rather than part of the claim-path attribution table above:
   share one transaction, with a savepoint each. Paired bursts give 1.16x
   throughput at 16 writers and 1.33x at 64. A lone decision keeps its p50
   (0.998 of the lane with grouping off).
+* [`docs/performance-fork-resolve-shapes.md`](performance-fork-resolve-shapes.md)
+  — `fork::resolve_activity` and `settle_holds` on five recorded-fork decision
+  shapes (issue #2000). The race-loser hold and scope-cancel paths are cubic in
+  K: one sibling scan in `source_race_winner` is 91.85% of the run at K=800.
+  Serve, override and miss stay quadratic. Baseline only, no code change.
+* [`docs/performance-fork-validate.md`](performance-fork-validate.md)
+  — the pure checks of one fork request, `reset::resolve_reset_point` then
+  `fork::validate_fork` (issue #2000). The cost is linear in the history:
+  4,006 to 4,576 `Ir` per event with `LastWorkflowTask`, which runs
+  `boundary_validity` twice. At P=16,500 that pass is 96.6% to 98.2% of the
+  cost, mostly allocator and `format!` work on its pending keys. Baseline only.
+* [`docs/performance-owner-kernels.md`](performance-owner-kernels.md)
+  — the pure decision-owner kernels around each decision (issues #2249,
+  #2256): partition hash 366 `Ir`, claim mask 5,844 `Ir` at 512 held
+  partitions, lone batch plan 112 `Ir`. Baseline only. `plan_batch` drains a
+  queue with D(D−1)/2 execution comparisons, and one renewal scans its
+  tenures in O(H²).
+* [`docs/performance-owner-disk-cache.md`](performance-owner-disk-cache.md)
+  — `OwnerDiskCache` store, append, load and entity row (issue #2258); a
+  baseline. A fresh store and a load cost about 17,800 instructions per
+  event and are linear. An append decision costs about 198,000, and its two
+  new events are at most 22.17% of it. Uncached SQL parses and two SHA-256
+  hashes lead the fixed cost.
+* [`docs/performance-entity-sql.md`](performance-entity-sql.md)
+  — `entity_sql::run`, the read-only SQL over one entity state (issue
+  #2260); a baseline. Each query has a fixed cost of 411,663 instructions.
+  The open, the setup statements and the close are 86.57% of a point query.
+  A `json_each` scan adds about 8,179 per item and stays linear.
+* [`docs/performance-entity-snapshot-replay.md`](performance-entity-snapshot-replay.md)
+  — the cold replay of keyed-entity state snapshots (issue #2259) through
+  `executor::run_workflow`: O(M×S) at about 171 `Ir` per snapshot byte.
+  Baseline only. Skipping the discarded live snapshot, publishing the query
+  view lazily and counting loaded bytes at load bound a 56.4% saving.
+* [`docs/performance-agent-model-turn.md`](performance-agent-model-turn.md)
+  — `AgentHarness::model_turn`, the activity side of one agent model turn
+  (issues #1973, #2264); baseline only. The delta form re-hashes the whole
+  prefix on every turn (`harness.rs:433`), so a run of T turns costs O(T²):
+  82.9% of all `Ir` at T=200, and 21x the full-form body. Ideas with upper
+  bounds, none implemented.
+* [`docs/performance-agent-loop-replay.md`](performance-agent-loop-replay.md)
+  — the replay of a recorded `agent_loop` run, the workflow side of the
+  agent loop (issue #1973). The replay is quadratic in the tool rounds. Each
+  round serializes the whole request twice and clones the transcript twice.
+  The two serializations are 55.5% of the replay at N=100. Baseline only.
+* [`docs/performance-durable-agent-replay.md`](performance-durable-agent-replay.md)
+  — the replay of a durable `agent` run, one op per user message (issue
+  #2263), measured with a fixed hash seed. Past the 200-message window an op
+  costs about 17.8M instructions, so the replay is linear in the ops until
+  the entity checkpoint continues the run near op 288. The transcript digest
+  is 34.5% of the replay at 200 ops, and the entity snapshot work 27.0%.
+  Baseline only.
