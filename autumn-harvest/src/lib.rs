@@ -479,6 +479,7 @@ pub mod remote_task;
 mod remote_task_db;
 // The position index of the activity terminal scan (issue #2330).
 mod activity_scan_index;
+// The signal stash of the matcher (issue #2349).
 pub mod replay;
 /// Stratified in-flight history sampling for the replay-drift gate (issue #798).
 ///
@@ -523,6 +524,7 @@ pub mod shard_fence;
 pub mod shard_rebalance;
 /// Shared, immutable JSON payload for the workflow start path (issue #1733).
 pub mod shared_json;
+mod signal_stash;
 /// Retry a transaction after a deadlock or serialization abort (issue #1822).
 ///
 /// Engine internal with no stability guarantee. It is `pub` for the

@@ -19,6 +19,7 @@ use crate::activity_scan_index::{
 };
 use crate::error::TimeoutType;
 use crate::event::{SideEffectKind, WorkflowEvent};
+use crate::signal_stash::{SignalStash, StashedSignal};
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalCancelId,
     ExternalSignalId, ParentClosePolicy, UpdateId,
@@ -1045,7 +1046,7 @@ pub(crate) struct LocalActivityResolution {
 /// (issue #1984).
 pub(crate) struct ViewCut {
     tail: Vec<WorkflowEvent>,
-    hidden_signals: VecDeque<(String, Value, usize)>,
+    hidden_signals: Vec<StashedSignal>,
     cursor: usize,
 }
 
@@ -1062,7 +1063,9 @@ pub struct HistoryMatcher {
     cursor: usize,
     consumed_out_of_order_events: EventIndexSet,
     consumed_signal_events: EventIndexSet,
-    pending_signals: VecDeque<(String, Value, usize)>,
+    /// The signals that a scan crossed before their wait ran, in push order
+    /// (issue #2349).
+    pending_signals: SignalStash,
     /// The external signals, cancels and awaits drained before their natural
     /// cursor position, and the state of their scan.
     external: Box<ExternalCalls>,
@@ -1196,7 +1199,7 @@ type SignalPredicate<'a> = &'a dyn Fn(usize, &Value) -> bool;
 /// where the last one stopped, so a scan over N candidates stays linear.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignalCandidateCursor {
-    /// The next position in `pending_signals`.
+    /// The next push number in `pending_signals` (issue #2349).
     Buffered(usize),
     /// The next event index.
     Recorded(usize),
@@ -1326,7 +1329,7 @@ impl HistoryMatcher {
             cursor: 0,
             consumed_out_of_order_events: EventIndexSet::default(),
             consumed_signal_events: EventIndexSet::default(),
-            pending_signals: VecDeque::new(),
+            pending_signals: SignalStash::default(),
             external: Box::new(ExternalCalls::new()),
             transparent_events,
             late_race_signal_events: HashSet::new(),
@@ -1856,8 +1859,7 @@ impl HistoryMatcher {
         self.consumed_signal_events.insert(cursor);
         // Carry the source event index so the late-race exemption (issue
         // #476) can follow the exact losing event into the stash.
-        self.pending_signals
-            .push_back((signal_name, payload, cursor));
+        self.pending_signals.push(signal_name, payload, cursor);
     }
 
     fn stash_external_signal_request(
@@ -2745,9 +2747,9 @@ impl HistoryMatcher {
         // consumed by wait_for_signal represent unconsumed history, except
         // for the exact events excused by a lost race. A signal that a
         // payload predicate rejected is excused too (issue #1985).
-        if self.pending_signals.iter().any(|(_, _, idx)| {
-            !self.late_race_signal_events.contains(idx)
-                && !self.predicate_rejected_signal_events.contains(idx)
+        if self.pending_signals.iter().any(|entry| {
+            !self.late_race_signal_events.contains(&entry.index)
+                && !self.predicate_rejected_signal_events.contains(&entry.index)
         }) {
             return true;
         }
@@ -2905,9 +2907,9 @@ impl HistoryMatcher {
 
         // Source 2: signals drained early into pending_signals (index < cursor)
         // that were never consumed, minus the exact lost-race exemptions.
-        for (signal_name, _, idx) in &self.pending_signals {
-            if !self.late_race_signal_events.contains(idx) {
-                *counts.entry(signal_name.clone()).or_insert(0) += 1;
+        for entry in self.pending_signals.iter() {
+            if !self.late_race_signal_events.contains(&entry.index) {
+                *counts.entry(entry.name.clone()).or_insert(0) += 1;
             }
         }
 
@@ -4681,10 +4683,8 @@ impl HistoryMatcher {
         tolerate_interleaved: Option<&str>,
         predicate: Option<SignalPredicate<'_>>,
     ) -> HistoryMatch {
-        if let Some(index) = self.claim_buffered_signal_position(signal_name, predicate)
-            && let Some((_name, payload, _idx)) = self.pending_signals.remove(index)
-        {
-            return HistoryMatch::Matched { output: payload };
+        if let Some(output) = self.claim_buffered_signal(signal_name, predicate) {
+            return HistoryMatch::Matched { output };
         }
 
         self.advance_to_next_unconsumed_event();
@@ -5003,25 +5003,28 @@ impl HistoryMatcher {
         self.prepare_match();
         self.note_signal_probe(signal_name);
 
-        let (matched, remaining): (VecDeque<_>, VecDeque<_>) =
-            std::mem::take(&mut self.pending_signals)
-                .into_iter()
-                .partition(|(name, _, idx)| {
-                    stash_probe(
-                        name == signal_name && !self.race_reserved_signal_events.contains(idx),
-                    )
-                });
-        self.pending_signals = remaining;
+        let claimable: Vec<usize> = self
+            .pending_signals
+            .of_name(signal_name)
+            .filter(|(_, entry)| {
+                stash_probe(!self.race_reserved_signal_events.contains(&entry.index))
+            })
+            .map(|(push, _)| push)
+            .collect();
+        let matched: Vec<StashedSignal> = claimable
+            .into_iter()
+            .filter_map(|push| self.pending_signals.remove(push))
+            .collect();
         // Every stashed entry already has its index in `consumed_signal_events`
         // (set by `stash_signal` at stash time), but re-asserting it here makes
         // the no-double-delivery invariant explicit at the point of use rather
         // than relying on the reader to trace it back to the stash call site.
-        for (_, _, idx) in &matched {
-            self.consumed_signal_events.insert(*idx);
+        for entry in &matched {
+            self.consumed_signal_events.insert(entry.index);
         }
         matched
             .into_iter()
-            .map(|(_, payload, idx)| (idx, payload))
+            .map(|entry| (entry.index, entry.payload))
             .collect()
     }
 
@@ -5053,15 +5056,37 @@ impl HistoryMatcher {
     pub(crate) fn try_claim_pending_signal(&mut self, signal_name: &str) -> Option<Value> {
         self.prepare_match();
         self.note_signal_probe(signal_name);
-        let index = self.pending_signals.iter().position(|(name, _, idx)| {
-            stash_probe(name == signal_name && !self.race_reserved_signal_events.contains(idx))
-        })?;
-        let (_name, payload, idx) = self.pending_signals.remove(index)?;
+        let (push, _) = self
+            .pending_signals
+            .of_name(signal_name)
+            .find(|(_, entry)| {
+                stash_probe(!self.race_reserved_signal_events.contains(&entry.index))
+            })?;
+        let entry = self.pending_signals.remove(push)?;
         // Already inserted by `stash_signal`, but re-asserting here makes the
         // no-double-delivery invariant explicit at the point of use (mirrors
         // `claim_pending_signal`).
-        self.consumed_signal_events.insert(idx);
-        Some(payload)
+        self.consumed_signal_events.insert(entry.index);
+        Some(entry.payload)
+    }
+
+    /// Takes the stashed `signal_name` signal of event `at`, if any (issue
+    /// #2349).
+    ///
+    /// A stash entry names its own `SignalReceived` event. So only a signal
+    /// event of that name can have an entry. Any other event needs no search.
+    fn take_stashed_signal_at(&mut self, at: usize, signal_name: &str) -> Option<Value> {
+        if !matches!(
+            &self.events[at],
+            WorkflowEvent::SignalReceived { signal_name: name, .. } if name == signal_name
+        ) {
+            return None;
+        }
+        let (push, _) = self
+            .pending_signals
+            .of_name(signal_name)
+            .find(|(_, entry)| stash_probe(entry.index == at))?;
+        self.pending_signals.remove(push).map(|entry| entry.payload)
     }
 
     /// Settle the bookkeeping for a signal-branch win of a signal-or-deadline
@@ -5127,13 +5152,17 @@ impl HistoryMatcher {
         // decides, so they compete at their recorded index during the scan
         // below.
         let race_pos = self.cursor;
-        if let Some(index) = self
+        let early = self
             .pending_signals
-            .iter()
-            .position(|(name, _, idx)| stash_probe(name == signal_name && *idx < race_pos))
-            && let Some((_name, payload, _idx)) = self.pending_signals.remove(index)
+            .of_name(signal_name)
+            .find(|(_, entry)| stash_probe(entry.index < race_pos))
+            .map(|(push, _)| push);
+        if let Some(push) = early
+            && let Some(entry) = self.pending_signals.remove(push)
         {
-            return SignalOrTimerMatch::SignalWon { payload };
+            return SignalOrTimerMatch::SignalWon {
+                payload: entry.payload,
+            };
         }
 
         if !replaying {
@@ -5184,10 +5213,7 @@ impl HistoryMatcher {
                 // still undelivered in the pending buffer) competes at its
                 // recorded position: if it precedes the race's TimerFired in
                 // history, the signal branch wins.
-                if let Some(index) = self.pending_signals.iter().position(|(name, _, idx)| {
-                    stash_probe(*idx == scan_cursor && name == signal_name)
-                }) && let Some((_name, payload, _idx)) = self.pending_signals.remove(index)
-                {
+                if let Some(payload) = self.take_stashed_signal_at(scan_cursor, signal_name) {
                     self.settle_race_signal_won(scan_cursor, first_interleaved_command, timer_id);
                     return SignalOrTimerMatch::SignalWon { payload };
                 }
@@ -6948,11 +6974,7 @@ impl HistoryMatcher {
     /// is still available anywhere.
     #[must_use]
     pub fn has_unconsumed_signal(&self, signal_name: &str) -> bool {
-        if self
-            .pending_signals
-            .iter()
-            .any(|(name, _, _)| stash_probe(name == signal_name))
-        {
+        if self.pending_signals.contains_name(signal_name) {
             return true;
         }
         self.events
@@ -7023,18 +7045,14 @@ impl HistoryMatcher {
         from: SignalCandidateCursor,
     ) -> Option<(SignalCandidateCursor, usize, Value)> {
         let event_start = match from {
-            SignalCandidateCursor::Buffered(position) => {
-                let buffered = self
-                    .pending_signals
-                    .iter()
-                    .enumerate()
-                    .skip(position)
-                    .find(|(_, (name, _, _))| stash_probe(name == signal_name));
-                if let Some((offset, (_, payload, index))) = buffered {
+            SignalCandidateCursor::Buffered(from) => {
+                let buffered = self.pending_signals.of_name_from(signal_name, from).next();
+                if let Some((push, entry)) = buffered {
+                    stash_probe(true);
                     return Some((
-                        SignalCandidateCursor::Buffered(offset + 1),
-                        *index,
-                        payload.clone(),
+                        SignalCandidateCursor::Buffered(push + 1),
+                        entry.index,
+                        entry.payload.clone(),
                     ));
                 }
                 self.cursor
@@ -7066,9 +7084,8 @@ impl HistoryMatcher {
     ) -> impl Iterator<Item = (usize, &'s Value)> + 's {
         let buffered = self
             .pending_signals
-            .iter()
-            .filter(move |(name, _, _)| stash_probe(name == signal_name))
-            .map(|(_, payload, index)| (*index, payload));
+            .of_name(signal_name)
+            .map(|(_, entry)| (entry.index, &entry.payload));
         let recorded =
             self.events
                 .iter()
@@ -7084,29 +7101,37 @@ impl HistoryMatcher {
         buffered.chain(recorded)
     }
 
-    /// Position in `pending_signals` of the first buffered `signal_name`
-    /// signal that `predicate` accepts (issue #1985).
+    /// Takes the payload of the first buffered `signal_name` signal that
+    /// `predicate` accepts (issue #1985).
     ///
     /// With no predicate this is the first buffered signal of that name. Each
     /// same-name payload that the predicate rejects is recorded in
-    /// `predicate_rejected_signal_events`.
-    fn claim_buffered_signal_position(
+    /// `predicate_rejected_signal_events`. The search reads the entries of
+    /// one name only (issue #2349).
+    fn claim_buffered_signal(
         &mut self,
         signal_name: &str,
         predicate: Option<SignalPredicate<'_>>,
-    ) -> Option<usize> {
-        for (position, (name, payload, index)) in self.pending_signals.iter().enumerate() {
-            if !stash_probe(name == signal_name) {
-                continue;
-            }
+    ) -> Option<Value> {
+        if self.pending_signals.is_empty() {
+            return None;
+        }
+        let mut claimed = None;
+        for (push, entry) in self.pending_signals.of_name(signal_name) {
+            stash_probe(true);
             match predicate {
-                Some(accepts) if !accepts(*index, payload) => {
-                    self.predicate_rejected_signal_events.insert(*index);
+                Some(accepts) if !accepts(entry.index, &entry.payload) => {
+                    self.predicate_rejected_signal_events.insert(entry.index);
                 }
-                _ => return Some(position),
+                _ => {
+                    claimed = Some(push);
+                    break;
+                }
             }
         }
-        None
+        self.pending_signals
+            .remove(claimed?)
+            .map(|entry| entry.payload)
     }
 
     /// Hide every event at or after `horizon` (issue #1984).
@@ -7119,11 +7144,7 @@ impl HistoryMatcher {
             return None;
         }
         let tail = self.events.split_off(horizon);
-        let (kept, hidden_signals): (VecDeque<_>, VecDeque<_>) =
-            std::mem::take(&mut self.pending_signals)
-                .into_iter()
-                .partition(|(_, _, idx)| *idx < horizon);
-        self.pending_signals = kept;
+        let hidden_signals = self.pending_signals.split_off_from(horizon);
         Some(ViewCut {
             tail,
             hidden_signals,
@@ -7135,10 +7156,7 @@ impl HistoryMatcher {
     pub(crate) fn restore_view(&mut self, cut: ViewCut) {
         let horizon = self.events.len();
         self.events.extend(cut.tail);
-        self.pending_signals.extend(cut.hidden_signals);
-        self.pending_signals
-            .make_contiguous()
-            .sort_by_key(|(_, _, idx)| *idx);
+        self.pending_signals.restore(cut.hidden_signals);
         if cut.cursor > horizon {
             self.cursor = cut.cursor;
         }
@@ -16124,15 +16142,15 @@ mod activity_scan_tests {
         signal_name: &str,
         predicate: Option<SignalPredicate<'_>>,
     ) -> Option<usize> {
-        for (position, (name, payload, index)) in m.pending_signals.iter().enumerate() {
-            if name != signal_name {
+        for (push, entry) in m.pending_signals.numbered() {
+            if entry.name != signal_name {
                 continue;
             }
             match predicate {
-                Some(accepts) if !accepts(*index, payload) => {
-                    m.predicate_rejected_signal_events.insert(*index);
+                Some(accepts) if !accepts(entry.index, &entry.payload) => {
+                    m.predicate_rejected_signal_events.insert(entry.index);
                 }
-                _ => return Some(position),
+                _ => return Some(push),
             }
         }
         None
@@ -16145,10 +16163,12 @@ mod activity_scan_tests {
         tolerate_interleaved: Option<&str>,
         predicate: Option<SignalPredicate<'_>>,
     ) -> HistoryMatch {
-        if let Some(index) = oracle_claim_buffered_signal_position(m, signal_name, predicate)
-            && let Some((_name, payload, _idx)) = m.pending_signals.remove(index)
+        if let Some(push) = oracle_claim_buffered_signal_position(m, signal_name, predicate)
+            && let Some(entry) = m.pending_signals.remove(push)
         {
-            return HistoryMatch::Matched { output: payload };
+            return HistoryMatch::Matched {
+                output: entry.payload,
+            };
         }
 
         m.advance_to_next_unconsumed_event();
@@ -16269,31 +16289,36 @@ mod activity_scan_tests {
         m.prepare_match();
         m.note_signal_probe(signal_name);
 
-        let (matched, remaining): (VecDeque<_>, VecDeque<_>) =
-            std::mem::take(&mut m.pending_signals)
-                .into_iter()
-                .partition(|(name, _, idx)| {
-                    name == signal_name && !m.race_reserved_signal_events.contains(idx)
-                });
-        m.pending_signals = remaining;
-        for (_, _, idx) in &matched {
-            m.consumed_signal_events.insert(*idx);
+        let pushes: Vec<usize> = m
+            .pending_signals
+            .numbered()
+            .filter(|(_, entry)| {
+                entry.name == signal_name && !m.race_reserved_signal_events.contains(&entry.index)
+            })
+            .map(|(push, _)| push)
+            .collect();
+        let matched: Vec<StashedSignal> = pushes
+            .into_iter()
+            .filter_map(|push| m.pending_signals.remove(push))
+            .collect();
+        for entry in &matched {
+            m.consumed_signal_events.insert(entry.index);
         }
         matched
             .into_iter()
-            .map(|(_, payload, idx)| (idx, payload))
+            .map(|entry| (entry.index, entry.payload))
             .collect()
     }
 
     fn oracle_try_claim_pending_signal(m: &mut HistoryMatcher, signal_name: &str) -> Option<Value> {
         m.prepare_match();
         m.note_signal_probe(signal_name);
-        let index = m.pending_signals.iter().position(|(name, _, idx)| {
-            name == signal_name && !m.race_reserved_signal_events.contains(idx)
+        let (push, _) = m.pending_signals.numbered().find(|(_, entry)| {
+            entry.name == signal_name && !m.race_reserved_signal_events.contains(&entry.index)
         })?;
-        let (_name, payload, idx) = m.pending_signals.remove(index)?;
-        m.consumed_signal_events.insert(idx);
-        Some(payload)
+        let entry = m.pending_signals.remove(push)?;
+        m.consumed_signal_events.insert(entry.index);
+        Some(entry.payload)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -16306,13 +16331,17 @@ mod activity_scan_tests {
         let replaying = m.prepare_match();
 
         let race_pos = m.cursor;
-        if let Some(index) = m
+        let early = m
             .pending_signals
-            .iter()
-            .position(|(name, _, idx)| name == signal_name && *idx < race_pos)
-            && let Some((_name, payload, _idx)) = m.pending_signals.remove(index)
+            .numbered()
+            .find(|(_, entry)| entry.name == signal_name && entry.index < race_pos)
+            .map(|(push, _)| push);
+        if let Some(push) = early
+            && let Some(entry) = m.pending_signals.remove(push)
         {
-            return SignalOrTimerMatch::SignalWon { payload };
+            return SignalOrTimerMatch::SignalWon {
+                payload: entry.payload,
+            };
         }
 
         if !replaying {
@@ -16358,14 +16387,18 @@ mod activity_scan_tests {
 
         while scan_cursor < m.events.len() {
             if m.is_consumed(scan_cursor) {
-                if let Some(index) = m
+                let stashed = m
                     .pending_signals
-                    .iter()
-                    .position(|(name, _, idx)| *idx == scan_cursor && name == signal_name)
-                    && let Some((_name, payload, _idx)) = m.pending_signals.remove(index)
+                    .numbered()
+                    .find(|(_, entry)| entry.index == scan_cursor && entry.name == signal_name)
+                    .map(|(push, _)| push);
+                if let Some(push) = stashed
+                    && let Some(entry) = m.pending_signals.remove(push)
                 {
                     m.settle_race_signal_won(scan_cursor, first_interleaved_command, timer_id);
-                    return SignalOrTimerMatch::SignalWon { payload };
+                    return SignalOrTimerMatch::SignalWon {
+                        payload: entry.payload,
+                    };
                 }
                 scan_cursor += 1;
                 continue;
@@ -16463,7 +16496,7 @@ mod activity_scan_tests {
     fn oracle_has_unconsumed_signal(m: &HistoryMatcher, signal_name: &str) -> bool {
         if m.pending_signals
             .iter()
-            .any(|(name, _, _)| name == signal_name)
+            .any(|entry| entry.name == signal_name)
         {
             return true;
         }
@@ -16480,8 +16513,8 @@ mod activity_scan_tests {
         let buffered = m
             .pending_signals
             .iter()
-            .filter(|(name, _, _)| name == signal_name)
-            .map(|(_, payload, index)| (*index, payload.clone()));
+            .filter(|entry| entry.name == signal_name)
+            .map(|entry| (entry.index, entry.payload.clone()));
         let recorded = m
             .events
             .iter()
@@ -16722,7 +16755,7 @@ mod activity_scan_tests {
                 },
                 "pad {pad}"
             );
-            let stashed: Vec<usize> = matcher.pending_signals.iter().map(|s| s.2).collect();
+            let stashed: Vec<usize> = matcher.pending_signals.iter().map(|s| s.index).collect();
             assert_eq!(stashed, vec![1 + pad, 2 + pad], "pad {pad}");
             for want in 1..=3 {
                 assert_eq!(
@@ -17466,6 +17499,7 @@ mod activity_scan_tests {
                     apply(&mut oracle, &mut oracle_cut, &pools, op, appended.as_ref(), true);
                 prop_assert_eq!(&got, &want, "step {} {:?}", step, op);
                 prop_assert_eq!(state(&indexed), state(&oracle), "step {} {:?}", step, op);
+                indexed.pending_signals.check();
             }
         }
     }
@@ -19120,10 +19154,7 @@ mod scan_fanout_tests {
 
     /// The event indices of the stashed signals, in stash order.
     fn stashed(m: &HistoryMatcher) -> Vec<usize> {
-        m.pending_signals
-            .iter()
-            .map(|(_, _, index)| *index)
-            .collect()
+        m.pending_signals.iter().map(|entry| entry.index).collect()
     }
 
     /// The scan crosses a deadline timer of its own signal, and does not
