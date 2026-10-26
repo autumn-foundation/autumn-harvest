@@ -12,6 +12,15 @@
 //! [`memory`] and [`loop_guard`]. [`ResponseCache`] serves an identical
 //! model call across runs. The `eval` feature adds the `eval` module.
 //! That module re-drives a recorded run with a candidate model or prompt.
+//! The `sandbox` feature adds the `sandbox` module. Its `SandboxTool` runs
+//! agent code in a sandbox.
+//!
+//! A durable [`Agent`] (issue #2263) is a named, long-lived actor. It is the
+//! agent loop inside a keyed entity: the workflow `agent`, with its
+//! [`AgentId`] `<kind>/<name>` as the workflow id. It handles one op at a
+//! time from a durable inbox, and it survives a crash. A message can queue,
+//! steer the running op, or interrupt it (issue #2265). See section 15 of
+//! `docs/agent-adapter.md`.
 //!
 //! The [`mesh`] module lets a run delegate a task to a [`Peer`]. A
 //! [`Mandate`] bounds the delegation tree. The [`flow`] module gates a

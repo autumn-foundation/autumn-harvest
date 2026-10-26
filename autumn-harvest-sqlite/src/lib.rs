@@ -146,15 +146,15 @@
 //!   normalized — exactly as the Postgres worker's `handle_activity_result` does —
 //!   into a NON-RETRYABLE `PayloadTooLarge` `ActivityFailed` (the workflow observes
 //!   the failure and drives its own error branch) rather than stored as an unbounded
-//!   `ActivityCompleted`. The **activity INPUT** (schedule time), **side-effect
-//!   value**, and **continue-as-new input** caps are enforced by the reused core
-//!   [`WorkflowContext`] itself (the executor threads the same global caps), so the
-//!   only boundaries this backend enforces directly are the two ingress rejections
-//!   and the activity-result normalization. All caps use the GLOBAL default constants
-//!   (this backend has no per-workflow / per-activity cap override); a `0` cap means
-//!   uncapped, matching the core convention. Child-workflow input and external-signal
-//!   payloads have no cap surface because those primitives are
-//!   [`SqliteError::Unsupported`] here.
+//!   `ActivityCompleted`. The reused core [`WorkflowContext`] enforces the
+//!   **activity INPUT** (schedule time), **side-effect value**, **continue-as-new
+//!   input**, **child-workflow input** and **external-signal payload** caps itself.
+//!   The last two apply because this backend supports child workflows and external
+//!   signals (issue #2026). The executor threads the same global caps into the
+//!   context. So the only boundaries this backend enforces directly are the two
+//!   ingress rejections and the activity-result normalization. All caps use the
+//!   GLOBAL default constants (this backend has no per-workflow / per-activity cap
+//!   override); a `0` cap means uncapped, matching the core convention.
 //!
 //! # Crash-model bound (accepted non-goal)
 //!
@@ -293,16 +293,18 @@
 //! This backend's execution state model is a strict subset of the core's. An
 //! active run is only ever `RUNNING` (there is no `PAUSED`). The terminal states
 //! it writes are `COMPLETED`, `FAILED`, `CANCELLED` and `TERMINATED` (issue
-//! #2021), plus the `CONTINUED_AS_NEW` SEAL of the reuse "replace" cases. It never
-//! writes `TIMED_OUT`. The reuse lookup skips `TERMINATED` and `CONTINUED_AS_NEW`,
-//! so the reuse matrix is realized over
-//! `{none, RUNNING, COMPLETED, FAILED, CANCELLED}` priors only:
+//! #2021), and `TIMED_OUT` (issue #2029). It also writes the `CONTINUED_AS_NEW`
+//! SEAL, for the reuse "replace" cases and for `continue_as_new` (issue #2023).
+//! The reuse lookup skips `TERMINATED` and `CONTINUED_AS_NEW`, so the reuse
+//! matrix is realized over
+//! `{none, RUNNING, COMPLETED, FAILED, CANCELLED, TIMED_OUT}` priors only:
 //!
 //! - `AllowDuplicate` — attach to / return any non-sealed prior; else fresh.
 //! - `RejectDuplicate` — [`SqliteError::AlreadyExists`] for any non-sealed prior;
 //!   else fresh (a SEALED-only prior is invisible, so it creates fresh).
 //! - `AllowDuplicateFailedOnly` — replace (seal + fresh) a FAILED or `CANCELLED`
-//!   prior, as core does; return a RUNNING/COMPLETED prior unchanged; else fresh.
+//!   prior, as core does; return a RUNNING/COMPLETED/`TIMED_OUT` prior unchanged;
+//!   else fresh.
 //!   A `CANCELLED` prior comes from [`SqliteRuntime::cancel`] (issue #2021) or
 //!   from another run's cancel (issue #2026).
 //! - `TerminateIfRunning` — cancel (record `WorkflowCancelled` + clean up the
@@ -321,6 +323,8 @@
 //! drive replays the body with `ctx.cancellation_reason()` set. The body can run
 //! cleanup activities. The run ends `CANCELLED` when the body returns, when it
 //! blocks with no activity task left, or when the cycle diverges or deadlocks.
+//! An open `ctx.non_cancellable` block defers the seal of a blocked run until
+//! the block closes (issue #1984).
 //! [`SqliteRuntime::terminate`] ends the run `TERMINATED` at once, and the body
 //! does not run again.
 //!
@@ -357,6 +361,10 @@
 //!   batch with a durable awaitable (`RunLocalActivity`, issue #950). Postgres
 //!   rejects both shapes too. This backend also rejects a second local
 //!   activity in one batch.
+//! - **A durable command that the last cycle leaves unawaited.** A run that
+//!   returns with an unawaited activity, `ctx.timer` or signal wait fails by
+//!   name (`ScheduleActivity`, `StartTimer`, `WaitForSignal`). This backend
+//!   accepts an unawaited `ctx.start_timer`, which records `TimerStarted`.
 //!
 //! The command-name table (`runtime.rs`) is EXHAUSTIVE — a future core
 //! `WorkflowCommand` variant is a compile error in this backend, forcing an
@@ -380,6 +388,9 @@
 //! session-acquire-only `schedule_to_start_override`, all outside the subset) —
 //! never silently ignored, so a workflow's declared setting can never take
 //! silently-wrong effect.
+//! `result_writer` (the fan-out result writer, issue #1986) is REJECTED LOUDLY
+//! too, because it needs a `PayloadStore`. This backend has no store, so the
+//! core context fails the fan-out first.
 //!
 //! ## Long-lived runs (issue #2023)
 //!
@@ -460,6 +471,9 @@
 //! - **HONORED:** `name` (the registration key), `handler` (the dispatch fn),
 //!   `execution_timeout` (#243) and the workflow-level `retry_policy` (#523). See
 //!   [issue #2029](#timers-mutex-local-activities-timeout-and-retry-issue-2029).
+//! - **NOT AUDITED:** `chain_execution_timeout` (#617). `register_workflow`
+//!   neither honors nor rejects it. This backend drops it silently. A
+//!   continue-as-new chain (issue #2023) therefore runs with no chain cap.
 //!
 //! Honoring the rejected admission gates is real, out-of-v0.1-scope work tracked
 //! as issue #1068 follow-ups — hence rejection rather than a partial,
@@ -509,7 +523,8 @@
 //!   - `default_schedule_to_close` on a local activity, as on Postgres.
 //!   - A raised `max_input_bytes` / `max_result_bytes` (#252).
 //! - **ACCEPTED, inert:** `name` (registration key), `module` (diagnostics), and a lone
-//!   `concurrency_key` (groups a cap that is not set).
+//!   `concurrency_key` (groups a cap that is not set). Also `input_schema` and
+//!   `output_schema`: only the schema contract reads them (issue #1994).
 //! - **RUN:** `handler`. `register_activity` awaits the `#[activity]` body with a
 //!   real `ActivityContext` (issue #2024). `register_activity_with_body` runs a
 //!   synchronous closure in its place, after the same audit.
@@ -520,6 +535,8 @@
 //! fires after the signals of the cycle (issue #1071). So every signal API
 //! works:
 //! - the plain waits `ctx.wait_for_signal` / `ctx.receive_signal`;
+//! - the payload-matching waits `ctx.wait_for_signal_matching` /
+//!   `ctx.receive_signal_matching` (issue #1985);
 //! - the non-blocking reads `ctx.drain_signals` / `ctx.try_receive_signal`
 //!   (#775);
 //! - the push handlers of `ctx.register_signal_handler` (#546), also with
@@ -571,25 +588,23 @@
 //! orphaned timer.
 //!
 //! **Known limitation — a plain `wait_for_signal(name)` composed with a
-//! `wait_for_signal_timeout(name, ...)` on the SAME signal name concurrently** (e.g.
-//! `tokio::join!(ctx.wait_for_signal("go"), ctx.wait_for_signal_timeout("go", ...))`)
-//! is subject to a pre-existing limitation of the *core* determinism engine, NOT
-//! this backend: the sibling timeout wait's deadline (`__signal_timeout:{seq}:go`)
-//! is a legitimate durable timer, so a signal arriving after that deadline records
-//! `TimerFired` before `SignalReceived(go)`; the core `HistoryMatcher::match_signal`
-//! path (the plain wait) does not skip an interleaved `TimerFired`, so replay cannot
-//! consume the delivered signal and the run stays parked. This is NOT a backend
-//! ingest/correlation gap — even exact per-wait timer correlation cannot fix it,
-//! because the deadline `TimerFired` is in history regardless of ingest order, and
-//! `match_signal` still stops at it (verified on the core `WorkflowReplayer`:
-//! `[…, TimerFired(__signal_timeout:0:go), SignalReceived(go)]` for a plain-wait
-//! handler → `NonDeterminismDetected`). Tracked as the same core-matcher class as
-//! #1071 (the interleaved-`TimerFired` intolerance also behind the declined
-//! activity-vs-timer reorder). The **supported** path for a signal-with-deadline is
-//! `wait_for_signal_timeout` / `receive_signal_timeout` used ALONE (which arms
-//! exactly the `__signal_timeout` deadline this backend reorders, and is covered by
-//! the late-signal-vs-deadline tests) — do not also add a plain `wait_for_signal`
-//! on the same name in the same race.
+//! `wait_for_signal_timeout(name, ...)` on the SAME signal name concurrently.**
+//! An example is
+//! `tokio::join!(ctx.wait_for_signal("go"), ctx.wait_for_signal_timeout("go", ...))`.
+//! The *core* determinism engine does not support this shape. The gap is in how
+//! the core matcher reads history, NOT in this backend's ingest or correlation.
+//! Since issue #1071, the core `HistoryMatcher::match_signal` scan crosses a
+//! same-name `__signal_timeout:{seq}:go` deadline and its `TimerFired`. So the
+//! plain-wait history
+//! `[…, TimerFired(__signal_timeout:0:go), SignalReceived(go)]` replays as
+//! `ReplaySucceeded` on the core `WorkflowReplayer`. The scan treats a same-name
+//! deadline as spent. It cannot tell a spent deadline from a same-name race that
+//! is still open. So the core marks the concurrent composition unsupported
+//! (issue #1071). The **supported** path for a signal-with-deadline is
+//! `wait_for_signal_timeout` or `receive_signal_timeout` used ALONE. That path
+//! arms exactly the `__signal_timeout` deadline that this backend reorders. The
+//! late-signal-vs-deadline tests cover it. Do not also add a plain
+//! `wait_for_signal` on the same name in the same race.
 //!
 //! [`SqliteRuntime::send_signal`](crate::SqliteRuntime::send_signal) validates
 //! the target at the boundary. An unknown execution is
@@ -682,17 +697,13 @@
 //!   handler-panic containment (issue #782). Write bodies to be idempotent
 //!   regardless — a caught panic is a retry, and (as with any failure) the body
 //!   may have run partially.
-//! - **Mixed timer + activity batch.** A single decision cycle emitting BOTH a
-//!   timer and an activity (`tokio::join!`) records its schedule events in COMMAND
-//!   order and drives to completion + replays cleanly on the core
-//!   `WorkflowReplayer` — **when the activity branch is polled first**
-//!   (`join!(activity, timer)`). The reverse order (`join!(timer, activity)`) is a
-//!   pre-existing limitation of the *core* determinism engine, NOT this backend:
-//!   `HistoryMatcher::match_timer_strict` breaks its forward `TimerFired` scan at
-//!   an unconsumed `ActivityScheduled`, so the core `WorkflowReplayer` rejects even
-//!   an ideal timer-first history (`NonDeterminismDetected(EarlyCompletion)`) —
-//!   shared with the Postgres engine. Put the activity branch first in a mixed
-//!   `join!`.
+//! - **Mixed timer + activity batch.** A decision cycle can emit BOTH a timer
+//!   and an activity (`tokio::join!`). The cycle records their schedule events
+//!   in COMMAND order. In either join order, the run drives to completion and
+//!   its history replays on the core `WorkflowReplayer`. Before issue #1071, the
+//!   core `HistoryMatcher::match_timer_strict` stopped its `TimerFired` scan at
+//!   an unconsumed `ActivityScheduled`. The core then rejected an ideal timer-first
+//!   history. The scan now crosses that event to reach its own `TimerFired`.
 //!
 //! # Queries (issue #2022)
 //!
