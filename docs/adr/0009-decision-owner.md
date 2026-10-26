@@ -595,7 +595,7 @@ with the shared head scan. Stage 1b moves workflow tasks off the claim loop.
 ### 14. Group commit: one transaction for several executions
 
 Issue #2256 builds this decision.
-[`DESIGN-2256.md`](../../DESIGN-2256.md) section 1 is the design note.
+[`DESIGN-2256.md`](../design/DESIGN-2256.md) section 1 is the design note.
 
 - `group_commit::GroupCommit` keeps one lane per shard and partition. A
   lane has `width` slots and a queue.

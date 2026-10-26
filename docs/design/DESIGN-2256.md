@@ -1,6 +1,6 @@
 # Design: issue #2256, group commit across executions in one decision partition
 
-A later stage of epic #2247. [ADR 0009](docs/adr/0009-decision-owner.md)
+A later stage of epic #2247. [ADR 0009](../adr/0009-decision-owner.md)
 fixes the owner protocol. Issue #2255 moved workflow tasks to the owner
 decider. This issue lets an owner commit the decisions of several executions
 of one partition in one Postgres transaction.
@@ -301,7 +301,7 @@ Accepted as is:
 
 ## 6. Measurements
 
-[`performance-group-commit.md`](docs/performance-group-commit.md) has the
+[`performance-group-commit.md`](../performance-group-commit.md) has the
 tables. In short, on a 4-CPU host with Postgres on the same host and
 `synchronous_commit = on`:
 

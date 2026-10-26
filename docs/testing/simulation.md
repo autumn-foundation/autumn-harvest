@@ -498,7 +498,7 @@ consume every signal. Before issue #2294, it failed on an invariant only.
 ## The group commit simulation
 
 Issue #2256. `autumn_harvest::dst::group` models the lanes of
-`autumn_harvest::group_commit`. [`DESIGN-2256.md`](../../DESIGN-2256.md)
+`autumn_harvest::group_commit`. [`DESIGN-2256.md`](../design/DESIGN-2256.md)
 is the design note.
 
 ### The model
