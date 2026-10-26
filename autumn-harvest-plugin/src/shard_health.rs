@@ -769,9 +769,10 @@ struct MigrationVersionRow {
     version: String,
 }
 
-/// Sibling of `preflight.rs`'s `required_migration_versions` (clone class,
-/// tracked in issue #2358). The two bodies must stay byte-identical.
-/// `docs/audits/required-migration-versions-sync.py` gates CI on that.
+/// This function is a sibling of `preflight.rs`'s `required_migration_versions`.
+/// Both copies form one clone class (issue #2358).
+/// The two bodies must stay byte-identical.
+/// `docs/audits/required-migration-versions-sync.py` fails CI when they differ.
 /// A fix here must land in both files in the same change.
 fn required_migration_versions() -> Result<Vec<String>, String> {
     let migrations = <diesel_migrations::EmbeddedMigrations as MigrationSource<Pg>>::migrations(
