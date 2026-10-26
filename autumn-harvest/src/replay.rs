@@ -54,6 +54,24 @@ impl Hasher for EventIndexHasher {
 /// A set of event indices, hashed with [`EventIndexHasher`].
 type EventIndexSet = HashSet<usize, BuildHasherDefault<EventIndexHasher>>;
 
+/// The consumed sets of a matcher, borrowed apart from its scan index.
+struct ConsumedView<'m> {
+    out_of_order: &'m EventIndexSet,
+    signals: &'m EventIndexSet,
+    transparent: &'m EventIndexSet,
+}
+
+impl ConsumedView<'_> {
+    /// Whether a scan treats the event at `index` as consumed.
+    fn contains(&self, index: usize) -> bool {
+        #[cfg(test)]
+        crate::activity_scan_index::steps::count();
+        self.out_of_order.contains(&index)
+            || self.signals.contains(&index)
+            || self.transparent.contains(&index)
+    }
+}
+
 /// The fewest events that an activity terminal scan walks one by one before
 /// it can move to the activity scan index (issue #2330).
 ///
@@ -1504,11 +1522,28 @@ impl HistoryMatcher {
 
     /// Returns `true` if the event at `index` has already been consumed out-of-order.
     fn is_consumed(&self, index: usize) -> bool {
-        #[cfg(test)]
-        crate::activity_scan_index::steps::count();
-        self.consumed_out_of_order_events.contains(&index)
-            || self.consumed_signal_events.contains(&index)
-            || self.transparent_events.contains(&index)
+        ConsumedView {
+            out_of_order: &self.consumed_out_of_order_events,
+            signals: &self.consumed_signal_events,
+            transparent: &self.transparent_events,
+        }
+        .contains(index)
+    }
+
+    /// The scan index and the consumed sets, borrowed apart (issue #2338).
+    ///
+    /// A scan reads the index with a consumed test. A move of the index out
+    /// of the matcher would copy it twice and build an empty one, on each
+    /// indexed scan. This split borrow costs nothing.
+    fn index_and_consumed(&mut self) -> (&mut ActivityScanIndex, ConsumedView<'_>) {
+        (
+            &mut self.activity_scan_index,
+            ConsumedView {
+                out_of_order: &self.consumed_out_of_order_events,
+                signals: &self.consumed_signal_events,
+                transparent: &self.transparent_events,
+            },
+        )
     }
 
     fn stash_signal(&mut self, cursor: usize, signal_name: String, payload: Value) {
@@ -1934,10 +1969,32 @@ impl HistoryMatcher {
     /// move. Most terminals are near their start, so most scans end on the
     /// walk and build no index. A scan in a wide fan-out continues on the
     /// scan index.
+    #[inline]
     fn find_scan_stop(
         &mut self,
         target: ScanTarget<'_>,
         from: usize,
+    ) -> (Option<usize>, Option<usize>) {
+        // Each arm gives the walk its own copy with a fixed target. The stop
+        // test then compiles to a direct match, as in the old walk.
+        match target {
+            ScanTarget::Activity(id) => {
+                self.walk_to_stop(target, from, |role| ScanTarget::Activity(id).stops_at(role))
+            }
+            ScanTarget::Timer(id) => {
+                self.walk_to_stop(target, from, |role| ScanTarget::Timer(id).stops_at(role))
+            }
+        }
+    }
+
+    /// The walk of [`Self::find_scan_stop`]. `stops` is the stop test of
+    /// `target`.
+    #[inline]
+    fn walk_to_stop(
+        &mut self,
+        target: ScanTarget<'_>,
+        from: usize,
+        stops: impl Fn(ScanRole<'_>) -> bool,
     ) -> (Option<usize>, Option<usize>) {
         let len = self.events.len();
         let mut first_interleaved = None;
@@ -1950,7 +2007,7 @@ impl HistoryMatcher {
             }
             if !self.is_consumed(at) {
                 match Self::activity_scan_role(&self.events[at]) {
-                    role if target.stops_at(role) => {
+                    role if stops(role) => {
                         ended = Some(Some(at));
                         break;
                     }
@@ -1981,11 +2038,9 @@ impl HistoryMatcher {
         if at == len {
             return (None, first_interleaved);
         }
-        let mut index = std::mem::take(&mut self.activity_scan_index);
-        index.extend(&self.events, Self::activity_scan_role);
-        let found = self.find_indexed_terminal(&mut index, target, at, first_interleaved);
-        self.activity_scan_index = index;
-        found
+        self.activity_scan_index
+            .extend(&self.events, Self::activity_scan_role);
+        self.find_indexed_terminal(target, at, first_interleaved)
     }
 
     /// Whether a scan that walked `walked` events moves to the index.
@@ -2017,25 +2072,26 @@ impl HistoryMatcher {
     /// stash consumes a barrier only, so the stop stays the same.
     fn find_indexed_terminal(
         &mut self,
-        index: &mut ActivityScanIndex,
         target: ScanTarget<'_>,
         mut from: usize,
         mut first_interleaved: Option<usize>,
     ) -> (Option<usize>, Option<usize>) {
         // A cut view hides the tail, so no position at or past `len` counts.
         let len = self.events.len();
+        let (index, consumed) = self.index_and_consumed();
         let stop = index
-            .first_stop(target, from, |p| self.is_consumed(p))
+            .first_stop(target, from, |p| consumed.contains(p))
             .filter(|&p| p < len);
         let end = stop.unwrap_or(len);
         loop {
+            let (index, consumed) = self.index_and_consumed();
             let barrier = index
-                .first_barrier(from, |p| self.is_consumed(p))
+                .first_barrier(from, |p| consumed.contains(p))
                 .filter(|&p| p < end);
             if first_interleaved.is_none() {
                 let limit = barrier.unwrap_or(end);
                 first_interleaved = index
-                    .first_interleaved(from, |p| self.is_consumed(p))
+                    .first_interleaved(from, |p| consumed.contains(p))
                     .filter(|&p| p < limit);
             }
             match barrier {
@@ -2735,18 +2791,22 @@ impl HistoryMatcher {
             }
             return;
         }
-        let mut index = std::mem::take(&mut self.activity_scan_index);
-        index.extend(&self.events, Self::activity_scan_role);
+        self.activity_scan_index
+            .extend(&self.events, Self::activity_scan_role);
         let mut next = from;
-        // A cut view hides the tail, so no position at or past `len` counts.
-        while let Some(at) = index
-            .first_external_terminal(next, |p| self.is_consumed(p))
-            .filter(|&p| p < len)
-        {
+        loop {
+            let (index, consumed) = self.index_and_consumed();
+            // A cut view hides the tail, so no position at or past `len`
+            // counts.
+            let Some(at) = index
+                .first_external_terminal(next, |p| consumed.contains(p))
+                .filter(|&p| p < len)
+            else {
+                return;
+            };
             self.resolve_stashed_terminal(at);
             next = at + 1;
         }
-        self.activity_scan_index = index;
     }
 
     /// Resolves the stashed entry that the unconsumed event at `at`
@@ -4114,10 +4174,10 @@ impl HistoryMatcher {
         // The timer scan has the same rules as the activity scan. Only the
         // stop differs: the fire of this timer, not an activity event. A
         // foreign fire is a step, and a consumed fire is skipped. Signals
-        // and external events are stashed. Interleaved sibling commands
-        // keep the first one as the rewind cursor, and `settle_terminal`
-        // rewinds to it, so each sibling matcher re-scans in program order
-        // (issues #768 and #1071). A timer fan-out reads the scan index, so
+        // and external events are stashed. The first interleaved sibling
+        // command becomes the rewind cursor. `settle_terminal` rewinds to
+        // it, so each sibling matcher scans again in program order (issues
+        // #768 and #1071). A timer fan-out reads the scan index, so
         // its replay is not O(N²) (issue #2338).
         let (fire, first_interleaved_command) =
             self.find_scan_stop(ScanTarget::Timer(timer_id), self.cursor);
@@ -5414,7 +5474,10 @@ impl HistoryMatcher {
         while at < len && !self.leaves_walk(at - from, true) {
             #[cfg(test)]
             crate::activity_scan_index::steps::count();
-            if Self::activity_scan_role(&self.events[at]) == ScanRole::ChildTerminal(child_id) {
+            if let WorkflowEvent::ChildWorkflowCompleted { child_id: id, .. }
+            | WorkflowEvent::ChildWorkflowFailed { child_id: id, .. } = &self.events[at]
+                && *id == child_id
+            {
                 self.activity_scan_index.note_walk(at - from);
                 return Some(at);
             }

@@ -170,8 +170,8 @@ MATCH_ACTIVITY_PROFILE_N=1000 valgrind --tool=dhat --dhat-out-file=dhat.json "$B
 ## Issue #2338: the external, timer and child scans
 
 **Outcome: shipped.** Three more scans now read the same index. At N=1000 the
-`fanout_extsig` bench costs AFTER_EXTSIG_PCT fewer instructions, the `timers`
-bench AFTER_TIMERS_PCT fewer and the `children` bench AFTER_CHILDREN_PCT fewer.
+`fanout_extsig` bench costs 80% fewer instructions, the `timers`
+bench 79% fewer and the `children` bench 68% fewer.
 `docs/design/DESIGN-2338.md` records the plan.
 
 ### Cause
@@ -218,9 +218,48 @@ Callgrind, total instructions (`Ir`) of the harness. "Before" is `e2c7bfb`.
 
 | Bench | Shape | N | Before | After | Change |
 |---|---|---|---|---|---|
-AFTER_TABLE
+| `match_activity_profile` | `fanout` | 500 | 12,320,261 | 12,488,526 | +1.4% |
+| `match_activity_profile` | `fanout` | 1000 | 24,234,173 | 24,569,705 | +1.4% |
+| `match_activity_profile` | `fanout` | 2000 | 47,833,937 | 48,508,146 | +1.4% |
+| `match_activity_profile` | `fanout_extsig` | 500 | 38,623,150 | 13,057,175 | −66.2% |
+| `match_activity_profile` | `fanout_extsig` | 1000 | 129,798,172 | 25,616,229 | −80.3% |
+| `match_activity_profile` | `fanout_extsig` | 2000 | 465,940,560 | 50,739,416 | −89.1% |
+| `match_activity_profile` | `sequential` | 500 | 9,624,003 | 9,703,530 | +0.8% |
+| `match_activity_profile` | `sequential` | 1000 | 18,821,993 | 18,980,895 | +0.8% |
+| `match_activity_profile` | `sequential` | 2000 | 35,407,161 | 35,724,799 | +0.9% |
+| `timer_child_fanout_profile` | `timers` | 500 | 13,427,715 | 5,407,186 | −59.7% |
+| `timer_child_fanout_profile` | `timers` | 1000 | 49,383,239 | 10,432,040 | −78.9% |
+| `timer_child_fanout_profile` | `timers` | 2000 | 185,700,506 | 20,355,658 | −89.0% |
+| `timer_child_fanout_profile` | `timers_rev` | 500 | 20,032,969 | 5,708,005 | −71.5% |
+| `timer_child_fanout_profile` | `timers_rev` | 1000 | 74,281,950 | 10,988,155 | −85.2% |
+| `timer_child_fanout_profile` | `timers_rev` | 2000 | 285,438,552 | 21,490,427 | −92.5% |
+| `timer_child_fanout_profile` | `timers_seq` | 500 | 2,263,765 | 2,281,281 | +0.8% |
+| `timer_child_fanout_profile` | `timers_seq` | 1000 | 4,094,835 | 4,127,351 | +0.8% |
+| `timer_child_fanout_profile` | `timers_seq` | 2000 | 7,664,012 | 7,726,528 | +0.8% |
+| `timer_child_fanout_profile` | `children` | 500 | 5,022,614 | 2,843,721 | −43.4% |
+| `timer_child_fanout_profile` | `children` | 1000 | 16,272,109 | 5,258,871 | −67.7% |
+| `timer_child_fanout_profile` | `children` | 2000 | 58,114,910 | 10,093,580 | −82.6% |
+| `timer_child_fanout_profile` | `children_rev` | 500 | 5,030,074 | 2,919,336 | −42.0% |
+| `timer_child_fanout_profile` | `children_rev` | 1000 | 16,271,824 | 5,405,844 | −66.8% |
+| `timer_child_fanout_profile` | `children_rev` | 2000 | 58,121,515 | 10,393,662 | −82.1% |
+| `timer_child_fanout_profile` | `children_seq` | 500 | 1,806,955 | 1,834,980 | +1.6% |
+| `timer_child_fanout_profile` | `children_seq` | 1000 | 3,293,786 | 3,347,291 | +1.6% |
+| `timer_child_fanout_profile` | `children_seq` | 2000 | 6,162,328 | 6,266,833 | +1.7% |
 
 The quadratic shapes now grow about 2 times per doubling of N.
+
+The shapes with no fan-out cost a little more. A sequential history costs
+0.8% more, a sequential timer history 0.8% and a sequential child history
+1.6%. Inside the matcher, that is about 21 instructions for each activity, 43
+for each timer and 40 for each child. A plain activity fan-out with no stashed
+external call costs 1.4% more, about 200 instructions for each activity. Most
+of it is in the inlined scan walk. #2330 accepted a cost of the same size.
+
+The scans no longer move the index out of the matcher and back. A move
+copied the index twice and built an empty one, which created a `RandomState`
+for each of its hash maps. With the larger index of this change, that cost
+about 300 instructions for each indexed scan. A split borrow of the index and
+the consumed sets now replaces it.
 
 ### Tests
 

@@ -17,8 +17,8 @@ child terminals per id. The timer scan runs through the activity scan code,
 because the rules of the two scans agree on every event class. The
 ski-rental rule of #2330 applies, so a sequential history builds no index.
 
-At N=1000, `fanout_extsig` costs AFTER_EXTSIG_PCT fewer instructions,
-`timers` AFTER_TIMERS_PCT fewer and `children` AFTER_CHILDREN_PCT fewer. See
+At N=1000, `fanout_extsig` costs 80% fewer instructions,
+`timers` 79% fewer and `children` 68% fewer. See
 `docs/performance-match-activity-fanout.md` and `docs/design/DESIGN-2338.md`.
 The local activity scan and the external signal, cancel and await scans are
 linear already. A scaling test guards all of them.

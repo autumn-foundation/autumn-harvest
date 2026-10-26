@@ -148,6 +148,15 @@ consumed filter.
 | `ChildTerminal(id)` | `ChildWorkflowCompleted`, `ChildWorkflowFailed` | A step, as `Pass` was. |
 | `ExternalTerminal` | The six external terminal events | A stash, as a transparent `Barrier` was. |
 
+### 1.5 No move of the index
+
+A scan used to move the index out of the matcher with `std::mem::take`, so it
+could read the consumed sets while it held the index. The move copied the
+index twice and built an empty one with a `RandomState` for each hash map.
+This change adds two maps to the index, so the move cost more. A split borrow,
+`index_and_consumed`, now gives the index and the consumed sets apart. It
+costs nothing.
+
 ---
 
 ## 2. Acceptance criteria
