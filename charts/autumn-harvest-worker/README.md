@@ -93,7 +93,7 @@ Build on the Harvest image. Your worker then has the CLI for the migration
 job and the init container.
 
 ```dockerfile
-FROM rust:1.99.0-bookworm AS build
+FROM rust:1.99.1-bookworm AS build
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked --bin my-worker

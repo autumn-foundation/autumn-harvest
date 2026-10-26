@@ -16,5 +16,5 @@
 # that the coverage nightly still builds. The MSRV itself is `rust-version`
 # in Cargo.toml, not this file.
 [toolchain]
-channel = "1.99.0"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]

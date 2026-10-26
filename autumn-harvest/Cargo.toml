@@ -102,14 +102,14 @@ serde_json = { workspace = true }
 base64 = "0.23"
 sha2 = "0.11"
 hmac = "0.13"
-# AES-256-GCM payload codec (issue #1825). `autumn-web` already pins 0.10.3 in
+# AES-256-GCM payload codec (issue #1825). `autumn-web` 0.8 keeps its own 0.10.3 in
 # the lockfile. No default features: the codec reads nonces from `rand`'s
 # `OsRng`, so `aead/getrandom` is not needed.
-aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"] }
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc", "zeroize"] }
 # `aes-gcm`'s own `zeroize` feature clears only a temporary key. These turn on
 # `ZeroizeOnDrop` for the AES round keys and the GHASH state. All three crates
 # are already in the lockfile through `aes-gcm`.
-aes = { version = "0.8.4", features = ["zeroize"] }
+aes = { version = "0.9.2", features = ["zeroize"] }
 ghash = { version = "0.6.0", default-features = false, features = ["zeroize"] }
 polyval = { version = "0.7.3", default-features = false, features = ["zeroize"] }
 # Clears data-key bytes on drop (issue #1825). Already in the lockfile.
@@ -167,7 +167,38 @@ schemars = { version = "0.8", optional = true }
 # `wasm-activities` can't silently resolve back to a vulnerable 48.0.x (same
 # reasoning as tokio-postgres above -- a workspace's own Cargo.lock never
 # propagates to downstream consumers, only the manifest constraint does).
-wasmtime = { version = "48.0.7", optional = true }
+# Default features minus `cache`. Harvest keeps compiled modules in memory
+# (`WasmModuleStore`) and never reads wasmtime's on-disk cache. That cache is
+# the only path to `zstd` 0.13, which carries RUSTSEC-2026-0391 and
+# RUSTSEC-2026-0395 to -0410. No wasmtime release depends on the patched
+# `zstd` 0.14, so dropping the feature removes the crate from the graph.
+wasmtime = { version = "48.0.7", optional = true, default-features = false, features = [
+    "addr2line",
+    "anyhow",
+    "async",
+    "backtrace",
+    "component-model",
+    "component-model-async",
+    "compile-time-builtins",
+    "coredump",
+    "cranelift",
+    "debug",
+    "debug-builtins",
+    "demangle",
+    "gc",
+    "gc-copying",
+    "gc-drc",
+    "gc-null",
+    "parallel-compilation",
+    "pooling-allocator",
+    "profiling",
+    "runtime",
+    "stack-switching",
+    "std",
+    "threads",
+    "wat",
+    "wit-parser",
+] }
 wat = { version = "1", optional = true }
 # Process limits, signals and namespaces for `sandbox-activities`. The
 # lockfile already holds this crate through tokio.

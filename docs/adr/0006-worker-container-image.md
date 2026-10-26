@@ -40,7 +40,7 @@ image. The worker then has the CLI for its migration job, the same runtime
 libraries and the same non-root user.
 
 ```dockerfile
-FROM rust:1.99.0-bookworm AS build
+FROM rust:1.99.1-bookworm AS build
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked --bin my-worker
