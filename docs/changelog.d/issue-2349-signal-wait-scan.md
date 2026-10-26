@@ -25,7 +25,12 @@ The fix:
   race branch keeps the walk, because it must stop at its own settle
   marker.
 
-MEASUREMENT_PLACEHOLDER
+At N=2000, the new `signal_wait_profile` bench costs 84% fewer
+instructions for `rev` and 93% fewer for `after_fanout`. Both now grow
+about 2 times per doubling. The `fwd` shape costs 0.4% more, and a loop
+that stashes one signal at a time costs 0.9% to 1.1% more. See
+`docs/performance-match-activity-fanout.md` and
+`docs/design/DESIGN-2349.md`.
 
 Tests: the scaling test gains eight signal shapes and counts the stash
 compares. The old code fails it for seven of them. The differential test

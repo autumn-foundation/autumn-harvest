@@ -139,10 +139,11 @@ the front of the queue and of the deque, so it costs O(1). In reverse order,
 it is the back of the deque, which costs O(1) too.
 
 The first version kept `names` for every stash. Each stash then paid a
-SipHash, and a clone of a new name. Callgrind on the `loop` shape at N=1000:
-the matcher cost 3,033,533 instructions before, and 3,195,822 with a map on
-every stash. With no map below 16 slots and the hot calls inlined, it costs
-3,104,572. That is 71 instructions, or 2.3%, more for each loop step.
+SipHash, and a clone of a new name. Callgrind on the `loop` shape at N=1000,
+the inclusive cost of `match_activity` and `match_signal`: 1,489,030
+instructions before, and 2,298,520 with a map on every stash. With no map
+below 16 slots and the hot calls inlined, it costs 1,523,030. That is 34
+instructions, or 2.3%, more for each loop step.
 
 `restore_view` takes every entry out, adds the hidden entries, sorts by event
 index and pushes them back. That is the order of the old sort. The cost is
