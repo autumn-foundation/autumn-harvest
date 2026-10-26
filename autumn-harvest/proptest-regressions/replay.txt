@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d141fe8672e75b3cea7a4183030b471be1810bf03fe526f41e81fa1d0cde0fb3 # shrinks to first = Scheduled(0, false), evs = [AwaitRequested(2), Completion, AwaitResolved(2), Scheduled(0, false), Scheduled(0, false)], ops = [AtCursor, Timer(0)], budget = Some(0)
+cc 35f1687ac74f47fa3b09a8c61a5ed918f602e23667aa550b7ca3dc10e88e6617 # shrinks to first = Scheduled(0, false), evs = [TimerCancelled(0), Scheduled(0, false), CancelFailed(0), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Detached(0), CancelRequested(0), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false), Scheduled(0, false)], ops = [Append(Scheduled(0, false)), Rewind(17), Activity(false), Activity(false), Rewind(24), Timer(0)], budget = Some(0)
+cc 4f23507fb6660f460a834d6133ea4d6a1666f1b2780e44dc8685310d0c448290 # shrinks to first = Scheduled(0, false), evs = [CancelRequested(2), Completion, CancelDelivered(2)], ops = [Cut(2), Activity(false), ExternalSignal(0), Restore, Activity(false)], budget = Some(0)

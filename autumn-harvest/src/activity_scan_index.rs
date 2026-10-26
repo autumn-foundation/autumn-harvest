@@ -18,7 +18,9 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use crate::event::WorkflowEvent;
-use crate::types::{ActivityExecId, ExecutionId, TimerId};
+use crate::types::{
+    ActivityExecId, ExecutionId, ExternalAwaitId, ExternalCancelId, ExternalSignalId, TimerId,
+};
 
 /// The cost of indexing one event, in walk steps.
 ///
@@ -50,11 +52,21 @@ pub enum ScanRole<'e> {
     Interleaved,
     /// A terminal event of an external signal, cancel or await. A scan
     /// stashes it, as a barrier. The external stash scan resolves it.
-    ExternalTerminal,
+    ExternalTerminal(ExternalKey),
     /// An event that the scan stashes, or an event that stops it.
     Barrier,
     /// An event that the scan steps over.
     Pass,
+}
+
+/// The kind and the id of one external call (issue #2346).
+///
+/// A terminal event resolves only a stash entry with the same key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExternalKey {
+    Signal(ExternalSignalId),
+    Cancel(ExternalCancelId),
+    Await(ExternalAwaitId),
 }
 
 /// What an activity or timer scan looks for (issue #2338).
@@ -108,6 +120,9 @@ pub struct ActivityScanIndex {
     barriers: SkipList,
     /// The external terminal events. Each one is a barrier too.
     external_terminals: SkipList,
+    /// The external terminal events of each key, in history order (issue
+    /// #2346). The ids are unique, so a key has few terminals.
+    external_by_key: HashMap<ExternalKey, Vec<usize>>,
 }
 
 impl ActivityScanIndex {
@@ -152,9 +167,10 @@ impl ActivityScanIndex {
                 }
                 ScanRole::ChildTerminal(id) => self.children.entry(id).or_default().push(position),
                 ScanRole::Interleaved => self.interleaved.push(position),
-                ScanRole::ExternalTerminal => {
+                ScanRole::ExternalTerminal(key) => {
                     self.barriers.push(position);
                     self.external_terminals.push(position);
+                    self.external_by_key.entry(key).or_default().push(position);
                 }
                 ScanRole::Barrier => self.barriers.push(position),
                 ScanRole::Pass => {}
@@ -223,6 +239,19 @@ impl ActivityScanIndex {
         consumed: impl Fn(usize) -> bool,
     ) -> Option<usize> {
         self.external_terminals.first_unconsumed(from, consumed)
+    }
+
+    /// The first unconsumed external terminal event of `key` at or after
+    /// `from` (issue #2346).
+    pub fn first_external_terminal_of(
+        &self,
+        key: ExternalKey,
+        from: usize,
+        consumed: impl Fn(usize) -> bool,
+    ) -> Option<usize> {
+        let terminals = self.external_by_key.get(&key)?;
+        let start = terminals.partition_point(|&p| p < from);
+        terminals[start..].iter().copied().find(|&p| !consumed(p))
     }
 
     /// The first unconsumed interleaved command at or after `from`.
@@ -438,7 +467,9 @@ mod tests {
             | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
                 ScanRole::ChildTerminal(*child_id)
             }
-            WorkflowEvent::ExternalSignalDelivered { .. } => ScanRole::ExternalTerminal,
+            WorkflowEvent::ExternalSignalDelivered { signal_id } => {
+                ScanRole::ExternalTerminal(ExternalKey::Signal(*signal_id))
+            }
             _ => ScanRole::Barrier,
         }
     }
@@ -487,7 +518,7 @@ mod tests {
     #[test]
     fn an_external_terminal_is_a_barrier_too() {
         let delivered = WorkflowEvent::ExternalSignalDelivered {
-            signal_id: crate::types::ExternalSignalId::new(),
+            signal_id: ExternalSignalId::new(),
         };
         let mut index = ActivityScanIndex::default();
         index.extend(&[fired("t"), delivered.clone(), delivered], test_role);
@@ -495,6 +526,27 @@ mod tests {
         assert_eq!(index.first_external_terminal(0, |p| p == 1), Some(2));
         assert_eq!(index.first_barrier(0, |_| false), Some(1));
         assert_eq!(index.first_external_terminal(3, |_| false), None);
+    }
+
+    #[test]
+    fn a_key_query_returns_the_terminals_of_its_key_only() {
+        let a = ExternalSignalId::new();
+        let b = ExternalSignalId::new();
+        let delivered = |signal_id| WorkflowEvent::ExternalSignalDelivered { signal_id };
+        let mut index = ActivityScanIndex::default();
+        index.extend(&[delivered(a), delivered(b), delivered(a)], test_role);
+        let key = ExternalKey::Signal(a);
+        assert_eq!(index.first_external_terminal_of(key, 0, |_| false), Some(0));
+        assert_eq!(index.first_external_terminal_of(key, 1, |_| false), Some(2));
+        assert_eq!(
+            index.first_external_terminal_of(key, 0, |p| p == 0),
+            Some(2)
+        );
+        assert_eq!(index.first_external_terminal_of(key, 3, |_| false), None);
+        let other = ExternalKey::Signal(ExternalSignalId::new());
+        assert_eq!(index.first_external_terminal_of(other, 0, |_| false), None);
+        let cancel = ExternalKey::Cancel(ExternalCancelId::new());
+        assert_eq!(index.first_external_terminal_of(cancel, 0, |_| false), None);
     }
 
     #[test]
