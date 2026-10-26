@@ -536,6 +536,15 @@ jobs:
           python3 docs/audits/tenant-header-validation-sync.py --self-test
           python3 docs/audits/tenant-header-validation-sync.py
 
+      # Issue #2358: the preflight.rs/shard_health.rs
+      # required_migration_versions clone class is linked, not merged (2
+      # instances, below the rule-of-three merge bar). A fix in one copy and
+      # not the other fails here.
+      - name: Required-migration-versions sync (docs/audits/required-migration-versions-sync.py)
+        run: |
+          python3 docs/audits/required-migration-versions-sync.py --self-test
+          python3 docs/audits/required-migration-versions-sync.py
+
       # Only listed files sit at the repository root. A design record goes in
       # docs/design/. The script lists each root file with a reason.
       - name: Root files (docs/audits/root-files.py)
