@@ -769,6 +769,9 @@ struct MigrationVersionRow {
     version: String,
 }
 
+/// Linked clone (issue #2358, not merged — 2 instances, below rule-of-three).
+/// `preflight.rs` holds a byte-identical copy. Keep both in step, or cite a
+/// missed-fix and merge them; `required-migration-versions-sync.py` checks.
 fn required_migration_versions() -> Result<Vec<String>, String> {
     let migrations = <diesel_migrations::EmbeddedMigrations as MigrationSource<Pg>>::migrations(
         &autumn_harvest::MIGRATIONS,
