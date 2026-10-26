@@ -12,6 +12,7 @@ come from these files (issue #2255). Non-production. One box, one shape.
 | `results/raw/` | the verbatim output of the sweep |
 | `results/graded.md` | the output of `grade.py` |
 | `results/fence-bench/` | the output of the fence bench runs |
+| `results-2026-10-26/` | a second sweep, after issues #2296 and #2308: `raw/` and `graded.md` |
 
 ## Prerequisites
 

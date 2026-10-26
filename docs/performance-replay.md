@@ -75,7 +75,7 @@ with the same `scan_cursor`) only ever re-reads `activity_id` from this same
 event, never `output`. Once an `ActivityCompleted` event is matched, its
 recorded payload is never observed again anywhere in `HistoryMatcher` — this
 was confirmed by grepping every `ActivityCompleted` pattern match in
-`replay.rs` (a 12k-line file) outside `#[cfg(test)]`.
+`replay.rs` (then a 12k-line file) outside `#[cfg(test)]`.
 
 ## Hypothesis
 
@@ -111,6 +111,21 @@ same win.
 No behavior change: the recorded event's `activity_id` (the only field any
 other code path reads from a matched `ActivityCompleted`) is untouched;
 `output` is left as `Value::Null`, but nothing reads it again.
+
+Issue #2330 (PR #2340) later rewrote this scan. `find_activity_terminal`
+found where the scan stops, and issue #2338 renamed it `find_scan_stop`. The
+finder also stashes each signal and external event on the way. So no arm of
+the match passes data from the event to a `&mut self` method. `scan_activity_terminal` now matches on
+`&mut self.events[terminal_cursor]` in every arm. The `ActivityCompleted` arm
+keeps `std::mem::take(output)`.
+
+PR #2303, issue #2330 and issue #2338 changed code that `match_activity_strict`
+shares with `match_activity`. None of them records a run of this harness. The
+counts on this page predate all three changes. On a sequential history,
+`match_activity_profile.rs` counted 0.2% more instructions after PR #2303,
+0.7% more after issue #2330 and 0.8% more after issue #2338.
+[`performance-match-activity-fanout.md`](performance-match-activity-fanout.md)
+records the three runs.
 
 ## Measurement
 
@@ -243,8 +258,10 @@ compiled in but **never executed** by this harness. The measured +0.095%
 regression below is attributable entirely to the strict-path copy;
 `match_activity`'s copy is untested by this specific harness, not
 independently confirmed regressive on its own — though the same "nothing
-was ever cloned here" argument applies to it structurally, and a dedicated
-non-strict-path benchmark would be needed to measure it directly.
+was ever cloned here" argument applies to it structurally. A direct
+measurement needs a benchmark that drives the non-strict path.
+`benches/match_activity_profile.rs` (PR #2303) is that benchmark. No doc
+records a run of the reverted patch on that harness.
 
 ### Change tested (reverted — not present in the shipped source)
 

@@ -353,6 +353,9 @@ for a compile-checked polling loop that works with and without the `db` feature.
 | [`autumn-harvest-redis`](autumn-harvest-redis/) | Optional Redis Streams dispatch channel — carries references to claimable rows; Postgres stays the source of truth |
 | [`autumn-harvest-sqlite`](autumn-harvest-sqlite/) | Optional SQLite storage backend for single-process and embedded deployments |
 | [`autumn-harvest-agent`](autumn-harvest-agent/) | Optional durable agent loop: model and tool calls as activities, approvals as durable waits ([guide](docs/agent-adapter.md)) |
+| [`autumn-harvest-verify`](autumn-harvest-verify/) | `cargo-harvest-verify`: opt-in semantic (MIR-level) determinism verifier for `#[workflow]` functions. R&D prototype, not published ([guide](docs/harvest-verify.md)) |
+| [`autumn-harvest-sandbox-guest`](autumn-harvest-sandbox-guest/) | `harvest-guest-agent`: process 1 of each Firecracker microVM for sandboxed code activities ([guide](docs/sandbox-activities.md)) |
+| [`autumn-harvest-conformance`](autumn-harvest-conformance/) | Test only: runs one workflow corpus on Postgres and on SQLite and compares the results. Not published |
 
 Use `autumn-harvest-plugin` if you're building an Autumn app. For a non-web
 context — a worker or CLI process with no HTTP surface at all — use the bare
@@ -1210,13 +1213,15 @@ The equivalent environment override is
 
 ## Redis dispatch (optional)
 
-Postgres is the only required infrastructure dependency. On a deep backlog
-the Postgres claim scans and sorts the queue on every claim. An optional
-Redis Streams **dispatch channel** removes that scan: the engine publishes a
-small reference (task id, queue, due time) for each claimable row, and a
-worker claims the named row in Postgres with the full claim predicate before
-it acks the reference. Postgres keeps every row, every claim gate and the
-whole history write path.
+Postgres is the only required infrastructure dependency. Since issue #1971,
+the default Postgres claim reads a bounded window from the head of each
+queue. It scans and sorts the backlog only as a fallback. A claim with
+fairness keys or priority ageing always runs that scan. An optional Redis
+Streams **dispatch channel** removes the search for a row from each claim.
+The engine publishes a small reference (task id, queue, due time) for each
+claimable row. A worker claims the named row in Postgres with the full claim
+predicate before it acks the reference. Postgres keeps every row, every
+claim gate and the whole history write path.
 
 Build `autumn-harvest-plugin` with the `redis` feature, then set the URL:
 

@@ -8,9 +8,8 @@ every number below is a deterministic instruction count
 ## 🎯 Workload
 
 `payload_codec::PayloadCodecs::{encode_event, decode_event}` are the codec
-transform `store.rs` runs on **every** workflow-event append (`encode_event`,
-`store.rs` lines 150/558) and **every** history read or replay load
-(`decode_event`, `store.rs` lines 1131/1349/1395/1441/1445). This is the
+transform `store.rs` runs on **every** workflow-event append (`encode_event`)
+and **every** history read or replay load (`decode_event`). This is the
 highest-call-volume path any profiling harness in this repo measures so
 far: it fires on literally every event of every execution, not only when an
 operator opts into a feature (`queue_fairness`, issue #515) or once per UI
@@ -46,7 +45,8 @@ Callgrind's flat, self-cost profile does not attribute cost to
 LLVM inlines their callers' cost into generic `serde_json`/`BTreeMap`
 symbols shared with the (unrelated, unavoidable) `serde_json::to_value`/
 `from_value` conversion `encode_event`/`decode_event` also do
-(issue #1721 later removed the `Content` buffering from `decode_event`). dhat's
+(issue #1721 later removed the `Content` buffering from `decode_event`, and
+issue #2136 removed its payload-tree copy). dhat's
 per-call-stack allocation attribution does not have that problem: every
 allocation site in `docs/perf-artifacts/payload-codec-owned-transform/before-dhat.json`
 carries its full call stack, so summing every program point whose stack
@@ -81,6 +81,14 @@ the caller already owns outright. Moving that field out with
 `std::mem::take` instead of borrowing it removes the clone on the fast
 path unconditionally — one call, one field, on every event, every time.
 
+Since issue #2136, only `encode_event` goes through `transform_event_data`.
+`decode_event` has its own field loop. It moves each payload out with
+`std::mem::take` and passes it to `decode_payload_owned`, so the decode fast
+path still skips the clone. It then moves each decoded payload into its
+event field, so serde no longer copies the tree.
+[`performance-decode-event-payload-move.md`](performance-decode-event-payload-move.md)
+measures that change on this harness.
+
 ## 🔧 Change
 
 `autumn-harvest/src/payload_codec.rs`:
@@ -89,11 +97,11 @@ path unconditionally — one call, one field, on every event, every time.
   the existing public `encode_payload`/`decode_payload` except they take
   `payload: Value` instead of `payload: &Value`. Each fast path now returns
   the owned value directly instead of cloning it.
-* The public `encode_payload`/`decode_payload` become one-line wrappers
-  (`self.encode_payload_owned(payload.clone())`) — their signature and
-  behavior are unchanged, so every other caller (the two call sites in
-  `worker.rs`/`payload_codec.rs` itself that only hold a borrow) is
-  unaffected.
+* The public `encode_payload`/`decode_payload` keep their own bodies.
+  Each clones the borrowed value only on its fast path. A wrapper that
+  cloned into the owned variant would add a full clone to the slow path.
+  Their signature and behavior are unchanged, so every caller that holds
+  only a borrow is unaffected.
 * `transform_event_data`'s per-field loop now does
   `let owned = std::mem::take(payload); *payload = ...encode_payload_owned(owned)?...`
   instead of calling the borrowing API. `mem::take` leaves a `Value::Null`

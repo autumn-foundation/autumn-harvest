@@ -61,7 +61,7 @@ Owner mode (issue #2252, [ADR 0009](adr/0009-decision-owner.md)) gives each exec
 - **Who owns.** A worker with no workflow slot or no workflow type never owns a partition. It still claims activity tasks.
 - **Failover.** A crashed owner drops out of the live owners within 3 s. Its leases lapse after the TTL, 10 s by default. A peer scans just after that lease end and acquires its partitions. A new owner starts cold. [`performance-owner-failover.md`](performance-owner-failover.md) records the measured bounds.
 - **Fence.** Each decision commit checks the owner's lease epoch. A stale owner cannot write. See [ADR 0009](adr/0009-decision-owner.md).
-- **Decider.** The owner does not claim its workflow tasks through the claim loop (issue #2255). An owner decider takes each one by its execution, after an owner wake or a scan of its partitions. The claim loops claim activities only. [`performance-owner-decider.md`](performance-owner-decider.md) records the claim counts and the throughput.
+- **Decider.** The owner does not claim its workflow tasks through the claim loop (issue #2255). An owner decider takes each one by its execution, after an owner wake or a scan of its partitions. It takes them in [claim order](operations/claim-order.md): priority, then the due time with the 30 s new-start handicap (issue #2308). Where it runs, the claim loops claim activities only. A worker with queue weights, fairness keys or a nonzero `priority_aging_secs` runs no decider. A decider runs only on a database with an owner wake listener. Without a decider, the claim loops keep the owned claim of issue #2252. [`performance-owner-decider.md`](performance-owner-decider.md) records the claim counts and the throughput.
 
 | | Sticky routing | Owner mode |
 |---|---|---|

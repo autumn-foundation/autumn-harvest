@@ -98,8 +98,8 @@ compiles the workspace, which is the slow part; the client steps take seconds.
   can separate reads from control-plane writes, and can see which routes are
   safe without any credential. The route category is also the operation tag.
 - **`x-harvest-idempotency`**, where the contract records an idempotency rule.
-- **`x-harvest-stream`** on the two `text/event-stream` routes. A blocking
-  client that buffers a whole response would hang on those.
+- **`x-harvest-stream`** on every `text/event-stream` route. A blocking
+  client that buffers a whole response would hang on such a route.
 - **Response headers** where the contract records them: `X-Harvest-Execution-Id`
   on the by-id family, `Retry-After` on the `204` a still-running `/result`
   returns.

@@ -165,7 +165,7 @@ original timeout used.
 | `Patched` / `DeprecatePatch` | `ctx.patched(id)` / `ctx.deprecate_patch(id)` | issue #687 |
 | `workflow.SideEffect` | `ctx.system_now()`, `ctx.new_uuid()`, `ctx.random_*()`, `ctx.side_effect()` | issue #384 |
 | No built-in non-determinism linting | Compile-time determinism guardrails HVG001–HVG011, the `det_check` static analyzer | issue #785 (HVG011), issue #600 / issue #799 (HVG010) |
-| Replay testing for safe deploys (`WorkflowReplayer`, same name in the Temporal .NET and PHP SDKs) | `autumn_harvest::testing::WorkflowReplayer` | `autumn-harvest/tests/replayer_tests.rs`, Phase 3.5 |
+| Replay testing for safe deploys (`WorkflowReplayer`, same name in the Temporal .NET and PHP SDKs) | `autumn_harvest::testing::WorkflowReplayer` | `autumn-harvest/tests/integration/replayer_tests.rs`, Phase 3.5 |
 
 ### Worker placement and build routing
 

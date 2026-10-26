@@ -65,8 +65,9 @@
 //! `autumn_harvest::dispatch::TaskDispatch`.
 //!
 //! Postgres keeps every `harvest_task_queue` row and stays the source of
-//! truth. A stream entry carries a reference only: the task id, the queue and
-//! the due time. A worker reads a reference, claims the named row in Postgres
+//! truth. A stream entry carries a reference only. It holds the task id, the
+//! queue, the due time, the priority, the redelivery count, the shard and the
+//! task kind. A worker reads a reference, claims the named row in Postgres
 //! with the full claim predicate, and then acks the reference. Workflow state
 //! and event history stay in the Postgres transactions that exist today, so
 //! no transactional boundary moves.
@@ -120,19 +121,21 @@
 //!   order. A read sized to exactly one queue's ready backlog therefore sees
 //!   no priority signal at all. `COUNT` caps what Redis returns, before this
 //!   channel ever sees the candidates. The reconcile sweep publishes in
-//!   priority order instead. A read that spans queues also favors the
-//!   highest-priority candidates over lower ones (issue #1429). It does so
-//!   only among whatever surplus that span already produces, with no extra
-//!   round trip. Neither is a per-priority stream.
+//!   priority order instead. A read sizes each queue's `COUNT` from the
+//!   batch capacity still left, so a normal read has no surplus to rank
+//!   (issue #1429). The priority sort only orders the batch that the read
+//!   delivers. Neither is a per-priority stream.
 //! - **Sticky affinity is best effort.** Any worker in the consumer group may
 //!   read any reference. The Postgres claim predicate still enforces the
 //!   affinity gate, and a rejected reference is released with backoff.
 //!
 //! ### Standalone adapter
 //!
-//! [`RedisTaskQueue`] and [`TaskQueueAdapter`] are unchanged and stay
-//! supported for callers that use this crate as a task queue on its own. The
-//! two key families do not overlap.
+//! [`RedisTaskQueue`] and [`TaskQueueAdapter`] stay supported for callers
+//! that use this crate as a task queue on its own. The two key families do
+//! not overlap. [`RedisTaskQueue`] connects over TLS the same way as the
+//! dispatch channel (issue #1834). [`RedisTaskQueue::connect_with_tls`] takes
+//! the same [`RedisTlsOptions`].
 
 #![cfg_attr(not(feature = "test-utils"), allow(rustdoc::private_intra_doc_links))]
 

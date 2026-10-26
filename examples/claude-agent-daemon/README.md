@@ -410,10 +410,10 @@ Honest limits, so nothing here reads as a promise:
   from the `--tick-ms` poll. The poll reads no database at all: the daemon is
   the only writer, so it holds the live sessions in memory, seeded once at
   startup from the rows a previous process left `RUNNING`. A query on every
-  tick would visit every session that ever ran, because `harvest_executions`
-  is indexed on `(workflow_name, workflow_id)` and not on `state`. The engine
-  owns that schema, and an example does not add an index to it. A production
-  daemon would sleep until the next timer deadline.
+  tick would only read back what the daemon already holds. The backend indexes
+  `harvest_executions` on `state` (issue #2027), so that query does not visit
+  every session that ever ran. A production daemon would sleep until the next
+  timer deadline.
 - **No streaming.** One turn is one non-streaming request, because an activity
   result is a value, not a stream. Token-by-token output needs a side channel.
 - **One turn can be paid for twice.** Activity execution is at-least-once, and

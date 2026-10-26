@@ -197,7 +197,11 @@ cost of the walker's design: `serde_json::Value::Object` is
 `BTreeMap`-backed (this crate does not enable `preserve_order`), so every
 `schema_obj.get(...)`/`properties.get(prop_name)` lookup pays a `BTreeMap`
 key-comparison walk — a dependency-level cost already flagged as
-out-of-scope by PR #1169, unaffected by this change.
+out-of-scope by PR #1169, unaffected by this change. PR #2044 later removed
+part of this cost. `validate_node` now looks up `required`, `properties`,
+`items` and `additionalProperties` only when the value has the matching
+kind. That cut `__memcmp_avx2_movbe` by 22.7% on the same harness, as
+`docs/performance-schema-validate-kind-gated-lookups.md` records.
 
 **Correctness**: `cargo test -p autumn-harvest --no-default-features
 --features testing --lib` (1,891 tests) and `cargo test -p autumn-harvest

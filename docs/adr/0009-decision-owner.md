@@ -6,7 +6,7 @@ Accepted (issue #2249).
 
 Issues #2250 to #2256 build it. Issue #2253 adds decision 12. Issue #2255
 adds decision 13. Issue #2256 adds decision 14.
-[ADR 0010](0010-fenced-owner-lease.md) holds the lease rules R1 to R7 that
+[ADR 0010](0010-fenced-owner-lease.md) holds the lease rules R1 to R8 that
 the model forces. The planning record is
 [`docs/design/DESIGN-2249.md`](../design/DESIGN-2249.md). The source is the stage 1 section
 of `reports/Actor ownership prior art for Harvest.md`.
@@ -477,8 +477,9 @@ Issue #2253 builds this decision.
   holds the entry, and that decision then puts the entry back.
 - So in owner mode, a cache hit whose delta holds a state change replays
   cold. A hit whose entry has another owner key replays cold too.
-- Until issue #2252 adds the switch row, owner mode turns owner wakes on
-  for the process. A writer-only process calls `enable_owner_wakes`.
+- Owner mode turns owner wakes on for the process. The owner loop turns
+  owner mode on when the switch row of its database is on (issue #2252). A
+  writer-only process runs no owner loop, so it calls `enable_owner_wakes`.
 - That process also needs a post-commit sender (`register_pool`). Without
   one, the fallback drops each owner note.
 
@@ -678,7 +679,7 @@ here.
 | Serialization unit | Does the owner serialize per partition or per execution? | Answered. Per execution. A single-threaded owner caps throughput, as at Durable Objects. |
 | Model nemeses | Which nemeses do the TLA+ model and the simulator cover? | Deferred to #2250. Stale commit after takeover, lease flap during an append, renewal during commits, and a signal before an epoch bump. |
 | Frozen-owner test | Does Harvest port Golem's frozen-owner test? | Answered. Yes. `owner_failover_tests.rs` stops an owner with `SIGSTOP` in a decision and in an open commit. See [`performance-owner-failover.md`](../performance-owner-failover.md). |
-| Pass conditions | Which measurements pass stage 1? | Deferred to #2248 for the throughput, claim, cold-decision, hit-rate and persist rows. Issue #2254 measured the kill -9 and scale-out rows, and both pass. |
+| Pass conditions | Which measurements pass stage 1? | Answered in part. Issue #2252 measured the cold-decision and hit-rate rows. Two claim loops made no extra cold decisions, and the continuation hit rate was 100%. The hit rate over all decisions cannot pass 75%, because the first decision of each run has no resident state. Issue #2255 measured the claim, throughput and persist rows. The claim and persist rows pass. Throughput reached 1.27x, not 1.5x, on a 4-CPU host. Issue #2254 measured the kill -9 and scale-out rows, and both pass. See [`performance-owner-decider.md`](../performance-owner-decider.md). |
 
 ## Options considered
 
@@ -706,7 +707,10 @@ here.
 - A crash leaves a partition without an owner for about one TTL, 10 s by
   default. Today a pending task pinned to a crashed worker waits up to the
   5 s sticky timeout.
-- Each commit takes one more row lock. Issue #2248 measures the cost.
+- Each commit takes one more row lock. With the DR fence on, issue #2248
+  measured a median persist cost of +17.8% at one writer, with two
+  statements. After issue #2255 fuses them, an owner decision persists
+  9.3% faster than one with the DR fence alone.
 - Each worker renews its partitions every TTL / 3.
 - Enabling owner mode is an operator step per database.
 - The fence adds no `WorkflowEvent` variant and writes no history.

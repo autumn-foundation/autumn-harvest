@@ -45,6 +45,18 @@ whose workflow type declares any `QuotaPolicy` cap **and** whose input
 resolves to a quota key — not only ones using `max_history_bytes`, and not
 to admissions that fail open on an unresolvable key.
 
+PR #1484 (issue #1228, commit `e3572874`) changed the admission read after
+this page shipped. `enforce_quota_admission` now calls
+`load_quota_usage_excluding`, not `load_quota_usage`.
+`fork::check_stored_history` calls it too, for a fork's `max_history_bytes`
+check. Its SQL, `QUOTA_USAGE_EXCLUDING_SQL`, differs from `QUOTA_USAGE_SQL`
+in one filter only: `AND id <> ALL($3)` in the `active` CTE. `$3` holds the
+execution under check, plus any incumbents that a `cancel_running`
+supersede pass will shed. The evidence-capture test runs `EXPLAIN` on
+`quota_usage_query()` and calls `load_quota_usage()`, so no figure on this
+page includes that filter. `load_quota_usage` now has no production caller.
+Only tests call it.
+
 `tests/integration/quota_history_bytes_perf_tests.rs::zz_capture_quota_history_bytes_evidence`
 seeds a production-shaped fixture: one target tenant
 (`workflow_name = 'order_saga'`, `quota_key = 'acme'`) with 1,000 active

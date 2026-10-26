@@ -35,13 +35,14 @@ it returns or blocks on Harvest futures (issue #1797). Returns one of:
 - `Failed { error }` — handler returned Err
 - `Suspended { commands }` — handler blocked on a parked Harvest future (a oneshot or a park token)
 - `TaskFailed { error }` — handler waited on a foreign future past the deadlock timeout; the task is retried
+- `ContinuedAsNew { input, new_workflow_type }` — handler called `continue_as_new`; the worker starts a fresh execution of the same workflow id with `input`; `new_workflow_type` names the successor type, or `None` keeps it
 
 ### 3. HistoryMatcher (`replay.rs`)
 
 Walks through recorded `WorkflowEvent`s during replay:
 
 - Matches each workflow command against history
-- Returns `HistoryMatch` enum: `Matched`, `Failed`, `TimedOut`, `NoMatch`, `Diverged`
+- Returns a `HistoryMatch`, such as `Matched`, `Failed`, `TimedOut`, `NoMatch`, `Diverged` or `ActivityInProgress`
 - Handles interleaved signals and child workflows
 
 ### 4. Worker Runtime (`worker.rs`)
@@ -118,28 +119,26 @@ With the `testing` feature:
 
 - Integration tests use `testcontainers` for ephemeral Postgres
 - `HistoryMatcher` enables deterministic replay verification
-- Example: `tests/integration_e2e.rs`
+- Example: `autumn-harvest/tests/integration/integration_e2e.rs`
 
 ## Crate Metrics
 
-- 8,682 Rust code lines across 27 files
-- 180 SQL code lines across 4 migrations
 - Diesel-managed schema changes embedded in `MIGRATIONS` const
 
 ## Dependencies
 
-**Core**: tokio, diesel, diesel-async, serde_json, chrono, uuid, thiserror, tracing
+**Core**: tokio, serde_json, chrono, uuid, thiserror, tracing, croner
 
-**Optional (db feature)**: deadpool, tokio-postgres, scoped-futures
+**Optional (`db` feature, on by default)**: deadpool, diesel, diesel-async,
+diesel_migrations, percent-encoding, tokio-postgres
 
 **Macros**: autumn-harvest-macros (proc macros for `#[workflow]`, `#[activity]`, `#[dag]`)
 
 ## Status
 
-**Phase 3 (Current)**: DAG scheduling, signals, queries, management API — implemented
-and integration tested.
-
-**Phase 4 (Roadmap)**: Cancellation/saga semantics, sticky cross-worker routing,
-richer observability, dashboard UI.
+**Shipped**: DAG scheduling, signals, queries, updates and the management API.
+Cancellation, cancellation scopes, sagas and sticky cross-worker routing also ship.
+Metrics, OpenTelemetry spans and the Vantage dashboard UI ship too. Integration tests
+cover each one. `docs/shipped-work.md` holds the shipped-work record.
 
 API stability: pre-1.0. Breaking changes in minor versions per Cargo 0.x semver.

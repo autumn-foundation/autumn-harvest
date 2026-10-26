@@ -112,13 +112,21 @@ for row in rows {
 
 // After: one discard_dead_letters_batch(conn, &ids).await per page.
 let ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.id).collect();
-let deleted: HashSet<uuid::Uuid> = dlq::discard_dead_letters_batch(conn, &ids)
-    .await?
-    .into_iter()
-    .collect();
-result.ids = ids.iter().filter(|id| deleted.contains(id)).map(ToString::to_string).collect();
-result.acted_on = result.ids.len();
-result.skipped = ids.len() - result.acted_on;
+match dlq::discard_dead_letters_batch(conn, &ids).await {
+    Ok(deleted_ids) => {
+        let deleted: HashSet<uuid::Uuid> = deleted_ids.into_iter().collect();
+        result.ids = ids.iter().filter(|id| deleted.contains(id)).map(ToString::to_string).collect();
+        result.acted_on = result.ids.len();
+        result.skipped = ids.len() - result.acted_on;
+    }
+    Err(e) => {
+        let reason = e.to_string();
+        result.failures = ids
+            .iter()
+            .map(|id| dlq::BulkDlqFailure { id: id.to_string(), reason: reason.clone() })
+            .collect();
+    }
+}
 ```
 
 `dlq::discard_dead_letters_batch` (`autumn-harvest/src/dlq.rs`):
@@ -236,11 +244,13 @@ whole handler. A single `DELETE ... WHERE id = ANY($1)` is one statement:
 if it fails, it fails atomically, and *zero* of the targeted rows are
 deleted. This is a strengthening (an operator retrying a failed bulk
 discard no longer has to wonder which prefix of the page already landed),
-not a weakening — and the `failures` field of `BulkDlqResult`, which the
-old discard loop never actually populated in practice either (a
-primary-key `DELETE` has no per-row business-logic failure mode the way
-`replay_dead_letter` does), stays in the struct for API-shape compatibility
-but is now always empty for discard specifically.
+not a weakening. The old discard loop never populated the `failures` field
+of `BulkDlqResult`. A primary-key `DELETE` has no per-row business-logic
+failure mode, unlike `replay_dead_letter`. The batch leaves `failures` empty
+on success. When the batch `DELETE` fails, both call sites list every
+selected id in `failures` with the error text and return `Ok`.
+`bulk_discard_from_shards` stops at the first `Err`. The `Ok` lets it move
+on to the next shard and keep the totals of earlier shards.
 
 ## Write cost
 

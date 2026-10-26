@@ -84,7 +84,8 @@ concentrated on one database. Every 20th gen3 leaf is marked `FAILED`
 (via one bulk `id = ANY($1)` UPDATE per shard — deliberately outside the
 code path under investigation, so it does not distort the query-count
 evidence) to exercise result filtering alongside pure traversal cost.
-`fixture-summary.txt` records the exact shape: 3,901 total nodes,
+`before-fixture-summary.txt` and `after-fixture-summary.txt` record the
+exact shape: 3,901 total nodes,
 `GET /workflows/{root}/children?depth=2&limit=500` (`limit=500` is the
 endpoint's own page-size ceiling — the traversal itself computes the
 *full* 3,900-descendant set internally regardless of the final page size;

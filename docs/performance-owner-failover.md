@@ -9,7 +9,9 @@ the Linux database job.
 
 All four tests pass. The engine needed four fixes first. The
 [RED results](#red-results-and-the-fixes) section gives the failures that
-they fix.
+they fix. The table below is the first measurement.
+[A re-measurement after issue #2296](#re-measured-after-issue-2296) passes
+too, and the scale-out settles in 5.3 s to 5.5 s.
 
 | Test | Pass condition | Measured |
 |---|---|---|
@@ -128,6 +130,42 @@ Owner mode costs the dip. The control recovers in 1 s to 2 s. Owner mode
 recovers in about 9 s. A released partition takes no claim until its new
 owner acquires it. Its first decision on the new owner then replays cold.
 
+## Re-measured after issue #2296
+
+The suite ran again on 2026-10-26, on `572c7ff` with the docs changes of
+this sweep. Issue #2296 had landed by then. The host was a 4-CPU container
+with Postgres 16.15 on the same host, and the build was a debug build. All
+four tests passed in each run.
+
+| Test | Measured, 3 runs | First measurement |
+|---|---|---|
+| `a_frozen_owner_is_fenced_after_a_takeover` | Takeover 9.6 s to 9.7 s after `SIGSTOP` | 9.2 s to 10.0 s |
+| `a_frozen_commit_transaction_does_not_block_the_takeover` | Takeover 12.0 s to 13.0 s after `SIGSTOP` | 12.0 s to 12.1 s |
+| `after_kill_9_the_next_decision_runs_within_ttl_plus_one_second` | Next decision 10.1 s to 10.2 s after the kill | 10.2 s to 10.3 s |
+
+Builds ran on the host during these three runs. The 10 s lease TTL sets
+these times, so they stay close to the first measurement.
+
+The scale-out test then ran six times with nothing else on the host:
+
+| Run | Baseline | Rate after | Slowest second | Settled | Recovered | Fences before, after |
+|---|---|---|---|---|---|---|
+| 1 | 56.4/s | 42.3/s | 35% | 5.5 s | 5.5 s | 0, 0 |
+| 2 | 54.0/s | 39.8/s | 39% | 5.4 s | 5.4 s | 0, 0 |
+| 3 | 57.3/s | 41.3/s | 42% | 5.3 s | 5.3 s | 3, 0 |
+| 4 | 57.6/s | 41.4/s | 50% | 5.4 s | 5.4 s | 3, 0 |
+| 5 | 53.5/s | 43.3/s | 45% | 5.5 s | 5.5 s | 2, 0 |
+| 6 | 52.9/s | 40.9/s | 43% | 5.5 s | 5.5 s | 1, 0 |
+
+The fleet now settles in 5.3 s to 5.5 s, against 8.4 s to 9.8 s before.
+Issue #2296 takes the partitions of a scan in one transaction, not one
+transaction per partition. No run had a fenced commit after the settle.
+
+The control, with owner mode off, ran twice. Its baseline was 61.8/s and
+50.8/s, and its rate after the scale-out was 41.6/s and 43.2/s. Both modes
+run about a quarter below the first measurement, so this host is slower.
+Compare rates within one table only.
+
 ## RED results and the fixes
 
 The tests ran first against the engine of issue #2253.
@@ -169,6 +207,11 @@ commit first. ADR 0009 decision 9 calls that the drain.
   fewer of them.
 - The frozen-commit test uses a test trigger to stop inside the
   transaction. The trigger runs only on the test database.
+- The first measurement predates issue #2296. Each acquisition then took
+  one partition in its own transaction. Since then, the worker takes the
+  partitions of a scan in one transaction.
+  [The re-measurement](#re-measured-after-issue-2296) runs on the current
+  engine.
 
 ## Reproduce
 

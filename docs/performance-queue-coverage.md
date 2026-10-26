@@ -214,8 +214,10 @@ the indexed path (run several times, per above, rather than trusting a
 single sample — see the corrected doc comment in
 `queue_coverage_profile.rs`). To reproduce the 145,305,864-instruction
 pre-fix figure, temporarily restore `partition_uncovered_and_paused` /
-`worker_covers_queue` to the single-function nested-scan form from commit
-`baddbef` (the harness-only commit at the start of this PR) without
-reverting `benches/queue_coverage_profile.rs` itself — the two figures in
-the table above are both measured against today's harness, not against
-that older commit's own (since-corrected) oracle.
+`worker_covers_queue` to the single-function nested-scan form in
+`01049a61^`, the parent of PR #1554's squash commit. The squash merge
+dropped the PR's harness-only first commit, which changed no algorithm.
+Keep `partition_uncovered_and_paused` `pub` so the bench still builds. Do
+not change `benches/queue_coverage_profile.rs` itself. Both figures in the
+table above use today's harness, not the first commit's harness, whose
+oracle a later commit corrected.

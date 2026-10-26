@@ -7,6 +7,13 @@ least predictable from the query text, and the most defensible next scenario
 to add. The seed leaves `required_capabilities` null." This page is that
 measurement.
 
+> **Follow-up (issue #1971):** the claim plans and buffer deltas on this page
+> measure the full scan. The default claim now reads a bounded seek window
+> first, and runs the full scan only as a fallback. The window scan runs the
+> same capability test, on window rows only. The write-side cost does not
+> depend on the claim path. See
+> [the seek window](performance.md#the-seek-window-issue-1971).
+
 The result is a **negative finding, not an optimization**: the predicate has a
 real, non-trivial buffer cost on the claim query (+24.5% to +36.0% across the
 tested backlog depths -- see [Buffer deltas across backlog

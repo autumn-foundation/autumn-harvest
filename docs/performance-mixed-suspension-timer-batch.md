@@ -107,7 +107,7 @@ the multi-row form writes the same rows.
   remaining 2 scans. It adds write cost on every timer insert and a migration.
   It needs a human decision and its own write-cost measurement.
 * The sibling per-timer loops in `ArmTimer` / `CancelTimer` persist and
-  `persist_race_loser_cancellations` have the same shape and were not touched.
+  `apply_race_loser_cancellations` have the same shape and were not touched.
 
 ## Reproduce
 

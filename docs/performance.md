@@ -26,6 +26,15 @@ the PAUSED skip. The other six are present in the query and held constant, so
 this page says nothing about what they cost in *that* table; see
 [known limitations](#known-limitations).
 
+Three later gates are not in the table. They are the expired-run gate
+(#1824), the saturated-activity gate (#1836) and the owner gate of owner
+mode (#2252).
+[The expired-run section](#the-continuation-band-and-the-expired-run-gate-issue-1824)
+measures the first.
+[What the seek window does not establish](#what-the-seek-window-does-not-establish)
+gives a buffer count for the owner gate. No section measures the
+saturated-activity gate.
+
 > **Looking for end-to-end numbers?** This page measures the claim and enqueue
 > path in isolation. [`benchmarks.md`](benchmarks.md) publishes what the engine
 > does end to end — workflows/sec, dispatch and signal latency, replay
@@ -1108,6 +1117,13 @@ Docker daemon for its testcontainer fallback — not both.
 
 ### Known limitation: cost scales with distinct concurrency-key cardinality
 
+> **Follow-up (issue #1971):** this limit now applies to the full scan only.
+> The default claim reads `concurrency_running_counts` only when it falls
+> back. Its window scan runs the same per-row lookup on `seek_running_counts`.
+> That CTE counts the `RUNNING` rows of the window keys only. A fair claim
+> and an ageing claim still run the full scan. See
+> [when the window falls back](#when-the-window-falls-back).
+
 The committed hot-contention fixture above uses 256 distinct concurrency
 keys — the harness's fixed `KEY_CARDINALITY` constant
 (`tests/integration/claim_bench_support.rs`) — and at that cardinality the
@@ -1568,6 +1584,12 @@ without a capped key pay nothing.
   at the head until a peer acquires its partitions, so each claim reads
   them until then. A review run on PG16 read 381 buffers against 119 for
   the legacy claim, with 4,900 foreign rows ahead of 100 owned ones.
+  Issue #2255 moves the workflow take to the owner decider. Where it runs,
+  the claim loops claim activities only and read no workflow head. The
+  decider scan never reads the rows of another owner. The owned claim and
+  this cost remain on a worker with queue weights, fairness keys or
+  priority ageing on. They also remain on a worker with no LISTEN/NOTIFY
+  URL for the database, which runs no owner wake.
 - **A large live pin set.** The pin head reads every live pin of this
   worker. More than 32 of them that pass the gates also make every rank-0
   row wait for the fallback.
@@ -2202,6 +2224,10 @@ from the benchmark are directly comparable.
     dropping this predicate alone would not recover the cheap plan, while
     this page measures what it costs to keep it, holding the already-collapsed
     plan shape fixed.
+    **Follow-up (issue #1971):** these figures predate the seek window and
+    the fillfactor of 80 that issue #1811 set. The default claim now runs the
+    full scan measured here only as a fallback. See
+    [the seek window](#the-seek-window-issue-1971).
   * **Worker sessions (#606)** — measured directly, on a genuinely different
     axis from issue #1177 just below: `docs/performance-worker-sessions.md`
     seeds `session_id` and `sticky_worker_id`/`sticky_until`/`sticky_timeout`
@@ -2224,6 +2250,10 @@ from the benchmark are directly comparable.
     sessions' predicate, like `schedule_to_close`'s and sticky routing's,
     independently defeats sort-elision (see immediately below); the two are
     answers to different questions about the same predicate.
+    **Follow-up (issue #1971):** these figures predate the seek window and
+    the fillfactor of 80 that issue #1811 set. The default claim now runs the
+    full scan measured here only as a fallback. See
+    [the seek window](#the-seek-window-issue-1971).
   * **Sticky routing (#235)** — measured directly:
     [`docs/performance-sticky-routing.md`](performance-sticky-routing.md)
     seeds `sticky_worker_id`/`sticky_until`/`sticky_timeout` (session_id left
@@ -2262,6 +2292,10 @@ from the benchmark are directly comparable.
     replacing one unsupported cost claim with another would have been no
     improvement, which is why all three now carry a real measurement
     instead.
+    **Follow-up (issue #1971):** these figures predate the seek window and
+    the fillfactor of 80 that issue #1811 set. The default claim now runs the
+    full scan measured here only as a fallback. See
+    [the seek window](#the-seek-window-issue-1971).
 * **Queue count is a parameter, but it is not swept.** `Scenario.queues`
   parameterizes how many distinct queues the backlog spreads across, and every
   published row holds it at 4. Backlog depth and claimer count *are* varied.
@@ -2294,6 +2328,11 @@ from the benchmark are directly comparable.
   [the concurrency-key gate fix](#the-concurrency-key-gate-fix).
 * `autumn-harvest/scripts/concurrency_key_claim_perf_repro.sh` — regenerates
   that evidence from a clean checkout.
+* `docs/perf-artifacts/claim-paused-gate/` — the PAUSED-run gate after the
+  `idx_harvest_we_paused` partial index (issue #2212, PR #2215). With 50
+  PAUSED-run tasks at the queue head, claim buffers fall from 6,515 to 1,289
+  at 1,000,000 executions. The claimed ids are identical. Its `run.sh`
+  regenerates the evidence.
 * [`docs/performance-capability-labels.md`](performance-capability-labels.md) — the capability-labels claim
   predicate (#382) measurement referenced above.
 * `docs/perf-artifacts/capability-labels-claim-predicate/` — committed
@@ -2378,6 +2417,11 @@ standalone note rather than part of the claim-path attribution table above:
   (issue #1194).
 * [`docs/performance-workflow-children-traversal.md`](performance-workflow-children-traversal.md)
   — batching the N+1 in `GET /workflows/{id}/children?depth=N` (issue #786-adjacent).
+* [`docs/performance-history-bloat-filter.md`](performance-history-bloat-filter.md)
+  — the `min_history_events` and `history_bloat_min_events` filters of three
+  `autumn-harvest-plugin/src/api.rs` queries. `COUNT(*) >= N` counted every
+  event of a run. A bounded `EXISTS (... OFFSET N-1 LIMIT 1)` reads at most N
+  rows (buffers 3,976 → 94 on a 448,175-event run, -97.6%). Shipped.
 * [`docs/performance-schedule-overdue-aux.md`](performance-schedule-overdue-aux.md)
   — the same N+1 shape in `GET /admin/schedules`'s overdue-aux computation
   (issue #696).
@@ -2398,7 +2442,9 @@ standalone note rather than part of the claim-path attribution table above:
   — `reconcile_quota_keys_from` candidate-scan cost under mixed-deployment
   skew (issue #1226 follow-up); confirms the scaling risk is a permanent
   per-tick cost, not a rollout expense, and diagnoses a planner
-  cardinality misestimate as the cause. No fix ships in this pass.
+  cardinality misestimate as the cause. That pass shipped no fix. Issue #1631
+  (PR #1855) later made the scan seek once per registered name. A tick now
+  reads at most `batch_size` rows per name.
 * [`docs/performance-codec-rotation-reencrypt.md`](performance-codec-rotation-reencrypt.md)
   — skipping a JSON round-trip in the codec-key-rotation re-encryption sweep
   (issue #948).
@@ -2490,10 +2536,6 @@ standalone note rather than part of the claim-path attribution table above:
   `shard_rebalance::history_fingerprint`, the replay-determinism check a
   shard migration runs on both sides of a copy (`docs/sharding.md`), fixed
   by reusing one buffer across events (alloc bytes -16.45%).
-* [`docs/performance-timeline-acckey-hash.md`](performance-timeline-acckey-hash.md)
-  — SipHash over `AccKey` in `timeline::derive_timeline`, the read model behind
-  `GET /workflows/{id}/timeline` (issue #739), replaced by one 128-bit hash
-  write per key (instructions -8.3%).
 * [`docs/performance-lineage.md`](performance-lineage.md) — the `visited`/
   `next`/`node.children` vecs in `lineage::LineageWalk`/
   `LineageTreeReport::finish`, the in-memory half of
@@ -2552,7 +2594,7 @@ standalone note rather than part of the claim-path attribution table above:
   400→4 at a 400-child fixture, 100 executions per chunk).
 * [`docs/performance-timeline-acckey-hash.md`](performance-timeline-acckey-hash.md)
   — the three-write derived `Hash` for `timeline::AccKey`, the lookup key of
-  `derive_timeline` behind `GET /workflows/{id}/timeline` (PR #1894);
+  `derive_timeline` behind `GET /workflows/{id}/timeline` (issue #739, PR #1894);
   replaced by a manual impl that writes one 128-bit value (instructions
   -8.3%, callgrind).
 * [`docs/performance-metrics-rs-labels.md`](performance-metrics-rs-labels.md)
@@ -2582,24 +2624,51 @@ standalone note rather than part of the claim-path attribution table above:
   tick, because the planner could not prove its predicate implies the partial
   index's. It now repeats the index clause and uses the index (buffers
   19,887 → 1 at 1,000,000 executions, `EXPLAIN (ANALYZE, BUFFERS)`).
+* [`docs/performance-analyzer-large-payload.md`](performance-analyzer-large-payload.md)
+  — `LargePayloadRule` in `HistoryAnalyzer::analyze` built the JSON text of
+  each payload to measure it. A counting writer now measures it with no text
+  (instructions -77.5%, allocated bytes -97.6%, PR #2287).
+* [`docs/performance-debug-diff-redaction-probe.md`](performance-debug-diff-redaction-probe.md)
+  — `debugger::is_redacted_export` in `harvest debug diff` parsed each
+  snapshot into a `Value` tree to read one key. A map visitor now reads the
+  key with no tree (pipeline instructions -23.7%, allocation blocks -16.5%,
+  PR #2292).
+* [`docs/performance-chrome-trace-export.md`](performance-chrome-trace-export.md)
+  — `trace_export::export_chrome_trace` returned `json!(events)`, which
+  copied the finished event tree. It now moves the vector into
+  `Value::Array` (instructions -34.8%, allocation blocks -35.4%, PR #2279).
+* [`docs/performance-fork-scheduled-occurrence.md`](performance-fork-scheduled-occurrence.md)
+  — `fork::scheduled_occurrence` hashed every scheduled activity name to
+  count one name. Two passes with no map replace it (instructions -49.2% at
+  K=1000, PR #2214). The cost stays quadratic in K.
 * [`docs/performance-decision-owner-baseline.md`](performance-decision-owner-baseline.md)
   — the baseline for the decision owner (issue #2248): claim latency by
   task kind on the assay #14 shape, the phases of the decision persist, and
   a criterion bench of the second fence row. Owner mode with DR on adds
   two statements and about 20% to the persist at one writer, so it fails
-  the stage 1b bar of 10%.
+  the stage 1b bar of 10%. Issue #2255 fuses the two into one statement.
+  The persist then passes the bar, at 9.3% faster than DR alone.
+* [`docs/performance-owner-failover.md`](performance-owner-failover.md)
+  — owner failover on real Postgres (issue #2254): a frozen owner, `kill -9`
+  and a scale-out from 4 to 8 workers. All four tests pass. After a kill,
+  the next decision runs in 10.2 s to 10.3 s, inside the 11 s bound. After
+  issue #2296, a re-run settles the scale-out in 5.3 s to 5.5 s, not 8.4 s
+  to 9.8 s.
 * [`docs/performance-owner-decider.md`](performance-owner-decider.md)
   — stage 1b of the decision owner (issue #2255). The owner decider takes
   workflow tasks by execution, so the claim loops claim 3 tasks per
   3-activity workflow instead of 7. On a 4-CPU host the CPU limits the gain
-  to 1.27x at one claim loop. The fused fence result is on the page.
+  to 1.27x at one claim loop. The fused fence result is on the page. A
+  re-run after issues #2296 and #2308 gives 1.28x at one claim loop.
 * [`docs/performance-match-activity-fanout.md`](performance-match-activity-fanout.md)
   — `HistoryMatcher::match_activity` on a fan-out history (issue #2330). The
   terminal scan reads a position index, so a fan-out replay is no longer
   quadratic. At N=1000 it costs 72% fewer instructions. A sequential history
   costs 0.7% more. Issue #2338 moves the external stash, timer fire
   and child terminal scans onto the same index. At N=1000 a fan-out after one
-  external signal costs 80% fewer instructions. Shipped.
+  external signal costs 80% fewer instructions. Shipped. Before issue #2330,
+  PR #2303 hashed event positions without `SipHash` (instructions -61.6% at
+  N=1000).
 * [`docs/performance-payload-depth.md`](performance-payload-depth.md)
   — the depth walk that the worker runs on every activity result (issue
   #2312). The walk is 10.6% of a harness that only clones and checks. The one

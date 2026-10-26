@@ -20,8 +20,10 @@ execution pause, circuit breaker, schedule-to-close and due time. Every write
 to workflow state and history stays in the Postgres transactions that exist
 today.
 
-The channel removes one cost, and only one: the backlog scan and sort that the
-Postgres claim performs on every claim.
+The channel removes one cost, and only one: the search for a claimable row.
+Since issue #1971, the default Postgres claim bounds that search with a window
+at the head of each queue. It scans and sorts the backlog only as a fallback.
+A claim with fairness keys or priority ageing always runs that scan.
 
 ## When to use it
 
