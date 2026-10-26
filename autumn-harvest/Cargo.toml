@@ -726,3 +726,11 @@ harness = false
 name = "timer_child_fanout_profile"
 required-features = ["testing"]
 harness = false
+
+# Deterministic (non-criterion) instruction-count profiling harness for the
+# external stash of `HistoryMatcher` (issue #2346). Drive it under
+# `valgrind --tool=callgrind`. See `benches/external_stash_profile.rs`.
+[[bench]]
+name = "external_stash_profile"
+required-features = ["testing"]
+harness = false

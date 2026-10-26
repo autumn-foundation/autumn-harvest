@@ -16959,9 +16959,25 @@ mod scan_fanout_tests {
         /// drain at the cursor stashes every event, so the external scan has
         /// no work.
         ExternalSignals,
+        /// A loop of an activity and an external call. With a first call,
+        /// that call comes before the loop, ends last, and the workflow
+        /// matches it last. A loop terminal matches no stash entry until the
+        /// drain stashes its request (issue #2346).
+        ExternalLoop(Option<Call>, Call),
+        /// An external await, then signal pairs, then the await terminal. A
+        /// control: the drain stashes every event at the first call.
+        ExternalPairs,
     }
 
-    const SHAPES: [Shape; 9] = [
+    /// An external call of the loop shapes.
+    #[derive(Debug, Clone, Copy)]
+    enum Call {
+        Signal,
+        Cancel,
+        Await,
+    }
+
+    const SHAPES: [Shape; 14] = [
         Shape::SignalThenActivities,
         Shape::OpenAwaitThenActivities,
         Shape::CancelThenActivities,
@@ -16971,6 +16987,11 @@ mod scan_fanout_tests {
         Shape::ChildrenReversed,
         Shape::LocalActivities,
         Shape::ExternalSignals,
+        Shape::ExternalLoop(None, Call::Signal),
+        Shape::ExternalLoop(Some(Call::Await), Call::Signal),
+        Shape::ExternalLoop(Some(Call::Signal), Call::Await),
+        Shape::ExternalLoop(Some(Call::Await), Call::Cancel),
+        Shape::ExternalPairs,
     ];
 
     fn activity_fan_out(n: usize) -> Vec<WorkflowEvent> {
@@ -17004,6 +17025,102 @@ mod scan_fanout_tests {
                 }
             );
         }
+    }
+
+    /// The request and the terminal of one external call to `callee`.
+    fn external_pair(call: Call, callee: ExecutionId, output: usize) -> [WorkflowEvent; 2] {
+        let target = ExternalTarget::ExecutionId(callee);
+        match call {
+            Call::Signal => {
+                let signal_id = ExternalSignalId::new();
+                [
+                    WorkflowEvent::ExternalSignalRequested {
+                        signal_id,
+                        target,
+                        signal_name: "go".into(),
+                        payload: Value::Null,
+                        idempotency_key: None,
+                    },
+                    WorkflowEvent::ExternalSignalDelivered { signal_id },
+                ]
+            }
+            Call::Cancel => {
+                let cancel_id = ExternalCancelId::new();
+                [
+                    WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+                    WorkflowEvent::ExternalCancelDelivered { cancel_id },
+                ]
+            }
+            Call::Await => {
+                let await_id = ExternalAwaitId::new();
+                [
+                    WorkflowEvent::ExternalAwaitRequested {
+                        await_id,
+                        target: callee,
+                    },
+                    WorkflowEvent::ExternalAwaitResolved {
+                        await_id,
+                        output: serde_json::json!(output),
+                    },
+                ]
+            }
+        }
+    }
+
+    /// Matches the external call to `callee` and checks its result.
+    fn match_external(m: &mut HistoryMatcher, call: Call, callee: ExecutionId, output: usize) {
+        let target = ExternalTarget::ExecutionId(callee);
+        let (got, want) = match call {
+            Call::Signal => (m.match_external_signal(&target, "go"), Value::Null),
+            Call::Cancel => (m.match_external_cancel(&target), Value::Null),
+            Call::Await => (m.match_external_await(callee), serde_json::json!(output)),
+        };
+        assert_eq!(got, HistoryMatch::Matched { output: want }, "{call:?}");
+    }
+
+    /// Replays an optional `first` call, then `n` loop steps of a `body`
+    /// call. With `commands`, an activity comes before each body call.
+    fn replay_external_loop(first: Option<Call>, body: Call, n: usize, commands: bool) -> u64 {
+        let opener = ExecutionId::new();
+        let callees: Vec<ExecutionId> = (0..n).map(|_| ExecutionId::new()).collect();
+        let pair = first.map(|call| external_pair(call, opener, n));
+        let mut events: Vec<WorkflowEvent> =
+            pair.iter().map(|[request, _]| request.clone()).collect();
+        for (i, callee) in callees.iter().enumerate() {
+            if commands {
+                let activity_id = ActivityExecId::new();
+                events.push(WorkflowEvent::ActivityScheduled {
+                    activity_id,
+                    name: "charge".into(),
+                    input: Value::Null,
+                    queue: "default".into(),
+                });
+                events.push(WorkflowEvent::ActivityCompleted {
+                    activity_id,
+                    output: serde_json::json!(i),
+                });
+            }
+            events.extend(external_pair(body, *callee, i));
+        }
+        events.extend(pair.map(|[_, terminal]| terminal));
+        let mut m = HistoryMatcher::new(events);
+        steps_of(|| {
+            for (i, callee) in callees.iter().enumerate() {
+                if commands {
+                    assert_eq!(
+                        m.match_activity("charge"),
+                        HistoryMatch::Matched {
+                            output: serde_json::json!(i)
+                        }
+                    );
+                }
+                match_external(&mut m, body, *callee, i);
+            }
+            if let Some(call) = first {
+                match_external(&mut m, call, opener, n);
+            }
+            assert!(!m.is_replaying());
+        })
     }
 
     /// The order in which the fires or completions of a fan-out arrive.
@@ -17204,6 +17321,8 @@ mod scan_fanout_tests {
                     assert!(!m.is_replaying());
                 })
             }
+            Shape::ExternalLoop(first, body) => replay_external_loop(first, body, n, true),
+            Shape::ExternalPairs => replay_external_loop(Some(Call::Await), Call::Signal, n, false),
         }
     }
 
