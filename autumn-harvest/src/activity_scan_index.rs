@@ -1,5 +1,5 @@
 //! A position index for the terminal scans of `HistoryMatcher` (issues
-//! #2330 and #2338).
+//! #2330, #2338 and #2346).
 //!
 //! `HistoryMatcher::scan_activity_terminal` looks for the terminal event of
 //! one activity. A plain walk visits every event between the schedule and
@@ -13,8 +13,13 @@
 //! events are steps that have no effect. `HistoryMatcher::activity_scan_role` sorts each
 //! event into one role, and `docs/performance-match-activity-fanout.md`
 //! records the measurement.
+//!
+//! [`ExternalTerminalIndex`] keeps the external terminal events apart, per
+//! [`ExternalKey`]. The external stash scan reads it with no walk, because
+//! that scan reads only the terminals of a new stash key (issue #2346).
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::ops::Range;
 
 use crate::event::WorkflowEvent;
@@ -51,7 +56,9 @@ pub enum ScanRole<'e> {
     /// cursor after the scan.
     Interleaved,
     /// A terminal event of an external signal, cancel or await. A scan
-    /// stashes it, as a barrier. The external stash scan resolves it.
+    /// stashes it, as a barrier. The external stash scan resolves it through
+    /// [`ExternalTerminalIndex`]. Give this role only to an event that
+    /// [`ExternalKey::of_terminal`] maps to a key.
     ExternalTerminal,
     /// An event that the scan stashes, or an event that stops it.
     Barrier,
@@ -64,8 +71,11 @@ pub enum ScanRole<'e> {
 /// A terminal event resolves only a stash entry with the same key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExternalKey {
+    /// An external signal.
     Signal(ExternalSignalId),
+    /// An external cancel.
     Cancel(ExternalCancelId),
+    /// An external await.
     Await(ExternalAwaitId),
 }
 
@@ -73,9 +83,9 @@ impl ExternalKey {
     /// The key of an external terminal event, or `None` for any other
     /// event.
     ///
-    /// [`ScanRole::ExternalTerminal`] does not carry the key. A key in the
-    /// role made the role larger, and the activity scan walk of a fan-out
-    /// cost about 4% more (issue #2346).
+    /// [`ScanRole::ExternalTerminal`] does not carry the key, so the role
+    /// stays small. A key in the role made the activity scan walk of the
+    /// `fanout` shape cost about 4% more.
     pub const fn of_terminal(event: &WorkflowEvent) -> Option<Self> {
         match event {
             WorkflowEvent::ExternalSignalDelivered { signal_id }
@@ -141,12 +151,8 @@ pub struct ActivityScanIndex {
     /// The terminal events of each child, in history order.
     children: HashMap<ExecutionId, Vec<usize>>,
     interleaved: SkipList,
+    /// The barriers, the external terminals among them.
     barriers: SkipList,
-    /// The external terminal events. Each one is a barrier too.
-    external_terminals: SkipList,
-    /// The external terminal events of each key, in history order (issue
-    /// #2346). The ids are unique, so a key has few terminals.
-    external_by_key: HashMap<ExternalKey, Vec<usize>>,
 }
 
 impl ActivityScanIndex {
@@ -191,14 +197,7 @@ impl ActivityScanIndex {
                 }
                 ScanRole::ChildTerminal(id) => self.children.entry(id).or_default().push(position),
                 ScanRole::Interleaved => self.interleaved.push(position),
-                ScanRole::ExternalTerminal => {
-                    self.barriers.push(position);
-                    self.external_terminals.push(position);
-                    if let Some(key) = ExternalKey::of_terminal(event) {
-                        self.external_by_key.entry(key).or_default().push(position);
-                    }
-                }
-                ScanRole::Barrier => self.barriers.push(position),
+                ScanRole::ExternalTerminal | ScanRole::Barrier => self.barriers.push(position),
                 ScanRole::Pass => {}
             }
         }
@@ -258,28 +257,6 @@ impl ActivityScanIndex {
             .copied()
     }
 
-    /// The first unconsumed external terminal event at or after `from`.
-    pub fn first_external_terminal(
-        &mut self,
-        from: usize,
-        consumed: impl Fn(usize) -> bool,
-    ) -> Option<usize> {
-        self.external_terminals.first_unconsumed(from, consumed)
-    }
-
-    /// The first unconsumed external terminal event of `key` at or after
-    /// `from` (issue #2346).
-    pub fn first_external_terminal_of(
-        &self,
-        key: ExternalKey,
-        from: usize,
-        consumed: impl Fn(usize) -> bool,
-    ) -> Option<usize> {
-        let terminals = self.external_by_key.get(&key)?;
-        let start = terminals.partition_point(|&p| p < from);
-        terminals[start..].iter().copied().find(|&p| !consumed(p))
-    }
-
     /// The first unconsumed interleaved command at or after `from`.
     pub fn first_interleaved(
         &mut self,
@@ -307,6 +284,87 @@ impl ActivityScanIndex {
         let start = progress.partition_point(|&p| p < range.start);
         let end = progress.partition_point(|&p| p < range.end);
         &progress[start..end.max(start)]
+    }
+}
+
+/// The positions of the external terminal events (issue #2346).
+///
+/// The external stash scan reads the terminals of one key, or every terminal
+/// in a range. A build tests each event with [`ExternalKey::of_terminal`]
+/// and stores the six external terminal events only.
+#[derive(Debug, Default)]
+pub struct ExternalTerminalIndex {
+    /// The length of the history prefix that the index holds.
+    indexed: usize,
+    /// Every external terminal event, in history order.
+    terminals: SkipList,
+    /// The terminal events of each key.
+    by_key: HashMap<ExternalKey, KeyPositions>,
+}
+
+/// The terminal positions of one key, in history order.
+///
+/// Each call has its own id, so a key has one terminal in almost every
+/// history. That position needs no allocation. A history can repeat an id,
+/// so a key can have more.
+#[derive(Debug)]
+enum KeyPositions {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl ExternalTerminalIndex {
+    /// Adds the events after the indexed prefix.
+    ///
+    /// The prefix never changes, as for [`ActivityScanIndex::extend`]. The
+    /// caller ignores a position at or after the visible length.
+    pub fn extend(&mut self, events: &[WorkflowEvent]) {
+        for (position, event) in events.iter().enumerate().skip(self.indexed) {
+            #[cfg(test)]
+            steps::count();
+            let Some(key) = ExternalKey::of_terminal(event) else {
+                continue;
+            };
+            self.terminals.push(position);
+            match self.by_key.entry(key) {
+                Entry::Occupied(mut positions) => {
+                    let positions = positions.get_mut();
+                    match positions {
+                        KeyPositions::One(first) => {
+                            *positions = KeyPositions::Many(vec![*first, position]);
+                        }
+                        KeyPositions::Many(all) => all.push(position),
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(KeyPositions::One(position));
+                }
+            }
+        }
+        self.indexed = self.indexed.max(events.len());
+    }
+
+    /// The first unconsumed external terminal event at or after `from`.
+    pub fn first(&mut self, from: usize, consumed: impl Fn(usize) -> bool) -> Option<usize> {
+        self.terminals.first_unconsumed(from, consumed)
+    }
+
+    /// The first unconsumed terminal event of `key` at or after `from`.
+    pub fn first_of(
+        &self,
+        key: ExternalKey,
+        from: usize,
+        consumed: impl Fn(usize) -> bool,
+    ) -> Option<usize> {
+        match self.by_key.get(&key)? {
+            KeyPositions::One(position) => {
+                (*position >= from && !consumed(*position)).then_some(*position)
+            }
+            KeyPositions::Many(all) => {
+                let start = all.partition_point(|&p| p < from);
+                all[start..].iter().copied().find(|&p| !consumed(p))
+            }
+        }
     }
 }
 
@@ -540,37 +598,114 @@ mod tests {
     }
 
     #[test]
-    fn an_external_terminal_is_a_barrier_too() {
+    fn an_external_terminal_is_a_barrier() {
         let delivered = WorkflowEvent::ExternalSignalDelivered {
             signal_id: ExternalSignalId::new(),
         };
         let mut index = ActivityScanIndex::default();
-        index.extend(&[fired("t"), delivered.clone(), delivered], test_role);
-        assert_eq!(index.first_external_terminal(0, |_| false), Some(1));
-        assert_eq!(index.first_external_terminal(0, |p| p == 1), Some(2));
+        index.extend(&[fired("t"), delivered], test_role);
         assert_eq!(index.first_barrier(0, |_| false), Some(1));
-        assert_eq!(index.first_external_terminal(3, |_| false), None);
+        assert_eq!(index.first_barrier(2, |_| false), None);
+    }
+
+    fn signal_delivered(signal_id: ExternalSignalId) -> WorkflowEvent {
+        WorkflowEvent::ExternalSignalDelivered { signal_id }
+    }
+
+    #[test]
+    fn the_external_index_holds_every_external_terminal_in_order() {
+        let mut index = ExternalTerminalIndex::default();
+        let a = ExternalSignalId::new();
+        index.extend(&[fired("t"), signal_delivered(a), signal_delivered(a)]);
+        assert_eq!(index.first(0, |_| false), Some(1));
+        assert_eq!(index.first(0, |p| p == 1), Some(2));
+        assert_eq!(index.first(3, |_| false), None);
     }
 
     #[test]
     fn a_key_query_returns_the_terminals_of_its_key_only() {
         let a = ExternalSignalId::new();
         let b = ExternalSignalId::new();
-        let delivered = |signal_id| WorkflowEvent::ExternalSignalDelivered { signal_id };
-        let mut index = ActivityScanIndex::default();
-        index.extend(&[delivered(a), delivered(b), delivered(a)], test_role);
+        let mut index = ExternalTerminalIndex::default();
+        index.extend(&[signal_delivered(a), signal_delivered(b)]);
         let key = ExternalKey::Signal(a);
-        assert_eq!(index.first_external_terminal_of(key, 0, |_| false), Some(0));
-        assert_eq!(index.first_external_terminal_of(key, 1, |_| false), Some(2));
-        assert_eq!(
-            index.first_external_terminal_of(key, 0, |p| p == 0),
-            Some(2)
-        );
-        assert_eq!(index.first_external_terminal_of(key, 3, |_| false), None);
+        assert_eq!(index.first_of(key, 0, |_| false), Some(0));
+        assert_eq!(index.first_of(key, 1, |_| false), None);
+        assert_eq!(index.first_of(key, 0, |p| p == 0), None);
+        // A later extend turns the one position of `a` into a list.
+        let events = [
+            signal_delivered(a),
+            signal_delivered(b),
+            signal_delivered(a),
+        ];
+        index.extend(&events);
+        assert_eq!(index.first_of(key, 0, |_| false), Some(0));
+        assert_eq!(index.first_of(key, 1, |_| false), Some(2));
+        assert_eq!(index.first_of(key, 0, |p| p == 0), Some(2));
+        assert_eq!(index.first_of(key, 3, |_| false), None);
         let other = ExternalKey::Signal(ExternalSignalId::new());
-        assert_eq!(index.first_external_terminal_of(other, 0, |_| false), None);
+        assert_eq!(index.first_of(other, 0, |_| false), None);
         let cancel = ExternalKey::Cancel(ExternalCancelId::new());
-        assert_eq!(index.first_external_terminal_of(cancel, 0, |_| false), None);
+        assert_eq!(index.first_of(cancel, 0, |_| false), None);
+    }
+
+    /// Each external terminal event maps to the key of its own kind and id.
+    /// Every other event maps to no key.
+    #[test]
+    fn of_terminal_maps_each_external_terminal_to_its_key() {
+        let signal = ExternalSignalId::new();
+        let cancel = ExternalCancelId::new();
+        let awaited = ExternalAwaitId::new();
+        let cases = [
+            (signal_delivered(signal), Some(ExternalKey::Signal(signal))),
+            (
+                WorkflowEvent::ExternalSignalFailed {
+                    signal_id: signal,
+                    reason_code: "gone".into(),
+                },
+                Some(ExternalKey::Signal(signal)),
+            ),
+            (
+                WorkflowEvent::ExternalCancelDelivered { cancel_id: cancel },
+                Some(ExternalKey::Cancel(cancel)),
+            ),
+            (
+                WorkflowEvent::ExternalCancelFailed {
+                    cancel_id: cancel,
+                    reason_code: "gone".into(),
+                },
+                Some(ExternalKey::Cancel(cancel)),
+            ),
+            (
+                WorkflowEvent::ExternalAwaitResolved {
+                    await_id: awaited,
+                    output: serde_json::Value::Null,
+                },
+                Some(ExternalKey::Await(awaited)),
+            ),
+            (
+                WorkflowEvent::ExternalAwaitFailed {
+                    await_id: awaited,
+                    reason_code: "gone".into(),
+                    message: None,
+                    error_type: None,
+                    details: None,
+                    non_retryable: None,
+                },
+                Some(ExternalKey::Await(awaited)),
+            ),
+            (
+                WorkflowEvent::ExternalAwaitRequested {
+                    await_id: awaited,
+                    target: ExecutionId::new(),
+                },
+                None,
+            ),
+            (fired("t"), None),
+        ];
+        for (event, key) in cases {
+            assert_eq!(ExternalKey::of_terminal(&event), key, "{event:?}");
+        }
     }
 
     #[test]

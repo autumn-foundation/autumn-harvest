@@ -14,7 +14,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::ops::Range;
 
-use crate::activity_scan_index::{ActivityScanIndex, ExternalKey, ScanRole, ScanTarget};
+use crate::activity_scan_index::{
+    ActivityScanIndex, ExternalKey, ExternalTerminalIndex, ScanRole, ScanTarget,
+};
 use crate::error::TimeoutType;
 use crate::event::{SideEffectKind, WorkflowEvent};
 use crate::types::{
@@ -736,22 +738,27 @@ struct StashedExternalAwait {
     terminal: Option<StashedAwaitTerminal>,
 }
 
-/// What the external stash scan resolved already (issue #2346).
+/// The range that the external stash scan settled, and the keys stashed
+/// since then (issue #2346).
 ///
 /// A terminal changes the stash only when its key has an eligible entry. A
 /// signal or cancel entry is always eligible. An await entry is eligible
-/// while it is open. After a scan, no unconsumed terminal inside `covered`
-/// matches an eligible entry, except a terminal of a key in `new_keys`.
+/// while it is open. From one scan with work to the next, no unconsumed
+/// terminal inside `covered` matches an eligible entry, unless its key is in
+/// `new_keys`.
 ///
 /// The changes between two scans keep that rule. A push notes its key. A
-/// remove or a terminal can only make an entry ineligible. A consumed event
-/// stays consumed. So inside `covered`, a scan reads the new keys only.
-/// `docs/design/DESIGN-2346.md` gives the full argument.
+/// remove, or a new terminal on an entry, can only make an entry ineligible.
+/// A consumed event stays consumed. A cursor move and a view change do not
+/// change `covered`, and the scan compares the two at its start. So inside
+/// `covered`, a scan reads the new keys only. `docs/design/DESIGN-2346.md`
+/// gives the full argument.
 #[derive(Debug)]
 struct ExternalScanMemo {
     /// The positions that the rule covers.
     covered: Range<usize>,
-    /// The keys of the entries that the matcher stashed after the last scan.
+    /// The keys of the entries that the matcher stashed since the last scan
+    /// with work. A key can repeat.
     new_keys: Vec<ExternalKey>,
 }
 
@@ -1018,10 +1025,10 @@ pub struct HistoryMatcher {
     /// e.g. when signal events appear before `ActivityScheduled` or
     /// `TimerStarted` events in a mixed-batch history.
     ///
-    ///
-    /// Push an entry only through a `stash_external_*_request` helper. The
-    /// helper notes its key in `external_scan_memo`. A push without the note
-    /// makes the external scan skip a terminal (issue #2346).
+    /// Push onto the three stashes only through a `stash_external_*_request`
+    /// helper. The helper notes the key in `external_scan_memo`. A push
+    /// without the note makes the external scan skip a terminal (issue
+    /// #2346).
     pending_external_signals: ExternalStash<StashedExternalSignal>,
     /// External cancels drained before their natural cursor position (issue #492).
     pending_external_cancels: ExternalStash<StashedExternalCancel>,
@@ -1146,8 +1153,12 @@ pub struct HistoryMatcher {
     /// The first scan that leaves its walk builds it. Each later use adds
     /// the new events.
     activity_scan_index: ActivityScanIndex,
-    /// What the external stash scan resolved already (issue #2346).
+    /// The range that the external stash scan settled, and the keys stashed
+    /// since then (issue #2346).
     external_scan_memo: ExternalScanMemo,
+    /// The external terminal events. The first external stash scan with
+    /// work builds it (issue #2346).
+    external_terminal_index: ExternalTerminalIndex,
 }
 
 /// A signal predicate over `(event index, payload)` (issue #1985).
@@ -1304,6 +1315,7 @@ impl HistoryMatcher {
             predicate_rejected_signal_events: HashSet::new(),
             activity_scan_index: ActivityScanIndex::default(),
             external_scan_memo: ExternalScanMemo::new(),
+            external_terminal_index: ExternalTerminalIndex::default(),
         }
     }
 
@@ -1797,6 +1809,21 @@ impl HistoryMatcher {
     const fn index_and_consumed(&mut self) -> (&mut ActivityScanIndex, ConsumedView<'_>) {
         (
             &mut self.activity_scan_index,
+            ConsumedView {
+                out_of_order: &self.consumed_out_of_order_events,
+                signals: &self.consumed_signal_events,
+                transparent: &self.transparent_events,
+            },
+        )
+    }
+
+    /// The external terminal index and the consumed sets, borrowed apart
+    /// (issue #2346).
+    const fn external_index_and_consumed(
+        &mut self,
+    ) -> (&mut ExternalTerminalIndex, ConsumedView<'_>) {
+        (
+            &mut self.external_terminal_index,
             ConsumedView {
                 out_of_order: &self.consumed_out_of_order_events,
                 signals: &self.consumed_signal_events,
@@ -3021,6 +3048,10 @@ impl HistoryMatcher {
     /// lands later than its request, often past a sibling's child or activity
     /// events, as in `join!(await_external_workflow, spawn_child_workflow)`.
     /// Without this scan the stashed await stays in progress and parks forever.
+    ///
+    /// The scan skips a terminal that an earlier scan left unmatched, unless a
+    /// new stash entry has its key (issue #2346). [`ExternalScanMemo`] holds
+    /// that state.
     fn scan_ahead_for_external_signal_terminals(&mut self) {
         #[cfg(test)]
         if activity_scan_tests::oracle_on() {
@@ -3045,29 +3076,20 @@ impl HistoryMatcher {
         if lo == from && hi == len && self.external_scan_memo.new_keys.is_empty() {
             return;
         }
-        let new_keys = std::mem::take(&mut self.external_scan_memo.new_keys);
         self.external_scan_memo.covered = from..len;
-        // The cursor does not move past the walked events, so a later call
-        // walks them again. The scan therefore needs no interleaved command
-        // to leave its walk.
-        if !self.leaves_walk(len - from, true) {
-            self.activity_scan_index.note_walk(len - from);
-            for at in from..len {
-                if !self.is_consumed(at) {
-                    self.resolve_stashed_terminal(at);
-                }
-            }
-            return;
-        }
-        self.activity_scan_index
-            .extend(&self.events, Self::activity_scan_role);
+        // A build tests each event once, so the scan needs no walk.
+        self.external_terminal_index.extend(&self.events);
         // The three ranges run in position order. So the terminals of one key
         // resolve in history order, as in the walk. The terminals of two keys
         // never touch the same entry.
         self.resolve_external_terminals(None, from..lo);
-        for key in new_keys {
+        // The loop reads the list in place, so the list keeps its capacity.
+        let mut next = 0;
+        while let Some(&key) = self.external_scan_memo.new_keys.get(next) {
             self.resolve_external_terminals(Some(key), lo..hi);
+            next += 1;
         }
+        self.external_scan_memo.new_keys.clear();
         self.resolve_external_terminals(None, hi..len);
     }
 
@@ -3077,14 +3099,15 @@ impl HistoryMatcher {
     fn resolve_external_terminals(&mut self, key: Option<ExternalKey>, range: Range<usize>) {
         let mut next = range.start;
         while next < range.end {
-            let (index, consumed) = self.index_and_consumed();
+            let (index, consumed) = self.external_index_and_consumed();
             let is_consumed = |p| consumed.contains(p);
             let found = match key {
-                Some(key) => index.first_external_terminal_of(key, next, is_consumed),
-                None => index.first_external_terminal(next, is_consumed),
+                Some(key) => index.first_of(key, next, is_consumed),
+                None => index.first(next, is_consumed),
             };
-            // The index can hold a position that a cut view hides. The range
-            // ends at the visible length or before it, so the filter drops it.
+            // The filter ends the pass at the end of the range. The range ends
+            // at or before the visible length, so the filter also drops a
+            // position that a cut view hides.
             let Some(at) = found.filter(|&p| p < range.end) else {
                 return;
             };
@@ -16691,11 +16714,11 @@ mod activity_scan_tests {
                 },
                 Ev::SignalFailed(i) => WorkflowEvent::ExternalSignalFailed {
                     signal_id: self.signals[*i],
-                    reason_code: "gone".into(),
+                    reason_code: format!("gone{at}"),
                 },
                 Ev::CancelFailed(i) => WorkflowEvent::ExternalCancelFailed {
                     cancel_id: self.cancels[*i],
-                    reason_code: "gone".into(),
+                    reason_code: format!("gone{at}"),
                 },
                 Ev::AwaitRequested(i) => WorkflowEvent::ExternalAwaitRequested {
                     await_id: self.awaits[*i],
@@ -16707,7 +16730,7 @@ mod activity_scan_tests {
                 },
                 Ev::AwaitFailed(i) => WorkflowEvent::ExternalAwaitFailed {
                     await_id: self.awaits[*i],
-                    reason_code: "gone".into(),
+                    reason_code: format!("gone{at}"),
                     message: None,
                     error_type: None,
                     details: None,
@@ -16751,8 +16774,16 @@ mod activity_scan_tests {
         Cut(usize),
         Restore,
         /// Moves the cursor back by this many events. No production path
-        /// does this, but a scan must still match the old one (issue #2346).
+        /// moves the cursor below the start of the last scan. The scan must
+        /// still match the old one after such a move (issue #2346).
         Rewind(usize),
+        /// Moves the cursor forward by this many events, and consumes none.
+        /// A later rewind then finds unconsumed terminals below the range of
+        /// the last scan (issue #2346).
+        Skip(usize),
+        /// Runs `prepare_match` only. The state is then compared right after
+        /// the external scan, before another scan can stash a terminal.
+        Prepare,
     }
 
     fn op() -> impl Strategy<Value = Op> {
@@ -16770,6 +16801,8 @@ mod activity_scan_tests {
             1 => (0..80_usize).prop_map(Op::Cut),
             1 => Just(Op::Restore),
             1 => (1..30_usize).prop_map(Op::Rewind),
+            1 => (1..30_usize).prop_map(Op::Skip),
+            2 => Just(Op::Prepare),
         ]
     }
 
@@ -16871,6 +16904,11 @@ mod activity_scan_tests {
                 m.cursor = m.cursor.saturating_sub(*back);
                 return format!("cursor={}", m.cursor);
             }
+            Op::Skip(ahead) => {
+                m.cursor = (m.cursor + ahead).min(m.events.len());
+                return format!("cursor={}", m.cursor);
+            }
+            Op::Prepare => return format!("replaying={}", m.prepare_match()),
             Op::Append(_) => {
                 // Production code never appends inside a cut view.
                 let append = cut.is_none();
@@ -16923,9 +16961,181 @@ mod activity_scan_tests {
             }
         }
     }
+
+    proptest! {
+        /// The scan role and the external key agree on every event (issue
+        /// #2346). The external index files only an event with a key. The
+        /// activity scan stashes an event with the external terminal role.
+        #[test]
+        fn the_scan_role_and_the_external_key_agree(
+            ev in ev().prop_filter("a pad is not one event", |e| !matches!(e, Ev::Pad(_))),
+        ) {
+            let event = Pools::new().event(&ev, 0);
+            prop_assert_eq!(
+                HistoryMatcher::activity_scan_role(&event) == ScanRole::ExternalTerminal,
+                ExternalKey::of_terminal(&event).is_some(),
+                "{:?}",
+                event
+            );
+        }
+    }
 }
 
-/// Scaling tests of the matcher scans that issue #2338 names.
+/// Tests of [`ExternalStash`] against a plain `VecDeque` (issue #2346).
+#[cfg(test)]
+mod external_stash_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A stash entry. The tag tells two entries with one id apart.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Entry {
+        id: u8,
+        tag: u16,
+        open: bool,
+    }
+
+    impl StashEntry for Entry {
+        type Id = u8;
+
+        fn id(&self) -> u8 {
+            self.id
+        }
+    }
+
+    /// One stash call. The ids come from a small pool, so they repeat.
+    #[derive(Debug, Clone)]
+    enum Step {
+        Push(u8),
+        /// Closes the first entry with the id.
+        CloseFirst(u8),
+        /// Closes the first open entry with the id.
+        CloseFirstOpen(u8),
+        /// Removes the first entry with the id.
+        RemoveId(u8),
+        /// Removes the first entry whose tag has this remainder mod 3, as a
+        /// match by target does.
+        RemoveTag(u16),
+        Contains(u8),
+    }
+
+    fn step() -> impl Strategy<Value = Step> {
+        let id = || 0..4_u8;
+        prop_oneof![
+            4 => id().prop_map(Step::Push),
+            1 => id().prop_map(Step::CloseFirst),
+            1 => id().prop_map(Step::CloseFirstOpen),
+            2 => id().prop_map(Step::RemoveId),
+            2 => (0..3_u16).prop_map(Step::RemoveTag),
+            1 => id().prop_map(Step::Contains),
+        ]
+    }
+
+    /// Closes `entry` and returns its tag.
+    fn close(entry: &mut Entry) -> u16 {
+        entry.open = false;
+        entry.tag
+    }
+
+    proptest! {
+        /// Under any order of calls, the stash gives the result of a plain
+        /// search, and it keeps the same entries in the same order.
+        #[test]
+        fn the_stash_matches_a_plain_search(steps in proptest::collection::vec(step(), 1..200)) {
+            let mut stash = ExternalStash::new();
+            let mut model: VecDeque<Entry> = VecDeque::new();
+            let mut next_tag = 0;
+            for step in steps {
+                let (got, want) = match step {
+                    Step::Push(id) => {
+                        next_tag += 1;
+                        let entry = Entry { id, tag: next_tag, open: true };
+                        stash.push_back(entry.clone());
+                        model.push_back(entry);
+                        (None, None)
+                    }
+                    Step::CloseFirst(id) => (
+                        stash.first_mut(id, |_| true).map(close),
+                        model.iter_mut().find(|e| e.id == id).map(close),
+                    ),
+                    Step::CloseFirstOpen(id) => (
+                        stash.first_mut(id, |e| e.open).map(close),
+                        model.iter_mut().find(|e| e.id == id && e.open).map(close),
+                    ),
+                    Step::RemoveId(id) => (
+                        stash.remove_first(|e| e.id == id).map(|e| e.tag),
+                        model
+                            .iter()
+                            .position(|e| e.id == id)
+                            .and_then(|at| model.remove(at))
+                            .map(|e| e.tag),
+                    ),
+                    Step::RemoveTag(rest) => (
+                        stash.remove_first(|e| e.tag % 3 == rest).map(|e| e.tag),
+                        model
+                            .iter()
+                            .position(|e| e.tag % 3 == rest)
+                            .and_then(|at| model.remove(at))
+                            .map(|e| e.tag),
+                    ),
+                    Step::Contains(id) => (
+                        stash.contains(id).then_some(0),
+                        model.iter().any(|e| e.id == id).then_some(0),
+                    ),
+                };
+                prop_assert_eq!(got, want);
+                prop_assert_eq!(stash.len(), model.len());
+                prop_assert_eq!(stash.is_empty(), model.is_empty());
+                prop_assert_eq!(format!("{stash:?}"), format!("{model:?}"));
+                for (at, entry) in model.iter().enumerate() {
+                    prop_assert_eq!(&stash[at], entry);
+                }
+            }
+        }
+    }
+
+    /// After a remove in the middle, the position guess misses, and the
+    /// binary search finds the entry.
+    #[test]
+    fn a_search_after_a_middle_remove_finds_the_entry() {
+        let mut stash = ExternalStash::new();
+        for (id, tag) in [(1, 1), (2, 2), (3, 3), (4, 4)] {
+            stash.push_back(Entry {
+                id,
+                tag,
+                open: true,
+            });
+        }
+        assert_eq!(stash.remove_first(|e| e.id == 2).map(|e| e.tag), Some(2));
+        assert_eq!(stash.first_mut(4, |_| true).map(|e| e.tag), Some(4));
+        assert_eq!(stash.first_mut(1, |_| true).map(|e| e.tag), Some(1));
+        assert_eq!(stash.first_mut(2, |_| true), None);
+        assert!(!stash.contains(2));
+    }
+
+    /// A remove of the first entry of a repeated id moves the first entry
+    /// of that id to the next one.
+    #[test]
+    fn a_repeated_id_keeps_its_next_entry_after_a_remove() {
+        let mut stash = ExternalStash::new();
+        for (id, tag) in [(7, 1), (8, 2), (7, 3), (7, 4)] {
+            stash.push_back(Entry {
+                id,
+                tag,
+                open: true,
+            });
+        }
+        assert_eq!(stash.remove_first(|e| e.id == 7).map(|e| e.tag), Some(1));
+        assert_eq!(stash.first_mut(7, |_| true).map(|e| e.tag), Some(3));
+        assert_eq!(stash.remove_first(|e| e.tag == 4).map(|e| e.tag), Some(4));
+        assert_eq!(stash.first_mut(7, |_| true).map(|e| e.tag), Some(3));
+        assert_eq!(stash.remove_first(|e| e.id == 7).map(|e| e.tag), Some(3));
+        assert!(!stash.contains(7));
+        assert!(stash.contains(8));
+    }
+}
+
+/// Scaling tests of the matcher scans that issues #2338 and #2346 name.
 #[cfg(test)]
 mod scan_fanout_tests {
     use super::*;
@@ -17088,7 +17298,8 @@ mod scan_fanout_tests {
     }
 
     /// Replays an optional `first` call, then `n` loop steps of a `body`
-    /// call. With `commands`, an activity comes before each body call.
+    /// call, and returns the scan steps. With `commands`, an activity comes
+    /// before each body call.
     fn replay_external_loop(first: Option<Call>, body: Call, n: usize, commands: bool) -> u64 {
         let opener = ExecutionId::new();
         let callees: Vec<ExecutionId> = (0..n).map(|_| ExecutionId::new()).collect();
@@ -17132,9 +17343,9 @@ mod scan_fanout_tests {
         })
     }
 
-    /// Replays `n` requests of an external call, then their terminals. With
-    /// `past_command`, an activity schedule comes before the terminals and
-    /// its completion after them.
+    /// Replays `n` requests of an external call, then their terminals, and
+    /// returns the scan steps. With `past_command`, an activity schedule
+    /// comes before the terminals and its completion after them.
     fn replay_external_fan_out(call: Call, n: usize, past_command: bool) -> u64 {
         let callees: Vec<ExecutionId> = (0..n).map(|_| ExecutionId::new()).collect();
         let pairs: Vec<[WorkflowEvent; 2]> = callees
@@ -17787,14 +17998,19 @@ mod scan_fanout_tests {
         });
     }
 
-    /// The index holds an external terminal that a later cut hides. The
-    /// external scan inside the cut does not resolve it.
+    /// The external index holds a terminal that a later cut hides. The
+    /// external scan inside the cut does not resolve it. After the restore,
+    /// it does.
     #[test]
     fn the_external_scan_ignores_an_indexed_terminal_that_a_cut_hides() {
         each_mode(|mode| {
             let a = ExecutionId::new();
             let cancel_id = ExternalCancelId::new();
             let mut events = vec![
+                WorkflowEvent::ExternalAwaitRequested {
+                    await_id: ExternalAwaitId::new(),
+                    target: ExecutionId::new(),
+                },
                 WorkflowEvent::ChildWorkflowStarted {
                     child_id: a,
                     workflow_name: "child".into(),
@@ -17809,15 +18025,272 @@ mod scan_fanout_tests {
             events.extend(padding(8));
             events.push(WorkflowEvent::ExternalCancelDelivered { cancel_id });
             let mut m = HistoryMatcher::new(events);
+            // The stashed await makes the first scan build the index. The
+            // cancel request is not in the stash yet, so its terminal at 12
+            // stays unconsumed.
             assert_eq!(
                 m.match_child_workflow("child", &Value::Null),
                 HistoryMatch::ChildInProgress { child_id: a },
                 "{mode}"
             );
-            let _cut = m.cut_view(11).expect("the cut hides an event");
+            assert_eq!(m.external_terminal_index.first(0, |_| false), Some(12));
+            let cut = m.cut_view(12).expect("the cut hides an event");
+            // The drain stashes the cancel request, so its key is new.
             assert!(m.prepare_match(), "{mode}");
+            assert_eq!(m.pending_external_cancels.len(), 1, "{mode}");
             assert!(m.pending_external_cancels[0].terminal.is_none(), "{mode}");
+            m.restore_view(cut);
+            assert!(m.prepare_match(), "{mode}");
+            assert!(m.consumed_signal_events.contains(&12), "{mode}");
         });
+    }
+
+    /// A per-key pass resolves each of the six terminal kinds. The drain
+    /// stashes six requests, and an unfired timer then stops it. So only
+    /// the passes of the six new keys can reach the terminals.
+    #[test]
+    fn a_key_pass_resolves_every_terminal_kind() {
+        let target =
+            |i: u128| ExternalTarget::ExecutionId(ExecutionId::from_uuid(uuid::Uuid::from_u128(i)));
+        let signals = [ExternalSignalId::new(), ExternalSignalId::new()];
+        let cancels = [ExternalCancelId::new(), ExternalCancelId::new()];
+        let awaits = [ExternalAwaitId::new(), ExternalAwaitId::new()];
+        let awaited = [ExecutionId::new(), ExecutionId::new()];
+        let mut events = Vec::new();
+        for (i, signal_id) in signals.iter().enumerate() {
+            events.push(WorkflowEvent::ExternalSignalRequested {
+                signal_id: *signal_id,
+                target: target(i as u128),
+                signal_name: "go".into(),
+                payload: Value::Null,
+                idempotency_key: None,
+            });
+        }
+        for (i, cancel_id) in cancels.iter().enumerate() {
+            events.push(WorkflowEvent::ExternalCancelRequested {
+                cancel_id: *cancel_id,
+                target: target(10 + i as u128),
+            });
+        }
+        for (await_id, target) in awaits.iter().zip(awaited) {
+            events.push(WorkflowEvent::ExternalAwaitRequested {
+                await_id: *await_id,
+                target,
+            });
+        }
+        events.push(timer_started("t"));
+        events.push(WorkflowEvent::ExternalSignalDelivered {
+            signal_id: signals[0],
+        });
+        events.push(WorkflowEvent::ExternalSignalFailed {
+            signal_id: signals[1],
+            reason_code: "sig".into(),
+        });
+        events.push(WorkflowEvent::ExternalCancelDelivered {
+            cancel_id: cancels[0],
+        });
+        events.push(WorkflowEvent::ExternalCancelFailed {
+            cancel_id: cancels[1],
+            reason_code: "cancel".into(),
+        });
+        events.push(WorkflowEvent::ExternalAwaitResolved {
+            await_id: awaits[0],
+            output: serde_json::json!("done"),
+        });
+        events.push(WorkflowEvent::ExternalAwaitFailed {
+            await_id: awaits[1],
+            reason_code: "await".into(),
+            message: None,
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        });
+        let mut m = HistoryMatcher::new(events);
+        assert!(m.prepare_match());
+        assert_eq!(m.cursor, 6);
+        for terminal in 7..13 {
+            assert!(m.consumed_signal_events.contains(&terminal), "{terminal}");
+        }
+        assert_eq!(
+            m.match_external_signal(&target(0), "go"),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert_eq!(
+            m.match_external_signal(&target(1), "go"),
+            HistoryMatch::ExternalSignalFailed {
+                signal_id: signals[1],
+                reason_code: "sig".into(),
+            }
+        );
+        assert_eq!(
+            m.match_external_cancel(&target(10)),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert_eq!(
+            m.match_external_cancel(&target(11)),
+            HistoryMatch::ExternalCancelFailed {
+                cancel_id: cancels[1],
+                reason_code: "cancel".into(),
+            }
+        );
+        assert_eq!(
+            m.match_external_await(awaited[0]),
+            HistoryMatch::Matched {
+                output: serde_json::json!("done")
+            }
+        );
+        assert!(matches!(
+            m.match_external_await(awaited[1]),
+            HistoryMatch::ExternalAwaitFailed { reason_code, .. } if reason_code == "await"
+        ));
+    }
+
+    /// The stash gives its entries out in push order. A match of one target
+    /// does not move the entries of another target.
+    #[test]
+    fn the_stash_keeps_push_order_across_a_remove() {
+        let first = ExternalTarget::ExecutionId(ExecutionId::new());
+        let second = ExternalTarget::ExecutionId(ExecutionId::new());
+        let ids = [
+            ExternalSignalId::new(),
+            ExternalSignalId::new(),
+            ExternalSignalId::new(),
+        ];
+        let request = |signal_id, target: &ExternalTarget| WorkflowEvent::ExternalSignalRequested {
+            signal_id,
+            target: target.clone(),
+            signal_name: "go".into(),
+            payload: Value::Null,
+            idempotency_key: None,
+        };
+        let mut m = HistoryMatcher::new(vec![
+            request(ids[0], &first),
+            request(ids[1], &second),
+            WorkflowEvent::ExternalSignalDelivered { signal_id: ids[1] },
+            request(ids[2], &second),
+        ]);
+        assert!(matches!(
+            m.match_external_signal(&first, "go"),
+            HistoryMatch::ExternalSignalInProgress { signal_id, .. } if signal_id == ids[0]
+        ));
+        assert_eq!(
+            m.match_external_signal(&second, "go"),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert!(matches!(
+            m.match_external_signal(&second, "go"),
+            HistoryMatch::ExternalSignalInProgress { signal_id, .. } if signal_id == ids[2]
+        ));
+    }
+
+    /// After a rewind, the pass below the covered range runs before the pass
+    /// of a new key. A key with a terminal in each range then resolves in
+    /// history order, and the later terminal sets the result.
+    #[test]
+    fn a_rewind_keeps_the_order_of_one_key() {
+        let target = ExternalTarget::ExecutionId(ExecutionId::new());
+        let signal_id = ExternalSignalId::new();
+        let a = ActivityExecId::new();
+        let mut events = padding(2);
+        events.push(timer_started("u"));
+        events.push(WorkflowEvent::ExternalSignalDelivered { signal_id });
+        events.extend(padding(1));
+        events.push(WorkflowEvent::ExternalAwaitRequested {
+            await_id: ExternalAwaitId::new(),
+            target: ExecutionId::new(),
+        });
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: a,
+            name: "charge".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        });
+        events.push(WorkflowEvent::ExternalSignalRequested {
+            signal_id,
+            target: target.clone(),
+            signal_name: "go".into(),
+            payload: Value::Null,
+            idempotency_key: None,
+        });
+        events.push(WorkflowEvent::ActivityCompleted {
+            activity_id: a,
+            output: Value::Null,
+        });
+        events.push(timer_started("v"));
+        events.push(WorkflowEvent::ExternalSignalFailed {
+            signal_id,
+            reason_code: "late".into(),
+        });
+        let mut m = HistoryMatcher::new(events);
+        m.cursor = 5;
+        assert!(m.prepare_match());
+        assert!(matches!(
+            m.match_activity("charge"),
+            HistoryMatch::Matched { .. }
+        ));
+        assert!(!m.is_consumed(3));
+        assert!(!m.is_consumed(10));
+        m.cursor = 2;
+        assert!(m.prepare_match());
+        assert!(m.consumed_signal_events.contains(&3));
+        assert!(m.consumed_signal_events.contains(&10));
+        assert_eq!(
+            m.match_external_signal(&target, "go"),
+            HistoryMatch::ExternalSignalFailed {
+                signal_id,
+                reason_code: "late".into(),
+            }
+        );
+    }
+
+    /// A pass leaves a third terminal of one await id unmatched. A later
+    /// stash of a third await with that id takes it.
+    #[test]
+    fn a_later_await_with_one_id_takes_an_unmatched_terminal() {
+        let await_id = ExternalAwaitId::new();
+        let targets = [ExecutionId::new(), ExecutionId::new(), ExecutionId::new()];
+        let request = |target| WorkflowEvent::ExternalAwaitRequested { await_id, target };
+        // The unfired timer `w` stops the drain before the terminals.
+        let mut events = vec![
+            request(targets[0]),
+            request(targets[1]),
+            timer_started("t"),
+            request(targets[2]),
+            timer_fired("t"),
+            timer_started("w"),
+        ];
+        events.extend(padding(8));
+        for output in [1, 2, 3] {
+            events.push(WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::json!(output),
+            });
+        }
+        let mut m = HistoryMatcher::new(events);
+        assert!(m.prepare_match());
+        assert!(!m.is_consumed(16), "no open entry takes the third terminal");
+        assert_eq!(
+            m.match_timer("t"),
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert!(m.prepare_match());
+        assert!(m.consumed_signal_events.contains(&16));
+        for (target, output) in targets.into_iter().zip([1, 2, 3]) {
+            assert_eq!(
+                m.match_external_await(target),
+                HistoryMatch::Matched {
+                    output: serde_json::json!(output)
+                }
+            );
+        }
     }
 
     /// Inside a cut view, the child scan does not see a hidden terminal.

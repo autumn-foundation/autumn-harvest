@@ -19,8 +19,9 @@
 //!
 //! The harness replays the history through the public `HistoryMatcher::new`,
 //! `match_activity`, `match_external_signal` and `match_external_await` entry
-//! points. The history is built once, outside the measured loop.
-//! `EXTERNAL_STASH_PROFILE_REPS` (default 1) repeats the replay.
+//! points. `EXTERNAL_STASH_PROFILE_REPS` (default 1) repeats the replay. Each
+//! repetition builds the history again, so the total `Ir` includes the
+//! build. Read the inclusive cost of the `match_*` functions to leave it out.
 //!
 //! # Running
 //!
