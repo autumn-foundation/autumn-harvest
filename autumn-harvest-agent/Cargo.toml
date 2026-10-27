@@ -142,3 +142,24 @@ required-features = ["sqlite"]
 name = "agent_session_entity"
 required-features = ["sqlite"]
 test = true
+
+# Deterministic instruction-count harness for `AgentHarness::model_turn`, the
+# activity side of one model turn (issues #1973, #2264). Drive it under
+# valgrind. See `benches/agent_model_turn_profile.rs`.
+[[bench]]
+name = "agent_model_turn_profile"
+harness = false
+
+# Deterministic instruction-count harness for the replay of a recorded
+# `agent_loop` run, the workflow side of the loop (issue #1973). See
+# `benches/agent_loop_replay_profile.rs`.
+[[bench]]
+name = "agent_loop_replay_profile"
+harness = false
+
+# Deterministic instruction-count harness for the replay of a durable `agent`
+# run, one entity op at a time (issue #2263). See
+# `benches/durable_agent_replay_profile.rs`.
+[[bench]]
+name = "durable_agent_replay_profile"
+harness = false
