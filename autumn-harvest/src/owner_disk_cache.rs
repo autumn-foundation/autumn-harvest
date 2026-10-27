@@ -40,8 +40,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use aes_gcm::aead::{AeadInPlace, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce, Tag};
+use aes_gcm::Aes256Gcm;
+use aes_gcm::aead::{AeadInOut, KeyInit, Nonce, Tag};
 use rand::RngCore as _;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -248,7 +248,7 @@ impl Sealer {
         let mut prefix = [0_u8; 4];
         rand::rngs::OsRng.fill_bytes(&mut prefix);
         Self {
-            cipher: Aes256Gcm::new(key.as_slice().into()),
+            cipher: Aes256Gcm::new((&*key).into()),
             prefix,
             counter: AtomicU64::new(0),
         }
@@ -282,7 +282,11 @@ impl Sealer {
         let mut body = plaintext.to_vec();
         let tag = self
             .cipher
-            .encrypt_in_place_detached(Nonce::from_slice(&nonce), aad, &mut body)
+            .encrypt_inout_detached(
+                &Nonce::<Aes256Gcm>::from(nonce),
+                aad,
+                body.as_mut_slice().into(),
+            )
             .ok()?;
         let mut sealed = Vec::with_capacity(NONCE_BYTES + body.len() + TAG_BYTES);
         sealed.extend_from_slice(&nonce);
@@ -298,14 +302,11 @@ impl Sealer {
         }
         let (nonce, rest) = sealed.split_at(NONCE_BYTES);
         let (body, tag) = rest.split_at(rest.len() - TAG_BYTES);
+        let nonce = Nonce::<Aes256Gcm>::try_from(nonce).ok()?;
+        let tag = Tag::<Aes256Gcm>::try_from(tag).ok()?;
         let mut body = body.to_vec();
         self.cipher
-            .decrypt_in_place_detached(
-                Nonce::from_slice(nonce),
-                aad,
-                &mut body,
-                Tag::from_slice(tag),
-            )
+            .decrypt_inout_detached(&nonce, aad, body.as_mut_slice().into(), &tag)
             .ok()?;
         Some(body)
     }

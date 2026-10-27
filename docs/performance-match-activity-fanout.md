@@ -512,3 +512,171 @@ for shape in loop loop_seq fanout; do
   done
 done
 ```
+
+## Issue #2349: the signal wait
+
+**Outcome: shipped.** At N=2000 the `rev` shape of `signal_wait_profile`
+costs 84% fewer instructions, and `after_fanout` costs 93% fewer. Both now
+grow about 2 times per doubling of N. `docs/design/DESIGN-2349.md` records
+the plan.
+
+### Workload
+
+`benches/signal_wait_profile.rs` replays a history through
+`HistoryMatcher::new`, `match_activity` and `match_signal`.
+`SIGNAL_PROFILE_SHAPE` picks the shape:
+
+- `fwd`: N signals, each with its own name. The workflow waits in arrival
+  order.
+- `rev`: the same signals. The workflow waits in reverse order.
+- `after_fanout`: N activity schedules, then N signals. The workflow waits
+  in arrival order, and no call claims the activities.
+- `loop`: N steps of one activity. Each signal arrives before the
+  completion of its activity, so the activity scan stashes it. Every
+  signal has the name `go`.
+- `loop_named`: `loop`, with a name per signal.
+
+### Cause
+
+- A wait found its stashed signal with a linear name compare. Waits in
+  reverse order of N stashed signals cost O(N²) compares. The push handler
+  claim, the non-blocking receive and the race scan searched the stash the
+  same way. The race scan searched it once for each consumed event that it
+  crossed.
+- Each wait walked from the cursor and crossed every unclaimed sibling
+  command. The cursor then went back to the first one. So the next wait
+  crossed the same commands again.
+
+### Change
+
+- `SignalStash` keeps the stashed signals in push order. A stash that grows
+  past 16 slots also keeps a queue of push numbers for each name. A search
+  then walks one queue. A smaller stash scans its slots. Either way, a
+  search visits the entries of one name in push order, as the old search
+  did.
+- A push or a cut compacts the stash when its empty slots outnumber its
+  entries. A cut removes the hidden entries from the last one back. A restore of a
+  sorted stash only pushes the hidden entries back. A cancelled scope cuts
+  and restores on each poll, so these keep the poll cost near the old one.
+- A stash entry names its own event. So the race scan searches the stash
+  only at a consumed signal of the same name.
+- `signal_scan_step` holds the rule of the old walk for one event. A wait
+  that is not a race branch leaves the walk by the rule of #2330 and
+  continues on the scan index. It visits each unconsumed barrier and
+  runs the same step on it.
+  Between two barriers, it looks up the first interleaved command once. It
+  skips a deadline timer of its own signal, as the walk does.
+- A race branch keeps the walk. It must stop at its own settle marker, and
+  the index has no lookup by marker name.
+
+A name map on every stash made the `loop` shape cost 12.6% more. Each stash
+paid a SipHash, and a clone of a new name. A stash usually holds one or two
+signals, so only a stash that grows past 16 slots builds the map.
+
+### Measurement
+
+Callgrind, total instructions (`Ir`) of the harness. The totals include the
+build of the history. "Before" is `a9048c9`, with the bench of this change.
+
+| Bench | Shape | N | Before | After | Change |
+|---|---|---|---|---|---|
+| `signal_wait_profile` | `fwd` | 500 | 2,490,395 | 2,498,721 | +0.3% |
+| `signal_wait_profile` | `fwd` | 1000 | 4,740,181 | 4,759,007 | +0.4% |
+| `signal_wait_profile` | `fwd` | 2000 | 8,983,478 | 9,023,304 | +0.4% |
+| `signal_wait_profile` | `rev` | 500 | 7,927,824 | 4,333,149 | −45.3% |
+| `signal_wait_profile` | `rev` | 1000 | 25,935,642 | 8,232,823 | −68.3% |
+| `signal_wait_profile` | `rev` | 2000 | 91,149,488 | 14,885,284 | −83.7% |
+| `signal_wait_profile` | `after_fanout` | 500 | 21,813,577 | 5,695,527 | −73.9% |
+| `signal_wait_profile` | `after_fanout` | 1000 | 77,990,601 | 10,877,899 | −86.1% |
+| `signal_wait_profile` | `after_fanout` | 2000 | 294,715,202 | 21,281,310 | −92.8% |
+| `signal_wait_profile` | `loop` | 500 | 3,830,926 | 3,866,255 | +0.9% |
+| `signal_wait_profile` | `loop` | 1000 | 6,741,836 | 6,821,647 | +1.2% |
+| `signal_wait_profile` | `loop` | 2000 | 14,018,564 | 14,180,375 | +1.2% |
+| `signal_wait_profile` | `loop_named` | 500 | 4,563,883 | 4,599,226 | +0.8% |
+| `signal_wait_profile` | `loop_named` | 1000 | 8,200,672 | 8,280,497 | +1.0% |
+| `signal_wait_profile` | `loop_named` | 2000 | 16,866,405 | 17,028,230 | +1.0% |
+| `match_activity_profile` | `sequential` | 1000 | 18,221,261 | 18,188,054 | −0.2% |
+| `match_activity_profile` | `fanout` | 1000 | 23,730,128 | 23,697,737 | −0.1% |
+| `match_activity_profile` | `fanout_extsig` | 1000 | 24,327,184 | 24,290,983 | −0.1% |
+
+Inside the matcher (the inclusive cost of `match_activity` and
+`match_signal`), at N=1000:
+
+| Shape | Before | After | Change |
+|---|---|---|---|
+| `fwd` | 724,974 | 731,975 | +1.0% |
+| `rev` | 21,598,746 | 4,070,979 | −81.2% |
+| `after_fanout` | 71,923,616 | 4,577,093 | −93.6% |
+| `loop` | 1,489,030 | 1,529,030 | +2.7% |
+| `loop_named` | 1,486,093 | 1,526,093 | +2.7% |
+
+A wait with no stash costs about 7 instructions more. A loop step costs
+about 40 more, in the stash push and the claim. #2338 and #2346 accepted a
+cost of the same size.
+
+### Step counts
+
+The scaling test counts scan steps at N=256 and N=512. It now also counts
+each stash entry that a signal search visits.
+
+| Shape | Before | After | Ratio after |
+|---|---|---|---|
+| `Signals(false)` | 1,024 → 2,048 | 1,024 → 2,048 | 2.00 |
+| `Signals(true)` | 32,899 → 131,331 | 514 → 1,026 | 2.00 |
+| `SignalsAfterFanOut(false)` | 99,200 → 395,008 | 11,092 → 22,383 | 2.02 |
+| `SignalsAfterFanOut(true)` | 33,155 → 131,843 | 770 → 1,538 | 2.00 |
+| `SignalHandlers(false)` | 33,409 → 132,353 | 769 → 1,537 | 2.00 |
+| `SignalHandlers(true)` | 33,409 → 132,353 | 769 → 1,537 | 2.00 |
+| `TryReceiveReversed` | 33,409 → 132,353 | 769 → 1,537 | 2.00 |
+| `RaceOverStash` | 67,083 → 265,227 | 1,035 → 2,059 | 1.99 |
+
+### Tests
+
+- `replay_steps_grow_near_linearly_for_every_shape` gains the eight signal
+  shapes above. The old code fails it for seven of them.
+- `the_indexed_scan_matches_the_oracle` runs copies of the old signal wait,
+  push handler claim, non-blocking receive, signal race and pure signal
+  reads as its oracle. Its histories now hold deadline timers, their fires
+  and a race marker. Each case runs with a scan, with a name map, or with a
+  switch between them. The test checks the stash invariant after every
+  call.
+- `the_signal_stash_matches_a_plain_deque` compares `SignalStash` with a
+  plain `VecDeque` after every push, search, remove, cut and restore.
+- `the_signal_step_acts_only_on_indexed_events` checks that the signal step
+  changes nothing on an event that the scan index does not list.
+- Edge tests in `scan_fanout_tests` cover a deadline timer as the rewind
+  target, an unexpected event, a predicate, a cut and a race branch. Each
+  runs on the walk and on the index. Another cut test hides a stashed
+  signal, and a cursor test removes a candidate between two lookups.
+- Stash tests run 10,000 steps behind an entry that never leaves, and
+  10,000 distinct names. The empty slots and the empty keys stay bounded. A
+  restore of a sorted stash keeps every push number.
+- With the `fuzzing` feature, `check_signal_step` also runs over random
+  events of every `WorkflowEvent` variant.
+- Eleven mutants, each made by hand, fail the tests above:
+  - no skip of a deadline timer of the awaited signal,
+  - no interleaved lookup on the index,
+  - a race branch that leaves the walk,
+  - a race search that matches the wrong event,
+  - an indexed scan that ignores a cut,
+  - a restore with no sort,
+  - a non-blocking receive that claims a reserved signal,
+  - a stash that always scans its slots,
+  - a stash with no compaction,
+  - a restore fast path that ignores the order across the cut,
+  - a cut that returns the hidden entries in reverse order.
+
+### Reproduce
+
+```bash
+BIN=$(cargo bench -p autumn-harvest --no-default-features --features testing \
+  --bench signal_wait_profile --no-run --message-format=json 2>/dev/null \
+  | jq -r 'select(.reason=="compiler-artifact" and .target.name=="signal_wait_profile") | .executable')
+for shape in fwd rev after_fanout loop loop_named; do
+  for n in 500 1000 2000; do
+    SIGNAL_PROFILE_SHAPE=$shape SIGNAL_PROFILE_N=$n \
+      valgrind --tool=callgrind --branch-sim=no --cache-sim=no \
+      --callgrind-out-file="cg.$shape.$n" "$BIN"
+  done
+done
+```

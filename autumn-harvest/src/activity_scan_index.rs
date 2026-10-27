@@ -1,12 +1,13 @@
 //! A position index for the terminal scans of `HistoryMatcher` (issues
-//! #2330, #2338 and #2346).
+//! #2330, #2338, #2346 and #2349).
 //!
 //! `HistoryMatcher::scan_activity_terminal` looks for the terminal event of
 //! one activity. A plain walk visits every event between the schedule and
 //! the terminal. In a fan-out of N activities, each walk steps over the
 //! later schedules and the consumed completions, so a replay costs O(N²).
 //! The timer fire scan, the child terminal scan and the external stash scan
-//! have the same problem.
+//! have the same problem. So does the signal wait scan, which steps over
+//! every unclaimed sibling command (issue #2349).
 //!
 //! This index keeps the positions that can change the result of a scan.
 //! Once a scan leaves its walk, it reads only those positions. All other

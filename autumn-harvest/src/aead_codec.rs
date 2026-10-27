@@ -49,8 +49,8 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use aes_gcm::aead::{AeadInPlace, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce, Tag};
+use aes_gcm::Aes256Gcm;
+use aes_gcm::aead::{AeadInOut, KeyInit, Nonce, Tag};
 use base64::Engine as _;
 use rand::RngCore as _;
 /// Re-exported so that a [`KmsDecrypt`] implementation needs no direct
@@ -241,7 +241,7 @@ impl AeadCodec {
         Ok(Self {
             key_id: key_id.to_string(),
             header,
-            cipher: Aes256Gcm::new(key.0.as_slice().into()),
+            cipher: Aes256Gcm::new((&**key.0).into()),
         })
     }
 
@@ -307,10 +307,10 @@ impl PayloadCodec for AeadCodec {
         out.extend_from_slice(raw);
         let tag = self
             .cipher
-            .encrypt_in_place_detached(
-                Nonce::from_slice(&nonce),
+            .encrypt_inout_detached(
+                &Nonce::<Aes256Gcm>::from(nonce),
                 &self.header,
-                &mut out[body_start..],
+                (&mut out[body_start..]).into(),
             )
             .map_err(|_| CodecError("aes-256-gcm: encryption failed".to_string()))?;
         out.extend_from_slice(&tag);
@@ -338,14 +338,11 @@ impl PayloadCodec for AeadCodec {
         // `self.header`.
         let (nonce, body) = rest.split_at(NONCE_BYTES);
         let (ciphertext, tag) = body.split_at(body.len() - TAG_BYTES);
+        let nonce = Nonce::<Aes256Gcm>::try_from(nonce).map_err(|_| truncated())?;
+        let tag = Tag::<Aes256Gcm>::try_from(tag).map_err(|_| truncated())?;
         let mut plaintext = ciphertext.to_vec();
         self.cipher
-            .decrypt_in_place_detached(
-                Nonce::from_slice(nonce),
-                &self.header,
-                &mut plaintext,
-                Tag::from_slice(tag),
-            )
+            .decrypt_inout_detached(&nonce, &self.header, plaintext.as_mut_slice().into(), &tag)
             .map_err(|_| {
                 CodecError(
                     "aes-256-gcm: authentication failed (wrong key or tampered ciphertext)"

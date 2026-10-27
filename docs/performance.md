@@ -2735,3 +2735,11 @@ standalone note rather than part of the claim-path attribution table above:
   the entity checkpoint continues the run near op 288. The transcript digest
   is 34.5% of the replay at 200 ops, and the entity snapshot work 27.0%.
   Baseline only.
+* [`docs/performance-analyzer-large-payload.md`](performance-analyzer-large-payload.md)
+  — `LargePayloadRule` in `HistoryAnalyzer::analyze`. It counts payload bytes
+  without building the JSON text. Instructions fall from 1.32G to 298M, and
+  allocated bytes fall 97.6%.
+* [`docs/performance-debug-diff-redaction-probe.md`](performance-debug-diff-redaction-probe.md)
+  — `debugger::is_redacted_export`, the first step of `harvest debug diff`.
+  It reads one top-level key without building a `Value` tree. The probe
+  cost 29% of the pipeline before the change.

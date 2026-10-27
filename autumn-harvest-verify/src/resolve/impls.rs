@@ -123,7 +123,7 @@ impl<'ast> syn::visit::Visit<'ast> for FieldScan {
 
     fn visit_type_ptr(&mut self, pointer: &'ast syn::TypePtr) {
         // A `*mut` pointer writes as a `&mut` reference does.
-        if pointer.mutability.is_some() {
+        if matches!(pointer.mutability, syn::PointerMutability::Mut(_)) {
             self.0.mut_ref = true;
         }
         self.visit_type(&pointer.elem);
@@ -732,7 +732,7 @@ fn generic_names(generics: &syn::Generics) -> Vec<String> {
 /// The self type name of an `impl Future for T` block, with no generics.
 /// An impl for a shared reference, `&T`, gives `&T`.
 fn future_self_type(item: &syn::ItemImpl) -> Option<String> {
-    let (_, trait_path, _) = item.trait_.as_ref()?;
+    let (trait_path, _) = item.trait_.as_ref()?;
     if trait_path.segments.last()?.ident != "Future" {
         return None;
     }
