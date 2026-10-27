@@ -1555,14 +1555,14 @@ fn depth_comparisons(expr: &str) -> Vec<(&'static str, u64)> {
 /// The gauge reads the cap for any deeper queue. A `>` threshold at or above
 /// the cap, or a `>=` threshold above it, can never fire. The backlog rule
 /// keys on growth, and a gauge at the cap shows none. So the rule needs a
-/// clause for a gauge at the cap. That clause reads the age gauge, which has
-/// no cap. The promtool cases in
+/// clause for a gauge at the cap. That clause fires on the level and leaves a
+/// paused queue out. The promtool cases in
 /// `docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml` test its
 /// behaviour.
 #[test]
 fn queue_depth_alerts_sit_below_the_gauge_cap() {
     let cap = u64::from(autumn_harvest::telemetry::QUEUE_DEPTH_CAP.get());
-    let saturated = format!("[10m]) >= {cap} and (deriv(harvest_queue_oldest_pending_age");
+    let saturated = format!("[10m]) >= {cap} unless harvest_queue_paused");
     let pack = read_pack();
     let rules = pack["rules"].as_array().expect("rules must be an array");
     let mut backlog_rule_fires_at_the_cap = false;

@@ -505,15 +505,18 @@ added, or if the queue backs a customer-facing workflow with a breached SLA.
 signal or as a fallback when histogram metrics are not yet wired.
 
 The depth gauge stops at 10,000 (#2356). Above that value it shows no growth.
-While the gauge holds at 10,000 for the whole window, the rule reads growth
-from `harvest_queue_oldest_pending_age` instead. That gauge has no cap. It
-applies the claim gates, so it reads 0 when a pause, a concurrency cap or a
-rate limit blocks every row. At the cap, a 0 for the whole window also fires
-the rule, because no row can move. A paused queue is left out, because
-`harvest_queue_paused_too_long` covers it. At the cap the rule cannot tell
-growth from a large burst that drains slowly. In both, the oldest task waits
-longer, so both fire. For an exact count above the cap, scrape
-`harvest_queue_backlog` from `GET /admin/queues/scaling?format=prometheus`.
+So while the gauge holds at 10,000 for the whole window, the rule fires on the
+level: a backlog of 10,000 or more for 10 minutes, growing or not. A paused
+queue is left out, because `harvest_queue_paused_too_long` covers it. Each
+depth series matches the pause gauge of its own scrape target, so a pause in
+another deployment with the same queue name does not count. Another deliberate
+hold, such as an activity pause, still fires it. The pause gauge has no shard
+label. So a pause on one shard leaves the whole queue out, while the other
+shards still dispatch. During such a hold, read `harvest_queue_backlog` or the
+schedule-to-start alert. To tell growth from
+a drain at the cap, read the trend of `harvest_queue_oldest_pending_age`, or
+scrape the exact `harvest_queue_backlog` from
+`GET /admin/queues/scaling?format=prometheus`.
 `docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml` tests each case
 with promtool.
 
@@ -533,10 +536,10 @@ routing for part of the fleet.
 ### False positives
 
 Batch windows can create expected short spikes. Alert only when depth stays
-high and growth remains positive for the rule window. At the cap, growth is
-the growth of the oldest pending age. A queue that normally holds more than
-10,000 tasks stays at the cap. For such a queue, drop the depth rule and rely
-on the schedule-to-start alert.
+high and growth remains positive for the rule window. At the cap the rule
+fires on the level, so a deep backlog that drains slowly fires too. A queue
+that normally holds more than 10,000 tasks stays at the cap. For such a queue,
+drop the depth rule and rely on the schedule-to-start alert.
 
 ### Safe actions
 

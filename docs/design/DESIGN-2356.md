@@ -60,13 +60,15 @@ stays exact below the bound.
 | B9 | Make the cap a `WorkerRuntimeConfig` field. | Rejected. About 50 test files change. A constant serves the alerts that ship. |
 | B10 | Keep `queue_depths` exact and add a bounded function. | **Adopted.** The public contract does not change. The exact function is the test oracle. |
 | B11 | Sum the shards, then cap the sum. | **Adopted.** Each shard value is `min(count, cap)`. So the capped sum is `min(total, cap)`. Verus proves it. |
-| B12 | At the cap, read growth from the oldest pending age. | **Adopted.** Without it the backlog alert clears when the backlog is largest. A clause on the level alone would fire on a healthy drain. |
-| B15 | At the cap, also fire when the age stays 0 for the whole window. | **Adopted.** The age gauge applies the claim gates. When a gate blocks every row, it reads 0 and shows no growth. |
+| B12 | At the cap, read growth from the oldest pending age. | Superseded by B21. The age gauge reads the oldest claimable row. It misses growth behind a gate while other rows flow, and growth that the gate shows only in some samples. It also fires on a burst that drains at full speed. |
+| B15 | At the cap, also fire when the age stays 0 for the whole window. | Superseded by B21. One sample in which the gate opens turns the clause off. |
 | B16 | Test the rule with promtool. | **Adopted.** A loadable copy of the rule and promtool cases run in the `lint` job. A guard keeps the copy equal to the pack. |
 | B17 | Force the walk in every state. | Rejected. With an empty visibility map the walk visits a heap page per row. On the 300,000-row fixture it read 81,479 to 155,878 buffers. One pass read 14,152. |
 | B18 | Pick the walk or one pass from `pg_class`. Walk only when its worst case, `(1 − all-visible share) × queues × cap` heap visits, is below the page count of the table. | **Adopted.** A run then costs no more than the smaller of the two bounds. With an empty map it costs what the exact count costs. |
 | B19 | Turn sorts off for the count. | **Adopted.** A walk near the cap can otherwise sort every eligible row. The claim path turns bitmap scans off for the same reason (issue #1956). |
-| B20 | Leave a paused queue out of the clause for a zero age. | **Adopted.** A deliberate pause of a deep queue would ticket. `harvest_queue_paused_too_long` covers a pause. |
+| B20 | Leave a paused queue out of the at-cap clause. | **Adopted.** A deliberate pause of a deep queue would ticket. `harvest_queue_paused_too_long` covers a pause. |
+| B21 | At the cap, fire on the level: the gauge holds at the cap for the whole window. | **Adopted.** No clause that reads the age gauge reproduces the growth of an uncapped depth. The level misses no growth above the cap. It also fires on a deep backlog that does not grow, which the runbook states. |
+| B22 | Export `harvest.queue.paused` from the plugin scrape endpoint. | **Adopted.** `docs/telemetry.md` says the endpoint covers it, but its recorder had no override. Without the series the pause exclusion of B20 does nothing there. |
 | B13 | Order the bounded scan by the index key. | **Adopted.** It pins the plan to the ordered index walk. |
 | B14 | Keep the cap in `telemetry`. | **Adopted.** It is the contract of the gauge. The alert guard then runs in the CI leg without the `db` feature. |
 
@@ -74,13 +76,14 @@ stays exact below the bound.
 
 | # | How to make it harmful | Mitigation |
 |---|------------------------|------------|
-| R1 | The gauge goes flat at the cap. `deriv` is 0, so the backlog alert clears during the worst backlog. | At the cap the rule fires on the growth of the oldest pending age. A guard test pins the clause to the constant. |
-| R11 | A gate blocks every row of a deep queue. The age gauge reads 0, so the age clause sees no growth either. | At the cap, an age of 0 for the whole window fires the rule. A promtool case covers it. |
+| R1 | The gauge goes flat at the cap. `deriv` is 0, so the backlog alert clears during the worst backlog. | At the cap the rule fires on the level. A guard test pins the clause to the constant. |
+| R11 | A gate blocks some or all rows of a deep queue, so the age gauge shows no growth. | The at-cap clause does not read the age gauge. promtool cases cover a full gate, a partial gate and a gate that opens in some samples. |
 | R2 | A cap at or below an alert threshold. The alert can never fire. | The cap is 10,000. The largest strict starter threshold is 1,000. A guard test fails when a starter threshold cannot fire under the cap. |
 | R3 | `LIMIT` after `GROUP BY` caps the number of queues, not the rows. | The limit sits in a `LATERAL` subquery per queue. A shape test checks it. |
 | R4 | A `LIMIT` with no order lets the planner pick a sequential scan, or an index that reads future rows. A shallow queue then reads the whole table on each tick. | The subquery orders by `scheduled_at, id`, and the count turns sorts off. A test with an empty visibility map and future rows checks that each scan walks the index and reads at most the cap. |
 | R12 | An empty visibility map makes the walk visit a heap page per row, once per queue. It then costs more than the exact count. | The query makes one pass instead. A test checks the pass before a vacuum and the walk after it. |
-| R13 | A deliberate pause of a deep queue tickets through the clause for a zero age. | The clause leaves out a queue with `harvest_queue_paused` at 1. A promtool case covers it. |
+| R13 | A deliberate pause of a deep queue tickets through the at-cap clause. | The clause leaves out a queue with `harvest_queue_paused` at 1. The plugin endpoint now exports that gauge. promtool and plugin tests cover it. |
+| R14 | A join on `queue` alone lets a pause in one deployment silence the same queue name in another deployment on the same Prometheus. | The clause matches each depth series to the pause gauge of its own scrape target. A promtool case covers it. |
 | R5 | The shard sum reports `shards × cap`. | The sampler caps the sum. A Verus proof, a proptest and a two-shard worker test cover it. |
 | R6 | A duplicate queue name in the input counts twice. | The query takes `DISTINCT` names. A test covers it. |
 | R7 | The bounded value differs from the exact count below the cap. | A test compares both functions at ten caps, each cap in one transaction. |
@@ -127,11 +130,11 @@ means "10,000 or more".
   caps the result. The sampler folds the shards with it.
   `formal/verus/src/depth_cap.rs` proves that the fold equals the capped
   total.
-- `harvest_queue_backlog_growth` fires at the cap when the oldest pending age
-  grows over the window. It also fires when the age stays 0 for the whole
-  window on a queue that is not paused.
+- `harvest_queue_backlog_growth` fires at the cap when the gauge holds at the
+  cap for the whole window, on a queue that is not paused.
   `docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml` tests the rule
   with promtool in the `lint` job.
+- The plugin scrape endpoint exports `harvest_queue_paused`.
 
 ## 2. Known limits
 
@@ -145,10 +148,14 @@ means "10,000 or more".
   count costs, until autovacuum runs.
 - The choice reads `relpages` and `relallvisible`, which a vacuum or an
   analyze sets. Between two runs of autovacuum the choice can lag the table.
-- At the cap the backlog rule cannot tell growth from a burst larger than the
-  cap that drains slowly. In both, the oldest task waits longer, so both fire.
-- The clause for a zero age leaves out a queue pause only. Another deliberate
-  hold, such as an activity pause, still fires it.
+- At the cap the backlog rule fires on the level. It cannot tell growth from
+  a deep backlog that drains or holds steady, so both fire. A queue that
+  normally holds more than 10,000 tasks should rely on schedule-to-start.
+- The at-cap clause leaves out a queue pause only. Another deliberate hold,
+  such as an activity pause, still fires it.
+- The pause gauge reads 1 when any shard holds the queue, and it has no shard
+  label. So a pause on one shard leaves the whole queue out of the at-cap
+  clause, while the other shards still dispatch.
 
 ## 3. Tests and acceptance criteria
 
@@ -160,5 +167,6 @@ means "10,000 or more".
 | The sampler caps the sum of the shards. | `queue_depth_gauge_caps_the_sum_of_the_shards` |
 | The capped shard sum equals the capped total. | `add_bounded_depth_caps_the_sum_of_the_shards`, `a_fold_of_bounded_shards_is_the_capped_total` and `formal/verus/src/depth_cap.rs` |
 | Each starter depth threshold can fire under the cap, and the backlog rule fires at the cap. | `queue_depth_alerts_sit_below_the_gauge_cap` |
-| The backlog rule fires on growth and on a fully gated backlog at the cap. It stays silent on a queue that catches up, a steady queue and a paused queue. | promtool cases in `docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml` and `the_backlog_rule_file_matches_the_starter_pack` |
+| The backlog rule fires on growth below the cap and on any backlog held at the cap, gated or not. It stays silent below the cap without growth, on a paused queue, and after a drain below the cap. | promtool cases in `docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml` and `the_backlog_rule_file_matches_the_starter_pack` |
+| The plugin scrape endpoint exports `harvest_queue_paused`. | `queue_paused_is_a_binary_gauge_labeled_by_queue` and the scrape HTTP test |
 | Depth buffers drop at 100,000 and 300,000 pending rows. | `queue_age_gauge_perf`, see `docs/performance-queue-depth-gauge.md` |

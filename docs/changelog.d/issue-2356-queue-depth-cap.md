@@ -16,16 +16,15 @@ new write.
 
 **Behaviour change.** An alert that needs a depth above 10,000 can no longer
 fire. The starter rule `harvest_queue_backlog_growth` keys on growth, and a
-gauge at the cap shows none. While the gauge holds at the cap, the rule now
-reads growth from `harvest.queue.oldest_pending_age`, which has no cap. It also
-fires when that age stays 0 on a queue that is not paused, because then a gate
-blocks every row. At the cap it cannot tell growth from a large burst that
-drains slowly, so both fire. promtool
-cases in `docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml` test the
-rule in the `lint` job. For an exact count, scrape `harvest_queue_backlog`
-from `GET /admin/queues/scaling?format=prometheus`. Autoscaling reads that metric,
-so it does not change. The load shedder reads the age, not the depth, so it
-does not change either.
+gauge at the cap shows none. While the gauge holds at the cap for the whole
+window, the rule now fires on the level, on a queue that is not paused. So a
+deep backlog that drains or holds steady fires too. promtool cases in
+`docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml` test the rule in the
+`lint` job. The plugin scrape endpoint now exports `harvest_queue_paused`,
+which `docs/telemetry.md` already listed. For an exact count, scrape
+`harvest_queue_backlog` from `GET /admin/queues/scaling?format=prometheus`.
+Autoscaling reads that metric, so it does not change. The load shedder reads
+the age, not the depth, so it does not change either.
 
 `docs/design/DESIGN-2356.md` records the options and the decision. Tests:
 `bounded_depths_match_the_exact_count_up_to_the_cap` compares the bounded and
