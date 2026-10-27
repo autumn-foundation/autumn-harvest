@@ -69,6 +69,16 @@ pub proof fn theorem_a_tick_is_never_due_again_at_once(every: i64, now: i64) req
 pub open spec fn messages(current: Option < i64 >, every_ms: Option < i64 >, nows: Seq < i64 >) -> Option < i64, > decreases nows.len(), { if nows.len() == 0 { current } else { messages(spec_next_heartbeat(current, every_ms, nows [0], false), every_ms, nows.drop_first()) } }
 pub proof fn theorem_messages_never_starve_the_heartbeat(at: i64, every: i64, nows: Seq < i64 >) ensures messages(Some(at), Some(every), nows) == Some(at), decreases nows.len(),
 
+## formal/verus/src/depth_cap.rs
+pub open spec fn capped(n: int, cap: int) -> int { if n > cap { cap } else { n } }
+pub open spec fn step(total: int, shard_depth: int, cap: int) -> int { capped(capped(total, cap) + capped(shard_depth, cap), cap) }
+pub fn add_bounded_depth(total: u64, shard_depth: u64, cap: u32) -> (r: u64) ensures r == step(total as int, shard_depth as int, cap as int), r <= cap,
+pub open spec fn total(counts: Seq < nat >) -> nat decreases counts.len(), { if counts.len() == 0 { 0 } else { total(counts.drop_last()) + counts.last() } }
+pub open spec fn fold(counts: Seq < nat >, cap: int) -> int decreases counts.len(), { if counts.len() == 0 { 0 } else { step(fold(counts.drop_last(), cap), capped(counts.last() as int, cap), cap) } }
+proof fn lemma_a_cap_before_the_add_changes_nothing(sum: int, count: int, cap: int) requires sum >= 0, count >= 0, cap >= 0, ensures capped(capped(sum, cap) + capped(count, cap), cap) == capped(sum + count, cap),
+pub proof fn theorem_the_gauge_is_the_capped_total(counts: Seq < nat >, cap: nat) ensures fold(counts, cap as int) == capped(total(counts) as int, cap as int), decreases counts.len(),
+pub proof fn theorem_a_call_extends_the_fold(prefix: Seq < nat >, count: nat, cap: u32) ensures step(fold(prefix, cap as int), capped(count as int, cap as int), cap as int) == fold(prefix.push(count), cap as int,),
+
 ## formal/verus/src/dlq_spread.rs
 pub open spec fn two64() -> int { 0x1_0000_0000_0000_0000 }
 pub open spec fn spec_jitter(slot: int, mix: int) -> int { (slot * mix) / two64() }

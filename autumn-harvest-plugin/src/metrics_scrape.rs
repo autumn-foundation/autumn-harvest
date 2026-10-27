@@ -149,6 +149,9 @@ struct Inner {
     activity_duration: Histogram,
     timer_started: Counter,
     queue_depth: Gauge,
+    // The starter alert `harvest_queue_backlog_growth` leaves a paused queue
+    // out at the depth cap by this gauge (issue #2356).
+    queue_paused: Gauge,
     dlq_entries: Gauge,
     schedule_runs: Counter,
     schedule_skipped: Counter,
@@ -425,6 +428,12 @@ impl MetricsRecorder for HarvestMetricsRecorder {
         self.0
             .queue_depth
             .set(vec![queue_name.to_owned()], depth as f64);
+    }
+
+    fn record_queue_paused(&self, queue: &str, paused: bool) {
+        self.0
+            .queue_paused
+            .set(vec![queue.to_owned()], if paused { 1.0 } else { 0.0 });
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -781,9 +790,16 @@ fn push_catalogue_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
     push_gauge(
         families,
         "harvest_queue_depth",
-        "Current pending task count per queue",
+        "Current pending task count per queue, capped at 10000",
         &[METRIC_LABEL_QUEUE],
         inner.queue_depth.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_queue_paused",
+        "1 while an operator pause holds the queue, else 0",
+        &[METRIC_LABEL_QUEUE],
+        inner.queue_paused.snapshot(),
     );
     push_gauge(
         families,
@@ -1173,6 +1189,23 @@ mod tests {
         let f = family(&families, "harvest_queue_depth");
         assert_eq!(f.kind, MetricKind::Gauge);
         assert_eq!(sample_value(f, &[("queue", "default")]), 3.0);
+    }
+
+    /// The starter alert `harvest_queue_backlog_growth` leaves a paused queue
+    /// out by this gauge (issue #2356). Without it, the alert fires on every
+    /// pause of a deep queue.
+    #[test]
+    fn queue_paused_is_a_binary_gauge_labeled_by_queue() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_queue_paused("payments", true);
+        recorder.record_queue_paused("default", true);
+        recorder.record_queue_paused("default", false);
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_queue_paused");
+        assert_eq!(f.kind, MetricKind::Gauge);
+        assert_eq!(sample_value(f, &[("queue", "payments")]), 1.0);
+        assert_eq!(sample_value(f, &[("queue", "default")]), 0.0);
     }
 
     #[test]

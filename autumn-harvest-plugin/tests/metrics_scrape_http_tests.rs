@@ -57,6 +57,7 @@ async fn scrape_endpoint_renders_all_catalogue_metrics_after_recording() {
     );
     recorder.record_timer_started(30.0);
     recorder.record_queue_depth("default", 3);
+    recorder.record_queue_paused("default", true);
     recorder.record_dlq_entries(0, 2);
     recorder.record_schedule_run("cron", "nightly_report");
     recorder.record_schedule_skipped("cron", "nightly_report", "overlap");
@@ -99,6 +100,8 @@ async fn scrape_endpoint_renders_all_catalogue_metrics_after_recording() {
         "harvest_timer_started_total 1",
         "# TYPE harvest_queue_depth gauge",
         "harvest_queue_depth{queue=\"default\"} 3",
+        "# TYPE harvest_queue_paused gauge",
+        "harvest_queue_paused{queue=\"default\"} 1",
         "# TYPE harvest_dlq_entries gauge",
         "harvest_dlq_entries{shard=\"0\"} 2",
         "# TYPE harvest_schedule_runs_total counter",

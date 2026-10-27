@@ -284,6 +284,8 @@ mod query_terminal_tests;
 mod query_tests;
 #[cfg(feature = "db")]
 mod queue_age_gauge_perf;
+#[cfg(feature = "db")]
+mod queue_depth_bound_tests;
 mod queue_fairness_tests;
 mod queue_pause_success_metric_tests;
 mod queue_pause_tests;

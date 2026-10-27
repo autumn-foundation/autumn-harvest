@@ -1,0 +1,730 @@
+=== after: oldest_pending_ages, pending=20000
+Nested Loop Left Join  (cost=42846.93..5065733.06 rows=199 width=40) (actual time=1235.792..1235.826 rows=20 loops=1)
+  Output: seek.queue_name, (GREATEST(EXTRACT(epoch FROM (now() - COALESCE((min(GREATEST(harvest_task_queue_1.scheduled_at, COALESCE(harvest_task_queue_1.created_at, harvest_task_queue_1.scheduled_at)))), r.oldest))), '0'::numeric))::double precision
+  Inner Unique: true
+  Filter: (COALESCE((min(GREATEST(harvest_task_queue_1.scheduled_at, COALESCE(harvest_task_queue_1.created_at, harvest_task_queue_1.scheduled_at)))), r.oldest) IS NOT NULL)
+  Buffers: shared hit=2650
+  CTE seek
+    ->  Nested Loop  (cost=0.54..1911.05 rows=640 width=98) (actual time=1201.306..1202.129 rows=640 loops=1)
+          Output: u.queue_name, t.scheduled_at, t.created_at, t.activity_name, t.task_type, t.schedule_to_close_at, t.workflow_exec_id, t.concurrency_key, t.concurrency_cap, t.rate_limit_key
+          Buffers: shared hit=682
+          ->  HashAggregate  (cost=0.25..0.45 rows=20 width=32) (actual time=1201.252..1201.256 rows=20 loops=1)
+                Output: u.queue_name
+                Group Key: u.queue_name
+                Batches: 1  Memory Usage: 24kB
+                ->  Function Scan on pg_catalog.unnest u  (cost=0.00..0.20 rows=20 width=32) (actual time=1201.198..1201.201 rows=20 loops=1)
+                      Output: u.queue_name
+                      Function Call: unnest('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])
+          ->  Limit  (cost=0.29..94.89 rows=32 width=82) (actual time=0.009..0.040 rows=32 loops=20)
+                Output: t.scheduled_at, t.created_at, t.activity_name, t.task_type, t.schedule_to_close_at, t.workflow_exec_id, t.concurrency_key, t.concurrency_cap, t.rate_limit_key, t.id
+                Buffers: shared hit=682
+                ->  Index Scan using idx_harvest_tq_coverage_sample on public.harvest_task_queue t  (cost=0.29..2894.45 rows=979 width=82) (actual time=0.008..0.038 rows=32 loops=20)
+                      Output: t.scheduled_at, t.created_at, t.activity_name, t.task_type, t.schedule_to_close_at, t.workflow_exec_id, t.concurrency_key, t.concurrency_cap, t.rate_limit_key, t.id
+                      Index Cond: ((t.queue_name = u.queue_name) AND (t.scheduled_at <= now()))
+                      Buffers: shared hit=682
+  ->  Hash Left Join  (cost=15695.29..15697.83 rows=200 width=56) (actual time=1235.761..1235.775 rows=20 loops=1)
+        Output: seek.queue_name, (count(*)), (max(seek.scheduled_at)), r.oldest
+        Inner Unique: true
+        Hash Cond: (seek.queue_name = r.queue_name)
+        Buffers: shared hit=2650
+        ->  HashAggregate  (cost=17.60..19.60 rows=200 width=48) (actual time=1202.497..1202.503 rows=20 loops=1)
+              Output: seek.queue_name, count(*), max(seek.scheduled_at)
+              Group Key: seek.queue_name
+              Batches: 1  Memory Usage: 40kB
+              Buffers: shared hit=682
+              ->  CTE Scan on seek  (cost=0.00..12.80 rows=640 width=40) (actual time=1201.310..1202.397 rows=640 loops=1)
+                    Output: seek.queue_name, seek.scheduled_at, seek.created_at, seek.activity_name, seek.task_type, seek.schedule_to_close_at, seek.workflow_exec_id, seek.concurrency_key, seek.concurrency_cap, seek.rate_limit_key
+                    Buffers: shared hit=682
+        ->  Hash  (cost=15677.47..15677.47 rows=18 width=40) (actual time=33.246..33.250 rows=20 loops=1)
+              Output: r.oldest, r.queue_name
+              Buckets: 1024  Batches: 1  Memory Usage: 9kB
+              Buffers: shared hit=1968
+              ->  Subquery Scan on r  (cost=15676.93..15677.47 rows=18 width=40) (actual time=33.168..33.240 rows=20 loops=1)
+                    Output: r.oldest, r.queue_name
+                    Buffers: shared hit=1968
+                    ->  GroupAggregate  (cost=15676.93..15677.29 rows=18 width=40) (actual time=33.165..33.235 rows=20 loops=1)
+                          Output: harvest_task_queue.queue_name, min(GREATEST(harvest_task_queue.scheduled_at, COALESCE(harvest_task_queue.created_at, harvest_task_queue.scheduled_at)))
+                          Group Key: harvest_task_queue.queue_name
+                          Buffers: shared hit=1968
+                          ->  Sort  (cost=15676.93..15676.97 rows=18 width=48) (actual time=33.144..33.172 rows=619 loops=1)
+                                Output: harvest_task_queue.queue_name, harvest_task_queue.scheduled_at, harvest_task_queue.created_at
+                                Sort Key: harvest_task_queue.queue_name
+                                Sort Method: quicksort  Memory: 54kB
+                                Buffers: shared hit=1968
+                                ->  Nested Loop Anti Join  (cost=0.30..15676.55 rows=18 width=48) (actual time=12.621..33.021 rows=619 loops=1)
+                                      Output: harvest_task_queue.queue_name, harvest_task_queue.scheduled_at, harvest_task_queue.created_at
+                                      Join Filter: (harvest_task_queue.task_type = 'activity'::text)
+                                      Buffers: shared hit=1968
+                                      ->  Nested Loop Anti Join  (cost=0.15..15651.91 rows=18 width=112) (actual time=12.614..32.709 rows=619 loops=1)
+                                            Output: harvest_task_queue.queue_name, harvest_task_queue.scheduled_at, harvest_task_queue.created_at, harvest_task_queue.activity_name, harvest_task_queue.task_type
+                                            Buffers: shared hit=1240
+                                            ->  CTE Scan on seek harvest_task_queue  (cost=0.00..15608.83 rows=37 width=112) (actual time=12.593..32.367 rows=619 loops=1)
+                                                  Output: harvest_task_queue.queue_name, harvest_task_queue.scheduled_at, harvest_task_queue.created_at, harvest_task_queue.activity_name, harvest_task_queue.task_type, harvest_task_queue.schedule_to_close_at, harvest_task_queue.workflow_exec_id, harvest_task_queue.concurrency_key, harvest_task_queue.concurrency_cap, harvest_task_queue.rate_limit_key
+                                                  Filter: (((harvest_task_queue.schedule_to_close_at IS NULL) OR (harvest_task_queue.schedule_to_close_at > now())) AND ((harvest_task_queue.task_type <> 'workflow'::text) OR (harvest_task_queue.workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 3))) AND ((harvest_task_queue.rate_limit_key IS NULL) OR (harvest_task_queue.activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 6)) AND ((harvest_task_queue.concurrency_key IS NULL) OR (harvest_task_queue.concurrency_cap IS NULL) OR ((SubPlan 4) < harvest_task_queue.concurrency_cap)))
+                                                  Rows Removed by Filter: 21
+                                                  Buffers: shared hit=2
+                                                  SubPlan 3
+                                                    ->  Index Only Scan using idx_harvest_we_paused on public.harvest_workflow_executions e  (cost=0.14..9.64 rows=100 width=16) (actual time=0.010..0.023 rows=100 loops=1)
+                                                          Output: e.id
+                                                          Heap Fetches: 0
+                                                          Buffers: shared hit=2
+                                                  SubPlan 6
+                                                    ->  Seq Scan on public.harvest_rate_limit_buckets b  (cost=0.00..43.00 rows=183 width=32) (actual time=0.013..0.013 rows=0 loops=1)
+                                                          Output: b.key
+                                                          Filter: (LEAST(COALESCE(CASE WHEN (b.override_expires_at > now()) THEN b.override_burst ELSE NULL::double precision END, b.burst), ((b.tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), now()) - b.last_refilled_at))))::double precision * COALESCE(b.override_refill_rate, b.refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))))::double precision * b.refill_rate))) >= '1'::double precision)
+                                                  SubPlan 4
+                                                    ->  Aggregate  (cost=11.97..11.98 rows=1 width=8) (never executed)
+                                                          Output: count(*)
+                                                          ->  Bitmap Heap Scan on public.harvest_task_queue inner_q  (cost=4.17..11.97 rows=1 width=0) (never executed)
+                                                                Recheck Cond: ((inner_q.concurrency_key = harvest_task_queue.concurrency_key) AND (inner_q.state = 'RUNNING'::text))
+                                                                Filter: ((inner_q.worker_id IS NOT NULL) AND (inner_q.task_type = harvest_task_queue.task_type))
+                                                                ->  Bitmap Index Scan on harvest_task_queue_concurrency_key_running  (cost=0.00..4.17 rows=2 width=0) (never executed)
+                                                                      Index Cond: (inner_q.concurrency_key = harvest_task_queue.concurrency_key)
+                                            ->  Index Only Scan using harvest_queue_pauses_pkey on public.harvest_queue_pauses qp  (cost=0.15..1.36 rows=1 width=32) (actual time=0.000..0.000 rows=0 loops=619)
+                                                  Output: qp.queue_name
+                                                  Index Cond: (qp.queue_name = harvest_task_queue.queue_name)
+                                                  Heap Fetches: 0
+                                                  Buffers: shared hit=1238
+                                      ->  Index Only Scan using harvest_activity_pauses_pkey on public.harvest_activity_pauses ap  (cost=0.15..1.36 rows=1 width=32) (actual time=0.000..0.000 rows=0 loops=619)
+                                            Output: ap.activity_name
+                                            Index Cond: (ap.activity_name = harvest_task_queue.activity_name)
+                                            Heap Fetches: 0
+                                            Buffers: shared hit=728
+  ->  Aggregate  (cost=25240.59..25240.60 rows=1 width=8) (actual time=0.000..0.001 rows=1 loops=20)
+        Output: min(GREATEST(harvest_task_queue_1.scheduled_at, COALESCE(harvest_task_queue_1.created_at, harvest_task_queue_1.scheduled_at)))
+        ->  Result  (cost=46.84..25240.58 rows=1 width=16) (actual time=0.000..0.000 rows=0 loops=20)
+              Output: harvest_task_queue_1.scheduled_at, harvest_task_queue_1.created_at
+              One-Time Filter: (((count(*)) >= 32) AND ((r.oldest IS NULL) OR (r.oldest > (max(seek.scheduled_at)))))
+              ->  Nested Loop Anti Join  (cost=46.84..25240.58 rows=1 width=16) (never executed)
+                    Output: harvest_task_queue_1.scheduled_at, harvest_task_queue_1.created_at
+                    Join Filter: (harvest_task_queue_1.task_type = 'activity'::text)
+                    ->  Nested Loop Anti Join  (cost=46.69..25240.35 rows=1 width=30) (never executed)
+                          Output: harvest_task_queue_1.scheduled_at, harvest_task_queue_1.created_at, harvest_task_queue_1.activity_name, harvest_task_queue_1.task_type
+                          ->  Bitmap Heap Scan on public.harvest_task_queue harvest_task_queue_1  (cost=46.54..25220.79 rows=911 width=33) (never executed)
+                                Output: harvest_task_queue_1.scheduled_at, harvest_task_queue_1.created_at, harvest_task_queue_1.queue_name, harvest_task_queue_1.activity_name, harvest_task_queue_1.task_type
+                                Recheck Cond: ((harvest_task_queue_1.queue_name = seek.queue_name) AND (harvest_task_queue_1.scheduled_at <= now()) AND (harvest_task_queue_1.state = 'PENDING'::text))
+                                Filter: (((harvest_task_queue_1.schedule_to_close_at IS NULL) OR (harvest_task_queue_1.schedule_to_close_at > now())) AND ((harvest_task_queue_1.task_type <> 'workflow'::text) OR (harvest_task_queue_1.workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 8))) AND ((harvest_task_queue_1.rate_limit_key IS NULL) OR (harvest_task_queue_1.activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 11)) AND ((harvest_task_queue_1.concurrency_key IS NULL) OR (harvest_task_queue_1.concurrency_cap IS NULL) OR ((SubPlan 9) < harvest_task_queue_1.concurrency_cap)))
+                                ->  Bitmap Index Scan on idx_harvest_tq_poll  (cost=0.00..46.31 rows=979 width=0) (never executed)
+                                      Index Cond: ((harvest_task_queue_1.queue_name = seek.queue_name) AND (harvest_task_queue_1.scheduled_at <= now()))
+                                SubPlan 8
+                                  ->  Index Only Scan using idx_harvest_we_paused on public.harvest_workflow_executions e_1  (cost=0.14..9.64 rows=100 width=16) (never executed)
+                                        Output: e_1.id
+                                        Heap Fetches: 0
+                                SubPlan 11
+                                  ->  Seq Scan on public.harvest_rate_limit_buckets b_1  (cost=0.00..43.00 rows=183 width=32) (never executed)
+                                        Output: b_1.key
+                                        Filter: (LEAST(COALESCE(CASE WHEN (b_1.override_expires_at > now()) THEN b_1.override_burst ELSE NULL::double precision END, b_1.burst), ((b_1.tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(b_1.override_expires_at, b_1.last_refilled_at), now()) - b_1.last_refilled_at))))::double precision * COALESCE(b_1.override_refill_rate, b_1.refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(b_1.override_expires_at, b_1.last_refilled_at), b_1.last_refilled_at)))))::double precision * b_1.refill_rate))) >= '1'::double precision)
+                                SubPlan 9
+                                  ->  Aggregate  (cost=11.97..11.98 rows=1 width=8) (never executed)
+                                        Output: count(*)
+                                        ->  Bitmap Heap Scan on public.harvest_task_queue inner_q_1  (cost=4.17..11.97 rows=1 width=0) (never executed)
+                                              Recheck Cond: ((inner_q_1.concurrency_key = harvest_task_queue_1.concurrency_key) AND (inner_q_1.state = 'RUNNING'::text))
+                                              Filter: ((inner_q_1.worker_id IS NOT NULL) AND (inner_q_1.task_type = harvest_task_queue_1.task_type))
+                                              ->  Bitmap Index Scan on harvest_task_queue_concurrency_key_running  (cost=0.00..4.17 rows=2 width=0) (never executed)
+                                                    Index Cond: (inner_q_1.concurrency_key = harvest_task_queue_1.concurrency_key)
+                          ->  Materialize  (cost=0.15..8.17 rows=1 width=32) (never executed)
+                                Output: qp_1.queue_name
+                                ->  Index Only Scan using harvest_queue_pauses_pkey on public.harvest_queue_pauses qp_1  (cost=0.15..8.17 rows=1 width=32) (never executed)
+                                      Output: qp_1.queue_name
+                                      Index Cond: (qp_1.queue_name = seek.queue_name)
+                                      Heap Fetches: 0
+                    ->  Index Only Scan using harvest_activity_pauses_pkey on public.harvest_activity_pauses ap_1  (cost=0.15..0.22 rows=1 width=32) (never executed)
+                          Output: ap_1.activity_name
+                          Index Cond: (ap_1.activity_name = harvest_task_queue_1.activity_name)
+                          Heap Fetches: 0
+Query Identifier: -2022898087597511307
+Planning:
+  Buffers: shared hit=485 read=2
+Planning Time: 3.071 ms
+JIT:
+  Functions: 127
+  Options: Inlining true, Optimization true, Expressions true, Deforming true
+  Timing: Generation 5.856 ms, Inlining 27.380 ms, Optimization 736.906 ms, Emission 468.761 ms, Total 1238.903 ms
+Execution Time: 1241.895 ms
+
+=== after: exact queue_depths, pending=20000
+GroupAggregate  (cost=0.29..971.90 rows=20 width=11) (actual time=1.372..3.567 rows=20 loops=1)
+  Output: queue_name, count(*)
+  Group Key: harvest_task_queue.queue_name
+  Buffers: shared hit=197
+  ->  Index Only Scan using idx_harvest_tq_poll on public.harvest_task_queue  (cost=0.29..873.85 rows=19570 width=3) (actual time=0.026..2.344 rows=18980 loops=1)
+        Output: queue_name, state, priority, scheduled_at
+        Index Cond: ((harvest_task_queue.queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (harvest_task_queue.scheduled_at <= now()))
+        Heap Fetches: 0
+        Buffers: shared hit=197
+Query Identifier: 7743466523538566364
+Planning:
+  Buffers: shared hit=11
+Planning Time: 0.353 ms
+Execution Time: 3.588 ms
+
+=== after: bounded_queue_depths, pending=20000
+Append  (cost=89.37..2584.43 rows=40 width=26) (actual time=0.135..4.719 rows=20 loops=1)
+  Buffers: shared hit=249
+  CTE queues
+    ->  HashAggregate  (cost=0.25..0.45 rows=20 width=32) (actual time=0.013..0.015 rows=20 loops=1)
+          Output: u.queue_name
+          Group Key: u.queue_name
+          Batches: 1  Memory Usage: 24kB
+          ->  Function Scan on pg_catalog.unnest u  (cost=0.00..0.20 rows=20 width=32) (actual time=0.005..0.007 rows=20 loops=1)
+                Output: u.queue_name
+                Function Call: unnest('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])
+  CTE walk
+    ->  Result  (cost=8.78..8.79 rows=1 width=1) (actual time=0.029..0.030 rows=1 loops=1)
+          Output: COALESCE($2, true)
+          Buffers: shared hit=3
+          InitPlan 3 (returns $2)
+            ->  Index Scan using pg_class_oid_index on pg_catalog.pg_class c  (cost=0.74..8.78 rows=1 width=1) (actual time=0.028..0.029 rows=1 loops=1)
+                  Output: (((('1'::double precision - ((c.relallvisible)::double precision / (GREATEST(c.relpages, 1))::double precision)) * ($1)::double precision) * '10000'::double precision) < (c.relpages)::double precision)
+                  Index Cond: (c.oid = '66361'::oid)
+                  Buffers: shared hit=3
+                  InitPlan 2 (returns $1)
+                    ->  Aggregate  (cost=0.45..0.46 rows=1 width=8) (actual time=0.020..0.021 rows=1 loops=1)
+                          Output: count(*)
+                          ->  CTE Scan on queues  (cost=0.00..0.40 rows=20 width=0) (actual time=0.013..0.018 rows=20 loops=1)
+                                Output: queues.queue_name
+  ->  Result  (cost=80.13..1603.02 rows=20 width=40) (actual time=0.135..4.710 rows=20 loops=1)
+        Output: q.queue_name, (count(*))
+        One-Time Filter: $4
+        Buffers: shared hit=249
+        InitPlan 5 (returns $4)
+          ->  CTE Scan on walk  (cost=0.00..0.02 rows=1 width=1) (actual time=0.029..0.030 rows=1 loops=1)
+                Output: walk.chosen
+                Buffers: shared hit=3
+        ->  Nested Loop  (cost=80.13..1603.02 rows=20 width=40) (actual time=0.104..4.676 rows=20 loops=1)
+              Output: q.queue_name, (count(*))
+              Inner Unique: true
+              Buffers: shared hit=246
+              ->  CTE Scan on queues q  (cost=0.00..0.40 rows=20 width=32) (actual time=0.000..0.003 rows=20 loops=1)
+                    Output: q.queue_name
+              ->  Aggregate  (cost=80.11..80.12 rows=1 width=8) (actual time=0.233..0.233 rows=1 loops=20)
+                    Output: count(*)
+                    Filter: (count(*) > 0)
+                    Buffers: shared hit=246
+                    ->  Limit  (cost=0.29..67.87 rows=979 width=28) (actual time=0.006..0.188 rows=949 loops=20)
+                          Output: NULL::integer, t.scheduled_at, t.id
+                          Buffers: shared hit=246
+                          ->  Index Only Scan using idx_harvest_tq_coverage_sample on public.harvest_task_queue t  (cost=0.29..67.87 rows=979 width=28) (actual time=0.006..0.125 rows=949 loops=20)
+                                Output: NULL::integer, t.scheduled_at, t.id
+                                Index Cond: ((t.queue_name = q.queue_name) AND (t.scheduled_at <= now()))
+                                Heap Fetches: 0
+                                Buffers: shared hit=246
+  ->  GroupAggregate  (cost=0.31..971.97 rows=20 width=11) (actual time=0.002..0.003 rows=0 loops=1)
+        Output: t_1.queue_name, LEAST(count(*), '10000'::bigint)
+        Group Key: t_1.queue_name
+        InitPlan 6 (returns $6)
+          ->  CTE Scan on walk walk_1  (cost=0.00..0.02 rows=1 width=1) (actual time=0.000..0.000 rows=1 loops=1)
+                Output: walk_1.chosen
+        ->  Result  (cost=0.29..873.85 rows=19570 width=3) (actual time=0.002..0.002 rows=0 loops=1)
+              Output: t_1.queue_name
+              One-Time Filter: (NOT $6)
+              ->  Index Only Scan using idx_harvest_tq_poll on public.harvest_task_queue t_1  (cost=0.29..873.85 rows=19570 width=3) (never executed)
+                    Output: t_1.queue_name, t_1.state, t_1.priority, t_1.scheduled_at
+                    Index Cond: ((t_1.queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (t_1.scheduled_at <= now()))
+                    Heap Fetches: 0
+Settings: enable_sort = 'off'
+Query Identifier: -8880901168617789709
+Planning:
+  Buffers: shared hit=32
+Planning Time: 0.599 ms
+Execution Time: 4.838 ms
+
+=== after: oldest_pending_ages, pending=100000
+Nested Loop Left Join  (cost=316751.43..55828907.16 rows=199 width=40) (actual time=1262.364..1262.397 rows=20 loops=1)
+  Output: seek.queue_name, (GREATEST(EXTRACT(epoch FROM (now() - COALESCE((min(GREATEST(harvest_task_queue_1.scheduled_at, COALESCE(harvest_task_queue_1.created_at, harvest_task_queue_1.scheduled_at)))), r.oldest))), '0'::numeric))::double precision
+  Inner Unique: true
+  Filter: (COALESCE((min(GREATEST(harvest_task_queue_1.scheduled_at, COALESCE(harvest_task_queue_1.created_at, harvest_task_queue_1.scheduled_at)))), r.oldest) IS NOT NULL)
+  Buffers: shared hit=846 read=39
+  CTE seek
+    ->  Nested Loop  (cost=0.67..1914.74 rows=640 width=98) (actual time=1225.597..1226.893 rows=640 loops=1)
+          Output: u.queue_name, t.scheduled_at, t.created_at, t.activity_name, t.task_type, t.schedule_to_close_at, t.workflow_exec_id, t.concurrency_key, t.concurrency_cap, t.rate_limit_key
+          Buffers: shared hit=662 read=39
+          ->  HashAggregate  (cost=0.25..0.45 rows=20 width=32) (actual time=1225.541..1225.547 rows=20 loops=1)
+                Output: u.queue_name
+                Group Key: u.queue_name
+                Batches: 1  Memory Usage: 24kB
+                ->  Function Scan on pg_catalog.unnest u  (cost=0.00..0.20 rows=20 width=32) (actual time=1225.506..1225.510 rows=20 loops=1)
+                      Output: u.queue_name
+                      Function Call: unnest('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])
+          ->  Limit  (cost=0.42..95.07 rows=32 width=82) (actual time=0.013..0.063 rows=32 loops=20)
+                Output: t.scheduled_at, t.created_at, t.activity_name, t.task_type, t.schedule_to_close_at, t.workflow_exec_id, t.concurrency_key, t.concurrency_cap, t.rate_limit_key, t.id
+                Buffers: shared hit=662 read=39
+                ->  Index Scan using idx_harvest_tq_coverage_sample on public.harvest_task_queue t  (cost=0.42..14396.78 rows=4867 width=82) (actual time=0.012..0.060 rows=32 loops=20)
+                      Output: t.scheduled_at, t.created_at, t.activity_name, t.task_type, t.schedule_to_close_at, t.workflow_exec_id, t.concurrency_key, t.concurrency_cap, t.rate_limit_key, t.id
+                      Index Cond: ((t.queue_name = u.queue_name) AND (t.scheduled_at <= now()))
+                      Buffers: shared hit=662 read=39
+  ->  Hash Left Join  (cost=35881.18..35883.71 rows=200 width=56) (actual time=1262.334..1262.347 rows=20 loops=1)
+        Output: seek.queue_name, (count(*)), (max(seek.scheduled_at)), r.oldest
+        Inner Unique: true
+        Hash Cond: (seek.queue_name = r.queue_name)
+        Buffers: shared hit=846 read=39
+        ->  HashAggregate  (cost=17.60..19.60 rows=200 width=48) (actual time=1227.335..1227.341 rows=20 loops=1)
+              Output: seek.queue_name, count(*), max(seek.scheduled_at)
+              Group Key: seek.queue_name
+              Batches: 1  Memory Usage: 40kB
+              Buffers: shared hit=662 read=39
+              ->  CTE Scan on seek  (cost=0.00..12.80 rows=640 width=40) (actual time=1225.601..1227.206 rows=640 loops=1)
+                    Output: seek.queue_name, seek.scheduled_at, seek.created_at, seek.activity_name, seek.task_type, seek.schedule_to_close_at, seek.workflow_exec_id, seek.concurrency_key, seek.concurrency_cap, seek.rate_limit_key
+                    Buffers: shared hit=662 read=39
+        ->  Hash  (cost=35863.35..35863.35 rows=18 width=40) (actual time=34.978..34.983 rows=20 loops=1)
+              Output: r.oldest, r.queue_name
+              Buckets: 1024  Batches: 1  Memory Usage: 9kB
+              Buffers: shared hit=184
+              ->  Subquery Scan on r  (cost=35859.30..35863.35 rows=18 width=40) (actual time=34.858..34.975 rows=20 loops=1)
+                    Output: r.oldest, r.queue_name
+                    Buffers: shared hit=184
+                    ->  GroupAggregate  (cost=35859.30..35863.17 rows=18 width=40) (actual time=34.855..34.970 rows=20 loops=1)
+                          Output: harvest_task_queue.queue_name, min(GREATEST(harvest_task_queue.scheduled_at, COALESCE(harvest_task_queue.created_at, harvest_task_queue.scheduled_at)))
+                          Group Key: harvest_task_queue.queue_name
+                          Buffers: shared hit=184
+                          ->  Merge Anti Join  (cost=35859.30..35862.86 rows=18 width=48) (actual time=34.836..34.915 rows=625 loops=1)
+                                Output: harvest_task_queue.queue_name, harvest_task_queue.scheduled_at, harvest_task_queue.created_at
+                                Merge Cond: (harvest_task_queue.queue_name = qp.queue_name)
+                                Buffers: shared hit=184
+                                ->  Sort  (cost=35815.62..35815.71 rows=37 width=48) (actual time=34.811..34.838 rows=625 loops=1)
+                                      Output: harvest_task_queue.queue_name, harvest_task_queue.scheduled_at, harvest_task_queue.created_at
+                                      Sort Key: harvest_task_queue.queue_name
+                                      Sort Method: quicksort  Memory: 54kB
+                                      Buffers: shared hit=184
+                                      ->  Hash Anti Join  (cost=23.50..35814.65 rows=37 width=48) (actual time=0.027..34.694 rows=625 loops=1)
+                                            Output: harvest_task_queue.queue_name, harvest_task_queue.scheduled_at, harvest_task_queue.created_at
+                                            Hash Cond: (harvest_task_queue.activity_name = ap.activity_name)
+                                            Join Filter: (harvest_task_queue.task_type = 'activity'::text)
+                                            Buffers: shared hit=184
+                                            ->  CTE Scan on seek harvest_task_queue  (cost=0.00..35790.59 rows=37 width=112) (actual time=0.006..34.601 rows=625 loops=1)
+                                                  Output: harvest_task_queue.queue_name, harvest_task_queue.scheduled_at, harvest_task_queue.created_at, harvest_task_queue.activity_name, harvest_task_queue.task_type, harvest_task_queue.schedule_to_close_at, harvest_task_queue.workflow_exec_id, harvest_task_queue.concurrency_key, harvest_task_queue.concurrency_cap, harvest_task_queue.rate_limit_key
+                                                  Filter: (((harvest_task_queue.schedule_to_close_at IS NULL) OR (harvest_task_queue.schedule_to_close_at > now())) AND ((harvest_task_queue.task_type <> 'workflow'::text) OR (harvest_task_queue.workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 3))) AND ((harvest_task_queue.rate_limit_key IS NULL) OR (harvest_task_queue.activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 6)) AND ((harvest_task_queue.concurrency_key IS NULL) OR (harvest_task_queue.concurrency_cap IS NULL) OR ((SubPlan 4) < harvest_task_queue.concurrency_cap)))
+                                                  Rows Removed by Filter: 15
+                                                  Buffers: shared hit=184
+                                                  SubPlan 3
+                                                    ->  Index Only Scan using idx_harvest_we_paused on public.harvest_workflow_executions e  (cost=0.27..27.80 rows=502 width=16) (actual time=0.013..0.059 rows=500 loops=1)
+                                                          Output: e.id
+                                                          Heap Fetches: 0
+                                                          Buffers: shared hit=5
+                                                  SubPlan 6
+                                                    ->  Seq Scan on public.harvest_rate_limit_buckets b  (cost=0.00..43.00 rows=183 width=32) (actual time=0.009..0.009 rows=0 loops=1)
+                                                          Output: b.key
+                                                          Filter: (LEAST(COALESCE(CASE WHEN (b.override_expires_at > now()) THEN b.override_burst ELSE NULL::double precision END, b.burst), ((b.tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), now()) - b.last_refilled_at))))::double precision * COALESCE(b.override_refill_rate, b.refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))))::double precision * b.refill_rate))) >= '1'::double precision)
+                                                  SubPlan 4
+                                                    ->  Aggregate  (cost=43.38..43.39 rows=1 width=8) (actual time=0.158..0.158 rows=1 loops=2)
+                                                          Output: count(*)
+                                                          Buffers: shared hit=179
+                                                          ->  Bitmap Heap Scan on public.harvest_task_queue inner_q  (cost=4.36..43.37 rows=1 width=0) (actual time=0.092..0.149 rows=40 loops=2)
+                                                                Recheck Cond: ((inner_q.concurrency_key = harvest_task_queue.concurrency_key) AND (inner_q.state = 'RUNNING'::text))
+                                                                Filter: ((inner_q.worker_id IS NOT NULL) AND (inner_q.task_type = harvest_task_queue.task_type))
+                                                                Rows Removed by Filter: 48
+                                                                Heap Blocks: exact=175
+                                                                Buffers: shared hit=179
+                                                                ->  Bitmap Index Scan on harvest_task_queue_concurrency_key_running  (cost=0.00..4.36 rows=10 width=0) (actual time=0.015..0.015 rows=88 loops=2)
+                                                                      Index Cond: (inner_q.concurrency_key = harvest_task_queue.concurrency_key)
+                                                                      Buffers: shared hit=4
+                                            ->  Hash  (cost=16.00..16.00 rows=600 width=32) (actual time=0.010..0.011 rows=0 loops=1)
+                                                  Output: ap.activity_name
+                                                  Buckets: 1024  Batches: 1  Memory Usage: 8kB
+                                                  ->  Seq Scan on public.harvest_activity_pauses ap  (cost=0.00..16.00 rows=600 width=32) (actual time=0.009..0.010 rows=0 loops=1)
+                                                        Output: ap.activity_name
+                                ->  Sort  (cost=43.69..45.19 rows=600 width=32) (actual time=0.015..0.015 rows=0 loops=1)
+                                      Output: qp.queue_name
+                                      Sort Key: qp.queue_name
+                                      Sort Method: quicksort  Memory: 25kB
+                                      ->  Seq Scan on public.harvest_queue_pauses qp  (cost=0.00..16.00 rows=600 width=32) (actual time=0.007..0.007 rows=0 loops=1)
+                                            Output: qp.queue_name
+  ->  Aggregate  (cost=278955.51..278955.52 rows=1 width=8) (actual time=0.000..0.001 rows=1 loops=20)
+        Output: min(GREATEST(harvest_task_queue_1.scheduled_at, COALESCE(harvest_task_queue_1.created_at, harvest_task_queue_1.scheduled_at)))
+        ->  Result  (cost=239.71..278955.51 rows=1 width=16) (actual time=0.000..0.000 rows=0 loops=20)
+              Output: harvest_task_queue_1.scheduled_at, harvest_task_queue_1.created_at
+              One-Time Filter: (((count(*)) >= 32) AND ((r.oldest IS NULL) OR (r.oldest > (max(seek.scheduled_at)))))
+              ->  Nested Loop Anti Join  (cost=239.71..278955.51 rows=1 width=16) (never executed)
+                    Output: harvest_task_queue_1.scheduled_at, harvest_task_queue_1.created_at
+                    Join Filter: (harvest_task_queue_1.task_type = 'activity'::text)
+                    ->  Nested Loop Anti Join  (cost=239.55..278955.31 rows=1 width=30) (never executed)
+                          Output: harvest_task_queue_1.scheduled_at, harvest_task_queue_1.created_at, harvest_task_queue_1.activity_name, harvest_task_queue_1.task_type
+                          ->  Bitmap Heap Scan on public.harvest_task_queue harvest_task_queue_1  (cost=239.40..278890.49 rows=4532 width=33) (never executed)
+                                Output: harvest_task_queue_1.scheduled_at, harvest_task_queue_1.created_at, harvest_task_queue_1.queue_name, harvest_task_queue_1.activity_name, harvest_task_queue_1.task_type
+                                Recheck Cond: ((harvest_task_queue_1.queue_name = seek.queue_name) AND (harvest_task_queue_1.scheduled_at <= now()) AND (harvest_task_queue_1.state = 'PENDING'::text))
+                                Filter: (((harvest_task_queue_1.schedule_to_close_at IS NULL) OR (harvest_task_queue_1.schedule_to_close_at > now())) AND ((harvest_task_queue_1.task_type <> 'workflow'::text) OR (harvest_task_queue_1.workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 8))) AND ((harvest_task_queue_1.rate_limit_key IS NULL) OR (harvest_task_queue_1.activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 11)) AND ((harvest_task_queue_1.concurrency_key IS NULL) OR (harvest_task_queue_1.concurrency_cap IS NULL) OR ((SubPlan 9) < harvest_task_queue_1.concurrency_cap)))
+                                ->  Bitmap Index Scan on idx_harvest_tq_poll  (cost=0.00..238.27 rows=4867 width=0) (never executed)
+                                      Index Cond: ((harvest_task_queue_1.queue_name = seek.queue_name) AND (harvest_task_queue_1.scheduled_at <= now()))
+                                SubPlan 8
+                                  ->  Index Only Scan using idx_harvest_we_paused on public.harvest_workflow_executions e_1  (cost=0.27..27.80 rows=502 width=16) (never executed)
+                                        Output: e_1.id
+                                        Heap Fetches: 0
+                                SubPlan 11
+                                  ->  Seq Scan on public.harvest_rate_limit_buckets b_1  (cost=0.00..43.00 rows=183 width=32) (never executed)
+                                        Output: b_1.key
+                                        Filter: (LEAST(COALESCE(CASE WHEN (b_1.override_expires_at > now()) THEN b_1.override_burst ELSE NULL::double precision END, b_1.burst), ((b_1.tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(b_1.override_expires_at, b_1.last_refilled_at), now()) - b_1.last_refilled_at))))::double precision * COALESCE(b_1.override_refill_rate, b_1.refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(b_1.override_expires_at, b_1.last_refilled_at), b_1.last_refilled_at)))))::double precision * b_1.refill_rate))) >= '1'::double precision)
+                                SubPlan 9
+                                  ->  Aggregate  (cost=43.38..43.39 rows=1 width=8) (never executed)
+                                        Output: count(*)
+                                        ->  Bitmap Heap Scan on public.harvest_task_queue inner_q_1  (cost=4.36..43.37 rows=1 width=0) (never executed)
+                                              Recheck Cond: ((inner_q_1.concurrency_key = harvest_task_queue_1.concurrency_key) AND (inner_q_1.state = 'RUNNING'::text))
+                                              Filter: ((inner_q_1.worker_id IS NOT NULL) AND (inner_q_1.task_type = harvest_task_queue_1.task_type))
+                                              ->  Bitmap Index Scan on harvest_task_queue_concurrency_key_running  (cost=0.00..4.36 rows=10 width=0) (never executed)
+                                                    Index Cond: (inner_q_1.concurrency_key = harvest_task_queue_1.concurrency_key)
+                          ->  Materialize  (cost=0.15..8.17 rows=1 width=32) (never executed)
+                                Output: qp_1.queue_name
+                                ->  Index Only Scan using harvest_queue_pauses_pkey on public.harvest_queue_pauses qp_1  (cost=0.15..8.17 rows=1 width=32) (never executed)
+                                      Output: qp_1.queue_name
+                                      Index Cond: (qp_1.queue_name = seek.queue_name)
+                                      Heap Fetches: 0
+                    ->  Index Only Scan using harvest_activity_pauses_pkey on public.harvest_activity_pauses ap_1  (cost=0.15..0.18 rows=1 width=32) (never executed)
+                          Output: ap_1.activity_name
+                          Index Cond: (ap_1.activity_name = harvest_task_queue_1.activity_name)
+                          Heap Fetches: 0
+Query Identifier: -871485291060350558
+Planning:
+  Buffers: shared hit=484 read=3
+Planning Time: 2.949 ms
+JIT:
+  Functions: 137
+  Options: Inlining true, Optimization true, Expressions true, Deforming true
+  Timing: Generation 8.016 ms, Inlining 30.414 ms, Optimization 745.646 ms, Emission 483.146 ms, Total 1267.222 ms
+Execution Time: 1270.697 ms
+
+=== after: exact queue_depths, pending=100000
+GroupAggregate  (cost=0.42..4973.76 rows=20 width=11) (actual time=7.115..18.710 rows=20 loops=1)
+  Output: queue_name, count(*)
+  Group Key: harvest_task_queue.queue_name
+  Buffers: shared hit=734 read=243
+  ->  Index Only Scan using idx_harvest_tq_poll on public.harvest_task_queue  (cost=0.42..4486.82 rows=97347 width=3) (actual time=0.026..12.377 rows=94938 loops=1)
+        Output: queue_name, state, priority, scheduled_at
+        Index Cond: ((harvest_task_queue.queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (harvest_task_queue.scheduled_at <= now()))
+        Heap Fetches: 0
+        Buffers: shared hit=734 read=243
+Query Identifier: 1284971005956542005
+Planning:
+  Buffers: shared hit=10 read=1
+Planning Time: 0.366 ms
+Execution Time: 18.735 ms
+
+=== after: bounded_queue_depths, pending=100000
+Append  (cost=387.86..12556.09 rows=40 width=26) (actual time=0.570..17.723 rows=20 loops=1)
+  Buffers: shared hit=602 read=219
+  CTE queues
+    ->  HashAggregate  (cost=0.25..0.45 rows=20 width=32) (actual time=0.012..0.014 rows=20 loops=1)
+          Output: u.queue_name
+          Group Key: u.queue_name
+          Batches: 1  Memory Usage: 24kB
+          ->  Function Scan on pg_catalog.unnest u  (cost=0.00..0.20 rows=20 width=32) (actual time=0.005..0.007 rows=20 loops=1)
+                Output: u.queue_name
+                Function Call: unnest('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])
+  CTE walk
+    ->  Result  (cost=8.78..8.79 rows=1 width=1) (actual time=0.055..0.057 rows=1 loops=1)
+          Output: COALESCE($2, true)
+          Buffers: shared hit=3
+          InitPlan 3 (returns $2)
+            ->  Index Scan using pg_class_oid_index on pg_catalog.pg_class c  (cost=0.74..8.78 rows=1 width=1) (actual time=0.054..0.056 rows=1 loops=1)
+                  Output: (((('1'::double precision - ((c.relallvisible)::double precision / (GREATEST(c.relpages, 1))::double precision)) * ($1)::double precision) * '10000'::double precision) < (c.relpages)::double precision)
+                  Index Cond: (c.oid = '67361'::oid)
+                  Buffers: shared hit=3
+                  InitPlan 2 (returns $1)
+                    ->  Aggregate  (cost=0.45..0.46 rows=1 width=8) (actual time=0.045..0.046 rows=1 loops=1)
+                          Output: count(*)
+                          ->  CTE Scan on queues  (cost=0.00..0.40 rows=20 width=0) (actual time=0.012..0.019 rows=20 loops=1)
+                                Output: queues.queue_name
+  ->  Result  (cost=378.62..7572.82 rows=20 width=40) (actual time=0.569..17.710 rows=20 loops=1)
+        Output: q.queue_name, (count(*))
+        One-Time Filter: $4
+        Buffers: shared hit=602 read=219
+        InitPlan 5 (returns $4)
+          ->  CTE Scan on walk  (cost=0.00..0.02 rows=1 width=1) (actual time=0.056..0.056 rows=1 loops=1)
+                Output: walk.chosen
+                Buffers: shared hit=3
+        ->  Nested Loop  (cost=378.62..7572.82 rows=20 width=40) (actual time=0.512..17.648 rows=20 loops=1)
+              Output: q.queue_name, (count(*))
+              Inner Unique: true
+              Buffers: shared hit=599 read=219
+              ->  CTE Scan on queues q  (cost=0.00..0.40 rows=20 width=32) (actual time=0.000..0.005 rows=20 loops=1)
+                    Output: q.queue_name
+              ->  Aggregate  (cost=378.60..378.61 rows=1 width=8) (actual time=0.881..0.881 rows=1 loops=20)
+                    Output: count(*)
+                    Filter: (count(*) > 0)
+                    Buffers: shared hit=599 read=219
+                    ->  Limit  (cost=0.42..317.76 rows=4867 width=28) (actual time=0.008..0.716 rows=3494 loops=20)
+                          Output: NULL::integer, t.scheduled_at, t.id
+                          Buffers: shared hit=599 read=219
+                          ->  Index Only Scan using idx_harvest_tq_coverage_sample on public.harvest_task_queue t  (cost=0.42..317.76 rows=4867 width=28) (actual time=0.008..0.484 rows=3494 loops=20)
+                                Output: NULL::integer, t.scheduled_at, t.id
+                                Index Cond: ((t.queue_name = q.queue_name) AND (t.scheduled_at <= now()))
+                                Heap Fetches: 0
+                                Buffers: shared hit=599 read=219
+  ->  GroupAggregate  (cost=0.44..4973.83 rows=20 width=11) (actual time=0.003..0.004 rows=0 loops=1)
+        Output: t_1.queue_name, LEAST(count(*), '10000'::bigint)
+        Group Key: t_1.queue_name
+        InitPlan 6 (returns $6)
+          ->  CTE Scan on walk walk_1  (cost=0.00..0.02 rows=1 width=1) (actual time=0.001..0.001 rows=1 loops=1)
+                Output: walk_1.chosen
+        ->  Result  (cost=0.42..4486.82 rows=97347 width=3) (actual time=0.003..0.003 rows=0 loops=1)
+              Output: t_1.queue_name
+              One-Time Filter: (NOT $6)
+              ->  Index Only Scan using idx_harvest_tq_poll on public.harvest_task_queue t_1  (cost=0.42..4486.82 rows=97347 width=3) (never executed)
+                    Output: t_1.queue_name, t_1.state, t_1.priority, t_1.scheduled_at
+                    Index Cond: ((t_1.queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (t_1.scheduled_at <= now()))
+                    Heap Fetches: 0
+Settings: enable_sort = 'off'
+Query Identifier: 1624360938549641206
+Planning:
+  Buffers: shared hit=41
+Planning Time: 0.661 ms
+Execution Time: 17.850 ms
+
+=== after: oldest_pending_ages, pending=300000
+Nested Loop Left Join  (cost=1998900.15..382790397.70 rows=199 width=40) (actual time=1144.801..1144.836 rows=20 loops=1)
+  Output: seek.queue_name, (GREATEST(EXTRACT(epoch FROM (now() - COALESCE((min(GREATEST(harvest_task_queue_1.scheduled_at, COALESCE(harvest_task_queue_1.created_at, harvest_task_queue_1.scheduled_at)))), r.oldest))), '0'::numeric))::double precision
+  Inner Unique: true
+  Filter: (COALESCE((min(GREATEST(harvest_task_queue_1.scheduled_at, COALESCE(harvest_task_queue_1.created_at, harvest_task_queue_1.scheduled_at)))), r.oldest) IS NOT NULL)
+  Buffers: shared hit=1093 read=1064 written=264
+  CTE seek
+    ->  Nested Loop  (cost=0.68..1914.26 rows=640 width=98) (actual time=1108.369..1111.370 rows=640 loops=1)
+          Output: u.queue_name, t.scheduled_at, t.created_at, t.activity_name, t.task_type, t.schedule_to_close_at, t.workflow_exec_id, t.concurrency_key, t.concurrency_cap, t.rate_limit_key
+          Buffers: shared hit=59 read=642
+          ->  HashAggregate  (cost=0.25..0.45 rows=20 width=32) (actual time=1108.278..1108.284 rows=20 loops=1)
+                Output: u.queue_name
+                Group Key: u.queue_name
+                Batches: 1  Memory Usage: 24kB
+                ->  Function Scan on pg_catalog.unnest u  (cost=0.00..0.20 rows=20 width=32) (actual time=1108.249..1108.252 rows=20 loops=1)
+                      Output: u.queue_name
+                      Function Call: unnest('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])
+          ->  Limit  (cost=0.42..95.05 rows=32 width=82) (actual time=0.020..0.149 rows=32 loops=20)
+                Output: t.scheduled_at, t.created_at, t.activity_name, t.task_type, t.schedule_to_close_at, t.workflow_exec_id, t.concurrency_key, t.concurrency_cap, t.rate_limit_key, t.id
+                Buffers: shared hit=59 read=642
+                ->  Index Scan using idx_harvest_tq_coverage_sample on public.harvest_task_queue t  (cost=0.42..42978.17 rows=14534 width=82) (actual time=0.019..0.145 rows=32 loops=20)
+                      Output: t.scheduled_at, t.created_at, t.activity_name, t.task_type, t.schedule_to_close_at, t.workflow_exec_id, t.concurrency_key, t.concurrency_cap, t.rate_limit_key, t.id
+                      Index Cond: ((t.queue_name = u.queue_name) AND (t.scheduled_at <= now()))
+                      Buffers: shared hit=59 read=642
+  ->  Hash Left Join  (cost=83460.82..83463.35 rows=200 width=56) (actual time=1144.773..1144.789 rows=20 loops=1)
+        Output: seek.queue_name, (count(*)), (max(seek.scheduled_at)), r.oldest
+        Inner Unique: true
+        Hash Cond: (seek.queue_name = r.queue_name)
+        Buffers: shared hit=1093 read=1064 written=264
+        ->  HashAggregate  (cost=17.60..19.60 rows=200 width=48) (actual time=1111.831..1111.838 rows=20 loops=1)
+              Output: seek.queue_name, count(*), max(seek.scheduled_at)
+              Group Key: seek.queue_name
+              Batches: 1  Memory Usage: 40kB
+              Buffers: shared hit=59 read=642
+              ->  CTE Scan on seek  (cost=0.00..12.80 rows=640 width=40) (actual time=1108.375..1111.687 rows=640 loops=1)
+                    Output: seek.queue_name, seek.scheduled_at, seek.created_at, seek.activity_name, seek.task_type, seek.schedule_to_close_at, seek.workflow_exec_id, seek.concurrency_key, seek.concurrency_cap, seek.rate_limit_key
+                    Buffers: shared hit=59 read=642
+        ->  Hash  (cost=83442.99..83442.99 rows=18 width=40) (actual time=32.920..32.924 rows=20 loops=1)
+              Output: r.oldest, r.queue_name
+              Buckets: 1024  Batches: 1  Memory Usage: 9kB
+              Buffers: shared hit=1034 read=422 written=264
+              ->  Subquery Scan on r  (cost=83414.45..83442.99 rows=18 width=40) (actual time=32.553..32.914 rows=20 loops=1)
+                    Output: r.oldest, r.queue_name
+                    Buffers: shared hit=1034 read=422 written=264
+                    ->  GroupAggregate  (cost=83414.45..83442.81 rows=18 width=40) (actual time=32.550..32.909 rows=20 loops=1)
+                          Output: harvest_task_queue.queue_name, min(GREATEST(harvest_task_queue.scheduled_at, COALESCE(harvest_task_queue.created_at, harvest_task_queue.scheduled_at)))
+                          Group Key: harvest_task_queue.queue_name
+                          Buffers: shared hit=1034 read=422 written=264
+                          ->  Nested Loop Anti Join  (cost=83414.45..83442.50 rows=18 width=48) (actual time=32.511..32.849 rows=622 loops=1)
+                                Output: harvest_task_queue.queue_name, harvest_task_queue.scheduled_at, harvest_task_queue.created_at
+                                Join Filter: (harvest_task_queue.task_type = 'activity'::text)
+                                Buffers: shared hit=1034 read=422 written=264
+                                ->  Merge Anti Join  (cost=83414.30..83417.85 rows=18 width=112) (actual time=32.502..32.587 rows=622 loops=1)
+                                      Output: harvest_task_queue.queue_name, harvest_task_queue.scheduled_at, harvest_task_queue.created_at, harvest_task_queue.activity_name, harvest_task_queue.task_type
+                                      Merge Cond: (harvest_task_queue.queue_name = qp.queue_name)
+                                      Buffers: shared hit=264 read=422 written=264
+                                      ->  Sort  (cost=83370.61..83370.70 rows=37 width=112) (actual time=32.469..32.496 rows=622 loops=1)
+                                            Output: harvest_task_queue.queue_name, harvest_task_queue.scheduled_at, harvest_task_queue.created_at, harvest_task_queue.activity_name, harvest_task_queue.task_type
+                                            Sort Key: harvest_task_queue.queue_name
+                                            Sort Method: quicksort  Memory: 63kB
+                                            Buffers: shared hit=264 read=422 written=264
+                                            ->  CTE Scan on seek harvest_task_queue  (cost=0.00..83369.64 rows=37 width=112) (actual time=11.949..32.319 rows=622 loops=1)
+                                                  Output: harvest_task_queue.queue_name, harvest_task_queue.scheduled_at, harvest_task_queue.created_at, harvest_task_queue.activity_name, harvest_task_queue.task_type
+                                                  Filter: (((harvest_task_queue.schedule_to_close_at IS NULL) OR (harvest_task_queue.schedule_to_close_at > now())) AND ((harvest_task_queue.task_type <> 'workflow'::text) OR (harvest_task_queue.workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 3))) AND ((harvest_task_queue.rate_limit_key IS NULL) OR (harvest_task_queue.activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 6)) AND ((harvest_task_queue.concurrency_key IS NULL) OR (harvest_task_queue.concurrency_cap IS NULL) OR ((SubPlan 4) < harvest_task_queue.concurrency_cap)))
+                                                  Rows Removed by Filter: 18
+                                                  Buffers: shared hit=264 read=422 written=264
+                                                  SubPlan 3
+                                                    ->  Index Only Scan using idx_harvest_we_paused on public.harvest_workflow_executions e  (cost=0.28..64.75 rows=1365 width=16) (actual time=0.023..0.180 rows=1500 loops=1)
+                                                          Output: e.id
+                                                          Heap Fetches: 0
+                                                          Buffers: shared hit=1 read=10
+                                                  SubPlan 6
+                                                    ->  Seq Scan on public.harvest_rate_limit_buckets b  (cost=0.00..43.00 rows=183 width=32) (actual time=0.009..0.009 rows=0 loops=1)
+                                                          Output: b.key
+                                                          Filter: (LEAST(COALESCE(CASE WHEN (b.override_expires_at > now()) THEN b.override_burst ELSE NULL::double precision END, b.burst), ((b.tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), now()) - b.last_refilled_at))))::double precision * COALESCE(b.override_refill_rate, b.refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))))::double precision * b.refill_rate))) >= '1'::double precision)
+                                                  SubPlan 4
+                                                    ->  Aggregate  (cost=117.71..117.72 rows=1 width=8) (actual time=0.973..0.974 rows=1 loops=3)
+                                                          Output: count(*)
+                                                          Buffers: shared hit=263 read=412 written=264
+                                                          ->  Bitmap Heap Scan on public.harvest_task_queue inner_q  (cost=4.50..117.71 rows=1 width=0) (actual time=0.059..0.948 rows=223 loops=3)
+                                                                Recheck Cond: ((inner_q.concurrency_key = harvest_task_queue.concurrency_key) AND (inner_q.state = 'RUNNING'::text))
+                                                                Filter: ((inner_q.worker_id IS NOT NULL) AND (inner_q.task_type = harvest_task_queue.task_type))
+                                                                Heap Blocks: exact=669
+                                                                Buffers: shared hit=263 read=412 written=264
+                                                                ->  Bitmap Index Scan on harvest_task_queue_concurrency_key_running  (cost=0.00..4.50 rows=29 width=0) (actual time=0.030..0.030 rows=223 loops=3)
+                                                                      Index Cond: (inner_q.concurrency_key = harvest_task_queue.concurrency_key)
+                                                                      Buffers: shared hit=3 read=3 written=1
+                                      ->  Sort  (cost=43.69..45.19 rows=600 width=32) (actual time=0.014..0.014 rows=0 loops=1)
+                                            Output: qp.queue_name
+                                            Sort Key: qp.queue_name
+                                            Sort Method: quicksort  Memory: 25kB
+                                            ->  Seq Scan on public.harvest_queue_pauses qp  (cost=0.00..16.00 rows=600 width=32) (actual time=0.006..0.006 rows=0 loops=1)
+                                                  Output: qp.queue_name
+                                ->  Index Only Scan using harvest_activity_pauses_pkey on public.harvest_activity_pauses ap  (cost=0.15..1.36 rows=1 width=32) (actual time=0.000..0.000 rows=0 loops=622)
+                                      Output: ap.activity_name
+                                      Index Cond: (ap.activity_name = harvest_task_queue.activity_name)
+                                      Heap Fetches: 0
+                                      Buffers: shared hit=770
+  ->  Aggregate  (cost=1913525.07..1913525.08 rows=1 width=8) (actual time=0.000..0.001 rows=1 loops=20)
+        Output: min(GREATEST(harvest_task_queue_1.scheduled_at, COALESCE(harvest_task_queue_1.created_at, harvest_task_queue_1.scheduled_at)))
+        ->  Result  (cost=677.23..1913525.06 rows=1 width=16) (actual time=0.000..0.000 rows=0 loops=20)
+              Output: harvest_task_queue_1.scheduled_at, harvest_task_queue_1.created_at
+              One-Time Filter: (((count(*)) >= 32) AND ((r.oldest IS NULL) OR (r.oldest > (max(seek.scheduled_at)))))
+              ->  Nested Loop Anti Join  (cost=677.23..1913525.06 rows=1 width=16) (never executed)
+                    Output: harvest_task_queue_1.scheduled_at, harvest_task_queue_1.created_at
+                    Join Filter: (harvest_task_queue_1.task_type = 'activity'::text)
+                    ->  Nested Loop Anti Join  (cost=677.07..1913524.87 rows=1 width=30) (never executed)
+                          Output: harvest_task_queue_1.scheduled_at, harvest_task_queue_1.created_at, harvest_task_queue_1.activity_name, harvest_task_queue_1.task_type
+                          ->  Bitmap Heap Scan on public.harvest_task_queue harvest_task_queue_1  (cost=676.92..1913347.92 rows=13503 width=33) (never executed)
+                                Output: harvest_task_queue_1.scheduled_at, harvest_task_queue_1.created_at, harvest_task_queue_1.queue_name, harvest_task_queue_1.activity_name, harvest_task_queue_1.task_type
+                                Recheck Cond: ((harvest_task_queue_1.queue_name = seek.queue_name) AND (harvest_task_queue_1.scheduled_at <= now()) AND (harvest_task_queue_1.state = 'PENDING'::text))
+                                Filter: (((harvest_task_queue_1.schedule_to_close_at IS NULL) OR (harvest_task_queue_1.schedule_to_close_at > now())) AND ((harvest_task_queue_1.task_type <> 'workflow'::text) OR (harvest_task_queue_1.workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 8))) AND ((harvest_task_queue_1.rate_limit_key IS NULL) OR (harvest_task_queue_1.activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 11)) AND ((harvest_task_queue_1.concurrency_key IS NULL) OR (harvest_task_queue_1.concurrency_cap IS NULL) OR ((SubPlan 9) < harvest_task_queue_1.concurrency_cap)))
+                                ->  Bitmap Index Scan on idx_harvest_tq_poll  (cost=0.00..673.55 rows=14534 width=0) (never executed)
+                                      Index Cond: ((harvest_task_queue_1.queue_name = seek.queue_name) AND (harvest_task_queue_1.scheduled_at <= now()))
+                                SubPlan 8
+                                  ->  Index Only Scan using idx_harvest_we_paused on public.harvest_workflow_executions e_1  (cost=0.28..64.75 rows=1365 width=16) (never executed)
+                                        Output: e_1.id
+                                        Heap Fetches: 0
+                                SubPlan 11
+                                  ->  Seq Scan on public.harvest_rate_limit_buckets b_1  (cost=0.00..43.00 rows=183 width=32) (never executed)
+                                        Output: b_1.key
+                                        Filter: (LEAST(COALESCE(CASE WHEN (b_1.override_expires_at > now()) THEN b_1.override_burst ELSE NULL::double precision END, b_1.burst), ((b_1.tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(b_1.override_expires_at, b_1.last_refilled_at), now()) - b_1.last_refilled_at))))::double precision * COALESCE(b_1.override_refill_rate, b_1.refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(b_1.override_expires_at, b_1.last_refilled_at), b_1.last_refilled_at)))))::double precision * b_1.refill_rate))) >= '1'::double precision)
+                                SubPlan 9
+                                  ->  Aggregate  (cost=117.71..117.72 rows=1 width=8) (never executed)
+                                        Output: count(*)
+                                        ->  Bitmap Heap Scan on public.harvest_task_queue inner_q_1  (cost=4.50..117.71 rows=1 width=0) (never executed)
+                                              Recheck Cond: ((inner_q_1.concurrency_key = harvest_task_queue_1.concurrency_key) AND (inner_q_1.state = 'RUNNING'::text))
+                                              Filter: ((inner_q_1.worker_id IS NOT NULL) AND (inner_q_1.task_type = harvest_task_queue_1.task_type))
+                                              ->  Bitmap Index Scan on harvest_task_queue_concurrency_key_running  (cost=0.00..4.50 rows=29 width=0) (never executed)
+                                                    Index Cond: (inner_q_1.concurrency_key = harvest_task_queue_1.concurrency_key)
+                          ->  Materialize  (cost=0.15..8.17 rows=1 width=32) (never executed)
+                                Output: qp_1.queue_name
+                                ->  Index Only Scan using harvest_queue_pauses_pkey on public.harvest_queue_pauses qp_1  (cost=0.15..8.17 rows=1 width=32) (never executed)
+                                      Output: qp_1.queue_name
+                                      Index Cond: (qp_1.queue_name = seek.queue_name)
+                                      Heap Fetches: 0
+                    ->  Index Only Scan using harvest_activity_pauses_pkey on public.harvest_activity_pauses ap_1  (cost=0.15..0.17 rows=1 width=32) (never executed)
+                          Output: ap_1.activity_name
+                          Index Cond: (ap_1.activity_name = harvest_task_queue_1.activity_name)
+                          Heap Fetches: 0
+Query Identifier: -4374477977037704454
+Planning:
+  Buffers: shared hit=484 read=3
+Planning Time: 3.042 ms
+JIT:
+  Functions: 131
+  Options: Inlining true, Optimization true, Expressions true, Deforming true
+  Timing: Generation 6.113 ms, Inlining 25.359 ms, Optimization 675.319 ms, Emission 436.120 ms, Total 1142.911 ms
+Execution Time: 1151.153 ms
+
+=== after: exact queue_depths, pending=300000
+Finalize GroupAggregate  (cost=1000.43..9986.69 rows=20 width=11) (actual time=64.048..69.910 rows=20 loops=1)
+  Output: queue_name, count(*)
+  Group Key: harvest_task_queue.queue_name
+  Buffers: shared hit=39 read=2599 written=2535
+  ->  Gather Merge  (cost=1000.43..9986.39 rows=20 width=11) (actual time=63.983..69.893 rows=22 loops=1)
+        Output: queue_name, (PARTIAL count(*))
+        Workers Planned: 1
+        Workers Launched: 1
+        Buffers: shared hit=39 read=2599 written=2535
+        ->  Partial GroupAggregate  (cost=0.42..8984.13 rows=20 width=11) (actual time=12.862..34.244 rows=11 loops=2)
+              Output: queue_name, PARTIAL count(*)
+              Group Key: harvest_task_queue.queue_name
+              Buffers: shared hit=39 read=2599 written=2535
+              Worker 0:  actual time=4.706..47.419 rows=20 loops=1
+                Buffers: shared hit=36 read=1817 written=1814
+              ->  Parallel Index Only Scan using idx_harvest_tq_poll on public.harvest_task_queue  (cost=0.42..8411.91 rows=114405 width=3) (actual time=0.065..24.824 rows=142486 loops=2)
+                    Output: queue_name, state, priority, scheduled_at
+                    Index Cond: ((harvest_task_queue.queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (harvest_task_queue.scheduled_at <= now()))
+                    Heap Fetches: 0
+                    Buffers: shared hit=39 read=2599 written=2535
+                    Worker 0:  actual time=0.082..34.448 rows=196281 loops=1
+                      Buffers: shared hit=36 read=1817 written=1814
+Query Identifier: -5177927552378138446
+Planning:
+  Buffers: shared hit=10 read=1 written=1
+Planning Time: 0.355 ms
+Execution Time: 69.938 ms
+
+=== after: bounded_queue_depths, pending=300000
+Append  (cost=769.53..25202.42 rows=40 width=26) (actual time=1.801..60.979 rows=20 loops=1)
+  Buffers: shared hit=65 read=1643 written=1627
+  CTE queues
+    ->  HashAggregate  (cost=0.25..0.45 rows=20 width=32) (actual time=0.013..0.016 rows=20 loops=1)
+          Output: u.queue_name
+          Group Key: u.queue_name
+          Batches: 1  Memory Usage: 24kB
+          ->  Function Scan on pg_catalog.unnest u  (cost=0.00..0.20 rows=20 width=32) (actual time=0.006..0.008 rows=20 loops=1)
+                Output: u.queue_name
+                Function Call: unnest('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])
+  CTE walk
+    ->  Result  (cost=8.78..8.79 rows=1 width=1) (actual time=0.031..0.034 rows=1 loops=1)
+          Output: COALESCE($2, true)
+          Buffers: shared hit=3
+          InitPlan 3 (returns $2)
+            ->  Index Scan using pg_class_oid_index on pg_catalog.pg_class c  (cost=0.74..8.78 rows=1 width=1) (actual time=0.030..0.032 rows=1 loops=1)
+                  Output: (((('1'::double precision - ((c.relallvisible)::double precision / (GREATEST(c.relpages, 1))::double precision)) * ($1)::double precision) * '10000'::double precision) < (c.relpages)::double precision)
+                  Index Cond: (c.oid = '68364'::oid)
+                  Buffers: shared hit=3
+                  InitPlan 2 (returns $1)
+                    ->  Aggregate  (cost=0.45..0.46 rows=1 width=8) (actual time=0.022..0.023 rows=1 loops=1)
+                          Output: count(*)
+                          ->  CTE Scan on queues  (cost=0.00..0.40 rows=20 width=0) (actual time=0.014..0.020 rows=20 loops=1)
+                                Output: queues.queue_name
+  ->  Result  (cost=760.29..15206.22 rows=20 width=40) (actual time=1.800..43.909 rows=20 loops=1)
+        Output: q.queue_name, (count(*))
+        One-Time Filter: $4
+        Buffers: shared hit=65 read=1643 written=1627
+        InitPlan 5 (returns $4)
+          ->  CTE Scan on walk  (cost=0.00..0.02 rows=1 width=1) (actual time=0.032..0.033 rows=1 loops=1)
+                Output: walk.chosen
+                Buffers: shared hit=3
+        ->  Nested Loop  (cost=760.29..15206.22 rows=20 width=40) (actual time=1.765..43.863 rows=20 loops=1)
+              Output: q.queue_name, (count(*))
+              Inner Unique: true
+              Buffers: shared hit=62 read=1643 written=1627
+              ->  CTE Scan on queues q  (cost=0.00..0.40 rows=20 width=32) (actual time=0.000..0.014 rows=20 loops=1)
+                    Output: q.queue_name
+              ->  Aggregate  (cost=760.27..760.28 rows=1 width=8) (actual time=2.189..2.189 rows=1 loops=20)
+                    Output: count(*)
+                    Filter: (count(*) > 0)
+                    Buffers: shared hit=62 read=1643 written=1627
+                    ->  Limit  (cost=0.42..635.27 rows=10000 width=28) (actual time=0.011..1.823 rows=7714 loops=20)
+                          Output: NULL::integer, t.scheduled_at, t.id
+                          Buffers: shared hit=62 read=1643 written=1627
+                          ->  Index Only Scan using idx_harvest_tq_coverage_sample on public.harvest_task_queue t  (cost=0.42..923.11 rows=14534 width=28) (actual time=0.010..1.311 rows=7714 loops=20)
+                                Output: NULL::integer, t.scheduled_at, t.id
+                                Index Cond: ((t.queue_name = q.queue_name) AND (t.scheduled_at <= now()))
+                                Heap Fetches: 0
+                                Buffers: shared hit=62 read=1643 written=1627
+  ->  Finalize GroupAggregate  (cost=1000.45..9986.76 rows=20 width=11) (actual time=15.914..17.052 rows=0 loops=1)
+        Output: t_1.queue_name, LEAST(count(*), '10000'::bigint)
+        Group Key: t_1.queue_name
+        InitPlan 6 (returns $6)
+          ->  CTE Scan on walk walk_1  (cost=0.00..0.02 rows=1 width=1) (actual time=0.001..0.001 rows=1 loops=1)
+                Output: walk_1.chosen
+        ->  Gather Merge  (cost=1000.43..9986.39 rows=20 width=11) (actual time=15.913..17.050 rows=0 loops=1)
+              Output: t_1.queue_name, (PARTIAL count(*))
+              Workers Planned: 1
+              Params Evaluated: $6
+              Workers Launched: 1
+              ->  Partial GroupAggregate  (cost=0.42..8984.13 rows=20 width=11) (actual time=0.002..0.002 rows=0 loops=2)
+                    Output: t_1.queue_name, PARTIAL count(*)
+                    Group Key: t_1.queue_name
+                    Worker 0:  actual time=0.002..0.002 rows=0 loops=1
+                    ->  Result  (cost=0.42..8411.91 rows=114405 width=3) (actual time=0.001..0.001 rows=0 loops=2)
+                          Output: t_1.queue_name
+                          One-Time Filter: (NOT $6)
+                          Worker 0:  actual time=0.001..0.001 rows=0 loops=1
+                          ->  Parallel Index Only Scan using idx_harvest_tq_poll on public.harvest_task_queue t_1  (cost=0.42..8411.91 rows=114405 width=3) (never executed)
+                                Output: t_1.queue_name, t_1.state, t_1.priority, t_1.scheduled_at
+                                Index Cond: ((t_1.queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND (t_1.scheduled_at <= now()))
+                                Heap Fetches: 0
+Settings: enable_sort = 'off'
+Query Identifier: -7431786105068363968
+Planning:
+  Buffers: shared hit=37 read=4 dirtied=2 written=4
+Planning Time: 0.642 ms
+Execution Time: 61.111 ms
+

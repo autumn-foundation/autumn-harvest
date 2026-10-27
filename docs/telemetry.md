@@ -361,7 +361,7 @@ metric is emitted in the source code.
 | `harvest.activity.concurrency_deferred` | Counter | `worker.rs` — `process_activity_task`, once per claimed attempt that the adaptive limit deferred. The claim skips a type at its cap, so a steady rate means claims race past the cap. Prometheus: `harvest_activity_concurrency_deferred_total` (issue #1836) |
 | `harvest.activity.pause_actions` | Counter | `activity_pause.rs` — the `pause_activity` / `resume_activity` write path, once per operator action on a whole activity type (issue #807). **Gated on the action having genuinely changed state** (`ActivityPauseOutcome::newly_paused` / `ActivityResumeOutcome::newly_resumed`) so an idempotent retry after a lost response does not read as a second hold — the same gating `harvest.workflow.paused` uses (issue #383). Deliberately a counter, not a gauge: it records *actions*, so a flat line says nothing about whether a hold is currently in effect — `GET /api/harvest/activities` is the read model for the state. Contrast its sibling `harvest.queue.paused` (issue #619), a gauge, because there the alertable thing is the *duration* of the hold |
 | `harvest.timer.started` | Counter | `worker.rs` — `handle_suspended_workflow` and `persist_mixed_suspension_batch`, when a durable timer is written |
-| `harvest.queue.depth` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, periodic (5 s default). Aggregated **across all shards** of the worker's `ShardedDbPool` (summed per queue) so multi-shard backlog is fleet-wide, not default-shard-only (issue #522) |
+| `harvest.queue.depth` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, periodic (5 s default). Aggregated **across all shards** of the worker's `ShardedDbPool` (summed per queue) so multi-shard backlog is fleet-wide, not default-shard-only (issue #522). **Capped at 10,000** (`telemetry::QUEUE_DEPTH_CAP`). Each shard counts at most 10,000 eligible rows per queue, and the sum is capped again. Below the cap the value is exact. A value of 10,000 means 10,000 or more. For the trend of a deeper queue, read `harvest.queue.oldest_pending_age`, which has no cap but applies the claim gates. For an exact count, scrape `harvest_queue_backlog` from `GET /admin/queues/scaling?format=prometheus`, which also feeds autoscaling (issue #2356) |
 | `harvest.queue.schedule_to_start` | Histogram | `worker.rs` — recorded at handler start in `process_workflow_task` / `process_activity_task`. The sample runs from eligibility, so it includes the `PENDING` wait behind a saturated worker (issue #1787); skew-discounted (issue #501) |
 | `harvest.queue.oldest_pending_age` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, alongside depth; excludes PAUSED executions, skew-discounted, periodic (5 s default) (issue #501). Aggregated across all shards as the **max** age per queue (the single oldest task fleet-wide) (issue #522) |
 | `harvest.load_shed.active` | Gauge | `load_shed.rs` — `sample_once`, the load-shed sampler. It writes 1 or 0 for every configured queue on every tick, also after a failed read (issue #1794) |
@@ -617,7 +617,7 @@ contract in `docs/saga.md`.
 # Activity failure rate
 rate(harvest_activity_duration_count{status="failed"}[5m])
 
-# Current queue backlog
+# Current queue backlog, exact below 10,000 (issue #2356)
 harvest_queue_depth{queue="default"}
 
 # p99 schedule-to-start latency per queue (canonical worker-capacity SLI, issue #501)

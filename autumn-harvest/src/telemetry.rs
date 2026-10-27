@@ -200,7 +200,21 @@ pub const METRIC_TIMER_STARTED: &str = "harvest.timer.started";
 pub const METRIC_TIMER_DURATION: &str = "harvest.timer.duration";
 
 /// Gauge: current number of pending (unclaimed) tasks in a queue.
+///
+/// The value is at most [`QUEUE_DEPTH_CAP`] (issue #2356).
 pub const METRIC_QUEUE_DEPTH: &str = "harvest.queue.depth";
+
+/// The highest value of [`METRIC_QUEUE_DEPTH`] (issue #2356).
+///
+/// The sampler counts each queue up to this cap, so its cost does not grow
+/// with the backlog. Below the cap the gauge is exact. At the cap it means
+/// "this many or more". The guard `queue_depth_alerts_sit_below_the_gauge_cap`
+/// keeps each depth threshold of the starter alert pack at or below the cap.
+pub const QUEUE_DEPTH_CAP: std::num::NonZeroU32 = match std::num::NonZeroU32::new(10_000) {
+    Some(cap) => cap,
+    // Const evaluation stops the build here, so no run reaches this arm.
+    None => panic!("QUEUE_DEPTH_CAP must not be zero"),
+};
 
 /// Histogram: wall-clock seconds a task waited between becoming eligible
 /// (`scheduled_at`) and being claimed by a worker (`started_at`).
@@ -3379,6 +3393,8 @@ pub trait MetricsRecorder: Send + Sync {
     }
 
     /// A periodic snapshot of queued pending task count.
+    ///
+    /// `depth` is at most [`QUEUE_DEPTH_CAP`] (issue #2356).
     fn record_queue_depth(&self, queue_name: &str, depth: u64) {
         let _ = (queue_name, depth);
     }
@@ -4720,11 +4736,11 @@ pub trait MetricsRecorder: Send + Sync {
     /// Whether this recorder actually forwards samples anywhere.
     ///
     /// Defaults to `true` for every real recorder. [`NoOpMetrics`] overrides it to
-    /// `false` so callers can skip *expensive sample-production work* (e.g. the
-    /// per-poll-interval `oldest_pending_ages` / `queue_depths` sampler SQL) when
-    /// no recorder is configured — the per-event `record_*` calls are already
-    /// zero-cost, but the queries that feed gauges are not. Treat this as a hint
-    /// for guarding observation work, never for changing engine behavior.
+    /// `false` so callers can skip *expensive sample-production work*, such as
+    /// the `oldest_pending_ages` and `bounded_queue_depths` sampler SQL. The
+    /// per-event `record_*` calls are already zero-cost, but the queries that
+    /// feed gauges are not. Treat this as a hint for guarding observation work,
+    /// never for changing engine behavior.
     fn is_enabled(&self) -> bool {
         true
     }

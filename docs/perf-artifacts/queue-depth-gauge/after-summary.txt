@@ -1,0 +1,5 @@
+-- after: depth + age + claim per worker tick, 10 ticks x 4 workers
+pending | statements | all buffers | age calls | age buffers | age share | depth buffers | claim buffers | WAL bytes | queues with an age
+20000 | 600 | 220514 | 40 | 105998 | 48.1% | 35089 | 78423 | 44200 | 20
+100000 | 600 | 210283 | 40 | 64946 | 30.9% | 49155 | 95049 | 46634 | 20
+300000 | 600 | 292304 | 40 | 86476 | 29.6% | 79871 | 124799 | 714999 | 20

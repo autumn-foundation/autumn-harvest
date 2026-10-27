@@ -20,7 +20,8 @@ Runbook step: `harvest_queue_backlog_growth` -> `### Triage steps`, especially
 `harvest concurrency status --output json`.
 
 Resolution target: add enough test workers to flatten `harvest_queue_depth`, or
-pause the synthetic producer.
+pause the synthetic producer. Keep the drill backlog below 10,000. The depth
+gauge stops at 10,000, so a deeper backlog is flat from the start (#2356).
 
 ## dlq-spike
 

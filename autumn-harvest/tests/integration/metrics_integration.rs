@@ -37,7 +37,7 @@ use autumn_harvest::telemetry::{
     METRIC_UPDATE_DURATION, METRIC_UPDATE_FAILED, METRIC_WORKFLOW_CONTINUE_AS_NEW,
     METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_BLOAT, METRIC_WORKFLOW_HISTORY_SIZE,
     METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_UNFINISHED_HANDLERS,
-    MetricsRecorder, TelemetryConfig, WorkflowStatus,
+    MetricsRecorder, QUEUE_DEPTH_CAP, TelemetryConfig, WorkflowStatus,
 };
 use autumn_harvest::types::{ActivityExecId, ExecutionId, ParentClosePolicy, ShardId, UpdateId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
@@ -520,50 +520,59 @@ fn build_worker_with_budget(
     workflow_task_timeout: Duration,
     max_local_activity_start_to_close: Duration,
 ) -> Arc<Worker> {
-    Arc::new(
-        Worker::new(
-            WorkerRuntimeConfig {
-                codec_rotation_batch_size: 0,
-                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
-                dr: autumn_harvest::replication::DrConfig::default(),
-                worker_id: worker_id.to_string(),
-                queues: vec!["default".to_string()],
-                notification_database_url: None,
-                max_concurrent_workflows: 2,
-                max_concurrent_activities: 2,
-                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
-                poll_interval: Duration::from_millis(25),
-                shutdown_timeout: Duration::from_secs(2),
-                cancellation_grace_period: Duration::from_secs(1),
-                sticky_timeout: Duration::from_secs(5),
-                max_local_activity_start_to_close,
-                shard_assignments: vec![ShardId::new(0)],
-                worker_heartbeat_interval: Duration::from_secs(30),
-                build_id: String::new(),
-                deployment_name: None,
-                workflow_cache_size: 1000,
-                resident_workflows: true,
-                priority_aging_secs: None,
-                unknown_target_grace_window: Duration::from_secs(5),
-                poison_pill_threshold: 3,
-                capability_miss_max_redeliveries: 5,
+    let config = worker_config(
+        worker_id,
+        workflow_task_timeout,
+        max_local_activity_start_to_close,
+    );
+    Arc::new(Worker::new(config, registry).expect("worker should build"))
+}
 
-                workflow_task_timeout,
-                workflow_panic_max_attempts: 3,
-                labels: std::collections::HashMap::new(),
-                queue_weights: std::collections::HashMap::new(),
-                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
-                max_workflow_history_events: None,
-                shard_notification_database_urls: Vec::new(),
-                sharded_pool: None,
-                slot_tuner: None,
-                max_concurrent_sessions: 0,
-                fairness_keys: false,
-            },
-            registry,
-        )
-        .expect("worker should build"),
-    )
+/// The config of [`build_worker_with_budget`]. A test that needs another field,
+/// such as a sharded pool, changes it before it builds the worker.
+fn worker_config(
+    worker_id: &str,
+    workflow_task_timeout: Duration,
+    max_local_activity_start_to_close: Duration,
+) -> WorkerRuntimeConfig {
+    WorkerRuntimeConfig {
+        codec_rotation_batch_size: 0,
+        scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+        dr: autumn_harvest::replication::DrConfig::default(),
+        worker_id: worker_id.to_string(),
+        queues: vec!["default".to_string()],
+        notification_database_url: None,
+        max_concurrent_workflows: 2,
+        max_concurrent_activities: 2,
+        max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+        poll_interval: Duration::from_millis(25),
+        shutdown_timeout: Duration::from_secs(2),
+        cancellation_grace_period: Duration::from_secs(1),
+        sticky_timeout: Duration::from_secs(5),
+        max_local_activity_start_to_close,
+        shard_assignments: vec![ShardId::new(0)],
+        worker_heartbeat_interval: Duration::from_secs(30),
+        build_id: String::new(),
+        deployment_name: None,
+        workflow_cache_size: 1000,
+        resident_workflows: true,
+        priority_aging_secs: None,
+        unknown_target_grace_window: Duration::from_secs(5),
+        poison_pill_threshold: 3,
+        capability_miss_max_redeliveries: 5,
+
+        workflow_task_timeout,
+        workflow_panic_max_attempts: 3,
+        labels: std::collections::HashMap::new(),
+        queue_weights: std::collections::HashMap::new(),
+        max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+        max_workflow_history_events: None,
+        shard_notification_database_urls: Vec::new(),
+        sharded_pool: None,
+        slot_tuner: None,
+        max_concurrent_sessions: 0,
+        fairness_keys: false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5417,5 +5426,100 @@ async fn update_completed_metric_fires_on_the_suspend_path() {
             .count(),
         0,
         "no update.failed for a successful update"
+    );
+}
+
+/// The depth gauge caps the sum of the shards (issue #2356).
+///
+/// Each of two shards holds 6,000 eligible rows, below the cap. The sum is
+/// 12,000, so the gauge must read the cap. A sampler that adds the shards
+/// without the cap reads 12,000.
+///
+/// The test pauses `default` on both shards, so the worker claims nothing and
+/// the backlog stays put. The depth count has no pause gate. The pause must
+/// not reach a shared database, so each shard is a database of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_depth_gauge_caps_the_sum_of_the_shards() {
+    use autumn_harvest::shard::ShardedDbPool;
+    use diesel_async::SimpleAsyncConnection;
+
+    let (admin, _container) = setup_db_env_or_container().await;
+    let shards = [
+        crate::throwaway_db::ThrowawayDb::create_on(&admin, "depth_cap_shard").await,
+        crate::throwaway_db::ThrowawayDb::create_on(&admin, "depth_cap_shard").await,
+    ];
+    let mut pools = std::collections::BTreeMap::new();
+    for (index, shard) in (0..).zip(&shards) {
+        let mut conn = AsyncPgConnection::establish(&shard.url())
+            .await
+            .expect("failed to connect");
+        conn.batch_execute(
+            "INSERT INTO harvest_queue_pauses (queue_name, reason) VALUES ('default', 'depth'); \
+             INSERT INTO harvest_task_queue (queue_name, task_type, input, state, scheduled_at) \
+             SELECT 'default', 'activity', '{}', 'PENDING', now() - interval '1 minute' \
+             FROM generate_series(1, 6000) g;",
+        )
+        .await
+        .expect("seed 6,000 eligible rows");
+        pools.insert(ShardId::new(index), build_test_pool(&shard.url()));
+    }
+    let pool = pools[&ShardId::new(0)].clone();
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+    ));
+    let mut config = worker_config(
+        "metrics-worker-depth-cap",
+        Duration::from_secs(10),
+        Duration::from_secs(60),
+    );
+    config.sharded_pool = Some(ShardedDbPool::from_map(pools, ShardId::new(0)));
+    let worker = Arc::new(Worker::new(config, registry).expect("worker should build"));
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move {
+        runner.run(&pool).await;
+    });
+
+    let depth_sample = || {
+        recording
+            .emissions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.name == METRIC_QUEUE_DEPTH && e.labels_debug.contains("queue=default"))
+            .map(|e| e.labels_debug.clone())
+    };
+    let sampled = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(labels) = depth_sample() {
+                break labels;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    let labels = sampled.expect("harvest.queue.depth must be sampled within 15 s");
+    let depth: u64 = labels
+        .split(',')
+        .find_map(|label| label.strip_prefix("depth="))
+        .and_then(|value| value.parse().ok())
+        .expect("depth label must be a valid u64");
+    assert_eq!(
+        depth,
+        u64::from(QUEUE_DEPTH_CAP.get()),
+        "two shards of 6,000 rows read the cap, not 12,000"
     );
 }

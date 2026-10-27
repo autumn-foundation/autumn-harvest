@@ -337,8 +337,9 @@ jobs:
 
       # Issue #1816: load and unit-test the SLO burn-rate rules. The pinned
       # tarball and its checksum keep a new promtool release from reddening
-      # lint, and a tampered download fails the checksum.
-      - name: SLO burn-rate rules (promtool check and test)
+      # lint, and a tampered download fails the checksum. Issue #2356 adds
+      # the starter backlog rule.
+      - name: Alert rules (promtool check and test)
         env:
           PROMETHEUS_VERSION: "3.5.0"
           PROMETHEUS_SHA256: "e811827af26d822afb09a4f28314f61b618b12cff5369835a67f674d8b46f39a"
@@ -351,6 +352,10 @@ jobs:
           tar -xzf "${RUNNER_TEMP}/$name.tar.gz" -C "${RUNNER_TEMP}" --strip-components=1 "$name/promtool"
           "${RUNNER_TEMP}/promtool" check rules docs/alerts/slo-pack-v0.1.0.rules.yml
           "${RUNNER_TEMP}/promtool" test rules docs/alerts/slo-pack-v0.1.0.test.yml
+          # The guard alert_pack_docs::the_backlog_rule_file_matches_the_starter_pack
+          # keeps the backlog rule file equal to the pack.
+          "${RUNNER_TEMP}/promtool" check rules docs/alerts/starter-pack-v0.1.0.backlog-growth.rules.yml
+          "${RUNNER_TEMP}/promtool" test rules docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml
 
       # Issue #1202: same reasoning as the two steps above, for
       # docs/testing/chaos.md's worked local-iteration example. It lives

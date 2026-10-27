@@ -2620,6 +2620,11 @@ standalone note rather than part of the claim-path attribution table above:
   on each sampler tick. It now seeks the oldest 32 rows per queue and falls back
   to the full read only when it cannot settle the answer (age buffers -88.8%,
   -98.6% and -99.5% at 20k, 100k and 300k pending rows, `pg_stat_statements`).
+* [`docs/performance-queue-depth-gauge.md`](performance-queue-depth-gauge.md)
+  — before issue #2356, the depth gauge counted every eligible pending row on
+  each sampler tick. It now counts each queue up to 10,000 rows, by a walk of
+  the index or one pass (depth buffers +7.6%, -20.1% and -36.7% at 20k, 100k
+  and 300k pending rows; 22,744 to 114 for one queue of 1,000,000 rows).
 * [`docs/performance-stream-append-count.md`](performance-stream-append-count.md)
   — `append_stream_chunks` counted every stored chunk of a run on each append.
   It now skips the count while the offset span plus the new chunks fits the cap
