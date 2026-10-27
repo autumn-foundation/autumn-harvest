@@ -2703,9 +2703,9 @@ standalone note rather than part of the claim-path attribution table above:
   tenures in O(H²).
 * [`docs/performance-owner-disk-cache.md`](performance-owner-disk-cache.md)
   — `OwnerDiskCache` store, append, load and entity row (issue #2258); a
-  baseline. A fresh store and a load cost about 17,800 instructions per
-  event and are linear. An append decision costs about 198,000, and its two
-  new events are at most 22.17% of it. Uncached SQL parses and two SHA-256
+  baseline. A fresh store costs about 17,300 instructions per event and a
+  load about 17,200, both linear. An append decision costs about 196,000, and
+  its two new events are at most 21.75% of it. Uncached SQL parses and two SHA-256
   hashes lead the fixed cost.
 * [`docs/performance-entity-sql.md`](performance-entity-sql.md)
   — `entity_sql::run`, the read-only SQL over one entity state (issue
@@ -2714,9 +2714,9 @@ standalone note rather than part of the claim-path attribution table above:
   A `json_each` scan adds about 8,179 per item and stays linear.
 * [`docs/performance-entity-snapshot-replay.md`](performance-entity-snapshot-replay.md)
   — the cold replay of keyed-entity state snapshots (issue #2259) through
-  `executor::run_workflow`: O(M×S) at about 171 `Ir` per snapshot byte.
+  `executor::run_workflow`: O(M×S) at about 172 `Ir` per snapshot byte.
   Baseline only. Skipping the discarded live snapshot, publishing the query
-  view lazily and counting loaded bytes at load bound a 56.4% saving.
+  view lazily and counting loaded bytes at load bound a 56.6% saving.
 * [`docs/performance-agent-model-turn.md`](performance-agent-model-turn.md)
   — `AgentHarness::model_turn`, the activity side of one agent model turn
   (issues #1973, #2264); baseline only. The delta form re-hashes the whole
@@ -2731,9 +2731,9 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-durable-agent-replay.md`](performance-durable-agent-replay.md)
   — the replay of a durable `agent` run, one op per user message (issue
   #2263), measured with a fixed hash seed. Past the 200-message window an op
-  costs about 17.8M instructions, so the replay is linear in the ops until
+  costs about 18.0M instructions, so the replay is linear in the ops until
   the entity checkpoint continues the run near op 288. The transcript digest
-  is 34.5% of the replay at 200 ops, and the entity snapshot work 27.0%.
+  is 34.4% of the replay at 200 ops, and the entity snapshot work 27.0%.
   Baseline only.
 * [`docs/performance-analyzer-large-payload.md`](performance-analyzer-large-payload.md)
   — `LargePayloadRule` in `HistoryAnalyzer::analyze`. It counts payload bytes
