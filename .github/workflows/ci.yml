@@ -536,6 +536,15 @@ jobs:
           python3 docs/audits/tenant-header-validation-sync.py --self-test
           python3 docs/audits/tenant-header-validation-sync.py
 
+      # Issue #2358: two copies of required_migration_versions exist, in
+      # preflight.rs and shard_health.rs. Two copies are below the
+      # rule-of-three merge bar, so the code links them and does not merge
+      # them. This step fails when one copy changes and the other does not.
+      - name: Required-migration-versions sync (docs/audits/required-migration-versions-sync.py)
+        run: |
+          python3 docs/audits/required-migration-versions-sync.py --self-test
+          python3 docs/audits/required-migration-versions-sync.py
+
       # Only listed files sit at the repository root. A design record goes in
       # docs/design/. The script lists each root file with a reason.
       - name: Root files (docs/audits/root-files.py)
