@@ -501,6 +501,9 @@ fn cluster_is_confirmed_down(binaries: &PostgresBinaries, data_dir: &Path) -> bo
 /// cluster it did not own, and a "not running" message that was merely English
 /// text. Every one of them ends in the caller deleting the data directory of a
 /// *live* postmaster, so the pid — when we know it — is checked directly.
+///
+/// The check gives the pid [`EXIT_GRACE`] to end, because the postmaster
+/// removes `postmaster.pid` before it exits.
 pub(super) fn stop_cluster_blocking(
     binaries: &PostgresBinaries,
     data_dir: &Path,
@@ -512,11 +515,7 @@ pub(super) fn stop_cluster_blocking(
     if !data_dir.join("postmaster.pid").exists() {
         // No pid file. If we know the pid we can still answer truthfully; if we
         // do not, we cannot claim anything was stopped.
-        return match expected_pid {
-            Some(pid) if !super::reaper::process_is_alive(pid) => Ok(()),
-            Some(pid) => Err(DevError::StopUnconfirmed { pid }),
-            None => Ok(()),
-        };
+        return expected_pid.map_or(Ok(()), confirm_exit);
     }
     let output = std::process::Command::new(binaries.tool("pg_ctl"))
         .arg("--pgdata")
@@ -541,26 +540,49 @@ pub(super) fn stop_cluster_blocking(
         })?;
 
     if output.status.success() || already_gone(expected_pid) {
-        return match expected_pid {
-            Some(pid) if super::reaper::process_is_alive(pid) => {
-                Err(DevError::StopUnconfirmed { pid })
-            }
-            _ => Ok(()),
-        };
+        return expected_pid.map_or(Ok(()), confirm_exit);
     }
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if stderr.contains("not running") || stderr.contains("No such file") {
-        return match expected_pid {
-            Some(pid) if super::reaper::process_is_alive(pid) => {
-                Err(DevError::StopUnconfirmed { pid })
-            }
-            _ => Ok(()),
-        };
+        return expected_pid.map_or(Ok(()), confirm_exit);
     }
     Err(DevError::Tool {
         tool: "pg_ctl stop",
         stderr,
     })
+}
+
+/// How long a postmaster can run after `postmaster.pid` is gone.
+///
+/// `pg_ctl stop --wait` returns when that file is gone. The postmaster removes
+/// the file in its exit callbacks, before the process ends. On a loaded host
+/// the process can outlive the file for a short time.
+const EXIT_GRACE: Duration = Duration::from_secs(5);
+
+/// The time between two liveness checks in [`exited_within`].
+const EXIT_POLL: Duration = Duration::from_millis(20);
+
+/// `Ok` when the postmaster `pid` ends within [`EXIT_GRACE`].
+fn confirm_exit(pid: u32) -> Result<(), DevError> {
+    if exited_within(EXIT_GRACE, || super::reaper::process_is_alive(pid)) {
+        Ok(())
+    } else {
+        Err(DevError::StopUnconfirmed { pid })
+    }
+}
+
+/// Whether `is_alive` reports `false` within `grace`.
+///
+/// The first check runs at once, so a process that is gone costs no wait.
+fn exited_within(grace: Duration, mut is_alive: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + grace;
+    while is_alive() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(EXIT_POLL);
+    }
+    true
 }
 
 /// Run one Postgres tool to completion, failing with its own stderr.
@@ -927,4 +949,52 @@ pub(super) async fn query_scalar_on(url: &str, sql: &str) -> Result<String, DevE
             what: "query",
             detail: "the query returned no rows".to_owned(),
         })
+}
+
+#[cfg(test)]
+mod exit_grace_tests {
+    //! `pg_ctl stop --wait` can return before the postmaster exits. These tests
+    //! pin the grace that covers that window.
+
+    use std::time::{Duration, Instant};
+
+    use super::exited_within;
+
+    #[test]
+    fn a_process_that_exits_late_is_confirmed_stopped() {
+        let mut checks = 0;
+
+        let exited = exited_within(Duration::from_secs(5), || {
+            checks += 1;
+            checks <= 3
+        });
+
+        assert!(exited);
+        assert_eq!(checks, 4);
+    }
+
+    #[test]
+    fn a_process_that_is_gone_is_checked_once() {
+        let mut checks = 0;
+
+        let exited = exited_within(Duration::from_secs(5), || {
+            checks += 1;
+            false
+        });
+
+        assert!(exited);
+        assert_eq!(checks, 1);
+    }
+
+    #[test]
+    fn a_process_that_never_exits_is_not_confirmed_after_the_grace() {
+        let grace = Duration::from_millis(100);
+        let started = Instant::now();
+
+        let exited = exited_within(grace, || true);
+
+        assert!(!exited);
+        assert!(started.elapsed() >= grace);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 }
