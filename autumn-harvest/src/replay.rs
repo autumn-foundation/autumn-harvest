@@ -1188,6 +1188,39 @@ pub struct HistoryMatcher {
     /// The first scan that leaves its walk builds it. Each later use adds
     /// the new events.
     activity_scan_index: ActivityScanIndex,
+    /// The recorded result of each update.
+    /// [`Self::match_update`] takes `&self`, so the index sits in a cell.
+    update_results: std::cell::RefCell<UpdateResultIndex>,
+}
+
+/// The first `UpdateCompleted` or `UpdateFailed` position of each update.
+///
+/// A scan per lookup costs the history length each time. So N updates cost
+/// N times that length. The index is built once and then answers in constant
+/// time. It stays off until the scans have walked as many events as the
+/// history holds. A matcher that serves one lookup then builds nothing.
+///
+/// Events only grow at the end (`append_consumed`) or lose and regain one
+/// tail (`cut_view`). So a recorded position stays valid. A lookup checks
+/// the event at that position, and falls back to a scan if it differs.
+#[derive(Debug, Default)]
+struct UpdateResultIndex {
+    /// The length of the history prefix that the index holds.
+    indexed: usize,
+    /// Whether the index is in use.
+    built: bool,
+    /// The events that unindexed lookups walked.
+    walked: usize,
+    first: HashMap<UpdateId, usize>,
+}
+
+/// The update that a result event settles.
+const fn update_result_id(event: &WorkflowEvent) -> Option<UpdateId> {
+    match event {
+        WorkflowEvent::UpdateCompleted { update_id, .. }
+        | WorkflowEvent::UpdateFailed { update_id, .. } => Some(*update_id),
+        _ => None,
+    }
 }
 
 /// A signal predicate over `(event index, payload)` (issue #1985).
@@ -1345,6 +1378,7 @@ impl HistoryMatcher {
             frontier_probed_signals: HashSet::new(),
             predicate_rejected_signal_events: HashSet::new(),
             activity_scan_index: ActivityScanIndex::default(),
+            update_results: std::cell::RefCell::default(),
         }
     }
 
@@ -7619,32 +7653,56 @@ impl HistoryMatcher {
     ///   if the ID is entirely unknown.
     #[must_use]
     pub fn match_update(&self, update_id: UpdateId) -> HistoryMatch {
-        for event in &self.events {
-            match event {
-                WorkflowEvent::UpdateCompleted {
-                    update_id: id,
-                    output,
-                } if *id == update_id => {
-                    return HistoryMatch::Matched {
-                        output: output.clone(),
-                    };
+        let mut index = self.update_results.borrow_mut();
+        // A cut view hides a tail. The index then holds positions that are
+        // not visible, so the lookup scans instead.
+        if index.indexed <= self.events.len() {
+            if index.walked >= self.events.len() {
+                index.built = true;
+            }
+            if index.built {
+                for (position, event) in self.events.iter().enumerate().skip(index.indexed) {
+                    if let Some(id) = update_result_id(event) {
+                        index.first.entry(id).or_insert(position);
+                    }
                 }
-                WorkflowEvent::UpdateFailed {
-                    update_id: id,
-                    error,
-                } if *id == update_id => {
-                    return HistoryMatch::Failed {
-                        error: error.clone(),
-                        attempt: 1,
-                        error_type: "Error".to_string(),
-                        details: None,
-                        non_retryable: false,
-                    };
-                }
-                _ => {}
+                index.indexed = self.events.len();
+                return index
+                    .first
+                    .get(&update_id)
+                    .map_or(HistoryMatch::NoMatch, |&at| {
+                        Self::update_result(&self.events[at], update_id)
+                    });
             }
         }
-        HistoryMatch::NoMatch
+        let found = self
+            .events
+            .iter()
+            .position(|event| update_result_id(event) == Some(update_id));
+        index.walked += found.map_or(self.events.len(), |at| at + 1);
+        found.map_or(HistoryMatch::NoMatch, |at| {
+            Self::update_result(&self.events[at], update_id)
+        })
+    }
+
+    /// The match for the result event of `update_id`.
+    fn update_result(event: &WorkflowEvent, update_id: UpdateId) -> HistoryMatch {
+        match event {
+            WorkflowEvent::UpdateCompleted { output, .. } => HistoryMatch::Matched {
+                output: output.clone(),
+            },
+            WorkflowEvent::UpdateFailed { error, .. } => HistoryMatch::Failed {
+                error: error.clone(),
+                attempt: 1,
+                error_type: "Error".to_string(),
+                details: None,
+                non_retryable: false,
+            },
+            _ => {
+                debug_assert_eq!(update_result_id(event), Some(update_id));
+                HistoryMatch::NoMatch
+            }
+        }
     }
 
     /// Return all `UpdateAdmitted` events that do not have a paired
@@ -7694,6 +7752,85 @@ mod tests {
     use crate::error::TimeoutType;
     use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
     use chrono::Utc;
+
+    fn update_done(update_id: UpdateId, n: u64) -> WorkflowEvent {
+        WorkflowEvent::UpdateCompleted {
+            update_id,
+            output: serde_json::json!(n),
+        }
+    }
+
+    /// the index answers like a scan, before and after it builds.
+    #[test]
+    fn match_update_indexed_lookup_equals_the_scan() {
+        let ids: Vec<UpdateId> = (0..8).map(|_| UpdateId::new()).collect();
+        let failed = ids[3];
+        let mut events: Vec<WorkflowEvent> = ids
+            .iter()
+            .enumerate()
+            .map(|(n, id)| update_done(*id, n as u64))
+            .collect();
+        events[3] = WorkflowEvent::UpdateFailed {
+            update_id: failed,
+            error: "boom".into(),
+        };
+        // A second result for the first update must lose to the first one.
+        events.push(update_done(ids[0], 99));
+        let matcher = HistoryMatcher::new(events);
+        for _ in 0..4 {
+            for (n, id) in ids.iter().enumerate() {
+                match matcher.match_update(*id) {
+                    HistoryMatch::Matched { output } => {
+                        assert_eq!(output, serde_json::json!(n as u64));
+                    }
+                    HistoryMatch::Failed { error, .. } => {
+                        assert_eq!((n, error.as_str()), (3, "boom"));
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            assert!(matches!(
+                matcher.match_update(UpdateId::new()),
+                HistoryMatch::NoMatch
+            ));
+        }
+    }
+
+    /// an appended result and a cut view stay visible and hidden.
+    #[test]
+    fn match_update_index_follows_append_and_cut() {
+        let (first, second) = (UpdateId::new(), UpdateId::new());
+        let mut matcher = HistoryMatcher::new(vec![update_done(first, 1)]);
+        for _ in 0..3 {
+            assert!(matches!(
+                matcher.match_update(first),
+                HistoryMatch::Matched { .. }
+            ));
+        }
+        assert!(matches!(
+            matcher.match_update(second),
+            HistoryMatch::NoMatch
+        ));
+        matcher.append_consumed(&[update_done(second, 2)]);
+        assert!(matches!(
+            matcher.match_update(second),
+            HistoryMatch::Matched { .. }
+        ));
+        let cut = matcher.cut_view(1).expect("the cut hides an event");
+        assert!(matches!(
+            matcher.match_update(second),
+            HistoryMatch::NoMatch
+        ));
+        assert!(matches!(
+            matcher.match_update(first),
+            HistoryMatch::Matched { .. }
+        ));
+        matcher.restore_view(cut);
+        assert!(matches!(
+            matcher.match_update(second),
+            HistoryMatch::Matched { .. }
+        ));
+    }
 
     /// Helper: build a minimal activity lifecycle (Scheduled -> Completed).
     fn activity_completed_events(

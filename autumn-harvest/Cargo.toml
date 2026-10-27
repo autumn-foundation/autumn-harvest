@@ -811,3 +811,10 @@ harness = false
 name = "signal_wait_profile"
 required-features = ["testing"]
 harness = false
+
+# Deterministic profiling harness for the recorded-update lookup
+# (`HistoryMatcher::match_update`). See `benches/update_lookup_profile.rs`.
+[[bench]]
+name = "update_lookup_profile"
+required-features = ["testing"]
+harness = false
