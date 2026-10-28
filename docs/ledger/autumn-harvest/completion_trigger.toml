@@ -28,6 +28,13 @@ kind = ["read"]
 tables = ["harvest_schedules"]
 measured = "docs/performance-completion-trigger-outbox-queue.md"
 
+["resolve_target_queues_batch"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "docs/performance-completion-trigger-outbox-queue.md"
+
 ["stamp_outbox_relay_backoff"]
 driver = "per_tick"
 backend = ["postgres"]

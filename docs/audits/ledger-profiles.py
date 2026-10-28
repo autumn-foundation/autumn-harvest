@@ -70,13 +70,16 @@ BACKENDS = ("postgres", "sqlite")
 FIELDS = {"driver", "backend", "kind", "tables", "measured"}
 UNMEASURED = "unmeasured"
 
+# An optional turbofish, such as `::<i64>` or `::<(Uuid, String)>`. A tuple
+# type has parentheses, so the pattern stops at the first `>(` instead.
+TURBOFISH = r"(?:::\s*<[^;{}]*?>\s*)?"
 # Calls that only Diesel makes, as methods or in the fully qualified form.
 POSTGRES_CALL = re.compile(
     r"\bsql_query\s*\(|\binsert_into\s*\(|\bdiesel::(?:update|delete)\s*\("
     r"|\b(?:SimpleAsyncConnection|RunQueryDsl)::(?:batch_execute|execute|load|get_result"
     r"|get_results|first)\s*\("
     r"|\.(?:get_result|get_results|load|load_stream|first|batch_execute)"
-    r"\s*(?:::\s*<[^()]*>\s*)?\("
+    r"\s*" + TURBOFISH + r"\("
 )
 # Calls that only rusqlite makes.
 SQLITE_CALL = re.compile(
@@ -85,7 +88,7 @@ SQLITE_CALL = re.compile(
     r"|pragma_query_value)\s*\("
 )
 # Both libraries name a call `execute`.
-EITHER_CALL = re.compile(r"\.execute\s*(?:::\s*<[^()]*>\s*)?\(")
+EITHER_CALL = re.compile(r"\.execute\s*" + TURBOFISH + r"\(")
 # An atomic `load(Ordering::...)` is not a query.
 ATOMIC_ARG = re.compile(r"\b(?:Ordering|SeqCst|Acquire|Relaxed|AcqRel|Release)\b")
 DB_FILE = re.compile(r"\b(?:diesel|diesel_async|rusqlite|AsyncPgConnection|RunQueryDsl)\b")
@@ -103,7 +106,7 @@ DDL_SQL = re.compile(
 READ_SQL = re.compile(r"\bSELECT\b|\bRETURNING\b|\bPRAGMA\b")
 READ_DSL = re.compile(
     r"\bdiesel::select\s*\(|\.(?:load|load_stream|first|get_result|get_results|query_row|query_map)"
-    r"\s*(?:::\s*<[^()]*>\s*)?\("
+    r"\s*" + TURBOFISH + r"\("
     r"(?!\s*\)|\s*(?:\w+::)*(?:Ordering|SeqCst|Acquire|Relaxed|AcqRel|Release)\b)"
 )
 CREATE_TABLE = re.compile(
@@ -662,6 +665,10 @@ fn archive_query() -> String {
     format!("SELECT id FROM harvest_archive LIMIT {}", 10)
 }
 
+pub async fn newest(conn: &mut AsyncPgConnection) -> QueryResult<(i64, String)> {
+    harvest_jobs::table.select((id, state)).first::<(i64, String)>(conn).await
+}
+
 macro_rules! park_sql {
     () => {
         concat!("UPDATE harvest_jobs j \
@@ -710,7 +717,8 @@ def self_test():
     assert len(code) == len(full) == len(sql_view(code, full)) == len(FIXTURE)
 
     sites = scan_source(FIXTURE, tables)
-    assert set(sites) == {"claim", "Store::depth", "count_rows!", "park", "purge"}, sites
+    assert set(sites) == {"claim", "Store::depth", "count_rows!", "newest", "park", "purge"}, sites
+    assert sites["newest"]["kind"] == {"read"}, sites["newest"]
     assert sites["park"]["kind"] == {"write"}, sites["park"]
     assert sites["park"]["tables"] == {"harvest_jobs"}, sites["park"]
     assert sites["purge"]["kind"] == {"read", "write"}, sites["purge"]
@@ -740,6 +748,8 @@ def self_test():
                          "tables": ["harvest_jobs"], "measured": "unmeasured"},
         "count_rows!": {"driver": "per_request", "backend": ["postgres"], "kind": ["read"],
                         "tables": ["harvest_jobs"], "measured": "unmeasured"},
+        "newest": {"driver": "per_request", "backend": ["postgres"], "kind": ["read"],
+                   "tables": ["harvest_jobs"], "measured": "unmeasured"},
         "park": {"driver": "per_task", "backend": ["postgres"], "kind": ["write"],
                  "tables": ["harvest_jobs"], "measured": "unmeasured"},
         "purge": {"driver": "setup", "backend": ["postgres"], "kind": ["read", "write"],

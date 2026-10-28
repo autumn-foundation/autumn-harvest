@@ -168,6 +168,13 @@ kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
 
+["list_dead_letters"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
 ["list_fleet_decisions"]
 driver = "per_request"
 backend = ["postgres"]
@@ -259,6 +266,13 @@ kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
 
+["probe_committed_start_replay"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
 ["progress_stream_end_reason"]
 driver = "per_request"
 backend = ["postgres"]
@@ -313,6 +327,13 @@ driver = "per_request"
 backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["reload_execution_deadline"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
 
 ["reserve_backfill_budget_slot"]
@@ -385,6 +406,13 @@ kind = ["read", "write"]
 tables = ["harvest_rate_limit_buckets"]
 measured = "unmeasured"
 
+["signal_with_start_workflow"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
 ["start_workflow"]
 driver = "per_request"
 backend = ["postgres"]
@@ -411,6 +439,13 @@ driver = "per_request"
 backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_schedules", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["update_with_start_workflow"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
 
 ["upsert_workflow_schedule_and_read_back"]

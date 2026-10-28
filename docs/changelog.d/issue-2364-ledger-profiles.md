@@ -8,7 +8,7 @@ file. A profile records the query's `driver` (`per_task`, `per_tick`,
 `write`, `ddl`), the `tables` that it touches, and the Ledger page that
 measures it, or `unmeasured`.
 
-The first catalog holds 932 profiles in 95 files across `autumn-harvest`,
+The first catalog holds 953 profiles in 96 files across `autumn-harvest`,
 `autumn-harvest-plugin`, `autumn-harvest-sqlite`, `autumn-harvest-cli` and
 `autumn-harvest-agent`. About one in ten names a measured Ledger page. The
 rest are `unmeasured`, which makes the measurement gap countable for the

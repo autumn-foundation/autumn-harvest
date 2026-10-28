@@ -7,6 +7,13 @@ kind = ["write"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
 
+["apply_parent_close_cascade"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "docs/performance-parent-close-cascade-unfinished-handlers.md"
+
 ["auto_resume_expired_pauses"]
 driver = "per_tick"
 backend = ["postgres"]
@@ -169,6 +176,13 @@ tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
 
 ["resolve_carryover"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["resolve_execution_id_by_workflow_id"]
 driver = "per_request"
 backend = ["postgres"]
 kind = ["read"]

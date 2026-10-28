@@ -17,7 +17,7 @@ measured = "docs/performance-queue-depth-gauge.md"
 ["cancel_activity_task_with_reason"]
 driver = "per_task"
 backend = ["postgres"]
-kind = ["write"]
+kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
 
@@ -40,6 +40,13 @@ driver = "per_task"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_rate_limit_buckets", "harvest_task_queue"]
+measured = "unmeasured"
+
+["claim_handler_started"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
 measured = "unmeasured"
 
 ["claim_held_for_update_skip_locked"]
@@ -129,14 +136,14 @@ measured = "unmeasured"
 ["defer_claimed_task"]
 driver = "per_task"
 backend = ["postgres"]
-kind = ["write"]
+kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
 
 ["defer_rate_limited_task_inner"]
 driver = "per_task"
 backend = ["postgres"]
-kind = ["write"]
+kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
 
@@ -225,6 +232,13 @@ tables = ["harvest_task_queue"]
 measured = "unmeasured"
 
 ["later_claim_shares_strikes"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["lock_claim_for_update"]
 driver = "per_task"
 backend = ["postgres"]
 kind = ["read"]
@@ -325,7 +339,7 @@ measured = "unmeasured"
 ["release_abandoned_claim"]
 driver = "per_task"
 backend = ["postgres"]
-kind = ["write"]
+kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
 
@@ -346,7 +360,7 @@ measured = "unmeasured"
 ["release_unstarted_claim"]
 driver = "per_task"
 backend = ["postgres"]
-kind = ["write"]
+kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
 
@@ -367,28 +381,28 @@ measured = "unmeasured"
 ["requeue_claimed_workflow_task_with_backoff"]
 driver = "per_task"
 backend = ["postgres"]
-kind = ["write"]
+kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
 
 ["requeue_for_retry_inner"]
 driver = "per_task"
 backend = ["postgres"]
-kind = ["write"]
+kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
 
 ["requeue_workflow_task_with_backoff"]
 driver = "per_task"
 backend = ["postgres"]
-kind = ["write"]
+kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
 
 ["reschedule_task"]
 driver = "per_task"
 backend = ["postgres"]
-kind = ["write"]
+kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
 
@@ -462,7 +476,21 @@ kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
 
+["task_deadline_for_claim"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
 ["task_exists"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["task_status_for_claim"]
 driver = "per_task"
 backend = ["postgres"]
 kind = ["read"]

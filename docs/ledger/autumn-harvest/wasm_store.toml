@@ -28,6 +28,20 @@ kind = ["read"]
 tables = ["harvest_wasm_modules"]
 measured = "unmeasured"
 
+["resolve_active_wasm_module"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_wasm_modules"]
+measured = "unmeasured"
+
+["resolve_active_wasm_version"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_wasm_modules"]
+measured = "unmeasured"
+
 ["seed_signed_wasm_module"]
 driver = "per_request"
 backend = ["postgres"]

@@ -7,6 +7,13 @@ kind = ["read"]
 tables = ["harvest_execution_summaries", "harvest_workflow_executions"]
 measured = "unmeasured"
 
+["db::collect_cross_shard_child_ids"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_cross_shard_children"]
+measured = "unmeasured"
+
 ["db::erase_execution_summary"]
 driver = "per_request"
 backend = ["postgres"]
@@ -38,7 +45,7 @@ measured = "unmeasured"
 ["db::scrub_events"]
 driver = "per_request"
 backend = ["postgres"]
-kind = ["write"]
+kind = ["read", "write"]
 tables = ["harvest_events"]
 measured = "unmeasured"
 

@@ -49,11 +49,25 @@ kind = ["read"]
 tables = []
 measured = "unmeasured"
 
+["dead_letter_for_history_cap"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
 ["detached_child_quota_lock_keys"]
 driver = "per_task"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["fail_activities_for_broken_sessions"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_sessions"]
 measured = "unmeasured"
 
 ["ingest_due_timers_and_signals"]
@@ -199,7 +213,7 @@ measured = "unmeasured"
 ["read_session_after_inserts"]
 driver = "per_task"
 backend = ["postgres"]
-kind = ["write"]
+kind = ["read", "write"]
 tables = ["harvest_sessions"]
 measured = "unmeasured"
 
@@ -256,5 +270,19 @@ measured = "unmeasured"
 driver = "per_task"
 backend = ["postgres"]
 kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["workflow_execution_transition_error"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["workflow_task_timeout_metric_names"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
