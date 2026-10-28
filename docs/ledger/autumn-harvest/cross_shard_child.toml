@@ -111,6 +111,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_cross_shard_children"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/cross_shard_child.md"
 
 ["request_cross_shard_cancel"]
 driver = "per_task"
@@ -118,6 +119,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_cross_shard_children"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/cross_shard_child.md"
 
 ["start_child_on_target"]
 driver = "per_tick"

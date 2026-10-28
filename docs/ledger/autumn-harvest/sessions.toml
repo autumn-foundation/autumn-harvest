@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_sessions", "harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/sessions.md"
 
 ["enforce_broken_sessions"]
 driver = "per_tick"
@@ -27,6 +28,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_sessions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/sessions.md"
 
 ["record_session_completed"]
 driver = "per_task"
@@ -34,6 +36,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_sessions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/sessions.md"
 
 ["refresh_session_lease"]
 driver = "per_task"
@@ -41,6 +44,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_sessions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/sessions.md"
 
 ["resolve_broken_reason"]
 driver = "per_task"
@@ -48,3 +52,4 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue", "harvest_workers", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/sessions.md"

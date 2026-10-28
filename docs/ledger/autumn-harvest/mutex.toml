@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/mutex.md"
 
 ["db_ops::delete_waiters_for_holder"]
 driver = "per_task"
@@ -13,6 +14,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_mutex_waiters"]
 measured = "docs/performance-mutex-lease-reclaim.md"
+plan = "docs/ledger/plans/autumn-harvest/mutex.md"
 
 ["db_ops::head_of_line"]
 driver = "per_task"
@@ -20,6 +22,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_mutex_waiters"]
 measured = "docs/performance-mutex-lease-reclaim.md"
+plan = "docs/ledger/plans/autumn-harvest/mutex.md"
 
 ["db_ops::holder_holds_any_mutex"]
 driver = "per_task"
@@ -27,6 +30,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_mutex_locks"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/mutex.md"
 
 ["db_ops::is_grantable_head"]
 driver = "per_task"
@@ -34,6 +38,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_mutex_locks", "harvest_mutex_waiters"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/mutex.md"
 
 ["db_ops::reclaim_expired_leases_and_wake"]
 driver = "per_tick"
@@ -48,6 +53,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_mutex_locks", "harvest_mutex_waiters"]
 measured = "docs/performance-mutex-lease-reclaim.md"
+plan = "docs/ledger/plans/autumn-harvest/mutex.md"
 
 ["db_ops::release_lock"]
 driver = "per_task"
@@ -55,6 +61,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_mutex_locks", "harvest_mutex_waiters"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/mutex.md"
 
 ["db_ops::renew_leases_for_holder"]
 driver = "per_task"
@@ -62,6 +69,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_mutex_locks"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/mutex.md"
 
 ["db_ops::table_present"]
 driver = "setup"
@@ -76,6 +84,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_mutex_locks", "harvest_mutex_waiters"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/mutex.md"
 
 ["db_ops::waiter_wait_metrics"]
 driver = "per_task"
@@ -83,3 +92,4 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_mutex_waiters"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/mutex.md"
