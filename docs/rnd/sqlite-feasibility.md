@@ -226,6 +226,7 @@ Classification rule:
 | `retention` | diesel, skip-locked, row-lock, raw-pg-sql, raw-sql | (c) | Batched delete scanner with claim. |
 | `scanner_lease` | diesel, interval-sql, raw-sql | (b) | Per-shard scanner lease (#1795). The upsert with `ON CONFLICT ... DO UPDATE ... WHERE` and `RETURNING` works on SQLite 3.35+, and `make_interval` becomes integer epoch ms. A single process has no peer to elect, so the lease can also simply be off. |
 | `schedule_decision` | diesel | (a) | Append-only decision log. |
+| `schedule_override` | diesel, row-lock | (a) | Operator overrides for DAG schedules (issue #2385). Plain keyed reads, an upsert and a delete. The patch takes `FOR UPDATE` on the override row; the single write lock subsumes it. Parity is #2390. |
 | `scheduler` | diesel, row-lock, advisory-lock, interval-sql, raw-pg-sql, raw-sql | (b) | Cron/interval arithmetic as epoch ms. |
 | `schema` | diesel | (c) | Diesel `table!` definitions; reimplemented wholesale. |
 | `sessions` | diesel, row-lock, interval-sql, raw-pg-sql, raw-sql | (b) | Lease expiry as epoch ms. |
