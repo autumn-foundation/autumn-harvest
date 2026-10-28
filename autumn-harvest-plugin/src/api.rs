@@ -104,6 +104,7 @@ use autumn_harvest::reset::{
     batch_skip_reason, preview_workflow_reset, reset_workflow_execution, resolve_batch_reset_one,
 };
 use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStatus};
+use autumn_harvest::schedule_override::{self, ScheduleOverridePatch};
 use autumn_harvest::scheduler::{
     BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag,
     ScheduleUpdateOutcome, SchedulerMonitor, SchedulerSnapshot, WorkflowSchedulePatch,
@@ -2843,9 +2844,94 @@ struct FailActivityNowRequest {
     reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct DagPauseRequest {
-    paused: bool,
+/// Request body for `PATCH /dags/{dag_name}`.
+///
+/// `paused` pauses or resumes the DAG schedule. The other fields set an
+/// operator override (issue #2385). An override wins over the code value
+/// and survives a restart.
+///
+/// Each override field is tri-state. An absent field keeps the stored
+/// override. A JSON `null` returns the field to its code value. A value
+/// sets the override. `clear_override: true` returns every field to code.
+///
+/// `deny_unknown_fields`: every field is optional, so a misspelt field would
+/// otherwise be a silent no-op with a SUCCEEDED audit row.
+#[expect(
+    clippy::option_option,
+    reason = "serde tri-state: absent keeps, null returns to code, a value sets"
+)]
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DagPatchRequest {
+    paused: Option<bool>,
+    /// The cadence, in the create vocabulary: bare cron, `cron:<expr>`,
+    /// `cron_tz:<tz>:<expr>`, `interval:<secs>` or `manual`.
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    schedule_expr: Option<Option<String>>,
+    /// The IANA timezone of a cron `schedule_expr`. Valid only with one.
+    timezone: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    catchup: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    max_active_runs: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    jitter_secs: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    overlap_policy: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    buffer_all_max: Option<Option<u32>>,
+    #[serde(default)]
+    clear_override: bool,
+    /// The operator's reason, stored with the override.
+    reason: Option<String>,
+}
+
+impl DagPatchRequest {
+    /// The override patch that this request carries (issue #2385).
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for a 400 when a value does not parse, or when the
+    /// request combines `clear_override` with an override field.
+    fn override_patch(&self) -> Result<ScheduleOverridePatch, String> {
+        let schedule = match (&self.schedule_expr, &self.timezone) {
+            (Some(Some(expr)), tz) => Some(Some(
+                parse_schedule_expr_with_tz(expr, tz.as_deref().unwrap_or("UTC"))
+                    .map_err(|error| format!("invalid schedule_expr: {error}"))?,
+            )),
+            (_, Some(_)) => {
+                return Err("timezone is valid only with a schedule_expr value".to_string());
+            }
+            (Some(None), None) => Some(None),
+            (None, None) => None,
+        };
+        let overlap_policy = match &self.overlap_policy {
+            Some(Some(raw)) => Some(Some(
+                autumn_harvest::OverlapPolicy::from_user_input(raw).map_err(|value| {
+                    format!(
+                        "invalid overlap_policy '{value}'; valid values: {}",
+                        autumn_harvest::OverlapPolicy::VALID_VALUES
+                    )
+                })?,
+            )),
+            Some(None) => Some(None),
+            None => None,
+        };
+        let patch = ScheduleOverridePatch {
+            schedule,
+            catchup: self.catchup,
+            max_active_runs: self.max_active_runs,
+            jitter: self
+                .jitter_secs
+                .map(|inner| inner.map(std::time::Duration::from_secs)),
+            overlap_policy,
+            buffer_all_max: self.buffer_all_max,
+        };
+        if self.clear_override && !patch.is_empty() {
+            return Err("clear_override cannot be combined with override fields".to_string());
+        }
+        Ok(patch)
+    }
 }
 
 /// Kind tag on a schedule entry returned by `GET /admin/schedules`.
@@ -7466,7 +7552,22 @@ pub const fn management_api_request_fields()
             Some(&["from_nodes", "reason", "operator_id", "dry_run"]),
         ),
         ("POST", "/dags/{dag_name}/trigger", Some(&["conf"])),
-        ("PATCH", "/dags/{dag_name}", Some(&["paused"])),
+        (
+            "PATCH",
+            "/dags/{dag_name}",
+            Some(&[
+                "paused",
+                "schedule_expr",
+                "timezone",
+                "catchup",
+                "max_active_runs",
+                "jitter_secs",
+                "overlap_policy",
+                "buffer_all_max",
+                "clear_override",
+                "reason",
+            ]),
+        ),
         // ── dead-letter queue ─────────────────────────────────────────────────
         (
             "POST",
@@ -27876,98 +27977,170 @@ pub(crate) async fn trigger_dag_run_inner(
     }
 }
 
+/// Insert one `dag.patch` audit row.
+///
+/// A failed request logs its audit error and keeps its own error. A
+/// succeeded request returns the audit error, because an unaudited change
+/// must not report success.
+async fn audit_dag_patch(
+    conn: &mut AsyncPgConnection,
+    ctx: (&str, &str, Option<&str>),
+    dag_name: &str,
+    error_summary: Option<&str>,
+) -> Result<(), AutumnError> {
+    let (actor, source, request_id) = ctx;
+    let ar = NewAuditRecord {
+        actor,
+        operation: OP_DAG_PATCH,
+        target_type: TARGET_DAG,
+        target_id: Some(dag_name),
+        route_or_command: "PATCH /dags/{dag_name}",
+        request_id,
+        idempotency_key: None,
+        status: if error_summary.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_SUCCEEDED
+        },
+        error_summary,
+        shard_id: None,
+        source,
+    };
+    match audit::insert_audit(conn, &ar).await {
+        Ok(_) => Ok(()),
+        Err(error) if error_summary.is_some() => {
+            tracing::warn!(error = %error, dag_name, "audit insert failed for dag.patch");
+            Ok(())
+        }
+        Err(error) => Err(map_error(error)),
+    }
+}
+
+/// Apply the override part of a `PATCH /dags/{dag_name}` (issue #2385).
+async fn apply_dag_override_request(
+    conn: &mut AsyncPgConnection,
+    dag: &RegisteredDag,
+    request: &DagPatchRequest,
+    patch: &ScheduleOverridePatch,
+    actor: &str,
+) -> HarvestResult<()> {
+    if request.clear_override {
+        schedule_override::clear_dag_override(conn, &dag.name).await?;
+    } else {
+        schedule_override::update_dag_override(conn, dag, patch, actor, request.reason.as_deref())
+            .await?;
+    }
+    Ok(())
+}
+
+/// Map a rejected override to its response. A `Config` error is the
+/// caller's bad value, so it is a 400.
+fn dag_override_error(error: HarvestError) -> AutumnError {
+    match error {
+        HarvestError::Config(message) => {
+            AutumnError::bad_request_msg(format!("invalid schedule override: {message}"))
+        }
+        other => map_error(other),
+    }
+}
+
 async fn patch_dag(
     Extension(api_state): Extension<HarvestApiState>,
     Path(dag_name): Path<String>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<DagPauseRequest>,
+    request: Result<Json<DagPatchRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<HarvestSchedule>, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
 
     let runtime = api_state.runtime().map_err(map_error)?;
     let mut conn = db_conn_for_dag(&api_state, &dag_name).await?;
-    if let Some(dag) = runtime.dags.get(&dag_name) {
-        ensure_dag_schedule(&mut conn, dag)
-            .await
-            .map_err(map_error)?;
-    }
-
     let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let route = "PATCH /dags/{dag_name}";
+    let ctx = (actor.as_str(), source.as_str(), request_id.as_deref());
 
-    let update_result = diesel::update(dsl::harvest_schedules.filter(dsl::dag_name.eq(&dag_name)))
-        .set((
-            dsl::is_paused.eq(request.paused),
-            dsl::updated_at.eq(chrono::Utc::now()),
-        ))
-        .execute(&mut conn)
-        .await
-        .map_err(database_error);
-
-    match update_result {
-        Err(e) => {
-            let err_str = e.to_string();
-            let ar = NewAuditRecord {
-                actor: &actor,
-                operation: OP_DAG_PATCH,
-                target_type: TARGET_DAG,
-                target_id: Some(dag_name.as_str()),
-                route_or_command: route,
-                request_id: request_id.as_deref(),
-                idempotency_key: None,
-                status: STATUS_FAILED,
-                error_summary: Some(err_str.as_str()),
-                shard_id: None,
-                source: &source,
-            };
-            let _ = audit::insert_audit(&mut conn, &ar).await;
-            Err(map_error(e))
+    // Unwrapped in the handler, so a bad body is this route's 400 with an
+    // audit row, not axum's plain-text 422.
+    let parsed = match request {
+        Ok(Json(request)) => request
+            .override_patch()
+            .map(|patch| (request, patch))
+            .map_err(|message| format!("invalid request body: {message}")),
+        Err(rejection) => Err(format!("invalid request body: {}", rejection.body_text())),
+    };
+    let (request, patch) = match parsed {
+        Ok(parsed) => parsed,
+        Err(summary) => {
+            audit_dag_patch(&mut conn, ctx, &dag_name, Some(&summary)).await?;
+            return Err(AutumnError::bad_request_msg(summary));
         }
-        Ok(0) => {
-            let ar = NewAuditRecord {
-                actor: &actor,
-                operation: OP_DAG_PATCH,
-                target_type: TARGET_DAG,
-                target_id: Some(dag_name.as_str()),
-                route_or_command: route,
-                request_id: request_id.as_deref(),
-                idempotency_key: None,
-                status: STATUS_FAILED,
-                error_summary: Some("dag not found"),
-                shard_id: None,
-                source: &source,
-            };
-            let _ = audit::insert_audit(&mut conn, &ar).await;
-            Err(AutumnError::not_found_msg(format!("dag '{dag_name}'")))
-        }
-        Ok(_) => {
-            let schedule = dsl::harvest_schedules
-                .filter(dsl::dag_name.eq(&dag_name))
-                .select(HarvestSchedule::as_select())
-                .first(&mut conn)
-                .await
-                .map_err(database_error)
-                .map_err(map_error)?;
+    };
+    let overriding = request.clear_override || !patch.is_empty();
+    if !overriding && request.paused.is_none() {
+        let summary = "empty patch: set paused, an override field or clear_override";
+        audit_dag_patch(&mut conn, ctx, &dag_name, Some(summary)).await?;
+        return Err(AutumnError::bad_request_msg(summary));
+    }
 
-            let ar = NewAuditRecord {
-                actor: &actor,
-                operation: OP_DAG_PATCH,
-                target_type: TARGET_DAG,
-                target_id: Some(dag_name.as_str()),
-                route_or_command: route,
-                request_id: request_id.as_deref(),
-                idempotency_key: None,
-                status: STATUS_SUCCEEDED,
-                error_summary: None,
-                shard_id: None,
-                source: &source,
-            };
-            audit::insert_audit(&mut conn, &ar)
-                .await
-                .map_err(map_error)?;
-            Ok(Json(schedule))
+    let dag = runtime.dags.get(&dag_name);
+    if overriding {
+        // An override needs the code value to merge over and to validate.
+        let Some(dag) = dag else {
+            audit_dag_patch(&mut conn, ctx, &dag_name, Some("dag not registered")).await?;
+            return Err(AutumnError::not_found_msg(format!(
+                "dag '{dag_name}' is not registered"
+            )));
+        };
+        if let Err(error) =
+            apply_dag_override_request(&mut conn, dag, &request, &patch, &actor).await
+        {
+            let summary = error.to_string();
+            audit_dag_patch(&mut conn, ctx, &dag_name, Some(&summary)).await?;
+            return Err(dag_override_error(error));
         }
     }
+    // `ensure_dag_schedule` converges the row to the effective value, so the
+    // response already shows the override. The next tick does the same.
+    // A stored override stays when this fails, and the next tick applies it.
+    if let Some(dag) = dag
+        && let Err(error) = ensure_dag_schedule(&mut conn, dag).await
+    {
+        let summary = error.to_string();
+        audit_dag_patch(&mut conn, ctx, &dag_name, Some(&summary)).await?;
+        return Err(map_error(error));
+    }
+
+    if let Some(paused) = request.paused {
+        let update_result =
+            diesel::update(dsl::harvest_schedules.filter(dsl::dag_name.eq(&dag_name)))
+                .set((
+                    dsl::is_paused.eq(paused),
+                    dsl::updated_at.eq(chrono::Utc::now()),
+                ))
+                .execute(&mut conn)
+                .await
+                .map_err(database_error);
+        match update_result {
+            Err(error) => {
+                let summary = error.to_string();
+                audit_dag_patch(&mut conn, ctx, &dag_name, Some(&summary)).await?;
+                return Err(map_error(error));
+            }
+            Ok(0) => {
+                audit_dag_patch(&mut conn, ctx, &dag_name, Some("dag not found")).await?;
+                return Err(AutumnError::not_found_msg(format!("dag '{dag_name}'")));
+            }
+            Ok(_) => {}
+        }
+    }
+
+    let schedule = dsl::harvest_schedules
+        .filter(dsl::dag_name.eq(&dag_name))
+        .select(HarvestSchedule::as_select())
+        .first(&mut conn)
+        .await
+        .map_err(database_error)
+        .map_err(map_error)?;
+    audit_dag_patch(&mut conn, ctx, &dag_name, None).await?;
+    Ok(Json(schedule))
 }
 
 pub(crate) fn effective_fire_time(

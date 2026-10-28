@@ -8584,3 +8584,95 @@ async fn schedule_api_surfaces_effective_execution_timeout_and_sla() {
         "GET /admin/schedules/{{id}} must resolve sla_secs identically to the list route: {single}"
     );
 }
+
+/// Issue #2385: `PATCH /dags/{dag_name}` sets and clears a schedule override.
+///
+/// The override wins over the code value, a pause keeps it, and a bad value
+/// writes nothing.
+#[tokio::test]
+async fn harvest_api_patch_dag_sets_and_clears_a_schedule_override() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_name = "override_pipeline";
+    let dag_catalog = Arc::new(
+        compile_dag_catalog(vec![DagInfo {
+            schedule: Some(Schedule::Interval(std::time::Duration::from_secs(3600))),
+            ..unified_manual_dag_info_named(dag_name, "dag-workers")
+        }])
+        .expect("scheduled unified DAG should compile"),
+    );
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info_named(dag_name)],
+        vec![],
+    ));
+    let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
+    api_state.set_allow_unauthenticated_mutations(true);
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::clone(&dag_catalog),
+        Arc::new(Vec::new()),
+        Some("scheduler-only".to_string()),
+        vec!["dag-workers".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state);
+    let route = format!("/dags/{dag_name}");
+
+    let (status, body) = patch_json(
+        &app,
+        route.clone(),
+        json!({ "schedule_expr": "interval:60", "reason": "incident" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["schedule_expr"], "interval:60");
+    assert!(body["next_run_at"].is_string(), "{body}");
+
+    for bad in [
+        json!({ "schedule_expr": "interval:0" }),
+        json!({ "schedle_expr": "interval:30" }),
+        json!({}),
+        json!({ "timezone": "UTC" }),
+        json!({ "overlap_policy": "sometimes" }),
+        json!({ "clear_override": true, "catchup": true }),
+    ] {
+        let (status, body) = patch_json(&app, route.clone(), bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} -> {body}");
+    }
+    assert_eq!(
+        load_schedule_from_url(&database_url, dag_name)
+            .await
+            .schedule_expr
+            .as_deref(),
+        Some("interval:60"),
+        "a rejected patch must leave the override in force"
+    );
+
+    let (status, body) = patch_json(&app, route.clone(), json!({ "paused": true })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["is_paused"], true);
+    assert_eq!(
+        body["schedule_expr"], "interval:60",
+        "a pause keeps the override"
+    );
+
+    let (status, body) = patch_json(&app, route.clone(), json!({ "clear_override": true })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["schedule_expr"], "interval:3600");
+    assert_eq!(
+        body["is_paused"], true,
+        "clearing the override keeps the pause"
+    );
+
+    let (status, body) = patch_json(
+        &app,
+        "/dags/not_registered".to_string(),
+        json!({ "schedule_expr": "interval:60" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}

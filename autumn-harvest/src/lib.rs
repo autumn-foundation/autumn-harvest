@@ -611,6 +611,9 @@ pub mod ramp_guard;
 pub mod sandbox;
 #[cfg(feature = "db")]
 pub mod schedule_decision;
+/// Operator overrides for code-declared DAG schedules (issue #2385).
+#[cfg(feature = "db")]
+pub mod schedule_override;
 /// Backend-neutral cron and interval slot arithmetic (issue #2031).
 pub mod schedule_plan;
 #[cfg(feature = "db")]
