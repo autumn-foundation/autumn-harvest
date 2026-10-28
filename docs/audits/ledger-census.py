@@ -51,7 +51,12 @@ _spec = importlib.util.spec_from_file_location("ledger_profiles", ROOT / "docs/a
 lp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(lp)
 
-PLANNABLE = re.compile(r"^\s*(?:\(\s*)*(?:SELECT|INSERT|UPDATE|DELETE|WITH|VALUES|MERGE|TABLE)\b", re.IGNORECASE)
+# Leading `/* ... */` and `-- ...` comments are skipped, such as the claim
+# ageing marker in `queue.rs`.
+PLANNABLE = re.compile(
+    r"^(?:\s|/\*.*?\*/|--[^\n]*\n)*(?:\(\s*)*(?:SELECT|INSERT|UPDATE|DELETE|WITH|VALUES|MERGE|TABLE)\b",
+    re.IGNORECASE | re.DOTALL,
+)
 NO_INDEX = "no usable index"
 FULL_INDEX = "full scan of index"
 PARTIAL_INDEX = "full scan of partial index"
@@ -137,7 +142,7 @@ def attribute(lines, resolver, skipped=None):
             hit = resolver.key(frame)
             if hit:
                 lits = literals(record.get("binds", ""))
-                sql = re.sub(r"\s+", " ", record["sql"]).strip()
+                sql = normalize(record["sql"])
                 found[hit[0]][hit[1]][sql].add(json.dumps(lits, sort_keys=True))
                 break
     return {
@@ -145,6 +150,12 @@ def attribute(lines, resolver, skipped=None):
             for k, sqls in sorted(keys.items())}
         for c, keys in sorted(found.items())
     }
+
+
+def normalize(sql):
+    """Collapse indentation, but keep each newline that ends a `--` comment."""
+    sql = re.sub(r"[ \t]+", " ", sql)
+    return re.sub(r" ?\n[ \n]*", "\n", sql).strip()
 
 
 def merge(old, new):
@@ -535,6 +546,10 @@ def self_test():
     assert PLANNABLE.match("(SELECT 1) UNION (SELECT 2)")
     assert not PLANNABLE.match("SET LOCAL lock_timeout = '5s'")
     assert not PLANNABLE.match("BEGIN")
+    assert PLANNABLE.match("/* claim: priority ageing */ WITH c AS (SELECT 1) SELECT * FROM c")
+    assert PLANNABLE.match("-- note\n  SELECT 1")
+    assert not PLANNABLE.match("/* x */ SET LOCAL a = 1")
+    assert normalize("SELECT a -- why\n      FROM t\n\n  WHERE  b") == "SELECT a -- why\nFROM t\nWHERE b"
 
     text = '["a"]\ndriver = "per_task"\nmeasured = "unmeasured"\n\n["b"]\nmeasured = "unmeasured"\n'
     once = set_plan_field(text, "a", "docs/ledger/plans/x.md")
@@ -550,7 +565,7 @@ def self_test():
     assert resolver.key("c/src/queue.rs:2") == ("docs/ledger/c/queue.toml", "claim")
     assert resolver.key("c/src/queue.rs:7") is None
     lines = [json.dumps({"sql": "SELECT\n    1", "frames": ["c/src/queue.rs:7", "c/src/queue.rs:3"]})]
-    assert attribute(lines, resolver) == {"docs/ledger/c/queue.toml": {"claim": {"SELECT 1": [{}]}}}
+    assert attribute(lines, resolver) == {"docs/ledger/c/queue.toml": {"claim": {"SELECT\n1": [{}]}}}
     torn = []
     assert attribute(lines + ['{"sql": "SEL{"sql"'], resolver, torn) == attribute(lines, resolver)
     assert len(torn) == 1
