@@ -1,0 +1,15 @@
+# Ledger profiles for `autumn-harvest/src/testing.rs`. See `docs/ledger/README.md`.
+
+["load_workflow_name_and_headers"]
+driver = "test_support"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["query_running_executions"]
+driver = "test_support"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"

@@ -1,0 +1,8 @@
+# Ledger profiles for `autumn-harvest/src/handle.rs`. See `docs/ledger/README.md`.
+
+["WorkflowHandle::validate_workflow_type_for"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"

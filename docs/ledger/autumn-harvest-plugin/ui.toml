@@ -1,0 +1,106 @@
+# Ledger profiles for `autumn-harvest-plugin/src/ui.rs`. See `docs/ledger/README.md`.
+
+["count_dead_letters_for_ui"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters"]
+measured = "unmeasured"
+
+["dag_run_exists_for_dag"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["execute_schedule_trigger_ui"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["find_schedule_row"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["load_blocked_on_data"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_external_tasks", "harvest_signals", "harvest_task_queue", "harvest_timers"]
+measured = "unmeasured"
+
+["load_dead_letter_details_batch"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["load_recent_decisions"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedule_decisions"]
+measured = "unmeasured"
+
+["load_schedules_from_shards_ui"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["query_dead_letters_for_ui"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters"]
+measured = "unmeasured"
+
+["render_workflow_detail_page"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["schedule_bulk_pause_ui"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_schedules"]
+measured = "docs/performance-schedule-bulk-audit.md"
+
+["schedule_bulk_resume_ui"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_schedules"]
+measured = "docs/performance-schedule-bulk-audit.md"
+
+["schedule_delete_ui"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["schedule_pause_ui"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["schedule_resume_ui"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"

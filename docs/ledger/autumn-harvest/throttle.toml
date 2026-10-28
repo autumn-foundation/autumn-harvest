@@ -1,0 +1,78 @@
+# Ledger profiles for `autumn-harvest/src/throttle.rs`. See `docs/ledger/README.md`.
+
+["delete_throttle_row"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_start_throttle"]
+measured = "unmeasured"
+
+["existing_pending_throttle_for_workflow_id"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_start_throttle"]
+measured = "unmeasured"
+
+["fire_due_on_conn"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_rate_limit_buckets", "harvest_start_throttle"]
+measured = "unmeasured"
+
+["insert_pending_throttle_row"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_start_throttle"]
+measured = "unmeasured"
+
+["list_pending_throttle"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_start_throttle"]
+measured = "unmeasured"
+
+["pending_backlog_exists"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_start_throttle"]
+measured = "unmeasured"
+
+["pending_throttle_count_for_workflow"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_start_throttle"]
+measured = "docs/performance-schedule-overdue-aux.md"
+
+["pending_throttle_counts_for_workflows"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_start_throttle"]
+measured = "docs/performance-schedule-overdue-aux.md"
+
+["pre_lock_rate_limit_buckets_for_claimed_batch"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_rate_limit_buckets"]
+measured = "unmeasured"
+
+["redefer_throttle_row"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_start_throttle"]
+measured = "unmeasured"
+
+["throttle_backlog_by_key"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_rate_limit_buckets", "harvest_start_throttle"]
+measured = "unmeasured"

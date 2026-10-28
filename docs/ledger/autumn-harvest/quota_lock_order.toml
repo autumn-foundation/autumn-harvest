@@ -1,0 +1,8 @@
+# Ledger profiles for `autumn-harvest/src/quota_lock_order.rs`. See `docs/ledger/README.md`.
+
+["resolve_quota_lock_ids"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"

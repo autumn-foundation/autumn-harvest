@@ -1,0 +1,92 @@
+# Ledger profiles for `autumn-harvest/src/notify.rs`. See `docs/ledger/README.md`.
+
+["DurableStreamListener::open"]
+driver = "setup"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["OwnerWakeListener::run_verb"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["QueueListener::connect"]
+driver = "setup"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["WorkflowEventListener::connect"]
+driver = "setup"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["WorkflowProgressListener::connect"]
+driver = "setup"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["notify_activity_progress_batch"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["probe"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["raw_block_aborted"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["resolve_owner_notes"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "docs/performance-owner-kernels.md"
+
+["send_outside_diesel_transaction"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["send_progress"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["send_wakes"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["tick"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"

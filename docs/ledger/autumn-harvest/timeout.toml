@@ -1,0 +1,127 @@
+# Ledger profiles for `autumn-harvest/src/timeout.rs`. See `docs/ledger/README.md`.
+
+["commit_workflow_execution_timeout"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["enforce_external_awaits_outbox"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["enforce_external_cancels_outbox"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["enforce_external_signals_outbox"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "docs/performance-external-outbox-scan.md"
+
+["enforce_external_task_timeouts"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_external_tasks", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["enforce_workflow_execution_timeouts"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["enforce_workflow_history_ceiling_with_codecs"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_events", "harvest_task_queue", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["enforce_workflow_sla_breaches"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "docs/performance-sla-breach-scan.md"
+
+["find_timed_out_tasks"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["find_timed_out_tasks_batch"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["force_fail_activity"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["lapsed_moves"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["lock_task_for_timeout"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["lock_workflow_execution_row_and_load_history"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["schedule_to_start_still_expired"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["schedule_to_start_still_expired_unlocked"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["task_state_for_update"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["update_workflow_execution_timed_out"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"

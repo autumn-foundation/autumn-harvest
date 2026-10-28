@@ -1,0 +1,36 @@
+# Ledger profiles for `autumn-harvest-plugin/src/api_token.rs`. See `docs/ledger/README.md`.
+
+["create_token"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_api_tokens"]
+measured = "unmeasured"
+
+["list_tokens"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_api_tokens"]
+measured = "unmeasured"
+
+["lookup_by_secret"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_api_tokens"]
+measured = "unmeasured"
+
+["revoke_token"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_api_tokens"]
+measured = "unmeasured"
+
+["write_last_used"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_api_tokens"]
+measured = "unmeasured"

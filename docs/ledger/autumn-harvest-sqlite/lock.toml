@@ -1,0 +1,15 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/lock.rs`. See `docs/ledger/README.md`.
+
+["WriterLock::release"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["write"]
+tables = []
+measured = "unmeasured"
+
+["acquire_memory"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["ddl"]
+tables = []
+measured = "unmeasured"

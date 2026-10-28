@@ -1,0 +1,50 @@
+# Ledger profiles for `autumn-harvest/src/calendar.rs`. See `docs/ledger/README.md`.
+
+["create_calendar"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_calendars"]
+measured = "unmeasured"
+
+["delete_calendar"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_calendars"]
+measured = "unmeasured"
+
+["get_calendar"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_calendars"]
+measured = "unmeasured"
+
+["list_calendars"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_calendars"]
+measured = "unmeasured"
+
+["load_exclusions_for_calendar"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_calendar_exclusions"]
+measured = "docs/performance-schedule-overdue-aux.md"
+
+["load_exclusions_for_calendars"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_calendar_exclusions"]
+measured = "docs/performance-schedule-overdue-pass.md"
+
+["replace_calendar_exclusions"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_calendar_exclusions"]
+measured = "unmeasured"

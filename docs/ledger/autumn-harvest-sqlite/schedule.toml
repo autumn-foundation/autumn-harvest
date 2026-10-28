@@ -1,0 +1,57 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/schedule.rs`. See `docs/ledger/README.md`.
+
+["active_runs"]
+driver = "per_tick"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["advance"]
+driver = "per_tick"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["delete"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["due_names"]
+driver = "per_tick"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["list"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["load_due"]
+driver = "per_tick"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["set_paused"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["upsert"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"

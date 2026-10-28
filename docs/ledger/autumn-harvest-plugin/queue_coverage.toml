@@ -1,0 +1,8 @@
+# Ledger profiles for `autumn-harvest-plugin/src/queue_coverage.rs`. See `docs/ledger/README.md`.
+
+["fetch_potentially_live_workers"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workers"]
+measured = "unmeasured"

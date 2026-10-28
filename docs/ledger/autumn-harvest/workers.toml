@@ -1,0 +1,141 @@
+# Ledger profiles for `autumn-harvest/src/workers.rs`. See `docs/ledger/README.md`.
+
+["delete_worker_task_stats"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_worker_task_stats"]
+measured = "unmeasured"
+
+["fleet_health"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workers"]
+measured = "unmeasured"
+
+["get_worker"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue", "harvest_workers"]
+measured = "unmeasured"
+
+["heartbeat_worker_status"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workers"]
+measured = "unmeasured"
+
+["list_pinned_executions"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["list_workers"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workers"]
+measured = "unmeasured"
+
+["live_workers_on_queue"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workers"]
+measured = "unmeasured"
+
+["load_task_stats"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_worker_task_stats", "harvest_workers"]
+measured = "unmeasured"
+
+["prune_worker_task_stats"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_worker_task_stats"]
+measured = "unmeasured"
+
+["read_draining_worker_deadline"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workers"]
+measured = "unmeasured"
+
+["read_worker_drain_deadline"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workers"]
+measured = "unmeasured"
+
+["read_worker_status"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workers"]
+measured = "unmeasured"
+
+["register_worker"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workers"]
+measured = "unmeasured"
+
+["request_drain"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workers"]
+measured = "unmeasured"
+
+["restore_stopped_worker_row"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workers"]
+measured = "unmeasured"
+
+["touch_worker_liveness"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workers"]
+measured = "unmeasured"
+
+["transition_active_to_draining"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workers"]
+measured = "unmeasured"
+
+["transition_status"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workers"]
+measured = "unmeasured"
+
+["withdraw_unverified_worker_row"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workers"]
+measured = "unmeasured"
+
+["write_task_stats_snapshot"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_worker_task_stats"]
+measured = "unmeasured"

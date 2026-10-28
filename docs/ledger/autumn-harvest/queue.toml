@@ -1,0 +1,533 @@
+# Ledger profiles for `autumn-harvest/src/queue.rs`. See `docs/ledger/README.md`.
+
+["HeldClaim::lock"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["bounded_queue_depths"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "docs/performance-queue-depth-gauge.md"
+
+["cancel_activity_task_with_reason"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["cancel_open_tasks_for_execution"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["charge_fairness_key"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_fairness_state", "harvest_fairness_weights"]
+measured = "unmeasured"
+
+["check_throttled_keys"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_rate_limit_buckets", "harvest_task_queue"]
+measured = "unmeasured"
+
+["claim_handler_started"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["claim_held_for_update_skip_locked"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["claim_still_held_for_update"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["claim_task_by_id_with_owner"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_activity_pauses", "harvest_build_compat", "harvest_queue_pauses", "harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workers", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["claim_task_one_statement"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_activity_pauses", "harvest_build_compat", "harvest_queue_pauses", "harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workers", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["claim_workflow_task_of_execution"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_activity_pauses", "harvest_build_compat", "harvest_queue_pauses", "harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workers", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["claimable_pending_demand_by_queue"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["complete_task_inner"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["concurrency_key_stats"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["concurrency_key_workflows"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["concurrency_probe_passes"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["db_clock_now"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["db_now"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["defer_claimed_task"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["defer_rate_limited_task_inner"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["delete_pending_timer"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+
+["dispatch_probe"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["due_dispatch_hints_page"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_queue_pauses", "harvest_task_queue"]
+measured = "unmeasured"
+
+["enqueue"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["enqueue_batch"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "docs/performance-activity-fanout-enqueue.md"
+
+["ensure_rate_limit_bucket"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_rate_limit_buckets"]
+measured = "unmeasured"
+
+["fail_open_tasks_for_execution"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["fail_task_inner"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["fetch_claim_batch"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_activity_pauses", "harvest_build_compat", "harvest_queue_pauses", "harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workers", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["force_retry_activity_now"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["insert_task_rows"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["invalidate_capability_miss_evidence_for_worker"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["later_claim_shares_strikes"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["lock_claim_for_update"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["mark_claim_handler_started"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["oldest_pending_ages"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_activity_pauses", "harvest_queue_pauses", "harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workflow_executions"]
+measured = "docs/performance-queue-age-gauge.md"
+
+["owner_keys"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["owner_scan"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_queue_pauses"]
+measured = "unmeasured"
+
+["park_workflow_task_inner"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["pending_queue_demand_by_queue_name"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["primary_repend_workflow_task"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["queue_depths"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "docs/performance-queue-depth-gauge.md"
+
+["queue_task_counts"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["read_capability_miss_state"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["record_pending_hints"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["record_timed_out_claim"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["refund_rate_limit_token"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_rate_limit_buckets"]
+measured = "unmeasured"
+
+["release_abandoned_claim"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["release_claim_via"]
+driver = "per_task"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["release_task_for_capability_miss"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["release_unstarted_claim"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["release_worker_sticky_pins"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["release_workflow_claim_inner"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["requeue_claimed_workflow_task_with_backoff"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["requeue_for_retry_inner"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["requeue_workflow_task_with_backoff"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["reschedule_task"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["reset_capability_misses_after_inline_progress"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "docs/performance-standalone-activity-overhead.md"
+
+["running_claims_of_worker"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["sample_rate_limit_buckets"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_rate_limit_buckets"]
+measured = "unmeasured"
+
+["session_has_other_live_tasks"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["set_local_lock_timeout"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["set_task_sticky_affinity"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["sweep_idle_rate_limit_buckets"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_rate_limit_buckets"]
+measured = "unmeasured"
+
+["sweep_terminal_tasks_into"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["take_timed_out_claim"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["take_wake_requested"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["task_deadline_for_claim"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["task_exists"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["task_status_for_claim"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["try_claim_batched_candidate"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_activity_pauses", "harvest_build_compat", "harvest_queue_pauses", "harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workers", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["try_consume_rate_limit_token"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_rate_limit_buckets"]
+measured = "unmeasured"
+
+["update_task_priority"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["wake_workflow_task"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "docs/performance-mutex-lease-reclaim.md"
+
+["write_heartbeat"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"

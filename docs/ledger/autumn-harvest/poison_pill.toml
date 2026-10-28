@@ -1,0 +1,43 @@
+# Ledger profiles for `autumn-harvest/src/poison_pill.rs`. See `docs/ledger/README.md`.
+
+["scanner::fail_owning_workflow"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["scanner::quarantine_orphan"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue", "harvest_workflow_executions"]
+measured = "docs/performance-poison-pill-orphan-recheck.md"
+
+["scanner::reclaim_sweep"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue", "harvest_workers"]
+measured = "unmeasured"
+
+["scanner::requeue_orphan"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue", "harvest_workers"]
+measured = "docs/performance-poison-pill-orphan-recheck.md"
+
+["scanner::requeue_stuck_task"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["scanner::worker_sighting"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workers"]
+measured = "unmeasured"

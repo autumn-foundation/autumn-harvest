@@ -1,0 +1,43 @@
+# Ledger profiles for `autumn-harvest/src/hot_swap_store.rs`. See `docs/ledger/README.md`.
+
+["fetch_workflow_module"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_modules"]
+measured = "unmeasured"
+
+["fetch_workflow_module_including_retired"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_modules"]
+measured = "unmeasured"
+
+["list_workflow_modules"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_modules"]
+measured = "unmeasured"
+
+["list_workflow_modules_for_build"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_modules"]
+measured = "unmeasured"
+
+["publish_workflow_module"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_modules"]
+measured = "unmeasured"
+
+["retire_build_modules"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_modules"]
+measured = "unmeasured"

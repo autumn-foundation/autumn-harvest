@@ -1,0 +1,85 @@
+# Ledger profiles for `autumn-harvest/src/retention.rs`. See `docs/ledger/README.md`.
+
+["delete_candidate_execution"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_completion_deliveries", "harvest_dead_letters", "harvest_execution_summaries", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["legal_hold_db::load_hold_for_update"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["legal_hold_db::release_legal_hold"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["legal_hold_db::set_legal_hold"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["list_execution_summaries"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_execution_summaries"]
+measured = "unmeasured"
+
+["purge_expired_summaries"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_execution_summaries"]
+measured = "unmeasured"
+
+["purge_expired_trigger_fires"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_completion_trigger_fires", "harvest_completion_trigger_outbox", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["read_candidate_hold"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["release_retention_leases"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["routine_skip_candidate"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["run_shard_tick"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_completion_deliveries", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["should_skip_candidate"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_signals", "harvest_task_queue", "harvest_timers", "harvest_workflow_executions"]
+measured = "unmeasured"

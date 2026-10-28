@@ -1,0 +1,85 @@
+# Ledger profiles for `autumn-harvest/src/dlq.rs`. See `docs/ledger/README.md`.
+
+["aggregate_dead_letters"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters", "harvest_workflow_executions"]
+measured = "docs/performance-dlq-aggregate.md"
+
+["count_bulk_filter_matches"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["count_redrive_filter_matches"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters"]
+measured = "unmeasured"
+
+["dead_letter_count"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters"]
+measured = "unmeasured"
+
+["dead_letter_with_codecs"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_dead_letters", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["discard_dead_letters_batch"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_dead_letters"]
+measured = "docs/performance-dlq-bulk-discard.md"
+
+["list_dead_letters"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters"]
+measured = "unmeasured"
+
+["load_workflow_names"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["query_dead_letters_for_bulk"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["query_dead_letters_for_redrive"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters"]
+measured = "unmeasured"
+
+["redrive_dead_letter_at"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_dead_letters", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["replay_dead_letter_at"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_dead_letters", "harvest_workflow_executions"]
+measured = "unmeasured"

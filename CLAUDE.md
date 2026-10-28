@@ -234,6 +234,15 @@ builds it. Code for owner mode follows these rules:
 
 `decision_owner_lock_modes_db_tests.rs` proves the lock modes.
 
+## Ledger Profiles
+
+Every function that sends SQL needs a Ledger profile in `docs/ledger/`
+(issue #2364). CI's `lint` job runs `docs/audits/ledger-profiles.py`. It
+fails on a query with no profile, and on a profile that no longer matches
+its query. When you add, rename or change a query, run the gate. Print a stub
+with `--scaffold`, then choose its `driver`. When Ledger measures a query,
+set `measured` to the page. Read `docs/ledger/README.md` for the fields.
+
 ## Performance Agents
 
 Do not profile the strict replay path again (`WorkflowReplayer::replay_from_events`,

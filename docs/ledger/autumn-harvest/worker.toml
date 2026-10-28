@@ -1,0 +1,288 @@
+# Ledger profiles for `autumn-harvest/src/worker.rs`. See `docs/ledger/README.md`.
+
+["AbandonedDispatchPlan::resolve"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["block_workflow_for_non_determinism"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["check_paused_and_park"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["claim_failed_its_task"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["clear_nd_block"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["create_detached_child_executions"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["db_clock_now"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["dead_letter_for_history_cap"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["detached_child_quota_lock_keys"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["fail_activities_for_broken_sessions"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_sessions"]
+measured = "unmeasured"
+
+["ingest_due_timers_and_signals"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+
+["insert_awaited_child_execution"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["load_unfired_timers_by_id"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_timers"]
+measured = "docs/performance-mixed-suspension-timer-batch.md"
+
+["load_workflow_execution"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["lock_workflow_execution_row_and_load_history"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["lock_workflow_execution_row_only"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["materialize_due_child_timeout_deadlines"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_timers", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["new_child_workflow_event_count"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["owning_execution_is_paused"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["parent_is_on_another_shard"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["persist_activity_wait_park"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["persist_all_started_child_workflows"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["persist_child_timeout_race"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue", "harvest_timers", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["persist_mixed_suspension_batch"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue", "harvest_timers", "harvest_workflow_executions"]
+measured = "docs/performance-activity-fanout-enqueue.md"
+
+["persist_started_timer"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_events", "harvest_task_queue", "harvest_timers"]
+measured = "unmeasured"
+
+["persist_workflow_continue_as_new_with_verdict"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_signals", "harvest_workflow_executions"]
+measured = "docs/performance-mutex-terminal-sweep-table-present.md"
+
+["plan_timer_lifecycle"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+
+["process_workflow_task"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "docs/performance-owner-kernels.md"
+
+["quarantine_workflow_task_timeout_outcome"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["read_lost_start"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["read_session_after_inserts"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_sessions"]
+measured = "unmeasured"
+
+["reset_timed_out_workflow_task"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["resolve_successor_slot"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["sample_active_workflow_counts"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["sample_history_oversized_counts"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "docs/performance-metrics-sampler-guard.md"
+
+["suspended_command_event_count"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_timers"]
+measured = "docs/performance-mixed-suspension-timer-batch.md"
+
+["task_state_and_deadline_for_update"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
+["update_workflow_execution_completed"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["update_workflow_execution_failed"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["workflow_execution_transition_error"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["workflow_task_timeout_metric_names"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"

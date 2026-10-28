@@ -557,6 +557,14 @@ jobs:
           python3 docs/audits/root-files.py --self-test
           python3 docs/audits/root-files.py
 
+      # Issue #2364: every function that sends SQL has a Ledger profile in
+      # docs/ledger/. A new query without one, or a profile that no longer
+      # matches its query, fails here. See docs/ledger/README.md.
+      - name: Ledger profiles (docs/audits/ledger-profiles.py)
+        run: |
+          python3 docs/audits/ledger-profiles.py --self-test
+          python3 docs/audits/ledger-profiles.py
+
       # Issue #1831: a doc claim that shipped code made false fails the build.
       - name: Doc claim drift (docs/audits/doc-claim-drift.py)
         run: |

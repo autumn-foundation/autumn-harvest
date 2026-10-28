@@ -1,0 +1,8 @@
+# Ledger profiles for `autumn-harvest/src/group_commit.rs`. See `docs/ledger/README.md`.
+
+["db::probe"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
