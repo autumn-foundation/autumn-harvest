@@ -4,8 +4,8 @@ name: autumn-harvest-worker
 description: A standalone Harvest worker with probes, drain settings and a migration job.
 type: application
 # The chart version follows the workspace version.
-version: 0.7.0
-appVersion: "0.7.0"
+version: 0.8.0
+appVersion: "0.8.0"
 # The preStop `sleep` action is on by default from Kubernetes 1.30.
 kubeVersion: ">=1.30.0-0"
 home: https://github.com/autumn-foundation/autumn-harvest

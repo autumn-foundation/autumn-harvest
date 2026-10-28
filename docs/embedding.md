@@ -56,7 +56,7 @@ multi-shard pool, run one invocation per shard, each with its own
 **These crates.** The Axum types come from the `autumn_web::reexports::axum`
 re-export, so the version always matches the router. The `path` keys point
 into a checkout of this repository, next to your crate. Remove them to build
-against the 0.7.0 release from crates.io.
+against the 0.8.0 release from crates.io.
 
 ```toml
 [dependencies]
