@@ -1,0 +1,43 @@
+# Ledger profiles for `autumn-harvest/src/fairness_keys.rs`. See `docs/ledger/README.md`.
+
+["clear_fairness_weight"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_fairness_weights"]
+measured = "unmeasured"
+
+["delete_prune_batches"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = []
+measured = "unmeasured"
+
+["list_fairness_state"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_fairness_state"]
+measured = "unmeasured"
+
+["list_fairness_weights"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_fairness_weights"]
+measured = "unmeasured"
+
+["prune_fairness_state"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["ddl", "read", "write"]
+tables = ["harvest_fairness_state", "harvest_task_queue"]
+measured = "unmeasured"
+
+["set_fairness_weight"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_fairness_weights"]
+measured = "unmeasured"

@@ -1,0 +1,120 @@
+# Ledger profiles for `autumn-harvest/src/decision_owner.rs`. See `docs/ledger/README.md`.
+
+["db::OwnerLoop::acquire_some"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_decision_owner", "harvest_task_queue", "harvest_workers"]
+measured = "unmeasured"
+
+["db::OwnerLoop::balance"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_decision_owner", "harvest_decision_owner_candidates"]
+measured = "unmeasured"
+
+["db::OwnerLoop::release_everything"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_decision_owner_candidates"]
+measured = "unmeasured"
+
+["db::OwnerLoop::tick"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_decision_owner_candidates"]
+measured = "unmeasured"
+
+["db::acquire"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_decision_owner"]
+measured = "unmeasured"
+
+["db::acquire_many"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_decision_owner"]
+measured = "docs/performance-owner-kernels.md"
+
+["db::check_fleet"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_decision_owner_candidates", "harvest_workers"]
+measured = "unmeasured"
+
+["db::disable_owner_mode"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["ddl", "read", "write"]
+tables = ["harvest_decision_owner_mode", "harvest_task_queue"]
+measured = "unmeasured"
+
+["db::enable_owner_mode"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["ddl", "read", "write"]
+tables = ["harvest_decision_owner_mode", "harvest_task_queue", "harvest_workers"]
+measured = "unmeasured"
+
+["db::expire_all"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_decision_owner"]
+measured = "unmeasured"
+
+["db::fence"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["db::fence_with_generation"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["db::locked_write"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_decision_owner"]
+measured = "docs/performance-owner-kernels.md"
+
+["db::open_lease_write"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["db::read_owner_mode"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_decision_owner_mode", "harvest_task_queue"]
+measured = "unmeasured"
+
+["db::set_idle"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["db::stamp_unstamped"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue", "harvest_workflow_executions"]
+measured = "unmeasured"

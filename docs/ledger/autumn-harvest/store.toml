@@ -1,0 +1,316 @@
+# Ledger profiles for `autumn-harvest/src/store.rs`. See `docs/ledger/README.md`.
+
+["admit_update_event_with_codecs"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["admitted_count"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_stream_chunks"]
+measured = "docs/performance-stream-append-count.md"
+
+["append_new_execution_started_events_batch"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_events", "harvest_payload_refs"]
+measured = "unmeasured"
+
+["append_single_event_with_codecs"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["append_stream_chunks_in_tx"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_stream_chunks", "harvest_workflow_executions"]
+measured = "docs/performance-stream-append-count.md"
+
+["append_workflow_logs"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_logs"]
+measured = "unmeasured"
+
+["batch_blob_keys_still_referenced"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_payload_refs"]
+measured = "unmeasured"
+
+["blob_key_still_referenced"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_payload_refs"]
+measured = "unmeasured"
+
+["check_execution_exists"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["count_history_events"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["count_workflow_logs"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_logs"]
+measured = "unmeasured"
+
+["delete_llm_ledger"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_llm_ledger"]
+measured = "unmeasured"
+
+["delete_stream_chunks"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_stream_chunks"]
+measured = "unmeasured"
+
+["delete_workflow_logs"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_logs"]
+measured = "unmeasured"
+
+["insert_events"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["insert_payload_refs"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_payload_refs"]
+measured = "unmeasured"
+
+["load_events_after_row_id"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["load_histories_undecoded_batch"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "docs/performance-parent-close-cascade-unfinished-handlers.md"
+
+["load_history_inflated"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["load_history_inflated_undecoded"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["load_history_inflated_with_bytes"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["load_history_page"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["load_history_since"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["load_history_since_inflated"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["load_history_undecoded"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["load_history_with_codecs"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["load_history_with_timestamps"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["load_parents_with_children"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["load_parents_with_summary_children"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_execution_summaries"]
+measured = "unmeasured"
+
+["load_payload_refs"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_payload_refs"]
+measured = "unmeasured"
+
+["load_payload_refs_for_keys"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_payload_refs"]
+measured = "unmeasured"
+
+["load_raw_started_carryover"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["load_stream_chunks"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_stream_chunks"]
+measured = "unmeasured"
+
+["load_timestamped_history"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["load_workflow_children"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "docs/performance-workflow-children-traversal.md"
+
+["load_workflow_children_batch"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "docs/performance-workflow-children-traversal.md"
+
+["load_workflow_children_multi"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "docs/performance-workflow-children-traversal.md"
+
+["load_workflow_logs"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_logs"]
+measured = "unmeasured"
+
+["lock_and_load_history_undecoded"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["mark_history_bloat_warned"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["next_event_id_for"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["row_id_for_event_id"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["sum_history_bytes_between"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["update_current_details"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["update_search_attrs"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"

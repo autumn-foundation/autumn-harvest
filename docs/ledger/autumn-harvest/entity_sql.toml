@@ -1,0 +1,15 @@
+# Ledger profiles for `autumn-harvest/src/entity_sql.rs`. See `docs/ledger/README.md`.
+
+["open"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["ddl", "read", "write"]
+tables = ["entity"]
+measured = "unmeasured"
+
+["run_cancellable"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = []
+tables = []
+measured = "docs/performance-entity-sql.md"

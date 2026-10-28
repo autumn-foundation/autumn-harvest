@@ -1,0 +1,43 @@
+# Ledger profiles for `autumn-harvest/src/signal.rs`. See `docs/ledger/README.md`.
+
+["forward_signals_to_retry_attempt"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+
+["has_pending_signals"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+
+["load_pending_signals"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+
+["mark_signals_consumed"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+
+["send_signal_idempotent_with_codecs"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_signals", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["signal_idempotency_key_exists"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_signals"]
+measured = "unmeasured"

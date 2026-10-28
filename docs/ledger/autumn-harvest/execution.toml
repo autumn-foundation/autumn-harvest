@@ -1,0 +1,253 @@
+# Ledger profiles for `autumn-harvest/src/execution.rs`. See `docs/ledger/README.md`.
+
+["annotate_workflow_execution"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["auto_resume_expired_pauses"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["cancel_workflow_execution_collect_mode"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["cascade_cancel_detached_child"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["cascade_terminate_detached_child"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["count_workflow_executions_grouped"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["execution_exists_by_key"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["execution_summary_exists_by_key"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_execution_summaries"]
+measured = "unmeasured"
+
+["inline_cancel"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["list_schedule_runs"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["load_execution"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["load_execution_row"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["load_triage_for_update"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["load_workflow_execution_by_key_for_update"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["lock_execution_admission"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["lookup_idempotent_signal_dedupe"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_signals", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["lookup_idempotent_update_dedupe"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["non_terminal_counts_by_workflow_name"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["notify_awaited_parent_of_child_terminal"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["parent_close_cascade_event_count"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["pause_workflow_execution"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["reactivate_failed_execution_at"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["replace_execution"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["rerun_workflow_execution_with_codecs"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["resolve_carryover"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["resume_workflow_execution"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["schedule_run_state_summary"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["seal_replaced_execution"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["shift_schedule_to_close_for_resume"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_external_tasks", "harvest_task_queue"]
+measured = "unmeasured"
+
+["stage_signal_with_idempotency"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+
+["start_or_load_workflow_execution_collect_with_codecs_and_quota_override"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["terminate_workflow_execution_collect"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["try_load_active_execution_for_update"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["try_load_by_key"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["walk_retry_chain"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["walk_retry_chain_on_conn_only"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"

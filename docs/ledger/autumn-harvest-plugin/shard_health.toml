@@ -1,0 +1,15 @@
+# Ledger profiles for `autumn-harvest-plugin/src/shard_health.rs`. See `docs/ledger/README.md`.
+
+["load_schedule_probes"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["observe_schema"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["__diesel_schema_migrations"]
+measured = "unmeasured"

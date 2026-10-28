@@ -1,0 +1,183 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/queue.rs`. See `docs/ledger/README.md`.
+
+["arm_awaited_timer"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+
+["cancel_activity_task"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+
+["claim_next_ready_task_tx"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_tasks"]
+measured = "docs/performance-sqlite-runtime-drive.md"
+
+["delete_pending_tasks_for_execution"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+
+["delete_pending_timer"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+
+["delete_undelivered_signals_for_execution"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+
+["delete_unfired_timers_for_execution"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+
+["due_timers"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+
+["due_timers_with_deadlines"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+
+["enqueue_activity"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "docs/performance-sqlite-runtime-drive.md"
+
+["enqueue_timer"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+
+["finish_task"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+
+["freeze_task_defaults"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+
+["has_pending_activity"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+
+["has_unfired_timer"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+
+["mark_timer_fired"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+
+["move_all_signals_to_retry"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+
+["move_undelivered_signals"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+
+["next_task_seq"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+
+["next_timer_arm_seq"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+
+["pending_tasks"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+
+["reclaim_orphaned_running"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+
+["reclaim_running_for_execution"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+
+["record_heartbeat"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+
+["requeue_task"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+
+["requeue_task_to_back"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"

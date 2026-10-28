@@ -1,0 +1,176 @@
+# Ledger profiles for `autumn-harvest/src/partition.rs`. See `docs/ledger/README.md`.
+
+["bounded_rename_name"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["capture_index_defs"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["cohort_has_rows_for"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["cohort_occupancy"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["constraint_backed_unique_indexes_on_partitioned_parent"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["ddl", "read"]
+tables = ["entity", "harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["delete_orphan_rows"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["dependent_views"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["deployed_cohort_width"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["detect_layout"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["disable_partitioning"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["ddl", "read", "write"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["drain_default_bounded_inner"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["ddl", "read", "write"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["enable_partitioning"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["ddl", "read"]
+tables = ["entity", "harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["exec"]
+driver = "setup"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["explicitly_published_by"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["inbound_foreign_keys"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["incompatible_publications"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["list_partitions"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["maintenance_owner_gap"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["operator_triggers"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["restore_session_limits"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["row_security_config"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["scalar_bool"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["switch_off_session_limits"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["unique_indexes_missing_cohort"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["unreplayable_constraints"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"

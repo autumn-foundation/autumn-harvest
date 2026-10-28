@@ -1,0 +1,8 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/append_only.rs`. See `docs/ledger/README.md`.
+
+["with_guard_off"]
+driver = "test_support"
+backend = ["sqlite"]
+kind = []
+tables = []
+measured = "unmeasured"

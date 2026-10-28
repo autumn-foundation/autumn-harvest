@@ -1,0 +1,36 @@
+# Ledger profiles for `autumn-harvest/src/wasm_store.rs`. See `docs/ledger/README.md`.
+
+["fetch_wasm_module_bytes"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_wasm_modules"]
+measured = "unmeasured"
+
+["list_wasm_modules"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_wasm_modules"]
+measured = "unmeasured"
+
+["publish_signed_wasm_module"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_wasm_modules"]
+measured = "unmeasured"
+
+["resolve_active_wasm_hash"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_wasm_modules"]
+measured = "unmeasured"
+
+["seed_signed_wasm_module"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_wasm_modules"]
+measured = "unmeasured"

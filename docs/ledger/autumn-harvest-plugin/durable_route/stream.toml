@@ -1,0 +1,15 @@
+# Ledger profiles for `autumn-harvest-plugin/src/durable_route/stream.rs`. See `docs/ledger/README.md`.
+
+["PgReads::next_run"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["PgReads::state"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"

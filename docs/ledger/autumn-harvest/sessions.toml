@@ -1,0 +1,50 @@
+# Ledger profiles for `autumn-harvest/src/sessions.rs`. See `docs/ledger/README.md`.
+
+["break_session_and_fail_members"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_sessions", "harvest_task_queue"]
+measured = "unmeasured"
+
+["enforce_broken_sessions"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_sessions", "harvest_workers", "harvest_workflow_executions"]
+measured = "docs/performance-broken-session-scan.md"
+
+["reconcile_local_sessions"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_sessions"]
+measured = "unmeasured"
+
+["record_session_acquired"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_sessions"]
+measured = "unmeasured"
+
+["record_session_completed"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_sessions"]
+measured = "unmeasured"
+
+["refresh_session_lease"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_sessions"]
+measured = "unmeasured"
+
+["resolve_broken_reason"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue", "harvest_workers", "harvest_workflow_executions"]
+measured = "unmeasured"

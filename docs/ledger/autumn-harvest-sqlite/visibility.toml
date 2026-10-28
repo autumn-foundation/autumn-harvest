@@ -1,0 +1,15 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/visibility.rs`. See `docs/ledger/README.md`.
+
+["present_columns"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["query"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"

@@ -1,0 +1,43 @@
+# Ledger profiles for `autumn-harvest/src/event_batch.rs`. See `docs/ledger/README.md`.
+
+["admit_batched_start_with_codecs"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_event_batches"]
+measured = "unmeasured"
+
+["fire_claimed_batch_row"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_event_batches"]
+measured = "unmeasured"
+
+["fire_due_on_conn"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_event_batches"]
+measured = "unmeasured"
+
+["list_pending_event_batches"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_event_batches"]
+measured = "unmeasured"
+
+["pull_in_event_batch_row"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_event_batches"]
+measured = "unmeasured"
+
+["redefer_event_batch_row"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_event_batches"]
+measured = "unmeasured"

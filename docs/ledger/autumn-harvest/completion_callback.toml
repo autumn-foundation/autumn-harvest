@@ -1,0 +1,71 @@
+# Ledger profiles for `autumn-harvest/src/completion_callback.rs`. See `docs/ledger/README.md`.
+
+["apply_backoff_outcomes_batch"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_completion_deliveries"]
+measured = "docs/performance-completion-callback-outcome-batch.md"
+
+["apply_delivered_outcomes_batch"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_completion_deliveries"]
+measured = "docs/performance-completion-callback-outcome-batch.md"
+
+["apply_outcome"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_completion_deliveries"]
+measured = "docs/performance-completion-callback-outcome-batch.md"
+
+["claim_due_deliveries"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_completion_deliveries"]
+measured = "unmeasured"
+
+["completion_deliveries_table_exists"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_completion_deliveries"]
+measured = "unmeasured"
+
+["dead_letter_entry_with_current_payload"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_completion_deliveries"]
+measured = "docs/performance-completion-callback-outcome-batch.md"
+
+["enqueue_completion_deliveries"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_completion_deliveries"]
+measured = "unmeasured"
+
+["list_deliveries_for_execution"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_completion_deliveries"]
+measured = "unmeasured"
+
+["redrive_delivery_at"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_completion_deliveries", "harvest_dead_letters"]
+measured = "unmeasured"
+
+["reread_claimed_payloads"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_completion_deliveries"]
+measured = "unmeasured"

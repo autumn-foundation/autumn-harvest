@@ -1,0 +1,50 @@
+# Ledger profiles for `autumn-harvest/src/migrate.rs`. See `docs/ledger/README.md`.
+
+["apply_in_transaction"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["__diesel_schema_migrations"]
+measured = "unmeasured"
+
+["apply_without_transaction"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["__diesel_schema_migrations"]
+measured = "unmeasured"
+
+["create_ledger"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["ddl"]
+tables = ["__diesel_schema_migrations"]
+measured = "unmeasured"
+
+["ledger_exists"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["__diesel_schema_migrations"]
+measured = "unmeasured"
+
+["ledger_lock_is_permitted"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["ddl", "read"]
+tables = ["__diesel_schema_migrations"]
+measured = "unmeasured"
+
+["recorded_versions"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["__diesel_schema_migrations"]
+measured = "unmeasured"
+
+["version_is_recorded"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["__diesel_schema_migrations"]
+measured = "unmeasured"

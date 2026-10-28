@@ -1,0 +1,92 @@
+# Ledger profiles for `autumn-harvest/src/reset.rs`. See `docs/ledger/README.md`.
+
+["append_fork_marker"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["cancel_pending_external_tasks"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_external_tasks"]
+measured = "unmeasured"
+
+["copy_carried_events"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["count_open_task_rows"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_external_tasks", "harvest_task_queue"]
+measured = "unmeasured"
+
+["count_pending_timers"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+
+["count_unconsumed_signals"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+
+["insert_fork_row"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["load_event_rows"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["load_source_execution"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["reapply_or_drop_signals"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+
+["remove_pending_timers"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+
+["resolve_batch_reset_one"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "docs/performance-fork-validate.md"
+
+["terminate_source_execution"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "docs/performance-mutex-terminal-sweep-table-present.md"

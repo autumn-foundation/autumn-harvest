@@ -1,0 +1,15 @@
+# Ledger profiles for `autumn-harvest/src/schedule_decision.rs`. See `docs/ledger/README.md`.
+
+["purge_old_schedule_decisions"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_schedule_decisions"]
+measured = "unmeasured"
+
+["record_decision_graceful"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_schedule_decisions"]
+measured = "unmeasured"

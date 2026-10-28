@@ -1,0 +1,36 @@
+# Ledger profiles for `autumn-harvest-plugin/src/mcp_tasks.rs`. See `docs/ledger/README.md`.
+
+["history_head"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["last_events"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["load_task"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["open_signal_waits"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+
+["wait_still_open"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_signals"]
+measured = "unmeasured"

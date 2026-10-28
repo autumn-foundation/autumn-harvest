@@ -1,0 +1,29 @@
+# Ledger profiles for `autumn-harvest-plugin/src/outbox.rs`. See `docs/ledger/README.md`.
+
+["claim_due_outbox_rows"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_outbox"]
+measured = "unmeasured"
+
+["enqueue_workflow_start_outbox"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_outbox"]
+measured = "docs/performance-outbox-start-relay.md"
+
+["mark_outbox_rows_delivered_batch"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_outbox"]
+measured = "docs/performance-outbox-start-relay.md"
+
+["mark_outbox_rows_failed_batch"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_outbox"]
+measured = "docs/performance-outbox-start-relay.md"

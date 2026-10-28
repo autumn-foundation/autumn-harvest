@@ -1,0 +1,15 @@
+# Ledger profiles for `autumn-harvest-plugin/src/dev/postgres.rs`. See `docs/ledger/README.md`.
+
+["execute_sql"]
+driver = "setup"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["query_scalar_on"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"

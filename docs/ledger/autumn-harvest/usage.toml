@@ -1,0 +1,8 @@
+# Ledger profiles for `autumn-harvest/src/usage.rs`. See `docs/ledger/README.md`.
+
+["load_usage_grouped"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_llm_ledger", "harvest_shard_migrations", "harvest_workflow_executions"]
+measured = "docs/performance-usage-report-activity-lookback.md"

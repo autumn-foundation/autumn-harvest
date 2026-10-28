@@ -1,0 +1,29 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/llm_ledger.rs`. See `docs/ledger/README.md`.
+
+["insert_rows"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_llm_ledger"]
+measured = "unmeasured"
+
+["rows_between"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_llm_ledger"]
+measured = "unmeasured"
+
+["rows_of"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_llm_ledger"]
+measured = "unmeasured"
+
+["table_exists"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_llm_ledger"]
+measured = "unmeasured"

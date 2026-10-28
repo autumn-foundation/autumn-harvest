@@ -42,6 +42,11 @@ saturated-activity gate.
 > are complements: when an end-to-end number there moves, this page is where you
 > find out whether the claim path is why.
 
+> **Looking for a query that this page does not cover?** Every function
+> that sends SQL has a [Ledger profile](ledger/README.md). The profile names
+> the tables, what makes the query run, and the page that measures it, or
+> `unmeasured`.
+
 > **These are starter reference numbers, not an SLO.** They were taken on one
 > machine with one Postgres configuration (below). Your hardware, your
 > `shared_buffers`, your backlog shape, and your queue count all move them.

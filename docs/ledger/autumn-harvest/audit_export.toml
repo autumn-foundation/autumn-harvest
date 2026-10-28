@@ -1,0 +1,141 @@
+# Ledger profiles for `autumn-harvest/src/audit_export.rs`. See `docs/ledger/README.md`.
+
+["apply_outcome"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_audit_export_cursor"]
+measured = "unmeasured"
+
+["audit_table_schema"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+
+["build_unexported_index"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["claim_shard_chained"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_audit_export_cursor", "harvest_audit_log"]
+measured = "unmeasured"
+
+["connect_index_builder"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["count_redrive_recoverable"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+
+["database_identity"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["decommission_cursor_locked"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_audit_export_cursor"]
+measured = "unmeasured"
+
+["emit_lag_and_observed"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_export_cursor"]
+measured = "unmeasured"
+
+["ensure_cursor_row"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_audit_export_cursor", "harvest_audit_log"]
+measured = "unmeasured"
+
+["ensure_unexported_index"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+
+["export_lag_seconds"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+
+["export_status"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_export_cursor"]
+measured = "unmeasured"
+
+["pending_and_lag"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+
+["reactivate_cursor_locked"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_audit_export_cursor"]
+measured = "unmeasured"
+
+["redrive_window_truncated"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_purge_watermark"]
+measured = "unmeasured"
+
+["release_claim"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_audit_export_cursor"]
+measured = "unmeasured"
+
+["repair_and_build_unexported_index"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["ddl"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+
+["rewind_cursor_locked"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_audit_export_cursor", "harvest_audit_log"]
+measured = "unmeasured"
+
+["unexported_index_valid"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"

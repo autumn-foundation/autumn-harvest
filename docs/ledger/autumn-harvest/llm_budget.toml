@@ -1,0 +1,8 @@
+# Ledger profiles for `autumn-harvest/src/llm_budget.rs`. See `docs/ledger/README.md`.
+
+["load_llm_spend"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_llm_ledger", "harvest_shard_migrations", "harvest_workflow_executions"]
+measured = "unmeasured"

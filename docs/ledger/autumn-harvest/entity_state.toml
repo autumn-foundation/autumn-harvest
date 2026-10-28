@@ -1,0 +1,50 @@
+# Ledger profiles for `autumn-harvest/src/entity_state.rs`. See `docs/ledger/README.md`.
+
+["erase_for_execution"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_entity_state"]
+measured = "unmeasured"
+
+["list"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_entity_state"]
+measured = "unmeasured"
+
+["pointer"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_entity_state", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["read"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_entity_state"]
+measured = "unmeasured"
+
+["read_for_execution"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_entity_state"]
+measured = "unmeasured"
+
+["rebuild_without_execution"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["entity", "harvest_entity_state", "harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["snapshot_at"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"

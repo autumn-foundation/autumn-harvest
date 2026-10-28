@@ -1,0 +1,64 @@
+# Ledger profiles for `autumn-harvest/src/fork.rs`. See `docs/ledger/README.md`.
+
+["check_stored_history"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "docs/performance-quota-history-bytes.md"
+
+["copy_prefix"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["erased_fork_ancestor"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["is_pinned_by_recorded_fork"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters", "harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["is_recorded_fork"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["load_fork_source"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["record_source_is_readable"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["serve_recorded_activities"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "docs/performance-fork-scheduled-occurrence.md"
+
+["workflow_id_in_use"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"

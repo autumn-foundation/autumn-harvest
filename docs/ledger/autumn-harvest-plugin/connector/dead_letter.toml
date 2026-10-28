@@ -1,0 +1,8 @@
+# Ledger profiles for `autumn-harvest-plugin/src/connector/dead_letter.rs`. See `docs/ledger/README.md`.
+
+["insert_dead_letter"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_connector_dead_letters"]
+measured = "unmeasured"

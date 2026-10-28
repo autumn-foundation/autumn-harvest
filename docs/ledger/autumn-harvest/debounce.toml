@@ -1,0 +1,36 @@
+# Ledger profiles for `autumn-harvest/src/debounce.rs`. See `docs/ledger/README.md`.
+
+["admit_debounced_start_with_codecs"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_debounce"]
+measured = "unmeasured"
+
+["delete_debounce_row"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_debounce"]
+measured = "unmeasured"
+
+["fire_due_on_conn"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_debounce"]
+measured = "unmeasured"
+
+["list_pending_debounce"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_debounce"]
+measured = "unmeasured"
+
+["redefer_debounce_row"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_debounce"]
+measured = "unmeasured"

@@ -1,0 +1,92 @@
+# Ledger profiles for `autumn-harvest/src/backup_verify.rs`. See `docs/ledger/README.md`.
+
+["probes::await_verdict"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["probes::connect_read_only"]
+driver = "setup"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["probes::effect_verdict"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_signals", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["probes::fetch_trigger_fire_page"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_completion_trigger_fires", "harvest_completion_trigger_outbox", "harvest_completion_triggers"]
+measured = "unmeasured"
+
+["probes::matching_execution_states"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["probes::matching_retention_summaries"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_execution_summaries"]
+measured = "unmeasured"
+
+["probes::matching_workflow_executions"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["probes::matching_workflow_keys"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["probes::probe"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["probes::read_owner_group"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["probes::replay_sample"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["probes::scan_reference_events"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["probes::verify_shard"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_completion_deliveries", "harvest_events", "harvest_schedules", "harvest_task_queue", "harvest_workflow_executions"]
+measured = "unmeasured"

@@ -1,0 +1,274 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/store.rs`. See `docs/ledger/README.md`.
+
+["append_event_seq"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["cancel_request"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["copy_inherited_fields"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["execution_error"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["execution_exists"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["execution_input"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "docs/performance-sqlite-runtime-drive.md"
+
+["execution_output"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "docs/performance-sqlite-runtime-drive.md"
+
+["execution_state"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["find_active_execution_by_key"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["find_active_executions_by_key"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["find_signal_key_in_chain"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions", "harvest_signals"]
+measured = "unmeasured"
+
+["for_each_pending_signal"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+
+["has_signal_key"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+
+["insert_child_execution"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["insert_execution_with_config"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["last_event"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["load_attempts"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_activity_attempts"]
+measured = "unmeasured"
+
+["load_history_sized"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["mark_signal_delivered"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+
+["next_seq"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "docs/performance-sqlite-runtime-drive.md"
+
+["parent_link"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["record_attempt"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_activity_attempts"]
+measured = "unmeasured"
+
+["request_cancel"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_events", "harvest_executions"]
+measured = "unmeasured"
+
+["resolve_run_by_key"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["run_config"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["running_detached_children"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["running_executions"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["seal_execution"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["set_cancelled"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["set_completed"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["set_failed"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["set_local_retry_at"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["set_schedule_name"]
+driver = "per_tick"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["set_start_fields"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["set_terminal_with_reason"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["stage_signal"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+
+["upsert_search_attrs"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["workflow_id_of"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "docs/performance-sqlite-runtime-drive.md"
+
+["workflow_name_of"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "docs/performance-sqlite-runtime-drive.md"

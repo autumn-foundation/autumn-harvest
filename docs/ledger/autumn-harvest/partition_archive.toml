@@ -1,0 +1,43 @@
+# Ledger profiles for `autumn-harvest/src/partition_archive.rs`. See `docs/ledger/README.md`.
+
+["dropped_manifest_key"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_partition_exports"]
+measured = "unmeasured"
+
+["flag"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["locked_checksum"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["read_page"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["record_drop"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_partition_exports"]
+measured = "unmeasured"
+
+["with_local_settings"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
