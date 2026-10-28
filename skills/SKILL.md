@@ -15,7 +15,7 @@ description: >
 # autumn-harvest — Durable Workflow Engine for Rust
 
 **Repository**: https://github.com/autumn-foundation/autumn-harvest
-**Version**: 0.7.0 | **Edition**: 2024 | **MSRV**: 1.88.0
+**Version**: 0.8.0 | **Edition**: 2024 | **MSRV**: 1.88.0
 **Author**: autumn-foundation
 
 autumn-harvest is a Postgres-backed durable workflow engine — Temporal-style semantics
@@ -64,9 +64,9 @@ non-web or other-framework contexts.
 
 ```toml
 [dependencies]
-autumn-harvest = { version = "0.7", features = ["db"] }
-autumn-harvest-plugin = "0.7"
-autumn-web = { version = "0.8", features = ["ws"] }
+autumn-harvest = { version = "0.8", features = ["db"] }
+autumn-harvest-plugin = "0.8"
+autumn-web = { version = "0.9", features = ["ws"] }
 # ... plus standard deps (serde_json, chrono, uuid, tokio, tracing, etc.)
 ```
 
@@ -265,12 +265,16 @@ async fn weekly_digest(ctx: &WorkflowContext, user_id: i64) -> HarvestResult<()>
 
 ## Integrating with autumn-web
 
-Harvest 0.7 needs `autumn-web` 0.8. A leftover `autumn-web = "0.7"` builds a
+Harvest 0.8 needs `autumn-web` 0.9. A leftover `autumn-web = "0.8"` builds a
 second copy whose `Plugin` trait `HarvestPlugin` does not implement.
 
 Outside the `dev` profile, a management API with no declared auth layer
 answers every mutating route with `401` (0.7.0). Declare an auth layer before
 you deploy. See `docs/upgrading/0.7.0.md` for every 0.7.0 default change.
+
+Under the `prod` profile, `autumn-web` 0.9 refuses unknown top-level config
+tables. `HarvestPlugin` declares `[harvest]`, so that table is accepted. See
+`docs/upgrading/0.8.0.md` for the 0.8.0 changes.
 
 ### Building the HarvestPlugin
 

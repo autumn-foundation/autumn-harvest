@@ -60,10 +60,10 @@ against the 0.7.0 release from crates.io.
 
 ```toml
 [dependencies]
-autumn-harvest = { version = "0.7.0", path = "../autumn-harvest/autumn-harvest" }
+autumn-harvest = { version = "0.8.0", path = "../autumn-harvest/autumn-harvest" }
 # `metrics` adds the Prometheus recorder. `webhooks` adds webhook receivers.
-autumn-harvest-plugin = { version = "0.7.0", path = "../autumn-harvest/autumn-harvest-plugin", features = ["metrics", "webhooks"] }
-autumn-web = "0.8"
+autumn-harvest-plugin = { version = "0.8.0", path = "../autumn-harvest/autumn-harvest-plugin", features = ["metrics", "webhooks"] }
+autumn-web = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ```
 
