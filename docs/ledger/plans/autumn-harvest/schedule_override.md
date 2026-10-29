@@ -33,4 +33,3 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_schedule_overrides"."name", "harvest_schedule_overrides"."schedule_expr", "harves...` | `harvest_schedule_overrides`: Index Scan on `harvest_schedule_overrides_pkey` |
-
