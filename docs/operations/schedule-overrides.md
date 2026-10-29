@@ -171,4 +171,36 @@ Rules that differ from a row edit:
 - SLAs and execution timeouts are #2387.
 - A workflow override lives on the default shard. A change of the default
   shard does not move it. A DAG override does move (#2389).
-- The SQLite backend has no override table yet (#2390).
+- The SQLite backend has no DAGs, so it has no DAG override. See
+  [SQLite](#sqlite) for its workflow schedule overrides.
+
+## SQLite
+
+The SQLite backend (issue #2390) overrides the schedules that an app
+declares with `SqliteRuntime::upsert_schedule`. It uses the same
+`WorkflowSchedulePatch` and the same merge rules as Postgres:
+
+```rust
+use autumn_harvest::schedule_patch::WorkflowSchedulePatch;
+
+let patch = WorkflowSchedulePatch {
+    schedule: Some(Schedule::Interval(Duration::from_secs(60))),
+    max_active_runs: Some(3),
+    ..WorkflowSchedulePatch::default()
+};
+rt.set_schedule_override("nightly_report", &patch, "ops", Some("INC-4821"))?;
+let stored = rt.schedule_override("nightly_report")?;
+rt.clear_schedule_override("nightly_report")?;
+```
+
+- The override is stored in `harvest_schedule_overrides`. It wins over the
+  code value, and survives a reopen that upserts new code. A field with no
+  override follows code.
+- The backend can override the cadence, `max_active_runs`, and the `skip`
+  and `allow_all` overlap policies. Any other field returns
+  `SqliteError::Unsupported`, which names the field, and writes nothing.
+  Catch-up is always off and jitter is ignored on SQLite, so an override
+  of either is refused rather than dropped.
+- Deleting a schedule deletes its override.
+- A schedule row from before #2390 has no stored code value until its next
+  upsert. An override of it returns `SqliteError::InvalidSchedule`.

@@ -616,6 +616,9 @@ pub mod schedule_decision;
 /// Operator overrides for code-declared schedules (issues #2385 and #2386).
 #[cfg(feature = "db")]
 pub mod schedule_override;
+/// The partial update of a workflow schedule and its override rules
+/// (issues #771, #2386 and #2390). Shared by both backends.
+pub mod schedule_patch;
 /// Backend-neutral cron and interval slot arithmetic (issue #2031).
 pub mod schedule_plan;
 #[cfg(feature = "db")]

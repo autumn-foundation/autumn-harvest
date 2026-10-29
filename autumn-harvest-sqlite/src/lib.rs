@@ -811,7 +811,7 @@ pub use crate::runtime::{
     UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
 // The depth cap is shared with the Postgres backend (issue #2225).
-pub use crate::schedule::ScheduleSummary;
+pub use crate::schedule::{ScheduleOverride, ScheduleSummary};
 pub use crate::store::ActivityAttempt;
 pub use crate::visibility::{
     DEFAULT_LIST_LIMIT, ExecutionDescription, ExecutionFilter, ExecutionPage, ExecutionSummary,

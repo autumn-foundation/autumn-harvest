@@ -35,7 +35,7 @@ use crate::history_cap::{CapCheck, HistoryCapReason};
 use crate::llm_ledger::LlmLedgerRow;
 use crate::lock::WriterLock;
 use crate::query::{DEFAULT_QUERY_TIMEOUT, QueryReplay};
-use crate::schedule::ScheduleSummary;
+use crate::schedule::{ScheduleOverride, ScheduleSummary};
 use crate::visibility::{ExecutionDescription, ExecutionFilter, ExecutionPage, ListCursor};
 use crate::{
     composition, llm_ledger, lock, mutex, queue, retention, schedule, schema, store, update,
@@ -2027,7 +2027,9 @@ impl SqliteRuntime {
     /// The workflow name is the key, as on Postgres. A new schedule fires
     /// first at its first slot after now. An update keeps the stored pause.
     /// An update with the same spec also keeps the next slot. So an app can
-    /// upsert its schedules on every open, and a reopen moves no slot.
+    /// upsert its schedules on every open, and a reopen moves no slot. A
+    /// stored operator override wins over `schedule` (issue #2390). See
+    /// [`set_schedule_override`](Self::set_schedule_override).
     ///
     /// [`poll_once`](Self::poll_once) and [`run_until_idle`](Self::run_until_idle)
     /// fire due schedules. [`run_until_blocked`](Self::run_until_blocked)
@@ -2084,6 +2086,68 @@ impl SqliteRuntime {
     pub fn resume_schedule(&mut self, workflow_name: &str) -> SqliteResult<()> {
         let now = (self.now_fn)().timestamp_millis();
         schedule::set_paused(&self.conn, workflow_name, false, now)
+    }
+
+    /// Set or change the operator override of the schedule of
+    /// `workflow_name` (issue #2390), and return the effective schedule.
+    ///
+    /// The override wins over the code value of
+    /// [`upsert_schedule`](Self::upsert_schedule), and survives a reopen
+    /// that upserts new code. `patch` merges over the stored override with
+    /// the Postgres rules of issue #2386: a field that `patch` sets wins, and
+    /// a field that it leaves out keeps the stored value. To return every
+    /// field to its code value, call
+    /// [`clear_schedule_override`](Self::clear_schedule_override).
+    ///
+    /// The backend can override the cadence, `max_active_runs`, and the
+    /// `Skip` and `AllowAll` overlap policies. A change of cadence counts the
+    /// next slot from now.
+    ///
+    /// # Errors
+    ///
+    /// - [`SqliteError::Unsupported`]: `patch` sets a field that this backend
+    ///   cannot honor. The message starts with `WorkflowSchedulePatch.<field>`.
+    ///   Nothing is written.
+    /// - [`SqliteError::ScheduleNotFound`]: no schedule exists.
+    /// - [`SqliteError::InvalidSchedule`]: the merged value does not validate,
+    ///   or the row predates issue #2390 and has no code value yet. Nothing is
+    ///   written.
+    /// - [`SqliteError::Corrupt`] or [`SqliteError::Sqlite`]: a stored value
+    ///   does not parse, or the write fails.
+    pub fn set_schedule_override(
+        &mut self,
+        workflow_name: &str,
+        patch: &autumn_harvest::schedule_patch::WorkflowSchedulePatch,
+        actor: &str,
+        reason: Option<&str>,
+    ) -> SqliteResult<WorkflowSchedule> {
+        let now = (self.now_fn)().timestamp_millis();
+        schedule::set_override(&self.conn, workflow_name, patch, actor, reason, now)
+    }
+
+    /// Delete the operator override of the schedule of `workflow_name`
+    /// (issue #2390), so every field takes its code value again. Returns
+    /// whether an override existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ScheduleNotFound`] when no schedule exists, and
+    /// [`SqliteError::Corrupt`] or [`SqliteError::Sqlite`] when a stored value
+    /// does not parse or the write fails.
+    pub fn clear_schedule_override(&mut self, workflow_name: &str) -> SqliteResult<bool> {
+        let now = (self.now_fn)().timestamp_millis();
+        schedule::clear_override(&self.conn, workflow_name, now)
+    }
+
+    /// The stored operator override of the schedule of `workflow_name`, if
+    /// any (issue #2390).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Corrupt`] for a stored override that does not
+    /// parse, and [`SqliteError::Sqlite`] if the query fails.
+    pub fn schedule_override(&self, workflow_name: &str) -> SqliteResult<Option<ScheduleOverride>> {
+        schedule::load_override(&self.conn, workflow_name)
     }
 
     /// Every stored schedule, by workflow name (issue #2031).

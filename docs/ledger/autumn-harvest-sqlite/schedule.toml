@@ -14,11 +14,18 @@ kind = ["write"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
 
+["clear_override"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+
 ["delete"]
 driver = "per_request"
 backend = ["sqlite"]
 kind = ["write"]
-tables = ["harvest_schedules"]
+tables = ["harvest_schedule_overrides", "harvest_schedules"]
 measured = "unmeasured"
 
 ["due_names"]
@@ -35,11 +42,32 @@ kind = ["read"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
 
+["load_code"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
 ["load_due"]
 driver = "per_tick"
 backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["load_override"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+
+["set_override"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_schedule_overrides"]
 measured = "unmeasured"
 
 ["set_paused"]
@@ -49,7 +77,7 @@ kind = ["read", "write"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
 
-["upsert"]
+["write_row"]
 driver = "per_request"
 backend = ["sqlite"]
 kind = ["read", "write"]
