@@ -1,7 +1,7 @@
 //! The schedule-override cases that both backends run (issue #2390).
 //!
 //! `schedule_overrides.rs` in this crate runs each case on SQLite.
-//! `sqlite_schedule_override_parity_tests.rs` in the core crate runs the same
+//! `schedule_override_parity_tests.rs` in the core crate runs the same
 //! file on Postgres. Each backend must reach the same effective value after
 //! every step, so a drift in the override rules fails one of the two suites.
 //!
