@@ -40,16 +40,16 @@ edition = "2024"
 publish = false
 
 [dependencies]
-autumn-harvest = { version = "0.8.0", path = "../../autumn-harvest" }
-autumn-harvest-plugin = { version = "0.8.0", path = "../../autumn-harvest-plugin" }
-autumn-web = "0.9"
+autumn-harvest = { version = "0.7.0", path = "../../autumn-harvest" }
+autumn-harvest-plugin = { version = "0.7.0", path = "../../autumn-harvest-plugin" }
+autumn-web = "0.8"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
 [dev-dependencies]
-autumn-harvest = { version = "0.8.0", path = "../../autumn-harvest", features = ["testing"] }
+autumn-harvest = { version = "0.7.0", path = "../../autumn-harvest", features = ["testing"] }
 ```
 
 The crate does not call autumn-web's `AppBuilder`. It still depends on

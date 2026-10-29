@@ -135,7 +135,8 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
     mock.expect_called(1);
 
     // Verify delivery logs were recorded successfully
-    let log = logs.first().expect("a delivery log is recorded");
+    assert!(!logs.is_empty());
+    let log = &logs[0];
     assert_eq!(log.subscription_id, "sub_durable");
     assert_eq!(log.topic, "order.completed");
     assert_eq!(log.response_status, Some(200));

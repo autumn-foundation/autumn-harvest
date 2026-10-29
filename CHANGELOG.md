@@ -7,18 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.0] - 2026-10-28
-
-### Upgraded
-
-- **Upgrade to autumn-web 0.9.** Harvest 0.8.0 depends on `autumn-web` 0.9, so an app that mounts `HarvestPlugin` bumps `autumn-web` in the same change: Cargo treats 0.8 and 0.9 as distinct crates, and a leftover `autumn-web = "0.8"` compiles a second copy whose `Plugin` trait `HarvestPlugin` does not implement. Harvest's generated webhook, MCP tool and MCP task routes set 0.9's new `Route::criticality` to `Criticality::Default`, which is what a route attribute without `criticality` produces. **`HarvestPlugin` now declares `[harvest]` as its own config root** through `AppBuilder::config_section` (public as `autumn_harvest_plugin::config::HARVEST_CONFIG_ROOT`): 0.9's `prod` profile turns on `server.strict_config`, which otherwise refuses the undeclared `[harvest]` table and stops the boot. The plugin contract declares `autumn-web = "0.9"`. autumn-web 0.9 adds framework migrations, none sharing a version with a Harvest migration. The `harvest new` scaffold now writes `autumn-harvest = "0.8"`, `autumn-harvest-plugin = "0.8"` and `autumn-web = "0.9"`. MSRV stays 1.88.0. See [`docs/upgrading/0.8.0.md`](docs/upgrading/0.8.0.md) §2.
-
-### Changed
-
-- **Breaking and behavior changes.** Decision boundaries are recorded opt-in (issue #1833); the default claim reads a bounded window and sets its own planner settings (issue #1971, migration `20261008042107_harvest_task_queue_claim_seek_index`); `queue::complete_task` takes a `&TaskClaim` (issue #1992); no reset forks a PII-erased run (issue #1999); a worker runs up to two claims at once by default (`max_concurrent_claims = 2`); the schema contract covers activities and side effects, `contract_version` 2 (issue #1994); the usage report carries the agent cost ledger (issue #1996); fairness keys are opt-in (issue #1976); column encoding covers activity rows and short-lived copies (issues #1979 and #2043); a keyed entity drops the input of a caller start (issue #2082); a dropped `Session` releases its slot (issue #2193); activity results and workflow-side values nested past 100 levels fail (issues #2225 and #2224); and a calendar tests the schedule's local date (issue #2332). Each has its own section and check in [`docs/upgrading/0.8.0.md`](docs/upgrading/0.8.0.md) §1.
-
-The per-PR entries for this release are the fragments in [`docs/changelog.d/`](docs/changelog.d/README.md). The collation sweep folds them into this section and into `docs/shipped-work.md`.
-
 ## [0.7.0] - 2026-10-05
 
 ### Upgraded
