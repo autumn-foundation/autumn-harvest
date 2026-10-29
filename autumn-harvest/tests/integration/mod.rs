@@ -337,6 +337,7 @@ mod retry_clock_skew_tests;
 mod retry_now_tests;
 #[cfg(feature = "db")]
 mod run_defaults_db_tests;
+mod runtime_parameter_inventory_docs;
 mod safety_report_docs;
 mod saga_tests;
 mod sandbox_activities_docs;
