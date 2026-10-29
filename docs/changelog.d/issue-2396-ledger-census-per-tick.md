@@ -14,10 +14,8 @@ terminal states, but `idx_harvest_we_retention_scan` covers only five. So
 the scan cannot use its index and reads all of `harvest_workflow_executions`
 on each tick (issue #2395).
 
-Two drivers are corrected. `codec_rotation::db::count_rows_by_key_id` is an
-operator rotation census, so its driver is `setup`.
-`audit_export::pending_and_lag` backs an admin read, so its driver is
-`per_request`.
+One driver is corrected. `audit_export::pending_and_lag` backs an admin
+read, so its driver is `per_request`.
 
 No engine change: no new `WorkflowEvent` variant, no migration, no schema
 change and no public API change.

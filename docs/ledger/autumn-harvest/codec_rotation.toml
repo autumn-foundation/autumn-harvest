@@ -40,7 +40,7 @@ measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest/codec_rotation.md"
 
 ["db::count_rows_by_key_id"]
-driver = "setup"
+driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_batch_jobs", "harvest_completion_deliveries", "harvest_completion_trigger_outbox", "harvest_cross_shard_children", "harvest_dead_letters", "harvest_debounce", "harvest_entity_state", "harvest_event_batches", "harvest_events", "harvest_execution_summaries", "harvest_schedules", "harvest_signals", "harvest_start_throttle", "harvest_task_queue", "harvest_workflow_executions"]
