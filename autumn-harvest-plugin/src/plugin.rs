@@ -1311,7 +1311,7 @@ const fn mcp_tools_unprotected(mcp_tools_enabled: bool, has_tool_middleware: boo
 ///
 /// It must equal the `autumn-web` requirement in this crate's `Cargo.toml`.
 /// A unit test enforces that, so a dependency bump cannot leave it stale.
-pub const AUTUMN_WEB_REQUIREMENT: &str = "0.9";
+pub const AUTUMN_WEB_REQUIREMENT: &str = "0.8";
 
 /// The compatibility contract that [`HarvestPlugin`] declares to Autumn.
 ///
@@ -1378,10 +1378,6 @@ impl Plugin for HarvestPlugin {
         // `api_with_auth` clears the login, and with it these roles.
         #[cfg(feature = "oidc")]
         let roles = oidc.as_ref().map(|login| login.roles().clone()).or(roles);
-
-        // The `prod` profile of autumn-web 0.9 refuses an undeclared top-level
-        // table. Declaring `[harvest]` keeps the strict check on every other key.
-        let app = app.config_section(crate::config::HARVEST_CONFIG_ROOT);
 
         // Autumn owns migrations for every set that lives in the application
         // database (since autumn-web 0.7). See `register_plugin_migrations`.
@@ -3007,7 +3003,7 @@ mod tests {
         use autumn_web::plugin_contract::{ContractVerdict, evaluate};
 
         let contract = harvest_plugin_contract();
-        for other in ["0.8.0", "0.10.0"] {
+        for other in ["0.7.0", "0.9.0"] {
             assert!(
                 matches!(evaluate(&contract, other), ContractVerdict::Incompatible(_)),
                 "autumn-web {other} must be outside the declared range"
@@ -3734,16 +3730,6 @@ mod tests {
         );
 
         assert!(app.has_plugin(std::any::type_name::<HarvestPlugin>()));
-    }
-
-    /// Under `strict_config`, an undeclared `[harvest]` table stops the boot.
-    /// The `prod` profile turns that check on since autumn-web 0.9.
-    #[test]
-    fn harvest_plugin_build_declares_the_harvest_config_section() {
-        let app =
-            autumn_web::app().plugin(HarvestPlugin::new().workflows(vec![fake_workflow_info()]));
-
-        assert!(app.has_config_section(crate::config::HARVEST_CONFIG_ROOT));
     }
 
     #[tokio::test]

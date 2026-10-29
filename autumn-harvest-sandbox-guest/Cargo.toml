@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 # The protocol and the process executor. No database.
-autumn-harvest = { version = "0.8.0", path = "../autumn-harvest", default-features = false, features = ["sandbox-activities"] }
+autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", default-features = false, features = ["sandbox-activities"] }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 # AF_VSOCK, mount, reboot and the random pool ioctls. Already in the lockfile.

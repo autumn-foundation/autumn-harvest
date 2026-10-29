@@ -172,7 +172,7 @@ The `autumn-harvest-plugin` crate ships adapters for `PayloadStore` and
 | `gcs` | `object_store::gcs::GcsBackend` on the GCS JSON API. It uses the `reqwest` client that the plugin already has. |
 
 ```toml
-autumn-harvest-plugin = { version = "0.8", features = ["s3"] }
+autumn-harvest-plugin = { version = "0.7", features = ["s3"] }
 ```
 
 ```rust

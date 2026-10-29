@@ -6,14 +6,6 @@ use autumn_harvest::dispatch::DEFAULT_DISPATCH_RECONCILE_BATCH;
 use autumn_web::config::{ConfigError, DatabaseConfig, Env, OsEnv, normalize_profile_name};
 use serde::Deserialize;
 
-/// The top-level table of `autumn.toml` that holds Harvest configuration.
-///
-/// Autumn's config schema is closed. Under `server.strict_config`, an unknown
-/// top-level table stops the boot. The `prod` profile turns that check on
-/// (since autumn-web 0.9). `HarvestPlugin` declares this root to Autumn, so the
-/// check accepts `[harvest]` and leaves its contents to Harvest.
-pub const HARVEST_CONFIG_ROOT: &str = "harvest";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum HarvestMode {
@@ -956,37 +948,6 @@ mod tests {
         assert!(config.worker_enabled);
         assert!(config.scheduler_enabled);
         assert_eq!(config.database.url, None);
-    }
-
-    /// The `prod` profile turns on `strict_config` (since autumn-web 0.9).
-    /// The check refuses an undeclared `[harvest]` table and accepts a declared one.
-    #[test]
-    fn strict_prod_config_accepts_harvest_only_as_a_declared_root() {
-        use autumn_web::config::AutumnConfig;
-        use std::collections::BTreeSet;
-
-        let dir = unique_temp_dir("harvest-config-strict-prod");
-        write_file(
-            &dir.join("autumn.toml"),
-            r#"
-[harvest]
-mode = "embedded"
-"#,
-        );
-        let env = MockEnv::new()
-            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
-            .with("AUTUMN_PROFILE", "prod");
-
-        let error = AutumnConfig::load_with_env(&env)
-            .expect_err("strict_config must refuse an undeclared [harvest] table");
-        assert!(
-            error.to_string().contains(HARVEST_CONFIG_ROOT),
-            "expected the refusal to name the harvest root, got {error}"
-        );
-
-        let roots = BTreeSet::from([HARVEST_CONFIG_ROOT.to_owned()]);
-        AutumnConfig::load_with_env_and_plugin_roots(&env, &roots)
-            .expect("strict_config must accept a declared [harvest] table");
     }
 
     #[test]

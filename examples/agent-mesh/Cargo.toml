@@ -12,12 +12,12 @@ path = "src/main.rs"
 
 [dependencies]
 # The backend-neutral core only: the desk runs on the embedded SQLite backend.
-autumn-harvest = { version = "0.8.0", path = "../../autumn-harvest", default-features = false }
-autumn-harvest-sqlite = { version = "0.8.0", path = "../../autumn-harvest-sqlite" }
-autumn-harvest-agent = { version = "0.8.0", path = "../../autumn-harvest-agent", features = ["sqlite"] }
+autumn-harvest = { version = "0.7.0", path = "../../autumn-harvest", default-features = false }
+autumn-harvest-sqlite = { version = "0.7.0", path = "../../autumn-harvest-sqlite" }
+autumn-harvest-agent = { version = "0.7.0", path = "../../autumn-harvest-agent", features = ["sqlite"] }
 # The Claude adapter, with SSE streaming (issue #2268), lives in the
 # autoresearch capstone. One copy serves both examples.
-autoresearch = { version = "0.8.0", path = "../autoresearch" }
+autoresearch = { version = "0.7.0", path = "../autoresearch" }
 chrono = { workspace = true }
 clap = { version = "4.5", features = ["derive", "env"] }
 serde = { workspace = true }
@@ -28,7 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 # `db` runs the Postgres suite on a real worker (issues #2270 and #2268).
-autumn-harvest = { version = "0.8.0", path = "../../autumn-harvest", default-features = false, features = ["testing", "db"] }
+autumn-harvest = { version = "0.7.0", path = "../../autumn-harvest", default-features = false, features = ["testing", "db"] }
 deadpool = { workspace = true }
 diesel = { workspace = true }
 diesel-async = { workspace = true }

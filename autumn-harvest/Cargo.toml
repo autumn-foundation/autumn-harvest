@@ -93,7 +93,7 @@ chaos = ["db"]
 owner-disk-cache = ["db", "dep:rusqlite", "dep:fs4"]
 
 [dependencies]
-autumn-harvest-macros = { version = "0.8.0", path = "../autumn-harvest-macros" }
+autumn-harvest-macros = { version = "0.7.0", path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
 async-trait = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -102,7 +102,7 @@ serde_json = { workspace = true }
 base64 = "0.23"
 sha2 = "0.11"
 hmac = "0.13"
-# AES-256-GCM payload codec (issue #1825). `autumn-web` 0.9 keeps its own 0.10.3 in
+# AES-256-GCM payload codec (issue #1825). `autumn-web` 0.8 keeps its own 0.10.3 in
 # the lockfile. No default features: the codec reads nonces from `rand`'s
 # `OsRng`, so `aead/getrandom` is not needed.
 aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc", "zeroize"] }
@@ -412,7 +412,7 @@ testcontainers-modules = { workspace = true }
 # Runs the real `agent_loop` on a Postgres worker to measure the resident hit
 # rate (issue #2013). The loom and shuttle models never use it.
 [target.'cfg(not(any(loom, shuttle)))'.dev-dependencies]
-autumn-harvest-agent = { version = "0.8.0", path = "../autumn-harvest-agent" }
+autumn-harvest-agent = { version = "0.7.0", path = "../autumn-harvest-agent" }
 # Explores every interleaving of the DST oracles within a bound (the
 # `stateright` test target). Dev-only, so it never ships. The loom and Shuttle
 # builds skip it, so `--cfg loom` cannot reach its dependencies.
