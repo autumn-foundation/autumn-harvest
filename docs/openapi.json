@@ -3932,7 +3932,7 @@
         "x-harvest-route-class": "read_only"
       },
       "patch": {
-        "description": "Partially update an existing workflow schedule in place (issue #771). Only provided fields change; the schedule_id is never changed, so #488 carryover lineage, the sched:{schedule_id}: workflow-id namespace, and run history are preserved. The workflow type is NOT editable (400). DAG schedules are owned by PATCH /dags/{dag_name} (400). Nullable fields (calendar, consecutive_failure_limit, end_at, max_runs, catchup_policy, retry_policy) are tri-state: omitting the field leaves it unchanged, an explicit JSON null clears it. The merged spec is validated before any write, so a 400 writes nothing. Changing the schedule expression recomputes next_run_at anchored at now (elapsed slots are never retroactively fired); other edits preserve the pending next_run_at. Anti-race with the scheduler tick: an edit is rejected 409 while a fire claim is live, an expired claim is fenced (token nulled) so a straggler fire cannot finalize over the edit, and a tick that wins its claim re-reads the row before firing, so a fire that lands concurrently with the edit always dispatches the committed new input/queue/policies.",
+        "description": "Partially update an existing workflow schedule in place (issue #771). Only provided fields change; the schedule_id is never changed, so #488 carryover lineage, the sched:{schedule_id}: workflow-id namespace, and run history are preserved. The workflow type is NOT editable (400). DAG schedules are owned by PATCH /dags/{dag_name} (400). Nullable fields (calendar, consecutive_failure_limit, end_at, max_runs, catchup_policy, retry_policy) are tri-state: omitting the field leaves it unchanged, an explicit JSON null clears it. The merged spec is validated before any write, so a 400 writes nothing. Changing the schedule expression recomputes next_run_at anchored at now (elapsed slots are never retroactively fired); other edits preserve the pending next_run_at. Anti-race with the scheduler tick: an edit is rejected 409 while a fire claim is live, an expired claim is fenced (token nulled) so a straggler fire cannot finalize over the edit, and a tick that wins its claim re-reads the row before firing, so a fire that lands concurrently with the edit always dispatches the committed new input/queue/policies. A schedule declared in code (WorkerBuilder::workflow_schedule) converges to its code value on every tick, so for it the request writes an operator override instead of a row edit (issue #2386): the override wins over code and survives a restart, clear_override returns to code, and input returns 400.",
         "operationId": "patch_admin_schedules_by_id",
         "parameters": [
           {
@@ -3965,6 +3965,9 @@
                   "catchup_window_secs": {
                     "description": "Window length in seconds for catchup_policy = window; re-windows an already-'window' policy when sent alone, ignored for other modes (issue #484)."
                   },
+                  "clear_override": {
+                    "description": "Code-declared schedule only (issue #2386): delete the stored operator override before the other fields apply. Alone, it returns the schedule to its code value. 400 on a schedule made through the API."
+                  },
                   "consecutive_failure_limit": {
                     "description": "New auto-pause threshold (issue #360). Tri-state: omit = unchanged, explicit null = disable auto-pause."
                   },
@@ -3988,6 +3991,9 @@
                   },
                   "queue_name": {
                     "description": "New task queue name for scheduled runs."
+                  },
+                  "reason": {
+                    "description": "Code-declared schedule only (issue #2386): the operator reason stored with the override. 400 on a schedule made through the API."
                   },
                   "retry_policy": {
                     "description": "New schedule-level workflow retry policy (issue #523). Tri-state: omit = unchanged, explicit null = clear."

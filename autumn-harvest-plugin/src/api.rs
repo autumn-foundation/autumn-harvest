@@ -107,9 +107,10 @@ use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStat
 use autumn_harvest::schedule_override::{self, ScheduleOverridePatch};
 use autumn_harvest::scheduler::{
     BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag,
-    ScheduleUpdateOutcome, SchedulerMonitor, SchedulerSnapshot, WorkflowSchedulePatch,
-    ensure_dag_schedule, parse_schedule_from_expr_pub, plan_backfill_timestamps,
-    scheduled_workflow_id_pub, trigger_unified_dag, update_workflow_schedule_with_codecs,
+    ScheduleUpdateOutcome, SchedulerMonitor, SchedulerSnapshot, WorkflowOverrideRequest,
+    WorkflowSchedulePatch, ensure_dag_schedule, parse_schedule_from_expr_pub,
+    plan_backfill_timestamps, scheduled_workflow_id_pub, trigger_unified_dag,
+    update_code_declared_workflow_schedule, update_workflow_schedule_with_codecs,
 };
 use autumn_harvest::schema::{
     harvest_backfill_log, harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals,
@@ -3243,6 +3244,14 @@ struct UpdateWorkflowScheduleRequest {
     catchup_window_secs: Option<i64>,
     #[serde(default, deserialize_with = "deserialize_tristate")]
     retry_policy: Option<Option<autumn_harvest::RetryPolicy>>,
+    /// Delete the stored override of a code-declared schedule before the
+    /// other fields apply (issue #2386). With no other field, the schedule
+    /// returns to its code value.
+    #[serde(default)]
+    clear_override: bool,
+    /// The operator's reason, stored with the override of a code-declared
+    /// schedule (issue #2386).
+    reason: Option<String>,
 }
 
 fn default_queue_name() -> String {
@@ -7756,6 +7765,8 @@ pub const fn management_api_request_fields()
                 "catchup_policy",
                 "catchup_window_secs",
                 "retry_policy",
+                "clear_override",
+                "reason",
                 "workflow_name",
             ]),
         ),
@@ -29525,6 +29536,51 @@ async fn load_schedule_overdue_aux_by_shard(
     aux
 }
 
+/// The code value of a schedule row, when the row is declared in code
+/// (issue #2386).
+///
+/// The `DELETE /schedules` guard uses the same test. A runtime that is not
+/// attached has no code catalog, so its rows count as API-created.
+fn code_declared_schedule(
+    api_state: &HarvestApiState,
+    row: &autumn_harvest::models::HarvestSchedule,
+) -> Option<WorkflowSchedule> {
+    let workflow_name = row.workflow_name.as_deref()?;
+    if row.dag_name.is_some() {
+        return None;
+    }
+    let runtime = api_state.runtime().ok()?;
+    runtime
+        .workflow_schedules()
+        .iter()
+        .find(|ws| ws.dag_name.is_none() && ws.workflow_name == workflow_name)
+        .cloned()
+}
+
+/// Reject the fields that do not fit the kind of schedule (issue #2386).
+///
+/// An override cannot change the input of a code-declared schedule. An
+/// API-created schedule has no override, so `clear_override` and `reason`
+/// do not apply to it.
+fn check_override_fields(
+    request: &UpdateWorkflowScheduleRequest,
+    code: Option<&WorkflowSchedule>,
+    id: uuid::Uuid,
+) -> Result<(), String> {
+    match code {
+        Some(code) if request.input.is_some() => Err(format!(
+            "schedule {id} is declared in code for workflow '{}'; its input is set in code \
+             and an override cannot change it",
+            code.workflow_name
+        )),
+        None if request.clear_override || request.reason.is_some() => Err(format!(
+            "schedule {id} is not declared in code, so it has no override; \
+             clear_override and reason apply to a code-declared schedule only"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// `PATCH /admin/schedules/{id}` — partial in-place update of an existing
 /// workflow schedule (issue #771).
 ///
@@ -29534,6 +29590,11 @@ async fn load_schedule_overdue_aux_by_shard(
 /// (400). DAG schedule rows are owned by `PATCH /dags/{dag_name}` (400).
 /// The merged spec is validated before any write (400 writes nothing), and a
 /// live #350 fire claim yields 409 so an edit never races an in-flight fire.
+///
+/// A schedule declared in code converges to its code value on every tick.
+/// So a patch of one writes an operator override instead of a row edit
+/// (issue #2386). The tick applies the override before it converges the row.
+/// Such a patch cannot change `input`.
 #[allow(clippy::too_many_lines)]
 async fn update_schedule_handler(
     Extension(api_state): Extension<HarvestApiState>,
@@ -29620,6 +29681,22 @@ async fn update_schedule_handler(
     if existing.dag_name.is_some() || existing.workflow_name.is_none() {
         let err_summary =
             format!("schedule {id} is a DAG schedule; manage it via PATCH /dags/{{dag_name}}");
+        schedule_update_audit_failed(
+            &api_state,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            &id_str_owned,
+            &err_summary,
+        )
+        .await;
+        return Err(AutumnError::bad_request_msg(err_summary));
+    }
+
+    // Issue #2386: a schedule declared in code takes an override, because the
+    // tick reverts a row edit. The runtime holds the code catalog.
+    let code_schedule = code_declared_schedule(&api_state, &existing);
+    if let Err(err_summary) = check_override_fields(&request, code_schedule.as_ref(), id) {
         schedule_update_audit_failed(
             &api_state,
             &actor,
@@ -29859,7 +29936,23 @@ async fn update_schedule_handler(
         |_| api_state.payload_codecs(),
         |rt| rt.registry.payload_codecs().clone(),
     );
-    match update_workflow_schedule_with_codecs(&mut conn, id, &patch, &write_codecs).await {
+    let outcome = match &code_schedule {
+        Some(code) => {
+            let override_request = WorkflowOverrideRequest {
+                schedule_id: id,
+                code,
+                patch: &patch,
+                clear: request.clear_override,
+                actor: &actor,
+                reason: request.reason.as_deref(),
+            };
+            update_code_declared_workflow_schedule(&mut conn, &override_request, &write_codecs)
+                .await
+                .map(|update| update.outcome)
+        }
+        None => update_workflow_schedule_with_codecs(&mut conn, id, &patch, &write_codecs).await,
+    };
+    match outcome {
         Ok(ScheduleUpdateOutcome::Updated(row)) => {
             let ar = NewAuditRecord {
                 actor: &actor,

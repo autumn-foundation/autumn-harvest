@@ -391,6 +391,8 @@ diesel::table! {
         updated_by -> Text,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        /// Workflow-only override fields as one JSON object (issue #2386).
+        workflow_fields -> Jsonb,
     }
 }
 

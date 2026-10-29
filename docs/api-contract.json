@@ -8293,7 +8293,7 @@
       "path": "/admin/schedules/{id}",
       "category": "schedule",
       "read_only": false,
-      "description": "Partially update an existing workflow schedule in place (issue #771). Only provided fields change; the schedule_id is never changed, so #488 carryover lineage, the sched:{schedule_id}: workflow-id namespace, and run history are preserved. The workflow type is NOT editable (400). DAG schedules are owned by PATCH /dags/{dag_name} (400). Nullable fields (calendar, consecutive_failure_limit, end_at, max_runs, catchup_policy, retry_policy) are tri-state: omitting the field leaves it unchanged, an explicit JSON null clears it. The merged spec is validated before any write, so a 400 writes nothing. Changing the schedule expression recomputes next_run_at anchored at now (elapsed slots are never retroactively fired); other edits preserve the pending next_run_at. Anti-race with the scheduler tick: an edit is rejected 409 while a fire claim is live, an expired claim is fenced (token nulled) so a straggler fire cannot finalize over the edit, and a tick that wins its claim re-reads the row before firing, so a fire that lands concurrently with the edit always dispatches the committed new input/queue/policies.",
+      "description": "Partially update an existing workflow schedule in place (issue #771). Only provided fields change; the schedule_id is never changed, so #488 carryover lineage, the sched:{schedule_id}: workflow-id namespace, and run history are preserved. The workflow type is NOT editable (400). DAG schedules are owned by PATCH /dags/{dag_name} (400). Nullable fields (calendar, consecutive_failure_limit, end_at, max_runs, catchup_policy, retry_policy) are tri-state: omitting the field leaves it unchanged, an explicit JSON null clears it. The merged spec is validated before any write, so a 400 writes nothing. Changing the schedule expression recomputes next_run_at anchored at now (elapsed slots are never retroactively fired); other edits preserve the pending next_run_at. Anti-race with the scheduler tick: an edit is rejected 409 while a fire claim is live, an expired claim is fenced (token nulled) so a straggler fire cannot finalize over the edit, and a tick that wins its claim re-reads the row before firing, so a fire that lands concurrently with the edit always dispatches the committed new input/queue/policies. A schedule declared in code (WorkerBuilder::workflow_schedule) converges to its code value on every tick, so for it the request writes an operator override instead of a row edit (issue #2386): the override wins over code and survives a restart, clear_override returns to code, and input returns 400.",
       "idempotency": "Idempotent for identical bodies: re-applying the same partial update converges on the same row state. Returns 409 while a scheduler replica holds a live fire claim on the row (the claim lease is bounded at ~30 s); retry shortly.",
       "params": [
         {
@@ -8392,6 +8392,16 @@
             "name": "retry_policy",
             "required": false,
             "description": "New schedule-level workflow retry policy (issue #523). Tri-state: omit = unchanged, explicit null = clear."
+          },
+          {
+            "name": "clear_override",
+            "required": false,
+            "description": "Code-declared schedule only (issue #2386): delete the stored operator override before the other fields apply. Alone, it returns the schedule to its code value. 400 on a schedule made through the API."
+          },
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Code-declared schedule only (issue #2386): the operator reason stored with the override. 400 on a schedule made through the API."
           },
           {
   "name": "workflow_name",

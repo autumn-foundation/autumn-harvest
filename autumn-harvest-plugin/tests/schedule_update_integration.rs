@@ -1146,3 +1146,144 @@ async fn timezone_only_patch_on_unparseable_stored_expr_returns_400() {
     assert_eq!(status, StatusCode::OK, "{patched}");
     assert_eq!(patched["schedule_expr"], "manual");
 }
+
+// ── Code-declared schedules (issue #2386) ─────────────────────────────────────
+
+fn build_app_with_code_schedules(
+    pool: &DbPool,
+    registry: Arc<HandlerRegistry>,
+    code: Vec<autumn_harvest::policy::WorkflowSchedule>,
+) -> HarvestApiApp {
+    let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
+    api_state.set_allow_unauthenticated_mutations(true);
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::new(DagCatalog::default()),
+        Arc::new(code),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    harvest_api_router(api_state)
+}
+
+async fn tick_with_code(
+    pool: &DbPool,
+    registry: &Arc<HandlerRegistry>,
+    code: &[autumn_harvest::policy::WorkflowSchedule],
+) {
+    tick_once(
+        pool.clone(),
+        registry.clone(),
+        Arc::new(DagCatalog::default()),
+        Arc::new(code.to_vec()),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("tick_once must succeed");
+}
+
+async fn schedule_id_for(url: &str, wf_name: &str) -> Uuid {
+    use harvest_schedules::dsl;
+    let mut conn = connect(url).await;
+    harvest_schedules::table
+        .filter(dsl::workflow_name.eq(wf_name))
+        .select(dsl::id)
+        .first(&mut conn)
+        .await
+        .expect("schedule row")
+}
+
+async fn override_count(url: &str) -> i64 {
+    let mut conn = connect(url).await;
+    autumn_harvest::schema::harvest_schedule_overrides::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count overrides")
+}
+
+/// Issue #2386 AC1 to AC3 and AC5, over HTTP: a patch of a code-declared
+/// schedule writes an override, the tick keeps it, and a clear restores code.
+#[tokio::test]
+async fn code_declared_schedule_patch_writes_an_override_that_the_tick_keeps() {
+    let (url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&url);
+    let wf_name = "sched_override_code_wf";
+    let registry = etl_registry(wf_name);
+    let code = vec![autumn_harvest::policy::WorkflowSchedule::new(
+        wf_name,
+        autumn_harvest::policy::Schedule::Interval(Duration::from_secs(3600)),
+    )];
+    let app = build_app_with_code_schedules(&pool, registry.clone(), code.clone());
+    tick_with_code(&pool, &registry, &code).await;
+    let id = schedule_id_for(&url, wf_name).await;
+    let route = format!("/admin/schedules/{id}");
+
+    let (status, body) = patch_json(
+        &app,
+        route.clone(),
+        json!({ "schedule_expr": "interval:60", "reason": "incident" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["schedule_expr"], "interval:60");
+    assert_eq!(override_count(&url).await, 1);
+
+    for _ in 0..3 {
+        tick_with_code(&pool, &registry, &code).await;
+    }
+    assert_eq!(
+        load_schedule_row(&url, id).await.schedule_expr.as_deref(),
+        Some("interval:60"),
+        "the tick must keep the override"
+    );
+
+    for bad in [
+        json!({ "input": { "env": "B" } }),
+        json!({ "schedule_expr": "interval:0" }),
+    ] {
+        let (status, body) = patch_json(&app, route.clone(), bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} -> {body}");
+    }
+    assert_eq!(
+        load_schedule_row(&url, id).await.schedule_expr.as_deref(),
+        Some("interval:60"),
+        "a rejected patch must leave the override in force"
+    );
+
+    let (status, body) = patch_json(&app, route, json!({ "clear_override": true })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["schedule_expr"], "interval:3600");
+    assert_eq!(override_count(&url).await, 0);
+}
+
+/// Issue #2386 AC4: a schedule made through the API keeps the row edit.
+#[tokio::test]
+async fn api_created_schedule_patch_edits_the_row_with_no_override() {
+    let (url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&url);
+    let wf_name = "sched_override_api_wf";
+    let registry = etl_registry(wf_name);
+    let app = build_app(&pool, registry);
+    let id = create_schedule(&app, wf_name, json!({})).await;
+    let route = format!("/admin/schedules/{id}");
+
+    let (status, body) = patch_json(&app, route.clone(), json!({ "max_active_runs": 3 })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["max_active_runs"], 3);
+    assert_eq!(override_count(&url).await, 0);
+
+    for bad in [
+        json!({ "clear_override": true }),
+        json!({ "max_active_runs": 4, "reason": "incident" }),
+    ] {
+        let (status, body) = patch_json(&app, route.clone(), bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} -> {body}");
+    }
+    assert_eq!(load_schedule_row(&url, id).await.max_active_runs, 3);
+}

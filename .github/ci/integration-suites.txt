@@ -266,6 +266,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          workflow_pause_claim_recheck_tests
 linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
+linux        autumn-harvest         integration                      -                          workflow_schedule_override_db_tests
 linux        autumn-harvest         integration                      -                          workflow_task_timeout_tests
 linux        autumn-harvest         integration                      atomicity-spike            atomicity_spike_tests
 linux        autumn-harvest         integration                      hot-code-swap,testing      hot_code_swap_tests

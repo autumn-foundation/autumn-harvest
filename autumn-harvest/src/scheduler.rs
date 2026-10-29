@@ -1546,7 +1546,7 @@ async fn load_shard_overrides(
     conn: &mut AsyncPgConnection,
     shard: ShardId,
 ) -> Option<crate::schedule_override::ScheduleOverrides> {
-    match crate::schedule_override::load_dag_overrides(conn).await {
+    match crate::schedule_override::load_overrides(conn).await {
         Ok(overrides) => Some(overrides),
         Err(error) => {
             tracing::warn!(
@@ -3322,6 +3322,138 @@ pub async fn update_workflow_schedule_with_codecs(
                     Ok(ScheduleUpdateOutcome::NotFound)
                 }
             }
+        }
+    }))
+    .await
+}
+
+/// A change to the override of one code-declared workflow schedule
+/// (issue #2386).
+#[derive(Debug, Clone, Copy)]
+pub struct WorkflowOverrideRequest<'a> {
+    /// The `harvest_schedules.id` of the row.
+    pub schedule_id: uuid::Uuid,
+    /// The code value of the schedule, as the builder declares it.
+    pub code: &'a WorkflowSchedule,
+    /// The fields to set. `input` must be `None`.
+    pub patch: &'a WorkflowSchedulePatch,
+    /// Delete the stored override before `patch` merges.
+    pub clear: bool,
+    /// The actor that makes the change.
+    pub actor: &'a str,
+    /// The operator's stated reason, if any.
+    pub reason: Option<&'a str>,
+}
+
+/// The result of [`update_code_declared_workflow_schedule`].
+#[derive(Debug)]
+pub struct WorkflowOverrideUpdate {
+    /// The row outcome, as for [`update_workflow_schedule`].
+    pub outcome: ScheduleUpdateOutcome,
+    /// The stored override after the call. `None` when no field is left.
+    pub stored: Option<crate::schedule_override::WorkflowScheduleOverride>,
+}
+
+/// Change the override of a code-declared workflow schedule (issue #2386).
+///
+/// The tick converges a code-declared row to its code value. So an in-place
+/// edit through [`update_workflow_schedule`] lasts one tick. This call stores
+/// the change as an override instead, and the tick applies it before it
+/// converges the row. The precedence is override, then code.
+///
+/// The call converges the row in the same transaction, so the returned row
+/// shows the effective value. It writes nothing when the merged value fails
+/// validation, and nothing when a live fire claim holds the row. The guard
+/// and the `next_run_at` rules are those of [`update_workflow_schedule`].
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] when the patch carries an input, when
+/// the row belongs to another workflow, or when the merged value is invalid.
+/// Returns [`HarvestError::Database`] on a failed read or write.
+pub async fn update_code_declared_workflow_schedule(
+    conn: &mut AsyncPgConnection,
+    request: &WorkflowOverrideRequest<'_>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<WorkflowOverrideUpdate> {
+    use crate::schedule_override as overrides;
+    use crate::schema::harvest_schedules::dsl;
+    use diesel_async::AsyncConnection;
+
+    let workflow_name = request.code.workflow_name.as_str();
+    Box::pin(conn.transaction(async |conn| {
+        // FOR UPDATE, as in `update_workflow_schedule_with_codecs`: it orders
+        // this change against a fire of the same row.
+        let existing: Option<HarvestSchedule> = dsl::harvest_schedules
+            .find(request.schedule_id)
+            .select(HarvestSchedule::as_select())
+            .for_update()
+            .first(conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+        let Some(existing) = existing else {
+            return Ok(WorkflowOverrideUpdate {
+                outcome: ScheduleUpdateOutcome::NotFound,
+                stored: None,
+            });
+        };
+        if existing.dag_name.is_some() || existing.workflow_name.is_none() {
+            return Ok(WorkflowOverrideUpdate {
+                outcome: ScheduleUpdateOutcome::DagSchedule,
+                stored: None,
+            });
+        }
+        if existing.workflow_name.as_deref() != Some(workflow_name) {
+            return Err(HarvestError::Config(format!(
+                "schedule {} belongs to workflow {:?}, not to '{workflow_name}'",
+                existing.id, existing.workflow_name
+            )));
+        }
+
+        // The row lock above already orders two patches of this schedule.
+        // The override lock keeps the read-modify-write sound on its own.
+        let stored = overrides::lock_workflow_override(conn, workflow_name).await?;
+        let base = if request.clear {
+            WorkflowSchedulePatch::default()
+        } else {
+            stored
+                .as_ref()
+                .map(|value| value.fields.clone())
+                .unwrap_or_default()
+        };
+        if request.patch.input.is_some() {
+            return Err(HarvestError::Config(format!(
+                "schedule '{workflow_name}' is declared in code; an override cannot change \
+                 its input. Change the input in code"
+            )));
+        }
+        let merged = overrides::merge_workflow_fields(request.patch, &base);
+        let effective = overrides::validate_effective_workflow(request.code, &merged)?;
+
+        // The row update runs first. On a live claim it writes nothing, so
+        // the override is not stored either and the caller can retry.
+        let stored_ws = schedule_for_storage(&effective, codecs)?;
+        match apply_workflow_schedule_update(conn, &stored_ws, &existing, true).await? {
+            AppliedScheduleUpdate::Updated(row) => {
+                overrides::store_workflow_override(
+                    conn,
+                    workflow_name,
+                    &merged,
+                    request.actor,
+                    request.reason,
+                )
+                .await?;
+                let stored = overrides::get_workflow_override(conn, workflow_name).await?;
+                Ok(WorkflowOverrideUpdate {
+                    outcome: ScheduleUpdateOutcome::Updated(row),
+                    stored,
+                })
+            }
+            AppliedScheduleUpdate::SkippedLiveClaim => Ok(WorkflowOverrideUpdate {
+                outcome: ScheduleUpdateOutcome::ClaimLive,
+                stored,
+            }),
         }
     }))
     .await

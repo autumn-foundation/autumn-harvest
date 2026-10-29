@@ -196,6 +196,13 @@ kind = ["read"]
 tables = []
 measured = "unmeasured"
 
+["update_code_declared_workflow_schedule"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
 ["update_workflow_schedule_with_codecs"]
 driver = "per_request"
 backend = ["postgres"]
