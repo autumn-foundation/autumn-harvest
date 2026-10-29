@@ -24,6 +24,6 @@ measured = "unmeasured"
 ["db::update_run_default_override"]
 driver = "per_request"
 backend = ["postgres"]
-kind = ["write"]
+kind = ["read", "write"]
 tables = ["harvest_run_default_overrides"]
 measured = "unmeasured"

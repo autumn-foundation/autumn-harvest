@@ -51,6 +51,13 @@ use chrono::{DateTime, Utc};
 /// The maximum age of a loaded snapshot before a refresh loop reloads it.
 pub const RUN_DEFAULTS_TTL: Duration = Duration::from_secs(5);
 
+/// The longest duration that an override can set: 100 years.
+///
+/// A start adds the duration to its start time. A sum past the range of
+/// `chrono` panics, and a larger value fails its conversion and drops the
+/// deadline. So the write refuses a value above this bound.
+pub const MAX_RUN_DEFAULT: Duration = Duration::from_secs(100 * 365 * 86_400);
+
 /// The run-default fields that an override can set.
 ///
 /// `None` inherits the code value.
@@ -227,7 +234,8 @@ pub use db::*;
 #[cfg(feature = "db")]
 mod db {
     use super::{
-        RUN_DEFAULTS_TTL, RunDefaultFields, RunDefaultOverride, RunDefaultPatch, RunDefaultsCache,
+        MAX_RUN_DEFAULT, RUN_DEFAULTS_TTL, RunDefaultFields, RunDefaultOverride, RunDefaultPatch,
+        RunDefaultsCache,
     };
     use std::time::Duration;
 
@@ -383,11 +391,26 @@ mod db {
                     "{field} must be at least one second"
                 )));
             }
+            if value.flatten().is_some_and(|d| d > MAX_RUN_DEFAULT) {
+                return Err(HarvestError::Config(format!(
+                    "{field} must be at most {} seconds (100 years)",
+                    MAX_RUN_DEFAULT.as_secs()
+                )));
+            }
         }
         let change = *change;
         Box::pin(conn.transaction(async |conn| {
-            // FOR UPDATE serializes two patches of the same type. A first
-            // override has no row to lock; the primary key then decides.
+            // A first override has no row for FOR UPDATE to lock. This lock
+            // serializes two patches of the same type in that case too, so
+            // neither one merges over a read that the other replaces.
+            diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::int8)")
+                .bind::<diesel::sql_types::Text, _>(format!(
+                    "harvest:run_defaults:{}",
+                    change.workflow_name
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
             let stored = select_override(conn, change.workflow_name, true).await?;
             let base = if change.clear {
                 RunDefaultFields::default()

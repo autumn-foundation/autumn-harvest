@@ -7180,12 +7180,12 @@
           {
             "name": "sla_secs",
             "required": false,
-            "description": "Override soft SLA in whole seconds, at least 1. null returns to code."
+            "description": "Override soft SLA in whole seconds, from 1 to 3153600000 (100 years). null returns to code."
           },
           {
             "name": "execution_timeout_secs",
             "required": false,
-            "description": "Override hard execution timeout in whole seconds, at least 1. null returns to code."
+            "description": "Override hard execution timeout in whole seconds, from 1 to 3153600000 (100 years). null returns to code."
           },
           {
             "name": "clear_override",
@@ -7216,7 +7216,7 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "Empty patch, unknown field, or a zero duration."
+          "description": "Empty patch, unknown field, or a duration of zero or past 100 years."
         },
         {
           "status": 404,

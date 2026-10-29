@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use autumn_harvest::run_defaults::{
-    RUN_DEFAULTS_TTL, RunDefaultChange, RunDefaultPatch, RunDefaultsCache,
+    MAX_RUN_DEFAULT, RUN_DEFAULTS_TTL, RunDefaultChange, RunDefaultPatch, RunDefaultsCache,
     get_run_default_override, update_run_default_override,
 };
 use diesel_async::AsyncConnection;
@@ -27,14 +27,36 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 const WF: &str = "run_defaults_db_wf";
 const THREE_HOURS: Option<Duration> = Some(Duration::from_secs(3 * 3600));
 
-async fn setup_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
+/// Serializes the tests on a shared database.
+///
+/// They share one table, and one test renames it away for a moment.
+static SHARED_DB: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Keeps a test database alive: its container, or the shared-database lock.
+struct Hold {
+    _container: Option<ContainerAsync<Postgres>>,
+    _shared: Option<tokio::sync::MutexGuard<'static, ()>>,
+}
+
+async fn setup_db() -> (AsyncPgConnection, Hold) {
+    let (conn, hold, _) = setup_db_with_url().await;
+    (conn, hold)
+}
+
+/// Also returns the URL, so a test can open a second connection.
+async fn setup_db_with_url() -> (AsyncPgConnection, Hold, String) {
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        let shared = SHARED_DB.lock().await;
         let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
         diesel::sql_query("DELETE FROM harvest_run_default_overrides")
             .execute(&mut conn)
             .await
             .expect("scrub");
-        return (conn, None);
+        let hold = Hold {
+            _container: None,
+            _shared: Some(shared),
+        };
+        return (conn, hold, url);
     }
     let container = Postgres::default()
         .with_tag("16")
@@ -48,7 +70,11 @@ async fn setup_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
     conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migration");
-    (conn, Some(container))
+    let hold = Hold {
+        _container: Some(container),
+        _shared: None,
+    };
+    (conn, hold, url)
 }
 
 fn set_sla(secs: u64) -> RunDefaultPatch {
@@ -175,6 +201,58 @@ async fn a_patch_merges_and_the_last_field_deletes_the_row() {
             .expect("read")
             .is_none()
     );
+}
+
+/// Two first patches of the same type both land, field by field.
+///
+/// Neither finds a row to lock, so the type lock serializes them. Without it
+/// the second upsert would overwrite the field of the first.
+#[tokio::test]
+async fn two_first_patches_of_one_type_both_land() {
+    let (mut conn, _container, url) = setup_db_with_url().await;
+    let mut handles = Vec::new();
+    for patch in [
+        set_sla(300),
+        RunDefaultPatch {
+            execution_timeout: Some(Some(Duration::from_secs(600))),
+            ..RunDefaultPatch::default()
+        },
+    ] {
+        let url = url.clone();
+        handles.push(tokio::spawn(async move {
+            let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+            change(&mut conn, patch).await;
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("join");
+    }
+    let stored = get_run_default_override(&mut conn, WF)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(stored.fields.sla, Some(Duration::from_secs(300)));
+    assert_eq!(
+        stored.fields.execution_timeout,
+        Some(Duration::from_secs(600))
+    );
+}
+
+/// A duration that a start cannot add to its start time is refused.
+#[tokio::test]
+async fn a_duration_past_the_bound_is_refused() {
+    let (mut conn, _container) = setup_db().await;
+    let change = RunDefaultChange {
+        workflow_name: WF,
+        patch: set_sla(MAX_RUN_DEFAULT.as_secs() + 1),
+        clear: false,
+        actor: "ops",
+        reason: None,
+    };
+    let error = update_run_default_override(&mut conn, &change)
+        .await
+        .expect_err("past the bound is refused");
+    assert!(error.to_string().contains("at most"), "{error}");
 }
 
 /// A zero duration is refused and writes nothing.

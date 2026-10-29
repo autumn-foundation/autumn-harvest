@@ -8,7 +8,8 @@ operator override of `sla_secs` and `execution_timeout_secs` for one type. A
 DAG uses its own name. The override wins over code for every new run and
 survives a restart. `GET` on the same route shows the code value, the
 override and the effective value. Each field is tri-state, and
-`clear_override` returns the type to its code values.
+`clear_override` returns the type to its code values. A duration must be
+from 1 second to 100 years, so a start can always add it to its start time.
 
 Every start path reads the override from an in-process cache, so a start
 sends no extra query. The cache reloads once it is older than 5 seconds. The

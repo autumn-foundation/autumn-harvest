@@ -5654,7 +5654,7 @@
                     "description": "true deletes the stored override before the other fields merge."
                   },
                   "execution_timeout_secs": {
-                    "description": "Override hard execution timeout in whole seconds, at least 1. null returns to code."
+                    "description": "Override hard execution timeout in whole seconds, from 1 to 3153600000 (100 years). null returns to code."
                   },
                   "reason": {
                     "description": "Operator reason stored with the override."
@@ -5663,7 +5663,7 @@
                     "description": "true also moves the SLA deadline of the in-flight runs of the type. Default false: the change applies to new runs only."
                   },
                   "sla_secs": {
-                    "description": "Override soft SLA in whole seconds, at least 1. null returns to code."
+                    "description": "Override soft SLA in whole seconds, from 1 to 3153600000 (100 years). null returns to code."
                   }
                 },
                 "type": "object"
@@ -5690,7 +5690,7 @@
             "description": "Success."
           },
           "400": {
-            "description": "Empty patch, unknown field, or a zero duration."
+            "description": "Empty patch, unknown field, or a duration of zero or past 100 years."
           },
           "404": {
             "description": "Workflow type not registered in this process."

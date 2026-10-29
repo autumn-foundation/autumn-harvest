@@ -37890,6 +37890,10 @@ impl Worker {
         // A direct caller of this entry point skips `run`, so bind here too
         // (issue #1431).
         self.register_notify_pools(pool);
+        // It also skips the run-default refresh loop of `run` (issue #2387).
+        #[cfg(feature = "db")]
+        let _run_defaults =
+            spawn_run_defaults_refresh(Arc::clone(self.registry.run_defaults()), pool.clone());
         let bound = self.bound_channel();
         crate::dispatch::with_bound_channel(
             bound,

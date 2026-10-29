@@ -41,8 +41,8 @@ Both routes need the admin role. Each `PATCH` writes one
 
 | Field | Meaning |
 |-------|---------|
-| `sla_secs` | The soft SLA in whole seconds, at least 1. A breach is reported. It never ends a run. |
-| `execution_timeout_secs` | The hard execution timeout in whole seconds, at least 1. A run past it is ended. |
+| `sla_secs` | The soft SLA in whole seconds, from 1 to 3153600000 (100 years). A breach is reported. It never ends a run. |
+| `execution_timeout_secs` | The hard execution timeout in whole seconds, from 1 to 3153600000 (100 years). A run past it is ended. |
 | `clear_override` | `true` deletes the stored override before the other fields merge. |
 | `reason` | Free text stored with the override. |
 | `recompute_in_flight` | `true` moves the SLA deadline of the runs in flight. Default `false`. |
