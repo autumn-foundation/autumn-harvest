@@ -213,7 +213,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **An agent workspace snapshot survives a host crash.** `DirWorkspaceBlobs::put` now syncs the scratch file, renames it with `partition_archive::rename_durable` and syncs its folder, and the parent of each folder that it makes, before it returns. Before, the put ended at a flush, so a crash after a tool-call result committed could lose the snapshot that the history names.
+- **An agent workspace snapshot survives a host crash.** `DirWorkspaceBlobs::put` now syncs the scratch file, renames it and syncs its folder with `partition_archive::sync_dir`, and the parent of each folder that it makes, before it returns. Before, the put ended at a flush, so a crash after a tool-call result committed could lose the snapshot that the history names.
 
 - **Run the MCP tools and durable webhook suites in CI (issue #1959).** `mcp_tools_integration` and `webhook_durable_integration` now run in CI from `linux` manifest rows. Before this change, every test in them was `#[ignore]`d, so CI never ran them.
 

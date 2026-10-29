@@ -506,14 +506,19 @@ async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<
 /// the snapshot key. So the rename must survive a crash. `created` lists the
 /// folders that this put made. Each of their parents holds a new entry, so
 /// each parent is synced too.
+///
+/// The rename is `std::fs::rename`. On Windows it replaces with POSIX
+/// semantics, so concurrent puts of one digest all succeed. A write-through
+/// `MoveFileExW` refuses that race with an access error. Windows has no
+/// folder sync, so the rename there is not written through.
 async fn publish_durable(
     tmp: PathBuf,
     path: PathBuf,
     created: Vec<PathBuf>,
 ) -> std::io::Result<()> {
     tokio::task::spawn_blocking(move || {
-        use autumn_harvest::partition_archive::{rename_durable, sync_dir};
-        rename_durable(&tmp, &path)?;
+        use autumn_harvest::partition_archive::sync_dir;
+        std::fs::rename(&tmp, &path)?;
         if let Some(folder) = path.parent() {
             sync_dir(folder)?;
         }

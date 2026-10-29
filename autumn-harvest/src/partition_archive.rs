@@ -639,14 +639,7 @@ fn dir_or_cwd(dir: &Path) -> &Path {
 
 /// Rename `from` to `to`. On Windows, the call returns only when the move is
 /// on disk, because a directory there cannot be opened for a sync.
-///
-/// Pair it with [`sync_dir`] on the directory of `to`. Other crates of the
-/// workspace use the two for their own atomic writes.
-///
-/// # Errors
-///
-/// The error of the rename.
-pub fn rename_durable(from: &Path, to: &Path) -> std::io::Result<()> {
+fn rename_durable(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt as _;
@@ -677,7 +670,8 @@ pub fn rename_durable(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// Sync a directory, so a rename in it survives a crash. A no-op off Unix.
-/// On Windows, [`rename_durable`] writes the move through instead.
+/// On Windows, the archiver writes the move through instead. Other crates of
+/// the workspace call it after their own atomic renames.
 ///
 /// # Errors
 ///
