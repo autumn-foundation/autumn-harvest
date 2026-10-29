@@ -486,7 +486,9 @@ fn io_error(err: &std::io::Error) -> AgentError {
 
 /// Write `bytes` to a new file at `path` that only its owner can read.
 ///
-/// The file must not exist, so two writers never share one handle.
+/// The file must not exist, so two writers never share one handle. The call
+/// returns after the bytes are on disk, so a later rename cannot expose an
+/// empty file after a crash.
 async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt as _;
     let mut options = tokio::fs::OpenOptions::new();
@@ -495,7 +497,50 @@ async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<
     options.mode(0o600);
     let mut file = options.open(path).await?;
     file.write_all(bytes).await?;
-    file.flush().await
+    file.sync_all().await
+}
+
+/// Rename the synced scratch file `tmp` to `path`, then sync the folder.
+///
+/// A tool-call result commits after the put returns, and its history names
+/// the snapshot key. So the rename must survive a crash. `created` lists the
+/// folders that this put made. Each of their parents holds a new entry, so
+/// each parent is synced too.
+async fn publish_durable(
+    tmp: PathBuf,
+    path: PathBuf,
+    created: Vec<PathBuf>,
+) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        use autumn_harvest::partition_archive::{rename_durable, sync_dir};
+        rename_durable(&tmp, &path)?;
+        if let Some(folder) = path.parent() {
+            sync_dir(folder)?;
+        }
+        for dir in &created {
+            if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+                sync_dir(parent)?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+/// The folders of `folder` and its parents that do not exist yet, nearest
+/// first.
+async fn missing_dirs(folder: &std::path::Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut probe = Some(folder);
+    while let Some(dir) = probe.filter(|d| !d.as_os_str().is_empty()) {
+        if tokio::fs::metadata(dir).await.is_ok() {
+            break;
+        }
+        missing.push(dir.to_path_buf());
+        probe = dir.parent();
+    }
+    missing
 }
 
 /// A scratch path next to `path` that no other put uses.
@@ -518,12 +563,14 @@ impl WorkspaceBlobs for DirWorkspaceBlobs {
     ) -> BoxFuture<'a, Result<(), AgentError>> {
         Box::pin(async move {
             let path = self.file(scope, digest)?;
-            tokio::fs::create_dir_all(self.folder(scope))
+            let folder = self.folder(scope);
+            let created = missing_dirs(&folder).await;
+            tokio::fs::create_dir_all(&folder)
                 .await
                 .map_err(|e| io_error(&e))?;
             let tmp = scratch_path(&path);
             let written = match write_private(&tmp, &bytes).await {
-                Ok(()) => tokio::fs::rename(&tmp, &path).await,
+                Ok(()) => publish_durable(tmp.clone(), path, created).await,
                 Err(err) => Err(err),
             };
             if let Err(err) = written {
@@ -1365,6 +1412,35 @@ mod tests {
         let path = blobs.file("agent:x/y", &digest).unwrap();
         let mode = std::fs::metadata(path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn missing_dirs_lists_each_new_folder_nearest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("a").join("b");
+        assert_eq!(
+            missing_dirs(&folder).await,
+            vec![folder.clone(), dir.path().join("a")]
+        );
+        std::fs::create_dir_all(&folder).unwrap();
+        assert_eq!(missing_dirs(&folder).await, Vec::<PathBuf>::new());
+    }
+
+    #[tokio::test]
+    async fn a_put_under_a_new_root_publishes_the_blob_and_no_scratch_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = DirWorkspaceBlobs::new(dir.path().join("new").join("root"));
+        let digest = format!("{}-{}", "0".repeat(16), "c".repeat(64));
+        blobs.put("s", &digest, b"three".to_vec()).await.unwrap();
+        assert_eq!(
+            blobs.get("s", &digest).await.unwrap().as_deref(),
+            Some(&b"three"[..])
+        );
+        let names: Vec<_> = std::fs::read_dir(blobs.folder("s"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(&digest)]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
