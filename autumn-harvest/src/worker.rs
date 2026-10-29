@@ -37723,24 +37723,34 @@ impl Worker {
             // Sequential round-robin avoids borrow-checker issues with
             // select_all over &mut references while still letting any listener
             // wake the loop.
-            let poll_interval = self.config.poll_interval;
-            let shutdown = &self.shutdown;
             // A full pool also wakes on a released permit (issue #1787).
             let capacity = self.capacity_wait();
 
             if shard_listeners.iter().all(Option::is_none) {
-                tokio::select! {
-                    () = shutdown.cancelled() => break,
-                    () = capacity.woken() => {}
-                    () = self.deferral_due.notified() => {}
-                    () = self.decision_done.notified() => {}
-                    () = self.owner_woken.notified() => {}
-                    () = tokio::time::sleep(poll_interval) => {}
+                if self.wait_without_listeners(capacity).await {
+                    break;
                 }
             } else {
                 self.wait_on_shard_listeners(&mut shard_listeners, capacity)
                     .await;
             }
+        }
+    }
+
+    /// Wait for one `poll_interval` when no shard has a listener (extracted
+    /// from [`Self::run_poll_loop_multi`]).
+    ///
+    /// Any local wake ends the wait early. A cut settle still owes its poll
+    /// here (issue #2418). Returns `true` on shutdown.
+    async fn wait_without_listeners(&self, capacity: CapacityWait<'_>) -> bool {
+        tokio::select! {
+            () = self.shutdown.cancelled() => true,
+            () = capacity.woken() => false,
+            () = self.deferral_due.notified() => false,
+            () = self.decision_done.notified() => false,
+            () = self.owed_poll() => false,
+            () = self.owner_woken.notified() => false,
+            () = tokio::time::sleep(self.config.poll_interval) => false,
         }
     }
 
@@ -59048,6 +59058,28 @@ mod tests {
             "the owed poll must come at the end of the later settle, came {waited:?} after it began \
              ({:?} after the first)",
             start.elapsed()
+        );
+    }
+
+    /// A multi-shard worker that lost every listener still takes the poll
+    /// that a cut settle owes (issue #2418). It does not wait the whole
+    /// poll interval.
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_settle_owes_its_poll_with_no_listener() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let mut config = default_runtime_config();
+        config.poll_interval = Duration::from_secs(5);
+        let worker = Worker::new(config, registry).expect("valid config");
+
+        let start = tokio::time::Instant::now();
+        worker.decision_done.notify_one();
+        worker.settle().await;
+        let shut = worker.wait_without_listeners(worker.capacity_wait()).await;
+        let waited = start.elapsed();
+        assert!(!shut, "the wait must not report a shutdown");
+        assert!(
+            waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
+            "the owed poll must come at the end of the cut settle, came after {waited:?}"
         );
     }
 
