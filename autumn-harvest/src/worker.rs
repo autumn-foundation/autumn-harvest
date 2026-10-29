@@ -40218,7 +40218,9 @@ impl Worker {
                     .owed_poll
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                *owed = Some(owed.map_or(end, |at| at.min(end)));
+                // Keep the later end. A row due at the earlier end is still
+                // pending then, so one poll covers both.
+                *owed = Some(owed.map_or(end, |at| at.max(end)));
             }
         }
     }
@@ -58832,6 +58834,34 @@ mod tests {
         )
         .await;
         assert!(later.is_err(), "an owed poll must wake one wait only");
+    }
+
+    /// Two cut settles owe one poll at the later end (issue #2418). A poll
+    /// at the earlier end could miss the row of the second NOTIFY.
+    #[tokio::test(start_paused = true)]
+    async fn two_cut_settles_owe_a_poll_at_the_later_end() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        let start = tokio::time::Instant::now();
+        worker.decision_done.notify_one();
+        worker.settle().await;
+        // The second settle starts past the latest end of the first.
+        tokio::time::sleep(crate::notify::SETTLE_DELAY_MAX).await;
+        let second = tokio::time::Instant::now();
+        worker.decision_done.notify_one();
+        worker.settle().await;
+
+        worker
+            .idle_wait_then_settle(std::future::pending::<bool>())
+            .await;
+        let waited = second.elapsed();
+        assert!(
+            waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
+            "the owed poll must come at the end of the later settle, came {waited:?} after it began \
+             ({:?} after the first)",
+            start.elapsed()
+        );
     }
 
     /// Only a workflow permit wakes the leader on release (issue #2418). A
