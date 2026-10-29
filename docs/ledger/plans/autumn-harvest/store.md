@@ -69,6 +69,46 @@ Statements: 7. Tables with no usable index: none.
 | 6 | `SELECT COUNT(*) FROM "harvest_workflow_logs" WHERE ((("harvest_workflow_logs"."workflow_exec_id" ...` | `harvest_workflow_logs`: Bitmap Heap Scan on `harvest_workflow_logs_exec_seq` |
 | 7 | `SELECT EXISTS (SELECT "harvest_workflow_logs"."id", "harvest_workflow_logs"."workflow_exec_id", "...` | `harvest_workflow_logs`: Index Only Scan on `harvest_workflow_logs_exec_seq` |
 
+## `batch_blob_keys_still_referenced`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT DISTINCT "harvest_payload_refs"."blob_key" FROM "harvest_payload_refs" WHERE ("harvest_pay...` | `harvest_payload_refs`: Bitmap Heap Scan on `idx_harvest_payload_refs_key` |
+
+## `blob_key_still_referenced`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_payload_refs"."blob_key" FROM "harvest_payload_refs" WHERE ("harvest_payload_refs...` | `harvest_payload_refs`: Index Only Scan on `idx_harvest_payload_refs_key` |
+
+## `delete_llm_ledger`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM "harvest_llm_ledger" WHERE ("harvest_llm_ledger"."workflow_exec_id" = $1)` | `harvest_llm_ledger`: Bitmap Heap Scan on `harvest_llm_ledger_pkey`<br>`harvest_llm_ledger`: ModifyTable |
+
+## `delete_stream_chunks`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM "harvest_stream_chunks" WHERE ("harvest_stream_chunks"."workflow_exec_id" = $1)` | `harvest_stream_chunks`: Bitmap Heap Scan on `harvest_stream_chunks_exec_offset`<br>`harvest_stream_chunks`: ModifyTable |
+
+## `delete_workflow_logs`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM "harvest_workflow_logs" WHERE ("harvest_workflow_logs"."workflow_exec_id" = $1)` | `harvest_workflow_logs`: Bitmap Heap Scan on `harvest_workflow_logs_exec_seq`<br>`harvest_workflow_logs`: ModifyTable |
+
 ## `insert_events`
 
 Statements: 25. Tables with no usable index: none.

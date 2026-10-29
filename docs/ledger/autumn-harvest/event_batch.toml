@@ -13,6 +13,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_event_batches"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/event_batch.md"
 
 ["fire_due_on_conn"]
 driver = "per_tick"
@@ -20,6 +21,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_event_batches"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/event_batch.md"
 
 ["list_pending_event_batches"]
 driver = "per_request"
@@ -34,6 +36,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_event_batches"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/event_batch.md"
 
 ["redefer_event_batch_row"]
 driver = "per_tick"
@@ -41,3 +44,4 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_event_batches"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/event_batch.md"

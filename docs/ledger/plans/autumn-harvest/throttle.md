@@ -18,6 +18,24 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `delete_throttle_row`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM harvest_start_throttle WHERE id = $1` | `harvest_start_throttle`: Index Scan on `harvest_start_throttle_pkey`<br>`harvest_start_throttle`: ModifyTable |
+
+## `fire_due_on_conn`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT EXISTS (SELECT 1 FROM harvest_start_throttle LIMIT 1) AS present` | `harvest_start_throttle`: full scan of index `idx_harvest_start_throttle_workflow_id` |
+| 2 | `SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS present` | no table |
+| 3 | `WITH candidates AS ( SELECT t.id, t.deferred_at, ROW_NUMBER() OVER ( PARTITION BY t.bucket_key OR...` | `harvest_rate_limit_buckets`: full scan of index `harvest_rate_limit_buckets_pkey`<br>`harvest_start_throttle`: Index Scan on `harvest_start_throttle_pkey`<br>`harvest_start_throttle`: full scan of index `idx_harvest_start_throttle_bucket_deferred` |
+
 ## `pre_lock_rate_limit_buckets_for_claimed_batch`
 
 Statements: 1. Tables with no usable index: none.
@@ -25,4 +43,12 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT key FROM harvest_rate_limit_buckets WHERE key = ANY($1) ORDER BY key COLLATE "C" FOR UPDATE` | `harvest_rate_limit_buckets`: Bitmap Heap Scan on `harvest_rate_limit_buckets_pkey` |
+
+## `redefer_throttle_row`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE harvest_start_throttle SET deferred_at = $2 WHERE id = $1` | `harvest_start_throttle`: Index Scan on `harvest_start_throttle_pkey`<br>`harvest_start_throttle`: ModifyTable |
 

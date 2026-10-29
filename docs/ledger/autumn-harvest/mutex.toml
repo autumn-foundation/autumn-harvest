@@ -46,6 +46,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_mutex_locks", "harvest_mutex_waiters", "harvest_workflow_executions"]
 measured = "docs/performance-mutex-lease-reclaim.md"
+plan = "docs/ledger/plans/autumn-harvest/mutex.md"
 
 ["db_ops::release_all_locks_for_holder"]
 driver = "per_task"

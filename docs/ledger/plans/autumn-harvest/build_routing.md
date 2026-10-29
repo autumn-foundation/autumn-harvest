@@ -26,3 +26,11 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT build_id, compatible_with FROM harvest_build_compat` | `harvest_build_compat`: Bitmap Heap Scan on `harvest_build_compat_build_id_compatible_with_key` |
 
+## `ramp_generation_aborted`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT EXISTS ( SELECT 1 FROM harvest_build_policies p, unnest($2::uuid[]) AS g(id) WHERE p.queue...` | `harvest_build_policies`: Index Scan on `harvest_build_policies_queue_name_key`<br>`harvest_ramp_abort_reports`: Index Only Scan on `harvest_ramp_abort_reports_pkey`<br>`harvest_ramp_retired_ids`: Index Only Scan on `harvest_ramp_retired_ids_pkey` |
+

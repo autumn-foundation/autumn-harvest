@@ -20,6 +20,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_start_idempotency"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/start_idempotency.md"
 
 ["db_impl::repoint_start_idempotency_claim"]
 driver = "per_request"
@@ -48,3 +49,4 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_start_idempotency"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/start_idempotency.md"

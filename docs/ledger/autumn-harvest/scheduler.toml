@@ -13,6 +13,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["claim_and_fire_workflow_schedule"]
 driver = "per_tick"
@@ -20,6 +21,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["dag_registration_is_converged"]
 driver = "setup"
@@ -41,6 +43,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["drain_claimed_buffered_schedule"]
 driver = "per_tick"
@@ -48,6 +51,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["due_workflow_schedules"]
 driver = "per_tick"
@@ -55,6 +59,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["find_converged_workflow_schedule"]
 driver = "setup"
@@ -97,6 +102,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["maybe_increment_schedule_failure_counter"]
 driver = "per_tick"
@@ -104,6 +110,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["maybe_reset_schedule_failure_counter"]
 driver = "per_tick"
@@ -111,6 +118,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["merge_pause_metadata_into_schedule"]
 driver = "per_request"
@@ -125,6 +133,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_schedules"]
 measured = "docs/performance-schedule-overdue-pass.md"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["record_catchup_drops"]
 driver = "per_tick"
@@ -132,6 +141,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["release_fire_claim"]
 driver = "per_tick"
@@ -139,6 +149,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["release_squatted_workflow_name"]
 driver = "setup"
@@ -153,6 +164,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "docs/performance-schedule-overdue-aux.md"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["schedule_running_basis_batch"]
 driver = "per_tick"
@@ -160,6 +172,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "docs/performance-schedule-overdue-aux.md"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["stale_dag_rows_exist"]
 driver = "setup"
@@ -174,6 +187,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["tick_workflow_schedules"]
 driver = "per_tick"

@@ -14,6 +14,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "docs/performance-queue-depth-gauge.md"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["cancel_activity_task_with_reason"]
 driver = "per_task"
@@ -101,6 +102,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["complete_task_inner"]
 driver = "per_task"
@@ -286,6 +288,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_activity_pauses", "harvest_queue_pauses", "harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workflow_executions"]
 measured = "docs/performance-queue-age-gauge.md"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["owner_keys"]
 driver = "per_task"
@@ -301,6 +304,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_queue_pauses"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["park_workflow_task_inner"]
 driver = "per_task"
@@ -331,6 +335,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "docs/performance-queue-depth-gauge.md"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["queue_task_counts"]
 driver = "per_request"
@@ -472,6 +477,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_rate_limit_buckets"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["session_has_other_live_tasks"]
 driver = "per_task"
@@ -503,6 +509,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_rate_limit_buckets"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["sweep_terminal_tasks_into"]
 driver = "per_tick"
@@ -510,6 +517,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["take_timed_out_claim"]
 driver = "per_task"

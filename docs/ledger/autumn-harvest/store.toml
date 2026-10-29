@@ -52,6 +52,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_payload_refs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["blob_key_still_referenced"]
 driver = "per_tick"
@@ -59,6 +60,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_payload_refs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["check_execution_exists"]
 driver = "per_task"
@@ -87,6 +89,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_llm_ledger"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["delete_stream_chunks"]
 driver = "per_tick"
@@ -94,6 +97,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_stream_chunks"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["delete_workflow_logs"]
 driver = "per_tick"
@@ -101,6 +105,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_workflow_logs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["insert_events"]
 driver = "per_task"

@@ -293,6 +293,22 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."state" FROM "harvest_wo...` | `harvest_workflow_executions`: Index Scan on `harvest_we_workflow_name_workflow_id_active_key` |
 
+## `sample_active_workflow_counts`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT workflow_name, state, COUNT(*)::bigint AS active_count FROM harvest_workflow_executions WH...` | `harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_non_terminal_wf_name` |
+
+## `sample_history_oversized_counts`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT wf.workflow_name, COUNT(*)::bigint AS oversized_count FROM harvest_workflow_executions wf ...` | `harvest_events`: Bitmap Heap Scan on `idx_harvest_events_history_page`<br>`harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_non_terminal_wf_name` |
+
 ## `suspended_command_event_count`
 
 Statements: 1. Tables with no usable index: none.

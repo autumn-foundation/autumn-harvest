@@ -161,6 +161,12 @@ values replace their parameters first, as in the custom plan that Postgres
 makes for each call. Without them, a generic plan cannot use a partial index
 such as `WHERE NOT consumed`.
 
+A generic plan also cannot infer the type of a parameter in `($3)[2]` or
+`unnest($1)`. When a plan fails, the script guesses each type from the
+recorded bind value and plans again with casts. A statement that still
+fails shows its error on the page. Most are a list of `None` with no type,
+or a table that a partition or preview step creates at run time.
+
 The tables are empty, so the index that the planner picks among several
 usable ones is a hint only. A plan is not a buffer count, so the census
 does not change `measured`.
@@ -169,7 +175,7 @@ does not change `measured`.
 HARVEST_LEDGER_CENSUS=/var/tmp/census.jsonl \
     cargo test -p autumn-harvest --test integration -- --test-threads=6
 python3 docs/audits/ledger-census.py attribute /var/tmp/census.jsonl
-python3 docs/audits/ledger-census.py plan postgres://postgres@127.0.0.1/ledger_plan --driver per_task
+python3 docs/audits/ledger-census.py plan postgres://postgres@127.0.0.1/ledger_plan --driver per_tick
 ```
 
 Run the suites with no `HARVEST_TEST_DATABASE_URL`, so that each suite boots

@@ -13,6 +13,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_build_policies"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/ramp_guard.md"
 
 ["clear_ramp"]
 driver = "per_tick"
@@ -20,6 +21,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_build_policies", "harvest_ramp_retired_ids"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/ramp_guard.md"
 
 ["mark_abort_reported"]
 driver = "per_tick"
@@ -27,6 +29,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_build_policies"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/ramp_guard.md"
 
 ["prune_finished_markers"]
 driver = "per_tick"
@@ -34,6 +37,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_build_policies"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/ramp_guard.md"
 
 ["ramp_aborted_by_guard"]
 driver = "per_tick"
@@ -41,6 +45,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_build_policies"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/ramp_guard.md"
 
 ["read_pool_ramps"]
 driver = "per_tick"
@@ -48,6 +53,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_build_policies"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/ramp_guard.md"
 
 ["read_step_stats"]
 driver = "per_tick"
@@ -55,6 +61,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/ramp_guard.md"
 
 ["record_abort_report"]
 driver = "per_tick"
@@ -62,6 +69,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_ramp_abort_reports"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/ramp_guard.md"
 
 ["record_abort_tombstones"]
 driver = "per_tick"
@@ -69,6 +77,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_build_policies", "harvest_ramp_abort_reports", "harvest_ramp_retired_ids"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/ramp_guard.md"
 
 ["stamp_report_id"]
 driver = "per_tick"
@@ -76,3 +85,4 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_build_policies"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/ramp_guard.md"
