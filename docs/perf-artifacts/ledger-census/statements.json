@@ -2050,7 +2050,7 @@
    }
   },
   "release_backfill_budget_slot": {
-   "UPDATE \"harvest_schedules\" SET \"exhausted_at\" = $1, \"exhausted_reason\" = $2, \"updated_at\" = $3 WHERE ((((\"harvest_schedules\".\"id\" = $4) AND (\"harvest_schedules\".\"exhausted_at\" IS NOT NULL)) AND (\"harvest_schedules\".\"exhausted_reason\" = $5)) AND max_runs IS NULL OR max_runs <= 0 OR runs_started < max_runs)": {
+   "UPDATE \"harvest_schedules\" SET \"exhausted_at\" = $1, \"exhausted_reason\" = $2, \"updated_at\" = $3 WHERE ((((\"harvest_schedules\".\"id\" = $4) AND (\"harvest_schedules\".\"exhausted_at\" IS NOT NULL)) AND (\"harvest_schedules\".\"exhausted_reason\" = $5)) AND (max_runs IS NULL OR max_runs <= 0 OR runs_started < max_runs))": {
     "literals": [
      {
       "5": "'max_runs_exhausted'"
@@ -2095,7 +2095,7 @@
    }
   },
   "reserve_backfill_budget_slot": {
-   "UPDATE \"harvest_schedules\" SET \"runs_started\" = (\"harvest_schedules\".\"runs_started\" + $1), \"updated_at\" = $2 WHERE (((\"harvest_schedules\".\"id\" = $3) AND (\"harvest_schedules\".\"exhausted_at\" IS NULL)) AND max_runs IS NULL OR max_runs <= 0 OR runs_started < max_runs) RETURNING \"harvest_schedules\".\"runs_started\"": {
+   "UPDATE \"harvest_schedules\" SET \"runs_started\" = (\"harvest_schedules\".\"runs_started\" + $1), \"updated_at\" = $2 WHERE (((\"harvest_schedules\".\"id\" = $3) AND (\"harvest_schedules\".\"exhausted_at\" IS NULL)) AND (max_runs IS NULL OR max_runs <= 0 OR runs_started < max_runs)) RETURNING \"harvest_schedules\".\"runs_started\"": {
     "literals": [
      {}
     ],
@@ -2453,7 +2453,7 @@
     ],
     "types": {}
    },
-   "UPDATE \"harvest_schedules\" SET \"runs_started\" = (\"harvest_schedules\".\"runs_started\" + $1), \"updated_at\" = $2 WHERE (((\"harvest_schedules\".\"id\" = $3) AND (\"harvest_schedules\".\"exhausted_at\" IS NULL)) AND max_runs IS NULL OR runs_started < max_runs)": {
+   "UPDATE \"harvest_schedules\" SET \"runs_started\" = (\"harvest_schedules\".\"runs_started\" + $1), \"updated_at\" = $2 WHERE (((\"harvest_schedules\".\"id\" = $3) AND (\"harvest_schedules\".\"exhausted_at\" IS NULL)) AND (max_runs IS NULL OR runs_started < max_runs))": {
     "literals": [
      {}
     ],

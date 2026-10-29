@@ -441,11 +441,11 @@ Statements: 1. Tables with no usable index: none.
 
 ## `release_backfill_budget_slot`
 
-Statements: 3. Tables with no usable index: `harvest_schedules`.
+Statements: 3. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `UPDATE "harvest_schedules" SET "exhausted_at" = $1, "exhausted_reason" = $2, "updated_at" = $3 WH...` | `harvest_schedules`: ModifyTable<br>`harvest_schedules`: no usable index |
+| 1 | `UPDATE "harvest_schedules" SET "exhausted_at" = $1, "exhausted_reason" = $2, "updated_at" = $3 WH...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
 | 2 | `UPDATE "harvest_schedules" SET "next_run_at" = $1, "updated_at" = $2 WHERE ((("harvest_schedules"...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
 | 3 | `UPDATE "harvest_schedules" SET "runs_started" = ("harvest_schedules"."runs_started" - $1), "updat...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
 
@@ -459,11 +459,11 @@ Statements: 1. Tables with no usable index: none.
 
 ## `reserve_backfill_budget_slot`
 
-Statements: 1. Tables with no usable index: `harvest_schedules`.
+Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `UPDATE "harvest_schedules" SET "runs_started" = ("harvest_schedules"."runs_started" + $1), "updat...` | `harvest_schedules`: ModifyTable<br>`harvest_schedules`: no usable index |
+| 1 | `UPDATE "harvest_schedules" SET "runs_started" = ("harvest_schedules"."runs_started" + $1), "updat...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
 
 ## `resolve_schedule_with_shard`
 
@@ -562,12 +562,12 @@ Statements: 1. Tables with no usable index: none.
 
 ## `trigger_schedule_now`
 
-Statements: 2. Tables with no usable index: `harvest_schedules`.
+Statements: 2. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT $1` | no table |
-| 2 | `UPDATE "harvest_schedules" SET "runs_started" = ("harvest_schedules"."runs_started" + $1), "updat...` | `harvest_schedules`: ModifyTable<br>`harvest_schedules`: no usable index |
+| 2 | `UPDATE "harvest_schedules" SET "runs_started" = ("harvest_schedules"."runs_started" + $1), "updat...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
 
 ## `update_with_start_workflow`
 
