@@ -1,4 +1,4 @@
-## Tooling — Ledger census batch 4: the setup profiles (issue #2366)
+## Tooling — Ledger census batch 4: the setup profiles (issue #2414)
 
 The Ledger census now plans the `setup` Postgres profiles, the queries that
 run at startup, in migrations and in partition layout changes. 63 of them link
