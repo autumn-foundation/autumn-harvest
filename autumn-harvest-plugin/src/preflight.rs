@@ -420,6 +420,13 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
     ("harvest_schedules", &["SELECT", "INSERT", "UPDATE"]),
+    // Each scheduler pass reads the operator overrides, and a missing grant
+    // skips every pass (issue #2385). `PATCH /dags/{dag_name}` writes and
+    // deletes rows.
+    (
+        "harvest_schedule_overrides",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
     ("harvest_signals", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_timers", &["SELECT", "INSERT", "UPDATE", "DELETE"]),
     ("harvest_dead_letters", &["SELECT", "INSERT", "DELETE"]),

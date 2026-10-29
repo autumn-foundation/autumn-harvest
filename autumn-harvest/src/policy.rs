@@ -737,7 +737,7 @@ impl TriggerRule {
 ///
 /// let sched = Schedule::Interval(Duration::from_secs(60));
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Schedule {
     /// Standard cron expression (e.g., `"0 2 * * *"` for daily at 2 AM).
     ///
