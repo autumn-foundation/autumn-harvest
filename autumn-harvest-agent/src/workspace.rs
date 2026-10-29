@@ -528,7 +528,7 @@ async fn publish_durable(
             sync_dir(folder)?;
         }
         for dir in &created {
-            if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Some(parent) = entry_parent(dir) {
                 sync_dir(parent)?;
             }
         }
@@ -536,6 +536,20 @@ async fn publish_durable(
     })
     .await
     .map_err(std::io::Error::other)?
+}
+
+/// The folder that holds the entry for `dir`.
+///
+/// A relative path with one component has an empty parent. Its entry is in
+/// the current folder, so that folder gets the sync.
+fn entry_parent(dir: &std::path::Path) -> Option<&std::path::Path> {
+    dir.parent().map(|parent| {
+        if parent.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            parent
+        }
+    })
 }
 
 /// The folders of `folder` and its parents that do not exist yet, nearest
@@ -1434,6 +1448,19 @@ mod tests {
         );
         std::fs::create_dir_all(&folder).unwrap();
         assert_eq!(missing_dirs(&folder).await, Vec::<PathBuf>::new());
+    }
+
+    /// A new relative root has an empty parent. The current folder holds its
+    /// entry, so the put syncs that folder.
+    #[test]
+    fn a_new_relative_root_syncs_the_current_folder() {
+        use std::path::Path;
+        assert_eq!(entry_parent(Path::new("snapshots")), Some(Path::new(".")));
+        assert_eq!(
+            entry_parent(Path::new("snapshots/s")),
+            Some(Path::new("snapshots"))
+        );
+        assert_eq!(entry_parent(Path::new("/")), None);
     }
 
     #[tokio::test]
