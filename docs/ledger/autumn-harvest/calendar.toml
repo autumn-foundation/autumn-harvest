@@ -34,6 +34,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_calendar_exclusions"]
 measured = "docs/performance-schedule-overdue-aux.md"
+plan = "docs/ledger/plans/autumn-harvest/calendar.md"
 
 ["load_exclusions_for_calendars"]
 driver = "per_tick"
@@ -41,6 +42,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_calendar_exclusions"]
 measured = "docs/performance-schedule-overdue-pass.md"
+plan = "docs/ledger/plans/autumn-harvest/calendar.md"
 
 ["replace_calendar_exclusions"]
 driver = "per_request"

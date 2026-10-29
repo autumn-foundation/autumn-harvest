@@ -18,6 +18,47 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `apply_backoff_outcomes_batch`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE harvest_completion_deliveries d SET state = 'PENDING', next_attempt_at = v.next_attempt_at...` | `harvest_completion_deliveries`: Index Scan on `harvest_completion_deliveries_pkey`<br>`harvest_completion_deliveries`: ModifyTable |
+
+## `apply_delivered_outcomes_batch`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE harvest_completion_deliveries d SET state = 'DELIVERED', last_status = v.last_status, last...` | `harvest_completion_deliveries`: Index Scan on `harvest_completion_deliveries_pkey`<br>`harvest_completion_deliveries`: ModifyTable |
+
+## `apply_outcome`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE "harvest_completion_deliveries" SET "state" = $1, "last_status" = $2, "last_error" = $3, "...` | `harvest_completion_deliveries`: Index Scan on `harvest_completion_deliveries_pkey`<br>`harvest_completion_deliveries`: ModifyTable |
+
+## `claim_due_deliveries`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `WITH candidate AS ( SELECT id FROM harvest_completion_deliveries WHERE state IN ('PENDING', 'INFL...` | `harvest_completion_deliveries`: Index Scan on `harvest_completion_deliveries_pkey`<br>`harvest_completion_deliveries`: Index Scan on `idx_harvest_completion_deliveries_due`<br>`harvest_completion_deliveries`: ModifyTable |
+| 2 | `WITH candidate AS ( SELECT id FROM harvest_completion_deliveries WHERE state IN ('PENDING', 'INFL...` | `harvest_completion_deliveries`: Index Scan on `harvest_completion_deliveries_pkey`<br>`harvest_completion_deliveries`: Index Scan on `idx_harvest_completion_deliveries_due`<br>`harvest_completion_deliveries`: ModifyTable |
+
+## `dead_letter_entry_with_current_payload`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_completion_deliveries"."payload" FROM "harvest_completion_deliveries" WHERE ("har...` | `harvest_completion_deliveries`: Index Scan on `harvest_completion_deliveries_pkey` |
+
 ## `enqueue_completion_deliveries`
 
 Statements: 1. Tables with no usable index: none.
@@ -25,4 +66,12 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `INSERT INTO "harvest_completion_deliveries" ("id", "workflow_exec_id", "shard_id", "callback_inde...` | `harvest_completion_deliveries`: ModifyTable |
+
+## `reread_claimed_payloads`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_completion_deliveries"."id", "harvest_completion_deliveries"."payload" FROM "harv...` | `harvest_completion_deliveries`: Bitmap Heap Scan on `harvest_completion_deliveries_pkey` |
 

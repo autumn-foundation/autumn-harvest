@@ -59,6 +59,15 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT NOT EXISTS ( SELECT 1 FROM harvest_mutex_waiters w WHERE w.lock_key = $1 AND w.id < (SELEC...` | `harvest_mutex_locks`: Index Scan on `harvest_mutex_locks_pkey`<br>`harvest_mutex_waiters`: Index Only Scan on `idx_harvest_mutex_waiters_key_id`<br>`harvest_mutex_waiters`: Index Scan on `harvest_mutex_waiters_lock_key_waiter_exec_id_key` |
 
+## `db_ops::reclaim_expired_leases_and_wake`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT l.lock_key FROM harvest_mutex_locks l WHERE l.lease_expires_at < now() AND NOT EXISTS ( SE...` | `harvest_mutex_locks`: Bitmap Heap Scan on `idx_harvest_mutex_locks_lease`<br>`harvest_workflow_executions`: full scan of partial index `idx_harvest_we_paused` |
+| 2 | `WITH reclaimed AS ( DELETE FROM harvest_mutex_locks l WHERE l.lock_key = $1 AND l.lease_expires_a...` | `harvest_mutex_locks`: Index Scan on `harvest_mutex_locks_pkey`<br>`harvest_mutex_locks`: ModifyTable<br>`harvest_mutex_waiters`: Index Scan on `harvest_mutex_waiters_lock_key_waiter_exec_id_key`<br>`harvest_mutex_waiters`: Index Scan on `idx_harvest_mutex_waiters_key_id`<br>`harvest_mutex_waiters`: ModifyTable<br>`harvest_workflow_executions`: full scan of partial index `idx_harvest_we_paused` |
+
 ## `db_ops::release_all_locks_for_holder`
 
 Statements: 3. Tables with no usable index: none.

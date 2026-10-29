@@ -13,6 +13,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/fairness_keys.md"
 
 ["list_fairness_state"]
 driver = "per_request"
@@ -34,6 +35,7 @@ backend = ["postgres"]
 kind = ["ddl", "read", "write"]
 tables = ["harvest_fairness_state", "harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/fairness_keys.md"
 
 ["set_fairness_weight"]
 driver = "per_request"

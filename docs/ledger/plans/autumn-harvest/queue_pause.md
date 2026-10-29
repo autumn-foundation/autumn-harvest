@@ -26,6 +26,14 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT COUNT(*) AS count FROM harvest_queue_pauses WHERE queue_name = $1` | `harvest_queue_pauses`: Index Only Scan on `harvest_queue_pauses_pkey` |
 
+## `lock_queue_for_timeout_recheck`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT pg_advisory_xact_lock_shared($1, $2)` | no table |
+
 ## `paused_queue_names`
 
 Statements: 1. Tables with no usable index: none.

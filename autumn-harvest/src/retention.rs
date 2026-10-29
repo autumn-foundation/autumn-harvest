@@ -3724,9 +3724,13 @@ static CANDIDATE_SCAN_NO_GLOBAL_SQL: std::sync::LazyLock<String> = std::sync::La
     )
 });
 
-/// Returns the candidate-scan query, rendered once from [`RETENTION_CANDIDATE_STATES`].
+/// Returns the candidate-scan query, rendered once from `RETENTION_CANDIDATE_STATES`.
+///
+/// It is public for one reason. A plan gate in the integration suite checks
+/// that `idx_harvest_we_retention_candidates` serves this exact text (issue #2395).
 #[cfg(feature = "db")]
-fn candidate_scan_sql(has_global_age: bool) -> &'static str {
+#[must_use]
+pub fn candidate_scan_sql(has_global_age: bool) -> &'static str {
     if has_global_age {
         &CANDIDATE_SCAN_GLOBAL_SQL
     } else {

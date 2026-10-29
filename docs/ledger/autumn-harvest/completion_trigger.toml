@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_completion_trigger_fires", "harvest_completion_trigger_outbox"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/completion_trigger.md"
 
 ["evaluate_triggers_for_execution_collecting_with_codecs"]
 driver = "per_task"
@@ -21,6 +22,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_completion_trigger_fires", "harvest_completion_trigger_outbox"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/completion_trigger.md"
 
 ["resolve_target_queue"]
 driver = "per_tick"
@@ -28,6 +30,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_schedules"]
 measured = "docs/performance-completion-trigger-outbox-queue.md"
+plan = "docs/ledger/plans/autumn-harvest/completion_trigger.md"
 
 ["resolve_target_queues_batch"]
 driver = "per_tick"
@@ -35,6 +38,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_schedules"]
 measured = "docs/performance-completion-trigger-outbox-queue.md"
+plan = "docs/ledger/plans/autumn-harvest/completion_trigger.md"
 
 ["stamp_outbox_relay_backoff"]
 driver = "per_tick"
@@ -42,6 +46,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_completion_trigger_outbox"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/completion_trigger.md"
 
 ["sync_completion_triggers"]
 driver = "setup"

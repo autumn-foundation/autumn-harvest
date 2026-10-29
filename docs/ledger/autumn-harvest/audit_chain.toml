@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_audit_log"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_chain.md"
 
 ["other_live_cursor"]
 driver = "per_tick"
@@ -13,6 +14,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_audit_export_cursor"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_chain.md"
 
 ["reanchor_shard_chain"]
 driver = "per_tick"
@@ -20,6 +22,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_audit_export_cursor"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_chain.md"
 
 ["stamp_chain"]
 driver = "per_tick"
@@ -27,6 +30,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_audit_log"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_chain.md"
 
 ["verify_shard_chain_with"]
 driver = "per_request"
@@ -41,3 +45,4 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_audit_export_cursor"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_chain.md"

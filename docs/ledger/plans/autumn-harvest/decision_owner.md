@@ -18,6 +18,69 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `db::OwnerLoop::acquire_some`
+
+Statements: 2. Tables with no usable index: `harvest_decision_owner`.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT partition FROM harvest_decision_owner WHERE holder IS NULL OR lease_until <= clock_timesta...` | `harvest_decision_owner`: no usable index |
+| 2 | `UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, last_heartb...` | `harvest_task_queue`: Index Scan on `harvest_task_queue_pkey`<br>`harvest_task_queue`: Index Scan on `harvest_task_queue_running_worker_idx`<br>`harvest_task_queue`: ModifyTable<br>`harvest_workers`: Index Scan on `harvest_workers_pkey` |
+
+## `db::OwnerLoop::balance`
+
+Statements: 2. Tables with no usable index: `harvest_decision_owner`, `harvest_decision_owner_candidates`.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT holder FROM harvest_decision_owner_candidates WHERE seen_at > clock_timestamp() - make_int...` | `harvest_decision_owner_candidates`: no usable index |
+| 2 | `WITH c AS (SELECT clock_timestamp() AS now, make_interval(secs => $1) AS orphan) SELECT count(*) ...` | `harvest_decision_owner`: no usable index |
+
+## `db::OwnerLoop::release_everything`
+
+Statements: 1. Tables with no usable index: `harvest_decision_owner_candidates`.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM harvest_decision_owner_candidates WHERE holder = $1 OR seen_at < clock_timestamp() - ...` | `harvest_decision_owner_candidates`: ModifyTable<br>`harvest_decision_owner_candidates`: no usable index |
+
+## `db::OwnerLoop::tick`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO harvest_decision_owner_candidates (holder, seen_at) VALUES ($1, clock_timestamp()) ON...` | `harvest_decision_owner_candidates`: ModifyTable |
+
+## `db::acquire`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT epoch FROM harvest_decision_owner WHERE partition = $1` | `harvest_decision_owner`: Index Scan on `harvest_decision_owner_pkey` |
+| 2 | `SELECT epoch FROM harvest_decision_owner WHERE partition = $1 AND (holder IS NULL OR lease_until ...` | `harvest_decision_owner`: Index Scan on `harvest_decision_owner_pkey` |
+| 3 | `UPDATE harvest_decision_owner SET holder = $2, epoch = $3, lease_until = clock_timestamp() + make...` | `harvest_decision_owner`: Index Scan on `harvest_decision_owner_pkey`<br>`harvest_decision_owner`: ModifyTable |
+
+## `db::acquire_many`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT partition, (holder IS NULL OR lease_until <= clock_timestamp()) AS takeable FROM harvest_d...` | `harvest_decision_owner`: Index Scan on `harvest_decision_owner_pkey` |
+| 2 | `SELECT partition, epoch FROM harvest_decision_owner WHERE partition = ANY($1::int[]) AND (holder ...` | `harvest_decision_owner`: Index Scan on `harvest_decision_owner_pkey` |
+| 3 | `UPDATE harvest_decision_owner o SET holder = $1, epoch = w.next, lease_until = clock_timestamp() ...` | `harvest_decision_owner`: ModifyTable<br>`harvest_decision_owner`: full scan of index `harvest_decision_owner_pkey` |
+
+## `db::expire_all`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT partition FROM harvest_decision_owner WHERE lease_until > clock_timestamp() ORDER BY parti...` | `harvest_decision_owner`: full scan of index `harvest_decision_owner_pkey` |
+| 2 | `UPDATE harvest_decision_owner SET lease_until = clock_timestamp() WHERE partition = ANY($1::int[])` | `harvest_decision_owner`: Index Scan on `harvest_decision_owner_pkey`<br>`harvest_decision_owner`: ModifyTable |
+
 ## `db::fence`
 
 Statements: 1. Tables with no usable index: none.
@@ -44,4 +107,20 @@ Statements: 4. Tables with no usable index: none.
 | 2 | `SELECT o.partition FROM harvest_decision_owner o JOIN unnest($1::int[], $2::bigint[], $3::text[])...` | `harvest_decision_owner`: full scan of index `harvest_decision_owner_pkey` |
 | 3 | `UPDATE harvest_decision_owner SET lease_until = LEAST(lease_until, clock_timestamp()) WHERE parti...` | `harvest_decision_owner`: Index Scan on `harvest_decision_owner_pkey`<br>`harvest_decision_owner`: ModifyTable |
 | 4 | `UPDATE harvest_decision_owner o SET lease_until = clock_timestamp() + make_interval(secs => w.ttl...` | `harvest_decision_owner`: ModifyTable<br>`harvest_decision_owner`: full scan of index `harvest_decision_owner_pkey` |
+
+## `db::read_owner_mode`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT m.enabled, m.partitions, EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgname = 'harvest_task...` | `harvest_decision_owner_mode`: Index Scan on `harvest_decision_owner_mode_pkey`<br>`pg_trigger`: Index Scan on `pg_trigger_tgrelid_tgname_index` |
+
+## `db::set_idle`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT set_config('idle_in_transaction_session_timeout', $1, true) AS v` | no table |
 

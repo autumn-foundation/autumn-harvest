@@ -13,6 +13,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_debounce"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/debounce.md"
 
 ["fire_due_on_conn"]
 driver = "per_tick"
@@ -20,6 +21,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_debounce"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/debounce.md"
 
 ["list_pending_debounce"]
 driver = "per_request"
@@ -34,3 +36,4 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_debounce"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/debounce.md"

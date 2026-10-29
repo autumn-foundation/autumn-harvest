@@ -13,6 +13,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/cross_shard_child.md"
 
 ["apply_action"]
 driver = "per_tick"
@@ -20,6 +21,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_cross_shard_children"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/cross_shard_child.md"
 
 ["apply_cascade_bookkeeping"]
 driver = "per_tick"
@@ -41,6 +43,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_cross_shard_children"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/cross_shard_child.md"
 
 ["cross_shard_table_exists"]
 driver = "setup"
@@ -55,6 +58,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_cross_shard_children"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/cross_shard_child.md"
 
 ["deliver_terminal"]
 driver = "per_tick"
@@ -69,6 +73,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/cross_shard_child.md"
 
 ["load_child_typed_failures"]
 driver = "per_tick"
@@ -76,6 +81,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/cross_shard_child.md"
 
 ["load_parent_terminal_states"]
 driver = "per_tick"
@@ -83,6 +89,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/cross_shard_child.md"
 
 ["load_sweep_batch"]
 driver = "per_tick"
@@ -90,6 +97,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_cross_shard_children"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/cross_shard_child.md"
 
 ["mark_swept"]
 driver = "per_tick"
@@ -97,6 +105,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_cross_shard_children"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/cross_shard_child.md"
 
 ["record_attempt_failure"]
 driver = "per_tick"
@@ -104,6 +113,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_cross_shard_children"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/cross_shard_child.md"
 
 ["record_cross_shard_child_with_codecs"]
 driver = "per_task"
@@ -127,3 +137,4 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_cross_shard_children", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/cross_shard_child.md"

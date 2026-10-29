@@ -266,6 +266,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
 
 ["sample_history_oversized_counts"]
 driver = "per_tick"
@@ -273,6 +274,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events", "harvest_workflow_executions"]
 measured = "docs/performance-metrics-sampler-guard.md"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
 
 ["suspended_command_event_count"]
 driver = "per_task"

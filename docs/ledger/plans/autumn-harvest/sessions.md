@@ -28,6 +28,14 @@ Statements: 3. Tables with no usable index: none.
 | 2 | `SELECT "harvest_task_queue"."id", "harvest_task_queue"."queue_name", "harvest_task_queue"."task_t...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_session_active` |
 | 3 | `UPDATE "harvest_sessions" SET "state" = $1, "broken_at" = $2, "broken_reason" = $3 WHERE ("harves...` | `harvest_sessions`: Index Scan on `harvest_sessions_pkey`<br>`harvest_sessions`: ModifyTable |
 
+## `enforce_broken_sessions`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers w ON w.worker_id = s.host_worker_id ...` | `harvest_sessions`: Bitmap Heap Scan on `harvest_sessions_active_host_worker_id`<br>`harvest_workers`: Index Scan on `harvest_workers_pkey`<br>`harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+
 ## `record_session_acquired`
 
 Statements: 2. Tables with no usable index: none.

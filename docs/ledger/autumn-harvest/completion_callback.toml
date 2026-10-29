@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_completion_deliveries"]
 measured = "docs/performance-completion-callback-outcome-batch.md"
+plan = "docs/ledger/plans/autumn-harvest/completion_callback.md"
 
 ["apply_delivered_outcomes_batch"]
 driver = "per_tick"
@@ -13,6 +14,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_completion_deliveries"]
 measured = "docs/performance-completion-callback-outcome-batch.md"
+plan = "docs/ledger/plans/autumn-harvest/completion_callback.md"
 
 ["apply_outcome"]
 driver = "per_tick"
@@ -20,6 +22,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_completion_deliveries"]
 measured = "docs/performance-completion-callback-outcome-batch.md"
+plan = "docs/ledger/plans/autumn-harvest/completion_callback.md"
 
 ["claim_due_deliveries"]
 driver = "per_tick"
@@ -27,6 +30,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_completion_deliveries"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/completion_callback.md"
 
 ["completion_deliveries_table_exists"]
 driver = "setup"
@@ -41,6 +45,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_completion_deliveries"]
 measured = "docs/performance-completion-callback-outcome-batch.md"
+plan = "docs/ledger/plans/autumn-harvest/completion_callback.md"
 
 ["enqueue_completion_deliveries"]
 driver = "per_task"
@@ -70,3 +75,4 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_completion_deliveries"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/completion_callback.md"

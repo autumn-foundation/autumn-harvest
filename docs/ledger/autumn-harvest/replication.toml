@@ -59,6 +59,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_shard_generation"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
 
 ["db::end_backend"]
 driver = "per_task"
@@ -95,6 +96,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_replication_heartbeat", "harvest_shard_generation"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
 
 ["db::hold_in_pass"]
 driver = "per_task"
@@ -118,6 +120,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
 
 ["db::probe_dr_markers"]
 driver = "per_tick"
@@ -125,6 +128,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_shard_generation"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
 
 ["db::query_replication_status"]
 driver = "per_request"
@@ -139,3 +143,4 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_replication_heartbeat", "harvest_shard_generation"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
