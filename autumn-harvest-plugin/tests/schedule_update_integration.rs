@@ -1207,8 +1207,8 @@ async fn override_count(url: &str) -> i64 {
         .expect("count overrides")
 }
 
-/// Issue #2386 AC1 to AC3 and AC5, over HTTP: a patch of a code-declared
-/// schedule writes an override, the tick keeps it, and a clear restores code.
+/// Issue #2386 AC1 to AC3 and AC5, over HTTP. A patch of a code-declared
+/// schedule writes an override. The tick keeps it, and a clear restores code.
 #[tokio::test]
 async fn code_declared_schedule_patch_writes_an_override_that_the_tick_keeps() {
     let (url, _container) = setup_test_database_url().await;
