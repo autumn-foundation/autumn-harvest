@@ -564,6 +564,7 @@ jobs:
         run: |
           python3 docs/audits/ledger-profiles.py --self-test
           python3 docs/audits/ledger-profiles.py
+          python3 docs/audits/ledger-census.py --self-test
 
       # Issue #1831: a doc claim that shipped code made false fails the build.
       - name: Doc claim drift (docs/audits/doc-claim-drift.py)

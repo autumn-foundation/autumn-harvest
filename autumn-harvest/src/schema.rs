@@ -376,6 +376,27 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    /// Operator overrides for code-declared schedules (issue #2385). A NULL
+    /// column inherits the code value.
+    harvest_schedule_overrides (kind, name) {
+        kind -> Text,
+        name -> Text,
+        schedule_expr -> Nullable<Text>,
+        catchup -> Nullable<Bool>,
+        max_active_runs -> Nullable<Int4>,
+        jitter_secs -> Nullable<Int8>,
+        overlap_policy -> Nullable<Text>,
+        buffer_all_max -> Nullable<Int4>,
+        reason -> Nullable<Text>,
+        updated_by -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     harvest_schedules (id) {
         id -> Uuid,
         dag_name -> Nullable<Text>,
@@ -1391,6 +1412,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_calendars,
     harvest_calendar_exclusions,
     harvest_schedule_decisions,
+    harvest_schedule_overrides,
     harvest_rate_limit_buckets,
     harvest_completion_triggers,
     harvest_completion_trigger_fires,

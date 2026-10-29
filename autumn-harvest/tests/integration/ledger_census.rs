@@ -1,0 +1,189 @@
+//! Record which function sends each SQL statement (issue #2366).
+//!
+//! The Ledger census measures every profiled query in `docs/ledger/`. A plan
+//! needs the statement text, and a profile is keyed by the function that sends
+//! it. Diesel can report each statement to a default instrumentation. This
+//! module installs one when `HARVEST_LEDGER_CENSUS` names an output file.
+//!
+//! For each statement, the hook writes one JSON line with the SQL text and the
+//! source frames of the call stack. `docs/audits/ledger-census.py` maps the
+//! frames to profiles. The hook samples a few stacks for each distinct
+//! statement, because symbol resolution is slow.
+//!
+//! The variable is unset in every ordinary run, so the hook is inert there.
+//! The engine code does not change.
+
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::Write as _;
+use std::sync::{Mutex, OnceLock};
+
+use diesel::connection::{Instrumentation, InstrumentationEvent};
+
+/// The variable that names the census output file.
+pub const CENSUS_ENV: &str = "HARVEST_LEDGER_CENSUS";
+
+/// Stacks recorded for each distinct statement text.
+const SAMPLES_PER_STATEMENT: u32 = 8;
+
+/// Source frames kept from each stack.
+const MAX_FRAMES: usize = 48;
+
+/// Diesel appends the bind values after this marker.
+const BINDS_MARKER: &str = " -- binds: ";
+
+struct Census {
+    out: Mutex<File>,
+    seen: Mutex<HashMap<String, u32>>,
+}
+
+fn census() -> Option<&'static Census> {
+    static CENSUS: OnceLock<Option<Census>> = OnceLock::new();
+    CENSUS
+        .get_or_init(|| {
+            let path = std::env::var_os(CENSUS_ENV)?;
+            let out = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()?;
+            Some(Census {
+                out: Mutex::new(out),
+                seen: Mutex::new(HashMap::new()),
+            })
+        })
+        .as_ref()
+}
+
+/// Strip the bind values, so one statement has one text.
+pub fn statement_text(debug: &str) -> &str {
+    debug
+        .split_once(BINDS_MARKER)
+        .map_or(debug, |(sql, _)| sql)
+        .trim()
+}
+
+/// Return the `Debug` text of the bind values, or an empty string.
+///
+/// A generic plan cannot prove a partial-index predicate such as `NOT fired`
+/// from a bound `fired = $3`. The script puts the bool and string values in
+/// place of their parameters, as Postgres does for each custom plan.
+pub fn bind_text(debug: &str) -> &str {
+    debug
+        .split_once(BINDS_MARKER)
+        .map_or("", |(_, binds)| binds.trim())
+}
+
+/// Keep the `crate/src/path:line` of each frame in a workspace crate's `src/` tree.
+pub fn source_frames(backtrace: &str) -> Vec<String> {
+    backtrace
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("at "))
+        .filter_map(|at| {
+            let src = at.rfind("/src/")?;
+            let crate_start = at[..src].rfind('/')? + 1;
+            let rel = &at[crate_start..];
+            rel.starts_with("autumn-harvest").then(|| {
+                let mut parts = rel.rsplitn(3, ':');
+                let _column = parts.next();
+                let line = parts.next().unwrap_or_default();
+                let path = parts.next().unwrap_or_default();
+                format!("{path}:{line}")
+            })
+        })
+        .take(MAX_FRAMES)
+        .collect()
+}
+
+struct Hook;
+
+impl Instrumentation for Hook {
+    fn on_connection_event(&mut self, event: InstrumentationEvent<'_>) {
+        let InstrumentationEvent::StartQuery { query, .. } = event else {
+            return;
+        };
+        let Some(census) = census() else {
+            return;
+        };
+        let debug = query.to_string();
+        let sql = statement_text(&debug).to_owned();
+        let binds = bind_text(&debug);
+        {
+            let Ok(mut seen) = census.seen.lock() else {
+                return;
+            };
+            let count = seen.entry(sql.clone()).or_insert(0);
+            if *count >= SAMPLES_PER_STATEMENT {
+                return;
+            }
+            *count += 1;
+        }
+        let frames = source_frames(&std::backtrace::Backtrace::force_capture().to_string());
+        // One `write` call for each line. A test that runs this binary as a
+        // child process appends to the same file, and one append is atomic.
+        let line = format!(
+            "{}\n",
+            serde_json::json!({ "sql": sql, "binds": binds, "frames": frames })
+        );
+        if let Ok(mut out) = census.out.lock() {
+            let _ = out.write_all(line.as_bytes());
+        }
+    }
+}
+
+fn make_hook() -> Option<Box<dyn Instrumentation>> {
+    census().map(|_| Box::new(Hook) as Box<dyn Instrumentation>)
+}
+
+/// Install the hook before any test opens a connection.
+///
+/// The test harness has no global set-up step. A function in `.init_array`
+/// runs before `main`, so every connection that a test opens gets the hook.
+extern "C" fn install() {
+    if std::env::var_os(CENSUS_ENV).is_some() {
+        let _ = diesel::connection::set_default_instrumentation(make_hook);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static INSTALL: extern "C" fn() = install;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn statement_text_drops_the_binds() {
+        assert_eq!(
+            statement_text("SELECT 1 WHERE id = $1 -- binds: [7]"),
+            "SELECT 1 WHERE id = $1"
+        );
+        assert_eq!(statement_text("  BEGIN  "), "BEGIN");
+    }
+
+    #[test]
+    fn bind_text_keeps_the_values_only() {
+        assert_eq!(
+            bind_text("SELECT 1 WHERE id = $1 -- binds: [7, false]"),
+            "[7, false]"
+        );
+        assert_eq!(bind_text("BEGIN"), "");
+    }
+
+    #[test]
+    fn source_frames_keeps_workspace_sources_only() {
+        let trace = "\
+   0: std::backtrace::Backtrace::force_capture
+             at /rustc/abc/library/std/src/backtrace.rs:312:13
+   1: autumn_harvest::queue::claim_task_one_statement::{{closure}}
+             at /home/u/autumn-harvest/autumn-harvest/src/queue.rs:2440:20
+   2: integration::queue_tests::claims
+             at /home/u/autumn-harvest/autumn-harvest/tests/integration/queue_tests.rs:10:5";
+        assert_eq!(
+            source_frames(trace),
+            vec!["autumn-harvest/src/queue.rs:2440".to_owned()]
+        );
+    }
+}

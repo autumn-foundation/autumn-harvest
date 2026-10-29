@@ -13,6 +13,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_stream_chunks"]
 measured = "docs/performance-stream-append-count.md"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["append_new_execution_started_events_batch"]
 driver = "per_request"
@@ -27,6 +28,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["append_stream_chunks_in_tx"]
 driver = "per_task"
@@ -34,6 +36,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_stream_chunks", "harvest_workflow_executions"]
 measured = "docs/performance-stream-append-count.md"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["append_workflow_logs"]
 driver = "per_task"
@@ -41,6 +44,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_workflow_logs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["batch_blob_keys_still_referenced"]
 driver = "per_tick"
@@ -104,6 +108,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["insert_payload_refs"]
 driver = "per_task"
@@ -111,6 +116,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_payload_refs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_events_after_row_id"]
 driver = "per_request"
@@ -125,6 +131,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "docs/performance-parent-close-cascade-unfinished-handlers.md"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_history_inflated"]
 driver = "per_task"
@@ -146,6 +153,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_history_page"]
 driver = "per_request"
@@ -167,6 +175,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_history_undecoded"]
 driver = "per_task"
@@ -181,6 +190,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_history_with_timestamps"]
 driver = "per_request"
@@ -209,6 +219,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_payload_refs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_payload_refs_for_keys"]
 driver = "per_task"
@@ -216,6 +227,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_payload_refs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_raw_started_carryover"]
 driver = "per_task"
@@ -223,6 +235,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_stream_chunks"]
 driver = "per_request"
@@ -272,6 +285,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["mark_history_bloat_warned"]
 driver = "per_task"
@@ -279,6 +293,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["next_event_id_for"]
 driver = "per_task"
@@ -286,6 +301,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["row_id_for_event_id"]
 driver = "per_task"
@@ -307,6 +323,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["update_search_attrs"]
 driver = "per_task"
@@ -314,3 +331,4 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"

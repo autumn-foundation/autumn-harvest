@@ -49,6 +49,7 @@ source file, and then they conflict on that source file too.
 | `kind` | `read`, `write`, `ddl` | the scan, at least |
 | `tables` | table names | the scan, at least |
 | `measured` | a `docs/` page, or `unmeasured` | the author |
+| `plan` | a page under `docs/ledger/plans/` (optional) | `ledger-census.py plan` |
 
 `driver` says what makes the query run, and so how often it runs:
 
@@ -100,6 +101,8 @@ grep -rB5 'measured = "unmeasured"' docs/ledger | grep -B4 'per_task'
 
 4. When Ledger measures a query, set `measured` to the page.
 
+5. To refresh a `plan` page, run the census below again.
+
 ## What the scan counts as a query
 
 - `sql_query(...)`, `insert_into(...)`, `diesel::update(...)` and
@@ -130,3 +133,47 @@ Each `driver` came from the role of the module, with a per-function
 override where a function plays a different role. Each `measured` link
 names a page that names both the function and its module. A driver is a
 judgment. Correct one in a normal PR when a profile is wrong.
+
+## Plans: the access path of each query (issue #2366)
+
+`measured` needs a Ledger page with real buffer counts, and each page costs
+a benchmark. The census is a cheaper first pass over the whole catalog. It
+records whether an index can serve each statement. The result is in
+[`plans/`](plans/README.md), and the `plan` field of a profile links its
+page.
+
+The census has two steps:
+
+1. `autumn-harvest/tests/integration/ledger_census.rs` installs a Diesel
+   instrumentation hook when `HARVEST_LEDGER_CENSUS` names a file. While the
+   DB suites run, the hook writes each statement, its bind values and the
+   source frames of its call stack. The variable is unset in every ordinary
+   run.
+2. [`docs/audits/ledger-census.py`](../audits/ledger-census.py) maps each
+   statement to the profile of the innermost profiled frame. It then runs
+   `EXPLAIN (GENERIC_PLAN, FORMAT JSON)` for each statement on a migrated
+   database, with `enable_seqscan = off`.
+
+`enable_seqscan = off` makes the planner take any index that can serve the
+predicate. A `Seq Scan` that remains means that no index can, so that
+finding does not depend on table size or statistics. Bool and string bind
+values replace their parameters first, as in the custom plan that Postgres
+makes for each call. Without them, a generic plan cannot use a partial index
+such as `WHERE NOT consumed`.
+
+The tables are empty, so the index that the planner picks among several
+usable ones is a hint only. A plan is not a buffer count, so the census
+does not change `measured`.
+
+```sh
+HARVEST_LEDGER_CENSUS=/var/tmp/census.jsonl \
+    cargo test -p autumn-harvest --test integration -- --test-threads=6
+python3 docs/audits/ledger-census.py attribute /var/tmp/census.jsonl
+python3 docs/audits/ledger-census.py plan postgres://postgres@127.0.0.1/ledger_plan --driver per_task
+```
+
+Run the suites with no `HARVEST_TEST_DATABASE_URL`, so that each suite boots
+a migrated container. Apply every migration to the plan database first.
+`attribute` writes `docs/perf-artifacts/ledger-census/statements.json`,
+which is committed, so `plan` needs no test run. The census reaches only the
+profiles that the suites exercise. `plan` lists the rest as not reached.

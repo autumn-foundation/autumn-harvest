@@ -4456,8 +4456,8 @@
       "path": "/dags/{dag_name}",
       "category": "dag",
       "read_only": false,
-      "description": "Update mutable DAG configuration fields (currently: pause/unpause).",
-      "idempotency": "Idempotent: applying the same pause state twice is a no-op.",
+      "description": "Update mutable DAG configuration: pause or resume, and set or clear an operator schedule override (issue #2385). An override wins over the code value and survives a restart. Each override field is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. The response is the DAG schedule row with the effective values.",
+      "idempotency": "Idempotent: applying the same pause state or the same override twice is a no-op.",
       "params": [
         {
           "name": "dag_name",
@@ -4473,8 +4473,53 @@
         "fields": [
           {
             "name": "paused",
-            "required": true,
+            "required": false,
             "description": "true to pause the DAG, false to resume it."
+          },
+          {
+            "name": "schedule_expr",
+            "required": false,
+            "description": "Override cadence: bare cron, cron:\u003cexpr\u003e, cron_tz:\u003ctz\u003e:\u003cexpr\u003e, interval:\u003csecs\u003e or manual. null returns to the code cadence."
+          },
+          {
+            "name": "timezone",
+            "required": false,
+            "description": "IANA timezone of a cron schedule_expr. Valid only with a schedule_expr value."
+          },
+          {
+            "name": "catchup",
+            "required": false,
+            "description": "Override catchup flag. null returns to code."
+          },
+          {
+            "name": "max_active_runs",
+            "required": false,
+            "description": "Override run cap. null returns to code."
+          },
+          {
+            "name": "jitter_secs",
+            "required": false,
+            "description": "Override fire jitter in seconds. null returns to code."
+          },
+          {
+            "name": "overlap_policy",
+            "required": false,
+            "description": "Override overlap policy: skip, buffer_one, buffer_all, cancel_other, terminate_other or allow_all. null returns to code."
+          },
+          {
+            "name": "buffer_all_max",
+            "required": false,
+            "description": "Override buffer cap under buffer_all. null returns to code."
+          },
+          {
+            "name": "clear_override",
+            "required": false,
+            "description": "true returns every field to its code value. Cannot be combined with an override field."
+          },
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Operator reason stored with the override."
           }
         ]
       },
@@ -4483,6 +4528,10 @@
         "free_form": true
       },
       "error_responses": [
+        {
+          "status": 400,
+          "description": "Empty patch, unknown field, or an invalid override value."
+        },
         {
           "status": 404,
           "description": "DAG not found."

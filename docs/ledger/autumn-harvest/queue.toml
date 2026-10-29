@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["bounded_queue_depths"]
 driver = "per_tick"
@@ -20,6 +21,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["cancel_open_tasks_for_execution"]
 driver = "per_task"
@@ -27,6 +29,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["charge_fairness_key"]
 driver = "per_task"
@@ -34,6 +37,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_fairness_state", "harvest_fairness_weights"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["check_throttled_keys"]
 driver = "per_task"
@@ -41,6 +45,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_rate_limit_buckets", "harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["claim_handler_started"]
 driver = "per_task"
@@ -48,6 +53,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["claim_held_for_update_skip_locked"]
 driver = "per_task"
@@ -55,6 +61,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["claim_still_held_for_update"]
 driver = "per_task"
@@ -62,6 +69,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["claim_task_by_id_with_owner"]
 driver = "per_task"
@@ -69,6 +77,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_activity_pauses", "harvest_build_compat", "harvest_queue_pauses", "harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workers", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["claim_task_one_statement"]
 driver = "per_task"
@@ -76,6 +85,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_activity_pauses", "harvest_build_compat", "harvest_queue_pauses", "harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workers", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["claim_workflow_task_of_execution"]
 driver = "per_task"
@@ -83,6 +93,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_activity_pauses", "harvest_build_compat", "harvest_queue_pauses", "harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workers", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["claimable_pending_demand_by_queue"]
 driver = "per_tick"
@@ -97,6 +108,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["concurrency_key_stats"]
 driver = "per_request"
@@ -118,6 +130,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["db_clock_now"]
 driver = "per_task"
@@ -125,6 +138,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["db_now"]
 driver = "per_task"
@@ -139,6 +153,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["defer_rate_limited_task_inner"]
 driver = "per_task"
@@ -146,6 +161,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["delete_pending_timer"]
 driver = "per_task"
@@ -153,6 +169,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_timers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["dispatch_probe"]
 driver = "per_task"
@@ -174,6 +191,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["enqueue_batch"]
 driver = "per_task"
@@ -181,6 +199,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
 measured = "docs/performance-activity-fanout-enqueue.md"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["ensure_rate_limit_bucket"]
 driver = "per_task"
@@ -188,6 +207,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_rate_limit_buckets"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["fail_open_tasks_for_execution"]
 driver = "per_task"
@@ -195,6 +215,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["fail_task_inner"]
 driver = "per_task"
@@ -202,6 +223,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["fetch_claim_batch"]
 driver = "per_task"
@@ -209,6 +231,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_activity_pauses", "harvest_build_compat", "harvest_queue_pauses", "harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workers", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["force_retry_activity_now"]
 driver = "per_request"
@@ -223,6 +246,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["invalidate_capability_miss_evidence_for_worker"]
 driver = "per_task"
@@ -230,6 +254,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["later_claim_shares_strikes"]
 driver = "per_task"
@@ -237,6 +262,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["lock_claim_for_update"]
 driver = "per_task"
@@ -244,6 +270,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["mark_claim_handler_started"]
 driver = "per_task"
@@ -251,6 +278,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["oldest_pending_ages"]
 driver = "per_tick"
@@ -265,6 +293,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["owner_scan"]
 driver = "per_tick"
@@ -279,6 +308,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["pending_queue_demand_by_queue_name"]
 driver = "per_tick"
@@ -293,6 +323,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["queue_depths"]
 driver = "per_tick"
@@ -314,6 +345,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["record_pending_hints"]
 driver = "per_task"
@@ -328,6 +360,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["refund_rate_limit_token"]
 driver = "per_task"
@@ -335,6 +368,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_rate_limit_buckets"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["release_abandoned_claim"]
 driver = "per_task"
@@ -342,6 +376,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["release_claim_via"]
 driver = "per_task"
@@ -349,6 +384,7 @@ backend = ["postgres"]
 kind = []
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["release_task_for_capability_miss"]
 driver = "per_task"
@@ -356,6 +392,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["release_unstarted_claim"]
 driver = "per_task"
@@ -363,6 +400,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["release_worker_sticky_pins"]
 driver = "per_task"
@@ -370,6 +408,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["release_workflow_claim_inner"]
 driver = "per_task"
@@ -377,6 +416,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["requeue_claimed_workflow_task_with_backoff"]
 driver = "per_task"
@@ -384,6 +424,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["requeue_for_retry_inner"]
 driver = "per_task"
@@ -391,6 +432,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["requeue_workflow_task_with_backoff"]
 driver = "per_task"
@@ -398,6 +440,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["reschedule_task"]
 driver = "per_task"
@@ -405,6 +448,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["reset_capability_misses_after_inline_progress"]
 driver = "per_task"
@@ -412,6 +456,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
 measured = "docs/performance-standalone-activity-overhead.md"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["running_claims_of_worker"]
 driver = "per_task"
@@ -419,6 +464,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["sample_rate_limit_buckets"]
 driver = "per_tick"
@@ -433,6 +479,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["set_local_lock_timeout"]
 driver = "per_task"
@@ -440,6 +487,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["set_task_sticky_affinity"]
 driver = "per_task"
@@ -447,6 +495,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["sweep_idle_rate_limit_buckets"]
 driver = "per_tick"
@@ -468,6 +517,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["take_wake_requested"]
 driver = "per_task"
@@ -475,6 +525,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["task_deadline_for_claim"]
 driver = "per_task"
@@ -482,6 +533,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["task_exists"]
 driver = "per_task"
@@ -496,6 +548,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["try_claim_batched_candidate"]
 driver = "per_task"
@@ -510,6 +563,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_rate_limit_buckets"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["update_task_priority"]
 driver = "per_request"
@@ -524,6 +578,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "docs/performance-mutex-lease-reclaim.md"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["write_heartbeat"]
 driver = "per_task"
@@ -531,3 +586,4 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"

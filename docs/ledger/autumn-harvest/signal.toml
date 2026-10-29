@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_signals"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/signal.md"
 
 ["has_pending_signals"]
 driver = "per_task"
@@ -13,6 +14,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_signals"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/signal.md"
 
 ["load_pending_signals"]
 driver = "per_task"
@@ -20,6 +22,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_signals"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/signal.md"
 
 ["mark_signals_consumed"]
 driver = "per_task"
@@ -27,6 +30,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_signals"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/signal.md"
 
 ["send_signal_idempotent_with_codecs"]
 driver = "per_request"

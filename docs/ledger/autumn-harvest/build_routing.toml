@@ -55,6 +55,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_build_compat"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/build_routing.md"
 
 ["lock_ramp_generations"]
 driver = "per_request"

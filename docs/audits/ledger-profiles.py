@@ -28,6 +28,7 @@ The gate reports these findings:
 - a `driver` that is not one of DRIVERS
 - a `backend`, `kind` or `tables` list that omits what the scan detects
 - a `measured` page that does not exist or does not name the function
+- a `plan` page that does not exist or has no section for the profile
 
 The scan detects `backend`, `kind` and `tables`. A profile must list at least
 what the scan detects. It can list more, because the scan cannot follow a
@@ -67,7 +68,7 @@ DRIVERS = {
 }
 KINDS = ("read", "write", "ddl")
 BACKENDS = ("postgres", "sqlite")
-FIELDS = {"driver", "backend", "kind", "tables", "measured"}
+FIELDS = {"driver", "backend", "kind", "tables", "measured", "plan"}
 UNMEASURED = "unmeasured"
 
 # An optional turbofish, such as `::<i64>` or `::<(Uuid, String)>`. A tuple
@@ -524,6 +525,13 @@ def check_profile(where, key, profile, detected, read_text):
             found.append(f"{where}: [\"{key}\"] measured page {page} does not exist")
         elif not re.search(r"\b" + re.escape(name) + r"\b", text):
             found.append(f"{where}: [\"{key}\"] measured page {page} does not name `{name}`")
+    plan = profile.get("plan")
+    if plan is not None:
+        text = read_text(plan) if isinstance(plan, str) else None
+        if text is None:
+            found.append(f"{where}: [\"{key}\"] plan page {plan} does not exist")
+        elif f"## `{key}`" not in text:
+            found.append(f"{where}: [\"{key}\"] plan page {plan} has no section for `{key}`")
     return found
 
 
@@ -734,7 +742,10 @@ def self_test():
     assert sites["open"]["backend"] == {"sqlite"}, sites["open"]
     assert sites["open"]["kind"] == {"ddl", "write"}, sites["open"]
 
-    pages = {"docs/performance-claim.md": "Ledger measured `claim` here."}
+    pages = {
+        "docs/performance-claim.md": "Ledger measured `claim` here.",
+        "docs/ledger/plans/c/queue.md": "## `claim`\n\n| Statement |",
+    }
     sources = {
         "c/src/queue.rs": FIXTURE,
         "c/src/lib.rs": "#[cfg(test)]\nmod fixtures;\n",
@@ -743,7 +754,8 @@ def self_test():
     }
     good = {
         "claim": {"driver": "per_task", "backend": ["postgres"], "kind": ["write"],
-                  "tables": ["harvest_jobs"], "measured": "docs/performance-claim.md#x"},
+                  "tables": ["harvest_jobs"], "measured": "docs/performance-claim.md#x",
+                  "plan": "docs/ledger/plans/c/queue.md"},
         "Store::depth": {"driver": "per_tick", "backend": ["postgres"], "kind": ["read"],
                          "tables": ["harvest_jobs"], "measured": "unmeasured"},
         "count_rows!": {"driver": "per_request", "backend": ["postgres"], "kind": ["read"],
@@ -783,6 +795,15 @@ def self_test():
         "docs/ledger/c/queue.toml: [\"claim\"] tables omits detected ['harvest_jobs']",
         "docs/ledger/c/queue.toml: [\"claim\"] measured page docs/performance-other.md does not exist",
     ], findings(sources, {"docs/ledger/c/queue.toml": wrong}, pages.get)
+
+    planless = dict(good)
+    planless["count_rows!"] = dict(good["count_rows!"], plan="docs/ledger/plans/c/queue.md")
+    planless["purge"] = dict(good["purge"], plan="docs/ledger/plans/c/gone.md")
+    assert findings(sources, {"docs/ledger/c/queue.toml": planless}, pages.get) == [
+        "docs/ledger/c/queue.toml: [\"count_rows!\"] plan page docs/ledger/plans/c/queue.md "
+        "has no section for `count_rows!`",
+        "docs/ledger/c/queue.toml: [\"purge\"] plan page docs/ledger/plans/c/gone.md does not exist",
+    ], findings(sources, {"docs/ledger/c/queue.toml": planless}, pages.get)
 
     stub = scaffold({"c/src/queue.rs": FIXTURE}, {})
     assert '["claim"]\ndriver = "CHOOSE"\nbackend = ["postgres"]' in stub, stub

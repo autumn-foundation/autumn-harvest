@@ -62,6 +62,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_rate_limit_buckets"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/throttle.md"
 
 ["redefer_throttle_row"]
 driver = "per_tick"

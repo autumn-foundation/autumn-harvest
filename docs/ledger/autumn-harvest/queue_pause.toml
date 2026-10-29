@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_queue_pauses"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue_pause.md"
 
 ["list_paused_queues"]
 driver = "per_request"
@@ -48,6 +49,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_queue_pauses"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue_pause.md"
 
 ["resume_queue"]
 driver = "per_request"
@@ -62,3 +64,4 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue_pause.md"

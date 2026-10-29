@@ -18,7 +18,7 @@ measured = "unmeasured"
 driver = "setup"
 backend = ["postgres"]
 kind = ["read"]
-tables = ["harvest_activity_pauses", "harvest_audit_log", "harvest_audit_purge_watermark", "harvest_batch_jobs", "harvest_build_compat", "harvest_dead_letters", "harvest_decision_owner", "harvest_decision_owner_candidates", "harvest_decision_owner_mode", "harvest_entity_state", "harvest_events", "harvest_external_tasks", "harvest_fairness_state", "harvest_fairness_weights", "harvest_llm_ledger", "harvest_partition_export", "harvest_partition_exports", "harvest_queue_pauses", "harvest_rate_limit_buckets", "harvest_scanner_leases", "harvest_schedules", "harvest_signals", "harvest_task_queue", "harvest_timers", "harvest_worker_task_stats", "harvest_workers", "harvest_workflow_executions"]
+tables = ["harvest_activity_pauses", "harvest_audit_log", "harvest_audit_purge_watermark", "harvest_batch_jobs", "harvest_build_compat", "harvest_dead_letters", "harvest_decision_owner", "harvest_decision_owner_candidates", "harvest_decision_owner_mode", "harvest_entity_state", "harvest_events", "harvest_external_tasks", "harvest_fairness_state", "harvest_fairness_weights", "harvest_llm_ledger", "harvest_partition_export", "harvest_partition_exports", "harvest_queue_pauses", "harvest_rate_limit_buckets", "harvest_scanner_leases", "harvest_schedule_overrides", "harvest_schedules", "harvest_signals", "harvest_task_queue", "harvest_timers", "harvest_worker_task_stats", "harvest_workers", "harvest_workflow_executions"]
 measured = "unmeasured"
 
 ["observe_migration_shard"]
