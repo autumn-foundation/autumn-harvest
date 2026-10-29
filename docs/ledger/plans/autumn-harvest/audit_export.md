@@ -27,6 +27,25 @@ Statements: 2. Tables with no usable index: none.
 | 1 | `UPDATE "harvest_audit_export_cursor" SET "last_acked_seq" = $1, "lease_until" = $2, "next_attempt...` | `harvest_audit_export_cursor`: Index Scan on `harvest_audit_export_cursor_pkey`<br>`harvest_audit_export_cursor`: ModifyTable |
 | 2 | `UPDATE "harvest_audit_export_cursor" SET "lease_until" = $1, "next_attempt_at" = $2, "consecutive...` | `harvest_audit_export_cursor`: Index Scan on `harvest_audit_export_cursor_pkey`<br>`harvest_audit_export_cursor`: ModifyTable |
 
+## `audit_table_schema`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT quote_ident(n.nspname)::text AS value FROM pg_class c JOIN pg_namespace n ON n.oid = c.rel...` | `pg_class`: Index Scan on `pg_class_oid_index`<br>`pg_namespace`: Index Scan on `pg_namespace_oid_index` |
+
+## `build_unexported_index`
+
+Statements: 4. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT current_setting('lock_timeout') AS value` | no table |
+| 2 | `SELECT current_setting('statement_timeout') AS value` | no table |
+| 3 | `SELECT set_config('lock_timeout', $1, false)` | no table |
+| 4 | `SELECT set_config('statement_timeout', $1, false)` | no table |
+
 ## `claim_shard_chained`
 
 Statements: 5. Tables with no usable index: none.
@@ -39,6 +58,14 @@ Statements: 5. Tables with no usable index: none.
 | 4 | `UPDATE "harvest_audit_export_cursor" SET "last_assigned_seq" = $1, "updated_at" = $2 WHERE ("harv...` | `harvest_audit_export_cursor`: Index Scan on `harvest_audit_export_cursor_pkey`<br>`harvest_audit_export_cursor`: ModifyTable |
 | 5 | `WITH claimed AS ( SELECT id, row_number() OVER (ORDER BY occurred_at, id) AS rn FROM harvest_audi...` | `harvest_audit_log`: Index Scan on `harvest_audit_log_pkey`<br>`harvest_audit_log`: ModifyTable<br>`harvest_audit_log`: full scan of index `harvest_audit_occurred_at_idx` |
 
+## `connect_index_builder`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT set_config('search_path', $1, false)` | no table |
+
 ## `count_redrive_recoverable`
 
 Statements: 1. Tables with no usable index: none.
@@ -46,6 +73,14 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT COUNT(*) FROM "harvest_audit_log" WHERE (("harvest_audit_log"."export_seq" > $1) AND ("har...` | `harvest_audit_log`: Index Only Scan on `harvest_audit_log_export_seq_idx` |
+
+## `database_identity`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT current_database()::text AS name, COALESCE(inet_server_addr()::text, '') AS addr, COALESCE...` | no table |
 
 ## `decommission_cursor_locked`
 
@@ -70,6 +105,15 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `INSERT INTO harvest_audit_export_cursor (shard_id, last_assigned_seq) SELECT $1, COALESCE(MAX(exp...` | `harvest_audit_export_cursor`: ModifyTable<br>`harvest_audit_log`: full scan of partial index `harvest_audit_log_export_seq_idx` |
+
+## `ensure_unexported_index`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT pg_advisory_unlock($1, hashtext(to_regclass('harvest_audit_log')::oid::text))` | no table |
+| 2 | `SELECT pg_try_advisory_lock($1, hashtext(to_regclass('harvest_audit_log')::oid::text)) AS flag` | no table |
 
 ## `export_lag_seconds`
 
@@ -112,4 +156,12 @@ Statements: 2. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT min("harvest_audit_log"."export_seq") FROM "harvest_audit_log" WHERE (("harvest_audit_log"...` | `harvest_audit_log`: Index Only Scan on `harvest_audit_log_export_seq_idx` |
 | 2 | `UPDATE "harvest_audit_export_cursor" SET "last_acked_seq" = $1, "claim_epoch" = $2, "lease_until"...` | `harvest_audit_export_cursor`: Index Scan on `harvest_audit_export_cursor_pkey`<br>`harvest_audit_export_cursor`: ModifyTable |
+
+## `unexported_index_valid`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT i.indisvalid AS valid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.reln...` | `pg_class`: Index Scan on `pg_class_relname_nsp_index`<br>`pg_index`: Index Scan on `pg_index_indexrelid_index` |
 

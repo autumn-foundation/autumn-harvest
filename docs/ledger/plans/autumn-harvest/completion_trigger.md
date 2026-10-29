@@ -75,3 +75,13 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `UPDATE harvest_completion_trigger_outbox SET next_attempt_at = clock_timestamp() + make_interval(...` | `harvest_completion_trigger_outbox`: Index Scan on `harvest_completion_trigger_outbox_pkey`<br>`harvest_completion_trigger_outbox`: ModifyTable |
 
+## `sync_completion_triggers`
+
+Statements: 3. Tables with no usable index: `harvest_completion_triggers`.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM "harvest_completion_triggers" WHERE (("harvest_completion_triggers"."is_static" = $1)...` | `harvest_completion_triggers`: ModifyTable<br>`harvest_completion_triggers`: no usable index |
+| 2 | `INSERT INTO "harvest_completion_triggers" ("id", "source_workflow_name", "terminal_states", "targ...` | `harvest_completion_triggers`: ModifyTable |
+| 3 | `INSERT INTO "harvest_completion_triggers" ("id", "source_workflow_name", "terminal_states", "targ...` | `harvest_completion_triggers`: ModifyTable |
+

@@ -85,6 +85,16 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT "harvest_workers"."status" FROM "harvest_workers" WHERE ("harvest_workers"."worker_id" = $...` | `harvest_workers`: Index Scan on `harvest_workers_pkey` |
 
+## `register_worker`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO "harvest_workers" ("worker_id", "queues", "shard_assignments", "max_concurrency", "ho...` | `harvest_workers`: ModifyTable |
+| 2 | `INSERT INTO "harvest_workers" ("worker_id", "queues", "shard_assignments", "max_concurrency", "ho...` | `harvest_workers`: ModifyTable |
+| 3 | `INSERT INTO "harvest_workers" ("worker_id", "queues", "shard_assignments", "max_concurrency", "ho...` | `harvest_workers`: ModifyTable |
+
 ## `request_drain`
 
 Statements: 3. Tables with no usable index: none.
@@ -94,6 +104,14 @@ Statements: 3. Tables with no usable index: none.
 | 1 | `SELECT "harvest_workers"."worker_id", "harvest_workers"."started_at", "harvest_workers"."last_hea...` | `harvest_workers`: Index Scan on `harvest_workers_pkey` |
 | 2 | `UPDATE "harvest_workers" SET "drain_deadline_at" = $1 WHERE ("harvest_workers"."worker_id" = $2)` | `harvest_workers`: Index Scan on `harvest_workers_pkey`<br>`harvest_workers`: ModifyTable |
 | 3 | `UPDATE "harvest_workers" SET "status" = $1, "drain_deadline_at" = $2 WHERE (("harvest_workers"."w...` | `harvest_workers`: Index Scan on `harvest_workers_pkey`<br>`harvest_workers`: ModifyTable |
+
+## `restore_stopped_worker_row`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO "harvest_workers" ("worker_id", "queues", "shard_assignments", "max_concurrency", "ho...` | `harvest_workers`: ModifyTable |
 
 ## `touch_worker_liveness`
 
@@ -118,6 +136,14 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `UPDATE "harvest_workers" SET "status" = $1 WHERE ("harvest_workers"."worker_id" = $2)` | `harvest_workers`: Index Scan on `harvest_workers_pkey`<br>`harvest_workers`: ModifyTable |
+
+## `withdraw_unverified_worker_row`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM "harvest_workers" WHERE ("harvest_workers"."worker_id" = $1)` | `harvest_workers`: Index Scan on `harvest_workers_pkey`<br>`harvest_workers`: ModifyTable |
 
 ## `write_task_stats_snapshot`
 

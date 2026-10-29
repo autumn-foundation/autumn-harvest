@@ -18,6 +18,24 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `db::advance_sequences_in_transaction`
+
+Statements: 11. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT setval('"dr_seq_home"."dr_cross_seq"', GREATEST( COALESCE((SELECT MAX("id") FROM "dr_seq_h...` | not planned: ERROR:  relation "dr_seq_home.dr_cross" does not exist |
+| 2 | `SELECT setval('"public"."MixedCase_Id_seq"', GREATEST( COALESCE((SELECT MAX("Id") FROM "public"."...` | not planned: ERROR:  relation "public.MixedCase" does not exist |
+| 3 | `SELECT setval('"public"."dr_ahead_id_seq"', GREATEST( COALESCE((SELECT MAX("id") FROM "public"."d...` | not planned: ERROR:  relation "public.dr_ahead" does not exist |
+| 4 | `SELECT setval('"public"."dr_desc_seq"', LEAST( COALESCE((SELECT MIN("id") FROM "public"."dr_desc"...` | not planned: ERROR:  relation "public.dr_desc" does not exist |
+| 5 | `SELECT setval('"public"."harvest_events_id_seq"', GREATEST( COALESCE((SELECT MAX("id") FROM "publ...` | `harvest_events`: Index Only Scan on `harvest_events_pkey` |
+| 6 | `SELECT setval('"public"."harvest_mutex_waiters_id_seq"', GREATEST( COALESCE((SELECT MAX("id") FRO...` | `harvest_mutex_waiters`: Index Only Scan on `harvest_mutex_waiters_pkey` |
+| 7 | `SELECT setval('"public"."harvest_stream_chunks_id_seq"', GREATEST( COALESCE((SELECT MAX("id") FRO...` | `harvest_stream_chunks`: Index Only Scan on `harvest_stream_chunks_pkey` |
+| 8 | `SELECT setval('"public"."harvest_workflow_logs_id_seq"', GREATEST( COALESCE((SELECT MAX("id") FRO...` | `harvest_workflow_logs`: Index Only Scan on `harvest_workflow_logs_pkey` |
+| 9 | `SELECT setval('"public"."order_id_seq"', GREATEST( COALESCE((SELECT MAX("id") FROM "public"."orde...` | not planned: ERROR:  relation "public.order" does not exist |
+| 10 | `SELECT setval('"public"."user_id_seq"', GREATEST( COALESCE((SELECT MAX("id") FROM "public"."user"...` | not planned: ERROR:  relation "public.user" does not exist |
+| 11 | `SELECT tn.nspname::text AS table_schema, c.relname::text AS table_name, a.attname::text AS column...` | `pg_attribute`: Index Scan on `pg_attribute_relid_attnum_index`<br>`pg_class`: Index Scan on `pg_class_oid_index`<br>`pg_class`: Index Scan on `pg_class_relname_nsp_index`<br>`pg_class`: full scan of index `pg_class_oid_index`<br>`pg_depend`: Index Scan on `pg_depend_depender_index`<br>`pg_namespace`: Index Scan on `pg_namespace_oid_index`<br>`pg_sequence`: Index Scan on `pg_sequence_seqrelid_index` |
+
 ## `db::assert_database_fence`
 
 Statements: 1. Tables with no usable index: none.
@@ -50,6 +68,15 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT pg_advisory_xact_lock_shared($1)` | no table |
 
+## `db::bump_generation`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT pg_advisory_xact_lock($1)` | no table |
+| 2 | `UPDATE harvest_shard_generation SET generation = generation + 1, fenced_at = NOW(), fenced_reason...` | `harvest_shard_generation`: Index Scan on `harvest_shard_generation_pkey`<br>`harvest_shard_generation`: ModifyTable |
+
 ## `db::current_generation`
 
 Statements: 1. Tables with no usable index: none.
@@ -66,6 +93,23 @@ Statements: 2. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT count(*) AS alive FROM pg_stat_activity WHERE pid = $1` | no table |
 | 2 | `SELECT pg_terminate_backend($1)` | no table |
+
+## `db::ensure_generation_row`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO harvest_shard_generation (shard_id, generation, fenced_reason) VALUES ($1, 0, 'provis...` | `harvest_shard_generation`: ModifyTable |
+| 2 | `SELECT pg_advisory_xact_lock($1)` | no table |
+
+## `db::generation_shard_ids`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT shard_id FROM harvest_shard_generation ORDER BY shard_id` | `harvest_shard_generation`: full scan of index `harvest_shard_generation_pkey` |
 
 ## `db::heartbeat_reading`
 

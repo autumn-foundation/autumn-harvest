@@ -82,6 +82,16 @@ Statements: 3. Tables with no usable index: none.
 | 2 | `SELECT count(DISTINCT COALESCE(labels->>'decision_owner_handlers', ''))::bigint AS n FROM harvest...` | `harvest_workers`: Bitmap Heap Scan on `harvest_workers_last_heartbeat_at_idx` |
 | 3 | `SELECT worker_id FROM harvest_workers WHERE status <> 'Stopped' AND last_heartbeat_at > NOW() - m...` | `harvest_workers`: Bitmap Heap Scan on `harvest_workers_last_heartbeat_at_idx` |
 
+## `db::enable_owner_mode`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT enabled FROM harvest_decision_owner_mode WHERE singleton FOR UPDATE` | `harvest_decision_owner_mode`: Index Scan on `harvest_decision_owner_mode_pkey` |
+| 2 | `UPDATE harvest_decision_owner_mode SET enabled = $1, changed_at = NOW() WHERE singleton` | `harvest_decision_owner_mode`: Index Scan on `harvest_decision_owner_mode_pkey`<br>`harvest_decision_owner_mode`: ModifyTable |
+| 3 | `UPDATE harvest_task_queue t SET state = 'PENDING', worker_id = NULL, started_at = NULL, last_hear...` | `harvest_task_queue`: Index Scan on `harvest_task_queue_running_worker_idx`<br>`harvest_task_queue`: ModifyTable<br>`harvest_workers`: Index Scan on `harvest_workers_pkey` |
+
 ## `db::expire_all`
 
 Statements: 2. Tables with no usable index: none.
@@ -133,4 +143,13 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT set_config('idle_in_transaction_session_timeout', $1, true) AS v` | no table |
+
+## `db::stamp_unstamped`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT t.id, e.workflow_id FROM harvest_task_queue t JOIN harvest_workflow_executions e ON e.id =...` | `harvest_task_queue`: Bitmap Heap Scan on `idx_harvest_tq_live_created`<br>`harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+| 2 | `UPDATE harvest_task_queue t SET decision_partition = u.p FROM unnest($1::uuid[], $2::int2[]) AS u...` | `harvest_task_queue`: Index Scan on `harvest_task_queue_pkey`<br>`harvest_task_queue`: ModifyTable |
 

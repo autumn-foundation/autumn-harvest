@@ -43,6 +43,14 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `DELETE FROM "harvest_cross_shard_children" WHERE ("harvest_cross_shard_children"."child_exec_id" ...` | `harvest_cross_shard_children`: Index Scan on `harvest_cross_shard_children_pkey`<br>`harvest_cross_shard_children`: ModifyTable |
 
+## `cross_shard_table_exists`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT to_regclass('harvest_cross_shard_children')::text` | no table |
+
 ## `current_cancel_reason`
 
 Statements: 1. Tables with no usable index: none.

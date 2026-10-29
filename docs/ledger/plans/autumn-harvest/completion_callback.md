@@ -51,6 +51,14 @@ Statements: 2. Tables with no usable index: none.
 | 1 | `WITH candidate AS ( SELECT id FROM harvest_completion_deliveries WHERE state IN ('PENDING', 'INFL...` | `harvest_completion_deliveries`: Index Scan on `harvest_completion_deliveries_pkey`<br>`harvest_completion_deliveries`: Index Scan on `idx_harvest_completion_deliveries_due`<br>`harvest_completion_deliveries`: ModifyTable |
 | 2 | `WITH candidate AS ( SELECT id FROM harvest_completion_deliveries WHERE state IN ('PENDING', 'INFL...` | `harvest_completion_deliveries`: Index Scan on `harvest_completion_deliveries_pkey`<br>`harvest_completion_deliveries`: Index Scan on `idx_harvest_completion_deliveries_due`<br>`harvest_completion_deliveries`: ModifyTable |
 
+## `completion_deliveries_table_exists`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT to_regclass('harvest_completion_deliveries') IS NOT NULL AS present` | no table |
+
 ## `dead_letter_entry_with_current_payload`
 
 Statements: 1. Tables with no usable index: none.

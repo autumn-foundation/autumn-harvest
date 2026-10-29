@@ -26,6 +26,15 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT pg_notify(c, p) FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS t(c, p, n) ORDER BY n` | no table |
 
+## `probe`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT txid_current() AS txid, current_database()::text AS database, pg_postmaster_start_time() A...` | no table |
+| 2 | `SELECT txid_current_if_assigned() AS txid, current_database()::text AS database, pg_postmaster_st...` | no table |
+
 ## `resolve_owner_notes`
 
 Statements: 1. Tables with no usable index: none.

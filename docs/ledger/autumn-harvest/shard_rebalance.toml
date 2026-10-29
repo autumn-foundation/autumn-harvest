@@ -41,6 +41,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_shard_migrations"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::collapse_forward_chain"]
 driver = "setup"
@@ -125,6 +126,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::read_json"]
 driver = "setup"
@@ -202,6 +204,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::stage_copy"]
 driver = "setup"

@@ -95,6 +95,14 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `UPDATE harvest_mutex_locks SET lease_expires_at = now() + make_interval(secs => $2) WHERE holder_...` | `harvest_mutex_locks`: Bitmap Heap Scan on `idx_harvest_mutex_locks_holder`<br>`harvest_mutex_locks`: ModifyTable |
 
+## `db_ops::table_present`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present` | no table |
+
 ## `db_ops::try_grant_or_enqueue`
 
 Statements: 2. Tables with no usable index: none.
