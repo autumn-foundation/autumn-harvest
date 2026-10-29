@@ -35910,6 +35910,20 @@ folds fragments in here.
   **Fix.** A workflow permit now wakes the leader on release through `Worker::decision_done`. The task has committed the tasks that it schedules, so this wake does not settle. It also cuts a running settle short. The NOTIFY of a cut settle can name a row that is not claimable yet, so the cut settle owes one poll at its original end (`Worker::owed_poll`). The single-pool and the multi-shard leader both take the wake. On the same box, two loops now give a p50 of 8.1 ms and a p99 of 14.1 ms, against 66.3 ms and 91.4 ms before.
 
   **Tests.** `a_local_decision_end_wakes_the_idle_wait_without_a_settle`, `a_local_decision_end_cuts_the_settle_short_and_owes_a_poll` and `a_released_workflow_permit_wakes_the_leader`, all on paused time. `a_released_permit_does_not_cut_the_settle_delay_short` still holds: only a workflow task that ends cuts the settle. No new `WorkflowEvent` variant, no migration, no replay impact.
+- **Fix** (implemented): a NOTIFY polls before it settles — see issue #2422. After a NOTIFY, the idle leader slept `notify::settle_delay` (50 to 75 ms) before its first poll. The settle gives a row that a host clock stamped ahead of the database `NOW()` time to become claimable. A row that the database clock stamped is claimable at once, and it waited the whole settle too. The #2418 fix showed it: the bench's signal round-trip p50 rose from 44 to 68 ms. Before #2418, the leader was nearly always in a settle that an earlier NOTIFY had started. The poll at its end took the signal's task early, so the old p50 sat below the 50 ms floor.
+
+  **Fix.** A NOTIFY now ends the idle wait at once, so the leader polls first. It sets `Worker::settle_pending`. The next idle wait comes only after an empty poll, and it runs the settle in place of a wait (`Worker::settle_if_pending`). The loop then polls again, so a host-clock row still gets its margin. The single-pool and the multi-shard leader both work this way. A local decision end still cuts the settle short (#2418).
+
+  **Measurement.** One shard, same box, with the #2418 fix in both columns:
+
+  | workers per shard | signal p50 before | signal p50 after | dispatch p50 before | dispatch p50 after |
+  |--:|--:|--:|--:|--:|
+  | 1 | 68.0 ms | 13.4 ms | 8.1 ms | 7.6 ms |
+  | 4 | 55.8 ms | 24.8 ms | 7.1 ms | 7.5 ms |
+
+  The cost is extra polls. With four workers on one shard, the index scans on `harvest_task_queue` rose 28% in the dispatch scenario and 47% in the signal scenario. The settle jitter no longer spreads the first poll of each worker after one NOTIFY. `SKIP LOCKED` keeps those polls correct, and the claim seek keeps each one cheap.
+
+  **Tests.** `a_notify_polls_before_it_settles`. `a_released_permit_does_not_cut_the_settle_delay_short` and `a_local_decision_end_cuts_the_settle_short_and_owes_a_poll` now drive the poll-first sequence. No new `WorkflowEvent` variant, no migration, no replay impact.
 - **Tooling** (implemented): Ledger census batch 4: the setup profiles — see issue #2414. The Ledger census now plans the `setup` Postgres profiles, the queries that run at startup, in migrations and in partition layout changes. 63 of them link a plan page under `docs/ledger/plans/`. The suites did not reach 62.
 
   No setup statement is a defect. The ones with no usable index read the system

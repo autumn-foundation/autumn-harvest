@@ -1779,6 +1779,10 @@ slept the NOTIFY settle while the activities committed. A workflow task of
 the worker that ends now wakes the leader with no settle. On the same box,
 two loops then give a p50 of 8.1 ms and a p99 of 14.1 ms.
 
+Issue #2422 then made a NOTIFY poll before it settles. The settle runs only
+after an empty poll. A signal to an idle worker then no longer waits the
+whole 50 to 75 ms settle.
+
 ### What the measurement does not establish
 
 - **Another box.** This host is not assay #14's host. Temporal reads 31.9 to

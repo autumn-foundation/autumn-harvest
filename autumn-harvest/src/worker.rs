@@ -33695,6 +33695,9 @@ pub struct Worker {
     /// The end of a settle that `decision_done` cut short (issue #2418).
     /// The leader owes one poll at that instant.
     owed_poll: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// A NOTIFY woke the leader, and its settle waits for an empty poll
+    /// (issue #2422). See [`Worker::settle_if_pending`].
+    settle_pending: AtomicBool,
     /// The claim targets of the running claim loops (issue #2255). The run
     /// path sets them.
     claim_targets: std::sync::RwLock<Vec<Option<crate::types::ShardId>>>,
@@ -36614,6 +36617,7 @@ impl Worker {
             decider_capacity: Arc::new(tokio::sync::Notify::new()),
             decision_done: Arc::new(tokio::sync::Notify::new()),
             owed_poll: std::sync::Mutex::new(None),
+            settle_pending: AtomicBool::new(false),
             claim_targets: std::sync::RwLock::default(),
             owner_wake_shards: std::sync::RwLock::default(),
             owner_listening: Arc::default(),
@@ -37708,6 +37712,11 @@ impl Worker {
             // shard in round-robin order regardless of which fired a NOTIFY.
             start_idx = (start_idx + 1) % n;
 
+            // A NOTIFY polled first, and that poll was empty (issue #2422).
+            if self.settle_if_pending().await {
+                continue;
+            }
+
             // All shards idle — poll all per-shard listeners in round-robin
             // with a short per-listener timeout (fix #6). Notifications are
             // buffered in each listener's channel so no wake-up is lost.
@@ -37805,7 +37814,7 @@ impl Worker {
             }
         }
         if notified {
-            self.settle().await;
+            self.settle_pending.store(true, Ordering::Relaxed);
         }
     }
 
@@ -40277,12 +40286,16 @@ impl Worker {
     /// `idle` waits on the listener or the timer. It returns `true` on a
     /// NOTIFY. A released permit or a due deferral also ends the wait.
     ///
-    /// After a NOTIFY, the leader sleeps the settle delay. Host clocks can
-    /// run ahead of the database `NOW()`. The jittered delay lets a new task
-    /// become claimable, and spreads the claims of many workers. It runs
-    /// after the select, so no other wake cuts it short. An earlier wake
-    /// leaves the NOTIFY queued for the next wait.
+    /// A NOTIFY returns at once, so the leader polls first (issue #2422).
+    /// The next call after an empty poll sleeps the settle delay instead of
+    /// a wait. Host clocks can run ahead of the database `NOW()`. The
+    /// jittered delay lets such a task become claimable. Only a workflow
+    /// task of this worker that ends cuts it short (issue #2418). An earlier
+    /// wake leaves the NOTIFY queued for the next wait.
     async fn idle_wait_then_settle(&self, idle: impl std::future::Future<Output = bool>) {
+        if self.settle_if_pending().await {
+            return;
+        }
         // A full pool also wakes on a released permit (issue #1787).
         let capacity = self.capacity_wait();
         let notified = tokio::select! {
@@ -40296,8 +40309,26 @@ impl Worker {
             notified = idle => notified,
         };
         if notified {
-            self.settle().await;
+            self.settle_pending.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Run the settle that a NOTIFY left pending, and report whether it ran
+    /// (issue #2422).
+    ///
+    /// A NOTIFY polls first. A row that the database clock stamped is
+    /// claimable at once, so that poll takes it with no delay. Only an empty
+    /// poll then settles, and the loop polls again after it. So a row that a
+    /// host clock stamped ahead of the database still gets its margin.
+    ///
+    /// Before, every NOTIFY slept the settle before its first poll. A signal
+    /// to an idle worker waited 50 ms at least.
+    async fn settle_if_pending(&self) -> bool {
+        if !self.settle_pending.swap(false, Ordering::Relaxed) {
+            return false;
+        }
+        self.settle().await;
+        true
     }
 
     /// Sleep the settle delay after a NOTIFY (issue #2418).
@@ -58830,6 +58861,45 @@ mod tests {
         );
     }
 
+    /// A NOTIFY polls before it settles (issue #2422). The wait returns at
+    /// the NOTIFY. The next wait, after an empty poll, is the settle.
+    #[tokio::test(start_paused = true)]
+    async fn a_notify_polls_before_it_settles() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        let start = tokio::time::Instant::now();
+        worker
+            .idle_wait_then_settle(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                true
+            })
+            .await;
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(10),
+            "a NOTIFY must return at once, so the leader polls first"
+        );
+
+        // The poll was empty. The next wait settles and has no other wake.
+        worker
+            .idle_wait_then_settle(std::future::pending::<bool>())
+            .await;
+        let waited = start.elapsed() - Duration::from_millis(10);
+        assert!(
+            waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
+            "an empty poll after a NOTIFY must settle, waited {waited:?}"
+        );
+
+        // The settle is spent. A later wait does not settle again.
+        let later = tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(std::future::pending::<bool>()),
+        )
+        .await;
+        assert!(later.is_err(), "one NOTIFY must settle once only");
+    }
+
     /// A released permit during the settle delay does not cut it short
     /// (issue #1796). An idle wait with no NOTIFY does not settle.
     #[tokio::test(start_paused = true)]
@@ -58853,7 +58923,15 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             freed.notify_one();
         };
-        tokio::join!(worker.idle_wait_then_settle(notify), release);
+        // The NOTIFY returns at once (issue #2422). The settle follows the
+        // empty poll.
+        let settle = async {
+            worker.idle_wait_then_settle(notify).await;
+            worker
+                .idle_wait_then_settle(std::future::pending::<bool>())
+                .await;
+        };
+        tokio::join!(settle, release);
         assert!(
             start.elapsed() >= Duration::from_millis(10) + crate::notify::SETTLE_DELAY_MIN,
             "the settle delay must run in full after a NOTIFY"
@@ -58910,7 +58988,15 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             done.notify_one();
         };
-        tokio::join!(worker.idle_wait_then_settle(notify), end);
+        // The NOTIFY returns at once (issue #2422). The settle follows the
+        // empty poll.
+        let settle = async {
+            worker.idle_wait_then_settle(notify).await;
+            worker
+                .idle_wait_then_settle(std::future::pending::<bool>())
+                .await;
+        };
+        tokio::join!(settle, end);
         assert!(
             start.elapsed() < Duration::from_millis(10) + crate::notify::SETTLE_DELAY_MIN,
             "a local decision end must cut the settle short, waited {:?}",
