@@ -211,6 +211,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Runtime DAG schedule overrides (issue #2385, epic #2384).** A DAG schedule came only from code. The scheduler converged each `harvest_schedules` row to the code value on every tick, so an operator could change a schedule only by a restart or a deploy.
 
+- **Runtime overrides for code-declared workflow schedules (issue #2386, epic #2384).** `PATCH /admin/schedules/{id}` edited a schedule row in place (issue #771). For a schedule declared with `WorkerBuilder::workflow_schedule`, the next scheduler tick converged the row back to its code value.
+
+- **Runtime SLA and execution-timeout overrides per workflow type (issue #2387, epic #2384).** `WorkflowInfo::sla`, `WorkflowInfo::execution_timeout` and their `DagInfo` counterparts were static, so a change needed a restart.
+
+- **See and change runtime overrides from the CLI and Vantage (issue #2388, epic #2384).** The overrides of #2385, #2386 and #2387 were visible only one route at a time. An operator could not tell which parameters were overridden.
+
+- **Schedule overrides follow their DAG to a new shard (issue #2389, epic #2384).** A DAG schedule override lives on the shard that owns the DAG. A shard routing change moved the schedule row to its new owner, but the override stayed behind.
+
 ### Fixed
 
 - **An agent workspace snapshot survives a host crash.** `DirWorkspaceBlobs::put` now syncs the scratch file, renames it and syncs its folder with `partition_archive::sync_dir`, and the parent of each folder that it makes, before it returns. Before, the put ended at a flush, so a crash after a tool-call result committed could lose the snapshot that the history names.
@@ -379,6 +387,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Ledger census batch 2: the per-tick profiles (issue #2396).** The Ledger census now plans the `per_tick` Postgres profiles, the background loops, scanners and sweepers. 172 of them link a plan page under `docs/ledger/plans/`. The suites did not reach 23.
 
 - **Ledger census batch 3: the per-request profiles (issue #2402).** The Ledger census now plans the `per_request` Postgres profiles, the queries behind API calls and operator reads. 153 of them link a plan page under `docs/ledger/plans/`.
+
+- **Ledger census batch 4: the setup profiles (issue #2414).** The Ledger census now plans the `setup` Postgres profiles, the queries that run at startup, in migrations and in partition layout changes. 63 of them link a plan page under `docs/ledger/plans/`.
 
 The full entry for each change is in [`docs/shipped-work.md`](docs/shipped-work.md).
 

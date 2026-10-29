@@ -35910,6 +35910,104 @@ folds fragments in here.
   **Fix.** A workflow permit now wakes the leader on release through `Worker::decision_done`. The task has committed the tasks that it schedules, so this wake does not settle. It also cuts a running settle short. The NOTIFY of a cut settle can name a row that is not claimable yet, so the cut settle owes one poll at its original end (`Worker::owed_poll`). The single-pool and the multi-shard leader both take the wake. On the same box, two loops now give a p50 of 8.1 ms and a p99 of 14.1 ms, against 66.3 ms and 91.4 ms before.
 
   **Tests.** `a_local_decision_end_wakes_the_idle_wait_without_a_settle`, `a_local_decision_end_cuts_the_settle_short_and_owes_a_poll` and `a_released_workflow_permit_wakes_the_leader`, all on paused time. `a_released_permit_does_not_cut_the_settle_delay_short` still holds: only a workflow task that ends cuts the settle. No new `WorkflowEvent` variant, no migration, no replay impact.
+- **Tooling** (implemented): Ledger census batch 4: the setup profiles — see issue #2414. The Ledger census now plans the `setup` Postgres profiles, the queries that run at startup, in migrations and in partition layout changes. 63 of them link a plan page under `docs/ledger/plans/`. The suites did not reach 62.
+
+  No setup statement is a defect. The ones with no usable index read the system
+  catalog, rewrite all of `harvest_events` during a layout change on purpose, or
+  sync the small completion-trigger registry at startup.
+
+  The census itself changes no engine code: no new `WorkflowEvent` variant, no
+  migration and no schema change.
+- **Scheduler** (implemented): Runtime overrides for code-declared workflow schedules — see issue #2386, epic #2384. `PATCH /admin/schedules/{id}` edited a schedule row in place (issue #771). For a schedule declared with `WorkerBuilder::workflow_schedule`, the next scheduler tick converged the row back to its code value. The edit lasted about one tick, and the API still returned 200.
+
+  `PATCH /admin/schedules/{id}` on a code-declared schedule now writes an
+  operator override instead. The override wins over code, survives a restart and
+  applies on every tick. Each field that the request sets becomes part of the
+  override. The new `clear_override: true` returns the schedule to its code
+  value, and the new `reason` is stored with the override. A schedule made with
+  `POST /admin/schedules/workflow` keeps the #771 row edit and gets no override.
+
+  The API tells the two apart with the code catalog of its process, the same
+  test that `DELETE /admin/schedules` uses.
+
+  See [`docs/operations/schedule-overrides.md`](operations/schedule-overrides.md).
+
+  **Behaviour change.** On a code-declared schedule, `input` now returns 400.
+  Before, it returned 200 and the next tick reverted it. `clear_override` and
+  `reason` return 400 on a schedule made through the API.
+
+  **Migration.** `20261029023935_harvest_schedule_overrides_workflow` lets
+  `harvest_schedule_overrides.kind` hold `workflow`, and adds the column
+  `workflow_fields JSONB NOT NULL DEFAULT '{}'`. No other table changes, no
+  `WorkflowEvent` variant, no replay impact. The grants of #2385 cover it.
+
+  **Tests.** `workflow_schedule_override_db_tests` (the patched cadence holds for
+  three ticks, the override survives new code, clear restores code, a second
+  patch merges, an invalid patch or a live fire claim writes nothing, an
+  unreadable override skips the pass) and the `schedule_update_integration`
+  override tests.
+- **Engine** (implemented): Runtime SLA and execution-timeout overrides per workflow type — see issue #2387, epic #2384. `WorkflowInfo::sla`, `WorkflowInfo::execution_timeout` and their `DagInfo` counterparts were static, so a change needed a restart.
+
+  The new `PATCH /admin/workflow-types/{workflow_name}/run-defaults` sets an
+  operator override of `sla_secs` and `execution_timeout_secs` for one type. A
+  DAG uses its own name. The override wins over code for every new run and
+  survives a restart. `GET` on the same route shows the code value, the
+  override and the effective value. Each field is tri-state, and
+  `clear_override` returns the type to its code values. A duration must be
+  from 1 second to 100 years, so a start can always add it to its start time.
+
+  Every start path reads the override from an in-process cache, so a start
+  sends no extra query. The cache reloads once it is older than 5 seconds. The
+  start clamps still hold: an SLA above the effective timeout is clamped to it.
+
+  By default a change applies to new runs only. `recompute_in_flight: true` also
+  moves the SLA deadline of each non-terminal run of the type that has not
+  breached, on every shard. The hard `deadline_at` never moves.
+
+  See [`docs/operations/run-default-overrides.md`](operations/run-default-overrides.md).
+
+  **Migration.** `20261029050916_harvest_run_default_overrides` adds one small
+  table on the default shard. **Grants:** `SELECT`, `INSERT`, `UPDATE`, `DELETE`
+  on `harvest_run_default_overrides`; `GET /admin/preflight` checks them. No
+  `WorkflowEvent` variant, no replay impact.
+
+  **Tests.** `run_defaults_integration` (a new start takes the override, the
+  opt-in recompute moves only in-flight runs and the breach scanner fires on
+  the new deadline, clear restores code, a timeout override clamps the SLA, bad
+  requests are refused and audited) and `run_defaults_db_tests` (a warm cache
+  sends no query, another process sees a change within one TTL).
+- **Operations** (implemented): See and change runtime overrides from the CLI and Vantage — see issue #2388, epic #2384. The overrides of #2385, #2386 and #2387 were visible only one route at a time. An operator could not tell which parameters were overridden.
+
+  - `GET /admin/overrides` lists every stored override. It reads the schedule
+    overrides from every shard pool, and the run-default overrides from the
+    default shard. Each entry names its actor, reason and time. A shard that
+    cannot be read is named in `unavailable_shards`.
+  - `GET /admin/config` gains `overrides`, the count of each kind.
+  - The CLI gains `harvest dags set-schedule <dag>` (`--interval`, `--cron`,
+    `--manual`, `--timezone`, `--catchup`, `--max-active-runs`,
+    `--jitter-secs`, `--overlap-policy`, `--buffer-all-max`, `--reason`),
+    `harvest dags clear-override <dag>` and `harvest overrides list`. Each
+    command sends one request. `dags` is now an alias of `dag`.
+  - The Vantage DAG page shows each schedule field as declared in code, as
+    overridden and as effective. A field with an override has a marker. A DAG
+    with no override shows none.
+
+  See [`docs/operations/schedule-overrides.md`](operations/schedule-overrides.md).
+
+  No migration, no `WorkflowEvent` variant, no replay impact.
+
+  **Tests.** `run_defaults_integration` (the list names actor, reason and time,
+  the config counts match, and the route is admin-only), `ui_integration` (the
+  DAG page shows the code value and the override, and no marker without an
+  override), and the CLI `request_mapping` and `contract_coverage` suites.
+- **Scheduler** (implemented): Schedule overrides follow their DAG to a new shard — see issue #2389, epic #2384. A DAG schedule override lives on the shard that owns the DAG. A shard routing change moved the schedule row to its new owner, but the override stayed behind. The new owner then reconciled the row to the code value.
+
+  Now the old shard's scheduler pass finds each override that it holds for
+  another shard. It copies the row to the new owner, then deletes its own copy.
+  The copy commits first, so a failure at either step leaves the override on at
+  least one shard, and the next tick retries. An override that the new owner
+  already holds wins. Two shards on one pool share one table, so nothing moves
+  between them. No migration and no configuration change.
 - **Phase 4** (next): production hardening -- sharding, observability, metrics, dashboard (Vantage UI — Workers tab shipped in issue #142; DLQ, schedules, and DAG visualization pages remain); Step 5 of issue #256 (remove classic DAG executor, drop `harvest_dag_runs`). Note: the cancellation primitive and `Saga` both ship; their interaction semantics, idempotency contract, and replay-determinism contract are documented in `docs/saga.md` and locked in by three integration tests in `tests/saga_tests.rs` (issue #238).
 
 ---
