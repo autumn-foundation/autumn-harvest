@@ -6,3 +6,4 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_llm_ledger"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/llm_ledger.md"

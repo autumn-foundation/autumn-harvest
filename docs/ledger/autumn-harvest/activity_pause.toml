@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_activity_pauses"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/activity_pause.md"
 
 ["list_paused_activities"]
 driver = "per_request"

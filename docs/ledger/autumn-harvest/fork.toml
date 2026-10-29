@@ -55,6 +55,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
 measured = "docs/performance-fork-scheduled-occurrence.md"
+plan = "docs/ledger/plans/autumn-harvest/fork.md"
 
 ["workflow_id_in_use"]
 driver = "per_request"

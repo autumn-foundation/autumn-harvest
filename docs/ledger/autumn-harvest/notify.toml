@@ -41,6 +41,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/notify.md"
 
 ["probe"]
 driver = "setup"
@@ -62,6 +63,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "docs/performance-owner-kernels.md"
+plan = "docs/ledger/plans/autumn-harvest/notify.md"
 
 ["send_outside_diesel_transaction"]
 driver = "per_task"
@@ -69,6 +71,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/notify.md"
 
 ["send_progress"]
 driver = "per_task"
@@ -76,6 +79,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/notify.md"
 
 ["send_wakes"]
 driver = "per_task"
@@ -83,6 +87,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/notify.md"
 
 ["tick"]
 driver = "per_tick"

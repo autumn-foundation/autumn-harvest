@@ -76,6 +76,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/decision_owner.md"
 
 ["db::fence_with_generation"]
 driver = "per_task"
@@ -83,6 +84,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/decision_owner.md"
 
 ["db::locked_write"]
 driver = "per_task"
@@ -90,6 +92,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_decision_owner"]
 measured = "docs/performance-owner-kernels.md"
+plan = "docs/ledger/plans/autumn-harvest/decision_owner.md"
 
 ["db::open_lease_write"]
 driver = "per_tick"

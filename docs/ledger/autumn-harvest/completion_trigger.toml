@@ -13,6 +13,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_completion_trigger_fires", "harvest_completion_trigger_outbox", "harvest_completion_triggers", "harvest_workflow_executions"]
 measured = "docs/performance-mutex-terminal-sweep-table-present.md"
+plan = "docs/ledger/plans/autumn-harvest/completion_trigger.md"
 
 ["relay_gate_checked_start"]
 driver = "per_tick"

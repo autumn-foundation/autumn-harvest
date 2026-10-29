@@ -13,6 +13,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "docs/performance-parent-close-cascade-unfinished-handlers.md"
+plan = "docs/ledger/plans/autumn-harvest/execution.md"
 
 ["auto_resume_expired_pauses"]
 driver = "per_tick"
@@ -34,6 +35,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/execution.md"
 
 ["cascade_terminate_detached_child"]
 driver = "per_task"
@@ -41,6 +43,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/execution.md"
 
 ["count_workflow_executions_grouped"]
 driver = "per_request"
@@ -146,6 +149,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/execution.md"
 
 ["pause_workflow_execution"]
 driver = "per_request"
