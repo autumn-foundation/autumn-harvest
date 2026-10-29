@@ -6198,7 +6198,7 @@
     },
     "/dags/{dag_name}": {
       "patch": {
-        "description": "Update mutable DAG configuration fields (currently: pause/unpause).",
+        "description": "Update mutable DAG configuration: pause or resume, and set or clear an operator schedule override (issue #2385). An override wins over the code value and survives a restart. Each override field is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. The response is the DAG schedule row with the effective values.",
         "operationId": "patch_dags_by_dag_name",
         "parameters": [
           {
@@ -6216,13 +6216,37 @@
             "application/json": {
               "schema": {
                 "properties": {
+                  "buffer_all_max": {
+                    "description": "Override buffer cap under buffer_all. null returns to code."
+                  },
+                  "catchup": {
+                    "description": "Override catchup flag. null returns to code."
+                  },
+                  "clear_override": {
+                    "description": "true returns every field to its code value. Cannot be combined with an override field."
+                  },
+                  "jitter_secs": {
+                    "description": "Override fire jitter in seconds. null returns to code."
+                  },
+                  "max_active_runs": {
+                    "description": "Override run cap. null returns to code."
+                  },
+                  "overlap_policy": {
+                    "description": "Override overlap policy: skip, buffer_one, buffer_all, cancel_other, terminate_other or allow_all. null returns to code."
+                  },
                   "paused": {
                     "description": "true to pause the DAG, false to resume it."
+                  },
+                  "reason": {
+                    "description": "Operator reason stored with the override."
+                  },
+                  "schedule_expr": {
+                    "description": "Override cadence: bare cron, cron:<expr>, cron_tz:<tz>:<expr>, interval:<secs> or manual. null returns to the code cadence."
+                  },
+                  "timezone": {
+                    "description": "IANA timezone of a cron schedule_expr. Valid only with a schedule_expr value."
                   }
                 },
-                "required": [
-                  "paused"
-                ],
                 "type": "object"
               }
             }
@@ -6240,6 +6264,9 @@
             },
             "description": "Success."
           },
+          "400": {
+            "description": "Empty patch, unknown field, or an invalid override value."
+          },
           "404": {
             "description": "DAG not found."
           },
@@ -6247,11 +6274,11 @@
             "description": "Database error."
           }
         },
-        "summary": "Update mutable DAG configuration fields (currently: pause/unpause).",
+        "summary": "Update mutable DAG configuration: pause or resume, and set or clear an operator schedule override (issue #2385).",
         "tags": [
           "dag"
         ],
-        "x-harvest-idempotency": "Idempotent: applying the same pause state twice is a no-op.",
+        "x-harvest-idempotency": "Idempotent: applying the same pause state or the same override twice is a no-op.",
         "x-harvest-read-only": false,
         "x-harvest-route-class": "mutating"
       }

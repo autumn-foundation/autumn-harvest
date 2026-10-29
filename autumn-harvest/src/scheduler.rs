@@ -1480,6 +1480,17 @@ pub async fn tick_once_sharded_with_backoff(
             // genuinely needs a write opens a transaction and contends for the
             // fleet-wide registration lock, and a per-schedule failure is collected
             // and backed off rather than aborting the rest of the pass.
+            // Issue #2385: operator overrides win over code. Both registration
+            // passes and the firing pass read the same effective values, or the
+            // two registration passes would rewrite the same DAG row each tick.
+            let Some(overrides) = load_shard_overrides(&mut conn, shard).await else {
+                return Ok(());
+            };
+            // `apply_to_workflow_schedules` reads the code catalog, so it runs
+            // before the catalog is shadowed.
+            let workflow_schedules =
+                overrides.apply_to_workflow_schedules(workflow_schedules.as_ref(), dags.as_ref());
+            let dags = overrides.apply_to_catalog(dags.as_ref());
             register_schedules_for_shard(&mut conn, dags.as_ref(), &router, shard, backoff).await?;
             let firing = register_workflow_schedules_for_shard_with_codecs(
                 &mut conn,
@@ -1524,6 +1535,29 @@ pub async fn tick_once_sharded_with_backoff(
     }
 
     Ok(())
+}
+
+/// Load the operator overrides of one shard for a scheduler pass (issue #2385).
+///
+/// Returns `None` when the overrides cannot be read, and the pass then skips
+/// the shard. Registration with code values would undo every override for one
+/// tick. Each undo recomputes `next_run_at`, so the schedule would move twice.
+async fn load_shard_overrides(
+    conn: &mut AsyncPgConnection,
+    shard: ShardId,
+) -> Option<crate::schedule_override::ScheduleOverrides> {
+    match crate::schedule_override::load_dag_overrides(conn).await {
+        Ok(overrides) => Some(overrides),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                shard_id = shard.as_i32(),
+                "harvest: could not read schedule overrides; skipping this shard's \
+                 scheduler pass (fail-closed)"
+            );
+            None
+        }
+    }
 }
 
 /// Fire one shard's due schedules: drain buffered slots, then tick.
@@ -1741,15 +1775,24 @@ pub async fn trigger_unified_dag(
 /// This is used by management API paths that need pause metadata even before
 /// the background scheduler has run its registration tick.
 ///
+/// `dag` is the code value. The row converges to the effective value: the
+/// code value with the operator override of the DAG (issue #2385). A
+/// convergence to the code value would undo the override until the next
+/// tick, and recompute `next_run_at` twice.
+///
+/// `conn` must be a connection to the shard that owns the DAG.
+///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] if the schedule row cannot be read or
-/// written.
+/// written, and [`HarvestError::Config`] if the stored override does not
+/// decode.
 pub async fn ensure_dag_schedule(
     conn: &mut AsyncPgConnection,
     dag: &RegisteredDag,
 ) -> HarvestResult<HarvestSchedule> {
-    upsert_schedule(conn, dag).await
+    let effective = crate::schedule_override::effective_dag_from_db(conn, dag).await?;
+    upsert_schedule(conn, &effective).await
 }
 
 async fn merge_pause_metadata_into_schedule(
