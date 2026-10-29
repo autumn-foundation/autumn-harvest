@@ -319,6 +319,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **0.8.0 end-to-end benchmarks.** [`docs/benchmarks/results-v0.8.0.md`](docs/benchmarks/results-v0.8.0.md) publishes the 0.8.0 sweep, with a replay spread of 5.6%. It was measured on a new host. A same-box control runs the 0.7.0 suite there. On that host, 0.8.0 completes 57% more workflows at one shard, and its 1-shard dispatch p50 is 6.89 ms against 12.60. The control was noisier than the 10% bar, so that comparison is rough. `PUBLISHED_BASELINES` holds the new numbers.
+
 - **License texts, security policy and contribution guide (issue #1990).** The repository root holds `LICENSE-MIT`, `LICENSE-APACHE`, `SECURITY.md` and `CONTRIBUTING.md`. `LICENSE-APACHE` is the canonical Apache-2.0 text. `SECURITY.md` sends reports to GitHub private vulnerability reporting. It names the fail-closed gate and the scoped token checks as in scope.
 
 - **Why Harvest keeps deterministic replay (issue #1993).** Docs-only. New page `docs/why-deterministic-replay.md` answers engines that advertise "no deterministic replay" as a feature. It compares replay with checkpoint-only steps and process snapshots by what each engine checks on resume.

@@ -103,7 +103,7 @@ pub const SHARD_COUNTS: [u32; 3] = [1, 2, 4];
 /// on every bump until somebody re-measured. Bump this constant in the same
 /// commit that adds a new results file and updates the baselines below; see
 /// "Publishing a new release's numbers" in `docs/benchmarks.md`.
-pub const PUBLISHED_RESULTS_VERSION: &str = "0.7.0";
+pub const PUBLISHED_RESULTS_VERSION: &str = "0.8.0";
 
 /// Published reproduction tolerance (issue #941 AC3): a fresh clone on the
 /// documented hardware should land within this percentage of the published
@@ -1474,109 +1474,109 @@ pub const PUBLISHED_BASELINES: &[Baseline] = &[
         scenario: BenchScenario::Throughput,
         shards: 1,
         metric: "workflows_per_sec",
-        value: 15.46,
+        value: 52.91,
     },
     Baseline {
         scenario: BenchScenario::Throughput,
         shards: 2,
         metric: "workflows_per_sec",
-        value: 18.84,
+        value: 48.14,
     },
     Baseline {
         scenario: BenchScenario::Throughput,
         shards: 4,
         metric: "workflows_per_sec",
-        value: 19.50,
+        value: 50.90,
     },
     Baseline {
         scenario: BenchScenario::DispatchLatency,
         shards: 1,
         metric: "p50_ms",
-        value: 16.12,
+        value: 6.89,
     },
     Baseline {
         scenario: BenchScenario::DispatchLatency,
         shards: 1,
         metric: "p99_ms",
-        value: 90.86,
+        value: 12.11,
     },
     Baseline {
         scenario: BenchScenario::DispatchLatency,
         shards: 2,
         metric: "p50_ms",
-        value: 26.17,
+        value: 10.68,
     },
     Baseline {
         scenario: BenchScenario::DispatchLatency,
         shards: 2,
         metric: "p99_ms",
-        value: 107.79,
+        value: 22.93,
     },
     Baseline {
         scenario: BenchScenario::DispatchLatency,
         shards: 4,
         metric: "p50_ms",
-        value: 69.98,
+        value: 25.35,
     },
     Baseline {
         scenario: BenchScenario::DispatchLatency,
         shards: 4,
         metric: "p99_ms",
-        value: 183.13,
+        value: 49.73,
     },
     Baseline {
         scenario: BenchScenario::SignalRoundtrip,
         shards: 1,
         metric: "p50_ms",
-        value: 47.53,
+        value: 11.36,
     },
     Baseline {
         scenario: BenchScenario::SignalRoundtrip,
         shards: 1,
         metric: "p99_ms",
-        value: 92.99,
+        value: 80.38,
     },
     Baseline {
         scenario: BenchScenario::SignalRoundtrip,
         shards: 2,
         metric: "p50_ms",
-        value: 51.10,
+        value: 15.55,
     },
     Baseline {
         scenario: BenchScenario::SignalRoundtrip,
         shards: 2,
         metric: "p99_ms",
-        value: 95.52,
+        value: 81.96,
     },
     Baseline {
         scenario: BenchScenario::SignalRoundtrip,
         shards: 4,
         metric: "p50_ms",
-        value: 62.27,
+        value: 25.69,
     },
     Baseline {
         scenario: BenchScenario::SignalRoundtrip,
         shards: 4,
         metric: "p99_ms",
-        value: 118.00,
+        value: 85.03,
     },
     Baseline {
         scenario: BenchScenario::ReplayThroughput,
         shards: 1,
         metric: "events_per_sec",
-        value: 9_750_423.86,
+        value: 9_571_608.09,
     },
     Baseline {
         scenario: BenchScenario::ReplayThroughput,
         shards: 2,
         metric: "events_per_sec",
-        value: 9_063_901.37,
+        value: 9_591_638.46,
     },
     Baseline {
         scenario: BenchScenario::ReplayThroughput,
         shards: 4,
         metric: "events_per_sec",
-        value: 8_981_387.93,
+        value: 9_058_597.83,
     },
 ];
 
