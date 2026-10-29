@@ -7,6 +7,13 @@ kind = ["read"]
 tables = ["harvest_run_default_overrides"]
 measured = "unmeasured"
 
+["db::lock_type"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
 ["db::recompute_in_flight_sla"]
 driver = "per_request"
 backend = ["postgres"]

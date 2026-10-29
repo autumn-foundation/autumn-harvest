@@ -108,6 +108,12 @@ keeps the old SLA. Send the same request again to retry it.
 The recompute updates rows in batches of 500, so it holds a bounded number of
 row locks at a time.
 
+Before each batch the recompute reads the stored override again. If a newer
+change has replaced its SLA, it stops and reports `recompute.superseded:
+true`. So two recomputes of one type never undo each other: the newer change
+decides the SLA of the runs in flight. To move them, set
+`recompute_in_flight: true` on that newer change.
+
 ## Grants
 
 The runtime role needs `SELECT`, `INSERT`, `UPDATE` and `DELETE` on

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use autumn_harvest::run_defaults::{
     MAX_RUN_DEFAULT, RUN_DEFAULTS_TTL, RunDefaultChange, RunDefaultPatch, RunDefaultsCache,
-    get_run_default_override, update_run_default_override,
+    get_run_default_override, recompute_in_flight_sla, update_run_default_override,
 };
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -276,4 +276,48 @@ async fn a_zero_duration_is_refused() {
             .expect("read")
             .is_none()
     );
+}
+
+/// A recompute for an SLA that a newer change replaced stops, and moves
+/// nothing.
+#[tokio::test]
+async fn a_superseded_recompute_stops() {
+    let (mut conn, _hold) = setup_db().await;
+    change(&mut conn, set_sla(300)).await;
+    let stale = recompute_in_flight_sla(
+        &mut conn,
+        None,
+        WF,
+        THREE_HOURS,
+        Some(Duration::from_secs(600)),
+    )
+    .await
+    .expect("recompute");
+    assert!(stale.superseded);
+    assert_eq!(stale.moved, 0);
+
+    let current = recompute_in_flight_sla(
+        &mut conn,
+        None,
+        WF,
+        THREE_HOURS,
+        Some(Duration::from_secs(300)),
+    )
+    .await
+    .expect("recompute");
+    assert!(!current.superseded);
+
+    // With no override stored, the code value is the current one.
+    change(
+        &mut conn,
+        RunDefaultPatch {
+            sla: Some(None),
+            ..RunDefaultPatch::default()
+        },
+    )
+    .await;
+    let code = recompute_in_flight_sla(&mut conn, None, WF, THREE_HOURS, THREE_HOURS)
+        .await
+        .expect("recompute");
+    assert!(!code.superseded);
 }

@@ -90,6 +90,9 @@ pub struct RecomputeReport {
     /// The shards that the recompute could not reach. Their runs keep the old
     /// SLA. Send the request again to retry them.
     pub unavailable_shards: Vec<UnavailableShard>,
+    /// Whether a newer change to the SLA of the type stopped this recompute.
+    /// That change then decides the SLA of the in-flight runs.
+    pub superseded: bool,
 }
 
 /// The run defaults of one workflow type.
@@ -253,27 +256,58 @@ async fn audit_patch(
 
 /// Move the SLA of the in-flight runs of a type on every shard.
 ///
-/// One unreachable shard does not stop the others. The report names it.
+/// One unreachable shard does not stop the others. The report names it. A
+/// shard other than the default one also takes a default-shard connection,
+/// to read the stored override before each batch. It takes it only while it
+/// holds no other default-shard connection, so a pool of one is enough.
 async fn recompute_on_every_shard(
     api_state: &HarvestApiState,
     workflow_name: &str,
+    code_sla: Option<Duration>,
     sla: Option<Duration>,
 ) -> Result<RecomputeReport, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
+    let default_shard = pool.default_shard();
     let mut report = RecomputeReport {
         moved_runs: 0,
         unavailable_shards: Vec::new(),
+        superseded: false,
     };
     for (shard, shard_pool) in pool.iter_shards() {
         let shard_id = shard.as_i32();
-        let moved = match acquire_conn(shard_pool).await {
-            Ok(mut conn) => recompute_in_flight_sla(&mut conn, workflow_name, sla)
-                .await
-                .map_err(|error| error.to_string()),
-            Err(error) => Err(error.to_string()),
-        };
-        match moved {
-            Ok(moved) => report.moved_runs += moved,
+        let on_default =
+            shard == default_shard || pool.sharded_pool().same_physical_pool(shard, default_shard);
+        let outcome = async {
+            let mut conn = acquire_conn(shard_pool).await.map_err(|e| e.to_string())?;
+            let mut store = if on_default {
+                None
+            } else {
+                Some(
+                    acquire_conn(pool.default_pool())
+                        .await
+                        .map_err(|e| e.to_string())?,
+                )
+            };
+            recompute_in_flight_sla(
+                &mut conn,
+                store.as_deref_mut(),
+                workflow_name,
+                code_sla,
+                sla,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        }
+        .await;
+        match outcome {
+            Ok(outcome) => {
+                report.moved_runs += outcome.moved;
+                if outcome.superseded {
+                    // A newer change owns the in-flight runs now.
+                    report.superseded = true;
+                    break;
+                }
+            }
             Err(reason) => report
                 .unavailable_shards
                 .push(UnavailableShard { shard_id, reason }),
@@ -350,10 +384,13 @@ pub async fn patch_run_defaults(
         stored.as_ref().map(|s| s.fields).unwrap_or_default(),
     );
     audit_patch(&mut conn, ctx, &workflow_name, None).await?;
+    // The recompute takes its own connections, the default shard among them.
+    // Holding this one would starve a small pool.
+    drop(conn);
 
     let recompute = if request.recompute_in_flight {
         let effective = effective_fields(code, stored.as_ref());
-        Some(recompute_on_every_shard(&api_state, &workflow_name, effective.sla).await?)
+        Some(recompute_on_every_shard(&api_state, &workflow_name, code.sla, effective.sla).await?)
     } else {
         None
     };

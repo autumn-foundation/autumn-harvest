@@ -403,14 +403,7 @@ mod db {
             // A first override has no row for FOR UPDATE to lock. This lock
             // serializes two patches of the same type in that case too, so
             // neither one merges over a read that the other replaces.
-            diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::int8)")
-                .bind::<diesel::sql_types::Text, _>(format!(
-                    "harvest:run_defaults:{}",
-                    change.workflow_name
-                ))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+            lock_type(conn, change.workflow_name).await?;
             let stored = select_override(conn, change.workflow_name, true).await?;
             let base = if change.clear {
                 RunDefaultFields::default()
@@ -485,27 +478,64 @@ mod db {
         }
     }
 
+    /// Take the transaction lock of one workflow type.
+    ///
+    /// An override change takes it on the default shard. A recompute batch
+    /// takes it on the shard that it updates.
+    async fn lock_type(conn: &mut AsyncPgConnection, workflow_name: &str) -> HarvestResult<()> {
+        diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::int8)")
+            .bind::<diesel::sql_types::Text, _>(format!("harvest:run_defaults:{workflow_name}"))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        Ok(())
+    }
+
+    /// The result of [`recompute_in_flight_sla`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Recompute {
+        /// The number of runs that moved.
+        pub moved: u64,
+        /// Whether a newer change replaced `sla`, so the recompute stopped.
+        pub superseded: bool,
+    }
+
     /// Move the SLA of the in-flight runs of one type to `sla`. Call it on
     /// every shard.
     ///
-    /// Only a RUNNING, SUSPENDED or PAUSED run that has not breached moves. The run keeps
-    /// its SLA anchor: the new deadline is the old deadline minus the old SLA,
-    /// plus the new one. A run with no SLA so far anchors at `started_at`. The
-    /// new SLA is clamped to the run's own `execution_timeout`, as at start.
-    /// `None` removes the SLA. The hard `deadline_at` never changes.
+    /// Only a RUNNING, SUSPENDED or PAUSED run that has not breached moves.
+    /// The run keeps its SLA anchor: the new deadline is the old deadline
+    /// minus the old SLA, plus the new one. A run with no SLA so far anchors
+    /// at `started_at`. The new SLA is clamped to the run's own
+    /// `execution_timeout`, as at start. `None` removes the SLA. The hard
+    /// `deadline_at` never changes.
     ///
-    /// The update runs in batches of [`RECOMPUTE_BATCH`] rows. Returns the
-    /// number of runs that moved.
+    /// The update runs in batches of [`RECOMPUTE_BATCH`] rows. Each batch is
+    /// one transaction under the lock of the type on this shard. Under that
+    /// lock it reads the stored override from `store`, the default shard.
+    /// `None` means that `conn` is the default shard. If the effective SLA is
+    /// no longer `sla`, a newer change replaced it, and the recompute stops.
+    /// `code_sla` is the code value, which applies when no override is
+    /// stored.
+    ///
+    /// So two recomputes of one type cannot undo each other. A batch of the
+    /// older one either runs before the newer change commits, or it sees that
+    /// change and stops. A newer batch waits on the lock for an older one, so
+    /// it always runs after it.
     ///
     /// # Errors
     ///
-    /// Returns [`HarvestError::Database`] when an update fails.
+    /// Returns [`HarvestError::Database`] when a read or an update fails, and
+    /// [`HarvestError::Config`] when the stored override does not decode.
     pub async fn recompute_in_flight_sla(
         conn: &mut AsyncPgConnection,
+        mut store: Option<&mut AsyncPgConnection>,
         workflow_name: &str,
+        code_sla: Option<Duration>,
         sla: Option<Duration>,
-    ) -> HarvestResult<u64> {
+    ) -> HarvestResult<Recompute> {
         use diesel::sql_types::{BigInt, Nullable, Text};
+        use diesel_async::AsyncConnection;
 
         // `target` is the clamped new SLA of each row. The `IS DISTINCT FROM`
         // filter makes each batch skip the rows that already moved, so the
@@ -540,16 +570,39 @@ mod db {
         let secs = sla.map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
         let mut moved = 0_u64;
         loop {
-            let updated = diesel::sql_query(SQL)
-                .bind::<Text, _>(workflow_name)
-                .bind::<Nullable<BigInt>, _>(secs)
-                .bind::<BigInt, _>(RECOMPUTE_BATCH)
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+            let store = store.as_deref_mut();
+            let batch = Box::pin(conn.transaction(async |conn| {
+                lock_type(conn, workflow_name).await?;
+                let stored = match store {
+                    Some(store) => get_run_default_override(store, workflow_name).await?,
+                    None => get_run_default_override(conn, workflow_name).await?,
+                };
+                let current = stored.map_or(code_sla, |stored| stored.fields.sla.or(code_sla));
+                if current != sla {
+                    return Ok(None);
+                }
+                diesel::sql_query(SQL)
+                    .bind::<Text, _>(workflow_name)
+                    .bind::<Nullable<BigInt>, _>(secs)
+                    .bind::<BigInt, _>(RECOMPUTE_BATCH)
+                    .execute(conn)
+                    .await
+                    .map(Some)
+                    .map_err(crate::error::database_error)
+            }))
+            .await?;
+            let Some(updated) = batch else {
+                return Ok(Recompute {
+                    moved,
+                    superseded: true,
+                });
+            };
             moved += u64::try_from(updated).unwrap_or(0);
             if i64::try_from(updated).unwrap_or(i64::MAX) < RECOMPUTE_BATCH {
-                return Ok(moved);
+                return Ok(Recompute {
+                    moved,
+                    superseded: false,
+                });
             }
         }
     }
