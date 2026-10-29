@@ -6,3 +6,4 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events", "harvest_llm_ledger", "harvest_shard_migrations", "harvest_workflow_executions"]
 measured = "docs/performance-usage-report-activity-lookback.md"
+plan = "docs/ledger/plans/autumn-harvest/usage.md"

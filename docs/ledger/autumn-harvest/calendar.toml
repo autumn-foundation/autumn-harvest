@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_calendars"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/calendar.md"
 
 ["delete_calendar"]
 driver = "per_request"
@@ -20,6 +21,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_calendars"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/calendar.md"
 
 ["list_calendars"]
 driver = "per_request"
@@ -50,3 +52,4 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_calendar_exclusions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/calendar.md"

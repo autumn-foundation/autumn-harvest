@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_execution_summaries", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/erase.md"
 
 ["db::collect_cross_shard_child_ids"]
 driver = "per_request"
@@ -13,6 +14,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_cross_shard_children"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/erase.md"
 
 ["db::erase_execution_summary"]
 driver = "per_request"
@@ -20,6 +22,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_execution_summaries"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/erase.md"
 
 ["db::load_erase_gate_row"]
 driver = "per_request"
@@ -27,6 +30,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/erase.md"
 
 ["db::scrub_callback_pii"]
 driver = "per_request"
@@ -34,6 +38,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_completion_deliveries", "harvest_dead_letters"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/erase.md"
 
 ["db::scrub_cross_shard_child_spec"]
 driver = "per_request"
@@ -41,6 +46,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_cross_shard_children"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/erase.md"
 
 ["db::scrub_events"]
 driver = "per_request"
@@ -48,6 +54,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/erase.md"
 
 ["db::scrub_execution_node"]
 driver = "per_request"
@@ -55,3 +62,4 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_signals", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/erase.md"

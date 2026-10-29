@@ -18,6 +18,14 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `clear_fairness_weight`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM harvest_fairness_weights WHERE queue_name = $1 AND fairness_key = $2` | `harvest_fairness_weights`: Index Scan on `harvest_fairness_weights_pkey`<br>`harvest_fairness_weights`: ModifyTable |
+
 ## `delete_prune_batches`
 
 Statements: 2. Tables with no usable index: none.
@@ -27,6 +35,22 @@ Statements: 2. Tables with no usable index: none.
 | 1 | `WITH clock AS ( SELECT g.queue_name, g.last_charge, k.fairness_key AS clock_key FROM ( SELECT que...` | not planned: ERROR:  relation "harvest_fairness_preview" does not exist |
 | 2 | `WITH clock AS ( SELECT g.queue_name, g.last_charge, k.fairness_key AS clock_key FROM ( SELECT que...` | `harvest_fairness_state`: Index Only Scan on `harvest_fairness_state_clock`<br>`harvest_fairness_state`: Index Scan on `harvest_fairness_state_pass`<br>`harvest_fairness_state`: Index Scan on `harvest_fairness_state_pkey`<br>`harvest_fairness_state`: ModifyTable<br>`harvest_fairness_state`: full scan of index `harvest_fairness_state_pass`<br>`harvest_task_queue`: full scan of partial index `idx_harvest_tq_claim_seek` |
 
+## `list_fairness_state`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT s.queue_name, s.fairness_key, s.pass, s.last_start, GREATEST(s.pass - MAX(s.last_start) OV...` | `harvest_fairness_state`: Bitmap Heap Scan on `harvest_fairness_state_pass` |
+
+## `list_fairness_weights`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT queue_name, fairness_key, weight, updated_by, updated_at FROM harvest_fairness_weights WHE...` | `harvest_fairness_weights`: Bitmap Heap Scan on `harvest_fairness_weights_pkey` |
+
 ## `prune_fairness_state`
 
 Statements: 1. Tables with no usable index: none.
@@ -34,4 +58,13 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `WITH cp AS ( INSERT INTO harvest_fairness_preview SELECT * FROM harvest_fairness_state WHERE $1::...` | not planned: ERROR:  relation "harvest_fairness_preview" does not exist |
+
+## `set_fairness_weight`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO harvest_fairness_weights (queue_name, fairness_key, weight, updated_by, updated_at) S...` | `harvest_fairness_weights`: Bitmap Heap Scan on `harvest_fairness_weights_pkey`<br>`harvest_fairness_weights`: Index Only Scan on `harvest_fairness_weights_pkey`<br>`harvest_fairness_weights`: ModifyTable |
+| 2 | `SELECT pg_advisory_xact_lock(hashtextextended('harvest_fairness_weights:' \|\| $1, 0))` | no table |
 

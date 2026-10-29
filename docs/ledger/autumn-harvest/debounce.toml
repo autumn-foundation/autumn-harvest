@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_debounce"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/debounce.md"
 
 ["delete_debounce_row"]
 driver = "per_tick"
@@ -29,6 +30,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_debounce"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/debounce.md"
 
 ["redefer_debounce_row"]
 driver = "per_tick"

@@ -26,3 +26,31 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT EXISTS ( SELECT 1 FROM harvest_activity_pauses WHERE activity_name = $1 ) AS paused` | `harvest_activity_pauses`: Index Only Scan on `harvest_activity_pauses_pkey` |
 
+## `list_paused_activities`
+
+Statements: 1. Tables with no usable index: `harvest_activity_pauses`.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT p.activity_name, p.reason, p.paused_by, p.paused_at, p.scope_shard_id, (SELECT COUNT(*) FR...` | `harvest_activity_pauses`: no usable index<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_claim_seek` |
+
+## `pause_activity`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO harvest_activity_pauses (activity_name, reason, paused_by, paused_at, scope_shard_id)...` | `harvest_activity_pauses`: ModifyTable |
+| 2 | `SELECT COUNT(*) AS count FROM harvest_task_queue WHERE task_type = 'activity' AND activity_name =...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_claim_seek` |
+
+## `resume_activity`
+
+Statements: 4. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM harvest_activity_pauses WHERE activity_name = $1 RETURNING reason, paused_by, paused_at` | `harvest_activity_pauses`: Index Scan on `harvest_activity_pauses_pkey`<br>`harvest_activity_pauses`: ModifyTable |
+| 2 | `SELECT DISTINCT ON (queue_name) id, queue_name FROM harvest_task_queue WHERE task_type = 'activit...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_claim_seek` |
+| 3 | `UPDATE harvest_task_queue SET scheduled_at = CASE WHEN created_at IS NULL OR created_at < $2 THEN...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_claim_seek`<br>`harvest_task_queue`: ModifyTable |
+| 4 | `UPDATE harvest_task_queue SET scheduled_at = CASE WHEN created_at IS NULL OR created_at < $2 THEN...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_claim_seek`<br>`harvest_task_queue`: ModifyTable |
+

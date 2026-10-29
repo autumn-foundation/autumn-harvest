@@ -34,6 +34,15 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `UPDATE "harvest_workers" SET "last_heartbeat_at" = CURRENT_TIMESTAMP, "in_flight_count" = $1, "la...` | `harvest_workers`: Index Scan on `harvest_workers_pkey`<br>`harvest_workers`: ModifyTable |
 
+## `list_workers`
+
+Statements: 2. Tables with no usable index: `harvest_workers`.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workers"."worker_id", "harvest_workers"."started_at", "harvest_workers"."last_hea...` | `harvest_workers`: no usable index |
+| 2 | `SELECT "harvest_workers"."worker_id", "harvest_workers"."started_at", "harvest_workers"."last_hea...` | `harvest_workers`: Index Scan on `harvest_workers_status_idx` |
+
 ## `live_workers_on_queue`
 
 Statements: 1. Tables with no usable index: none.
@@ -41,6 +50,16 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT worker_id, build_id, labels FROM harvest_workers WHERE last_heartbeat_at > NOW() - ($1::bi...` | `harvest_workers`: Bitmap Heap Scan on `harvest_workers_last_heartbeat_at_idx` |
+
+## `load_task_stats`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT s.worker_id, s.cohort, s.window_tasks, s.window_failures, s.p99_latency_ms, s.snapshot_seq...` | `harvest_worker_task_stats`: Bitmap Heap Scan on `harvest_worker_task_stats_cohort_idx`<br>`harvest_workers`: Index Scan on `harvest_workers_status_idx` |
+| 2 | `SELECT s.worker_id, s.cohort, s.window_tasks, s.window_failures, s.p99_latency_ms, s.snapshot_seq...` | `harvest_worker_task_stats`: Index Scan on `harvest_worker_task_stats_pkey`<br>`harvest_workers`: Index Scan on `harvest_workers_status_idx` |
+| 3 | `SELECT s.worker_id, s.cohort, s.window_tasks, s.window_failures, s.p99_latency_ms, s.snapshot_seq...` | `harvest_worker_task_stats`: Index Scan on `harvest_worker_task_stats_pkey`<br>`harvest_workers`: Index Scan on `harvest_workers_status_idx` |
 
 ## `prune_worker_task_stats`
 
@@ -50,6 +69,32 @@ Statements: 1. Tables with no usable index: `harvest_worker_task_stats`.
 |---|---|---|
 | 1 | `DELETE FROM harvest_worker_task_stats s WHERE s.updated_at < NOW() - (GREATEST($1::bigint, LEAST(...` | `harvest_worker_task_stats`: ModifyTable<br>`harvest_worker_task_stats`: no usable index |
 
+## `read_worker_drain_deadline`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workers"."drain_deadline_at" FROM "harvest_workers" WHERE ("harvest_workers"."wor...` | `harvest_workers`: Index Scan on `harvest_workers_pkey` |
+
+## `read_worker_status`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workers"."status" FROM "harvest_workers" WHERE ("harvest_workers"."worker_id" = $...` | `harvest_workers`: Index Scan on `harvest_workers_pkey` |
+
+## `request_drain`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workers"."worker_id", "harvest_workers"."started_at", "harvest_workers"."last_hea...` | `harvest_workers`: Index Scan on `harvest_workers_pkey` |
+| 2 | `UPDATE "harvest_workers" SET "drain_deadline_at" = $1 WHERE ("harvest_workers"."worker_id" = $2)` | `harvest_workers`: Index Scan on `harvest_workers_pkey`<br>`harvest_workers`: ModifyTable |
+| 3 | `UPDATE "harvest_workers" SET "status" = $1, "drain_deadline_at" = $2 WHERE (("harvest_workers"."w...` | `harvest_workers`: Index Scan on `harvest_workers_pkey`<br>`harvest_workers`: ModifyTable |
+
 ## `touch_worker_liveness`
 
 Statements: 1. Tables with no usable index: none.
@@ -57,6 +102,22 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `UPDATE "harvest_workers" SET "last_heartbeat_at" = CURRENT_TIMESTAMP, "queues" = CASE WHEN status...` | `harvest_workers`: Index Scan on `harvest_workers_pkey`<br>`harvest_workers`: ModifyTable |
+
+## `transition_active_to_draining`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE "harvest_workers" SET "status" = $1, "drain_deadline_at" = $2 WHERE (("harvest_workers"."w...` | `harvest_workers`: Index Scan on `harvest_workers_status_idx`<br>`harvest_workers`: ModifyTable |
+
+## `transition_status`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE "harvest_workers" SET "status" = $1 WHERE ("harvest_workers"."worker_id" = $2)` | `harvest_workers`: Index Scan on `harvest_workers_pkey`<br>`harvest_workers`: ModifyTable |
 
 ## `write_task_stats_snapshot`
 

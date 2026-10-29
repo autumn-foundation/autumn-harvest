@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_fairness_weights"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/fairness_keys.md"
 
 ["delete_prune_batches"]
 driver = "per_tick"
@@ -21,6 +22,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_fairness_state"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/fairness_keys.md"
 
 ["list_fairness_weights"]
 driver = "per_request"
@@ -28,6 +30,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_fairness_weights"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/fairness_keys.md"
 
 ["prune_fairness_state"]
 driver = "per_tick"
@@ -43,3 +46,4 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_fairness_weights"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/fairness_keys.md"

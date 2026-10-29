@@ -18,6 +18,44 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `insert_audit_row`
+
+Statements: 7. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 2 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 3 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 4 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 5 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 6 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 7 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+
+## `insert_audit_rows`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+
+## `list_audit`
+
+Statements: 9. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_audit_log"."id", "harvest_audit_log"."occurred_at", "harvest_audit_log"."actor", ...` | `harvest_audit_log`: full scan of index `harvest_audit_occurred_at_idx` |
+| 2 | `SELECT "harvest_audit_log"."id", "harvest_audit_log"."occurred_at", "harvest_audit_log"."actor", ...` | `harvest_audit_log`: Index Scan on `harvest_audit_actor_occurred_at_idx` |
+| 3 | `SELECT "harvest_audit_log"."id", "harvest_audit_log"."occurred_at", "harvest_audit_log"."actor", ...` | `harvest_audit_log`: Index Scan on `harvest_audit_occurred_at_idx` |
+| 4 | `SELECT "harvest_audit_log"."id", "harvest_audit_log"."occurred_at", "harvest_audit_log"."actor", ...` | `harvest_audit_log`: Index Scan on `harvest_audit_occurred_at_idx` |
+| 5 | `SELECT "harvest_audit_log"."id", "harvest_audit_log"."occurred_at", "harvest_audit_log"."actor", ...` | `harvest_audit_log`: Index Scan on `harvest_audit_operation_occurred_at_idx` |
+| 6 | `SELECT "harvest_audit_log"."id", "harvest_audit_log"."occurred_at", "harvest_audit_log"."actor", ...` | `harvest_audit_log`: full scan of index `harvest_audit_occurred_at_idx` |
+| 7 | `SELECT "harvest_audit_log"."id", "harvest_audit_log"."occurred_at", "harvest_audit_log"."actor", ...` | `harvest_audit_log`: Index Scan on `harvest_audit_target_occurred_at_idx` |
+| 8 | `SELECT "harvest_audit_log"."id", "harvest_audit_log"."occurred_at", "harvest_audit_log"."actor", ...` | `harvest_audit_log`: full scan of index `harvest_audit_occurred_at_idx` |
+| 9 | `SELECT "harvest_audit_log"."id", "harvest_audit_log"."occurred_at", "harvest_audit_log"."actor", ...` | `harvest_audit_log`: full scan of index `harvest_audit_occurred_at_idx` |
+
 ## `purge_old_audit_records`
 
 Statements: 1. Tables with no usable index: `harvest_audit_export_cursor`.

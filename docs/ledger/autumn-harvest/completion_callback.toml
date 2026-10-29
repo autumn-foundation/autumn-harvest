@@ -61,6 +61,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_completion_deliveries"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/completion_callback.md"
 
 ["redrive_delivery_at"]
 driver = "per_request"
@@ -68,6 +69,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_completion_deliveries", "harvest_dead_letters"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/completion_callback.md"
 
 ["reread_claimed_payloads"]
 driver = "per_tick"

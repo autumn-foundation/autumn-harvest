@@ -72,6 +72,16 @@ Statements: 3. Tables with no usable index: none.
 | 2 | `SELECT partition, epoch FROM harvest_decision_owner WHERE partition = ANY($1::int[]) AND (holder ...` | `harvest_decision_owner`: Index Scan on `harvest_decision_owner_pkey` |
 | 3 | `UPDATE harvest_decision_owner o SET holder = $1, epoch = w.next, lease_until = clock_timestamp() ...` | `harvest_decision_owner`: ModifyTable<br>`harvest_decision_owner`: full scan of index `harvest_decision_owner_pkey` |
 
+## `db::check_fleet`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT count(DISTINCT (queues, build_id))::bigint AS n FROM harvest_workers WHERE status <> 'Stop...` | `harvest_workers`: Bitmap Heap Scan on `harvest_workers_last_heartbeat_at_idx` |
+| 2 | `SELECT count(DISTINCT COALESCE(labels->>'decision_owner_handlers', ''))::bigint AS n FROM harvest...` | `harvest_workers`: Bitmap Heap Scan on `harvest_workers_last_heartbeat_at_idx` |
+| 3 | `SELECT worker_id FROM harvest_workers WHERE status <> 'Stopped' AND last_heartbeat_at > NOW() - m...` | `harvest_workers`: Bitmap Heap Scan on `harvest_workers_last_heartbeat_at_idx` |
+
 ## `db::expire_all`
 
 Statements: 2. Tables with no usable index: none.

@@ -26,6 +26,14 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `DELETE FROM harvest_start_throttle WHERE id = $1` | `harvest_start_throttle`: Index Scan on `harvest_start_throttle_pkey`<br>`harvest_start_throttle`: ModifyTable |
 
+## `existing_pending_throttle_for_workflow_id`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT throttle_key, deferred_at FROM harvest_start_throttle WHERE workflow_name = $1 AND workflo...` | `harvest_start_throttle`: Index Scan on `idx_harvest_start_throttle_workflow_id` |
+
 ## `fire_due_on_conn`
 
 Statements: 3. Tables with no usable index: none.
@@ -35,6 +43,38 @@ Statements: 3. Tables with no usable index: none.
 | 1 | `SELECT EXISTS (SELECT 1 FROM harvest_start_throttle LIMIT 1) AS present` | `harvest_start_throttle`: full scan of index `idx_harvest_start_throttle_workflow_id` |
 | 2 | `SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS present` | no table |
 | 3 | `WITH candidates AS ( SELECT t.id, t.deferred_at, ROW_NUMBER() OVER ( PARTITION BY t.bucket_key OR...` | `harvest_rate_limit_buckets`: full scan of index `harvest_rate_limit_buckets_pkey`<br>`harvest_start_throttle`: Index Scan on `harvest_start_throttle_pkey`<br>`harvest_start_throttle`: full scan of index `idx_harvest_start_throttle_bucket_deferred` |
+
+## `insert_pending_throttle_row`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO harvest_start_throttle (id, workflow_name, throttle_key, bucket_key, workflow_id, que...` | `harvest_start_throttle`: ModifyTable |
+
+## `pending_backlog_exists`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT EXISTS (SELECT 1 FROM harvest_start_throttle WHERE bucket_key = $1) AS present` | `harvest_start_throttle`: Index Only Scan on `idx_harvest_start_throttle_bucket_deferred` |
+
+## `pending_throttle_count_for_workflow`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT COUNT(*) AS n FROM harvest_start_throttle WHERE workflow_name = $1` | `harvest_start_throttle`: Index Only Scan on `idx_harvest_start_throttle_workflow_id` |
+
+## `pending_throttle_counts_for_workflows`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT workflow_name, COUNT(*) AS n FROM harvest_start_throttle WHERE workflow_name = ANY($1) GRO...` | `harvest_start_throttle`: Bitmap Heap Scan on `idx_harvest_start_throttle_workflow_id`<br>`harvest_start_throttle`: Index Only Scan on `idx_harvest_start_throttle_workflow_id` |
 
 ## `pre_lock_rate_limit_buckets_for_claimed_batch`
 
@@ -51,4 +91,12 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `UPDATE harvest_start_throttle SET deferred_at = $2 WHERE id = $1` | `harvest_start_throttle`: Index Scan on `harvest_start_throttle_pkey`<br>`harvest_start_throttle`: ModifyTable |
+
+## `throttle_backlog_by_key`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT t.workflow_name, t.throttle_key, t.shard_id, COUNT(*) AS deferred_count, MIN(t.deferred_at...` | `harvest_rate_limit_buckets`: full scan of index `harvest_rate_limit_buckets_pkey`<br>`harvest_start_throttle`: full scan of index `idx_harvest_start_throttle_bucket_deferred` |
 

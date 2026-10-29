@@ -13,6 +13,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_dead_letters", "harvest_events", "harvest_workflow_executions"]
 measured = "docs/performance-quota-history-bytes.md"
+plan = "docs/ledger/plans/autumn-harvest/quota.md"
 
 ["load_quota_usage_excluding"]
 driver = "per_request"
@@ -20,6 +21,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_dead_letters", "harvest_events", "harvest_workflow_executions"]
 measured = "docs/performance-quota-history-bytes.md"
+plan = "docs/ledger/plans/autumn-harvest/quota.md"
 
 ["lock_quota_key"]
 driver = "per_request"

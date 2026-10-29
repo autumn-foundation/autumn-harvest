@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_event_batches"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/event_batch.md"
 
 ["fire_claimed_batch_row"]
 driver = "per_tick"
