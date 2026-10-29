@@ -119,7 +119,8 @@ The request body is the #771 body. Each field that it sets becomes part of the
 override, and a field that it leaves out keeps the stored override. A JSON
 `null` keeps its #771 meaning: it sets a nullable field such as `calendar` to
 NULL, and the override stores that NULL. Use `clear_override: true` to return
-to code. With other fields in the same request, the clear runs first.
+to code. A clear takes no other field except `reason`, and returns 400
+otherwise. Send the new values in a second request.
 
 Rules that differ from a row edit:
 

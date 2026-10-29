@@ -16,11 +16,11 @@ use std::time::Duration;
 
 use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest::policy::{Schedule, WorkflowSchedule};
-use autumn_harvest::schedule_override::get_workflow_override;
+use autumn_harvest::schedule_override::{get_workflow_override, override_fingerprint};
 use autumn_harvest::scheduler::{
-    DagCatalog, ScheduleUpdateOutcome, SchedulerMonitor, WorkflowOverrideRequest,
-    WorkflowOverrideUpdate, WorkflowSchedulePatch, tick_once,
-    update_code_declared_workflow_schedule,
+    DagCatalog, REGISTRATION_LOCK_KEY, ScheduleUpdateOutcome, SchedulerMonitor,
+    WorkflowOverrideRequest, WorkflowOverrideUpdate, WorkflowSchedulePatch, registration_lock_stmt,
+    tick_once, update_code_declared_workflow_schedule,
 };
 use autumn_harvest::worker::HandlerRegistry;
 use chrono::{DateTime, Utc};
@@ -396,6 +396,27 @@ async fn an_unreadable_workflow_override_skips_the_pass() {
         before,
         "a pass with unreadable overrides must write no schedule row"
     );
+
+    // A clear never decodes the row, so it removes it and the pass resumes.
+    let minutely_code = code_schedule("nightly", minutely());
+    patch(
+        &mut conn,
+        before.id,
+        &minutely_code,
+        &WorkflowSchedulePatch::default(),
+        true,
+    )
+    .await
+    .expect("a clear removes an unreadable override");
+    assert_eq!(override_rows(&mut conn).await, 0);
+    tick(&db.url, std::slice::from_ref(&minutely_code)).await;
+    assert_eq!(
+        workflow_row(&mut conn, "nightly")
+            .await
+            .schedule_expr
+            .as_deref(),
+        Some("interval:60")
+    );
 }
 
 /// A DAG row is not a workflow override target.
@@ -411,5 +432,65 @@ async fn the_database_refuses_workflow_fields_on_a_dag_row() {
     assert!(
         result.is_err(),
         "the check must refuse workflow_fields on a dag row"
+    );
+}
+
+/// A PATCH cannot commit while a scheduler pass holds the registration lock.
+///
+/// The pass reads an override fingerprint before its snapshot and again
+/// under the lock. Each committed write changes the fingerprint. So a pass
+/// skips a write that would undo a PATCH made after its snapshot.
+#[tokio::test]
+async fn a_patch_waits_for_a_pass_and_changes_the_fingerprint() {
+    let (mut conn, db) = setup_db().await;
+    let code = code_schedule("nightly", hourly());
+    tick(&db.url, std::slice::from_ref(&code)).await;
+    let id = workflow_row(&mut conn, "nightly").await.id;
+    let before = override_fingerprint(&mut conn).await.expect("fingerprint");
+    assert_eq!(
+        override_fingerprint(&mut conn).await.expect("fingerprint"),
+        before,
+        "a read does not change the fingerprint"
+    );
+
+    // A peer pass holds the registration lock.
+    let mut peer = AsyncPgConnection::establish(&db.url)
+        .await
+        .expect("connect");
+    peer.batch_execute("BEGIN").await.expect("begin");
+    diesel::sql_query(registration_lock_stmt())
+        .bind::<diesel::sql_types::Text, _>(REGISTRATION_LOCK_KEY)
+        .execute(&mut peer)
+        .await
+        .expect("take lock");
+
+    let url = db.url.clone();
+    let code_for_patch = code.clone();
+    let patching = tokio::spawn(async move {
+        let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+        patch(
+            &mut conn,
+            id,
+            &code_for_patch,
+            &set_cadence(minutely()),
+            false,
+        )
+        .await
+        .map(|_| ())
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!patching.is_finished(), "the PATCH must wait for the pass");
+    assert_eq!(
+        override_fingerprint(&mut conn).await.expect("fingerprint"),
+        before,
+        "nothing commits while the pass holds the lock"
+    );
+
+    peer.batch_execute("COMMIT").await.expect("commit");
+    patching.await.expect("join").expect("patch");
+    assert_ne!(
+        override_fingerprint(&mut conn).await.expect("fingerprint"),
+        before,
+        "a committed override write changes the fingerprint"
     );
 }

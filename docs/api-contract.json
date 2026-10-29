@@ -7123,6 +7123,113 @@
     },
     {
       "method": "GET",
+      "path": "/admin/workflow-types/{workflow_name}/run-defaults",
+      "category": "admin",
+      "read_only": true,
+      "description": "Read the run defaults of one workflow type (issue #2387). code holds the sla_secs and execution_timeout_secs declared in code. override holds the stored operator override (sla_secs, execution_timeout_secs, reason, updated_by, updated_at), or null. effective holds the values a new run takes: the override, then code. The start clamps still apply after it: sla is clamped to execution_timeout, and the fleet ceiling caps execution_timeout.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Registered workflow type name. A DAG uses its own name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "workflow_name",
+          "code",
+          "override",
+          "effective"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Workflow type not registered in this process."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "PATCH",
+      "path": "/admin/workflow-types/{workflow_name}/run-defaults",
+      "category": "admin",
+      "read_only": false,
+      "description": "Set, change or clear the run-default override of one workflow type (issue #2387). The override wins over the code value for every new run and survives a restart. It reaches this process at once and every other process within its refresh period (about 5 seconds). Each duration is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. With recompute_in_flight, the SLA deadline of each RUNNING, SUSPENDED or PAUSED run of the type that has not breached moves to the new effective SLA, on every shard, and the response gains recompute (moved_runs, unavailable_shards). A hard deadline_at never changes. The response has the same shape as GET.",
+      "idempotency": "Idempotent: applying the same override twice is a no-op.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Registered workflow type name. A DAG uses its own name."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "sla_secs",
+            "required": false,
+            "description": "Override soft SLA in whole seconds, at least 1. null returns to code."
+          },
+          {
+            "name": "execution_timeout_secs",
+            "required": false,
+            "description": "Override hard execution timeout in whole seconds, at least 1. null returns to code."
+          },
+          {
+            "name": "clear_override",
+            "required": false,
+            "description": "true deletes the stored override before the other fields merge."
+          },
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Operator reason stored with the override."
+          },
+          {
+            "name": "recompute_in_flight",
+            "required": false,
+            "description": "true also moves the SLA deadline of the in-flight runs of the type. Default false: the change applies to new runs only."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "workflow_name",
+          "code",
+          "override",
+          "effective"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Empty patch, unknown field, or a zero duration."
+        },
+        {
+          "status": 404,
+          "description": "Workflow type not registered in this process."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/retention",
       "category": "admin",
       "read_only": true,
@@ -8396,7 +8503,7 @@
           {
             "name": "clear_override",
             "required": false,
-            "description": "Code-declared schedule only (issue #2386): delete the stored operator override before the other fields apply. Alone, it returns the schedule to its code value. 400 on a schedule made through the API."
+            "description": "Code-declared schedule only (issue #2386): delete the stored operator override, so the schedule returns to its code value. Takes no other field except reason (400 otherwise). 400 on a schedule made through the API."
           },
           {
             "name": "reason",

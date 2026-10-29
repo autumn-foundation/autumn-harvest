@@ -34,6 +34,7 @@ New route families added in **0.5.0** (all in the contract; each has a CLI verb)
 - `GET /admin/config` — redacted effective runtime config (#695).
 - `GET /admin/usage` — per-tenant/per-workflow historical usage report (#596).
 - `GET /admin/workflow-types/reachability` — safe-handler-removal pre-flight (#520).
+- `GET` / `PATCH /admin/workflow-types/{workflow_name}/run-defaults` — runtime SLA and execution-timeout override (#2387).
 - `GET /dags/{dag_name}/runs/{run_exec_id}` — DAG run graph view (#690).
 
 ## Authorization: token scopes and the authorizer hook

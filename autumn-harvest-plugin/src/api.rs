@@ -3180,7 +3180,9 @@ struct CreateWorkflowScheduleRequest {
 /// unchanged"), while an explicit JSON `null` deserializes to `Some(None)`
 /// ("clear to NULL") and a value to `Some(Some(v))`.
 #[allow(clippy::option_option)] // deliberate serde tri-state: absent vs null vs value
-fn deserialize_tristate<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn deserialize_tristate<'de, T, D>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error>
 where
     T: serde::Deserialize<'de>,
     D: serde::Deserializer<'de>,
@@ -3252,6 +3254,30 @@ struct UpdateWorkflowScheduleRequest {
     /// The operator's reason, stored with the override of a code-declared
     /// schedule (issue #2386).
     reason: Option<String>,
+}
+
+impl UpdateWorkflowScheduleRequest {
+    /// Whether the request edits a field, beyond `clear_override` and `reason`.
+    const fn has_edit_fields(&self) -> bool {
+        self.workflow_name.is_some()
+            || self.schedule_expr.is_some()
+            || self.timezone.is_some()
+            || self.input.is_some()
+            || self.catchup.is_some()
+            || self.max_active_runs.is_some()
+            || self.queue_name.is_some()
+            || self.jitter_secs.is_some()
+            || self.overlap_policy.is_some()
+            || self.buffer_all_max.is_some()
+            || self.calendar.is_some()
+            || self.skip_policy.is_some()
+            || self.consecutive_failure_limit.is_some()
+            || self.end_at.is_some()
+            || self.max_runs.is_some()
+            || self.catchup_policy.is_some()
+            || self.catchup_window_secs.is_some()
+            || self.retry_policy.is_some()
+    }
 }
 
 fn default_queue_name() -> String {
@@ -5262,6 +5288,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             get(workflow_types_reachability).route_layer(require_admin.clone()),
         )
         .route(
+            // Run-default overrides of a workflow type (issue #2387).
+            "/admin/workflow-types/{workflow_name}/run-defaults",
+            get(crate::run_defaults_api::get_run_defaults)
+                .patch(crate::run_defaults_api::patch_run_defaults)
+                .route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/retention",
             get(retention_status).route_layer(require_admin.clone()),
         )
@@ -7260,6 +7293,11 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/version-gates/usage"),
         ("GET", "/admin/version-gates/retirement-check"),
         ("GET", "/admin/workflow-types/reachability"),
+        ("GET", "/admin/workflow-types/{workflow_name}/run-defaults"),
+        (
+            "PATCH",
+            "/admin/workflow-types/{workflow_name}/run-defaults",
+        ),
         ("GET", "/admin/retention"),
         ("POST", "/admin/retention/run-now"),
         ("POST", "/admin/workflows/replay-canary"),
@@ -7575,6 +7613,18 @@ pub const fn management_api_request_fields()
                 "buffer_all_max",
                 "clear_override",
                 "reason",
+            ]),
+        ),
+        // Run-default overrides of a workflow type (issue #2387).
+        (
+            "PATCH",
+            "/admin/workflow-types/{workflow_name}/run-defaults",
+            Some(&[
+                "sla_secs",
+                "execution_timeout_secs",
+                "clear_override",
+                "reason",
+                "recompute_in_flight",
             ]),
         ),
         // ── dead-letter queue ─────────────────────────────────────────────────
@@ -8770,6 +8820,18 @@ pub const fn management_api_response_fields()
                 "items",
                 "shards",
             ]),
+        ),
+        // Issue #2387. `recompute` is present only on a PATCH that asked for
+        // one, so it is not listed.
+        (
+            "GET",
+            "/admin/workflow-types/{workflow_name}/run-defaults",
+            Some(&["workflow_name", "code", "override", "effective"]),
+        ),
+        (
+            "PATCH",
+            "/admin/workflow-types/{workflow_name}/run-defaults",
+            Some(&["workflow_name", "code", "override", "effective"]),
         ),
         ("GET", "/admin/retention", None), // RetentionStatus (external model)
         ("POST", "/admin/retention/run-now", Some(&["ok"])),
@@ -18890,6 +18952,12 @@ pub(crate) async fn start_workflow(
                     )
                 },
             );
+            // Issue #2387: an operator override wins over the declared value.
+            let (info_execution_timeout, info_sla) = runtime.registry.apply_run_defaults(
+                &workflow_name,
+                info_execution_timeout,
+                info_sla,
+            );
             let debounce_workflow_retry_policy =
                 info_retry_policy_debounce.and_then(|p| serde_json::to_value(&p).ok());
 
@@ -19235,6 +19303,11 @@ pub(crate) async fn start_workflow(
                 )
             },
         );
+        // Issue #2387: an operator override wins over the declared value.
+        let (info_execution_timeout, info_sla) =
+            runtime
+                .registry
+                .apply_run_defaults(&workflow_name, info_execution_timeout, info_sla);
         let batch_workflow_retry_policy =
             info_retry_policy_batch.and_then(|p| serde_json::to_value(&p).ok());
 
@@ -19520,6 +19593,11 @@ pub(crate) async fn start_workflow(
             )
         },
     );
+    // Issue #2387: an operator override wins over the declared value.
+    let (info_execution_timeout, info_sla) =
+        runtime
+            .registry
+            .apply_run_defaults(&workflow_name, info_execution_timeout, info_sla);
     let workflow_retry_policy = info_retry_policy;
     // Chain-scoped lifetime cap (issue #617): resolve the workflow-type default,
     // at parity with `info_execution_timeout` above. The fleet-wide ceiling from
@@ -21223,6 +21301,12 @@ async fn batch_start_workflows(
                     )
                 },
             );
+            // Issue #2387: an operator override wins over the declared value.
+            let (info_execution_timeout, info_sla) = runtime.registry.apply_run_defaults(
+                &item.workflow_name,
+                info_execution_timeout,
+                info_sla,
+            );
             let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
             let item_workflow_retry_policy = info_retry_policy;
 
@@ -22668,6 +22752,11 @@ pub(crate) async fn signal_with_start_workflow(
             )
         },
     );
+    // Issue #2387: an operator override wins over the declared value.
+    let (info_execution_timeout, info_sla) =
+        runtime
+            .registry
+            .apply_run_defaults(&workflow_name, info_execution_timeout, info_sla);
     let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
     let sws_workflow_retry_policy =
         info_retry_policy_sws.and_then(|p| serde_json::to_value(&p).ok());
@@ -23431,6 +23520,11 @@ async fn update_with_start_workflow(
             )
         },
     );
+    // Issue #2387: an operator override wins over the declared value.
+    let (info_execution_timeout, info_sla) =
+        runtime
+            .registry
+            .apply_run_defaults(&workflow_name, info_execution_timeout, info_sla);
     let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
     let uws_workflow_retry_policy =
         info_retry_policy_uws.and_then(|p| serde_json::to_value(&p).ok());
@@ -29267,18 +29361,22 @@ fn resolve_schedule_deadline_secs(
     registry: Option<&HandlerRegistry>,
     name: &str,
 ) -> (Option<i64>, Option<i64>) {
-    let Some(info) = registry.and_then(|r| r.workflows.get(name)) else {
+    let Some((registry, info)) = registry.and_then(|r| r.workflows.get(name).map(|info| (r, info)))
+    else {
         return (None, None);
     };
-    let ceiling = registry.and_then(|r| r.max_workflow_execution_timeout);
-    let effective_execution_timeout = match (info.execution_timeout, ceiling) {
+    let ceiling = registry.max_workflow_execution_timeout;
+    // Issue #2387: an operator override wins over the declared value.
+    let (execution_timeout, sla) =
+        registry.apply_run_defaults(name, info.execution_timeout, info.sla);
+    let effective_execution_timeout = match (execution_timeout, ceiling) {
         (Some(t), Some(ceiling)) => Some(t.min(ceiling)),
         (other, _) => other,
     };
     let execution_timeout_secs =
         effective_execution_timeout.and_then(|d| i64::try_from(d.as_secs()).ok());
     let sla_secs =
-        clamp_info_default_sla(info.sla, effective_execution_timeout).map(|d| d.num_seconds());
+        clamp_info_default_sla(sla, effective_execution_timeout).map(|d| d.num_seconds());
     (execution_timeout_secs, sla_secs)
 }
 
@@ -29559,7 +29657,8 @@ fn code_declared_schedule(
 
 /// Reject the fields that do not fit the kind of schedule (issue #2386).
 ///
-/// An override cannot change the input of a code-declared schedule. An
+/// An override cannot change the input of a code-declared schedule, and a
+/// clear of its override takes no other field. An
 /// API-created schedule has no override, so `clear_override` and `reason`
 /// do not apply to it.
 fn check_override_fields(
@@ -29572,6 +29671,12 @@ fn check_override_fields(
             "schedule {id} is declared in code for workflow '{}'; its input is set in code \
              and an override cannot change it",
             code.workflow_name
+        )),
+        // `timezone` and `catchup_window_secs` resolve against the stored row.
+        // That row still holds the old override, so a clear stands alone.
+        Some(_) if request.clear_override && request.has_edit_fields() => Err(format!(
+            "schedule {id}: clear_override cannot be combined with other fields; \
+             clear first, then send the new values"
         )),
         None if request.clear_override || request.reason.is_some() => Err(format!(
             "schedule {id} is not declared in code, so it has no override; \
@@ -31080,16 +31185,16 @@ async fn trigger_schedule_now(
         }
     };
     // Only registered workflows carry an SLA default; DAGs have no SLA concept.
-    let sla = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .and_then(|info| clamp_info_default_sla(info.sla, info.execution_timeout));
-    let info_execution_timeout = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .and_then(|info| info.execution_timeout)
+    // Issue #2387: an operator override wins over the declared value.
+    let effective_info_defaults = runtime.registry.workflows.get(&workflow_name).map(|info| {
+        runtime
+            .registry
+            .apply_run_defaults(&workflow_name, info.execution_timeout, info.sla)
+    });
+    let sla = effective_info_defaults
+        .and_then(|(execution_timeout, sla)| clamp_info_default_sla(sla, execution_timeout));
+    let info_execution_timeout = effective_info_defaults
+        .and_then(|(execution_timeout, _)| execution_timeout)
         .and_then(|d| chrono::Duration::from_std(d).ok());
     // Chain-scoped lifetime cap default (issue #617): only registered workflows
     // carry it; DAGs have no chain-cap concept.
@@ -32562,6 +32667,11 @@ pub(crate) async fn schedule_backfill_inner(
                         )
                     },
                 );
+                // Issue #2387: an operator override wins over the declared value.
+                let (info_execution_timeout, info_sla) =
+                    runtime
+                        .registry
+                        .apply_run_defaults(&wf_name, info_execution_timeout, info_sla);
                 let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
                 // Issue #1412: thread the declared execution_timeout and the
                 // fleet-wide ceiling into the start below, via the same shared

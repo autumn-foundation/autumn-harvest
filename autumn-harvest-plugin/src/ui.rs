@@ -10422,6 +10422,11 @@ async fn execute_schedule_trigger_ui(
         .map_or((None, None, None), |info| {
             (info.sla, info.retry_policy.clone(), info.execution_timeout)
         });
+    // Issue #2387: an operator override wins over the declared value.
+    let (raw_execution_timeout, raw_sla) =
+        runtime
+            .registry()
+            .apply_run_defaults(workflow_name, raw_execution_timeout, raw_sla);
     let sla = crate::api::clamp_info_default_sla(raw_sla, raw_execution_timeout);
     // Issue #1412: thread the declared execution_timeout and the fleet-wide
     // ceiling via the same shared lookup the scheduler and DAG-backfill paths

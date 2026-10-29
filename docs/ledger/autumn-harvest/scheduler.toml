@@ -216,3 +216,10 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+
+["wait_for_registration_lock"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"

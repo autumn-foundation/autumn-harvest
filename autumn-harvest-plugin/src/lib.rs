@@ -71,6 +71,7 @@ pub mod queue_coverage;
 pub mod replay_diagnosis;
 /// Custom roles for the management API and Vantage (issue #1978).
 pub mod roles;
+mod run_defaults_api;
 pub mod runner;
 /// Cross-site request rejection for Vantage and DLQ mutations (issue #1278).
 pub mod same_origin;

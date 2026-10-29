@@ -1246,6 +1246,8 @@ async fn code_declared_schedule_patch_writes_an_override_that_the_tick_keeps() {
     for bad in [
         json!({ "input": { "env": "B" } }),
         json!({ "schedule_expr": "interval:0" }),
+        // A clear stands alone: `timezone` would resolve against the override.
+        json!({ "clear_override": true, "timezone": "Europe/Berlin" }),
     ] {
         let (status, body) = patch_json(&app, route.clone(), bad.clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} -> {body}");

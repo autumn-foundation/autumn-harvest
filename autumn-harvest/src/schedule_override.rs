@@ -904,11 +904,38 @@ pub async fn load_overrides(conn: &mut AsyncPgConnection) -> HarvestResult<Sched
     Ok(ScheduleOverrides::from_dag_overrides(dags).with_workflow_overrides(workflows))
 }
 
+/// A fingerprint of every stored override (issue #2386).
+///
+/// Any committed write changes it, because a write gives the row a new
+/// `xmin`. A scheduler pass takes it before [`load_overrides`]. It reads it
+/// again before it writes a schedule row, and skips the write on a change.
+/// So a pass never converges a row to a snapshot that a PATCH has replaced.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when the read fails.
+pub async fn override_fingerprint(conn: &mut AsyncPgConnection) -> HarvestResult<String> {
+    #[derive(diesel::QueryableByName)]
+    struct FingerprintRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        fingerprint: String,
+    }
+
+    let row: FingerprintRow = diesel::sql_query(
+        "SELECT md5(COALESCE(string_agg(kind || ':' || name || ':' || xmin::text, ',' \
+         ORDER BY kind, name), '')) AS fingerprint FROM harvest_schedule_overrides",
+    )
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(row.fingerprint)
+}
+
 /// Load the override of one DAG, if any.
 ///
 /// # Errors
 ///
-/// As [`load_dag_overrides`].
+/// As [`load_overrides`].
 pub async fn get_dag_override(
     conn: &mut AsyncPgConnection,
     dag_name: &str,
@@ -1090,6 +1117,9 @@ pub async fn update_dag_override(
 
     let dag_name = dag.name.clone();
     Box::pin(conn.transaction(async |conn| {
+        // A scheduler pass reconciles under this lock (issue #2386). Taking it
+        // here keeps that pass from undoing this change with an old snapshot.
+        crate::scheduler::wait_for_registration_lock(conn).await?;
         // FOR UPDATE serializes two concurrent patches of the same DAG. Without
         // it, each would merge over the same stored row and one change would
         // be lost. A first override has no row to lock. The insert conflict
@@ -1114,7 +1144,14 @@ pub async fn clear_dag_override(
     conn: &mut AsyncPgConnection,
     dag_name: &str,
 ) -> HarvestResult<bool> {
-    delete_override(conn, KIND_DAG, dag_name).await
+    use diesel_async::AsyncConnection;
+
+    Box::pin(conn.transaction(async |conn| {
+        // As in `update_dag_override`.
+        crate::scheduler::wait_for_registration_lock(conn).await?;
+        delete_override(conn, KIND_DAG, dag_name).await
+    }))
+    .await
 }
 
 /// Load the override of one code-declared workflow schedule, if any
@@ -1137,6 +1174,28 @@ pub(crate) async fn lock_workflow_override(
     workflow_name: &str,
 ) -> HarvestResult<Option<WorkflowScheduleOverride>> {
     select_workflow_override(conn, workflow_name, true).await
+}
+
+/// Lock the override row of one workflow schedule without decoding it.
+///
+/// A clear calls this. So a clear removes a row that no longer decodes, and
+/// that row then stops skipping the scheduler pass of its shard.
+pub(crate) async fn lock_workflow_override_row(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_schedule_overrides::dsl;
+
+    dsl::harvest_schedule_overrides
+        .filter(dsl::kind.eq(KIND_WORKFLOW))
+        .filter(dsl::name.eq(workflow_name))
+        .select(dsl::name)
+        .for_update()
+        .first::<String>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(())
 }
 
 async fn select_workflow_override(

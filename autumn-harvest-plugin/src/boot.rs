@@ -117,6 +117,31 @@ pub async fn load_boot_admission_gates(api_state: &HarvestApiState, pool: &DbPoo
     }
 }
 
+/// Reload the run-default overrides of the installed runtime (issue #2387).
+///
+/// The API start paths read that cache. A failed load keeps the last
+/// snapshot, because an override only moves a deadline and never admits a
+/// start.
+async fn refresh_run_defaults(
+    api_state: &HarvestApiState,
+    conn: &mut diesel_async::AsyncPgConnection,
+) {
+    let Ok(runtime) = api_state.runtime() else {
+        return;
+    };
+    if let Err(error) = runtime
+        .registry()
+        .run_defaults()
+        .refresh_if_stale(conn)
+        .await
+    {
+        tracing::warn!(
+            error = %error,
+            "run-default override refresh failed; keeping the last snapshot"
+        );
+    }
+}
+
 /// The background loops that keep the gate cache current (issue #377).
 ///
 /// The load-shed sampler (issue #1794) shares the shutdown token.
@@ -171,6 +196,7 @@ pub fn spawn_gate_refresh(
             }
             match acquire_conn(&pool).await {
                 Ok(mut conn) => {
+                    refresh_run_defaults(&api_state, &mut conn).await;
                     match autumn_harvest::admission_gate::db::load_active_gates(&mut conn).await {
                         Ok(gates) => {
                             let count = i64::try_from(gates.len()).unwrap_or(0);

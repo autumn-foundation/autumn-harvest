@@ -28,6 +28,20 @@ kind = ["read"]
 tables = ["harvest_schedule_overrides"]
 measured = "unmeasured"
 
+["lock_workflow_override_row"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+
+["override_fingerprint"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+
 ["select_workflow_override"]
 driver = "per_request"
 backend = ["postgres"]

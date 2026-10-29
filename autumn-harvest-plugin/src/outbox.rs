@@ -588,7 +588,8 @@ pub(crate) async fn dispatch_workflow_start_request(
                     wf.owner,
                     wf.runbook_url,
                     wf.severity,
-                    wf.sla,
+                    // Issue #2387: an operator SLA override wins.
+                    registry.apply_run_defaults(wf.name, None, wf.sla).1,
                     wf.retry_policy.clone(),
                 )
             })
