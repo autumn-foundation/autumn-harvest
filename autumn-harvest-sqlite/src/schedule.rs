@@ -321,7 +321,10 @@ fn effective_under(
     code: &WorkflowSchedule,
     fields: &WorkflowSchedulePatch,
 ) -> SqliteResult<WorkflowSchedule> {
-    let effective = validate_effective_workflow(code, fields).map_err(|error| match error {
+    // This backend ignores jitter, so a default cron jitter must not limit the cadence.
+    let mut code = code.clone();
+    code.jitter = std::time::Duration::ZERO;
+    let effective = validate_effective_workflow(&code, fields).map_err(|error| match error {
         autumn_harvest::HarvestError::Config(message) => SqliteError::InvalidSchedule(message),
         other => SqliteError::InvalidSchedule(other.to_string()),
     })?;

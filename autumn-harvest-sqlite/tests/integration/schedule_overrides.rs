@@ -275,3 +275,33 @@ fn an_override_returns_the_stored_pause() {
         .expect("stored");
     assert!(summary.paused, "the stored pause is unchanged");
 }
+
+/// This backend ignores jitter. So the default cron jitter never blocks a
+/// short interval override, at set time or at the next upsert.
+#[test]
+fn ignored_cron_jitter_does_not_block_a_short_interval() {
+    let mut rt = SqliteRuntime::open_in_memory().expect("open");
+    rt.register_workflow(&override_parity_flow_info());
+    let cron = autumn_harvest::policy::WorkflowSchedule::new(
+        SCHEDULED_WORKFLOW,
+        Schedule::Cron("*/5 * * * *".to_string()),
+    );
+    assert!(
+        !cron.jitter.is_zero(),
+        "a 5-field cron has a default jitter"
+    );
+    rt.upsert_schedule(&cron).expect("upsert");
+
+    let fields = WorkflowSchedulePatch {
+        schedule: Some(Schedule::Interval(Duration::from_secs(5))),
+        ..WorkflowSchedulePatch::default()
+    };
+    rt.set_schedule_override(SCHEDULED_WORKFLOW, &fields, "ops", None)
+        .expect("a 5s interval is a supported cadence");
+    rt.upsert_schedule(&cron)
+        .expect("a restart keeps the override");
+    let Expect::Effective { interval_secs, .. } = observed(&rt) else {
+        unreachable!("observed is always effective");
+    };
+    assert_eq!(interval_secs, 5);
+}
