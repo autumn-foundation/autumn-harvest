@@ -64,6 +64,7 @@ fn census() -> Option<&'static Census> {
 }
 
 /// Strip the bind values, so one statement has one text.
+#[must_use]
 pub fn statement_text(debug: &str) -> &str {
     debug
         .split_once(BINDS_MARKER)
@@ -76,6 +77,7 @@ pub fn statement_text(debug: &str) -> &str {
 /// A generic plan cannot prove a partial-index predicate such as `NOT fired`
 /// from a bound `fired = $3`. The script puts the bool and string values in
 /// place of their parameters, as Postgres does for each custom plan.
+#[must_use]
 pub fn bind_text(debug: &str) -> &str {
     debug
         .split_once(BINDS_MARKER)
@@ -88,6 +90,7 @@ pub fn bind_text(debug: &str) -> &str {
 ///
 /// Rustc records the package under test as `./src/...`, relative to its own
 /// directory. `package` names that directory, so its frames keep their crate.
+#[must_use]
 pub fn source_frames(backtrace: &str, package: &str) -> Vec<String> {
     backtrace
         .lines()
@@ -191,7 +194,7 @@ static INSTALL: extern "C" fn() = install;
 /// It does nothing. It sits in this module so that `-u` on its name pulls
 /// the module, and with it `INSTALL`, into the binary.
 #[unsafe(no_mangle)]
-pub extern "C" fn harvest_ledger_census_anchor() {}
+pub const extern "C" fn harvest_ledger_census_anchor() {}
 
 #[cfg(test)]
 mod tests {
