@@ -26,6 +26,15 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `DELETE FROM harvest_worker_task_stats WHERE worker_id = $1` | `harvest_worker_task_stats`: Index Scan on `harvest_worker_task_stats_pkey`<br>`harvest_worker_task_stats`: ModifyTable |
 
+## `get_worker`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_task_queue"."id" FROM "harvest_task_queue" WHERE (("harvest_task_queue"."worker_i...` | `harvest_task_queue`: full scan of partial index `idx_harvest_tq_running_started` |
+| 2 | `SELECT "harvest_workers"."worker_id", "harvest_workers"."started_at", "harvest_workers"."last_hea...` | `harvest_workers`: Index Scan on `harvest_workers_pkey` |
+
 ## `heartbeat_worker_status`
 
 Statements: 1. Tables with no usable index: none.
@@ -33,6 +42,14 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `UPDATE "harvest_workers" SET "last_heartbeat_at" = CURRENT_TIMESTAMP, "in_flight_count" = $1, "la...` | `harvest_workers`: Index Scan on `harvest_workers_pkey`<br>`harvest_workers`: ModifyTable |
+
+## `list_pinned_executions`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_task_queue"."workflow_exec_id", "harvest_task_queue"."sticky_until", "harvest_wor...` | `harvest_task_queue`: Bitmap Heap Scan on `idx_harvest_tq_live_created`<br>`harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
 
 ## `list_workers`
 
@@ -87,13 +104,14 @@ Statements: 1. Tables with no usable index: none.
 
 ## `register_worker`
 
-Statements: 3. Tables with no usable index: none.
+Statements: 4. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `INSERT INTO "harvest_workers" ("worker_id", "queues", "shard_assignments", "max_concurrency", "ho...` | `harvest_workers`: ModifyTable |
 | 2 | `INSERT INTO "harvest_workers" ("worker_id", "queues", "shard_assignments", "max_concurrency", "ho...` | `harvest_workers`: ModifyTable |
 | 3 | `INSERT INTO "harvest_workers" ("worker_id", "queues", "shard_assignments", "max_concurrency", "ho...` | `harvest_workers`: ModifyTable |
+| 4 | `INSERT INTO "harvest_workers" ("worker_id", "queues", "shard_assignments", "max_concurrency", "ho...` | `harvest_workers`: ModifyTable |
 
 ## `request_drain`
 

@@ -43,6 +43,14 @@ Statements: 2. Tables with no usable index: none.
 | 1 | `INSERT INTO harvest_activity_pauses (activity_name, reason, paused_by, paused_at, scope_shard_id)...` | `harvest_activity_pauses`: ModifyTable |
 | 2 | `SELECT COUNT(*) AS count FROM harvest_task_queue WHERE task_type = 'activity' AND activity_name =...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_claim_seek` |
 
+## `paused_activity_names`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT activity_name FROM harvest_activity_pauses ORDER BY activity_name ASC` | `harvest_activity_pauses`: full scan of index `harvest_activity_pauses_pkey` |
+
 ## `resume_activity`
 
 Statements: 4. Tables with no usable index: none.

@@ -18,6 +18,16 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `db::count_targets_on_shard`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT COUNT(*) FROM "harvest_workflow_executions" WHERE (("harvest_workflow_executions"."state" ...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_wfx_workflow_identity` |
+| 2 | `SELECT COUNT(*) FROM "harvest_workflow_executions" WHERE (("harvest_workflow_executions"."state" ...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_non_terminal_wf_name` |
+| 3 | `SELECT COUNT(*) FROM "harvest_workflow_executions" WHERE (("harvest_workflow_executions"."state" ...` | `harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_search` |
+
 ## `db::find_job_by_key`
 
 Statements: 1. Tables with no usable index: none.
@@ -33,6 +43,16 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_batch_jobs"."id", "harvest_batch_jobs"."action", "harvest_batch_jobs"."filter", "...` | `harvest_batch_jobs`: Index Scan on `harvest_batch_jobs_pkey` |
+
+## `db::list_batch_jobs`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_batch_jobs"."id", "harvest_batch_jobs"."action", "harvest_batch_jobs"."filter", "...` | `harvest_batch_jobs`: full scan of index `harvest_batch_jobs_created_at_idx` |
+| 2 | `SELECT "harvest_batch_jobs"."id", "harvest_batch_jobs"."action", "harvest_batch_jobs"."filter", "...` | `harvest_batch_jobs`: full scan of index `harvest_batch_jobs_created_at_idx` |
+| 3 | `SELECT "harvest_batch_jobs"."id", "harvest_batch_jobs"."action", "harvest_batch_jobs"."filter", "...` | `harvest_batch_jobs`: Index Scan on `harvest_batch_jobs_status_idx` |
 
 ## `db::mark_completed`
 
@@ -60,22 +80,36 @@ Statements: 1. Tables with no usable index: none.
 
 ## `db::resolve_targets_on_shard`
 
-Statements: 2. Tables with no usable index: none.
+Statements: 3. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: full scan of partial index `idx_harvest_we_canary_order` |
-| 2 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: full scan of partial index `idx_harvest_we_canary_order` |
+| 2 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_wfx_workflow_identity` |
+| 3 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_non_terminal_wf_name`<br>`harvest_workflow_executions`: Index Scan on `idx_harvest_wfx_workflow_identity`<br>`harvest_workflow_executions`: full scan of partial index `idx_harvest_we_canary_order` |
+
+## `db::sample_targets_on_shard`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_wfx_workflow_identity` |
+| 2 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_non_terminal_wf_name` |
+| 3 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_search` |
 
 ## `db::submit_batch_job_with_codecs`
 
-Statements: 3. Tables with no usable index: none.
+Statements: 6. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `INSERT INTO "harvest_batch_jobs" ("id", "action", "filter", "signal_name", "signal_payload", "sta...` | `harvest_batch_jobs`: ModifyTable |
 | 2 | `INSERT INTO "harvest_batch_jobs" ("id", "action", "filter", "signal_name", "signal_payload", "sta...` | `harvest_batch_jobs`: ModifyTable |
 | 3 | `INSERT INTO "harvest_batch_jobs" ("id", "action", "filter", "signal_name", "signal_payload", "sta...` | `harvest_batch_jobs`: ModifyTable |
+| 4 | `INSERT INTO "harvest_batch_jobs" ("id", "action", "filter", "signal_name", "signal_payload", "sta...` | `harvest_batch_jobs`: ModifyTable |
+| 5 | `INSERT INTO "harvest_batch_jobs" ("id", "action", "filter", "signal_name", "signal_payload", "sta...` | `harvest_batch_jobs`: ModifyTable |
+| 6 | `INSERT INTO "harvest_batch_jobs" ("id", "action", "filter", "signal_name", "signal_payload", "sta...` | `harvest_batch_jobs`: ModifyTable |
 
 ## `db::try_claim_job`
 

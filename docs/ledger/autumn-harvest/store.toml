@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["admitted_count"]
 driver = "per_task"
@@ -69,6 +70,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["count_history_events"]
 driver = "per_request"
@@ -132,6 +134,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_histories_undecoded_batch"]
 driver = "per_task"
@@ -169,6 +172,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_history_since"]
 driver = "per_task"
@@ -191,6 +195,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_history_with_codecs"]
 driver = "per_task"
@@ -206,6 +211,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_parents_with_children"]
 driver = "per_request"
@@ -221,6 +227,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_execution_summaries"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_payload_refs"]
 driver = "per_task"
@@ -260,6 +267,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_workflow_children"]
 driver = "per_request"
@@ -267,6 +275,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "docs/performance-workflow-children-traversal.md"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_workflow_children_batch"]
 driver = "per_request"
@@ -282,6 +291,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "docs/performance-workflow-children-traversal.md"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_workflow_logs"]
 driver = "per_request"
@@ -321,6 +331,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["sum_history_bytes_between"]
 driver = "per_request"

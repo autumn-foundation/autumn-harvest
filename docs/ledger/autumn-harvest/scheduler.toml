@@ -134,6 +134,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["overdue_schedule_pass"]
 driver = "per_tick"
@@ -205,6 +206,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["trigger_unified_dag"]
 driver = "per_request"

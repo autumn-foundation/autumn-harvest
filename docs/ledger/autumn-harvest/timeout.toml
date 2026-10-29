@@ -110,6 +110,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
 
 ["schedule_to_start_still_expired"]
 driver = "per_tick"

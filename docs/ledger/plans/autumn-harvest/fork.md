@@ -28,12 +28,13 @@ Statements: 1. Tables with no usable index: none.
 
 ## `copy_prefix`
 
-Statements: 2. Tables with no usable index: none.
+Statements: 3. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
 | 2 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 3 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
 
 ## `erased_fork_ancestor`
 

@@ -110,11 +110,13 @@ Statements: 1. Tables with no usable index: none.
 
 ## `find_reusable_dag_workflow_schedule`
 
-Statements: 1. Tables with no usable index: none.
+Statements: 3. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_ex...` | `harvest_schedules`: Index Scan on `harvest_schedules_dag_name_key` |
+| 1 | `DELETE FROM "harvest_schedules" WHERE ("harvest_schedules"."id" = $1)` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
+| 2 | `SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_ex...` | `harvest_schedules`: Index Scan on `harvest_schedules_dag_name_key` |
+| 3 | `SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_ex...` | `harvest_schedules`: Index Scan on `harvest_schedules_workflow_name_unique` |
 
 ## `insert_dag_workflow_schedule_if_missing`
 
@@ -157,6 +159,14 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `UPDATE "harvest_schedules" SET "consecutive_failure_count" = $1, "auto_paused_at" = $2, "updated_...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
+
+## `merge_pause_metadata_into_schedule`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE "harvest_schedules" SET "is_paused" = $1, "paused_at" = $2, "paused_by" = $3, "pause_reaso...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
 
 ## `overdue_schedule_pass`
 
@@ -228,6 +238,14 @@ Statements: 7. Tables with no usable index: none.
 | 6 | `UPDATE "harvest_schedules" SET "next_run_at" = $1, "buffered_runs" = $2, "fire_claim_token" = $3,...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
 | 7 | `UPDATE "harvest_schedules" SET "next_run_at" = $1, "fire_claim_token" = $2, "fire_claimed_until" ...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
 
+## `tick_workflow_schedules`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE "harvest_schedules" SET "next_run_at" = $1, "updated_at" = $2 WHERE ("harvest_schedules"."...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
+
 ## `trigger_unified_dag`
 
 Statements: 1. Tables with no usable index: none.
@@ -255,10 +273,12 @@ Statements: 2. Tables with no usable index: none.
 
 ## `upsert_schedule`
 
-Statements: 2. Tables with no usable index: none.
+Statements: 4. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `INSERT INTO "harvest_schedules" ("id", "dag_name", "schedule_expr", "timezone", "catchup", "max_a...` | `harvest_schedules`: ModifyTable |
-| 2 | `UPDATE "harvest_schedules" SET "next_run_at" = $1 WHERE ("harvest_schedules"."id" = $2)` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
+| 2 | `INSERT INTO "harvest_schedules" ("id", "dag_name", "schedule_expr", "timezone", "catchup", "max_a...` | `harvest_schedules`: ModifyTable |
+| 3 | `UPDATE "harvest_schedules" SET "next_run_at" = $1 WHERE ("harvest_schedules"."id" = $2)` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
+| 4 | `UPDATE "harvest_schedules" SET "schedule_expr" = $1, "timezone" = $2, "catchup" = $3, "catchup_po...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
 

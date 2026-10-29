@@ -28,6 +28,14 @@ Statements: 3. Tables with no usable index: none.
 | 2 | `SELECT COUNT(*) FROM "harvest_admission_gates" WHERE (("harvest_admission_gates"."lifted_at" IS N...` | `harvest_admission_gates`: Bitmap Heap Scan on `harvest_admission_gates_active_idx` |
 | 3 | `SELECT pg_advisory_xact_lock(377)` | no table |
 
+## `db::list_gates`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_admission_gates"."id", "harvest_admission_gates"."scope_kind", "harvest_admission...` | `harvest_admission_gates`: Bitmap Heap Scan on `harvest_admission_gates_active_idx` |
+
 ## `db::load_active_gates`
 
 Statements: 1. Tables with no usable index: none.

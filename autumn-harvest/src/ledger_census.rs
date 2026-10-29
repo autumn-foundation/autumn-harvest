@@ -85,14 +85,21 @@ pub fn bind_text(debug: &str) -> &str {
 /// Keep the `crate/src/path:line` of each frame in a workspace crate's `src/` tree.
 ///
 /// The hook's own frames are dropped, because no profile covers them.
-pub fn source_frames(backtrace: &str) -> Vec<String> {
+///
+/// Rustc records the package under test as `./src/...`, relative to its own
+/// directory. `package` names that directory, so its frames keep their crate.
+pub fn source_frames(backtrace: &str, package: &str) -> Vec<String> {
     backtrace
         .lines()
         .filter_map(|line| line.trim().strip_prefix("at "))
         .filter_map(|at| {
-            let src = at.rfind("/src/")?;
-            let crate_start = at[..src].rfind('/')? + 1;
-            let rel = &at[crate_start..];
+            let rel = if let Some(local) = at.strip_prefix("./src/") {
+                format!("{package}/src/{local}")
+            } else {
+                let src = at.rfind("/src/")?;
+                let crate_start = at[..src].rfind('/').map_or(0, |slash| slash + 1);
+                at[crate_start..].to_owned()
+            };
             let own = rel.starts_with("autumn-harvest/src/ledger_census.rs");
             (rel.starts_with("autumn-harvest") && !own).then(|| {
                 let mut parts = rel.rsplitn(3, ':');
@@ -104,6 +111,21 @@ pub fn source_frames(backtrace: &str) -> Vec<String> {
         })
         .take(MAX_FRAMES)
         .collect()
+}
+
+/// The directory name of the package under test, from Cargo's environment.
+fn package_dir() -> &'static str {
+    static PACKAGE: OnceLock<String> = OnceLock::new();
+    PACKAGE.get_or_init(|| {
+        std::env::var("CARGO_MANIFEST_DIR")
+            .ok()
+            .and_then(|dir| {
+                std::path::Path::new(&dir)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default()
+    })
 }
 
 struct Hook;
@@ -129,7 +151,10 @@ impl Instrumentation for Hook {
             }
             *count += 1;
         }
-        let frames = source_frames(&std::backtrace::Backtrace::force_capture().to_string());
+        let frames = source_frames(
+            &std::backtrace::Backtrace::force_capture().to_string(),
+            package_dir(),
+        );
         // One `write` call for each line. A test that runs this binary as a
         // child process appends to the same file, and one append is atomic.
         let line = format!(
@@ -199,11 +224,16 @@ mod tests {
              at /home/u/autumn-harvest/autumn-harvest/src/ledger_census.rs:129:20
    1: autumn_harvest::queue::claim_task_one_statement::{{closure}}
              at /home/u/autumn-harvest/autumn-harvest/src/queue.rs:2440:20
+   2: autumn_harvest_plugin::api::list_workflows::{{closure}}
+             at ./src/api.rs:120:9
    2: integration::queue_tests::claims
              at /home/u/autumn-harvest/autumn-harvest/tests/integration/queue_tests.rs:10:5";
         assert_eq!(
-            source_frames(trace),
-            vec!["autumn-harvest/src/queue.rs:2440".to_owned()]
+            source_frames(trace, "autumn-harvest-plugin"),
+            vec![
+                "autumn-harvest/src/queue.rs:2440".to_owned(),
+                "autumn-harvest-plugin/src/api.rs:120".to_owned(),
+            ]
         );
     }
 }

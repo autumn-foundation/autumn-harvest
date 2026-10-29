@@ -30,15 +30,17 @@ Statements: 3. Tables with no usable index: none.
 
 ## `evaluate_triggers_for_execution_collecting_with_codecs`
 
-Statements: 5. Tables with no usable index: none.
+Statements: 7. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `INSERT INTO "harvest_completion_trigger_fires" ("source_exec_id", "trigger_id", "outcome", "targe...` | `harvest_completion_trigger_fires`: ModifyTable |
 | 2 | `INSERT INTO "harvest_completion_trigger_fires" ("source_exec_id", "trigger_id", "outcome", "targe...` | `harvest_completion_trigger_fires`: ModifyTable |
-| 3 | `INSERT INTO "harvest_completion_trigger_outbox" ("source_exec_id", "trigger_id", "target_shard", ...` | `harvest_completion_trigger_outbox`: ModifyTable |
-| 4 | `SELECT "harvest_completion_triggers"."id", "harvest_completion_triggers"."source_workflow_name", ...` | `harvest_completion_triggers`: Index Scan on `idx_harvest_completion_triggers_source` |
-| 5 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+| 3 | `INSERT INTO "harvest_completion_trigger_fires" ("source_exec_id", "trigger_id", "outcome", "targe...` | `harvest_completion_trigger_fires`: ModifyTable |
+| 4 | `INSERT INTO "harvest_completion_trigger_outbox" ("source_exec_id", "trigger_id", "target_shard", ...` | `harvest_completion_trigger_outbox`: ModifyTable |
+| 5 | `INSERT INTO "harvest_completion_trigger_outbox" ("source_exec_id", "trigger_id", "target_shard", ...` | `harvest_completion_trigger_outbox`: ModifyTable |
+| 6 | `SELECT "harvest_completion_triggers"."id", "harvest_completion_triggers"."source_workflow_name", ...` | `harvest_completion_triggers`: Index Scan on `idx_harvest_completion_triggers_source` |
+| 7 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
 
 ## `relay_gate_checked_start`
 
@@ -77,11 +79,12 @@ Statements: 1. Tables with no usable index: none.
 
 ## `sync_completion_triggers`
 
-Statements: 3. Tables with no usable index: `harvest_completion_triggers`.
+Statements: 4. Tables with no usable index: `harvest_completion_triggers`.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `DELETE FROM "harvest_completion_triggers" WHERE (("harvest_completion_triggers"."is_static" = $1)...` | `harvest_completion_triggers`: ModifyTable<br>`harvest_completion_triggers`: no usable index |
-| 2 | `INSERT INTO "harvest_completion_triggers" ("id", "source_workflow_name", "terminal_states", "targ...` | `harvest_completion_triggers`: ModifyTable |
+| 1 | `DELETE FROM "harvest_completion_triggers" WHERE ("harvest_completion_triggers"."is_static" = $1)` | `harvest_completion_triggers`: ModifyTable<br>`harvest_completion_triggers`: no usable index |
+| 2 | `DELETE FROM "harvest_completion_triggers" WHERE (("harvest_completion_triggers"."is_static" = $1)...` | `harvest_completion_triggers`: ModifyTable<br>`harvest_completion_triggers`: no usable index |
 | 3 | `INSERT INTO "harvest_completion_triggers" ("id", "source_workflow_name", "terminal_states", "targ...` | `harvest_completion_triggers`: ModifyTable |
+| 4 | `INSERT INTO "harvest_completion_triggers" ("id", "source_workflow_name", "terminal_states", "targ...` | `harvest_completion_triggers`: ModifyTable |
 

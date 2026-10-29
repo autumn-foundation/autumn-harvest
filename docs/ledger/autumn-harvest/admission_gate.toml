@@ -21,6 +21,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_admission_gates"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/admission_gate.md"
 
 ["db::load_active_gates"]
 driver = "per_request"

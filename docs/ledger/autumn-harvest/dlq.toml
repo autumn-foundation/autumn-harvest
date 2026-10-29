@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_dead_letters", "harvest_workflow_executions"]
 measured = "docs/performance-dlq-aggregate.md"
+plan = "docs/ledger/plans/autumn-harvest/dlq.md"
 
 ["count_bulk_filter_matches"]
 driver = "per_request"
@@ -45,6 +46,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_dead_letters"]
 measured = "docs/performance-dlq-bulk-discard.md"
+plan = "docs/ledger/plans/autumn-harvest/dlq.md"
 
 ["list_dead_letters"]
 driver = "per_request"
@@ -60,6 +62,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/dlq.md"
 
 ["query_dead_letters_for_bulk"]
 driver = "per_request"

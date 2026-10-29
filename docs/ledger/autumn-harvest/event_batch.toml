@@ -30,6 +30,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_event_batches"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/event_batch.md"
 
 ["pull_in_event_batch_row"]
 driver = "per_tick"

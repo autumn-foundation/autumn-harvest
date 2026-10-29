@@ -21,6 +21,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/reset.md"
 
 ["count_open_task_rows"]
 driver = "per_request"
@@ -36,6 +37,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_timers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/reset.md"
 
 ["count_unconsumed_signals"]
 driver = "per_request"
@@ -43,6 +45,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_signals"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/reset.md"
 
 ["insert_fork_row"]
 driver = "per_request"
@@ -58,6 +61,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/reset.md"
 
 ["load_source_execution"]
 driver = "per_request"
@@ -65,6 +69,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/reset.md"
 
 ["reapply_or_drop_signals"]
 driver = "per_request"
@@ -88,6 +93,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "docs/performance-fork-validate.md"
+plan = "docs/ledger/plans/autumn-harvest/reset.md"
 
 ["terminate_source_execution"]
 driver = "per_request"

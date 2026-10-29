@@ -26,6 +26,40 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `UPDATE "harvest_external_tasks" SET "state" = $1, "updated_at" = $2 WHERE ("harvest_external_task...` | `harvest_external_tasks`: Index Scan on `harvest_external_tasks_pkey`<br>`harvest_external_tasks`: ModifyTable |
 
+## `fail_externally`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE "harvest_external_tasks" SET "state" = $1, "updated_at" = $2 WHERE ("harvest_external_task...` | `harvest_external_tasks`: Index Scan on `harvest_external_tasks_pkey`<br>`harvest_external_tasks`: ModifyTable |
+
+## `find_by_token`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_external_tasks"."id", "harvest_external_tasks"."token", "harvest_external_tasks"....` | `harvest_external_tasks`: Index Scan on `idx_harvest_ext_token` |
+
+## `find_by_token_locked`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_external_tasks"."id", "harvest_external_tasks"."token", "harvest_external_tasks"....` | `harvest_external_tasks`: Index Scan on `idx_harvest_ext_token` |
+
+## `list_external_handoffs`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_external_tasks"."token", "harvest_external_tasks"."workflow_exec_id", "harvest_wo...` | `harvest_external_tasks`: full scan of index `idx_harvest_ext_workflow_exec`<br>`harvest_workflow_executions`: full scan of index `harvest_workflow_executions_pkey` |
+| 2 | `SELECT "harvest_external_tasks"."token", "harvest_external_tasks"."workflow_exec_id", "harvest_wo...` | `harvest_external_tasks`: Bitmap Heap Scan on `idx_harvest_ext_state_updated`<br>`harvest_external_tasks`: full scan of partial index `idx_harvest_ext_timeout`<br>`harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+| 3 | `SELECT "harvest_external_tasks"."token", "harvest_external_tasks"."workflow_exec_id", "harvest_wo...` | `harvest_external_tasks`: Bitmap Heap Scan on `idx_harvest_ext_timeout`<br>`harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+
 ## `lock_task`
 
 Statements: 1. Tables with no usable index: none.
@@ -33,4 +67,20 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_external_tasks"."id", "harvest_external_tasks"."token", "harvest_external_tasks"....` | `harvest_external_tasks`: Index Scan on `idx_harvest_ext_token` |
+
+## `record_external_task`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO "harvest_external_tasks" ("token", "workflow_exec_id", "activity_id", "name", "queue"...` | `harvest_external_tasks`: ModifyTable |
+
+## `run_has_ended`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_w...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
 

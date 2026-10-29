@@ -54,6 +54,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/execution.md"
 
 ["execution_exists_by_key"]
 driver = "per_request"
@@ -76,6 +77,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/execution.md"
 
 ["list_schedule_runs"]
 driver = "per_request"
@@ -99,6 +101,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/execution.md"
 
 ["load_triage_for_update"]
 driver = "per_request"
@@ -154,6 +157,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/execution.md"
 
 ["parent_close_cascade_event_count"]
 driver = "per_task"

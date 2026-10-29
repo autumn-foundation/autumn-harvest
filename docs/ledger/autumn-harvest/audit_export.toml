@@ -102,6 +102,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_audit_export_cursor"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
 
 ["pending_and_lag"]
 driver = "per_request"

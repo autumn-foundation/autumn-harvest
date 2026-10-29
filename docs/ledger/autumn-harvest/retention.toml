@@ -38,6 +38,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_execution_summaries"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/retention.md"
 
 ["purge_expired_summaries"]
 driver = "per_tick"
