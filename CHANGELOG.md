@@ -214,6 +214,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **An agent workspace snapshot survives a host crash.** `DirWorkspaceBlobs::put` now syncs the scratch file, renames it and syncs its folder with `partition_archive::sync_dir`, and the parent of each folder that it makes, before it returns. Before, the put ended at a flush, so a crash after a tool-call result committed could lose the snapshot that the history names.
+- **Two claim loops no longer slow activity dispatch** (issue #2418). With the default two claim loops from #2106, the activity dispatch p50 at a paced start rate rose from 13 ms to 66 ms. Both loops drained the workflow backlog, went idle and slept the 50–75 ms NOTIFY settle while the workflow tasks committed their activities. A workflow task of the worker that ends now wakes the leader with no settle, and cuts a running settle short. A cut settle owes one poll at its original end. On the same box the p50 is now 8 ms.
 
 - **Run the MCP tools and durable webhook suites in CI (issue #1959).** `mcp_tools_integration` and `webhook_durable_integration` now run in CI from `linux` manifest rows. Before this change, every test in them was `#[ignore]`d, so CI never ran them.
 

@@ -33596,6 +33596,13 @@ pub struct Worker {
     owner_hints: Arc<OwnerHints>,
     /// Wakes the owner deciders when a workflow permit frees (issue #2255).
     decider_capacity: Arc<tokio::sync::Notify>,
+    /// Wakes the leader's idle wait when a workflow task of this worker ends
+    /// (issue #2418). Its commit is visible, so the wake does not settle.
+    /// It also cuts a running settle short. See [`Worker::settle`].
+    decision_done: Arc<tokio::sync::Notify>,
+    /// The end of a settle that `decision_done` cut short (issue #2418).
+    /// The leader owes one poll at that instant.
+    owed_poll: std::sync::Mutex<Option<tokio::time::Instant>>,
     /// The claim targets of the running claim loops (issue #2255). The run
     /// path sets them.
     claim_targets: std::sync::RwLock<Vec<Option<crate::types::ShardId>>>,
@@ -35900,6 +35907,9 @@ struct CapacityPermit {
     /// Also wakes the owner deciders when a workflow permit frees (issue
     /// #2255). A claim loop then never takes their wake.
     decider: Option<Arc<tokio::sync::Notify>>,
+    /// Also wakes the leader when a workflow permit frees (issue #2418).
+    /// The task has committed the tasks that it schedules.
+    leader: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl CapacityPermit {
@@ -35908,12 +35918,19 @@ impl CapacityPermit {
             permit: Some(permit),
             freed: Arc::clone(freed),
             decider: None,
+            leader: None,
         }
     }
 
     /// This permit, which also wakes the owner deciders on release.
     fn waking_deciders(mut self, decider: Option<Arc<tokio::sync::Notify>>) -> Self {
         self.decider = decider;
+        self
+    }
+
+    /// This permit, which also wakes the leader on release (issue #2418).
+    fn waking_leader(mut self, leader: Option<Arc<tokio::sync::Notify>>) -> Self {
+        self.leader = leader;
         self
     }
 }
@@ -35924,6 +35941,11 @@ impl Drop for CapacityPermit {
         self.freed.notify_one();
         if let Some(decider) = &self.decider {
             decider.notify_waiters();
+        }
+        // `notify_one` stores the wake while the leader polls. The leader
+        // then polls once more instead of a settle.
+        if let Some(leader) = &self.leader {
+            leader.notify_one();
         }
     }
 }
@@ -36498,6 +36520,8 @@ impl Worker {
             owner_woken: Arc::new(tokio::sync::Notify::new()),
             owner_hints: Arc::default(),
             decider_capacity: Arc::new(tokio::sync::Notify::new()),
+            decision_done: Arc::new(tokio::sync::Notify::new()),
+            owed_poll: std::sync::Mutex::new(None),
             claim_targets: std::sync::RwLock::default(),
             owner_wake_shards: std::sync::RwLock::default(),
             owner_listening: Arc::default(),
@@ -37603,6 +37627,7 @@ impl Worker {
                     () = shutdown.cancelled() => break,
                     () = capacity.woken() => {}
                     () = self.deferral_due.notified() => {}
+                    () = self.decision_done.notified() => {}
                     () = self.owner_woken.notified() => {}
                     () = tokio::time::sleep(poll_interval) => {}
                 }
@@ -37638,6 +37663,12 @@ impl Worker {
                 break 'notify_wait;
             }
             if futures::FutureExt::now_or_never(self.deferral_due.notified()).is_some() {
+                break 'notify_wait;
+            }
+            // Issue #2418: a local commit is visible, so it does not settle.
+            if futures::FutureExt::now_or_never(self.decision_done.notified()).is_some()
+                || futures::FutureExt::now_or_never(self.owed_poll()).is_some()
+            {
                 break 'notify_wait;
             }
             // An owner wake is a NOTIFY too, so it settles (issue #2253).
@@ -37677,7 +37708,7 @@ impl Worker {
             }
         }
         if notified {
-            tokio::time::sleep(crate::notify::settle_delay()).await;
+            self.settle().await;
         }
     }
 
@@ -40156,12 +40187,59 @@ impl Worker {
         let notified = tokio::select! {
             () = capacity.woken() => false,
             () = self.deferral_due.notified() => false,
+            // Issue #2418: a local commit is visible, so it does not settle.
+            () = self.decision_done.notified() => false,
+            () = self.owed_poll() => false,
             // An owner wake is a NOTIFY too, so it settles (issue #2253).
             () = self.owner_woken.notified() => true,
             notified = idle => notified,
         };
         if notified {
-            tokio::time::sleep(crate::notify::settle_delay()).await;
+            self.settle().await;
+        }
+    }
+
+    /// Sleep the settle delay after a NOTIFY (issue #2418).
+    ///
+    /// A workflow task of this worker that ends cuts the delay short. Its
+    /// commit is visible, so the tasks that it schedules need no settle.
+    /// The NOTIFY can name another row that is not claimable yet. So a cut
+    /// settle owes one more poll at its original end.
+    ///
+    /// Without the cut, two claim loops drain the workflow backlog and then
+    /// both go idle. Each activity committed in the settle waits for it, so
+    /// the dispatch p50 rose from 13 ms to 66 ms.
+    async fn settle(&self) {
+        let end = tokio::time::Instant::now() + crate::notify::settle_delay();
+        tokio::select! {
+            () = tokio::time::sleep_until(end) => {}
+            () = self.decision_done.notified() => {
+                let mut owed = self
+                    .owed_poll
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *owed = Some(owed.map_or(end, |at| at.min(end)));
+            }
+        }
+    }
+
+    /// Resolve at the poll that a cut settle owes, and clear it (issue
+    /// #2418). Pending forever when no poll is owed.
+    async fn owed_poll(&self) {
+        let at = *self
+            .owed_poll
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(at) = at else {
+            return std::future::pending().await;
+        };
+        tokio::time::sleep_until(at).await;
+        let mut owed = self
+            .owed_poll
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *owed == Some(at) {
+            *owed = None;
         }
     }
 
@@ -41832,6 +41910,9 @@ impl Worker {
         // Issue #2255: a freed workflow permit also wakes the owner deciders.
         let decider_wake =
             matches!(kind, ClaimedTaskKind::Workflow).then(|| Arc::clone(&self.decider_capacity));
+        // Issue #2418: a workflow task that ends wakes the leader too.
+        let leader_wake =
+            matches!(kind, ClaimedTaskKind::Workflow).then(|| Arc::clone(&self.decision_done));
         // The row waited in `PENDING` from eligibility to claim. Database
         // clocks measure this wait. The poll gate holds a backlog in
         // `PENDING`, not at the permit (issue #1787). The tuner signal below
@@ -41966,7 +42047,8 @@ impl Worker {
                 },
                 &capacity_freed,
             )
-            .waking_deciders(decider_wake);
+            .waking_deciders(decider_wake)
+            .waking_leader(leader_wake);
             // The permit is held, so the reference no longer needs a
             // reservation against it (issue #1312). The early return above
             // drops it too, so a closed semaphore cannot leak one.
@@ -58679,6 +58761,111 @@ mod tests {
         assert!(
             start.elapsed() < crate::notify::SETTLE_DELAY_MIN,
             "an idle wait with no NOTIFY must not settle"
+        );
+    }
+
+    /// A workflow task of this worker that ends wakes the idle wait, with
+    /// no settle (issue #2418). Its commit is visible already.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_decision_end_wakes_the_idle_wait_without_a_settle() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        let start = tokio::time::Instant::now();
+        let done = Arc::clone(&worker.decision_done);
+        let end = async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            done.notify_one();
+        };
+        tokio::join!(
+            worker.idle_wait_then_settle(std::future::pending::<bool>()),
+            end
+        );
+        assert!(
+            start.elapsed() < crate::notify::SETTLE_DELAY_MIN,
+            "a local decision end must wake the wait at once, waited {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A local decision end cuts a running settle short (issue #2418). The
+    /// cut settle owes one poll at its original end, so the NOTIFY that
+    /// started it still gets a poll once its row is claimable.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_decision_end_cuts_the_settle_short_and_owes_a_poll() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        // A NOTIFY at 10 ms, then a local decision end at 20 ms.
+        let start = tokio::time::Instant::now();
+        let notify = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            true
+        };
+        let done = Arc::clone(&worker.decision_done);
+        let end = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            done.notify_one();
+        };
+        tokio::join!(worker.idle_wait_then_settle(notify), end);
+        assert!(
+            start.elapsed() < Duration::from_millis(10) + crate::notify::SETTLE_DELAY_MIN,
+            "a local decision end must cut the settle short, waited {:?}",
+            start.elapsed()
+        );
+
+        // The next wait has no other wake. It ends when the settle would have.
+        worker
+            .idle_wait_then_settle(std::future::pending::<bool>())
+            .await;
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(10) + crate::notify::SETTLE_DELAY_MIN
+                && waited <= Duration::from_millis(10) + crate::notify::SETTLE_DELAY_MAX,
+            "the owed poll must come at the end of the cut settle, came at {waited:?}"
+        );
+
+        // The owed poll is paid. A later wait does not wake for it again.
+        let later = tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(std::future::pending::<bool>()),
+        )
+        .await;
+        assert!(later.is_err(), "an owed poll must wake one wait only");
+    }
+
+    /// Only a workflow permit wakes the leader on release (issue #2418). A
+    /// workflow task commits the tasks that it schedules. An activity
+    /// commits none.
+    #[tokio::test]
+    async fn a_released_workflow_permit_wakes_the_leader() {
+        let semaphore = Arc::new(Semaphore::new(2));
+        let freed = Arc::new(tokio::sync::Notify::new());
+        let done = Arc::new(tokio::sync::Notify::new());
+        let activity = CapacityPermit::new(
+            Arc::clone(&semaphore)
+                .acquire_owned()
+                .await
+                .expect("permit"),
+            &freed,
+        );
+        drop(activity);
+        assert!(
+            futures::FutureExt::now_or_never(done.notified()).is_none(),
+            "an activity permit must not wake the leader"
+        );
+        let workflow = CapacityPermit::new(
+            Arc::clone(&semaphore)
+                .acquire_owned()
+                .await
+                .expect("permit"),
+            &freed,
+        )
+        .waking_leader(Some(Arc::clone(&done)));
+        drop(workflow);
+        assert!(
+            futures::FutureExt::now_or_never(done.notified()).is_some(),
+            "a workflow permit must wake the leader on release"
         );
     }
 
