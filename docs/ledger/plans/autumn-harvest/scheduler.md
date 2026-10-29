@@ -49,6 +49,23 @@ Statements: 3. Tables with no usable index: none.
 | 2 | `UPDATE harvest_schedules SET fire_claim_token = $1, fire_claimed_until = NOW() + INTERVAL '30 sec...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
 | 3 | `UPDATE harvest_schedules SET next_run_at = $1, updated_at = $2, fire_claim_token = NULL, fire_cla...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
 
+## `dag_registration_is_converged`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_schedules"."id" FROM "harvest_schedules" WHERE (("harvest_schedules"."workflow_na...` | `harvest_schedules`: Index Scan on `harvest_schedules_workflow_name_unique` |
+| 2 | `SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_ex...` | `harvest_schedules`: Index Scan on `harvest_schedules_dag_name_key` |
+
+## `delete_stale_dag_workflow_schedule`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM "harvest_schedules" WHERE ((("harvest_schedules"."workflow_name" = $1) OR ("harvest_s...` | `harvest_schedules`: Bitmap Heap Scan on `harvest_schedules_workflow_name_unique`<br>`harvest_schedules`: ModifyTable |
+
 ## `drain_buffered_schedule_runs`
 
 Statements: 1. Tables with no usable index: none.
@@ -72,6 +89,50 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_ex...` | `harvest_schedules`: Bitmap Heap Scan on `harvest_schedules_workflow_name_unique` |
+
+## `find_converged_workflow_schedule`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_schedules"."id" FROM "harvest_schedules" WHERE ("harvest_schedules"."workflow_nam...` | `harvest_schedules`: Index Scan on `harvest_schedules_workflow_name_unique` |
+| 2 | `SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_ex...` | `harvest_schedules`: Index Scan on `harvest_schedules_dag_name_key` |
+| 3 | `SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_ex...` | `harvest_schedules`: Index Scan on `harvest_schedules_workflow_name_unique` |
+
+## `find_reusable_dag_schedule`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_ex...` | `harvest_schedules`: Index Scan on `harvest_schedules_workflow_name_unique` |
+
+## `find_reusable_dag_workflow_schedule`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_ex...` | `harvest_schedules`: Index Scan on `harvest_schedules_dag_name_key` |
+
+## `insert_dag_workflow_schedule_if_missing`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO "harvest_schedules" ("id", "dag_name", "schedule_expr", "timezone", "catchup", "max_a...` | `harvest_schedules`: ModifyTable |
+| 2 | `SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_ex...` | `harvest_schedules`: Index Scan on `harvest_schedules_dag_name_key` |
+
+## `insert_workflow_schedule_if_missing`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO "harvest_schedules" ("id", "dag_name", "schedule_expr", "timezone", "catchup", "max_a...` | `harvest_schedules`: ModifyTable |
+| 2 | `SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_ex...` | `harvest_schedules`: Index Scan on `harvest_schedules_workflow_name_unique` |
 
 ## `load_overlap_cleanup_targets`
 
@@ -121,6 +182,14 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `UPDATE harvest_schedules SET fire_claim_token = NULL, fire_claimed_until = NULL WHERE id = $1 AND...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
 
+## `release_squatted_workflow_name`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE "harvest_schedules" SET "workflow_name" = $1, "updated_at" = $2 WHERE (("harvest_schedules...` | `harvest_schedules`: Index Scan on `harvest_schedules_workflow_name_unique`<br>`harvest_schedules`: ModifyTable |
+
 ## `schedule_running_basis`
 
 Statements: 1. Tables with no usable index: none.
@@ -136,6 +205,14 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."schedule_id"...` | `harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_non_terminal_wf_name` |
+
+## `stale_dag_rows_exist`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT COUNT(*) FROM "harvest_schedules" WHERE ((("harvest_schedules"."workflow_name" = $1) OR ("...` | `harvest_schedules`: Bitmap Heap Scan on `harvest_schedules_workflow_name_unique` |
 
 ## `tick_one_workflow_schedule`
 
@@ -158,6 +235,14 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_ex...` | `harvest_schedules`: Bitmap Heap Scan on `harvest_schedules_dag_name_key`, `harvest_schedules_workflow_name_unique` |
+
+## `try_take_registration_lock`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT pg_try_advisory_xact_lock(hashtext($1)::int8) AS acquired` | no table |
 
 ## `update_workflow_schedule_with_codecs`
 

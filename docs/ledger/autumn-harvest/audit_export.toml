@@ -14,6 +14,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_audit_log"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
 
 ["build_unexported_index"]
 driver = "setup"
@@ -21,6 +22,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
 
 ["claim_shard_chained"]
 driver = "per_tick"
@@ -36,6 +38,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
 
 ["count_redrive_recoverable"]
 driver = "per_request"
@@ -51,6 +54,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
 
 ["decommission_cursor_locked"]
 driver = "per_request"
@@ -82,6 +86,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_audit_log"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
 
 ["export_lag_seconds"]
 driver = "per_tick"
@@ -150,3 +155,4 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_audit_log"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"

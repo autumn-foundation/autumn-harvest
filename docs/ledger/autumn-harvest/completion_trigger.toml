@@ -54,3 +54,4 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_completion_triggers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/completion_trigger.md"

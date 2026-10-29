@@ -98,6 +98,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["request_drain"]
 driver = "per_request"
@@ -113,6 +114,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["touch_worker_liveness"]
 driver = "per_tick"
@@ -144,6 +146,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["write_task_stats_snapshot"]
 driver = "per_tick"
