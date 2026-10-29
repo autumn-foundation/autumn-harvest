@@ -23,8 +23,8 @@ sandbox = ["autumn-harvest/sandbox-activities", "dep:tokio-util"]
 
 [dependencies]
 # The backend-neutral core only: no Diesel, no Postgres, no autumn-web.
-autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", default-features = false }
-autumn-harvest-sqlite = { version = "0.7.0", path = "../autumn-harvest-sqlite", optional = true }
+autumn-harvest = { version = "0.8.0", path = "../autumn-harvest", default-features = false }
+autumn-harvest-sqlite = { version = "0.8.0", path = "../autumn-harvest-sqlite", optional = true }
 # Workspace snapshots carry file bytes as base64 (issue #2274). The core
 # crate already depends on this version.
 base64 = "0.23"
@@ -42,9 +42,9 @@ tokio-util = { version = "0.7", optional = true }
 
 [dev-dependencies]
 # `testing` adds `ActivityContext::new_test_with_state` for the engine path.
-autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
+autumn-harvest = { version = "0.8.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
 chrono = { workspace = true }
-autumn-harvest-sqlite = { version = "0.7.0", path = "../autumn-harvest-sqlite" }
+autumn-harvest-sqlite = { version = "0.8.0", path = "../autumn-harvest-sqlite" }
 proptest = { workspace = true }
 tempfile = "3"
 # The sandbox tool tests pass a cancellation token.

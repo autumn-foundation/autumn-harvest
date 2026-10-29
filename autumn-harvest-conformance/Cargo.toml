@@ -14,8 +14,8 @@ readme = "README.md"
 # The suite lives in `tests/conformance/`. Each test runs a scenario on a
 # testcontainers Postgres and on an in-memory SQLite runtime, then compares.
 [dev-dependencies]
-autumn-harvest = { version = "0.7.0", path = "../autumn-harvest", features = ["db", "testing", "debugger"] }
-autumn-harvest-sqlite = { version = "0.7.0", path = "../autumn-harvest-sqlite" }
+autumn-harvest = { version = "0.8.0", path = "../autumn-harvest", features = ["db", "testing", "debugger"] }
+autumn-harvest-sqlite = { version = "0.8.0", path = "../autumn-harvest-sqlite" }
 chrono = { workspace = true }
 deadpool = { workspace = true }
 diesel = { workspace = true }

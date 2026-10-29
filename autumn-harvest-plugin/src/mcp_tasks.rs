@@ -941,6 +941,8 @@ pub fn build_mcp_task_route(
         repository: None,
         idempotency: autumn_web::RouteIdempotency::Direct,
         timeout: autumn_web::RouteTimeout::Inherit,
+        // The class that a route macro sets when it names none (since autumn-web 0.9).
+        criticality: autumn_web::Criticality::Default,
         seo: autumn_web::SeoRouteDefaults::EMPTY,
     }
 }

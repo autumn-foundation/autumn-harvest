@@ -159,24 +159,24 @@ ignore = [
     #
     # No fix is possible from this repo. elliptic-curve 0.13.8 is the only
     # crate that depends on crypto-bigint, and it requires `0.5`
-    # (elliptic-curve-0.13.8/Cargo.toml:61-62). autumn-web 0.8.0 pins
-    # `p256 = "0.13"` as a required dependency (Cargo.toml:780-787). It
+    # (elliptic-curve-0.13.8/Cargo.toml:61-62). autumn-web 0.9.0 pins
+    # `p256 = "0.13"` as a required dependency (Cargo.toml:941-948). It
     # also turns on the `rust_crypto` feature of jsonwebtoken 11.1.0
-    # (Cargo.toml:715-718). That feature pins p256 and p384 0.13
+    # (Cargo.toml:876-879). That feature pins p256 and p384 0.13
     # (jsonwebtoken-11.1.0/Cargo.toml:53-57). On 2026-10-24, each crate of
     # the chain is at the last release of its line. So a `cargo update`, a
     # feature change or a `[patch]` cannot move crypto-bigint.
     #
     # Verdict: undetermined from this repo alone, as for RUSTSEC-2023-0071.
     # Code in this workspace runs no P-256 or P-384 secret-key operation.
-    # The `oidc` feature only verifies ID tokens (autumn-web-0.8.0
-    # src/auth.rs:1517, 1571), and each verify input is public. The only JWT
+    # The `oidc` feature only verifies ID tokens (autumn-web-0.9.0
+    # src/auth.rs:1523, 1577), and each verify input is public. The only JWT
     # signer here is a test that uses EdDSA
     # (autumn-harvest-plugin/tests/oidc_login.rs:194-199). Ed25519 does not
     # use crypto-bigint.
     #
     # The open part is the Web Push module of autumn-web. It has no feature
-    # gate (src/lib.rs:635), so each build that links autumn-harvest-plugin
+    # gate (src/lib.rs:670), so each build that links autumn-harvest-plugin
     # holds it. `WebPush::send` signs an ES256 VAPID JWT with the long-term
     # private key (src/push/vapid.rs:147). It also does ECDH with a new key
     # for each message (src/push/encryption.rs:84, 129). On these secrets,
@@ -185,10 +185,10 @@ ignore = [
     # sbb (crypto-bigint-0.5.5/src/uint/add_mod.rs:13). So this path runs the
     # class of operation that the advisory names. A subscriber can name its
     # own https endpoint and so get each VAPID signature
-    # (src/push/store.rs:313-345). Nothing in this workspace sets `[push]`
+    # (src/push/store.rs:321-353). Nothing in this workspace sets `[push]`
     # or calls `WebPush`. With `AUTUMN_PUSH__PRIVATE_KEY` set and no code,
     # `AppBuilder::run` parses the key and derives its public key at boot
-    # (src/app.rs:4724).
+    # (src/app.rs:5144).
     #
     # The crypto-bigint source on these paths has no secret-dependent branch
     # (src/limb/sub.rs:10-16, src/uint/add_mod.rs:9-22). Any leak depends on
@@ -202,7 +202,7 @@ ignore = [
     # - Code or config here sets `[push] private_key` or
     #   `AUTUMN_PUSH__PRIVATE_KEY`, or calls `WebPush`. Or it signs ES256 or
     #   ES384, or makes a JWK from an EC private key, with jsonwebtoken.
-    { id = "RUSTSEC-2026-0387", reason = "undetermined from this repo. Code here runs no P-256 or P-384 secret-key operation. OIDC only verifies, and the one test signer uses EdDSA. autumn-web 0.8.0 has ungated Web Push. It signs ES256 and does ECDH through p256 0.13 when a host app sets [push] and calls WebPush. No upgrade exists: autumn-web 0.8.0 pins p256 0.13, and its jsonwebtoken 11.1.0 pins p256 and p384 0.13. Any leak depends on the compiler and the CPU. Revisit: either crate moves to elliptic-curve 0.14, a second crypto-bigint version appears, or code or config here uses Web Push or signs with an EC key." },
+    { id = "RUSTSEC-2026-0387", reason = "undetermined from this repo. Code here runs no P-256 or P-384 secret-key operation. OIDC only verifies, and the one test signer uses EdDSA. autumn-web 0.9.0 has ungated Web Push. It signs ES256 and does ECDH through p256 0.13 when a host app sets [push] and calls WebPush. No upgrade exists: autumn-web 0.9.0 pins p256 0.13, and its jsonwebtoken 11.1.0 pins p256 and p384 0.13. Any leak depends on the compiler and the CPU. Revisit: either crate moves to elliptic-curve 0.14, a second crypto-bigint version appears, or code or config here uses Web Push or signs with an EC key." },
 
     # RUSTSEC-2024-0384 — `instant` 0.1.13 is unmaintained (no vulnerability,
     # "no safe upgrade available"). Pulled by parking_lot 0.11 / wasm-timer ->
@@ -266,32 +266,27 @@ ignore = [
     # archived on 2024-03-25, and 0.2.11 is the last release. This is an
     # `unmaintained` notice, not a vulnerability.
     #
-    # The only path is `serde_yaml` 0.9.34, itself deprecated. Two crates
-    # pull it in:
-    # - `autumn-web` 0.8.0 (external, a normal dependency), through its
-    #   `openapi` feature. Its one call is `serde_yaml::to_string` in
-    #   `openapi::write_openapi_spec_to_dist`, which emits our own spec and
-    #   parses no input. It is not ours to change, so this entry stays until
-    #   it moves off `serde_yaml`.
-    # - our own dev-dependency in autumn-harvest/Cargo.toml. `grep -rl
-    #   serde_yaml autumn-harvest/tests` (re-run at each revisit, since this
-    #   count drifts as guards are added) finds 11 integration-test modules
-    #   importing it directly, not three: `slo_pack_docs`, `supply_chain_ci`,
-    #   `formal_trace_coverage`, `formal_models_coverage`,
-    #   `migration_lock_safety`, `otel_workflow_semconv_docs`,
-    #   `chaos_watchdog`, `coverage_nightly_wiring`, `ci_run_coverage`,
-    #   `concurrency_model_ci`, `fuzz_nightly_wiring`. Every one of them
-    #   parses a checked-in CI workflow YAML file under `.github/workflows/`,
-    #   never external input. Tests never ship, so no release build is
-    #   affected either way; the count only matters for the revisit below.
+    # The only path is `serde_yaml` 0.9.34, itself deprecated. Since
+    # `autumn-web` 0.9.0 moved to `serde-saphyr`, one crate pulls it in: our
+    # own dev-dependency in autumn-harvest/Cargo.toml. `grep -rl serde_yaml
+    # autumn-harvest/tests` (re-run at each revisit, since this count drifts
+    # as guards are added) finds 11 integration-test modules importing it
+    # directly, not three: `slo_pack_docs`, `supply_chain_ci`,
+    # `formal_trace_coverage`, `formal_models_coverage`,
+    # `migration_lock_safety`, `otel_workflow_semconv_docs`,
+    # `chaos_watchdog`, `coverage_nightly_wiring`, `ci_run_coverage`,
+    # `concurrency_model_ci`, `fuzz_nightly_wiring`. Every one of them
+    # parses a checked-in CI workflow YAML file under `.github/workflows/`,
+    # never external input. Tests never ship, so no release build is
+    # affected either way; the count only matters for the revisit below.
     #
-    # Dropping our dev-dependency alone would not clear the advisory, since
-    # `autumn-web` keeps the crate in the graph. The advisory names
-    # `saphyr` / `serde-saphyr` and `noyalib` as safe replacements.
+    # The advisory names `saphyr` / `serde-saphyr` and `noyalib` as safe
+    # replacements. `serde-saphyr` has no dynamic `Value` type, and the guards
+    # walk one. So the move is its own change.
     #
-    # Revisit: when `autumn-web` drops `serde_yaml`, re-run the grep above
-    # for the current guard list, move all of them to a maintained parser,
-    # and delete this entry.
+    # Revisit: when the guards above move to a maintained parser, delete this
+    # entry. The upstream condition that this entry waited on is met: no
+    # normal dependency pulls in `serde_yaml` since `autumn-web` 0.9.0.
     #
     # Ballast note (2026-10-19): this advisory previously had two separate
     # ignore entries here with near-identical reasoning, written at
@@ -304,7 +299,7 @@ ignore = [
     # three named, eleven actually importing `serde_yaml` — so this pass
     # also corrects that count. Neither correction changes the dependency
     # graph or the advisory verdict.
-    { id = "RUSTSEC-2024-0449", reason = "unmaintained, not a vulnerability: unsafe-libyaml arrives only through the deprecated serde_yaml, which autumn-web 0.8.0 (external) depends on via its openapi feature (one call, serde_yaml::to_string, emits our own spec, parses no input); our own use is a dev-dependency that parses checked-in CI workflow YAML in 11 integration-test modules. Revisit: autumn-web drops serde_yaml." },
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained, not a vulnerability: unsafe-libyaml arrives only through the deprecated serde_yaml, which only our own dev-dependency pulls in since autumn-web 0.9.0 moved to serde-saphyr. It parses checked-in CI workflow YAML in 11 integration-test modules. Revisit: those guards move to a maintained parser." },
 ]
 
 # ---------------------------------------------------------------------------
