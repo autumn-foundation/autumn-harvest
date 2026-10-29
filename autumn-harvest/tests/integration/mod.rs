@@ -326,6 +326,7 @@ mod resident_hit_rate_db_tests;
 #[cfg(feature = "db")]
 mod resident_outcome_tests;
 mod retention_archive_codec_tests;
+mod retention_candidate_scan_index_tests;
 mod retention_overrides_tests;
 mod retention_reclaim_support;
 mod retention_summary_tests;

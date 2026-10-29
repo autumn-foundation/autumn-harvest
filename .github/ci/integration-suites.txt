@@ -205,6 +205,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          resident_hit_rate_db_tests
 linux        autumn-harvest         integration                      -                          resident_outcome_tests
 linux        autumn-harvest         integration                      -                          retention_archive_codec_tests
+linux        autumn-harvest         integration                      -                          retention_candidate_scan_index_tests
 linux        autumn-harvest         integration                      -                          retention_overrides_tests
 linux        autumn-harvest         integration                      -                          retention_summary_tests
 linux        autumn-harvest         integration                      -                          retry_after_tests

@@ -83,13 +83,13 @@ Statements: 1. Tables with no usable index: none.
 
 ## `run_shard_tick`
 
-Statements: 4. Tables with no usable index: `harvest_workflow_executions`.
+Statements: 4. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `DELETE FROM harvest_completion_deliveries WHERE state = 'DELIVERED' AND NOT EXISTS ( SELECT 1 FRO...` | `harvest_completion_deliveries`: ModifyTable<br>`harvest_completion_deliveries`: full scan of index `idx_harvest_completion_deliveries_exec`<br>`harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
-| 2 | `SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, l...` | `harvest_workflow_executions`: no usable index |
-| 3 | `SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, l...` | `harvest_workflow_executions`: no usable index |
+| 2 | `SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, l...` | `harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_retention_candidates` |
+| 3 | `SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, l...` | `harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_retention_candidates` |
 | 4 | `UPDATE "harvest_workflow_executions" SET "sticky_worker_id" = $1 WHERE ("harvest_workflow_executi...` | `harvest_workflow_executions`: Bitmap Heap Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
 
 ## `should_skip_candidate`
