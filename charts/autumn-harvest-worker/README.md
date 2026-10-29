@@ -40,7 +40,7 @@ The chart needs Kubernetes 1.30 or later, for the `preStop` sleep action.
    output, and this output holds the secret:
 
    ```bash
-   docker run --rm ghcr.io/autumn-foundation/autumn-harvest:0.7.0 harvest token bootstrap
+   docker run --rm ghcr.io/autumn-foundation/autumn-harvest:0.8.0 harvest token bootstrap
    ```
 
    Run the printed `INSERT` statement against the database, and keep the
@@ -98,7 +98,7 @@ WORKDIR /src
 COPY . .
 RUN cargo build --release --locked --bin my-worker
 
-FROM ghcr.io/autumn-foundation/autumn-harvest:0.7.0
+FROM ghcr.io/autumn-foundation/autumn-harvest:0.8.0
 COPY --from=build /src/target/release/my-worker /usr/local/bin/
 CMD ["my-worker"]
 ```
