@@ -489,6 +489,10 @@ fn io_error(err: &std::io::Error) -> AgentError {
 /// The file must not exist, so two writers never share one handle. The call
 /// returns after the bytes are on disk, so a later rename cannot expose an
 /// empty file after a crash.
+///
+/// The flush comes before the sync. Tokio keeps a failed write error for the
+/// next write or flush, and `sync_all` does not return it. Without the flush,
+/// a full disk could publish a short file.
 async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt as _;
     let mut options = tokio::fs::OpenOptions::new();
@@ -497,6 +501,7 @@ async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<
     options.mode(0o600);
     let mut file = options.open(path).await?;
     file.write_all(bytes).await?;
+    file.flush().await?;
     file.sync_all().await
 }
 
