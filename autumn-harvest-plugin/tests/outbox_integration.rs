@@ -23,6 +23,15 @@ struct CountRow {
     count: i64,
 }
 
+/// The deadline spans of a started run, in seconds from its start.
+#[derive(Debug, QueryableByName)]
+struct Spans {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    timeout: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    sla: Option<f64>,
+}
+
 #[derive(Debug, QueryableByName)]
 struct DelayRow {
     #[diesel(sql_type = diesel::sql_types::Double)]
@@ -60,6 +69,100 @@ async fn framework_outbox_delivers_to_split_harvest_store() {
         .await
         .expect("outbox drain should succeed");
     assert_eq!(delivered, 1, "one row should be delivered");
+}
+
+fn noop_handler<'a>(
+    _ctx: &'a autumn_harvest::WorkflowContext,
+    _input: serde_json::Value,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+> {
+    Box::pin(async move { Ok(serde_json::json!({})) })
+}
+
+/// Issue #2387: an outbox start takes the operator's timeout and SLA override,
+/// as an API start does.
+#[tokio::test]
+async fn framework_outbox_start_takes_the_run_default_override() {
+    const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+    let (state, mut app_conn, _app_url, harvest_url, _container) =
+        setup_split_test_databases(true).await;
+    let info = autumn_harvest::info::WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
+        mcp: false,
+        name: "user_onboarding",
+        module: "outbox_integration",
+        handler: noop_handler,
+        execution_timeout: Some(3 * HOUR),
+        chain_execution_timeout: None,
+        sla: Some(2 * HOUR),
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+    };
+    let registry = std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(
+        vec![info],
+        vec![],
+    ));
+    registry.run_defaults().write_through(
+        "user_onboarding",
+        autumn_harvest::run_defaults::RunDefaultFields {
+            execution_timeout: Some(std::time::Duration::from_secs(600)),
+            sla: None,
+        },
+    );
+    state.insert_extension(registry);
+
+    let request = WorkflowStartRequest {
+        workflow_name: "user_onboarding".to_string(),
+        workflow_id: "user-onboarding:2387".to_string(),
+        queue_name: "default".to_string(),
+        input: serde_json::json!({}),
+        memo: None,
+        search_attrs: None,
+    };
+    enqueue_workflow_start_outbox(&mut app_conn, &request)
+        .await
+        .expect("outbox row should persist");
+    let delivered = drain_workflow_start_outbox_once(&state, 32)
+        .await
+        .expect("outbox drain should succeed");
+    assert_eq!(delivered, 1);
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&harvest_url)
+        .await
+        .expect("connect to the harvest database");
+    let spans: Spans = diesel::sql_query(
+        "SELECT EXTRACT(EPOCH FROM deadline_at - started_at)::float8 AS timeout, \
+                EXTRACT(EPOCH FROM sla_deadline_at - started_at)::float8 AS sla \
+         FROM harvest_workflow_executions WHERE workflow_id = 'user-onboarding:2387'",
+    )
+    .get_result(&mut conn)
+    .await
+    .expect("read the started run");
+    let timeout = spans.timeout.expect("the run has a hard deadline");
+    assert!(
+        (timeout - 600.0).abs() < 2.0,
+        "the override timeout applies: {timeout}"
+    );
+    // The code SLA of 2 hours is clamped to the 10-minute override timeout.
+    let sla = spans.sla.expect("the run has an SLA deadline");
+    assert!(
+        (sla - 600.0).abs() < 2.0,
+        "the SLA is clamped to the timeout: {sla}"
+    );
 }
 
 #[tokio::test]

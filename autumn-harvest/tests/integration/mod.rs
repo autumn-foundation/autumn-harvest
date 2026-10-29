@@ -335,6 +335,9 @@ mod retry_budget_tests;
 mod retry_chain_routing_tests;
 mod retry_clock_skew_tests;
 mod retry_now_tests;
+#[cfg(feature = "db")]
+mod run_defaults_db_tests;
+mod runtime_parameter_inventory_docs;
 mod safety_report_docs;
 mod saga_tests;
 mod sandbox_activities_docs;
@@ -343,6 +346,7 @@ mod scanner_liveness_tests;
 mod scanner_tick_db_tests;
 mod schedule_decisions;
 mod schedule_override_db_tests;
+mod schedule_override_reshard_db_tests;
 mod schedule_runs_tests;
 mod schedule_to_close_tests;
 mod schedule_update_tests;
@@ -466,6 +470,7 @@ mod workflow_pause_claim_recheck_tests;
 #[cfg(feature = "db")]
 mod workflow_reachability_samples_tests;
 mod workflow_retry_tests;
+mod workflow_schedule_override_db_tests;
 mod workflow_schema_contract_tests;
 mod workflow_sim_ingest_tests;
 #[cfg(feature = "testing")]

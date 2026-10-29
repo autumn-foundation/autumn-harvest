@@ -1,0 +1,36 @@
+# Ledger profiles for `autumn-harvest/src/run_defaults.rs`. See `docs/ledger/README.md`.
+
+["db::load_run_default_overrides"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_run_default_overrides"]
+measured = "unmeasured"
+
+["db::lock_type"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["db::recompute_in_flight_sla"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["db::select_override"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_run_default_overrides"]
+measured = "unmeasured"
+
+["db::update_run_default_override"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_run_default_overrides"]
+measured = "unmeasured"

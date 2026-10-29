@@ -644,6 +644,35 @@ async fn try_take_registration_lock(conn: &mut AsyncPgConnection) -> HarvestResu
     Ok(row.acquired)
 }
 
+/// Whether the overrides still match the snapshot of this pass (issue #2386).
+///
+/// Call it after [`try_take_registration_lock`]. An override write takes the
+/// same lock before it commits, so no write lands between this check and the
+/// upsert. `None` is a caller with no snapshot, and always passes.
+async fn overrides_unchanged(
+    conn: &mut AsyncPgConnection,
+    fence: Option<&str>,
+) -> HarvestResult<bool> {
+    let Some(fence) = fence else {
+        return Ok(true);
+    };
+    Ok(crate::schedule_override::override_fingerprint(conn).await? == fence)
+}
+
+/// Take the registration lock and wait for it (issue #2386).
+///
+/// An override write calls this inside its transaction. A scheduler pass that
+/// holds the lock then finishes its write first. A pass that starts later
+/// sees a new fingerprint and skips its write.
+pub(crate) async fn wait_for_registration_lock(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
+    diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::int8)")
+        .bind::<diesel::sql_types::Text, _>(REGISTRATION_LOCK_KEY)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
 /// Log a per-schedule registration failure once, naming the schedule.
 ///
 /// Issue #1157, defect 2: the pre-fix reconciler propagated the first error
@@ -668,6 +697,7 @@ async fn register_schedules_for_shard(
     router: &ShardRouter,
     shard: ShardId,
     backoff: &ScheduleRegistrationBackoff,
+    fence: Option<&str>,
 ) -> HarvestResult<()> {
     #[cfg(not(feature = "unified-dag-execution"))]
     reject_classic_dags_without_unified_execution(dags)?;
@@ -682,7 +712,7 @@ async fn register_schedules_for_shard(
         }
         // Collect rather than `?`: one unconvergeable DAG must not prevent
         // every DAG after it in the iteration order from being registered.
-        let outcome = register_one_dag_schedule(conn, dag).await;
+        let outcome = register_one_dag_schedule(conn, dag, fence).await;
         record_registration_outcome(backoff, &key, "dag", &dag.name, shard, outcome, now);
     }
     Ok(())
@@ -748,6 +778,7 @@ fn record_registration_outcome(
 async fn register_one_dag_schedule(
     conn: &mut AsyncPgConnection,
     dag: &RegisteredDag,
+    fence: Option<&str>,
 ) -> HarvestResult<RegistrationOutcome> {
     if let Some(schedule) = &dag.schedule {
         crate::policy::validate_schedule(schedule).map_err(crate::error::HarvestError::Config)?;
@@ -770,6 +801,10 @@ async fn register_one_dag_schedule(
             // `RegistrationOutcome::Skipped`.
             return Ok(RegistrationOutcome::Skipped);
         }
+        // A PATCH replaced the overrides of this pass. The next pass applies them.
+        if !overrides_unchanged(c, fence).await? {
+            return Ok(RegistrationOutcome::Skipped);
+        }
         upsert_schedule(c, dag).await?;
         Ok(RegistrationOutcome::Settled)
     }))
@@ -784,6 +819,7 @@ async fn register_one_workflow_schedule_locked(
     conn: &mut AsyncPgConnection,
     ws: &WorkflowSchedule,
     codecs: &crate::payload_codec::PayloadCodecs,
+    fence: Option<&str>,
 ) -> HarvestResult<RegistrationOutcome> {
     crate::policy::validate_schedule(&ws.schedule).map_err(crate::error::HarvestError::Config)?;
     if workflow_registration_is_converged(conn, ws, codecs).await? {
@@ -792,7 +828,7 @@ async fn register_one_workflow_schedule_locked(
     // See `register_one_dag_schedule` for why the isolation level is pinned.
     let mut tx = conn.build_transaction().read_committed();
     Box::pin(tx.run(async |c| {
-        if !try_take_registration_lock(c).await? {
+        if !try_take_registration_lock(c).await? || !overrides_unchanged(c, fence).await? {
             return Ok(RegistrationOutcome::Skipped);
         }
         upsert_workflow_schedule(c, ws, codecs).await?;
@@ -1008,6 +1044,20 @@ pub async fn register_workflow_schedules_for_shard_with_codecs(
     backoff: &ScheduleRegistrationBackoff,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<ShardFiringDecision> {
+    register_workflow_schedules_fenced(conn, schedules, router, shard, backoff, codecs, None).await
+}
+
+/// [`register_workflow_schedules_for_shard_with_codecs`] under the override
+/// fence of one scheduler pass (issue #2386).
+async fn register_workflow_schedules_fenced(
+    conn: &mut AsyncPgConnection,
+    schedules: &[WorkflowSchedule],
+    router: &ShardRouter,
+    shard: ShardId,
+    backoff: &ScheduleRegistrationBackoff,
+    codecs: &crate::payload_codec::PayloadCodecs,
+    fence: Option<&str>,
+) -> HarvestResult<ShardFiringDecision> {
     let now = Utc::now();
     let mut decision = ShardFiringDecision::Allowed;
     for ws in schedules {
@@ -1023,7 +1073,7 @@ pub async fn register_workflow_schedules_for_shard_with_codecs(
             // costs a missed fire on the owning shard, never a duplicate — the
             // row's previous owner still collects its stale copy — so it is
             // backed off and the pass keeps going.
-            let outcome = register_one_workflow_schedule_locked(conn, ws, codecs).await;
+            let outcome = register_one_workflow_schedule_locked(conn, ws, codecs, fence).await;
             record_registration_outcome(
                 backoff,
                 &key,
@@ -1426,6 +1476,19 @@ pub async fn tick_once_sharded_with_backoff(
     let active_gates: Vec<crate::admission_gate::AdmissionGate> = {
         match pool.pool_for_execution(ExecutionId::new()).get().await {
             Ok(mut gate_conn) => {
+                // Issue #2387: run-default overrides live on the same shard.
+                // A failed refresh keeps the last snapshot, so it does not skip the tick.
+                if let Err(e) = registry
+                    .run_defaults()
+                    .refresh_if_stale(&mut gate_conn)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "harvest: could not refresh run-default overrides; \
+                         keeping the last snapshot"
+                    );
+                }
                 match crate::admission_gate::db::load_active_gates(&mut gate_conn).await {
                     Ok(gates) => gates,
                     Err(e) => {
@@ -1475,66 +1538,182 @@ pub async fn tick_once_sharded_with_backoff(
             // A lost guard then ends its backend.
             #[cfg(feature = "db")]
             let _member = crate::replication::join_fenced_pass(shard_pool, &mut conn).await;
-            // Issue #1157: on a converged shard this pass is read-only — no
-            // transaction, no advisory lock, no UPDATE. Only a schedule that
-            // genuinely needs a write opens a transaction and contends for the
-            // fleet-wide registration lock, and a per-schedule failure is collected
-            // and backed off rather than aborting the rest of the pass.
-            // Issue #2385: operator overrides win over code. Both registration
-            // passes and the firing pass read the same effective values, or the
-            // two registration passes would rewrite the same DAG row each tick.
-            let Some(overrides) = load_shard_overrides(&mut conn, shard).await else {
-                return Ok(());
-            };
-            // `apply_to_workflow_schedules` reads the code catalog, so it runs
-            // before the catalog is shadowed.
-            let workflow_schedules =
-                overrides.apply_to_workflow_schedules(workflow_schedules.as_ref(), dags.as_ref());
-            let dags = overrides.apply_to_catalog(dags.as_ref());
-            register_schedules_for_shard(&mut conn, dags.as_ref(), &router, shard, backoff).await?;
-            let firing = register_workflow_schedules_for_shard_with_codecs(
-                &mut conn,
-                workflow_schedules.as_ref(),
-                &router,
-                shard,
-                backoff,
-                registry.payload_codecs(),
-            )
-            .await?;
-
-            // Issue #1157: neither firing pass below filters by target shard, so a
-            // stale row this pass could not collect would be fired here *and* by the
-            // shard that now owns it. Stand this shard down for the tick rather than
-            // duplicate the run; the owning shard is unaffected and still fires it
-            // exactly once, and the next tick re-attempts the collection.
-            if firing == ShardFiringDecision::SuppressedUncollectedStaleRows {
-                tracing::warn!(
-                    shard_id = shard.as_i32(),
-                    "harvest: suppressing schedule firing on this shard for this tick; \
-                 stale schedule rows left behind by a routing change could not be \
-                 collected, and firing them here would duplicate the owning shard's run"
-                );
-                return Ok(());
-            }
-
-            fire_shard_schedules(
+            let pass = register_shard_pass(
                 &mut conn,
                 shard,
                 dags.as_ref(),
+                workflow_schedules.as_ref(),
+                &router,
+                backoff,
                 registry.as_ref(),
-                &metrics,
-                &active_gates,
             )
-            .await;
-            Ok::<(), HarvestError>(())
+            .await?;
+            if let Some(dags) = pass.dags {
+                fire_shard_schedules(
+                    &mut conn,
+                    shard,
+                    dags.as_ref(),
+                    registry.as_ref(),
+                    &metrics,
+                    &active_gates,
+                )
+                .await;
+            }
+            Ok::<Vec<String>, HarvestError>(pass.misplaced)
         };
         // Boxed: the pass is large, and inline it would bloat this future.
-        if let Some(result) = under_pass_fence(&fence, Box::pin(pass)).await {
-            result?;
+        let misplaced = match under_pass_fence(&fence, Box::pin(pass)).await {
+            Some(result) => result?,
+            None => Vec::new(),
+        };
+        // The move checks out a connection to another shard. The barrier
+        // drops first, so a wait on that pool cannot hold off a bump.
+        #[cfg(feature = "db")]
+        drop(fence);
+        if !single_pool {
+            carry_misplaced_overrides(&mut conn, shard, &misplaced, &pool, &router).await;
         }
     }
 
     Ok(())
+}
+
+/// The result of [`register_shard_pass`].
+struct ShardPass<'a> {
+    /// The effective DAG catalog for the firing pass. `None` when the shard
+    /// must not fire this tick.
+    dags: Option<std::borrow::Cow<'a, DagCatalog>>,
+    /// The DAG overrides that this shard holds for another shard (issue #2389).
+    misplaced: Vec<String>,
+}
+
+impl ShardPass<'_> {
+    const fn skipped() -> Self {
+        Self {
+            dags: None,
+            misplaced: Vec::new(),
+        }
+    }
+}
+
+/// Move each DAG override that this shard holds for another shard to its new
+/// owner (issue #2389).
+///
+/// A routing change moves a DAG's schedule row to a new shard. Its override
+/// must move too, or the new owner reconciles the row to the code value. The
+/// move runs after this shard's pass, so an owner later in shard order
+/// applies the override in the same tick. An owner earlier in shard order
+/// applies it on the next tick.
+///
+/// A failure is logged, and the next tick retries the move. Two shards of one
+/// pool share one table, so nothing moves between them.
+async fn carry_misplaced_overrides(
+    conn: &mut AsyncPgConnection,
+    shard: ShardId,
+    misplaced: &[String],
+    pool: &ShardedDbPool,
+    router: &ShardRouter,
+) {
+    for dag_name in misplaced {
+        let owner = router.pick_for_dag(dag_name);
+        if pool.same_physical_pool(shard, owner)
+            || crate::replication::shard_writes_held(Some(owner))
+        {
+            continue;
+        }
+        let Some(owner_pool) = pool.exact_pool_for(owner) else {
+            continue;
+        };
+        let moved = match crate::replication::fenced_checkout(owner_pool).await {
+            Ok(mut to) => {
+                crate::schedule_override::carry_dag_override(conn, &mut to, dag_name).await
+            }
+            Err(error) => Err(error),
+        };
+        match moved {
+            Ok(true) => tracing::info!(
+                dag_name = dag_name.as_str(),
+                from_shard = shard.as_i32(),
+                to_shard = owner.as_i32(),
+                "harvest: moved a DAG schedule override to the shard that now owns the DAG"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                error = %error,
+                dag_name = dag_name.as_str(),
+                from_shard = shard.as_i32(),
+                to_shard = owner.as_i32(),
+                "harvest: could not move a DAG schedule override to its new shard; \
+                 the next tick retries"
+            ),
+        }
+    }
+}
+
+/// Register the schedules of one shard for one pass.
+async fn register_shard_pass<'a>(
+    conn: &mut AsyncPgConnection,
+    shard: ShardId,
+    dags: &'a DagCatalog,
+    workflow_schedules: &[WorkflowSchedule],
+    router: &ShardRouter,
+    backoff: &ScheduleRegistrationBackoff,
+    registry: &HandlerRegistry,
+) -> HarvestResult<ShardPass<'a>> {
+    // Issue #1157: on a converged shard this pass is read-only — no
+    // transaction, no advisory lock, no UPDATE. Only a schedule that
+    // genuinely needs a write opens a transaction and contends for the
+    // fleet-wide registration lock, and a per-schedule failure is collected
+    // and backed off rather than aborting the rest of the pass.
+    // Issue #2385: operator overrides win over code. Both registration
+    // passes and the firing pass read the same effective values, or the
+    // two registration passes would rewrite the same DAG row each tick.
+    let Some((overrides, override_fence)) = load_shard_overrides(conn, shard).await else {
+        return Ok(ShardPass::skipped());
+    };
+    let misplaced = overrides
+        .dag_names()
+        .filter(|dag_name| router.pick_for_dag(dag_name) != shard)
+        .map(str::to_owned)
+        .collect();
+    // `apply_to_workflow_schedules` reads the code catalog, so it runs
+    // before the catalog is shadowed.
+    let workflow_schedules = overrides.apply_to_workflow_schedules(workflow_schedules, dags);
+    let dags = overrides.apply_to_catalog(dags);
+    let fence = Some(override_fence.as_str());
+    register_schedules_for_shard(conn, dags.as_ref(), router, shard, backoff, fence).await?;
+    let firing = register_workflow_schedules_fenced(
+        conn,
+        workflow_schedules.as_ref(),
+        router,
+        shard,
+        backoff,
+        registry.payload_codecs(),
+        fence,
+    )
+    .await?;
+
+    // Issue #1157: neither firing pass below filters by target shard, so a
+    // stale row this pass could not collect would be fired here *and* by the
+    // shard that now owns it. Stand this shard down for the tick rather than
+    // duplicate the run; the owning shard is unaffected and still fires it
+    // exactly once, and the next tick re-attempts the collection.
+    if firing == ShardFiringDecision::SuppressedUncollectedStaleRows {
+        tracing::warn!(
+            shard_id = shard.as_i32(),
+            "harvest: suppressing schedule firing on this shard for this tick; \
+             stale schedule rows left behind by a routing change could not be \
+             collected, and firing them here would duplicate the owning shard's run"
+        );
+        return Ok(ShardPass {
+            dags: None,
+            misplaced,
+        });
+    }
+    Ok(ShardPass {
+        dags: Some(dags),
+        misplaced,
+    })
 }
 
 /// Load the operator overrides of one shard for a scheduler pass (issue #2385).
@@ -1545,9 +1724,17 @@ pub async fn tick_once_sharded_with_backoff(
 async fn load_shard_overrides(
     conn: &mut AsyncPgConnection,
     shard: ShardId,
-) -> Option<crate::schedule_override::ScheduleOverrides> {
-    match crate::schedule_override::load_dag_overrides(conn).await {
-        Ok(overrides) => Some(overrides),
+) -> Option<(crate::schedule_override::ScheduleOverrides, String)> {
+    // The fingerprint is read first. A write between the two reads then only
+    // makes the snapshot newer than its fence, and the pass skips its writes.
+    let loaded = match crate::schedule_override::override_fingerprint(conn).await {
+        Ok(fence) => crate::schedule_override::load_overrides(conn)
+            .await
+            .map(|overrides| (overrides, fence)),
+        Err(error) => Err(error),
+    };
+    match loaded {
+        Ok(loaded) => Some(loaded),
         Err(error) => {
             tracing::warn!(
                 error = %error,
@@ -3322,6 +3509,145 @@ pub async fn update_workflow_schedule_with_codecs(
                     Ok(ScheduleUpdateOutcome::NotFound)
                 }
             }
+        }
+    }))
+    .await
+}
+
+/// A change to the override of one code-declared workflow schedule
+/// (issue #2386).
+#[derive(Debug, Clone, Copy)]
+pub struct WorkflowOverrideRequest<'a> {
+    /// The `harvest_schedules.id` of the row.
+    pub schedule_id: uuid::Uuid,
+    /// The code value of the schedule, as the builder declares it.
+    pub code: &'a WorkflowSchedule,
+    /// The fields to set. `input` must be `None`.
+    pub patch: &'a WorkflowSchedulePatch,
+    /// Delete the stored override before `patch` merges.
+    pub clear: bool,
+    /// The actor that makes the change.
+    pub actor: &'a str,
+    /// The operator's stated reason, if any.
+    pub reason: Option<&'a str>,
+}
+
+/// The result of [`update_code_declared_workflow_schedule`].
+#[derive(Debug)]
+pub struct WorkflowOverrideUpdate {
+    /// The row outcome, as for [`update_workflow_schedule`].
+    pub outcome: ScheduleUpdateOutcome,
+    /// The stored override after the call. `None` when no field is left.
+    pub stored: Option<crate::schedule_override::WorkflowScheduleOverride>,
+}
+
+/// Change the override of a code-declared workflow schedule (issue #2386).
+///
+/// The tick converges a code-declared row to its code value. So an in-place
+/// edit through [`update_workflow_schedule`] lasts one tick. This call stores
+/// the change as an override instead, and the tick applies it before it
+/// converges the row. The precedence is override, then code.
+///
+/// The call converges the row in the same transaction, so the returned row
+/// shows the effective value. It writes nothing when the merged value fails
+/// validation, and nothing when a live fire claim holds the row. The guard
+/// and the `next_run_at` rules are those of [`update_workflow_schedule`].
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] when the patch carries an input, when
+/// the row belongs to another workflow, or when the merged value is invalid.
+/// Returns [`HarvestError::Database`] on a failed read or write.
+pub async fn update_code_declared_workflow_schedule(
+    conn: &mut AsyncPgConnection,
+    request: &WorkflowOverrideRequest<'_>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<WorkflowOverrideUpdate> {
+    use crate::schedule_override as overrides;
+    use crate::schema::harvest_schedules::dsl;
+    use diesel_async::AsyncConnection;
+
+    let workflow_name = request.code.workflow_name.as_str();
+    Box::pin(conn.transaction(async |conn| {
+        // A scheduler pass that holds this lock finishes its write first. A
+        // later pass sees the new fingerprint and does not undo this change.
+        // The pass takes this lock before the row lock, so this call does too.
+        wait_for_registration_lock(conn).await?;
+        // FOR UPDATE, as in `update_workflow_schedule_with_codecs`: it orders
+        // this change against a fire of the same row.
+        let existing: Option<HarvestSchedule> = dsl::harvest_schedules
+            .find(request.schedule_id)
+            .select(HarvestSchedule::as_select())
+            .for_update()
+            .first(conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+        let Some(existing) = existing else {
+            return Ok(WorkflowOverrideUpdate {
+                outcome: ScheduleUpdateOutcome::NotFound,
+                stored: None,
+            });
+        };
+        if existing.dag_name.is_some() || existing.workflow_name.is_none() {
+            return Ok(WorkflowOverrideUpdate {
+                outcome: ScheduleUpdateOutcome::DagSchedule,
+                stored: None,
+            });
+        }
+        if existing.workflow_name.as_deref() != Some(workflow_name) {
+            return Err(HarvestError::Config(format!(
+                "schedule {} belongs to workflow {:?}, not to '{workflow_name}'",
+                existing.id, existing.workflow_name
+            )));
+        }
+
+        // The row lock above already orders two patches of this schedule.
+        // The override lock keeps the read-modify-write sound on its own.
+        // A clear never decodes the stored row, so it also removes a row that
+        // no longer decodes.
+        let stored = if request.clear {
+            overrides::lock_workflow_override_row(conn, workflow_name).await?;
+            None
+        } else {
+            overrides::lock_workflow_override(conn, workflow_name).await?
+        };
+        let base = stored
+            .as_ref()
+            .map(|value| value.fields.clone())
+            .unwrap_or_default();
+        if request.patch.input.is_some() {
+            return Err(HarvestError::Config(format!(
+                "schedule '{workflow_name}' is declared in code; an override cannot change \
+                 its input. Change the input in code"
+            )));
+        }
+        let merged = overrides::merge_workflow_fields(request.patch, &base);
+        let effective = overrides::validate_effective_workflow(request.code, &merged)?;
+
+        // The row update runs first. On a live claim it writes nothing, so
+        // the override is not stored either and the caller can retry.
+        let stored_ws = schedule_for_storage(&effective, codecs)?;
+        match apply_workflow_schedule_update(conn, &stored_ws, &existing, true).await? {
+            AppliedScheduleUpdate::Updated(row) => {
+                overrides::store_workflow_override(
+                    conn,
+                    workflow_name,
+                    &merged,
+                    request.actor,
+                    request.reason,
+                )
+                .await?;
+                let stored = overrides::get_workflow_override(conn, workflow_name).await?;
+                Ok(WorkflowOverrideUpdate {
+                    outcome: ScheduleUpdateOutcome::Updated(row),
+                    stored,
+                })
+            }
+            AppliedScheduleUpdate::SkippedLiveClaim => Ok(WorkflowOverrideUpdate {
+                outcome: ScheduleUpdateOutcome::ClaimLive,
+                stored,
+            }),
         }
     }))
     .await

@@ -753,6 +753,10 @@ pub struct HandlerRegistry {
     /// so a core path can enforce a rule the HTTP layer already enforces.
     /// Empty (the default) = no DAGs registered.
     dag_workflow_names: std::collections::HashSet<String>,
+    /// Operator overrides of per-type `sla` and `execution_timeout`
+    /// (issue #2387). Shared so that a refresh loop and the start paths read
+    /// one snapshot.
+    run_defaults: Arc<crate::run_defaults::RunDefaultsCache>,
 }
 
 impl HandlerRegistry {
@@ -843,6 +847,13 @@ impl HandlerRegistry {
                 .collect();
             *lock = Some(metadata);
         }
+        // Issue #2387: the completion-trigger path has no registry, so it
+        // reads the run-default overrides through a global, as it reads the
+        // metadata above.
+        let run_defaults: Arc<crate::run_defaults::RunDefaultsCache> = Arc::default();
+        if let Ok(mut lock) = crate::completion_trigger::GLOBAL_RUN_DEFAULTS.write() {
+            *lock = Some(Arc::clone(&run_defaults));
+        }
         let mut activities: HashMap<String, ActivityInfo> = activities
             .into_iter()
             .map(|a| (a.name.to_string(), a))
@@ -912,6 +923,7 @@ impl HandlerRegistry {
             max_workflow_chain_timeout: None,
             max_workflow_execution_timeout: None,
             dag_workflow_names: std::collections::HashSet::new(),
+            run_defaults,
             payload_offloader: None,
             payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             activity_interceptors: Vec::new(),
@@ -1055,6 +1067,29 @@ impl HandlerRegistry {
     {
         self.dag_workflow_names = names.into_iter().map(Into::into).collect();
         self
+    }
+
+    /// The run-default override cache of this registry (issue #2387).
+    #[must_use]
+    pub const fn run_defaults(&self) -> &Arc<crate::run_defaults::RunDefaultsCache> {
+        &self.run_defaults
+    }
+
+    /// The effective `(execution_timeout, sla)` of a workflow type
+    /// (issue #2387).
+    ///
+    /// `execution_timeout` and `sla` are the declared values. An operator
+    /// override in the cache wins over each one. A start path applies its
+    /// usual clamps to the result. The call reads memory only.
+    #[must_use]
+    pub fn apply_run_defaults(
+        &self,
+        workflow_name: &str,
+        execution_timeout: Option<std::time::Duration>,
+        sla: Option<std::time::Duration>,
+    ) -> (Option<std::time::Duration>, Option<std::time::Duration>) {
+        self.run_defaults
+            .apply(workflow_name, execution_timeout, sla)
     }
 
     /// Attach the large-payload offloader (issue #524).
@@ -1667,12 +1702,14 @@ impl HandlerRegistry {
     #[must_use]
     pub fn resolve_dispatch_deadline(&self, name: &str) -> DispatchDeadline {
         let info = self.workflows.get(name);
-        let execution_timeout = info
-            .and_then(|info| info.execution_timeout)
-            .and_then(|d| chrono::Duration::from_std(d).ok());
-        let sla = info
-            .and_then(|info| info.sla)
-            .and_then(|d| chrono::Duration::from_std(d).ok());
+        // Issue #2387: an operator override wins over the declared value.
+        let (execution_timeout, sla) = self.apply_run_defaults(
+            name,
+            info.and_then(|info| info.execution_timeout),
+            info.and_then(|info| info.sla),
+        );
+        let execution_timeout = execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
+        let sla = sla.and_then(|d| chrono::Duration::from_std(d).ok());
         let max_execution_timeout_ceiling = self
             .max_workflow_execution_timeout
             .and_then(|d| chrono::Duration::from_std(d).ok());
@@ -1926,6 +1963,7 @@ impl std::fmt::Debug for HandlerRegistry {
             &self.owner_disk_cache_min_events,
         );
         d.field("owner_entity_sql", &self.owner_entity_sql);
+        d.field("run_defaults", &self.run_defaults);
         #[cfg(feature = "owner-disk-cache")]
         d.field(
             "owner_disk_cache_open",
@@ -13548,6 +13586,9 @@ fn resolve_child_workflow_defaults(
             w.quota,
         )
     });
+    // Issue #2387: an operator override wins over the declared value.
+    let (execution_timeout, sla) =
+        registry.apply_run_defaults(workflow_name, execution_timeout, sla);
     let execution_timeout = execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
     let sla = sla.and_then(|d| chrono::Duration::from_std(d).ok());
     let deadline_at = execution_timeout.map(|d| chrono::Utc::now() + d);
@@ -16189,6 +16230,9 @@ async fn create_detached_child_executions(
             }
             p
         });
+        // Issue #2387: an operator SLA override wins over the declared one. A
+        // detached child resolves no `execution_timeout`, so only the SLA applies.
+        let (_, child_sla) = registry.apply_run_defaults(workflow_name, None, child_sla);
         let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
         let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
         // A detached child accumulates its own history/DLQ/active-execution
@@ -23389,7 +23433,10 @@ async fn check_continue_as_new_type<'a>(
                 // `resolve_continue_as_new_successor_defaults` will actually
                 // store — otherwise a configured ceiling that makes the
                 // declaration perfectly valid would still be rejected.
-                info.execution_timeout
+                // Issue #2387: judge the operator override too.
+                registry
+                    .apply_run_defaults(info.name, info.execution_timeout, None)
+                    .0
                     .and_then(|d| chrono::Duration::from_std(d).ok())
                     .map(|t| {
                         registry
@@ -23607,8 +23654,9 @@ fn continue_as_new_certainly_redirects(
         Ok(ContinueAsNewTypeCheck::SameType) => return false,
         Ok(ContinueAsNewTypeCheck::CrossType(info)) => info,
     };
-    let effective_timeout = target_info
-        .execution_timeout
+    let effective_timeout = registry
+        .apply_run_defaults(target_info.name, target_info.execution_timeout, None)
+        .0
         .and_then(|d| chrono::Duration::from_std(d).ok())
         .map(|t| {
             registry
@@ -24460,9 +24508,18 @@ async fn persist_workflow_continue_as_new_with_verdict(
     // continuation, resolved from the target type's own `WorkflowInfo` for a
     // cross-type one. Per-run deadlines are re-anchored to the successor's start
     // in both cases.
+    // Issue #2387: a cross-type successor is a new run of its target type, so
+    // an operator override of that type applies. A same-type successor keeps
+    // the values of its run, as before.
+    let target_info = target_info.map(|info| {
+        let mut effective = info.clone();
+        (effective.execution_timeout, effective.sla) =
+            registry.apply_run_defaults(info.name, info.execution_timeout, info.sla);
+        effective
+    });
     let defaults = resolve_continue_as_new_successor_defaults(
         execution,
-        target_info,
+        target_info.as_ref(),
         registry
             .max_workflow_execution_timeout
             .and_then(|d| chrono::Duration::from_std(d).ok()),
@@ -32373,6 +32430,41 @@ fn spawn_worker_slot_sampler(
     })
 }
 
+/// Spawn the loop that keeps the run-default overrides current (issue #2387).
+///
+/// The start paths of a worker read the cache of its registry and send no
+/// query. So a worker with no scheduler still needs this loop. The loop reads
+/// the default pool, which holds the override table. A failed refresh keeps
+/// the last snapshot, and the next period retries.
+///
+/// Dropping the returned guard aborts the task.
+#[cfg(feature = "db")]
+fn spawn_run_defaults_refresh(
+    cache: Arc<crate::run_defaults::RunDefaultsCache>,
+    pool: DbPool,
+) -> AbortOnDrop {
+    AbortOnDrop::new(tokio::spawn(async move {
+        loop {
+            match pool.get().await {
+                Ok(mut conn) => {
+                    if let Err(error) = cache.refresh_if_stale(&mut conn).await {
+                        tracing::warn!(
+                            error = %error,
+                            "harvest: could not refresh run-default overrides; \
+                             keeping the last snapshot"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "harvest: no connection to refresh run-default overrides"
+                ),
+            }
+            tokio::time::sleep(crate::run_defaults::RUN_DEFAULTS_TTL).await;
+        }
+    }))
+}
+
 /// Spawn the DB-pool gauge sampler (issue #1815).
 ///
 /// Each tick reads `Pool::status()` for every `(shard, pool)` pair. That read
@@ -36896,6 +36988,11 @@ impl Worker {
             }
         }
 
+        // Issue #2387: the guard keeps the refresh loop alive for the run.
+        #[cfg(feature = "db")]
+        let _run_defaults =
+            spawn_run_defaults_refresh(Arc::clone(self.registry.run_defaults()), pool.clone());
+
         // Resolve the set of (ShardId, DbPool) claim targets from the sharded
         // pool when available, deduplicating by ShardId.
         #[cfg(feature = "db")]
@@ -37793,6 +37890,10 @@ impl Worker {
         // A direct caller of this entry point skips `run`, so bind here too
         // (issue #1431).
         self.register_notify_pools(pool);
+        // It also skips the run-default refresh loop of `run` (issue #2387).
+        #[cfg(feature = "db")]
+        let _run_defaults =
+            spawn_run_defaults_refresh(Arc::clone(self.registry.run_defaults()), pool.clone());
         let bound = self.bound_channel();
         crate::dispatch::with_bound_channel(
             bound,

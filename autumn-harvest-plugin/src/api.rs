@@ -107,9 +107,10 @@ use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStat
 use autumn_harvest::schedule_override::{self, ScheduleOverridePatch};
 use autumn_harvest::scheduler::{
     BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag,
-    ScheduleUpdateOutcome, SchedulerMonitor, SchedulerSnapshot, WorkflowSchedulePatch,
-    ensure_dag_schedule, parse_schedule_from_expr_pub, plan_backfill_timestamps,
-    scheduled_workflow_id_pub, trigger_unified_dag, update_workflow_schedule_with_codecs,
+    ScheduleUpdateOutcome, SchedulerMonitor, SchedulerSnapshot, WorkflowOverrideRequest,
+    WorkflowSchedulePatch, ensure_dag_schedule, parse_schedule_from_expr_pub,
+    plan_backfill_timestamps, scheduled_workflow_id_pub, trigger_unified_dag,
+    update_code_declared_workflow_schedule, update_workflow_schedule_with_codecs,
 };
 use autumn_harvest::schema::{
     harvest_backfill_log, harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals,
@@ -3179,7 +3180,9 @@ struct CreateWorkflowScheduleRequest {
 /// unchanged"), while an explicit JSON `null` deserializes to `Some(None)`
 /// ("clear to NULL") and a value to `Some(Some(v))`.
 #[allow(clippy::option_option)] // deliberate serde tri-state: absent vs null vs value
-fn deserialize_tristate<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn deserialize_tristate<'de, T, D>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error>
 where
     T: serde::Deserialize<'de>,
     D: serde::Deserializer<'de>,
@@ -3243,6 +3246,38 @@ struct UpdateWorkflowScheduleRequest {
     catchup_window_secs: Option<i64>,
     #[serde(default, deserialize_with = "deserialize_tristate")]
     retry_policy: Option<Option<autumn_harvest::RetryPolicy>>,
+    /// Delete the stored override of a code-declared schedule before the
+    /// other fields apply (issue #2386). With no other field, the schedule
+    /// returns to its code value.
+    #[serde(default)]
+    clear_override: bool,
+    /// The operator's reason, stored with the override of a code-declared
+    /// schedule (issue #2386).
+    reason: Option<String>,
+}
+
+impl UpdateWorkflowScheduleRequest {
+    /// Whether the request edits a field, beyond `clear_override` and `reason`.
+    const fn has_edit_fields(&self) -> bool {
+        self.workflow_name.is_some()
+            || self.schedule_expr.is_some()
+            || self.timezone.is_some()
+            || self.input.is_some()
+            || self.catchup.is_some()
+            || self.max_active_runs.is_some()
+            || self.queue_name.is_some()
+            || self.jitter_secs.is_some()
+            || self.overlap_policy.is_some()
+            || self.buffer_all_max.is_some()
+            || self.calendar.is_some()
+            || self.skip_policy.is_some()
+            || self.consecutive_failure_limit.is_some()
+            || self.end_at.is_some()
+            || self.max_runs.is_some()
+            || self.catchup_policy.is_some()
+            || self.catchup_window_secs.is_some()
+            || self.retry_policy.is_some()
+    }
 }
 
 fn default_queue_name() -> String {
@@ -5229,6 +5264,11 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             get(effective_config).route_layer(require_admin.clone()),
         )
         .route(
+            // Every operator override, of schedules and run defaults (issue #2388).
+            "/admin/overrides",
+            get(crate::overrides_api::get_overrides).route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/canary",
             get(admin_canary).route_layer(require_admin.clone()),
         )
@@ -5251,6 +5291,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
         .route(
             "/admin/workflow-types/reachability",
             get(workflow_types_reachability).route_layer(require_admin.clone()),
+        )
+        .route(
+            // Run-default overrides of a workflow type (issue #2387).
+            "/admin/workflow-types/{workflow_name}/run-defaults",
+            get(crate::run_defaults_api::get_run_defaults)
+                .patch(crate::run_defaults_api::patch_run_defaults)
+                .route_layer(require_admin.clone()),
         )
         .route(
             "/admin/retention",
@@ -7244,6 +7291,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/queue-coverage"),
         ("GET", "/admin/status"),
         ("GET", "/admin/config"),
+        ("GET", "/admin/overrides"),
         ("GET", "/admin/canary"),
         // Payload-codec key rotation progress (issue #948): admin-gated,
         // read-only. See docs/api-contract.json.
@@ -7251,6 +7299,11 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/version-gates/usage"),
         ("GET", "/admin/version-gates/retirement-check"),
         ("GET", "/admin/workflow-types/reachability"),
+        ("GET", "/admin/workflow-types/{workflow_name}/run-defaults"),
+        (
+            "PATCH",
+            "/admin/workflow-types/{workflow_name}/run-defaults",
+        ),
         ("GET", "/admin/retention"),
         ("POST", "/admin/retention/run-now"),
         ("POST", "/admin/workflows/replay-canary"),
@@ -7568,6 +7621,18 @@ pub const fn management_api_request_fields()
                 "reason",
             ]),
         ),
+        // Run-default overrides of a workflow type (issue #2387).
+        (
+            "PATCH",
+            "/admin/workflow-types/{workflow_name}/run-defaults",
+            Some(&[
+                "sla_secs",
+                "execution_timeout_secs",
+                "clear_override",
+                "reason",
+                "recompute_in_flight",
+            ]),
+        ),
         // ── dead-letter queue ─────────────────────────────────────────────────
         (
             "POST",
@@ -7756,6 +7821,8 @@ pub const fn management_api_request_fields()
                 "catchup_policy",
                 "catchup_window_secs",
                 "retry_policy",
+                "clear_override",
+                "reason",
                 "workflow_name",
             ]),
         ),
@@ -8709,6 +8776,16 @@ pub const fn management_api_response_fields()
                 "shard_topology",
                 "features",
                 "pool",
+                "overrides",
+            ]),
+        ),
+        (
+            "GET",
+            "/admin/overrides",
+            Some(&[
+                "schedule_overrides",
+                "run_default_overrides",
+                "unavailable_shards",
             ]),
         ),
         (
@@ -8759,6 +8836,18 @@ pub const fn management_api_response_fields()
                 "items",
                 "shards",
             ]),
+        ),
+        // Issue #2387. `recompute` is present only on a PATCH that asked for
+        // one, so it is not listed.
+        (
+            "GET",
+            "/admin/workflow-types/{workflow_name}/run-defaults",
+            Some(&["workflow_name", "code", "override", "effective"]),
+        ),
+        (
+            "PATCH",
+            "/admin/workflow-types/{workflow_name}/run-defaults",
+            Some(&["workflow_name", "code", "override", "effective"]),
         ),
         ("GET", "/admin/retention", None), // RetentionStatus (external model)
         ("POST", "/admin/retention/run-now", Some(&["ok"])),
@@ -9589,17 +9678,32 @@ async fn admin_status(
 /// fabricated config is worse than an honest error, so a placeholder is never
 /// served.
 ///
+/// The body also carries `overrides`, the count of the stored operator
+/// overrides (issue #2388). It is `null` when the runtime has no storage pool.
+///
 /// [`EffectiveConfigView`]: autumn_harvest::effective_config::EffectiveConfigView
 async fn effective_config(
     Extension(api_state): Extension<HarvestApiState>,
-) -> Result<Json<autumn_harvest::effective_config::EffectiveConfigView>, AutumnError> {
+) -> Result<Json<EffectiveConfigResponse>, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let view = runtime.effective_config().ok_or_else(|| {
         map_error(HarvestError::Config(
             "effective configuration not available".to_string(),
         ))
     })?;
-    Ok(Json(view))
+    let overrides = crate::overrides_api::collect_overrides(&api_state)
+        .await
+        .ok()
+        .map(|overrides| overrides.counts());
+    Ok(Json(EffectiveConfigResponse { view, overrides }))
+}
+
+/// The body of `GET /admin/config`.
+#[derive(Serialize)]
+struct EffectiveConfigResponse {
+    #[serde(flatten)]
+    view: autumn_harvest::effective_config::EffectiveConfigView,
+    overrides: Option<crate::overrides_api::OverrideCounts>,
 }
 
 /// `GET /admin/canary` — synthetic liveness canary freshness report (issue #796).
@@ -18879,6 +18983,12 @@ pub(crate) async fn start_workflow(
                     )
                 },
             );
+            // Issue #2387: an operator override wins over the declared value.
+            let (info_execution_timeout, info_sla) = runtime.registry.apply_run_defaults(
+                &workflow_name,
+                info_execution_timeout,
+                info_sla,
+            );
             let debounce_workflow_retry_policy =
                 info_retry_policy_debounce.and_then(|p| serde_json::to_value(&p).ok());
 
@@ -19224,6 +19334,11 @@ pub(crate) async fn start_workflow(
                 )
             },
         );
+        // Issue #2387: an operator override wins over the declared value.
+        let (info_execution_timeout, info_sla) =
+            runtime
+                .registry
+                .apply_run_defaults(&workflow_name, info_execution_timeout, info_sla);
         let batch_workflow_retry_policy =
             info_retry_policy_batch.and_then(|p| serde_json::to_value(&p).ok());
 
@@ -19509,6 +19624,11 @@ pub(crate) async fn start_workflow(
             )
         },
     );
+    // Issue #2387: an operator override wins over the declared value.
+    let (info_execution_timeout, info_sla) =
+        runtime
+            .registry
+            .apply_run_defaults(&workflow_name, info_execution_timeout, info_sla);
     let workflow_retry_policy = info_retry_policy;
     // Chain-scoped lifetime cap (issue #617): resolve the workflow-type default,
     // at parity with `info_execution_timeout` above. The fleet-wide ceiling from
@@ -21212,6 +21332,12 @@ async fn batch_start_workflows(
                     )
                 },
             );
+            // Issue #2387: an operator override wins over the declared value.
+            let (info_execution_timeout, info_sla) = runtime.registry.apply_run_defaults(
+                &item.workflow_name,
+                info_execution_timeout,
+                info_sla,
+            );
             let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
             let item_workflow_retry_policy = info_retry_policy;
 
@@ -22657,6 +22783,11 @@ pub(crate) async fn signal_with_start_workflow(
             )
         },
     );
+    // Issue #2387: an operator override wins over the declared value.
+    let (info_execution_timeout, info_sla) =
+        runtime
+            .registry
+            .apply_run_defaults(&workflow_name, info_execution_timeout, info_sla);
     let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
     let sws_workflow_retry_policy =
         info_retry_policy_sws.and_then(|p| serde_json::to_value(&p).ok());
@@ -23420,6 +23551,11 @@ async fn update_with_start_workflow(
             )
         },
     );
+    // Issue #2387: an operator override wins over the declared value.
+    let (info_execution_timeout, info_sla) =
+        runtime
+            .registry
+            .apply_run_defaults(&workflow_name, info_execution_timeout, info_sla);
     let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
     let uws_workflow_retry_policy =
         info_retry_policy_uws.and_then(|p| serde_json::to_value(&p).ok());
@@ -29256,18 +29392,22 @@ fn resolve_schedule_deadline_secs(
     registry: Option<&HandlerRegistry>,
     name: &str,
 ) -> (Option<i64>, Option<i64>) {
-    let Some(info) = registry.and_then(|r| r.workflows.get(name)) else {
+    let Some((registry, info)) = registry.and_then(|r| r.workflows.get(name).map(|info| (r, info)))
+    else {
         return (None, None);
     };
-    let ceiling = registry.and_then(|r| r.max_workflow_execution_timeout);
-    let effective_execution_timeout = match (info.execution_timeout, ceiling) {
+    let ceiling = registry.max_workflow_execution_timeout;
+    // Issue #2387: an operator override wins over the declared value.
+    let (execution_timeout, sla) =
+        registry.apply_run_defaults(name, info.execution_timeout, info.sla);
+    let effective_execution_timeout = match (execution_timeout, ceiling) {
         (Some(t), Some(ceiling)) => Some(t.min(ceiling)),
         (other, _) => other,
     };
     let execution_timeout_secs =
         effective_execution_timeout.and_then(|d| i64::try_from(d.as_secs()).ok());
     let sla_secs =
-        clamp_info_default_sla(info.sla, effective_execution_timeout).map(|d| d.num_seconds());
+        clamp_info_default_sla(sla, effective_execution_timeout).map(|d| d.num_seconds());
     (execution_timeout_secs, sla_secs)
 }
 
@@ -29525,6 +29665,58 @@ async fn load_schedule_overdue_aux_by_shard(
     aux
 }
 
+/// The code value of a schedule row, when the row is declared in code
+/// (issue #2386).
+///
+/// The `DELETE /schedules` guard uses the same test. A runtime that is not
+/// attached has no code catalog, so its rows count as API-created.
+fn code_declared_schedule(
+    api_state: &HarvestApiState,
+    row: &autumn_harvest::models::HarvestSchedule,
+) -> Option<WorkflowSchedule> {
+    let workflow_name = row.workflow_name.as_deref()?;
+    if row.dag_name.is_some() {
+        return None;
+    }
+    let runtime = api_state.runtime().ok()?;
+    runtime
+        .workflow_schedules()
+        .iter()
+        .find(|ws| ws.dag_name.is_none() && ws.workflow_name == workflow_name)
+        .cloned()
+}
+
+/// Reject the fields that do not fit the kind of schedule (issue #2386).
+///
+/// An override cannot change the input of a code-declared schedule, and a
+/// clear of its override takes no other field. An
+/// API-created schedule has no override, so `clear_override` and `reason`
+/// do not apply to it.
+fn check_override_fields(
+    request: &UpdateWorkflowScheduleRequest,
+    code: Option<&WorkflowSchedule>,
+    id: uuid::Uuid,
+) -> Result<(), String> {
+    match code {
+        Some(code) if request.input.is_some() => Err(format!(
+            "schedule {id} is declared in code for workflow '{}'; its input is set in code \
+             and an override cannot change it",
+            code.workflow_name
+        )),
+        // `timezone` and `catchup_window_secs` resolve against the stored row.
+        // That row still holds the old override, so a clear stands alone.
+        Some(_) if request.clear_override && request.has_edit_fields() => Err(format!(
+            "schedule {id}: clear_override cannot be combined with other fields; \
+             clear first, then send the new values"
+        )),
+        None if request.clear_override || request.reason.is_some() => Err(format!(
+            "schedule {id} is not declared in code, so it has no override; \
+             clear_override and reason apply to a code-declared schedule only"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// `PATCH /admin/schedules/{id}` — partial in-place update of an existing
 /// workflow schedule (issue #771).
 ///
@@ -29534,6 +29726,11 @@ async fn load_schedule_overdue_aux_by_shard(
 /// (400). DAG schedule rows are owned by `PATCH /dags/{dag_name}` (400).
 /// The merged spec is validated before any write (400 writes nothing), and a
 /// live #350 fire claim yields 409 so an edit never races an in-flight fire.
+///
+/// A schedule declared in code converges to its code value on every tick.
+/// So a patch of one writes an operator override instead of a row edit
+/// (issue #2386). The tick applies the override before it converges the row.
+/// Such a patch cannot change `input`.
 #[allow(clippy::too_many_lines)]
 async fn update_schedule_handler(
     Extension(api_state): Extension<HarvestApiState>,
@@ -29620,6 +29817,22 @@ async fn update_schedule_handler(
     if existing.dag_name.is_some() || existing.workflow_name.is_none() {
         let err_summary =
             format!("schedule {id} is a DAG schedule; manage it via PATCH /dags/{{dag_name}}");
+        schedule_update_audit_failed(
+            &api_state,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            &id_str_owned,
+            &err_summary,
+        )
+        .await;
+        return Err(AutumnError::bad_request_msg(err_summary));
+    }
+
+    // Issue #2386: a schedule declared in code takes an override, because the
+    // tick reverts a row edit. The runtime holds the code catalog.
+    let code_schedule = code_declared_schedule(&api_state, &existing);
+    if let Err(err_summary) = check_override_fields(&request, code_schedule.as_ref(), id) {
         schedule_update_audit_failed(
             &api_state,
             &actor,
@@ -29859,7 +30072,23 @@ async fn update_schedule_handler(
         |_| api_state.payload_codecs(),
         |rt| rt.registry.payload_codecs().clone(),
     );
-    match update_workflow_schedule_with_codecs(&mut conn, id, &patch, &write_codecs).await {
+    let outcome = match &code_schedule {
+        Some(code) => {
+            let override_request = WorkflowOverrideRequest {
+                schedule_id: id,
+                code,
+                patch: &patch,
+                clear: request.clear_override,
+                actor: &actor,
+                reason: request.reason.as_deref(),
+            };
+            update_code_declared_workflow_schedule(&mut conn, &override_request, &write_codecs)
+                .await
+                .map(|update| update.outcome)
+        }
+        None => update_workflow_schedule_with_codecs(&mut conn, id, &patch, &write_codecs).await,
+    };
+    match outcome {
         Ok(ScheduleUpdateOutcome::Updated(row)) => {
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -30987,16 +31216,16 @@ async fn trigger_schedule_now(
         }
     };
     // Only registered workflows carry an SLA default; DAGs have no SLA concept.
-    let sla = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .and_then(|info| clamp_info_default_sla(info.sla, info.execution_timeout));
-    let info_execution_timeout = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .and_then(|info| info.execution_timeout)
+    // Issue #2387: an operator override wins over the declared value.
+    let effective_info_defaults = runtime.registry.workflows.get(&workflow_name).map(|info| {
+        runtime
+            .registry
+            .apply_run_defaults(&workflow_name, info.execution_timeout, info.sla)
+    });
+    let sla = effective_info_defaults
+        .and_then(|(execution_timeout, sla)| clamp_info_default_sla(sla, execution_timeout));
+    let info_execution_timeout = effective_info_defaults
+        .and_then(|(execution_timeout, _)| execution_timeout)
         .and_then(|d| chrono::Duration::from_std(d).ok());
     // Chain-scoped lifetime cap default (issue #617): only registered workflows
     // carry it; DAGs have no chain-cap concept.
@@ -32469,6 +32698,11 @@ pub(crate) async fn schedule_backfill_inner(
                         )
                     },
                 );
+                // Issue #2387: an operator override wins over the declared value.
+                let (info_execution_timeout, info_sla) =
+                    runtime
+                        .registry
+                        .apply_run_defaults(&wf_name, info_execution_timeout, info_sla);
                 let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
                 // Issue #1412: thread the declared execution_timeout and the
                 // fleet-wide ceiling into the start below, via the same shared
