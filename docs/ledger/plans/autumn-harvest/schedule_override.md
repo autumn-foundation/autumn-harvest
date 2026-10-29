@@ -18,14 +18,6 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
-## `clear_dag_override`
-
-Statements: 1. Tables with no usable index: none.
-
-| # | Statement | Access |
-|---|---|---|
-| 1 | `DELETE FROM "harvest_schedule_overrides" WHERE (("harvest_schedule_overrides"."kind" = $1) AND ("...` | `harvest_schedule_overrides`: Index Scan on `harvest_schedule_overrides_pkey`<br>`harvest_schedule_overrides`: ModifyTable |
-
 ## `get_dag_override`
 
 Statements: 1. Tables with no usable index: none.
@@ -34,14 +26,6 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT "harvest_schedule_overrides"."name", "harvest_schedule_overrides"."schedule_expr", "harves...` | `harvest_schedule_overrides`: Index Scan on `harvest_schedule_overrides_pkey` |
 
-## `load_dag_overrides`
-
-Statements: 1. Tables with no usable index: none.
-
-| # | Statement | Access |
-|---|---|---|
-| 1 | `SELECT "harvest_schedule_overrides"."name", "harvest_schedule_overrides"."schedule_expr", "harves...` | `harvest_schedule_overrides`: Bitmap Heap Scan on `harvest_schedule_overrides_pkey` |
-
 ## `lock_dag_override`
 
 Statements: 1. Tables with no usable index: none.
@@ -49,12 +33,4 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_schedule_overrides"."name", "harvest_schedule_overrides"."schedule_expr", "harves...` | `harvest_schedule_overrides`: Index Scan on `harvest_schedule_overrides_pkey` |
-
-## `store_dag_override`
-
-Statements: 1. Tables with no usable index: none.
-
-| # | Statement | Access |
-|---|---|---|
-| 1 | `INSERT INTO "harvest_schedule_overrides" ("kind", "name", "schedule_expr", "catchup", "max_active...` | `harvest_schedule_overrides`: ModifyTable |
 

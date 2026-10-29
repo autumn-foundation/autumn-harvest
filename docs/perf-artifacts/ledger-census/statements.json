@@ -59765,20 +59765,6 @@
   }
  },
  "docs/ledger/autumn-harvest/schedule_override.toml": {
-  "clear_dag_override": {
-   "DELETE FROM \"harvest_schedule_overrides\" WHERE ((\"harvest_schedule_overrides\".\"kind\" = $1) AND (\"harvest_schedule_overrides\".\"name\" = $2))": {
-    "literals": [
-     {
-      "1": "'dag'",
-      "2": "'override_pipeline'"
-     }
-    ],
-    "types": {
-     "1": "text",
-     "2": "text"
-    }
-   }
-  },
   "get_dag_override": {
    "SELECT \"harvest_schedule_overrides\".\"name\", \"harvest_schedule_overrides\".\"schedule_expr\", \"harvest_schedule_overrides\".\"catchup\", \"harvest_schedule_overrides\".\"max_active_runs\", \"harvest_schedule_overrides\".\"jitter_secs\", \"harvest_schedule_overrides\".\"overlap_policy\", \"harvest_schedule_overrides\".\"buffer_all_max\", \"harvest_schedule_overrides\".\"reason\", \"harvest_schedule_overrides\".\"updated_by\", \"harvest_schedule_overrides\".\"created_at\", \"harvest_schedule_overrides\".\"updated_at\" FROM \"harvest_schedule_overrides\" WHERE ((\"harvest_schedule_overrides\".\"kind\" = $1) AND (\"harvest_schedule_overrides\".\"name\" = $2)) LIMIT $3": {
     "literals": [
@@ -59806,18 +59792,6 @@
     }
    }
   },
-  "load_dag_overrides": {
-   "SELECT \"harvest_schedule_overrides\".\"name\", \"harvest_schedule_overrides\".\"schedule_expr\", \"harvest_schedule_overrides\".\"catchup\", \"harvest_schedule_overrides\".\"max_active_runs\", \"harvest_schedule_overrides\".\"jitter_secs\", \"harvest_schedule_overrides\".\"overlap_policy\", \"harvest_schedule_overrides\".\"buffer_all_max\", \"harvest_schedule_overrides\".\"reason\", \"harvest_schedule_overrides\".\"updated_by\", \"harvest_schedule_overrides\".\"created_at\", \"harvest_schedule_overrides\".\"updated_at\" FROM \"harvest_schedule_overrides\" WHERE (\"harvest_schedule_overrides\".\"kind\" = $1)": {
-    "literals": [
-     {
-      "1": "'dag'"
-     }
-    ],
-    "types": {
-     "1": "text"
-    }
-   }
-  },
   "lock_dag_override": {
    "SELECT \"harvest_schedule_overrides\".\"name\", \"harvest_schedule_overrides\".\"schedule_expr\", \"harvest_schedule_overrides\".\"catchup\", \"harvest_schedule_overrides\".\"max_active_runs\", \"harvest_schedule_overrides\".\"jitter_secs\", \"harvest_schedule_overrides\".\"overlap_policy\", \"harvest_schedule_overrides\".\"buffer_all_max\", \"harvest_schedule_overrides\".\"reason\", \"harvest_schedule_overrides\".\"updated_by\", \"harvest_schedule_overrides\".\"created_at\", \"harvest_schedule_overrides\".\"updated_at\" FROM \"harvest_schedule_overrides\" WHERE ((\"harvest_schedule_overrides\".\"kind\" = $1) AND (\"harvest_schedule_overrides\".\"name\" = $2)) LIMIT $3 FOR UPDATE": {
     "literals": [
@@ -59830,33 +59804,6 @@
      "1": "text",
      "2": "text",
      "3": "bigint"
-    }
-   }
-  },
-  "store_dag_override": {
-   "INSERT INTO \"harvest_schedule_overrides\" (\"kind\", \"name\", \"schedule_expr\", \"catchup\", \"max_active_runs\", \"jitter_secs\", \"overlap_policy\", \"buffer_all_max\", \"reason\", \"updated_by\", \"created_at\", \"updated_at\") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (\"kind\", \"name\") DO UPDATE SET \"schedule_expr\" = $13, \"catchup\" = $14, \"max_active_runs\" = $15, \"jitter_secs\" = $16, \"overlap_policy\" = $17, \"buffer_all_max\" = $18, \"reason\" = $19, \"updated_by\" = $20, \"updated_at\" = $21": {
-    "literals": [
-     {
-      "1": "'dag'",
-      "10": "'anonymous'",
-      "19": "'incident'",
-      "2": "'override_pipeline'",
-      "20": "'anonymous'",
-      "9": "'incident'"
-     }
-    ],
-    "types": {
-     "1": "text",
-     "10": "text",
-     "11": "timestamptz",
-     "12": "timestamptz",
-     "13": "text",
-     "19": "text",
-     "2": "text",
-     "20": "text",
-     "21": "timestamptz",
-     "3": "text",
-     "9": "text"
     }
    }
   }

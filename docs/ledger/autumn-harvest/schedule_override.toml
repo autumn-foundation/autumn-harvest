@@ -13,7 +13,6 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_schedule_overrides"]
 measured = "unmeasured"
-plan = "docs/ledger/plans/autumn-harvest/schedule_override.md"
 
 ["get_dag_override"]
 driver = "per_request"
@@ -36,7 +35,6 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_schedule_overrides"]
 measured = "unmeasured"
-plan = "docs/ledger/plans/autumn-harvest/schedule_override.md"
 
 ["lock_dag_override"]
 driver = "per_request"
@@ -73,4 +71,3 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_schedule_overrides"]
 measured = "unmeasured"
-plan = "docs/ledger/plans/autumn-harvest/schedule_override.md"
