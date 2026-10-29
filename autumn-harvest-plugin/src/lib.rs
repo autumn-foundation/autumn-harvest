@@ -63,6 +63,7 @@ pub mod object_store;
 #[cfg(feature = "oidc")]
 pub mod oidc;
 pub mod outbox;
+mod overrides_api;
 pub mod plugin;
 pub mod preflight;
 pub mod prelude;

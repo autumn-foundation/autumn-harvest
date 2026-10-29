@@ -544,6 +544,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "GET /admin/workflow-types/reachability",
         RouteClass::ReadOnly,
     ),
+    // Every operator override (issue #2388): read-only.
+    ("GET /admin/overrides", RouteClass::ReadOnly),
     // Run-default overrides of a workflow type (issue #2387).
     (
         "GET /admin/workflow-types/{workflow_name}/run-defaults",
@@ -1291,6 +1293,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/codec/rotation", None),
     // Workflow-type handler reachability (issue #520): read-only.
     ("GET /admin/workflow-types/reachability", None),
+    // Every operator override (issue #2388): read-only.
+    ("GET /admin/overrides", None),
     // Run-default overrides of a workflow type (issue #2387).
     (
         "GET /admin/workflow-types/{workflow_name}/run-defaults",

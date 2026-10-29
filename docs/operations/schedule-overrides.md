@@ -42,6 +42,30 @@ curl -X PATCH https://<host>/api/harvest/dags/nightly_etl \
      -d '{"clear_override": true}'
 ```
 
+The CLI sends the same requests (issue #2388):
+
+```bash
+harvest dags set-schedule nightly_etl --interval 60 --reason "INC-4821 catch-up"
+harvest dags set-schedule nightly_etl --cron "0 3 * * *" \
+    --timezone America/Chicago --max-active-runs 2
+harvest dags clear-override nightly_etl --reason "INC-4821 closed"
+
+# Every override, of schedules and run defaults, with actor, reason and time.
+harvest overrides list
+```
+
+`set-schedule` sets only the fields that you give. To return one field to its
+code value, send `null` for it with the API.
+
+## Where to see an override
+
+- `GET /admin/overrides` lists every override, from every shard pool.
+- `GET /admin/config` counts them under `overrides`.
+- The Vantage DAG page shows each schedule field three times: declared in
+  code, the override, and the effective value. A field with an override has
+  the `override` marker, and the page names the actor, the time and the
+  reason.
+
 ## Fields
 
 | Field | Override value | `null` |

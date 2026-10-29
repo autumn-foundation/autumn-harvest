@@ -21,6 +21,13 @@ kind = ["read"]
 tables = ["harvest_schedule_overrides"]
 measured = "unmeasured"
 
+["list_overrides"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+
 ["load_overrides"]
 driver = "per_tick"
 backend = ["postgres"]

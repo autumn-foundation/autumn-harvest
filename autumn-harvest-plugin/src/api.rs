@@ -5264,6 +5264,11 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             get(effective_config).route_layer(require_admin.clone()),
         )
         .route(
+            // Every operator override, of schedules and run defaults (issue #2388).
+            "/admin/overrides",
+            get(crate::overrides_api::get_overrides).route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/canary",
             get(admin_canary).route_layer(require_admin.clone()),
         )
@@ -7286,6 +7291,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/queue-coverage"),
         ("GET", "/admin/status"),
         ("GET", "/admin/config"),
+        ("GET", "/admin/overrides"),
         ("GET", "/admin/canary"),
         // Payload-codec key rotation progress (issue #948): admin-gated,
         // read-only. See docs/api-contract.json.
@@ -8770,6 +8776,16 @@ pub const fn management_api_response_fields()
                 "shard_topology",
                 "features",
                 "pool",
+                "overrides",
+            ]),
+        ),
+        (
+            "GET",
+            "/admin/overrides",
+            Some(&[
+                "schedule_overrides",
+                "run_default_overrides",
+                "unavailable_shards",
             ]),
         ),
         (
@@ -9662,17 +9678,32 @@ async fn admin_status(
 /// fabricated config is worse than an honest error, so a placeholder is never
 /// served.
 ///
+/// The body also carries `overrides`, the count of the stored operator
+/// overrides (issue #2388). It is `null` when the runtime has no storage pool.
+///
 /// [`EffectiveConfigView`]: autumn_harvest::effective_config::EffectiveConfigView
 async fn effective_config(
     Extension(api_state): Extension<HarvestApiState>,
-) -> Result<Json<autumn_harvest::effective_config::EffectiveConfigView>, AutumnError> {
+) -> Result<Json<EffectiveConfigResponse>, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let view = runtime.effective_config().ok_or_else(|| {
         map_error(HarvestError::Config(
             "effective configuration not available".to_string(),
         ))
     })?;
-    Ok(Json(view))
+    let overrides = crate::overrides_api::collect_overrides(&api_state)
+        .await
+        .ok()
+        .map(|overrides| overrides.counts());
+    Ok(Json(EffectiveConfigResponse { view, overrides }))
+}
+
+/// The body of `GET /admin/config`.
+#[derive(Serialize)]
+struct EffectiveConfigResponse {
+    #[serde(flatten)]
+    view: autumn_harvest::effective_config::EffectiveConfigView,
+    overrides: Option<crate::overrides_api::OverrideCounts>,
 }
 
 /// `GET /admin/canary` — synthetic liveness canary freshness report (issue #796).

@@ -909,6 +909,76 @@ pub async fn load_overrides(conn: &mut AsyncPgConnection) -> HarvestResult<Sched
     Ok(ScheduleOverrides::from_dag_overrides(dags).with_workflow_overrides(workflows))
 }
 
+/// One stored override as an operator sees it (issue #2388).
+///
+/// The row is not decoded. `fields` holds each column that the row sets, so
+/// an unreadable row is listed too, and an operator can find it and clear it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OverrideSummary {
+    /// `dag` or `workflow`.
+    pub kind: String,
+    /// The DAG name, or the workflow name of a code-declared schedule.
+    pub name: String,
+    /// The stored fields as JSON, by their API names.
+    pub fields: serde_json::Value,
+    /// The operator's stated reason, if any.
+    pub reason: Option<String>,
+    /// The actor that last changed the override.
+    pub updated_by: String,
+    /// When the override was first stored.
+    pub created_at: DateTime<Utc>,
+    /// When the override last changed.
+    pub updated_at: DateTime<Utc>,
+}
+
+impl OverrideRow {
+    fn summary(self) -> OverrideSummary {
+        let mut fields = match self.workflow_fields {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        let mut set = |key: &str, value: Option<serde_json::Value>| {
+            if let Some(value) = value {
+                fields.insert(key.to_string(), value);
+            }
+        };
+        set("schedule_expr", self.schedule_expr.map(Into::into));
+        set("catchup", self.catchup.map(Into::into));
+        set("max_active_runs", self.max_active_runs.map(Into::into));
+        set("jitter_secs", self.jitter_secs.map(Into::into));
+        set("overlap_policy", self.overlap_policy.map(Into::into));
+        set("buffer_all_max", self.buffer_all_max.map(Into::into));
+        OverrideSummary {
+            kind: self.kind,
+            name: self.name,
+            fields: serde_json::Value::Object(fields),
+            reason: self.reason,
+            updated_by: self.updated_by,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+/// List every override stored on this shard, of both kinds, by kind and name
+/// (issue #2388).
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when the read fails. A row that does
+/// not decode is still listed.
+pub async fn list_overrides(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<OverrideSummary>> {
+    use crate::schema::harvest_schedule_overrides::dsl;
+
+    let rows: Vec<OverrideRow> = dsl::harvest_schedule_overrides
+        .select(OverrideRow::as_select())
+        .order((dsl::kind.asc(), dsl::name.asc()))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(rows.into_iter().map(OverrideRow::summary).collect())
+}
+
 /// A fingerprint of every stored override (issue #2386).
 ///
 /// Any committed write changes it, because a write gives the row a new

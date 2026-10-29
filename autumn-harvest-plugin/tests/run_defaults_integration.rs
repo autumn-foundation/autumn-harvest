@@ -4,12 +4,17 @@
 //! the operator override of the `sla` and `execution_timeout` of one type.
 //! Each test maps to one acceptance criterion of #2387. No worker runs, so a
 //! started run stays `RUNNING` and its deadlines stay as the start wrote them.
+//!
+//! `GET /admin/overrides` and the `overrides` count on `GET /admin/config`
+//! (issue #2388) are tested here too, because they read these overrides.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_harvest::RetentionConfig;
 use autumn_harvest::WorkflowContext;
+use autumn_harvest::builder::WorkerConfig;
+use autumn_harvest::effective_config::{EffectiveConfigView, PayloadCapsView, PoolConfigView};
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::schema::{harvest_audit_log, harvest_workflow_executions};
@@ -119,17 +124,49 @@ fn build_app_with_admin(pool: &DbPool, admin: bool) -> axum::Router {
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.set_admin_auth_boundary(admin);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    api_state.install(HarvestApiRuntime::new(
-        registry(),
-        Arc::new(DagCatalog::default()),
-        Arc::new(Vec::new()),
-        Some("api-only".to_string()),
-        vec!["default".to_string()],
-        SchedulerMonitor::offline(),
-        HarvestRetentionRuntime::disabled(RetentionConfig::default()),
-        ShardRouter::single(),
-    ));
+    api_state.install(
+        HarvestApiRuntime::new(
+            registry(),
+            Arc::new(DagCatalog::default()),
+            Arc::new(Vec::new()),
+            Some("api-only".to_string()),
+            vec!["default".to_string()],
+            SchedulerMonitor::offline(),
+            HarvestRetentionRuntime::disabled(RetentionConfig::default()),
+            ShardRouter::single(),
+        )
+        .with_effective_config(effective_config()),
+    );
     harvest_api_router(api_state)
+}
+
+/// A snapshot for `GET /admin/config`. Its values are not under test.
+fn effective_config() -> EffectiveConfigView {
+    EffectiveConfigView::capture(
+        &WorkerConfig::default(),
+        PayloadCapsView::new(
+            1024,
+            1024,
+            1024,
+            1024,
+            1024,
+            None,
+            None,
+            None,
+            Duration::from_secs(3600),
+            100,
+            false,
+            1024,
+        ),
+        &ShardRouter::single(),
+        PoolConfigView {
+            worker_pool_max_connections: 4,
+            shard_pool_count: 1,
+        },
+        Duration::from_millis(500),
+        None,
+        None,
+    )
 }
 
 async fn request_json(
@@ -418,5 +455,69 @@ async fn the_routes_require_admin_auth() {
     let (status, _) = request_json(&app, "GET", &route(WF), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = patch(&app, WF, json!({ "sla_secs": 60 })).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Issue #2388 AC3: `GET /admin/overrides` lists every override with its
+/// actor, reason and time, and `GET /admin/config` counts them.
+#[tokio::test]
+async fn the_override_list_names_actor_reason_and_time() {
+    let (url, _container) = setup_test_database_url().await;
+    let app = build_app(&build_test_pool(&url));
+
+    let (status, body) = request_json(&app, "GET", "/admin/overrides", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["schedule_overrides"], json!([]));
+    assert_eq!(body["run_default_overrides"], json!([]));
+    let (status, body) = request_json(&app, "GET", "/admin/config", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["overrides"]["schedule_overrides"], json!(0));
+    assert_eq!(body["overrides"]["run_default_overrides"], json!(0));
+
+    let (status, body) = patch(&app, WF, json!({ "sla_secs": 300, "reason": "tighter" })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // A DAG override, written as the PATCH /dags route stores it.
+    let mut conn = connect(&url).await;
+    diesel::sql_query(
+        "INSERT INTO harvest_schedule_overrides \
+             (kind, name, max_active_runs, reason, updated_by) \
+         VALUES ('dag', 'nightly_dag', 4, 'backfill week', 'oncall@example.com')",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("insert a DAG override");
+
+    let (status, body) = request_json(&app, "GET", "/admin/overrides", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let dag = &body["schedule_overrides"][0];
+    assert_eq!(dag["kind"], json!("dag"));
+    assert_eq!(dag["name"], json!("nightly_dag"));
+    assert_eq!(dag["fields"], json!({ "max_active_runs": 4 }));
+    assert_eq!(dag["reason"], json!("backfill week"));
+    assert_eq!(dag["updated_by"], json!("oncall@example.com"));
+    assert!(dag["updated_at"].is_string(), "{dag}");
+    assert_eq!(dag["shard_ids"], json!([0]));
+    let run_default = &body["run_default_overrides"][0];
+    assert_eq!(run_default["workflow_name"], json!(WF));
+    assert_eq!(run_default["sla_secs"], json!(300));
+    assert_eq!(run_default["reason"], json!("tighter"));
+    assert!(run_default["updated_by"].is_string(), "{run_default}");
+    assert!(run_default["updated_at"].is_string(), "{run_default}");
+    assert_eq!(body["unavailable_shards"], json!([]));
+
+    let (status, body) = request_json(&app, "GET", "/admin/config", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["overrides"],
+        json!({ "schedule_overrides": 1, "run_default_overrides": 1, "unavailable_shards": 0 })
+    );
+}
+
+/// The override list sits behind the admin guard.
+#[tokio::test]
+async fn the_override_list_requires_admin_auth() {
+    let (url, _container) = setup_test_database_url().await;
+    let app = build_app_with_admin(&build_test_pool(&url), false);
+    let (status, _) = request_json(&app, "GET", "/admin/overrides", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
