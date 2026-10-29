@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue", "harvest_workers", "harvest_workflow_executions"]
 measured = "docs/performance-build-reachability-fanout.md"
+plan = "docs/ledger/plans/autumn-harvest/build_routing.md"
 
 ["build_reachability"]
 driver = "per_request"
@@ -13,6 +14,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue", "harvest_workers", "harvest_workflow_executions"]
 measured = "docs/performance-build-reachability-fanout.md"
+plan = "docs/ledger/plans/autumn-harvest/build_routing.md"
 
 ["clear_build_ramp"]
 driver = "per_request"
@@ -20,6 +22,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_build_policies"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/build_routing.md"
 
 ["declare_compat"]
 driver = "per_request"
@@ -27,6 +30,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_build_compat"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/build_routing.md"
 
 ["get_build_policy"]
 driver = "per_request"
@@ -34,6 +38,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_build_policies"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/build_routing.md"
 
 ["list_build_compat"]
 driver = "per_request"
@@ -48,6 +53,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_build_policies"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/build_routing.md"
 
 ["load_compat_set"]
 driver = "per_task"
@@ -63,6 +69,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/build_routing.md"
 
 ["ramp_generation_aborted"]
 driver = "per_tick"
@@ -78,6 +85,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_ramp_retired_ids"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/build_routing.md"
 
 ["revoke_compat"]
 driver = "per_request"
@@ -85,6 +93,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_build_compat"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/build_routing.md"
 
 ["update_build_ramp_with_id"]
 driver = "per_request"
@@ -92,6 +101,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_build_policies", "harvest_ramp_abort_reports", "harvest_ramp_retired_ids"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/build_routing.md"
 
 ["upsert_build_policy_with_ramp_id"]
 driver = "per_request"
@@ -99,3 +109,4 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_build_policies", "harvest_ramp_abort_reports", "harvest_ramp_retired_ids"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/build_routing.md"

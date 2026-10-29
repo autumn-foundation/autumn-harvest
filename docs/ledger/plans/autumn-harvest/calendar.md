@@ -18,6 +18,24 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `create_calendar`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO "harvest_calendars" ("id", "name", "description", "built_in") VALUES ($1, $2, $3, $4)` | `harvest_calendars`: ModifyTable |
+| 2 | `INSERT INTO "harvest_calendars" ("id", "name", "description", "built_in") VALUES ($1, $2, DEFAULT...` | `harvest_calendars`: ModifyTable |
+| 3 | `SELECT "harvest_calendars"."id", "harvest_calendars"."name", "harvest_calendars"."description", "...` | `harvest_calendars`: Index Scan on `harvest_calendars_name_unique` |
+
+## `get_calendar`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_calendars"."id", "harvest_calendars"."name", "harvest_calendars"."description", "...` | `harvest_calendars`: Index Scan on `harvest_calendars_name_unique` |
+
 ## `load_exclusions_for_calendar`
 
 Statements: 1. Tables with no usable index: none.
@@ -33,4 +51,13 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_calendar_exclusions"."calendar_name", "harvest_calendar_exclusions"."excluded_dat...` | `harvest_calendar_exclusions`: Bitmap Heap Scan on `harvest_calendar_exclusions_name_idx` |
+
+## `replace_calendar_exclusions`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM "harvest_calendar_exclusions" WHERE ("harvest_calendar_exclusions"."calendar_name" = $1)` | `harvest_calendar_exclusions`: Bitmap Heap Scan on `harvest_calendar_exclusions_name_idx`<br>`harvest_calendar_exclusions`: ModifyTable |
+| 2 | `INSERT INTO "harvest_calendar_exclusions" ("calendar_name", "excluded_date") VALUES ($1, $2), ($3...` | `harvest_calendar_exclusions`: ModifyTable |
 

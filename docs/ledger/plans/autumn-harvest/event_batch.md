@@ -18,6 +18,15 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `admit_batched_start_with_codecs`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM harvest_event_batches WHERE id = $1` | `harvest_event_batches`: Index Scan on `harvest_event_batches_pkey`<br>`harvest_event_batches`: ModifyTable |
+| 2 | `INSERT INTO harvest_event_batches (id, workflow_name, batch_key, workflow_id, queue_name, buffere...` | `harvest_event_batches`: ModifyTable |
+
 ## `fire_claimed_batch_row`
 
 Statements: 1. Tables with no usable index: none.

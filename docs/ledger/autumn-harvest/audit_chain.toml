@@ -38,6 +38,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_audit_export_cursor", "harvest_audit_log"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_chain.md"
 
 ["write_checkpoint"]
 driver = "per_tick"

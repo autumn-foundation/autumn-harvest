@@ -109,6 +109,15 @@ Statements: 3. Tables with no usable index: none.
 | 2 | `SELECT ARRAY[]::integer[] AS generation_shards, (SELECT COUNT(*) FROM pg_replication_slots s WHER...` | `pg_database`: Index Scan on `pg_database_datname_index`<br>`pg_database`: Index Scan on `pg_database_oid_index`<br>`pg_subscription`: full scan of index `pg_subscription_subname_index` |
 | 3 | `SELECT to_regclass('harvest_shard_generation') IS NOT NULL AS present` | no table |
 
+## `db::query_replication_status`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT r.state::text AS state, EXTRACT(EPOCH FROM r.replay_lag)::double precision AS replay_lag_s...` | `pg_database`: full scan of index `pg_database_oid_index` |
+| 2 | `SELECT s.slot_name::text AS slot_name, s.active, CASE WHEN COALESCE(s.confirmed_flush_lsn, s.rest...` | `pg_database`: Index Scan on `pg_database_oid_index` |
+
 ## `db::record_replication_heartbeat`
 
 Statements: 3. Tables with no usable index: none.

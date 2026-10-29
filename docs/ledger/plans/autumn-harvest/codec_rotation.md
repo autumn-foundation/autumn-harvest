@@ -131,3 +131,13 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `INSERT INTO harvest_codec_rotation_cursor (shard_id, active_key_id, last_event_id, rows_reencrypt...` | `harvest_codec_rotation_cursor`: ModifyTable |
 
+## `db::write_key_state_activation`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO harvest_codec_key_state (key_id, state, activated_at, updated_at) VALUES ($1, 'active...` | `harvest_codec_key_state`: ModifyTable |
+| 2 | `INSERT INTO harvest_codec_key_state (key_id, state, retiring_since, updated_at) VALUES ($1, 'reti...` | `harvest_codec_key_state`: ModifyTable |
+| 3 | `UPDATE harvest_codec_key_state SET state = 'retiring', retiring_since = NOW(), updated_at = NOW()...` | `harvest_codec_key_state`: Index Scan on `harvest_codec_key_state_one_active_idx`<br>`harvest_codec_key_state`: ModifyTable |
+

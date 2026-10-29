@@ -14,6 +14,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/retention.md"
 
 ["legal_hold_db::release_legal_hold"]
 driver = "per_request"
@@ -21,6 +22,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/retention.md"
 
 ["legal_hold_db::set_legal_hold"]
 driver = "per_request"
@@ -28,6 +30,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/retention.md"
 
 ["list_execution_summaries"]
 driver = "per_request"

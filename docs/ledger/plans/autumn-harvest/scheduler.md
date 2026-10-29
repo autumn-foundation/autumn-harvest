@@ -18,6 +18,19 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `apply_workflow_schedule_update`
+
+Statements: 6. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_ex...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey` |
+| 2 | `UPDATE "harvest_schedules" SET "auto_paused_at" = $1 WHERE ("harvest_schedules"."id" = $2)` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
+| 3 | `UPDATE "harvest_schedules" SET "exhausted_at" = $1, "exhausted_reason" = $2, "next_run_at" = $3, ...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
+| 4 | `UPDATE "harvest_schedules" SET "exhausted_at" = $1, "exhausted_reason" = $2, "updated_at" = $3 WH...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
+| 5 | `UPDATE "harvest_schedules" SET "schedule_expr" = $1, "timezone" = $2, "catchup" = $3, "max_active...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
+| 6 | `UPDATE "harvest_schedules" SET "schedule_expr" = $1, "timezone" = $2, "catchup" = $3, "max_active...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
+
 ## `claim_and_drain_buffered_schedule`
 
 Statements: 1. Tables with no usable index: none.
@@ -137,4 +150,30 @@ Statements: 7. Tables with no usable index: none.
 | 5 | `UPDATE "harvest_schedules" SET "last_run_at" = $1, "next_run_at" = $2, "runs_started" = ("harvest...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
 | 6 | `UPDATE "harvest_schedules" SET "next_run_at" = $1, "buffered_runs" = $2, "fire_claim_token" = $3,...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
 | 7 | `UPDATE "harvest_schedules" SET "next_run_at" = $1, "fire_claim_token" = $2, "fire_claimed_until" ...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
+
+## `trigger_unified_dag`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_ex...` | `harvest_schedules`: Bitmap Heap Scan on `harvest_schedules_dag_name_key`, `harvest_schedules_workflow_name_unique` |
+
+## `update_workflow_schedule_with_codecs`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedules"."schedule_ex...` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey` |
+| 2 | `SELECT EXISTS (SELECT "harvest_schedules"."id", "harvest_schedules"."dag_name", "harvest_schedule...` | `harvest_schedules`: Index Only Scan on `harvest_schedules_pkey` |
+
+## `upsert_schedule`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO "harvest_schedules" ("id", "dag_name", "schedule_expr", "timezone", "catchup", "max_a...` | `harvest_schedules`: ModifyTable |
+| 2 | `UPDATE "harvest_schedules" SET "next_run_at" = $1 WHERE ("harvest_schedules"."id" = $2)` | `harvest_schedules`: Index Scan on `harvest_schedules_pkey`<br>`harvest_schedules`: ModifyTable |
 

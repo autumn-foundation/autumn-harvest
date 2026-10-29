@@ -13,6 +13,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_external_tasks"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/reset.md"
 
 ["copy_carried_events"]
 driver = "per_request"
@@ -27,6 +28,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_external_tasks", "harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/reset.md"
 
 ["count_pending_timers"]
 driver = "per_request"
@@ -48,6 +50,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/reset.md"
 
 ["load_event_rows"]
 driver = "per_request"
@@ -69,6 +72,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_signals"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/reset.md"
 
 ["remove_pending_timers"]
 driver = "per_request"
@@ -76,6 +80,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_timers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/reset.md"
 
 ["resolve_batch_reset_one"]
 driver = "per_request"
@@ -90,3 +95,4 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_workflow_executions"]
 measured = "docs/performance-mutex-terminal-sweep-table-present.md"
+plan = "docs/ledger/plans/autumn-harvest/reset.md"

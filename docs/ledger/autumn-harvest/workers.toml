@@ -43,6 +43,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["live_workers_on_queue"]
 driver = "per_tick"
@@ -58,6 +59,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_worker_task_stats", "harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["prune_worker_task_stats"]
 driver = "per_tick"
@@ -80,6 +82,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["read_worker_status"]
 driver = "per_request"
@@ -87,6 +90,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["register_worker"]
 driver = "setup"
@@ -101,6 +105,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["restore_stopped_worker_row"]
 driver = "setup"
@@ -123,6 +128,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["transition_status"]
 driver = "per_request"
@@ -130,6 +136,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["withdraw_unverified_worker_row"]
 driver = "setup"

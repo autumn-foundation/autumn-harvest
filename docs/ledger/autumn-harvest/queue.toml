@@ -118,6 +118,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["concurrency_key_workflows"]
 driver = "per_request"
@@ -241,6 +242,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["insert_task_rows"]
 driver = "per_task"

@@ -51,6 +51,15 @@ Statements: 2. Tables with no usable index: none.
 | 1 | `SELECT "harvest_audit_log"."id", "harvest_audit_log"."occurred_at", "harvest_audit_log"."actor", ...` | `harvest_audit_log`: Index Scan on `harvest_audit_log_export_seq_idx` |
 | 2 | `UPDATE harvest_audit_log a SET chain_prev = v.prev, chain_newest_before = v.newest, chain_hash = ...` | not planned: ERROR:  function pg_catalog.unnest(unknown) is not unique |
 
+## `verify_shard_chain_with`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_audit_export_cursor"."shard_id", "harvest_audit_export_cursor"."last_assigned_seq...` | `harvest_audit_export_cursor`: Index Scan on `harvest_audit_export_cursor_pkey` |
+| 2 | `SELECT "harvest_audit_log"."id", "harvest_audit_log"."occurred_at", "harvest_audit_log"."actor", ...` | `harvest_audit_log`: Index Scan on `harvest_audit_log_export_seq_idx` |
+
 ## `write_checkpoint`
 
 Statements: 1. Tables with no usable index: none.
