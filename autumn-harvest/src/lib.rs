@@ -400,6 +400,9 @@ pub mod info;
 /// Activity execution interceptors (issue #680): an ordered middleware chain
 /// wrapping every activity execution on the worker (regular + local).
 pub mod interceptor;
+/// The Ledger census hook (issues #2366 and #2414). Never in a release build.
+#[cfg(all(feature = "ledger-census", feature = "db"))]
+pub mod ledger_census;
 /// Every persisted workflow execution state and every sanctioned transition.
 pub mod lifecycle;
 /// LLM token and cost budgets per run and per tenant (issue #1997).

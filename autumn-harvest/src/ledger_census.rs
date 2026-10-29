@@ -1,4 +1,4 @@
-//! Record which function sends each SQL statement (issue #2366).
+//! Record which function sends each SQL statement (issues #2366 and #2414).
 //!
 //! The Ledger census measures every profiled query in `docs/ledger/`. A plan
 //! needs the statement text, and a profile is keyed by the function that sends
@@ -10,8 +10,16 @@
 //! frames to profiles. The hook samples a few stacks for each distinct
 //! statement, because symbol resolution is slow.
 //!
-//! The variable is unset in every ordinary run, so the hook is inert there.
-//! The engine code does not change.
+//! The module exists only with the `ledger-census` feature, which no release
+//! build enables. Even then, the hook stays inert until the variable is set.
+//!
+//! # Linking
+//!
+//! A function in `.init_array` installs the hook before `main`. The linker
+//! drops an archive member that no symbol pulls in, so the census run passes
+//! `-u harvest_ledger_census_anchor` to the linker. That pulls this module
+//! into every test binary, the plugin's binaries included, with no call site.
+//! `docs/ledger/README.md` gives the command.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -75,6 +83,8 @@ pub fn bind_text(debug: &str) -> &str {
 }
 
 /// Keep the `crate/src/path:line` of each frame in a workspace crate's `src/` tree.
+///
+/// The hook's own frames are dropped, because no profile covers them.
 pub fn source_frames(backtrace: &str) -> Vec<String> {
     backtrace
         .lines()
@@ -83,7 +93,8 @@ pub fn source_frames(backtrace: &str) -> Vec<String> {
             let src = at.rfind("/src/")?;
             let crate_start = at[..src].rfind('/')? + 1;
             let rel = &at[crate_start..];
-            rel.starts_with("autumn-harvest").then(|| {
+            let own = rel.starts_with("autumn-harvest/src/ledger_census.rs");
+            (rel.starts_with("autumn-harvest") && !own).then(|| {
                 let mut parts = rel.rsplitn(3, ':');
                 let _column = parts.next();
                 let line = parts.next().unwrap_or_default();
@@ -150,6 +161,13 @@ extern "C" fn install() {
 #[unsafe(link_section = ".init_array")]
 static INSTALL: extern "C" fn() = install;
 
+/// The symbol that the census run asks the linker to keep.
+///
+/// It does nothing. It sits in this module so that `-u` on its name pulls
+/// the module, and with it `INSTALL`, into the binary.
+#[unsafe(no_mangle)]
+pub extern "C" fn harvest_ledger_census_anchor() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +195,8 @@ mod tests {
         let trace = "\
    0: std::backtrace::Backtrace::force_capture
              at /rustc/abc/library/std/src/backtrace.rs:312:13
+   1: autumn_harvest::ledger_census::Hook::on_connection_event
+             at /home/u/autumn-harvest/autumn-harvest/src/ledger_census.rs:129:20
    1: autumn_harvest::queue::claim_task_one_statement::{{closure}}
              at /home/u/autumn-harvest/autumn-harvest/src/queue.rs:2440:20
    2: integration::queue_tests::claims
