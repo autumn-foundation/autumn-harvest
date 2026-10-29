@@ -6,8 +6,8 @@
 //! every step, so a drift in the override rules fails one of the two suites.
 //!
 //! The four cases are the acceptance criteria of the DAG slice (#2385), on a
-//! code-declared workflow schedule: an override wins over code, it survives
-//! a restart, a clear restores the code value, and a refused override writes
+//! code-declared workflow schedule. An override wins over code. It survives a
+//! restart. A clear restores the code value. A refused override writes
 //! nothing.
 
 use std::time::Duration;

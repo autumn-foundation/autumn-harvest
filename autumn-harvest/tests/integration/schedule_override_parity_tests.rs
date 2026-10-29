@@ -2,7 +2,7 @@
 //! The shared schedule-override cases on Postgres (issue #2390).
 //!
 //! `autumn-harvest-sqlite` runs the same cases on SQLite. Both suites must
-//! reach the same effective value after every step, so a drift in the
+//! reach the same effective value after every step. So a drift in the
 //! override rules between the two backends fails one of them.
 //!
 //! Each `Step::Code` runs one scheduler tick over freshly built code values,

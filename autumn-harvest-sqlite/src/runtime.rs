@@ -2094,8 +2094,8 @@ impl SqliteRuntime {
     /// The override wins over the code value of
     /// [`upsert_schedule`](Self::upsert_schedule), and survives a reopen
     /// that upserts new code. `patch` merges over the stored override with
-    /// the Postgres rules of issue #2386: a field that `patch` sets wins, and
-    /// a field that it leaves out keeps the stored value. To return every
+    /// the Postgres rules of issue #2386. A field that `patch` sets wins. A
+    /// field that it leaves out keeps the stored value. To return every
     /// field to its code value, call
     /// [`clear_schedule_override`](Self::clear_schedule_override).
     ///
