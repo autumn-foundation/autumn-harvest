@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_start_throttle"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/throttle.md"
 
 ["existing_pending_throttle_for_workflow_id"]
 driver = "per_request"
@@ -20,6 +21,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_rate_limit_buckets", "harvest_start_throttle"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/throttle.md"
 
 ["insert_pending_throttle_row"]
 driver = "per_request"
@@ -70,6 +72,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_start_throttle"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/throttle.md"
 
 ["throttle_backlog_by_key"]
 driver = "per_request"

@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/poison_pill.md"
 
 ["scanner::quarantine_orphan"]
 driver = "per_tick"
@@ -13,6 +14,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue", "harvest_workflow_executions"]
 measured = "docs/performance-poison-pill-orphan-recheck.md"
+plan = "docs/ledger/plans/autumn-harvest/poison_pill.md"
 
 ["scanner::reclaim_sweep"]
 driver = "per_tick"
@@ -20,6 +22,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue", "harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/poison_pill.md"
 
 ["scanner::requeue_orphan"]
 driver = "per_tick"
@@ -27,6 +30,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue", "harvest_workers"]
 measured = "docs/performance-poison-pill-orphan-recheck.md"
+plan = "docs/ledger/plans/autumn-harvest/poison_pill.md"
 
 ["scanner::requeue_stuck_task"]
 driver = "per_tick"
@@ -34,6 +38,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/poison_pill.md"
 
 ["scanner::worker_sighting"]
 driver = "per_tick"
@@ -41,3 +46,4 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/poison_pill.md"

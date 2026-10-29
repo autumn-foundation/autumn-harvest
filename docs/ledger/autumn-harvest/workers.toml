@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_worker_task_stats"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["fleet_health"]
 driver = "per_request"
@@ -27,6 +28,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["list_pinned_executions"]
 driver = "per_request"
@@ -48,6 +50,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["load_task_stats"]
 driver = "per_request"
@@ -62,6 +65,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_worker_task_stats"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["read_draining_worker_deadline"]
 driver = "per_request"
@@ -111,6 +115,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["transition_active_to_draining"]
 driver = "per_request"
@@ -139,3 +144,4 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_worker_task_stats"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"

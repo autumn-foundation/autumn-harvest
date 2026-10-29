@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_schedule_decisions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/schedule_decision.md"
 
 ["record_decision_graceful"]
 driver = "per_tick"
@@ -13,3 +14,4 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_schedule_decisions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/schedule_decision.md"

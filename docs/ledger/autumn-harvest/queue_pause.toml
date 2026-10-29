@@ -28,6 +28,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue_pause.md"
 
 ["notify_resumed_queue"]
 driver = "per_request"

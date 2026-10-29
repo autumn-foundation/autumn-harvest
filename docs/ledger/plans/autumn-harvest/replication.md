@@ -50,6 +50,14 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT pg_advisory_xact_lock_shared($1)` | no table |
 
+## `db::current_generation`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT generation FROM harvest_shard_generation WHERE shard_id = $1` | `harvest_shard_generation`: Index Scan on `harvest_shard_generation_pkey` |
+
 ## `db::end_backend`
 
 Statements: 2. Tables with no usable index: none.
@@ -58,6 +66,14 @@ Statements: 2. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT count(*) AS alive FROM pg_stat_activity WHERE pid = $1` | no table |
 | 2 | `SELECT pg_terminate_backend($1)` | no table |
+
+## `db::heartbeat_reading`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `WITH current_gen AS ( SELECT generation FROM harvest_shard_generation WHERE shard_id = $1 ) SELEC...` | `harvest_replication_heartbeat`: Bitmap Heap Scan on `harvest_replication_heartbeat_pkey`<br>`harvest_replication_heartbeat`: Bitmap Heap Scan on `harvest_replication_heartbeat_shard_at_idx`<br>`harvest_shard_generation`: Index Scan on `harvest_shard_generation_pkey` |
 
 ## `db::hold_in_pass`
 
@@ -74,4 +90,32 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT 1` | no table |
+
+## `db::measure_rpo`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT (MIN(pos) FILTER (WHERE pos IS NOT NULL))::text AS position, COUNT(*) FILTER (WHERE pos IS...` | `pg_database`: Index Scan on `pg_database_oid_index` |
+
+## `db::probe_dr_markers`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT ARRAY(SELECT shard_id FROM harvest_shard_generation ORDER BY shard_id) AS generation_shard...` | `harvest_shard_generation`: full scan of index `harvest_shard_generation_pkey`<br>`pg_database`: Index Scan on `pg_database_datname_index`<br>`pg_database`: Index Scan on `pg_database_oid_index`<br>`pg_subscription`: full scan of index `pg_subscription_subname_index` |
+| 2 | `SELECT ARRAY[]::integer[] AS generation_shards, (SELECT COUNT(*) FROM pg_replication_slots s WHER...` | `pg_database`: Index Scan on `pg_database_datname_index`<br>`pg_database`: Index Scan on `pg_database_oid_index`<br>`pg_subscription`: full scan of index `pg_subscription_subname_index` |
+| 3 | `SELECT to_regclass('harvest_shard_generation') IS NOT NULL AS present` | no table |
+
+## `db::record_replication_heartbeat`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM harvest_replication_heartbeat WHERE shard_id = $1 AND beat_at < NOW() - make_interval...` | `harvest_replication_heartbeat`: Bitmap Heap Scan on `harvest_replication_heartbeat_shard_at_idx`<br>`harvest_replication_heartbeat`: ModifyTable |
+| 2 | `INSERT INTO harvest_replication_heartbeat (shard_id, beat_lsn, beat_at, fence_generation) SELECT ...` | `harvest_replication_heartbeat`: Index Only Scan on `harvest_replication_heartbeat_shard_at_idx`<br>`harvest_replication_heartbeat`: ModifyTable<br>`harvest_shard_generation`: Index Scan on `harvest_shard_generation_pkey` |
+| 3 | `SELECT pg_try_advisory_xact_lock($1) AS locked` | no table |
 

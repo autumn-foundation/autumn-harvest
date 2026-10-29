@@ -26,6 +26,14 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_parent_id` |
 
+## `auto_resume_expired_pauses`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workflow_executions"."id" FROM "harvest_workflow_executions" WHERE ((("harvest_wo...` | `harvest_workflow_executions`: full scan of partial index `idx_harvest_we_paused` |
+
 ## `cascade_cancel_detached_child`
 
 Statements: 1. Tables with no usable index: none.

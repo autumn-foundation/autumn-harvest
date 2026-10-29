@@ -67,6 +67,9 @@ STATE_WORD = re.compile(r"^[A-Za-z_]{1,32}$")
 MAX_LITERAL = 64
 # Literal sets kept for each statement.
 MAX_LITERAL_SETS = 4
+# A statement with more parameters is a bulk write. Its guessed types would
+# fill most of the file, and a bulk write plans without them.
+MAX_TYPED_PARAMS = 64
 
 
 def line_starts(source):
@@ -146,10 +149,28 @@ def attribute(lines, resolver, skipped=None):
                 found[hit[0]][hit[1]][sql].add(json.dumps(lits, sort_keys=True))
                 break
     return {
-        c: {k: {sql: [json.loads(m) for m in sorted(maps)][:MAX_LITERAL_SETS] for sql, maps in sorted(sqls.items())}
+        c: {k: {sql: shape([json.loads(m) for m in maps]) for sql, maps in sorted(sqls.items())}
             for k, sqls in sorted(keys.items())}
         for c, keys in sorted(found.items())
     }
+
+
+def shape(maps):
+    """Split literal maps into `{"types": ..., "literals": [...]}`.
+
+    The types of a statement rarely change between calls, so one map holds
+    them. Each distinct literal set is kept, up to MAX_LITERAL_SETS.
+    """
+    types, sets = {}, set()
+    for lits in maps:
+        for key, value in lits.items():
+            if key.startswith("::"):
+                types.setdefault(key[2:], value)
+        sets.add(json.dumps({k: v for k, v in lits.items() if not k.startswith("::")}, sort_keys=True))
+    literal_sets = [json.loads(m) for m in sorted(sets)][:MAX_LITERAL_SETS]
+    if len(types) > MAX_TYPED_PARAMS:
+        types = {}
+    return {"types": dict(sorted(types.items(), key=lambda kv: int(kv[0]))), "literals": literal_sets}
 
 
 def normalize(sql):
@@ -163,10 +184,11 @@ def merge(old, new):
     for catalog, keys in new.items():
         for key, sqls in keys.items():
             slot = out.setdefault(catalog, {}).setdefault(key, {})
-            for sql, maps in sqls.items():
-                known = {json.dumps(m, sort_keys=True) for m in slot.get(sql, [])}
-                known |= {json.dumps(m, sort_keys=True) for m in maps}
-                slot[sql] = [json.loads(m) for m in sorted(known)][:MAX_LITERAL_SETS]
+            for sql, entry in sqls.items():
+                prior = slot.get(sql, {"types": {}, "literals": []})
+                maps = [{**{f"::{n}": t for n, t in prior["types"].items()}, **m} for m in prior["literals"]]
+                maps += [{**{f"::{n}": t for n, t in entry["types"].items()}, **m} for m in entry["literals"]]
+                slot[sql] = shape(maps)
             out[catalog][key] = dict(sorted(slot.items()))
     return {c: dict(sorted(k.items())) for c, k in sorted(out.items())}
 
@@ -223,11 +245,49 @@ def literal(debug):
     return None
 
 
+UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+TIMESTAMPTZ = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$")
+JSON_DEBUG = ("Object {", "Array [", "String(", "Number(", "Bool(", "Null")
+
+
+def bind_type(debug):
+    """Guess the Postgres type of one bind from its `Debug` text, or None.
+
+    A generic plan cannot infer the type of `$3[2]` or `unnest($1)`. The
+    guess is used only after a plan fails, so a wrong guess costs nothing.
+    """
+    if debug in ("true", "false"):
+        return "boolean"
+    if debug.startswith("Some(") and debug.endswith(")"):
+        return bind_type(debug[5:-1])
+    if re.fullmatch(r"-?\d+", debug):
+        return "bigint"
+    if re.fullmatch(r"-?\d+\.\d+(?:e-?\d+)?", debug):
+        return "float8"
+    if UUID.match(debug):
+        return "uuid"
+    if TIMESTAMPTZ.match(debug):
+        return "timestamptz"
+    if debug.startswith('"'):
+        return "text"
+    if debug.startswith(JSON_DEBUG):
+        return "jsonb"
+    if debug.startswith("[") and debug.endswith("]"):
+        for item in split_top(debug[1:-1]):
+            inner = bind_type(item)
+            if inner and not inner.endswith("[]"):
+                return inner + "[]"
+            if inner:
+                return None
+    return None
+
+
 def literals(binds):
     """Map parameter numbers to the literals that a custom plan would see.
 
     Only bool values and state words are kept. They decide whether a partial index
     such as `WHERE NOT fired` applies. A generic plan cannot prove that.
+    The key `::n` holds the guessed type of parameter `n`.
     """
     binds = binds.strip()
     if not (binds.startswith("[") and binds.endswith("]")):
@@ -237,11 +297,17 @@ def literals(binds):
         value = literal(debug)
         if value is not None and len(value) <= MAX_LITERAL:
             out[str(number)] = value
+        kind = bind_type(debug)
+        if kind:
+            out[f"::{number}"] = kind
     return out
 
 
-def substitute(sql, lits):
-    """Put each literal in place of its parameter, then renumber the rest."""
+def substitute(sql, lits, cast=False):
+    """Put each literal in place of its parameter, then renumber the rest.
+
+    With `cast`, each remaining parameter with a guessed type gets a cast.
+    """
     numbers = {}
 
     def swap(match):
@@ -249,7 +315,8 @@ def substitute(sql, lits):
         if number in lits:
             return lits[number]
         numbers.setdefault(number, len(numbers) + 1)
-        return f"${numbers[number]}"
+        kind = lits.get(f"::{number}") if cast else None
+        return f"${numbers[number]}::{kind}" if kind else f"${numbers[number]}"
 
     return re.sub(r"\$(\d+)\b", swap, sql)
 
@@ -330,17 +397,21 @@ def explain(url, sql, partial=frozenset()):
     return access_paths(text[start:], partial), None
 
 
-def plan_statement(url, sql, maps, partial):
+def plan_statement(url, sql, entry, partial):
     """Plan one statement once for each set of bind literals that it saw.
 
-    The union of the access paths is the result. A statement with no literal
-    gets one generic plan. A literal set that does not plan falls back to it.
+    The union of the access paths is the result. A literal set that does not
+    plan is tried again with type casts, then without its literals.
     """
     paths, errors = set(), []
-    for lits in [m for m in maps if m] or [{}]:
-        found, error = explain(url, substitute(sql, lits), partial)
-        if error and lits:
-            found, error = explain(url, sql, partial)
+    types = {f"::{n}": t for n, t in entry["types"].items()}
+    for literal_set in [m for m in entry["literals"] if m] or [{}]:
+        lits = {**types, **literal_set}
+        for text in (substitute(sql, lits), substitute(sql, lits, cast=True),
+                     substitute(sql, {}), substitute(sql, types, cast=True)):
+            found, error = explain(url, text, partial)
+            if not error:
+                break
         if error:
             errors.append(error)
         else:
@@ -451,7 +522,7 @@ def run_plan(url, driver):
             if not sqls:
                 missing.append(f"{catalog} {key}")
                 continue
-            results[key] = [(sql, *plan_statement(url, sql, maps, partial)) for sql, maps in sqls.items()]
+            results[key] = [(sql, *plan_statement(url, sql, entry, partial)) for sql, entry in sqls.items()]
         if not results:
             continue
         source = source_of(catalog)
@@ -565,20 +636,28 @@ def self_test():
     assert resolver.key("c/src/queue.rs:2") == ("docs/ledger/c/queue.toml", "claim")
     assert resolver.key("c/src/queue.rs:7") is None
     lines = [json.dumps({"sql": "SELECT\n    1", "frames": ["c/src/queue.rs:7", "c/src/queue.rs:3"]})]
-    assert attribute(lines, resolver) == {"docs/ledger/c/queue.toml": {"claim": {"SELECT\n1": [{}]}}}
+    assert attribute(lines, resolver) == {"docs/ledger/c/queue.toml": {"claim": {"SELECT\n1": {"types": {}, "literals": [{}]}}}}
     torn = []
     assert attribute(lines + ['{"sql": "SEL{"sql"'], resolver, torn) == attribute(lines, resolver)
     assert len(torn) == 1
 
     assert source_of("docs/ledger/autumn-harvest/dst/mod.toml") == "autumn-harvest/src/dst/mod.rs"
-    assert merge({"c": {"k": {"a": [{}]}}}, {"c": {"k": {"b": [{}], "a": [{"1": "true"}]}, "j": {"c": [{}]}}}) == {
-        "c": {"j": {"c": [{}]}, "k": {"a": [{"1": "true"}, {}], "b": [{}]}}}
+    e = {"types": {}, "literals": [{}]}
+    t = {"types": {"2": "uuid"}, "literals": [{"1": "true"}]}
+    assert merge({"c": {"k": {"a": e}}}, {"c": {"k": {"b": e, "a": t}, "j": {"c": e}}}) == {
+        "c": {"j": {"c": e}, "k": {"a": {"types": {"2": "uuid"}, "literals": [{"1": "true"}, {}]}, "b": e}}}
+    assert shape([{"::2": "uuid", "1": "true"}, {"::2": "uuid"}]) == {"types": {"2": "uuid"}, "literals": [{"1": "true"}, {}]}
 
     binds = ('[0b1c-uuid, false, "RUNNING", Some(true), ["A", "B"], Object {"a": String("x, y")}, '
              '"it\'s", "test-' + "0a" * 16 + '"]')
-    assert literals(binds) == {"2": "false", "3": "'RUNNING'", "4": "true", "5": "ARRAY['A', 'B']"}, literals(binds)
+    found = {k: v for k, v in literals(binds).items() if not k.startswith("::")}
+    assert found == {"2": "false", "3": "'RUNNING'", "4": "true", "5": "ARRAY['A', 'B']"}, found
+    typed = literals('[1f0c3a2e-0000-4000-8000-000000000001, 7, [2026-10-28T17:35:07.25Z], None, Object {}]')
+    assert typed == {"::1": "uuid", "::2": "bigint", "::3": "timestamptz[]", "::5": "jsonb"}, typed
+    assert substitute("SELECT ($2)[1] WHERE a = $1", {"1": "true", "::2": "timestamptz[]"}, cast=True) == \
+        "SELECT ($1::timestamptz[])[1] WHERE a = true"
     assert literals("[]") == {} and literals("") == {}
-    assert literals('["' + "x" * 80 + '"]') == {}
+    assert literals('["' + "x" * 80 + '"]') == {"::1": "text"}
     assert split_top('a, [b, c], "d, e"') == ["a", "[b, c]", '"d, e"']
     assert substitute("SELECT 1 WHERE a = $1 AND b = $2 AND c = $3 AND d = $10",
                       {"2": "false"}) == "SELECT 1 WHERE a = $1 AND b = false AND c = $2 AND d = $3"

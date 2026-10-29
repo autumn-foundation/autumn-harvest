@@ -21,6 +21,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/execution.md"
 
 ["cancel_workflow_execution_collect_mode"]
 driver = "per_request"

@@ -27,6 +27,14 @@ Statements: 2. Tables with no usable index: none.
 | 1 | `SELECT "harvest_task_queue"."id" FROM "harvest_task_queue" WHERE ((("harvest_task_queue"."id" = $...` | `harvest_task_queue`: full scan of partial index `idx_harvest_tq_running_started` |
 | 2 | `SELECT "harvest_task_queue"."id" FROM "harvest_task_queue" WHERE ((("harvest_task_queue"."id" = $...` | `harvest_task_queue`: full scan of partial index `idx_harvest_tq_running_started` |
 
+## `bounded_queue_depths`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `WITH queues AS ( SELECT DISTINCT queue_name FROM unnest($1::text[]) AS u(queue_name) ), walk AS (...` | `harvest_task_queue`: Index Only Scan on `idx_harvest_tq_claim_seek`<br>`harvest_task_queue`: Index Only Scan on `idx_harvest_tq_coverage_sample`<br>`pg_class`: Index Scan on `pg_class_oid_index` |
+
 ## `cancel_activity_task_with_reason`
 
 Statements: 1. Tables with no usable index: none.
@@ -119,6 +127,14 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `WITH owner_gate AS MATERIALIZED ( SELECT set_config('harvest.owner_claim', $8::text, true) AS own...` | `harvest_activity_pauses`: Bitmap Heap Scan on `harvest_activity_pauses_pkey`<br>`harvest_build_compat`: Bitmap Heap Scan on `harvest_build_compat_build_id_compatible_with_key`<br>`harvest_decision_owner`: Index Scan on `harvest_decision_owner_pkey`<br>`harvest_decision_owner_mode`: Index Scan on `harvest_decision_owner_mode_pkey`<br>`harvest_queue_pauses`: Bitmap Heap Scan on `harvest_queue_pauses_pkey`<br>`harvest_rate_limit_buckets`: Index Scan on `harvest_rate_limit_buckets_pkey`<br>`harvest_rate_limit_buckets`: ModifyTable<br>`harvest_task_queue`: Index Scan on `harvest_task_queue_pkey`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_owner_order`<br>`harvest_task_queue`: ModifyTable<br>`harvest_task_queue`: full scan of partial index `harvest_task_queue_concurrency_key_running`<br>`harvest_task_queue`: full scan of partial index `idx_harvest_tq_running_started`<br>`harvest_workers`: Index Scan on `harvest_workers_pkey`<br>`harvest_workflow_executions`: full scan of partial index `idx_harvest_we_canary_order`<br>`harvest_workflow_executions`: full scan of partial index `idx_harvest_we_paused` |
+
+## `claimable_pending_demand_by_queue`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT tq.queue_name, tq.required_capabilities, tq.required_build_id, CASE WHEN tq.sticky_worker_...` | `harvest_activity_pauses`: Index Only Scan on `harvest_activity_pauses_pkey`<br>`harvest_queue_pauses`: Index Only Scan on `harvest_queue_pauses_pkey`<br>`harvest_rate_limit_buckets`: Index Scan on `harvest_rate_limit_buckets_pkey`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_claim_seek`<br>`harvest_task_queue`: full scan of partial index `idx_harvest_tq_running_started`<br>`harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
 
 ## `complete_task_inner`
 
@@ -354,6 +370,14 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `UPDATE "harvest_task_queue" SET "handler_started_attempt" = $1, "handler_started_at" = clock_time...` | `harvest_task_queue`: ModifyTable<br>`harvest_task_queue`: full scan of partial index `idx_harvest_tq_running_started` |
 
+## `oldest_pending_ages`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `WITH queues AS ( SELECT DISTINCT queue_name FROM unnest($1::text[]) AS u(queue_name) ), seek AS (...` | `harvest_activity_pauses`: Index Only Scan on `harvest_activity_pauses_pkey`<br>`harvest_queue_pauses`: Index Only Scan on `harvest_queue_pauses_pkey`<br>`harvest_rate_limit_buckets`: Index Scan on `harvest_rate_limit_buckets_pkey`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_claim_seek`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_coverage_sample`<br>`harvest_task_queue`: full scan of partial index `idx_harvest_tq_running_started`<br>`harvest_workflow_executions`: full scan of partial index `idx_harvest_we_paused` |
+
 ## `owner_keys`
 
 Statements: 1. Tables with no usable index: none.
@@ -361,6 +385,14 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT workflow_exec_id AS exec_id, 0::float8 AS wait_secs, priority AS eff_priority, (scheduled_...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_owner_order` |
+
+## `owner_scan`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `WITH paused AS MATERIALIZED ( SELECT COALESCE(array_agg(queue_name), ARRAY[]::text[]) AS names FR...` | `harvest_queue_pauses`: Bitmap Heap Scan on `harvest_queue_pauses_pkey`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_owner_order`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_owner_scan`<br>`harvest_workflow_executions`: full scan of partial index `idx_harvest_we_paused` |
 
 ## `park_workflow_task_inner`
 
@@ -379,6 +411,14 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, scheduled_a...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_workflow`<br>`harvest_task_queue`: ModifyTable |
+
+## `queue_depths`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT queue_name, COUNT(*)::BIGINT AS depth FROM harvest_task_queue WHERE queue_name = ANY($1) A...` | `harvest_task_queue`: Index Only Scan on `idx_harvest_tq_claim_seek` |
 
 ## `read_capability_miss_state`
 
@@ -508,6 +548,14 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT "harvest_task_queue"."id", "harvest_task_queue"."attempt", "harvest_task_queue"."started_a...` | `harvest_task_queue`: full scan of partial index `idx_harvest_tq_running_started` |
 
+## `sample_rate_limit_buckets`
+
+Statements: 1. Tables with no usable index: `harvest_rate_limit_buckets`.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT key, COALESCE(CASE WHEN harvest_rate_limit_buckets.override_expires_at > NOW() THEN harves...` | `harvest_rate_limit_buckets`: no usable index |
+
 ## `session_has_other_live_tasks`
 
 Statements: 1. Tables with no usable index: none.
@@ -532,6 +580,26 @@ Statements: 2. Tables with no usable index: none.
 |---|---|---|
 | 1 | `UPDATE "harvest_task_queue" SET "sticky_worker_id" = $1, "sticky_until" = $2, "sticky_timeout" = ...` | `harvest_task_queue`: Index Scan on `harvest_task_queue_pkey`<br>`harvest_task_queue`: ModifyTable |
 | 2 | `UPDATE harvest_task_queue SET sticky_worker_id = $2, sticky_until = NOW() + $3, sticky_timeout = ...` | `harvest_task_queue`: Index Scan on `harvest_task_queue_pkey`<br>`harvest_task_queue`: ModifyTable |
+
+## `sweep_idle_rate_limit_buckets`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT b.key FROM harvest_rate_limit_buckets b WHERE (b.key LIKE 'dyn-rate:%' OR b.key LIKE 'star...` | `harvest_rate_limit_buckets`: Bitmap Heap Scan on `harvest_rate_limit_buckets_pkey`<br>`harvest_start_throttle`: Index Only Scan on `idx_harvest_start_throttle_bucket_deferred`<br>`harvest_task_queue`: Bitmap Heap Scan on `idx_harvest_task_queue_rate_limit_key_live` |
+| 2 | `WITH victims AS ( SELECT b.key FROM harvest_rate_limit_buckets b WHERE (b.key LIKE 'dyn-rate:%' O...` | `harvest_rate_limit_buckets`: Bitmap Heap Scan on `harvest_rate_limit_buckets_pkey`<br>`harvest_rate_limit_buckets`: Index Scan on `harvest_rate_limit_buckets_pkey`<br>`harvest_rate_limit_buckets`: ModifyTable<br>`harvest_start_throttle`: Index Scan on `idx_harvest_start_throttle_bucket_deferred`<br>`harvest_task_queue`: Bitmap Heap Scan on `idx_harvest_task_queue_rate_limit_key_live` |
+
+## `sweep_terminal_tasks_into`
+
+Statements: 4. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT t.id, t.state, t.completed_at FROM harvest_task_queue t WHERE t.state IN ('COMPLETED', 'FA...` | `harvest_dead_letters`: Index Only Scan on `idx_harvest_dl_workflow_exec_id`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_terminal_completed_at`<br>`harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_non_terminal_wf_name` |
+| 2 | `SELECT t.id, t.state, t.completed_at FROM harvest_task_queue t WHERE t.state IN ('COMPLETED', 'FA...` | `harvest_dead_letters`: Index Only Scan on `idx_harvest_dl_workflow_exec_id`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_terminal_completed_at`<br>`harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_non_terminal_wf_name` |
+| 3 | `WITH victims AS ( SELECT t.id FROM harvest_task_queue t WHERE t.state IN ('COMPLETED', 'FAILED', ...` | `harvest_dead_letters`: Index Only Scan on `idx_harvest_dl_workflow_exec_id`<br>`harvest_task_queue`: Index Scan on `harvest_task_queue_pkey`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_terminal_completed_at`<br>`harvest_task_queue`: ModifyTable<br>`harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_non_terminal_wf_name` |
+| 4 | `WITH victims AS ( SELECT t.id FROM harvest_task_queue t WHERE t.state IN ('COMPLETED', 'FAILED', ...` | `harvest_dead_letters`: Index Only Scan on `idx_harvest_dl_workflow_exec_id`<br>`harvest_task_queue`: Index Scan on `harvest_task_queue_pkey`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_terminal_completed_at`<br>`harvest_task_queue`: ModifyTable<br>`harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_non_terminal_wf_name` |
 
 ## `take_timed_out_claim`
 

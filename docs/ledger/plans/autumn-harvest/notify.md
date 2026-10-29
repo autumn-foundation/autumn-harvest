@@ -58,3 +58,11 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)` | no table |
 
+## `tick`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notific...` | no table |
+

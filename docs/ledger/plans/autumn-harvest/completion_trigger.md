@@ -18,6 +18,16 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `enforce_completion_triggers_outbox_with_codecs`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec...` | `harvest_completion_trigger_outbox`: Index Scan on `idx_harvest_completion_trigger_outbox_shard_next_attempt` |
+| 2 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec...` | `harvest_completion_trigger_outbox`: Bitmap Heap Scan on `idx_harvest_completion_trigger_outbox_shard_next_attempt` |
+| 3 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec...` | `harvest_completion_trigger_outbox`: Index Scan on `idx_harvest_completion_trigger_outbox_shard_next_attempt` |
+
 ## `evaluate_triggers_for_execution_collecting_with_codecs`
 
 Statements: 5. Tables with no usable index: none.
@@ -29,4 +39,39 @@ Statements: 5. Tables with no usable index: none.
 | 3 | `INSERT INTO "harvest_completion_trigger_outbox" ("source_exec_id", "trigger_id", "target_shard", ...` | `harvest_completion_trigger_outbox`: ModifyTable |
 | 4 | `SELECT "harvest_completion_triggers"."id", "harvest_completion_triggers"."source_workflow_name", ...` | `harvest_completion_triggers`: Index Scan on `idx_harvest_completion_triggers_source` |
 | 5 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+
+## `relay_gate_checked_start`
+
+Statements: 4. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM "harvest_completion_trigger_outbox" WHERE ("harvest_completion_trigger_outbox"."id" =...` | `harvest_completion_trigger_outbox`: Index Scan on `harvest_completion_trigger_outbox_pkey`<br>`harvest_completion_trigger_outbox`: ModifyTable |
+| 2 | `SELECT id FROM harvest_completion_trigger_outbox WHERE id = $1 AND (next_attempt_at IS NULL OR ne...` | `harvest_completion_trigger_outbox`: Index Scan on `harvest_completion_trigger_outbox_pkey` |
+| 3 | `UPDATE "harvest_completion_trigger_fires" SET "outcome" = $1 WHERE (("harvest_completion_trigger_...` | `harvest_completion_trigger_fires`: Index Scan on `harvest_completion_trigger_fires_pkey`<br>`harvest_completion_trigger_fires`: ModifyTable |
+| 4 | `UPDATE "harvest_completion_trigger_outbox" SET "next_attempt_at" = clock_timestamp() + make_inter...` | `harvest_completion_trigger_outbox`: Index Scan on `harvest_completion_trigger_outbox_pkey`<br>`harvest_completion_trigger_outbox`: ModifyTable |
+
+## `resolve_target_queue`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_schedules"."queue_name" FROM "harvest_schedules" WHERE ("harvest_schedules"."work...` | `harvest_schedules`: Index Scan on `harvest_schedules_workflow_name_unique` |
+
+## `resolve_target_queues_batch`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_schedules"."workflow_name", "harvest_schedules"."queue_name" FROM "harvest_schedu...` | `harvest_schedules`: Index Scan on `harvest_schedules_workflow_name_unique` |
+
+## `stamp_outbox_relay_backoff`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE harvest_completion_trigger_outbox SET next_attempt_at = clock_timestamp() + make_interval(...` | `harvest_completion_trigger_outbox`: Index Scan on `harvest_completion_trigger_outbox_pkey`<br>`harvest_completion_trigger_outbox`: ModifyTable |
 

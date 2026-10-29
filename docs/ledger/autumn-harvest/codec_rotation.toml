@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_codec_key_state"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/codec_rotation.md"
 
 ["db::blocking_workers"]
 driver = "per_tick"
@@ -13,6 +14,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/codec_rotation.md"
 
 ["db::claim_completed_cursor_revalidation_statement"]
 driver = "per_tick"
@@ -20,6 +22,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_codec_rotation_cursor"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/codec_rotation.md"
 
 ["db::column_cell_pending"]
 driver = "per_tick"
@@ -34,13 +37,15 @@ backend = ["postgres"]
 kind = []
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/codec_rotation.md"
 
 ["db::count_rows_by_key_id"]
-driver = "per_tick"
+driver = "setup"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_batch_jobs", "harvest_completion_deliveries", "harvest_completion_trigger_outbox", "harvest_cross_shard_children", "harvest_dead_letters", "harvest_debounce", "harvest_entity_state", "harvest_event_batches", "harvest_events", "harvest_execution_summaries", "harvest_schedules", "harvest_signals", "harvest_start_throttle", "harvest_task_queue", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/codec_rotation.md"
 
 ["db::cursor_table_present"]
 driver = "per_tick"
@@ -48,6 +53,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_codec_rotation_cursor"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/codec_rotation.md"
 
 ["db::load_cursor"]
 driver = "per_tick"
@@ -55,6 +61,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_codec_rotation_cursor"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/codec_rotation.md"
 
 ["db::read_key_state"]
 driver = "per_tick"
@@ -69,6 +76,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/codec_rotation.md"
 
 ["db::sweep_codec_columns"]
 driver = "per_tick"
@@ -76,6 +84,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_batch_jobs", "harvest_completion_deliveries", "harvest_completion_trigger_outbox", "harvest_cross_shard_children", "harvest_dead_letters", "harvest_debounce", "harvest_entity_state", "harvest_event_batches", "harvest_execution_summaries", "harvest_schedules", "harvest_signals", "harvest_start_throttle", "harvest_task_queue", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/codec_rotation.md"
 
 ["db::sweep_codec_reencryption_once"]
 driver = "per_tick"
@@ -83,6 +92,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "docs/performance-codec-rotation-reencrypt.md"
+plan = "docs/ledger/plans/autumn-harvest/codec_rotation.md"
 
 ["db::write_cursor_statement"]
 driver = "per_tick"
@@ -90,6 +100,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_codec_rotation_cursor"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/codec_rotation.md"
 
 ["db::write_key_state_activation"]
 driver = "per_request"
