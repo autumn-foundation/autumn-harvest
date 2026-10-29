@@ -58885,7 +58885,7 @@ mod tests {
         worker
             .idle_wait_then_settle(std::future::pending::<bool>())
             .await;
-        let waited = start.elapsed() - Duration::from_millis(10);
+        let waited = start.elapsed().saturating_sub(Duration::from_millis(10));
         assert!(
             waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
             "an empty poll after a NOTIFY must settle, waited {waited:?}"
