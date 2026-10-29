@@ -27,7 +27,7 @@ ALLOWED = {
     ".gitattributes": "git attributes",
     ".gitignore": "git ignore rules",
     "AGENTS.md": "agent instructions; agents read it from the root",
-    "CHANGELOG.md": "release changelog; git-cliff writes it here",
+    "CHANGELOG.md": "release changelog, collated by hand from docs/changelog.d/",
     "CLAUDE.md": "agent instructions; agents read it from the root",
     "CONTRIBUTING.md": "GitHub links it from the root",
     "Cargo.lock": "workspace lockfile",

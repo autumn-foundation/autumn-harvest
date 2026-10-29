@@ -22,6 +22,24 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// The shipped-work entry for issue #1987, collated from its changelog fragment.
+///
+/// An entry starts at a `- **` line that cites the issue. It ends at the next
+/// `- **` line in the first column.
+fn shipped_work_entry(text: &str, issue: &str) -> String {
+    let cite = format!("see issue {issue}");
+    let mut lines = text
+        .lines()
+        .skip_while(|l| !(l.starts_with("- **") && l.contains(&cite)));
+    let first = lines
+        .next()
+        .unwrap_or_else(|| panic!("docs/shipped-work.md has no entry for issue {issue}"));
+    std::iter::once(first)
+        .chain(lines.take_while(|l| !l.starts_with("- **")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn read(relative: &str) -> String {
     let path = repo_root().join(relative);
     std::fs::read_to_string(&path)
@@ -146,7 +164,7 @@ fn the_ratio_table_matches_the_cost_table() {
 fn the_quoting_docs_match_the_cost_table() {
     let doc = read(PERF_DOC);
     let adr = read(ADR_DOC);
-    let fragment = read("docs/changelog.d/issue-1987-standalone-activity.md");
+    let fragment = shipped_work_entry(&read("docs/shipped-work.md"), "#1987");
     let guide = read(GUIDE_DOC);
     let index = read("docs/performance.md");
     let (d_rows, d_wal) = cost(&doc, ARM_D);
@@ -174,7 +192,7 @@ fn the_quoting_docs_match_the_cost_table() {
             arm.label
         );
         assert!(
-            fragment.lines().any(
+            fragment.lines().map(str::trim_start).any(
                 |l| l.starts_with(&format!("| {} |", arm.label)) && l.ends_with(&fragment_row)
             ),
             "the changelog table must quote arm {} as `{fragment_row}`",

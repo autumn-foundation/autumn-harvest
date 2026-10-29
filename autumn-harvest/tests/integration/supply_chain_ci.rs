@@ -1149,24 +1149,15 @@ fn release_runs_every_tag_gate_before_signing() {
         .filter_map(|s| text(s, "run"))
         .collect::<Vec<_>>()
         .join("\n");
-    for needle in ["diff -u CHANGELOG.md", "clients/typescript/package.json"] {
+    for needle in [
+        r###"heading="## [${GITHUB_REF_NAME#v}] - ""###,
+        "clients/typescript/package.json",
+    ] {
         assert!(
             runs.contains(needle),
             "validate must run the `{needle}` gate:\n{runs}"
         );
     }
-    let checkout = validate
-        .iter()
-        .find(|s| uses(s, "actions/checkout"))
-        .expect("validate checkout");
-    assert_eq!(
-        checkout
-            .get("with")
-            .and_then(|w| w.get("fetch-depth"))
-            .and_then(Value::as_u64),
-        Some(0),
-        "git-cliff needs the full history"
-    );
     for name in ["sign", "sign-client"] {
         let needs = job_needs(&doc, RELEASE_WORKFLOW, name);
         assert!(
@@ -1180,7 +1171,7 @@ fn release_runs_every_tag_gate_before_signing() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        !release_runs.contains("diff -u CHANGELOG.md"),
+        !release_runs.contains("CHANGELOG.md"),
         "the CHANGELOG gate must not wait until after signing"
     );
 }

@@ -1,1 +1,0 @@
-- **perf:** `info::validate_node` looks up `required`, `properties`, `items` and `additionalProperties` only when the value has the matching kind. Instructions on `schema_validate_profile` drop 18.8% (312.5M to 253.8M, callgrind). Behavior is unchanged; the 50 `info::` unit tests pass. See `docs/performance-schema-validate-kind-gated-lookups.md`.
