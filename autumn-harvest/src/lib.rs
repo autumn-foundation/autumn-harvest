@@ -610,11 +610,13 @@ pub mod notify;
 pub mod queue;
 /// Metric-gated automatic abort of a build ramp (issue #1814).
 pub mod ramp_guard;
+/// Operator overrides for per-type `sla` and `execution_timeout` (issue #2387).
+pub mod run_defaults;
 #[cfg(feature = "sandbox-activities")]
 pub mod sandbox;
 #[cfg(feature = "db")]
 pub mod schedule_decision;
-/// Operator overrides for code-declared DAG schedules (issue #2385).
+/// Operator overrides for code-declared schedules (issues #2385 and #2386).
 #[cfg(feature = "db")]
 pub mod schedule_override;
 /// Backend-neutral cron and interval slot arithmetic (issue #2031).

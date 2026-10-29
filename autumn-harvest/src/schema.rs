@@ -376,6 +376,22 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    /// Operator overrides for per-type run defaults (issue #2387). A NULL
+    /// column inherits the code value.
+    harvest_run_default_overrides (workflow_name) {
+        workflow_name -> Text,
+        sla_secs -> Nullable<Int8>,
+        execution_timeout_secs -> Nullable<Int8>,
+        reason -> Nullable<Text>,
+        updated_by -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     /// Operator overrides for code-declared schedules (issue #2385). A NULL
     /// column inherits the code value.
     harvest_schedule_overrides (kind, name) {
@@ -391,6 +407,8 @@ diesel::table! {
         updated_by -> Text,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        /// Workflow-only override fields as one JSON object (issue #2386).
+        workflow_fields -> Jsonb,
     }
 }
 
@@ -1412,6 +1430,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_calendars,
     harvest_calendar_exclusions,
     harvest_schedule_decisions,
+    harvest_run_default_overrides,
     harvest_schedule_overrides,
     harvest_rate_limit_buckets,
     harvest_completion_triggers,

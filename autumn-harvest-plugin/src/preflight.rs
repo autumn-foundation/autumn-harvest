@@ -427,6 +427,12 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         "harvest_schedule_overrides",
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
+    // Every refresh loop reads the run-default overrides (issue #2387). The
+    // run-defaults PATCH writes and deletes rows.
+    (
+        "harvest_run_default_overrides",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
     ("harvest_signals", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_timers", &["SELECT", "INSERT", "UPDATE", "DELETE"]),
     ("harvest_dead_letters", &["SELECT", "INSERT", "DELETE"]),

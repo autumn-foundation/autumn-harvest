@@ -1,6 +1,13 @@
 # Ledger profiles for `autumn-harvest/src/schedule_override.rs`. See `docs/ledger/README.md`.
 
-["clear_dag_override"]
+["carry_dag_override"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+
+["delete_override"]
 driver = "per_request"
 backend = ["postgres"]
 kind = ["write"]
@@ -16,7 +23,14 @@ tables = ["harvest_schedule_overrides"]
 measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest/schedule_override.md"
 
-["load_dag_overrides"]
+["list_overrides"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+
+["load_overrides"]
 driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
@@ -32,7 +46,28 @@ tables = ["harvest_schedule_overrides"]
 measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest/schedule_override.md"
 
-["store_dag_override"]
+["lock_workflow_override_row"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+
+["override_fingerprint"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+
+["select_workflow_override"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+
+["upsert_override"]
 driver = "per_request"
 backend = ["postgres"]
 kind = ["write"]

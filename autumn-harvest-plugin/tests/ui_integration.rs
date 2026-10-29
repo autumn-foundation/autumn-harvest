@@ -7304,6 +7304,73 @@ async fn ui_dag_run_graph_classic_dag_degraded() {
     );
 }
 
+// Issue #2388 AC2: the DAG page shows the code value and the override side by side.
+#[tokio::test]
+async fn ui_dag_detail_shows_declared_and_override_values() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+    let catalog = compile_dag_catalog(dags![dag957_linear]).expect("dag catalog compiles");
+    let dag = catalog.get("dag957_linear").expect("dag registered");
+    let patch = autumn_harvest::schedule_override::ScheduleOverridePatch {
+        max_active_runs: Some(Some(7)),
+        ..Default::default()
+    };
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    autumn_harvest::schedule_override::update_dag_override(
+        &mut conn,
+        dag,
+        &patch,
+        "oncall@example.com",
+        Some("backfill week"),
+    )
+    .await
+    .expect("store the override");
+
+    let (status, html) = fetch_html(&app, "/dags/dag957_linear").await;
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+    let row = html
+        .split("<tr")
+        .find(|row| row.contains("<code>max_active_runs</code>"))
+        .expect("a max_active_runs row");
+    assert!(row.contains("override-marker"), "row is marked: {row}");
+    assert!(
+        row.contains("<code>1</code>") && row.contains("<code>7</code>"),
+        "row shows the code value and the override: {row}"
+    );
+    assert!(
+        html.contains("oncall@example.com"),
+        "names the actor: {html}"
+    );
+    assert!(html.contains("backfill week"), "names the reason: {html}");
+    let catchup = html
+        .split("<tr")
+        .find(|row| row.contains("<code>catchup</code>"))
+        .expect("a catchup row");
+    assert!(
+        !catchup.contains("override-marker"),
+        "a field without an override is not marked: {catchup}"
+    );
+}
+
+// Issue #2388 AC4: a DAG with no override shows no override marker.
+#[tokio::test]
+async fn ui_dag_detail_without_an_override_shows_no_marker() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    let (status, html) = fetch_html(&app, "/dags/dag957_fanout").await;
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+    assert!(
+        html.contains("Declared in code"),
+        "the schedule table renders: {html}"
+    );
+    assert!(!html.contains("override-marker"), "no marker: {html}");
+    assert!(
+        !html.contains("Operator override by"),
+        "no override note: {html}"
+    );
+}
+
 // I-G
 #[tokio::test]
 async fn ui_dag_retry_requires_admin() {

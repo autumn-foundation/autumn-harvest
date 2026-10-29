@@ -1233,6 +1233,167 @@ fn dag_commands_match_dag_management_routes() {
     assert_eq!(unpause_request.body, Some(json!({ "paused": false })));
 }
 
+/// Issue #2388: `dags set-schedule` sends one PATCH with each given field.
+#[test]
+fn dag_set_schedule_maps_to_one_patch() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "dags",
+        "set-schedule",
+        "nightly_etl",
+        "--cron",
+        "0 3 * * *",
+        "--timezone",
+        "Europe/Berlin",
+        "--catchup",
+        "true",
+        "--max-active-runs",
+        "2",
+        "--reason",
+        "incident 42",
+    ])
+    .expect("dag set-schedule args should parse");
+    let request = cli
+        .api_request()
+        .expect("set-schedule request should build");
+
+    assert_eq!(request.method, ApiMethod::Patch);
+    assert_eq!(request.path, "/dags/nightly_etl");
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "schedule_expr": "cron:0 3 * * *",
+            "timezone": "Europe/Berlin",
+            "catchup": true,
+            "max_active_runs": 2,
+            "reason": "incident 42",
+        }))
+    );
+
+    let interval = Cli::try_parse_from([
+        "harvest",
+        "dag",
+        "set-schedule",
+        "nightly_etl",
+        "--interval",
+        "600",
+        "--overlap-policy",
+        "buffer_all",
+        "--buffer-all-max",
+        "3",
+        "--jitter-secs",
+        "0",
+    ])
+    .expect("interval args should parse")
+    .api_request()
+    .expect("interval request should build");
+    assert_eq!(
+        interval.body,
+        Some(json!({
+            "schedule_expr": "interval:600",
+            "overlap_policy": "buffer_all",
+            "buffer_all_max": 3,
+            "jitter_secs": 0,
+        }))
+    );
+
+    let manual = Cli::try_parse_from(["harvest", "dag", "set-schedule", "nightly_etl", "--manual"])
+        .expect("manual args should parse")
+        .api_request()
+        .expect("manual request should build");
+    assert_eq!(manual.body, Some(json!({ "schedule_expr": "manual" })));
+}
+
+/// A `set-schedule` with no field, or with two cadences, is refused locally.
+#[test]
+fn dag_set_schedule_refuses_an_empty_or_ambiguous_change() {
+    let empty = Cli::try_parse_from([
+        "harvest",
+        "dag",
+        "set-schedule",
+        "nightly_etl",
+        "--reason",
+        "x",
+    ])
+    .expect("args parse");
+    assert!(
+        empty.api_request().is_err(),
+        "a reason alone changes nothing"
+    );
+
+    assert!(
+        Cli::try_parse_from([
+            "harvest",
+            "dag",
+            "set-schedule",
+            "nightly_etl",
+            "--cron",
+            "0 3 * * *",
+            "--interval",
+            "60",
+        ])
+        .is_err(),
+        "two cadences conflict"
+    );
+    assert!(
+        Cli::try_parse_from([
+            "harvest",
+            "dag",
+            "set-schedule",
+            "nightly_etl",
+            "--interval",
+            "60",
+            "--timezone",
+            "UTC",
+        ])
+        .expect("args parse")
+        .api_request()
+        .is_err(),
+        "a timezone needs a cron expression"
+    );
+}
+
+/// Issue #2388: `dags clear-override` sends `clear_override` only.
+#[test]
+fn dag_clear_override_maps_to_one_patch() {
+    let cli = Cli::try_parse_from(["harvest", "dags", "clear-override", "nightly_etl"])
+        .expect("clear-override args should parse");
+    let request = cli
+        .api_request()
+        .expect("clear-override request should build");
+    assert_eq!(request.method, ApiMethod::Patch);
+    assert_eq!(request.path, "/dags/nightly_etl");
+    assert_eq!(request.body, Some(json!({ "clear_override": true })));
+
+    let with_reason = Cli::try_parse_from([
+        "harvest",
+        "dag",
+        "clear-override",
+        "nightly_etl",
+        "--reason",
+        "incident over",
+    ])
+    .expect("args parse")
+    .api_request()
+    .expect("request builds");
+    assert_eq!(
+        with_reason.body,
+        Some(json!({ "clear_override": true, "reason": "incident over" }))
+    );
+}
+
+/// Issue #2388: `overrides list` reads the override list.
+#[test]
+fn overrides_list_maps_to_the_admin_route() {
+    let request = Cli::try_parse_from(["harvest", "overrides", "list"])
+        .expect("overrides list args should parse")
+        .api_request()
+        .expect("overrides list request should build");
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/overrides");
+    assert_eq!(request.body, None);
+}
+
 #[test]
 fn dag_retry_maps_to_retry_route() {
     let cli = Cli::try_parse_from([

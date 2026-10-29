@@ -580,26 +580,37 @@ pub(crate) async fn dispatch_workflow_start_request(
         .map_err(database_error)?;
 
     let registry_ext = state.extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>();
-    let (owner, runbook_url, severity, info_sla, info_retry_policy) = registry_ext
-        .as_ref()
-        .and_then(|registry| {
-            registry.workflows.get(&request.workflow_name).map(|wf| {
-                (
-                    wf.owner,
-                    wf.runbook_url,
-                    wf.severity,
-                    wf.sla,
-                    wf.retry_policy.clone(),
-                )
+    let (owner, runbook_url, severity, (info_execution_timeout, info_sla), info_retry_policy) =
+        registry_ext
+            .as_ref()
+            .and_then(|registry| {
+                registry.workflows.get(&request.workflow_name).map(|wf| {
+                    (
+                        wf.owner,
+                        wf.runbook_url,
+                        wf.severity,
+                        // Issue #2387: an operator override wins, for both durations.
+                        registry.apply_run_defaults(wf.name, wf.execution_timeout, wf.sla),
+                        wf.retry_policy.clone(),
+                    )
+                })
             })
-        })
-        .unwrap_or((None, None, None, None, None));
+            .unwrap_or((None, None, None, (None, None), None));
     // Honour the operator's server-side retry-attempt ceiling for outbox-started
     // workflows, consistent with the API/scheduler/typed start paths (issue #523).
     let max_workflow_attempts_ceiling = registry_ext
         .as_ref()
         .and_then(|registry| registry.max_workflow_attempts_ceiling);
     let sla = info_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+    // The start clamps the timeout to the fleet ceiling, and the SLA to the
+    // timeout, as on the API start path.
+    let to_chrono =
+        |d: std::time::Duration| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX);
+    let execution_timeout = info_execution_timeout.map(to_chrono);
+    let max_execution_timeout_ceiling = registry_ext
+        .as_ref()
+        .and_then(|registry| registry.max_workflow_execution_timeout)
+        .map(to_chrono);
 
     // Issue #1243: `WorkflowStarted.input` is payload-bearing. Fall back to
     // the identity registry only when no `HandlerRegistry` extension is
@@ -619,6 +630,8 @@ pub(crate) async fn dispatch_workflow_start_request(
             runbook_url,
             severity,
             sla,
+            execution_timeout,
+            max_execution_timeout_ceiling,
             workflow_retry_policy: info_retry_policy,
             max_workflow_attempts_ceiling,
             // Started by the cross-shard outbox dispatcher (issue #740).

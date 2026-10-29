@@ -606,6 +606,43 @@ fn dag_retry_is_covered() {
     ]);
 }
 
+const DAG_SET_SCHEDULE: &[&str] = &[
+    "dags",
+    "set-schedule",
+    "my_dag",
+    "--cron",
+    "0 3 * * *",
+    "--timezone",
+    "Europe/Berlin",
+    "--catchup",
+    "false",
+    "--max-active-runs",
+    "2",
+    "--jitter-secs",
+    "30",
+    "--overlap-policy",
+    "buffer_all",
+    "--buffer-all-max",
+    "5",
+    "--reason",
+    "incident",
+];
+
+#[test]
+fn dag_set_schedule_is_covered() {
+    assert_covered(DAG_SET_SCHEDULE);
+}
+
+#[test]
+fn dag_clear_override_is_covered() {
+    assert_covered(&["dags", "clear-override", "my_dag", "--reason", "done"]);
+}
+
+#[test]
+fn overrides_list_is_covered() {
+    assert_covered(&["overrides", "list"]);
+}
+
 // ── schedules ─────────────────────────────────────────────────────────────────
 
 #[test]
@@ -914,6 +951,16 @@ fn dag_pause_body_fields_are_documented() {
 #[test]
 fn dag_unpause_body_fields_are_documented() {
     assert_body_fields_documented(&["dag", "unpause", "my_dag"]);
+}
+
+#[test]
+fn dag_set_schedule_body_fields_are_documented() {
+    assert_body_fields_documented(DAG_SET_SCHEDULE);
+}
+
+#[test]
+fn dag_clear_override_body_fields_are_documented() {
+    assert_body_fields_documented(&["dags", "clear-override", "my_dag", "--reason", "done"]);
 }
 
 #[test]
