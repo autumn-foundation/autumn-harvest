@@ -250,3 +250,28 @@ fn deleting_a_schedule_drops_its_override() {
         }
     );
 }
+
+/// The returned effective schedule carries the stored pause, not the code one.
+#[test]
+fn an_override_returns_the_stored_pause() {
+    let mut rt = SqliteRuntime::open_in_memory().expect("open");
+    rt.register_workflow(&override_parity_flow_info());
+    rt.upsert_schedule(&code(3600, 1)).expect("upsert");
+    rt.pause_schedule(SCHEDULED_WORKFLOW).expect("pause");
+
+    let fields = WorkflowSchedulePatch {
+        max_active_runs: Some(2),
+        ..WorkflowSchedulePatch::default()
+    };
+    let effective = rt
+        .set_schedule_override(SCHEDULED_WORKFLOW, &fields, "ops", None)
+        .expect("set");
+    assert!(effective.paused, "the override keeps the operator pause");
+    let summary = rt
+        .list_schedules()
+        .expect("list")
+        .into_iter()
+        .find(|s| s.workflow_name == SCHEDULED_WORKFLOW)
+        .expect("stored");
+    assert!(summary.paused, "the stored pause is unchanged");
+}

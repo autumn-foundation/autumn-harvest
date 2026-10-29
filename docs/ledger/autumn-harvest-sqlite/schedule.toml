@@ -66,8 +66,8 @@ measured = "unmeasured"
 ["set_override"]
 driver = "per_request"
 backend = ["sqlite"]
-kind = ["write"]
-tables = ["harvest_schedule_overrides"]
+kind = ["read", "write"]
+tables = ["harvest_schedule_overrides", "harvest_schedules"]
 measured = "unmeasured"
 
 ["set_paused"]

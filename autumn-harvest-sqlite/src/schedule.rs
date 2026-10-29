@@ -270,6 +270,13 @@ pub fn set_override(
         )?;
     }
     write_row(&tx, &effective, &code, now)?;
+    // `write_row` keeps the stored pause. Return that pause, not the code one.
+    let mut effective = effective;
+    effective.paused = tx.query_row(
+        "SELECT paused FROM harvest_schedules WHERE workflow_name = ?1",
+        [workflow_name],
+        |row| row.get(0),
+    )?;
     tx.commit()?;
     Ok(effective)
 }
