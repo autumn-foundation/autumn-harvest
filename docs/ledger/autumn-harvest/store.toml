@@ -21,6 +21,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_events", "harvest_payload_refs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["append_single_event_with_codecs"]
 driver = "per_task"
@@ -75,6 +76,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["count_workflow_logs"]
 driver = "per_request"
@@ -82,6 +84,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_logs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["delete_llm_ledger"]
 driver = "per_tick"
@@ -210,6 +213,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_parents_with_summary_children"]
 driver = "per_request"
@@ -248,6 +252,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_stream_chunks"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_timestamped_history"]
 driver = "per_request"
@@ -269,6 +274,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "docs/performance-workflow-children-traversal.md"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["load_workflow_children_multi"]
 driver = "per_request"
@@ -283,6 +289,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_logs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["lock_and_load_history_undecoded"]
 driver = "per_task"
@@ -321,6 +328,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/store.md"
 
 ["update_current_details"]
 driver = "per_task"

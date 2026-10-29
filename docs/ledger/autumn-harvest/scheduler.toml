@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["claim_and_drain_buffered_schedule"]
 driver = "per_tick"
@@ -202,6 +203,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["try_take_registration_lock"]
 driver = "setup"
@@ -223,6 +225,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["upsert_schedule"]
 driver = "per_request"
@@ -230,6 +233,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/scheduler.md"
 
 ["wait_for_registration_lock"]
 driver = "per_request"

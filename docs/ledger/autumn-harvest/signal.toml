@@ -38,6 +38,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_signals", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/signal.md"
 
 ["signal_idempotency_key_exists"]
 driver = "per_request"

@@ -26,6 +26,22 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT COUNT(*) AS count FROM harvest_queue_pauses WHERE queue_name = $1` | `harvest_queue_pauses`: Index Only Scan on `harvest_queue_pauses_pkey` |
 
+## `list_paused_queues`
+
+Statements: 1. Tables with no usable index: `harvest_queue_pauses`.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT p.queue_name, p.reason, p.paused_by, p.paused_at, p.scope_shard_id, (SELECT COUNT(*) FROM ...` | `harvest_queue_pauses`: no usable index<br>`harvest_task_queue`: Index Only Scan on `idx_harvest_tq_claim_seek` |
+
+## `lock_queue_for_pause`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT pg_advisory_xact_lock($1, $2)` | no table |
+
 ## `lock_queue_for_timeout_recheck`
 
 Statements: 1. Tables with no usable index: none.
@@ -34,6 +50,24 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT pg_advisory_xact_lock_shared($1, $2)` | no table |
 
+## `notify_resumed_queue`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT id FROM harvest_task_queue WHERE queue_name = $1 AND state = 'PENDING' AND scheduled_at <=...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_claim_seek` |
+
+## `pause_queue`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO harvest_queue_pauses (queue_name, reason, paused_by, scope_shard_id, paused_at) VALUE...` | `harvest_queue_pauses`: ModifyTable |
+| 2 | `SELECT COUNT(*) AS count FROM harvest_task_queue WHERE queue_name = $1 AND state = 'PENDING'` | `harvest_task_queue`: Index Only Scan on `idx_harvest_tq_claim_seek` |
+| 3 | `SELECT clock_timestamp() AS now` | no table |
+
 ## `paused_queue_names`
 
 Statements: 1. Tables with no usable index: none.
@@ -41,6 +75,16 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT queue_name FROM harvest_queue_pauses ORDER BY queue_name ASC` | `harvest_queue_pauses`: full scan of index `harvest_queue_pauses_pkey` |
+
+## `resume_queue`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM harvest_queue_pauses WHERE queue_name = $1 RETURNING reason, paused_by, paused_at` | `harvest_queue_pauses`: Index Scan on `harvest_queue_pauses_pkey`<br>`harvest_queue_pauses`: ModifyTable |
+| 2 | `UPDATE harvest_task_queue SET scheduled_at = CASE WHEN created_at IS NULL OR created_at < $2 THEN...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_claim_seek`<br>`harvest_task_queue`: ModifyTable |
+| 3 | `UPDATE harvest_task_queue SET scheduled_at = scheduled_at + (clock_timestamp() - GREATEST(schedul...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_claim_seek`<br>`harvest_task_queue`: ModifyTable |
 
 ## `try_lock_queue_for_claim`
 

@@ -39,6 +39,22 @@ Statements: 5. Tables with no usable index: none.
 | 4 | `UPDATE "harvest_audit_export_cursor" SET "last_assigned_seq" = $1, "updated_at" = $2 WHERE ("harv...` | `harvest_audit_export_cursor`: Index Scan on `harvest_audit_export_cursor_pkey`<br>`harvest_audit_export_cursor`: ModifyTable |
 | 5 | `WITH claimed AS ( SELECT id, row_number() OVER (ORDER BY occurred_at, id) AS rn FROM harvest_audi...` | `harvest_audit_log`: Index Scan on `harvest_audit_log_pkey`<br>`harvest_audit_log`: ModifyTable<br>`harvest_audit_log`: full scan of index `harvest_audit_occurred_at_idx` |
 
+## `count_redrive_recoverable`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT COUNT(*) FROM "harvest_audit_log" WHERE (("harvest_audit_log"."export_seq" > $1) AND ("har...` | `harvest_audit_log`: Index Only Scan on `harvest_audit_log_export_seq_idx` |
+
+## `decommission_cursor_locked`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE "harvest_audit_export_cursor" SET "retired_at" = $1, "updated_at" = $2, "claim_epoch" = $3...` | `harvest_audit_export_cursor`: Index Scan on `harvest_audit_export_cursor_pkey`<br>`harvest_audit_export_cursor`: ModifyTable |
+
 ## `emit_lag_and_observed`
 
 Statements: 1. Tables with no usable index: none.
@@ -72,6 +88,14 @@ Statements: 1. Tables with no usable index: `harvest_audit_log`.
 |---|---|---|
 | 1 | `SELECT COUNT(*)::BIGINT AS pending, MIN(occurred_at) AS oldest FROM harvest_audit_log WHERE expor...` | `harvest_audit_log`: no usable index |
 
+## `reactivate_cursor_locked`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE "harvest_audit_export_cursor" SET "retired_at" = $1, "updated_at" = $2, "claim_epoch" = $3...` | `harvest_audit_export_cursor`: Index Scan on `harvest_audit_export_cursor_pkey`<br>`harvest_audit_export_cursor`: ModifyTable |
+
 ## `redrive_window_truncated`
 
 Statements: 1. Tables with no usable index: `harvest_audit_purge_watermark`.
@@ -79,4 +103,13 @@ Statements: 1. Tables with no usable index: `harvest_audit_purge_watermark`.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT COUNT(*) FROM "harvest_audit_purge_watermark" WHERE ("harvest_audit_purge_watermark"."max_...` | `harvest_audit_purge_watermark`: no usable index |
+
+## `rewind_cursor_locked`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT min("harvest_audit_log"."export_seq") FROM "harvest_audit_log" WHERE (("harvest_audit_log"...` | `harvest_audit_log`: Index Only Scan on `harvest_audit_log_export_seq_idx` |
+| 2 | `UPDATE "harvest_audit_export_cursor" SET "last_acked_seq" = $1, "claim_epoch" = $2, "lease_until"...` | `harvest_audit_export_cursor`: Index Scan on `harvest_audit_export_cursor_pkey`<br>`harvest_audit_export_cursor`: ModifyTable |
 

@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_admission_gates"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/admission_gate.md"
 
 ["db::lift_gate"]
 driver = "per_request"
@@ -27,3 +28,4 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_admission_gates"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/admission_gate.md"

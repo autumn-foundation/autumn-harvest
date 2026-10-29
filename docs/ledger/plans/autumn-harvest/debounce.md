@@ -18,6 +18,14 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `admit_debounced_start_with_codecs`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO harvest_debounce (id, workflow_name, debounce_key, workflow_id, queue_name, last_inpu...` | `harvest_debounce`: ModifyTable |
+
 ## `delete_debounce_row`
 
 Statements: 1. Tables with no usable index: none.
@@ -34,6 +42,14 @@ Statements: 2. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT id, workflow_name, debounce_key, workflow_id, queue_name, last_input, start_options, shard...` | `harvest_debounce`: Index Scan on `idx_harvest_debounce_fire_at` |
 | 2 | `SELECT to_regclass('harvest_debounce') IS NOT NULL AS present` | no table |
+
+## `list_pending_debounce`
+
+Statements: 1. Tables with no usable index: `harvest_debounce`.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT id, workflow_name, debounce_key, workflow_id, queue_name, effective_fire_at, max_fire_at, ...` | `harvest_debounce`: no usable index |
 
 ## `redefer_debounce_row`
 

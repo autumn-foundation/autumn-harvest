@@ -26,6 +26,14 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT e.id, e.workflow_name, e.queue_name FROM harvest_workflow_executions e WHERE e.workflow_na...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_workflow`<br>`harvest_workflow_executions`: Index Scan on `idx_harvest_we_non_terminal_wf_name` |
 
+## `dry_run_supersede_credit`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT e.id, e.quota_key FROM harvest_workflow_executions e WHERE e.workflow_name = $1 AND e.stat...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_workflow`<br>`harvest_workflow_executions`: Index Scan on `idx_harvest_we_non_terminal_wf_name` |
+
 ## `try_claim_candidate_row`
 
 Statements: 1. Tables with no usable index: none.

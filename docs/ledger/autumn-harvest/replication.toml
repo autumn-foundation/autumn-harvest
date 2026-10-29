@@ -136,6 +136,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
 
 ["db::record_replication_heartbeat"]
 driver = "per_tick"

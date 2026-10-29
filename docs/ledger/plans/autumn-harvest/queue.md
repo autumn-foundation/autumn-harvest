@@ -144,6 +144,14 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = ...` | `harvest_task_queue`: ModifyTable<br>`harvest_task_queue`: full scan of partial index `idx_harvest_tq_running_started` |
 
+## `concurrency_key_stats`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT concurrency_key AS key, task_type, MAX(concurrency_cap)::INT4 AS max_concurrent, COUNT(*) ...` | `harvest_task_queue`: Bitmap Heap Scan on `idx_harvest_tq_live_created` |
+
 ## `concurrency_probe_passes`
 
 Statements: 1. Tables with no usable index: none.
@@ -233,6 +241,15 @@ Statements: 2. Tables with no usable index: none.
 |---|---|---|
 | 1 | `WITH fence AS MATERIALIZED ( SELECT 1 AS ok FROM harvest_shard_generation g LEFT JOIN unnest($13:...` | `harvest_activity_pauses`: Bitmap Heap Scan on `harvest_activity_pauses_pkey`<br>`harvest_build_compat`: Bitmap Heap Scan on `harvest_build_compat_build_id_compatible_with_key`<br>`harvest_queue_pauses`: Bitmap Heap Scan on `harvest_queue_pauses_pkey`<br>`harvest_rate_limit_buckets`: Index Scan on `harvest_rate_limit_buckets_pkey`<br>`harvest_shard_generation`: full scan of index `harvest_shard_generation_pkey`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_claim_seek`<br>`harvest_workers`: Index Scan on `harvest_workers_pkey`<br>`harvest_workflow_executions`: full scan of partial index `idx_harvest_we_canary_order`<br>`harvest_workflow_executions`: full scan of partial index `idx_harvest_we_paused` |
 | 2 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), ...` | `harvest_activity_pauses`: Bitmap Heap Scan on `harvest_activity_pauses_pkey`<br>`harvest_build_compat`: Bitmap Heap Scan on `harvest_build_compat_build_id_compatible_with_key`<br>`harvest_queue_pauses`: Bitmap Heap Scan on `harvest_queue_pauses_pkey`<br>`harvest_rate_limit_buckets`: Index Scan on `harvest_rate_limit_buckets_pkey`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_claim_seek`<br>`harvest_workers`: Index Scan on `harvest_workers_pkey`<br>`harvest_workflow_executions`: full scan of partial index `idx_harvest_we_canary_order`<br>`harvest_workflow_executions`: full scan of partial index `idx_harvest_we_paused` |
+
+## `force_retry_activity_now`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_task_queue"."id", "harvest_task_queue"."queue_name", "harvest_task_queue"."task_t...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_workflow` |
+| 2 | `UPDATE "harvest_task_queue" SET "scheduled_at" = clock_timestamp() WHERE ((("harvest_task_queue"....` | `harvest_task_queue`: ModifyTable<br>`harvest_task_queue`: full scan of partial index `idx_harvest_tq_claim_seek` |
 
 ## `insert_task_rows`
 

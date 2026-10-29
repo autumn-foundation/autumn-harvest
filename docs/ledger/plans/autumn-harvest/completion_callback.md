@@ -67,6 +67,24 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `INSERT INTO "harvest_completion_deliveries" ("id", "workflow_exec_id", "shard_id", "callback_inde...` | `harvest_completion_deliveries`: ModifyTable |
 
+## `list_deliveries_for_execution`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_completion_deliveries"."id", "harvest_completion_deliveries"."workflow_exec_id", ...` | `harvest_completion_deliveries`: Index Scan on `harvest_completion_deliveries_unique_target` |
+
+## `redrive_delivery_at`
+
+Statements: 3. Tables with no usable index: `harvest_dead_letters`.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM "harvest_dead_letters" WHERE (("harvest_dead_letters"."original_task_id" = $1) AND ("...` | `harvest_dead_letters`: ModifyTable<br>`harvest_dead_letters`: no usable index |
+| 2 | `SELECT "harvest_completion_deliveries"."state", "harvest_completion_deliveries"."max_attempts" FR...` | `harvest_completion_deliveries`: Index Scan on `idx_harvest_completion_deliveries_exec` |
+| 3 | `UPDATE "harvest_completion_deliveries" SET "state" = $1, "max_attempts" = $2, "next_attempt_at" =...` | `harvest_completion_deliveries`: Index Scan on `idx_harvest_completion_deliveries_exec`<br>`harvest_completion_deliveries`: ModifyTable |
+
 ## `reread_claimed_payloads`
 
 Statements: 1. Tables with no usable index: none.

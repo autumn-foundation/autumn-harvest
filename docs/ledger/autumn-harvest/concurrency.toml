@@ -14,6 +14,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/concurrency.md"
 
 ["lock_concurrency_key"]
 driver = "per_task"

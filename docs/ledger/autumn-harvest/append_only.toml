@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/append_only.md"
 
 ["with_guard_off"]
 driver = "test_support"

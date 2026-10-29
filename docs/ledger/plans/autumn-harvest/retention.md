@@ -40,6 +40,30 @@ Statements: 15. Tables with no usable index: none.
 | 14 | `SELECT "harvest_workflow_executions"."legal_hold_set_at", "harvest_workflow_executions"."legal_ho...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
 | 15 | `UPDATE "harvest_workflow_executions" SET "parent_id" = $1 WHERE (("harvest_workflow_executions"."...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_parent_id`<br>`harvest_workflow_executions`: ModifyTable |
 
+## `legal_hold_db::load_hold_for_update`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workflow_executions"."legal_hold_set_at", "harvest_workflow_executions"."legal_ho...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+
+## `legal_hold_db::release_legal_hold`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE "harvest_workflow_executions" SET "legal_hold_set_at" = $1, "legal_hold_until" = $2, "lega...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
+
+## `legal_hold_db::set_legal_hold`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE "harvest_workflow_executions" SET "legal_hold_set_at" = $1, "legal_hold_until" = $2, "lega...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
+
 ## `purge_expired_summaries`
 
 Statements: 2. Tables with no usable index: none.

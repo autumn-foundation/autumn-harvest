@@ -50,3 +50,12 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `UPDATE "harvest_signals" SET "consumed" = $1 WHERE ("harvest_signals"."id" = ANY($2))` | `harvest_signals`: Bitmap Heap Scan on `harvest_signals_pkey`<br>`harvest_signals`: ModifyTable |
 
+## `send_signal_idempotent_with_codecs`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO "harvest_signals" ("workflow_exec_id", "signal_name", "payload", "idempotency_key") V...` | `harvest_signals`: ModifyTable |
+| 2 | `INSERT INTO "harvest_signals" ("workflow_exec_id", "signal_name", "payload", "idempotency_key") V...` | `harvest_signals`: ModifyTable |
+

@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "docs/performance-quota-history-bytes.md"
+plan = "docs/ledger/plans/autumn-harvest/fork.md"
 
 ["copy_prefix"]
 driver = "per_request"
@@ -13,6 +14,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/fork.md"
 
 ["erased_fork_ancestor"]
 driver = "per_request"
@@ -20,6 +22,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/fork.md"
 
 ["is_pinned_by_recorded_fork"]
 driver = "per_request"
@@ -27,6 +30,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_dead_letters", "harvest_events", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/fork.md"
 
 ["is_recorded_fork"]
 driver = "per_request"
@@ -34,6 +38,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/fork.md"
 
 ["load_fork_source"]
 driver = "per_request"
@@ -41,6 +46,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/fork.md"
 
 ["record_source_is_readable"]
 driver = "per_request"
@@ -48,6 +54,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/fork.md"
 
 ["serve_recorded_activities"]
 driver = "per_task"
@@ -63,3 +70,4 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/fork.md"

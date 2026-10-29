@@ -108,6 +108,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_codec_key_state"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/codec_rotation.md"
 
 ["db::write_key_state_retired"]
 driver = "per_request"

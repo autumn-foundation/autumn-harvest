@@ -18,6 +18,22 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `db_impl::load_claimed_execution`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT we.id, we.workflow_id, we.state FROM harvest_start_idempotency si JOIN harvest_workflow_ex...` | `harvest_start_idempotency`: Index Scan on `harvest_start_idempotency_pkey`<br>`harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+
+## `db_impl::lookup_live_start_idempotency_claim`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT we.id FROM harvest_start_idempotency si JOIN harvest_workflow_executions we ON we.id = si....` | `harvest_start_idempotency`: Index Scan on `harvest_start_idempotency_pkey`<br>`harvest_workflow_executions`: Index Only Scan on `harvest_workflow_executions_pkey` |
+
 ## `db_impl::purge_expired_start_idempotency`
 
 Statements: 1. Tables with no usable index: none.
@@ -25,6 +41,30 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT ctid FROM harvest_start_idempotency ...` | `harvest_start_idempotency`: Index Scan on `idx_harvest_start_idempotency_sweep`<br>`harvest_start_idempotency`: ModifyTable<br>`harvest_start_idempotency`: Tid Scan |
+
+## `db_impl::repoint_start_idempotency_claim`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE harvest_start_idempotency SET workflow_exec_id = $3 WHERE workflow_name = $1 AND idempoten...` | `harvest_start_idempotency`: Index Scan on `harvest_start_idempotency_pkey`<br>`harvest_start_idempotency`: ModifyTable |
+
+## `db_impl::reserve_start_idempotency`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM harvest_start_idempotency WHERE workflow_name = $1 AND idempotency_key = $2 AND NOT E...` | `harvest_start_idempotency`: Index Scan on `harvest_start_idempotency_pkey`<br>`harvest_start_idempotency`: ModifyTable<br>`harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+
+## `db_impl::run_reserve_upsert`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO harvest_start_idempotency AS s (workflow_name, idempotency_key, workflow_exec_id, cre...` | `harvest_start_idempotency`: ModifyTable |
 
 ## `db_impl::sweep_expired_start_idempotency_on_conn_shard::purge_on_conn`
 

@@ -423,7 +423,7 @@ Enable the `debugger` feature (it implies `testing`):
 
 ```toml
 [dev-dependencies]
-autumn-harvest = { version = "0.7", default-features = false, features = ["debugger"] }
+autumn-harvest = { version = "0.8", default-features = false, features = ["debugger"] }
 ```
 
 | Item | Purpose |

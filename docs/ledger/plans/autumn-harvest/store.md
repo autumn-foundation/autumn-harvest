@@ -26,6 +26,23 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT COUNT(*) FROM "harvest_stream_chunks" WHERE ("harvest_stream_chunks"."workflow_exec_id" = $1)` | `harvest_stream_chunks`: Bitmap Heap Scan on `harvest_stream_chunks_exec_offset` |
 
+## `append_new_execution_started_events_batch`
+
+Statements: 10. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 2 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 3 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 4 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 5 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 6 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 7 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 8 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 9 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 10 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+
 ## `append_single_event_with_codecs`
 
 Statements: 1. Tables with no usable index: none.
@@ -84,6 +101,22 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_payload_refs"."blob_key" FROM "harvest_payload_refs" WHERE ("harvest_payload_refs...` | `harvest_payload_refs`: Index Only Scan on `idx_harvest_payload_refs_key` |
+
+## `count_history_events`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT COUNT(*) FROM "harvest_events" WHERE ("harvest_events"."workflow_exec_id" = $1) LIMIT $2` | `harvest_events`: Bitmap Heap Scan on `idx_harvest_events_history_page` |
+
+## `count_workflow_logs`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT COUNT(*) FROM "harvest_workflow_logs" WHERE (("harvest_workflow_logs"."workflow_exec_id" =...` | `harvest_workflow_logs`: Bitmap Heap Scan on `harvest_workflow_logs_exec_seq` |
 
 ## `delete_llm_ledger`
 
@@ -184,6 +217,14 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "...` | `harvest_events`: Bitmap Heap Scan on `idx_harvest_events_history_page` |
 
+## `load_parents_with_children`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT DISTINCT "harvest_workflow_executions"."parent_id" FROM "harvest_workflow_executions" WHER...` | `harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_parent_id` |
+
 ## `load_payload_refs`
 
 Statements: 1. Tables with no usable index: none.
@@ -207,6 +248,33 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "...` | `harvest_events`: Index Scan on `idx_harvest_events_exec` |
+
+## `load_stream_chunks`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_stream_chunks"."id", "harvest_stream_chunks"."workflow_exec_id", "harvest_stream_...` | `harvest_stream_chunks`: Index Scan on `harvest_stream_chunks_exec_offset` |
+| 2 | `SELECT "harvest_stream_chunks"."id", "harvest_stream_chunks"."workflow_exec_id", "harvest_stream_...` | `harvest_stream_chunks`: Index Scan on `harvest_stream_chunks_exec_offset` |
+
+## `load_workflow_children_batch`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."parent_id", "harvest_wo...` | `harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_parent_id` |
+
+## `load_workflow_logs`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workflow_logs"."id", "harvest_workflow_logs"."workflow_exec_id", "harvest_workflo...` | `harvest_workflow_logs`: Index Scan on `harvest_workflow_logs_exec_seq` |
+| 2 | `SELECT "harvest_workflow_logs"."id", "harvest_workflow_logs"."workflow_exec_id", "harvest_workflo...` | `harvest_workflow_logs`: Bitmap Heap Scan on `harvest_workflow_logs_exec_seq` |
+| 3 | `SELECT "harvest_workflow_logs"."id", "harvest_workflow_logs"."workflow_exec_id", "harvest_workflo...` | `harvest_workflow_logs`: Index Scan on `harvest_workflow_logs_exec_seq` |
 
 ## `lock_and_load_history_undecoded`
 
@@ -232,6 +300,14 @@ Statements: 2. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT "harvest_workflow_executions"."id" FROM "harvest_workflow_executions" WHERE ("harvest_work...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
 | 2 | `SELECT max("harvest_events"."event_id") FROM "harvest_events" WHERE ("harvest_events"."workflow_e...` | `harvest_events`: Index Only Scan on `idx_harvest_events_exec` |
+
+## `sum_history_bytes_between`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT COALESCE(SUM(pg_column_size(event_data)), 0)::bigint FROM "harvest_events" WHERE ((("harve...` | `harvest_events`: Index Scan on `idx_harvest_events_exec` |
 
 ## `update_current_details`
 

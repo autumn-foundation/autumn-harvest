@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_start_idempotency", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/start_idempotency.md"
 
 ["db_impl::lookup_live_start_idempotency_claim"]
 driver = "per_request"
@@ -13,6 +14,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_start_idempotency", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/start_idempotency.md"
 
 ["db_impl::purge_expired_start_idempotency"]
 driver = "per_tick"
@@ -28,6 +30,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_start_idempotency"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/start_idempotency.md"
 
 ["db_impl::reserve_start_idempotency"]
 driver = "per_request"
@@ -35,6 +38,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_start_idempotency", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/start_idempotency.md"
 
 ["db_impl::run_reserve_upsert"]
 driver = "per_request"
@@ -42,6 +46,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_start_idempotency"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/start_idempotency.md"
 
 ["db_impl::sweep_expired_start_idempotency_on_conn_shard::purge_on_conn"]
 driver = "per_tick"
