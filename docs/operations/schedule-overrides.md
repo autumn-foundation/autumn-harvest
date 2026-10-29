@@ -84,6 +84,14 @@ change the override, and clearing the override does not resume the DAG.
 - **Fail-closed.** A scheduler pass that cannot read the override table skips
   its shard and logs a warning. It never falls back to code values, because
   each fallback would move `next_run_at` twice.
+- **Shard routing changes (issue #2389).** A DAG override lives on the shard
+  that owns the DAG. When a routing change moves the DAG, the old shard's pass
+  copies the override to the new owner, then deletes its own row. The copy
+  commits first, so a failure leaves the override on at least one shard, and
+  the next tick retries. An override that the new owner already holds wins.
+  If the new owner comes later in shard order, it applies the override in the
+  same tick. Otherwise it runs one tick on the code value first. Two shards on
+  one pool share one table, so nothing moves between them.
 
 ## Code-declared workflow schedules
 
@@ -137,6 +145,6 @@ Rules that differ from a row edit:
 ## Limits of this slice
 
 - SLAs and execution timeouts are #2387.
-- An override row lives on the shard of its schedule row. A shard routing
-  change does not move it yet (#2389).
+- A workflow override lives on the default shard. A change of the default
+  shard does not move it. A DAG override does move (#2389).
 - The SQLite backend has no override table yet (#2390).

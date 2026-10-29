@@ -1538,7 +1538,7 @@ pub async fn tick_once_sharded_with_backoff(
             // A lost guard then ends its backend.
             #[cfg(feature = "db")]
             let _member = crate::replication::join_fenced_pass(shard_pool, &mut conn).await;
-            let Some(dags) = register_shard_pass(
+            let pass = register_shard_pass(
                 &mut conn,
                 shard,
                 dags.as_ref(),
@@ -1547,35 +1547,110 @@ pub async fn tick_once_sharded_with_backoff(
                 backoff,
                 registry.as_ref(),
             )
-            .await?
-            else {
-                return Ok(());
-            };
-
-            fire_shard_schedules(
-                &mut conn,
-                shard,
-                dags.as_ref(),
-                registry.as_ref(),
-                &metrics,
-                &active_gates,
-            )
-            .await;
-            Ok::<(), HarvestError>(())
+            .await?;
+            if let Some(dags) = pass.dags {
+                fire_shard_schedules(
+                    &mut conn,
+                    shard,
+                    dags.as_ref(),
+                    registry.as_ref(),
+                    &metrics,
+                    &active_gates,
+                )
+                .await;
+            }
+            Ok::<Vec<String>, HarvestError>(pass.misplaced)
         };
         // Boxed: the pass is large, and inline it would bloat this future.
-        if let Some(result) = under_pass_fence(&fence, Box::pin(pass)).await {
-            result?;
+        let misplaced = match under_pass_fence(&fence, Box::pin(pass)).await {
+            Some(result) => result?,
+            None => Vec::new(),
+        };
+        // The move checks out a connection to another shard. The barrier
+        // drops first, so a wait on that pool cannot hold off a bump.
+        #[cfg(feature = "db")]
+        drop(fence);
+        if !single_pool {
+            carry_misplaced_overrides(&mut conn, shard, &misplaced, &pool, &router).await;
         }
     }
 
     Ok(())
 }
 
-/// Register the schedules of one shard for one pass.
+/// The result of [`register_shard_pass`].
+struct ShardPass<'a> {
+    /// The effective DAG catalog for the firing pass. `None` when the shard
+    /// must not fire this tick.
+    dags: Option<std::borrow::Cow<'a, DagCatalog>>,
+    /// The DAG overrides that this shard holds for another shard (issue #2389).
+    misplaced: Vec<String>,
+}
+
+impl ShardPass<'_> {
+    const fn skipped() -> Self {
+        Self {
+            dags: None,
+            misplaced: Vec::new(),
+        }
+    }
+}
+
+/// Move each DAG override that this shard holds for another shard to its new
+/// owner (issue #2389).
 ///
-/// Returns the effective DAG catalog for the firing pass, or `None` when the
-/// shard must not fire this tick.
+/// A routing change moves a DAG's schedule row to a new shard. Its override
+/// must move too, or the new owner reconciles the row to the code value. The
+/// move runs after this shard's pass, so an owner later in shard order
+/// applies the override in the same tick. An owner earlier in shard order
+/// applies it on the next tick.
+///
+/// A failure is logged, and the next tick retries the move. Two shards of one
+/// pool share one table, so nothing moves between them.
+async fn carry_misplaced_overrides(
+    conn: &mut AsyncPgConnection,
+    shard: ShardId,
+    misplaced: &[String],
+    pool: &ShardedDbPool,
+    router: &ShardRouter,
+) {
+    for dag_name in misplaced {
+        let owner = router.pick_for_dag(dag_name);
+        if pool.same_physical_pool(shard, owner)
+            || crate::replication::shard_writes_held(Some(owner))
+        {
+            continue;
+        }
+        let Some(owner_pool) = pool.exact_pool_for(owner) else {
+            continue;
+        };
+        let moved = match crate::replication::fenced_checkout(owner_pool).await {
+            Ok(mut to) => {
+                crate::schedule_override::carry_dag_override(conn, &mut to, dag_name).await
+            }
+            Err(error) => Err(error),
+        };
+        match moved {
+            Ok(true) => tracing::info!(
+                dag_name = dag_name.as_str(),
+                from_shard = shard.as_i32(),
+                to_shard = owner.as_i32(),
+                "harvest: moved a DAG schedule override to the shard that now owns the DAG"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                error = %error,
+                dag_name = dag_name.as_str(),
+                from_shard = shard.as_i32(),
+                to_shard = owner.as_i32(),
+                "harvest: could not move a DAG schedule override to its new shard; \
+                 the next tick retries"
+            ),
+        }
+    }
+}
+
+/// Register the schedules of one shard for one pass.
 async fn register_shard_pass<'a>(
     conn: &mut AsyncPgConnection,
     shard: ShardId,
@@ -1584,7 +1659,7 @@ async fn register_shard_pass<'a>(
     router: &ShardRouter,
     backoff: &ScheduleRegistrationBackoff,
     registry: &HandlerRegistry,
-) -> HarvestResult<Option<std::borrow::Cow<'a, DagCatalog>>> {
+) -> HarvestResult<ShardPass<'a>> {
     // Issue #1157: on a converged shard this pass is read-only — no
     // transaction, no advisory lock, no UPDATE. Only a schedule that
     // genuinely needs a write opens a transaction and contends for the
@@ -1594,8 +1669,13 @@ async fn register_shard_pass<'a>(
     // passes and the firing pass read the same effective values, or the
     // two registration passes would rewrite the same DAG row each tick.
     let Some((overrides, override_fence)) = load_shard_overrides(conn, shard).await else {
-        return Ok(None);
+        return Ok(ShardPass::skipped());
     };
+    let misplaced = overrides
+        .dag_names()
+        .filter(|dag_name| router.pick_for_dag(dag_name) != shard)
+        .map(str::to_owned)
+        .collect();
     // `apply_to_workflow_schedules` reads the code catalog, so it runs
     // before the catalog is shadowed.
     let workflow_schedules = overrides.apply_to_workflow_schedules(workflow_schedules, dags);
@@ -1625,9 +1705,15 @@ async fn register_shard_pass<'a>(
              stale schedule rows left behind by a routing change could not be \
              collected, and firing them here would duplicate the owning shard's run"
         );
-        return Ok(None);
+        return Ok(ShardPass {
+            dags: None,
+            misplaced,
+        });
     }
-    Ok(Some(dags))
+    Ok(ShardPass {
+        dags: Some(dags),
+        misplaced,
+    })
 }
 
 /// Load the operator overrides of one shard for a scheduler pass (issue #2385).

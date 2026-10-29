@@ -218,6 +218,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          scanner_tick_db_tests
 linux        autumn-harvest         integration                      -                          schedule_decisions
 linux        autumn-harvest         integration                      -                          schedule_override_db_tests
+linux        autumn-harvest         integration                      -                          schedule_override_reshard_db_tests
 linux        autumn-harvest         integration                      -                          schedule_runs_tests
 linux        autumn-harvest         integration                      -                          schedule_to_close_tests
 linux        autumn-harvest         integration                      -                          schedule_update_tests

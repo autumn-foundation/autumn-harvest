@@ -518,6 +518,11 @@ pub struct ScheduleOverrides {
 }
 
 impl ScheduleOverrides {
+    /// The names of the DAGs that this set overrides.
+    pub fn dag_names(&self) -> impl Iterator<Item = &str> {
+        self.dags.keys().map(String::as_str)
+    }
+
     /// A set with no override.
     #[must_use]
     pub fn none() -> Self {
@@ -755,7 +760,7 @@ pub fn schedule_from_storage(stored: &str) -> Option<Schedule> {
     crate::scheduler::parse_schedule_from_expr_pub(stored)
 }
 
-#[derive(Debug, Clone, Queryable, Selectable)]
+#[derive(Debug, Clone, Queryable, Selectable, Insertable)]
 #[diesel(table_name = crate::schema::harvest_schedule_overrides)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 struct OverrideRow {
@@ -1152,6 +1157,76 @@ pub async fn clear_dag_override(
         delete_override(conn, KIND_DAG, dag_name).await
     }))
     .await
+}
+
+/// Move the override of one DAG to the shard that now owns it (issue #2389).
+///
+/// `from` holds the row, and `to` is the new owner. The copy commits on `to`
+/// before the delete runs on `from`. So a failure at either step leaves the
+/// override readable on at least one shard. The next scheduler pass retries
+/// the move.
+///
+/// A row that `to` already holds wins. An operator who changes the DAG after
+/// the move writes to the new owner, and the move must not undo that change.
+/// The row moves as stored, with its reason, actor and timestamps. It is not
+/// decoded.
+///
+/// The delete matches the `updated_at` of the copied row. A write on `from`
+/// after the copy then keeps its row, and the next pass moves it again.
+///
+/// Never pass two shards of one pool. They share one table, so the delete
+/// would remove the only copy.
+///
+/// Returns whether the row on `from` was deleted.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when a read or write fails.
+pub async fn carry_dag_override(
+    from: &mut AsyncPgConnection,
+    to: &mut AsyncPgConnection,
+    dag_name: &str,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_schedule_overrides::dsl;
+    use diesel_async::AsyncConnection;
+
+    let row: Option<OverrideRow> = dsl::harvest_schedule_overrides
+        .filter(dsl::kind.eq(KIND_DAG))
+        .filter(dsl::name.eq(dag_name))
+        .select(OverrideRow::as_select())
+        .first(from)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    // Each write takes the registration lock first, as every override
+    // writer does (issue #2386).
+    Box::pin(to.transaction(async |conn| {
+        crate::scheduler::wait_for_registration_lock(conn).await?;
+        diesel::insert_into(dsl::harvest_schedule_overrides)
+            .values(&row)
+            .on_conflict_do_nothing()
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)
+    }))
+    .await?;
+    let deleted = Box::pin(from.transaction(async |conn| {
+        crate::scheduler::wait_for_registration_lock(conn).await?;
+        diesel::delete(
+            dsl::harvest_schedule_overrides
+                .filter(dsl::kind.eq(KIND_DAG))
+                .filter(dsl::name.eq(dag_name))
+                .filter(dsl::updated_at.eq(row.updated_at)),
+        )
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)
+    }))
+    .await?;
+    Ok(deleted > 0)
 }
 
 /// Load the override of one code-declared workflow schedule, if any

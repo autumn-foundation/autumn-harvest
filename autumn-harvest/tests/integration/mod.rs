@@ -345,6 +345,7 @@ mod scanner_liveness_tests;
 mod scanner_tick_db_tests;
 mod schedule_decisions;
 mod schedule_override_db_tests;
+mod schedule_override_reshard_db_tests;
 mod schedule_runs_tests;
 mod schedule_to_close_tests;
 mod schedule_update_tests;
