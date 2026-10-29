@@ -597,6 +597,33 @@ pub static GLOBAL_WORKFLOW_METADATA: std::sync::RwLock<
     Option<std::collections::HashMap<String, WorkflowMetadata>>,
 > = std::sync::RwLock::new(None);
 
+/// The run-default override cache of the last registry built (issue #2387).
+///
+/// It mirrors [`GLOBAL_WORKFLOW_METADATA`]. A completion trigger applies it
+/// to the declared SLA of its target type.
+#[cfg(feature = "db")]
+pub static GLOBAL_RUN_DEFAULTS: std::sync::RwLock<
+    Option<std::sync::Arc<crate::run_defaults::RunDefaultsCache>>,
+> = std::sync::RwLock::new(None);
+
+/// The effective SLA of a target type: its declared SLA with any operator
+/// override (issue #2387).
+#[cfg(feature = "db")]
+fn effective_target_sla(
+    workflow_name: &str,
+    sla: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    GLOBAL_RUN_DEFAULTS
+        .read()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .as_ref()
+                .map(|cache| cache.apply(workflow_name, None, sla).1)
+        })
+        .unwrap_or(sla)
+}
+
 #[cfg(feature = "db")]
 pub static GLOBAL_MAX_WORKFLOW_INPUT_BYTES: std::sync::RwLock<u64> =
     std::sync::RwLock::new(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES);
@@ -1762,6 +1789,8 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                         )
                     })
             };
+            // Issue #2387: an operator SLA override of the target type wins.
+            let target_sla = effective_target_sla(&trigger_db.target_workflow_name, target_sla);
 
             // issue #618: completion triggers are an in-process start producer
             // and MUST honour an active admission gate. This runs INSIDE the
@@ -2594,6 +2623,8 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                     )
                 })
         };
+        // Issue #2387: an operator SLA override of the target type wins.
+        let target_sla = effective_target_sla(&task.target_workflow_name, target_sla);
         let max_workflow_attempts_ceiling = GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING
             .read()
             .ok()

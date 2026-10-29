@@ -2286,6 +2286,8 @@ async fn start_harvest_runtime(
     // workers actually poll instead of the (possibly unset or stale)
     // process-global default.
     .with_queues(runner.api_runtime().queues().iter().map(String::as_str))
+    // Issue #2387: the registry's run-default overrides apply here too.
+    .with_run_defaults(Arc::clone(runner.api_runtime().registry().run_defaults()))
     .with_max_workflow_input_bytes(max_workflow_input_bytes)
     .with_max_workflow_execution_timeout(max_workflow_execution_timeout)
     .with_max_workflow_chain_timeout(max_workflow_chain_timeout)
@@ -2340,7 +2342,8 @@ async fn start_harvest_runtime(
                                 wf.owner,
                                 wf.runbook_url,
                                 wf.severity,
-                                wf.sla,
+                                // Issue #2387: an operator SLA override wins.
+                                registry.apply_run_defaults(wf.name, None, wf.sla).1,
                                 wf.retry_policy.clone(),
                             )
                         })

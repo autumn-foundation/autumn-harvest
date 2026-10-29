@@ -1221,9 +1221,16 @@ enum Commands {
         command: HandoffCommand,
     },
     /// Manage DAG schedules and runs.
+    #[command(alias = "dags")]
     Dag {
         #[command(subcommand)]
         command: DagCommand,
+    },
+    /// List the operator overrides of schedules and run defaults (issue #2388).
+    #[command(alias = "override")]
+    Overrides {
+        #[command(subcommand)]
+        command: OverridesCommand,
     },
     /// Manage workflow and DAG schedules (issue #91).
     #[command(alias = "schedules")]
@@ -2851,6 +2858,61 @@ enum DagCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Set an operator override on the schedule of a DAG (issue #2388).
+    ///
+    /// The override wins over the code value and survives a restart. A flag
+    /// that you omit keeps the stored override of its field.
+    SetSchedule {
+        /// Registered DAG name.
+        dag_name: String,
+        /// New interval in seconds.
+        #[arg(long, conflicts_with_all = ["cron", "manual"])]
+        interval: Option<u64>,
+        /// New cron expression (e.g. `"0 3 * * *"`).
+        #[arg(long, conflicts_with_all = ["interval", "manual"])]
+        cron: Option<String>,
+        /// Fire the DAG only on a manual trigger.
+        #[arg(long, conflicts_with_all = ["interval", "cron"])]
+        manual: bool,
+        /// IANA timezone of the cron expression (e.g. `"Europe/Berlin"`).
+        /// Valid only with `--cron`.
+        #[arg(long)]
+        timezone: Option<String>,
+        /// New catchup flag: `true` or `false`.
+        #[arg(long, value_name = "BOOL")]
+        catchup: Option<bool>,
+        /// New maximum number of active runs.
+        #[arg(long)]
+        max_active_runs: Option<u32>,
+        /// New fire jitter in seconds. 0 disables jitter.
+        #[arg(long)]
+        jitter_secs: Option<u64>,
+        /// New overlap policy: skip, `buffer_one`, `buffer_all`, `cancel_other`,
+        /// `terminate_other` or `allow_all`.
+        #[arg(long)]
+        overlap_policy: Option<String>,
+        /// New buffer cap under `buffer_all`.
+        #[arg(long)]
+        buffer_all_max: Option<u32>,
+        /// Operator reason stored with the override.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Remove the operator override of a DAG, so every field takes its code
+    /// value again (issue #2388).
+    ClearOverride {
+        /// Registered DAG name.
+        dag_name: String,
+        /// Operator reason, recorded in the audit trail.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OverridesCommand {
+    /// List every operator override, with its actor, reason and time.
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -3743,6 +3805,9 @@ impl Cli {
                 *shard_id,
             )),
             Commands::WorkflowTypes { command } => Ok(workflow_reachability_request(command)),
+            Commands::Overrides {
+                command: OverridesCommand::List,
+            } => Ok(ApiRequest::get("/admin/overrides")),
             Commands::Tui => unreachable!("Tui command handles its own requests"),
             Commands::Events { .. } => unreachable!("Events command handles its own requests"),
             Commands::StartBatch {
@@ -12076,7 +12141,88 @@ fn dag_request(command: &DagCommand, actor: Option<&str>) -> Result<ApiRequest, 
                 })),
             ))
         }
+        DagCommand::SetSchedule { dag_name, .. } => Ok(ApiRequest::patch(
+            format!("/dags/{}", path_segment(dag_name)),
+            dag_schedule_override_body(command)?,
+        )),
+        DagCommand::ClearOverride { dag_name, reason } => {
+            let mut body = Map::new();
+            body.insert("clear_override".to_string(), Value::Bool(true));
+            if let Some(reason) = reason {
+                body.insert("reason".to_string(), Value::String(reason.clone()));
+            }
+            Ok(ApiRequest::patch(
+                format!("/dags/{}", path_segment(dag_name)),
+                Value::Object(body),
+            ))
+        }
     }
+}
+
+/// The `PATCH /dags/{dag}` body of `dag set-schedule` (issue #2388).
+///
+/// Each flag that is present sets one override field. An omitted flag is
+/// absent from the body, so the stored override of that field stays.
+fn dag_schedule_override_body(command: &DagCommand) -> Result<Value, CliError> {
+    let DagCommand::SetSchedule {
+        interval,
+        cron,
+        manual,
+        timezone,
+        catchup,
+        max_active_runs,
+        jitter_secs,
+        overlap_policy,
+        buffer_all_max,
+        reason,
+        ..
+    } = command
+    else {
+        unreachable!("only `dag set-schedule` builds a schedule override body");
+    };
+    let mut body = Map::new();
+    if let Some(secs) = interval {
+        body.insert(
+            "schedule_expr".to_string(),
+            json!(format!("interval:{secs}")),
+        );
+    } else if let Some(expr) = cron {
+        body.insert("schedule_expr".to_string(), json!(format!("cron:{expr}")));
+    } else if *manual {
+        body.insert("schedule_expr".to_string(), json!("manual"));
+    }
+    if let Some(timezone) = timezone {
+        if cron.is_none() {
+            return Err(CliError::InvalidInput(
+                "dag set-schedule --timezone needs --cron".to_string(),
+            ));
+        }
+        body.insert("timezone".to_string(), json!(timezone));
+    }
+    if let Some(catchup) = catchup {
+        body.insert("catchup".to_string(), json!(catchup));
+    }
+    if let Some(max) = max_active_runs {
+        body.insert("max_active_runs".to_string(), json!(max));
+    }
+    if let Some(secs) = jitter_secs {
+        body.insert("jitter_secs".to_string(), json!(secs));
+    }
+    if let Some(policy) = overlap_policy {
+        body.insert("overlap_policy".to_string(), json!(policy));
+    }
+    if let Some(max) = buffer_all_max {
+        body.insert("buffer_all_max".to_string(), json!(max));
+    }
+    if body.is_empty() {
+        return Err(CliError::InvalidInput(
+            "dag set-schedule needs at least one override flag".to_string(),
+        ));
+    }
+    if let Some(reason) = reason {
+        body.insert("reason".to_string(), json!(reason));
+    }
+    Ok(Value::Object(body))
 }
 
 #[allow(clippy::too_many_lines)]

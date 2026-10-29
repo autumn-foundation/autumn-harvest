@@ -1068,6 +1068,8 @@ async fn dag_detail_ui(
         refresh = None;
     }
 
+    let schedule = load_dag_schedule_state(&api_state, &runtime, &dag_name).await;
+
     Ok(render_dag_detail(
         &dag_name,
         &dag,
@@ -1079,7 +1081,39 @@ async fn dag_detail_ui(
         node_error.as_deref(),
         refresh_error.as_deref(),
         view,
+        &schedule,
     ))
+}
+
+/// The operator override state of one DAG schedule (issue #2388).
+enum DagScheduleState {
+    /// No override is stored, so every field takes its code value.
+    Code,
+    /// An override is stored.
+    Overridden(Box<autumn_harvest::schedule_override::DagScheduleOverride>),
+    /// The override could not be read, with the reason.
+    Unreadable(String),
+}
+
+/// Read the override of one DAG from the shard that owns its schedule row.
+///
+/// A failed read does not fail the page. The page names the failure, because
+/// the code values alone could hide an override that is in force.
+async fn load_dag_schedule_state(
+    api_state: &HarvestApiState,
+    runtime: &HarvestApiRuntime,
+    dag_name: &str,
+) -> DagScheduleState {
+    let shard = runtime.router().pick_for_dag(dag_name);
+    let mut conn = match db_conn_for_shard(api_state, shard).await {
+        Ok(conn) => conn,
+        Err(error) => return DagScheduleState::Unreadable(error.to_string()),
+    };
+    match autumn_harvest::schedule_override::get_dag_override(&mut conn, dag_name).await {
+        Ok(None) => DagScheduleState::Code,
+        Ok(Some(stored)) => DagScheduleState::Overridden(Box::new(stored)),
+        Err(error) => DagScheduleState::Unreadable(error.to_string()),
+    }
 }
 
 /// Sentinel: a `?run=` param was explicitly provided but names no run of this
@@ -8353,6 +8387,7 @@ fn render_dag_detail(
     node_error: Option<&str>,
     refresh_error: Option<&str>,
     view: DagGraphView<'_>,
+    schedule: &DagScheduleState,
 ) -> Markup {
     let body = html! {
         @if let Some(message) = flash {
@@ -8392,8 +8427,125 @@ fn render_dag_detail(
             }
             (render_dag_run_rows(runs, selected_run))
         }
+        (render_dag_schedule_fields(dag, schedule))
     };
     layout_dag_detail(&format!("DAG {dag_name} · Vantage"), &body, "../", refresh)
+}
+
+/// The values of the schedule fields of a DAG, by their API names.
+fn dag_schedule_values(dag: &RegisteredDag) -> [String; 6] {
+    [
+        dag.schedule.as_ref().map_or_else(
+            || "none".to_string(),
+            autumn_harvest::schedule_override::schedule_to_storage,
+        ),
+        dag.catchup.to_string(),
+        dag.max_active_runs.to_string(),
+        dag.jitter.as_secs().to_string(),
+        dag.overlap_policy.as_str().to_string(),
+        dag.buffer_all_max.to_string(),
+    ]
+}
+
+/// The override value of each schedule field, or `None` where code applies.
+fn dag_override_values(
+    fields: &autumn_harvest::schedule_override::ScheduleOverrideFields,
+) -> [Option<String>; 6] {
+    [
+        fields
+            .schedule
+            .as_ref()
+            .map(autumn_harvest::schedule_override::schedule_to_storage),
+        fields.catchup.map(|value| value.to_string()),
+        fields.max_active_runs.map(|value| value.to_string()),
+        fields.jitter.map(|value| value.as_secs().to_string()),
+        fields
+            .overlap_policy
+            .map(|value| value.as_str().to_string()),
+        fields.buffer_all_max.map(|value| value.to_string()),
+    ]
+}
+
+/// Render the schedule fields of a DAG (issue #2388).
+///
+/// Each row shows the value declared in code, the operator override and the
+/// effective value. A row with an override carries the `override` marker. A
+/// DAG with no override shows no marker.
+fn render_dag_schedule_fields(dag: &RegisteredDag, schedule: &DagScheduleState) -> Markup {
+    const LABELS: [&str; 6] = [
+        "schedule_expr",
+        "catchup",
+        "max_active_runs",
+        "jitter_secs",
+        "overlap_policy",
+        "buffer_all_max",
+    ];
+    let code = dag_schedule_values(dag);
+    let (overrides, effective) = match schedule {
+        DagScheduleState::Overridden(stored) => (
+            dag_override_values(&stored.fields),
+            Some(dag_schedule_values(
+                &autumn_harvest::schedule_override::effective_dag(dag, &stored.fields),
+            )),
+        ),
+        DagScheduleState::Code => (Default::default(), Some(code.clone())),
+        DagScheduleState::Unreadable(_) => (Default::default(), None),
+    };
+    html! {
+        h3 { "Schedule" }
+        @match schedule {
+            DagScheduleState::Overridden(stored) => {
+                p.override-note {
+                    "Operator override by " code { (stored.updated_by) }
+                    " at " (stored.updated_at.to_rfc3339())
+                    @if let Some(reason) = &stored.reason { ": " (reason) }
+                }
+            }
+            DagScheduleState::Unreadable(reason) => {
+                div class="banner Warning" role="alert" {
+                    "The schedule override could not be read, so the effective values are unknown: "
+                    (reason)
+                }
+            }
+            DagScheduleState::Code => {}
+        }
+        table.dag-schedule-fields {
+            thead {
+                tr {
+                    th { "Field" }
+                    th { "Declared in code" }
+                    th { "Override" }
+                    th { "Effective" }
+                }
+            }
+            tbody {
+                @for (index, label) in LABELS.iter().enumerate() {
+                    @let overridden = overrides[index].as_ref();
+                    tr class=[overridden.map(|_| "overridden")] {
+                        td {
+                            code { (label) }
+                            @if overridden.is_some() {
+                                " " span.override-marker title="Set by an operator override" { "override" }
+                            }
+                        }
+                        td { code { (code[index]) } }
+                        td {
+                            @match overridden {
+                                Some(value) => code { (value) },
+                                None => "—",
+                            }
+                        }
+                        td {
+                            @match &effective {
+                                Some(values) => code { (values[index]) },
+                                None => "unknown",
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Render the `<tbody>` of the DAG run list (issue #957).
@@ -10422,6 +10574,11 @@ async fn execute_schedule_trigger_ui(
         .map_or((None, None, None), |info| {
             (info.sla, info.retry_policy.clone(), info.execution_timeout)
         });
+    // Issue #2387: an operator override wins over the declared value.
+    let (raw_execution_timeout, raw_sla) =
+        runtime
+            .registry()
+            .apply_run_defaults(workflow_name, raw_execution_timeout, raw_sla);
     let sla = crate::api::clamp_info_default_sla(raw_sla, raw_execution_timeout);
     // Issue #1412: thread the declared execution_timeout and the fleet-wide
     // ceiling via the same shared lookup the scheduler and DAG-backfill paths

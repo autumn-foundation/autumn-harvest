@@ -71,6 +71,9 @@ pub const OP_DAG_TRIGGER: &str = "dag.trigger";
 pub const OP_DAG_RETRY: &str = "dag.retry";
 /// Audit operation: Applied a hot-patch to an active DAG.
 pub const OP_DAG_PATCH: &str = "dag.patch";
+/// Audit operation: Set, changed or cleared the run-default override of a
+/// workflow type (issue #2387).
+pub const OP_WORKFLOW_TYPE_RUN_DEFAULTS: &str = "workflow_type.run_defaults";
 /// Audit operation: Created a new workflow schedule.
 pub const OP_SCHEDULE_CREATE: &str = "schedule.create";
 /// Audit operation: Edited an existing workflow schedule in place (issue #771).
@@ -308,6 +311,8 @@ pub const TARGET_QUEUE: &str = "queue";
 pub const TARGET_AUDIT_EXPORT: &str = "audit_export";
 /// Audit target type: a management API route that a deny refused (issue #1803).
 pub const TARGET_ROUTE: &str = "route";
+/// Audit target type: a registered workflow type (issue #2387).
+pub const TARGET_WORKFLOW_TYPE: &str = "workflow_type";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 
@@ -538,6 +543,17 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     (
         "GET /admin/workflow-types/reachability",
         RouteClass::ReadOnly,
+    ),
+    // Every operator override (issue #2388): read-only.
+    ("GET /admin/overrides", RouteClass::ReadOnly),
+    // Run-default overrides of a workflow type (issue #2387).
+    (
+        "GET /admin/workflow-types/{workflow_name}/run-defaults",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "PATCH /admin/workflow-types/{workflow_name}/run-defaults",
+        RouteClass::Mutating,
     ),
     ("GET /admin/history/exports", RouteClass::ReadOnly),
     ("GET /admin/history/export-sample", RouteClass::ReadOnly),
@@ -921,6 +937,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_WORKFLOW_FORK,
     OP_DAG_TRIGGER,
     OP_DAG_PATCH,
+    OP_WORKFLOW_TYPE_RUN_DEFAULTS,
     OP_SCHEDULE_CREATE,
     OP_SCHEDULE_UPDATE,
     OP_SCHEDULE_PAUSE,
@@ -1276,6 +1293,17 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/codec/rotation", None),
     // Workflow-type handler reachability (issue #520): read-only.
     ("GET /admin/workflow-types/reachability", None),
+    // Every operator override (issue #2388): read-only.
+    ("GET /admin/overrides", None),
+    // Run-default overrides of a workflow type (issue #2387).
+    (
+        "GET /admin/workflow-types/{workflow_name}/run-defaults",
+        None,
+    ),
+    (
+        "PATCH /admin/workflow-types/{workflow_name}/run-defaults",
+        Some(OP_WORKFLOW_TYPE_RUN_DEFAULTS),
+    ),
     ("GET /admin/history/exports", None),
     ("GET /admin/history/export-sample", None),
     ("GET /admin/external-handoffs", None),

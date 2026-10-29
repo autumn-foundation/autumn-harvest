@@ -198,6 +198,9 @@ struct WorkflowHandleClientInner {
     queues: Vec<String>,
     max_workflow_input_bytes: u64,
     max_workflow_execution_timeout: Option<Duration>,
+    /// Operator overrides of per-type `sla` and `execution_timeout`
+    /// (issue #2387). `None` uses the declared values only.
+    run_defaults: Option<Arc<crate::run_defaults::RunDefaultsCache>>,
     /// Server-side ceiling on the chain-scoped lifetime cap AND fleet-wide chain
     /// default (issue #617). `None` = no chain cap applied fleet-wide.
     max_workflow_chain_timeout: Option<Duration>,
@@ -248,6 +251,7 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
                 "max_workflow_execution_timeout",
                 &self.max_workflow_execution_timeout,
             )
+            .field("run_defaults", &self.run_defaults.is_some())
             .field(
                 "max_workflow_chain_timeout",
                 &self.max_workflow_chain_timeout,
@@ -337,6 +341,7 @@ impl WorkflowHandleClient {
                 queues: Vec::new(),
                 max_workflow_input_bytes: crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
                 max_workflow_execution_timeout: None,
+                run_defaults: None,
                 max_workflow_chain_timeout: None,
                 max_workflow_start_delay: crate::builder::DEFAULT_MAX_WORKFLOW_START_DELAY,
                 max_signal_payload_bytes: crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
@@ -481,6 +486,18 @@ impl WorkflowHandleClient {
     pub fn with_max_workflow_execution_timeout(self, ceiling: Option<Duration>) -> Self {
         let mut inner = (*self.inner).clone();
         inner.max_workflow_execution_timeout = ceiling;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Share the run-default override cache of the owning registry
+    /// (issue #2387), so a transactional start applies the same overrides as
+    /// the HTTP start route.
+    #[must_use]
+    pub fn with_run_defaults(self, cache: Arc<crate::run_defaults::RunDefaultsCache>) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.run_defaults = Some(cache);
         Self {
             inner: Arc::new(inner),
         }
@@ -1258,14 +1275,19 @@ impl WorkflowHandleClient {
                 policy.on_conflict
             });
 
-        let execution_timeout = info
-            .execution_timeout
-            .and_then(|d| chrono::Duration::from_std(d).ok());
+        // Issue #2387: an operator override wins over the declared value.
+        let (execution_timeout, sla) = self
+            .inner
+            .run_defaults
+            .as_ref()
+            .map_or((info.execution_timeout, info.sla), |cache| {
+                cache.apply(info.name, info.execution_timeout, info.sla)
+            });
+        let execution_timeout = execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
         // Effective SLA clamped to at most the hard execution timeout, mirroring
         // the HTTP start route's resolution (never a soft deadline past the hard
         // one).
-        let sla = info
-            .sla
+        let sla = sla
             .and_then(|d| chrono::Duration::from_std(d).ok())
             .map(|sla| execution_timeout.map_or(sla, |hard| sla.min(hard)));
         let chain_execution_timeout = info

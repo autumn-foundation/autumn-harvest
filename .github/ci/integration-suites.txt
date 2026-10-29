@@ -55,6 +55,7 @@ allos        autumn-harvest         integration                      -          
 allos        autumn-harvest         integration                      -                          lock_order_docs
 allos        autumn-harvest         integration                      -                          otel_semconv_docs
 allos        autumn-harvest         integration                      -                          partitioned_events_docs
+allos        autumn-harvest         integration                      -                          runtime_parameter_inventory_docs
 allos        autumn-harvest         integration                      -                          standalone_activity_docs
 allos        autumn-harvest         integration                      -                          tenant_isolation_docs
 allos        autumn-harvest         integration                      -                          typed_snapshot_docs
@@ -213,10 +214,12 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          retry_chain_routing_tests
 linux        autumn-harvest         integration                      -                          retry_clock_skew_tests
 linux        autumn-harvest         integration                      -                          retry_now_tests
+linux        autumn-harvest         integration                      -                          run_defaults_db_tests
 linux        autumn-harvest         integration                      -                          scanner_lease_tests
 linux        autumn-harvest         integration                      -                          scanner_tick_db_tests
 linux        autumn-harvest         integration                      -                          schedule_decisions
 linux        autumn-harvest         integration                      -                          schedule_override_db_tests
+linux        autumn-harvest         integration                      -                          schedule_override_reshard_db_tests
 linux        autumn-harvest         integration                      -                          schedule_runs_tests
 linux        autumn-harvest         integration                      -                          schedule_to_close_tests
 linux        autumn-harvest         integration                      -                          schedule_update_tests
@@ -267,6 +270,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          workflow_pause_claim_recheck_tests
 linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
+linux        autumn-harvest         integration                      -                          workflow_schedule_override_db_tests
 linux        autumn-harvest         integration                      -                          workflow_task_timeout_tests
 linux        autumn-harvest         integration                      atomicity-spike            atomicity_spike_tests
 linux        autumn-harvest         integration                      hot-code-swap,testing      hot_code_swap_tests
@@ -367,6 +371,7 @@ linux        autumn-harvest-plugin  replay_sample_export_integration  -         
 linux        autumn-harvest-plugin  retirement_check_integration     -                          -
 linux        autumn-harvest-plugin  retry_chain_routing_integration  -                          -
 linux        autumn-harvest-plugin  run_chain_integration            -                          -
+linux        autumn-harvest-plugin  run_defaults_integration         -                          -
 linux        autumn-harvest-plugin  runner_orphan_gate_integration   -                          -
 linux        autumn-harvest-plugin  scaling_api_tests                -                          -
 linux        autumn-harvest-plugin  schedule_bulk_audit_perf         -                          -

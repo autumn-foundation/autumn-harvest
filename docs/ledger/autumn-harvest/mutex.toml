@@ -78,6 +78,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_mutex_locks"]
 measured = "docs/performance-mutex-terminal-sweep-table-present.md"
+plan = "docs/ledger/plans/autumn-harvest/mutex.md"
 
 ["db_ops::try_grant_or_enqueue"]
 driver = "per_task"

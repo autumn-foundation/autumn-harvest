@@ -38,6 +38,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_completion_deliveries"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/completion_callback.md"
 
 ["dead_letter_entry_with_current_payload"]
 driver = "per_tick"

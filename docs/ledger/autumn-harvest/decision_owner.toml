@@ -69,6 +69,7 @@ backend = ["postgres"]
 kind = ["ddl", "read", "write"]
 tables = ["harvest_decision_owner_mode", "harvest_task_queue", "harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/decision_owner.md"
 
 ["db::expire_all"]
 driver = "per_tick"
@@ -131,3 +132,4 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/decision_owner.md"

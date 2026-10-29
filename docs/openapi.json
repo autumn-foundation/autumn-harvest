@@ -1768,7 +1768,7 @@
     },
     "/admin/config": {
       "get": {
-        "description": "Return the resolved effective runtime configuration of the fleet, secret-free. Secret-bearing configuration (LISTEN/NOTIFY database URLs, per-shard notification URLs, and the sharded pool handle) is surfaced only as presence booleans and counts — never a value — so a connection string can never appear in the response. Durations are reported as whole milliseconds with a _ms suffix; unset Option ceilings serialize as explicit JSON null. Top-level sections: worker (resolved WorkerConfig), payload_caps (size caps + server-side ceilings), shard_topology (readable/writable/default shards, the declared residency_key → shard map, issue #697 — diff residency_map across replicas to catch a fleet deployed with conflicting maps, which would otherwise place the same residency_key in different jurisdictions while reporting identical topology — and shard_forwards, the declared retired-shard → successor map, issue #964: empty until a shard is decommissioned, and diffed across replicas for the same reason, since replicas that disagree would answer the same ExecutionId from different databases — and reserved_shards, the shards reserved for pinned tenant-cell work, issue #1837: unpinned starts never land on them, so diff it across replicas too), features (compiled-in core-crate feature flags), pool (resolved database pool sizing).",
+        "description": "Return the resolved effective runtime configuration of the fleet, secret-free. Secret-bearing configuration (LISTEN/NOTIFY database URLs, per-shard notification URLs, and the sharded pool handle) is surfaced only as presence booleans and counts — never a value — so a connection string can never appear in the response. Durations are reported as whole milliseconds with a _ms suffix; unset Option ceilings serialize as explicit JSON null. Top-level sections: worker (resolved WorkerConfig), payload_caps (size caps + server-side ceilings), shard_topology (readable/writable/default shards, the declared residency_key → shard map, issue #697 — diff residency_map across replicas to catch a fleet deployed with conflicting maps, which would otherwise place the same residency_key in different jurisdictions while reporting identical topology — and shard_forwards, the declared retired-shard → successor map, issue #964: empty until a shard is decommissioned, and diffed across replicas for the same reason, since replicas that disagree would answer the same ExecutionId from different databases — and reserved_shards, the shards reserved for pinned tenant-cell work, issue #1837: unpinned starts never land on them, so diff it across replicas too), features (compiled-in core-crate feature flags), pool (resolved database pool sizing). overrides (issue #2388) holds the counts of the stored operator overrides: schedule_overrides, run_default_overrides and unavailable_shards. It is null when the runtime has no storage pool. GET /admin/overrides lists them.",
         "operationId": "get_admin_config",
         "responses": {
           "200": {
@@ -1777,6 +1777,7 @@
                 "schema": {
                   "properties": {
                     "features": {},
+                    "overrides": {},
                     "payload_caps": {},
                     "pool": {},
                     "shard_topology": {},
@@ -2413,6 +2414,38 @@
           }
         },
         "summary": "Return Prometheus-compatible metrics scrapable by autoscalers or monitoring systems.",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
+      }
+    },
+    "/admin/overrides": {
+      "get": {
+        "description": "List every operator override (issue #2388). schedule_overrides holds each DAG and workflow schedule override (issues #2385 and #2386), read from every shard pool: kind, name, fields (the stored override fields by their PATCH names), reason, updated_by, created_at, updated_at and shard_ids. run_default_overrides holds each run-default override (issue #2387) from the default shard: workflow_name, sla_secs, execution_timeout_secs, reason, updated_by and updated_at. unavailable_shards names each shard that could not be read; its overrides are absent from the list.",
+        "operationId": "get_admin_overrides",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "run_default_overrides": {},
+                    "schedule_overrides": {},
+                    "unavailable_shards": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "Harvest runtime has no storage pool."
+          }
+        },
+        "summary": "List every operator override (issue #2388).",
         "tags": [
           "admin"
         ],
@@ -3932,7 +3965,7 @@
         "x-harvest-route-class": "read_only"
       },
       "patch": {
-        "description": "Partially update an existing workflow schedule in place (issue #771). Only provided fields change; the schedule_id is never changed, so #488 carryover lineage, the sched:{schedule_id}: workflow-id namespace, and run history are preserved. The workflow type is NOT editable (400). DAG schedules are owned by PATCH /dags/{dag_name} (400). Nullable fields (calendar, consecutive_failure_limit, end_at, max_runs, catchup_policy, retry_policy) are tri-state: omitting the field leaves it unchanged, an explicit JSON null clears it. The merged spec is validated before any write, so a 400 writes nothing. Changing the schedule expression recomputes next_run_at anchored at now (elapsed slots are never retroactively fired); other edits preserve the pending next_run_at. Anti-race with the scheduler tick: an edit is rejected 409 while a fire claim is live, an expired claim is fenced (token nulled) so a straggler fire cannot finalize over the edit, and a tick that wins its claim re-reads the row before firing, so a fire that lands concurrently with the edit always dispatches the committed new input/queue/policies.",
+        "description": "Partially update an existing workflow schedule in place (issue #771). Only provided fields change; the schedule_id is never changed, so #488 carryover lineage, the sched:{schedule_id}: workflow-id namespace, and run history are preserved. The workflow type is NOT editable (400). DAG schedules are owned by PATCH /dags/{dag_name} (400). Nullable fields (calendar, consecutive_failure_limit, end_at, max_runs, catchup_policy, retry_policy) are tri-state: omitting the field leaves it unchanged, an explicit JSON null clears it. The merged spec is validated before any write, so a 400 writes nothing. Changing the schedule expression recomputes next_run_at anchored at now (elapsed slots are never retroactively fired); other edits preserve the pending next_run_at. Anti-race with the scheduler tick: an edit is rejected 409 while a fire claim is live, an expired claim is fenced (token nulled) so a straggler fire cannot finalize over the edit, and a tick that wins its claim re-reads the row before firing, so a fire that lands concurrently with the edit always dispatches the committed new input/queue/policies. A schedule declared in code (WorkerBuilder::workflow_schedule) converges to its code value on every tick, so for it the request writes an operator override instead of a row edit (issue #2386): the override wins over code and survives a restart, clear_override returns to code, and input returns 400.",
         "operationId": "patch_admin_schedules_by_id",
         "parameters": [
           {
@@ -3965,6 +3998,9 @@
                   "catchup_window_secs": {
                     "description": "Window length in seconds for catchup_policy = window; re-windows an already-'window' policy when sent alone, ignored for other modes (issue #484)."
                   },
+                  "clear_override": {
+                    "description": "Code-declared schedule only (issue #2386): delete the stored operator override, so the schedule returns to its code value. Takes no other field except reason (400 otherwise). 400 on a schedule made through the API."
+                  },
                   "consecutive_failure_limit": {
                     "description": "New auto-pause threshold (issue #360). Tri-state: omit = unchanged, explicit null = disable auto-pause."
                   },
@@ -3988,6 +4024,9 @@
                   },
                   "queue_name": {
                     "description": "New task queue name for scheduled runs."
+                  },
+                  "reason": {
+                    "description": "Code-declared schedule only (issue #2386): the operator reason stored with the override. 400 on a schedule made through the API."
                   },
                   "retry_policy": {
                     "description": "New schedule-level workflow retry policy (issue #523). Tri-state: omit = unchanged, explicit null = clear."
@@ -5577,6 +5616,129 @@
         ],
         "x-harvest-read-only": true,
         "x-harvest-route-class": "read_only"
+      }
+    },
+    "/admin/workflow-types/{workflow_name}/run-defaults": {
+      "get": {
+        "description": "Read the run defaults of one workflow type (issue #2387). code holds the sla_secs and execution_timeout_secs declared in code. override holds the stored operator override (sla_secs, execution_timeout_secs, reason, updated_by, updated_at), or null. effective holds the values a new run takes: the override, then code. The start clamps still apply after it: sla is clamped to execution_timeout, and the fleet ceiling caps execution_timeout.",
+        "operationId": "get_admin_workflow_types_by_workflow_name_run_defaults",
+        "parameters": [
+          {
+            "description": "Registered workflow type name. A DAG uses its own name.",
+            "in": "path",
+            "name": "workflow_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "code": {},
+                    "effective": {},
+                    "override": {},
+                    "workflow_name": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "404": {
+            "description": "Workflow type not registered in this process."
+          },
+          "500": {
+            "description": "Database error."
+          }
+        },
+        "summary": "Read the run defaults of one workflow type (issue #2387).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
+      },
+      "patch": {
+        "description": "Set, change or clear the run-default override of one workflow type (issue #2387). The override wins over the code value for every new run and survives a restart. It reaches this process at once and every other process within its refresh period (about 5 seconds). Each duration is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. With recompute_in_flight, the SLA deadline of each RUNNING, SUSPENDED or PAUSED run of the type that has not breached moves to the new effective SLA, on every shard, and the response gains recompute (moved_runs, unavailable_shards, superseded). A recompute stops when a newer change to the type replaces its SLA, and then reports superseded true. A hard deadline_at never changes. The response has the same shape as GET.",
+        "operationId": "patch_admin_workflow_types_by_workflow_name_run_defaults",
+        "parameters": [
+          {
+            "description": "Registered workflow type name. A DAG uses its own name.",
+            "in": "path",
+            "name": "workflow_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "clear_override": {
+                    "description": "true deletes the stored override before the other fields merge."
+                  },
+                  "execution_timeout_secs": {
+                    "description": "Override hard execution timeout in whole seconds, from 1 to 3153600000 (100 years). null returns to code."
+                  },
+                  "reason": {
+                    "description": "Operator reason stored with the override."
+                  },
+                  "recompute_in_flight": {
+                    "description": "true also moves the SLA deadline of the in-flight runs of the type. Default false: the change applies to new runs only."
+                  },
+                  "sla_secs": {
+                    "description": "Override soft SLA in whole seconds, from 1 to 3153600000 (100 years). null returns to code."
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "code": {},
+                    "effective": {},
+                    "override": {},
+                    "workflow_name": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "Empty patch, unknown field, or a duration of zero or past 100 years."
+          },
+          "404": {
+            "description": "Workflow type not registered in this process."
+          },
+          "500": {
+            "description": "Database error."
+          }
+        },
+        "summary": "Set, change or clear the run-default override of one workflow type (issue #2387).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-idempotency": "Idempotent: applying the same override twice is a no-op.",
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/workflows/replay-canary": {

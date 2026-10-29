@@ -51,6 +51,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_cross_shard_children"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/cross_shard_child.md"
 
 ["current_cancel_reason"]
 driver = "per_tick"
