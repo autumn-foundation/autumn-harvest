@@ -1689,7 +1689,7 @@ credentials. The plugin re-exports `aws_sdk_kms`.
 
 ```toml
 [dependencies]
-autumn-harvest-plugin = { version = "0.7", features = ["aws-kms"] }
+autumn-harvest-plugin = { version = "0.8", features = ["aws-kms"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 ```
 
@@ -1734,7 +1734,7 @@ path "transit/decrypt/harvest" { capabilities = ["update"] }
 
 ```toml
 [dependencies]
-autumn-harvest-plugin = { version = "0.7", features = ["vault-transit"] }
+autumn-harvest-plugin = { version = "0.8", features = ["vault-transit"] }
 ```
 
 ```rust,ignore

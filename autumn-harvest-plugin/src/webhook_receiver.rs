@@ -326,6 +326,8 @@ fn build_webhook_route(trigger: &WebhookTriggerInfo, api_state: HarvestApiState)
         idempotency: autumn_web::RouteIdempotency::Direct,
         // Inherit the global request-timeout deadline (autumn-web 0.6).
         timeout: autumn_web::RouteTimeout::Inherit,
+        // The class that a route macro sets when it names none (since autumn-web 0.9).
+        criticality: autumn_web::Criticality::Default,
         // An inbound webhook endpoint is machine-to-machine and is never
         // rendered or indexed, so it carries no SEO meta (since autumn-web 0.7).
         seo: autumn_web::SeoRouteDefaults::EMPTY,
