@@ -1,4 +1,4 @@
-//! Record which function sends each SQL statement (issue #2366).
+//! Record which function sends each SQL statement (issues #2366 and #2414).
 //!
 //! The Ledger census measures every profiled query in `docs/ledger/`. A plan
 //! needs the statement text, and a profile is keyed by the function that sends
@@ -10,8 +10,16 @@
 //! frames to profiles. The hook samples a few stacks for each distinct
 //! statement, because symbol resolution is slow.
 //!
-//! The variable is unset in every ordinary run, so the hook is inert there.
-//! The engine code does not change.
+//! The module exists only with the `ledger-census` feature, which no release
+//! build enables. Even then, the hook stays inert until the variable is set.
+//!
+//! # Linking
+//!
+//! A function in `.init_array` installs the hook before `main`. The linker
+//! drops an archive member that no symbol pulls in, so the census run passes
+//! `-u harvest_ledger_census_anchor` to the linker. That pulls this module
+//! into every test binary, the plugin's binaries included, with no call site.
+//! `docs/ledger/README.md` gives the command.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -56,6 +64,7 @@ fn census() -> Option<&'static Census> {
 }
 
 /// Strip the bind values, so one statement has one text.
+#[must_use]
 pub fn statement_text(debug: &str) -> &str {
     debug
         .split_once(BINDS_MARKER)
@@ -68,6 +77,7 @@ pub fn statement_text(debug: &str) -> &str {
 /// A generic plan cannot prove a partial-index predicate such as `NOT fired`
 /// from a bound `fired = $3`. The script puts the bool and string values in
 /// place of their parameters, as Postgres does for each custom plan.
+#[must_use]
 pub fn bind_text(debug: &str) -> &str {
     debug
         .split_once(BINDS_MARKER)
@@ -75,15 +85,26 @@ pub fn bind_text(debug: &str) -> &str {
 }
 
 /// Keep the `crate/src/path:line` of each frame in a workspace crate's `src/` tree.
-pub fn source_frames(backtrace: &str) -> Vec<String> {
+///
+/// The hook's own frames are dropped, because no profile covers them.
+///
+/// Rustc records the package under test as `./src/...`, relative to its own
+/// directory. `package` names that directory, so its frames keep their crate.
+#[must_use]
+pub fn source_frames(backtrace: &str, package: &str) -> Vec<String> {
     backtrace
         .lines()
         .filter_map(|line| line.trim().strip_prefix("at "))
         .filter_map(|at| {
-            let src = at.rfind("/src/")?;
-            let crate_start = at[..src].rfind('/')? + 1;
-            let rel = &at[crate_start..];
-            rel.starts_with("autumn-harvest").then(|| {
+            let rel = if let Some(local) = at.strip_prefix("./src/") {
+                format!("{package}/src/{local}")
+            } else {
+                let src = at.rfind("/src/")?;
+                let crate_start = at[..src].rfind('/').map_or(0, |slash| slash + 1);
+                at[crate_start..].to_owned()
+            };
+            let own = rel.starts_with("autumn-harvest/src/ledger_census.rs");
+            (rel.starts_with("autumn-harvest") && !own).then(|| {
                 let mut parts = rel.rsplitn(3, ':');
                 let _column = parts.next();
                 let line = parts.next().unwrap_or_default();
@@ -93,6 +114,21 @@ pub fn source_frames(backtrace: &str) -> Vec<String> {
         })
         .take(MAX_FRAMES)
         .collect()
+}
+
+/// The directory name of the package under test, from Cargo's environment.
+fn package_dir() -> &'static str {
+    static PACKAGE: OnceLock<String> = OnceLock::new();
+    PACKAGE.get_or_init(|| {
+        std::env::var("CARGO_MANIFEST_DIR")
+            .ok()
+            .and_then(|dir| {
+                std::path::Path::new(&dir)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default()
+    })
 }
 
 struct Hook;
@@ -118,7 +154,10 @@ impl Instrumentation for Hook {
             }
             *count += 1;
         }
-        let frames = source_frames(&std::backtrace::Backtrace::force_capture().to_string());
+        let frames = source_frames(
+            &std::backtrace::Backtrace::force_capture().to_string(),
+            package_dir(),
+        );
         // One `write` call for each line. A test that runs this binary as a
         // child process appends to the same file, and one append is atomic.
         let line = format!(
@@ -150,6 +189,13 @@ extern "C" fn install() {
 #[unsafe(link_section = ".init_array")]
 static INSTALL: extern "C" fn() = install;
 
+/// The symbol that the census run asks the linker to keep.
+///
+/// It does nothing. It sits in this module so that `-u` on its name pulls
+/// the module, and with it `INSTALL`, into the binary.
+#[unsafe(no_mangle)]
+pub const extern "C" fn harvest_ledger_census_anchor() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,13 +223,20 @@ mod tests {
         let trace = "\
    0: std::backtrace::Backtrace::force_capture
              at /rustc/abc/library/std/src/backtrace.rs:312:13
+   1: autumn_harvest::ledger_census::Hook::on_connection_event
+             at /home/u/autumn-harvest/autumn-harvest/src/ledger_census.rs:129:20
    1: autumn_harvest::queue::claim_task_one_statement::{{closure}}
              at /home/u/autumn-harvest/autumn-harvest/src/queue.rs:2440:20
+   2: autumn_harvest_plugin::api::list_workflows::{{closure}}
+             at ./src/api.rs:120:9
    2: integration::queue_tests::claims
              at /home/u/autumn-harvest/autumn-harvest/tests/integration/queue_tests.rs:10:5";
         assert_eq!(
-            source_frames(trace),
-            vec!["autumn-harvest/src/queue.rs:2440".to_owned()]
+            source_frames(trace, "autumn-harvest-plugin"),
+            vec![
+                "autumn-harvest/src/queue.rs:2440".to_owned(),
+                "autumn-harvest-plugin/src/api.rs:120".to_owned(),
+            ]
         );
     }
 }

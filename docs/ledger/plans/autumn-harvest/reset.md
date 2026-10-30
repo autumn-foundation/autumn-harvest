@@ -26,17 +26,47 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `UPDATE "harvest_external_tasks" SET "state" = $1, "updated_at" = $2 WHERE (("harvest_external_tas...` | `harvest_external_tasks`: Bitmap Heap Scan on `idx_harvest_ext_timeout`<br>`harvest_external_tasks`: ModifyTable |
 
+## `copy_carried_events`
+
+Statements: 6. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 2 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 3 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 4 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 5 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 6 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+
 ## `count_open_task_rows`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT COUNT(*) FROM "harvest_external_tasks" WHERE (("harvest_external_tasks"."workflow_exec_id"...` | `harvest_external_tasks`: Bitmap Heap Scan on `idx_harvest_ext_timeout` |
+| 2 | `SELECT COUNT(*) FROM "harvest_task_queue" WHERE (("harvest_task_queue"."workflow_exec_id" = $1) A...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_workflow` |
+
+## `count_pending_timers`
 
 Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT COUNT(*) FROM "harvest_external_tasks" WHERE (("harvest_external_tasks"."workflow_exec_id"...` | `harvest_external_tasks`: Bitmap Heap Scan on `idx_harvest_ext_timeout` |
+| 1 | `SELECT COUNT(*) FROM "harvest_timers" WHERE (("harvest_timers"."workflow_exec_id" = $1) AND ("har...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending` |
+
+## `count_unconsumed_signals`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT COUNT(*) FROM "harvest_signals" WHERE (("harvest_signals"."workflow_exec_id" = $1) AND ("h...` | `harvest_signals`: Index Only Scan on `idx_harvest_signals_pending` |
 
 ## `insert_fork_row`
 
-Statements: 7. Tables with no usable index: none.
+Statements: 8. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
@@ -47,16 +77,36 @@ Statements: 7. Tables with no usable index: none.
 | 5 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
 | 6 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
 | 7 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 8 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+
+## `load_event_rows`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "...` | `harvest_events`: Bitmap Heap Scan on `idx_harvest_events_history_page` |
+
+## `load_source_execution`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+| 2 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
 
 ## `reapply_or_drop_signals`
 
-Statements: 3. Tables with no usable index: none.
+Statements: 5. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `INSERT INTO "harvest_signals" ("workflow_exec_id", "signal_name", "payload", "idempotency_key", "...` | `harvest_signals`: ModifyTable |
 | 2 | `INSERT INTO "harvest_signals" ("workflow_exec_id", "signal_name", "payload", "idempotency_key", "...` | `harvest_signals`: ModifyTable |
-| 3 | `SELECT "harvest_signals"."id", "harvest_signals"."signal_name", "harvest_signals"."payload", "har...` | `harvest_signals`: Index Scan on `idx_harvest_signals_pending` |
+| 3 | `INSERT INTO "harvest_signals" ("workflow_exec_id", "signal_name", "payload", "idempotency_key", "...` | `harvest_signals`: ModifyTable |
+| 4 | `SELECT "harvest_signals"."id", "harvest_signals"."signal_name", "harvest_signals"."payload", "har...` | `harvest_signals`: Index Scan on `idx_harvest_signals_pending` |
+| 5 | `UPDATE "harvest_signals" SET "consumed" = $1 WHERE ("harvest_signals"."id" = ANY($2))` | `harvest_signals`: Bitmap Heap Scan on `harvest_signals_pkey`<br>`harvest_signals`: ModifyTable |
 
 ## `remove_pending_timers`
 
@@ -65,6 +115,14 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `DELETE FROM "harvest_timers" WHERE (("harvest_timers"."workflow_exec_id" = $1) AND ("harvest_time...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending`<br>`harvest_timers`: ModifyTable |
+
+## `resolve_batch_reset_one`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
 
 ## `terminate_source_execution`
 

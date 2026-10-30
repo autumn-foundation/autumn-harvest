@@ -6,3 +6,4 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/version_gate_retirement.md"

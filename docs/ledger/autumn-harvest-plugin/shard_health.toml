@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/shard_health.md"
 
 ["observe_schema"]
 driver = "per_request"
@@ -13,3 +14,4 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["__diesel_schema_migrations"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/shard_health.md"

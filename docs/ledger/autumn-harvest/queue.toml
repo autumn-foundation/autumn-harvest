@@ -126,6 +126,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["concurrency_probe_passes"]
 driver = "per_task"
@@ -149,6 +150,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["defer_claimed_task"]
 driver = "per_task"
@@ -322,6 +324,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["primary_repend_workflow_task"]
 driver = "per_task"
@@ -345,6 +348,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["read_capability_miss_state"]
 driver = "per_task"

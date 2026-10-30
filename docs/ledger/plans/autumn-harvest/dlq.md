@@ -18,6 +18,17 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `aggregate_dead_letters`
+
+Statements: 4. Tables with no usable index: `harvest_dead_letters`.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."workflow_exec_id", "harvest_dead_lett...` | `harvest_dead_letters`: no usable index |
+| 2 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."workflow_exec_id", "harvest_dead_lett...` | `harvest_dead_letters`: no usable index |
+| 3 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."workflow_exec_id", "harvest_dead_lett...` | `harvest_dead_letters`: Index Scan on `idx_harvest_dl_workflow_exec_id`<br>`harvest_workflow_executions`: Index Scan on `idx_harvest_wfx_workflow_identity` |
+| 4 | `SELECT COUNT(*) FROM "harvest_dead_letters"` | `harvest_dead_letters`: Bitmap Heap Scan on `harvest_dead_letters_pkey` |
+
 ## `count_bulk_filter_matches`
 
 Statements: 1. Tables with no usable index: `harvest_dead_letters`.
@@ -58,6 +69,14 @@ Statements: 7. Tables with no usable index: none.
 | 6 | `INSERT INTO "harvest_dead_letters" ("original_task_id", "queue_name", "task_type", "workflow_exec...` | `harvest_dead_letters`: ModifyTable |
 | 7 | `SELECT "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."quota_key" F...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
 
+## `discard_dead_letters_batch`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `DELETE FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."id" = ANY($1)) RETURNING "harve...` | `harvest_dead_letters`: Bitmap Heap Scan on `harvest_dead_letters_pkey`<br>`harvest_dead_letters`: ModifyTable |
+
 ## `list_dead_letters`
 
 Statements: 1. Tables with no usable index: `harvest_dead_letters`.
@@ -65,6 +84,14 @@ Statements: 1. Tables with no usable index: `harvest_dead_letters`.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: no usable index |
+
+## `load_workflow_names`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name" FROM "ha...` | `harvest_workflow_executions`: Bitmap Heap Scan on `harvest_workflow_executions_pkey` |
 
 ## `query_dead_letters_for_bulk`
 

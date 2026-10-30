@@ -31164,8 +31164,10 @@ async fn trigger_schedule_now(
             sdsl::harvest_schedules
                 .find(schedule.id)
                 .filter(sdsl::exhausted_at.is_null())
+                // Diesel does not group a raw fragment, and AND binds tighter than OR.
+                // Without the parentheses the guard matches other schedules (issue #2423).
                 .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
-                    "max_runs IS NULL OR runs_started < max_runs",
+                    "(max_runs IS NULL OR runs_started < max_runs)",
                 )),
         )
         .set((
@@ -31742,8 +31744,10 @@ macro_rules! reserve_backfill_budget_slot_stmt {
             sdsl::harvest_schedules
                 .find($schedule_id)
                 .filter(sdsl::exhausted_at.is_null())
+                // Diesel does not group a raw fragment, and AND binds tighter than OR.
+                // Without the parentheses the guard matches other schedules (issue #2423).
                 .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
-                    "max_runs IS NULL OR max_runs <= 0 OR runs_started < max_runs",
+                    "(max_runs IS NULL OR max_runs <= 0 OR runs_started < max_runs)",
                 )),
         )
         .set((
@@ -31773,8 +31777,10 @@ macro_rules! clear_stale_max_runs_exhaustion_stmt {
                 .find($schedule_id)
                 .filter(sdsl::exhausted_at.is_not_null())
                 .filter(sdsl::exhausted_reason.eq("max_runs_exhausted"))
+                // Diesel does not group a raw fragment, and AND binds tighter than OR.
+                // Without the parentheses the guard matches other schedules (issue #2423).
                 .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
-                    "max_runs IS NULL OR max_runs <= 0 OR runs_started < max_runs",
+                    "(max_runs IS NULL OR max_runs <= 0 OR runs_started < max_runs)",
                 )),
         )
         .set((
@@ -58602,8 +58608,8 @@ mod tests {
             "must increment runs_started, got: {sql}"
         );
         assert!(
-            sql.contains("max_runs IS NULL OR max_runs <= 0 OR runs_started < max_runs"),
-            "must carry the budget guard treating max_runs <= 0 as unlimited, got: {sql}"
+            sql.contains("AND (max_runs IS NULL OR max_runs <= 0 OR runs_started < max_runs)"),
+            "must carry the parenthesized budget guard treating max_runs <= 0 as unlimited (issue #2423), got: {sql}"
         );
         assert!(
             sql.contains(r#""harvest_schedules"."exhausted_at" IS NULL"#),
@@ -58636,8 +58642,8 @@ mod tests {
             "must guard on exhausted_at IS NOT NULL, got: {sql}"
         );
         assert!(
-            sql.contains("max_runs IS NULL OR max_runs <= 0 OR runs_started < max_runs"),
-            "must guard on the below-cap predicate, got: {sql}"
+            sql.contains("AND (max_runs IS NULL OR max_runs <= 0 OR runs_started < max_runs)"),
+            "must guard on the parenthesized below-cap predicate (issue #2423), got: {sql}"
         );
         assert!(
             sql.contains(r#"SET "exhausted_at" = $"#),

@@ -45,6 +45,14 @@ Statements: 3. Tables with no usable index: none.
 | 2 | `SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, f...` | `harvest_event_batches`: Index Scan on `idx_harvest_event_batches_shard_fire_at` |
 | 3 | `SELECT to_regclass('harvest_event_batches') IS NOT NULL AS present` | no table |
 
+## `list_pending_event_batches`
+
+Statements: 1. Tables with no usable index: `harvest_event_batches`.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, fire_at, max_siz...` | `harvest_event_batches`: no usable index |
+
 ## `pull_in_event_batch_row`
 
 Statements: 1. Tables with no usable index: none.

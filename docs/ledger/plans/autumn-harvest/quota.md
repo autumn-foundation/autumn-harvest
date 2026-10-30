@@ -18,6 +18,14 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `list_quota_usage`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `WITH active AS ( SELECT workflow_name, quota_key, COUNT(*)::BIGINT AS active_executions FROM harv...` | `harvest_dead_letters`: Bitmap Heap Scan on `idx_harvest_dl_quota`<br>`harvest_events`: Bitmap Heap Scan on `idx_harvest_events_history_page`<br>`harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_quota_active` |
+
 ## `load_quota_usage`
 
 Statements: 1. Tables with no usable index: none.
@@ -33,4 +41,12 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `WITH active AS ( SELECT id FROM harvest_workflow_executions WHERE workflow_name = $1 AND quota_ke...` | `harvest_dead_letters`: Index Only Scan on `idx_harvest_dl_quota`<br>`harvest_events`: Bitmap Heap Scan on `idx_harvest_events_history_page`<br>`harvest_workflow_executions`: Index Scan on `idx_harvest_we_llm_tenant` |
+
+## `lock_quota_key`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)` | no table |
 

@@ -13,6 +13,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_shard_migrations", "harvest_signals", "harvest_task_queue", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::assert_schema_parity"]
 driver = "setup"
@@ -20,6 +21,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events", "harvest_llm_ledger", "harvest_payload_refs", "harvest_signals", "harvest_stream_chunks", "harvest_task_queue", "harvest_timers", "harvest_workflow_executions", "harvest_workflow_logs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::begin_migration"]
 driver = "setup"
@@ -27,6 +29,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_shard_migrations"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::business_key_on"]
 driver = "setup"
@@ -56,6 +59,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_completion_deliveries", "harvest_cross_shard_children", "harvest_dead_letters", "harvest_entity_state", "harvest_events", "harvest_external_tasks", "harvest_mutex_locks", "harvest_mutex_waiters", "harvest_sessions", "harvest_shard_migrations", "harvest_signals", "harvest_task_queue", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::cutover_decline_reason"]
 driver = "setup"
@@ -70,6 +74,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_events", "harvest_llm_ledger", "harvest_payload_refs", "harvest_signals", "harvest_stream_chunks", "harvest_task_queue", "harvest_timers", "harvest_workflow_executions", "harvest_workflow_logs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::discard_staged_copy_restoring_seal"]
 driver = "setup"
@@ -84,6 +89,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::insert_stream_chunk_pages"]
 driver = "setup"
@@ -119,6 +125,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_completion_deliveries", "harvest_cross_shard_children", "harvest_dead_letters", "harvest_external_tasks", "harvest_mutex_locks", "harvest_mutex_waiters", "harvest_sessions", "harvest_signals", "harvest_task_queue", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::read_forward"]
 driver = "setup"
@@ -134,6 +141,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::read_legal_hold_set_at"]
 driver = "setup"
@@ -141,6 +149,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::read_stream_chunk_pages"]
 driver = "setup"
@@ -148,6 +157,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_stream_chunks"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::reconcile_migrated_seal_terminality"]
 driver = "setup"
@@ -176,6 +186,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_execution_summaries", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::resolve_continuation_outcome"]
 driver = "setup"
@@ -197,6 +208,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_shard_migrations"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::shard_of_held_row"]
 driver = "setup"
@@ -212,6 +224,7 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_events", "harvest_llm_ledger", "harvest_payload_refs", "harvest_shard_migrations", "harvest_signals", "harvest_task_queue", "harvest_timers", "harvest_workflow_executions", "harvest_workflow_logs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::verify_target_copy"]
 driver = "setup"
@@ -219,3 +232,4 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_events", "harvest_shard_migrations"]
 measured = "docs/performance-history-fingerprint.md"
+plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"

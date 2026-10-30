@@ -6,3 +6,4 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/queue_coverage.md"

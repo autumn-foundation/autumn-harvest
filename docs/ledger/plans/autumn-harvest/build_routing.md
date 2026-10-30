@@ -63,6 +63,14 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT id, queue_name, build_id, deployment_name, created_at, updated_at, target_build_id, ramp_p...` | `harvest_build_policies`: Index Scan on `harvest_build_policies_queue_name_key` |
 
+## `list_build_compat`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT id, build_id, compatible_with, declared_at FROM harvest_build_compat ORDER BY build_id, co...` | `harvest_build_compat`: full scan of index `harvest_build_compat_build_id_compatible_with_key` |
+
 ## `list_build_policies`
 
 Statements: 1. Tables with no usable index: none.

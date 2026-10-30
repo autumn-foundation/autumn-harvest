@@ -62,19 +62,21 @@ Statements: 1. Tables with no usable index: none.
 
 ## `pending_throttle_count_for_workflow`
 
-Statements: 1. Tables with no usable index: none.
+Statements: 2. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT COUNT(*) AS n FROM harvest_start_throttle WHERE workflow_name = $1` | `harvest_start_throttle`: Index Only Scan on `idx_harvest_start_throttle_workflow_id` |
+| 2 | `SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS present` | no table |
 
 ## `pending_throttle_counts_for_workflows`
 
-Statements: 1. Tables with no usable index: none.
+Statements: 2. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT workflow_name, COUNT(*) AS n FROM harvest_start_throttle WHERE workflow_name = ANY($1) GRO...` | `harvest_start_throttle`: Bitmap Heap Scan on `idx_harvest_start_throttle_workflow_id`<br>`harvest_start_throttle`: Index Only Scan on `idx_harvest_start_throttle_workflow_id` |
+| 1 | `SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS present` | no table |
+| 2 | `SELECT workflow_name, COUNT(*) AS n FROM harvest_start_throttle WHERE workflow_name = ANY($1) GRO...` | `harvest_start_throttle`: Bitmap Heap Scan on `idx_harvest_start_throttle_workflow_id`<br>`harvest_start_throttle`: Index Only Scan on `idx_harvest_start_throttle_workflow_id` |
 
 ## `pre_lock_rate_limit_buckets_for_claimed_batch`
 

@@ -64,6 +64,21 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `UPDATE "harvest_workflow_executions" SET "legal_hold_set_at" = $1, "legal_hold_until" = $2, "lega...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
 
+## `list_execution_summaries`
+
+Statements: 8. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_execution_summaries"."execution_id", "harvest_execution_summaries"."workflow_name...` | `harvest_execution_summaries`: full scan of index `idx_harvest_execution_summaries_gc` |
+| 2 | `SELECT "harvest_execution_summaries"."execution_id", "harvest_execution_summaries"."workflow_name...` | `harvest_execution_summaries`: full scan of index `idx_harvest_execution_summaries_gc` |
+| 3 | `SELECT "harvest_execution_summaries"."execution_id", "harvest_execution_summaries"."workflow_name...` | `harvest_execution_summaries`: Index Scan on `idx_harvest_execution_summaries_gc` |
+| 4 | `SELECT "harvest_execution_summaries"."execution_id", "harvest_execution_summaries"."workflow_name...` | `harvest_execution_summaries`: full scan of index `idx_harvest_execution_summaries_gc` |
+| 5 | `SELECT "harvest_execution_summaries"."execution_id", "harvest_execution_summaries"."workflow_name...` | `harvest_execution_summaries`: Index Scan on `idx_harvest_execution_summaries_name` |
+| 6 | `SELECT "harvest_execution_summaries"."execution_id", "harvest_execution_summaries"."workflow_name...` | `harvest_execution_summaries`: Index Scan on `idx_harvest_execution_summaries_gc` |
+| 7 | `SELECT "harvest_execution_summaries"."execution_id", "harvest_execution_summaries"."workflow_name...` | `harvest_execution_summaries`: Index Scan on `idx_harvest_execution_summaries_gc` |
+| 8 | `SELECT "harvest_execution_summaries"."execution_id", "harvest_execution_summaries"."workflow_name...` | `harvest_execution_summaries`: Bitmap Heap Scan on `idx_harvest_execution_summaries_search` |
+
 ## `purge_expired_summaries`
 
 Statements: 2. Tables with no usable index: none.

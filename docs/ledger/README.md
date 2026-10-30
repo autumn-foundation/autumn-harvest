@@ -144,11 +144,11 @@ page.
 
 The census has two steps:
 
-1. `autumn-harvest/tests/integration/ledger_census.rs` installs a Diesel
-   instrumentation hook when `HARVEST_LEDGER_CENSUS` names a file. While the
-   DB suites run, the hook writes each statement, its bind values and the
-   source frames of its call stack. The variable is unset in every ordinary
-   run.
+1. `autumn-harvest/src/ledger_census.rs` installs a Diesel instrumentation
+   hook when `HARVEST_LEDGER_CENSUS` names a file. While the DB suites run,
+   the hook writes each statement, its bind values and the source frames of
+   its call stack. The module exists only with the `ledger-census` feature,
+   and the variable is unset in every ordinary run.
 2. [`docs/audits/ledger-census.py`](../audits/ledger-census.py) maps each
    statement to the profile of the innermost profiled frame. It then runs
    `EXPLAIN (GENERIC_PLAN, FORMAT JSON)` for each statement on a migrated
@@ -172,11 +172,20 @@ usable ones is a hint only. A plan is not a buffer count, so the census
 does not change `measured`.
 
 ```sh
-HARVEST_LEDGER_CENSUS=/var/tmp/census.jsonl \
-    cargo test -p autumn-harvest --test integration -- --test-threads=6
+export HARVEST_LEDGER_CENSUS=/var/tmp/census.jsonl
+export RUSTFLAGS="-C link-arg=-Wl,-u,harvest_ledger_census_anchor"
+cargo test --target x86_64-unknown-linux-gnu -p autumn-harvest \
+    --features ledger-census --test integration -- --test-threads=6
+cargo test --target x86_64-unknown-linux-gnu -p autumn-harvest-plugin \
+    --features autumn-harvest/ledger-census --tests -- --test-threads=1
 python3 docs/audits/ledger-census.py attribute /var/tmp/census.jsonl
 python3 docs/audits/ledger-census.py plan postgres://postgres@127.0.0.1/ledger_plan --driver per_tick
 ```
+
+The hook installs itself from `.init_array`, before `main`. The `-u` flag
+makes the linker keep the module in every test binary, so neither crate's
+tests need a call site. `--target` keeps `RUSTFLAGS` off the build scripts
+and proc macros, which do not link the module.
 
 Run the suites with no `HARVEST_TEST_DATABASE_URL`, so that each suite boots
 a migrated container. Apply every migration to the plan database first.

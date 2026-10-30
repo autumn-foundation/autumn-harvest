@@ -36,6 +36,14 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT "harvest_calendars"."id", "harvest_calendars"."name", "harvest_calendars"."description", "...` | `harvest_calendars`: Index Scan on `harvest_calendars_name_unique` |
 
+## `list_calendars`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_calendars"."id", "harvest_calendars"."name", "harvest_calendars"."description", "...` | `harvest_calendars`: full scan of index `harvest_calendars_name_unique` |
+
 ## `load_exclusions_for_calendar`
 
 Statements: 1. Tables with no usable index: none.

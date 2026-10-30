@@ -5,7 +5,7 @@
 sends SQL. Most profiles say `measured = "unmeasured"`. This script measures
 them in bulk, in two steps.
 
-`attribute` reads the raw census that `tests/integration/ledger_census.rs`
+`attribute` reads the raw census that `autumn-harvest/src/ledger_census.rs`
 writes while the DB suites run. Each line holds one statement and the source
 frames of its call stack. The script maps the innermost frame that falls in a
 profiled function to that profile. It writes the result to STATEMENTS, which

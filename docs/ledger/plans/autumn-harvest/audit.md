@@ -20,7 +20,7 @@ The full statement text is in `docs/perf-artifacts/ledger-census/statements.json
 
 ## `insert_audit_row`
 
-Statements: 7. Tables with no usable index: none.
+Statements: 13. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
@@ -31,14 +31,25 @@ Statements: 7. Tables with no usable index: none.
 | 5 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
 | 6 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
 | 7 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 8 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 9 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 10 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 11 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 12 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 13 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
 
 ## `insert_audit_rows`
 
-Statements: 1. Tables with no usable index: none.
+Statements: 6. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 2 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 3 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 4 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 5 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
+| 6 | `INSERT INTO "harvest_audit_log" ("actor", "operation", "target_type", "target_id", "route_or_comm...` | `harvest_audit_log`: ModifyTable |
 
 ## `list_audit`
 

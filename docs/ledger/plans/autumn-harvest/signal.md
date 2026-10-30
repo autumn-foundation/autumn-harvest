@@ -52,10 +52,19 @@ Statements: 1. Tables with no usable index: none.
 
 ## `send_signal_idempotent_with_codecs`
 
-Statements: 2. Tables with no usable index: none.
+Statements: 3. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `INSERT INTO "harvest_signals" ("workflow_exec_id", "signal_name", "payload", "idempotency_key") V...` | `harvest_signals`: ModifyTable |
 | 2 | `INSERT INTO "harvest_signals" ("workflow_exec_id", "signal_name", "payload", "idempotency_key") V...` | `harvest_signals`: ModifyTable |
+| 3 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+
+## `signal_idempotency_key_exists`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT EXISTS (SELECT "harvest_signals"."id", "harvest_signals"."workflow_exec_id", "harvest_sign...` | `harvest_signals`: Index Only Scan on `uq_harvest_signals_idem` |
 

@@ -21,6 +21,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_external_tasks"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/external_task.md"
 
 ["find_by_token"]
 driver = "per_request"
@@ -28,6 +29,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_external_tasks"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/external_task.md"
 
 ["find_by_token_locked"]
 driver = "per_request"
@@ -35,6 +37,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_external_tasks"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/external_task.md"
 
 ["list_external_handoffs"]
 driver = "per_request"
@@ -42,6 +45,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_external_tasks", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/external_task.md"
 
 ["lock_task"]
 driver = "per_request"
@@ -57,6 +61,7 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_external_tasks"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/external_task.md"
 
 ["run_has_ended"]
 driver = "per_task"
@@ -64,3 +69,4 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/external_task.md"

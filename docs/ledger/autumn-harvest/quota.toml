@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_dead_letters", "harvest_events", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/quota.md"
 
 ["load_quota_usage"]
 driver = "per_request"
@@ -29,3 +30,4 @@ backend = ["postgres"]
 kind = ["read"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/quota.md"
