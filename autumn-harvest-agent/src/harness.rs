@@ -2005,6 +2005,19 @@ mod tests {
         assert!(!harness.has_model("other"));
         assert!(ModelRegistry::has_model(&harness, "cheap"));
         assert!(!ModelRegistry::has_model(&harness, "other"));
+        let profile = crate::AgentProfile::new("support");
+        let ceilings = crate::Ceilings {
+            models: ["cheap", "other"].map(str::to_owned).into(),
+            ..crate::Ceilings::from_profile(&profile)
+        };
+        for (name, registered) in [("cheap", true), ("other", false)] {
+            let overlay = crate::ProfileOverlay {
+                model: Some(name.to_owned()),
+                ..crate::ProfileOverlay::default()
+            };
+            let out = crate::agent::overlay::apply(&profile, &overlay, &ceilings, &harness);
+            assert_eq!(out.is_ok(), registered, "{name}");
+        }
     }
 
     #[test]

@@ -18,10 +18,13 @@ use crate::mesh::MAX_NAME_LEN;
 pub const GUARDRAILS_HEADING: &str = "## Guardrails";
 
 /// A change to an [`AgentProfile`] that a model may write.
+///
+/// Each `None` field keeps the profile value. A JSON `null` is `None`, so
+/// it cannot remove a bound.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileOverlay {
-    /// The system prompt.
+    /// The system prompt. It replaces the profile prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
     /// Text after the system prompt, under [`GUARDRAILS_HEADING`].
@@ -39,28 +42,32 @@ pub struct ProfileOverlay {
     /// The output cap of one model call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
-    /// Refuse every tool call that writes or acts outside the app.
+    /// Whether the harness refuses every tool call that writes or acts
+    /// outside the app.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
 }
 
 /// The limits of the profile that [`apply`] returns.
+///
+/// A `None` ceiling sets no limit. A `None` bound is above every set ceiling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ceilings {
-    /// The highest `max_steps`. `None` is no limit.
+    /// The highest `max_steps`.
     pub max_steps: Option<u32>,
-    /// The highest `max_total_tokens`. `None` is no limit.
+    /// The highest `max_total_tokens`.
     pub max_total_tokens: Option<u32>,
-    /// The highest `max_output_tokens`. `None` is no limit.
+    /// The highest `max_output_tokens`.
     pub max_output_tokens: Option<u32>,
     /// The models that the profile may name.
     pub models: BTreeSet<String>,
-    /// Let an overlay clear `read_only`.
+    /// Whether an overlay may clear `read_only`.
     pub allow_clear_read_only: bool,
 }
 
 impl Ceilings {
-    /// The default ceilings of `profile`. An overlay may only narrow it.
+    /// The default ceilings of `profile`. Under them, an overlay can only
+    /// narrow `profile`.
     #[must_use]
     pub fn from_profile(profile: &AgentProfile) -> Self {
         Self {
@@ -88,6 +95,8 @@ impl ModelRegistry for AgentHarness {
     }
 }
 
+/// A plain set holds only its own names, so it can leave out
+/// [`DEFAULT_MODEL`].
 impl ModelRegistry for BTreeSet<String> {
     fn has_model(&self, name: &str) -> bool {
         self.contains(name)
@@ -95,6 +104,9 @@ impl ModelRegistry for BTreeSet<String> {
 }
 
 /// Why [`apply`] refuses an overlay.
+///
+/// [`apply`] checks in variant order and returns the first refusal. It cuts
+/// a model name in an error to [`MAX_NAME_LEN`] characters.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum OverlayError {
@@ -107,44 +119,44 @@ pub enum OverlayError {
     /// The overlay clears `read_only`, and the ceilings do not allow it.
     #[error("the overlay clears read_only, and the ceilings do not allow it")]
     ClearsReadOnly,
-    /// The ceilings do not hold the result model.
-    #[error("the ceilings do not allow the model {:?}", truncate(.model, MAX_NAME_LEN))]
+    /// The ceilings or the profile mandate do not allow the model.
+    #[error("the ceilings do not allow the model {model:?}")]
     ModelNotAllowed {
         /// The model name.
         model: String,
     },
-    /// The harness has no model of the name that the overlay gives.
-    #[error("the harness has no model named {:?}", truncate(.model, MAX_NAME_LEN))]
+    /// The registry holds no model with the overlay model name.
+    #[error("the harness has no model named {model:?}")]
     UnknownModel {
         /// The model name.
         model: String,
     },
 }
 
-/// The bound after an overlay sets `set` over `current`, or `None` when it
-/// passes `ceiling`. A `None` bound is no bound.
+/// The bound after an overlay sets `set` over `current`. An error means
+/// that the bound is above `ceiling`.
 ///
 /// `formal/verus/src/agent_overlay.rs` proves it.
 pub(crate) const fn merged_bound(
     current: Option<u32>,
     set: Option<u32>,
     ceiling: Option<u32>,
-) -> Option<Option<u32>> {
+) -> Result<Option<u32>, ()> {
     let next = match set {
         Some(value) => Some(value),
         None => current,
     };
     match ceiling {
-        None => Some(next),
+        None => Ok(next),
         Some(cap) => match next {
-            Some(value) if value <= cap => Some(next),
-            _ => None,
+            Some(value) if value <= cap => Ok(next),
+            _ => Err(()),
         },
     }
 }
 
-/// The `read_only` flag after an overlay sets `set` over `current`, or
-/// `None` when it clears the flag and `allow_clear` is false.
+/// The `read_only` flag after an overlay sets `set` over `current`. `None`
+/// means that the overlay clears the flag and `allow_clear` is false.
 ///
 /// `formal/verus/src/agent_overlay.rs` proves it.
 pub(crate) const fn merged_read_only(
@@ -166,82 +178,100 @@ pub(crate) const fn merged_read_only(
 /// `system` with the guardrails section at its end.
 ///
 /// A prompt that ends with the section stays as it is. So a second apply
-/// adds nothing, and the text of the operator never changes.
+/// adds nothing. The append never edits the text before the section.
 fn with_guardrails(system: Option<&str>, guardrails: &str) -> String {
     let section = format!("{GUARDRAILS_HEADING}\n\n{guardrails}");
     match system {
         None | Some("") => section,
-        Some(system) if system.ends_with(&section) => system.to_owned(),
+        Some(system) if system == section || system.ends_with(&format!("\n\n{section}")) => {
+            system.to_owned()
+        }
         Some(system) => format!("{system}\n\n{section}"),
     }
 }
 
 /// Merges `overlay` into `profile` under `ceilings`.
 ///
-/// Each bound is the overlay bound, or else the profile bound. The result
-/// must be under each ceiling, so a profile bound above an operator ceiling
-/// fails too. The model is the overlay model, or else the profile model.
-/// The guardrails go after the system prompt. Each other field keeps its
-/// profile value. The Verus proof `agent_overlay.rs` models this function.
+/// Each bound is the overlay bound, or else the profile bound. No result
+/// bound may be above its ceiling. So a profile bound above an operator
+/// ceiling fails, even when the overlay does not set that bound. The model
+/// is the overlay model, or else the profile model. The guardrails go after
+/// the system prompt. Each other field keeps its profile value. The Verus
+/// proof `agent_overlay.rs` models this function.
 ///
 /// # Errors
 ///
-/// Returns [`OverlayError::AboveCeiling`] for a bound above its ceiling,
-/// [`OverlayError::ClearsReadOnly`] for a cleared flag that the ceilings
-/// do not allow, [`OverlayError::UnknownModel`] for an overlay model that
-/// `registry` does not hold, and [`OverlayError::ModelNotAllowed`] for a
-/// model outside the ceilings.
+/// - [`OverlayError::AboveCeiling`]: a result bound is above its ceiling.
+/// - [`OverlayError::ClearsReadOnly`]: the overlay clears `read_only`, and
+///   the ceilings do not allow it.
+/// - [`OverlayError::ModelNotAllowed`]: the ceilings do not hold the result
+///   model, or the profile mandate forbids the overlay model.
+/// - [`OverlayError::UnknownModel`]: `registry` does not hold the overlay
+///   model.
 pub fn apply<R: ModelRegistry + ?Sized>(
     profile: &AgentProfile,
     overlay: &ProfileOverlay,
     ceilings: &Ceilings,
     registry: &R,
 ) -> Result<AgentProfile, OverlayError> {
+    // A new overlay field fails to compile here until `apply` reads it.
+    let ProfileOverlay {
+        system,
+        guardrails,
+        model,
+        max_steps,
+        max_total_tokens,
+        max_output_tokens,
+        read_only,
+    } = overlay;
     let above = |field| OverlayError::AboveCeiling { field };
-    let Some(Some(max_steps)) = merged_bound(
-        Some(profile.max_steps),
-        overlay.max_steps,
-        ceilings.max_steps,
-    ) else {
+    let Ok(Some(max_steps)) = merged_bound(Some(profile.max_steps), *max_steps, ceilings.max_steps)
+    else {
         return Err(above("max_steps"));
     };
     let max_total_tokens = merged_bound(
         profile.max_total_tokens,
-        overlay.max_total_tokens,
+        *max_total_tokens,
         ceilings.max_total_tokens,
     )
-    .ok_or_else(|| above("max_total_tokens"))?;
+    .map_err(|()| above("max_total_tokens"))?;
     let max_output_tokens = merged_bound(
         profile.max_output_tokens,
-        overlay.max_output_tokens,
+        *max_output_tokens,
         ceilings.max_output_tokens,
     )
-    .ok_or_else(|| above("max_output_tokens"))?;
+    .map_err(|()| above("max_output_tokens"))?;
     let read_only = merged_read_only(
         profile.read_only,
-        overlay.read_only,
+        *read_only,
         ceilings.allow_clear_read_only,
     )
     .ok_or(OverlayError::ClearsReadOnly)?;
-    if let Some(model) = &overlay.model
-        && !registry.has_model(model)
+    let named = model.as_deref();
+    let model = model.as_ref().or(profile.model.as_ref());
+    let name = model.map_or(DEFAULT_MODEL, String::as_str);
+    let forbidden = named.is_some()
+        && profile
+            .mandate
+            .as_ref()
+            .is_some_and(|mandate| !mandate.allows_model(named));
+    if forbidden || !ceilings.models.contains(name) {
+        return Err(OverlayError::ModelNotAllowed {
+            model: truncate(name, MAX_NAME_LEN),
+        });
+    }
+    if let Some(named) = named
+        && !registry.has_model(named)
     {
         return Err(OverlayError::UnknownModel {
-            model: model.clone(),
+            model: truncate(named, MAX_NAME_LEN),
         });
     }
-    let model = overlay.model.as_ref().or(profile.model.as_ref());
-    let name = model.map_or(DEFAULT_MODEL, String::as_str);
-    if !ceilings.models.contains(name) {
-        return Err(OverlayError::ModelNotAllowed {
-            model: name.to_owned(),
-        });
-    }
-    let system = overlay.system.as_ref().or(profile.system.as_ref());
-    let system = match &overlay.guardrails {
-        Some(guardrails) => Some(with_guardrails(system.map(String::as_str), guardrails)),
-        None => system.cloned(),
-    };
+    let system = system.as_ref().or(profile.system.as_ref());
+    let system = guardrails.as_deref().map_or_else(
+        || system.cloned(),
+        |guardrails| Some(with_guardrails(system.map(String::as_str), guardrails)),
+    );
     Ok(AgentProfile {
         system,
         max_steps,
@@ -256,6 +286,7 @@ pub fn apply<R: ModelRegistry + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::AgentHeartbeat;
     use crate::mesh::Mandate;
     use proptest::prelude::*;
     use serde_json::json;
@@ -595,22 +626,21 @@ mod tests {
 
     #[test]
     fn an_overlay_that_names_a_reviewed_field_fails_to_decode() {
-        for field in [
-            "tools",
-            "tool_rules",
-            "flow_rules",
-            "mandate",
-            "tenant",
-            "mesh",
-            "memory",
-            "parallel_children",
-            "kind",
+        for (field, value) in [
+            ("tools", json!(["search"])),
+            ("tool_rules", json!({})),
+            ("flow_rules", json!({})),
+            ("mandate", json!({})),
+            ("tenant", json!("acme")),
+            ("mesh", json!("ops")),
+            ("memory", json!("state")),
+            ("parallel_children", json!(2)),
+            ("heartbeat", json!({"every_secs": 60})),
+            ("kind", json!("other")),
         ] {
-            let value = json!({ field: [] });
-            assert!(
-                serde_json::from_value::<ProfileOverlay>(value).is_err(),
-                "{field} must not decode"
-            );
+            let err = serde_json::from_value::<ProfileOverlay>(json!({ field: value }))
+                .expect_err("a reviewed field must not decode");
+            assert!(err.to_string().contains("unknown field"), "{field}: {err}");
         }
         assert!(serde_json::from_value::<ProfileOverlay>(json!({"tools": []})).is_err());
     }
@@ -640,9 +670,100 @@ mod tests {
 
     #[test]
     fn an_error_names_a_long_model_in_short() {
-        let model = "m".repeat(10_000);
-        let text = OverlayError::UnknownModel { model }.to_string();
-        assert!(text.len() < 200, "{}", text.len());
+        let profile = AgentProfile::new("support");
+        let long = "m".repeat(10_000);
+        let overlay = ProfileOverlay {
+            model: Some(long.clone()),
+            ..ProfileOverlay::default()
+        };
+        let not_allowed = apply(
+            &profile,
+            &overlay,
+            &Ceilings::from_profile(&profile),
+            &registry(&[]),
+        );
+        let allowed = Ceilings {
+            models: BTreeSet::from([long]),
+            ..Ceilings::from_profile(&profile)
+        };
+        let unknown = apply(&profile, &overlay, &allowed, &registry(&[]));
+        for err in [not_allowed, unknown] {
+            let err = err.expect_err("refused");
+            let (OverlayError::ModelNotAllowed { model } | OverlayError::UnknownModel { model }) =
+                &err
+            else {
+                panic!("unexpected {err:?}");
+            };
+            assert!(model.chars().count() < 100, "{}", model.len());
+            assert!(err.to_string().len() < 200);
+        }
+    }
+
+    #[test]
+    fn a_model_that_is_neither_allowed_nor_registered_is_not_allowed() {
+        let profile = rich_profile();
+        let overlay = ProfileOverlay {
+            model: Some("m9".to_owned()),
+            ..ProfileOverlay::default()
+        };
+        let err = apply(
+            &profile,
+            &overlay,
+            &Ceilings::from_profile(&profile),
+            &registry(&["m1"]),
+        );
+        assert_eq!(
+            err,
+            Err(OverlayError::ModelNotAllowed {
+                model: "m9".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn the_profile_mandate_forbids_an_overlay_model() {
+        let mut profile = AgentProfile::new("support").model("m1");
+        profile.mandate = Some(Mandate::new("support/a").models(["m1"]));
+        let ceilings = Ceilings {
+            models: registry(&["m1", "m2"]),
+            ..Ceilings::from_profile(&profile)
+        };
+        let overlay = ProfileOverlay {
+            model: Some("m2".to_owned()),
+            ..ProfileOverlay::default()
+        };
+        assert_eq!(
+            apply(&profile, &overlay, &ceilings, &registry(&["m1", "m2"])),
+            Err(OverlayError::ModelNotAllowed {
+                model: "m2".to_owned()
+            })
+        );
+        let same = ProfileOverlay {
+            model: Some("m1".to_owned()),
+            ..ProfileOverlay::default()
+        };
+        let out = apply(&profile, &same, &ceilings, &registry(&["m1"])).expect("allowed");
+        assert_eq!(out.model.as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn a_suffix_without_a_paragraph_break_gets_its_own_section() {
+        let profile = AgentProfile::new("support").system("x## Guardrails\n\ng");
+        let overlay = ProfileOverlay {
+            guardrails: Some("g".to_owned()),
+            ..ProfileOverlay::default()
+        };
+        let out = apply(
+            &profile,
+            &overlay,
+            &Ceilings::from_profile(&profile),
+            &registry(&[]),
+        )
+        .expect("applies");
+        assert_eq!(
+            out.system.as_deref(),
+            Some("x## Guardrails\n\ng\n\n## Guardrails\n\ng")
+        );
     }
 
     const MODELS: [&str; 4] = [DEFAULT_MODEL, "m1", "m2", "m3"];
@@ -664,6 +785,12 @@ mod tests {
             .prop_map(|names| names.into_iter().map(str::to_owned).collect())
     }
 
+    /// A registry. Half of the time it holds every model, so more overlays
+    /// apply.
+    fn any_registry() -> impl Strategy<Value = BTreeSet<String>> {
+        prop_oneof![any_models(), Just(registry(&MODELS))]
+    }
+
     prop_compose! {
         fn any_profile()(
             system in any_text(),
@@ -674,6 +801,8 @@ mod tests {
             read_only in any::<bool>(),
             tenant in proptest::option::of("[a-z]{1,4}"),
             window in 0_u32..300,
+            mandate in proptest::option::of(proptest::option::of(any_models())),
+            beat in proptest::option::of((any_bound(), any_model())),
         ) -> AgentProfile {
             let mut profile = AgentProfile::new("kind").max_steps(max_steps);
             profile.system = system;
@@ -683,6 +812,18 @@ mod tests {
             profile.read_only = read_only;
             profile.tenant = tenant;
             profile.window = window;
+            profile.mandate = mandate.map(|models| {
+                let mandate = Mandate::new("kind/a");
+                match models {
+                    Some(models) => mandate.models(models),
+                    None => mandate,
+                }
+            });
+            profile.heartbeat = beat.map(|(max_steps, model)| AgentHeartbeat {
+                max_steps,
+                model,
+                ..AgentHeartbeat::every(std::time::Duration::from_secs(60))
+            });
             profile
         }
     }
@@ -710,7 +851,7 @@ mod tests {
     }
 
     prop_compose! {
-        fn any_ceilings()(
+        fn random_ceilings()(
             max_steps in any_bound(),
             max_total_tokens in any_bound(),
             max_output_tokens in any_bound(),
@@ -727,8 +868,94 @@ mod tests {
         }
     }
 
-    /// Whether `value` is at most `ceiling`. `None` is no bound.
-    fn under(value: Option<u32>, ceiling: Option<u32>) -> bool {
+    prop_compose! {
+        /// Ceilings at or above every generated bound, with every model.
+        fn wide_ceilings()(
+            max_steps in proptest::option::of(64_u32..100),
+            allow_clear_read_only in any::<bool>(),
+        ) -> Ceilings {
+            Ceilings {
+                max_steps,
+                max_total_tokens: None,
+                max_output_tokens: None,
+                models: registry(&MODELS),
+                allow_clear_read_only,
+            }
+        }
+    }
+
+    fn any_ceilings() -> impl Strategy<Value = Ceilings> {
+        prop_oneof![random_ceilings(), wide_ceilings()]
+    }
+
+    /// `apply`, written from the rules in `docs/design/DESIGN-2370.md`.
+    fn oracle(
+        profile: &AgentProfile,
+        overlay: &ProfileOverlay,
+        ceilings: &Ceilings,
+        names: &BTreeSet<String>,
+    ) -> Result<AgentProfile, OverlayError> {
+        let max_steps = overlay.max_steps.unwrap_or(profile.max_steps);
+        let max_total_tokens = overlay.max_total_tokens.or(profile.max_total_tokens);
+        let max_output_tokens = overlay.max_output_tokens.or(profile.max_output_tokens);
+        let read_only = overlay.read_only.unwrap_or(profile.read_only);
+        let model = overlay.model.clone().or_else(|| profile.model.clone());
+        let name = model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_owned());
+        for (field, value, ceiling) in [
+            ("max_steps", Some(max_steps), ceilings.max_steps),
+            (
+                "max_total_tokens",
+                max_total_tokens,
+                ceilings.max_total_tokens,
+            ),
+            (
+                "max_output_tokens",
+                max_output_tokens,
+                ceilings.max_output_tokens,
+            ),
+        ] {
+            if !under(value, ceiling) {
+                return Err(OverlayError::AboveCeiling { field });
+            }
+        }
+        if profile.read_only && !read_only && !ceilings.allow_clear_read_only {
+            return Err(OverlayError::ClearsReadOnly);
+        }
+        let mandate_allows = profile.mandate.as_ref().is_none_or(|mandate| {
+            mandate
+                .models
+                .as_ref()
+                .is_none_or(|models| models.contains(&name))
+        });
+        if !ceilings.models.contains(&name) || (overlay.model.is_some() && !mandate_allows) {
+            return Err(OverlayError::ModelNotAllowed { model: name });
+        }
+        if overlay.model.is_some() && !names.contains(&name) {
+            return Err(OverlayError::UnknownModel { model: name });
+        }
+        let mut system = overlay.system.clone().or_else(|| profile.system.clone());
+        if let Some(guardrails) = &overlay.guardrails {
+            let section = format!("## Guardrails\n\n{guardrails}");
+            system = Some(match system {
+                None => section,
+                Some(text) if text.is_empty() => section,
+                Some(text) if text == section || text.ends_with(&format!("\n\n{section}")) => text,
+                Some(text) => text + "\n\n" + &section,
+            });
+        }
+        let mut out = profile.clone();
+        out.system = system;
+        out.model = model;
+        out.max_steps = max_steps;
+        out.max_total_tokens = max_total_tokens;
+        out.max_output_tokens = max_output_tokens;
+        out.read_only = read_only;
+        Ok(out)
+    }
+
+    /// Whether `value` is at most `ceiling`. A `None` ceiling sets no limit.
+    /// A `None` value is above every set ceiling.
+    const fn under(value: Option<u32>, ceiling: Option<u32>) -> bool {
         match (value, ceiling) {
             (_, None) => true,
             (Some(value), Some(ceiling)) => value <= ceiling,
@@ -750,14 +977,18 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(512))]
+        #![proptest_config(ProptestConfig {
+            cases: 512,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
 
         #[test]
         fn apply_is_idempotent(
             profile in any_profile(),
             overlay in any_overlay(),
             ceilings in any_ceilings(),
-            names in any_models(),
+            names in any_registry(),
         ) {
             if let Ok(once) = apply(&profile, &overlay, &ceilings, &names) {
                 let twice = apply(&once, &overlay, &ceilings, &names);
@@ -770,7 +1001,7 @@ mod tests {
             profile in any_profile(),
             overlay in any_overlay(),
             ceilings in any_ceilings(),
-            names in any_models(),
+            names in any_registry(),
         ) {
             if let Ok(out) = apply(&profile, &overlay, &ceilings, &names) {
                 prop_assert!(under(Some(out.max_steps), ceilings.max_steps));
@@ -781,16 +1012,45 @@ mod tests {
                 prop_assert!(ceilings.models.contains(model));
                 if let Some(model) = &overlay.model {
                     prop_assert!(names.contains(model));
+                    let mandate = profile.mandate.as_ref();
+                    prop_assert!(mandate.is_none_or(|m| m.allows_model(Some(model))));
                 }
                 prop_assert_eq!(unnamed(&out, &profile), profile);
             }
         }
 
         #[test]
+        fn apply_matches_the_oracle(
+            profile in any_profile(),
+            overlay in any_overlay(),
+            ceilings in any_ceilings(),
+            names in any_registry(),
+        ) {
+            prop_assert_eq!(
+                apply(&profile, &overlay, &ceilings, &names),
+                oracle(&profile, &overlay, &ceilings, &names)
+            );
+        }
+
+        #[test]
+        fn an_empty_overlay_keeps_any_profile(
+            profile in any_profile(),
+            names in any_registry(),
+        ) {
+            let out = apply(
+                &profile,
+                &ProfileOverlay::default(),
+                &Ceilings::from_profile(&profile),
+                &names,
+            );
+            prop_assert_eq!(out, Ok(profile));
+        }
+
+        #[test]
         fn default_ceilings_only_narrow(
             profile in any_profile(),
             overlay in any_overlay(),
-            names in any_models(),
+            names in any_registry(),
         ) {
             let ceilings = Ceilings::from_profile(&profile);
             if let Ok(out) = apply(&profile, &overlay, &ceilings, &names) {
