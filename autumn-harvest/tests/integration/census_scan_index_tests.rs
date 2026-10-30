@@ -58,7 +58,11 @@ async fn plan_gate_db() -> claim_bench_db::BenchDb {
 async fn generic_plan(conn: &mut AsyncPgConnection, sql: &str) -> String {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let name = format!("census_gate_{}", NEXT.fetch_add(1, Ordering::Relaxed));
-    let params = (1..).take_while(|n| sql.contains(&format!("${n}"))).count();
+    // Postgres numbers parameters from `$1` with no gap. A gated statement
+    // binds fewer than 10.
+    let params = (1..10)
+        .take_while(|n| sql.contains(&format!("${n}")))
+        .count();
     conn.batch_execute(&format!(
         "SET enable_seqscan = off; \
          SET plan_cache_mode = force_generic_plan; \
