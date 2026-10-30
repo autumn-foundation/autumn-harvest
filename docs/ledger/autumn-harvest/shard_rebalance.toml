@@ -223,7 +223,7 @@ driver = "setup"
 backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_events", "harvest_llm_ledger", "harvest_payload_refs", "harvest_shard_migrations", "harvest_signals", "harvest_task_queue", "harvest_timers", "harvest_workflow_executions", "harvest_workflow_logs"]
-measured = "unmeasured"
+measured = "docs/performance-signals-exec-index.md"
 plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::verify_target_copy"]

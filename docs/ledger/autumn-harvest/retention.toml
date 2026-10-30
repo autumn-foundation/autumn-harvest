@@ -5,7 +5,7 @@ driver = "per_tick"
 backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_completion_deliveries", "harvest_dead_letters", "harvest_execution_summaries", "harvest_workflow_executions"]
-measured = "unmeasured"
+measured = "docs/performance-signals-exec-index.md"
 plan = "docs/ledger/plans/autumn-harvest/retention.md"
 
 ["legal_hold_db::load_hold_for_update"]

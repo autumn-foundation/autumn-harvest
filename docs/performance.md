@@ -2800,3 +2800,8 @@ standalone note rather than part of the claim-path attribution table above:
   — `debugger::is_redacted_export`, the first step of `harvest debug diff`.
   It reads one top-level key without building a `Value` tree. The probe
   cost 29% of the pipeline before the change.
+* [`docs/performance-signals-exec-index.md`](performance-signals-exec-index.md)
+  — the statements that read every signal of one execution, consumed rows
+  included (issue #2367). A retry, a PII erasure, a shard rebalance and each
+  execution delete read the whole signals table. A plain index on
+  `workflow_exec_id` drops the execution delete from 4,151 to 149 buffers.
