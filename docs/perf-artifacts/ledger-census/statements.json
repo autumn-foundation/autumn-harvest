@@ -2694,15 +2694,12 @@
  },
  "docs/ledger/autumn-harvest-plugin/canary.toml": {
   "load_canary_rows": {
-   "SELECT queue_name, state, started_at, completed_at FROM harvest_workflow_executions WHERE starts_with(workflow_name, $1) ORDER BY completed_at DESC NULLS LAST LIMIT $2": {
+   "SELECT queue_name, state, started_at, completed_at FROM harvest_workflow_executions WHERE starts_with(workflow_name, '__harvest_canary_probe') ORDER BY completed_at DESC NULLS LAST LIMIT $1": {
     "literals": [
-     {
-      "1": "'__harvest_canary_probe'"
-     }
+     {}
     ],
     "types": {
-     "1": "text",
-     "2": "bigint"
+     "1": "bigint"
     }
    }
   }
@@ -3442,6 +3439,1624 @@
    }
   }
  },
+ "docs/ledger/autumn-harvest-sqlite/append_only.toml": {
+  "with_guard_off": {
+   "DROP TRIGGER IF EXISTS harvest_events_append_only_ins;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DROP TRIGGER IF EXISTS harvest_events_append_only_upd;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ROLLBACK": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "UPDATE harvest_events SET event_json = '[]'": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "UPDATE harvest_events SET event_json = '[]' WHERE exec_id = ?1 AND seq = 0": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/llm_ledger.toml": {
+  "insert_rows": {
+   "INSERT INTO harvest_llm_ledger (exec_id, event_seq, call_index, activity_name, model, input_tokens, output_tokens, cost_usd_micros, latency_ms, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "rows_between": {
+   "SELECT exec_id, event_seq, call_index, activity_name, model, input_tokens, output_tokens, cost_usd_micros, latency_ms, recorded_at FROM harvest_llm_ledger WHERE recorded_at >= ?1 AND recorded_at < ?2 ORDER BY recorded_at, exec_id, event_seq, call_index": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "rows_of": {
+   "SELECT exec_id, event_seq, call_index, activity_name, model, input_tokens, output_tokens, cost_usd_micros, latency_ms, recorded_at FROM harvest_llm_ledger WHERE exec_id = ?1 ORDER BY event_seq, call_index": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "table_exists": {
+   "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'harvest_llm_ledger'": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/lock.toml": {
+  "WriterLock::release": {
+   "DELETE FROM harvest_memory_writer_lock WHERE token = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "acquire_memory": {
+   "CREATE TABLE IF NOT EXISTS harvest_memory_writer_lock (id INTEGER PRIMARY KEY CHECK (id = 1), token TEXT NOT NULL);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "INSERT OR IGNORE INTO harvest_memory_writer_lock (id, token) VALUES (1, ?1)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/mutex.toml": {
+  "acquire": {
+   "DELETE FROM harvest_mutex_waiters WHERE lock_key = ?1 AND waiter_exec_id = ?2": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "INSERT INTO harvest_mutex_locks (lock_key, holder_exec_id, lock_seq) VALUES (?1, ?2, ?3)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "INSERT INTO harvest_mutex_seq (id, last) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET last = last + 1 RETURNING last": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "INSERT OR IGNORE INTO harvest_mutex_waiters (lock_key, waiter_exec_id) VALUES (?1, ?2)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT 1 FROM harvest_mutex_locks WHERE lock_key = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT waiter_exec_id FROM harvest_mutex_waiters WHERE lock_key = ?1 ORDER BY waiter_seq LIMIT 1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "drop_stale_waits": {
+   "DELETE FROM harvest_mutex_waiters WHERE lock_key = ?1 AND waiter_exec_id = ?2": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT lock_key FROM harvest_mutex_waiters WHERE waiter_exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "release": {
+   "DELETE FROM harvest_mutex_locks WHERE lock_key = ?1 AND holder_exec_id = ?2 AND lock_seq = ?3": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "release_all": {
+   "DELETE FROM harvest_mutex_locks WHERE holder_exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_mutex_waiters WHERE waiter_exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/queue.toml": {
+  "arm_awaited_timer": {
+   "SELECT 1 FROM harvest_timers WHERE exec_id = ?1 AND timer_id = ?2 AND fired = 0": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "cancel_activity_task": {
+   "UPDATE harvest_tasks SET state = 'CANCELLED' WHERE exec_id = ?1 AND activity_id = ?2 AND state IN ('PENDING', 'RUNNING')": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "claim_next_ready_task_tx": {
+   "BEGIN IMMEDIATE": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT task_id, activity_id, name, input_json, attempt, max_attempts, retry_policy_json, start_to_close_ms, scheduled_at, schedule_to_close_at, defaults_frozen, queue, heartbeat_details, last_error FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 AND run_at <= ?2 ORDER BY seq LIMIT 1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "UPDATE harvest_tasks SET state = 'RUNNING' WHERE task_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "delete_pending_tasks_for_execution": {
+   "DELETE FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING'": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "delete_pending_timer": {
+   "DELETE FROM harvest_timers WHERE exec_id = ?1 AND timer_id = ?2 AND fired = 0": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "delete_undelivered_signals_for_execution": {
+   "DELETE FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0 AND idempotency_key IS NULL": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "delete_unfired_timers_for_execution": {
+   "DELETE FROM harvest_timers WHERE exec_id = ?1 AND fired = 0": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "due_timers": {
+   "SELECT timer_id FROM harvest_timers WHERE exec_id = ?1 AND fired = 0 AND fire_at <= ?2 ORDER BY fire_at, arm_seq": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "due_timers_with_deadlines": {
+   "SELECT timer_id, fire_at FROM harvest_timers WHERE exec_id = ?1 AND fired = 0 AND fire_at <= ?2 ORDER BY fire_at, arm_seq": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "enqueue_activity": {
+   "INSERT INTO harvest_tasks (task_id, exec_id, activity_id, name, input_json, queue, state, attempt, run_at, seq, max_attempts, retry_policy_json, start_to_close_ms, scheduled_at, schedule_to_close_at, defaults_frozen) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0, ?7, ?8, ?9, ?10, ?11, ?7, ?12, ?13)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "enqueue_timer": {
+   "INSERT OR REPLACE INTO harvest_timers (timer_id, exec_id, fire_at, fired, arm_seq) VALUES (?1, ?2, ?3, 0, ?4)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "finish_task": {
+   "UPDATE harvest_tasks SET state = 'DONE' WHERE task_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "freeze_task_defaults": {
+   "UPDATE harvest_tasks SET retry_policy_json = ?2, max_attempts = ?3, start_to_close_ms = ?4, schedule_to_close_at = ?5, defaults_frozen = 1 WHERE task_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "has_pending_activity": {
+   "SELECT EXISTS(SELECT 1 FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING')": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "has_unfired_timer": {
+   "SELECT COUNT(*) FROM harvest_timers WHERE exec_id = ?1 AND fired = 0": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "mark_timer_fired": {
+   "UPDATE harvest_timers SET fired = 1 WHERE exec_id = ?1 AND timer_id = ?2": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "move_all_signals_to_retry": {
+   "UPDATE harvest_signals SET exec_id = ?2, delivered = 0 WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "move_undelivered_signals": {
+   "UPDATE harvest_signals SET exec_id = ?2 WHERE exec_id = ?1 AND delivered = 0": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "next_task_seq": {
+   "SELECT MAX(seq) FROM harvest_tasks": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "next_timer_arm_seq": {
+   "SELECT MAX(arm_seq) FROM harvest_timers": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "pending_tasks": {
+   "SELECT activity_id, name, attempt FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING' ORDER BY seq": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "reclaim_orphaned_running": {
+   "UPDATE harvest_tasks SET state = 'PENDING' WHERE state = 'RUNNING'": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "reclaim_running_for_execution": {
+   "UPDATE harvest_tasks SET state = 'PENDING' WHERE state = 'RUNNING' AND exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "record_heartbeat": {
+   "UPDATE harvest_tasks SET heartbeat_details = ?2 WHERE task_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "requeue_task": {
+   "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3, last_error = ?4 WHERE task_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "requeue_task_to_back": {
+   "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3, seq = ?4, last_error = ?5 WHERE task_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/retention.toml": {
+  "purge_terminal": {
+   "DELETE FROM harvest_activity_attempts WHERE exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_events WHERE exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_executions WHERE exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_llm_ledger WHERE exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_signals WHERE exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_tasks WHERE exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_timers WHERE exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT closed_at, exec_id FROM harvest_executions WHERE closed_at IS NOT NULL AND closed_at < ?1 AND (closed_at, exec_id) > (?2, ?3) AND state IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TERMINATED', 'TIMED_OUT', 'CONTINUED_AS_NEW') ORDER BY closed_at, exec_id LIMIT ?4": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/runtime.toml": {
+  "SqliteRuntime::prepare": {
+   "-- A purge deletes the attempts of a batch of runs by `exec_id` (issue\n-- #2031), as for `harvest_tasks` above.\nCREATE INDEX IF NOT EXISTS idx_harvest_activity_attempts_exec\nON harvest_activity_attempts (exec_id);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "-- A purge deletes the tasks of a batch of runs by `exec_id` (issue #2031).\n-- Without this index, each batch scans the whole table, so a large purge is\n-- quadratic. The column exists in every file, so the base schema builds it.\nCREATE INDEX IF NOT EXISTS idx_harvest_tasks_exec\nON harvest_tasks (exec_id);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "-- A usage report reads the ledger in a window of `recorded_at`.\nCREATE INDEX IF NOT EXISTS idx_harvest_llm_ledger_recorded_at\nON harvest_llm_ledger (recorded_at);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "-- Cron and interval schedules (issue #2031). The workflow name is the key,\n-- as on Postgres. Each `poll_once` pass fires the rows whose slot is due.\nCREATE TABLE IF NOT EXISTS harvest_schedules (\nworkflow_name TEXT PRIMARY KEY,\nschedule_json TEXT NOT NULL, -- the `Schedule` spec as JSON\ninput_json TEXT NOT NULL, -- the input of each run\noverlap_policy TEXT NOT NULL, -- skip | allow_all\nmax_active_runs INTEGER NOT NULL, -- the run limit of `skip`\npaused INTEGER NOT NULL DEFAULT 0,\nnext_run_at INTEGER, -- the next slot in epoch milliseconds.\n-- NULL = never fires.\nlast_run_at INTEGER, -- the slot of the last started run in\n-- epoch milliseconds\ncode_json TEXT -- the code `WorkflowSchedule` as JSON\n-- (issue #2390). The row holds the\n-- effective value; an override\n-- merges over this one.\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "-- Each timer arm reads `MAX(arm_seq)` over every timer row (issue #2429). Fired\n-- rows stay until retention purges their run, so without this index each arm\n-- reads the whole table. The column exists in every file, so the base schema\n-- builds the index.\nCREATE INDEX IF NOT EXISTS idx_harvest_timers_arm_seq\nON harvest_timers (arm_seq);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "-- Non-unique index on `harvest_tasks(seq)` so `MAX(seq)` (the next-`seq` allocation\n-- read in `queue`, used on every enqueue and every zero-delay requeue-to-back) is\n-- satisfied from the index instead of a full-table scan (issue #1068, hardening item\n-- 3). The new zero-delay requeue-to-back (which reassigns a fresh `MAX(seq) + 1` on\n-- each immediate race retry) makes that read hotter, so the index keeps a busy retry\n-- loop cheap. `CREATE INDEX IF NOT EXISTS` is idempotent and non-unique \u2014 it runs on\n-- every open (including a pre-existing file) and never fails, so no separate additive\n-- migration is needed.\nCREATE INDEX IF NOT EXISTS idx_harvest_tasks_seq\nON harvest_tasks (seq);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "-- Non-unique lookup index for the (workflow_name, workflow_id) reuse-policy probe\n-- (issue #1068, `store::find_active_execution_by_key`). Deliberately NON-unique: a\n-- unique index would FAIL to build on reopen of any database file already holding\n-- duplicate active ids from the pre-#1068 always-fresh start behavior, breaking\n-- durability. The reuse matrix is instead enforced in the single-writer start\n-- transaction (there are no concurrent writers, so a lookup-then-decide is atomic).\n-- `CREATE INDEX IF NOT EXISTS` is idempotent and never fails on duplicate keys, so\n-- it is applied by the base SCHEMA on every open \u2014 including pre-existing files \u2014\n-- needing no separate additive migration.\nCREATE INDEX IF NOT EXISTS idx_harvest_executions_key\nON harvest_executions (workflow_name, workflow_id);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "-- One row. It mints a new `lock_seq` for each grant, so a token is never\n-- reused after a release.\nCREATE TABLE IF NOT EXISTS harvest_mutex_seq (\nid INTEGER PRIMARY KEY CHECK (id = 1),\nlast INTEGER NOT NULL\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "-- The FIFO queue of runs that wait for a key. `waiter_seq` is the order.\nCREATE TABLE IF NOT EXISTS harvest_mutex_waiters (\nwaiter_seq INTEGER PRIMARY KEY AUTOINCREMENT,\nlock_key TEXT NOT NULL,\nwaiter_exec_id TEXT NOT NULL,\nUNIQUE (lock_key, waiter_exec_id)\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "-- The agent cost ledger (issue #2275), as on Postgres (issue #1996). One row\n-- per LLM call of a completed activity attempt. The runtime writes the rows in\n-- the transaction that appends the completion event. `event_seq` is the\n-- `seq` of that event, as `event_id` is on Postgres. A crash before the\n-- commit writes no row, so a re-run counts each call once. The table is new,\n-- so `CREATE TABLE IF NOT EXISTS` adds it to an older file.\nCREATE TABLE IF NOT EXISTS harvest_llm_ledger (\nexec_id TEXT NOT NULL,\nevent_seq INTEGER NOT NULL,\ncall_index INTEGER NOT NULL,\nactivity_name TEXT NOT NULL,\nmodel TEXT NOT NULL,\ninput_tokens INTEGER NOT NULL,\noutput_tokens INTEGER NOT NULL,\ncost_usd_micros INTEGER, -- millionths of a US dollar. NULL =\n-- unpriced.\nlatency_ms INTEGER NOT NULL,\nrecorded_at INTEGER NOT NULL, -- the epoch millisecond of the\n-- completion\nPRIMARY KEY (exec_id, event_seq, call_index),\n-- The bounds match the Postgres table and `llm_ledger.rs` in the core.\nCHECK (\ncall_index BETWEEN 0 AND 255\nAND input_tokens BETWEEN 0 AND 1000000000000\nAND output_tokens BETWEEN 0 AND 1000000000000\nAND (cost_usd_micros IS NULL OR cost_usd_micros BETWEEN 0 AND 1000000000000000)\nAND latency_ms BETWEEN 0 AND 10000000000\n),\n-- A model id is a token: no space, no control character, no NUL.\nCHECK (\nlength(CAST(model AS BLOB)) BETWEEN 1 AND 200\nAND model NOT GLOB '*[^A-Za-z0-9._:/@+-]*'\n)\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "-- The state filter of a listing (issue #2027). It indexes the same expression\n-- the filter tests, so the planner can use it. The filter compares bytes, so a\n-- value in the wrong storage class still matches. Without the index, a filter\n-- on `state` reads past `input_json` on every row, which is slow when the\n-- inputs are large. The index is non-unique and idempotent, so it builds on\n-- every open of an older file.\nCREATE INDEX IF NOT EXISTS idx_harvest_executions_state\nON harvest_executions (cast(state as blob));": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "-- The workflow mutex (issue #2029). A lock row means the key is held. Each\n-- grant and each release runs in one write transaction of the single writer.\nCREATE TABLE IF NOT EXISTS harvest_mutex_locks (\nlock_key TEXT PRIMARY KEY,\nholder_exec_id TEXT NOT NULL,\nlock_seq INTEGER NOT NULL -- the fencing token of the grant\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "-- Without this, every exec_id/delivered-scoped query here (the signal read,\n-- delete_undelivered_signals_for_execution) scans the whole table, unlike\n-- harvest_timers, whose (exec_id, timer_id) PRIMARY KEY already covers this.\n-- The trailing columns serve the arrival order of the signal read (issue\n-- #2020). Without them, the read sorts the whole backlog before its first row.\n-- It replaces the (exec_id, delivered) index of earlier files. Both statements\n-- are idempotent and run on every open, so no separate migration is needed.\nCREATE INDEX IF NOT EXISTS idx_harvest_signals_exec_arrival\nON harvest_signals (exec_id, delivered, received_at, signal_seq);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE INDEX IF NOT EXISTS idx_harvest_mutex_locks_holder\nON harvest_mutex_locks (holder_exec_id);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE INDEX IF NOT EXISTS idx_harvest_mutex_waiters_exec\nON harvest_mutex_waiters (waiter_exec_id);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_activity_attempts (\nattempt_seq INTEGER PRIMARY KEY AUTOINCREMENT,\nexec_id TEXT NOT NULL,\nname TEXT NOT NULL,\nattempt INTEGER NOT NULL,\nok INTEGER NOT NULL, -- 1 = success, 0 = failure\ndetail TEXT NOT NULL -- output JSON on success, error on failure\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_events (\nexec_id TEXT NOT NULL,\nseq INTEGER NOT NULL,\nevent_json TEXT NOT NULL,\nPRIMARY KEY (exec_id, seq)\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_executions (\nexec_id TEXT PRIMARY KEY,\nworkflow_name TEXT NOT NULL,\nworkflow_id TEXT NOT NULL DEFAULT '', -- the run-scoped BUSINESS workflow id\n-- (issue #698, Codex #1069 P2 runtime.rs:780):\n-- the value `ctx.info().workflow_id` reports,\n-- documented for minting idempotency keys.\n-- Persisted at start and re-read into the\n-- WorkflowContext on EVERY drive cycle, so it is\n-- STABLE across replays (never regenerated).\n-- Defaults to the `exec_id` string form when the\n-- caller supplies none, so it is never empty and\n-- distinct per run (mirrors the Postgres worker,\n-- which injects StartWorkflowParams.workflow_id).\ninput_json TEXT NOT NULL,\nstate TEXT NOT NULL, -- RUNNING | COMPLETED | FAILED | CANCELLED |\n-- TERMINATED | TIMED_OUT | CONTINUED_AS_NEW\noutput_json TEXT,\nerror TEXT,\ncancel_reason TEXT, -- a cooperative cancel request (issue #2021).\n-- NULL until `cancel` stores a request. The\n-- drive reads it only while the run is\n-- RUNNING. A terminal run keeps the value.\ncancel_from_seq INTEGER, -- the history length when `cancel` stored\n-- the request (issue #2021). It bounds the\n-- events that a cleanup can add.\nparent_exec_id TEXT, -- the parent run of a child (issue #2026)\nparent_close_policy TEXT, -- NULL for an awaited child; the policy of a\n-- detached child\nstarted_at INTEGER, -- the `WorkflowStarted` time in epoch\n-- microseconds (issue #2027). NULL on a row\n-- written before that issue.\nclosed_at INTEGER, -- the time of the first terminal write in\n-- epoch microseconds (issue #2027). NULL while the\n-- run is open.\nsearch_attrs TEXT, -- the search attributes as a JSON object\n-- (issue #2027). NULL until a start or an\n-- upsert sets one.\nmemo TEXT, -- the start memo as JSON (issue #2027). No\n-- command changes it after the start.\nexecution_timeout_ms INTEGER, -- the declared execution_timeout (issue\n-- #2029). NULL = no timeout. A successor\n-- re-anchors its deadline with it.\ndeadline_at INTEGER, -- the epoch-millisecond deadline of this run\n-- (issue #2029). NULL = no deadline.\nstart_at INTEGER, -- the earliest epoch-millisecond a drive may\n-- run this run (issue #2029). A retry\n-- successor waits for its backoff here.\nworkflow_attempt INTEGER NOT NULL DEFAULT 1, -- the 1-based workflow retry attempt\n-- (issue #2029).\nretry_policy_json TEXT, -- the frozen workflow-level RetryPolicy\n-- (issue #2029). NULL = no retry.\nretry_of_exec_id TEXT, -- the failed run that this retry replaces\n-- (issue #2029).\nlocal_retry_at INTEGER, -- the epoch-millisecond end of a local\n-- activity's retry backoff (issue #2029).\n-- A drive before it waits.\nschedule_name TEXT -- the schedule that started this run\n-- (issue #2031). A successor copies it.\n-- NULL = not a scheduled run.\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_schedule_overrides (\nworkflow_name TEXT PRIMARY KEY,\nfields_json TEXT NOT NULL, -- the override fields as JSON\nreason TEXT,\nupdated_by TEXT NOT NULL,\ncreated_at INTEGER NOT NULL, -- epoch milliseconds\nupdated_at INTEGER NOT NULL -- epoch milliseconds\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_signals (\nsignal_seq INTEGER PRIMARY KEY AUTOINCREMENT,\nexec_id TEXT NOT NULL,\nname TEXT NOT NULL,\npayload_json TEXT NOT NULL,\ndelivered INTEGER NOT NULL DEFAULT 0,\nreceived_at INTEGER NOT NULL DEFAULT 0, -- absolute epoch-millisecond the signal arrived\nidempotency_key TEXT -- the caller's dedupe key (issue #2028).\n-- NULL = no key. `migrate` builds the\n-- unique index on (exec_id, key).\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_tasks (\ntask_id TEXT PRIMARY KEY,\nexec_id TEXT NOT NULL,\nactivity_id TEXT NOT NULL, -- the scheduled ActivityExecId\nname TEXT NOT NULL,\ninput_json TEXT NOT NULL,\nqueue TEXT NOT NULL,\nstate TEXT NOT NULL, -- PENDING | RUNNING | DONE\nattempt INTEGER NOT NULL, -- attempts consumed so far\nrun_at INTEGER NOT NULL, -- earliest epoch-millisecond this may run\nseq INTEGER NOT NULL, -- FIFO ordering within the queue\nmax_attempts INTEGER, -- per-call retry cap from the command's\n-- retry_policy_override (issue #1069 P2);\n-- NULL = use the registered ActivitySpec default\nretry_policy_json TEXT, -- the WHOLE serialized RetryPolicy from the\n-- command's retry_policy_override (issue #1069 P2,\n-- Codex runtime.rs:985) \u2014 initial_interval,\n-- backoff_coefficient, max_interval,\n-- non_retryable_errors, jitter \u2014 so the worker\n-- honors backoff timing and non-retryable\n-- classification, not just max_attempts.\n-- NULL = raw-path task (no declared policy):\n-- immediate requeue, no policy non-retryable list.\nstart_to_close_ms INTEGER, -- per-activity start-to-close budget in\n-- milliseconds from the command's\n-- start_to_close_override (issue #1069 P2);\n-- NULL = no budget (unbounded, prior behavior).\n-- Enforced as a post-execution outcome by the\n-- worker: a body whose real wall-clock runtime\n-- exceeds it records a terminal ActivityTimedOut\n-- { StartToClose } instead of ActivityCompleted,\n-- byte-equivalent to what the Postgres timeout\n-- scanner durably records.\nscheduled_at INTEGER NOT NULL, -- ABSOLUTE epoch-millisecond the ScheduleActivity\n-- command was persisted (== the initial `run_at`).\n-- The STABLE anchor for the activity's total\n-- (cross-retry) schedule_to_close deadline (issue\n-- #378, Codex #1069 P2 runtime.rs:944): unlike\n-- `run_at`, it is NEVER mutated by a retry requeue,\n-- so it always denotes when the activity was first\n-- scheduled. The FROZEN absolute deadline derived from\n-- it lives in `schedule_to_close_at` below (issue\n-- #1068).\nschedule_to_close_at INTEGER, -- The FROZEN absolute (epoch-millisecond) total\n-- (cross-retry) schedule_to_close deadline for this\n-- task (issue #1068): `scheduled_at +\n-- default_schedule_to_close`. NULL = no total cap\n-- (the activity declared no schedule_to_close, or was\n-- raw-registered). Resolved ONCE and frozen \u2014 at\n-- schedule time when the activity is already registered\n-- (`defaults_frozen = 1`), else at first CLAIM for a\n-- LATE-registered activity \u2014 so an in-flight run's\n-- deadline is IMMUTABLE and a crash/reopen or a\n-- re-registration under a changed spec cannot alter it,\n-- mirroring the Postgres engine (which freezes the\n-- deadline onto the task-queue row). Anchoring to\n-- `scheduled_at` (never claim time) keeps the wall-clock\n-- budget measured from when the activity was first\n-- scheduled, so a wait for late registration does not\n-- extend it.\ndefaults_frozen INTEGER NOT NULL DEFAULT 0, -- Whether the four resolved-default scalars\n-- (`retry_policy_json`, `max_attempts`,\n-- `start_to_close_ms`, `schedule_to_close_at`) have\n-- been RESOLVED onto this row (issue #1068). 0 = not\n-- yet resolved (the activity was scheduled before its\n-- body/`ActivityInfo` was registered) \u2014 the CLAIM path\n-- resolves them from the now-present registered spec,\n-- persists them, and sets this to 1. 1 = frozen: read\n-- the four columns VERBATIM (a NULL means resolved-to-\n-- None) and NEVER re-consult the mutable registry for\n-- them. The activity BODY is always resolved from the\n-- registry regardless \u2014 only the policy/deadline\n-- scalars are frozen. `DEFAULT 0` so a row created by\n-- the additive migration (pre-#1068) is treated as\n-- unresolved and gets frozen on its next claim.\nheartbeat_details TEXT, -- The latest heartbeat payload as JSON (issue\n-- #2024). NULL = no heartbeat yet. A retry or a\n-- reopen reads it back as the checkpoint.\nlast_error TEXT -- The previous attempt's error message (issue\n-- #2024). `ActivityContext::previous_failure`\n-- reads it. NULL on the first attempt.\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_timers (\ntimer_id TEXT NOT NULL,\nexec_id TEXT NOT NULL,\nfire_at INTEGER NOT NULL, -- absolute epoch-millisecond (issue #1069 P2:\n-- sub-second precision so a timer never fires\n-- before its true deadline)\nfired INTEGER NOT NULL DEFAULT 0,\narm_seq INTEGER NOT NULL DEFAULT 0, -- monotonic arm order (issue #1069 P2);\n-- the deterministic tie-breaker for equal\n-- fire_at deadlines, so multiple timers armed\n-- in one batch (a join! of two timers) FIRE in\n-- TimerStarted-append order, which the core\n-- matcher requires to replay\nPRIMARY KEY (exec_id, timer_id)\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TRIGGER IF NOT EXISTS harvest_events_append_only_ins\nBEFORE INSERT ON harvest_events\nWHEN EXISTS (SELECT 1 FROM harvest_events\nWHERE exec_id = NEW.exec_id AND seq = NEW.seq)\nBEGIN\nSELECT RAISE(ABORT, 'harvest_events is append-only (issue #2031)');\nEND;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TRIGGER IF NOT EXISTS harvest_events_append_only_upd\nBEFORE UPDATE ON harvest_events\nBEGIN\nSELECT RAISE(ABORT, 'harvest_events is append-only (issue #2031)');\nEND;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DROP INDEX IF EXISTS idx_harvest_signals_exec_delivered;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA busy_timeout = 5000;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA journal_mode = WAL;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA synchronous = FULL;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/schedule.toml": {
+  "active_runs": {
+   "SELECT COUNT(*) FROM harvest_executions WHERE schedule_name = ?1 AND state = 'RUNNING' AND cancel_reason IS NULL AND (deadline_at IS NULL OR deadline_at > ?2)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "advance": {
+   "UPDATE harvest_schedules SET next_run_at = ?2, last_run_at = CASE WHEN ?3 THEN ?4 ELSE last_run_at END WHERE workflow_name = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "clear_override": {
+   "DELETE FROM harvest_schedule_overrides WHERE workflow_name = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "delete": {
+   "DELETE FROM harvest_schedule_overrides WHERE workflow_name = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_schedules WHERE workflow_name = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "due_names": {
+   "SELECT workflow_name FROM harvest_schedules WHERE paused = 0 AND next_run_at <= ?1 ORDER BY next_run_at, workflow_name": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "list": {
+   "SELECT workflow_name, schedule_json, paused, next_run_at, last_run_at, max_active_runs FROM harvest_schedules ORDER BY workflow_name": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "load_code": {
+   "SELECT code_json FROM harvest_schedules WHERE workflow_name = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "load_due": {
+   "SELECT schedule_json, input_json, overlap_policy, max_active_runs, next_run_at FROM harvest_schedules WHERE workflow_name = ?1 AND paused = 0 AND next_run_at <= ?2": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "load_override": {
+   "SELECT fields_json, reason, updated_by, created_at, updated_at FROM harvest_schedule_overrides WHERE workflow_name = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "set_override": {
+   "INSERT INTO harvest_schedule_overrides (workflow_name, fields_json, reason, updated_by, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5) ON CONFLICT (workflow_name) DO UPDATE SET fields_json = excluded.fields_json, reason = excluded.reason, updated_by = excluded.updated_by, updated_at = excluded.updated_at": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT paused FROM harvest_schedules WHERE workflow_name = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "set_paused": {
+   "SELECT schedule_json, paused FROM harvest_schedules WHERE workflow_name = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "UPDATE harvest_schedules SET paused = 0, next_run_at = ?2 WHERE workflow_name = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "UPDATE harvest_schedules SET paused = 1 WHERE workflow_name = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "write_row": {
+   "INSERT INTO harvest_schedules (workflow_name, schedule_json, input_json, overlap_policy, max_active_runs, paused, next_run_at, code_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT (workflow_name) DO UPDATE SET schedule_json = excluded.schedule_json, input_json = excluded.input_json, overlap_policy = excluded.overlap_policy, max_active_runs = excluded.max_active_runs, next_run_at = excluded.next_run_at, code_json = excluded.code_json": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT schedule_json, next_run_at FROM harvest_schedules WHERE workflow_name = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/schema.toml": {
+  "add_column_if_absent": {
+   "ALTER TABLE harvest_executions ADD COLUMN cancel_from_seq INTEGER": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_executions ADD COLUMN cancel_reason TEXT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_executions ADD COLUMN closed_at INTEGER": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_executions ADD COLUMN deadline_at INTEGER": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_executions ADD COLUMN execution_timeout_ms INTEGER": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_executions ADD COLUMN local_retry_at INTEGER": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_executions ADD COLUMN memo TEXT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_executions ADD COLUMN parent_close_policy TEXT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_executions ADD COLUMN parent_exec_id TEXT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_executions ADD COLUMN retry_of_exec_id TEXT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_executions ADD COLUMN retry_policy_json TEXT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_executions ADD COLUMN schedule_name TEXT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_executions ADD COLUMN search_attrs TEXT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_executions ADD COLUMN start_at INTEGER": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_executions ADD COLUMN started_at INTEGER": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_executions ADD COLUMN workflow_attempt INTEGER NOT NULL DEFAULT 1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_schedules ADD COLUMN code_json TEXT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_signals ADD COLUMN idempotency_key TEXT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_tasks ADD COLUMN defaults_frozen INTEGER NOT NULL DEFAULT 0": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_tasks ADD COLUMN heartbeat_details TEXT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_tasks ADD COLUMN last_error TEXT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ALTER TABLE harvest_tasks ADD COLUMN schedule_to_close_at INTEGER": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "add_schedule_code": {
+   "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'harvest_schedules')": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "add_signal_key": {
+   "BEGIN DEFERRED": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "COMMIT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE INDEX IF NOT EXISTS idx_harvest_executions_parent ON harvest_executions (parent_exec_id);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE UNIQUE INDEX IF NOT EXISTS uq_harvest_signals_idem ON harvest_signals (exec_id, idempotency_key) WHERE idempotency_key IS NOT NULL;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "back_fill_promise_keys": {
+   "UPDATE harvest_signals SET idempotency_key = name WHERE idempotency_key IS NULL AND substr(name, 1, length(?1)) = ?1 AND signal_seq = (SELECT MIN(first.signal_seq) FROM harvest_signals AS first WHERE first.exec_id = harvest_signals.exec_id AND first.name = harvest_signals.name) AND NOT EXISTS (SELECT 1 FROM harvest_signals AS held WHERE held.exec_id = harvest_signals.exec_id AND held.idempotency_key = harvest_signals.name)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "column_exists": {
+   "PRAGMA table_info(harvest_executions)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA table_info(harvest_schedules)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA table_info(harvest_signals)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA table_info(harvest_tasks)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "migrate": {
+   "CREATE INDEX IF NOT EXISTS idx_harvest_executions_closed ON harvest_executions (closed_at, exec_id) WHERE closed_at IS NOT NULL;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE INDEX IF NOT EXISTS idx_harvest_executions_schedule ON harvest_executions (schedule_name, state) WHERE schedule_name IS NOT NULL;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/store.toml": {
+  "append_event_seq": {
+   "INSERT INTO harvest_events (exec_id, seq, event_json) VALUES (?1, ?2, ?3)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "cancel_request": {
+   "SELECT cancel_reason, cancel_from_seq FROM harvest_executions WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "copy_inherited_fields": {
+   "UPDATE harvest_executions SET (memo, search_attrs, schedule_name) = (SELECT memo, search_attrs, schedule_name FROM harvest_executions WHERE exec_id = ?1) WHERE exec_id = ?2": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "execution_error": {
+   "SELECT error FROM harvest_executions WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "execution_exists": {
+   "SELECT 1 FROM harvest_executions WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "execution_input": {
+   "SELECT input_json FROM harvest_executions WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "execution_output": {
+   "SELECT output_json FROM harvest_executions WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "execution_state": {
+   "SELECT state FROM harvest_executions WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "find_active_execution_by_key": {
+   "SELECT exec_id, state FROM harvest_executions WHERE workflow_name = ?1 AND workflow_id = ?2 AND state NOT IN ('CONTINUED_AS_NEW','TERMINATED') ORDER BY rowid DESC LIMIT 1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "find_active_executions_by_key": {
+   "SELECT exec_id, state FROM harvest_executions WHERE workflow_name = ?1 AND workflow_id = ?2 AND state NOT IN ('CONTINUED_AS_NEW','TERMINATED') ORDER BY rowid DESC": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "find_signal_key_in_chain": {
+   "SELECT s.exec_id FROM harvest_executions AS e JOIN harvest_signals AS s ON s.exec_id = e.exec_id WHERE e.workflow_name = ?1 AND e.workflow_id = ?2 AND s.idempotency_key = ?3 ORDER BY s.signal_seq DESC LIMIT 1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "for_each_pending_signal": {
+   "SELECT signal_seq, name, received_at, payload_json FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0 ORDER BY received_at, signal_seq": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "has_signal_key": {
+   "SELECT EXISTS (SELECT 1 FROM harvest_signals WHERE exec_id = ?1 AND idempotency_key = ?2)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "insert_child_execution": {
+   "UPDATE harvest_executions SET parent_exec_id = ?2, parent_close_policy = ?3 WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "insert_execution_with_config": {
+   "INSERT INTO harvest_executions (exec_id, workflow_name, workflow_id, input_json, state, execution_timeout_ms, deadline_at, start_at, workflow_attempt, retry_policy_json, retry_of_exec_id) VALUES (?1, ?2, ?3, ?4, 'RUNNING', ?5, ?6, ?7, ?8, ?9, ?10)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "last_event": {
+   "SELECT event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq DESC LIMIT 1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "load_attempts": {
+   "SELECT attempt, ok, detail FROM harvest_activity_attempts WHERE exec_id = ?1 AND name = ?2 ORDER BY attempt_seq": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "load_history_sized": {
+   "SELECT event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "mark_signal_delivered": {
+   "UPDATE harvest_signals SET delivered = 1 WHERE signal_seq = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "next_seq": {
+   "SELECT MAX(seq) FROM harvest_events WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "parent_link": {
+   "SELECT parent_exec_id, parent_close_policy FROM harvest_executions WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "record_attempt": {
+   "INSERT INTO harvest_activity_attempts (exec_id, name, attempt, ok, detail) VALUES (?1, ?2, ?3, ?4, ?5)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "request_cancel": {
+   "UPDATE harvest_executions SET cancel_reason = ?2, cancel_from_seq = (SELECT COALESCE(MAX(seq) + 1, 0) FROM harvest_events WHERE exec_id = ?1) WHERE exec_id = ?1 AND state = 'RUNNING' AND cancel_reason IS NULL": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "resolve_run_by_key": {
+   "SELECT exec_id, state FROM harvest_executions WHERE workflow_name = ?1 AND workflow_id = ?2 ORDER BY state = 'RUNNING' DESC, rowid DESC LIMIT 1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "run_config": {
+   "SELECT execution_timeout_ms, deadline_at, start_at, workflow_attempt, retry_policy_json, retry_of_exec_id, local_retry_at FROM harvest_executions WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "running_detached_children": {
+   "SELECT exec_id, parent_close_policy FROM harvest_executions WHERE parent_exec_id = ?1 AND parent_close_policy IS NOT NULL AND state = 'RUNNING' ORDER BY rowid": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "running_executions": {
+   "SELECT exec_id FROM harvest_executions WHERE state = 'RUNNING' ORDER BY exec_id": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "seal_execution": {
+   "UPDATE harvest_executions SET state = ?2, closed_at = coalesce(closed_at, ?3) WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "set_cancelled": {
+   "UPDATE harvest_executions SET state = 'CANCELLED', output_json = NULL, error = ?2, closed_at = ?3 WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "set_completed": {
+   "UPDATE harvest_executions SET state = 'COMPLETED', output_json = ?2, closed_at = ?3 WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "set_failed": {
+   "UPDATE harvest_executions SET state = 'FAILED', error = ?2, closed_at = ?3 WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "set_local_retry_at": {
+   "UPDATE harvest_executions SET local_retry_at = ?2 WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "set_schedule_name": {
+   "UPDATE harvest_executions SET schedule_name = ?2 WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "set_start_fields": {
+   "UPDATE harvest_executions SET started_at = ?2, memo = ?3, search_attrs = ?4 WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "set_terminal_with_reason": {
+   "UPDATE harvest_executions SET state = ?2, error = ?3, closed_at = ?4 WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "stage_signal": {
+   "INSERT INTO harvest_signals (exec_id, name, payload_json, delivered, received_at, idempotency_key) VALUES (?1, ?2, ?3, 0, ?4, ?5)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "upsert_search_attrs": {
+   "SELECT CASE WHEN typeof(search_attrs) = 'text' THEN cast(search_attrs as blob) END FROM harvest_executions WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "UPDATE harvest_executions SET search_attrs = ?2 WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "workflow_id_of": {
+   "SELECT workflow_id FROM harvest_executions WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "workflow_name_of": {
+   "SELECT workflow_name FROM harvest_executions WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/visibility.toml": {
+  "present_columns": {
+   "SELECT name FROM pragma_table_info('harvest_executions')": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "query": {
+   "SELECT rowid, exec_id, workflow_name, NULL, state, NULL, NULL, NULL, NULL FROM harvest_executions WHERE rowid < ?1 AND typeof(NULL) = 'integer' AND NULL >= ?2 ORDER BY rowid DESC LIMIT ?3": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, NULL, state, NULL, NULL, NULL, NULL, input_json, output_json, error FROM harvest_executions WHERE rowid < ?1 AND cast(workflow_name as blob) = cast(?2 as blob) ORDER BY rowid DESC LIMIT ?3": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN typeof(search_attrs) = 'text' AND json_valid(search_attrs) AND json_type(search_attrs) = 'object' THEN search_attrs END) WHERE key = ?2 AND type = 'false') ORDER BY rowid DESC LIMIT ?3": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN typeof(search_attrs) = 'text' AND json_valid(search_attrs) AND json_type(search_attrs) = 'object' THEN search_attrs END) WHERE key = ?2 AND type = 'null') ORDER BY rowid DESC LIMIT ?3": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN typeof(search_attrs) = 'text' AND json_valid(search_attrs) AND json_type(search_attrs) = 'object' THEN search_attrs END) WHERE key = ?2 AND type = 'text' AND atom = ?3) AND EXISTS (SELECT 1 FROM json_each(CASE WHEN typeof(search_attrs) = 'text' AND json_valid(search_attrs) AND json_type(search_attrs) = 'object' THEN search_attrs END) WHERE key = ?4 AND type IN ('integer', 'real') AND atom = ?5) ORDER BY rowid DESC LIMIT ?6": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN typeof(search_attrs) = 'text' AND json_valid(search_attrs) AND json_type(search_attrs) = 'object' THEN search_attrs END) WHERE key = ?2 AND type = 'text' AND atom = ?3) ORDER BY rowid DESC LIMIT ?4": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN typeof(search_attrs) = 'text' AND json_valid(search_attrs) AND json_type(search_attrs) = 'object' THEN search_attrs END) WHERE key = ?2 AND type = 'true') ORDER BY rowid DESC LIMIT ?3": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN typeof(search_attrs) = 'text' AND json_valid(search_attrs) AND json_type(search_attrs) = 'object' THEN search_attrs END) WHERE key = ?2 AND type IN ('integer', 'real') AND atom = ?3) ORDER BY rowid DESC LIMIT ?4": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 AND cast(+state as blob) IN (cast(?2 as blob), cast(?3 as blob)) ORDER BY rowid DESC LIMIT ?4": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 AND cast(state as blob) IN (cast(?2 as blob)) AND EXISTS (SELECT 1 FROM json_each(CASE WHEN typeof(search_attrs) = 'text' AND json_valid(search_attrs) AND json_type(search_attrs) = 'object' THEN search_attrs END) WHERE key = ?3 AND type = 'text' AND atom = ?4) ORDER BY rowid DESC LIMIT ?5": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 AND cast(state as blob) IN (cast(?2 as blob)) ORDER BY rowid DESC LIMIT ?3": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 AND cast(workflow_id as blob) = cast(?2 as blob) ORDER BY rowid DESC LIMIT ?3": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 AND cast(workflow_name as blob) = cast(?2 as blob) AND substr(cast(workflow_id as blob), 1, ?3) = cast(?4 as blob) ORDER BY rowid DESC LIMIT ?5": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 AND cast(workflow_name as blob) = cast(?2 as blob) ORDER BY rowid DESC LIMIT ?3": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 AND exec_id = ?2 ORDER BY rowid DESC LIMIT ?3": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 AND substr(cast(workflow_id as blob), 1, ?2) = cast(?3 as blob) ORDER BY rowid DESC LIMIT ?4": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 AND typeof(started_at) = 'integer' AND started_at < ?2 ORDER BY rowid DESC LIMIT ?3": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 AND typeof(started_at) = 'integer' AND started_at >= ?2 ORDER BY rowid DESC LIMIT ?3": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo FROM harvest_executions WHERE rowid < ?1 ORDER BY rowid DESC LIMIT ?2": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo, input_json, output_json, error FROM harvest_executions WHERE rowid < ?1 AND exec_id = ?2 ORDER BY rowid DESC LIMIT ?3": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo, input_json, output_json, error FROM harvest_executions WHERE rowid < ?1 ORDER BY rowid DESC LIMIT ?2": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
  "docs/ledger/autumn-harvest/activity_pause.toml": {
   "is_activity_paused": {
    "SELECT EXISTS ( SELECT 1 FROM harvest_activity_pauses WHERE activity_name = $1 ) AS paused": {
@@ -3733,6 +5348,14 @@
     "types": {
      "1": "text",
      "2": "text"
+    }
+   },
+   "UPDATE harvest_events SET event_data = jsonb_set(event_data, '{data,input}', '\"rewritten\"', false) WHERE workflow_exec_id = $1 AND event_id = (SELECT max(event_id) FROM harvest_events WHERE workflow_exec_id = $1)": {
+    "literals": [
+     {}
+    ],
+    "types": {
+     "1": "uuid"
     }
    },
    "UPDATE harvest_events SET event_data = jsonb_set(event_data, '{data,last_completion_result}', '{\"rows\": 41}') WHERE workflow_exec_id = $1 AND event_id = 0": {
@@ -32577,6 +34200,19 @@
    }
   },
   "db::acquire": {
+   "BEGIN": {
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "COMMIT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
    "SELECT epoch FROM harvest_decision_owner WHERE partition = $1": {
     "literals": [
      {}
@@ -33307,6 +34943,222 @@
    }
   }
  },
+ "docs/ledger/autumn-harvest/entity_sql.toml": {
+  "open": {
+   "CREATE TABLE entity (\nworkflow_name TEXT NOT NULL,\nworkflow_id TEXT NOT NULL,\nexecution_id TEXT NOT NULL,\nevent_id INTEGER NOT NULL,\ndeleted INTEGER NOT NULL,\nstate TEXT NOT NULL,\nstats TEXT NOT NULL\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "INSERT INTO entity VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA query_only = ON;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA temp_store = MEMORY;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "run_cancellable": {
+   "SELECT * FROM pragma_table_info('entity')": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT ?1, ?2, ?3, json_extract(?4, '$.k')": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT DISTINCT state FROM entity": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT NULL, 2, 0.25, 'text', x'01ff', 1e999": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT count(*) FROM entity": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT count(*) FROM entity, json_each(entity.state) WHERE value = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT deleted FROM entity": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT event_id AS id FROM entity WHERE deleted": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT item.key AS position, item.value AS item, json_array_length(entity.state) AS count, entity.event_id FROM entity, json_each(entity.state) AS item ORDER BY item.key": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT json_extract(item.value, '$.sku') AS sku, json_extract(item.value, '$.qty') AS qty FROM entity, json_each(entity.state, '$.items') AS item ORDER BY qty DESC": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT json_extract(state, '$.owner'), length(state) > ?1 FROM entity": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT json_extract(value, '$.qty') FROM entity, json_each(entity.state, '$.items') WHERE json_extract(value, '$.sku') = ?1 AND ?2 AND ?3 IS NULL": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT state FROM entity": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT state FROM entity ORDER BY state": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT state || state || state || state || state FROM entity": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT state, workflow_id FROM entity ORDER BY 1, 2": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT sum(json_extract(value, '$.qty')) FROM entity, json_each(entity.state, '$.items')": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT workflow_name, workflow_id, execution_id, event_id, deleted, json_extract(state, '$.owner') AS owner, json_extract(stats, '$.applied') AS applied FROM entity": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT zeroblob(?1)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10) SELECT zeroblob(1000000) FROM n": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000) SELECT i FROM n": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000000) SELECT count(length(replace(printf('%.*c', 1000000 - i % 7, 'x'), 'x', 'y'))) FROM n": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10001) SELECT i FROM n": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20) SELECT printf('%.*c', 1000000, 'x') FROM n": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) SELECT count(DISTINCT printf('%.*c', 1000000, 'x') || i) FROM n": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT count(*) FROM n": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
  "docs/ledger/autumn-harvest/entity_state.toml": {
   "erase_for_execution": {
    "UPDATE harvest_entity_state SET snapshot = $2 WHERE execution_id = $1 AND snapshot IS DISTINCT FROM $2": {
@@ -33335,9 +35187,25 @@
     }
    }
   },
+  "pointer": {
+   "SELECT s.execution_id, s.event_id, s.deleted, x.state AS run_state FROM harvest_entity_state s JOIN harvest_workflow_executions x ON x.id = s.execution_id WHERE s.workflow_name = $1 AND s.workflow_id = $2": {
+    "literals": [
+     {
+      "1": "'entity_sql_cart'"
+     }
+    ],
+    "types": {
+     "1": "text",
+     "2": "text"
+    }
+   }
+  },
   "read": {
    "SELECT workflow_name, workflow_id, execution_id, event_id, deleted, snapshot, updated_at FROM harvest_entity_state WHERE workflow_name = $1 AND workflow_id = $2": {
     "literals": [
+     {
+      "1": "'entity_sql_cart'"
+     },
      {
       "1": "'entity_state_order'"
      },
@@ -33383,6 +35251,17 @@
      "2": "text",
      "3": "uuid",
      "4": "text"
+    }
+   }
+  },
+  "snapshot_at": {
+   "SELECT event_data FROM harvest_events WHERE workflow_exec_id = $1 AND event_id = $2 AND event_type = 'SideEffectRecorded' AND (event_data -> 'data' ->> 'kind') = 'EntityState'": {
+    "literals": [
+     {}
+    ],
+    "types": {
+     "1": "uuid",
+     "2": "bigint"
     }
    }
   }
@@ -34062,13 +35941,13 @@
       "1": "'approvals'"
      },
      {
+      "1": "'entity_sql_cart'"
+     },
+     {
       "1": "'entity_state_log'"
      },
      {
       "1": "'entity_state_pairs'"
-     },
-     {
-      "1": "'iface_wf'"
      }
     ],
     "types": {
@@ -34841,6 +36720,7 @@
     "types": {}
    },
    "COMMIT": {
+    "backend": "sqlite",
     "literals": [
      {}
     ],
@@ -36611,10 +38491,11 @@
      },
      {
       "1": "'TERMINATED'",
-      "3": "'test'"
+      "3": "'operator'"
      },
      {
-      "1": "'TERMINATED'"
+      "1": "'TERMINATED'",
+      "3": "'test'"
      }
     ],
     "types": {
@@ -38964,6 +40845,12 @@
    }
   },
   "resolve_owner_notes": {
+   "COMMIT": {
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
    "SELECT id, workflow_id FROM harvest_workflow_executions WHERE id = ANY($1::uuid[])": {
     "literals": [
      {}
@@ -39046,6 +40933,191 @@
     "types": {
      "1": "bigint[]"
     }
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest/owner_disk_cache.toml": {
+  "DiskTier::reconcile": {
+   "SELECT \"harvest_workflow_executions\".\"id\" FROM \"harvest_workflow_executions\" WHERE ((\"harvest_workflow_executions\".\"id\" = ANY($1)) AND (\"harvest_workflow_executions\".\"state\" = $2))": {
+    "literals": [
+     {
+      "2": "'RUNNING'"
+     }
+    ],
+    "types": {
+     "1": "uuid[]",
+     "2": "text"
+    }
+   }
+  },
+  "OwnerDiskCache::create_file": {
+   "CREATE TABLE IF NOT EXISTS harvest_cache_runs (\nexec_id TEXT PRIMARY KEY,\nsealed BLOB NOT NULL\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_cache_stamp (\nid INTEGER PRIMARY KEY CHECK (id = 1),\nsealed BLOB NOT NULL\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_entity_projection (\nexec_id TEXT PRIMARY KEY,\nsealed BLOB NOT NULL\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_events (\nexec_id TEXT NOT NULL,\nseq INTEGER NOT NULL,\nevent_json BLOB NOT NULL,\nPRIMARY KEY (exec_id, seq)\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "INSERT INTO harvest_cache_stamp (id, sealed) VALUES (1, ?1)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA journal_mode = MEMORY;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA secure_delete = ON;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA synchronous = OFF;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA temp_store = MEMORY;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "OwnerDiskCache::delete_run": {
+   "DELETE FROM harvest_cache_runs WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_entity_projection WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_events WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "OwnerDiskCache::read_entity": {
+   "SELECT sealed FROM harvest_entity_projection WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "OwnerDiskCache::read_events": {
+   "SELECT seq, event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "OwnerDiskCache::read_file_stamp": {
+   "SELECT sealed FROM harvest_cache_stamp WHERE id = 1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "OwnerDiskCache::read_run_stamp": {
+   "SELECT sealed FROM harvest_cache_runs WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "OwnerDiskCache::write_entity": {
+   "INSERT INTO harvest_entity_projection (exec_id, sealed) VALUES (?1, ?2) ON CONFLICT (exec_id) DO UPDATE SET sealed = excluded.sealed": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "OwnerDiskCache::write_run": {
+   "BEGIN DEFERRED": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "COMMIT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_events WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "INSERT INTO harvest_cache_runs (exec_id, sealed) VALUES (?1, ?2) ON CONFLICT (exec_id) DO UPDATE SET sealed = excluded.sealed": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "INSERT INTO harvest_events (exec_id, seq, event_json) VALUES (?1, ?2, ?3)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
    }
   }
  },
@@ -56627,7 +58699,7 @@
    }
   },
   "queue_task_counts": {
-   "SELECT queue_name AS queue, COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at <= $1) AS backlog, COUNT(*) FILTER (WHERE state = 'RUNNING') AS in_flight, COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at > $1) AS scheduled FROM harvest_task_queue GROUP BY queue_name": {
+   "SELECT queue_name AS queue, COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at <= $1) AS backlog, COUNT(*) FILTER (WHERE state = 'RUNNING') AS in_flight, COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at > $1) AS scheduled FROM harvest_task_queue WHERE state IN ('PENDING', 'RUNNING') GROUP BY queue_name": {
     "literals": [
      {}
     ],
@@ -59593,6 +61665,16 @@
      "1": "uuid",
      "2": "boolean"
     }
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest/run_defaults.toml": {
+  "db::load_run_default_overrides": {
+   "SELECT \"harvest_run_default_overrides\".\"workflow_name\", \"harvest_run_default_overrides\".\"sla_secs\", \"harvest_run_default_overrides\".\"execution_timeout_secs\", \"harvest_run_default_overrides\".\"reason\", \"harvest_run_default_overrides\".\"updated_by\", \"harvest_run_default_overrides\".\"created_at\", \"harvest_run_default_overrides\".\"updated_at\" FROM \"harvest_run_default_overrides\"": {
+    "literals": [
+     {}
+    ],
+    "types": {}
    }
   }
  },
@@ -80150,10 +82232,13 @@
       "7": "'LocalActivityExhausted'"
      },
      {
+      "3": "'SideEffectRecorded'",
+      "7": "'SideEffectRecorded'"
+     },
+     {
       "3": "'SignalReceived'",
       "7": "'TimerFired'"
-     },
-     {}
+     }
     ],
     "types": {
      "1": "uuid",

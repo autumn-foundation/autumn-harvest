@@ -267,6 +267,13 @@ CREATE TABLE IF NOT EXISTS harvest_timers (
     PRIMARY KEY (exec_id, timer_id)
 );
 
+-- Each timer arm reads `MAX(arm_seq)` over every timer row (issue #2429). Fired
+-- rows stay until retention purges their run, so without this index each arm
+-- reads the whole table. The column exists in every file, so the base schema
+-- builds the index.
+CREATE INDEX IF NOT EXISTS idx_harvest_timers_arm_seq
+    ON harvest_timers (arm_seq);
+
 CREATE TABLE IF NOT EXISTS harvest_signals (
     signal_seq   INTEGER PRIMARY KEY AUTOINCREMENT,
     exec_id      TEXT NOT NULL,

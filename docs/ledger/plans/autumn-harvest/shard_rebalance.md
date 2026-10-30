@@ -58,13 +58,13 @@ Statements: 1. Tables with no usable index: none.
 
 ## `db::commit_cutover`
 
-Statements: 3. Tables with no usable index: `harvest_cross_shard_children`.
+Statements: 3. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
 | 2 | `UPDATE harvest_shard_migrations SET phase = 'COMMITTED', updated_at = NOW() WHERE execution_id = ...` | `harvest_shard_migrations`: Index Scan on `harvest_shard_migrations_pkey`<br>`harvest_shard_migrations`: ModifyTable |
-| 3 | `WITH sealed AS ( UPDATE harvest_workflow_executions e SET state = 'MIGRATED', migrated_to_shard =...` | `harvest_completion_deliveries`: Index Scan on `idx_harvest_completion_deliveries_exec`<br>`harvest_cross_shard_children`: no usable index<br>`harvest_dead_letters`: Index Scan on `idx_harvest_dl_workflow_exec_id`<br>`harvest_entity_state`: Bitmap Heap Scan on `idx_harvest_entity_state_execution`<br>`harvest_entity_state`: ModifyTable<br>`harvest_events`: Bitmap Heap Scan on `idx_harvest_events_history_page`<br>`harvest_events`: Index Only Scan on `idx_harvest_events_exec`<br>`harvest_external_tasks`: Bitmap Heap Scan on `idx_harvest_ext_timeout`<br>`harvest_mutex_locks`: Bitmap Heap Scan on `idx_harvest_mutex_locks_holder`<br>`harvest_mutex_waiters`: Bitmap Heap Scan on `harvest_mutex_waiters_lock_key_waiter_exec_id_key`<br>`harvest_sessions`: Bitmap Heap Scan on `harvest_sessions_active_host_worker_id`<br>`harvest_shard_migrations`: Index Scan on `harvest_shard_migrations_pkey`<br>`harvest_signals`: Index Scan on `idx_harvest_signals_pending`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_owner_order`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_workflow`<br>`harvest_task_queue`: ModifyTable<br>`harvest_task_queue`: full scan of partial index `idx_harvest_tq_running_started`<br>`harvest_workflow_executions`: Index Scan on `idx_harvest_we_canary_order`<br>`harvest_workflow_executions`: Index Scan on `idx_harvest_we_parent_id`<br>`harvest_workflow_executions`: ModifyTable<br>`harvest_workflow_executions`: full scan of partial index `idx_harvest_we_fork_source` |
+| 3 | `WITH sealed AS ( UPDATE harvest_workflow_executions e SET state = 'MIGRATED', migrated_to_shard =...` | `harvest_completion_deliveries`: Index Scan on `idx_harvest_completion_deliveries_exec`<br>`harvest_cross_shard_children`: Index Scan on `idx_harvest_cross_shard_children_parent`<br>`harvest_dead_letters`: Index Scan on `idx_harvest_dl_workflow_exec_id`<br>`harvest_entity_state`: Bitmap Heap Scan on `idx_harvest_entity_state_execution`<br>`harvest_entity_state`: ModifyTable<br>`harvest_events`: Bitmap Heap Scan on `idx_harvest_events_history_page`<br>`harvest_events`: Index Only Scan on `idx_harvest_events_exec`<br>`harvest_external_tasks`: Bitmap Heap Scan on `idx_harvest_ext_timeout`<br>`harvest_mutex_locks`: Bitmap Heap Scan on `idx_harvest_mutex_locks_holder`<br>`harvest_mutex_waiters`: Bitmap Heap Scan on `harvest_mutex_waiters_lock_key_waiter_exec_id_key`<br>`harvest_sessions`: Bitmap Heap Scan on `harvest_sessions_active_host_worker_id`<br>`harvest_shard_migrations`: Index Scan on `harvest_shard_migrations_pkey`<br>`harvest_signals`: Index Scan on `idx_harvest_signals_pending`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_owner_order`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_workflow`<br>`harvest_task_queue`: ModifyTable<br>`harvest_task_queue`: full scan of partial index `idx_harvest_tq_running_started`<br>`harvest_workflow_executions`: Index Scan on `idx_harvest_we_canary_order`<br>`harvest_workflow_executions`: Index Scan on `idx_harvest_we_parent_id`<br>`harvest_workflow_executions`: ModifyTable<br>`harvest_workflow_executions`: full scan of partial index `idx_harvest_we_fork_source` |
 
 ## `db::discard_staged_copy`
 
@@ -84,11 +84,11 @@ Statements: 1. Tables with no usable index: none.
 
 ## `db::observe_quiescence`
 
-Statements: 1. Tables with no usable index: `harvest_cross_shard_children`.
+Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT e.state, e.parent_id, (e.schedule_id IS NOT NULL) AS schedule_attributed, (e.start_source ...` | `harvest_completion_deliveries`: Index Scan on `idx_harvest_completion_deliveries_exec`<br>`harvest_cross_shard_children`: no usable index<br>`harvest_dead_letters`: Index Only Scan on `idx_harvest_dl_workflow_exec_id`<br>`harvest_dead_letters`: Index Scan on `idx_harvest_dl_workflow_exec_id`<br>`harvest_external_tasks`: Bitmap Heap Scan on `idx_harvest_ext_timeout`<br>`harvest_mutex_locks`: Bitmap Heap Scan on `idx_harvest_mutex_locks_holder`<br>`harvest_mutex_waiters`: Bitmap Heap Scan on `harvest_mutex_waiters_lock_key_waiter_exec_id_key`<br>`harvest_sessions`: Bitmap Heap Scan on `harvest_sessions_active_host_worker_id`<br>`harvest_signals`: Index Only Scan on `idx_harvest_signals_pending`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_owner_order`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_workflow`<br>`harvest_task_queue`: full scan of partial index `idx_harvest_tq_running_started`<br>`harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: Index Scan on `idx_harvest_we_parent_id`<br>`harvest_workflow_executions`: full scan of partial index `idx_harvest_we_fork_source` |
+| 1 | `SELECT e.state, e.parent_id, (e.schedule_id IS NOT NULL) AS schedule_attributed, (e.start_source ...` | `harvest_completion_deliveries`: Index Scan on `idx_harvest_completion_deliveries_exec`<br>`harvest_cross_shard_children`: Index Only Scan on `idx_harvest_cross_shard_children_parent`<br>`harvest_dead_letters`: Index Only Scan on `idx_harvest_dl_workflow_exec_id`<br>`harvest_dead_letters`: Index Scan on `idx_harvest_dl_workflow_exec_id`<br>`harvest_external_tasks`: Bitmap Heap Scan on `idx_harvest_ext_timeout`<br>`harvest_mutex_locks`: Bitmap Heap Scan on `idx_harvest_mutex_locks_holder`<br>`harvest_mutex_waiters`: Bitmap Heap Scan on `harvest_mutex_waiters_lock_key_waiter_exec_id_key`<br>`harvest_sessions`: Bitmap Heap Scan on `harvest_sessions_active_host_worker_id`<br>`harvest_signals`: Index Only Scan on `idx_harvest_signals_pending`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_owner_order`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_workflow`<br>`harvest_task_queue`: full scan of partial index `idx_harvest_tq_running_started`<br>`harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: Index Scan on `idx_harvest_we_parent_id`<br>`harvest_workflow_executions`: full scan of partial index `idx_harvest_we_fork_source` |
 
 ## `db::read_forward`
 
@@ -100,7 +100,7 @@ Statements: 1. Tables with no usable index: none.
 
 ## `db::read_json`
 
-Statements: 7. Tables with no usable index: `harvest_signals`, `harvest_timers`.
+Statements: 7. Tables with no usable index: `harvest_signals`.
 
 | # | Statement | Access |
 |---|---|---|
@@ -110,7 +110,7 @@ Statements: 7. Tables with no usable index: `harvest_signals`, `harvest_timers`.
 | 4 | `SELECT COALESCE(jsonb_agg(to_jsonb(l)), '[]'::jsonb) AS payload FROM harvest_workflow_logs l WHER...` | `harvest_workflow_logs`: Bitmap Heap Scan on `harvest_workflow_logs_exec_seq` |
 | 5 | `SELECT COALESCE(jsonb_agg(to_jsonb(p)), '[]'::jsonb) AS payload FROM harvest_payload_refs p WHERE...` | `harvest_payload_refs`: Bitmap Heap Scan on `idx_harvest_payload_refs_exec` |
 | 6 | `SELECT COALESCE(jsonb_agg(to_jsonb(s)), '[]'::jsonb) AS payload FROM harvest_signals s WHERE s.wo...` | `harvest_signals`: no usable index |
-| 7 | `SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) AS payload FROM harvest_timers t WHERE t.wor...` | `harvest_timers`: no usable index |
+| 7 | `SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) AS payload FROM harvest_timers t WHERE t.wor...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_exec` |
 
 ## `db::read_legal_hold_set_at`
 

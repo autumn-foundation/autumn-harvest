@@ -20,9 +20,9 @@ The full statement text is in `docs/perf-artifacts/ledger-census/statements.json
 
 ## `load_canary_rows`
 
-Statements: 1. Tables with no usable index: `harvest_workflow_executions`.
+Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT queue_name, state, started_at, completed_at FROM harvest_workflow_executions WHERE starts_...` | `harvest_workflow_executions`: no usable index |
+| 1 | `SELECT queue_name, state, started_at, completed_at FROM harvest_workflow_executions WHERE starts_...` | `harvest_workflow_executions`: full scan of partial index `idx_harvest_we_canary_completed` |
 

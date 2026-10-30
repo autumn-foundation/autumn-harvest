@@ -54,7 +54,7 @@ Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT COUNT(*) FROM "harvest_timers" WHERE (("harvest_timers"."workflow_exec_id" = $1) AND ("har...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending` |
+| 1 | `SELECT COUNT(*) FROM "harvest_timers" WHERE (("harvest_timers"."workflow_exec_id" = $1) AND ("har...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_exec` |
 
 ## `count_unconsumed_signals`
 
@@ -114,7 +114,7 @@ Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `DELETE FROM "harvest_timers" WHERE (("harvest_timers"."workflow_exec_id" = $1) AND ("harvest_time...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending`<br>`harvest_timers`: ModifyTable |
+| 1 | `DELETE FROM "harvest_timers" WHERE (("harvest_timers"."workflow_exec_id" = $1) AND ("harvest_time...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_exec`<br>`harvest_timers`: ModifyTable |
 
 ## `resolve_batch_reset_one`
 

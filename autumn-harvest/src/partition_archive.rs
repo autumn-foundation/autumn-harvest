@@ -670,17 +670,12 @@ fn rename_durable(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// Sync a directory, so a rename in it survives a crash. A no-op off Unix.
-/// On Windows, the archiver writes the move through instead. Other crates of
-/// the workspace call it after their own atomic renames.
-///
-/// # Errors
-///
-/// The error of the open or of the sync.
+/// On Windows, [`rename_durable`] writes the move through instead.
 #[cfg_attr(
     not(unix),
     allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)
 )]
-pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     std::fs::File::open(dir)?.sync_all()?;
     #[cfg(not(unix))]

@@ -35898,11 +35898,9 @@ folds fragments in here.
 
   The census itself changes no engine code: no new `WorkflowEvent` variant, no
   migration and no schema change.
-- **Fix** (implemented): an agent workspace snapshot survives a host crash. Found in review of the 0.8.0 release PR #2400. `DirWorkspaceBlobs::put` wrote the scratch file, flushed it and renamed it. It never called `sync_all`, and it never synced the folder after the rename. A tool-call result commits after the put returns, and its history names the snapshot key. So a host crash could lose the snapshot that a committed history points at.
+- **Fix** (implemented): Durable workspace snapshots (agent workspace store) — see PR #2431. `DirWorkspaceBlobs::put` now syncs the scratch file before the rename. It then syncs the folder and its parent. Until one put has synced every ancestor of the folder, each put syncs them all, so a retry after a failed first put still makes the new root durable. An ancestor above the root that denies the open is skipped. A sync error fails the put. Before, a crash after a committed tool call could lose the snapshot that the history names. Replay does not rerun a completed tool call, so the workspace was lost for good.
 
-  **Fix.** `write_private` flushes the file, then syncs it. The flush comes first because tokio keeps a failed write error for the next flush, and its `sync_all` drops it. The new `publish_durable` renames it with `std::fs::rename`. It then syncs the folder, and the parent of each folder that the put made, with `partition_archive::sync_dir`. It runs on the blocking pool. `sync_dir` is now public for this use. The rename is not the archiver's write-through `MoveFileExW`: on Windows that call refuses concurrent puts of one digest with an access error. `DirectoryPartitionArchiver` already wrote this way.
-
-  **Tests.** `missing_dirs_lists_each_new_folder_nearest_first` and `a_put_under_a_new_root_publishes_the_blob_and_no_scratch_file`. A test cannot observe an fsync, so the sync calls rest on review. No new `WorkflowEvent` variant, no migration, no replay impact.
+  Tests: `a_put_syncs_the_file_before_the_rename_and_the_folder_after_it`, `a_put_syncs_the_parent_of_each_folder_that_it_creates` and `a_search_only_ancestor_does_not_fail_the_put`, `a_retry_after_a_failed_first_put_syncs_the_ancestors`, `a_put_into_an_existing_folder_still_syncs_the_folder_and_its_parent`. On Windows the rename is not durable, because a directory cannot be opened there for a sync.
 - **Fix** (implemented): two claim loops no longer slow activity dispatch — see issue #2418. Found when the 0.8.0 benchmark ran beside a v0.7.0 control on one box. The activity dispatch p50 at 8 starts per second was 12.6 to 14.0 ms on v0.7.0 and 66 to 67 ms on trunk-dev. A bisect over the 210 commits since v0.7.0 named #2106, which made two claim loops the default. With `HARVEST_BENCH_CLAIM_LOOPS=1` the p50 was 13.6 ms again.
 
   **Cause.** One loop polls back to back, about every 3 ms. A workflow task also takes about 3 ms, so the next poll finds the activity that it committed. Two loops drain the workflow backlog in parallel and both go empty before those commits. The leader then idles. A NOTIFY is nearly always queued, so it sleeps the 50 to 75 ms settle of `notify::settle_delay`, and nothing cuts that sleep short. Each activity committed in it waits for its end.
@@ -36072,6 +36070,89 @@ folds fragments in here.
   `runs_started` and `exhausted_at` on capped schedules in a shard that ran a
   trigger-now or a backfill. A schedule may have exhausted early, or resumed
   after its `end_at`.
+- **Engine** (implemented): Held claims no longer send the claim to the full scan — see issue #2420. **Claim order does not change.** The claim picks the same row as before. Only its cost changes under contention.
+
+  **The problem.** The seek window of issue #1971 reads 32 rows per queue
+  head with a plain read. A peer claim holds its row lock until it commits,
+  so the window still returns that row. With 32 or more claims in flight on
+  one head, every window row can be locked. The claim then ran the full scan
+  of the backlog. At 100K pending rows it read 106,467 buffers and 2,259 temp
+  blocks, against 263 with no held claim. A slow claim keeps more claims in
+  flight, so the cost fed itself.
+
+  **The fix.** `queue::claim_task_query` has a deep window between the window
+  and the full scan:
+
+  - It runs only when the window found no candidate and a guarded window row
+    passes every claim gate. So peers hold that row. A head that a gate
+    blocks never starts it.
+  - It reads up to `queue::CLAIM_DEEP_SEEK_WINDOW` (256) rows from each held
+    queue head only.
+  - The window guard runs on the window plus the deep rows. Each head is
+    still a prefix in claim order, so the guard stays exact.
+  - It counts the running rows for its own concurrency keys, so a capped key
+    stays capped.
+  - The full scan runs only when a bound remains. A held head that the deep
+    window reads to its end needs no full scan.
+
+  No migration. No new bind. No new `WorkflowEvent` variant. The fence, kind,
+  owner and fair splices reach the new scans.
+
+  **Evidence.** `held_claims_on_one_head_keep_the_claim_off_the_full_scan`
+  holds K claim transactions open on one queue. At 100K pending rows, K = 32
+  reads 1,727 buffers and K = 64 reads 1,772, with no full scan and no
+  spill. The cost is the same at 10K.
+  `a_claim_behind_held_rows_takes_the_next_row_in_order` checks the order
+  inside and past the deep window.
+  `the_deep_window_keeps_the_bound_of_a_full_head_it_does_not_read` and
+  `a_fully_held_short_head_skips_the_full_scan` cover the deep bounds.
+  Shape tests pin the new CTEs and the splice counts. With 256 or more held
+  claims on one head, the claim falls back to the full scan, as before. `docs/performance.md` § "Held claims" has the
+  table.
+- **Performance** (implemented): Scaling signals, canary status and shard rebalance use an index — see issue #2424. The Ledger census of the plugin suites found four statements that read a whole table. Each one now reads an index.
+
+  - **Scaling signals.** `queue::queue_task_counts` counted every task row,
+    finished rows included. An autoscaler polls it on every shard. It now reads
+    `PENDING` and `RUNNING` rows only, through the existing
+    `idx_harvest_tq_live_created`. The counts do not change. A queue with only
+    finished tasks no longer gets an all-zero row from the task side. It still
+    gets a row when a healthy, active worker lists it.
+  - **Canary status.** `GET /admin/canary` read each execution row to find the
+    canary runs. The statement moves to `canary::CANARY_ROWS_SQL`. It names the
+    canary prefix as a literal, so a partial index can serve it. The new index
+    `idx_harvest_we_canary_completed` holds canary runs only, newest first. The
+    read stops after its row cap.
+  - **Shard rebalance.** The quiescence check and the cutover read every
+    `harvest_cross_shard_children` row to find the children of one parent. The
+    timer copy and the timer delete read every `harvest_timers` row. The new
+    indexes `idx_harvest_cross_shard_children_parent` and
+    `idx_harvest_timers_exec` serve them. The timer index also serves each
+    `ON DELETE CASCADE` from an execution, which retention triggers.
+
+  Migration `20261030015439_harvest_census_scan_indexes` builds the three
+  indexes. Migration `20260901130054` left out the parent index on purpose. Since
+  then, the rebalance check and the PII erasure added lookups by parent.
+
+  **Upgrade.** A plain `CREATE INDEX` takes `SHARE` on its table and blocks
+  writes until the build ends. On a large deployment, build the three indexes
+  `CONCURRENTLY` first. The header of the migration's `up.sql` gives the
+  statements.
+
+  `census_scan_index_tests` gates each plan with `enable_seqscan` off and a
+  generic plan. It also checks the counts of each live state, and that the canary
+  read matches the prefix only, newest first, under its cap. No new
+  `WorkflowEvent` variant and no replay impact.
+- **Tooling** (implemented): Ledger census batch 6: the SQLite profiles — see issue #2429. The Ledger census now covers SQLite. The `ledger-census` feature registers a SQLite auto-extension, so every connection that a test opens records its statements. `ledger-census.py plan-sqlite` plans them with `EXPLAIN QUERY PLAN` on the schema that the census recorded. It needs no database.
+
+  103 of the 109 SQLite profiles now link a plan page under `docs/ledger/plans/`.
+  Five of the rest send only DDL or pragmas, so they have nothing to plan. No
+  test reaches `OwnerDiskCache::purge_entity`.
+- **Fixed** (implemented): A resolved race scanned the whole SQLite task table — see issue #2429. `ctx.race()` cancels each losing activity. On SQLite, that `UPDATE` matched the task by `activity_id` alone, and no index covers that column. The task table keeps the rows of finished runs, so each cancel read every task in the file. The statement now names the run too, so `idx_harvest_tasks_exec` finds the row.
+- **Fixed** (implemented): Each SQLite timer arm read every timer — see issue #2429. Each timer arm takes the next `arm_seq` from `MAX(arm_seq)` over all timers. Fired timers stay until retention purges their run, and no index covered the column, so each arm read the whole table. The base schema now builds `idx_harvest_timers_arm_seq`, so the read is one index step. An existing file gets the index on its next open.
+
+  The other SQLite scans are by design: a startup reclaim, a one-time
+  back-fill, the small schedule and writer-lock tables, a test fixture, and the
+  read-only SQL that an operator runs over one entity.
 - **Phase 4** (next): production hardening -- sharding, observability, metrics, dashboard (Vantage UI — Workers tab shipped in issue #142; DLQ, schedules, and DAG visualization pages remain); Step 5 of issue #256 (remove classic DAG executor, drop `harvest_dag_runs`). Note: the cancellation primitive and `Saga` both ship; their interaction semantics, idempotency contract, and replay-determinism contract are documented in `docs/saga.md` and locked in by three integration tests in `tests/saga_tests.rs` (issue #238).
 
 ---

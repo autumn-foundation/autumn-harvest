@@ -6,3 +6,4 @@ backend = ["sqlite"]
 kind = []
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/append_only.md"

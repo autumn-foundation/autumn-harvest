@@ -13,6 +13,7 @@ backend = ["sqlite"]
 kind = ["ddl", "read"]
 tables = ["harvest_schedules"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/schema.md"
 
 ["add_signal_key"]
 driver = "setup"
@@ -27,6 +28,7 @@ backend = ["sqlite"]
 kind = ["read", "write"]
 tables = ["harvest_signals"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/schema.md"
 
 ["column_exists"]
 driver = "setup"

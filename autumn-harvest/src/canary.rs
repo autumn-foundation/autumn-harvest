@@ -20,6 +20,13 @@
 //! execution path, so it introduces no new `WorkflowEvent` variant, no migration,
 //! and no replay-determinism change.
 
+/// The literal of [`CANARY_WORKFLOW_NAME_PREFIX`], for SQL built with `concat!`.
+macro_rules! canary_workflow_name_prefix {
+    () => {
+        "__harvest_canary_probe"
+    };
+}
+
 /// Name prefix shared by every built-in synthetic-liveness-canary workflow
 /// (issue #796).
 ///
@@ -28,7 +35,26 @@
 /// a single wedged worker pool is distinguishable from "some queue is draining".
 /// All such names share this prefix, so [`is_canary_workflow`] matches them with
 /// a single `starts_with` check.
-pub const CANARY_WORKFLOW_NAME_PREFIX: &str = "__harvest_canary_probe";
+pub const CANARY_WORKFLOW_NAME_PREFIX: &str = canary_workflow_name_prefix!();
+
+/// The newest canary executions of one shard, for `GET /admin/canary`.
+///
+/// `$1` caps the rows. The prefix is a literal, not a bind. A generic plan
+/// can then use the partial index `idx_harvest_we_canary_completed`, whose
+/// predicate names the same literal (issue #2424). The index holds canary
+/// runs only, in this order, so the read stops after `$1` rows.
+///
+/// The query uses `starts_with`, not `LIKE`. Each `_` of the prefix is a
+/// `LIKE` wildcard, so a `LIKE` form would match more names.
+pub const CANARY_ROWS_SQL: &str = concat!(
+    "SELECT queue_name, state, started_at, completed_at \
+     FROM harvest_workflow_executions \
+     WHERE starts_with(workflow_name, '",
+    canary_workflow_name_prefix!(),
+    "') \
+     ORDER BY completed_at DESC NULLS LAST \
+     LIMIT $1"
+);
 
 /// Reserved name of the built-in synthetic-liveness-canary activity (issue #796).
 ///

@@ -5637,7 +5637,7 @@ fn apply_cancel_race_losers(
         }
     }
     for activity_id in activities {
-        if queue::cancel_activity_task(conn, *activity_id)? {
+        if queue::cancel_activity_task(conn, exec, *activity_id)? {
             store::append_event(
                 conn,
                 exec,

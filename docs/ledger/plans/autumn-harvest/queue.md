@@ -206,7 +206,7 @@ Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `DELETE FROM "harvest_timers" WHERE ((("harvest_timers"."workflow_exec_id" = $1) AND ("harvest_tim...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending`<br>`harvest_timers`: ModifyTable |
+| 1 | `DELETE FROM "harvest_timers" WHERE ((("harvest_timers"."workflow_exec_id" = $1) AND ("harvest_tim...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_exec`<br>`harvest_timers`: ModifyTable |
 
 ## `enqueue`
 
@@ -465,11 +465,11 @@ Statements: 1. Tables with no usable index: none.
 
 ## `queue_task_counts`
 
-Statements: 1. Tables with no usable index: `harvest_task_queue`.
+Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT queue_name AS queue, COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at <= $1) AS b...` | `harvest_task_queue`: no usable index |
+| 1 | `SELECT queue_name AS queue, COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at <= $1) AS b...` | `harvest_task_queue`: Bitmap Heap Scan on `idx_harvest_tq_live_created` |
 
 ## `read_capability_miss_state`
 

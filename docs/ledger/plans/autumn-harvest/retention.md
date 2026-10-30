@@ -141,5 +141,5 @@ Statements: 5. Tables with no usable index: none.
 | 2 | `SELECT COUNT(*) AS count FROM harvest_workflow_executions WHERE workflow_name = $1 AND workflow_i...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_wfx_workflow_identity` |
 | 3 | `SELECT COUNT(*) FROM "harvest_signals" WHERE (("harvest_signals"."workflow_exec_id" = $1) AND ("h...` | `harvest_signals`: Index Only Scan on `idx_harvest_signals_pending` |
 | 4 | `SELECT COUNT(*) FROM "harvest_task_queue" WHERE (("harvest_task_queue"."workflow_exec_id" = $1) A...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_workflow` |
-| 5 | `SELECT COUNT(*) FROM "harvest_timers" WHERE (("harvest_timers"."workflow_exec_id" = $1) AND ("har...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending` |
+| 5 | `SELECT COUNT(*) FROM "harvest_timers" WHERE (("harvest_timers"."workflow_exec_id" = $1) AND ("har...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_exec` |
 

@@ -1511,13 +1511,13 @@ row-local gates do not catch. These rows are:
 - rows on a saturated concurrency key, or with an empty rate-limit bucket;
 - rows with a build or capability mismatch;
 - rows of a paused workflow or an expired run;
-- rows locked by other claimers. The guard passes only the rows that sort
-  before the last row of every full head. When gates reject the other rows
-  of the tightest head, that set can be smaller than the number of claims
-  in flight.
+- rows locked by other claimers, past the deep window. Since issue #2420,
+  held window rows start a deep window first. See
+  [held claims](#held-claims-issue-2420).
 
 Priority ageing also falls back. The fallback costs the full scan plus the
-window.
+window. A fallback with no held row also pays for `seek_held`, one more
+check of the window rows.
 
 Measured with 200 rows on a saturated concurrency key at the head of the
 queues:
@@ -1551,6 +1551,45 @@ cannot take the lock until this transaction commits. It skips the row, or
 it takes the lock after the commit and sees this claim. Every claim path
 runs the re-check: the default, the by-id and the batched claim. Claims
 without a capped key pay nothing.
+
+### Held claims (issue #2420)
+
+A peer claim holds its row lock until it commits. The head scan is a plain
+read, so it still returns that row. Before issue #2420, 32 claims in flight
+on one head could lock every window row of that head. The claim then ran
+the full scan. A slow claim keeps more claims in flight, so the cost fed
+itself.
+
+Now the claim reads a deep window first. It runs only when the window found
+no candidate and a guarded window row passes every claim gate. So it runs
+only for a head that peers hold, never for a head that a gate blocks. Each
+held head reads at most `queue::CLAIM_DEEP_SEEK_WINDOW` (256) rows. The
+claim order does not change. See
+[`DESIGN-1971.md` §5](design/DESIGN-1971.md#5-held-claims-issue-2420).
+
+`held_claims_on_one_head_keep_the_claim_off_the_full_scan` holds K real
+claim transactions open on one queue of the issue #1956 fixture. All the
+priority-2 rows sit in one head, so the held claims lock its front. Then
+one more claim runs. PG16, warm cache:
+
+| pending rows | K | before | after |
+|--:|--:|--:|--:|
+| 10,000 | 0 | — | 260 buffers |
+| 10,000 | 32 | — | 1,732 buffers |
+| 10,000 | 64 | — | 1,766 buffers |
+| 100,000 | 0 | 263 buffers | 264 buffers |
+| 100,000 | 32 | 106,467 buffers, 2,259 temp blocks, full scan | 1,727 buffers |
+| 100,000 | 64 | 106,534 buffers, 2,259 temp blocks, full scan | 1,772 buffers |
+
+The held cost does not grow with K or with the backlog depth. Most of it is
+the deep candidate scan: one primary-key probe for each of the 256 deep
+rows, about 4 buffers each. A claim whose window finds a row pays nothing
+for the deep window. When the window finds no row, `seek_held` checks the
+window rows once more. The deep window reads rows only for a held head.
+
+The guard still cuts the deep rows at the last row of every other full
+head. When gates reject the rows of that head, fewer held claims can cause
+the fallback.
 
 ### Costs of the seek window
 
@@ -1595,6 +1634,14 @@ without a capped key pay nothing.
   this cost remain on a worker with queue weights, fairness keys or
   priority ageing on. They also remain on a worker with no LISTEN/NOTIFY
   URL for the database, which runs no owner wake.
+- **256 or more held claims on one head.** The deep window reads at most
+  `queue::CLAIM_DEEP_SEEK_WINDOW` (256) rows of a held head. When peers
+  hold all of them, the claim falls back to the full scan. Rows that the
+  claim gates reject lower that number. Up to K = 64 the claim stays at
+  about 1,770 buffers at 100K pending rows. See
+  [held claims](#held-claims-issue-2420).
+- **A held pin head.** The deep window reads queue heads only. A full pin
+  head with every row held still falls back.
 - **A large live pin set.** The pin head reads every live pin of this
   worker. More than 32 of them that pass the gates also make every rank-0
   row wait for the fallback.

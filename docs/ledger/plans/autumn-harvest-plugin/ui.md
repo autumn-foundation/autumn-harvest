@@ -61,7 +61,7 @@ Statements: 4. Tables with no usable index: none.
 | 1 | `SELECT "harvest_external_tasks"."id", "harvest_external_tasks"."token", "harvest_external_tasks"....` | `harvest_external_tasks`: Bitmap Heap Scan on `idx_harvest_ext_timeout` |
 | 2 | `SELECT "harvest_signals"."id", "harvest_signals"."workflow_exec_id", "harvest_signals"."signal_na...` | `harvest_signals`: Index Scan on `idx_harvest_signals_pending` |
 | 3 | `SELECT "harvest_task_queue"."id", "harvest_task_queue"."queue_name", "harvest_task_queue"."task_t...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_workflow` |
-| 4 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending` |
+| 4 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_exec` |
 
 ## `load_dead_letter_details_batch`
 

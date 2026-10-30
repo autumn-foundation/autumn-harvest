@@ -110,6 +110,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          cancellation_scope_tests
 linux        autumn-harvest         integration                      -                          cancellation_tests
 linux        autumn-harvest         integration                      -                          capability_miss_tests
+linux        autumn-harvest         integration                      -                          census_scan_index_tests
 linux        autumn-harvest         integration                      -                          chain_timeout_tests
 linux        autumn-harvest         integration                      -                          child_fanout_batch_perf
 linux        autumn-harvest         integration                      -                          child_policy_tests

@@ -771,18 +771,11 @@ const CANARY_ROW_CAP: i64 = 500;
 /// prefix predicate, not a `LIKE` whose `_` wildcards would over-match the
 /// underscore-laden prefix).
 async fn load_canary_rows(conn: &mut AsyncPgConnection) -> Result<Vec<CanaryRow>, String> {
-    let rows: Vec<CanaryRowDb> = diesel::sql_query(
-        "SELECT queue_name, state, started_at, completed_at \
-         FROM harvest_workflow_executions \
-         WHERE starts_with(workflow_name, $1) \
-         ORDER BY completed_at DESC NULLS LAST \
-         LIMIT $2",
-    )
-    .bind::<Text, _>(autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX)
-    .bind::<diesel::sql_types::BigInt, _>(CANARY_ROW_CAP)
-    .load(conn)
-    .await
-    .map_err(|e| e.to_string())?;
+    let rows: Vec<CanaryRowDb> = diesel::sql_query(autumn_harvest::canary::CANARY_ROWS_SQL)
+        .bind::<diesel::sql_types::BigInt, _>(CANARY_ROW_CAP)
+        .load(conn)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(rows
         .into_iter()

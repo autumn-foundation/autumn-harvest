@@ -192,3 +192,31 @@ a migrated container. Apply every migration to the plan database first.
 `attribute` writes `docs/perf-artifacts/ledger-census/statements.json`,
 which is committed, so `plan` needs no test run. The census reaches only the
 profiles that the suites exercise. `plan` lists the rest as not reached.
+
+### SQLite (issue #2429)
+
+The same hook covers SQLite. It registers a SQLite auto-extension, which
+runs for each connection that the process opens. The extension installs a
+`trace_v2` callback that records each statement when it starts to run. Its
+line carries `"backend": "sqlite"` and no bind values.
+
+`plan-sqlite` needs no database. It replays every SQLite `CREATE` and
+`ALTER` statement that the census recorded into an in-memory database. It
+then runs `EXPLAIN QUERY PLAN` for each statement, with each parameter
+unbound. SQLite has no `enable_seqscan`. With no statistics it assumes a
+large table, so it takes any index that can serve the predicate. A `SCAN`
+that names no index is the finding, as a remaining `Seq Scan` is.
+
+```sh
+export HARVEST_LEDGER_CENSUS=/var/tmp/census.jsonl
+export RUSTFLAGS="-C link-arg=-Wl,-u,harvest_ledger_census_anchor"
+cargo test --target x86_64-unknown-linux-gnu -p autumn-harvest-sqlite \
+    --features autumn-harvest/ledger-census
+cargo test --target x86_64-unknown-linux-gnu -p autumn-harvest \
+    --features ledger-census,owner-disk-cache --lib -- owner_disk_cache entity_sql
+python3 docs/audits/ledger-census.py attribute /var/tmp/census.jsonl
+python3 docs/audits/ledger-census.py plan-sqlite
+```
+
+A profile whose statements are only DDL or pragmas, such as the schema
+set-up, has nothing to plan. `plan-sqlite` names it in its not-reached list.

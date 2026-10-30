@@ -223,11 +223,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **An agent workspace snapshot survives a host crash.** `DirWorkspaceBlobs::put` now syncs the scratch file, renames it and syncs its folder with `partition_archive::sync_dir`, and the parent of each folder that it makes, before it returns. Before, the put ended at a flush, so a crash after a tool-call result committed could lose the snapshot that the history names.
-- **Two claim loops no longer slow activity dispatch** (issue #2418). With the default two claim loops from #2106, the activity dispatch p50 at a paced start rate rose from 13 ms to 66 ms. Both loops drained the workflow backlog, went idle and slept the 50–75 ms NOTIFY settle while the workflow tasks committed their activities. A workflow task of the worker that ends now wakes the leader with no settle, and cuts a running settle short. A cut settle owes one poll at its original end. On the same box the p50 is now 8 ms.
-- **A NOTIFY polls before it settles** (issue #2422). After a NOTIFY, the idle leader slept the 50–75 ms settle before its first poll, so a signal to an idle worker waited 50 ms at least. The leader now polls at once and settles only when that poll is empty, then polls again. A row stamped by a host clock ahead of the database still gets its margin. On the same box the signal round-trip p50 fell from 68 ms to 13 ms with one worker, and from 56 ms to 25 ms with four workers on one shard.
+- **Durable agent workspace snapshots (PR #2431).** `DirWorkspaceBlobs::put` now syncs the scratch file before the rename, then the folder and its parent. Until one put has synced every ancestor of the folder, each put syncs them all, so a retry after a failed first put still makes a new root durable. Before, a crash after a committed tool call could lose the snapshot that the history names.
 
 - **Schedule budget updates touched every schedule (issue #2423).** The `max_runs` guard of trigger-now and backfill was a raw SQL fragment with a bare `OR`, so the `id` guard covered one branch only. Reservation incremented `runs_started` on every capped schedule under its cap on the shard, and backfill release cleared `exhausted_at` on them. Check `runs_started` and `exhausted_at` on capped schedules in a shard that ran a trigger-now or a backfill.
+
+- **A resolved race and each timer arm no longer scan whole SQLite tables (issue #2429).** On SQLite, the cancel of a losing `ctx.race()` activity matched the task by `activity_id` alone, and each timer arm read `MAX(arm_seq)` over every timer. The cancel now names the run, and `idx_harvest_timers_arm_seq` serves the arm. An existing file gets the index on its next open.
 
 - **Run the MCP tools and durable webhook suites in CI (issue #1959).** `mcp_tools_integration` and `webhook_durable_integration` now run in CI from `linux` manifest rows. Before this change, every test in them was `#[ignore]`d, so CI never ran them.
 
@@ -292,6 +292,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Authorizer hook sees the body `workflow_id` (issue #2081).** `AuthzRequest` has two new fields: `workflow_id` and `start_input_present`. Harvest reads them from the body of `start`, `signal-with-start` and `update-with-start` before the hook runs. They are `None` and `false` on every other route.
 
 ### Performance
+
+- **Held claims no longer send the claim to the full scan (issue #2420).** With 32 or more claims in flight on one queue head, every row of the #1971 seek window could be locked, and the claim ran the full backlog scan. At 100K pending rows that read 106,467 buffers. A deep window of up to 256 rows per held head now runs first, and reads about 1,750 buffers. Claim order does not change. No migration.
+
+- **Scaling signals, canary status and shard rebalance read an index (issue #2424).** `queue::queue_task_counts` now reads live rows only, and `GET /admin/canary`, the rebalance quiescence check and the timer copy use new indexes. Migration `20261030015439_harvest_census_scan_indexes` builds three indexes with a plain `CREATE INDEX`. On a large deployment, build them `CONCURRENTLY` first, as the header of its `up.sql` shows.
 
 - **Standalone durable activity: measured, decided (issue #1987).** [ADR 0007](docs/adr/0007-standalone-activity.md) records it: document the one-step-workflow pattern, and do not build a standalone-activity start path now. The activities guide shows the pattern and its local-activity fast path.
 
@@ -398,6 +402,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Ledger census batch 4: the setup profiles (issue #2414).** The Ledger census now plans the `setup` Postgres profiles, the queries that run at startup, in migrations and in partition layout changes. 63 of them link a plan page under `docs/ledger/plans/`.
 
 - **Ledger census batch 5: the plugin test suites (issue #2425).** The census hook moved into a `ledger-census` cargo feature, so the plugin's test binaries can link it. 729 Postgres profiles now link a plan page, up from 552. The census found the #2423 bug.
+
+- **Ledger census batch 6: the SQLite profiles (issue #2429).** The `ledger-census` feature registers a SQLite auto-extension, and `ledger-census.py plan-sqlite` plans the recorded statements with `EXPLAIN QUERY PLAN`. 103 of the 109 SQLite profiles now link a plan page.
 
 The full entry for each change is in [`docs/shipped-work.md`](docs/shipped-work.md).
 
