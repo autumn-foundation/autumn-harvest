@@ -102,6 +102,7 @@ pub mod types;
 pub mod workflow;
 pub mod workspace;
 
+pub use agent::overlay::{Ceilings, ModelRegistry, OverlayError, ProfileOverlay};
 pub use agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentHeartbeat, AgentId, AgentIdError, AgentMemory, AgentOp,
     AgentProfile, AgentState, AgentStatus, Control, HeartbeatSetting, INTERRUPT_SIGNAL, Interrupt,

@@ -48,6 +48,26 @@ pub proof fn theorem_an_open_inbox_has_run_every_op(ops: Seq < InboxOp >) ensure
 pub proof fn theorem_a_resume_runs_every_held_op(ops: Seq < InboxOp >) requires ops.len() > 0, ops.last() == InboxOp::Resume, ensures run(fresh(), ops).status == InboxStatus::Open, run(fresh(), ops).ran == work_ids(ops),
 proof fn lemma_run_ends_with_its_last_step(inbox: Inbox, ops: Seq < InboxOp >) requires ops.len() > 0, ensures run(inbox, ops) == step(run(inbox, ops.drop_last()), ops.last()), decreases ops.len(),
 
+## formal/verus/src/agent_overlay.rs
+pub open spec fn within(value: Option < u32 >, ceiling: Option < u32 >) -> bool { match ceiling { None => true, Some(cap) => value.is_some() && value.unwrap() <= cap, } }
+pub open spec fn spec_merged_bound(current: Option < u32 >, set: Option < u32 >, ceiling: Option < u32 >) -> Option < Option < u32 >, > { let next = if set.is_some() { set } else { current }; if within(next, ceiling) { Some(next) } else { None } }
+pub fn merged_bound(current: Option < u32 >, set: Option < u32 >, ceiling: Option < u32 >) -> (r: Option < Option < u32 >, >) ensures r == spec_merged_bound(current, set, ceiling), r.is_some() ==> within(r.unwrap(), ceiling), r.is_some() && set.is_some() ==> r.unwrap() == set, r.is_some() && set.is_none() ==> r.unwrap() == current,
+pub open spec fn spec_merged_read_only(current: bool, set: Option < bool >, allow_clear: bool) -> Option < bool, > { let next = if set.is_some() { set.unwrap() } else { current }; if current &&! next &&! allow_clear { None } else { Some(next) } }
+pub fn merged_read_only(current: bool, set: Option < bool >, allow_clear: bool) -> (r: Option < bool >) ensures r == spec_merged_read_only(current, set, allow_clear), r.is_some() && current &&! r.unwrap() ==> allow_clear, r.is_some() && set.is_none() ==> r.unwrap() == current,
+pub open spec fn default_model() -> int { 0 }
+pub open spec fn name(model: Option < int >) -> int { if model.is_some() { model.unwrap() } else { default_model() } }
+pub struct Profile { pub max_steps: u32, pub max_total_tokens: Option < u32 >, pub max_output_tokens: Option < u32 >, pub read_only: bool, pub model: Option < int >, pub rest: int, }
+pub struct Overlay { pub max_steps: Option < u32 >, pub max_total_tokens: Option < u32 >, pub max_output_tokens: Option < u32 >, pub read_only: Option < bool >, pub model: Option < int >, }
+pub struct Ceilings { pub max_steps: Option < u32 >, pub max_total_tokens: Option < u32 >, pub max_output_tokens: Option < u32 >, pub models: Set < int >, pub allow_clear_read_only: bool, }
+pub open spec fn from_profile(p: Profile) -> Ceilings { Ceilings { max_steps: Some(p.max_steps), max_total_tokens: p.max_total_tokens, max_output_tokens: p.max_output_tokens, models: set ! [name(p.model)], allow_clear_read_only: false, } }
+pub open spec fn apply(p: Profile, o: Overlay, c: Ceilings, registry: Set < int >) -> Option < Profile > { let steps = spec_merged_bound(Some(p.max_steps), o.max_steps, c.max_steps); let total = spec_merged_bound(p.max_total_tokens, o.max_total_tokens, c.max_total_tokens); let output = spec_merged_bound(p.max_output_tokens, o.max_output_tokens, c.max_output_tokens); let read_only = spec_merged_read_only(p.read_only, o.read_only, c.allow_clear_read_only); let model = if o.model.is_some() { o.model } else { p.model }; if steps.is_none() || steps.unwrap().is_none() || total.is_none() || output.is_none() || read_only.is_none() { None } else if o.model.is_some() &&! registry.contains(o.model.unwrap()) { None } else if ! c.models.contains(name(model)) { None } else { Some(Profile { max_steps: steps.unwrap().unwrap(), max_total_tokens: total.unwrap(), max_output_tokens: output.unwrap(), read_only: read_only.unwrap(), model, rest: p.rest, },) } }
+pub proof fn theorem_a_result_stays_under_the_ceilings(p: Profile, o: Overlay, c: Ceilings, registry: Set < int >,) ensures apply(p, o, c, registry).is_some() ==>
+, { }
+pub proof fn theorem_default_ceilings_only_narrow(p: Profile, o: Overlay, registry: Set < int >) ensures apply(p, o, from_profile(p), registry).is_some() ==>
+, { theorem_a_result_stays_under_the_ceilings(p, o, from_profile(p), registry); }
+pub proof fn theorem_apply_is_idempotent(p: Profile, o: Overlay, c: Ceilings, registry: Set < int >) ensures apply(p, o, c, registry).is_some() ==> apply(apply(p, o, c, registry).unwrap(), o, c, registry) == apply(p, o, c, registry),
+pub proof fn theorem_an_empty_overlay_keeps_the_profile(p: Profile, registry: Set < int >) ensures apply(p, Overlay { max_steps: None, max_total_tokens: None, max_output_tokens: None, read_only: None, model: None, }, from_profile(p), registry,) == Some(p),
+
 ## formal/verus/src/agent_siblings.rs
 pub open spec fn share(remaining: int, siblings: int, index: int) -> int { if index < remaining % siblings { remaining / siblings + 1 } else { remaining / siblings } }
 pub open spec fn total(remaining: int, siblings: int, n: int) -> int decreases n, { if n <= 0 { 0 } else { total(remaining, siblings, n - 1) + share(remaining, siblings, n - 1) } }
