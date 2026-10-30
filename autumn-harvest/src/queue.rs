@@ -4238,15 +4238,22 @@ pub struct QueueTaskCounts {
 }
 
 /// The statement that [`queue_task_counts`] runs. `$1` is the current time.
+///
+/// Each count needs a `PENDING` or `RUNNING` row. So the `WHERE` clause
+/// changes no count, and it lets `idx_harvest_tq_live_created` serve the
+/// statement. Without it, each poll reads every finished task (issue #2424).
 pub const QUEUE_TASK_COUNTS_SQL: &str = "SELECT \
          queue_name AS queue, \
          COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at <= $1) AS backlog, \
          COUNT(*) FILTER (WHERE state = 'RUNNING') AS in_flight, \
          COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at > $1) AS scheduled \
      FROM harvest_task_queue \
+     WHERE state IN ('PENDING', 'RUNNING') \
      GROUP BY queue_name";
 
 /// Return backlog, in-flight, and scheduled task counts per queue on this shard.
+///
+/// A queue with no `PENDING` or `RUNNING` task has no row.
 ///
 /// # Errors
 ///
@@ -4268,9 +4275,9 @@ pub async fn queue_task_counts(
 
     let rows: Vec<Row> = diesel::sql_query(QUEUE_TASK_COUNTS_SQL)
         .bind::<diesel::sql_types::Timestamptz, _>(Utc::now())
-    .load(conn)
-    .await
-    .map_err(crate::error::database_error)?;
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
 
     Ok(rows
         .into_iter()

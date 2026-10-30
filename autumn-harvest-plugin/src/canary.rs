@@ -772,11 +772,10 @@ const CANARY_ROW_CAP: i64 = 500;
 /// underscore-laden prefix).
 async fn load_canary_rows(conn: &mut AsyncPgConnection) -> Result<Vec<CanaryRow>, String> {
     let rows: Vec<CanaryRowDb> = diesel::sql_query(autumn_harvest::canary::CANARY_ROWS_SQL)
-    .bind::<Text, _>(autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX)
-    .bind::<diesel::sql_types::BigInt, _>(CANARY_ROW_CAP)
-    .load(conn)
-    .await
-    .map_err(|e| e.to_string())?;
+        .bind::<diesel::sql_types::BigInt, _>(CANARY_ROW_CAP)
+        .load(conn)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(rows
         .into_iter()

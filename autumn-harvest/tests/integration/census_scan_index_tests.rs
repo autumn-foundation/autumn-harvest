@@ -56,9 +56,7 @@ async fn plan_gate_db() -> claim_bench_db::BenchDb {
 async fn generic_plan(conn: &mut AsyncPgConnection, sql: &str) -> String {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let name = format!("census_gate_{}", NEXT.fetch_add(1, Ordering::Relaxed));
-    let params = (1..)
-        .take_while(|n| sql.contains(&format!("${n}")))
-        .count();
+    let params = (1..).take_while(|n| sql.contains(&format!("${n}"))).count();
     conn.batch_execute(&format!(
         "SET enable_seqscan = off; \
          SET plan_cache_mode = force_generic_plan; \
@@ -202,12 +200,37 @@ async fn canary_rows_match_the_prefix_newest_first() {
 
     let prefix = autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX;
     let rows = [
-        (format!("{prefix}__q1"), "q1", "COMPLETED", "NOW() - INTERVAL '3 minutes'"),
-        (format!("{prefix}__q2"), "q2", "COMPLETED", "NOW() - INTERVAL '1 minute'"),
+        (
+            format!("{prefix}__q1"),
+            "q1",
+            "COMPLETED",
+            "NOW() - INTERVAL '3 minutes'",
+        ),
+        (
+            format!("{prefix}__q2"),
+            "q2",
+            "COMPLETED",
+            "NOW() - INTERVAL '1 minute'",
+        ),
         (format!("{prefix}__q3"), "q3", "RUNNING", "NULL"),
-        (format!("{prefix}__q4"), "q4", "FAILED", "NOW() - INTERVAL '2 minutes'"),
-        ("xxharvest_canary_probe__q5".to_owned(), "q5", "COMPLETED", "NOW()"),
-        ("__harvestXcanaryXprobe__q6".to_owned(), "q6", "COMPLETED", "NOW()"),
+        (
+            format!("{prefix}__q4"),
+            "q4",
+            "FAILED",
+            "NOW() - INTERVAL '2 minutes'",
+        ),
+        (
+            "xxharvest_canary_probe__q5".to_owned(),
+            "q5",
+            "COMPLETED",
+            "NOW()",
+        ),
+        (
+            "__harvestXcanaryXprobe__q6".to_owned(),
+            "q6",
+            "COMPLETED",
+            "NOW()",
+        ),
         ("ordinary".to_owned(), "q7", "COMPLETED", "NOW()"),
     ];
     let mut sql = String::new();
@@ -224,9 +247,7 @@ async fn canary_rows_match_the_prefix_newest_first() {
     }
     conn.batch_execute(&sql).await.expect("seed executions");
 
-    let read = |cap: i64| {
-        diesel::sql_query(CANARY_ROWS_SQL).bind::<BigInt, _>(cap)
-    };
+    let read = |cap: i64| diesel::sql_query(CANARY_ROWS_SQL).bind::<BigInt, _>(cap);
     let all: Vec<CanaryRow> = read(500).load(&mut conn).await.expect("canary rows");
     let queues: Vec<&str> = all.iter().map(|r| r.queue_name.as_str()).collect();
     assert_eq!(queues, ["q2", "q4", "q1", "q3"]);
