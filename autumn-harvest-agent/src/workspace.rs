@@ -431,9 +431,9 @@ impl WorkspaceBlobs for InMemoryWorkspaceBlobs {
 /// safe name. A write goes to a scratch file first, then a rename makes it
 /// visible, so a key never holds half a blob.
 ///
-/// A put returns only after the data is on disk. It syncs the scratch file,
-/// renames it, and syncs the folder, and the parent of each folder that it
-/// creates. Retention can delete the previous snapshot, so a lost head would
+/// A put returns only after the data is on disk. It syncs the scratch file
+/// and renames it. It then syncs the folder and its parent. It also syncs the
+/// parent of each folder that it creates. Retention can delete the previous snapshot, so a lost head would
 /// lose the workspace.
 ///
 /// A put that stops before its rename leaves its scratch file. A crash, a
@@ -506,11 +506,12 @@ mod sync_log {
             let mut log = LOG.lock().unwrap_or_else(PoisonError::into_inner);
             log.push((kind, path.to_path_buf()));
         }
-        let faults = FAULTS.lock().unwrap_or_else(PoisonError::into_inner);
-        if faults
+        let failed = FAULTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .any(|(k, root)| *k == kind && path.starts_with(root))
-        {
+            .any(|(k, root)| *k == kind && path.starts_with(root));
+        if failed {
             return Err(std::io::Error::other("injected sync fault"));
         }
         Ok(())
@@ -580,8 +581,8 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 /// The scratch file is synced before the rename. The folder is synced after
 /// it, because the rename lives in the folder entry. The parent of the folder
 /// is synced on every put. An earlier put can create the folder and then fail
-/// before its parent sync, so a folder that exists is not proof that its entry
-/// is durable. The parent of each folder that this call creates is synced too.
+/// before its parent sync. So a folder that exists is not proof that its
+/// entry is durable. The parent of each folder that this call creates is synced too.
 /// Any sync error fails the put, so a put never acknowledges a blob that can
 /// vanish.
 ///

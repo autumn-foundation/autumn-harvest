@@ -1143,7 +1143,9 @@ store for workspaces only, because retention deletes the blobs of a scope
 that are not newer than its head.
 
 **Scratch files (issue #2315).** `DirWorkspaceBlobs` writes each blob to a
-scratch file, `<key>.tmp-<32 hex>`, then renames it. A crash, a save timeout
+scratch file, `<key>.tmp-<32 hex>`, then renames it. The put syncs the file
+before the rename. It syncs the folder and its parent after the rename. A
+sync error fails the put. A crash, a save timeout
 or a cancel can stop a put before the rename and leave that file. The store
 lists scratch names. Retention and a reset delete one by the generation of
 its key, with the same rule as for keys. So a late attempt never deletes the

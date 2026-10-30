@@ -1,4 +1,4 @@
-## Phase 7.x — Durable workspace snapshots (agent workspace store)
+## Fix — Durable workspace snapshots (agent workspace store)
 
 `DirWorkspaceBlobs::put` now syncs the scratch file before the rename. It then syncs the folder and its parent, and the parent of each folder that it creates. A sync error fails the put. Before, a crash after a committed tool call could lose the snapshot that the history names. Replay does not rerun a completed tool call, so the workspace was lost for good.
 
