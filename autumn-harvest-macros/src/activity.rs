@@ -402,6 +402,8 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let companion_name = format_ident!("__autumn_activity_info_{fn_name}");
     let public_info_name = format_ident!("{fn_name}_info");
+    // `quote!` does not interpolate inside `///`, so build the doc line here.
+    let info_doc_example = format!(" ctx.execute_activity(&{public_info_name}(), input).await?;");
 
     let retry_expr = attrs
         .retry
@@ -582,8 +584,8 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         ///
         /// Pass to typed dispatch helpers on [`::autumn_harvest::WorkflowContext`]:
         ///
-        /// ```rust,ignore
-        /// ctx.execute_activity(&#public_info_name(), input).await?;
+        /// ```text
+        #[doc = #info_doc_example]
         /// ```
         pub fn #public_info_name() -> ::autumn_harvest::ActivityInfo {
             #companion_name()
@@ -694,5 +696,46 @@ mod dispatch_characterization_tests {
             }
         });
         assert_eq!(extract_dispatch_body(&out), ACTIVITY_DISPATCH_N_TYPED);
+    }
+}
+
+#[cfg(test)]
+mod info_doc_tests {
+    use super::activity_macro;
+    use quote::quote;
+
+    fn generate() -> String {
+        activity_macro(
+            quote! {},
+            quote! {
+                async fn send_email(ctx: &ActivityContext, n: u32) -> Result<u32, String> {
+                    Ok(n)
+                }
+            },
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn info_doc_names_the_generated_info_fn() {
+        let out = generate();
+        assert!(
+            out.contains("ctx.execute_activity(&send_email_info(), input).await?;"),
+            "the doc example must name the real info fn:\n{out}"
+        );
+    }
+
+    #[test]
+    fn info_doc_has_no_uninterpolated_variable() {
+        assert!(!generate().contains("#public_info_name"));
+    }
+
+    #[test]
+    fn info_doc_example_is_never_compiled() {
+        // A fragment uses `ctx` and `input`, which a doctest does not define.
+        // `cargo test -- --include-ignored` compiles `ignore` fences.
+        let out = generate();
+        assert!(out.contains("```text"), "{out}");
+        assert!(!out.contains("```rust,ignore"), "{out}");
     }
 }
