@@ -240,3 +240,98 @@ with ageing off) and the fallback cases.
    at their cap. The head scans then skip those rows,
    and a head of hot-key rows no longer falls back. On the #1956 fixture at
    1M, one claim in 800 fell back this way under `pgbench`.
+
+---
+
+## 5. Held claims (issue #2420)
+
+A peer claim locks its row until it commits. The head scan is a plain
+read, so it still returns that row. With 32 or more claims in flight on one
+head, every window row of that head can be locked. `seek_candidate` is then
+empty, the head is full, and the claim runs the full scan. A slower claim
+keeps more claims in flight, so the cost feeds itself. DBOS reports the
+same loop as a metastable dequeue
+([post](https://www.dbos.dev/blog/one-million-workflows)).
+
+### 5.1 Brainstorm — how can a held head stay bounded?
+
+| # | Idea | Verdict |
+|---|------|---------|
+| H1 | `FOR UPDATE SKIP LOCKED` inside each head scan. | Rejected. It locks the whole window, up to 32 rows per head on each claim. Peers then skip rows that no claim takes, and each lock writes WAL. |
+| H2 | `FOR KEY SHARE SKIP LOCKED` inside each head scan. | Rejected. It still writes each tuple, and two readers make a `MultiXactId`. |
+| H3 | A larger window for every claim. | Rejected. Every claim pays for the worst case. |
+| H4 | Size the window from the number of live claimers. | Rejected. The fleet size is not known to the claim, and every claim pays for it. |
+| H5 | Read `xmax` to skip rows that look locked. | Rejected. A committed locker leaves `xmax` set. A skip on a stale value hides an eligible row, which breaks the guard. |
+| H6 | A deep window that runs only when the window rows are eligible but held, and only on the heads that hold them. | **Adopted.** No cost when the window finds a row. Each held head reads at most `CLAIM_DEEP_SEEK_WINDOW` rows. The guard argument is unchanged. |
+
+### 5.2 Reverse brainstorm — how can H6 do harm?
+
+| # | How to make it harmful | Mitigation |
+|---|------------------------|------------|
+| X1 | The deep window runs on a blocked head too, so a blocked claim pays more. | It runs only when a guarded window row passes every claim gate. A row that a gate rejects never triggers it. |
+| X2 | The deep window reads rows whose concurrency key the window counts do not cover. A capped key then passes. | The deep scan reads its own counts, `seek_deep_running_counts`, for every key in the deep window. |
+| X3 | A deep head keeps its old bound, so the guard rejects every deep row. | The deep bounds drop the window bound of each deepened head. |
+| X4 | Two candidate scans both lock a row, so the claim takes two. | Each scan runs only when every scan before it is empty. The union holds one row at most. |
+| X5 | A splice misses the new scans. The fence, kind, owner or fair claim then runs a scan without its gate. | Each splice counts its anchors per scan. The shape tests pin the new counts. |
+| X6 | More than `CLAIM_DEEP_SEEK_WINDOW` claims in flight on one head. | The claim falls back to the full scan, as before. `docs/performance.md` states the bound. |
+
+### 5.3 Six thinking hats — H6
+
+| Hat | Notes |
+|-----|-------|
+| White | The red test held K claims open on one head over 100K pending rows. Before the fix, K = 32 and K = 64 both ran the full scan: about 106,500 buffers and 2,259 temp blocks, against 263 with no held claim. After the fix: 1,727 and 1,772 buffers, and the same at 10K. `docs/performance.md` has the table. |
+| Red | A fix that runs only under contention is easy to trust. The uncontended claim does not change. |
+| Black | (1) The statement grows by one candidate scan and seven small CTEs. The plan is cached, so planning time does not grow per claim. (2) Past the deep window the cliff is still there. (3) The held check runs the claim gates twice on the window rows. |
+| Yellow | The claim order does not change. Under `SKIP LOCKED`, the deep window picks the row that the full scan picks. The `claimed` CTE and the post-claim rechecks do not change. |
+| Green | H4 as a later step: a deep window sized from the held rows. Issue #2418 may remove the need, if held rows leave the ready index. |
+| Blue | Red: a DB test with K held claims, K = 32 and 64. Green: the deep window. Refactor: macros, shape tests, docs. |
+
+### 5.4 Design
+
+Three tiers run in one statement. Each tier runs only when every tier
+before it is empty.
+
+1. `seek_candidate`: the window, as in §1.2 and §1.3.
+2. `seek_deep_candidate`: the deep window.
+3. `legacy_candidate`: the full scan, as in §1.4.
+
+The deep window has seven CTEs:
+
+- `seek_held` holds the guarded window rows that pass every claim gate.
+  It takes no lock. A row in it with an empty `seek_candidate` is a row
+  that a peer holds.
+- `seek_contended` names the queue heads of those rows.
+- `seek_deep_rows` reads up to `CLAIM_DEEP_SEEK_WINDOW` (256) rows from
+  each such head, with the head gates of §1.2.
+- `seek_deep_window` is the window plus the deep rows.
+- `seek_deep_bounds` keeps the window bounds of the other heads, the pin
+  bound, and the last row of each full deep head.
+- `seek_deep_pending_keys` and `seek_deep_running_counts` count the
+  `RUNNING` rows of each concurrency key in `seek_deep_window`.
+
+The guard of §1.3 then runs on `seek_deep_window` against
+`seek_deep_bounds`. Each head in the deep window is still a prefix of its
+head in claim order. Each bound is still the last row of a cut prefix. So
+the guard argument holds as before.
+
+The full scan then runs only when a bound remains. With a held head, the
+remaining bounds are `seek_deep_bounds`. A held head that the deep window
+reads to its end leaves no bound. Then the deep window proves that no free
+row exists, and the full scan does not run.
+
+### 5.5 Claim order
+
+No change. `SKIP LOCKED` already lets a claim pass a locked row. The deep
+window passes the same rows that the full scan passes, and picks the best
+row that is left.
+
+### 5.6 Test plan
+
+| Phase | Test | Expected in red | Expected in green |
+|---|---|---|---|
+| Red | `held_claims_on_one_head_keep_the_claim_off_the_full_scan` | Fail: the full scan runs at K = 32 and K = 64. | Pass. |
+| Both | `a_claim_behind_held_rows_takes_the_next_row_in_order` | Pass, through the full scan. | Pass. K = 100 lies inside the 256-row deep window. K = 280 lies past it. |
+| Red, added in review | `a_fully_held_short_head_skips_the_full_scan` | Fail: the full scan runs although the deep window read the whole head. | Pass. |
+| Both, added in review | `the_deep_window_keeps_the_bound_of_a_full_head_it_does_not_read` | Pass. | Pass. It fails if `seek_deep_bounds` drops the bounds of the heads that it does not read again. |
+| Green | Shape tests for the deep window and the splice counts | Fail: no deep window. | Pass. |
+| Both | The exactly-once, claim-order, seek-window and splice suites | Pass. | Pass. |

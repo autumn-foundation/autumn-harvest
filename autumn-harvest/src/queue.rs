@@ -990,6 +990,13 @@ pub const CLAIM_ORDER_DUE_SQL: &str = claim_order_due_sql!();
 /// Rows the claim reads from the head of each queue (issue #1971).
 pub const CLAIM_SEEK_WINDOW: i64 = 32;
 
+/// Rows the deep window reads from each held queue head (issue #2420).
+///
+/// The deep window runs only when peer claims hold the window rows. With
+/// fewer claims than this in flight on one head, the claim stays off the
+/// full scan.
+pub const CLAIM_DEEP_SEEK_WINDOW: i64 = 256;
+
 /// The error prefix on a task that the timeout scanner fails (issue #1824).
 ///
 /// The claim never hands out a task of an expired run. See
@@ -1139,11 +1146,19 @@ macro_rules! claim_seek_window_sql {
     };
 }
 
+/// The [`CLAIM_DEEP_SEEK_WINDOW`] value as SQL text, for `concat!`.
+macro_rules! claim_deep_seek_window_sql {
+    () => {
+        "256"
+    };
+}
+
 /// The claim gates that read only the row and constant arrays (issue #1971).
 ///
-/// Both candidate scans apply them, and so does each head scan of the seek
-/// window. A row they reject is ineligible. So a head scan may skip it, and
-/// the window guard stays exact.
+/// Each gated scan applies them: the three candidate scans and `seek_held`.
+/// So does each head scan of the seek window. A row they reject is
+/// ineligible. So a head scan may skip it, and the window guard stays
+/// exact.
 macro_rules! claim_row_local_gates_sql {
     () => {
         concat!(
@@ -1244,7 +1259,8 @@ macro_rules! claim_order_by_sql {
 /// The claim gates of one candidate scan, after the queue-pause test.
 ///
 /// `$counts` names the running-count CTE that the concurrency gate reads.
-/// Both candidate scans use this text, so every gate is the same in each.
+/// Each candidate scan and `seek_held` use this text, so every gate is the
+/// same in each.
 macro_rules! claim_candidate_gates_sql {
     ($counts:literal) => {
         concat!(
@@ -1326,8 +1342,23 @@ macro_rules! claim_candidate_scan_sql {
     ($name:literal, $counts:literal, [$($rows:tt)*], [$($extra:tt)*]) => {
         concat!(
             $name,
-            " AS ( \
-             SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name, \
+            " AS ( ",
+            claim_candidate_rows_sql!($counts, [$($rows)*], [$($extra)*]),
+            claim_order_by_sql!(),
+            "LIMIT 1 FOR UPDATE SKIP LOCKED \
+        )"
+        )
+    };
+}
+
+/// The eligible rows of one candidate scan, with no sort and no lock.
+///
+/// Each candidate scan and `seek_held` read this text, so each one applies
+/// every claim gate. The arguments are those of `claim_candidate_scan_sql!`.
+macro_rules! claim_candidate_rows_sql {
+    ($counts:literal, [$($rows:tt)*], [$($extra:tt)*]) => {
+        concat!(
+            "SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name, \
                     workflow_exec_id \
              FROM harvest_task_queue \
              CROSS JOIN worker_info \
@@ -1338,10 +1369,7 @@ macro_rules! claim_candidate_scan_sql {
             "AND scheduled_at <= NOW() \
                AND NOT (harvest_task_queue.queue_name = ANY(paused_queues.names)) ",
             $($extra)*,
-            claim_candidate_gates_sql!($counts),
-            claim_order_by_sql!(),
-            "LIMIT 1 FOR UPDATE SKIP LOCKED \
-        )"
+            claim_candidate_gates_sql!($counts)
         )
     };
 }
@@ -1525,6 +1553,7 @@ macro_rules! claim_seek_ctes_sql {
             "seek_heads AS MATERIALIZED ( \
              SELECT h.seek_id, h.seek_rank, h.seek_priority, h.seek_due, h.seek_pinned, \
                     h.seek_concurrency_key, h.seek_concurrency_cap, h.seek_task_type, \
+                    h.head_queue, h.head_kind, h.head_new_start, \
                     row_number() OVER ( \
                         PARTITION BY h.head_queue, h.head_kind, h.head_new_start \
                         ORDER BY h.seek_priority DESC, h.seek_due ASC \
@@ -1538,22 +1567,14 @@ macro_rules! claim_seek_ctes_sql {
                  CROSS JOIN (VALUES ('workflow', FALSE), ('workflow', TRUE), \
                                     ('activity', FALSE), ('activity', TRUE)) \
                      AS k(head_kind, new_start_head) \
-                 CROSS JOIN LATERAL ( \
-                     SELECT ",
-            claim_seek_row_sql!(),
-            " \
-                     FROM harvest_task_queue \
-                     WHERE queue_name = q.name \
-                       AND task_type = k.head_kind \
-                       AND state = 'PENDING' \
-                       AND (new_start AND attempt = 0) = k.new_start_head \
-                       AND scheduled_at <= NOW() ",
-            claim_head_gates_sql!(),
-            "ORDER BY priority DESC, scheduled_at ASC \
-                     LIMIT ",
-            claim_seek_window_sql!(),
-            " \
-                 ) s \
+                 CROSS JOIN LATERAL ( ",
+            claim_queue_head_scan_sql!(
+                "q.name",
+                "k.head_kind",
+                "k.new_start_head",
+                [claim_seek_window_sql!()]
+            ),
+            ") s \
                  WHERE NOT (q.name = ANY(paused_queues.names)) \
                  UNION ALL \
                  SELECT p.*, TRUE, NULL, NULL, NULL \
@@ -1581,7 +1602,8 @@ macro_rules! claim_seek_ctes_sql {
          ), \
          seek_bounds AS MATERIALIZED ( \
              SELECT seek_pinned AS bound_pinned, seek_priority AS bound_priority, \
-                    seek_due AS bound_due \
+                    seek_due AS bound_due, head_queue AS bound_queue, \
+                    head_kind AS bound_kind, head_new_start AS bound_new_start \
              FROM seek_heads \
              WHERE seek_rn = ",
             claim_seek_window_sql!(),
@@ -1618,6 +1640,147 @@ macro_rules! claim_seek_row_sql {
     };
 }
 
+/// One ordered head scan of `idx_harvest_tq_claim_seek` (issues #1971,
+/// #2420).
+///
+/// `$queue`, `$kind` and `$new_start` name the head. `$limit` is the number
+/// of rows to read. The window and the deep window both read their queue
+/// heads through this text. So each head is a prefix of its head in claim
+/// order.
+macro_rules! claim_queue_head_scan_sql {
+    ($queue:literal, $kind:literal, $new_start:literal, [$($limit:tt)*]) => {
+        concat!(
+            "SELECT ",
+            claim_seek_row_sql!(),
+            " \
+             FROM harvest_task_queue \
+             WHERE queue_name = ",
+            $queue,
+            " AND task_type = ",
+            $kind,
+            " AND state = 'PENDING' \
+               AND (new_start AND attempt = 0) = ",
+            $new_start,
+            " AND scheduled_at <= NOW() ",
+            claim_head_gates_sql!(),
+            "ORDER BY priority DESC, scheduled_at ASC \
+             LIMIT ",
+            $($limit)*,
+            " "
+        )
+    };
+}
+
+/// The deep window of the default claim (issue #2420).
+///
+/// A peer claim holds its row lock until it commits. The head scans are
+/// plain reads, so they still return that row. With enough claims in flight
+/// on one head, every window row of the head is locked. The window then has
+/// no candidate, and the head is full. Before issue #2420 the full scan ran.
+/// A slow claim keeps more claims in flight, so that cost fed itself.
+///
+/// The deep window runs only when `seek_candidate` is empty. It has these
+/// CTEs:
+///
+/// - `seek_held` holds the guarded window rows that pass every claim gate.
+///   It takes no lock. `seek_candidate` passed each of them because a peer
+///   holds it or has just claimed it. A row that a gate rejects is never in
+///   it, so a blocked head does not start the deep window.
+/// - `seek_contended` names the queue head of each held row.
+/// - `seek_deep_rows` reads up to [`CLAIM_DEEP_SEEK_WINDOW`] rows from each
+///   such head, with the same head scan as the window.
+/// - `seek_deep_window` is the window plus the deep rows.
+/// - `seek_deep_bounds` keeps the bound of each head that was not read
+///   again, and the last row of each full deep head.
+///
+/// Each head in the deep window is a prefix of its head in claim order. Each
+/// bound is the last row of a cut prefix. So the guard of the window holds
+/// for the deep window too. `seek_deep_running_counts` counts the keys of
+/// the deep window, so the concurrency gate stays exact.
+macro_rules! claim_deep_seek_ctes_sql {
+    () => {
+        concat!(
+            "seek_held AS MATERIALIZED ( ",
+            claim_candidate_rows_sql!(
+                "seek_running_counts",
+                [claim_seek_rows_sql!()],
+                [
+                    claim_seek_guard_sql!("seek_heads", "seek_bounds"),
+                    "AND NOT EXISTS (SELECT 1 FROM seek_candidate) "
+                ]
+            ),
+            "), \
+         seek_contended AS MATERIALIZED ( \
+             SELECT DISTINCT w.head_queue, w.head_kind, w.head_new_start \
+             FROM seek_heads w \
+             JOIN seek_held x ON x.id = w.seek_id \
+             WHERE w.head_queue IS NOT NULL \
+         ), \
+         seek_deep_rows AS MATERIALIZED ( \
+             SELECT d.*, \
+                    row_number() OVER ( \
+                        PARTITION BY c.head_queue, c.head_kind, c.head_new_start \
+                        ORDER BY d.seek_priority DESC, d.seek_due ASC \
+                    ) AS seek_rn \
+             FROM seek_contended c \
+             CROSS JOIN paused_activities \
+             CROSS JOIN LATERAL ( ",
+            claim_queue_head_scan_sql!(
+                "c.head_queue",
+                "c.head_kind",
+                "c.head_new_start",
+                [claim_deep_seek_window_sql!()]
+            ),
+            ") d \
+         ), \
+         seek_deep_window AS MATERIALIZED ( \
+             SELECT seek_id, seek_rank, seek_priority, seek_due, \
+                    seek_concurrency_key, seek_concurrency_cap, seek_task_type \
+             FROM seek_heads \
+             UNION ALL \
+             SELECT seek_id, seek_rank, seek_priority, seek_due, \
+                    seek_concurrency_key, seek_concurrency_cap, seek_task_type \
+             FROM seek_deep_rows \
+         ), \
+         seek_deep_bounds AS MATERIALIZED ( \
+             SELECT b.bound_pinned, b.bound_priority, b.bound_due \
+             FROM seek_bounds b \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM seek_contended c \
+                 WHERE c.head_queue = b.bound_queue \
+                   AND c.head_kind = b.bound_kind \
+                   AND c.head_new_start = b.bound_new_start \
+             ) \
+             UNION ALL \
+             SELECT FALSE, seek_priority, seek_due \
+             FROM seek_deep_rows \
+             WHERE seek_rn = ",
+            claim_deep_seek_window_sql!(),
+            " \
+         ), \
+         seek_deep_pending_keys AS MATERIALIZED ( \
+             SELECT DISTINCT seek_concurrency_key AS concurrency_key, seek_task_type AS task_type \
+             FROM seek_deep_window \
+             WHERE seek_concurrency_key IS NOT NULL \
+               AND seek_concurrency_cap IS NOT NULL \
+         ), ",
+            claim_running_counts_sql!("seek_deep_running_counts", "seek_deep_pending_keys"),
+            ", "
+        )
+    };
+}
+
+/// The gate on the deep window scan (issue #2420).
+///
+/// The deep scan runs only when the window found no candidate and a peer
+/// holds a window row. Postgres plans this as a one-time filter.
+macro_rules! claim_deep_seek_gate_sql {
+    () => {
+        "AND NOT EXISTS (SELECT 1 FROM seek_candidate) \
+               AND EXISTS (SELECT 1 FROM seek_contended) "
+    };
+}
+
 /// The row source of the window candidate scan (issue #1971).
 ///
 /// The array holds the window rows that pass the guard. A window row may be
@@ -1626,13 +1789,21 @@ macro_rules! claim_seek_row_sql {
 /// bounds it. Any other row must sort at or before the last row of each full
 /// head.
 ///
+/// `$rows` names the window CTE and `$bounds` its bounds. The deep window
+/// passes its own pair (issue #2420).
+///
 /// The candidate scan reads the table rows by primary key through the
 /// array. See `claim_seek_rows_sql!` for why no other index can serve it.
 macro_rules! claim_seek_guard_sql {
-    () => {
-        "AND harvest_task_queue.id = ANY(ARRAY( \
-                   SELECT w.seek_id FROM seek_heads w \
-                   WHERE NOT EXISTS (SELECT 1 FROM seek_bounds b WHERE \
+    ($rows:literal, $bounds:literal) => {
+        concat!(
+            "AND harvest_task_queue.id = ANY(ARRAY( \
+                   SELECT w.seek_id FROM ",
+            $rows,
+            " w \
+                   WHERE NOT EXISTS (SELECT 1 FROM ",
+            $bounds,
+            " b WHERE \
                        (b.bound_pinned OR w.seek_rank = 0) \
                        AND ( \
                            (b.bound_pinned AND w.seek_rank = 0) \
@@ -1642,6 +1813,7 @@ macro_rules! claim_seek_guard_sql {
                        ) \
                    ) \
                )) "
+        )
     };
 }
 
@@ -1677,13 +1849,20 @@ macro_rules! claim_seek_rows_sql {
 
 /// The gate on the full scan (issue #1971).
 ///
-/// The full scan runs only when the window found no candidate and cannot
-/// prove that none exists: a head was full, or ageing is on. Postgres plans
-/// this as a one-time filter, so otherwise the scan never runs.
+/// The full scan runs only when the window and the deep window found no
+/// candidate. A bound must also remain, or ageing must be on. Without a
+/// held head, the bounds are `seek_bounds`. With a held head, they are
+/// `seek_deep_bounds` (issue #2420). A held head that the deep window
+/// reads to its end leaves no bound, so the deep window proves that no row
+/// is free. Postgres plans this as a one-time filter, so otherwise the
+/// scan never runs.
 macro_rules! claim_full_scan_fallback_sql {
     () => {
         "AND NOT EXISTS (SELECT 1 FROM seek_candidate) \
+               AND NOT EXISTS (SELECT 1 FROM seek_deep_candidate) \
                AND (EXISTS (SELECT 1 FROM seek_bounds) \
+                   AND (NOT EXISTS (SELECT 1 FROM seek_contended) \
+                        OR EXISTS (SELECT 1 FROM seek_deep_bounds)) \
                OR ($4::BIGINT IS NOT NULL AND $4::BIGINT > 0)) "
     };
 }
@@ -1750,14 +1929,16 @@ macro_rules! claim_full_scan_fallback_sql {
 ///
 /// # Seek window (issue #1971)
 ///
-/// The query has two candidate scans. `seek_candidate` reads the rows of a
-/// bounded window from the head of each queue. `legacy_candidate` is the full
-/// scan. The full scan runs only when the window cannot prove its pick. See
-/// `claim_seek_ctes_sql!`, `claim_seek_guard_sql!` and
-/// `claim_full_scan_fallback_sql!`. Both scans come from
-/// `claim_candidate_scan_sql!`, so they apply the same gates and the same
-/// sort. So the claim picks the same row as one full scan would. Its cost no
-/// longer grows with the backlog when the window decides.
+/// The query has three candidate scans. `seek_candidate` reads the rows of
+/// a bounded window from the head of each queue. `seek_deep_candidate` reads
+/// deeper into each head that peer claims hold (issue #2420).
+/// `legacy_candidate` is the full scan. Each scan runs only when the scans
+/// before it found no row. The full scan runs only when the windows cannot
+/// prove their pick. See `claim_seek_ctes_sql!`, `claim_deep_seek_ctes_sql!`,
+/// `claim_seek_guard_sql!` and `claim_full_scan_fallback_sql!`. All three
+/// scans come from `claim_candidate_scan_sql!`, so they apply the same gates
+/// and the same sort. So the claim picks the same row as one full scan
+/// would. Its cost no longer grows with the backlog when a window decides.
 /// `docs/performance.md` has the measurements.
 ///
 /// Binds: `$1` worker id, `$2` queue names, `$3` worker build id,
@@ -1824,7 +2005,18 @@ pub const fn claim_task_query() -> &'static str {
             "seek_candidate",
             "seek_running_counts",
             [claim_seek_rows_sql!()],
-            [claim_seek_guard_sql!()]
+            [claim_seek_guard_sql!("seek_heads", "seek_bounds")]
+        ),
+        ", ",
+        claim_deep_seek_ctes_sql!(),
+        claim_candidate_scan_sql!(
+            "seek_deep_candidate",
+            "seek_deep_running_counts",
+            [claim_seek_rows_sql!()],
+            [
+                claim_seek_guard_sql!("seek_deep_window", "seek_deep_bounds"),
+                claim_deep_seek_gate_sql!()
+            ]
         ),
         ", ",
         claim_candidate_scan_sql!(
@@ -1834,6 +2026,7 @@ pub const fn claim_task_query() -> &'static str {
             [claim_full_scan_fallback_sql!()]
         ),
         ", candidate AS ( SELECT * FROM seek_candidate \
+         UNION ALL SELECT * FROM seek_deep_candidate \
          UNION ALL SELECT * FROM legacy_candidate ), ",
         claim_trailing_ctes_sql!()
     )
@@ -1859,7 +2052,7 @@ const fn claim_task_full_scan_query() -> &'static str {
 
 /// The planner settings for the rest of the claim transaction (issue #1971).
 ///
-/// **JIT off.** The claim plan holds two candidate scans. Postgres adds the
+/// **JIT off.** The claim plan holds three candidate scans. Postgres adds the
 /// estimated cost of the full scan to the plan, even when its one-time
 /// filter skips it. At a deep backlog that estimate passes
 /// `jit_above_cost`. JIT then compiles about 330 functions on every claim,
@@ -2054,7 +2247,7 @@ fn fence_binding(shard: Option<crate::types::ShardId>) -> Option<(Vec<i32>, Vec<
 #[must_use]
 pub fn claim_task_query_fenced() -> &'static str {
     static FENCED: std::sync::LazyLock<String> =
-        std::sync::LazyLock::new(|| splice_dr_fence(claim_task_query(), "$7", "$8", 2));
+        std::sync::LazyLock::new(|| splice_dr_fence(claim_task_query(), "$7", "$8", 4));
     &FENCED
 }
 
@@ -2085,14 +2278,14 @@ fn splice_dr_fence(base: &str, shard_bind: &str, generation_bind: &str, scans: u
     let spliced = format!("{fence_cte}{base}");
 
     // `CROSS JOIN worker_info ` appears once in the FROM list of each
-    // candidate scan. Each scan joins the fence. The count assertion turns an
+    // candidate scan and of `seek_held`. Each one joins the fence. The count assertion turns an
     // edit that duplicates or renames the anchor into a panic at first use.
     // Without it, a claim could silently run unfenced.
     let anchor = "CROSS JOIN worker_info ";
     assert_eq!(
         spliced.matches(anchor).count(),
         scans,
-        "claim query fence anchor must appear once per candidate scan"
+        "claim query fence anchor must appear once per gated scan"
     );
     spliced.replace(anchor, "CROSS JOIN worker_info CROSS JOIN fence ")
 }
@@ -2714,13 +2907,14 @@ const SEEK_QUEUE_HEADS_ANCHOR: &str = "WHERE NOT (q.name = ANY(paused_queues.nam
 
 /// Splice a literal task-kind predicate into every scan of `base`.
 ///
-/// The predicate goes into both candidate scans and the pin head. The queue
+/// The predicate goes into each gated scan and the pin head. The queue
 /// heads get a filter on their kind instead, so the heads of the other kind
-/// never run. The window then holds only rows of this kind. The assertions
+/// never run. The window then holds only rows of this kind. The deep window
+/// reads only heads of window rows, so it holds only rows of this kind too. The assertions
 /// make an edit that breaks an anchor panic at first use.
 fn splice_kind_predicate(base: &str, kind: TaskType) -> String {
     let anchors = [
-        (BY_ID_ANCHOR, 2, "harvest_task_queue.task_type"),
+        (BY_ID_ANCHOR, 4, "harvest_task_queue.task_type"),
         (SEEK_HEAD_ANCHOR, 1, "harvest_task_queue.task_type"),
         (SEEK_QUEUE_HEADS_ANCHOR, 1, "k.head_kind"),
     ];
@@ -2781,14 +2975,14 @@ fn fair_variant(kind: Option<TaskType>, fenced: bool) -> &'static str {
 
 pub use crate::decision_owner::OwnedClaim;
 
-/// The sticky gate, in each candidate scan and each head scan.
+/// The sticky gate, in each gated scan and each head scan.
 const OWNER_STICKY_ANCHOR: &str = "AND ( sticky_worker_id IS NULL ";
 
-/// The session gate, in each candidate scan and each head scan. The owned
+/// The session gate, in each gated scan and each head scan. The owned
 /// gate goes after it.
 const OWNER_SESSION_ANCHOR: &str = "AND ( session_id IS NULL OR sticky_worker_id = $1 ) ";
 
-/// The workflow pause gate, once in each candidate scan. The holder check
+/// The workflow pause gate, once in each gated scan. The holder check
 /// goes before it.
 const OWNER_CANDIDATE_ANCHOR: &str = "AND ( task_type <> 'workflow' OR workflow_exec_id IS NULL ";
 
@@ -2804,7 +2998,7 @@ const OWNER_CANDIDATE_ANCHOR: &str = "AND ( task_type <> 'workflow' OR workflow_
 /// - The owned gate, in each scan. A workflow row passes only with the
 ///   switch on, and only when it is unstamped or in an owned partition. The
 ///   partitions are a 64-byte mask, so one bit test serves any count.
-/// - The holder check, in each candidate scan: a stamped row passes only
+/// - The holder check, in each gated scan: a stamped row passes only
 ///   when its owner row names this holder. A stale local list then skips a
 ///   row that the guard would refuse, and the claim takes the next row. The
 ///   head scans keep no such check, so each head gate is still implied by a
@@ -2821,7 +3015,7 @@ fn splice_owner_gate(base: &str, holder_bind: &str, partitions_bind: &str) -> St
     assert_eq!(
         base.matches(OWNER_CANDIDATE_ANCHOR).count(),
         base.matches("CROSS JOIN worker_info").count(),
-        "claim query holder anchor must appear once per candidate scan"
+        "claim query holder anchor must appear once per gated scan"
     );
     #[expect(clippy::expect_used, reason = "every claim query is a constant")]
     let rest = base
@@ -11593,8 +11787,8 @@ mod tests {
         );
         assert_eq!(
             fenced.matches("CROSS JOIN fence").count(),
-            2,
-            "each candidate scan joins the fence once (issue #1971)"
+            4,
+            "each gated scan joins the fence once (issues #1971, #2420)"
         );
         assert_eq!(
             claim_task_by_id_query_fenced()
@@ -11731,15 +11925,15 @@ mod tests {
         }
     }
 
-    /// The owned gate reaches every scan: both candidate scans and both head
-    /// scans of the default claim. A missed scan could take a workflow task
-    /// of another owner.
+    /// The owned gate reaches every scan of the default claim: three
+    /// candidate scans, `seek_held` and three head scans. A missed scan
+    /// could take a workflow task of another owner.
     #[test]
     fn the_owned_gate_reaches_every_scan() {
         let legacy = claim_task_query();
         let owned = owned_claim_query_for(None, false, ClaimFairness::Off);
         let scans = legacy.matches(OWNER_SESSION_ANCHOR).count();
-        assert_eq!(scans, 4, "two candidate scans and two head scans");
+        assert_eq!(scans, 7, "four gated scans and three head scans");
         assert_eq!(
             owned
                 .matches("get_bit($8::bytea, decision_partition)")
@@ -11748,8 +11942,8 @@ mod tests {
         );
         assert_eq!(
             owned.matches("o.holder = $7::text").count(),
-            2,
-            "the holder check reaches both candidate scans, not the heads"
+            4,
+            "the holder check reaches every gated scan, not the heads"
         );
         assert_eq!(
             owned
@@ -11813,7 +12007,8 @@ mod tests {
                 1,
             )
             .replace("CROSS JOIN fence ", "");
-        // Both candidate scans of the seek claim join the fence (issue #1971).
+        // Each gated scan of the seek claim joins the fence (issues #1971,
+        // #2420).
         assert_eq!(unspliced, claim_task_query());
     }
 
@@ -12221,10 +12416,10 @@ mod tests {
     #[test]
     fn every_claim_query_sorts_on_the_claim_order_due_time() {
         let order_key = format!("END DESC, {CLAIM_ORDER_DUE_SQL} ASC");
-        // Each candidate scan sorts on the claim key. A seek form has two
-        // scans, and its window copies the same due time (issue #1971). Only
-        // its queue heads walk `scheduled_at`, because inside one head the due
-        // time follows it.
+        // Each candidate scan sorts on the claim key. A seek form has three
+        // candidate scans. Its window, pin head and deep window copy the same due time
+        // (issues #1971, #2420). Only its queue heads walk `scheduled_at`,
+        // because inside one head the due time follows it.
         let variants = [
             (claim_task_query(), true),
             (claim_task_query_fenced(), true),
@@ -12238,14 +12433,14 @@ mod tests {
         for (sql, seek) in variants {
             assert_eq!(
                 sql.matches(&order_key).count(),
-                if seek { 2 } else { 1 },
+                if seek { 3 } else { 1 },
                 "the due time must sort right after the priority key; got:\n{sql}"
             );
             let window_key = format!("{CLAIM_ORDER_DUE_SQL} AS seek_due");
-            assert_eq!(sql.matches(&window_key).count(), if seek { 2 } else { 0 });
+            assert_eq!(sql.matches(&window_key).count(), if seek { 3 } else { 0 });
             assert_eq!(
                 sql.matches("scheduled_at ASC").count(),
-                usize::from(seek),
+                if seek { 2 } else { 0 },
                 "got:\n{sql}"
             );
         }
@@ -12344,18 +12539,18 @@ mod tests {
     }
 
     /// Every claim variant carries the expired-run set once, and its gate
-    /// once in each candidate scan (issues #1824, #1971).
+    /// once in each gated scan (issues #1824, #1971, #2420).
     #[test]
     fn every_claim_query_skips_expired_runs() {
         let variants = [
-            (claim_task_query(), 2),
-            (claim_task_query_fenced(), 2),
+            (claim_task_query(), 4),
+            (claim_task_query_fenced(), 4),
             (claim_task_by_id_query(), 1),
             (claim_task_by_id_query_fenced(), 1),
-            (claim_task_query_for_kind(TaskType::Workflow, false), 2),
-            (claim_task_query_for_kind(TaskType::Activity, false), 2),
-            (claim_task_query_for_kind(TaskType::Workflow, true), 2),
-            (claim_task_query_for_kind(TaskType::Activity, true), 2),
+            (claim_task_query_for_kind(TaskType::Workflow, false), 4),
+            (claim_task_query_for_kind(TaskType::Activity, false), 4),
+            (claim_task_query_for_kind(TaskType::Workflow, true), 4),
+            (claim_task_query_for_kind(TaskType::Activity, true), 4),
             (claim_task_batched_candidates_query(), 1),
         ];
         for (sql, scans) in variants {
@@ -12436,7 +12631,7 @@ mod tests {
                 .contains(&format!("WHERE seek_rn = {CLAIM_SEEK_WINDOW}")),
             "only a full head bounds the rows outside the window; got:\n{sql}"
         );
-        let seek = cte(sql, "seek_candidate", "legacy_candidate");
+        let seek = cte(sql, "seek_candidate", "seek_held");
         for clause in [
             "AND harvest_task_queue.id = ANY(ARRAY( SELECT w.seek_id FROM seek_heads w",
             "NOT EXISTS (SELECT 1 FROM seek_bounds b",
@@ -12459,28 +12654,103 @@ mod tests {
         assert!(
             legacy.contains(
                 "AND NOT EXISTS (SELECT 1 FROM seek_candidate) \
+                 AND NOT EXISTS (SELECT 1 FROM seek_deep_candidate) \
                  AND (EXISTS (SELECT 1 FROM seek_bounds) \
+                 AND (NOT EXISTS (SELECT 1 FROM seek_contended) \
+                 OR EXISTS (SELECT 1 FROM seek_deep_bounds)) \
                  OR ($4::BIGINT IS NOT NULL AND $4::BIGINT > 0)) "
             ),
-            "the fallback needs an empty window result and a full head or ageing; \
+            "the fallback needs empty window results and a remaining bound or ageing; \
              got:\n{legacy}"
         );
         assert!(legacy.contains("FROM concurrency_running_counts rc"));
         assert!(
             sql.contains(
                 "candidate AS ( SELECT * FROM seek_candidate \
+                 UNION ALL SELECT * FROM seek_deep_candidate \
                  UNION ALL SELECT * FROM legacy_candidate )"
             ),
             "got:\n{sql}"
         );
     }
 
-    /// Both candidate scans carry the same gates, so the window cannot pick a
-    /// row that the full scan would reject.
+    /// The deep window runs only for the heads that peer claims hold, and
+    /// reads a bounded prefix of each (issue #2420).
     #[test]
-    fn both_candidate_scans_carry_every_gate() {
+    fn claim_query_reads_a_bounded_deep_window_only_for_held_heads() {
+        assert_eq!(
+            claim_deep_seek_window_sql!(),
+            CLAIM_DEEP_SEEK_WINDOW.to_string(),
+            "the SQL deep window and the public constant name one size"
+        );
         let sql = claim_task_query();
-        let seek = cte(sql, "seek_candidate", "legacy_candidate");
+        let held = cte(sql, "seek_held", "seek_contended");
+        for clause in [
+            "seek_held AS MATERIALIZED",
+            "AND harvest_task_queue.id = ANY(ARRAY( SELECT w.seek_id FROM seek_heads w",
+            "NOT EXISTS (SELECT 1 FROM seek_bounds b",
+            "AND NOT EXISTS (SELECT 1 FROM seek_candidate) ",
+            "FROM seek_running_counts rc",
+        ] {
+            assert!(held.contains(clause), "missing {clause:?} in:\n{held}");
+        }
+        let contended = cte(sql, "seek_contended", "seek_deep_rows");
+        assert!(
+            contended.contains("JOIN seek_held x ON x.id = w.seek_id"),
+            "{contended}"
+        );
+        let rows = cte(sql, "seek_deep_rows", "seek_deep_window");
+        for clause in [
+            "FROM seek_contended c",
+            "WHERE queue_name = c.head_queue AND task_type = c.head_kind",
+            "AND (new_start AND attempt = 0) = c.head_new_start",
+            "ORDER BY priority DESC, scheduled_at ASC",
+            "PARTITION BY c.head_queue, c.head_kind, c.head_new_start",
+        ] {
+            assert!(rows.contains(clause), "missing {clause:?} in:\n{rows}");
+        }
+        assert_eq!(
+            rows.matches(&format!("LIMIT {CLAIM_DEEP_SEEK_WINDOW} "))
+                .count(),
+            1,
+            "each held head reads a bounded prefix; got:\n{rows}"
+        );
+        let bounds = cte(sql, "seek_deep_bounds", "seek_deep_pending_keys");
+        for clause in [
+            "FROM seek_bounds b WHERE NOT EXISTS ( SELECT 1 FROM seek_contended c",
+            "AND c.head_new_start = b.bound_new_start",
+            &format!("WHERE seek_rn = {CLAIM_DEEP_SEEK_WINDOW}"),
+        ] {
+            assert!(bounds.contains(clause), "missing {clause:?} in:\n{bounds}");
+        }
+        let deep = cte(sql, "seek_deep_candidate", "legacy_candidate");
+        for clause in [
+            "SELECT w.seek_id FROM seek_deep_window w",
+            "NOT EXISTS (SELECT 1 FROM seek_deep_bounds b",
+            "AND NOT EXISTS (SELECT 1 FROM seek_candidate) \
+             AND EXISTS (SELECT 1 FROM seek_contended) ",
+            "FROM seek_deep_running_counts rc",
+            "LIMIT 1 FOR UPDATE SKIP LOCKED",
+        ] {
+            assert!(deep.contains(clause), "missing {clause:?} in:\n{deep}");
+        }
+        for scan in [held, deep] {
+            assert!(
+                !scan.contains("concurrency_running_counts"),
+                "a window scan must not read the backlog-wide count CTE; got:\n{scan}"
+            );
+        }
+    }
+
+    /// Every candidate scan carries the same gates, so a window cannot pick
+    /// a row that the full scan would reject. `seek_held` carries them too,
+    /// so a row that a gate rejects never starts the deep window.
+    #[test]
+    fn every_candidate_scan_carries_every_gate() {
+        let sql = claim_task_query();
+        let seek = cte(sql, "seek_candidate", "seek_held");
+        let held = cte(sql, "seek_held", "seek_contended");
+        let deep = cte(sql, "seek_deep_candidate", "legacy_candidate");
         let legacy = cte(sql, "legacy_candidate", "candidate");
         for gate in [
             "NOT (harvest_task_queue.queue_name = ANY(paused_queues.names))",
@@ -12497,8 +12767,13 @@ mod tests {
             "FOR UPDATE SKIP LOCKED",
         ] {
             assert!(seek.contains(gate), "window scan lacks {gate:?}");
+            assert!(deep.contains(gate), "deep window scan lacks {gate:?}");
             assert!(legacy.contains(gate), "full scan lacks {gate:?}");
+            if gate != "FOR UPDATE SKIP LOCKED" {
+                assert!(held.contains(gate), "seek_held lacks {gate:?}");
+            }
         }
+        assert!(!held.contains("FOR UPDATE"), "seek_held takes no lock");
     }
 
     /// The post-claim cap re-check counts what the claim counts, and gives
@@ -12538,13 +12813,18 @@ mod tests {
     #[test]
     fn the_window_scan_matches_no_partial_index() {
         let sql = claim_task_query();
-        let seek = cte(sql, "seek_candidate", "legacy_candidate");
         let legacy = cte(sql, "legacy_candidate", "candidate");
-        assert!(!seek.contains("WHERE queue_name = ANY($2)"), "{seek}");
-        assert!(
-            seek.contains("WHERE harvest_task_queue.state = (SELECT 'PENDING'::text) AND"),
-            "no partial index may match the window scan: {seek}"
-        );
+        for seek in [
+            cte(sql, "seek_candidate", "seek_held"),
+            cte(sql, "seek_held", "seek_contended"),
+            cte(sql, "seek_deep_candidate", "legacy_candidate"),
+        ] {
+            assert!(!seek.contains("WHERE queue_name = ANY($2)"), "{seek}");
+            assert!(
+                seek.contains("WHERE harvest_task_queue.state = (SELECT 'PENDING'::text) AND"),
+                "no partial index may match the window scan: {seek}"
+            );
+        }
         assert!(legacy.contains("WHERE queue_name = ANY($2) AND state = 'PENDING'"));
         let heads = cte(sql, "seek_heads", "seek_bounds");
         assert_eq!(heads.matches("unnest($2::text[])").count(), 1, "{heads}");
@@ -13155,12 +13435,12 @@ mod tests {
     fn claim_task_query_honors_the_effective_rate_limit_override() {
         let sql = claim_task_query();
         let effective = effective_available_tokens_expr("b");
-        // Four occurrences. Each candidate scan has one EXISTS gate (issue
-        // #1971). The rate_limit_debit CTE has its SET (the debit) and its
-        // WHERE (the re-check immediately before debiting).
+        // Six occurrences. Each candidate scan and `seek_held` has one
+        // EXISTS gate (issues #1971, #2420). The rate_limit_debit CTE has
+        // its SET (the debit) and its WHERE (the re-check before debiting).
         assert_eq!(
             sql.matches(&effective).count(),
-            4,
+            6,
             "claim_task_query must apply the effective-rate-limit formula at \
              each EXISTS gate and both halves of the rate_limit_debit CTE; \
              got:\n{sql}"
@@ -16150,8 +16430,8 @@ mod tests {
                 let query = claim_task_query_for_kind(kind, fenced);
                 assert_eq!(
                     query.matches(&predicate).count(),
-                    3,
-                    "two candidate scans and the pin head; {kind} {fenced}"
+                    5,
+                    "four gated scans and the pin head; {kind} {fenced}"
                 );
                 assert_eq!(query.matches(&head_filter).count(), 1, "{kind} {fenced}");
                 assert_eq!(
@@ -16186,7 +16466,9 @@ mod tests {
         );
         for (name, next, count) in [
             ("seek_heads", "seek_bounds", 1),
-            ("seek_candidate", "legacy_candidate", 1),
+            ("seek_candidate", "seek_held", 1),
+            ("seek_held", "seek_contended", 1),
+            ("seek_deep_candidate", "legacy_candidate", 1),
             ("legacy_candidate", "candidate", 1),
         ] {
             assert_eq!(
@@ -16195,6 +16477,11 @@ mod tests {
                 "the kind predicate must sit inside {name}"
             );
         }
+        assert!(
+            cte(query, "seek_deep_rows", "seek_deep_window").contains("FROM seek_contended c")
+                && cte(query, "seek_contended", "seek_deep_rows").contains("FROM seek_heads w"),
+            "the deep heads take their kind from the kind-filtered window"
+        );
         let claimed = query.find("claimed AS (").expect("claimed CTE");
         assert!(
             !query[claimed..].contains(predicate),
