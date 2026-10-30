@@ -33,6 +33,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use autumn_harvest::payload_codec::{PayloadCodecs, is_codec_envelope};
@@ -443,13 +444,18 @@ impl WorkspaceBlobs for InMemoryWorkspaceBlobs {
 #[derive(Debug, Clone)]
 pub struct DirWorkspaceBlobs {
     root: PathBuf,
+    /// Set after one put has synced every ancestor of its folder.
+    settled: Arc<AtomicBool>,
 }
 
 impl DirWorkspaceBlobs {
     /// Blobs under `root`. The folder is made on the first write.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            settled: Arc::default(),
+        }
     }
 
     fn folder(&self, scope: &str) -> PathBuf {
@@ -525,6 +531,14 @@ mod sync_log {
             .push((kind, root.to_path_buf()));
     }
 
+    /// Remove the faults on a path below `root`.
+    pub(super) fn heal(root: &Path) {
+        FAULTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(_, r)| !r.starts_with(root));
+    }
+
     /// Remove and return the calls on a path below `root`.
     pub(super) fn take_below(root: &Path) -> Vec<Call> {
         let mut log = LOG.lock().unwrap_or_else(PoisonError::into_inner);
@@ -579,44 +593,37 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 /// Write `bytes` to `path` so that the blob survives a power loss.
 ///
 /// The scratch file is synced before the rename. The folder is synced after
-/// it, because the rename lives in the folder entry. The parent of the folder
-/// is synced on every put. An earlier put can create the folder and then fail
-/// before its parent sync. So a folder that exists is not proof that its
-/// entry is durable. The parent of each folder that this call creates is synced too.
-/// Any sync error fails the put, so a put never acknowledges a blob that can
-/// vanish.
+/// it, because the rename lives in the folder entry. Any sync error fails the
+/// put, so a put never acknowledges a blob that can vanish.
+///
+/// A folder that exists is not proof that its entry is durable. An earlier put
+/// can create a folder and then fail before it syncs the parent. So until one
+/// put has synced every ancestor of the folder, each put syncs all of them. The
+/// `settled` flag records that. After it, a put syncs the folder and its
+/// parent, which covers a new scope folder.
 ///
 /// On Windows the rename is not durable, because a directory cannot be opened
 /// for a sync there.
-fn write_durable(folder: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut created = Vec::new();
-    let mut probe = folder;
-    while !probe.exists() {
-        created.push(probe);
-        match probe.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => probe = parent,
-            _ => break,
-        }
-    }
+fn write_durable(
+    folder: &Path,
+    path: &Path,
+    bytes: &[u8],
+    settled: &AtomicBool,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(folder)?;
     let tmp = scratch_path(path);
+    let all = !settled.load(Ordering::Acquire);
     let written = (|| {
         write_private(&tmp, bytes)?;
         std::fs::rename(&tmp, path)?;
         #[cfg(test)]
         sync_log::hit(sync_log::Kind::Rename, path)?;
-        let mut dirs = vec![folder];
-        dirs.extend(created.iter().copied());
-        dirs.extend(folder.parent());
-        for new_dir in &created {
-            dirs.extend(new_dir.parent());
-        }
-        let mut done: Vec<&Path> = Vec::new();
+        let dirs: Vec<&Path> = if all {
+            folder.ancestors().collect()
+        } else {
+            std::iter::once(folder).chain(folder.parent()).collect()
+        };
         for dir in dirs {
-            if done.contains(&dir) {
-                continue;
-            }
-            done.push(dir);
             sync_dir(if dir.as_os_str().is_empty() {
                 Path::new(".")
             } else {
@@ -627,6 +634,8 @@ fn write_durable(folder: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
+    } else if all {
+        settled.store(true, Ordering::Release);
     }
     written
 }
@@ -652,7 +661,8 @@ impl WorkspaceBlobs for DirWorkspaceBlobs {
         Box::pin(async move {
             let path = self.file(scope, digest)?;
             let folder = self.folder(scope);
-            tokio::task::spawn_blocking(move || write_durable(&folder, &path, &bytes))
+            let settled = Arc::clone(&self.settled);
+            tokio::task::spawn_blocking(move || write_durable(&folder, &path, &bytes, &settled))
                 .await
                 .map_err(|e| {
                     AgentError::new(
@@ -1203,6 +1213,35 @@ mod tests {
             .map(|(_, path)| path)
             .collect();
         assert_eq!(dirs, [blobs.folder("s"), root], "no other directory");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_retry_after_a_failed_first_put_syncs_the_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("a").join("blobs");
+        let blobs = DirWorkspaceBlobs::new(&root);
+        sync_log::fail(sync_log::Kind::File, dir.path());
+        assert!(
+            blobs
+                .put("s", &key_at(1, "a"), b"x".to_vec())
+                .await
+                .is_err()
+        );
+        sync_log::heal(dir.path());
+        sync_log::take_below(dir.path());
+        blobs
+            .put("s", &key_at(1, "a"), b"x".to_vec())
+            .await
+            .unwrap();
+        let synced: Vec<_> = sync_log::take_below(dir.path())
+            .into_iter()
+            .filter(|(kind, _)| *kind == sync_log::Kind::Dir)
+            .map(|(_, path)| path)
+            .collect();
+        for expected in [root.clone(), dir.path().join("a"), dir.path().to_path_buf()] {
+            assert!(synced.contains(&expected), "{expected:?} is synced");
+        }
     }
 
     #[cfg(unix)]

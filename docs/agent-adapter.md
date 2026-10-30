@@ -1144,7 +1144,7 @@ that are not newer than its head.
 
 **Scratch files (issue #2315).** `DirWorkspaceBlobs` writes each blob to a
 scratch file, `<key>.tmp-<32 hex>`, then renames it. The put syncs the file
-before the rename. It syncs the folder and its parent after the rename. A
+before the rename. It syncs the folder and its parent after the rename. Until one put succeeds, it syncs every ancestor folder. A
 sync error fails the put. A crash, a save timeout
 or a cancel can stop a put before the rename and leave that file. The store
 lists scratch names. Retention and a reset delete one by the generation of
