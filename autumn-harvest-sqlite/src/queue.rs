@@ -555,8 +555,9 @@ pub fn record_heartbeat(conn: &Connection, task_id: &str, details: &Value) -> Sq
     Ok(())
 }
 
-/// Cancel a still-open (`PENDING`/`RUNNING`) activity task by its `activity_id`,
-/// flipping it to `CANCELLED`. Returns `true` iff a row was actually cancelled.
+/// Cancel a still-open (`PENDING`/`RUNNING`) activity task of run `exec_id` by
+/// its `activity_id`, flipping it to `CANCELLED`. Returns `true` iff a row was
+/// actually cancelled.
 ///
 /// The loser-cancellation primitive for a losing activity branch of a resolved
 /// `ctx.race()` (issue #600), mirroring the Postgres `queue::cancel_activity_task`.
@@ -566,14 +567,22 @@ pub fn record_heartbeat(conn: &Connection, task_id: &str, details: &Value) -> Sq
 /// event is never shadowed by a synthetic one. A `CANCELLED` row is terminal for
 /// this queue: [`claim_next_ready_task_tx`] only selects `state = 'PENDING'`, so a
 /// cancelled loser is never re-run.
-pub fn cancel_activity_task(conn: &Connection, activity_id: ActivityExecId) -> SqliteResult<bool> {
+pub fn cancel_activity_task(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    activity_id: ActivityExecId,
+) -> SqliteResult<bool> {
     let n = conn.execute(
-        "UPDATE harvest_tasks SET state = 'CANCELLED' \
-         WHERE activity_id = ?1 AND state IN ('PENDING', 'RUNNING')",
-        params![activity_id.to_string()],
+        CANCEL_ACTIVITY_TASK_SQL,
+        params![exec_id.to_string(), activity_id.to_string()],
     )?;
     Ok(n > 0)
 }
+
+/// The run's own id lets `idx_harvest_tasks_exec` find the task (issue #2429).
+/// The task table keeps finished rows, so an `activity_id` match alone scans it.
+const CANCEL_ACTIVITY_TASK_SQL: &str = "UPDATE harvest_tasks SET state = 'CANCELLED' \
+     WHERE exec_id = ?1 AND activity_id = ?2 AND state IN ('PENDING', 'RUNNING')";
 
 // ── Durable timers ───────────────────────────────────────────────────────────
 
@@ -822,8 +831,9 @@ mod tests {
     use autumn_harvest::ExecutionId;
 
     use super::{
-        DELETE_UNDELIVERED_SIGNALS_SQL, delete_undelivered_signals_for_execution, due_timers,
-        due_timers_with_deadlines, enqueue_timer,
+        CANCEL_ACTIVITY_TASK_SQL, DELETE_UNDELIVERED_SIGNALS_SQL, cancel_activity_task,
+        delete_undelivered_signals_for_execution, due_timers, due_timers_with_deadlines,
+        enqueue_timer,
     };
     use crate::schema;
 
@@ -850,6 +860,69 @@ mod tests {
             !plan.contains("SCAN"),
             "expected no full-table scan, got plan: {plan}"
         );
+    }
+
+    // Issue #2429: a resolved race cancels each losing activity. The task
+    // table keeps the rows of finished runs, so a scan grows with history.
+    #[test]
+    fn race_loser_cancel_uses_an_index_not_a_full_scan() {
+        let conn = open();
+        let exec = ExecutionId::new();
+        let activity = autumn_harvest::ActivityExecId::new();
+        cancel_activity_task(&conn, exec, activity).unwrap();
+
+        let plan: String = conn
+            .query_row(
+                &format!("EXPLAIN QUERY PLAN {CANCEL_ACTIVITY_TASK_SQL}"),
+                params![exec.to_string(), activity.to_string()],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("USING INDEX idx_harvest_tasks_exec"),
+            "expected an index search, got plan: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN"),
+            "expected no full-table scan, got plan: {plan}"
+        );
+    }
+
+    // Issue #2429: the cancel touches the open task of its own run only.
+    #[test]
+    fn race_loser_cancel_touches_only_its_open_task() {
+        let conn = open();
+        let (exec, other) = (ExecutionId::new(), ExecutionId::new());
+        let activity = autumn_harvest::ActivityExecId::new();
+        for (task, run, state) in [
+            ("open", exec, "RUNNING"),
+            ("done", exec, "DONE"),
+            ("other", other, "PENDING"),
+        ] {
+            conn.execute(
+                "INSERT INTO harvest_tasks \
+                 (task_id, exec_id, activity_id, name, input_json, queue, state, attempt, run_at, \
+                  seq, scheduled_at) \
+                 VALUES (?1, ?2, ?3, 'a', '1', 'default', ?4, 1, 0, 0, 0)",
+                params![task, run.to_string(), activity.to_string(), state],
+            )
+            .unwrap();
+        }
+
+        assert!(cancel_activity_task(&conn, exec, activity).unwrap());
+        assert_eq!(
+            super::task_state(&conn, "open").unwrap().as_deref(),
+            Some("CANCELLED")
+        );
+        assert_eq!(
+            super::task_state(&conn, "done").unwrap().as_deref(),
+            Some("DONE")
+        );
+        assert_eq!(
+            super::task_state(&conn, "other").unwrap().as_deref(),
+            Some("PENDING")
+        );
+        assert!(!cancel_activity_task(&conn, exec, activity).unwrap());
     }
 
     // Issue #2028: a seal deletes the unkeyed undelivered rows. A keyed row

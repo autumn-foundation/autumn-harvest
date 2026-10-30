@@ -14,9 +14,10 @@ categories = ["asynchronous", "database"]
 [features]
 default = ["db", "unified-dag-execution", "tls"]
 unified-dag-execution = ["autumn-harvest-macros/unified-dag-execution"]
-# The Ledger census hook (issue #2414). It records each SQL statement and its
-# caller when `HARVEST_LEDGER_CENSUS` is set. Only a census run enables it.
-ledger-census = ["db"]
+# The Ledger census hook (issues #2414 and #2429). It records each SQL
+# statement and its caller when `HARVEST_LEDGER_CENSUS` is set. It hooks
+# Diesel and SQLite. Only a census run enables it.
+ledger-census = ["db", "dep:rusqlite", "rusqlite/trace"]
 db = [
     "dep:deadpool",
     "dep:diesel",

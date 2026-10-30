@@ -1,9 +1,13 @@
-//! Record which function sends each SQL statement (issues #2366 and #2414).
+//! Record which function sends each SQL statement (issues #2366, #2414 and #2429).
 //!
 //! The Ledger census measures every profiled query in `docs/ledger/`. A plan
 //! needs the statement text, and a profile is keyed by the function that sends
 //! it. Diesel can report each statement to a default instrumentation. This
 //! module installs one when `HARVEST_LEDGER_CENSUS` names an output file.
+//!
+//! SQLite has no default instrumentation. An auto-extension runs for each
+//! connection that the process opens. It installs a `trace_v2` callback that
+//! reports each statement when it starts to run.
 //!
 //! For each statement, the hook writes one JSON line with the SQL text and the
 //! source frames of the call stack. `docs/audits/ledger-census.py` maps the
@@ -131,6 +135,40 @@ fn package_dir() -> &'static str {
     })
 }
 
+/// Write one census line for a statement, unless it has enough samples.
+///
+/// `binds` is Diesel's `Debug` text of the bind values. A SQLite statement
+/// has none, and its line names its backend.
+fn record(sql: &str, binds: &str, sqlite: bool) {
+    let Some(census) = census() else {
+        return;
+    };
+    {
+        let Ok(mut seen) = census.seen.lock() else {
+            return;
+        };
+        let count = seen.entry(sql.to_owned()).or_insert(0);
+        if *count >= SAMPLES_PER_STATEMENT {
+            return;
+        }
+        *count += 1;
+    }
+    let frames = source_frames(
+        &std::backtrace::Backtrace::force_capture().to_string(),
+        package_dir(),
+    );
+    // One `write` call for each line. A test that runs this binary as a
+    // child process appends to the same file, and one append is atomic.
+    let mut entry = serde_json::json!({ "sql": sql, "binds": binds, "frames": frames });
+    if sqlite {
+        entry["backend"] = "sqlite".into();
+    }
+    let line = format!("{entry}\n");
+    if let Ok(mut out) = census.out.lock() {
+        let _ = out.write_all(line.as_bytes());
+    }
+}
+
 struct Hook;
 
 impl Instrumentation for Hook {
@@ -138,36 +176,52 @@ impl Instrumentation for Hook {
         let InstrumentationEvent::StartQuery { query, .. } = event else {
             return;
         };
-        let Some(census) = census() else {
-            return;
-        };
         let debug = query.to_string();
-        let sql = statement_text(&debug).to_owned();
-        let binds = bind_text(&debug);
-        {
-            let Ok(mut seen) = census.seen.lock() else {
-                return;
-            };
-            let count = seen.entry(sql.clone()).or_insert(0);
-            if *count >= SAMPLES_PER_STATEMENT {
-                return;
-            }
-            *count += 1;
-        }
-        let frames = source_frames(
-            &std::backtrace::Backtrace::force_capture().to_string(),
-            package_dir(),
-        );
-        // One `write` call for each line. A test that runs this binary as a
-        // child process appends to the same file, and one append is atomic.
-        let line = format!(
-            "{}\n",
-            serde_json::json!({ "sql": sql, "binds": binds, "frames": frames })
-        );
-        if let Ok(mut out) = census.out.lock() {
-            let _ = out.write_all(line.as_bytes());
-        }
+        record(statement_text(&debug), bind_text(&debug), false);
     }
+}
+
+/// Report each SQLite statement when it starts to run.
+///
+/// SQLite also reports each trigger program that a statement starts. Its text
+/// is then a `-- TRIGGER name` comment, not the statement's own text, and the
+/// statement that fired it is already recorded. A statement may itself start
+/// with a comment, so only the mismatch tells the two apart.
+/// The SQLite schema has no partial index on a bound value, so the plan
+/// needs no bind values.
+fn sqlite_trace(event: rusqlite::trace::TraceEvent<'_>) {
+    let rusqlite::trace::TraceEvent::Stmt(stmt, text) = event else {
+        return;
+    };
+    let sql = stmt.sql();
+    if *sql != *text || sql.trim().is_empty() {
+        return;
+    }
+    record(sql.trim(), "", true);
+}
+
+/// Install the statement callback on a connection that SQLite just opened.
+fn sqlite_connection(conn: rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(sqlite_trace),
+    );
+    Ok(())
+}
+
+/// The entry point that SQLite calls for each new connection.
+///
+/// # Safety
+///
+/// SQLite calls it with a live connection handle. The handle stays open
+/// for the whole call, and the bridge does not close it.
+unsafe extern "C" fn sqlite_auto_extension(
+    db: *mut rusqlite::ffi::sqlite3,
+    err: *mut *mut std::ffi::c_char,
+    _api: *const rusqlite::ffi::sqlite3_api_routines,
+) -> std::ffi::c_int {
+    // SAFETY: the arguments come from SQLite, as the bridge requires.
+    unsafe { rusqlite::auto_extension::init_auto_extension(db, err, sqlite_connection) }
 }
 
 fn make_hook() -> Option<Box<dyn Instrumentation>> {
@@ -181,6 +235,9 @@ fn make_hook() -> Option<Box<dyn Instrumentation>> {
 extern "C" fn install() {
     if std::env::var_os(CENSUS_ENV).is_some() {
         let _ = diesel::connection::set_default_instrumentation(make_hook);
+        // SAFETY: the extension opens no connection, and it neither closes
+        // its connection nor changes the list of extensions.
+        let _ = unsafe { rusqlite::auto_extension::register_auto_extension(sqlite_auto_extension) };
     }
 }
 

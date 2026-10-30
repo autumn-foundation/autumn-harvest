@@ -6,3 +6,4 @@ backend = ["sqlite"]
 kind = ["read", "write"]
 tables = ["harvest_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/retention.md"
