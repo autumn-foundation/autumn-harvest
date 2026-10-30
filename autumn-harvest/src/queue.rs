@@ -4240,7 +4240,7 @@ pub struct QueueTaskCounts {
 /// The statement that [`queue_task_counts`] runs. `$1` is the current time.
 ///
 /// Each count needs a `PENDING` or `RUNNING` row. So the `WHERE` clause
-/// changes no count, and it lets `idx_harvest_tq_live_created` serve the
+/// changes no count. It lets `idx_harvest_tq_live_created` serve the
 /// statement. Without it, each poll reads every finished task (issue #2424).
 pub const QUEUE_TASK_COUNTS_SQL: &str = "SELECT \
          queue_name AS queue, \

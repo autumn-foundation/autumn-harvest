@@ -8,8 +8,10 @@
 //! - the cross-shard child check of a shard rebalance;
 //! - the timer copy and delete of a shard rebalance.
 //!
-//! Each gate plans the exact text that the engine runs, with `enable_seqscan`
-//! off. The planner then takes any usable index. So a `Seq Scan` that remains
+//! Each gate plans the statement text that the engine runs, with
+//! `enable_seqscan` off. The cutover gate plans `QUIESCENCE_SQL` inside a
+//! `SELECT`, not the whole cutover. The erasure gate plans the Diesel query
+//! that `erase.rs` builds. The planner then takes any usable index. So a `Seq Scan` that remains
 //! means that no index can serve the statement. The gates use a generic plan,
 //! so a bound value cannot make a partial index usable.
 
@@ -74,9 +76,11 @@ async fn generic_plan(conn: &mut AsyncPgConnection, sql: &str) -> String {
             .load(conn)
             .await
             .unwrap_or_else(|e| panic!("EXPLAIN failed: {e}\n{sql}"));
-    conn.batch_execute(&format!("DEALLOCATE {name}"))
-        .await
-        .expect("deallocate the gate statement");
+    conn.batch_execute(&format!(
+        "DEALLOCATE {name}; RESET enable_seqscan; RESET plan_cache_mode"
+    ))
+    .await
+    .expect("deallocate the gate statement");
     lines
         .into_iter()
         .map(|l| l.line)
@@ -111,7 +115,7 @@ async fn queue_task_counts_read_only_live_tasks() {
     );
 }
 
-/// Insert `count` tasks of one queue in one state.
+/// Append to `sql` an `INSERT` of `count` tasks of one queue in one state.
 fn seed_tasks(sql: &mut String, queue: &str, state: &str, scheduled_at: &str, count: usize) {
     write!(
         sql,
@@ -286,4 +290,29 @@ async fn rebalance_reads_children_and_timers_by_execution() {
         .expect("the staged deletes remove timers");
     let plan = generic_plan(&mut conn, delete).await;
     assert_served(&plan, timers, timers_index, "the staged timer delete");
+}
+
+/// The PII erasure reads the cross-shard children of one parent by index.
+///
+/// This is the query of `erase::collect_cross_shard_child_ids`.
+#[tokio::test(flavor = "multi_thread")]
+async fn erasure_reads_children_by_parent() {
+    use autumn_harvest::schema::harvest_cross_shard_children as x;
+    use diesel::prelude::*;
+
+    let bench = plan_gate_db().await;
+    let mut conn = claim_bench_db::connect(&bench.url).await;
+
+    let query = x::table
+        .filter(x::parent_exec_id.eq(uuid::Uuid::nil()))
+        .select((x::child_exec_id, x::target_shard, x::status));
+    let sql = diesel::debug_query::<diesel::pg::Pg, _>(&query).to_string();
+    let sql = sql.split(" -- binds:").next().expect("a query text");
+    let plan = generic_plan(&mut conn, sql).await;
+    assert_served(
+        &plan,
+        "harvest_cross_shard_children",
+        "idx_harvest_cross_shard_children_parent",
+        "the erasure child lookup",
+    );
 }

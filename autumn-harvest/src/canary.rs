@@ -44,8 +44,8 @@ pub const CANARY_WORKFLOW_NAME_PREFIX: &str = canary_workflow_name_prefix!();
 /// predicate names the same literal (issue #2424). The index holds canary
 /// runs only, in this order, so the read stops after `$1` rows.
 ///
-/// `starts_with` is used, not `LIKE`. Each `_` of the prefix is a `LIKE`
-/// wildcard, so a `LIKE` form would match more names.
+/// The query uses `starts_with`, not `LIKE`. Each `_` of the prefix is a
+/// `LIKE` wildcard, so a `LIKE` form would match more names.
 pub const CANARY_ROWS_SQL: &str = concat!(
     "SELECT queue_name, state, started_at, completed_at \
      FROM harvest_workflow_executions \
