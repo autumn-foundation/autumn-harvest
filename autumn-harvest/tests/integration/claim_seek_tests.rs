@@ -369,6 +369,300 @@ async fn a_large_activity_pause_array_does_not_spill_the_claim_at_100k() {
     assert_eq!(cost.temp_written, 0, "the claim sort spills: {cost:?}");
 }
 
+// ── Held claims (issue #2420) ────────────────────────────────────────────────
+
+/// Open `k` claim transactions on `queues` and keep them open.
+///
+/// Each one sends the real claim statement under the claim settings. Each
+/// claims one row and holds its lock, as an in-flight claim does. Pass each
+/// connection to [`release`] to roll its claim back.
+async fn hold_claims(url: &str, queues: &[String], k: usize) -> Vec<AsyncPgConnection> {
+    #[derive(diesel::QueryableByName)]
+    struct Claimed {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        #[allow(dead_code)]
+        id: Uuid,
+    }
+    let mut holders = Vec::with_capacity(k);
+    for i in 0..k {
+        let mut holder = connect(url).await;
+        exec(
+            &mut holder,
+            &format!(
+                "BEGIN; {}; \
+                 PREPARE hold(text, text[], text, bigint, text[], text[]) AS {}",
+                queue::CLAIM_PLAN_SETTINGS_SQL,
+                queue::claim_task_query()
+            ),
+        )
+        .await;
+        let claimed: Vec<Claimed> = diesel::sql_query(format!(
+            "EXECUTE hold('holder-{i}', {}, '', NULL, ARRAY[]::text[], ARRAY[]::text[])",
+            text_array(queues)
+        ))
+        .load(&mut holder)
+        .await
+        .expect("held claim");
+        assert_eq!(claimed.len(), 1, "held claim {i} takes a row");
+        holders.push(holder);
+    }
+    holders
+}
+
+/// Lock the best `k` rows of `queue` in one open transaction.
+///
+/// A row lock is what a peer claim holds, so this stands in for `k` claims
+/// in flight. Pass the connection to [`release`] to drop the locks.
+async fn lock_head_rows(url: &str, queue: &str, k: usize) -> AsyncPgConnection {
+    let mut holder = connect(url).await;
+    exec(
+        &mut holder,
+        &format!(
+            "BEGIN; \
+             SELECT id FROM harvest_task_queue \
+             WHERE queue_name = '{queue}' AND state = 'PENDING' \
+             ORDER BY priority DESC, scheduled_at LIMIT {k} FOR UPDATE"
+        ),
+    )
+    .await;
+    holder
+}
+
+/// Roll back the open transaction of `holder`, then close it.
+///
+/// A dropped connection closes its socket, but the server ends its
+/// transaction later. An explicit `ROLLBACK` frees the locks and the
+/// backend before the next step of the test.
+async fn release(mut holder: AsyncPgConnection) {
+    exec(&mut holder, "ROLLBACK").await;
+}
+
+/// Held claims on one queue head must not send the claim to the full scan.
+///
+/// Every row in the window of a head can be locked by a peer claim that
+/// has not committed. The head scan still reads those rows. Before issue
+/// #2420 the window then found no candidate, and the claim ran the full
+/// scan of the backlog. A slow claim keeps more claims in flight, so the
+/// cost fed itself.
+///
+/// The fixture is the issue #1956 backlog on one queue, at 10K and 100K
+/// pending rows. The priority-2 rows all sit in one head. So the held
+/// claims lock the front of that head, and the probe claim must look past
+/// them. The cost must not grow with K or with the backlog depth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_claims_on_one_head_keep_the_claim_off_the_full_scan() {
+    let (mut conn, url, _container) = setup_db_with_url().await;
+    let mut costs = Vec::new();
+    for depth in [10_000_i64, 100_000] {
+        let qs = queues(1);
+        seed_deep_backlog(&mut conn, &qs, depth).await;
+        let result = AssertUnwindSafe(async {
+            // Warm the index state once. See `claim_buffers_stay_flat_...`.
+            claim_cost(&mut conn, &qs).await;
+            let mut runs = vec![(0, claim_cost(&mut conn, &qs).await)];
+            for k in [32_usize, 64] {
+                let holders = hold_claims(&url, &qs, k).await;
+                runs.push((k, claim_cost(&mut conn, &qs).await));
+                for holder in holders {
+                    release(holder).await;
+                }
+            }
+            runs
+        })
+        .catch_unwind()
+        .await;
+        delete_queues(&mut conn, &qs).await;
+        let runs = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        eprintln!("depth={depth} claim cost by held claims K: {runs:?}");
+        for (k, cost) in &runs {
+            assert!(cost.claimed, "depth {depth}, K={k}: the claim takes a row");
+            assert!(
+                !cost.fallback_ran,
+                "depth {depth}, K={k}: held claims send the claim to the full scan: {cost:?}"
+            );
+            assert_eq!(
+                cost.temp_written, 0,
+                "depth {depth}, K={k}: the claim spills: {cost:?}"
+            );
+        }
+        costs.push((depth, runs));
+    }
+    let held = |depth_ix: usize, k_ix: usize| costs[depth_ix].1[k_ix].1.buffers;
+    assert!(
+        held(1, 2) <= held(1, 1) * 3 / 2,
+        "claim cost grows with K: {costs:?}"
+    );
+    assert!(
+        held(1, 2) <= held(0, 2) * 2,
+        "held claim cost grows with backlog depth: {costs:?}"
+    );
+}
+
+/// A claim behind held rows takes the next row in claim order.
+///
+/// The queue has one deep activity head at priority 1 and one workflow row
+/// at priority 0. With the front of the activity head locked, the next
+/// activity row still sorts first. The claim must take it, not the
+/// workflow row. K = 100 lies inside the 256-row deep window. K = 280 lies
+/// past it, so that claim falls back to the full scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claim_behind_held_rows_takes_the_next_row_in_order() {
+    let (mut conn, url, _container) = setup_db_with_url().await;
+    let qs = queues(1);
+    let q = &qs[0];
+    exec(
+        &mut conn,
+        &format!(
+            "INSERT INTO harvest_task_queue \
+               (queue_name, task_type, activity_name, input, state, priority, max_attempts, \
+                scheduled_at) \
+             SELECT '{q}', 'activity', 'noop', '{{}}'::jsonb, 'PENDING', 1, 3, \
+                    NOW() - INTERVAL '1 hour' + make_interval(secs => i) \
+             FROM generate_series(1, {DEEP}) AS i"
+        ),
+    )
+    .await;
+    insert_row(
+        &mut conn,
+        "queue_name, task_type, priority, scheduled_at",
+        &format!("'{q}', 'workflow', 0, NOW() - INTERVAL '2 hours'"),
+    )
+    .await;
+    #[derive(diesel::QueryableByName)]
+    struct Id {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+    let mut picks = Vec::new();
+    for k in [100_usize, 280] {
+        let expected: Id = diesel::sql_query(format!(
+            "SELECT id FROM harvest_task_queue WHERE queue_name = '{q}' \
+             ORDER BY priority DESC, scheduled_at OFFSET {k} LIMIT 1"
+        ))
+        .get_result(&mut conn)
+        .await
+        .expect("next row");
+        let holder = lock_head_rows(&url, q, k).await;
+        let claimed = claim(&mut conn, &qs, None).await;
+        release(holder).await;
+        picks.push((k, expected.id, claimed));
+        // Give the row back for the next round.
+        exec(
+            &mut conn,
+            &format!(
+                "UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, \
+                        started_at = NULL, attempt = 0 \
+                 WHERE queue_name = '{q}' AND state = 'RUNNING'"
+            ),
+        )
+        .await;
+    }
+    delete_queues(&mut conn, &qs).await;
+    for (k, expected, claimed) in picks {
+        assert_eq!(
+            claimed,
+            Some(expected),
+            "K={k}: the claim takes the first unlocked row of the head"
+        );
+    }
+}
+
+/// A held head that the deep window reads to its end needs no full scan.
+///
+/// Every due row of the head is held, and the head has fewer rows than the
+/// deep window. So the deep window proves that no row is free. The claim
+/// returns no row and skips the full scan, even with a large backlog of
+/// future rows on the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fully_held_short_head_skips_the_full_scan() {
+    let (mut conn, url, _container) = setup_db_with_url().await;
+    let qs = queues(1);
+    let q = &qs[0];
+    exec(
+        &mut conn,
+        &format!(
+            "INSERT INTO harvest_task_queue \
+               (queue_name, task_type, activity_name, input, state, max_attempts, scheduled_at) \
+             SELECT '{q}', 'activity', 'noop', '{{}}'::jsonb, 'PENDING', 3, \
+                    NOW() - INTERVAL '1 hour' + make_interval(secs => i) \
+             FROM generate_series(1, 100) AS i; \
+             INSERT INTO harvest_task_queue \
+               (queue_name, task_type, activity_name, input, state, max_attempts, scheduled_at) \
+             SELECT '{q}', 'activity', 'noop', '{{}}'::jsonb, 'PENDING', 3, \
+                    NOW() + INTERVAL '1 hour' + make_interval(secs => i) \
+             FROM generate_series(1, 5000) AS i; \
+             ANALYZE harvest_task_queue;"
+        ),
+    )
+    .await;
+    let holder = lock_head_rows(&url, q, 100).await;
+    let cost = AssertUnwindSafe(claim_cost(&mut conn, &qs))
+        .catch_unwind()
+        .await;
+    release(holder).await;
+    delete_queues(&mut conn, &qs).await;
+    let cost = cost.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    assert!(!cost.claimed, "every due row is held: {cost:?}");
+    assert!(
+        !cost.fallback_ran,
+        "the deep window read the whole head, so the full scan cannot help: {cost:?}"
+    );
+}
+
+/// The deep window keeps the bound of each full head that it does not read
+/// again.
+///
+/// Queue B has a full head of rows on a saturated concurrency key. A free
+/// row `x` sits past the window of that head. Queue A has a held head whose
+/// rows interleave with B's rows in due time. So the window rows of A pass
+/// the guard, but the first free row of A sorts after the bound of B. Row
+/// `x` sorts before it. Only the bound of B stops the deep window from
+/// taking the row of A. The full scan then takes `x`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_deep_window_keeps_the_bound_of_a_full_head_it_does_not_read() {
+    let (mut conn, url, _container) = setup_db_with_url().await;
+    let qs = queues(2);
+    let (a, b) = (&qs[0], &qs[1]);
+    let key = unique("bkey");
+    exec(
+        &mut conn,
+        &format!(
+            "INSERT INTO harvest_task_queue \
+               (queue_name, task_type, activity_name, input, state, max_attempts, scheduled_at) \
+             SELECT '{a}', 'activity', 'noop', '{{}}'::jsonb, 'PENDING', 3, \
+                    NOW() - INTERVAL '1 hour' + make_interval(secs => i - 0.5) \
+             FROM generate_series(1, 300) AS i; \
+             INSERT INTO harvest_task_queue \
+               (queue_name, task_type, activity_name, input, state, max_attempts, scheduled_at, \
+                concurrency_key, concurrency_cap) \
+             SELECT '{b}', 'activity', 'noop', '{{}}'::jsonb, 'PENDING', 3, \
+                    NOW() - INTERVAL '1 hour' + make_interval(secs => i), '{key}', 1 \
+             FROM generate_series(1, 40) AS i; \
+             INSERT INTO harvest_task_queue \
+               (queue_name, task_type, activity_name, input, state, attempt, max_attempts, \
+                worker_id, started_at, concurrency_key, concurrency_cap) \
+             VALUES ('{b}', 'activity', 'noop', '{{}}'::jsonb, 'RUNNING', 1, 3, 'holder', NOW(), \
+                     '{key}', 1)"
+        ),
+    )
+    .await;
+    let x = insert_row(
+        &mut conn,
+        "queue_name, task_type, activity_name, scheduled_at",
+        &format!("'{b}', 'activity', 'noop', NOW() - INTERVAL '1 hour' + INTERVAL '35 seconds'"),
+    )
+    .await;
+    // Hold rows 1 to 40 of A. Row 41 of A is due at 40.5 s, after `x`.
+    let holder = lock_head_rows(&url, a, 40).await;
+    let claimed = AssertUnwindSafe(claim(&mut conn, &qs, None))
+        .catch_unwind()
+        .await;
+    release(holder).await;
+    delete_queues(&mut conn, &qs).await;
+    let claimed = claimed.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    assert_eq!(claimed, Some(x), "x sorts before the first free row of A");
+}
+
 // ── Claim order (issue #1971 AC3, AC4) ───────────────────────────────────────
 
 /// A continuation behind a deep storm of new starts still claims first
