@@ -10,8 +10,10 @@
 -- 3. `idx_harvest_cross_shard_children_parent` serves the parent-side lookups.
 --    Migration `20260901130054` left this index out on purpose. At that time
 --    no lookup went by parent. The rebalance quiescence check and the PII
---    erasure now do. The index costs one entry for each row version. Rows of
---    this table are few, because a row goes away when its child is done.
+--    erasure now do. Each lifecycle update already changes a column of another
+--    index, so no such update is HOT. This index adds one entry per row
+--    version. A row is deleted when its child is done. So the live rows are
+--    the in-flight cross-shard children.
 --
 -- ## Build cost and the zero-downtime recipe
 --
