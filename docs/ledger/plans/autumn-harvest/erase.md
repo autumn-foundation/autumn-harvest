@@ -29,11 +29,11 @@ Statements: 2. Tables with no usable index: none.
 
 ## `db::collect_cross_shard_child_ids`
 
-Statements: 1. Tables with no usable index: `harvest_cross_shard_children`.
+Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT "harvest_cross_shard_children"."child_exec_id", "harvest_cross_shard_children"."target_sha...` | `harvest_cross_shard_children`: no usable index |
+| 1 | `SELECT "harvest_cross_shard_children"."child_exec_id", "harvest_cross_shard_children"."target_sha...` | `harvest_cross_shard_children`: Index Scan on `idx_harvest_cross_shard_children_parent` |
 
 ## `db::erase_execution_summary`
 
