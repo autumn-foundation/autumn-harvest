@@ -36022,6 +36022,56 @@ folds fragments in here.
   least one shard, and the next tick retries. An override that the new owner
   already holds wins. Two shards on one pool share one table, so nothing moves
   between them. No migration and no configuration change.
+- **SQLite** (implemented): Runtime overrides of schedules — see issue #2390, epic #2384. The SQLite backend could not override a schedule at runtime. An app that upserts its schedules on every open reset each one to its code value.
+
+  `SqliteRuntime` gains `set_schedule_override`, `clear_schedule_override`
+  and `schedule_override`. An override is stored in the new
+  `harvest_schedule_overrides` table. It wins over the code value of
+  `upsert_schedule` and survives a reopen with new code, as on Postgres
+  (#2386). Both backends merge a `WorkflowSchedulePatch` with the same rules.
+  That type now lives in `autumn_harvest::schedule_patch`, which builds without
+  the `db` feature. `autumn_harvest::scheduler::WorkflowSchedulePatch` still
+  names it.
+
+  The backend can override the cadence, `max_active_runs`, and the `skip` and
+  `allow_all` overlap policies. Any other field returns
+  `SqliteError::Unsupported` with the field name, and writes nothing.
+  `ScheduleSummary` gains `max_active_runs`.
+
+  SQLite has no DAGs, so the DAG override of #2385 has no SQLite form.
+
+  **Schema.** `harvest_schedules.code_json` (nullable, added on open) and the
+  `harvest_schedule_overrides` table. A row from before this change gets its
+  code value on its next upsert.
+
+  **Tests.** `schedule_override_fixture.rs` holds four cases: an override wins
+  over code, it survives a restart with new code, a clear restores the code
+  value, and a refused override writes nothing. `schedule_overrides` runs them
+  on SQLite, and `schedule_override_parity_tests` runs them on Postgres. The
+  SQLite suite also checks that each unsupported field is refused by name.
+
+  See [`docs/operations/schedule-overrides.md`](operations/schedule-overrides.md#sqlite).
+- **Tooling** (implemented): Ledger census batch 5: the plugin test suites — see issue #2425. The Ledger census now runs in the plugin's test suites too. The census hook moved out of the core test binary into a `ledger-census` cargo feature, so any test binary can link it. `docs/ledger/README.md` gives the commands.
+
+  729 Postgres profiles now link a plan page under `docs/ledger/plans/`, up from
+  552. Most of the new ones are `per_request` profiles of the admin API, the UI
+  and the status endpoints, which only the plugin's tests reach.
+
+  The census found a correctness bug, fixed here, and four scans worth an index
+  decision (issue #2424). More dead-letter and signal readers were added to
+  issues #2401 and #2367.
+- **Fixed** (implemented): Schedule budget updates touched every schedule — see issue #2423. Trigger-now and backfill reserve a `max_runs` slot with a conditional `UPDATE`. Its budget guard was a raw SQL fragment with a bare `OR`, and `AND` binds tighter than `OR`. So the `id` guard covered one branch only, and the statement also matched every capped schedule under its cap on that shard.
+
+  - Trigger-now and backfill reservation incremented `runs_started` on those
+    schedules too.
+  - Backfill release cleared `exhausted_at` on those schedules. That resurrected
+    schedules that `end_at` had exhausted.
+
+  Schedules with no `max_runs` were not affected. Each guard is now
+  parenthesized, and the statements touch the target schedule only. Check
+  `runs_started` and `exhausted_at` on capped schedules in a shard that ran a
+  trigger-now or a backfill. A schedule may have exhausted early, or resumed
+  after its `end_at`.
 - **Phase 4** (next): production hardening -- sharding, observability, metrics, dashboard (Vantage UI — Workers tab shipped in issue #142; DLQ, schedules, and DAG visualization pages remain); Step 5 of issue #256 (remove classic DAG executor, drop `harvest_dag_runs`). Note: the cancellation primitive and `Saga` both ship; their interaction semantics, idempotency contract, and replay-determinism contract are documented in `docs/saga.md` and locked in by three integration tests in `tests/saga_tests.rs` (issue #238).
 
 ---

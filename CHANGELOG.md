@@ -219,11 +219,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Schedule overrides follow their DAG to a new shard (issue #2389, epic #2384).** A DAG schedule override lives on the shard that owns the DAG. A shard routing change moved the schedule row to its new owner, but the override stayed behind.
 
+- **SQLite: runtime overrides of schedules (issue #2390, epic #2384).** `SqliteRuntime` gains `set_schedule_override`, `clear_schedule_override` and `schedule_override`. An override wins over the code value of `upsert_schedule` and survives a reopen with new code, as on Postgres (#2386). Fields SQLite cannot override return `SqliteError::Unsupported` and write nothing.
+
 ### Fixed
 
 - **An agent workspace snapshot survives a host crash.** `DirWorkspaceBlobs::put` now syncs the scratch file, renames it and syncs its folder with `partition_archive::sync_dir`, and the parent of each folder that it makes, before it returns. Before, the put ended at a flush, so a crash after a tool-call result committed could lose the snapshot that the history names.
 - **Two claim loops no longer slow activity dispatch** (issue #2418). With the default two claim loops from #2106, the activity dispatch p50 at a paced start rate rose from 13 ms to 66 ms. Both loops drained the workflow backlog, went idle and slept the 50–75 ms NOTIFY settle while the workflow tasks committed their activities. A workflow task of the worker that ends now wakes the leader with no settle, and cuts a running settle short. A cut settle owes one poll at its original end. On the same box the p50 is now 8 ms.
 - **A NOTIFY polls before it settles** (issue #2422). After a NOTIFY, the idle leader slept the 50–75 ms settle before its first poll, so a signal to an idle worker waited 50 ms at least. The leader now polls at once and settles only when that poll is empty, then polls again. A row stamped by a host clock ahead of the database still gets its margin. On the same box the signal round-trip p50 fell from 68 ms to 13 ms with one worker, and from 56 ms to 25 ms with four workers on one shard.
+
+- **Schedule budget updates touched every schedule (issue #2423).** The `max_runs` guard of trigger-now and backfill was a raw SQL fragment with a bare `OR`, so the `id` guard covered one branch only. Reservation incremented `runs_started` on every capped schedule under its cap on the shard, and backfill release cleared `exhausted_at` on them. Check `runs_started` and `exhausted_at` on capped schedules in a shard that ran a trigger-now or a backfill.
 
 - **Run the MCP tools and durable webhook suites in CI (issue #1959).** `mcp_tools_integration` and `webhook_durable_integration` now run in CI from `linux` manifest rows. Before this change, every test in them was `#[ignore]`d, so CI never ran them.
 
@@ -392,6 +396,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Ledger census batch 3: the per-request profiles (issue #2402).** The Ledger census now plans the `per_request` Postgres profiles, the queries behind API calls and operator reads. 153 of them link a plan page under `docs/ledger/plans/`.
 
 - **Ledger census batch 4: the setup profiles (issue #2414).** The Ledger census now plans the `setup` Postgres profiles, the queries that run at startup, in migrations and in partition layout changes. 63 of them link a plan page under `docs/ledger/plans/`.
+
+- **Ledger census batch 5: the plugin test suites (issue #2425).** The census hook moved into a `ledger-census` cargo feature, so the plugin's test binaries can link it. 729 Postgres profiles now link a plan page, up from 552. The census found the #2423 bug.
 
 The full entry for each change is in [`docs/shipped-work.md`](docs/shipped-work.md).
 
