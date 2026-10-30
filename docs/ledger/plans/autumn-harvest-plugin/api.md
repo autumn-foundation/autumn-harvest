@@ -43,7 +43,7 @@ Statements: 3. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_task_queue"."id", "harvest_task_queue"."queue_name", "harvest_task_queue"."task_t...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_workflow` |
-| 2 | `SELECT "harvest_timers"."timer_id" FROM "harvest_timers" WHERE (("harvest_timers"."workflow_exec_...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending` |
+| 2 | `SELECT "harvest_timers"."timer_id" FROM "harvest_timers" WHERE (("harvest_timers"."workflow_exec_...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_exec` |
 | 3 | `SELECT $1` | no table |
 
 ## `build_diagnosis_report`
@@ -54,7 +54,7 @@ Statements: 6. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT "harvest_task_queue"."state", "harvest_task_queue"."activity_name", "harvest_task_queue"."...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_workflow` |
 | 2 | `SELECT "harvest_task_queue"."state", "harvest_task_queue"."worker_id", "harvest_task_queue"."queu...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_workflow` |
-| 3 | `SELECT "harvest_timers"."fires_at" FROM "harvest_timers" WHERE (("harvest_timers"."workflow_exec_...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending` |
+| 3 | `SELECT "harvest_timers"."fires_at" FROM "harvest_timers" WHERE (("harvest_timers"."workflow_exec_...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_exec` |
 | 4 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."state" FROM "harvest_wo...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_parent_id` |
 | 5 | `SELECT $1` | no table |
 | 6 | `SELECT max("harvest_events"."timestamp") FROM "harvest_events" WHERE ("harvest_events"."workflow_...` | `harvest_events`: Index Only Scan on `idx_harvest_events_exec_last` |
@@ -191,7 +191,7 @@ Statements: 9. Tables with no usable index: none.
 | 2 | `SELECT "harvest_events"."event_type", "harvest_events"."event_data", "harvest_events"."timestamp"...` | `harvest_events`: Bitmap Heap Scan on `idx_harvest_events_history_page` |
 | 3 | `SELECT "harvest_signals"."signal_name", "harvest_signals"."received_at" FROM "harvest_signals" WH...` | `harvest_signals`: Index Scan on `idx_harvest_signals_pending` |
 | 4 | `SELECT "harvest_task_queue"."id", "harvest_task_queue"."queue_name", "harvest_task_queue"."task_t...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_workflow` |
-| 5 | `SELECT "harvest_timers"."timer_id", "harvest_timers"."fires_at" FROM "harvest_timers" WHERE (("ha...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending` |
+| 5 | `SELECT "harvest_timers"."timer_id", "harvest_timers"."fires_at" FROM "harvest_timers" WHERE (("ha...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_exec` |
 | 6 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_parent_id` |
 | 7 | `SELECT $1` | no table |
 | 8 | `SELECT key FROM harvest_rate_limit_buckets WHERE key = ANY($1) AND LEAST(COALESCE(CASE WHEN harve...` | `harvest_rate_limit_buckets`: Index Scan on `harvest_rate_limit_buckets_pkey` |
@@ -314,7 +314,7 @@ Statements: 11. Tables with no usable index: none.
 | 7 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_events`: Index Only Scan on `idx_harvest_events_exec_last`<br>`harvest_signals`: Index Only Scan on `idx_harvest_signals_pending`<br>`harvest_task_queue`: Index Scan on `idx_harvest_tq_workflow`<br>`harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending`<br>`harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_timers_pending`, `idx_harvest_we_non_terminal_wf_name`, `idx_harvest_we_search`<br>`harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_non_terminal_wf_name` |
 | 8 | `SELECT DISTINCT "harvest_signals"."workflow_exec_id" FROM "harvest_signals" WHERE (("harvest_sign...` | `harvest_signals`: Bitmap Heap Scan on `idx_harvest_signals_pending` |
 | 9 | `SELECT DISTINCT "harvest_task_queue"."workflow_exec_id" FROM "harvest_task_queue" WHERE (("harves...` | `harvest_task_queue`: Bitmap Heap Scan on `idx_harvest_tq_workflow` |
-| 10 | `SELECT DISTINCT "harvest_timers"."workflow_exec_id" FROM "harvest_timers" WHERE (("harvest_timers...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending` |
+| 10 | `SELECT DISTINCT "harvest_timers"."workflow_exec_id" FROM "harvest_timers" WHERE (("harvest_timers...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_exec` |
 | 11 | `SELECT DISTINCT "harvest_workflow_executions"."parent_id" FROM "harvest_workflow_executions" WHER...` | `harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_parent_id` |
 
 ## `load_workflows`

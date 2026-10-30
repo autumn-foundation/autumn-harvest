@@ -2694,15 +2694,12 @@
  },
  "docs/ledger/autumn-harvest-plugin/canary.toml": {
   "load_canary_rows": {
-   "SELECT queue_name, state, started_at, completed_at FROM harvest_workflow_executions WHERE starts_with(workflow_name, $1) ORDER BY completed_at DESC NULLS LAST LIMIT $2": {
+   "SELECT queue_name, state, started_at, completed_at FROM harvest_workflow_executions WHERE starts_with(workflow_name, '__harvest_canary_probe') ORDER BY completed_at DESC NULLS LAST LIMIT $1": {
     "literals": [
-     {
-      "1": "'__harvest_canary_probe'"
-     }
+     {}
     ],
     "types": {
-     "1": "text",
-     "2": "bigint"
+     "1": "bigint"
     }
    }
   }
@@ -56627,7 +56624,7 @@
    }
   },
   "queue_task_counts": {
-   "SELECT queue_name AS queue, COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at <= $1) AS backlog, COUNT(*) FILTER (WHERE state = 'RUNNING') AS in_flight, COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at > $1) AS scheduled FROM harvest_task_queue GROUP BY queue_name": {
+   "SELECT queue_name AS queue, COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at <= $1) AS backlog, COUNT(*) FILTER (WHERE state = 'RUNNING') AS in_flight, COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at > $1) AS scheduled FROM harvest_task_queue WHERE state IN ('PENDING', 'RUNNING') GROUP BY queue_name": {
     "literals": [
      {}
     ],

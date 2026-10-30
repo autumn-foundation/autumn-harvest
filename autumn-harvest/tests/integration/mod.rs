@@ -69,6 +69,8 @@ mod cancellation_tests;
 #[cfg(feature = "db")]
 mod capability_miss_tests;
 #[cfg(feature = "db")]
+mod census_scan_index_tests;
+#[cfg(feature = "db")]
 mod chain_timeout_tests;
 mod chaos_catalogue_drift;
 mod chaos_docs;

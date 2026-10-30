@@ -99,7 +99,7 @@ Statements: 2. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending` |
+| 1 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_exec`, `idx_harvest_timers_pending` |
 | 2 | `UPDATE "harvest_timers" SET "fired" = $1 WHERE ("harvest_timers"."id" = ANY($2))` | `harvest_timers`: Bitmap Heap Scan on `harvest_timers_pkey`<br>`harvest_timers`: ModifyTable |
 
 ## `insert_awaited_child_execution`
@@ -117,7 +117,7 @@ Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending` |
+| 1 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_exec` |
 
 ## `load_workflow_execution`
 
@@ -149,7 +149,7 @@ Statements: 3. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending` |
+| 1 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_exec`, `idx_harvest_timers_pending` |
 | 2 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
 | 3 | `UPDATE "harvest_timers" SET "fired" = $1 WHERE ("harvest_timers"."id" = $2)` | `harvest_timers`: Index Scan on `harvest_timers_pkey`<br>`harvest_timers`: ModifyTable |
 
@@ -219,7 +219,7 @@ Statements: 4. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `INSERT INTO "harvest_timers" ("workflow_exec_id", "timer_id", "fires_at") VALUES ($1, $2, $3)` | `harvest_timers`: ModifyTable |
-| 2 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending` |
+| 2 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_exec` |
 | 3 | `SELECT 1 AS dummy FROM harvest_events e WHERE e.workflow_exec_id = $1 AND ( ( e.event_type = 'Ext...` | `harvest_events`: Bitmap Heap Scan on `idx_harvest_events_external_cancel_resolved`<br>`harvest_events`: Bitmap Heap Scan on `idx_harvest_events_external_cancel_resolved`, `idx_harvest_events_external_outbox_pending`, `idx_harvest_events_external_signal_resolved`, `idx_harvest_events_history_page`<br>`harvest_events`: Bitmap Heap Scan on `idx_harvest_events_external_signal_resolved` |
 | 4 | `UPDATE "harvest_task_queue" SET "activity_name" = $1 WHERE ("harvest_task_queue"."id" = $2)` | `harvest_task_queue`: Index Scan on `harvest_task_queue_pkey`<br>`harvest_task_queue`: ModifyTable |
 
@@ -316,7 +316,7 @@ Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending` |
+| 1 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_exec` |
 
 ## `task_state_and_deadline_for_update`
 
