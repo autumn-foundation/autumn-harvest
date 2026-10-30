@@ -11,7 +11,7 @@ turns whole, so a confirmed finding in an old turn goes too.
 
 CORAL gives the agent a working-memory toolset. The agent saves its progress,
 clears its context, and restarts from its notes only. We take the tools and
-the reset. We do not take the RL training.
+the reset. This design does not take the RL training.
 
 ## 2. Brainstorming
 
@@ -21,6 +21,7 @@ Options for each open question. The chosen option is in bold.
 |---|---|
 | Where the setting lives | **`AgentTask::context_reset` and `AgentProfile::context_reset`, `None` by default** · a harness-wide setting · a `Mandate` field |
 | What triggers a reset | **the size of the next request, against the request cap** · the token usage of the run · a model call to a `reset` tool |
+| When the model saves | at any time, unasked · **also in a save turn: a fixed notice before the reset, where only `save_progress` runs** |
 | What `save_progress` does | **replace the notes whole** · append to the notes · edit named sections |
 | Where the notes go after a reset | a user message · the system prompt · **the model's own `save_progress` call and a fixed tool result** |
 | What "the task" is | the segment input · **`AgentTask::input`** · the first user message of the history |
@@ -38,8 +39,12 @@ Options for each open question. The chosen option is in bold.
 | The notes come from a prompt injection and gain the authority of a person. | The notes never go into a user message. They stay in an assistant `save_progress` call, as in `followup.rs`. |
 | A reset clears the taint of an untrusted read. | A reset changes only the transcript. `Tree::exercised` stays. Durable notes keep the labels of the run that saved them. |
 | A reset drops a steer from a person. | A reset keeps the steer messages of the segment after the notes. |
+| A reset drops a round that the model has not read. A call with an effect, such as a sent mail, is then forgotten and runs again. | A save turn comes first. The model reads the round, and only `save_progress` runs in the save turn. The reset runs before the next request. |
+| A reset in a follow-up segment drops the `schedule_followup` call. The wake message then points at nothing. | The reset window keeps the last `schedule_followup` call with its result, and the wake message. |
+| An unattended segment, such as a heartbeat tick or a peer message, plants notes that a later attended op reads. | A durable agent keeps the notes of a segment only when the segment may write memory and keeps its transcript. |
+| The fixed result after the notes outranks a new message from a person. | The fixed result says that the user messages say what to do. |
 | A model fills the notes until the request is full again. | `max_notes_bytes` bounds the notes. A larger call gets an error result and leaves the notes unchanged. |
-| A window that is still over the threshold after a reset resets on every turn. | One reset per request. `max_resets` bounds the run. Each reset is followed by a model turn, or by `transcript_full`. |
+| A window that is still over the threshold after a reset resets on every turn. | A reset runs only when its window falls under the threshold. `max_resets` bounds the run. |
 | A durable agent shows two copies of its notes. | The restored pair is stripped before `trim_window`. Each op adds one fresh pair. |
 | A recorded run replays under new code. | A task with no `context_reset` field takes no new path. No patch gate is needed. |
 | A child reads the private notes of its parent. | A child starts with a new `Progress`, so it has no notes. |
@@ -54,7 +59,8 @@ Options for each open question. The chosen option is in bold.
   forgets in silence is worse. The model must know that a reset can come.
   The tool description says so.
 - **Black (risks).** Model-written text in a user message. A stale delta
-  prefix. A replay that diverges. Lost steers. Section 3 answers each one.
+  prefix. A replay that diverges. Lost steers. A round that the model never
+  reads. Notes that an unattended run plants. Section 3 answers each one.
 - **Yellow (value).** A long run continues past the request cap. A durable
   agent keeps confirmed findings after its window drops their turns. The
   setting is off by default, so no run changes.
@@ -79,16 +85,25 @@ pub struct ContextReset {
    `notes` replaces the notes of the run. The workflow handles the call, so no
    activity runs. Replay reads the call from the recorded model turn.
 2. Before each request, the loop measures it. When the request reaches
-   `reset_at_percent` of the cap and resets are left, the loop resets. The new
-   window is the system prompt, the task and the notes, then the steers of
-   the segment. The notes are a `save_progress` call with a fixed result.
-3. With no resets left, the loop works as before. A request over the cap ends
+   `reset_at_percent` of the cap and resets are left, the reset is due. The
+   reset runs only when its window falls under the threshold.
+3. A due reset first asks for a save turn. The loop sends the window with a
+   fixed notice. In that round only `save_progress` runs. The reset runs
+   before the next request. When the notice does not fit the cap, the reset
+   runs at once.
+4. The new window is the system prompt and the task. The last
+   `schedule_followup` call with its result, and the wake message of a
+   follow-up segment, follow. Then the notes and the steers of the segment
+   follow. The notes are a `save_progress` call with a fixed result.
+5. With no resets left, the loop works as before. A request over the cap ends
    the run as `transcript_full`.
-4. A durable agent keeps the notes in `AgentState::notes`, with their labels.
+6. A durable agent keeps the notes in `AgentState::notes`, with their labels.
    Each op shows them after its input. The restored pair is stripped before
-   `trim_window`. `Control::ClearTranscript` clears the notes.
-5. `AgentReport::resets` counts the resets. It is not written when zero.
-6. A delegated child inherits the setting and starts with no notes.
+   `trim_window`. Only a segment that may write memory, and that keeps its
+   transcript, writes the notes. `Control::ClearTranscript` clears them.
+7. `AgentReport::resets` and `DelegationRecord::resets` count the resets.
+   Neither is written when zero.
+8. A delegated child inherits the setting and starts with no notes.
 
 A zero cap is no cap, so it never resets. A `reset_at_percent` of 0 counts as
 1, and a value over 100 counts as 100.
@@ -104,6 +119,11 @@ All tests are in `autumn-harvest-agent/tests/context_reset.rs`.
 |---|---|
 | Unset: an overflow ends as `transcript_full`, report as today | `with_no_setting_an_overflow_ends_as_before` |
 | One reset: the next request is system, task and notes; `resets == 1` | `a_run_resets_once_and_restarts_from_its_notes` |
+| A save turn runs only `save_progress` | `a_save_turn_runs_only_save_progress` |
+| A reset that frees no room does not run | `a_reset_that_frees_no_room_does_not_run` |
+| A follow-up reset keeps the booked call | `a_reset_in_a_followup_segment_keeps_the_followup_call` |
+| A reset keeps the steers of the op | `a_reset_keeps_the_steers_of_the_op` |
+| A read-only op keeps no notes | `a_read_only_op_keeps_no_notes` |
 | Cap spent: the next overflow ends as `transcript_full` | `a_second_overflow_after_the_cap_is_spent_ends_the_run` |
 | A crash after a reset replays to the same window and cache key | `crash_after_a_reset_replays_the_same_window` |
 | Notes over `max_notes_bytes` get an error and leave the notes | `oversized_notes_are_refused_and_the_old_notes_stay` |
@@ -111,4 +131,6 @@ All tests are in `autumn-harvest-agent/tests/context_reset.rs`.
 | An untrusted read before a reset still trips the flow rule | `a_reset_clears_no_taint` |
 | A delegated child starts with no notes of its parent | `a_delegated_child_starts_with_no_notes` |
 
-`formal/verus/src/agent_reset.rs` proves the threshold kernel.
+`formal/verus/src/agent_reset.rs` proves the threshold kernel. The unit
+tests of `plan_reset` in `workflow.rs` cover the save turn and the reset at
+once.

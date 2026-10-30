@@ -288,7 +288,7 @@ shows what ran. The text of that turn is not the answer either.
 
 A `transcript_full` transcript is too large for one request. Do not pass it
 whole as the `history` of a new run. Summarise it, or keep its last turns.
-A run with `AgentTask::context_reset` resets before it reaches the cap. See
+A run with `AgentTask::context_reset` can reset before it reaches the cap. See
 [Context reset](#context-reset-issue-2453).
 
 Retries follow `ErrorKind::is_retryable`. `RateLimited`, `Transport` and
@@ -677,12 +677,19 @@ let task = AgentTask::new("audit the ledger")
   The default bound is 8 192 bytes.
 - Before each request, the loop measures it against the request cap of
   [Payload caps](#payload-caps-issue-2040). When the request reaches
-  `reset_at_percent` of the cap and a reset is left, the loop resets. 0 counts
+  `reset_at_percent` of the cap and a reset is left, a reset is due. 0 counts
   as 1, and a value over 100 counts as 100. A zero cap is no cap, so it never
-  resets.
-- The new window is the system prompt, `AgentTask::input` and the notes.
-  The steers of a durable agent op follow. A reset in a follow-up segment
-  also restarts from `AgentTask::input`.
+  resets. A reset whose window still reaches the threshold frees no room, so
+  it does not run.
+- A due reset first asks for a save turn. The loop sends the window with the
+  fixed notice `RESET_NOTICE`. The model reads the last round, and only
+  `save_progress` runs in that turn. Each other call gets an error result. The
+  reset runs before the next request. When the notice does not fit the cap,
+  the reset runs at once.
+- The new window is the system prompt and `AgentTask::input`. The last
+  `schedule_followup` call with its result, and the wake message of a
+  follow-up segment, follow. Then the notes and the steers of a durable agent
+  op follow.
 - The notes are the model's own `save_progress` call, with a fixed result.
   The model wrote them, maybe under the influence of a tool result, so they
   never go into a user message.
@@ -692,7 +699,7 @@ let task = AgentTask::new("audit the ledger")
 - A reset changes only the transcript. The flow labels belong to the run, so
   a reset clears no taint.
 - A delegated child takes the setting and starts with no notes. Its resets
-  are its own.
+  are its own. `DelegationRecord::resets` counts them.
 - The reset reads only recorded data, so replay takes the same reset. The
   next turn after a reset goes in full, not as a delta.
 
@@ -1129,7 +1136,13 @@ as an agent.
   an op with notes therefore goes in full, not as a delta.
 - An op that reads the notes takes their labels, so the taint follows the
   text.
-- A failed op keeps its notes, as it keeps its memory edits.
+- Only a segment that may write memory keeps its notes past the op. A
+  read-only op, a heartbeat tick, a follow-up and a peer message keep none,
+  unless the segment has `unattended_memory_writes`. Such a segment can read
+  untrusted data, and a later op with write tools reads the notes. A silent
+  tick leaves the notes as they were.
+- A failed op that may write memory keeps its notes, as it keeps its memory
+  edits.
 - `Control::ClearTranscript` clears the notes too.
 
 ### Workspaces (issue #2274)

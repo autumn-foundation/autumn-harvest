@@ -33,7 +33,7 @@ use crate::agent::{
     agent_workspace_reset_info, agent_workspace_retain_info,
 };
 use crate::approval::{Approval, Decision, approval_signal, await_decision, decode_decision};
-use crate::bounds::{RoundBudget, json_len, reset_due, sibling_cap};
+use crate::bounds::{RoundBudget, json_len, reaches_percent, reset_due, sibling_cap};
 use crate::context_reset::{self, ProgressNotes, SAVE_PROGRESS_TOOL};
 use crate::delivery::{Report, ReportSource, report_text};
 use crate::flow::Released;
@@ -133,6 +133,9 @@ pub(crate) struct Progress {
     /// The steer messages of this segment. A reset keeps them, so a reset
     /// never drops a message from a person.
     pub(crate) steers: Vec<ChatMessage>,
+    /// The last turn was the save turn of a reset. The reset runs before
+    /// the next request.
+    pub(crate) reset_pending: bool,
 }
 
 /// The steer messages of a durable agent (issue #2265).
@@ -199,6 +202,7 @@ impl Progress {
             notes: None,
             restore_notes: false,
             steers: Vec::new(),
+            reset_pending: false,
         }
     }
 
@@ -662,6 +666,8 @@ async fn open_segment(
     }
     progress.messages = messages;
     progress.steers.clear();
+    // A save turn that ended its segment has no reset to run.
+    progress.reset_pending = false;
     if progress
         .sent
         .as_ref()
@@ -732,16 +738,10 @@ pub(crate) async fn run_segment(
         let mut len = json_len(&request);
         // A reset reads only the recorded window, the cap and the reset
         // count, so replay takes the same reset (issue #2453).
-        if let Some(setting) = task.context_reset
-            && reset_due(
-                progress.resets,
-                setting.max_resets,
-                len,
-                cap,
-                setting.reset_at_percent,
-            )
+        if task.context_reset.is_some()
+            && let Some(window) = plan_reset(run, progress, tree, &extra_tools, input, len)
         {
-            reset_window(task, progress);
+            progress.messages = window;
             request = next_request(run, progress, tree, &extra_tools, progress.messages.clone());
             len = json_len(&request);
         }
@@ -842,14 +842,79 @@ pub(crate) async fn run_segment(
     }
 }
 
-/// Replace the window with the system prompt, the task and the notes, then
-/// the steers of the segment (issue #2453).
+/// Plan the context reset before one request of `len` bytes (issue
+/// #2453). Returns the new window, or `None` to send the window as it is.
 ///
-/// The task is the input of the task, not the wake message of a follow-up.
-/// That message points at a call that the reset drops. The new window does
-/// not start with the last sent window, so the next turn goes in full.
-fn reset_window(task: &AgentTask, progress: &mut Progress) {
-    let mut window = Vec::with_capacity(4 + progress.steers.len());
+/// A due reset first asks for a save turn. The loop sends the window with a
+/// fixed notice, and only `save_progress` runs in that round. The model so
+/// reads each result before the reset drops it. The reset runs before the
+/// next request.
+///
+/// The save turn needs room under the cap. Without room, the reset runs at
+/// once. A reset whose window still reaches the threshold frees no room, so
+/// it does not run. It would only spend the next reset.
+fn plan_reset(
+    run: Run<'_>,
+    progress: &mut Progress,
+    tree: &Tree,
+    extra_tools: &[ToolDefinition],
+    input: &str,
+    len: u64,
+) -> Option<Vec<ChatMessage>> {
+    let setting = run.task.context_reset?;
+    let cap = run.task.request_cap();
+    if std::mem::take(&mut progress.reset_pending) {
+        return Some(reset_now(run.task, progress, input));
+    }
+    if !reset_due(
+        progress.resets,
+        setting.max_resets,
+        len,
+        cap,
+        setting.reset_at_percent,
+    ) {
+        return None;
+    }
+    let after = reset_window(run.task, progress, input);
+    let after_len = json_len(&next_request(run, progress, tree, extra_tools, after));
+    if reaches_percent(after_len, cap, setting.reset_at_percent) {
+        return None;
+    }
+    let mut noticed = progress.messages.clone();
+    noticed.push(ChatMessage::text(
+        ChatRole::User,
+        context_reset::RESET_NOTICE,
+    ));
+    let noticed_len = json_len(&next_request(
+        run,
+        progress,
+        tree,
+        extra_tools,
+        noticed.clone(),
+    ));
+    if noticed_len > cap {
+        return Some(reset_now(run.task, progress, input));
+    }
+    progress.reset_pending = true;
+    Some(noticed)
+}
+
+/// Count one reset and return its window. The window does not start with
+/// the last sent window, so the next turn goes in full.
+fn reset_now(task: &AgentTask, progress: &mut Progress, input: &str) -> Vec<ChatMessage> {
+    progress.resets = progress.resets.saturating_add(1);
+    progress.sent = None;
+    reset_window(task, progress, input)
+}
+
+/// The window after a reset (issue #2453).
+///
+/// It holds the system prompt and the task. Then it holds the last
+/// `schedule_followup` call with its result, and the input of a segment
+/// that a follow-up woke. The wake message points at that call. Then the
+/// notes follow, and last the steers of the segment.
+fn reset_window(task: &AgentTask, progress: &Progress, input: &str) -> Vec<ChatMessage> {
+    let mut window = Vec::with_capacity(8 + progress.steers.len());
     window.extend(
         progress
             .messages
@@ -858,13 +923,45 @@ fn reset_window(task: &AgentTask, progress: &mut Progress) {
             .cloned(),
     );
     window.push(ChatMessage::text(ChatRole::User, task.input.clone()));
+    window.extend(last_followup(&progress.messages).into_iter().flatten());
+    if input != task.input {
+        window.push(ChatMessage::text(ChatRole::User, input));
+    }
     if let Some(notes) = &progress.notes {
         window.extend(context_reset::restored(&notes.text));
     }
     window.extend(progress.steers.iter().cloned());
-    progress.messages = window;
-    progress.resets = progress.resets.saturating_add(1);
-    progress.sent = None;
+    window
+}
+
+/// The last `schedule_followup` call of `messages`, alone in its message,
+/// and its result. `None` when no such call has a result.
+fn last_followup(messages: &[ChatMessage]) -> Option<[ChatMessage; 2]> {
+    let (id, call) = messages.iter().rev().find_map(|message| {
+        message.content.iter().rev().find_map(|part| match part {
+            ContentPart::ToolCall { id, name, .. }
+                if message.role == ChatRole::Assistant && name == FOLLOWUP_TOOL =>
+            {
+                Some((id.clone(), part.clone()))
+            }
+            _ => None,
+        })
+    })?;
+    let result = messages.iter().find_map(|message| {
+        message.content.iter().find(|part| {
+            matches!(part, ContentPart::ToolResult { tool_call_id, .. } if *tool_call_id == id)
+        })
+    })?;
+    Some([
+        ChatMessage {
+            role: ChatRole::Assistant,
+            content: vec![call],
+        },
+        ChatMessage {
+            role: ChatRole::Tool,
+            content: vec![result.clone()],
+        },
+    ])
 }
 
 /// One model turn. A durable agent races it against an interrupt.
@@ -1205,6 +1302,10 @@ async fn run_round(
             ToolOutcome::error(NOT_RUN_INTERRUPTED).content
         } else if stale {
             ToolOutcome::error(NOT_RUN_STALE).content
+        } else if progress.reset_pending && call.name != SAVE_PROGRESS_TOOL {
+            // The reset drops each result of this round unread, so only the
+            // notes tool runs.
+            ToolOutcome::error(NOT_RUN_RESET).content
         } else if !guard.budget.can_run() {
             // A placeholder for each call exceeds the cap. No result could
             // reach the model, so no call runs.
@@ -1413,6 +1514,7 @@ fn placeholder() -> String {
         NOT_RUN_LOOP,
         NOT_RUN_STALE,
         NOT_RUN_INTERRUPTED,
+        NOT_RUN_RESET,
         INTERRUPTED_CALL,
         INTERRUPTED_APPROVAL,
     ]
@@ -1444,6 +1546,11 @@ const INTERRUPTED_CALL: &str = "the call was cancelled: a person interrupted thi
 /// The answer to a gated call whose approval wait an interrupt ended.
 const INTERRUPTED_APPROVAL: &str =
     "denied: a person interrupted this op while the call waited for an approval";
+
+/// The answer to a call of a save turn other than `save_progress` (issue
+/// #2453). The reset after the turn drops each result unread.
+const NOT_RUN_RESET: &str =
+    "the call did not run: your context resets now, so only save_progress runs in this turn";
 
 /// The answer to a call that did not run because a delegation earlier in the
 /// round added flow labels after the decision.
@@ -1835,6 +1942,7 @@ async fn delegate(
         usage: child.usage,
         steps_used: steps,
         tool_calls,
+        resets: child.resets,
     });
     let outcome = serde_json::json!({
         "agent": peer.name,
@@ -1868,6 +1976,7 @@ fn refuse_delegation(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &s
         usage: TokenUsage::default(),
         steps_used: 0,
         tool_calls: 0,
+        resets: 0,
     });
     refused(refusal, name)
 }
@@ -2073,6 +2182,7 @@ fn merge_child(
         usage: report.usage,
         steps_used: report.steps_used,
         tool_calls: report.tool_calls,
+        resets: report.resets,
     });
     let outcome = serde_json::json!({
         "agent": peer.name,
@@ -2184,6 +2294,7 @@ fn peer_outcome(
                 usage: TokenUsage::new(u32::try_from(reply.tokens).unwrap_or(u32::MAX), 0),
                 steps_used: 0,
                 tool_calls: 0,
+                resets: 0,
             });
             if let Some(refusal) = reply.refusal {
                 refused(refusal, &peer.name)
@@ -2211,6 +2322,7 @@ fn peer_outcome(
                 usage: TokenUsage::default(),
                 steps_used: 0,
                 tool_calls: 0,
+                resets: 0,
             });
             ToolOutcome::error(&format!(
                 "the durable agent {:?} gave no answer: {error}",
@@ -2274,6 +2386,7 @@ fn refuse(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &str) -> Tool
         usage: TokenUsage::default(),
         steps_used: 0,
         tool_calls: 0,
+        resets: 0,
     });
     refused(refusal, name)
 }
@@ -2687,12 +2800,153 @@ mod tests {
             NOT_RUN_LOOP,
             NOT_RUN_STALE,
             NOT_RUN_INTERRUPTED,
+            NOT_RUN_RESET,
             INTERRUPTED_CALL,
             INTERRUPTED_APPROVAL,
         ] {
             let answer = ToolOutcome::error(message).content;
             assert!(json_len(&answer) <= reserved, "{message}");
         }
+        // The round budget of a recorded run holds this length. A longer
+        // fixed answer would change how that run replays.
+        assert_eq!(
+            reserved,
+            json_len(&ToolOutcome::error(NOT_RUN_STALE).content)
+        );
+    }
+
+    /// A tree with no labels, for a reset test.
+    fn bare_tree() -> Tree {
+        Tree {
+            root: "r".into(),
+            rounds: 0,
+            delegations: 0,
+            exercised: BTreeSet::new(),
+            released: Released::new(),
+            records: Vec::new(),
+            outbox: Outbox::default(),
+        }
+    }
+
+    /// A run of a task, a window and the request size of that window.
+    fn reset_fixture() -> (AgentTask, Progress, u64) {
+        let task = AgentTask::new("audit").context_reset(crate::ContextReset::new(1, 50));
+        let progress = Progress::new(
+            "r".into(),
+            vec![
+                ChatMessage::text(ChatRole::User, "audit"),
+                ChatMessage::text(ChatRole::Assistant, "x".repeat(2_000)),
+            ],
+        );
+        let run = Run {
+            task: &task,
+            agent: None,
+            live: false,
+        };
+        let request = next_request(
+            run,
+            &progress,
+            &bare_tree(),
+            &run.extra_tools(),
+            progress.messages.clone(),
+        );
+        let len = json_len(&request);
+        (task, progress, len)
+    }
+
+    fn plan(task: &AgentTask, progress: &mut Progress, len: u64) -> Option<Vec<ChatMessage>> {
+        let run = Run {
+            task,
+            agent: None,
+            live: false,
+        };
+        plan_reset(
+            run,
+            progress,
+            &bare_tree(),
+            &run.extra_tools(),
+            "audit",
+            len,
+        )
+    }
+
+    #[test]
+    fn a_save_turn_comes_first_and_the_reset_after_it() {
+        let (mut task, mut progress, len) = reset_fixture();
+        task.max_request_bytes = Some(len + 1_000);
+        let noticed = plan(&task, &mut progress, len).expect("a save turn");
+        assert!(progress.reset_pending);
+        assert_eq!(progress.resets, 0, "the save turn spends no reset");
+        let last = noticed.last().unwrap();
+        assert_eq!(
+            last.content,
+            vec![ContentPart::Text(context_reset::RESET_NOTICE.to_owned())]
+        );
+        assert_eq!(noticed.len(), progress.messages.len() + 1);
+
+        progress.sent = Some(crate::transcript::Sent::of(&progress.messages));
+        let window = plan(&task, &mut progress, len).expect("the reset");
+        assert!(!progress.reset_pending);
+        assert_eq!(progress.resets, 1);
+        assert!(progress.sent.is_none(), "the next turn goes in full");
+        assert_eq!(window, vec![ChatMessage::text(ChatRole::User, "audit")]);
+    }
+
+    #[test]
+    fn with_no_room_for_a_save_turn_the_reset_runs_at_once() {
+        let (mut task, mut progress, len) = reset_fixture();
+        task.max_request_bytes = Some(len);
+        task.context_reset = Some(crate::ContextReset::new(1, 100));
+        let window = plan(&task, &mut progress, len).expect("the reset");
+        assert!(!progress.reset_pending);
+        assert_eq!(progress.resets, 1);
+        assert_eq!(window, vec![ChatMessage::text(ChatRole::User, "audit")]);
+    }
+
+    #[test]
+    fn under_the_threshold_or_with_no_reset_left_nothing_changes() {
+        let (mut task, mut progress, len) = reset_fixture();
+        task.max_request_bytes = Some(len * 3);
+        assert!(plan(&task, &mut progress, len).is_none(), "under 50 %");
+        task.max_request_bytes = Some(len + 1_000);
+        progress.resets = 1;
+        assert!(plan(&task, &mut progress, len).is_none(), "no reset left");
+        assert!(!progress.reset_pending);
+    }
+
+    #[test]
+    fn the_last_followup_call_stays_alone_with_its_result() {
+        let call = |id: &str, name: &str| ContentPart::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: serde_json::json!({}),
+        };
+        let result = |id: &str| ContentPart::ToolResult {
+            tool_call_id: id.into(),
+            content: "ok".into(),
+        };
+        let messages = vec![
+            ChatMessage::text(ChatRole::User, "task"),
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: vec![
+                    ContentPart::Text("booking".into()),
+                    call("a", "lookup"),
+                    call("f", FOLLOWUP_TOOL),
+                ],
+            },
+            ChatMessage {
+                role: ChatRole::Tool,
+                content: vec![result("a"), result("f")],
+            },
+        ];
+        let [kept_call, kept_result] = last_followup(&messages).expect("the call");
+        assert_eq!(kept_call.content, vec![call("f", FOLLOWUP_TOOL)]);
+        assert_eq!(kept_result.content, vec![result("f")]);
+        assert!(
+            last_followup(&messages[..2]).is_none(),
+            "a call with no result"
+        );
     }
 
     #[test]

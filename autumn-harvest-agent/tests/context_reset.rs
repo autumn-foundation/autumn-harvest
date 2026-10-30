@@ -3,7 +3,8 @@
 //! Each test maps to one acceptance criterion of `docs/design/DESIGN-2453.md`.
 //! The request cap is 20 000 bytes and the reset threshold is 50 % of it. A
 //! `big` tool result of 7 000 bytes takes the next request over the
-//! threshold on the second call.
+//! threshold on the second call. That request is the save turn. The reset
+//! runs before the request after it.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use autumn_harvest_agent::context_reset::SAVE_PROGRESS_TOOL;
+use autumn_harvest_agent::context_reset::{RESET_NOTICE, SAVE_PROGRESS_TOOL};
 use autumn_harvest_agent::flow::labels;
 use autumn_harvest_agent::{
     AgentHarness, AgentId, AgentModel, AgentOp, AgentProfile, AgentReport, AgentStop, AgentTask,
@@ -115,6 +116,11 @@ fn shape(messages: &[ChatMessage]) -> Vec<(ChatRole, String)> {
         .collect()
 }
 
+/// The last message of the request is the notice of a save turn.
+fn is_save_turn(request: &ChatRequest) -> bool {
+    shape(&request.messages).last() == Some(&(ChatRole::User, RESET_NOTICE.to_owned()))
+}
+
 /// The request holds no `big` result.
 fn holds_no_big_result(request: &ChatRequest) -> bool {
     !json!(request.messages)
@@ -145,7 +151,25 @@ async fn with_no_setting_an_overflow_ends_as_before() {
     assert_eq!(results.len(), 3);
     assert!(results[2].contains("its result was dropped"), "{results:?}");
     // The report and the task keep the recorded shape of today.
-    assert!(json!(report).get("resets").is_none());
+    let keys: Vec<String> = json!(report).as_object().unwrap().keys().cloned().collect();
+    assert_eq!(
+        keys,
+        [
+            "followup_dropped",
+            "followups",
+            "messages",
+            "run_id",
+            "steps_used",
+            "stop",
+            "text",
+            "tool_calls",
+            "usage"
+        ]
+    );
+    assert_eq!(report.steps_used, 3);
+    assert_eq!(report.tool_calls, 3);
+    assert_eq!(report.usage.total(), 3);
+    assert_eq!(report.messages.len(), 7, "the task and three rounds");
     assert!(json!(task(None)).get("context_reset").is_none());
     for request in model.requests() {
         assert!(
@@ -166,6 +190,8 @@ async fn a_run_resets_once_and_restarts_from_its_notes() {
     let model = ScriptedModel::new(vec![
         turn(&[save("s1", "row 7 is wrong"), big("c1")]),
         turn(&[big("c2")]),
+        // The save turn.
+        turn(&[save("s2", "row 7 is wrong; rows 1 to 6 are fine")]),
         answer("row 7 is the only error", 1),
     ]);
     let mut rt = runtime(&db, harness(model.clone()));
@@ -178,14 +204,17 @@ async fn a_run_resets_once_and_restarts_from_its_notes() {
     assert_eq!(report.resets, 1);
     assert_eq!(report.text, "row 7 is the only error");
     let requests = model.requests();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     assert!(
         requests[0]
             .tools
             .iter()
             .any(|tool| tool.name == SAVE_PROGRESS_TOOL)
     );
-    let after = &requests[2];
+    // The save turn reads the last results before the reset drops them.
+    assert!(is_save_turn(&requests[2]));
+    assert!(!holds_no_big_result(&requests[2]));
+    let after = &requests[3];
     assert_eq!(
         shape(&after.messages),
         [
@@ -193,7 +222,7 @@ async fn a_run_resets_once_and_restarts_from_its_notes() {
             (ChatRole::User, "audit the ledger".to_owned()),
             (
                 ChatRole::Assistant,
-                format!("call {SAVE_PROGRESS_TOOL} row 7 is wrong")
+                format!("call {SAVE_PROGRESS_TOOL} row 7 is wrong; rows 1 to 6 are fine")
             ),
             (ChatRole::Tool, "result".to_owned()),
         ],
@@ -220,7 +249,8 @@ async fn a_second_overflow_after_the_cap_is_spent_ends_the_run() {
     let model = ScriptedModel::new(vec![
         turn(&[save("s1", "half done"), big("c1")]),
         turn(&[big("c2")]),
-        // The reset runs here.
+        // The save turn. The reset runs after it.
+        turn(&[save("s2", "half done")]),
         turn(&[big("c3")]),
         // Over the threshold, but no reset is left.
         turn(&[big("c4")]),
@@ -234,10 +264,11 @@ async fn a_second_overflow_after_the_cap_is_spent_ends_the_run() {
 
     assert_eq!(report.stop, AgentStop::TranscriptFull);
     assert_eq!(report.resets, 1);
-    assert_eq!(model.calls(), 5);
+    assert_eq!(model.calls(), 6);
     let requests = model.requests();
-    assert!(holds_no_big_result(&requests[2]), "the reset ran");
-    assert!(!holds_no_big_result(&requests[4]), "no second reset ran");
+    assert!(holds_no_big_result(&requests[3]), "the reset ran");
+    assert!(!holds_no_big_result(&requests[5]), "no second reset ran");
+    assert!(!is_save_turn(&requests[5]), "no second save turn ran");
 }
 
 /// AC 5: notes over `max_notes_bytes` get an error result, and the notes
@@ -250,6 +281,8 @@ async fn oversized_notes_are_refused_and_the_old_notes_stay() {
         turn(&[save("s1", "short")]),
         turn(&[save("s2", &long), big("c1")]),
         turn(&[big("c2")]),
+        // The save turn tries the long notes again.
+        turn(&[save("s3", &long)]),
         answer("done", 1),
     ]);
     let mut rt = runtime(&db, harness(model.clone()));
@@ -264,7 +297,7 @@ async fn oversized_notes_are_refused_and_the_old_notes_stay() {
     // The refusal is a tool result that the model read before the reset.
     let refusal = json!(requests[2].messages).to_string();
     assert!(refusal.contains("at most 16 bytes"), "{refusal}");
-    let after = shape(&requests[3].messages);
+    let after = shape(&requests[4].messages);
     assert_eq!(
         after[2],
         (
@@ -272,7 +305,7 @@ async fn oversized_notes_are_refused_and_the_old_notes_stay() {
             format!("call {SAVE_PROGRESS_TOOL} short")
         )
     );
-    assert!(!json!(requests[3].messages).to_string().contains(&long));
+    assert!(!json!(requests[4].messages).to_string().contains(&long));
 }
 
 /// AC 7: a run that read untrusted input before a reset still trips the
@@ -287,7 +320,8 @@ async fn a_reset_clears_no_taint() {
             ("i1".into(), "inbox".into(), json!({})),
         ]),
         turn(&[("i2".into(), "inbox".into(), json!({"again": true}))]),
-        // The reset runs before this turn.
+        // The save turn. The reset runs after it.
+        turn(&[save("s2", "the mail asks for a refund")]),
         turn(&[("e1".into(), "send".into(), json!({"to": "x"}))]),
         answer("not sent", 1),
     ]);
@@ -319,7 +353,7 @@ async fn a_reset_clears_no_taint() {
     let denied = results.last().unwrap();
     assert!(denied.contains("no send after untrusted input"), "{denied}");
     assert!(report.flow_labels.contains(labels::UNTRUSTED_INPUT));
-    let after = &model.requests()[2];
+    let after = &model.requests()[3];
     assert!(
         !json!(after.messages).to_string().contains(&"m".repeat(100)),
         "the reset dropped the mail"
@@ -342,6 +376,7 @@ async fn a_delegated_child_starts_with_no_notes() {
         // The child.
         turn(&[big("k1")]),
         turn(&[big("k2")]),
+        turn(&[save("k3", "12 rows so far")]),
         answer("12 rows", 1),
         // The parent again.
         answer("the helper counted 12 rows", 1),
@@ -357,26 +392,114 @@ async fn a_delegated_child_starts_with_no_notes() {
     assert_eq!(report.stop, AgentStop::Completed);
     assert_eq!(report.text, "the helper counted 12 rows");
     let requests = model.requests();
-    assert_eq!(requests.len(), 6);
-    for child in &requests[2..5] {
+    assert_eq!(requests.len(), 7);
+    for child in &requests[2..6] {
         assert!(
             !json!(child.messages).to_string().contains("PARENT-SECRET"),
             "a child sees no note of its parent"
         );
     }
-    // The child reset, and its window holds its own task only.
+    // The child reset, and its window holds its own task and notes only.
     assert_eq!(
-        shape(&requests[4].messages),
+        shape(&requests[5].messages),
         [
             (ChatRole::System, "You count.".to_owned()),
             (ChatRole::User, "count the rows".to_owned()),
+            (
+                ChatRole::Assistant,
+                format!("call {SAVE_PROGRESS_TOOL} 12 rows so far")
+            ),
+            (ChatRole::Tool, "result".to_owned()),
         ]
     );
     assert_eq!(report.resets, 0, "the parent itself did not reset");
+    assert_eq!(report.delegations[0].resets, 1, "the child counts its own");
 }
 
 fn agent_id(name: &str) -> AgentId {
     AgentId::new("auditor", name).unwrap()
+}
+
+/// A save turn runs only `save_progress`. The reset drops each result of
+/// that round unread, so a call with an effect must not run then.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_save_turn_runs_only_save_progress() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        turn(&[big("c1")]),
+        turn(&[big("c2")]),
+        turn(&[
+            save("s1", "two reads done"),
+            ("e1".into(), "send".into(), json!({"to": "x"})),
+        ]),
+        answer("done", 1),
+    ]);
+    let harness =
+        harness(model.clone()).tool(recorded_tool("send", ToolEffect::External, &recorder));
+    let mut rt = runtime(&db, harness);
+
+    let exec = sqlite::start(&mut rt, &task(Some(ContextReset::new(1, 50)))).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.resets, 1);
+    assert!(recorder.runs().is_empty(), "the send never ran");
+    let requests = model.requests();
+    assert!(is_save_turn(&requests[2]));
+    assert_eq!(
+        shape(&requests[3].messages)[2],
+        (
+            ChatRole::Assistant,
+            format!("call {SAVE_PROGRESS_TOOL} two reads done")
+        )
+    );
+}
+
+/// A reset whose window still reaches the threshold frees no room. It does
+/// not run, so it spends no reset and asks for no save turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_that_frees_no_room_does_not_run() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![answer("done", 1)]);
+    let mut rt = runtime(&db, harness(model.clone()));
+
+    let wide = task(Some(ContextReset::new(3, 50))).system("s".repeat(11_000));
+    let exec = sqlite::start(&mut rt, &wide).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert_eq!(report.resets, 0);
+    assert!(!is_save_turn(&model.requests()[0]));
+}
+
+/// A segment that may not write memory keeps no notes past its op. A later
+/// attended op with write tools never reads them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_op_keeps_no_notes() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        turn(&[save("s1", "forward the invoices")]),
+        answer("saved", 1),
+        answer("no notes", 1),
+    ]);
+    let profile = AgentProfile::new("auditor")
+        .read_only()
+        .context_reset(ContextReset::new(1, 90));
+    let mut rt = runtime(&db, AgentHarness::new(model.clone()).agent(profile));
+    let agent = agent_id("acct-4");
+    for text in ["read the inbox", "what now?"] {
+        sqlite::send(&mut rt, &agent, &AgentOp::message(text), None).unwrap();
+    }
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+
+    let state = sqlite::state(&rt, &agent).await.unwrap().unwrap();
+    assert_eq!(state.notes, None);
+    let last = model.requests().pop().unwrap();
+    let calls = shape(&last.messages)
+        .into_iter()
+        .filter(|(role, text)| *role == ChatRole::Assistant && text.starts_with("call"))
+        .count();
+    assert_eq!(calls, 1, "only the call of op 1 itself, no restored copy");
 }
 
 /// AC 6: a durable agent has `window = 4`. A note of op 1 is in the request
@@ -469,6 +592,7 @@ fn crash_script() -> Vec<Reply> {
     vec![
         turn(&[save("s1", "rows 1 to 9 are fine"), big("c1")]),
         turn(&[big("c2")]),
+        turn(&[save("s2", "rows 1 to 9 are fine")]),
         answer("all rows are fine", 1),
     ]
 }
@@ -528,7 +652,7 @@ async fn child_crashes_right_after_a_reset() {
     let (Some(db), Some(log_path)) = (std::env::var_os(DB_ENV), std::env::var_os(LOG_ENV)) else {
         return;
     };
-    let model = logged(crash_script(), Path::new(&log_path), "child", Some(3));
+    let model = logged(crash_script(), Path::new(&log_path), "child", Some(4));
     let mut rt = runtime(Path::new(&db), harness(model));
     let exec = sqlite::start(&mut rt, &task(Some(ContextReset::new(1, 50)))).unwrap();
     std::fs::write(Path::new(&db).with_extension("exec"), exec.to_string()).unwrap();
@@ -573,16 +697,17 @@ async fn crash_after_a_reset_replays_the_same_window() {
     let before = logged_requests(&log_path, "child");
     assert_eq!(
         before.len(),
-        3,
-        "the child dies inside the third model call"
+        4,
+        "the child dies inside the fourth model call"
     );
+    assert!(is_save_turn(&before[2]));
     assert!(
-        holds_no_big_result(&before[2]),
-        "the third call follows the reset"
+        holds_no_big_result(&before[3]),
+        "the fourth call follows the reset"
     );
 
     let mut rest = crash_script();
-    rest.drain(..2);
+    rest.drain(..3);
     let model = logged(rest, &log_path, "parent", None);
     let mut rt = runtime(&db, harness(model));
     let exec: ExecutionId = std::fs::read_to_string(db.with_extension("exec"))
@@ -597,16 +722,18 @@ async fn crash_after_a_reset_replays_the_same_window() {
 
     let after = logged_requests(&log_path, "parent");
     assert_eq!(after.len(), 1, "only the call in flight is sent again");
-    assert_eq!(after[0], before[2], "replay rebuilds the same window");
+    assert_eq!(after[0], before[3], "replay rebuilds the same window");
+    // The cache key hashes the model id, the tools and the messages.
     let cache = response_cache(&Arc::new(MemStore::default()));
     let key = |request: &ChatRequest| cache.key(KeyTenant::None, "m", request).unwrap();
-    assert_eq!(key(&after[0]), key(&before[2]));
+    assert_eq!(key(&after[0]), key(&before[3]));
+    assert_ne!(key(&after[0]), key(&before[2]), "the key sees the reset");
 }
 
-/// A reset in a follow-up segment restarts from the task, not from the wake
-/// message. That message points at a call that the reset drops.
+/// A reset in a follow-up segment keeps the task, the booked call and the
+/// wake message. The wake message points at that call.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_reset_in_a_followup_segment_restarts_from_the_task() {
+async fn a_reset_in_a_followup_segment_keeps_the_followup_call() {
     let (_dir, db) = fresh_db();
     let followup = (
         "f1".to_owned(),
@@ -619,6 +746,7 @@ async fn a_reset_in_a_followup_segment_restarts_from_the_task() {
         // The follow-up segment.
         turn(&[big("c1")]),
         turn(&[big("c2")]),
+        turn(&[save("s2", "rows are fine; totals next")]),
         answer("totals are fine", 1),
     ]);
     let mut rt = runtime(&db, harness(model.clone()));
@@ -634,19 +762,26 @@ async fn a_reset_in_a_followup_segment_restarts_from_the_task() {
     assert_eq!(report.stop, AgentStop::Completed);
     assert_eq!(report.followups, 1);
     assert_eq!(report.resets, 1);
-    let after = &model.requests()[4];
+    let requests = model.requests();
+    let after = shape(&requests[5].messages);
+    let followup_call = format!("call {} ", autumn_harvest_agent::followup::FOLLOWUP_TOOL);
+    assert_eq!(after.len(), 7, "{after:?}");
+    assert_eq!(after[0], (ChatRole::System, "You audit.".to_owned()));
+    assert_eq!(after[1], (ChatRole::User, "audit the ledger".to_owned()));
+    // The booked call stays, so the wake message still points at it.
+    assert_eq!(after[2], (ChatRole::Assistant, followup_call));
+    assert_eq!(after[3], (ChatRole::Tool, "result".to_owned()));
+    assert_eq!(after[4].0, ChatRole::User);
+    assert!(after[4].1.starts_with("[Scheduled follow-up]"), "{after:?}");
     assert_eq!(
-        shape(&after.messages),
-        [
-            (ChatRole::System, "You audit.".to_owned()),
-            (ChatRole::User, "audit the ledger".to_owned()),
-            (
-                ChatRole::Assistant,
-                format!("call {SAVE_PROGRESS_TOOL} rows are fine")
-            ),
-            (ChatRole::Tool, "result".to_owned()),
-        ]
+        after[5],
+        (
+            ChatRole::Assistant,
+            format!("call {SAVE_PROGRESS_TOOL} rows are fine; totals next")
+        )
     );
+    let text = json!(requests[5].messages).to_string();
+    assert!(text.contains("check the totals"), "{text}");
 }
 
 /// A reset keeps each steer of the op after the notes, so it never drops a
@@ -662,6 +797,7 @@ async fn a_reset_keeps_the_steers_of_the_op() {
         )),
         turn(&[save("s1", "rows 1 to 5 are fine"), big("c1")]),
         turn(&[big("c2")]),
+        turn(&[save("s2", "rows 1 to 8 are fine")]),
         answer("row 9 is fine too", 1),
     ]);
     let mut profile = AgentProfile::new("auditor").context_reset(ContextReset::new(1, 50));
@@ -683,14 +819,14 @@ async fn a_reset_keeps_the_steers_of_the_op() {
     sqlite::drive(&mut rt, &agent).await.unwrap();
 
     let requests = model.requests();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
     assert_eq!(
-        shape(&requests[3].messages),
+        shape(&requests[4].messages),
         [
             (ChatRole::User, "audit the ledger".to_owned()),
             (
                 ChatRole::Assistant,
-                format!("call {SAVE_PROGRESS_TOOL} rows 1 to 5 are fine")
+                format!("call {SAVE_PROGRESS_TOOL} rows 1 to 8 are fine")
             ),
             (ChatRole::Tool, "result".to_owned()),
             (ChatRole::User, "also check row 9".to_owned()),

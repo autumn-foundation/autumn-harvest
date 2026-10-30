@@ -1844,13 +1844,14 @@ impl AgentRun<'_> {
         }
         let mut outcome = None;
         let mut kept = false;
+        let mut silent = false;
         match result {
             Ok(stop) => {
                 let answer = progress.delivered_text(&progress.last_text).to_owned();
                 // A silent tick leaves the conversation as it was. So does a
                 // budget refusal: no model read the input. A requeued user
                 // message appends it again when it runs.
-                let silent = matches!(mode, Mode::Heartbeat(_)) && is_silent(&answer);
+                silent = matches!(mode, Mode::Heartbeat(_)) && is_silent(&answer);
                 kept = !silent && !refused;
                 if kept {
                     // The state keeps the notes, so the transcript holds no
@@ -1888,6 +1889,12 @@ impl AgentRun<'_> {
             // The transcript dropped the steer text, so the steer op must
             // run as its own op later.
             state.steer.steered = steered_before;
+        }
+        // The notes last past the op, as a memory note does. So only a
+        // segment that may write memory keeps them. A silent tick leaves
+        // them as they were, as it leaves the conversation.
+        if progress.restore_notes && task.memory_writable() && !silent {
+            state.notes = progress.notes.take();
         }
         (state, outcome)
     }
@@ -1971,10 +1978,6 @@ fn fold_segment(state: &mut AgentState, progress: &mut Progress, tree: Tree) {
     // A memory edit is part of the op, so it commits with the snapshot.
     if let Some(memory) = progress.memory.take() {
         state.memory = memory;
-    }
-    // So does a notes edit.
-    if progress.restore_notes {
-        state.notes = progress.notes.take();
     }
     if let Some(until_ms) = progress.parked_until.take() {
         state.status = AgentStatus::Parked { until_ms };

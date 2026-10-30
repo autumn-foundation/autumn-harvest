@@ -4,9 +4,10 @@
 //! `percent` of the request cap. `reset_due` adds the reset budget. The
 //! copies below prove that no step overflows and that each one equals its
 //! spec. The theorems show that a request over the cap always reaches the
-//! threshold. With a reset left, the loop therefore resets before it ends
-//! the run as `transcript_full`. A zero cap never resets, and no reset
-//! passes `max_resets`.
+//! threshold. So the check before a request finds a reset due while one is
+//! left. A zero cap never resets, and no reset passes `max_resets`. A tool
+//! round that passes the cap ends the run before that check, and these
+//! theorems do not cover it.
 
 use vstd::prelude::*;
 
@@ -69,8 +70,7 @@ pub fn reset_due(resets: u32, max_resets: u32, len: u64, cap: u64, percent: u8) 
     resets < max_resets && reaches_percent(len, cap, percent)
 }
 
-/// A request over the cap reaches the threshold for every percent. So a
-/// run with a reset left resets before the cap ends it.
+/// A request over the cap reaches the threshold for every percent.
 pub proof fn theorem_a_request_over_the_cap_reaches_the_threshold(len: int, cap: int, percent: int)
     requires
         0 < cap < len,

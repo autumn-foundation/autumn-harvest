@@ -146,7 +146,7 @@ pub const fn reaches_percent(len: u64, cap: u64, percent: u8) -> bool {
 ///
 /// It is due when the run used fewer than `max_resets` resets and the
 /// request reaches `percent` of `cap`. A request over the cap always
-/// reaches it, so a run with a reset left resets before the cap ends it.
+/// reaches it. A tool round can still pass the cap first and end the run.
 /// `formal/verus/src/agent_reset.rs` proves it for every input.
 #[must_use]
 pub const fn reset_due(resets: u32, max_resets: u32, len: u64, cap: u64, percent: u8) -> bool {
