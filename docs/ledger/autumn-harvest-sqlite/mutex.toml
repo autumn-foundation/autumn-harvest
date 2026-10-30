@@ -6,6 +6,7 @@ backend = ["sqlite"]
 kind = ["read", "write"]
 tables = ["harvest_mutex_locks", "harvest_mutex_seq", "harvest_mutex_waiters"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/mutex.md"
 
 ["drop_stale_waits"]
 driver = "per_task"
@@ -13,6 +14,7 @@ backend = ["sqlite"]
 kind = ["read", "write"]
 tables = ["harvest_mutex_waiters"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/mutex.md"
 
 ["release"]
 driver = "per_task"
@@ -20,6 +22,7 @@ backend = ["sqlite"]
 kind = ["write"]
 tables = ["harvest_mutex_locks"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/mutex.md"
 
 ["release_all"]
 driver = "per_task"
@@ -27,3 +30,4 @@ backend = ["sqlite"]
 kind = ["write"]
 tables = ["harvest_mutex_locks", "harvest_mutex_waiters"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/mutex.md"

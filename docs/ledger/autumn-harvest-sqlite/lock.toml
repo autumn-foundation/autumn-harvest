@@ -6,6 +6,7 @@ backend = ["sqlite"]
 kind = ["write"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/lock.md"
 
 ["acquire_memory"]
 driver = "setup"
@@ -13,3 +14,4 @@ backend = ["sqlite"]
 kind = ["ddl"]
 tables = []
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/lock.md"

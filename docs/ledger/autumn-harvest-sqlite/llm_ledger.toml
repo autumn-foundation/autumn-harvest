@@ -6,6 +6,7 @@ backend = ["sqlite"]
 kind = ["write"]
 tables = ["harvest_llm_ledger"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/llm_ledger.md"
 
 ["rows_between"]
 driver = "per_request"
@@ -13,6 +14,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_llm_ledger"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/llm_ledger.md"
 
 ["rows_of"]
 driver = "per_request"
@@ -20,6 +22,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_llm_ledger"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/llm_ledger.md"
 
 ["table_exists"]
 driver = "setup"
@@ -27,3 +30,4 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_llm_ledger"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/llm_ledger.md"

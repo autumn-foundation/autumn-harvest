@@ -6,6 +6,7 @@ backend = ["sqlite"]
 kind = ["ddl", "read", "write"]
 tables = ["entity"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/entity_sql.md"
 
 ["run_cancellable"]
 driver = "per_request"
@@ -13,3 +14,4 @@ backend = ["sqlite"]
 kind = []
 tables = []
 measured = "docs/performance-entity-sql.md"
+plan = "docs/ledger/plans/autumn-harvest/entity_sql.md"

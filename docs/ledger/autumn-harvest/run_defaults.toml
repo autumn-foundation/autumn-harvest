@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_run_default_overrides"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/run_defaults.md"
 
 ["db::lock_type"]
 driver = "per_request"
