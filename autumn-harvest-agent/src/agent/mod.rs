@@ -1821,7 +1821,7 @@ impl AgentRun<'_> {
         if task.memory_in_state {
             progress.memory = Some(open_memory(&mut state, &mut task, &mut tree));
         }
-        open_notes(&task, &state, &mut progress, &mut tree);
+        open_notes(&mut task, &state, &mut progress, &mut tree);
         let run = Run {
             task: &task,
             agent: peer
@@ -1996,9 +1996,16 @@ fn keep_segment(task: &AgentTask, state: &mut AgentState, progress: &mut Progres
 
 /// Give a segment of `task` the notes of the agent (issue #2453). The
 /// segment reads them, so it takes their labels.
-fn open_notes(task: &AgentTask, state: &AgentState, progress: &mut Progress, tree: &mut Tree) {
+///
+/// A segment that may not write memory keeps no notes. A reset would drop
+/// the history of the agent and keep no summary of it. So such a segment
+/// gets no reset and no `save_progress` tool. It still reads the notes.
+fn open_notes(task: &mut AgentTask, state: &AgentState, progress: &mut Progress, tree: &mut Tree) {
     if task.context_reset.is_none() {
         return;
+    }
+    if !task.memory_writable() {
+        task.context_reset = None;
     }
     if let Some(notes) = &state.notes {
         tree.exercised.extend(notes.labels.iter().cloned());

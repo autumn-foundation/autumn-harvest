@@ -8,9 +8,11 @@
 //! the request reaches [`ContextReset::reset_at_percent`] of the cap and a
 //! reset is left, the loop first asks for a save turn. It sends the window
 //! with [`RESET_NOTICE`], and only `save_progress` runs in that round. Then
-//! the loop resets. The new window holds the system prompt, the task and the
-//! notes. The reset reads only recorded data, so replay takes the same
-//! reset. `docs/design/DESIGN-2453.md` records the design.
+//! the loop resets. The new window holds the system prompt, the task, the
+//! follow-up bookings, the notes and the steers. With no room for a save
+//! turn, the loop resets at once. A reset that frees no room does not run.
+//! The reset reads only recorded data, so replay takes the same reset.
+//! `docs/design/DESIGN-2453.md` records the design.
 //!
 //! The model wrote the notes, maybe under the influence of a tool result.
 //! So the notes never go into a user message. The window shows them as the
@@ -59,8 +61,9 @@ const fn default_max_notes_bytes() -> u32 {
 pub struct ContextReset {
     /// The most resets in one run, follow-ups included.
     pub max_resets: u32,
-    /// Reset before a request that reaches this percent of the request cap.
-    /// 0 counts as 1, and a value over 100 counts as 100.
+    /// A request that reaches this percent of the request cap makes a reset
+    /// due. 0 counts as 1, and a value over 100 counts as 100. The loop
+    /// first asks for a save turn, then resets before the next request.
     pub reset_at_percent: u8,
     /// The bound on the notes, in bytes.
     #[serde(default = "default_max_notes_bytes")]

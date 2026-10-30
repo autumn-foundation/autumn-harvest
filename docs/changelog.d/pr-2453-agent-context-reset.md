@@ -3,12 +3,12 @@
 `ContextReset` is a new operator setting on `AgentTask` and
 `AgentProfile`. It is off by default. With it on, the model gets the
 `save_progress` tool. The workflow handles the call itself, as it handles
-`schedule_followup`. Before each request, the loop measures the request. When
-it reaches `reset_at_percent` of the request cap and a reset is left, the
-loop first asks for a save turn: a fixed notice, and a round where only
-`save_progress` runs. The reset runs before the next request. The new window
-is the system prompt, the task, the last `schedule_followup` call and the
-notes. The steers of a durable agent op follow.
+`schedule_followup`. Before each request, the loop measures the request. A
+request that reaches `reset_at_percent` of the cap makes a reset due. The
+loop then asks for a save turn. It sends a fixed notice, and only
+`save_progress` runs in that round. The reset runs before the next request.
+The new window is the system prompt, the task, the follow-up bookings and
+the notes. The steers of a durable agent op follow.
 
 Design decisions (`docs/design/DESIGN-2453.md`):
 
@@ -22,7 +22,8 @@ Design decisions (`docs/design/DESIGN-2453.md`):
 - A durable agent keeps the notes in `AgentState::notes`, with their flow
   labels. Each op shows them after its input. The transcript holds no copy,
   so `trim_window` never drops them. Only a segment that may write memory
-  keeps them. `Control::ClearTranscript` clears them.
+  keeps them, and only such a segment gets the reset and the tool.
+  `Control::ClearTranscript` clears them.
 - A delegated child takes the setting and starts with no notes.
 - `AgentReport::resets` and `DelegationRecord::resets` count the resets.
   Neither is written when zero.

@@ -679,17 +679,21 @@ let task = AgentTask::new("audit the ledger")
   [Payload caps](#payload-caps-issue-2040). When the request reaches
   `reset_at_percent` of the cap and a reset is left, a reset is due. 0 counts
   as 1, and a value over 100 counts as 100. A zero cap is no cap, so it never
-  resets. A reset whose window still reaches the threshold frees no room, so
-  it does not run.
+  resets. The loop measures the reset window with the notes of that time. A
+  reset whose window still reaches the threshold frees no room, so it does
+  not run.
 - A due reset first asks for a save turn. The loop sends the window with the
   fixed notice `RESET_NOTICE`. The model reads the last round, and only
-  `save_progress` runs in that turn. Each other call gets an error result. The
-  reset runs before the next request. When the notice does not fit the cap,
-  the reset runs at once.
-- The new window is the system prompt and `AgentTask::input`. The last
-  `schedule_followup` call with its result, and the wake message of a
-  follow-up segment, follow. Then the notes and the steers of a durable agent
-  op follow.
+  `save_progress` runs in that turn. Each other call gets an error result.
+- The reset runs before the next request. It also runs when the save turn
+  answers in text, or when its round does not fit the cap. The reply to the
+  notice is no answer. A failed save keeps the earlier notes.
+- The save turn needs room under the cap for the notice and
+  `max_notes_bytes`. Without that room, the reset runs at once.
+- The new window is the system prompt and `AgentTask::input`. In a segment
+  that a follow-up woke, the booking that woke it and the wake message
+  follow. A booking of the segment itself follows them. Then the notes and
+  the steers of a durable agent op follow.
 - The notes are the model's own `save_progress` call, with a fixed result.
   The model wrote them, maybe under the influence of a tool result, so they
   never go into a user message.
@@ -1136,10 +1140,11 @@ as an agent.
   an op with notes therefore goes in full, not as a delta.
 - An op that reads the notes takes their labels, so the taint follows the
   text.
-- Only a segment that may write memory keeps its notes past the op. A
-  read-only op, a heartbeat tick, a follow-up and a peer message keep none,
-  unless the segment has `unattended_memory_writes`. Such a segment can read
-  untrusted data, and a later op with write tools reads the notes.
+- Only a segment that may write memory gets the reset and the
+  `save_progress` tool. A read-only op, a heartbeat tick, a follow-up and a
+  peer message get neither, unless the segment has
+  `unattended_memory_writes`. Such a segment can read untrusted data, and a
+  later op with write tools reads the notes. It still reads the notes.
 - A silent tick or a failed op keeps no transcript, so it changes no notes
   either.
 - `Control::ClearTranscript` clears the notes too.

@@ -1,6 +1,7 @@
 //! Progress notes and a context reset inside one agent run (issue #2453).
 //!
-//! Each test maps to one acceptance criterion of `docs/design/DESIGN-2453.md`.
+//! A test labelled "AC n" proves the nth acceptance criterion of issue #2453.
+//! `docs/design/DESIGN-2453.md` maps each test to its rule.
 //! The request cap is 20 000 bytes and the reset threshold is 50 % of it. A
 //! `big` tool result of 7 000 bytes takes the next request over the
 //! threshold on the second call. That request is the save turn. The reset
@@ -58,6 +59,12 @@ fn harness(model: Arc<dyn AgentModel>) -> AgentHarness {
     AgentHarness::new(model)
         .tool(big_tool())
         .tool_output_limit(usize::MAX)
+}
+
+/// A reset at 50 % of the cap. A save turn reserves room for the notes, so
+/// the notes bound is small enough for the test cap.
+const fn setting(max_resets: u32) -> ContextReset {
+    ContextReset::new(max_resets, 50).max_notes_bytes(1_000)
 }
 
 /// The task of every test, with a reset at 50 % of the cap when `reset` is
@@ -196,7 +203,7 @@ async fn a_run_resets_once_and_restarts_from_its_notes() {
     ]);
     let mut rt = runtime(&db, harness(model.clone()));
 
-    let reset = ContextReset::new(1, 50);
+    let reset = setting(1);
     let exec = sqlite::start(&mut rt, &task(Some(reset))).unwrap();
     let report = report(rt.run_until_blocked(exec).await.unwrap());
 
@@ -259,7 +266,7 @@ async fn a_second_overflow_after_the_cap_is_spent_ends_the_run() {
     ]);
     let mut rt = runtime(&db, harness(model.clone()));
 
-    let exec = sqlite::start(&mut rt, &task(Some(ContextReset::new(1, 50)))).unwrap();
+    let exec = sqlite::start(&mut rt, &task(Some(setting(1)))).unwrap();
     let report = report(rt.run_until_blocked(exec).await.unwrap());
 
     assert_eq!(report.stop, AgentStop::TranscriptFull);
@@ -287,7 +294,7 @@ async fn oversized_notes_are_refused_and_the_old_notes_stay() {
     ]);
     let mut rt = runtime(&db, harness(model.clone()));
 
-    let reset = ContextReset::new(1, 50).max_notes_bytes(16);
+    let reset = setting(1).max_notes_bytes(16);
     let exec = sqlite::start(&mut rt, &task(Some(reset))).unwrap();
     let report = report(rt.run_until_blocked(exec).await.unwrap());
 
@@ -344,7 +351,7 @@ async fn a_reset_clears_no_taint() {
         ));
     let mut rt = runtime(&db, harness);
 
-    let exec = sqlite::start(&mut rt, &task(Some(ContextReset::new(1, 50)))).unwrap();
+    let exec = sqlite::start(&mut rt, &task(Some(setting(1)))).unwrap();
     let report = report(rt.run_until_blocked(exec).await.unwrap());
 
     assert_eq!(report.resets, 1);
@@ -384,8 +391,7 @@ async fn a_delegated_child_starts_with_no_notes() {
     let harness = harness(model.clone()).peer(Peer::new("helper", "Counts.").system("You count."));
     let mut rt = runtime(&db, harness);
 
-    let parent =
-        task(Some(ContextReset::new(1, 50))).mandate(Mandate::new("auditor").peers(["helper"]));
+    let parent = task(Some(setting(1))).mandate(Mandate::new("auditor").peers(["helper"]));
     let exec = sqlite::start(&mut rt, &parent).unwrap();
     let report = report(rt.run_until_blocked(exec).await.unwrap());
 
@@ -439,7 +445,7 @@ async fn a_save_turn_runs_only_save_progress() {
         harness(model.clone()).tool(recorded_tool("send", ToolEffect::External, &recorder));
     let mut rt = runtime(&db, harness);
 
-    let exec = sqlite::start(&mut rt, &task(Some(ContextReset::new(1, 50)))).unwrap();
+    let exec = sqlite::start(&mut rt, &task(Some(setting(1)))).unwrap();
     let report = report(rt.run_until_blocked(exec).await.unwrap());
 
     assert_eq!(report.resets, 1);
@@ -455,6 +461,89 @@ async fn a_save_turn_runs_only_save_progress() {
     );
 }
 
+/// A save turn that answers in text does not end the run. The reset runs,
+/// and the model goes on from its notes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_save_turn_that_answers_in_text_still_resets() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        turn(&[save("s1", "rows 1 to 6 are fine"), big("c1")]),
+        turn(&[big("c2")]),
+        answer("Understood.", 1),
+        answer("all rows are fine", 1),
+    ]);
+    let mut rt = runtime(&db, harness(model.clone()));
+
+    let exec = sqlite::start(&mut rt, &task(Some(setting(1)))).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert_eq!(
+        report.text, "all rows are fine",
+        "the notice reply is no answer"
+    );
+    assert_eq!(report.resets, 1);
+    let requests = model.requests();
+    assert!(is_save_turn(&requests[2]));
+    assert!(holds_no_big_result(&requests[3]));
+}
+
+/// A save round that does not fit the cap ends no run. The reset runs with
+/// the notes of that time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_save_round_over_the_cap_still_resets() {
+    let (_dir, db) = fresh_db();
+    // The save call comes first, and the round has no room for it.
+    let many: Vec<(String, String, Value)> = std::iter::once(save("s2", "rows 1 to 9 are fine"))
+        .chain((0..100).map(|n| big(&format!("m{n}"))))
+        .collect();
+    let model = ScriptedModel::new(vec![
+        turn(&[save("s1", "rows 1 to 6 are fine"), big("c1")]),
+        turn(&[big("c2")]),
+        turn(&many),
+        answer("all rows are fine", 1),
+    ]);
+    let mut rt = runtime(&db, harness(model.clone()));
+
+    let exec = sqlite::start(&mut rt, &task(Some(setting(1)))).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert_eq!(report.resets, 1);
+    // The save call did not run, so the earlier notes stay.
+    let after = shape(&model.requests()[3].messages);
+    assert_eq!(
+        after[2],
+        (
+            ChatRole::Assistant,
+            format!("call {SAVE_PROGRESS_TOOL} rows 1 to 6 are fine")
+        )
+    );
+}
+
+/// With no room for the notes of a save turn, the reset runs at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_no_room_for_the_notes_the_reset_runs_at_once() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        turn(&[save("s1", "rows 1 to 6 are fine"), big("c1")]),
+        turn(&[big("c2")]),
+        answer("all rows are fine", 1),
+    ]);
+    let mut rt = runtime(&db, harness(model.clone()));
+
+    // The default notes bound of 8 192 bytes does not fit under the cap.
+    let exec = sqlite::start(&mut rt, &task(Some(ContextReset::new(1, 50)))).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert_eq!(report.resets, 1);
+    let requests = model.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(!is_save_turn(&requests[2]));
+    assert!(holds_no_big_result(&requests[2]));
+}
+
 /// A reset whose window still reaches the threshold frees no room. It does
 /// not run, so it spends no reset and asks for no save turn.
 #[tokio::test(flavor = "multi_thread")]
@@ -463,7 +552,7 @@ async fn a_reset_that_frees_no_room_does_not_run() {
     let model = ScriptedModel::new(vec![answer("done", 1)]);
     let mut rt = runtime(&db, harness(model.clone()));
 
-    let wide = task(Some(ContextReset::new(3, 50))).system("s".repeat(11_000));
+    let wide = task(Some(setting(3))).system("s".repeat(11_000));
     let exec = sqlite::start(&mut rt, &wide).unwrap();
     let report = report(rt.run_until_blocked(exec).await.unwrap());
 
@@ -472,8 +561,8 @@ async fn a_reset_that_frees_no_room_does_not_run() {
     assert!(!is_save_turn(&model.requests()[0]));
 }
 
-/// A segment that may not write memory keeps no notes past its op. A later
-/// attended op with write tools never reads them.
+/// A segment that may not write memory gets no reset and no notes tool. A
+/// call to the tool fails, and the state keeps no notes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_only_op_keeps_no_notes() {
     let (_dir, db) = fresh_db();
@@ -494,6 +583,15 @@ async fn a_read_only_op_keeps_no_notes() {
 
     let state = sqlite::state(&rt, &agent).await.unwrap().unwrap();
     assert_eq!(state.notes, None);
+    for request in model.requests() {
+        assert!(
+            request
+                .tools
+                .iter()
+                .all(|tool| tool.name != SAVE_PROGRESS_TOOL),
+            "a read-only op gets no notes tool"
+        );
+    }
     let last = model.requests().pop().unwrap();
     let calls = shape(&last.messages)
         .into_iter()
@@ -654,7 +752,7 @@ async fn child_crashes_right_after_a_reset() {
     };
     let model = logged(crash_script(), Path::new(&log_path), "child", Some(4));
     let mut rt = runtime(Path::new(&db), harness(model));
-    let exec = sqlite::start(&mut rt, &task(Some(ContextReset::new(1, 50)))).unwrap();
+    let exec = sqlite::start(&mut rt, &task(Some(setting(1)))).unwrap();
     std::fs::write(Path::new(&db).with_extension("exec"), exec.to_string()).unwrap();
     let _ = rt.run_until_blocked(exec).await;
     panic!("the child must abort before the run ends");
@@ -752,7 +850,7 @@ async fn a_reset_in_a_followup_segment_keeps_the_followup_call() {
     let mut rt = runtime(&db, harness(model.clone()));
 
     let followups = autumn_harvest_agent::Followups::new(std::time::Duration::from_secs(600));
-    let task = task(Some(ContextReset::new(1, 50))).followups(followups);
+    let task = task(Some(setting(1))).followups(followups);
     let exec = sqlite::start(&mut rt, &task).unwrap();
     let waiting = rt.run_until_blocked(exec).await.unwrap();
     assert!(matches!(waiting, RunState::WaitingTimer), "{waiting:?}");
@@ -800,7 +898,7 @@ async fn a_reset_keeps_the_steers_of_the_op() {
         turn(&[save("s2", "rows 1 to 8 are fine")]),
         answer("row 9 is fine too", 1),
     ]);
-    let mut profile = AgentProfile::new("auditor").context_reset(ContextReset::new(1, 50));
+    let mut profile = AgentProfile::new("auditor").context_reset(setting(1));
     profile.max_request_bytes = Some(CAP);
     profile.loop_guard = LoopGuard::disabled();
     let mut rt = runtime(&db, harness(model.clone()).agent(profile));

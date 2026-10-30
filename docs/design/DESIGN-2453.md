@@ -10,8 +10,8 @@ A run whose transcript grows ends as `transcript_full` or
 turns whole, so a confirmed finding in an old turn goes too.
 
 CORAL gives the agent a working-memory toolset. The agent saves its progress,
-clears its context, and restarts from its notes only. We take the tools and
-the reset. This design does not take the RL training.
+clears its context, and restarts from its notes only. This design takes the
+tools and the reset. It does not take the RL training.
 
 ## 2. Brainstorming
 
@@ -45,7 +45,11 @@ Options for each open question. The chosen option is in bold.
 | The fixed result after the notes outranks a new message from a person. | The fixed result says that the user messages say what to do. |
 | A model fills the notes until the request is full again. | `max_notes_bytes` bounds the notes. A larger call gets an error result and leaves the notes unchanged. |
 | A window that is still over the threshold after a reset resets on every turn. | A reset runs only when its window falls under the threshold. `max_resets` bounds the run. |
-| A durable agent shows two copies of its notes. | The restored pair is stripped before `trim_window`. Each op adds one fresh pair. |
+| A durable agent shows two copies of its notes. | The agent strips the restored pair before `trim_window`. Each op adds one fresh pair. |
+| The save round does not fit the cap, so the run ends with a reset left. | The save turn reserves `max_notes_bytes`. A save round that still does not fit resets with the earlier notes. |
+| The model answers the notice in text, and that reply becomes the answer. | A text reply to the notice ends no segment. The reset runs next. |
+| A read-only durable op resets, drops the history and keeps no summary. | Only a segment that may write memory gets the reset. |
+| The reset window keeps a refused booking, not the one that woke the segment. | The segment records the booking that woke it when it opens. A refused call books nothing, so it never counts. |
 | A recorded run replays under new code. | A task with no `context_reset` field takes no new path. No patch gate is needed. |
 | A child reads the private notes of its parent. | A child starts with a new `Progress`, so it has no notes. |
 
@@ -89,18 +93,20 @@ pub struct ContextReset {
    reset runs only when its window falls under the threshold.
 3. A due reset first asks for a save turn. The loop sends the window with a
    fixed notice. In that round only `save_progress` runs. The reset runs
-   before the next request. When the notice does not fit the cap, the reset
-   runs at once.
-4. The new window is the system prompt and the task. The last
-   `schedule_followup` call with its result, and the wake message of a
-   follow-up segment, follow. Then the notes and the steers of the segment
+   before the next request, also after a text reply or a round over the cap.
+   When the notice and `max_notes_bytes` do not fit the cap, the reset runs
+   at once.
+4. The new window is the system prompt and the task. In a woken segment,
+   the booking that woke it and the wake message follow. A booking of the
+   segment itself follows them. Then the notes and the steers of the segment
    follow. The notes are a `save_progress` call with a fixed result.
 5. With no resets left, the loop works as before. A request over the cap ends
    the run as `transcript_full`.
 6. A durable agent keeps the notes in `AgentState::notes`, with their labels.
-   Each op shows them after its input. The restored pair is stripped before
-   `trim_window`. Only a segment that may write memory, and that keeps its
-   transcript, writes the notes. `Control::ClearTranscript` clears them.
+   Each op shows them after its input. The agent strips the restored pair
+   before `trim_window`. Only a segment that may write memory gets the reset
+   and the tool. Only such a segment that keeps its transcript writes the
+   notes. `Control::ClearTranscript` clears them.
 7. `AgentReport::resets` and `DelegationRecord::resets` count the resets.
    Neither is written when zero.
 8. A delegated child inherits the setting and starts with no notes.
@@ -122,6 +128,9 @@ All tests are in `autumn-harvest-agent/tests/context_reset.rs`.
 | A save turn runs only `save_progress` | `a_save_turn_runs_only_save_progress` |
 | A reset that frees no room does not run | `a_reset_that_frees_no_room_does_not_run` |
 | A follow-up reset keeps the booked call | `a_reset_in_a_followup_segment_keeps_the_followup_call` |
+| A text reply to the notice still resets | `a_save_turn_that_answers_in_text_still_resets` |
+| A save round over the cap still resets | `a_save_round_over_the_cap_still_resets` |
+| No room for the notes resets at once | `with_no_room_for_the_notes_the_reset_runs_at_once` |
 | A reset keeps the steers of the op | `a_reset_keeps_the_steers_of_the_op` |
 | A read-only op keeps no notes | `a_read_only_op_keeps_no_notes` |
 | Cap spent: the next overflow ends as `transcript_full` | `a_second_overflow_after_the_cap_is_spent_ends_the_run` |

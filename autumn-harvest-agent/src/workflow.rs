@@ -143,6 +143,9 @@ pub(crate) struct ResetState {
     /// The last turn was the save turn of a reset. The reset runs before
     /// the next request.
     pub(crate) pending: bool,
+    /// The booking that woke this segment, with its result. Each reset of
+    /// the segment keeps it, because the wake message points at it.
+    pub(crate) woken_by: Option<[ChatMessage; 2]>,
 }
 
 /// The steer messages of a durable agent (issue #2265).
@@ -662,6 +665,9 @@ async fn open_segment(
         messages.push(ChatMessage::text(ChatRole::System, system));
     }
     messages.append(&mut progress.messages);
+    if task.context_reset.is_some() && input == followup::WAKE_MESSAGE {
+        progress.reset.woken_by = booking(&messages);
+    }
     messages.push(ChatMessage::text(ChatRole::User, input));
     if progress.reset.restore
         && let Some(notes) = &progress.reset.notes
@@ -779,15 +785,12 @@ pub(crate) async fn run_segment(
         let calls = turn.calls();
 
         if calls.is_empty() {
+            if save_reply(progress, &turn, over_budget) {
+                continue;
+            }
             progress.push_assistant(&turn);
             progress.answer = Some(turn.text());
-            return Ok(if over_budget {
-                AgentStop::TokensExhausted
-            } else if turn.stop == StopReason::MaxTokens {
-                AgentStop::OutputCapped
-            } else {
-                AgentStop::Completed
-            });
+            return Ok(answer_stop(&turn, over_budget));
         }
         // A turn with calls that ends here is NOT added to the transcript. A
         // tool call with no result would make the transcript invalid for the
@@ -819,6 +822,8 @@ pub(crate) async fn run_segment(
 
         match Box::pin(run_round(ctx, run, progress, tree, slot, &turn, calls)).await? {
             RoundEnd::Continue => {}
+            // The reset of a save round runs next, with the notes it has.
+            RoundEnd::Full if progress.reset.pending => {}
             RoundEnd::Full => {
                 // Not every call ran, so the text of the turn is no answer.
                 // It can claim work that never ran.
@@ -833,6 +838,24 @@ pub(crate) async fn run_segment(
             }
         }
     }
+}
+
+/// How a segment ends on `turn`, a turn with no calls.
+fn answer_stop(turn: &ModelTurn, over_budget: bool) -> AgentStop {
+    if over_budget {
+        AgentStop::TokensExhausted
+    } else if turn.stop == StopReason::MaxTokens {
+        AgentStop::OutputCapped
+    } else {
+        AgentStop::Completed
+    }
+}
+
+/// Whether a turn with no calls is the text reply to a save turn (issue
+/// #2453). Such a reply has not ended the task. The reset drops it and runs
+/// before the next request. A bound that ends the run still ends it.
+fn save_reply(progress: &Progress, turn: &ModelTurn, over_budget: bool) -> bool {
+    progress.reset.pending && !over_budget && turn.stop != StopReason::MaxTokens
 }
 
 /// The next request and its size, after a context reset when one is due
@@ -871,9 +894,10 @@ fn sized_request(
 /// reads each result before the reset drops it. The reset runs before the
 /// next request.
 ///
-/// The save turn needs room under the cap. Without room, the reset runs at
-/// once. A reset whose window still reaches the threshold frees no room, so
-/// it does not run. It would only spend the next reset.
+/// The save turn needs room under the cap for the notice and the notes.
+/// Without room, the reset runs at once. A reset whose window, with the
+/// notes of that time, still reaches the threshold frees no room. So it does
+/// not run, because it would only spend the next reset.
 fn plan_reset(
     run: Run<'_>,
     progress: &mut Progress,
@@ -913,7 +937,7 @@ fn plan_reset(
         extra_tools,
         noticed.clone(),
     ));
-    if noticed_len > cap {
+    if noticed_len.saturating_add(u64::from(setting.max_notes_bytes)) > cap {
         return Some(reset_now(run.task, progress, input));
     }
     progress.reset.pending = true;
@@ -930,23 +954,36 @@ fn reset_now(task: &AgentTask, progress: &mut Progress, input: &str) -> Vec<Chat
 
 /// The window after a reset (issue #2453).
 ///
-/// It holds the system prompt and the task. Then it holds the last
-/// `schedule_followup` call with its result, and the input of a segment
-/// that a follow-up woke. The wake message points at that call. Then the
-/// notes follow, and last the steers of the segment.
+/// It holds the system prompt and the task. In a segment that a follow-up
+/// woke, the booking that woke it follows. The wake message points at that
+/// booking, so the wake message comes next. The booking that this segment
+/// made follows that. Then the notes follow, and last the steers.
 fn reset_window(task: &AgentTask, progress: &Progress, input: &str) -> Vec<ChatMessage> {
-    let mut window = Vec::with_capacity(8 + progress.steers.len());
+    let messages = &progress.messages;
+    let mut window = Vec::with_capacity(10 + progress.steers.len());
     window.extend(
-        progress
-            .messages
+        messages
             .first()
             .filter(|message| message.role == ChatRole::System)
             .cloned(),
     );
     window.push(ChatMessage::text(ChatRole::User, task.input.clone()));
-    window.extend(last_followup(&progress.messages).into_iter().flatten());
+    // The segment starts at its last input message.
+    let start = messages
+        .iter()
+        .rposition(|message| {
+            message.role == ChatRole::User
+                && message.content == [ContentPart::Text(input.to_owned())]
+        })
+        .unwrap_or(0);
+    if input == followup::WAKE_MESSAGE {
+        window.extend(progress.reset.woken_by.iter().flatten().cloned());
+    }
     if input != task.input {
         window.push(ChatMessage::text(ChatRole::User, input));
+    }
+    if progress.followup.is_some() {
+        window.extend(booking(&messages[start..]).into_iter().flatten());
     }
     if let Some(notes) = &progress.reset.notes {
         window.extend(context_reset::restored(&notes.text));
@@ -955,34 +992,57 @@ fn reset_window(task: &AgentTask, progress: &Progress, input: &str) -> Vec<ChatM
     window
 }
 
-/// The last `schedule_followup` call of `messages`, alone in its message,
-/// and its result. `None` when no such call has a result.
-fn last_followup(messages: &[ChatMessage]) -> Option<[ChatMessage; 2]> {
-    let (id, call) = messages.iter().rev().find_map(|message| {
-        message.content.iter().rev().find_map(|part| match part {
-            ContentPart::ToolCall { id, name, .. }
-                if message.role == ChatRole::Assistant && name == FOLLOWUP_TOOL =>
-            {
-                Some((id.clone(), part.clone()))
+/// The last `schedule_followup` call of `messages` that booked a follow-up,
+/// alone in its message, and its result. A refused call books nothing, so
+/// it does not count.
+fn booking(messages: &[ChatMessage]) -> Option<[ChatMessage; 2]> {
+    let calls = messages.iter().rev().flat_map(|message| {
+        message
+            .content
+            .iter()
+            .rev()
+            .filter(move |_| message.role == ChatRole::Assistant)
+    });
+    let (call, result) = calls
+        .filter_map(|part| match part {
+            ContentPart::ToolCall { id, name, .. } if name == FOLLOWUP_TOOL => {
+                result_of(messages, id).map(|result| (part, result))
             }
             _ => None,
         })
-    })?;
-    let result = messages.iter().find_map(|message| {
-        message.content.iter().find(|part| {
-            matches!(part, ContentPart::ToolResult { tool_call_id, .. } if *tool_call_id == id)
-        })
-    })?;
+        .find(|(_, result)| booked(result))?;
     Some([
         ChatMessage {
             role: ChatRole::Assistant,
-            content: vec![call],
+            content: vec![call.clone()],
         },
         ChatMessage {
             role: ChatRole::Tool,
             content: vec![result.clone()],
         },
     ])
+}
+
+/// The result part of the call `id` in `messages`.
+fn result_of<'a>(messages: &'a [ChatMessage], id: &str) -> Option<&'a ContentPart> {
+    messages.iter().find_map(|message| {
+        message.content.iter().find(
+            |part| matches!(part, ContentPart::ToolResult { tool_call_id, .. } if tool_call_id == id),
+        )
+    })
+}
+
+/// Whether a `schedule_followup` result booked a follow-up. The loop guard
+/// can add a note after the JSON, so only the first value counts.
+fn booked(result: &ContentPart) -> bool {
+    let ContentPart::ToolResult { content, .. } = result else {
+        return false;
+    };
+    serde_json::Deserializer::from_str(content)
+        .into_iter::<serde_json::Value>()
+        .next()
+        .and_then(Result::ok)
+        .is_some_and(|value| value["scheduled"] == true)
 }
 
 /// One model turn. A durable agent races it against an interrupt.
@@ -2851,7 +2911,8 @@ mod tests {
 
     /// A run of a task, a window and the request size of that window.
     fn reset_fixture() -> (AgentTask, Progress, u64) {
-        let task = AgentTask::new("audit").context_reset(crate::ContextReset::new(1, 50));
+        let setting = crate::ContextReset::new(1, 50).max_notes_bytes(100);
+        let task = AgentTask::new("audit").context_reset(setting);
         let progress = Progress::new(
             "r".into(),
             vec![
@@ -2917,9 +2978,21 @@ mod tests {
     fn with_no_room_for_a_save_turn_the_reset_runs_at_once() {
         let (mut task, mut progress, len) = reset_fixture();
         task.max_request_bytes = Some(len);
-        task.context_reset = Some(crate::ContextReset::new(1, 100));
+        task.context_reset = Some(crate::ContextReset::new(1, 100).max_notes_bytes(100));
         let window = plan(&task, &mut progress, len).expect("the reset");
         assert!(!progress.reset.pending);
+        assert_eq!(progress.reset.count, 1);
+        assert_eq!(window, vec![ChatMessage::text(ChatRole::User, "audit")]);
+    }
+
+    #[test]
+    fn the_save_turn_needs_room_for_the_notes() {
+        let (mut task, mut progress, len) = reset_fixture();
+        // The notice fits, but the notes of a save turn would not.
+        task.max_request_bytes = Some(len + 1_000);
+        task.context_reset = Some(crate::ContextReset::new(1, 50).max_notes_bytes(5_000));
+        let window = plan(&task, &mut progress, len).expect("the reset");
+        assert!(!progress.reset.pending, "no save turn");
         assert_eq!(progress.reset.count, 1);
         assert_eq!(window, vec![ChatMessage::text(ChatRole::User, "audit")]);
     }
@@ -2935,39 +3008,123 @@ mod tests {
         assert!(!progress.reset.pending);
     }
 
-    #[test]
-    fn the_last_followup_call_stays_alone_with_its_result() {
-        let call = |id: &str, name: &str| ContentPart::ToolCall {
+    fn followup_call(id: &str) -> ContentPart {
+        ContentPart::ToolCall {
             id: id.into(),
-            name: name.into(),
-            arguments: serde_json::json!({}),
-        };
-        let result = |id: &str| ContentPart::ToolResult {
+            name: FOLLOWUP_TOOL.into(),
+            arguments: serde_json::json!({"prompt": id, "delay_minutes": 1}),
+        }
+    }
+
+    fn result(id: &str, content: &str) -> ContentPart {
+        ContentPart::ToolResult {
             tool_call_id: id.into(),
-            content: "ok".into(),
-        };
+            content: content.into(),
+        }
+    }
+
+    fn assistant(content: Vec<ContentPart>) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Assistant,
+            content,
+        }
+    }
+
+    fn tool(content: Vec<ContentPart>) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Tool,
+            content,
+        }
+    }
+
+    #[test]
+    fn a_booking_is_the_last_call_that_booked() {
+        let booked = r#"{"in_minutes":1,"scheduled":true}"#;
+        let refused = ToolOutcome::error("a follow-up is already scheduled").content;
         let messages = vec![
             ChatMessage::text(ChatRole::User, "task"),
-            ChatMessage {
-                role: ChatRole::Assistant,
-                content: vec![
-                    ContentPart::Text("booking".into()),
-                    call("a", "lookup"),
-                    call("f", FOLLOWUP_TOOL),
-                ],
-            },
-            ChatMessage {
-                role: ChatRole::Tool,
-                content: vec![result("a"), result("f")],
-            },
+            assistant(vec![
+                ContentPart::Text("booking".into()),
+                ContentPart::ToolCall {
+                    id: "a".into(),
+                    name: "lookup".into(),
+                    arguments: serde_json::json!({}),
+                },
+                followup_call("f1"),
+            ]),
+            // The loop guard can add a note after the JSON.
+            tool(vec![
+                result("a", "ok"),
+                result("f1", &format!("{booked}\n[note]")),
+            ]),
+            assistant(vec![followup_call("f2")]),
+            tool(vec![result("f2", &refused)]),
+            assistant(vec![followup_call("f3")]),
+            tool(vec![result(
+                "f3",
+                &ToolOutcome::error(NOT_RUN_RESET).content,
+            )]),
         ];
-        let [kept_call, kept_result] = last_followup(&messages).expect("the call");
-        assert_eq!(kept_call.content, vec![call("f", FOLLOWUP_TOOL)]);
-        assert_eq!(kept_result.content, vec![result("f")]);
+        let [call, answer] = booking(&messages).expect("the booking");
+        assert_eq!(call.content, vec![followup_call("f1")]);
+        assert_eq!(answer.content.len(), 1);
+        assert!(booked_part(&answer.content[0]));
+        assert!(booking(&messages[..2]).is_none(), "a call with no result");
         assert!(
-            last_followup(&messages[..2]).is_none(),
-            "a call with no result"
+            booking(&messages[3..]).is_none(),
+            "refused calls book nothing"
         );
+    }
+
+    fn booked_part(part: &ContentPart) -> bool {
+        booked(part)
+    }
+
+    #[test]
+    fn a_woken_window_keeps_the_booking_that_woke_it() {
+        let booked = r#"{"in_minutes":1,"scheduled":true}"#;
+        let task = AgentTask::new("audit").system("s");
+        let mut progress = Progress::new(
+            "r".into(),
+            vec![
+                ChatMessage::text(ChatRole::System, "s"),
+                ChatMessage::text(ChatRole::User, "audit"),
+                assistant(vec![followup_call("f1")]),
+                tool(vec![result("f1", booked)]),
+                ChatMessage::text(ChatRole::User, followup::WAKE_MESSAGE),
+                // This segment books again.
+                assistant(vec![followup_call("f2")]),
+                tool(vec![result("f2", booked)]),
+            ],
+        );
+        progress.followup = Some(Planned { delay_secs: 60 });
+        progress.reset.woken_by = booking(&progress.messages[..4]);
+        let window = reset_window(&task, &progress, followup::WAKE_MESSAGE);
+        let ids: Vec<String> = window
+            .iter()
+            .map(|message| match &message.content[0] {
+                ContentPart::Text(text) => text.chars().take(5).collect(),
+                ContentPart::ToolCall { id, .. }
+                | ContentPart::ToolResult {
+                    tool_call_id: id, ..
+                } => id.clone(),
+            })
+            .collect();
+        assert_eq!(ids, ["s", "audit", "f1", "f1", "[Sche", "f2", "f2"]);
+        // A durable follow-up op has the wake message as its task.
+        let durable = AgentTask::new(followup::WAKE_MESSAGE);
+        progress.followup = None;
+        let window = reset_window(&durable, &progress, followup::WAKE_MESSAGE);
+        assert_eq!(
+            window.len(),
+            4,
+            "the system prompt, the task and the booking"
+        );
+        assert_eq!(window[2].content, vec![followup_call("f1")]);
+        // A second reset of the op still keeps the booking.
+        progress.messages = window;
+        let again = reset_window(&durable, &progress, followup::WAKE_MESSAGE);
+        assert_eq!(again, progress.messages);
     }
 
     #[test]
