@@ -44,6 +44,7 @@ use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::context_reset::{ContextReset, ProgressNotes};
 use crate::delivery::{Report, ReportSource, is_silent, report_text};
 use crate::flow::Released;
 use crate::followup::{Followups, WAKE_MESSAGE};
@@ -246,8 +247,8 @@ pub enum Control {
     Resume,
     /// Clear the memory of the agent.
     ResetMemory,
-    /// Clear the transcript and its flow labels. The labels of the memory
-    /// notes and of the workspace files stay.
+    /// Clear the transcript, its progress notes and its flow labels. The
+    /// labels of the memory notes and of the workspace files stay.
     ClearTranscript,
     /// Delete every workspace snapshot of the agent (issue #2274). The next
     /// op starts with an empty workspace.
@@ -661,6 +662,11 @@ pub struct AgentProfile {
     /// Install a store with `AgentHarness::workspace`.
     #[serde(default, skip_serializing_if = "crate::types::is_false")]
     pub workspace: bool,
+    /// The context reset setting of each op (issue #2453). The agent keeps
+    /// its notes across ops and across the window. See
+    /// [`context_reset`](crate::context_reset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_reset: Option<ContextReset>,
 }
 
 const fn default_max_steps() -> u32 {
@@ -702,7 +708,16 @@ impl AgentProfile {
             mesh: None,
             stream: false,
             workspace: false,
+            context_reset: None,
         }
+    }
+
+    /// Let the agents of the kind save notes and reset near the request
+    /// cap.
+    #[must_use]
+    pub const fn context_reset(mut self, setting: ContextReset) -> Self {
+        self.context_reset = Some(setting);
+        self
     }
 
     /// Give each agent of the kind a persistent workspace. See
@@ -879,6 +894,7 @@ impl AgentProfile {
         task.mesh.clone_from(&self.mesh);
         task.memory_in_state = self.memory == AgentMemory::State;
         task.stream = self.stream;
+        task.context_reset = self.context_reset;
         if self.workspace {
             task.workspace = Some(WorkspaceMount {
                 scope: WorkspaceMount::agent_scope(id.as_str()),
@@ -1052,6 +1068,11 @@ pub struct AgentState {
     /// by the activity `agent_workspace_floor`.
     #[serde(skip_serializing_if = "is_zero")]
     pub workspace_generation: u64,
+    /// The progress notes of the agent, with their labels (issue #2453).
+    /// Each op shows them after its input, so `trim_window` never drops
+    /// them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<ProgressNotes>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -1404,6 +1425,8 @@ impl AgentRun<'_> {
             }
             Control::ClearTranscript => {
                 state.transcript.clear();
+                // The notes stand in for dropped turns, so they go too.
+                state.notes = None;
                 // The transcript took its taint with it. A memory note keeps
                 // its own labels, and the next op reads a store note again
                 // (issue #2272). The workspace files keep theirs too.
@@ -1798,6 +1821,14 @@ impl AgentRun<'_> {
         if task.memory_in_state {
             progress.memory = Some(open_memory(&mut state, &mut task, &mut tree));
         }
+        if task.context_reset.is_some() {
+            // The op reads the notes, so it takes their labels.
+            if let Some(notes) = &state.notes {
+                tree.exercised.extend(notes.labels.iter().cloned());
+            }
+            progress.notes.clone_from(&state.notes);
+            progress.restore_notes = true;
+        }
         let run = Run {
             task: &task,
             agent: peer
@@ -1822,7 +1853,10 @@ impl AgentRun<'_> {
                 let silent = matches!(mode, Mode::Heartbeat(_)) && is_silent(&answer);
                 kept = !silent && !refused;
                 if kept {
+                    // The state keeps the notes, so the transcript holds no
+                    // copy of them.
                     let messages = crate::types::without_system(&progress.messages);
+                    let messages = crate::context_reset::without_restored(messages);
                     state.transcript = trim_window(messages, profile.window);
                 }
                 state.last_stop = Some(stop);
@@ -1937,6 +1971,10 @@ fn fold_segment(state: &mut AgentState, progress: &mut Progress, tree: Tree) {
     // A memory edit is part of the op, so it commits with the snapshot.
     if let Some(memory) = progress.memory.take() {
         state.memory = memory;
+    }
+    // So does a notes edit.
+    if progress.restore_notes {
+        state.notes = progress.notes.take();
     }
     if let Some(until_ms) = progress.parked_until.take() {
         state.status = AgentStatus::Parked { until_ms };

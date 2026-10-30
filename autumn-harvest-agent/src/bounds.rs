@@ -121,9 +121,99 @@ pub const fn sibling_cap(remaining: u32, siblings: u32, index: u32) -> u32 {
     }
 }
 
+/// Does a request of `len` bytes reach `percent` of `cap` (issue #2453)?
+///
+/// A `percent` of 0 counts as 1, and a value over 100 counts as 100. A
+/// `cap` of zero is no cap, so no request reaches it. The product runs in
+/// `u128`, so it never overflows.
+/// `formal/verus/src/agent_reset.rs` proves it for every input.
+#[must_use]
+pub const fn reaches_percent(len: u64, cap: u64, percent: u8) -> bool {
+    if cap == 0 {
+        return false;
+    }
+    let percent = if percent == 0 {
+        1
+    } else if percent > 100 {
+        100
+    } else {
+        percent
+    };
+    (len as u128) * 100 >= (cap as u128) * (percent as u128)
+}
+
+/// Is a context reset due before a request of `len` bytes (issue #2453)?
+///
+/// It is due when the run used fewer than `max_resets` resets and the
+/// request reaches `percent` of `cap`. A request over the cap always
+/// reaches it, so a run with a reset left resets before the cap ends it.
+/// `formal/verus/src/agent_reset.rs` proves it for every input.
+#[must_use]
+pub const fn reset_due(resets: u32, max_resets: u32, len: u64, cap: u64, percent: u8) -> bool {
+    resets < max_resets && reaches_percent(len, cap, percent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_threshold_is_a_percent_of_the_cap() {
+        assert!(!reaches_percent(49, 100, 50));
+        assert!(reaches_percent(50, 100, 50));
+        assert!(reaches_percent(u64::MAX, u64::MAX, 100));
+        assert!(!reaches_percent(u64::MAX - 1, u64::MAX, 100));
+    }
+
+    #[test]
+    fn a_zero_cap_never_reaches_the_threshold() {
+        assert!(!reaches_percent(u64::MAX, 0, 1));
+        assert!(!reset_due(0, 9, u64::MAX, 0, 50));
+    }
+
+    #[test]
+    fn an_out_of_range_percent_is_clamped() {
+        // 0 counts as 1.
+        assert!(!reaches_percent(0, 100, 0));
+        assert!(reaches_percent(1, 100, 0));
+        // Over 100 counts as 100.
+        assert!(!reaches_percent(99, 100, 255));
+        assert!(reaches_percent(100, 100, 255));
+    }
+
+    #[test]
+    fn a_reset_is_due_only_with_one_left() {
+        assert!(reset_due(0, 1, 60, 100, 50));
+        assert!(!reset_due(1, 1, 60, 100, 50));
+        assert!(!reset_due(0, 0, 60, 100, 50));
+        assert!(!reset_due(0, 1, 40, 100, 50));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn a_request_over_the_cap_always_reaches_the_threshold(
+            cap in 1_u64..u64::MAX,
+            extra in 1_u64..1_000,
+            percent in 0_u8..=255,
+        ) {
+            let len = cap.saturating_add(extra);
+            proptest::prop_assume!(len > cap);
+            proptest::prop_assert!(reaches_percent(len, cap, percent));
+        }
+
+        #[test]
+        fn the_threshold_is_monotone_in_the_size(
+            a in 0_u64..u64::MAX,
+            b in 0_u64..u64::MAX,
+            cap in 0_u64..u64::MAX,
+            percent in 0_u8..=255,
+        ) {
+            let (small, large) = if a <= b { (a, b) } else { (b, a) };
+            if reaches_percent(small, cap, percent) {
+                proptest::prop_assert!(reaches_percent(large, cap, percent));
+            }
+        }
+    }
 
     /// A JSON string of exactly `bytes` serialised bytes.
     fn string_of(bytes: u64) -> String {

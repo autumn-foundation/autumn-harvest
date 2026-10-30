@@ -1728,6 +1728,7 @@ mod tests {
                 run_id: None,
                 workspace: None,
                 error: None,
+                resets: 0,
             })
         };
         let done = report(crate::AgentStop::Completed);

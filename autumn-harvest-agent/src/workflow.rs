@@ -33,7 +33,8 @@ use crate::agent::{
     agent_workspace_reset_info, agent_workspace_retain_info,
 };
 use crate::approval::{Approval, Decision, approval_signal, await_decision, decode_decision};
-use crate::bounds::{RoundBudget, exceeds_bytes, json_len, sibling_cap};
+use crate::bounds::{RoundBudget, json_len, reset_due, sibling_cap};
+use crate::context_reset::{self, ProgressNotes, SAVE_PROGRESS_TOOL};
 use crate::delivery::{Report, ReportSource, report_text};
 use crate::flow::Released;
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
@@ -122,6 +123,16 @@ pub(crate) struct Progress {
     /// The workspace of the run and its head (issue #2274). A tool call that
     /// changes the workspace moves the head.
     pub(crate) workspace: Option<WorkspaceMount>,
+    /// The context resets of the run, follow-ups included (issue #2453).
+    pub(crate) resets: u32,
+    /// The notes of the last `save_progress` call that passed its checks.
+    pub(crate) notes: Option<ProgressNotes>,
+    /// Show the notes after the input of each segment. Only a durable agent
+    /// sets it, because its transcript holds no copy of the notes.
+    pub(crate) restore_notes: bool,
+    /// The steer messages of this segment. A reset keeps them, so a reset
+    /// never drops a message from a person.
+    pub(crate) steers: Vec<ChatMessage>,
 }
 
 /// The steer messages of a durable agent (issue #2265).
@@ -184,6 +195,10 @@ impl Progress {
             memory: None,
             parked_until: None,
             workspace: None,
+            resets: 0,
+            notes: None,
+            restore_notes: false,
+            steers: Vec::new(),
         }
     }
 
@@ -227,6 +242,7 @@ impl Progress {
             run_id: Some(self.run_id.clone()),
             workspace: self.workspace.as_ref().and_then(|mount| mount.head.clone()),
             error: None,
+            resets: self.resets,
         }
     }
 
@@ -360,6 +376,12 @@ impl Run<'_> {
             .chain(
                 (self.task.memory_in_state && self.task.memory_writable())
                     .then(MemoryTool::definition),
+            )
+            .chain(
+                self.task
+                    .context_reset
+                    .as_ref()
+                    .map(context_reset::definition),
             )
             .collect()
     }
@@ -633,7 +655,13 @@ async fn open_segment(
     }
     messages.append(&mut progress.messages);
     messages.push(ChatMessage::text(ChatRole::User, input));
+    if progress.restore_notes
+        && let Some(notes) = &progress.notes
+    {
+        messages.extend(context_reset::restored(&notes.text));
+    }
     progress.messages = messages;
+    progress.steers.clear();
     if progress
         .sent
         .as_ref()
@@ -684,7 +712,9 @@ pub(crate) async fn run_segment(
                 return Ok(AgentStop::Interrupted);
             }
             if let Some(book) = progress.steer.as_mut() {
-                take_steers(ctx, book, &mut progress.messages)?;
+                let steers = take_steers(ctx, book)?;
+                progress.messages.extend(steers.iter().cloned());
+                progress.steers.extend(steers);
             }
         }
         // A delegation adds the child usage after a turn. A tree over its cap
@@ -696,15 +726,32 @@ pub(crate) async fn run_segment(
         {
             return Ok(AgentStop::TokensExhausted);
         }
-        let request = next_request(run, progress, tree, &extra_tools, progress.messages.clone());
+        let cap = task.request_cap();
+        let mut request =
+            next_request(run, progress, tree, &extra_tools, progress.messages.clone());
+        let mut len = json_len(&request);
+        // A reset reads only the recorded window, the cap and the reset
+        // count, so replay takes the same reset (issue #2453).
+        if let Some(setting) = task.context_reset
+            && reset_due(
+                progress.resets,
+                setting.max_resets,
+                len,
+                cap,
+                setting.reset_at_percent,
+            )
+        {
+            reset_window(task, progress);
+            request = next_request(run, progress, tree, &extra_tools, progress.messages.clone());
+            len = json_len(&request);
+        }
         // A request the engine would refuse is not sent. The refusal is not
         // retryable, so it would fail the run after earlier work was paid for.
         //
         // A task recorded before the whole-request budget read a zero cap as a
         // limit of zero bytes. Its run ended here, so a replay must end here.
-        let cap = task.request_cap();
         let legacy_zero_cap = cap == 0 && !task.whole_request_budget;
-        if legacy_zero_cap || exceeds_bytes(&request, cap) {
+        if legacy_zero_cap || (cap > 0 && len > cap) {
             return Ok(AgentStop::TranscriptFull);
         }
         let turn: ModelTurn = match send_turn(ctx, run.live, progress, request).await {
@@ -793,6 +840,31 @@ pub(crate) async fn run_segment(
             }
         }
     }
+}
+
+/// Replace the window with the system prompt, the task and the notes, then
+/// the steers of the segment (issue #2453).
+///
+/// The task is the input of the task, not the wake message of a follow-up.
+/// That message points at a call that the reset drops. The new window does
+/// not start with the last sent window, so the next turn goes in full.
+fn reset_window(task: &AgentTask, progress: &mut Progress) {
+    let mut window = Vec::with_capacity(4 + progress.steers.len());
+    window.extend(
+        progress
+            .messages
+            .first()
+            .filter(|message| message.role == ChatRole::System)
+            .cloned(),
+    );
+    window.push(ChatMessage::text(ChatRole::User, task.input.clone()));
+    if let Some(notes) = &progress.notes {
+        window.extend(context_reset::restored(&notes.text));
+    }
+    window.extend(progress.steers.iter().cloned());
+    progress.messages = window;
+    progress.resets = progress.resets.saturating_add(1);
+    progress.sent = None;
 }
 
 /// One model turn. A durable agent races it against an interrupt.
@@ -918,15 +990,12 @@ fn take_interrupt(ctx: &WorkflowContext) -> Result<bool, String> {
         .is_some())
 }
 
-/// Add each waiting steer to the transcript as a user message.
+/// Take each waiting steer as a user message for the transcript.
 ///
 /// A steer whose op already ran is a no-op. A payload that does not decode
 /// is dropped: it carries no message id to keep.
-fn take_steers(
-    ctx: &WorkflowContext,
-    book: &mut SteerBook,
-    messages: &mut Vec<ChatMessage>,
-) -> Result<(), String> {
+fn take_steers(ctx: &WorkflowContext, book: &mut SteerBook) -> Result<Vec<ChatMessage>, String> {
+    let mut messages = Vec::new();
     for raw in ctx
         .drain_signals_raw(STEER_SIGNAL)
         .map_err(|err| err.to_string())?
@@ -940,7 +1009,7 @@ fn take_steers(
         messages.push(ChatMessage::text(ChatRole::User, steer.text));
         SteerBook::note(&mut book.steered, steer.message_id);
     }
-    Ok(())
+    Ok(messages)
 }
 
 /// The system prompt of one segment: the task prompt and the memory
@@ -1493,8 +1562,8 @@ async fn live_decision(
 
 /// Run one tool call.
 ///
-/// The follow-up tool and the delegate tool run in the workflow. Every other
-/// call is a durable activity.
+/// The follow-up tool, the notes tool and the delegate tool run in the
+/// workflow. Every other call is a durable activity.
 async fn run_tool(
     ctx: &WorkflowContext,
     run: Run<'_>,
@@ -1522,6 +1591,26 @@ async fn run_tool(
                     .to_string(),
                 );
                 progress.followup = Some(planned);
+                outcome
+            }
+            Err(reason) => ToolOutcome::error(&reason),
+        });
+    }
+    // The notes live in the workflow, so replay rebuilds them from the
+    // recorded call (issue #2453).
+    if let Some(settings) = task
+        .context_reset
+        .filter(|_| call.name == SAVE_PROGRESS_TOOL)
+    {
+        return Ok(match context_reset::notes_of(&call.arguments, &settings) {
+            Ok(text) => {
+                let outcome = ToolOutcome::ok(
+                    serde_json::json!({"saved": true, "bytes": text.len()}).to_string(),
+                );
+                progress.notes = Some(ProgressNotes {
+                    text,
+                    labels: tree.exercised.clone(),
+                });
                 outcome
             }
             Err(reason) => ToolOutcome::error(&reason),
@@ -2236,6 +2325,9 @@ fn child_task(
         waiting: Vec::new(),
         // Only a fan-out sets it, after its gate.
         report_failure: false,
+        // A child keeps the setting. Its new run holds no notes of the
+        // parent (issue #2453).
+        context_reset: task.context_reset,
     }
 }
 
