@@ -33,6 +33,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use autumn_harvest::payload_codec::{PayloadCodecs, is_codec_envelope};
@@ -431,6 +432,11 @@ impl WorkspaceBlobs for InMemoryWorkspaceBlobs {
 /// safe name. A write goes to a scratch file first, then a rename makes it
 /// visible, so a key never holds half a blob.
 ///
+/// A put returns only after the data is on disk. It syncs the scratch file
+/// and renames it. It then syncs the folder and its parent. It also syncs the
+/// parent of each folder that it creates. Retention can delete the previous snapshot, so a lost head would
+/// lose the workspace.
+///
 /// A put that stops before its rename leaves its scratch file. A crash, a
 /// timeout or a cancel can cause that. The store lists the scratch name, so
 /// retention, reset and erase delete it by the generation of its key (issue
@@ -438,13 +444,18 @@ impl WorkspaceBlobs for InMemoryWorkspaceBlobs {
 #[derive(Debug, Clone)]
 pub struct DirWorkspaceBlobs {
     root: PathBuf,
+    /// Set after one put has synced every ancestor of its folder.
+    settled: Arc<AtomicBool>,
 }
 
 impl DirWorkspaceBlobs {
     /// Blobs under `root`. The folder is made on the first write.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            settled: Arc::default(),
+        }
     }
 
     fn folder(&self, scope: &str) -> PathBuf {
@@ -477,6 +488,83 @@ impl DirWorkspaceBlobs {
     }
 }
 
+/// Durability calls, in order, and faults for them. Tests use both.
+#[cfg(test)]
+mod sync_log {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, PoisonError};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Kind {
+        File,
+        Rename,
+        Dir,
+    }
+
+    type Call = (Kind, PathBuf);
+
+    static LOG: Mutex<Vec<Call>> = Mutex::new(Vec::new());
+    static FAULTS: Mutex<Vec<Call>> = Mutex::new(Vec::new());
+    static DENIED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Record a call. Fail it when a fault covers the kind and the path.
+    pub(super) fn hit(kind: Kind, path: &Path) -> std::io::Result<()> {
+        {
+            let mut log = LOG.lock().unwrap_or_else(PoisonError::into_inner);
+            log.push((kind, path.to_path_buf()));
+        }
+        let denied = DENIED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|p| kind == Kind::Dir && p == path);
+        if denied {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        let failed = FAULTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(k, root)| *k == kind && path.starts_with(root));
+        if failed {
+            return Err(std::io::Error::other("injected sync fault"));
+        }
+        Ok(())
+    }
+
+    /// Fail each call of `kind` on a path below `root`.
+    pub(super) fn fail(kind: Kind, root: &Path) {
+        FAULTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((kind, root.to_path_buf()));
+    }
+
+    /// Make the sync of the directory `path` fail with `PermissionDenied`.
+    pub(super) fn deny(path: &Path) {
+        DENIED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(path.to_path_buf());
+    }
+
+    /// Remove the faults on a path below `root`.
+    pub(super) fn heal(root: &Path) {
+        FAULTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(_, r)| !r.starts_with(root));
+    }
+
+    /// Remove and return the calls on a path below `root`.
+    pub(super) fn take_below(root: &Path) -> Vec<Call> {
+        let mut log = LOG.lock().unwrap_or_else(PoisonError::into_inner);
+        let (taken, kept) = log.drain(..).partition(|(_, p)| p.starts_with(root));
+        *log = kept;
+        taken
+    }
+}
+
 fn io_error(err: &std::io::Error) -> AgentError {
     AgentError::new(
         ErrorKind::Unavailable,
@@ -484,18 +572,101 @@ fn io_error(err: &std::io::Error) -> AgentError {
     )
 }
 
-/// Write `bytes` to a new file at `path` that only its owner can read.
+/// Write `bytes` to a new file at `path` that only its owner can read, and
+/// sync it to disk.
 ///
 /// The file must not exist, so two writers never share one handle.
-async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt as _;
-    let mut options = tokio::fs::OpenOptions::new();
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(path).await?;
-    file.write_all(bytes).await?;
-    file.flush().await
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    #[cfg(test)]
+    sync_log::hit(sync_log::Kind::File, path)?;
+    file.sync_all()
+}
+
+/// Sync the directory `dir`, so its entries survive a power loss.
+///
+/// A directory cannot be opened for a sync on Windows, so the call does
+/// nothing there.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        #[cfg(test)]
+        sync_log::hit(sync_log::Kind::Dir, dir)?;
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// The folder and the configured root. A sync error on either fails the put.
+const ANCESTOR_DEPTH: usize = 2;
+
+/// Write `bytes` to `path` so that the blob survives a power loss.
+///
+/// The scratch file is synced before the rename. The folder is synced after
+/// it, because the rename lives in the folder entry. Any sync error fails the
+/// put, so a put never acknowledges a blob that can vanish.
+///
+/// A folder that exists is not proof that its entry is durable. An earlier put
+/// can create a folder and then fail before it syncs the parent. So until one
+/// put has synced every ancestor of the folder, each put syncs all of them. The
+/// `settled` flag records that. An ancestor above the root that denies the open
+/// is skipped. After it, a put syncs the folder and its
+/// parent, which covers a new scope folder.
+///
+/// On Windows the rename is not durable, because a directory cannot be opened
+/// for a sync there.
+fn write_durable(
+    folder: &Path,
+    path: &Path,
+    bytes: &[u8],
+    settled: &AtomicBool,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(folder)?;
+    let tmp = scratch_path(path);
+    let all = !settled.load(Ordering::Acquire);
+    let written = (|| {
+        write_private(&tmp, bytes)?;
+        std::fs::rename(&tmp, path)?;
+        #[cfg(test)]
+        sync_log::hit(sync_log::Kind::Rename, path)?;
+        let dirs: Vec<&Path> = if all {
+            folder.ancestors().collect()
+        } else {
+            std::iter::once(folder).chain(folder.parent()).collect()
+        };
+        for (depth, dir) in dirs.into_iter().enumerate() {
+            let dir = if dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                dir
+            };
+            match sync_dir(dir) {
+                // This store opens what it creates. It cannot open an ancestor
+                // that only grants search access, and it did not create one.
+                Err(e)
+                    if depth >= ANCESTOR_DEPTH
+                        && e.kind() == std::io::ErrorKind::PermissionDenied => {}
+                other => other?,
+            }
+        }
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    } else if all {
+        settled.store(true, Ordering::Release);
+    }
+    written
 }
 
 /// A scratch path next to `path` that no other put uses.
@@ -504,7 +675,7 @@ async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<
 /// two hosts that share the folder. A shared scratch file would mix their
 /// bytes. A process id is not enough, because each container can run as
 /// process 1, so the name holds a random UUID.
-fn scratch_path(path: &std::path::Path) -> PathBuf {
+fn scratch_path(path: &Path) -> PathBuf {
     let tag = autumn_harvest::uuid::Uuid::new_v4().simple();
     path.with_extension(format!("tmp-{tag}"))
 }
@@ -518,19 +689,17 @@ impl WorkspaceBlobs for DirWorkspaceBlobs {
     ) -> BoxFuture<'a, Result<(), AgentError>> {
         Box::pin(async move {
             let path = self.file(scope, digest)?;
-            tokio::fs::create_dir_all(self.folder(scope))
+            let folder = self.folder(scope);
+            let settled = Arc::clone(&self.settled);
+            tokio::task::spawn_blocking(move || write_durable(&folder, &path, &bytes, &settled))
                 .await
-                .map_err(|e| io_error(&e))?;
-            let tmp = scratch_path(&path);
-            let written = match write_private(&tmp, &bytes).await {
-                Ok(()) => tokio::fs::rename(&tmp, &path).await,
-                Err(err) => Err(err),
-            };
-            if let Err(err) = written {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                return Err(io_error(&err));
-            }
-            Ok(())
+                .map_err(|e| {
+                    AgentError::new(
+                        ErrorKind::Unavailable,
+                        format!("the workspace write stopped: {e}"),
+                    )
+                })?
+                .map_err(|e| io_error(&e))
         })
     }
 
@@ -1005,6 +1174,136 @@ mod tests {
         ) -> BoxFuture<'a, Result<bool, AgentError>> {
             self.log(format!("delete {digest}"));
             self.inner.delete(scope, digest)
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_put_syncs_the_file_then_renames_then_syncs_the_folder() {
+        use sync_log::Kind::{Dir, File, Rename};
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = DirWorkspaceBlobs::new(dir.path().join("blobs"));
+        let key = key_at(1, "a");
+        blobs.put("s", &key, b"x".to_vec()).await.unwrap();
+        let folder = blobs.folder("s");
+        let kinds: Vec<_> = sync_log::take_below(dir.path())
+            .into_iter()
+            .map(|(kind, path)| (kind, path.starts_with(&folder), path == folder))
+            .collect();
+        assert_eq!(kinds[0], (File, true, false), "the scratch file first");
+        assert_eq!(kinds[1], (Rename, true, false), "the rename second");
+        assert_eq!(kinds[2], (Dir, true, true), "the folder third");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_put_syncs_the_parent_of_each_folder_that_it_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("a").join("b").join("blobs");
+        let blobs = DirWorkspaceBlobs::new(&root);
+        blobs
+            .put("s", &key_at(1, "a"), b"x".to_vec())
+            .await
+            .unwrap();
+        let synced: Vec<_> = sync_log::take_below(dir.path())
+            .into_iter()
+            .filter(|(kind, _)| *kind == sync_log::Kind::Dir)
+            .map(|(_, path)| path)
+            .collect();
+        for expected in [
+            blobs.folder("s"),
+            root.clone(),
+            root.parent().unwrap().to_path_buf(),
+            dir.path().join("a"),
+            dir.path().to_path_buf(),
+        ] {
+            assert!(synced.contains(&expected), "{expected:?} is synced");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_put_into_an_existing_folder_still_syncs_the_folder_and_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("blobs");
+        let blobs = DirWorkspaceBlobs::new(&root);
+        blobs
+            .put("s", &key_at(1, "a"), b"x".to_vec())
+            .await
+            .unwrap();
+        sync_log::take_below(dir.path());
+        blobs
+            .put("s", &key_at(2, "a"), b"y".to_vec())
+            .await
+            .unwrap();
+        let dirs: Vec<_> = sync_log::take_below(dir.path())
+            .into_iter()
+            .filter(|(kind, _)| *kind == sync_log::Kind::Dir)
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(dirs, [blobs.folder("s"), root], "no other directory");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_retry_after_a_failed_first_put_syncs_the_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("a").join("blobs");
+        let blobs = DirWorkspaceBlobs::new(&root);
+        sync_log::fail(sync_log::Kind::File, dir.path());
+        assert!(
+            blobs
+                .put("s", &key_at(1, "a"), b"x".to_vec())
+                .await
+                .is_err()
+        );
+        sync_log::heal(dir.path());
+        sync_log::take_below(dir.path());
+        blobs
+            .put("s", &key_at(1, "a"), b"x".to_vec())
+            .await
+            .unwrap();
+        let synced: Vec<_> = sync_log::take_below(dir.path())
+            .into_iter()
+            .filter(|(kind, _)| *kind == sync_log::Kind::Dir)
+            .map(|(_, path)| path)
+            .collect();
+        for expected in [root.clone(), dir.path().join("a"), dir.path().to_path_buf()] {
+            assert!(synced.contains(&expected), "{expected:?} is synced");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_search_only_ancestor_does_not_fail_the_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("a").join("blobs");
+        let blobs = DirWorkspaceBlobs::new(&root);
+        sync_log::deny(dir.path());
+        blobs
+            .put("s", &key_at(1, "a"), b"x".to_vec())
+            .await
+            .unwrap();
+        assert!(blobs.settled.load(Ordering::Acquire));
+        sync_log::deny(&blobs.folder("t"));
+        let err = blobs.put("t", &key_at(1, "a"), b"x".to_vec()).await;
+        assert!(err.is_err(), "a denied folder still fails the put");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_sync_fails_the_put_and_leaves_no_scratch_file() {
+        for kind in [sync_log::Kind::File, sync_log::Kind::Dir] {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs = DirWorkspaceBlobs::new(dir.path().join("blobs"));
+            sync_log::fail(kind, dir.path());
+            let err = blobs.put("s", &key_at(1, "a"), b"x".to_vec()).await;
+            assert_eq!(err.unwrap_err().kind(), ErrorKind::Unavailable, "{kind:?}");
+            let names = blobs.list("s").await.unwrap();
+            assert!(
+                names.iter().all(|n| scratch_owner(n).is_none()),
+                "{kind:?}: {names:?}"
+            );
         }
     }
 
