@@ -1821,14 +1821,7 @@ impl AgentRun<'_> {
         if task.memory_in_state {
             progress.memory = Some(open_memory(&mut state, &mut task, &mut tree));
         }
-        if task.context_reset.is_some() {
-            // The op reads the notes, so it takes their labels.
-            if let Some(notes) = &state.notes {
-                tree.exercised.extend(notes.labels.iter().cloned());
-            }
-            progress.notes.clone_from(&state.notes);
-            progress.restore_notes = true;
-        }
+        open_notes(&task, &state, &mut progress, &mut tree);
         let run = Run {
             task: &task,
             agent: peer
@@ -1844,21 +1837,16 @@ impl AgentRun<'_> {
         }
         let mut outcome = None;
         let mut kept = false;
-        let mut silent = false;
         match result {
             Ok(stop) => {
                 let answer = progress.delivered_text(&progress.last_text).to_owned();
                 // A silent tick leaves the conversation as it was. So does a
                 // budget refusal: no model read the input. A requeued user
                 // message appends it again when it runs.
-                silent = matches!(mode, Mode::Heartbeat(_)) && is_silent(&answer);
+                let silent = matches!(mode, Mode::Heartbeat(_)) && is_silent(&answer);
                 kept = !silent && !refused;
                 if kept {
-                    // The state keeps the notes, so the transcript holds no
-                    // copy of them.
-                    let messages = crate::types::without_system(&progress.messages);
-                    let messages = crate::context_reset::without_restored(messages);
-                    state.transcript = trim_window(messages, profile.window);
+                    keep_segment(&task, &mut state, &mut progress, profile.window);
                 }
                 state.last_stop = Some(stop);
                 state.last_answer = Some(answer.clone());
@@ -1889,12 +1877,6 @@ impl AgentRun<'_> {
             // The transcript dropped the steer text, so the steer op must
             // run as its own op later.
             state.steer.steered = steered_before;
-        }
-        // The notes last past the op, as a memory note does. So only a
-        // segment that may write memory keeps them. A silent tick leaves
-        // them as they were, as it leaves the conversation.
-        if progress.restore_notes && task.memory_writable() && !silent {
-            state.notes = progress.notes.take();
         }
         (state, outcome)
     }
@@ -1995,6 +1977,34 @@ fn fold_segment(state: &mut AgentState, progress: &mut Progress, tree: Tree) {
     state.tokens_used = state
         .tokens_used
         .saturating_add(u64::from(progress.usage.total()));
+}
+
+/// Keep the transcript and the notes of a segment of `task` that ended.
+///
+/// The transcript drops the system prompt and is cut to `window`. The state
+/// keeps the notes, so the transcript holds no copy of them (issue #2453).
+/// The notes last past the op, as a memory note does. So only a segment
+/// that may write memory keeps them. A silent tick or a failed op keeps no
+/// transcript, so it changes no notes either.
+fn keep_segment(task: &AgentTask, state: &mut AgentState, progress: &mut Progress, window: u32) {
+    let messages = crate::types::without_system(&progress.messages);
+    state.transcript = trim_window(crate::context_reset::without_restored(messages), window);
+    if progress.reset.restore && task.memory_writable() {
+        state.notes = progress.reset.notes.take();
+    }
+}
+
+/// Give a segment of `task` the notes of the agent (issue #2453). The
+/// segment reads them, so it takes their labels.
+fn open_notes(task: &AgentTask, state: &AgentState, progress: &mut Progress, tree: &mut Tree) {
+    if task.context_reset.is_none() {
+        return;
+    }
+    if let Some(notes) = &state.notes {
+        tree.exercised.extend(notes.labels.iter().cloned());
+    }
+    progress.reset.notes.clone_from(&state.notes);
+    progress.reset.restore = true;
 }
 
 /// Put the state memory of the agent into the system prompt of a segment.

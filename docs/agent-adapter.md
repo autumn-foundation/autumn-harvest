@@ -1139,10 +1139,9 @@ as an agent.
 - Only a segment that may write memory keeps its notes past the op. A
   read-only op, a heartbeat tick, a follow-up and a peer message keep none,
   unless the segment has `unattended_memory_writes`. Such a segment can read
-  untrusted data, and a later op with write tools reads the notes. A silent
-  tick leaves the notes as they were.
-- A failed op that may write memory keeps its notes, as it keeps its memory
-  edits.
+  untrusted data, and a later op with write tools reads the notes.
+- A silent tick or a failed op keeps no transcript, so it changes no notes
+  either.
 - `Control::ClearTranscript` clears the notes too.
 
 ### Workspaces (issue #2274)

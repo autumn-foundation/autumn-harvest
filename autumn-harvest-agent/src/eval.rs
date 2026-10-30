@@ -354,6 +354,9 @@ pub struct TurnDiff {
 }
 
 /// How a run ended.
+// A box would change the public shape of `Completed`. The report is the
+// common case, so its size is no waste.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "end", content = "detail")]
 #[non_exhaustive]

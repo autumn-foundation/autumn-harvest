@@ -123,19 +123,26 @@ pub(crate) struct Progress {
     /// The workspace of the run and its head (issue #2274). A tool call that
     /// changes the workspace moves the head.
     pub(crate) workspace: Option<WorkspaceMount>,
-    /// The context resets of the run, follow-ups included (issue #2453).
-    pub(crate) resets: u32,
+    /// The notes and the context resets of the run (issue #2453).
+    pub(crate) reset: ResetState,
+    /// The steer messages of this segment. A reset keeps them, so a reset
+    /// never drops a message from a person.
+    pub(crate) steers: Vec<ChatMessage>,
+}
+
+/// The notes and the context resets of one run (issue #2453).
+#[derive(Debug, Default)]
+pub(crate) struct ResetState {
+    /// The context resets of the run, follow-ups included.
+    pub(crate) count: u32,
     /// The notes of the last `save_progress` call that passed its checks.
     pub(crate) notes: Option<ProgressNotes>,
     /// Show the notes after the input of each segment. Only a durable agent
     /// sets it, because its transcript holds no copy of the notes.
-    pub(crate) restore_notes: bool,
-    /// The steer messages of this segment. A reset keeps them, so a reset
-    /// never drops a message from a person.
-    pub(crate) steers: Vec<ChatMessage>,
+    pub(crate) restore: bool,
     /// The last turn was the save turn of a reset. The reset runs before
     /// the next request.
-    pub(crate) reset_pending: bool,
+    pub(crate) pending: bool,
 }
 
 /// The steer messages of a durable agent (issue #2265).
@@ -198,11 +205,8 @@ impl Progress {
             memory: None,
             parked_until: None,
             workspace: None,
-            resets: 0,
-            notes: None,
-            restore_notes: false,
+            reset: ResetState::default(),
             steers: Vec::new(),
-            reset_pending: false,
         }
     }
 
@@ -246,7 +250,7 @@ impl Progress {
             run_id: Some(self.run_id.clone()),
             workspace: self.workspace.as_ref().and_then(|mount| mount.head.clone()),
             error: None,
-            resets: self.resets,
+            resets: self.reset.count,
         }
     }
 
@@ -659,15 +663,15 @@ async fn open_segment(
     }
     messages.append(&mut progress.messages);
     messages.push(ChatMessage::text(ChatRole::User, input));
-    if progress.restore_notes
-        && let Some(notes) = &progress.notes
+    if progress.reset.restore
+        && let Some(notes) = &progress.reset.notes
     {
         messages.extend(context_reset::restored(&notes.text));
     }
     progress.messages = messages;
     progress.steers.clear();
     // A save turn that ended its segment has no reset to run.
-    progress.reset_pending = false;
+    progress.reset.pending = false;
     if progress
         .sent
         .as_ref()
@@ -733,18 +737,7 @@ pub(crate) async fn run_segment(
             return Ok(AgentStop::TokensExhausted);
         }
         let cap = task.request_cap();
-        let mut request =
-            next_request(run, progress, tree, &extra_tools, progress.messages.clone());
-        let mut len = json_len(&request);
-        // A reset reads only the recorded window, the cap and the reset
-        // count, so replay takes the same reset (issue #2453).
-        if task.context_reset.is_some()
-            && let Some(window) = plan_reset(run, progress, tree, &extra_tools, input, len)
-        {
-            progress.messages = window;
-            request = next_request(run, progress, tree, &extra_tools, progress.messages.clone());
-            len = json_len(&request);
-        }
+        let (request, len) = sized_request(run, progress, tree, &extra_tools, input);
         // A request the engine would refuse is not sent. The refusal is not
         // retryable, so it would fail the run after earlier work was paid for.
         //
@@ -842,6 +835,34 @@ pub(crate) async fn run_segment(
     }
 }
 
+/// The next request and its size, after a context reset when one is due
+/// (issue #2453).
+///
+/// A reset reads only the recorded window, the cap and the reset count, so
+/// replay takes the same reset.
+fn sized_request(
+    run: Run<'_>,
+    progress: &mut Progress,
+    tree: &Tree,
+    extra_tools: &[ToolDefinition],
+    input: &str,
+) -> (ModelTurnRequest, u64) {
+    let request = next_request(run, progress, tree, extra_tools, progress.messages.clone());
+    let len = json_len(&request);
+    if run.task.context_reset.is_none() {
+        return (request, len);
+    }
+    match plan_reset(run, progress, tree, extra_tools, input, len) {
+        Some(window) => {
+            progress.messages = window;
+            let request = next_request(run, progress, tree, extra_tools, progress.messages.clone());
+            let len = json_len(&request);
+            (request, len)
+        }
+        None => (request, len),
+    }
+}
+
 /// Plan the context reset before one request of `len` bytes (issue
 /// #2453). Returns the new window, or `None` to send the window as it is.
 ///
@@ -863,11 +884,11 @@ fn plan_reset(
 ) -> Option<Vec<ChatMessage>> {
     let setting = run.task.context_reset?;
     let cap = run.task.request_cap();
-    if std::mem::take(&mut progress.reset_pending) {
+    if std::mem::take(&mut progress.reset.pending) {
         return Some(reset_now(run.task, progress, input));
     }
     if !reset_due(
-        progress.resets,
+        progress.reset.count,
         setting.max_resets,
         len,
         cap,
@@ -895,14 +916,14 @@ fn plan_reset(
     if noticed_len > cap {
         return Some(reset_now(run.task, progress, input));
     }
-    progress.reset_pending = true;
+    progress.reset.pending = true;
     Some(noticed)
 }
 
 /// Count one reset and return its window. The window does not start with
 /// the last sent window, so the next turn goes in full.
 fn reset_now(task: &AgentTask, progress: &mut Progress, input: &str) -> Vec<ChatMessage> {
-    progress.resets = progress.resets.saturating_add(1);
+    progress.reset.count = progress.reset.count.saturating_add(1);
     progress.sent = None;
     reset_window(task, progress, input)
 }
@@ -927,7 +948,7 @@ fn reset_window(task: &AgentTask, progress: &Progress, input: &str) -> Vec<ChatM
     if input != task.input {
         window.push(ChatMessage::text(ChatRole::User, input));
     }
-    if let Some(notes) = &progress.notes {
+    if let Some(notes) = &progress.reset.notes {
         window.extend(context_reset::restored(&notes.text));
     }
     window.extend(progress.steers.iter().cloned());
@@ -1302,7 +1323,7 @@ async fn run_round(
             ToolOutcome::error(NOT_RUN_INTERRUPTED).content
         } else if stale {
             ToolOutcome::error(NOT_RUN_STALE).content
-        } else if progress.reset_pending && call.name != SAVE_PROGRESS_TOOL {
+        } else if progress.reset.pending && call.name != SAVE_PROGRESS_TOOL {
             // The reset drops each result of this round unread, so only the
             // notes tool runs.
             ToolOutcome::error(NOT_RUN_RESET).content
@@ -1714,7 +1735,7 @@ async fn run_tool(
                 let outcome = ToolOutcome::ok(
                     serde_json::json!({"saved": true, "bytes": text.len()}).to_string(),
                 );
-                progress.notes = Some(ProgressNotes {
+                progress.reset.notes = Some(ProgressNotes {
                     text,
                     labels: tree.exercised.clone(),
                 });
@@ -1942,7 +1963,7 @@ async fn delegate(
         usage: child.usage,
         steps_used: steps,
         tool_calls,
-        resets: child.resets,
+        resets: child.reset.count,
     });
     let outcome = serde_json::json!({
         "agent": peer.name,
@@ -2875,8 +2896,8 @@ mod tests {
         let (mut task, mut progress, len) = reset_fixture();
         task.max_request_bytes = Some(len + 1_000);
         let noticed = plan(&task, &mut progress, len).expect("a save turn");
-        assert!(progress.reset_pending);
-        assert_eq!(progress.resets, 0, "the save turn spends no reset");
+        assert!(progress.reset.pending);
+        assert_eq!(progress.reset.count, 0, "the save turn spends no reset");
         let last = noticed.last().unwrap();
         assert_eq!(
             last.content,
@@ -2886,8 +2907,8 @@ mod tests {
 
         progress.sent = Some(crate::transcript::Sent::of(&progress.messages));
         let window = plan(&task, &mut progress, len).expect("the reset");
-        assert!(!progress.reset_pending);
-        assert_eq!(progress.resets, 1);
+        assert!(!progress.reset.pending);
+        assert_eq!(progress.reset.count, 1);
         assert!(progress.sent.is_none(), "the next turn goes in full");
         assert_eq!(window, vec![ChatMessage::text(ChatRole::User, "audit")]);
     }
@@ -2898,8 +2919,8 @@ mod tests {
         task.max_request_bytes = Some(len);
         task.context_reset = Some(crate::ContextReset::new(1, 100));
         let window = plan(&task, &mut progress, len).expect("the reset");
-        assert!(!progress.reset_pending);
-        assert_eq!(progress.resets, 1);
+        assert!(!progress.reset.pending);
+        assert_eq!(progress.reset.count, 1);
         assert_eq!(window, vec![ChatMessage::text(ChatRole::User, "audit")]);
     }
 
@@ -2909,9 +2930,9 @@ mod tests {
         task.max_request_bytes = Some(len * 3);
         assert!(plan(&task, &mut progress, len).is_none(), "under 50 %");
         task.max_request_bytes = Some(len + 1_000);
-        progress.resets = 1;
+        progress.reset.count = 1;
         assert!(plan(&task, &mut progress, len).is_none(), "no reset left");
-        assert!(!progress.reset_pending);
+        assert!(!progress.reset.pending);
     }
 
     #[test]
