@@ -167,7 +167,8 @@ schemars = { version = "0.8", optional = true }
 # 48.0.3 is the first 48.x release with the RUSTSEC-2026-0316 fix (46.x has no
 # patched release). 48.0.6 is the first with the RUSTSEC-2026-0363 and
 # RUSTSEC-2026-0364 fixes. 48.0.7 is the first with the RUSTSEC-2026-0378 and
-# RUSTSEC-2026-0379 fixes. Pin the floor so a downstream consumer enabling
+# RUSTSEC-2026-0379 fixes. 48.0.8 is the first with the RUSTSEC-2026-0422 to
+# RUSTSEC-2026-0424 fixes. Pin the floor so a downstream consumer enabling
 # `wasm-activities` can't silently resolve back to a vulnerable 48.0.x (same
 # reasoning as tokio-postgres above -- a workspace's own Cargo.lock never
 # propagates to downstream consumers, only the manifest constraint does).
@@ -176,7 +177,7 @@ schemars = { version = "0.8", optional = true }
 # the only path to `zstd` 0.13, which carries RUSTSEC-2026-0391 and
 # RUSTSEC-2026-0395 to -0410. No wasmtime release depends on the patched
 # `zstd` 0.14, so dropping the feature removes the crate from the graph.
-wasmtime = { version = "48.0.7", optional = true, default-features = false, features = [
+wasmtime = { version = "48.0.8", optional = true, default-features = false, features = [
     "addr2line",
     "anyhow",
     "async",
