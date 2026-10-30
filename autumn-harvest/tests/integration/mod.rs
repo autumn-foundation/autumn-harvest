@@ -67,6 +67,8 @@ mod canary_tests;
 mod cancellation_scope_tests;
 mod cancellation_tests;
 #[cfg(feature = "db")]
+mod census_scan_index_tests;
+#[cfg(feature = "db")]
 mod capability_miss_tests;
 #[cfg(feature = "db")]
 mod chain_timeout_tests;

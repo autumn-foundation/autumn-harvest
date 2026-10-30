@@ -702,6 +702,11 @@ pub use db::{
 #[cfg(feature = "db")]
 pub(crate) use db::forwarding_hop_conflict;
 
+/// Statement texts that a plan gate reads (issue #2424). They are not an API.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub use db::{OBSERVE_SQL, QUIESCENCE_SQL, STAGED_CHILD_DELETES, STAGED_TIMERS_SQL};
+
 #[cfg(feature = "db")]
 mod db {
     use chrono::{DateTime, Utc};
@@ -770,7 +775,7 @@ mod db {
     /// SQL and Rust could drift, so it is written once and
     /// `the_sql_predicate_agrees_with_the_pure_predicate` in
     /// `shard_rebalance_db_tests.rs` pins them together against real rows.
-    const QUIESCENCE_SQL: &str = concat!(
+    pub const QUIESCENCE_SQL: &str = concat!(
         "\
         e.state = 'RUNNING' \
         AND e.parent_id IS NULL \
@@ -906,7 +911,8 @@ mod db {
         dead_letter_rows: i64,
     }
 
-    const OBSERVE_SQL: &str = concat!(
+    /// The facts of one execution that [`observe_quiescence`] reads. `$1` is its id.
+    pub const OBSERVE_SQL: &str = concat!(
         "\
         SELECT e.state, \
                e.parent_id, \
@@ -1488,13 +1494,7 @@ mod db {
         )
         .await?;
 
-        let timers = read_json(
-            source,
-            "SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) AS payload \
-             FROM harvest_timers t WHERE t.workflow_exec_id = $1",
-            exec_id,
-        )
-        .await?;
+        let timers = read_json(source, STAGED_TIMERS_SQL, exec_id).await?;
 
         let signals = read_json(
             source,
@@ -1881,8 +1881,12 @@ mod db {
         Ok(())
     }
 
+    /// Every timer of one execution, fired or not, as one JSON array.
+    pub const STAGED_TIMERS_SQL: &str = "SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) \
+         AS payload FROM harvest_timers t WHERE t.workflow_exec_id = $1";
+
     /// Everything a staged copy writes apart from the execution row itself.
-    const STAGED_CHILD_DELETES: &[&str] = &[
+    pub const STAGED_CHILD_DELETES: &[&str] = &[
         "DELETE FROM harvest_events WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_timers WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_signals WHERE workflow_exec_id = $1",

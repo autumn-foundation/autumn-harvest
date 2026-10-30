@@ -4237,6 +4237,15 @@ pub struct QueueTaskCounts {
     pub scheduled: i64,
 }
 
+/// The statement that [`queue_task_counts`] runs. `$1` is the current time.
+pub const QUEUE_TASK_COUNTS_SQL: &str = "SELECT \
+         queue_name AS queue, \
+         COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at <= $1) AS backlog, \
+         COUNT(*) FILTER (WHERE state = 'RUNNING') AS in_flight, \
+         COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at > $1) AS scheduled \
+     FROM harvest_task_queue \
+     GROUP BY queue_name";
+
 /// Return backlog, in-flight, and scheduled task counts per queue on this shard.
 ///
 /// # Errors
@@ -4257,16 +4266,8 @@ pub async fn queue_task_counts(
         scheduled: i64,
     }
 
-    let rows: Vec<Row> = diesel::sql_query(
-        "SELECT \
-             queue_name AS queue, \
-             COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at <= $1) AS backlog, \
-             COUNT(*) FILTER (WHERE state = 'RUNNING') AS in_flight, \
-             COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at > $1) AS scheduled \
-         FROM harvest_task_queue \
-         GROUP BY queue_name",
-    )
-    .bind::<diesel::sql_types::Timestamptz, _>(Utc::now())
+    let rows: Vec<Row> = diesel::sql_query(QUEUE_TASK_COUNTS_SQL)
+        .bind::<diesel::sql_types::Timestamptz, _>(Utc::now())
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;

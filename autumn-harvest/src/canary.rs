@@ -30,6 +30,15 @@
 /// a single `starts_with` check.
 pub const CANARY_WORKFLOW_NAME_PREFIX: &str = "__harvest_canary_probe";
 
+/// The newest canary executions of one shard, for `GET /admin/canary`.
+///
+/// `$1` is the canary prefix. `$2` caps the rows.
+pub const CANARY_ROWS_SQL: &str = "SELECT queue_name, state, started_at, completed_at \
+     FROM harvest_workflow_executions \
+     WHERE starts_with(workflow_name, $1) \
+     ORDER BY completed_at DESC NULLS LAST \
+     LIMIT $2";
+
 /// Reserved name of the built-in synthetic-liveness-canary activity (issue #796).
 ///
 /// Unlike the two reserved worker-session internal activities (issue #606), whose
