@@ -24769,7 +24769,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
         diesel::update(
             harvest_signals::table
                 .filter(harvest_signals::workflow_exec_id.eq(exec_id.as_uuid()))
-                .filter(harvest_signals::consumed.eq(false)),
+                .filter(diesel::dsl::not(harvest_signals::consumed)),
         )
         .set(harvest_signals::workflow_exec_id.eq(new_exec_id.as_uuid()))
         .execute(conn)

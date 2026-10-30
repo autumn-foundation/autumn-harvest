@@ -2,17 +2,27 @@
  buffers | rows | toplevel |                                                query                                                 
 ---------+------+----------+------------------------------------------------------------------------------------------------------
       53 |   25 | f        | DELETE FROM ONLY "public"."harvest_signals" WHERE $1 OPERATOR(pg_catalog.=) "workflow_exec_id"
+      53 |   25 | t        | DELETE FROM harvest_signals WHERE workflow_exec_id = $1
      149 |    1 | t        | DELETE FROM harvest_workflow_executions WHERE id = $1
      125 |   25 | f        | SELECT 1 FROM ONLY "public"."harvest_workflow_executions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR
       28 |    1 | t        | SELECT COALESCE(jsonb_agg(to_jsonb(s)), $1::jsonb) IS NOT NULL AS copied FROM harvest_signals s WHER
-     310 |   25 | t        | UPDATE harvest_signals SET payload = $1::jsonb WHERE workflow_exec_id = $2
+     311 |   25 | t        | UPDATE harvest_signals SET payload = $1::jsonb WHERE workflow_exec_id = $2
      529 |   25 | t        | UPDATE harvest_signals SET workflow_exec_id = $1, consumed = $2 WHERE workflow_exec_id = $3
-(6 rows)
+      32 |    1 | t        | WITH RECURSIVE chain(id) AS ( SELECT $1::uuid UNION SELECT w.id FROM harvest_workflow_executions w J
+(8 rows)
+
+           relname           | relpages 
+-----------------------------+----------
+ harvest_signals             |     4000
+ harvest_signals_pkey        |      530
+ idx_harvest_signals_exec    |      100
+ idx_harvest_signals_pending |       22
+(4 rows)
 
 -- psql -d sig_after -f write.sql
- buffers | rows | wal_records | wal_bytes |                            query                             
----------+------+-------------+-----------+--------------------------------------------------------------
-   13981 | 1000 |        5363 |    431936 | INSERT INTO harvest_signals (workflow_exec_id, signal_name, 
-   17460 | 1000 |        4272 |    364970 | UPDATE harvest_signals SET consumed = $1 WHERE signal_name L
+ buffers | rows | wal_records | wal_fpi | wal_bytes |                            query                             
+---------+------+-------------+---------+-----------+--------------------------------------------------------------
+   13997 | 1000 |        5364 |     518 |   3407174 | INSERT INTO harvest_signals (workflow_exec_id, signal_name, 
+   17442 | 1000 |        4258 |      12 |    364380 | UPDATE harvest_signals SET consumed = $1 WHERE signal_name L
 (2 rows)
 

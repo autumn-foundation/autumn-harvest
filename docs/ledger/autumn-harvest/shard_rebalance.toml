@@ -140,7 +140,7 @@ driver = "setup"
 backend = ["postgres"]
 kind = ["read"]
 tables = []
-measured = "unmeasured"
+measured = "docs/performance-signals-exec-index.md"
 plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
 ["db::read_legal_hold_set_at"]

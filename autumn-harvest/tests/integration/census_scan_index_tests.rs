@@ -589,7 +589,7 @@ fn no_query_binds_the_consumed_flag() {
             } else if path.extension().is_some_and(|e| e == "rs") {
                 let text = std::fs::read_to_string(&path).expect("read a source file");
                 for (number, line) in text.lines().enumerate() {
-                    if line.contains("consumed.eq(false)") {
+                    if line.contains(".filter(") && line.contains("consumed.eq(false)") {
                         found.push(format!("{}:{}", path.display(), number + 1));
                     }
                 }

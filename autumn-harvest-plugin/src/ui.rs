@@ -2482,7 +2482,7 @@ async fn load_blocked_on_data(
 
     let signals: Vec<HarvestSignal> = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(exec_uuid))
-        .filter(harvest_signals::consumed.eq(false))
+        .filter(diesel::dsl::not(harvest_signals::consumed))
         .order(harvest_signals::received_at.asc())
         .limit(20)
         .select(HarvestSignal::as_select())

@@ -1,18 +1,27 @@
 -- psql -d sig_before -f measure.sql
  buffers | rows | toplevel |                                                query                                                 
 ---------+------+----------+------------------------------------------------------------------------------------------------------
-    4055 |   25 | f        | DELETE FROM ONLY "public"."harvest_signals" WHERE $1 OPERATOR(pg_catalog.=) "workflow_exec_id"
-    4151 |    1 | t        | DELETE FROM harvest_workflow_executions WHERE id = $1
+    4054 |   25 | f        | DELETE FROM ONLY "public"."harvest_signals" WHERE $1 OPERATOR(pg_catalog.=) "workflow_exec_id"
+    4054 |   25 | t        | DELETE FROM harvest_signals WHERE workflow_exec_id = $1
+    4150 |    1 | t        | DELETE FROM harvest_workflow_executions WHERE id = $1
      125 |   25 | f        | SELECT 1 FROM ONLY "public"."harvest_workflow_executions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR
-    4030 |    1 | t        | SELECT COALESCE(jsonb_agg(to_jsonb(s)), $1::jsonb) IS NOT NULL AS copied FROM harvest_signals s WHER
-    4261 |   25 | t        | UPDATE harvest_signals SET payload = $1::jsonb WHERE workflow_exec_id = $2
-    4481 |   25 | t        | UPDATE harvest_signals SET workflow_exec_id = $1, consumed = $2 WHERE workflow_exec_id = $3
-(6 rows)
+    4029 |    1 | t        | SELECT COALESCE(jsonb_agg(to_jsonb(s)), $1::jsonb) IS NOT NULL AS copied FROM harvest_signals s WHER
+    4257 |   25 | t        | UPDATE harvest_signals SET payload = $1::jsonb WHERE workflow_exec_id = $2
+    4480 |   25 | t        | UPDATE harvest_signals SET workflow_exec_id = $1, consumed = $2 WHERE workflow_exec_id = $3
+    4029 |    1 | t        | WITH RECURSIVE chain(id) AS ( SELECT $1::uuid UNION SELECT w.id FROM harvest_workflow_executions w J
+(8 rows)
+
+           relname           | relpages 
+-----------------------------+----------
+ harvest_signals             |     4000
+ harvest_signals_pkey        |      530
+ idx_harvest_signals_pending |       22
+(3 rows)
 
 -- psql -d sig_before -f write.sql
- buffers | rows | wal_records | wal_bytes |                            query                             
----------+------+-------------+-----------+--------------------------------------------------------------
-   11990 | 1000 |        4034 |    346972 | INSERT INTO harvest_signals (workflow_exec_id, signal_name, 
-   15199 | 1000 |        3003 |    257200 | UPDATE harvest_signals SET consumed = $1 WHERE signal_name L
+ buffers | rows | wal_records | wal_fpi | wal_bytes |                            query                             
+---------+------+-------------+---------+-----------+--------------------------------------------------------------
+   11987 | 1000 |        4027 |     477 |   3010957 | INSERT INTO harvest_signals (workflow_exec_id, signal_name, 
+   15208 | 1000 |        3012 |       0 |    264864 | UPDATE harvest_signals SET consumed = $1 WHERE signal_name L
 (2 rows)
 

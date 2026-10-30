@@ -1,15 +1,16 @@
 -- Issue #2367. An index on `harvest_signals (workflow_exec_id)`.
 --
--- Four statements reach every signal of one execution, consumed rows too:
+-- These statements reach every signal of one execution, consumed rows too:
 --
 -- 1. the signal move of a workflow retry (issue #843);
 -- 2. the signal scrub of a PII erasure (issue #495);
--- 3. the signal copy and the signal delete of a shard rebalance;
--- 4. each `ON DELETE CASCADE` from an execution, which retention triggers.
+-- 3. the signal copy and the staged signal delete of a shard rebalance;
+-- 4. each `ON DELETE CASCADE` from an execution, which retention triggers;
+-- 5. the unkeyed signal check of a backup verification.
 --
--- `idx_harvest_signals_pending` and `uq_harvest_signals_idem` are partial.
--- Neither one holds a consumed row, so neither can serve these statements.
--- Each one read the whole table.
+-- `idx_harvest_signals_pending` skips consumed rows. `uq_harvest_signals_idem`
+-- skips rows with no idempotency key. So neither index can serve these
+-- statements, and each one read the whole table.
 --
 -- The new index adds one entry for each inserted signal. A consume update
 -- changes `consumed`, which is in the predicate of the pending index. So no
@@ -18,8 +19,10 @@
 -- ## Build cost and the zero-downtime recipe
 --
 -- `CREATE INDEX` (not `CONCURRENTLY`) takes `SHARE` on `harvest_signals`.
--- That blocks each signal send and each consume until the build ends. Size
--- the build window from the row count of `harvest_signals`.
+-- That blocks each write to the table until the build ends: each signal send,
+-- consume, retry move and erasure scrub. It also blocks each execution delete,
+-- because the cascade deletes signals. A blocked delete keeps its execution
+-- row locked. Size the build window from the row count of `harvest_signals`.
 --
 -- On a live, large deployment, build the index out of band first:
 --

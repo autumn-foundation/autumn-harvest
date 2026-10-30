@@ -8,3 +8,7 @@ SELECT shared_blks_hit + shared_blks_read AS buffers, rows, toplevel,
  WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
    AND shared_blks_hit + shared_blks_read > 10
  ORDER BY query;
+SELECT relname, relpages FROM pg_class
+ WHERE relname IN ('harvest_signals', 'harvest_signals_pkey', 'idx_harvest_signals_pending',
+                   'idx_harvest_signals_exec')
+ ORDER BY relname;
