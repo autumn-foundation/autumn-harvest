@@ -505,12 +505,21 @@ mod sync_log {
 
     static LOG: Mutex<Vec<Call>> = Mutex::new(Vec::new());
     static FAULTS: Mutex<Vec<Call>> = Mutex::new(Vec::new());
+    static DENIED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
     /// Record a call. Fail it when a fault covers the kind and the path.
     pub(super) fn hit(kind: Kind, path: &Path) -> std::io::Result<()> {
         {
             let mut log = LOG.lock().unwrap_or_else(PoisonError::into_inner);
             log.push((kind, path.to_path_buf()));
+        }
+        let denied = DENIED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|p| kind == Kind::Dir && p == path);
+        if denied {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
         }
         let failed = FAULTS
             .lock()
@@ -529,6 +538,14 @@ mod sync_log {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((kind, root.to_path_buf()));
+    }
+
+    /// Make the sync of the directory `path` fail with `PermissionDenied`.
+    pub(super) fn deny(path: &Path) {
+        DENIED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(path.to_path_buf());
     }
 
     /// Remove the faults on a path below `root`.
@@ -590,6 +607,9 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// The folder and the configured root. A sync error on either fails the put.
+const ANCESTOR_DEPTH: usize = 2;
+
 /// Write `bytes` to `path` so that the blob survives a power loss.
 ///
 /// The scratch file is synced before the rename. The folder is synced after
@@ -599,7 +619,8 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 /// A folder that exists is not proof that its entry is durable. An earlier put
 /// can create a folder and then fail before it syncs the parent. So until one
 /// put has synced every ancestor of the folder, each put syncs all of them. The
-/// `settled` flag records that. After it, a put syncs the folder and its
+/// `settled` flag records that. An ancestor above the root that denies the open
+/// is skipped. After it, a put syncs the folder and its
 /// parent, which covers a new scope folder.
 ///
 /// On Windows the rename is not durable, because a directory cannot be opened
@@ -623,12 +644,20 @@ fn write_durable(
         } else {
             std::iter::once(folder).chain(folder.parent()).collect()
         };
-        for dir in dirs {
-            sync_dir(if dir.as_os_str().is_empty() {
+        for (depth, dir) in dirs.into_iter().enumerate() {
+            let dir = if dir.as_os_str().is_empty() {
                 Path::new(".")
             } else {
                 dir
-            })?;
+            };
+            match sync_dir(dir) {
+                // This store opens what it creates. It cannot open an ancestor
+                // that only grants search access, and it did not create one.
+                Err(e)
+                    if depth >= ANCESTOR_DEPTH
+                        && e.kind() == std::io::ErrorKind::PermissionDenied => {}
+                other => other?,
+            }
         }
         Ok(())
     })();
@@ -1242,6 +1271,23 @@ mod tests {
         for expected in [root.clone(), dir.path().join("a"), dir.path().to_path_buf()] {
             assert!(synced.contains(&expected), "{expected:?} is synced");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_search_only_ancestor_does_not_fail_the_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("a").join("blobs");
+        let blobs = DirWorkspaceBlobs::new(&root);
+        sync_log::deny(dir.path());
+        blobs
+            .put("s", &key_at(1, "a"), b"x".to_vec())
+            .await
+            .unwrap();
+        assert!(blobs.settled.load(Ordering::Acquire));
+        sync_log::deny(&blobs.folder("t"));
+        let err = blobs.put("t", &key_at(1, "a"), b"x".to_vec()).await;
+        assert!(err.is_err(), "a denied folder still fails the put");
     }
 
     #[cfg(unix)]
