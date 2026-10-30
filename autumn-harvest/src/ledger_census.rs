@@ -200,28 +200,28 @@ fn sqlite_trace(event: rusqlite::trace::TraceEvent<'_>) {
     record(sql.trim(), "", true);
 }
 
-/// Install the statement callback on a connection that SQLite just opened.
-fn sqlite_connection(conn: rusqlite::Connection) -> rusqlite::Result<()> {
-    conn.trace_v2(
-        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
-        Some(sqlite_trace),
-    );
-    Ok(())
-}
-
 /// The entry point that SQLite calls for each new connection.
+///
+/// It installs the statement callback on that connection.
 ///
 /// # Safety
 ///
-/// SQLite calls it with a live connection handle. The handle stays open
-/// for the whole call, and the bridge does not close it.
+/// SQLite calls it with a live connection handle. The handle stays open for
+/// the whole call. The borrowed `Connection` does not own it, so its drop
+/// leaves the handle open.
 unsafe extern "C" fn sqlite_auto_extension(
     db: *mut rusqlite::ffi::sqlite3,
-    err: *mut *mut std::ffi::c_char,
+    _err: *mut *mut std::ffi::c_char,
     _api: *const rusqlite::ffi::sqlite3_api_routines,
 ) -> std::ffi::c_int {
-    // SAFETY: the arguments come from SQLite, as the bridge requires.
-    unsafe { rusqlite::auto_extension::init_auto_extension(db, err, sqlite_connection) }
+    // SAFETY: `db` is the live handle that SQLite passes in.
+    if let Ok(conn) = unsafe { rusqlite::Connection::from_handle(db) } {
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(sqlite_trace),
+        );
+    }
+    rusqlite::ffi::SQLITE_OK
 }
 
 fn make_hook() -> Option<Box<dyn Instrumentation>> {

@@ -5346,6 +5346,14 @@
      "2": "text"
     }
    },
+   "UPDATE harvest_events SET event_data = jsonb_set(event_data, '{data,input}', '\"rewritten\"', false) WHERE workflow_exec_id = $1 AND event_id = (SELECT max(event_id) FROM harvest_events WHERE workflow_exec_id = $1)": {
+    "literals": [
+     {}
+    ],
+    "types": {
+     "1": "uuid"
+    }
+   },
    "UPDATE harvest_events SET event_data = jsonb_set(event_data, '{data,last_completion_result}', '{\"rows\": 41}') WHERE workflow_exec_id = $1 AND event_id = 0": {
     "literals": [
      {}
@@ -34188,6 +34196,19 @@
    }
   },
   "db::acquire": {
+   "BEGIN": {
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "COMMIT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
    "SELECT epoch FROM harvest_decision_owner WHERE partition = $1": {
     "literals": [
      {}
@@ -34918,6 +34939,222 @@
    }
   }
  },
+ "docs/ledger/autumn-harvest/entity_sql.toml": {
+  "open": {
+   "CREATE TABLE entity (\nworkflow_name TEXT NOT NULL,\nworkflow_id TEXT NOT NULL,\nexecution_id TEXT NOT NULL,\nevent_id INTEGER NOT NULL,\ndeleted INTEGER NOT NULL,\nstate TEXT NOT NULL,\nstats TEXT NOT NULL\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "INSERT INTO entity VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA query_only = ON;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA temp_store = MEMORY;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "run_cancellable": {
+   "SELECT * FROM pragma_table_info('entity')": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT ?1, ?2, ?3, json_extract(?4, '$.k')": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT DISTINCT state FROM entity": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT NULL, 2, 0.25, 'text', x'01ff', 1e999": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT count(*) FROM entity": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT count(*) FROM entity, json_each(entity.state) WHERE value = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT deleted FROM entity": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT event_id AS id FROM entity WHERE deleted": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT item.key AS position, item.value AS item, json_array_length(entity.state) AS count, entity.event_id FROM entity, json_each(entity.state) AS item ORDER BY item.key": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT json_extract(item.value, '$.sku') AS sku, json_extract(item.value, '$.qty') AS qty FROM entity, json_each(entity.state, '$.items') AS item ORDER BY qty DESC": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT json_extract(state, '$.owner'), length(state) > ?1 FROM entity": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT json_extract(value, '$.qty') FROM entity, json_each(entity.state, '$.items') WHERE json_extract(value, '$.sku') = ?1 AND ?2 AND ?3 IS NULL": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT state FROM entity": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT state FROM entity ORDER BY state": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT state || state || state || state || state FROM entity": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT state, workflow_id FROM entity ORDER BY 1, 2": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT sum(json_extract(value, '$.qty')) FROM entity, json_each(entity.state, '$.items')": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT workflow_name, workflow_id, execution_id, event_id, deleted, json_extract(state, '$.owner') AS owner, json_extract(stats, '$.applied') AS applied FROM entity": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT zeroblob(?1)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10) SELECT zeroblob(1000000) FROM n": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000) SELECT i FROM n": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000000) SELECT count(length(replace(printf('%.*c', 1000000 - i % 7, 'x'), 'x', 'y'))) FROM n": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10001) SELECT i FROM n": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20) SELECT printf('%.*c', 1000000, 'x') FROM n": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) SELECT count(DISTINCT printf('%.*c', 1000000, 'x') || i) FROM n": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT count(*) FROM n": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
  "docs/ledger/autumn-harvest/entity_state.toml": {
   "erase_for_execution": {
    "UPDATE harvest_entity_state SET snapshot = $2 WHERE execution_id = $1 AND snapshot IS DISTINCT FROM $2": {
@@ -34946,9 +35183,25 @@
     }
    }
   },
+  "pointer": {
+   "SELECT s.execution_id, s.event_id, s.deleted, x.state AS run_state FROM harvest_entity_state s JOIN harvest_workflow_executions x ON x.id = s.execution_id WHERE s.workflow_name = $1 AND s.workflow_id = $2": {
+    "literals": [
+     {
+      "1": "'entity_sql_cart'"
+     }
+    ],
+    "types": {
+     "1": "text",
+     "2": "text"
+    }
+   }
+  },
   "read": {
    "SELECT workflow_name, workflow_id, execution_id, event_id, deleted, snapshot, updated_at FROM harvest_entity_state WHERE workflow_name = $1 AND workflow_id = $2": {
     "literals": [
+     {
+      "1": "'entity_sql_cart'"
+     },
      {
       "1": "'entity_state_order'"
      },
@@ -34994,6 +35247,17 @@
      "2": "text",
      "3": "uuid",
      "4": "text"
+    }
+   }
+  },
+  "snapshot_at": {
+   "SELECT event_data FROM harvest_events WHERE workflow_exec_id = $1 AND event_id = $2 AND event_type = 'SideEffectRecorded' AND (event_data -> 'data' ->> 'kind') = 'EntityState'": {
+    "literals": [
+     {}
+    ],
+    "types": {
+     "1": "uuid",
+     "2": "bigint"
     }
    }
   }
@@ -35673,13 +35937,13 @@
       "1": "'approvals'"
      },
      {
+      "1": "'entity_sql_cart'"
+     },
+     {
       "1": "'entity_state_log'"
      },
      {
       "1": "'entity_state_pairs'"
-     },
-     {
-      "1": "'iface_wf'"
      }
     ],
     "types": {
@@ -36452,6 +36716,7 @@
     "types": {}
    },
    "COMMIT": {
+    "backend": "sqlite",
     "literals": [
      {}
     ],
@@ -38222,10 +38487,11 @@
      },
      {
       "1": "'TERMINATED'",
-      "3": "'test'"
+      "3": "'operator'"
      },
      {
-      "1": "'TERMINATED'"
+      "1": "'TERMINATED'",
+      "3": "'test'"
      }
     ],
     "types": {
@@ -40575,6 +40841,12 @@
    }
   },
   "resolve_owner_notes": {
+   "COMMIT": {
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
    "SELECT id, workflow_id FROM harvest_workflow_executions WHERE id = ANY($1::uuid[])": {
     "literals": [
      {}
@@ -40657,6 +40929,191 @@
     "types": {
      "1": "bigint[]"
     }
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest/owner_disk_cache.toml": {
+  "DiskTier::reconcile": {
+   "SELECT \"harvest_workflow_executions\".\"id\" FROM \"harvest_workflow_executions\" WHERE ((\"harvest_workflow_executions\".\"id\" = ANY($1)) AND (\"harvest_workflow_executions\".\"state\" = $2))": {
+    "literals": [
+     {
+      "2": "'RUNNING'"
+     }
+    ],
+    "types": {
+     "1": "uuid[]",
+     "2": "text"
+    }
+   }
+  },
+  "OwnerDiskCache::create_file": {
+   "CREATE TABLE IF NOT EXISTS harvest_cache_runs (\nexec_id TEXT PRIMARY KEY,\nsealed BLOB NOT NULL\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_cache_stamp (\nid INTEGER PRIMARY KEY CHECK (id = 1),\nsealed BLOB NOT NULL\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_entity_projection (\nexec_id TEXT PRIMARY KEY,\nsealed BLOB NOT NULL\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_events (\nexec_id TEXT NOT NULL,\nseq INTEGER NOT NULL,\nevent_json BLOB NOT NULL,\nPRIMARY KEY (exec_id, seq)\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "INSERT INTO harvest_cache_stamp (id, sealed) VALUES (1, ?1)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA journal_mode = MEMORY;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA secure_delete = ON;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA synchronous = OFF;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA temp_store = MEMORY;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "OwnerDiskCache::delete_run": {
+   "DELETE FROM harvest_cache_runs WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_entity_projection WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_events WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "OwnerDiskCache::read_entity": {
+   "SELECT sealed FROM harvest_entity_projection WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "OwnerDiskCache::read_events": {
+   "SELECT seq, event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "OwnerDiskCache::read_file_stamp": {
+   "SELECT sealed FROM harvest_cache_stamp WHERE id = 1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "OwnerDiskCache::read_run_stamp": {
+   "SELECT sealed FROM harvest_cache_runs WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "OwnerDiskCache::write_entity": {
+   "INSERT INTO harvest_entity_projection (exec_id, sealed) VALUES (?1, ?2) ON CONFLICT (exec_id) DO UPDATE SET sealed = excluded.sealed": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "OwnerDiskCache::write_run": {
+   "BEGIN DEFERRED": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "COMMIT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_events WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "INSERT INTO harvest_cache_runs (exec_id, sealed) VALUES (?1, ?2) ON CONFLICT (exec_id) DO UPDATE SET sealed = excluded.sealed": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "INSERT INTO harvest_events (exec_id, seq, event_json) VALUES (?1, ?2, ?3)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
    }
   }
  },
@@ -61204,6 +61661,16 @@
      "1": "uuid",
      "2": "boolean"
     }
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest/run_defaults.toml": {
+  "db::load_run_default_overrides": {
+   "SELECT \"harvest_run_default_overrides\".\"workflow_name\", \"harvest_run_default_overrides\".\"sla_secs\", \"harvest_run_default_overrides\".\"execution_timeout_secs\", \"harvest_run_default_overrides\".\"reason\", \"harvest_run_default_overrides\".\"updated_by\", \"harvest_run_default_overrides\".\"created_at\", \"harvest_run_default_overrides\".\"updated_at\" FROM \"harvest_run_default_overrides\"": {
+    "literals": [
+     {}
+    ],
+    "types": {}
    }
   }
  },
@@ -81761,10 +82228,13 @@
       "7": "'LocalActivityExhausted'"
      },
      {
+      "3": "'SideEffectRecorded'",
+      "7": "'SideEffectRecorded'"
+     },
+     {
       "3": "'SignalReceived'",
       "7": "'TimerFired'"
-     },
-     {}
+     }
     ],
     "types": {
      "1": "uuid",

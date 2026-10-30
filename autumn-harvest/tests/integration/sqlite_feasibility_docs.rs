@@ -919,14 +919,17 @@ fn zero_regression_to_the_postgres_path_is_structurally_true() {
     // Issue #2258: the opt-in owner disk cache may pull `rusqlite`, but only as
     // an optional dependency that the `owner-disk-cache` feature enables. The
     // default build must never reach it.
+    // Issue #2429: the Ledger census hook traces SQLite statements. Its
+    // `ledger-census` feature is opt-in too, and only a census run enables it.
     for line in core_directives.iter().filter(|l| l.contains("rusqlite")) {
         let optional_dep = line.starts_with("rusqlite") && line.contains("optional = true");
-        let feature_edge = line.starts_with("owner-disk-cache =");
+        let feature_edge =
+            line.starts_with("owner-disk-cache =") || line.starts_with("ledger-census =");
         assert!(
             optional_dep || feature_edge,
             "core must not depend on rusqlite outside the opt-in `owner-disk-cache` \
-             feature — the SQLite backend is a downstream companion crate, never a \
-             core dependency. Found:\n  {line}"
+             and `ledger-census` features — the SQLite backend is a downstream \
+             companion crate, never a core dependency. Found:\n  {line}"
         );
     }
     let default_features = core_directives
@@ -934,7 +937,9 @@ fn zero_regression_to_the_postgres_path_is_structurally_true() {
         .find(|l| l.starts_with("default ="))
         .expect("core declares its default features");
     assert!(
-        !default_features.contains("owner-disk-cache") && !default_features.contains("rusqlite"),
+        !default_features.contains("owner-disk-cache")
+            && !default_features.contains("ledger-census")
+            && !default_features.contains("rusqlite"),
         "the default build of core must not pull rusqlite. Found:\n  {default_features}"
     );
     assert!(

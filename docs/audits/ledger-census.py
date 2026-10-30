@@ -19,6 +19,10 @@ does not depend on fixture data. The step writes one page for each source
 file under `docs/ledger/plans/`, and it sets the `plan` field of each profile
 that it measured.
 
+`plan-sqlite` does the same for SQLite statements, with `EXPLAIN QUERY PLAN`
+on an in-memory database built from the SQLite DDL that the census recorded
+(issue #2429). A `SCAN` that names no index is the finding.
+
 A plan is not a buffer count. `measured` stays for a Ledger page with real
 buffers. A `plan` page shows which index each statement uses, and which
 statements scan a table with no usable index.
@@ -28,6 +32,7 @@ Usage:
         cargo test -p autumn-harvest --test integration -- --test-threads=6
     python3 docs/audits/ledger-census.py attribute /var/tmp/census.jsonl
     python3 docs/audits/ledger-census.py plan postgres://postgres@127.0.0.1/ledger_plan [--driver per_task]
+    python3 docs/audits/ledger-census.py plan-sqlite [--driver per_task]
     python3 docs/audits/ledger-census.py --self-test
 
 Leave `HARVEST_TEST_DATABASE_URL` unset, so that each suite boots a migrated
@@ -670,10 +675,10 @@ def run_plan_sqlite(driver):
         seen = statements.get(catalog, {})
         results = {}
         for key in sorted(wanted):
-            sqls = [s for s, m in seen.get(key, {}).items()
-                    if m.get("backend") == "sqlite" and PLANNABLE.match(s)]
+            ours = [s for s, m in seen.get(key, {}).items() if m.get("backend") == "sqlite"]
+            sqls = [s for s in ours if PLANNABLE.match(s)]
             if not sqls:
-                missing.append(f"{catalog} {key}")
+                missing.append(f"{catalog} {key}" + (" (only DDL or pragmas)" if ours else ""))
                 continue
             results[key] = [(sql, *explain_sqlite(db, sql, tables, partial), True) for sql in sqls]
         if not results:
