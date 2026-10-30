@@ -206,7 +206,6 @@ mod integration_e2e;
 #[cfg(feature = "db")]
 mod late_signal_completion_tests;
 #[cfg(feature = "db")]
-mod ledger_census;
 mod legal_hold_tests;
 #[cfg(feature = "db")]
 mod lifecycle_model_props;
@@ -346,6 +345,7 @@ mod scanner_liveness_tests;
 mod scanner_tick_db_tests;
 mod schedule_decisions;
 mod schedule_override_db_tests;
+mod schedule_override_parity_tests;
 mod schedule_override_reshard_db_tests;
 mod schedule_runs_tests;
 mod schedule_to_close_tests;

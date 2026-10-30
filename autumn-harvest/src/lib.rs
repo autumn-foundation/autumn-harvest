@@ -400,6 +400,9 @@ pub mod info;
 /// Activity execution interceptors (issue #680): an ordered middleware chain
 /// wrapping every activity execution on the worker (regular + local).
 pub mod interceptor;
+/// The Ledger census hook (issues #2366 and #2414). Never in a release build.
+#[cfg(all(feature = "ledger-census", feature = "db"))]
+pub mod ledger_census;
 /// Every persisted workflow execution state and every sanctioned transition.
 pub mod lifecycle;
 /// LLM token and cost budgets per run and per tenant (issue #1997).
@@ -616,6 +619,9 @@ pub mod schedule_decision;
 /// Operator overrides for code-declared schedules (issues #2385 and #2386).
 #[cfg(feature = "db")]
 pub mod schedule_override;
+/// The partial update of a workflow schedule and its override rules
+/// (issues #771, #2386 and #2390). Shared by both backends.
+pub mod schedule_patch;
 /// Backend-neutral cron and interval slot arithmetic (issue #2031).
 pub mod schedule_plan;
 #[cfg(feature = "db")]

@@ -18,6 +18,15 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `admit_update_event_with_codecs`
+
+Statements: 2. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+| 2 | `SELECT max("harvest_events"."event_id") FROM "harvest_events" WHERE ("harvest_events"."workflow_e...` | `harvest_events`: Index Only Scan on `idx_harvest_events_exec` |
+
 ## `admitted_count`
 
 Statements: 1. Tables with no usable index: none.
@@ -45,11 +54,12 @@ Statements: 10. Tables with no usable index: none.
 
 ## `append_single_event_with_codecs`
 
-Statements: 1. Tables with no usable index: none.
+Statements: 2. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT max("harvest_events"."event_id") FROM "harvest_events" WHERE ("harvest_events"."workflow_e...` | `harvest_events`: Index Only Scan on `idx_harvest_events_exec` |
+| 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+| 2 | `SELECT max("harvest_events"."event_id") FROM "harvest_events" WHERE ("harvest_events"."workflow_e...` | `harvest_events`: Index Only Scan on `idx_harvest_events_exec` |
 
 ## `append_stream_chunks_in_tx`
 
@@ -74,7 +84,7 @@ Statements: 14. Tables with no usable index: none.
 
 ## `append_workflow_logs`
 
-Statements: 7. Tables with no usable index: none.
+Statements: 9. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
@@ -83,8 +93,10 @@ Statements: 7. Tables with no usable index: none.
 | 3 | `INSERT INTO "harvest_workflow_logs" ("workflow_exec_id", "seq", "level", "message") VALUES ($1, $...` | `harvest_workflow_logs`: ModifyTable |
 | 4 | `INSERT INTO "harvest_workflow_logs" ("workflow_exec_id", "seq", "level", "message") VALUES ($1, $...` | `harvest_workflow_logs`: ModifyTable |
 | 5 | `INSERT INTO "harvest_workflow_logs" ("workflow_exec_id", "seq", "level", "message") VALUES ($1, $...` | `harvest_workflow_logs`: ModifyTable |
-| 6 | `SELECT COUNT(*) FROM "harvest_workflow_logs" WHERE ((("harvest_workflow_logs"."workflow_exec_id" ...` | `harvest_workflow_logs`: Bitmap Heap Scan on `harvest_workflow_logs_exec_seq` |
-| 7 | `SELECT EXISTS (SELECT "harvest_workflow_logs"."id", "harvest_workflow_logs"."workflow_exec_id", "...` | `harvest_workflow_logs`: Index Only Scan on `harvest_workflow_logs_exec_seq` |
+| 6 | `INSERT INTO "harvest_workflow_logs" ("workflow_exec_id", "seq", "level", "message") VALUES ($1, $...` | `harvest_workflow_logs`: ModifyTable |
+| 7 | `INSERT INTO "harvest_workflow_logs" ("workflow_exec_id", "seq", "level", "message") VALUES ($1, $...` | `harvest_workflow_logs`: ModifyTable |
+| 8 | `SELECT COUNT(*) FROM "harvest_workflow_logs" WHERE ((("harvest_workflow_logs"."workflow_exec_id" ...` | `harvest_workflow_logs`: Bitmap Heap Scan on `harvest_workflow_logs_exec_seq` |
+| 9 | `SELECT EXISTS (SELECT "harvest_workflow_logs"."id", "harvest_workflow_logs"."workflow_exec_id", "...` | `harvest_workflow_logs`: Index Only Scan on `harvest_workflow_logs_exec_seq` |
 
 ## `batch_blob_keys_still_referenced`
 
@@ -101,6 +113,14 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_payload_refs"."blob_key" FROM "harvest_payload_refs" WHERE ("harvest_payload_refs...` | `harvest_payload_refs`: Index Only Scan on `idx_harvest_payload_refs_key` |
+
+## `check_execution_exists`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT EXISTS (SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow...` | `harvest_workflow_executions`: Index Only Scan on `harvest_workflow_executions_pkey` |
 
 ## `count_history_events`
 
@@ -144,7 +164,7 @@ Statements: 1. Tables with no usable index: none.
 
 ## `insert_events`
 
-Statements: 25. Tables with no usable index: none.
+Statements: 37. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
@@ -173,6 +193,18 @@ Statements: 25. Tables with no usable index: none.
 | 23 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
 | 24 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
 | 25 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 26 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 27 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 28 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 29 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 30 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 31 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 32 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 33 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 34 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 35 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 36 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
+| 37 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ...` | `harvest_events`: ModifyTable |
 
 ## `insert_payload_refs`
 
@@ -184,6 +216,14 @@ Statements: 4. Tables with no usable index: none.
 | 2 | `INSERT INTO "harvest_payload_refs" ("blob_key", "workflow_exec_id", "store_id", "byte_len") VALUE...` | `harvest_payload_refs`: ModifyTable |
 | 3 | `INSERT INTO "harvest_payload_refs" ("blob_key", "workflow_exec_id", "store_id", "byte_len") VALUE...` | `harvest_payload_refs`: ModifyTable |
 | 4 | `INSERT INTO "harvest_payload_refs" ("blob_key", "workflow_exec_id", "store_id", "byte_len") VALUE...` | `harvest_payload_refs`: ModifyTable |
+
+## `load_events_after_row_id`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "...` | `harvest_events`: Index Scan on `idx_harvest_events_history_page` |
 
 ## `load_histories_undecoded_batch`
 
@@ -201,6 +241,17 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "...` | `harvest_events`: Bitmap Heap Scan on `idx_harvest_events_history_page` |
 
+## `load_history_page`
+
+Statements: 4. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "...` | `harvest_events`: Index Scan on `idx_harvest_events_history_page` |
+| 2 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "...` | `harvest_events`: Bitmap Heap Scan on `idx_harvest_events_history_page` |
+| 3 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "...` | `harvest_events`: Index Scan on `idx_harvest_events_history_page` |
+| 4 | `SELECT COUNT(*), max("harvest_events"."id") FROM "harvest_events" WHERE ("harvest_events"."workfl...` | `harvest_events`: Bitmap Heap Scan on `idx_harvest_events_history_page` |
+
 ## `load_history_since_inflated`
 
 Statements: 1. Tables with no usable index: none.
@@ -209,7 +260,23 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "...` | `harvest_events`: Index Scan on `idx_harvest_events_exec` |
 
+## `load_history_undecoded`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "...` | `harvest_events`: Bitmap Heap Scan on `idx_harvest_events_history_page` |
+
 ## `load_history_with_codecs`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "...` | `harvest_events`: Bitmap Heap Scan on `idx_harvest_events_history_page` |
+
+## `load_history_with_timestamps`
 
 Statements: 1. Tables with no usable index: none.
 
@@ -224,6 +291,14 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT DISTINCT "harvest_workflow_executions"."parent_id" FROM "harvest_workflow_executions" WHER...` | `harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_parent_id` |
+
+## `load_parents_with_summary_children`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT DISTINCT "harvest_execution_summaries"."parent_id" FROM "harvest_execution_summaries" WHER...` | `harvest_execution_summaries`: Bitmap Heap Scan on `idx_harvest_execution_summaries_parent` |
 
 ## `load_payload_refs`
 
@@ -258,6 +333,25 @@ Statements: 2. Tables with no usable index: none.
 | 1 | `SELECT "harvest_stream_chunks"."id", "harvest_stream_chunks"."workflow_exec_id", "harvest_stream_...` | `harvest_stream_chunks`: Index Scan on `harvest_stream_chunks_exec_offset` |
 | 2 | `SELECT "harvest_stream_chunks"."id", "harvest_stream_chunks"."workflow_exec_id", "harvest_stream_...` | `harvest_stream_chunks`: Index Scan on `harvest_stream_chunks_exec_offset` |
 
+## `load_timestamped_history`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "...` | `harvest_events`: Bitmap Heap Scan on `idx_harvest_events_history_page` |
+
+## `load_workflow_children`
+
+Statements: 4. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_parent_id` |
+| 2 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_parent_id` |
+| 3 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_parent_id` |
+| 4 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_parent_id` |
+
 ## `load_workflow_children_batch`
 
 Statements: 1. Tables with no usable index: none.
@@ -266,15 +360,24 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."parent_id", "harvest_wo...` | `harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_parent_id` |
 
+## `load_workflow_children_multi`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Bitmap Heap Scan on `idx_harvest_we_parent_id` |
+
 ## `load_workflow_logs`
 
-Statements: 3. Tables with no usable index: none.
+Statements: 4. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_workflow_logs"."id", "harvest_workflow_logs"."workflow_exec_id", "harvest_workflo...` | `harvest_workflow_logs`: Index Scan on `harvest_workflow_logs_exec_seq` |
 | 2 | `SELECT "harvest_workflow_logs"."id", "harvest_workflow_logs"."workflow_exec_id", "harvest_workflo...` | `harvest_workflow_logs`: Bitmap Heap Scan on `harvest_workflow_logs_exec_seq` |
-| 3 | `SELECT "harvest_workflow_logs"."id", "harvest_workflow_logs"."workflow_exec_id", "harvest_workflo...` | `harvest_workflow_logs`: Index Scan on `harvest_workflow_logs_exec_seq` |
+| 3 | `SELECT "harvest_workflow_logs"."id", "harvest_workflow_logs"."workflow_exec_id", "harvest_workflo...` | `harvest_workflow_logs`: Bitmap Heap Scan on `harvest_workflow_logs_exec_seq` |
+| 4 | `SELECT "harvest_workflow_logs"."id", "harvest_workflow_logs"."workflow_exec_id", "harvest_workflo...` | `harvest_workflow_logs`: Index Scan on `harvest_workflow_logs_exec_seq` |
 
 ## `lock_and_load_history_undecoded`
 
@@ -300,6 +403,14 @@ Statements: 2. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT "harvest_workflow_executions"."id" FROM "harvest_workflow_executions" WHERE ("harvest_work...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
 | 2 | `SELECT max("harvest_events"."event_id") FROM "harvest_events" WHERE ("harvest_events"."workflow_e...` | `harvest_events`: Index Only Scan on `idx_harvest_events_exec` |
+
+## `row_id_for_event_id`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_events"."id" FROM "harvest_events" WHERE (("harvest_events"."workflow_exec_id" = ...` | `harvest_events`: Index Scan on `idx_harvest_events_exec` |
 
 ## `sum_history_bytes_between`
 

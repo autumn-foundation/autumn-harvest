@@ -5086,6 +5086,8 @@ async fn setup_workflow_backfill_app(
     let api_state = HarvestApiState::new();
     // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
+    // The embedder owns the admin boundary, so trigger-now (an admin route) runs.
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         registry,
@@ -5593,6 +5595,107 @@ async fn backfill_max_runs_zero_is_treated_as_unlimited() {
         count_workflow_executions_by_name_from_url(&database_url, name).await,
         3,
     );
+}
+
+// ── Budget guards touch only their own schedule (issue #2423) ───────────────
+
+/// Copy `source` into a second schedule row, the bystander.
+///
+/// The bystander has a budget of ten runs, three started runs and an `end_at`
+/// exhaustion. A budget statement for `source` must leave all three intact.
+async fn insert_exhausted_bystander_schedule(database_url: &str, source: uuid::Uuid) -> uuid::Uuid {
+    let bystander = uuid::Uuid::new_v4();
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect to insert the bystander schedule");
+    conn.batch_execute(&format!(
+        "CREATE TEMP TABLE bystander AS SELECT * FROM harvest_schedules WHERE id = '{source}'; \
+         UPDATE bystander SET id = '{bystander}', workflow_name = 'budget_bystander_wf', \
+             max_runs = 10, runs_started = 3, exhausted_at = NOW(), \
+             exhausted_reason = 'end_at_reached'; \
+         INSERT INTO harvest_schedules SELECT * FROM bystander;"
+    ))
+    .await
+    .expect("insert the bystander schedule");
+    bystander
+}
+
+/// Assert that the bystander kept its run count and its exhaustion.
+async fn assert_bystander_untouched(database_url: &str, bystander: uuid::Uuid) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect to load the bystander schedule");
+    let row: HarvestSchedule = harvest_schedules::table
+        .find(bystander)
+        .select(HarvestSchedule::as_select())
+        .first(&mut conn)
+        .await
+        .expect("bystander schedule row");
+    assert_eq!(
+        row.runs_started, 3,
+        "a budget statement for another schedule changed the bystander run count"
+    );
+    assert!(
+        row.exhausted_at.is_some(),
+        "a budget statement for another schedule cleared the bystander exhaustion"
+    );
+    assert_eq!(row.exhausted_reason.as_deref(), Some("end_at_reached"));
+}
+
+/// Trigger-now reserves a run slot on its own schedule only.
+#[tokio::test]
+async fn trigger_now_budget_reservation_touches_only_its_schedule() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "trigger_budget_scope_wf";
+    let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, Some(5)).await;
+    let bystander = insert_exhausted_bystander_schedule(&database_url, schedule.id).await;
+
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/trigger", schedule.id),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let reloaded = load_workflow_only_schedule_from_url_optional(&database_url, name)
+        .await
+        .expect("schedule row should still exist");
+    assert_eq!(reloaded.runs_started, 1, "the trigger reserves one slot");
+    assert_bystander_untouched(&database_url, bystander).await;
+}
+
+/// Backfill reserves and releases run slots on its own schedule only.
+///
+/// Every slot overflows the input cap, so each slot reserves, then releases.
+/// The release also runs the clear statement for a stale exhaustion.
+#[tokio::test]
+async fn backfill_budget_reserve_and_release_touch_only_their_schedule() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "backfill_budget_scope_wf";
+    let input = json!({ "blob": "x".repeat(2 * 1024 * 1024 + 1024) });
+    let (app, schedule) =
+        setup_throttled_workflow_backfill_app(&database_url, pool, name, Some(5), input).await;
+    let bystander = insert_exhausted_bystander_schedule(&database_url, schedule.id).await;
+
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T11:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["skipped_reasons"]["oversized_input"], json!(2));
+
+    assert_bystander_untouched(&database_url, bystander).await;
 }
 
 #[tokio::test]

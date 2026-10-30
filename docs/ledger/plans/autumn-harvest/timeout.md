@@ -152,6 +152,14 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT state, schedule_to_close_at, crash_strikes, worker_id, attempt, started_at, handler_starte...` | `harvest_task_queue`: Index Scan on `harvest_task_queue_pkey` |
 
+## `lock_workflow_execution_row_and_load_history`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+
 ## `schedule_to_start_still_expired`
 
 Statements: 1. Tables with no usable index: none.

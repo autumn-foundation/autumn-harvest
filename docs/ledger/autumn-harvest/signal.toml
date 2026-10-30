@@ -46,3 +46,4 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_signals"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/signal.md"

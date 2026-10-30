@@ -44,12 +44,13 @@ Statements: 1. Tables with no usable index: none.
 
 ## `cancel_workflow_execution_collect_mode`
 
-Statements: 2. Tables with no usable index: none.
+Statements: 3. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `DELETE FROM "harvest_task_queue" WHERE (((("harvest_task_queue"."workflow_exec_id" = $1) AND ("ha...` | `harvest_task_queue`: Index Scan on `idx_harvest_tq_owner_order`<br>`harvest_task_queue`: ModifyTable |
-| 2 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "output" = $2, "error" = $3, "completed_at...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
+| 2 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+| 3 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "output" = $2, "error" = $3, "completed_at...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
 
 ## `cascade_cancel_detached_child`
 
@@ -67,6 +68,16 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "error" = $2, "completed_at" = $3, "paused...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
 
+## `count_workflow_executions_grouped`
+
+Statements: 3. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT state::TEXT AS state, COUNT(*)::BIGINT AS count FROM harvest_workflow_executions WHERE sha...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_shard_started`<br>`harvest_workflow_executions`: Index Scan on `idx_harvest_wfx_workflow_identity` |
+| 2 | `SELECT state::TEXT AS state, workflow_name::TEXT AS workflow_name, COUNT(*)::BIGINT AS count FROM...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_shard_started` |
+| 3 | `SELECT workflow_name::TEXT AS workflow_name, COUNT(*)::BIGINT AS count FROM harvest_workflow_exec...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_shard_started` |
+
 ## `execution_exists_by_key`
 
 Statements: 1. Tables with no usable index: none.
@@ -74,6 +85,14 @@ Statements: 1. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT EXISTS (SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow...` | `harvest_workflow_executions`: Index Only Scan on `idx_harvest_wfx_workflow_identity` |
+
+## `inline_cancel`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "error" = $2, "completed_at" = $3, "paused...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
 
 ## `list_schedule_runs`
 
@@ -84,6 +103,14 @@ Statements: 1. Tables with no usable index: none.
 | 1 | `SELECT id, scheduled_for, started_at, completed_at, state::TEXT AS state, origin, error FROM harv...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_wfx_schedule_runs_slot` |
 
 ## `load_execution`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+
+## `load_execution_row`
 
 Statements: 1. Tables with no usable index: none.
 
@@ -139,6 +166,14 @@ Statements: 1. Tables with no usable index: none.
 |---|---|---|
 | 1 | `SELECT workflow_name::TEXT AS workflow_name, COUNT(*)::BIGINT AS non_terminal_count, MIN(started_...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_non_terminal_wf_name` |
 
+## `notify_awaited_parent_of_child_terminal`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_w...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+
 ## `parent_close_cascade_event_count`
 
 Statements: 1. Tables with no usable index: none.
@@ -149,38 +184,48 @@ Statements: 1. Tables with no usable index: none.
 
 ## `pause_workflow_execution`
 
-Statements: 1. Tables with no usable index: none.
+Statements: 2. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "paused_at" = $2, "pause_reason" = $3, "pa...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_canary_order`<br>`harvest_workflow_executions`: ModifyTable |
+| 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+| 2 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "paused_at" = $2, "pause_reason" = $3, "pa...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_canary_order`<br>`harvest_workflow_executions`: ModifyTable |
 
 ## `reactivate_failed_execution_at`
 
-Statements: 1. Tables with no usable index: none.
+Statements: 2. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "error" = $2, "output" = $3, "completed_at...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
+| 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+| 2 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "error" = $2, "output" = $3, "completed_at...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
 
 ## `replace_execution`
 
-Statements: 3. Tables with no usable index: none.
+Statements: 10. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
 | 2 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
 | 3 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 4 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 5 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 6 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 7 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 8 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 9 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 10 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
 
 ## `rerun_workflow_execution_with_codecs`
 
-Statements: 2. Tables with no usable index: none.
+Statements: 3. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT EXISTS (SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow...` | `harvest_workflow_executions`: Index Only Scan on `idx_harvest_wfx_retry_of` |
-| 2 | `UPDATE "harvest_workflow_executions" SET "completed_at" = $1 WHERE (("harvest_workflow_executions...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
+| 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+| 2 | `SELECT EXISTS (SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow...` | `harvest_workflow_executions`: Index Only Scan on `idx_harvest_wfx_retry_of` |
+| 3 | `UPDATE "harvest_workflow_executions" SET "completed_at" = $1 WHERE (("harvest_workflow_executions...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
 
 ## `resolve_carryover`
 
@@ -202,11 +247,12 @@ Statements: 2. Tables with no usable index: none.
 
 ## `resume_workflow_execution`
 
-Statements: 1. Tables with no usable index: none.
+Statements: 2. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "paused_at" = $2, "pause_reason" = $3, "pa...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_paused`<br>`harvest_workflow_executions`: ModifyTable |
+| 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+| 2 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "paused_at" = $2, "pause_reason" = $3, "pa...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_paused`<br>`harvest_workflow_executions`: ModifyTable |
 
 ## `schedule_run_state_summary`
 
@@ -218,11 +264,12 @@ Statements: 1. Tables with no usable index: none.
 
 ## `seal_replaced_execution`
 
-Statements: 1. Tables with no usable index: none.
+Statements: 2. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "completed_at" = $2 WHERE (("harvest_workf...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
+| 1 | `SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_w...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+| 2 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "completed_at" = $2 WHERE (("harvest_workf...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
 
 ## `shift_schedule_to_close_for_resume`
 
@@ -244,7 +291,7 @@ Statements: 2. Tables with no usable index: none.
 
 ## `start_or_load_workflow_execution_collect_with_codecs_and_quota_override`
 
-Statements: 39. Tables with no usable index: none.
+Statements: 55. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
@@ -286,15 +333,32 @@ Statements: 39. Tables with no usable index: none.
 | 36 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
 | 37 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
 | 38 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
-| 39 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_non_terminal_wf_name` |
+| 39 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 40 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 41 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 42 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 43 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 44 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 45 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 46 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 47 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 48 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 49 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 50 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 51 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 52 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 53 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 54 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard...` | `harvest_workflow_executions`: ModifyTable |
+| 55 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `idx_harvest_we_non_terminal_wf_name` |
 
 ## `terminate_workflow_execution_collect`
 
-Statements: 1. Tables with no usable index: none.
+Statements: 2. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "output" = $2, "error" = $3, "completed_at...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
+| 1 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+| 2 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "output" = $2, "error" = $3, "completed_at...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
 
 ## `try_load_active_execution_for_update`
 

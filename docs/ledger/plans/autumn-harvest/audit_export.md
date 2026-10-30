@@ -124,6 +124,14 @@ Statements: 2. Tables with no usable index: none.
 | 1 | `SELECT MIN(occurred_at) AS oldest FROM ( SELECT occurred_at FROM harvest_audit_log WHERE export_s...` | `harvest_audit_log`: Index Only Scan on `harvest_audit_log_export_seq_idx` |
 | 2 | `SELECT min("harvest_audit_log"."occurred_at") FROM "harvest_audit_log" WHERE ("harvest_audit_log"...` | `harvest_audit_log`: Index Scan on `harvest_audit_occurred_at_idx` |
 
+## `export_status`
+
+Statements: 1. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT "harvest_audit_export_cursor"."shard_id", "harvest_audit_export_cursor"."last_assigned_seq...` | `harvest_audit_export_cursor`: Index Scan on `harvest_audit_export_cursor_pkey` |
+
 ## `pending_and_lag`
 
 Statements: 1. Tables with no usable index: `harvest_audit_log`.

@@ -29,6 +29,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_calendars"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/calendar.md"
 
 ["load_exclusions_for_calendar"]
 driver = "per_tick"

@@ -6,6 +6,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/batch.md"
 
 ["db::find_job_by_key"]
 driver = "per_request"
@@ -29,6 +30,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_batch_jobs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/batch.md"
 
 ["db::mark_completed"]
 driver = "per_tick"
@@ -82,6 +84,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/batch.md"
 
 ["db::submit_batch_job_with_codecs"]
 driver = "per_request"

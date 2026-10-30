@@ -145,12 +145,13 @@ Statements: 1. Tables with no usable index: none.
 
 ## `materialize_due_child_timeout_deadlines`
 
-Statements: 2. Tables with no usable index: none.
+Statements: 3. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_pending` |
-| 2 | `UPDATE "harvest_timers" SET "fired" = $1 WHERE ("harvest_timers"."id" = $2)` | `harvest_timers`: Index Scan on `harvest_timers_pkey`<br>`harvest_timers`: ModifyTable |
+| 2 | `SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harves...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+| 3 | `UPDATE "harvest_timers" SET "fired" = $1 WHERE ("harvest_timers"."id" = $2)` | `harvest_timers`: Index Scan on `harvest_timers_pkey`<br>`harvest_timers`: ModifyTable |
 
 ## `new_child_workflow_event_count`
 

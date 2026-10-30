@@ -21,6 +21,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue", "harvest_workers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["heartbeat_worker_status"]
 driver = "per_tick"
@@ -36,6 +37,7 @@ backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue", "harvest_workflow_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["list_workers"]
 driver = "per_request"
