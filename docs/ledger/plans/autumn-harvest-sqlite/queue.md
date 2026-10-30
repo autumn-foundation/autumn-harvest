@@ -177,7 +177,7 @@ Statements: 1. Backend: SQLite. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT MAX(arm_seq) FROM harvest_timers` | no table |
+| 1 | `SELECT MAX(arm_seq) FROM harvest_timers` | `harvest_timers`: Search on `idx_harvest_timers_arm_seq` |
 
 ## `pending_tasks`
 

@@ -32,5 +32,5 @@ Statements: 1. Backend: SQLite. Tables with no usable index: `harvest_signals`.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `UPDATE harvest_signals SET idempotency_key = name WHERE idempotency_key IS NULL AND substr(name, ...` | `harvest_signals`: no usable index |
+| 1 | `UPDATE harvest_signals SET idempotency_key = name WHERE idempotency_key IS NULL AND substr(name, ...` | `harvest_signals`: Search on `idx_harvest_signals_exec_arrival`<br>`harvest_signals`: Search on `uq_harvest_signals_idem`<br>`harvest_signals`: no usable index |
 

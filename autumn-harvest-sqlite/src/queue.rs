@@ -139,12 +139,11 @@ fn next_task_seq(conn: &Connection) -> SqliteResult<i64> {
 /// second reads `MAX`. Robust to `VACUUM` (unlike an implicit `rowid`, which
 /// `VACUUM` may renumber).
 fn next_timer_arm_seq(conn: &Connection) -> SqliteResult<i64> {
-    let max: Option<i64> =
-        conn.query_row("SELECT MAX(arm_seq) FROM harvest_timers", [], |row| {
-            row.get(0)
-        })?;
+    let max: Option<i64> = conn.query_row(NEXT_TIMER_ARM_SEQ_SQL, [], |row| row.get(0))?;
     Ok(max.map_or(0, |m| m + 1))
 }
+
+const NEXT_TIMER_ARM_SEQ_SQL: &str = "SELECT MAX(arm_seq) FROM harvest_timers";
 
 /// Reclaim the tasks of `exec_id` that a dropped drive left `RUNNING` (issue
 /// #2024).
@@ -831,9 +830,9 @@ mod tests {
     use autumn_harvest::ExecutionId;
 
     use super::{
-        CANCEL_ACTIVITY_TASK_SQL, DELETE_UNDELIVERED_SIGNALS_SQL, cancel_activity_task,
-        delete_undelivered_signals_for_execution, due_timers, due_timers_with_deadlines,
-        enqueue_timer,
+        CANCEL_ACTIVITY_TASK_SQL, DELETE_UNDELIVERED_SIGNALS_SQL, NEXT_TIMER_ARM_SEQ_SQL,
+        cancel_activity_task, delete_undelivered_signals_for_execution, due_timers,
+        due_timers_with_deadlines, enqueue_timer,
     };
     use crate::schema;
 
@@ -885,6 +884,24 @@ mod tests {
         assert!(
             !plan.contains("SCAN"),
             "expected no full-table scan, got plan: {plan}"
+        );
+    }
+
+    // Issue #2429: each timer arm reads the largest arm_seq. Fired timers stay
+    // in the table, so without an index the read grows with history.
+    #[test]
+    fn next_timer_arm_seq_reads_an_index_not_every_timer() {
+        let conn = open();
+        let plan: String = conn
+            .query_row(
+                &format!("EXPLAIN QUERY PLAN {NEXT_TIMER_ARM_SEQ_SQL}"),
+                [],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("USING COVERING INDEX idx_harvest_timers_arm_seq"),
+            "expected an index search, got plan: {plan}"
         );
     }
 

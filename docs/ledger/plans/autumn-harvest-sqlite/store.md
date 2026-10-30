@@ -104,7 +104,7 @@ Statements: 1. Backend: SQLite. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT s.exec_id FROM harvest_executions AS e JOIN harvest_signals AS s ON s.exec_id = e.exec_id ...` | no table |
+| 1 | `SELECT s.exec_id FROM harvest_executions AS e JOIN harvest_signals AS s ON s.exec_id = e.exec_id ...` | `harvest_executions`: Search on `idx_harvest_executions_key`<br>`harvest_signals`: Search on `uq_harvest_signals_idem` |
 
 ## `for_each_pending_signal`
 

@@ -17,6 +17,14 @@ table keeps the rows of finished runs, so each cancel read every task in the
 file. The statement now names the run too, so `idx_harvest_tasks_exec` finds
 the row.
 
+## Fixed — each SQLite timer arm read every timer (issue #2429)
+
+Each timer arm takes the next `arm_seq` from `MAX(arm_seq)` over all timers.
+Fired timers stay until retention purges their run, and no index covered
+the column, so each arm read the whole table. The base schema now builds
+`idx_harvest_timers_arm_seq`, so the read is one index step. An existing file
+gets the index on its next open.
+
 The other SQLite scans are by design: a startup reclaim, a one-time
 back-fill, the small schedule and writer-lock tables, a test fixture, and the
 read-only SQL that an operator runs over one entity.

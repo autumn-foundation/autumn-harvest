@@ -3973,6 +3973,13 @@
     ],
     "types": {}
    },
+   "-- Each timer arm reads `MAX(arm_seq)` over every timer row (issue #2429). Fired\n-- rows stay until retention purges their run, so without this index each arm\n-- reads the whole table. The column exists in every file, so the base schema\n-- builds the index.\nCREATE INDEX IF NOT EXISTS idx_harvest_timers_arm_seq\nON harvest_timers (arm_seq);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
    "-- Non-unique index on `harvest_tasks(seq)` so `MAX(seq)` (the next-`seq` allocation\n-- read in `queue`, used on every enqueue and every zero-delay requeue-to-back) is\n-- satisfied from the index instead of a full-table scan (issue #1068, hardening item\n-- 3). The new zero-delay requeue-to-back (which reassigns a fresh `MAX(seq) + 1` on\n-- each immediate race retry) makes that read hotter, so the index keeps a busy retry\n-- loop cheap. `CREATE INDEX IF NOT EXISTS` is idempotent and non-unique \u2014 it runs on\n-- every open (including a pre-existing file) and never fails, so no separate additive\n-- migration is needed.\nCREATE INDEX IF NOT EXISTS idx_harvest_tasks_seq\nON harvest_tasks (seq);": {
     "backend": "sqlite",
     "literals": [

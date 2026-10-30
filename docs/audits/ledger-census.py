@@ -617,8 +617,32 @@ def sqlite_schema(statements):
     return db, tables, frozenset(partial)
 
 
-def sqlite_access(detail, tables, partial=frozenset()):
+SQL_KEYWORDS = {"WHERE", "ON", "JOIN", "LEFT", "INNER", "CROSS", "SET", "GROUP", "ORDER", "LIMIT",
+                "USING", "NATURAL", "UNION", "VALUES", "RETURNING", "AND", "OR", "AS", "INDEXED", "NOT"}
+
+
+def sqlite_aliases(sql, tables):
+    """Map each table alias in `sql` to its table. SQLite's plan names the alias."""
+    aliases = {}
+    for table, alias in re.findall(r"\b(?:FROM|JOIN|UPDATE|INTO)\s+(\w+)\s+(?:AS\s+)?(\w+)", sql, re.IGNORECASE):
+        if table in tables and alias.upper() not in SQL_KEYWORDS:
+            aliases[alias] = table
+    for table, alias in re.findall(r",\s*(\w+)\s+(?:AS\s+)?(\w+)", sql):
+        if table in tables and alias.upper() not in SQL_KEYWORDS:
+            aliases[alias] = table
+    return aliases
+
+
+def sqlite_access(detail, tables, partial=frozenset(), aliases=None):
     """Map one `EXPLAIN QUERY PLAN` row to `(table, access)`, or None."""
+    head = re.match(r"^(SEARCH|SCAN) (\w+)(?: AS (\w+))?", detail)
+    if head and aliases and head.group(2) in aliases and head.group(2) not in tables:
+        detail = f"{head.group(1)} {aliases[head.group(2)]}" + detail[head.end():]
+    # A bare `SEARCH t` is a MIN or MAX that no index can answer. The loop reads
+    # every row, so it is a scan.
+    bare = re.fullmatch(r"SEARCH (\w+)(?: AS \w+)?", detail.strip())
+    if bare and bare.group(1) in tables:
+        return bare.group(1), NO_INDEX
     match = SQLITE_SEARCH.match(detail)
     if match and match.group(1) in tables:
         index = match.group(2)
@@ -658,7 +682,8 @@ def explain_sqlite(db, sql, tables, partial=frozenset()):
             return None, str(retry).splitlines()[0]
     except sqlite3.Error as error:
         return None, str(error).splitlines()[0]
-    found = {hit for row in rows if (hit := sqlite_access(row[-1], tables, partial))}
+    aliases = sqlite_aliases(sql, tables)
+    found = {hit for row in rows if (hit := sqlite_access(row[-1], tables, partial, aliases))}
     return sorted(found), None
 
 
@@ -838,6 +863,18 @@ def self_test():
     assert sqlite_access("SEARCH harvest_tasks USING INTEGER PRIMARY KEY (rowid=?)", tables) == \
         ("harvest_tasks", "Search on the primary key")
     assert sqlite_access("USE TEMP B-TREE FOR ORDER BY", tables) is None
+    assert sqlite_access("SEARCH harvest_tasks", tables) == ("harvest_tasks", NO_INDEX)
+    assert sqlite_aliases("SELECT 1 FROM harvest_tasks t JOIN harvest_executions AS e ON 1 WHERE x", tables) == \
+        {"t": "harvest_tasks", "e": "harvest_executions"}
+    assert sqlite_aliases("SELECT 1 FROM harvest_tasks WHERE x", tables) == {}
+    assert sqlite_access("SCAN t", tables, aliases={"t": "harvest_tasks"}) == ("harvest_tasks", NO_INDEX)
+    assert sqlite_access("SEARCH e USING INDEX k (id=?)", tables, aliases={"e": "harvest_executions"}) == \
+        ("harvest_executions", "Search on `k`")
+    assert explain_sqlite(db_max := sqlite3.connect(":memory:"), "SELECT 1", set())[1] is None
+    db_max.execute("CREATE TABLE m (a INTEGER, b INTEGER)")
+    db_max.execute("CREATE INDEX m_b ON m (b)")
+    assert explain_sqlite(db_max, "SELECT MAX(a) FROM m", {"m"}) == ([("m", NO_INDEX)], None)
+    assert explain_sqlite(db_max, "SELECT MAX(b) FROM m", {"m"}) == ([("m", "Search on `m_b`")], None)
     assert ddl_kind("-- why\nCREATE TABLE IF NOT EXISTS t (a)") < ddl_kind("CREATE INDEX IF NOT EXISTS i ON t (a)")
     assert ddl_kind("ALTER TABLE t ADD COLUMN b") == SQLITE_DDL.index("ALTER TABLE")
     assert ddl_kind("SELECT 1") is None
