@@ -285,6 +285,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **wasmtime 48.0.8 for RUSTSEC-2026-0422 to -0424 (issue #2434).** Three new advisories affect `wasmtime` 48.0.7, used by the optional `wasm-activities` feature: a type-check panic, a cross-engine type confusion, and unchecked memory use when components transfer borrowed resources. `Cargo.lock` moves to 48.0.8, and the manifest floor in `autumn-harvest` moves to 48.0.8, so a downstream consumer stays off the vulnerable release.
+
 - **OIDC login and custom roles for Vantage and the API (issue #1978).** Issue #1978 asks where SSO lives. [ADR 0006](docs/adr/0006-oidc-sso-and-custom-roles.md) records the decision: SSO lives in Harvest as a thin opt-in layer, custom roles are built in, and mTLS stays in autumn-web.
 
 - **Bind the tenant to the principal, per-tenant retention (issue #1977).** ADR 0004 (`docs/adr/0004-tenant-isolation-cells.md`) records the decision in a new amendment. Hostile multi-tenancy is now in scope at the management API. It stays out of scope inside the engine.
