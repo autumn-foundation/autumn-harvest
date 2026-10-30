@@ -7,6 +7,13 @@ kind = []
 tables = []
 measured = "unmeasured"
 
+["add_schedule_code"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["ddl", "read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
 ["add_signal_key"]
 driver = "setup"
 backend = ["sqlite"]
@@ -32,5 +39,5 @@ measured = "unmeasured"
 driver = "setup"
 backend = ["sqlite"]
 kind = ["ddl"]
-tables = ["harvest_executions", "harvest_tasks"]
+tables = ["harvest_executions", "harvest_schedules", "harvest_tasks"]
 measured = "unmeasured"

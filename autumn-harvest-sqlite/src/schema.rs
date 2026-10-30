@@ -47,6 +47,9 @@
 //!   form a FIFO queue per key. The counter mints each fencing `lock_seq`.
 //! - `harvest_schedules` — cron and interval schedules (issue #2031). One row
 //!   per workflow name, as on Postgres.
+//! - `harvest_schedule_overrides` — operator overrides of those schedules
+//!   (issue #2390). One row per workflow name. An override wins over the code
+//!   value and survives a reopen, as on Postgres.
 //! - `harvest_llm_ledger` — the agent cost ledger (issue #2275). One row per
 //!   LLM call of a completed activity attempt, keyed `(exec_id, event_seq,
 //!   call_index)`. See [`llm_ledger`](crate::llm_ledger).
@@ -325,8 +328,21 @@ CREATE TABLE IF NOT EXISTS harvest_schedules (
     paused          INTEGER NOT NULL DEFAULT 0,
     next_run_at     INTEGER,               -- the next slot in epoch milliseconds.
                                            -- NULL = never fires.
-    last_run_at     INTEGER                -- the slot of the last started run in
+    last_run_at     INTEGER,               -- the slot of the last started run in
                                            -- epoch milliseconds
+    code_json       TEXT                   -- the code `WorkflowSchedule` as JSON
+                                           -- (issue #2390). The row holds the
+                                           -- effective value; an override
+                                           -- merges over this one.
+);
+
+CREATE TABLE IF NOT EXISTS harvest_schedule_overrides (
+    workflow_name TEXT PRIMARY KEY,
+    fields_json   TEXT NOT NULL,           -- the override fields as JSON
+    reason        TEXT,
+    updated_by    TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,        -- epoch milliseconds
+    updated_at    INTEGER NOT NULL         -- epoch milliseconds
 );
 
 CREATE TABLE IF NOT EXISTS harvest_activity_attempts (
@@ -468,6 +484,10 @@ use crate::error::SqliteResult;
 ///   time that retention reads. The column is nullable, so an old row is not
 ///   a scheduled run. The indexes are built here, because the base
 ///   [`SCHEMA`] runs before an old table has the columns.
+/// - **issue #2390** — `harvest_schedules.code_json`, the code value of a
+///   schedule. It is nullable. The next upsert of an old row fills it, and an
+///   override of a row without it is refused. The override table is new, so
+///   the base [`SCHEMA`] adds it.
 /// - **issue #2275** — the `harvest_llm_ledger` table and its index. Both are
 ///   new, so the base [`SCHEMA`] adds them to an older file. This step does
 ///   nothing for them.
@@ -572,7 +592,30 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         "ALTER TABLE harvest_executions ADD COLUMN schedule_name TEXT",
     )?;
     conn.execute_batch(SCHEDULE_AND_RETENTION_INDEXES)?;
+    add_schedule_code(conn)?;
     add_signal_key(conn)
+}
+
+/// Issue #2390: the code value of a schedule, which an override merges over.
+///
+/// A file opened by `SqliteRuntime::open` always has the table, because the
+/// base [`SCHEMA`] creates it first. A bare older file may not.
+fn add_schedule_code(conn: &Connection) -> SqliteResult<()> {
+    let has_schedules: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master \
+           WHERE type = 'table' AND name = 'harvest_schedules')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_schedules {
+        add_column_if_absent(
+            conn,
+            "harvest_schedules",
+            "code_json",
+            "ALTER TABLE harvest_schedules ADD COLUMN code_json TEXT",
+        )?;
+    }
+    Ok(())
 }
 
 /// Issue #2028: the signal idempotency key. The back-fill runs only when the
@@ -795,6 +838,36 @@ mod tests {
         assert!(column_exists(&conn, "harvest_tasks", "defaults_frozen").unwrap());
         assert!(column_exists(&conn, "harvest_executions", "cancel_reason").unwrap());
         assert!(column_exists(&conn, "harvest_executions", "cancel_from_seq").unwrap());
+    }
+
+    // Issue #2390: an old `harvest_schedules` gets `code_json`. The old row
+    // keeps its data and has no code value until its next upsert.
+    #[test]
+    fn migrate_adds_the_schedule_code_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE harvest_schedules (workflow_name TEXT PRIMARY KEY, \
+               schedule_json TEXT NOT NULL, input_json TEXT NOT NULL, \
+               overlap_policy TEXT NOT NULL, max_active_runs INTEGER NOT NULL, \
+               paused INTEGER NOT NULL DEFAULT 0, next_run_at INTEGER, last_run_at INTEGER); \
+             INSERT INTO harvest_schedules (workflow_name, schedule_json, input_json, \
+               overlap_policy, max_active_runs) VALUES ('wf', '{}', '{}', 'skip', 1);",
+        )
+        .unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        assert!(!column_exists(&conn, "harvest_schedules", "code_json").unwrap());
+
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let code: Option<String> = conn
+            .query_row(
+                "SELECT code_json FROM harvest_schedules WHERE workflow_name = 'wf'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(code, None);
     }
 
     // Issue #2021: an old `harvest_executions` gets `cancel_reason`. The old row

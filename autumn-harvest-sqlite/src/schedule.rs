@@ -16,9 +16,14 @@
 //! of a fleet, and one writer has no fleet. Retry jitter has the same rule.
 
 use autumn_harvest::policy::{CatchupPolicy, OverlapPolicy, Schedule, WorkflowSchedule};
+use autumn_harvest::schedule_patch::{
+    WorkflowSchedulePatch, merge_workflow_fields, validate_effective_workflow,
+    workflow_fields_are_empty,
+};
 use autumn_harvest::schedule_plan;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
@@ -35,6 +40,8 @@ pub struct ScheduleSummary {
     pub workflow_name: String,
     /// The cron or interval spec.
     pub schedule: Schedule,
+    /// The run limit of `skip` (issue #2390).
+    pub max_active_runs: u32,
     /// `true` while the schedule is paused.
     pub paused: bool,
     /// The next slot. `None` never fires.
@@ -58,58 +65,326 @@ pub struct Due {
     schedule: Schedule,
 }
 
-/// Insert or update `schedule` at `now`, in epoch milliseconds.
+/// Insert or update the code value `schedule` at `now`, in epoch
+/// milliseconds.
+///
+/// A stored operator override wins over `schedule` (issue #2390). So the row
+/// holds the merged value, and an app that upserts on every open keeps the
+/// override.
 ///
 /// A new row takes its first slot after `now`, and its `paused` flag from
 /// `schedule`. An update keeps the stored pause, so an app can upsert on
-/// every open. An update with the same spec also keeps the next slot, so a
-/// reopen never moves a slot. A changed spec counts its next slot from `now`.
+/// every open. An update with the same effective spec also keeps the next
+/// slot, so a reopen never moves a slot. A changed spec counts its next slot
+/// from `now`.
 pub fn upsert(conn: &Connection, schedule: &WorkflowSchedule, now: i64) -> SqliteResult<()> {
     // After this check the overlap policy is `skip` or `allow_all`.
     check_supported(schedule)?;
     autumn_harvest::policy::validate_schedule(&schedule.schedule)
         .map_err(SqliteError::InvalidSchedule)?;
-    let spec = serde_json::to_string(&schedule.schedule)?;
     let tx = conn.unchecked_transaction()?;
-    let stored: Option<(String, Option<i64>)> = tx
+    let effective = match load_override(&tx, &schedule.workflow_name)? {
+        Some(stored) => effective_under(schedule, &stored.fields)?,
+        None => schedule.clone(),
+    };
+    write_row(&tx, &effective, schedule, now)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Write the effective value of a schedule, and its code value.
+fn write_row(
+    conn: &Connection,
+    effective: &WorkflowSchedule,
+    code: &WorkflowSchedule,
+    now: i64,
+) -> SqliteResult<()> {
+    let spec = serde_json::to_string(&effective.schedule)?;
+    let stored: Option<(String, Option<i64>)> = conn
         .query_row(
             "SELECT schedule_json, next_run_at FROM harvest_schedules WHERE workflow_name = ?1",
-            [&schedule.workflow_name],
+            [&effective.workflow_name],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
     let next_run_at = match stored {
         Some((old_spec, next)) if old_spec == spec => next,
-        _ => first_slot(&schedule.schedule, now),
+        _ => first_slot(&effective.schedule, now),
     };
-    tx.execute(
+    conn.execute(
         "INSERT INTO harvest_schedules (workflow_name, schedule_json, input_json, \
-           overlap_policy, max_active_runs, paused, next_run_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+           overlap_policy, max_active_runs, paused, next_run_at, code_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
          ON CONFLICT (workflow_name) DO UPDATE SET \
            schedule_json = excluded.schedule_json, input_json = excluded.input_json, \
            overlap_policy = excluded.overlap_policy, \
-           max_active_runs = excluded.max_active_runs, next_run_at = excluded.next_run_at",
+           max_active_runs = excluded.max_active_runs, next_run_at = excluded.next_run_at, \
+           code_json = excluded.code_json",
         params![
-            schedule.workflow_name,
+            effective.workflow_name,
             spec,
-            serde_json::to_string(&schedule.input)?,
-            schedule.overlap_policy.as_str(),
-            i64::from(schedule.max_active_runs),
-            schedule.paused,
+            serde_json::to_string(&effective.input)?,
+            effective.overlap_policy.as_str(),
+            i64::from(effective.max_active_runs),
+            effective.paused,
             next_run_at,
+            serde_json::to_string(code)?,
         ],
     )?;
-    tx.commit()?;
     Ok(())
+}
+
+/// One stored operator override of a schedule (issue #2390), as
+/// [`SqliteRuntime::schedule_override`](crate::SqliteRuntime::schedule_override)
+/// returns it.
+///
+/// It is `non_exhaustive`, so a later field is not a breaking change.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ScheduleOverride {
+    /// The workflow name of the schedule.
+    pub workflow_name: String,
+    /// The fields that the override sets. A field that is `None` takes the
+    /// code value.
+    pub fields: WorkflowSchedulePatch,
+    /// The operator's stated reason, if any.
+    pub reason: Option<String>,
+    /// The actor that last changed the override.
+    pub updated_by: String,
+    /// When the override was first stored.
+    pub created_at: DateTime<Utc>,
+    /// When the override last changed.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// The stored form of the override fields that this backend honors.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OverrideFieldsJson {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schedule: Option<Schedule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_active_runs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    overlap_policy: Option<String>,
+}
+
+impl OverrideFieldsJson {
+    fn from_fields(fields: &WorkflowSchedulePatch) -> Self {
+        Self {
+            schedule: fields.schedule.clone(),
+            max_active_runs: fields.max_active_runs,
+            overlap_policy: fields.overlap_policy.map(|p| p.as_str().to_string()),
+        }
+    }
+
+    fn into_fields(self) -> WorkflowSchedulePatch {
+        WorkflowSchedulePatch {
+            schedule: self.schedule,
+            max_active_runs: self.max_active_runs,
+            overlap_policy: self.overlap_policy.as_deref().map(OverlapPolicy::from_db),
+            ..WorkflowSchedulePatch::default()
+        }
+    }
+}
+
+/// The override of `workflow_name`, if one is stored.
+pub fn load_override(
+    conn: &Connection,
+    workflow_name: &str,
+) -> SqliteResult<Option<ScheduleOverride>> {
+    let row = conn
+        .query_row(
+            "SELECT fields_json, reason, updated_by, created_at, updated_at \
+             FROM harvest_schedule_overrides WHERE workflow_name = ?1",
+            [workflow_name],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((fields, reason, updated_by, created_at, updated_at)) = row else {
+        return Ok(None);
+    };
+    let fields: OverrideFieldsJson = serde_json::from_str(&fields)
+        .map_err(|_| SqliteError::corrupt("harvest_schedule_overrides.fields_json"))?;
+    Ok(Some(ScheduleOverride {
+        workflow_name: workflow_name.to_string(),
+        fields: fields.into_fields(),
+        reason,
+        updated_by,
+        created_at: to_time(created_at),
+        updated_at: to_time(updated_at),
+    }))
+}
+
+/// Merge `patch` over the stored override of `workflow_name` at `now`
+/// (issue #2390), and return the effective schedule.
+///
+/// The merge and its checks are the Postgres rules of issue #2386. A field
+/// that this backend cannot honor is refused by name before any write, so a
+/// refused patch writes nothing. A merge that sets no field deletes the
+/// override, so the schedule takes its code value again.
+pub fn set_override(
+    conn: &Connection,
+    workflow_name: &str,
+    patch: &WorkflowSchedulePatch,
+    actor: &str,
+    reason: Option<&str>,
+    now: i64,
+) -> SqliteResult<WorkflowSchedule> {
+    refuse_unsupported_override(patch)?;
+    let tx = conn.unchecked_transaction()?;
+    let code = load_code(&tx, workflow_name)?;
+    let stored = load_override(&tx, workflow_name)?
+        .map(|stored| stored.fields)
+        .unwrap_or_default();
+    let merged = merge_workflow_fields(patch, &stored);
+    let effective = effective_under(&code, &merged)?;
+    if workflow_fields_are_empty(&merged) {
+        tx.execute(
+            "DELETE FROM harvest_schedule_overrides WHERE workflow_name = ?1",
+            [workflow_name],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO harvest_schedule_overrides \
+               (workflow_name, fields_json, reason, updated_by, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
+             ON CONFLICT (workflow_name) DO UPDATE SET \
+               fields_json = excluded.fields_json, reason = excluded.reason, \
+               updated_by = excluded.updated_by, updated_at = excluded.updated_at",
+            params![
+                workflow_name,
+                serde_json::to_string(&OverrideFieldsJson::from_fields(&merged))?,
+                reason,
+                actor,
+                now,
+            ],
+        )?;
+    }
+    write_row(&tx, &effective, &code, now)?;
+    // `write_row` keeps the stored pause. Return that pause, not the code one.
+    let mut effective = effective;
+    effective.paused = tx.query_row(
+        "SELECT paused FROM harvest_schedules WHERE workflow_name = ?1",
+        [workflow_name],
+        |row| row.get(0),
+    )?;
+    tx.commit()?;
+    Ok(effective)
+}
+
+/// Delete the override of `workflow_name` at `now` (issue #2390), so the
+/// schedule takes its code value again. Returns whether an override existed.
+pub fn clear_override(conn: &Connection, workflow_name: &str, now: i64) -> SqliteResult<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let code = load_code(&tx, workflow_name)?;
+    let removed = tx.execute(
+        "DELETE FROM harvest_schedule_overrides WHERE workflow_name = ?1",
+        [workflow_name],
+    )?;
+    write_row(&tx, &code, &code, now)?;
+    tx.commit()?;
+    Ok(removed > 0)
+}
+
+/// The code value of a stored schedule.
+fn load_code(conn: &Connection, workflow_name: &str) -> SqliteResult<WorkflowSchedule> {
+    let code: Option<Option<String>> = conn
+        .query_row(
+            "SELECT code_json FROM harvest_schedules WHERE workflow_name = ?1",
+            [workflow_name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match code {
+        None => Err(SqliteError::ScheduleNotFound(workflow_name.to_string())),
+        // A row from before issue #2390 has no code value until its next upsert.
+        Some(None) => Err(SqliteError::InvalidSchedule(format!(
+            "schedule '{workflow_name}' has no stored code value; upsert it again first"
+        ))),
+        Some(Some(json)) => serde_json::from_str(&json)
+            .map_err(|_| SqliteError::corrupt("harvest_schedules.code_json")),
+    }
+}
+
+/// The code value `code` with `fields` applied, under the Postgres checks
+/// and this backend's limits.
+fn effective_under(
+    code: &WorkflowSchedule,
+    fields: &WorkflowSchedulePatch,
+) -> SqliteResult<WorkflowSchedule> {
+    // This backend ignores jitter, so a default cron jitter must not limit the cadence.
+    let mut code = code.clone();
+    code.jitter = std::time::Duration::ZERO;
+    let effective = validate_effective_workflow(&code, fields).map_err(|error| match error {
+        autumn_harvest::HarvestError::Config(message) => SqliteError::InvalidSchedule(message),
+        other => SqliteError::InvalidSchedule(other.to_string()),
+    })?;
+    check_supported(&effective)?;
+    Ok(effective)
+}
+
+/// Refuse each override field that this backend cannot honor, by name
+/// (issue #2390).
+///
+/// The backend honors the cadence, `max_active_runs`, and the `skip` and
+/// `allow_all` overlap policies. Catch-up is always off and jitter is
+/// ignored here, so an override of either would change nothing. It is
+/// refused, not dropped, so an operator never sees a silent no-op.
+fn refuse_unsupported_override(patch: &WorkflowSchedulePatch) -> SqliteResult<()> {
+    let refused = [
+        ("input", patch.input.is_some()),
+        ("queue_name", patch.queue_name.is_some()),
+        ("catchup", patch.catchup.is_some()),
+        ("jitter", patch.jitter.is_some()),
+        (
+            "overlap_policy",
+            patch
+                .overlap_policy
+                .is_some_and(|p| !matches!(p, OverlapPolicy::Skip | OverlapPolicy::AllowAll)),
+        ),
+        ("buffer_all_max", patch.buffer_all_max.is_some()),
+        ("calendar", patch.calendar.is_some()),
+        ("skip_policy", patch.skip_policy.is_some()),
+        (
+            "consecutive_failure_limit",
+            patch.consecutive_failure_limit.is_some(),
+        ),
+        ("end_at", patch.end_at.is_some()),
+        ("max_runs", patch.max_runs.is_some()),
+        ("catchup_policy", patch.catchup_policy.is_some()),
+        ("retry_policy", patch.retry_policy.is_some()),
+    ];
+    match refused.iter().find(|(_, refused)| *refused) {
+        Some((field, _)) => Err(SqliteError::Unsupported(format!(
+            "WorkflowSchedulePatch.{field} — the sqlite backend cannot override it (issue #2390)"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Remove the schedule of `workflow_name`. Its runs keep running.
 pub fn delete(conn: &Connection, workflow_name: &str) -> SqliteResult<()> {
-    let removed = conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    let removed = tx.execute(
         "DELETE FROM harvest_schedules WHERE workflow_name = ?1",
         [workflow_name],
     )?;
+    // An override outlives no schedule, so a new schedule of the name starts
+    // from its code value (issue #2390).
+    tx.execute(
+        "DELETE FROM harvest_schedule_overrides WHERE workflow_name = ?1",
+        [workflow_name],
+    )?;
+    tx.commit()?;
     if removed == 0 {
         return Err(SqliteError::ScheduleNotFound(workflow_name.to_string()));
     }
@@ -156,7 +431,8 @@ pub fn set_paused(
 /// Every stored schedule, by workflow name.
 pub fn list(conn: &Connection) -> SqliteResult<Vec<ScheduleSummary>> {
     let mut stmt = conn.prepare(
-        "SELECT workflow_name, schedule_json, paused, next_run_at, last_run_at \
+        "SELECT workflow_name, schedule_json, paused, next_run_at, last_run_at, \
+           max_active_runs \
          FROM harvest_schedules ORDER BY workflow_name",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -166,14 +442,17 @@ pub fn list(conn: &Connection) -> SqliteResult<Vec<ScheduleSummary>> {
             row.get::<_, bool>(2)?,
             row.get::<_, Option<i64>>(3)?,
             row.get::<_, Option<i64>>(4)?,
+            row.get::<_, i64>(5)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (workflow_name, spec, paused, next, last) = row?;
+        let (workflow_name, spec, paused, next, last, max_active_runs) = row?;
         out.push(ScheduleSummary {
             workflow_name,
             schedule: parse_spec(&spec)?,
+            max_active_runs: u32::try_from(max_active_runs)
+                .map_err(|_| SqliteError::corrupt("harvest_schedules.max_active_runs"))?,
             paused,
             next_run_at: next.and_then(DateTime::from_timestamp_millis),
             last_run_at: last.and_then(DateTime::from_timestamp_millis),

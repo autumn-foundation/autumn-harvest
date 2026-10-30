@@ -38,6 +38,8 @@ mod reuse_policy;
 mod review_fixes;
 mod review_fixes_48d54b2;
 mod runtime_robustness;
+mod schedule_override_fixture;
+mod schedule_overrides;
 mod schedules;
 mod signal_ingest;
 mod signal_timeout;

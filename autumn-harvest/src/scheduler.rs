@@ -3196,51 +3196,7 @@ async fn apply_workflow_schedule_update(
     Ok(AppliedScheduleUpdate::Updated(Box::new(row)))
 }
 
-/// Partial, id-keyed update for an existing workflow schedule (issue #771).
-///
-/// Every field is optional: `None` leaves the stored value unchanged.
-/// Nullable columns use a double-`Option` — the outer `None` means
-/// "unchanged", `Some(None)` means "clear to NULL", `Some(Some(v))` sets `v`.
-///
-/// The schedule's workflow type is deliberately absent: it is not editable
-/// (changing it is semantically a different schedule).
-#[derive(Debug, Clone, Default)]
-pub struct WorkflowSchedulePatch {
-    /// New schedule cadence. Changing it recomputes `next_run_at` anchored
-    /// at now — elapsed slots are never retroactively fired.
-    pub schedule: Option<Schedule>,
-    /// New JSON input passed to every scheduled run.
-    pub input: Option<serde_json::Value>,
-    /// New task queue name for dispatched runs.
-    pub queue_name: Option<String>,
-    /// New legacy catchup bool. Ignored when a `catchup_policy` is stored or
-    /// provided (the policy takes precedence, issue #484).
-    pub catchup: Option<bool>,
-    /// New maximum number of concurrently running scheduled executions.
-    pub max_active_runs: Option<u32>,
-    /// New jitter window (issue #240).
-    pub jitter: Option<Duration>,
-    /// New overlap policy (issue #241).
-    pub overlap_policy: Option<OverlapPolicy>,
-    /// New maximum buffered slots under `BufferAll` (issue #241).
-    pub buffer_all_max: Option<u32>,
-    /// New calendar association (issue #337). `Some(None)` detaches.
-    pub calendar: Option<Option<String>>,
-    /// New calendar skip policy (issue #337).
-    pub skip_policy: Option<crate::policy::SkipPolicy>,
-    /// New auto-pause threshold (issue #360). `Some(None)` disables.
-    pub consecutive_failure_limit: Option<Option<u32>>,
-    /// New absolute cutoff (issue #478). `Some(None)` removes the cutoff.
-    pub end_at: Option<Option<DateTime<Utc>>>,
-    /// New total run budget (issue #478). `Some(None)` (or `Some(Some(0))`)
-    /// removes the budget.
-    pub max_runs: Option<Option<u32>>,
-    /// New bounded catchup policy (issue #484). `Some(None)` clears the
-    /// policy columns, falling back to the legacy `catchup` bool.
-    pub catchup_policy: Option<Option<crate::policy::CatchupPolicy>>,
-    /// New schedule-level retry policy (issue #523). `Some(None)` clears.
-    pub retry_policy: Option<Option<crate::policy::RetryPolicy>>,
-}
+pub use crate::schedule_patch::WorkflowSchedulePatch;
 
 /// Typed outcome of [`update_workflow_schedule`].
 #[derive(Debug)]
