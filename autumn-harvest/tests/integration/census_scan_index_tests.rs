@@ -8,6 +8,11 @@
 //! - the cross-shard child check of a shard rebalance;
 //! - the timer copy and delete of a shard rebalance.
 //!
+//! The same gates cover the `harvest_signals` finding (issue #2367). A
+//! workflow retry, a PII erasure, a shard rebalance and an execution delete
+//! each reach every signal of one execution, consumed rows included. The two
+//! partial indexes skip consumed rows, so they cannot serve these statements.
+//!
 //! Each gate plans the statement text that the engine runs, with
 //! `enable_seqscan` off. The cutover gate plans `QUIESCENCE_SQL` inside a
 //! `SELECT`, not the whole cutover. The erasure gate plans the Diesel query
@@ -17,12 +22,14 @@
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use autumn_harvest::canary::CANARY_ROWS_SQL;
 use autumn_harvest::queue::{QUEUE_TASK_COUNTS_SQL, QueueTaskCounts, queue_task_counts};
 use autumn_harvest::shard_rebalance::{
-    OBSERVE_SQL, QUIESCENCE_SQL, STAGED_CHILD_DELETES, STAGED_TIMERS_SQL,
+    OBSERVE_SQL, QUIESCENCE_SQL, STAGED_CHILD_DELETES, STAGED_SIGNALS_SQL, STAGED_TIMERS_SQL,
 };
+use autumn_harvest::types::ExecutionId;
 use diesel::QueryableByName;
 use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz};
 use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -318,5 +325,165 @@ async fn erasure_reads_children_by_parent() {
         "harvest_cross_shard_children",
         "idx_harvest_cross_shard_children_parent",
         "the erasure child lookup",
+    );
+}
+
+/// The table of the issue #2367 gates.
+const SIGNALS: &str = "harvest_signals";
+
+/// The index that serves each read of all signals of one execution.
+const SIGNALS_EXEC_INDEX: &str = "idx_harvest_signals_exec";
+
+/// Record the SQL of each statement that `conn` sends from now on.
+fn record_statements(conn: &mut AsyncPgConnection) -> Arc<Mutex<Vec<String>>> {
+    use diesel::connection::InstrumentationEvent;
+    use diesel_async::AsyncConnection;
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&log);
+    conn.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+        if let InstrumentationEvent::StartQuery { query, .. } = event {
+            sink.lock().expect("statement log").push(query.to_string());
+        }
+    });
+    log
+}
+
+/// Take the one recorded statement that starts with `prefix`, with no binds.
+fn take_statement(log: &Mutex<Vec<String>>, prefix: &str) -> String {
+    let statements = std::mem::take(&mut *log.lock().expect("statement log"));
+    let matches: Vec<&str> = statements
+        .iter()
+        .filter(|sql| sql.starts_with(prefix))
+        .map(|sql| sql.split(" -- binds:").next().expect("a query text"))
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected one statement that starts with {prefix}:\n{statements:#?}"
+    );
+    matches[0].to_owned()
+}
+
+/// A workflow retry moves every signal of the failed attempt by index.
+///
+/// The gate plans the statement that `forward_signals_to_retry_attempt` sends.
+/// `retry_chain_routing_tests` checks that consumed rows move too.
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_forwarding_reads_signals_by_execution() {
+    let bench = plan_gate_db().await;
+    let mut conn = claim_bench_db::connect(&bench.url).await;
+
+    let log = record_statements(&mut conn);
+    autumn_harvest::signal::forward_signals_to_retry_attempt(
+        &mut conn,
+        ExecutionId::new(),
+        ExecutionId::new(),
+    )
+    .await
+    .expect("forward an empty mailbox");
+    let sql = take_statement(&log, "UPDATE \"harvest_signals\"");
+
+    let plan = generic_plan(&mut conn, &sql).await;
+    assert_served(&plan, SIGNALS, SIGNALS_EXEC_INDEX, "the retry signal move");
+}
+
+#[derive(QueryableByName, Debug)]
+struct SignalPayload {
+    #[diesel(sql_type = diesel::sql_types::Jsonb)]
+    payload: serde_json::Value,
+}
+
+/// A PII erasure tombstones every signal of an execution by index.
+///
+/// The erasure must reach a consumed signal too. Its payload is still PII.
+#[tokio::test(flavor = "multi_thread")]
+async fn erasure_scrubs_every_signal_by_execution() {
+    let bench = plan_gate_db().await;
+    let mut conn = claim_bench_db::connect(&bench.url).await;
+
+    let exec_id = ExecutionId::new();
+    conn.batch_execute(&format!(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, run_id, shard_id, state, input, queue_name, \
+              started_at, created_at, completed_at) \
+         VALUES ('{exec_id}', 'erase_signals', 'erase_signals', gen_random_uuid(), 0, \
+                 'COMPLETED', '{{}}'::jsonb, 'default', NOW(), NOW(), NOW()); \
+         INSERT INTO harvest_signals (workflow_exec_id, signal_name, payload, consumed) \
+         VALUES ('{exec_id}', 'seen', '{{\"pii\": 1}}'::jsonb, true), \
+                ('{exec_id}', 'queued', '{{\"pii\": 2}}'::jsonb, false);"
+    ))
+    .await
+    .expect("seed a completed execution with two signals");
+
+    let log = record_statements(&mut conn);
+    let outcome = autumn_harvest::erase::erase_workflow_payloads(&mut conn, exec_id, "gate")
+        .await
+        .expect("erase the execution");
+    let sql = take_statement(&log, "UPDATE \"harvest_signals\"");
+    assert_eq!(outcome.signals_scrubbed, 2, "both signals are scrubbed");
+
+    let payloads: Vec<SignalPayload> =
+        diesel::sql_query("SELECT payload FROM harvest_signals WHERE workflow_exec_id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .load(&mut conn)
+            .await
+            .expect("load the signal payloads");
+    assert_eq!(payloads.len(), 2);
+    for row in &payloads {
+        assert!(
+            !row.payload.to_string().contains("pii"),
+            "a signal payload survives the erasure: {}",
+            row.payload
+        );
+    }
+
+    let plan = generic_plan(&mut conn, &sql).await;
+    assert_served(
+        &plan,
+        SIGNALS,
+        SIGNALS_EXEC_INDEX,
+        "the erasure signal scrub",
+    );
+}
+
+/// The rebalance copies and deletes the signals of one execution by index.
+#[tokio::test(flavor = "multi_thread")]
+async fn rebalance_reads_signals_by_execution() {
+    let bench = plan_gate_db().await;
+    let mut conn = claim_bench_db::connect(&bench.url).await;
+
+    let plan = generic_plan(&mut conn, STAGED_SIGNALS_SQL).await;
+    assert_served(&plan, SIGNALS, SIGNALS_EXEC_INDEX, "the staged signal copy");
+
+    let delete = STAGED_CHILD_DELETES
+        .iter()
+        .find(|sql| sql.contains(SIGNALS))
+        .expect("the staged deletes remove signals");
+    let plan = generic_plan(&mut conn, delete).await;
+    assert_served(
+        &plan,
+        SIGNALS,
+        SIGNALS_EXEC_INDEX,
+        "the staged signal delete",
+    );
+}
+
+/// The `ON DELETE CASCADE` from an execution deletes its signals by index.
+///
+/// Retention deletes executions, and the foreign key trigger then runs this
+/// statement. The text is the form that Postgres builds for a cascade delete.
+#[tokio::test(flavor = "multi_thread")]
+async fn execution_delete_cascades_to_signals_by_execution() {
+    let bench = plan_gate_db().await;
+    let mut conn = claim_bench_db::connect(&bench.url).await;
+
+    let cascade =
+        "DELETE FROM ONLY public.harvest_signals WHERE $1 OPERATOR(pg_catalog.=) workflow_exec_id";
+    let plan = generic_plan(&mut conn, cascade).await;
+    assert_served(
+        &plan,
+        SIGNALS,
+        SIGNALS_EXEC_INDEX,
+        "the execution delete cascade",
     );
 }
