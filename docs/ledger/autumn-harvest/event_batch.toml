@@ -1,0 +1,49 @@
+# Ledger profiles for `autumn-harvest/src/event_batch.rs`. See `docs/ledger/README.md`.
+
+["admit_batched_start_with_codecs"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_event_batches"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/event_batch.md"
+
+["fire_claimed_batch_row"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_event_batches"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/event_batch.md"
+
+["fire_due_on_conn"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_event_batches"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/event_batch.md"
+
+["list_pending_event_batches"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_event_batches"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/event_batch.md"
+
+["pull_in_event_batch_row"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_event_batches"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/event_batch.md"
+
+["redefer_event_batch_row"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_event_batches"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/event_batch.md"

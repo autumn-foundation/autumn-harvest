@@ -8,7 +8,7 @@ This guide explains the rule catalog (`autumn_harvest::guardrail`) that document
 
 ## Why replay determinism matters
 
-When a workflow suspends (waiting for an activity, a timer, or a signal), Harvest saves its progress as an ordered sequence of events in `harvest_events`. On resume, the engine re-invokes the workflow function and drives it forward by replaying those saved events. If the function produces a different command on replay than it produced originally, the engine raises a `NonDeterminismError` and moves the execution to the dead-letter queue.
+When a workflow suspends (waiting for an activity, a timer, or a signal), Harvest saves its progress as an ordered sequence of events in `harvest_events`. On resume, the engine re-invokes the workflow function and drives it forward by replaying those saved events. If the function produces a different command on replay than it produced originally, the engine detects a divergence. Since issue #603 it parks the execution: the state stays `RUNNING` and no terminal event is written. In most cases, a rollback lets it resume. The [non-determinism block runbook](runbooks/nondeterminism-block.md) lists the cases that need a reset. [Why Harvest keeps deterministic replay](why-deterministic-replay.md) explains why Harvest accepts this constraint.
 
 Common replay footguns all share the same root cause: **code that returns a different value each time it is called**.
 
@@ -239,7 +239,7 @@ workflow/activity metrics" section of `docs/telemetry.md` and
 | **Disallowed** | `ctx.await_condition(|| rand::random())` |
 | **Allowed** | `ctx.await_condition(|| local_approvals_count >= 2)` |
 
-Predicates evaluated inside `await_condition` and `await_condition_timeout` must be purely deterministic projections of workflow local state (variables rehydrated by replaying events). Using non-deterministic values (like the current system time `Instant::now()` or random numbers) inside these closures will yield different results during replay than in the original execution, leading to early/late completion or early/late timer triggers, which causes `NonDeterminismError` during history matching.
+Predicates evaluated inside `await_condition` and `await_condition_timeout` must be purely deterministic projections of workflow local state (variables rehydrated by replaying events). Using non-deterministic values (like the current system time `Instant::now()` or random numbers) inside these closures will yield different results during replay than in the original execution, leading to early/late completion or early/late timer triggers. The engine detects this mismatch as a replay divergence (`HarvestError::NonDeterministic`) during history matching.
 
 **Migration example:**
 
@@ -493,6 +493,8 @@ let json = serde_json::to_string_pretty(&finding).unwrap();
 
 Suppressions require an explicit, non-empty reason string and a non-empty rule ID. Empty or whitespace-only values are rejected at construction time so suppressions are always auditable.
 
+The `// harvest-suppress: RULE_ID "reason"` comment follows the same rule. `harvest det-check` ignores a comment with an empty or whitespace-only reason. The finding stays.
+
 ```rust
 use autumn_harvest::guardrail::{GuardrailSuppression, GuardrailSuppressionError};
 
@@ -515,7 +517,7 @@ assert_eq!(err, GuardrailSuppressionError::EmptyRuleId);
 
 ## Running the check in CI
 
-The `det_check` engine ships behind a runnable front door: the **`harvest det-check`** CLI subcommand ([issue #778](https://github.com/autumn-foundation/autumn-harvest/issues/778)). It statically flags non-deterministic API calls reachable from your `#[workflow]` bodies — including through **one hop** of first-party helper functions the body calls directly — so you catch replay foot-guns at PR/CI time instead of post-deploy when in-flight executions DLQ.
+The `det_check` engine ships behind a runnable front door: the **`harvest det-check`** CLI subcommand ([issue #778](https://github.com/autumn-foundation/autumn-harvest/issues/778)). It statically flags non-deterministic API calls reachable from your `#[workflow]` bodies — including through **one hop** of first-party helper functions the body calls directly — so you catch replay foot-guns at PR/CI time instead of post-deploy, when the engine parks diverging in-flight executions (issue #603).
 
 ```console
 # Scan the current directory (default). Directories are scanned recursively;
@@ -555,11 +557,11 @@ A hard-blocker call located in a first-party function that a `#[workflow]` body 
 - **Two or more hops** — reachability follows exactly one hop. A workflow → `helper_a` → `helper_b` (violation) chain is *not* flagged.
 - Third-party crates, trait-object dispatch, function pointers, and closures captured by reference.
 
-The catalog docs continue to own the "you must also avoid this transitively beyond one first-party hop" warning. Everything det-check skips here is a false-*negative* that the compile-time `#[workflow]` guardrail ([issue #386](https://github.com/autumn-foundation/autumn-harvest/issues/386)) **also** misses — #386 is likewise **body-only**, so it does *not* hard-block a non-deterministic call hidden inside a helper det-check skips (closing that body-only blind spot is exactly what det-check's one-hop pass partially does). det-check deliberately mirrors #386's boundary for what it *attempts* to analyze, and #386 remains the complementary compile-time check for **direct-in-body** violations — but neither is the net for these transitive skips. That net is the **runtime** determinism detection: `harvest-replay` / `WorkflowReplayer` run against recorded histories in tests/CI (post-hoc, once a history exists), and the live `HistoryMatcher` non-determinism check at execution time (which surfaces as a DLQ'd run) — plus manual code review.
+The catalog docs continue to own the "you must also avoid this transitively beyond one first-party hop" warning. Everything det-check skips here is a false-*negative* that the compile-time `#[workflow]` guardrail ([issue #386](https://github.com/autumn-foundation/autumn-harvest/issues/386)) **also** misses — #386 is likewise **body-only**, so it does *not* hard-block a non-deterministic call hidden inside a helper det-check skips (closing that body-only blind spot is exactly what det-check's one-hop pass partially does). det-check deliberately mirrors #386's boundary for what it *attempts* to analyze, and #386 remains the complementary compile-time check for **direct-in-body** violations — but neither is the net for these transitive skips. That net is the **runtime** determinism detection: `harvest-replay` / `WorkflowReplayer` run against recorded histories in tests/CI (post-hoc, once a history exists), and the live `HistoryMatcher` non-determinism check at execution time (which parks the run as ND-blocked, issue #603) — plus manual code review.
 
 ### Known limitations (conservative, safe-direction)
 
-`det_check` is a fast text pre-filter, not the authoritative gate. Its reachability resolution deliberately errs toward **missing** a transitive violation rather than reporting a false one — every case below is a false-*negative* (never a false-positive). These transitive false-negatives are **not** caught by the compile-time `#[workflow]` HVG guardrail ([issue #386](https://github.com/autumn-foundation/autumn-harvest/issues/386)) either: #386 is itself **body-only** — it scans only the annotated workflow body, so it does *not* hard-block a non-deterministic call hidden inside a helper det_check skips (that same body-only blind spot is exactly what det_check's one-hop pass was built to partially close). The backstop for what static analysis can't resolve is the **runtime** determinism detection — `WorkflowReplayer` / `harvest-replay` against recorded histories in tests/CI, and the live `HistoryMatcher` non-determinism check at execution time (which DLQs the run) — plus manual code review. When in doubt, trust `WorkflowReplayer` and a careful read of the helper, not the compile-time guardrail (which cannot see into these helpers).
+`det_check` is a fast text pre-filter, not the authoritative gate. Its reachability resolution deliberately errs toward **missing** a transitive violation rather than reporting a false one — every case below is a false-*negative* (never a false-positive). These transitive false-negatives are **not** caught by the compile-time `#[workflow]` HVG guardrail ([issue #386](https://github.com/autumn-foundation/autumn-harvest/issues/386)) either: #386 is itself **body-only** — it scans only the annotated workflow body, so it does *not* hard-block a non-deterministic call hidden inside a helper det_check skips (that same body-only blind spot is exactly what det_check's one-hop pass was built to partially close). The backstop for what static analysis can't resolve is the **runtime** determinism detection — `WorkflowReplayer` / `harvest-replay` against recorded histories in tests/CI, and the live `HistoryMatcher` non-determinism check at execution time (which parks the run as ND-blocked, issue #603) — plus manual code review. When in doubt, trust `WorkflowReplayer` and a careful read of the helper, not the compile-time guardrail (which cannot see into these helpers).
 
 - **Module scope vs. methods.** `#[workflow]` entry points and their first-party helpers are resolved at **module scope** — top level *and* inside `mod NAME { … }` blocks, at any nesting depth. Methods declared inside `impl`/`trait` blocks are **never** indexed as free helpers and a call to one (`self.method()`, `Type::method()`) is never resolved (the #386 method-exclusion boundary).
 - **One-hop resolution is same-module only.** A bare call `helper()` resolves to a first-party helper **only when that helper is declared in the caller's own module** (same file + `module_path`) — the one case a bare call provably reaches without an import the line-based scanner cannot see. A helper in a **different module or file** (reached via a `use` import, including an aliased `use ... as helper`) is **not** resolved; it is treated as ambiguous and skipped (a safe false-negative). This is deliberate: the text front-door cannot resolve `use` imports/aliases, so *any* cross-module resolution keeps producing false positives on innocent imported/aliased code — and for a CI gate a false positive (failing CI on innocent code) is the worst outcome, outranking marginal recall. Even a **globally unique** helper name is not resolved cross-module. This ends the Codex round-4 (same-file-different-module) and round-5 (aliased-import, globally-unique) false-positive family structurally. A **block-local `use` import inside the workflow body** rebinds a same-module name too (a `use crate::x::helper;` in the body makes `helper()` resolve to the import, not a sibling `fn helper`); such imports are added to the shadow set below so this last same-module rebind vector no longer false-positives (a module/file-level `use` + a same-name `fn` is itself a compile error, so a block-local `use` is the only way to shadow a same-module helper — Codex r6). Because the compile-time `#[workflow]` guardrail (#386) is itself body-only, it does *not* catch a violation inside such a skipped cross-module/imported helper either; `WorkflowReplayer` (and the live `HistoryMatcher` at execution time) is the backstop for this false-negative, not #386.
@@ -617,7 +619,7 @@ The shipped tree passes the check: a bare `harvest det-check` at the repo root r
 
 `det-check` covers non-deterministic **code**. The sibling hazard is a
 non-deterministic **payload**: renaming, retyping, or adding a required field to
-a workflow's input/output/error type compiles green but silently breaks every
+a workflow, activity or side-effect payload type compiles green but silently breaks every
 in-flight execution, whose recorded `harvest_events` JSON no longer deserializes.
 
 That is gated by **`harvest schema check`**
@@ -631,7 +633,7 @@ $ cargo run --quiet --bin dump-schema-contract > /tmp/current.json
 $ harvest schema check --current /tmp/current.json
 ```
 
-`dump-schema-contract` is a **three-line binary you add to your own crate** —
+`dump-schema-contract` is a **short binary you add to your own crate** —
 Harvest is a library, so only your process can enumerate the workflow registry.
 [The schema-contract guide](workflow-schema-contract-guide.md#generating---current)
 has the snippet; `autumn-harvest/examples/schema_workflow.rs --emit-contract` is
@@ -766,9 +768,22 @@ Each layer catches a different class of problem. All six together provide defenc
 
 Workflow Update Handlers allow external clients to interact with running workflows and receive synchronous results (issue #140). However, update handlers run asynchronously and their lifecycles are decoupled from the main workflow function.
 
+### When an Update Handler Runs
+
+The worker runs each pending update at the end of its next decision cycle. The workflow body runs first. The worker then runs the pending updates in history order. It records `UpdateCompleted` or `UpdateFailed` with the other events of that cycle.
+
+A cycle runs under the workflow-task budget. The worker starts a handler only while a full handler limit is left in half of the remaining budget. The first update of a decision always runs. The worker wakes the task for the updates that remain, and the next cycle runs them. A handler also stops at half of the budget that is left. A task with no budget gets a fixed 30 second window.
+
+Replay never runs the handler again. Replay returns the recorded result. Four rules follow:
+
+- Delivery is at least once. Any path that discards the cycle after the handler ran runs the handler again. Examples are a crash, a deadlock retry, an event-id conflict, a pause and a lost claim. Write a handler that tolerates a repeat.
+- A value that a handler writes to a captured variable does not return on replay. Do not let the workflow body depend on it.
+- A handler has 5 seconds to finish. A handler that panics or runs for more than 5 seconds records `UpdateFailed`. A handler that awaits an activity or a timer never finishes, so it hits the same limit.
+- The error text of a panic is not stored. The worker logs it. The caller sees `update handler panicked`.
+
 ### Orphaned Update Handlers
 
-If a workflow completes (or fails, times out, is cancelled/terminated) while update handlers are still in progress, these updates become **orphaned**. Orphaned updates will be terminated immediately, and their clients will receive a `409 Conflict` response with an `update_orphaned` error payload.
+If a workflow ends (completes, fails, times out, is cancelled or is terminated) before the worker runs an admitted update, the update becomes **orphaned**. The engine terminates an orphaned update at once. Its client gets a `409 Conflict` response with an `update_orphaned` error payload.
 
 ### Waiting for Update Handlers to Complete
 
@@ -780,3 +795,5 @@ ctx.await_condition(|| ctx.all_handlers_finished()).await;
 ```
 
 This ensures a clean exit and prevents unhandled update requests from being aborted.
+
+`all_handlers_finished()` reads history up to the replay position. The worker records a result at the end of a cycle. The helper sees that result once the body passes it, which can take one more cycle.

@@ -242,6 +242,8 @@ fn params<'a>(
         start_source: StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
+        tenant: None,
     }
 }
 
@@ -1055,6 +1057,8 @@ fn act_info(name: &'static str, handler: ActivityHandlerFn) -> ActivityInfo {
         max_result_bytes: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -3947,6 +3951,7 @@ async fn insert_outbox_row(
             concurrency_limit: None,
             priority: serde_json::to_value(Priority::default()).unwrap(),
             max_workflow_input_bytes: 1_000_000,
+            tenant: None,
         })
         .get_result::<CompletionTriggerOutboxDb>(conn)
         .await
@@ -4320,6 +4325,7 @@ async fn outbox_relay_missing_pool_backoff_lands_on_the_database_clock() {
             concurrency_limit: None,
             priority: serde_json::to_value(Priority::default()).unwrap(),
             max_workflow_input_bytes: 1_000_000,
+            tenant: None,
         })
         .get_result::<CompletionTriggerOutboxDb>(&mut conn)
         .await
@@ -4627,6 +4633,7 @@ async fn quota_blocked_outbox_backs_off_rows_targeting_an_unconfigured_shard() {
                 concurrency_limit: None,
                 priority: serde_json::to_value(Priority::default()).unwrap(),
                 max_workflow_input_bytes: 1_000_000,
+                tenant: None,
             })
             .get_result::<CompletionTriggerOutboxDb>(&mut conn)
             .await
@@ -4747,6 +4754,7 @@ async fn quota_blocked_outbox_relay_backoff_stamp_skips_a_concurrently_claimed_r
             concurrency_limit: None,
             priority: serde_json::to_value(Priority::default()).unwrap(),
             max_workflow_input_bytes: 1_000_000,
+            tenant: None,
         })
         .get_result::<CompletionTriggerOutboxDb>(&mut conn)
         .await

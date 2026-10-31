@@ -52,6 +52,8 @@ pub async fn poll_customer_exports(ctx: &WorkflowContext, state: Value) -> Harve
             return Ok(json!({
                 "status": "ready",
                 "page": page,
+                // The loaded count differs on replay. Report it only in output
+                // that no later code reads back.
                 "history_events": ctx.history_event_count(),
             }));
         }
@@ -61,6 +63,7 @@ pub async fn poll_customer_exports(ctx: &WorkflowContext, state: Value) -> Harve
             "cursor": page.get("next_cursor").cloned().unwrap_or(Value::Null),
         });
 
+        // The engine records each answer, so a replay is stable.
         if ctx.should_continue_as_new() {
             ctx.continue_as_new(next_state).await?;
             unreachable!("continue_as_new does not resolve while the execution is active");

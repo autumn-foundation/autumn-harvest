@@ -1,0 +1,103 @@
+# Ledger profiles for `autumn-harvest/src/batch.rs`. See `docs/ledger/README.md`.
+
+["db::count_targets_on_shard"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/batch.md"
+
+["db::find_job_by_key"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_batch_jobs"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/batch.md"
+
+["db::get_batch_job"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_batch_jobs"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/batch.md"
+
+["db::list_batch_jobs"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_batch_jobs"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/batch.md"
+
+["db::mark_completed"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_batch_jobs"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/batch.md"
+
+["db::mark_failed"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_batch_jobs"]
+measured = "unmeasured"
+
+["db::mark_running"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_batch_jobs"]
+measured = "unmeasured"
+
+["db::open_jobs"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_batch_jobs"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/batch.md"
+
+["db::record_progress"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_batch_jobs"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/batch.md"
+
+["db::resolve_targets_on_shard"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/batch.md"
+
+["db::sample_targets_on_shard"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/batch.md"
+
+["db::submit_batch_job_with_codecs"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_batch_jobs"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/batch.md"
+
+["db::try_claim_job"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_batch_jobs"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/batch.md"

@@ -10,7 +10,8 @@
 use std::collections::BTreeSet;
 
 use super::ci_run_coverage::{
-    parse_workflow, parse_workflow_text, repo_root, ungated, workflow_crons,
+    DRAFT_SKIP, alerts_on_scheduled_failure, dated_nightly, parse_workflow, parse_workflow_text,
+    repo_root, runs_on_every_schedule, steps, str_at, ungated, workflow_crons,
 };
 
 const FUZZ_CARGO_TOML: &str = include_str!("../../../fuzz/Cargo.toml");
@@ -72,24 +73,6 @@ fn matrix_targets(job: &serde_yaml::Value) -> BTreeSet<String> {
         .collect()
 }
 
-fn steps(job: &serde_yaml::Value) -> Vec<&serde_yaml::Value> {
-    job.get("steps")
-        .and_then(serde_yaml::Value::as_sequence)
-        .map(|s| s.iter().collect())
-        .unwrap_or_default()
-}
-
-fn str_at<'a>(node: &'a serde_yaml::Value, path: &[&str]) -> &'a str {
-    let mut cur = node;
-    for key in path {
-        match cur.get(key) {
-            Some(next) => cur = next,
-            None => return "",
-        }
-    }
-    cur.as_str().unwrap_or("")
-}
-
 /// True when a job restores the corpus before it fuzzes and saves it after.
 ///
 /// The corpus lives in a run artifact, not in the actions cache. The CI
@@ -137,37 +120,30 @@ fn persists_the_corpus(job: &serde_yaml::Value) -> bool {
         && fuzz.is_some_and(|f| r < f && f < sv)
 }
 
-/// The draft-skip condition that `ci.yml` uses. A schedule always runs.
-const DRAFT_SKIP: &str =
-    "github.event_name != 'pull_request' || github.event.pull_request.draft == false";
-
-/// True when a job has no `continue-on-error` and no `if` but [`DRAFT_SKIP`].
-fn runs_on_every_schedule(job: &serde_yaml::Value) -> bool {
-    let soft = job
-        .get("continue-on-error")
-        .is_some_and(|v| v.as_bool() != Some(false));
-    !soft
-        && matches!(
-            job.get("if").map(serde_yaml::Value::as_str),
-            None | Some(Some(DRAFT_SKIP))
-        )
-}
-
-/// True when a job opens an issue for a failed scheduled run of `needs`.
-fn alerts_on_scheduled_failure(job: &serde_yaml::Value, needs: &str) -> bool {
-    let condition = str_at(job, &["if"]);
-    let needs_ok = match job.get("needs") {
-        Some(serde_yaml::Value::String(s)) => s == needs,
-        Some(serde_yaml::Value::Sequence(s)) => s.iter().any(|n| n.as_str() == Some(needs)),
-        _ => false,
+/// True when a failed corpus download does not fail the run.
+///
+/// The corpus is a cache. A download can fail for a reason outside the
+/// code, such as an artifact quota. Then the run fuzzes from the seeds,
+/// and it does not save that corpus. Otherwise the next run would restore
+/// the small corpus and lose the grown one.
+fn tolerates_a_lost_corpus(job: &serde_yaml::Value) -> bool {
+    let steps = steps(job);
+    let restore = steps
+        .iter()
+        .find(|s| str_at(s, &["run"]).contains("gh run download"));
+    let save = steps.iter().find(|s| {
+        str_at(s, &["uses"]).starts_with("actions/upload-artifact@")
+            && str_at(s, &["with", "name"]) == CORPUS_ARTIFACT
+    });
+    let (Some(restore), Some(save)) = (restore, save) else {
+        return false;
     };
-    needs_ok
-        && condition.contains("failure()")
-        && condition.contains("'schedule'")
-        && str_at(job, &["permissions", "issues"]) == "write"
-        && steps(job)
-            .iter()
-            .any(|s| str_at(s, &["run"]).contains("gh issue create"))
+    let run = str_at(restore, &["run"]);
+    str_at(restore, &["id"]) == "restore"
+        && run.contains("if ! gh run download")
+        && run.contains("lost=true")
+        && run.contains("$GITHUB_OUTPUT")
+        && str_at(save, &["if"]).contains("steps.restore.outputs.lost != 'true'")
 }
 
 #[test]
@@ -196,11 +172,8 @@ fn fuzz_target_lists_agree() {
 fn fuzz_toolchain_pins_agree() {
     let doc = parse_workflow(NIGHTLY);
     let pinned = str_at(&doc, &["env", "FUZZ_TOOLCHAIN"]);
-    let dated = pinned
-        .strip_prefix("nightly-")
-        .is_some_and(|d| d.len() == 10 && d.chars().all(|c| c.is_ascii_digit() || c == '-'));
     assert!(
-        dated,
+        dated_nightly(pinned),
         "{NIGHTLY} must pin `env.FUZZ_TOOLCHAIN: nightly-YYYY-MM-DD`; found {pinned:?}"
     );
     assert_eq!(
@@ -234,8 +207,13 @@ fn fuzz_nightly_runs_on_a_cron_with_a_persisted_corpus() {
          `if: always()` and `overwrite: true`"
     );
     assert!(
-        alerts_on_scheduled_failure(&doc["jobs"]["alert"], "fuzz"),
+        alerts_on_scheduled_failure(&doc["jobs"]["alert"], &["fuzz"]),
         "the `alert` job must open an issue when a scheduled `fuzz` run fails"
+    );
+    assert!(
+        tolerates_a_lost_corpus(fuzz),
+        "a failed corpus download must not fail the `fuzz` job, and that run \
+         must not save its corpus"
     );
 }
 

@@ -624,3 +624,53 @@ fn a_saga_claims_its_compensations_past_siblings() {
         );
     }
 }
+
+/// Issue #2193: the release of a dropped session has no awaiter. The mirror
+/// maps a history with the release to the same program as one without it.
+#[test]
+fn the_mirror_skips_a_drop_release() {
+    use autumn_harvest::event::WorkflowEvent;
+    use autumn_harvest::types::{ActivityExecId, WorkerId};
+
+    let charge = ActivityExecId::new();
+    let release = ActivityExecId::new();
+    let started = WorkflowEvent::WorkflowStarted {
+        input: serde_json::Value::Null,
+        timestamp: chrono::Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    };
+    let scheduled = |activity_id, name: &str| WorkflowEvent::ActivityScheduled {
+        activity_id,
+        name: name.to_string(),
+        input: serde_json::Value::Null,
+        queue: "default".to_string(),
+    };
+    let without = vec![
+        started.clone(),
+        scheduled(charge, "charge"),
+        WorkflowEvent::ActivityCompleted {
+            activity_id: charge,
+            output: serde_json::Value::Null,
+        },
+    ];
+    let with = vec![
+        started,
+        scheduled(release, "__harvest_session_drop_release"),
+        scheduled(charge, "charge"),
+        WorkflowEvent::ActivityStarted {
+            activity_id: release,
+            worker_id: WorkerId::new("w"),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: release,
+            output: serde_json::Value::Null,
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: charge,
+            output: serde_json::Value::Null,
+        },
+    ];
+    assert_eq!(shape(&mirror(&with)), shape(&mirror(&without)));
+}

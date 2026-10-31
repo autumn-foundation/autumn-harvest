@@ -1,0 +1,310 @@
+# Design — Issue #2010: workflows as analyzable artifacts
+
+Issue #2010 asks one research question. Can `harvest-verify` emit each
+workflow's step, signal, update and compensation graph as data? Can a model
+checker then prove a property of *user* workflows over that data?
+
+The spike answers with three parts:
+
+- The structure manifest of #1995 gains a **flow graph** per body. It also
+  lists the signal, update and query handlers of each workflow.
+- A **saga compensation coverage** check runs over the manifest alone. It
+  reads no MIR.
+- A write-up, [`docs/rnd/workflow-graph-spike.md`](../rnd/workflow-graph-spike.md),
+  gives the verdict and the `unknown` rate on the examples.
+
+**No engine change. No migration. No new `WorkflowEvent` variant.** The
+work is in `autumn-harvest-verify` only.
+
+---
+
+## 0. Planning record
+
+### 0.1 Brainstorm — where can the graph come from, and what can check it?
+
+| # | Idea | Verdict |
+|---|------|---------|
+| B1 | Emit the graph from the `#[workflow]` macro with `syn`. | Rejected. The macro sees one function. It cannot follow helpers, closures or other crates. |
+| B2 | Extend the #1995 structure manifest. | **Adopted.** One artifact then feeds the drift diff and every model check. |
+| B3 | Write a second file with `--emit-graph`. | Rejected. Two artifacts from one build can drift apart. |
+| B4 | Store a condensed control-flow graph per body. A node is an event: a step, a call, a saga operation, a handler or an exit. An edge is a path with no other event on it. | **Adopted.** A property needs events and their order, not every MIR block. |
+| B5 | Store the full MIR CFG. | Rejected. It is large, and MIR text is not a stable API. |
+| B6 | Export the graph to TLA+ or Alloy (`formal/`). | Deferred. The spike runs an in-tree fixpoint. An export is a later step. |
+| B7 | Find saga calls by callee path: `Saga::new`, `Saga::step`, `Saga::compensate_all`. | **Adopted.** The API is one engine type. It needs no model row. |
+| B8 | Add a `[[saga]]` table to the model. | Rejected for the spike. Nothing else uses the same shape yet. |
+| B9 | Follow the `.await?` lowering after `Saga::step`. The `Continue` arm is the `ok` edge. The `Break` arm is the `err` edge. | **Adopted.** Any other shape is `unknown`. |
+| B10 | Run the check on the JSON: `--check-structure FILE`. | **Adopted.** It proves the graph is enough without MIR. |
+| B11 | Capability-typed determinism: the context is the only source of time, randomness and I/O. | Out of spike scope. The write-up assesses it. |
+| B12 | A race check between signal handlers and the main body. | Out of spike scope. The graph records each handler, so a later check can use it. |
+
+### 0.2 Reverse brainstorm — how can the check say "covered" for a gap?
+
+| # | How to make it lie | Mitigation |
+|---|--------------------|------------|
+| R1 | Return a `Result` held in a variable. No `Err(..)` literal shows. | An exit with no literal `Ok` or `Err` has the outcome `unknown`. The check treats it as an error. |
+| R2 | Put `map_err` between `.await` and `?`. `Break` then comes from another value. | The walk follows the value from the step call to `Try::branch`. Any other call gives `saga-result-untracked`. |
+| R3 | Pass the saga to a helper that steps or unwinds. | A `Saga` value that reaches a call or a capture other than a `Saga` method gives `saga-escapes`. |
+| R4 | Use two sagas. An unwind of one clears the other. | Two or more `saga-new` nodes in one body give `multiple-sagas`. |
+| R5 | The coroutine dispatch adds false paths or hides real ones. | The entry is the target of state `0`. In the fixture, each resume target jumps back into a poll loop that state `0` reaches. |
+| R6 | Read an old manifest with no flow graph. Every workflow then reads as "no saga". | The manifest names its flow format. The check refuses a manifest without it. |
+| R7 | A boundary hides the body that owns the saga. | A boundary that runs code gives `unknown`, with or without a saga in sight. An `external-const` runs no code. |
+| R8 | Ignore the result: `let _ = saga.step(..).await`. | No `Try::branch` reads it, so the result is untracked. |
+| R9 | A step sits in a loop, and a later iteration fails outside the saga. | The check is a fixpoint over cycles. |
+| R10 | A compensation emits no command. | It is a `noop-compensation` note. Some steps have nothing to undo. |
+| R11 | Build `compensate_all()` and never await it. | Only an awaited unwind clears the flag. |
+| R12 | Start a new saga while a step of the old one is pending. | `saga-recreated`. |
+| R13 | A helper owns a saga and returns `Ok` with a step pending. | `saga-dropped-pending`. |
+
+### 0.3 Six thinking hats
+
+| Hat | Notes |
+|-----|-------|
+| White | #1995 records bodies, call edges and step sites. Optimized coroutine MIR returns `Pending` at each suspend point. `?` lowers to `Try::branch` and `from_residual`. The engine examples hold 58 workflows. Two have boundaries. Two workspace examples use `Saga`. |
+| Red | A check that finds gaps in the repository examples has value. A false gap costs trust fast. |
+| Black | MIR text is not stable. A new rustc can change the `?` lowering. DAG compensation runs inside the engine, so the graph cannot see it. Third-party crates stay boundaries. |
+| Yellow | One artifact. No engine change. The check is a small fixpoint. It finds real defects. |
+| Green | The fault-injection simulator can drive the event graph. The handler nodes enable a signal race check. A TLA+ export can reuse the same JSON. |
+| Blue | Red phase: fixture and failing tests. Green phase: flow graph, handlers, check, CLI. Refactor phase: docs, examples run, review. |
+
+### 0.4 Corrections after the review
+
+Four review agents read the first version. Each fix has a test.
+
+1. The first version indexed every `Pin<&mut {async block}>` body by its
+   span. That let three former `unknown` verdicts become false
+   `proven-deterministic` ones. The lookup now stays inside the closure that
+   builds the block. A block that captures a `&mut` reference is a
+   boundary. Tests: `tests/async_block_follow.rs`.
+2. The `.await?` walk followed control flow only. A `?` on another value
+   could pass for the step result. The walk now follows the value.
+3. An unawaited `compensate_all()` cleared the flag. Now only an awaited
+   one does.
+4. A new saga over a pending step, and a helper that drops a pending saga,
+   each read as `covered`. They now give `saga-recreated` and
+   `saga-dropped-pending`.
+5. `Result::<(), E>::Ok(..)` read as an `unknown` exit, which gave a false
+   gap. Generics are now removed before the cut.
+6. A move of the saga into a coroutine state place read as an escape. A
+   capture of a state place was not seen. The type annotation of the place
+   now decides both.
+7. The CLI accepted build flags with `--check-structure` and ignored them.
+   They are now a usage error. `--strict` fails a manifest with no
+   workflow. The manifest format is checked before the full parse.
+8. The model version is now `2026.10.1`. The same MIR gives another
+   manifest than before, so the upgrade check must not compare the two.
+9. A closure can build a future of an untrusted crate with no call, as a
+   unit struct. Its `poll` has no body here, so it is now a boundary. A
+   same-named local impl no longer stands in for it.
+10. The check ignored a node that the entry cannot reach. A saga or a gap
+    there was silent. Such a graph is now refused.
+11. A local `Saga` method that took the engine saga, such as
+    `other::Saga::compensate_all`, read as the engine unwind. A saga
+    method now needs the engine path, `Saga` or `autumn_harvest::..`, and
+    no body here outside the engine crate. Any other such call is a
+    `saga-escape`. A run that also analyzes the engine crate keeps each
+    verdict.
+12. A boundary counted only when no saga was in sight. A body outside the
+    analysis can hold a second saga with a gap. Now each boundary that runs
+    code gives `unknown`. An `external-const` does not count.
+13. A call to a body that the manifest omits was not checked. That body
+    could hold the only saga. Such a manifest is now refused.
+14. The future of an `async` closure prints as `{async closure body@..}`.
+    The follow read only `{async block@..}`, so a clock read in an `async`
+    closure step was a false `proven-deterministic`. It is now followed.
+15. A `handler` node could name an index past the workflow `handlers`
+    list. Such a manifest is now refused.
+16. MIR prints a dependency type as `helpers::Clock`, the same as a type of
+    a local `helpers` module. A local module name is no proof alone. The
+    sources must declare exactly that path. rustc prints a local type by its
+    bare name or its full path, never by a part. The module path comes from
+    the file layout and any inline `mod`.
+17. A `step` node could name an index past the body `steps` list. Such a
+    manifest is now refused.
+18. The `&mut` capture check read only the value written to `_0`. A block
+    moved through a tuple before the return was a false proof. Each
+    coroutine the closure builds is now read.
+19. A body with only a `saga-escape` node read as `no-saga`. An escape now
+    counts as a saga use, so the verdict is `unknown`.
+20. A handler body, and the coroutine it returns, start an execution of
+    their own. Their error exit with a pending step is now a gap, as in
+    the root. The analysis records each returned coroutine in the handler
+    `returns`, so `|v| handle(v)` counts too. A body with no flow graph is
+    now refused.
+21. A followed named future also gets the capture check. Its type name can
+    hide a writable field, as `SharedFuture` hides an `Arc<Mutex<_>>`. The
+    check reads the arguments of a call that builds the future too, as in
+    `SharedFuture::new(handle)`.
+22. A local type that the sources implement `Future` for, but whose `poll`
+    has no body in the MIR, is a `missing-body` boundary.
+23. A local wrapper can hide interior mutability, as
+    `struct Shared(Arc<Mutex<u64>>)`. The source index records what each
+    local type's fields hold. A type whose fields hold `&mut`, a lifetime,
+    an interior-mutable type or another such type counts as interior-mutable.
+    The index follows each `mod x;` to its file, so a file of types only is
+    read too. It honors `#[path]`, and the declaring module gives the path.
+    MIR can name the moved file too, so a file is read once per module
+    path. A `#[path]` cycle ends when a file returns to a file that
+    declares it. There is no depth cap. A type declared in a
+    function body is indexed too, under the function path. So is a type
+    in a default trait method body. The item walk in a file has no depth
+    cap, so it skips no nested type. A `macro_rules!` arm that parses as
+    items is indexed as items. Another arm, or a type that a call names,
+    gets every fact of the macro. A macro with no definition here, as a
+    dependency or procedural macro, can declare any type. Each type its
+    call declares, and each bare type name it takes, is opaque and counts
+    as writable. The std macros that declare no type are exempt.
+    A type alias counts its target as a field, so a wrapper of an alias of
+    `Arc<Mutex<u64>>` is interior-mutable too. An associated type in an
+    `impl` block counts the same way.
+24. A `handlers` entry that no registration node names is refused. Its
+    bodies would read as entries, so a helper could look covered.
+25. A body that no reference reaches from the root is refused. The check
+    reads every body, so its gap would mark a workflow with no saga. Two
+    bodies of one id are refused too, as a reference to them is ambiguous.
+26. A handler body can also be the callee of an ordinary call. Such a body
+    is checked as an entry and as a helper, so a pending `Ok` exit is
+    `saga-dropped-pending`. The future such a helper run returns is a
+    helper too.
+27. A handler registration whose handler argument has no body in sight is
+    a `handler-unresolved` boundary. Each registration takes its handler
+    last. A declarative record or a function pointer hides it, even when
+    a validator closure resolves.
+28. Each edge of a tracked step carries a label. The fixpoint reads an
+    unlabeled step edge as success, so the check refuses one.
+29. The follow reads an `async` block by its source span, as
+    `{async block@noext:12:26: 12:31}`. A module file can lack the `.rs`
+    extension, so the test reads the `line:col` shape. A block of another
+    crate prints a def path, so it is still not followed.
+30. A raw `*mut` pointer writes as a `&mut` reference does. A capture of one
+    is a boundary, as a `&mut` capture is. A local type with a `*mut` field
+    is interior-mutable, as one with a `&mut` field is. `UnsafeCell` and
+    `SyncUnsafeCell` are roots of that check too, as the model lists only
+    the safe wrappers.
+31. A captured closure, `async` closure or `async` block hides its own
+    captures, and they can write. So a block that captures one is a boundary. A read of a field
+    of the closure self, as `(_1.0: u64)`, takes the field type instead.
+32. A shared reference `&T` is a future only by a local `impl Future for
+    &T`. The index keeps each layer, so `&&T` matches only `impl Future for
+    &&T`. The follow does not read that `poll`, so such a return is an
+    `unresolved-callback` boundary. A referent of an untrusted crate is an
+    `external-crate-body` boundary.
+33. The check counts `compensate_all` only when the body awaits it in the
+    `.await` shape. A future passed to another call, as `Box::pin`, can still
+    run the unwind. That call is a `saga-escape`, so the verdict is
+    `unknown`. A future moved into an aggregate, as `Some(..)`, is an escape
+    too. So is a future held across a branch, as the walk does not follow
+    one. A dropped future does not unwind, so it is still a gap. Only the
+    std `drop` and `drop_in_place` paths drop. A user function named
+    `drop` is an escape, as it can await the future.
+34. A closure sees the generics of each function around it. So a step
+    closure that returns `StepFuture` of its enclosing function is an
+    `unresolved-generic` boundary, not a value that is not a future. The
+    index keys generics by bare function name. A name that any function of
+    that name declares counts as generic, so a same-named function cannot
+    hide one. A trait method records the trait and method generics too.
+35. A captured trait object, as `Arc<dyn Writer>`, hides its type. Its
+    methods can write through `&self`, so its capture is a boundary.
+36. A result built before an `.await` lives in the coroutine state. The
+    exit moves it out of a field. The exit check follows each plain move
+    back to the assignments of its source. When each gives one literal
+    outcome, the exit takes it. Otherwise the exit is unknown.
+
+---
+
+## 1. The flow graph
+
+`BodyNode.flow` holds the condensed control-flow graph of one body. The
+manifest field `flow` names its format, `harvest-flow/1`. The upgrade check
+ignores both fields, so the manifest format stays `harvest-structure/1`.
+
+| Node kind | Fields | Meaning |
+|---|---|---|
+| `entry` | | The first block. For a coroutine, the target of state `0`. |
+| `step` | `step` | A sink call site. The value is its index in `steps`. |
+| `call` | `callees` | A call that starts other bodies of the graph. |
+| `handler` | `handler` | A handler registration. The value is its index in `handlers`. |
+| `saga-new` | | `Saga::new`, or another call that returns a saga value. |
+| `saga-step` | `forward`, `compensate`, `tracked` | `Saga::step`, with the two closure bodies. |
+| `saga-compensate` | `tracked` | `Saga::compensate_all`. `tracked` is true when the body awaits it. |
+| `saga-escape` | `to` | A saga value reaches a call or a capture that is not a `Saga` method. |
+| `exit` | `outcome` | A write of the returned value: `ok`, `err` or `unknown`. |
+
+An edge has an optional `label`. Only a tracked `saga-step` labels its
+edges, `ok` or `err`, and it has at least one of each. A step whose arm
+reaches no node, such as an arm that never returns, is untracked. An exit
+node has no out-edge. The check refuses a graph that breaks these rules,
+names a missing node, has other than one entry, or has a node that the entry
+cannot reach, or an exit with an out-edge. It also refuses a call, a saga
+step, a handler or a body `calls` entry that names a body or handler the
+workflow does not hold.
+
+`WorkflowStructure.handlers` lists each handler registration: its kind
+(`signal`, `update`, `query` or `other`), its name when the MIR shows it,
+its bodies, and the coroutines those bodies return (`returns`).
+
+## 2. Saga compensation coverage
+
+The check reads one manifest. For each body with a `saga-new` node, it runs
+a forward fixpoint. The state at a node is one flag: a forward step may have
+completed and not been unwound.
+
+| Node | Out-state |
+|---|---|
+| tracked `saga-step` | `ok` edges set the flag. `err` edges clear it, because the saga unwound. |
+| untracked `saga-step` | Every edge sets the flag. |
+| tracked `saga-compensate` | Every edge clears the flag. |
+| any other node | The in-state. |
+
+In the workflow root, a handler body, or the coroutine a handler body
+returns, an exit with the outcome `err` or `unknown` and a set flag is a
+**gap**. In any other body, an exit with a set flag gives
+`saga-dropped-pending`. A `saga-new` with a set flag gives
+`saga-recreated`.
+
+| Verdict | When |
+|---|---|
+| `no-saga` | No body has a saga node, and no boundary runs code. |
+| `covered` | No gap, and no reason for `unknown`. |
+| `gap` | At least one gap, and no reason for `unknown` other than a boundary. A boundary cannot clear a step pending in sight, so the gap is proven. |
+| `unknown` | `saga-escapes`, `saga-result-untracked`, `multiple-sagas`, `saga-recreated`, `saga-dropped-pending`, `no-flow-graph`, or a boundary that runs code and no gap. The report lists each gap as possible. |
+
+A `noop-compensation` note does not change the verdict.
+
+## 3. TDD plan and acceptance criteria
+
+| AC (issue #2010) | Red test first |
+|---|---|
+| Emit the graph for a representative set of example workflows | `every_body_has_a_flow_graph`; `a_saga_step_names_its_forward_and_compensation_bodies`; `a_signal_handler_and_a_signal_wait_are_in_the_graph`; `an_update_handler_and_its_validator_are_in_the_graph` |
+| Run one property (saga compensation coverage) over it | `every_fixture_workflow_gets_its_expected_verdict`; `a_plain_step_after_the_saga_is_a_gap`; `two_saga_steps_are_covered`; `an_unwind_that_is_never_awaited_is_a_gap` |
+| Report where the analysis hits `unknown` | `a_saga_passed_to_a_helper_is_unknown`; `a_step_result_that_is_not_the_question_mark_operand_is_untracked`; `a_new_saga_over_a_pending_step_is_unknown`; `a_case_the_analysis_cannot_follow_is_never_proven` |
+| A spike write-up under `docs/rnd/` with a go / no-go verdict and the `unknown` rate | `docs/rnd/workflow-graph-spike.md`; `the_write_up_states_a_verdict_and_an_unknown_rate` |
+
+## 4. Known limits
+
+- The check covers the `Saga` builder only. DAG compensation runs in the
+  engine, outside the graph.
+- A panic is not an error exit. Unwind edges are not in the graph.
+- A saga in an `Option` or a struct field is not seen as a saga.
+- A saga value passed straight from a coroutine state place as a call
+  argument is not seen as an escape.
+- The check trusts the `Saga` contract: a failed step unwinds every earlier
+  step.
+- The determinism model does not track a write through `&self` of an
+  interior-mutable local, such as `Cell::set` or a write through
+  `Mutex::lock`. This gap predates #2010. A followed `async` block that
+  captures such a value, owned or shared, adds a boundary. So does a local
+  wrapper of one, as `struct Shared(Arc<Mutex<u64>>)`.
+- The source index sees only the type definitions written in the
+  sources. A local type that a dependency macro makes without naming it,
+  or that `include!` adds, has unknown fields. A capture of it adds no
+  boundary when the block writes through its methods. A field read shows
+  its type, so that still adds one. A fix must tell such a type from a
+  std type that MIR prints bare, as `Arc`.
+- MIR prints a type by its path alone, with no crate. A local
+  `helpers::Clock` and a `Clock` from a dependency crate named `helpers`
+  print the same. The analysis then reads the dependency type as local. A
+  fix needs the dependency names from `cargo metadata`.
+- MIR text is not a stable API. A rustc change that removes the
+  `Try::branch` shape moves a step to untracked. The walk hard-codes the
+  case values of `Poll` and `ControlFlow`. A change to them is not
+  detected, so run the fixture tests after each toolchain bump.

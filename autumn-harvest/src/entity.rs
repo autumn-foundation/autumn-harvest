@@ -1,0 +1,2753 @@
+//! Keyed entity: serialized handlers over durable state for each key (issue #1975).
+//!
+//! An entity is sugar over a workflow. See `docs/adr/0006-keyed-entity.md`.
+//! Issue #2259 records each state change as a history event, and a Postgres
+//! table holds the latest one. See [`crate::entity_state`].
+//!
+//! | Entity concept | Harvest part |
+//! |---|---|
+//! | Entity type | A root `#[workflow]` function that calls [`Entity::run`](crate::entity::Entity::run) |
+//! | Entity key | The `workflow_id` |
+//! | Operation | A signal named [`ENTITY_OP_SIGNAL`](crate::entity::ENTITY_OP_SIGNAL) |
+//! | Send an operation | `signal_with_start` |
+//! | Read state | The query [`ENTITY_STATE_QUERY`](crate::entity::ENTITY_STATE_QUERY) |
+//! | State change | A snapshot event, [`ENTITY_STATE_SIDE_EFFECT`](crate::entity::ENTITY_STATE_SIDE_EFFECT) |
+//! | Read state without replay | The projection, [`crate::entity_state`] |
+//! | Run an op at a deadline | A [`Wake`](crate::entity::Wake) from the hook of [`Entity::run_with_wakes`](crate::entity::Entity::run_with_wakes) (issue #2266) |
+//!
+//! # Guarantees
+//!
+//! - **One handler at a time for each key.** One active run exists for each
+//!   `(workflow_name, workflow_id)`. The loop awaits each handler to the end
+//!   before it takes the next operation.
+//! - **State survives a crash.** The loop records a state snapshot at the
+//!   start of each run and after each operation. Replay adopts the recorded
+//!   snapshots, so it rebuilds the state from the events. A history from
+//!   before issue #2259 has no snapshot. It replays from the input, the
+//!   recorded operations and the recorded activity results.
+//! - **The projection agrees with history.** A trigger writes each snapshot
+//!   to `harvest_entity_state` in the transaction that appends it.
+//! - **No lost operations at a checkpoint.** The loop carries waiting
+//!   operations in the continue-as-new input while the input fits the
+//!   workflow input cap. It runs the operations that do not fit first.
+//! - **Atomic state changes.** A handler gets a copy of the state. Only an
+//!   `Ok` result replaces the state. Activities that ran before an `Err` stay
+//!   done. The copy is `S::clone`, so `clone` must copy the whole value. A
+//!   state that shares interior mutability, such as an `Arc<Mutex<_>>`,
+//!   loses this guarantee.
+//! - **A due wake runs first.** The hook of
+//!   [`Entity::run_with_wakes`](crate::entity::Entity::run_with_wakes) gives a
+//!   deadline and an op. A due wake runs before a waiting op. Otherwise the
+//!   loop races the op signal against a durable timer.
+//! - **No hook, no new events.** [`Entity::run`](crate::entity::Entity::run)
+//!   reads no clock and starts no timer. Its histories replay as before.
+//!
+//! # Limits
+//!
+//! - The checkpoint input is the whole state. A state larger than the
+//!   workflow input cap fails the run at its first checkpoint. Payload
+//!   offload lifts this limit only when its threshold is at or below the cap.
+//! - Continue-as-new works only in a root workflow. An entity cannot be a
+//!   child workflow.
+//! - [`Entity::max_ops_per_run`](crate::entity::Entity::max_ops_per_run), an `execution_timeout` and the
+//!   [`EntityCheckpoint`](crate::entity::EntityCheckpoint) wire form are part of replay. Change them as a
+//!   versioned workflow change.
+//! - A handler must await all the work it starts, and its error text must be
+//!   deterministic. The error text rides in the checkpoint input. The
+//!   checkpoint keeps at most
+//!   [`ENTITY_LAST_ERROR_MAX_BYTES`](crate::entity::ENTITY_LAST_ERROR_MAX_BYTES)
+//!   bytes of the error text.
+//! - A handler panic fails the run, as in any workflow.
+//! - The wake hook must be a pure function of the state, because replay
+//!   calls it again. A failed wake op keeps the old state, so the hook gives
+//!   the same wake, which is now due. The loop then runs it again at once.
+//! - Each step with a wake records one clock read. A wait for a wake also
+//!   records a timer. The timer counts whole seconds, so a wake can run up to
+//!   one second late.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use autumn_harvest::entity::Entity;
+//! use autumn_harvest::prelude::*;
+//!
+//! #[workflow]
+//! async fn counter(
+//!     ctx: &WorkflowContext,
+//!     input: serde_json::Value,
+//! ) -> Result<u64, String> {
+//!     Entity::<u64>::from_input(ctx, input)
+//!         .run(|count, add: u64| async move { Ok(count + add) })
+//!         .await
+//!         .map_err(|e| e.to_string())
+//! }
+//! ```
+//!
+//! A client sends an operation with the generated stub:
+//!
+//! ```rust,ignore
+//! use autumn_harvest::entity::{ENTITY_OP_SIGNAL, EntityCheckpoint, EntityMessage};
+//! use autumn_harvest::TypedSignalWithStartOptions;
+//!
+//! CounterStub::signal_with_start(
+//!     conn, &client, "counter-42", serde_json::json!({}),
+//!     ENTITY_OP_SIGNAL, EntityMessage::op(5_u64),
+//!     TypedSignalWithStartOptions { idempotency_key: Some(op_id), ..Default::default() },
+//! ).await?;
+//! ```
+//!
+//! A session that beats at a deadline in its state. The beat op moves the
+//! deadline, so the hook gives the next beat:
+//!
+//! ```rust,ignore
+//! use autumn_harvest::entity::{Entity, Wake};
+//!
+//! Entity::<Session>::from_input(ctx, input)
+//!     .run_with_wakes(
+//!         |session, op: SessionOp| async move { Ok(session.apply(op)) },
+//!         |session: &Session| Some(Wake::new(session.next_beat_at, SessionOp::Beat)),
+//!     )
+//!     .await
+//! ```
+
+use std::collections::VecDeque;
+use std::future::Future;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
+
+use crate::context::WorkflowContext;
+use crate::error::HarvestResult;
+
+/// The signal name that carries an [`EntityMessage`].
+pub const ENTITY_OP_SIGNAL: &str = "harvest.entity.op";
+
+/// The query that returns the last committed state.
+pub const ENTITY_STATE_QUERY: &str = "harvest.entity.state";
+
+/// The query that returns the [`EntityStats`].
+pub const ENTITY_STATS_QUERY: &str = "harvest.entity.stats";
+
+/// The side-effect id that records each checkpoint decision.
+///
+/// Replay reads the recorded decision. The live history size does not
+/// change it.
+pub const ENTITY_CHECKPOINT_SIDE_EFFECT: &str = "harvest.entity.checkpoint";
+
+/// The side-effect id that records the byte budget of a checkpoint input.
+///
+/// The budget is the configured workflow input cap. Each checkpoint attempt
+/// records it. Replay of an earlier attempt reads the recorded budget, not
+/// the current cap. A later attempt reads the current cap.
+pub const ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT: &str = "harvest.entity.checkpoint_budget";
+
+/// The side-effect name of a state snapshot (issue #2259).
+///
+/// The loop records a snapshot at the start of each run and after each op.
+/// Its kind is [`SideEffectKind::EntityState`]. Its value is an
+/// [`EntitySnapshot`].
+///
+/// [`SideEffectKind::EntityState`]: crate::event::SideEffectKind::EntityState
+pub const ENTITY_STATE_SIDE_EFFECT: &str = "harvest.entity.state";
+
+/// The side-effect name of the snapshot that a delete records before the run
+/// ends (issue #2259).
+///
+/// The projection reads this name and marks the key as deleted.
+pub const ENTITY_DELETED_SIDE_EFFECT: &str = "harvest.entity.deleted";
+
+/// The key of a snapshot that the loop did not store (issue #2259).
+///
+/// A state past the side-effect cap or the depth cap would make the history
+/// too large or unloadable. The loop then records
+/// `{"omitted": "too_large" | "too_deep", "stats": <EntityStats>}`. A query
+/// on such a run replays the body.
+pub const ENTITY_SNAPSHOT_OMITTED_KEY: &str = "omitted";
+
+/// The maximum size in bytes of [`EntityStats::last_error`], marker included.
+///
+/// A longer error is cut at a `char` boundary and ends with `... [truncated]`.
+/// The error rides in each checkpoint input. Without a bound, a huge error
+/// stops later checkpoints. A decode error can also quote part of a bad
+/// payload. Change this bound as a versioned workflow change.
+pub const ENTITY_LAST_ERROR_MAX_BYTES: usize = 1024;
+
+/// The text that ends a cut error.
+const TRUNCATION_MARKER: &str = "... [truncated]";
+
+const _: () = assert!(ENTITY_LAST_ERROR_MAX_BYTES > TRUNCATION_MARKER.len());
+
+/// One message on the [`ENTITY_OP_SIGNAL`] signal.
+///
+/// The wire form is `{"kind":"op","op":<op>}` or `{"kind":"delete"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum EntityMessage<O> {
+    /// Apply `op` to the state.
+    #[non_exhaustive]
+    Op {
+        /// The operation for the handler.
+        op: O,
+    },
+    /// Delete the entity.
+    ///
+    /// The run completes with the current state when no operation waits in
+    /// history. Otherwise the state resets to its default and the loop goes
+    /// on.
+    Delete,
+}
+
+impl<O> EntityMessage<O> {
+    /// A message that applies `op`.
+    #[must_use]
+    pub const fn op(op: O) -> Self {
+        Self::Op { op }
+    }
+
+    /// A message that deletes the entity.
+    #[must_use]
+    pub const fn delete() -> Self {
+        Self::Delete
+    }
+}
+
+/// Counters for the life of one entity. They carry across checkpoints.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct EntityStats {
+    /// Operations whose handler returned `Ok`.
+    pub applied: u64,
+    /// Operations whose handler returned `Err`, or that did not decode.
+    pub failed: u64,
+    /// Checkpoints taken with continue-as-new.
+    pub checkpoints: u64,
+    /// The error of the most recent failed operation.
+    ///
+    /// It keeps at most [`ENTITY_LAST_ERROR_MAX_BYTES`] bytes. A longer error
+    /// is cut and ends with `... [truncated]`.
+    pub last_error: Option<String>,
+}
+
+/// The input of an entity run.
+///
+/// A new entity starts from `{}` or `null`. A checkpoint writes the state,
+/// the operations that still wait, and the counters.
+///
+/// [`Entity::run`] drops the input of a start that a caller chose, such as a
+/// start route or a signal-with-start (issue #2082). Only a continue-as-new run
+/// keeps its checkpoint. A run with no recorded source also keeps it. Use
+/// [`Entity::initial_state`] to seed a fresh entity from code.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(bound(serialize = "S: Serialize"))]
+pub struct EntityCheckpoint<S> {
+    /// The committed state.
+    pub state: S,
+    /// Raw [`EntityMessage`] values to run before new signals.
+    pub pending: Vec<Value>,
+    /// Counters for the life of the entity.
+    pub stats: EntityStats,
+}
+
+/// The decode shape of [`EntityCheckpoint`]. Each field may be absent or
+/// `null`.
+#[derive(Deserialize)]
+#[serde(default, bound(deserialize = "S: DeserializeOwned + Default"))]
+struct CheckpointWire<S> {
+    #[serde(deserialize_with = "null_as_default")]
+    state: S,
+    #[serde(deserialize_with = "null_as_default")]
+    pending: Vec<Value>,
+    #[serde(deserialize_with = "null_as_default")]
+    stats: EntityStats,
+}
+
+impl<S: Default> Default for CheckpointWire<S> {
+    fn default() -> Self {
+        Self {
+            state: S::default(),
+            pending: Vec::new(),
+            stats: EntityStats::default(),
+        }
+    }
+}
+
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
+impl<'de, S: DeserializeOwned + Default> Deserialize<'de> for EntityCheckpoint<S> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = Option::<CheckpointWire<S>>::deserialize(deserializer)?.unwrap_or_default();
+        Ok(Self {
+            state: wire.state,
+            pending: wire.pending,
+            stats: wire.stats,
+        })
+    }
+}
+
+impl<S: Default> EntityCheckpoint<S> {
+    /// A checkpoint that starts from `state`.
+    #[must_use]
+    pub fn with_state(state: S) -> Self {
+        Self {
+            state,
+            ..Self::default()
+        }
+    }
+}
+
+/// The value of one state snapshot event (issue #2259).
+///
+/// The wire form is `{"state": <S>, "stats": <EntityStats>}`. Replay reads
+/// it back, and `harvest_entity_state.snapshot` holds a copy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound(serialize = "S: Serialize", deserialize = "S: DeserializeOwned"))]
+pub struct EntitySnapshot<S> {
+    /// The committed state.
+    pub state: S,
+    /// The counters at the time of the snapshot.
+    #[serde(default)]
+    pub stats: EntityStats,
+}
+
+/// A deadline and the op that the loop runs at it (issue #2266).
+///
+/// [`Entity::run_with_wakes`] asks its hook for a wake before each step. The
+/// op of a wake goes through the handler, as a decoded op does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Wake<O> {
+    /// When the op is due.
+    pub at: DateTime<Utc>,
+    /// The op that the loop runs at `at`.
+    pub op: O,
+}
+
+impl<O> Wake<O> {
+    /// A wake that runs `op` at `at`.
+    #[must_use]
+    pub const fn new(at: DateTime<Utc>, op: O) -> Self {
+        Self { at, op }
+    }
+}
+
+/// The handler loop of one entity run.
+pub struct Entity<'a, S> {
+    ctx: &'a WorkflowContext,
+    checkpoint: EntityCheckpoint<S>,
+    max_ops_per_run: Option<u64>,
+    initial_state: Option<S>,
+    trust_start_input: bool,
+    raw_input: Option<Value>,
+}
+
+impl<'a, S> Entity<'a, S>
+where
+    S: Serialize + DeserializeOwned + Default + Clone,
+{
+    /// A loop for the run that `ctx` drives, from `checkpoint`.
+    #[must_use]
+    pub const fn new(ctx: &'a WorkflowContext, checkpoint: EntityCheckpoint<S>) -> Self {
+        Self {
+            ctx,
+            checkpoint,
+            max_ops_per_run: None,
+            initial_state: None,
+            trust_start_input: false,
+            raw_input: None,
+        }
+    }
+
+    /// A loop for the run that `ctx` drives, from the raw start `input`.
+    ///
+    /// Prefer this to [`new`](Self::new). The run decodes `input` only when it
+    /// keeps it. A run that a caller started drops the input first, so a
+    /// malformed client input cannot fail the start (issue #2082). Declare the
+    /// workflow input as `serde_json::Value`. A typed `EntityCheckpoint<S>`
+    /// input decodes before this call.
+    ///
+    /// [`run`](Self::run) returns [`HarvestError::Serialization`] when it keeps
+    /// an input that does not decode.
+    #[must_use]
+    pub fn from_input(ctx: &'a WorkflowContext, input: Value) -> Self {
+        Self {
+            raw_input: Some(input),
+            ..Self::new(ctx, EntityCheckpoint::default())
+        }
+    }
+
+    /// Start a fresh entity from `state`, not from `S::default()`.
+    ///
+    /// The code sets this state, so it is trusted. A continue-as-new run
+    /// ignores it and keeps the state of its checkpoint. A change to `state`
+    /// changes replay, so version it.
+    #[must_use]
+    pub fn initial_state(mut self, state: S) -> Self {
+        self.initial_state = Some(state);
+        self
+    }
+
+    /// Keep the input of a fresh start as the checkpoint.
+    ///
+    /// By default a run that a caller started drops that input and starts from
+    /// [`initial_state`](Self::initial_state) or `S::default()`. Use this
+    /// only when every caller that can start the entity is trusted.
+    #[must_use]
+    pub const fn trust_start_input(mut self) -> Self {
+        self.trust_start_input = true;
+        self
+    }
+
+    /// Take a checkpoint after `n` operations in one run.
+    ///
+    /// This bound needs no event. The history checks still apply. A value of
+    /// `0` counts as `1`. A change to `n` changes replay, so version it.
+    #[must_use]
+    pub const fn max_ops_per_run(mut self, n: u64) -> Self {
+        self.max_ops_per_run = Some(if n == 0 { 1 } else { n });
+        self
+    }
+
+    /// Run the loop until a delete ends the entity.
+    ///
+    /// `handler` gets a copy of the state and one operation. Its `Ok` value
+    /// becomes the new state. An `Err` keeps the old state and counts as a
+    /// failed operation. Capture `ctx` in the handler to call activities.
+    ///
+    /// The copy is `S::clone`. Use plain data for `S`. A clone that shares
+    /// state, such as an `Arc<Mutex<_>>`, lets a failed handler change the
+    /// committed state.
+    ///
+    /// Returns the final state after a delete. A checkpoint does not return.
+    ///
+    /// # Errors
+    ///
+    /// Returns the engine error of a signal wait, a side effect or a
+    /// continue-as-new, for example [`HarvestError::Cancelled`].
+    /// Returns [`HarvestError::PayloadTooLarge`] when the state alone is
+    /// larger than the workflow input cap at a checkpoint.
+    /// Returns [`HarvestError::Serialization`] if the state does not
+    /// serialize at a snapshot or a checkpoint.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `continue_as_new` resolves. The engine never resolves it.
+    ///
+    /// [`HarvestError::Cancelled`]: crate::error::HarvestError::Cancelled
+    /// [`HarvestError::PayloadTooLarge`]: crate::error::HarvestError::PayloadTooLarge
+    /// [`HarvestError::Serialization`]: crate::error::HarvestError::Serialization
+    pub async fn run<O, H, Fut>(self, handler: H) -> HarvestResult<S>
+    where
+        O: DeserializeOwned,
+        H: FnMut(S, O) -> Fut,
+        Fut: Future<Output = Result<S, String>>,
+    {
+        // No hook means no clock read and no timer, so old histories replay.
+        self.run_loop(handler, |_: &S| None::<Wake<O>>).await
+    }
+
+    /// Run the loop like [`run`](Self::run), and also run the op of `wake` at
+    /// its deadline (issue #2266).
+    ///
+    /// Before each step, the loop calls `wake` with the committed state:
+    ///
+    /// - `None` gives the step of `run`: a waiting op, else a wait for an op
+    ///   signal.
+    /// - `Some(wake)` makes the loop read the clock with
+    ///   [`WorkflowContext::system_now`]. A due wake runs first, before any
+    ///   waiting op. Otherwise a waiting op runs.
+    /// - With no waiting op, the loop races the op signal against a durable
+    ///   timer at the deadline. A signal that wins runs as usual. A timer that
+    ///   fires runs the op of the wake.
+    ///
+    /// The op of a wake does not decode. The handler, the `Ok` and `Err`
+    /// rules, the snapshot and the checkpoint check apply to it as to a
+    /// decoded op. A delete keeps its rules.
+    ///
+    /// `wake` must be a pure function of the state, because replay calls it
+    /// again. A failed wake op keeps the old state, so `wake` gives the same
+    /// wake again. That wake is due, so the loop runs it again at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`run`](Self::run), and the engine error of a
+    /// clock read or a timer race.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `continue_as_new` resolves. The engine never resolves it.
+    pub async fn run_with_wakes<O, H, Fut, W>(self, handler: H, wake: W) -> HarvestResult<S>
+    where
+        O: DeserializeOwned,
+        H: FnMut(S, O) -> Fut,
+        Fut: Future<Output = Result<S, String>>,
+        W: FnMut(&S) -> Option<Wake<O>>,
+    {
+        self.run_loop(handler, wake).await
+    }
+
+    /// The loop of [`run`](Self::run) and [`run_with_wakes`](Self::run_with_wakes).
+    async fn run_loop<O, H, Fut, W>(self, mut handler: H, mut wake: W) -> HarvestResult<S>
+    where
+        O: DeserializeOwned,
+        H: FnMut(S, O) -> Fut,
+        Fut: Future<Output = Result<S, String>>,
+        W: FnMut(&S) -> Option<Wake<O>>,
+    {
+        let Self {
+            ctx,
+            mut checkpoint,
+            max_ops_per_run,
+            initial_state,
+            trust_start_input,
+            raw_input,
+        } = self;
+        let drops_input = !trust_start_input && ctx.start_source().carries_caller_input();
+        // Decode the raw input only when the run keeps it.
+        if let Some(raw) = raw_input.filter(|_| !drops_input) {
+            checkpoint = serde_json::from_value(raw)?;
+        }
+        // A caller chose the input of a fresh start, so drop it (issue #2082).
+        // A run with no recorded source keeps its input: it can be an entity
+        // that started before the engine recorded the source.
+        if drops_input {
+            checkpoint = EntityCheckpoint::with_state(initial_state.unwrap_or_default());
+        }
+        // A kept input is trusted, but its error must obey the bound too.
+        checkpoint.stats.last_error = checkpoint.stats.last_error.take().map(bound_error);
+        let mut waiting: VecDeque<Value> = std::mem::take(&mut checkpoint.pending).into();
+        let mut run = RunCounters::default();
+        // The first snapshot moves the projection to this run (issue #2259).
+        record_snapshot(ctx, &mut checkpoint, ENTITY_STATE_SIDE_EFFECT, &mut run)?;
+        let published = Arc::new(Mutex::new(Published::of(&checkpoint)));
+        register_queries(ctx, &published);
+
+        loop {
+            let message = match next_step(ctx, &mut waiting, wake(&checkpoint.state)).await? {
+                Step::Message(raw) => {
+                    run.op_bytes += json_len(&raw)?;
+                    serde_json::from_value::<EntityMessage<O>>(raw)
+                }
+                // A wake op is typed. It does not decode and adds no op bytes.
+                Step::Wake(op) => Ok(EntityMessage::op(op)),
+            };
+            match message {
+                Ok(EntityMessage::Op { op }) => match handler(checkpoint.state.clone(), op).await {
+                    Ok(next) => {
+                        checkpoint.state = next;
+                        checkpoint.stats.applied += 1;
+                    }
+                    Err(error) => record_failure(&mut checkpoint.stats, error),
+                },
+                Ok(EntityMessage::Delete) => {
+                    waiting.extend(ctx.drain_signals_raw(ENTITY_OP_SIGNAL)?);
+                    if waiting.is_empty() {
+                        record_snapshot(
+                            ctx,
+                            &mut checkpoint,
+                            ENTITY_DELETED_SIDE_EFFECT,
+                            &mut run,
+                        )?;
+                        return Ok(checkpoint.state);
+                    }
+                    checkpoint.state = S::default();
+                }
+                Err(error) => record_failure(
+                    &mut checkpoint.stats,
+                    format!("entity message does not decode: {error}"),
+                ),
+            }
+            run.ops += 1;
+            record_snapshot(ctx, &mut checkpoint, ENTITY_STATE_SIDE_EFFECT, &mut run)?;
+            *lock(&published) = Published::of(&checkpoint);
+
+            if checkpoint_due(ctx, &mut run, max_ops_per_run)? {
+                // Record the budget at each attempt. A cap that changes while a
+                // handler waits then applies to the next attempt.
+                let limit = ctx.side_effect(ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT, || {
+                    ctx.continue_as_new_input_budget()
+                })?;
+                if !claim_waiting_ops(ctx, &checkpoint, &mut waiting, limit)? {
+                    // An op does not fit. Run it in this run, then try again.
+                    continue;
+                }
+                checkpoint.pending = waiting.into();
+                checkpoint.stats.checkpoints += 1;
+                ctx.continue_as_new(serde_json::to_value(&checkpoint)?)
+                    .await?;
+                unreachable!("continue_as_new never resolves while the run is active");
+            }
+        }
+    }
+}
+
+/// What the loop runs next.
+enum Step<O> {
+    /// A raw message: a carried op or an op signal.
+    Message(Value),
+    /// The op of a wake.
+    Wake(O),
+}
+
+/// Take the next step of the loop (issue #2266).
+///
+/// With no wake, take a waiting op, else wait for an op signal. This path
+/// reads no clock and starts no timer. With a wake, a due wake comes first,
+/// so a backlog cannot starve it.
+async fn next_step<O>(
+    ctx: &WorkflowContext,
+    waiting: &mut VecDeque<Value>,
+    wake: Option<Wake<O>>,
+) -> HarvestResult<Step<O>> {
+    let Some(wake) = wake else {
+        return match waiting.pop_front() {
+            Some(raw) => Ok(Step::Message(raw)),
+            None => ctx
+                .wait_for_signal(ENTITY_OP_SIGNAL)
+                .await
+                .map(Step::Message),
+        };
+    };
+    let now = ctx.system_now();
+    if wake.at <= now {
+        return Ok(Step::Wake(wake.op));
+    }
+    if let Some(raw) = waiting.pop_front() {
+        return Ok(Step::Message(raw));
+    }
+    let remaining = time_until(wake.at, now);
+    let raw = ctx
+        .wait_for_signal_timeout(ENTITY_OP_SIGNAL, remaining)
+        .await?;
+    // No signal came before the deadline, so the wake is due.
+    Ok(match raw {
+        Some(raw) => Step::Message(raw),
+        None => Step::Wake(wake.op),
+    })
+}
+
+/// The time from `now` to `at`, rounded up to whole milliseconds.
+///
+/// The result is at least 1 ms, so the race always arms a timer.
+fn time_until(at: DateTime<Utc>, now: DateTime<Utc>) -> std::time::Duration {
+    let delta = (at - now).to_std().unwrap_or_default();
+    let millis = delta.as_millis() + u128::from(!delta.subsec_nanos().is_multiple_of(1_000_000));
+    std::time::Duration::from_millis(u64::try_from(millis.max(1)).unwrap_or(u64::MAX))
+}
+
+/// Counters for one run. They reset at each checkpoint.
+#[derive(Default)]
+struct RunCounters {
+    /// Messages taken in this run.
+    ops: u64,
+    /// Serialized bytes of those messages and of this run's snapshots.
+    op_bytes: u64,
+    /// The loaded history size, as `(event count, bytes)`. A new task loads
+    /// more events, so a new count means a new measure.
+    loaded: Option<(u64, u64)>,
+}
+
+/// The borrowed write form of an [`EntitySnapshot`].
+#[derive(Serialize)]
+struct SnapshotRef<'s, S> {
+    state: &'s S,
+    stats: &'s EntityStats,
+}
+
+/// Record or replay the snapshot `name` of `checkpoint` (issue #2259).
+///
+/// A replay adopts the recorded state and stats, so replay rebuilds the state
+/// from the events. A recorded snapshot that does not decode as `S` is a
+/// non-determinism error, and the loop keeps its own state. A history from
+/// before issue #2259 records nothing here.
+///
+/// A state past the side-effect cap or the depth cap is not stored. The loop
+/// records an [`ENTITY_SNAPSHOT_OMITTED_KEY`] marker instead, and replay keeps
+/// its own state at that marker.
+///
+/// Only a live snapshot counts toward the byte budget. The loaded history
+/// bytes already hold the recorded ones.
+fn record_snapshot<S: Serialize + DeserializeOwned>(
+    ctx: &WorkflowContext,
+    checkpoint: &mut EntityCheckpoint<S>,
+    name: &str,
+    run: &mut RunCounters,
+) -> HarvestResult<()> {
+    let live = serde_json::to_value(SnapshotRef {
+        state: &checkpoint.state,
+        stats: &checkpoint.stats,
+    })?;
+    let stats = &checkpoint.stats;
+    let omitted = |reason: &'static str| serde_json::json!({ ENTITY_SNAPSHOT_OMITTED_KEY: reason, "stats": stats });
+    match ctx.record_entity_snapshot(name, live, omitted)? {
+        crate::context::EntitySnapshot::Recorded(recorded) => {
+            if recorded.get(ENTITY_SNAPSHOT_OMITTED_KEY).is_some() {
+                return Ok(());
+            }
+            match serde_json::from_value::<EntitySnapshot<S>>(recorded) {
+                Ok(snapshot) => {
+                    checkpoint.state = snapshot.state;
+                    checkpoint.stats = snapshot.stats;
+                }
+                Err(error) => ctx.record_entity_drift(format!(
+                    "side-effect drift mismatch: the recorded entity snapshot {name} \
+                     does not decode ({error})"
+                )),
+            }
+        }
+        crate::context::EntitySnapshot::Live(live) => run.op_bytes += json_len(&live)?,
+        crate::context::EntitySnapshot::Absent => {}
+    }
+    Ok(())
+}
+
+/// The committed view that the queries read.
+struct Published {
+    state: Result<Value, String>,
+    stats: EntityStats,
+}
+
+impl Published {
+    fn of<S: Serialize>(checkpoint: &EntityCheckpoint<S>) -> Self {
+        Self {
+            state: serde_json::to_value(&checkpoint.state).map_err(|e| e.to_string()),
+            stats: checkpoint.stats.clone(),
+        }
+    }
+}
+
+/// Lock the view. A panic in a query cannot leave it half written, so a
+/// poisoned lock is safe to read.
+fn lock(published: &Mutex<Published>) -> MutexGuard<'_, Published> {
+    published.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn register_queries(ctx: &WorkflowContext, published: &Arc<Mutex<Published>>) {
+    let view = Arc::clone(published);
+    ctx.register_query_handler(ENTITY_STATE_QUERY, move |_: &Value| {
+        lock(&view).state.clone()
+    });
+    let view = Arc::clone(published);
+    ctx.register_query_handler(ENTITY_STATS_QUERY, move |_: &Value| {
+        Ok(lock(&view).stats.clone())
+    });
+}
+
+/// Claim the op signals that wait in history, while the checkpoint fits.
+///
+/// Returns `true` when every waiting op is in `waiting` and the input fits
+/// `limit`. Returns `false` when an op does not fit. That op stays at the
+/// end of `waiting`, so the loop runs it before the next checkpoint. An
+/// input that does not fit with no op to carry still checkpoints. The
+/// continue-as-new cap then reports the size, and no op is lost.
+fn claim_waiting_ops<S: Serialize>(
+    ctx: &WorkflowContext,
+    checkpoint: &EntityCheckpoint<S>,
+    waiting: &mut VecDeque<Value>,
+    limit: Option<u64>,
+) -> HarvestResult<bool> {
+    let Some(limit) = limit else {
+        waiting.extend(ctx.drain_signals_raw(ENTITY_OP_SIGNAL)?);
+        return Ok(true);
+    };
+    // The base input has an empty `pending` array. Each op adds its own
+    // bytes and at most one separator, so the sum is an upper bound. The
+    // checkpoint counter goes up by one before the write, which can add a
+    // digit.
+    let mut size = json_len(checkpoint)? + counter_growth(checkpoint.stats.checkpoints);
+    for op in &*waiting {
+        size += json_len(op)? + 1;
+    }
+    if !waiting.is_empty() && size > limit {
+        return Ok(false);
+    }
+    while let Some(op) = ctx.try_wait_for_signal(ENTITY_OP_SIGNAL)? {
+        size += json_len(&op)? + 1;
+        waiting.push_back(op);
+        if size > limit {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The bytes that `n + 1` adds over `n` in decimal JSON.
+fn counter_growth(n: u64) -> u64 {
+    let digits = |v: u64| u64::from(v.checked_ilog10().unwrap_or(0) + 1);
+    n.checked_add(1).map_or(1, |next| digits(next) - digits(n))
+}
+
+fn json_len<T: Serialize + ?Sized>(value: &T) -> HarvestResult<u64> {
+    Ok(serde_json::to_string(value)?.len() as u64)
+}
+
+/// Cut `error` to [`ENTITY_LAST_ERROR_MAX_BYTES`], marker included.
+///
+/// The cut lands on a `char` boundary. The loop below replaces
+/// `str::floor_char_boundary`, which the MSRV lacks.
+fn bound_error(error: String) -> String {
+    if error.len() <= ENTITY_LAST_ERROR_MAX_BYTES {
+        return error;
+    }
+    let mut end = ENTITY_LAST_ERROR_MAX_BYTES - TRUNCATION_MARKER.len();
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    // `truncate` would keep the buffer of the long error. A new string drops it.
+    let mut bounded = String::with_capacity(end + TRUNCATION_MARKER.len());
+    bounded.push_str(&error[..end]);
+    bounded.push_str(TRUNCATION_MARKER);
+    bounded
+}
+
+fn record_failure(stats: &mut EntityStats, error: String) {
+    stats.failed += 1;
+    stats.last_error = Some(bound_error(error));
+}
+
+/// Decide if the run takes a checkpoint after this op.
+///
+/// The op bound is a pure function of the run, so it needs no event. The
+/// other checks read live values, and the side effect records the answer.
+/// Replay reads that answer back.
+///
+/// The loaded history count does not include the events of the current
+/// task. The run therefore also counts one event for each op it took, so a
+/// long backlog in one task still reaches the threshold.
+///
+/// The byte check adds the loaded history bytes and this run's op bytes. The
+/// loaded bytes include the activity results of earlier tasks. The check
+/// trips at half the history byte cap, which leaves room for estimate error.
+fn checkpoint_due(
+    ctx: &WorkflowContext,
+    run: &mut RunCounters,
+    max_ops_per_run: Option<u64>,
+) -> HarvestResult<bool> {
+    if max_ops_per_run.is_some_and(|max| run.ops >= max) {
+        return Ok(true);
+    }
+    let policy = ctx.history_policy();
+    let by_engine = ctx.continue_as_new_hint();
+    let events = ctx.history_event_count();
+    let by_events = events.saturating_add(run.ops) > policy.continue_as_new_threshold();
+    let by_bytes = match policy.byte_hard_cap() {
+        Some(cap) => {
+            let loaded = match run.loaded {
+                Some((count, bytes)) if count == events => bytes,
+                _ => {
+                    let bytes = ctx.loaded_history_bytes();
+                    run.loaded = Some((events, bytes));
+                    bytes
+                }
+            };
+            over_byte_budget(loaded, run.op_bytes, cap)
+        }
+        None => false,
+    };
+    let live = by_engine || by_events || by_bytes;
+    ctx.side_effect(ENTITY_CHECKPOINT_SIDE_EFFECT, || live)
+}
+
+/// Whether the history bytes reach half of `cap`.
+const fn over_byte_budget(loaded: u64, op_bytes: u64, cap: u64) -> bool {
+    loaded.saturating_add(op_bytes) > cap / 2
+}
+
+/// Kani proofs of the entity byte budget (issue #1975).
+///
+/// The `kani` CI job runs them. See `docs/testing/formal-methods.md`.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// A counter grows by 0 or 1 bytes, and by 1 only when `n + 1` gains a
+    /// digit. The subtraction never underflows.
+    #[kani::proof]
+    fn counter_growth_is_one_byte_at_a_power_of_ten() {
+        let n: u64 = kani::any();
+        let growth = counter_growth(n);
+        assert!(growth <= 1);
+        if n < u64::MAX {
+            // A table, not `ilog10`, so the harness adds no symbolic divide.
+            let powers: [u64; 19] = core::array::from_fn(|i| 10_u64.pow(i as u32 + 1));
+            assert_eq!(growth == 1, powers.contains(&(n + 1)));
+        }
+        kani::cover!(growth == 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::context::{WorkflowCommand, WorkflowHistoryPolicy};
+    use crate::event::{SideEffectKind, WorkflowEvent};
+    use crate::executor::{WorkflowOutcome, drive_workflow};
+    use crate::testing::{ReplayStatus, TestRunStatus, WorkflowReplayer, WorkflowTestEnv};
+    use crate::types::{ExecutionId, StartProvenance, StartSource};
+
+    type BoxedRun<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
+
+    /// The counter op: add `n`, or fail with `fail`.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum CounterOp {
+        Add(i64),
+        Fail,
+    }
+
+    fn checkpoint_of(input: Value) -> Result<EntityCheckpoint<i64>, String> {
+        serde_json::from_value(input).map_err(|e| e.to_string())
+    }
+
+    fn apply(count: i64, op: &CounterOp) -> Result<i64, String> {
+        match op {
+            CounterOp::Add(n) => Ok(count + n),
+            CounterOp::Fail => Err("op refused".to_string()),
+        }
+    }
+
+    /// A counter entity with no activity.
+    fn counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .run(|count, op: CounterOp| async move { apply(count, &op) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    /// A counter entity that takes a checkpoint after two operations.
+    fn bounded_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .max_ops_per_run(2)
+                .run(|count, op: CounterOp| async move { apply(count, &op) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    // Only `handlers_run_one_at_a_time` may use these counters.
+    static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+    static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+    /// Counts running handlers. The harness drops a suspended cycle, so the
+    /// count goes down on drop, not at the end of the handler.
+    struct InFlight;
+
+    impl InFlight {
+        fn enter() -> Self {
+            let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+            MAX_IN_FLIGHT.fetch_max(now, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A counter entity whose handler awaits one activity for each op.
+    fn activity_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .run(|count, op: CounterOp| async move {
+                    let _guard = InFlight::enter();
+                    let n = ctx
+                        .execute_activity_raw("entity_step", json!(op), "default")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(count + n.as_i64().unwrap_or_default())
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    /// A loop that calls `should_continue_as_new()` directly.
+    fn naive_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let mut count = input.as_i64().unwrap_or_default();
+            loop {
+                let raw = ctx
+                    .wait_for_signal(ENTITY_OP_SIGNAL)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let add: i64 = ctx
+                    .side_effect("naive.add", || raw.as_i64().unwrap_or_default())
+                    .map_err(|e| e.to_string())?;
+                count += add;
+                if ctx.should_continue_as_new() {
+                    ctx.continue_as_new(json!(count))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                if add == 0 {
+                    return Ok(json!(count));
+                }
+            }
+        })
+    }
+
+    fn op(n: i64) -> Value {
+        json!(EntityMessage::op(CounterOp::Add(n)))
+    }
+
+    fn delete() -> Value {
+        json!(EntityMessage::<CounterOp>::delete())
+    }
+
+    fn env_with(messages: &[Value]) -> WorkflowTestEnv {
+        messages.iter().fold(WorkflowTestEnv::new(), |env, m| {
+            env.queue_signal(ENTITY_OP_SIGNAL, m.clone())
+        })
+    }
+
+    /// The values of the side effects recorded under `id`.
+    fn recorded(events: &[WorkflowEvent], id: &str) -> Vec<Value> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEvent::SideEffectRecorded { name, value, .. }
+                    if name.as_deref() == Some(id) =>
+                {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn checkpoint_side_effects(events: &[WorkflowEvent]) -> Vec<Value> {
+        recorded(events, ENTITY_CHECKPOINT_SIDE_EFFECT)
+    }
+
+    #[test]
+    fn message_wire_form_is_tagged() {
+        assert_eq!(op(3), json!({"kind": "op", "op": {"add": 3}}));
+        assert_eq!(delete(), json!({"kind": "delete"}));
+        let back: EntityMessage<CounterOp> =
+            serde_json::from_value(json!({"kind": "delete"})).unwrap();
+        assert_eq!(back, EntityMessage::Delete);
+    }
+
+    #[test]
+    fn checkpoint_decodes_from_an_empty_object() {
+        let cp: EntityCheckpoint<i64> = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(cp, EntityCheckpoint::default());
+        let cp: EntityCheckpoint<i64> = serde_json::from_value(json!({"state": 7})).unwrap();
+        assert_eq!(cp, EntityCheckpoint::with_state(7));
+    }
+
+    #[test]
+    fn checkpoint_decodes_null_as_the_default() {
+        let cp: EntityCheckpoint<i64> = serde_json::from_value(Value::Null).unwrap();
+        assert_eq!(cp, EntityCheckpoint::default());
+        let cp: EntityCheckpoint<Vec<i64>> =
+            serde_json::from_value(json!({"state": null, "pending": null})).unwrap();
+        assert_eq!(cp, EntityCheckpoint::default());
+    }
+
+    /// The budget is the cap, unless every size is accepted.
+    #[test]
+    fn the_checkpoint_budget_follows_the_cap_and_the_offload_threshold() {
+        let budget = |cap: u64, threshold: Option<u64>| {
+            WorkflowContext::for_replay(ExecutionId::new(), vec![])
+                .with_payload_caps(cap, cap, cap, cap)
+                .with_payload_offload_threshold(threshold)
+                .continue_as_new_input_budget()
+        };
+        assert_eq!(budget(0, None), None, "no cap");
+        assert_eq!(budget(100, None), Some(100), "no offload");
+        assert_eq!(budget(100, Some(50)), None, "offload below the cap");
+        assert_eq!(budget(100, Some(100)), None, "offload at the cap");
+        assert_eq!(
+            budget(100, Some(200)),
+            Some(100),
+            "offload above the cap leaves a rejected band"
+        );
+    }
+
+    #[test]
+    fn the_byte_budget_is_half_the_cap() {
+        assert!(!over_byte_budget(40, 10, 100));
+        assert!(over_byte_budget(40, 11, 100));
+        assert!(over_byte_budget(u64::MAX, 1, 100));
+    }
+
+    /// Large activity results fill the history while the ops stay tiny. The
+    /// loaded history bytes still force a checkpoint before the byte cap.
+    #[tokio::test]
+    async fn large_activity_results_force_a_checkpoint() {
+        let messages: Vec<Value> = (0..40).map(|_| op(1)).collect();
+        let outcome = env_with(&messages)
+            .mock_activity("entity_step", |_| Ok(json!("x".repeat(1 << 20))))
+            .run(blob_counter, json!({}))
+            .await;
+        let carried: EntityCheckpoint<i64> =
+            serde_json::from_value(outcome.result.expect("checkpoint")).unwrap();
+        let half_cap = crate::context::DEFAULT_HISTORY_BYTE_HARD_CAP / 2;
+        let applied = i64::try_from(half_cap >> 20).unwrap();
+        assert!(
+            carried.state > 0 && carried.state <= applied + 1,
+            "the run checkpoints near half the byte cap, after {} ops",
+            carried.state
+        );
+        assert_eq!(carried.stats.checkpoints, 1);
+    }
+
+    /// A counter entity whose handler stores a large activity result.
+    fn blob_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .run(|count, _: CounterOp| async move {
+                    ctx.execute_activity_raw("entity_step", json!(null), "default")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(count + 1)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    #[test]
+    fn the_counter_growth_counts_a_new_digit() {
+        assert_eq!(counter_growth(0), 0);
+        assert_eq!(counter_growth(8), 0);
+        assert_eq!(counter_growth(9), 1);
+        assert_eq!(counter_growth(10), 0);
+        assert_eq!(counter_growth(99), 1);
+        assert_eq!(counter_growth(u64::MAX), 1);
+    }
+
+    #[test]
+    fn max_ops_per_run_of_zero_counts_as_one() {
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![]);
+        let entity = Entity::new(&ctx, EntityCheckpoint::<i64>::default()).max_ops_per_run(0);
+        assert_eq!(entity.max_ops_per_run, Some(1));
+    }
+
+    #[tokio::test]
+    async fn ops_apply_in_order_and_delete_returns_the_final_state() {
+        let outcome = env_with(&[op(1), op(2), op(4), delete()])
+            .run(counter, json!({}))
+            .await;
+        assert_eq!(outcome.result, Ok(json!(7)));
+        assert_eq!(
+            checkpoint_side_effects(outcome.events()),
+            vec![json!(false); 3],
+            "the loop records one checkpoint decision for each op that does not end the run"
+        );
+        assert!(
+            recorded(outcome.events(), ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT).is_empty(),
+            "a run with no checkpoint attempt records no budget"
+        );
+        let report = outcome.replay_check(counter).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handlers_run_one_at_a_time() {
+        IN_FLIGHT.store(0, Ordering::SeqCst);
+        MAX_IN_FLIGHT.store(0, Ordering::SeqCst);
+        let outcome = env_with(&[op(1), op(2), op(3), delete()])
+            .mock_activity("entity_step", |input| {
+                Ok(json!(
+                    input.get("add").and_then(Value::as_i64).unwrap_or(0) * 10
+                ))
+            })
+            .run(activity_counter, json!({}))
+            .await;
+        assert_eq!(outcome.result, Ok(json!(60)));
+        assert_eq!(MAX_IN_FLIGHT.load(Ordering::SeqCst), 1);
+
+        // Each activity completes before the next one is scheduled.
+        let mut open = false;
+        let mut scheduled = Vec::new();
+        for event in outcome.events() {
+            match event {
+                WorkflowEvent::ActivityScheduled { input, .. } => {
+                    assert!(!open, "an op started while another op ran");
+                    open = true;
+                    scheduled.push(input.clone());
+                }
+                WorkflowEvent::ActivityCompleted { .. } => open = false,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            scheduled,
+            vec![json!({"add": 1}), json!({"add": 2}), json!({"add": 3})],
+            "ops run in arrival order"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_handler_keeps_the_old_state() {
+        let fail = json!(EntityMessage::op(CounterOp::Fail));
+        let outcome = env_with(&[op(5), fail, op(1), delete()])
+            .run(counter, json!({}))
+            .await;
+        assert_eq!(outcome.result, Ok(json!(6)));
+    }
+
+    #[tokio::test]
+    async fn a_message_that_does_not_decode_is_a_failed_op() {
+        let outcome = env_with(&[op(5), json!({"kind": "op", "op": "nonsense"}), delete()])
+            .run(counter, json!({}))
+            .await;
+        assert_eq!(outcome.result, Ok(json!(5)));
+    }
+
+    #[tokio::test]
+    async fn delete_with_queued_ops_resets_the_state_and_goes_on() {
+        let outcome = env_with(&[op(5), delete(), op(1), delete()])
+            .run(counter, json!({}))
+            .await;
+        assert_eq!(outcome.result, Ok(json!(1)));
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_carries_the_ops_that_wait() {
+        let first = env_with(&[op(1), op(2), op(4), op(8), delete()])
+            .run(bounded_counter, json!({}))
+            .await;
+        let carried: EntityCheckpoint<i64> =
+            serde_json::from_value(first.result.clone().expect("checkpoint")).unwrap();
+        assert!(
+            first
+                .events()
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. })),
+            "two ops end the run with continue-as-new"
+        );
+        assert_eq!(carried.state, 3);
+        assert_eq!(carried.pending, vec![op(4), op(8), delete()]);
+        assert_eq!(carried.stats.applied, 2);
+        assert_eq!(carried.stats.checkpoints, 1);
+
+        // The next run takes the carried ops first and ends at the delete.
+        let second = WorkflowTestEnv::new()
+            .run(bounded_counter, json!(carried))
+            .await;
+        let carried_again: EntityCheckpoint<i64> =
+            serde_json::from_value(second.result.clone().expect("checkpoint")).unwrap();
+        assert_eq!(carried_again.state, 15);
+        assert_eq!(carried_again.pending, vec![delete()]);
+
+        let third = WorkflowTestEnv::new()
+            .run(bounded_counter, json!(carried_again))
+            .await;
+        assert_eq!(third.result, Ok(json!(15)));
+    }
+
+    #[tokio::test]
+    async fn stats_count_applied_and_failed_ops() {
+        let fail = json!(EntityMessage::op(CounterOp::Fail));
+        let first = env_with(&[op(1), fail])
+            .run(bounded_counter, json!({}))
+            .await;
+        let carried: EntityCheckpoint<i64> =
+            serde_json::from_value(first.result.expect("checkpoint")).unwrap();
+        assert_eq!(carried.stats.applied, 1);
+        assert_eq!(carried.stats.failed, 1);
+        assert_eq!(carried.stats.last_error.as_deref(), Some("op refused"));
+    }
+
+    /// An error above the input cap.
+    const HUGE_ERROR_BYTES: usize = 3 << 20;
+
+    /// A counter entity that asks for a checkpoint after each op. Each op
+    /// fails with a huge error.
+    fn huge_error_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .max_ops_per_run(1)
+                .run(|_: i64, _: CounterOp| async move { Err("x".repeat(HUGE_ERROR_BYTES)) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    /// A huge error does not block the checkpoint. The input fits the cap
+    /// and replay succeeds.
+    #[tokio::test]
+    async fn a_huge_error_does_not_block_the_checkpoint() {
+        let outcome = env_with(&[op(1)]).run(huge_error_counter, json!({})).await;
+        let input = outcome
+            .result
+            .clone()
+            .expect("the checkpoint fits the input cap");
+        let carried: EntityCheckpoint<i64> = serde_json::from_value(input).unwrap();
+        assert_eq!(carried.stats.failed, 1);
+        let error = carried.stats.last_error.expect("the failure is recorded");
+        assert!(
+            error.len() <= ENTITY_LAST_ERROR_MAX_BYTES,
+            "the error keeps {} bytes",
+            error.len()
+        );
+        assert!(
+            error.ends_with(TRUNCATION_MARKER),
+            "the cut leaves a marker"
+        );
+
+        let report = outcome.replay_check(huge_error_counter).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    /// A decode error can quote the payload. The bound cuts the quote.
+    #[tokio::test]
+    async fn a_decode_error_that_quotes_the_payload_is_bounded() {
+        let bad = json!({"kind": "z".repeat(64 * 1024)});
+        let outcome = env_with(&[bad]).run(one_op_counter, json!({})).await;
+        let input = outcome.result.expect("checkpoint");
+        let carried: EntityCheckpoint<i64> = serde_json::from_value(input).unwrap();
+        let error = carried.stats.last_error.expect("the failure is recorded");
+        assert!(error.starts_with("entity message does not decode: "));
+        assert!(error.contains("zzz"), "the error quotes the payload");
+        assert!(
+            error.len() <= ENTITY_LAST_ERROR_MAX_BYTES,
+            "the error keeps {} bytes",
+            error.len()
+        );
+    }
+
+    /// The start input is trusted, but its `last_error` obeys the bound too.
+    #[tokio::test]
+    async fn a_start_input_error_above_the_bound_is_cut() {
+        let input = json!({"stats": {"last_error": "x".repeat(HUGE_ERROR_BYTES)}});
+        let outcome = env_with(&[op(1)]).run(one_op_counter, input).await;
+        let checkpoint = outcome.result.expect("the checkpoint fits the input cap");
+        let carried: EntityCheckpoint<i64> = serde_json::from_value(checkpoint).unwrap();
+        let error = carried.stats.last_error.expect("the start input set it");
+        assert!(
+            error.len() <= ENTITY_LAST_ERROR_MAX_BYTES,
+            "the error keeps {} bytes",
+            error.len()
+        );
+        assert!(
+            error.ends_with(TRUNCATION_MARKER),
+            "the cut leaves a marker"
+        );
+    }
+
+    #[test]
+    fn an_error_within_the_bound_stays_whole() {
+        let exact = "e".repeat(ENTITY_LAST_ERROR_MAX_BYTES);
+        assert_eq!(bound_error(exact.clone()), exact);
+        assert_eq!(bound_error(String::new()), "");
+    }
+
+    #[test]
+    fn the_bound_and_the_marker_are_wire_values() {
+        assert_eq!(ENTITY_LAST_ERROR_MAX_BYTES, 1024);
+        assert_eq!(TRUNCATION_MARKER, "... [truncated]");
+    }
+
+    /// The bound applies when the loop records the failure, so the stats
+    /// query and the checkpoint carry the same text.
+    #[test]
+    fn a_recorded_failure_is_counted_and_bounded() {
+        let mut stats = EntityStats::default();
+        record_failure(&mut stats, "x".repeat(HUGE_ERROR_BYTES));
+        assert_eq!(stats.failed, 1);
+        let error = stats.last_error.expect("the failure is recorded");
+        assert!(error.len() <= ENTITY_LAST_ERROR_MAX_BYTES);
+        assert!(error.ends_with(TRUNCATION_MARKER));
+    }
+
+    /// The cut keeps the head of the error and frees the long buffer.
+    #[test]
+    fn a_longer_error_is_cut_to_the_bound_with_a_marker() {
+        let kept = ENTITY_LAST_ERROR_MAX_BYTES - TRUNCATION_MARKER.len();
+        let expected = format!("HEAD{}{TRUNCATION_MARKER}", "e".repeat(kept - 4));
+        for len in [
+            ENTITY_LAST_ERROR_MAX_BYTES + 1,
+            ENTITY_LAST_ERROR_MAX_BYTES * 2,
+            HUGE_ERROR_BYTES,
+        ] {
+            let cut = bound_error(format!("HEAD{}TAIL", "e".repeat(len - 8)));
+            assert_eq!(cut, expected, "{len} bytes in");
+            assert!(
+                cut.capacity() <= 2 * ENTITY_LAST_ERROR_MAX_BYTES,
+                "the buffer of the long error is gone"
+            );
+        }
+    }
+
+    /// Characters of 2, 3 and 4 bytes at four offsets. Most cuts land inside
+    /// a character.
+    #[test]
+    fn the_cut_lands_on_a_char_boundary() {
+        let kept = ENTITY_LAST_ERROR_MAX_BYTES - TRUNCATION_MARKER.len();
+        for ch in ['é', '€', '😀'] {
+            for lead in 0..4 {
+                let wide = ch.to_string().repeat(ENTITY_LAST_ERROR_MAX_BYTES);
+                let error = format!("{}{wide}", "a".repeat(lead));
+                let cut = bound_error(error);
+                let body = cut.strip_suffix(TRUNCATION_MARKER).expect("a marker");
+                assert!(
+                    body.chars().skip(lead).all(|c| c == ch),
+                    "{ch} after {lead}"
+                );
+                assert!(cut.len() <= ENTITY_LAST_ERROR_MAX_BYTES);
+                assert!(
+                    kept - body.len() < ch.len_utf8(),
+                    "the cut gives up less than one {ch}"
+                );
+            }
+        }
+    }
+
+    /// A recorded `true` decision replays to the same checkpoint, with the
+    /// waiting ops in its input.
+    #[tokio::test]
+    async fn a_recorded_checkpoint_decision_replays() {
+        let stats = EntityStats {
+            applied: 1,
+            checkpoints: 1,
+            ..EntityStats::default()
+        };
+        let carried = EntityCheckpoint {
+            state: 1_i64,
+            pending: vec![op(2)],
+            stats,
+        };
+        let events = vec![
+            started(json!({})),
+            signal(op(1)),
+            signal(op(2)),
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                name: Some(ENTITY_CHECKPOINT_SIDE_EFFECT.to_string()),
+                value: json!(true),
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                name: Some(ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT.to_string()),
+                value: json!(2_097_152),
+            },
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: ExecutionId::new(),
+                input: json!(carried),
+                new_workflow_type: None,
+            },
+        ];
+        let report = WorkflowReplayer::new()
+            .register_fn("counter", counter)
+            .replay_from_events(events)
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    /// A replay with a larger loaded history keeps the recorded decisions.
+    /// A naive loop over `should_continue_as_new()` replays clean on the
+    /// same history (issue #2080).
+    #[tokio::test]
+    async fn the_checkpoint_decision_is_stable_when_history_grows() {
+        let small_threshold = WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
+
+        let outcome = env_with(&[op(1), op(2), op(3), delete()])
+            .run(counter, json!({}))
+            .await;
+        assert_eq!(outcome.result, Ok(json!(6)));
+        let report = WorkflowReplayer::new()
+            .with_history_policy(small_threshold)
+            .register_fn("counter", counter)
+            .replay_from_events(outcome.events().to_vec())
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+
+        // The run finishes, so a call never sits at the end of its history.
+        let outcome = env_with(&[json!(1), json!(2), json!(3), json!(0)])
+            .run(naive_counter, json!(0))
+            .await;
+        assert_eq!(outcome.result, Ok(json!(6)));
+        let report = WorkflowReplayer::new()
+            .with_history_policy(small_threshold)
+            .register_fn("naive_counter", naive_counter)
+            .replay_from_events(outcome.events().to_vec())
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "a naive loop must replay clean: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn queries_read_the_committed_state_and_stats() {
+        let fail = json!(EntityMessage::op(CounterOp::Fail));
+        let outcome = env_with(&[op(2), fail, op(3)])
+            .run(counter, json!({}))
+            .await;
+        let waiting = outcome.result.clone().unwrap_err();
+        assert!(
+            waiting.contains("suspended with no resolvable commands"),
+            "the entity waits for more ops: {waiting}"
+        );
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), outcome.events().to_vec());
+        let drive = crate::executor::drive_query_replay(
+            &ctx,
+            counter,
+            json!({}),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            matches!(drive, crate::executor::QueryReplayOutcome::Suspended),
+            "{drive:?}"
+        );
+        assert_eq!(ctx.execute_query(ENTITY_STATE_QUERY).unwrap(), json!(5));
+        let stats: EntityStats =
+            serde_json::from_value(ctx.execute_query(ENTITY_STATS_QUERY).unwrap()).unwrap();
+        assert_eq!(stats.applied, 2);
+        assert_eq!(stats.failed, 1);
+    }
+
+    /// An op message with `pad_bytes` of padding. The decoder ignores the
+    /// pad, so the op still applies.
+    fn padded(n: i64, pad_bytes: usize) -> Value {
+        json!({"kind": "op", "op": {"add": n}, "pad": "x".repeat(pad_bytes)})
+    }
+
+    /// One small op, then four ops of 600 KiB. The first checkpoint cannot
+    /// carry all four under the default 2 MiB input cap.
+    fn overflowing_ops() -> Vec<Value> {
+        let big = 600 * 1024;
+        vec![
+            op(1),
+            padded(2, big),
+            padded(4, big),
+            padded(8, big),
+            padded(16, big),
+        ]
+    }
+
+    /// Waiting ops that overflow the input cap run in this run. The
+    /// checkpoint carries only what fits.
+    #[tokio::test]
+    async fn a_checkpoint_carries_only_what_fits_the_input_cap() {
+        let outcome = env_with(&overflowing_ops())
+            .run(one_op_counter, json!({}))
+            .await;
+        let input = outcome.result.clone().expect("checkpoint");
+        let size = serde_json::to_string(&input).unwrap().len() as u64;
+        assert!(
+            size <= crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+            "the checkpoint input fits the cap: {size} bytes"
+        );
+        let carried: EntityCheckpoint<i64> = serde_json::from_value(input).unwrap();
+        assert_eq!(carried.state, 3, "one padded op ran before the checkpoint");
+        assert_eq!(carried.pending.len(), 3);
+        assert_eq!(carried.stats.checkpoints, 1);
+
+        let report = outcome.replay_check(one_op_counter).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    /// A counter entity that asks for a checkpoint after each op.
+    fn one_op_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .max_ops_per_run(1)
+                .run(|count, op: CounterOp| async move { apply(count, &op) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    /// A counter entity that asks for a checkpoint after each op. Its
+    /// handler awaits one activity.
+    fn activity_one_op_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .max_ops_per_run(1)
+                .run(|count, op: CounterOp| async move {
+                    ctx.execute_activity_raw("entity_step", json!(op), "default")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(count + 1)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    /// Each attempt records its budget. The first attempt here does not fit,
+    /// so the run makes a second one.
+    #[tokio::test]
+    async fn each_checkpoint_attempt_records_its_budget() {
+        let outcome = env_with(&overflowing_ops())
+            .run(one_op_counter, json!({}))
+            .await;
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        let cap = json!(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES);
+        assert_eq!(
+            recorded(outcome.events(), ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT),
+            vec![cap.clone(), cap],
+            "one record for each attempt"
+        );
+    }
+
+    /// A deploy lowers the input cap while a handler waits on an activity.
+    /// Replay restores the budget of the first attempt. The next attempt must
+    /// size its input under the live cap, not under that budget.
+    #[tokio::test]
+    async fn a_lowered_cap_applies_to_the_next_attempt() {
+        let outcome = env_with(&overflowing_ops())
+            .mock_activity("entity_step", |_| Ok(json!(1)))
+            .run(activity_one_op_counter, json!({}))
+            .await;
+        // End the history after the activity of the first op that follows the
+        // first attempt.
+        let cut = outcome
+            .events()
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, WorkflowEvent::ActivityCompleted { .. }))
+            .nth(1)
+            .map(|(index, _)| index + 1)
+            .expect("the op after the first attempt ran an activity");
+        let history = outcome.events()[..cut].to_vec();
+        assert_eq!(
+            recorded(&history, ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT).len(),
+            1,
+            "the first attempt is in the history"
+        );
+
+        // Three ops of 600 KiB fit the default cap but not half of it.
+        let lowered = crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES / 2;
+        let activity = crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES;
+        let signal = crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES;
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history)
+            .with_payload_caps(activity, activity, signal, lowered);
+        let (cycle, ..) = drive_workflow(ctx, activity_one_op_counter, json!({}), None).await;
+        let WorkflowOutcome::Suspended { commands } = cycle else {
+            panic!("the run must go on, not fail: {cycle:?}");
+        };
+        let budgets: Vec<&Value> = commands
+            .iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::RecordSideEffect { name, value, .. }
+                    if name.as_deref() == Some(ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT) =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            budgets,
+            [&json!(lowered)],
+            "the new attempt records the live budget"
+        );
+        let next_op = commands.iter().any(|c| {
+            matches!(
+                c,
+                WorkflowCommand::ScheduleActivity { name, input, .. }
+                    if name == "entity_step" && *input == json!({"add": 4})
+            )
+        });
+        assert!(
+            next_op,
+            "the carried ops do not fit, so the loop runs the next op first"
+        );
+    }
+
+    /// Replay reads the recorded budgets. A full history from the default cap
+    /// replays under a lowered cap.
+    #[tokio::test]
+    async fn a_full_history_replays_under_a_lowered_cap() {
+        let outcome = env_with(&overflowing_ops())
+            .run(one_op_counter, json!({}))
+            .await;
+        let report = WorkflowReplayer::new()
+            .with_payload_caps(
+                crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+                crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+                crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES / 2,
+            )
+            .register_fn("one_op_counter", one_op_counter)
+            .replay_from_events(outcome.events().to_vec())
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_entity_stops_with_an_error() {
+        let outcome = env_with(&[op(1)])
+            .with_cancellation("stop")
+            .run(counter, json!({}))
+            .await;
+        let error = outcome.result.unwrap_err();
+        assert!(error.to_lowercase().contains("cancel"), "{error}");
+    }
+
+    /// With an execution timeout, each decision also records a deadline
+    /// probe. The probe and the decision replay in the same order.
+    #[tokio::test]
+    async fn the_deadline_probe_and_the_decision_replay_together() {
+        let outcome = env_with(&[op(1), op(2), delete()])
+            .with_execution_timeout(chrono::Duration::hours(1))
+            .run(counter, json!({}))
+            .await;
+        assert_eq!(outcome.result, Ok(json!(3)));
+        let report = outcome.replay_check(counter).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_input_that_does_not_decode_fails_the_run() {
+        let outcome = WorkflowTestEnv::new()
+            .run(counter, json!({"state": "x"}))
+            .await;
+        assert!(outcome.result.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_bad_carried_message_counts_as_failed() {
+        let input = json!({"pending": [{"kind": "bogus"}, op(2), delete()]});
+        let first = WorkflowTestEnv::new().run(bounded_counter, input).await;
+        let carried: EntityCheckpoint<i64> =
+            serde_json::from_value(first.result.expect("checkpoint")).unwrap();
+        assert_eq!(carried.state, 2);
+        assert_eq!(carried.stats.failed, 1);
+        assert_eq!(carried.pending, vec![delete()]);
+    }
+
+    /// A counter entity that starts from 100 on a fresh start.
+    fn seeded_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .initial_state(100)
+                .run(|count, op: CounterOp| async move { apply(count, &op) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    /// A counter entity that keeps a trusted start input.
+    fn trusting_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .trust_start_input()
+                .run(|count, op: CounterOp| async move { apply(count, &op) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    fn forged() -> Value {
+        json!({"state": 50, "pending": [op(7)], "stats": {"applied": 9}})
+    }
+
+    fn fresh(source: StartSource) -> StartProvenance {
+        StartProvenance::fresh(source)
+    }
+
+    #[tokio::test]
+    async fn a_client_checkpoint_is_ignored_on_a_fresh_start() {
+        for source in [StartSource::Api, StartSource::SignalWithStart] {
+            let outcome = env_with(&[op(1), delete()])
+                .with_start_provenance(fresh(source))
+                .run(counter, forged())
+                .await;
+            assert_eq!(outcome.result, Ok(json!(1)), "{source:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_start_drops_the_forged_pending_ops_and_stats() {
+        let outcome = env_with(&[op(1), op(1)])
+            .with_start_provenance(fresh(StartSource::Api))
+            .run(bounded_counter, forged())
+            .await;
+        let carried: EntityCheckpoint<i64> =
+            serde_json::from_value(outcome.result.expect("checkpoint")).unwrap();
+        assert_eq!(carried.state, 2);
+        assert_eq!(carried.pending, Vec::<Value>::new());
+        assert_eq!(carried.stats.applied, 2);
+    }
+
+    #[tokio::test]
+    async fn a_continue_as_new_run_keeps_its_checkpoint() {
+        let outcome = env_with(&[delete()])
+            .with_start_provenance(StartProvenance::continued_from(ExecutionId::new()))
+            .run(counter, forged())
+            .await;
+        assert_eq!(outcome.result, Ok(json!(57)), "state 50 plus pending 7");
+    }
+
+    #[tokio::test]
+    async fn a_start_with_unknown_provenance_keeps_its_checkpoint() {
+        let outcome = env_with(&[delete()]).run(counter, forged()).await;
+        assert_eq!(outcome.result, Ok(json!(57)), "legacy runs stay valid");
+    }
+
+    #[tokio::test]
+    async fn an_operator_reset_keeps_its_checkpoint() {
+        let outcome = env_with(&[delete()])
+            .with_start_provenance(fresh(StartSource::Reset))
+            .run(counter, forged())
+            .await;
+        assert_eq!(outcome.result, Ok(json!(57)));
+    }
+
+    #[tokio::test]
+    async fn the_initial_state_hook_seeds_a_fresh_start_only() {
+        let first = env_with(&[op(1), delete()])
+            .with_start_provenance(fresh(StartSource::Api))
+            .run(seeded_counter, forged())
+            .await;
+        assert_eq!(first.result, Ok(json!(101)));
+        let carried = env_with(&[delete()])
+            .with_start_provenance(StartProvenance::continued_from(ExecutionId::new()))
+            .run(seeded_counter, forged())
+            .await;
+        assert_eq!(carried.result, Ok(json!(57)));
+    }
+
+    #[tokio::test]
+    async fn trust_start_input_keeps_the_client_checkpoint() {
+        let outcome = env_with(&[delete()])
+            .with_start_provenance(fresh(StartSource::Api))
+            .run(trusting_counter, forged())
+            .await;
+        assert_eq!(outcome.result, Ok(json!(57)));
+    }
+
+    #[tokio::test]
+    async fn a_re_run_keeps_its_checkpoint() {
+        let outcome = env_with(&[delete()])
+            .with_start_provenance(fresh(StartSource::Rerun))
+            .run(counter, forged())
+            .await;
+        assert_eq!(outcome.result, Ok(json!(57)));
+    }
+
+    #[tokio::test]
+    async fn the_initial_state_is_ignored_when_the_input_is_kept() {
+        let unknown = env_with(&[delete()]).run(seeded_counter, forged()).await;
+        assert_eq!(unknown.result, Ok(json!(57)), "unknown source keeps input");
+        let trusted = env_with(&[delete()])
+            .with_start_provenance(fresh(StartSource::Api))
+            .run(trusting_seeded_counter, forged())
+            .await;
+        assert_eq!(trusted.result, Ok(json!(57)), "trusted input wins");
+    }
+
+    /// A counter entity with both an initial state and a trusted start input.
+    fn trusting_seeded_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .initial_state(100)
+                .trust_start_input()
+                .run(|count, op: CounterOp| async move { apply(count, &op) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    /// A counter entity that decodes its raw start input after the gate.
+    fn raw_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::<i64>::from_input(ctx, input)
+                .run(|count, op: CounterOp| async move { apply(count, &op) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    #[tokio::test]
+    async fn a_malformed_client_input_does_not_fail_a_fresh_start() {
+        let outcome = env_with(&[op(1), delete()])
+            .with_start_provenance(fresh(StartSource::Api))
+            .run(raw_counter, json!({"state": "wrong-type"}))
+            .await;
+        assert_eq!(outcome.result, Ok(json!(1)));
+    }
+
+    #[tokio::test]
+    async fn a_kept_input_that_does_not_decode_fails_the_run() {
+        let outcome = env_with(&[delete()])
+            .with_start_provenance(StartProvenance::continued_from(ExecutionId::new()))
+            .run(raw_counter, json!({"state": "wrong-type"}))
+            .await;
+        assert!(outcome.result.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_raw_input_follows_the_same_gate_as_a_typed_one() {
+        let dropped = env_with(&[delete()])
+            .with_start_provenance(fresh(StartSource::SignalWithStart))
+            .run(raw_counter, forged())
+            .await;
+        assert_eq!(dropped.result, Ok(json!(0)));
+        let kept = env_with(&[delete()])
+            .with_start_provenance(StartProvenance::continued_from(ExecutionId::new()))
+            .run(raw_counter, forged())
+            .await;
+        assert_eq!(kept.result, Ok(json!(57)));
+        let legacy = env_with(&[delete()]).run(raw_counter, forged()).await;
+        assert_eq!(legacy.result, Ok(json!(57)));
+    }
+
+    #[tokio::test]
+    async fn the_fresh_start_gate_replays() {
+        let outcome = env_with(&[op(1), delete()])
+            .with_start_provenance(fresh(StartSource::Api))
+            .run(counter, forged())
+            .await;
+        let report = outcome.replay_check(counter).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    /// The state snapshots in `events`, as `(name, value)` (issue #2259).
+    fn snapshots(events: &[WorkflowEvent]) -> Vec<(String, Value)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEvent::SideEffectRecorded {
+                    kind: SideEffectKind::EntityState,
+                    name: Some(name),
+                    value,
+                } => Some((name.clone(), value.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn snapshot(state: i64, applied: u64) -> Value {
+        json!({
+            "state": state,
+            "stats": EntityStats { applied, ..EntityStats::default() },
+        })
+    }
+
+    fn state_snapshot(state: i64, applied: u64) -> (String, Value) {
+        (
+            ENTITY_STATE_SIDE_EFFECT.to_string(),
+            snapshot(state, applied),
+        )
+    }
+
+    fn checkpoint_record(due: bool) -> WorkflowEvent {
+        WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::Custom,
+            name: Some(ENTITY_CHECKPOINT_SIDE_EFFECT.to_string()),
+            value: json!(due),
+        }
+    }
+
+    fn snapshot_record(name: &str, value: Value) -> WorkflowEvent {
+        WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::EntityState,
+            name: Some(name.to_string()),
+            value,
+        }
+    }
+
+    /// The state that a query reads after a replay of `events`.
+    fn replayed_state(events: Vec<WorkflowEvent>, input: Value) -> Value {
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let drive = crate::executor::drive_query_replay(
+            &ctx,
+            counter,
+            input,
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            matches!(drive, crate::executor::QueryReplayOutcome::Suspended),
+            "{drive:?}"
+        );
+        ctx.execute_query(ENTITY_STATE_QUERY).expect("state query")
+    }
+
+    /// The snapshot value has a stable wire form.
+    #[test]
+    fn the_snapshot_wire_form_is_state_and_stats() {
+        let value = serde_json::to_value(EntitySnapshot {
+            state: 3_i64,
+            stats: EntityStats::default(),
+        })
+        .unwrap();
+        assert_eq!(value, snapshot(3, 0));
+        let back: EntitySnapshot<i64> = serde_json::from_value(json!({"state": 4})).unwrap();
+        assert_eq!(back.state, 4);
+        assert_eq!(back.stats, EntityStats::default());
+        assert_eq!(ENTITY_STATE_SIDE_EFFECT, "harvest.entity.state");
+        assert_eq!(ENTITY_DELETED_SIDE_EFFECT, "harvest.entity.deleted");
+        assert_eq!(SideEffectKind::EntityState.as_str(), "entity_state");
+    }
+
+    /// A run records a snapshot at its start, after each op, and before a
+    /// delete ends it (issue #2259).
+    #[tokio::test]
+    async fn each_step_records_a_state_snapshot() {
+        let outcome = env_with(&[op(1), op(2), delete()])
+            .run(counter, json!({}))
+            .await;
+        assert_eq!(outcome.result, Ok(json!(3)));
+        assert_eq!(
+            snapshots(outcome.events()),
+            vec![
+                state_snapshot(0, 0),
+                state_snapshot(1, 1),
+                state_snapshot(3, 2),
+                (ENTITY_DELETED_SIDE_EFFECT.to_string(), snapshot(3, 2)),
+            ]
+        );
+        let report = outcome.replay_check(counter).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    /// A failed op keeps the state but changes the stats, so it records a
+    /// snapshot too.
+    #[tokio::test]
+    async fn a_failed_op_records_its_stats() {
+        let fail = json!(EntityMessage::op(CounterOp::Fail));
+        let outcome = env_with(&[fail]).run(counter, json!({})).await;
+        let recorded = snapshots(outcome.events());
+        let (name, last) = recorded.last().expect("a snapshot after the op");
+        assert_eq!(name, ENTITY_STATE_SIDE_EFFECT);
+        let last: EntitySnapshot<i64> = serde_json::from_value(last.clone()).unwrap();
+        assert_eq!(last.state, 0);
+        assert_eq!(last.stats.failed, 1);
+        assert_eq!(last.stats.last_error.as_deref(), Some("op refused"));
+    }
+
+    /// Each snapshot comes before the checkpoint decision of its op.
+    #[tokio::test]
+    async fn the_snapshot_precedes_the_checkpoint_decision() {
+        let outcome = env_with(&[op(1)]).run(counter, json!({})).await;
+        let order: Vec<&str> = outcome
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEvent::SideEffectRecorded { name, .. } => name.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ENTITY_STATE_SIDE_EFFECT,
+                ENTITY_STATE_SIDE_EFFECT,
+                ENTITY_CHECKPOINT_SIDE_EFFECT
+            ]
+        );
+    }
+
+    /// Replay rebuilds the state from the recorded snapshots, not from the
+    /// handler. A changed snapshot changes the replayed state.
+    #[tokio::test]
+    async fn replay_rebuilds_the_state_from_the_snapshots() {
+        let outcome = env_with(&[op(1), op(2)]).run(counter, json!({})).await;
+        let mut events = outcome.events().to_vec();
+        assert_eq!(replayed_state(events.clone(), json!({})), json!(3));
+        let first_op = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                matches!(
+                    e,
+                    WorkflowEvent::SideEffectRecorded {
+                        kind: SideEffectKind::EntityState,
+                        ..
+                    }
+                )
+            })
+            .nth(1)
+            .map(|(index, _)| index)
+            .expect("a snapshot after the first op");
+        events[first_op] = snapshot_record(ENTITY_STATE_SIDE_EFFECT, snapshot(100, 1));
+        // Keep the checkpoint record of the first op. The second op then runs
+        // live, on top of the recorded state.
+        events.truncate(first_op + 2);
+        assert_eq!(
+            replayed_state(events, json!({})),
+            json!(102),
+            "replay adopts the recorded state, then applies the next op"
+        );
+    }
+
+    /// A history from before issue #2259 has no snapshot. It replays clean
+    /// under the new loop.
+    #[tokio::test]
+    async fn a_history_without_snapshots_replays_clean() {
+        let events = vec![
+            started(json!({})),
+            signal(op(1)),
+            checkpoint_record(false),
+            signal(op(2)),
+            checkpoint_record(false),
+            signal(delete()),
+            WorkflowEvent::WorkflowCompleted { output: json!(3) },
+        ];
+        let report = WorkflowReplayer::new()
+            .register_fn("counter", counter)
+            .replay_from_events(events)
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    /// A run from before issue #2259 records snapshots from its live
+    /// frontier on. Its recorded part stays as it was.
+    #[tokio::test]
+    async fn an_old_run_records_snapshots_from_its_frontier() {
+        let history = vec![
+            started(json!({})),
+            signal(op(1)),
+            checkpoint_record(false),
+            signal(op(2)),
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history);
+        let (cycle, ..) = drive_workflow(ctx, counter, json!({}), None).await;
+        let WorkflowOutcome::Suspended { commands } = cycle else {
+            panic!("the entity waits for the next op: {cycle:?}");
+        };
+        let recorded: Vec<&Value> = commands
+            .iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::RecordSideEffect {
+                    kind: SideEffectKind::EntityState,
+                    value,
+                    ..
+                } => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recorded, [&snapshot(3, 2)], "only the live op records");
+    }
+
+    /// A continued run starts from its checkpoint, records it as its first
+    /// snapshot, and replays to it.
+    #[tokio::test]
+    async fn a_continued_run_records_its_starting_state_first() {
+        let continued = StartProvenance::continued_from(ExecutionId::new());
+        let outcome = WorkflowTestEnv::new()
+            .with_start_provenance(continued)
+            .run(counter, forged())
+            .await;
+        let recorded = snapshots(outcome.events());
+        assert_eq!(
+            recorded.first(),
+            Some(&state_snapshot(50, 9)),
+            "the first snapshot is the carried state"
+        );
+        let history = outcome.events().to_vec();
+        let start = history
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    WorkflowEvent::SideEffectRecorded {
+                        kind: SideEffectKind::EntityState,
+                        ..
+                    }
+                )
+            })
+            .expect("a start snapshot");
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history[..=start].to_vec())
+            .with_start_provenance(continued);
+        let drive = crate::executor::drive_query_replay(
+            &ctx,
+            counter,
+            forged(),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            matches!(drive, crate::executor::QueryReplayOutcome::Suspended),
+            "{drive:?}"
+        );
+        assert_eq!(
+            ctx.execute_query(ENTITY_STATE_QUERY).unwrap(),
+            json!(57),
+            "replay rebuilds the carried state and runs the carried op"
+        );
+    }
+
+    /// A reset of a continued run keeps the checkpoint input. Its first
+    /// snapshot is the starting state of the continued run.
+    #[tokio::test]
+    async fn a_reset_of_a_continued_run_rebuilds_its_starting_state() {
+        for source in [StartSource::Reset, StartSource::Rerun] {
+            let outcome = env_with(&[delete()])
+                .with_start_provenance(fresh(source))
+                .run(counter, forged())
+                .await;
+            assert_eq!(outcome.result, Ok(json!(57)), "{source:?}");
+            assert_eq!(
+                snapshots(outcome.events()).first(),
+                Some(&state_snapshot(50, 9)),
+                "{source:?}"
+            );
+            let report = outcome.replay_check(counter).await;
+            assert!(
+                matches!(report.status, ReplayStatus::ReplaySucceeded),
+                "{source:?}: {report}"
+            );
+        }
+    }
+
+    /// A `Custom` side effect with the reserved name is user data. The loop
+    /// does not read it as a snapshot, so it is a divergence. The same value
+    /// with the `EntityState` kind is the start snapshot and replays clean.
+    #[tokio::test]
+    async fn a_custom_side_effect_is_not_a_snapshot() {
+        let record = WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::Custom,
+            name: Some(ENTITY_STATE_SIDE_EFFECT.to_string()),
+            value: snapshot(0, 0),
+        };
+        let forged = WorkflowReplayer::new()
+            .register_fn("counter", counter)
+            .replay_from_events(vec![started(json!({})), record])
+            .await;
+        assert!(
+            matches!(forged.status, ReplayStatus::NonDeterminismDetected { .. }),
+            "the forged record is a divergence: {forged}"
+        );
+        let real = vec![
+            started(json!({})),
+            snapshot_record(ENTITY_STATE_SIDE_EFFECT, snapshot(0, 0)),
+        ];
+        assert_eq!(
+            replayed_state(real, json!({})),
+            json!(0),
+            "the real kind is the start snapshot"
+        );
+    }
+
+    /// A large state makes large snapshots. The loop counts their bytes, so
+    /// it checkpoints before the history reaches half the byte cap.
+    #[tokio::test]
+    async fn snapshot_bytes_count_toward_the_byte_budget() {
+        let messages: Vec<Value> = (0..64).map(|_| op(1)).collect();
+        let outcome = env_with(&messages).run(wide_counter, json!({})).await;
+        let carried: EntityCheckpoint<String> =
+            serde_json::from_value(outcome.result.clone().expect("checkpoint")).unwrap();
+        assert_eq!(carried.stats.checkpoints, 1, "the run checkpoints");
+        let recorded: u64 = snapshots(outcome.events())
+            .iter()
+            .map(|(_, value)| json_len(value).unwrap())
+            .sum();
+        // The check trips after the op that crosses half the cap. One
+        // snapshot is at most the input cap.
+        let bound = crate::context::DEFAULT_HISTORY_BYTE_HARD_CAP / 2
+            + crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES;
+        assert!(
+            recorded <= bound,
+            "the snapshots hold {recorded} bytes, over {bound}"
+        );
+    }
+
+    /// A state past the side-effect cap records an omitted marker, not the
+    /// state. Replay keeps its own state at the marker.
+    #[tokio::test]
+    async fn an_oversized_state_records_an_omitted_marker() {
+        let messages: Vec<Value> = (0..3).map(|_| op(1)).collect();
+        let outcome = env_with(&messages).run(huge_state_counter, json!({})).await;
+        let recorded = snapshots(outcome.events());
+        let (_, last) = recorded.last().expect("a snapshot");
+        assert_eq!(last[ENTITY_SNAPSHOT_OMITTED_KEY], json!("too_large"));
+        assert_eq!(last["stats"]["applied"], json!(3));
+        assert!(last.get("state").is_none(), "the state is not stored");
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), outcome.events().to_vec());
+        let drive = crate::executor::drive_query_replay(
+            &ctx,
+            huge_state_counter,
+            json!({}),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            matches!(drive, crate::executor::QueryReplayOutcome::Suspended),
+            "{drive:?}"
+        );
+        let state = ctx.execute_query(ENTITY_STATE_QUERY).unwrap();
+        assert_eq!(
+            state.as_str().map(str::len),
+            Some(3 << 20),
+            "replay keeps its state"
+        );
+    }
+
+    /// A state nested past the depth cap records an omitted marker. The
+    /// history stays loadable.
+    #[tokio::test]
+    async fn a_deep_state_records_an_omitted_marker() {
+        let outcome = env_with(&[op(1)]).run(deep_counter, json!({})).await;
+        let recorded = snapshots(outcome.events());
+        let (_, last) = recorded.last().expect("a snapshot");
+        assert_eq!(last[ENTITY_SNAPSHOT_OMITTED_KEY], json!("too_deep"));
+        let text = serde_json::to_string(&outcome.events()).unwrap();
+        let back: Vec<WorkflowEvent> = serde_json::from_str(&text).expect("the history loads");
+        assert_eq!(back.len(), outcome.events().len());
+    }
+
+    /// An entity whose state becomes a 3 MiB string. It is past the cap.
+    fn huge_state_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let checkpoint: EntityCheckpoint<String> =
+                serde_json::from_value(input).map_err(|e| e.to_string())?;
+            let state = Entity::new(ctx, checkpoint)
+                .run(|_: String, _: CounterOp| async move { Ok("h".repeat(3 << 20)) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state.len()))
+        })
+    }
+
+    /// An entity whose state nests past the depth cap.
+    fn deep_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let checkpoint: EntityCheckpoint<Value> =
+                serde_json::from_value(input).map_err(|e| e.to_string())?;
+            let state = Entity::new(ctx, checkpoint)
+                .run(|_: Value, _: CounterOp| async move {
+                    let mut deep = json!(0);
+                    for _ in 0..crate::payload_depth::MAX_PAYLOAD_DEPTH + 10 {
+                        deep = json!([deep]);
+                    }
+                    Ok(deep)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state.is_array()))
+        })
+    }
+
+    /// An entity whose state grows by 64 KiB for each op.
+    fn wide_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let checkpoint: EntityCheckpoint<String> =
+                serde_json::from_value(input).map_err(|e| e.to_string())?;
+            let state = Entity::new(ctx, checkpoint)
+                .run(|mut wide: String, _: CounterOp| async move {
+                    wide.push_str(&"w".repeat(64 * 1024));
+                    Ok(wide)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state.len()))
+        })
+    }
+
+    fn started(input: Value) -> WorkflowEvent {
+        WorkflowEvent::WorkflowStarted {
+            input,
+            timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }
+    }
+
+    fn signal(payload: Value) -> WorkflowEvent {
+        WorkflowEvent::SignalReceived {
+            signal_name: ENTITY_OP_SIGNAL.to_string(),
+            payload,
+        }
+    }
+
+    /// The op of the wake tests (issue #2266). Only the wake hook sends
+    /// `Tick`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum WakeOp {
+        Add(i64),
+        Tick,
+    }
+
+    /// The state of the wake tests. The log keeps the order of the ops.
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    struct Ticker {
+        count: i64,
+        ticks: u32,
+        log: Vec<String>,
+    }
+
+    fn apply_wake_op(mut ticker: Ticker, op: WakeOp) -> Ticker {
+        match op {
+            WakeOp::Add(n) => {
+                ticker.count += n;
+                ticker.log.push(format!("add {n}"));
+            }
+            WakeOp::Tick => {
+                ticker.ticks += 1;
+                ticker.log.push("tick".to_string());
+            }
+        }
+        ticker
+    }
+
+    /// A ticker entity. Its wake is due `offset` after the start of the run.
+    /// The hook returns a wake while the state has fewer than `max_ticks`
+    /// ticks.
+    fn ticker(
+        ctx: &WorkflowContext,
+        input: Value,
+        offset: chrono::Duration,
+        max_ticks: u32,
+        max_ops: Option<u64>,
+    ) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let checkpoint: EntityCheckpoint<Ticker> =
+                serde_json::from_value(input).map_err(|e| e.to_string())?;
+            let at = ctx.now() + offset;
+            let mut entity = Entity::new(ctx, checkpoint);
+            if let Some(n) = max_ops {
+                entity = entity.max_ops_per_run(n);
+            }
+            let state = entity
+                .run_with_wakes(
+                    |state, op: WakeOp| async move { Ok(apply_wake_op(state, op)) },
+                    move |state: &Ticker| {
+                        (state.ticks < max_ticks).then(|| Wake::new(at, WakeOp::Tick))
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    /// One wake, one minute after the start of the run.
+    fn late_ticker(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        ticker(ctx, input, chrono::Duration::minutes(1), 1, None)
+    }
+
+    /// One wake, one minute before the start of the run. It is due at once.
+    fn due_ticker(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        ticker(ctx, input, chrono::Duration::minutes(-1), 1, None)
+    }
+
+    /// Two wakes in all, with a checkpoint after each op.
+    fn chained_ticker(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        ticker(ctx, input, chrono::Duration::minutes(1), 2, Some(1))
+    }
+
+    /// A counter entity on the wake path with a hook that never wakes.
+    fn sleepless_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .run_with_wakes(
+                    |count, op: CounterOp| async move { apply(count, &op) },
+                    |_: &i64| None,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    /// Drive `handler` until it blocks, then send a delete and finish.
+    async fn finish_with_delete(
+        env: &WorkflowTestEnv,
+        handler: crate::info::WorkflowHandlerFn,
+        input: Value,
+    ) -> crate::testing::TestRunOutcome {
+        let mut run = env.start(handler, input);
+        assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
+        run.signal(ENTITY_OP_SIGNAL, delete()).unwrap();
+        run.finish().await
+    }
+
+    /// The clock reads of `system_now` in `events`.
+    fn clock_reads(events: &[WorkflowEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    WorkflowEvent::SideEffectRecorded {
+                        kind: SideEffectKind::Now,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    /// The timers that `events` start.
+    fn timers(events: &[WorkflowEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TimerStarted { .. }))
+            .count()
+    }
+
+    fn final_ticker(outcome: &crate::testing::TestRunOutcome) -> Ticker {
+        serde_json::from_value(outcome.result.clone().expect("a final state")).unwrap()
+    }
+
+    fn carried_ticker(outcome: &crate::testing::TestRunOutcome) -> EntityCheckpoint<Ticker> {
+        serde_json::from_value(outcome.result.clone().expect("a checkpoint")).unwrap()
+    }
+
+    async fn assert_replays(
+        outcome: &crate::testing::TestRunOutcome,
+        handler: crate::info::WorkflowHandlerFn,
+    ) {
+        let report = outcome.replay_check(handler).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    /// With no op to run, the loop waits on a timer. The timer fires, and
+    /// the op of the wake runs through the handler.
+    #[tokio::test]
+    async fn a_wake_fires_when_no_op_waits() {
+        let outcome = finish_with_delete(&WorkflowTestEnv::new(), late_ticker, json!({})).await;
+        let ticker = final_ticker(&outcome);
+        assert_eq!(ticker.ticks, 1);
+        assert_eq!(ticker.log, ["tick"]);
+        assert_eq!(timers(outcome.events()), 1, "the loop waits on one timer");
+        assert!(
+            outcome
+                .events()
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+            "the timer fires"
+        );
+        assert_eq!(
+            clock_reads(outcome.events()),
+            1,
+            "one clock read for each wake"
+        );
+        let (_, last) = snapshots(outcome.events()).pop().expect("a snapshot");
+        let last: EntitySnapshot<Ticker> = serde_json::from_value(last).unwrap();
+        assert_eq!(last.stats.applied, 1, "the wake op counts as an applied op");
+        assert_replays(&outcome, late_ticker).await;
+    }
+
+    /// An op that waits runs before a wake that is not due. The wake then
+    /// fires.
+    #[tokio::test]
+    async fn a_queued_op_runs_before_a_wake_that_is_not_due() {
+        let outcome = finish_with_delete(&env_with(&[op(1)]), late_ticker, json!({})).await;
+        let ticker = final_ticker(&outcome);
+        assert_eq!(ticker.log, ["add 1", "tick"]);
+        assert_eq!(ticker.count, 1);
+        assert_eq!(
+            timers(outcome.events()),
+            1,
+            "only the second step waits on a timer"
+        );
+        assert_eq!(
+            clock_reads(outcome.events()),
+            2,
+            "each step with a wake reads the clock"
+        );
+        assert_replays(&outcome, late_ticker).await;
+    }
+
+    /// A due wake runs before a carried op and before an op signal.
+    #[tokio::test]
+    async fn a_due_wake_runs_before_a_backlog() {
+        let input = json!({"pending": [op(1)]});
+        let outcome = env_with(&[op(2), delete()]).run(due_ticker, input).await;
+        let ticker = final_ticker(&outcome);
+        assert_eq!(ticker.log, ["tick", "add 1", "add 2"]);
+        assert_eq!(timers(outcome.events()), 0, "a due wake does not wait");
+        assert_eq!(clock_reads(outcome.events()), 1);
+        assert_replays(&outcome, due_ticker).await;
+    }
+
+    /// A hook that returns `None` stops the wakes. The loop then waits on the
+    /// op signal only.
+    #[tokio::test]
+    async fn a_wake_that_returns_none_never_fires_again() {
+        let env = WorkflowTestEnv::new();
+        let mut run = env.start(late_ticker, json!({}));
+        assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
+        assert_eq!(timers(run.events()), 1);
+        assert_eq!(clock_reads(run.events()), 1);
+
+        run.signal(ENTITY_OP_SIGNAL, op(5)).unwrap();
+        assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
+        assert_eq!(timers(run.events()), 1, "no new timer after the wake ran");
+        assert_eq!(clock_reads(run.events()), 1, "no clock read without a wake");
+
+        run.signal(ENTITY_OP_SIGNAL, delete()).unwrap();
+        let outcome = run.finish().await;
+        let ticker = final_ticker(&outcome);
+        assert_eq!(ticker.log, ["tick", "add 5"]);
+        assert_eq!(timers(outcome.events()), 1);
+        assert_replays(&outcome, late_ticker).await;
+    }
+
+    /// The shape of `events`: the variant, and the kind and name of a side
+    /// effect.
+    fn shape(events: &[WorkflowEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| match e {
+                WorkflowEvent::SideEffectRecorded { kind, name, .. } => {
+                    format!("{}:{}", kind.as_str(), name.as_deref().unwrap_or(""))
+                }
+                other => serde_json::to_value(other).unwrap()["type"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+            .collect()
+    }
+
+    /// `run` records the same commands as before issue #2266. It reads no
+    /// clock and starts no timer. A hook that never wakes records the same
+    /// events as `run`.
+    #[tokio::test]
+    async fn run_records_no_clock_read_and_no_timer() {
+        let messages = [op(1), op(2), delete()];
+        let plain = env_with(&messages).run(counter, json!({})).await;
+        assert_eq!(plain.result, Ok(json!(3)));
+        assert_eq!(
+            shape(plain.events()),
+            [
+                "WorkflowStarted",
+                "SignalReceived",
+                "SignalReceived",
+                "SignalReceived",
+                "entity_state:harvest.entity.state",
+                "entity_state:harvest.entity.state",
+                "custom:harvest.entity.checkpoint",
+                "entity_state:harvest.entity.state",
+                "custom:harvest.entity.checkpoint",
+                "entity_state:harvest.entity.deleted",
+                "WorkflowCompleted",
+            ]
+        );
+        assert_eq!(clock_reads(plain.events()), 0);
+        assert_eq!(timers(plain.events()), 0);
+
+        let sleepless = env_with(&messages).run(sleepless_counter, json!({})).await;
+        assert_eq!(sleepless.result, Ok(json!(3)));
+        assert_eq!(
+            serde_json::to_value(&sleepless.events()[1..]).unwrap(),
+            serde_json::to_value(&plain.events()[1..]).unwrap(),
+            "a hook that never wakes records the events of `run`"
+        );
+        assert_replays(&sleepless, sleepless_counter).await;
+    }
+
+    /// A checkpoint carries the state. The next run computes its wake from
+    /// the carried state.
+    #[tokio::test]
+    async fn a_checkpoint_carries_the_state_that_the_hook_reads() {
+        let continued = StartProvenance::continued_from(ExecutionId::new());
+        let first = WorkflowTestEnv::new().run(chained_ticker, json!({})).await;
+        let carried = carried_ticker(&first);
+        assert_eq!(carried.state.ticks, 1);
+        assert_eq!(carried.stats.checkpoints, 1);
+        assert_eq!(timers(first.events()), 1);
+        assert_replays(&first, chained_ticker).await;
+
+        let second = WorkflowTestEnv::new()
+            .with_start_provenance(continued)
+            .run(chained_ticker, json!(carried))
+            .await;
+        let carried = carried_ticker(&second);
+        assert_eq!(
+            carried.state.ticks, 2,
+            "the carried state still asks for a wake"
+        );
+        assert_eq!(carried.state.log, ["tick", "tick"]);
+        assert_eq!(carried.stats.checkpoints, 2);
+        assert_eq!(timers(second.events()), 1);
+        assert_replays(&second, chained_ticker).await;
+
+        let third = env_with(&[delete()])
+            .with_start_provenance(continued)
+            .run(chained_ticker, json!(carried))
+            .await;
+        assert_eq!(final_ticker(&third).ticks, 2);
+        assert_eq!(
+            timers(third.events()),
+            0,
+            "the carried state asks for no wake"
+        );
+        assert_eq!(clock_reads(third.events()), 0);
+        assert_replays(&third, chained_ticker).await;
+    }
+
+    /// The wait rounds up to whole milliseconds and is at least 1 ms.
+    #[test]
+    fn the_wait_for_a_wake_rounds_up_to_a_millisecond() {
+        let now = DateTime::UNIX_EPOCH;
+        let wait = |delta: chrono::Duration| time_until(now + delta, now);
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(wait(chrono::Duration::milliseconds(2)), ms(2));
+        assert_eq!(wait(chrono::Duration::microseconds(1500)), ms(2));
+        assert_eq!(wait(chrono::Duration::nanoseconds(1)), ms(1));
+        assert_eq!(wait(chrono::Duration::zero()), ms(1), "never a zero wait");
+        assert_eq!(
+            wait(chrono::Duration::seconds(-5)),
+            ms(1),
+            "never a negative wait"
+        );
+        assert_eq!(wait(chrono::Duration::days(400)), ms(400 * 86_400_000));
+    }
+}

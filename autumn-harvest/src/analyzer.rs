@@ -169,6 +169,30 @@ impl AnalyzerRule for SuspiciousTimerRule {
     }
 }
 
+/// Counts the bytes a writer receives and discards them.
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Byte length of the compact JSON text of `value`, without building it.
+///
+/// Equals `value.to_string().len()`. Both use the compact formatter.
+fn serialized_len(value: &serde_json::Value) -> usize {
+    let mut counter = ByteCounter(0);
+    // A `Value` always serializes, and `ByteCounter` never fails.
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
 /// Flags JSON payloads in events that exceed a specified byte threshold.
 /// Large payloads can bloat the database and impact history replay performance.
 pub struct LargePayloadRule {
@@ -221,8 +245,7 @@ impl AnalyzerRule for LargePayloadRule {
             };
 
             if let Some(p) = payload {
-                // Calculate roughly the size in bytes when serialized to a string
-                let size = p.to_string().len();
+                let size = serialized_len(p);
                 if size > self.max_bytes {
                     warnings.push(AnalyzerWarning {
                         rule_name: self.name().to_string(),
@@ -380,6 +403,22 @@ mod tests {
         assert_eq!(warnings[0].rule_name, "LargePayload");
         assert!(warnings[0].message.contains("Activity Completed output"));
         assert!(warnings[0].message.contains("threshold: 50"));
+    }
+
+    #[test]
+    fn serialized_len_matches_to_string_len() {
+        let values = [
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(-12.5e3),
+            serde_json::json!("quote\" slash\\ nl\n tab\t é 日本 \u{1F600} \u{0001}"),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!({"a": [1, 2, {"b": null}], "é": "x", "": ""}),
+        ];
+        for v in &values {
+            assert_eq!(serialized_len(v), v.to_string().len(), "{v}");
+        }
     }
 
     #[test]

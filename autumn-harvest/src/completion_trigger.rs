@@ -345,10 +345,9 @@ pub enum ConditionGate {
 
 /// Pure gate: `None` = unconditional (byte-identical legacy behavior).
 ///
-/// Evaluates the stored condition against the source output **as stored** —
-/// raw bytes from `harvest_workflow_executions.output`. Engine write paths
-/// always store the plaintext handler output there (payload codecs/offload
-/// apply only to the `harvest_events` copy), so guards see real output today.
+/// Evaluates the stored condition against the source output. The caller
+/// decodes `harvest_workflow_executions.output` first, because that column
+/// can hold a codec envelope (issue #1979). So guards see the real output.
 #[must_use]
 pub fn gate_stored_condition(stored: Option<&Value>, source_output: &Value) -> ConditionGate {
     let Some(raw) = stored else {
@@ -597,6 +596,33 @@ pub struct WorkflowMetadata {
 pub static GLOBAL_WORKFLOW_METADATA: std::sync::RwLock<
     Option<std::collections::HashMap<String, WorkflowMetadata>>,
 > = std::sync::RwLock::new(None);
+
+/// The run-default override cache of the last registry built (issue #2387).
+///
+/// It mirrors [`GLOBAL_WORKFLOW_METADATA`]. A completion trigger applies it
+/// to the declared SLA of its target type.
+#[cfg(feature = "db")]
+pub static GLOBAL_RUN_DEFAULTS: std::sync::RwLock<
+    Option<std::sync::Arc<crate::run_defaults::RunDefaultsCache>>,
+> = std::sync::RwLock::new(None);
+
+/// The effective SLA of a target type: its declared SLA with any operator
+/// override (issue #2387).
+#[cfg(feature = "db")]
+fn effective_target_sla(
+    workflow_name: &str,
+    sla: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    GLOBAL_RUN_DEFAULTS
+        .read()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .as_ref()
+                .map(|cache| cache.apply(workflow_name, None, sla).1)
+        })
+        .unwrap_or(sla)
+}
 
 #[cfg(feature = "db")]
 pub static GLOBAL_MAX_WORKFLOW_INPUT_BYTES: std::sync::RwLock<u64> =
@@ -1225,6 +1251,8 @@ pub struct DeferredTriggerStart {
     /// detached from the evaluating call's own scope, so the registry rides
     /// along on the struct rather than through a process-global static.
     pub codecs: crate::payload_codec::PayloadCodecs,
+    /// Tenant of the source run (issue #1977). The target run gets it.
+    pub tenant: Option<String>,
 }
 
 #[cfg(feature = "db")]
@@ -1320,6 +1348,8 @@ impl DeferredTriggerStart {
                 max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
                 start_source: crate::types::StartSource::CompletionTrigger,
                 start_source_ref: Some(source_exec_id_str.as_str()),
+                // A target run belongs to the tenant of its source (issue #1977).
+                tenant: self.tenant.as_deref(),
                 // `origin` and `completion_callbacks` keep their `None` default.
                 // A completion-trigger start is not a schedule fire (issue #534).
                 // Only builder-wide callback targets apply (issue #605).
@@ -1542,8 +1572,16 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
         // callback config has ever been registered
         // (`completion_callback::GLOBAL_CALLBACK_CONFIG` is `None`) or when
         // no target matches this terminal state.
-        crate::completion_callback::enqueue_completion_deliveries(conn, &execution, exec_id, state)
+        // Issue #2000: a recorded fork must not notify an outside system or
+        // start a run, so it skips callbacks and triggers. It still releases
+        // its mutexes below.
+        let recorded_fork = crate::fork::is_recorded_fork(conn, &execution).await?;
+        if !recorded_fork {
+            crate::completion_callback::enqueue_completion_deliveries(
+                conn, &execution, exec_id, state, codecs,
+            )
             .await?;
+        }
 
         // Durable mutex terminal auto-release (issue #691): this is the single
         // per-terminal-transition chokepoint (complete/fail/cancel/terminate/
@@ -1555,6 +1593,9 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
         // non-terminal nd-block path (issue #603) deliberately does NOT reach
         // this function, so a blocked holder keeps its locks.
         crate::mutex::sweep_terminal_holder_and_wake(conn, exec_id).await?;
+        if recorded_fork {
+            return Ok(deferred_starts);
+        }
 
         let triggers = triggers_dsl::harvest_completion_triggers
             .filter(triggers_dsl::source_workflow_name.eq(&execution.workflow_name))
@@ -1565,6 +1606,13 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
         // Provenance ref for every completion-triggered target start is the
         // triggering (source) execution id (#740).
         let source_exec_id_str = exec_id.to_string();
+        // The output column can hold an envelope (issue #1979). Guards and
+        // input mapping read the plaintext. Decode only when a trigger exists.
+        let decoded_output = if triggers.is_empty() {
+            None
+        } else {
+            codecs.decode_column_opt(execution.output.as_ref())?
+        };
 
         for trigger_db in triggers {
             let terminal_states: Vec<TerminalState> = serde_json::from_value(trigger_db.terminal_states)
@@ -1575,7 +1623,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
             }
 
             let trigger_name = trigger_db.id.to_string();
-            let source_output = execution.output.clone().unwrap_or(Value::Null);
+            let source_output = decoded_output.clone().unwrap_or(Value::Null);
 
             // Output guard (issue #810): evaluated against the RAW source
             // output — deliberately before (and independent of) input
@@ -1741,6 +1789,8 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                         )
                     })
             };
+            // Issue #2387: an operator SLA override of the target type wins.
+            let target_sla = effective_target_sla(&trigger_db.target_workflow_name, target_sla);
 
             // issue #618: completion triggers are an in-process start producer
             // and MUST honour an active admission gate. This runs INSIDE the
@@ -1964,6 +2014,9 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                         max_workflow_attempts_ceiling,
                         start_source: crate::types::StartSource::CompletionTrigger,
                         start_source_ref: Some(source_exec_id_str.as_str()),
+                        // A target run belongs to the tenant of its source
+                        // (issue #1977).
+                        tenant: execution.tenant.as_deref(),
                         // `target_input` is cloned, not moved. The `QuotaExceeded`
                         // outbox-fallback arm below needs the original values to
                         // build a `DeferredTriggerStart` for retry (issue #946).
@@ -2104,7 +2157,9 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                             target_shard: source_shard.as_i32(),
                             target_workflow_name: trigger_db.target_workflow_name.clone(),
                             target_workflow_id: target_workflow_id.clone(),
-                            target_input: target_input.clone(),
+                            // The row stores the input in the column form
+                            // (issue #2043). The relay decodes it.
+                            target_input: codecs.encode_column(&target_input)?,
                             queue_name: trigger_db.queue_name.clone(),
                             concurrency_key: concurrency_key.clone(),
                             concurrency_limit: concurrency_limit
@@ -2113,6 +2168,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                                 .unwrap_or(Value::Null),
                             max_workflow_input_bytes: i64::try_from(max_workflow_input_bytes)
                                 .unwrap_or(i64::MAX),
+                            tenant: execution.tenant.clone(),
                         })
                         .get_result::<crate::models::CompletionTriggerOutboxDb>(conn)
                         .await
@@ -2141,6 +2197,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                             retry_policy: target_retry_policy,
                             max_workflow_attempts_ceiling,
                             codecs: codecs.clone(),
+                            tenant: execution.tenant.clone(),
                         });
 
                         continue;
@@ -2195,12 +2252,15 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                         target_shard: target_shard.as_i32(),
                         target_workflow_name: trigger_db.target_workflow_name.clone(),
                         target_workflow_id: target_workflow_id.clone(),
-                        target_input: target_input.clone(),
+                        // The row stores the input in the column form
+                        // (issue #2043). The relay decodes it.
+                        target_input: codecs.encode_column(&target_input)?,
                         queue_name: trigger_db.queue_name.clone(),
                         concurrency_key: concurrency_key.clone(),
                         concurrency_limit: concurrency_limit.map(|l| i32::try_from(l).unwrap_or(i32::MAX)),
                         priority: serde_json::to_value(Priority::default()).unwrap_or(Value::Null),
                         max_workflow_input_bytes: i64::try_from(max_workflow_input_bytes).unwrap_or(i64::MAX),
+                        tenant: execution.tenant.clone(),
                     })
                     .get_result::<crate::models::CompletionTriggerOutboxDb>(conn)
                     .await
@@ -2229,6 +2289,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                     retry_policy: target_retry_policy,
                     max_workflow_attempts_ceiling,
                     codecs: codecs.clone(),
+                    tenant: execution.tenant.clone(),
                 });
             }
         }
@@ -2492,6 +2553,22 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
 
     let mut processed_count = 0;
     for task in pending_tasks {
+        // The row stores the input in the column form (issue #2043). A row
+        // that does not decode stays pending and backs off. It starts after
+        // an operator restores the key.
+        let target_input = match codecs.decode_column(&task.target_input) {
+            Ok(input) => input,
+            Err(error) => {
+                tracing::warn!(
+                    outbox_id = %task.id,
+                    error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                    "outbox input could not be decoded; the row stays pending"
+                );
+                stamp_outbox_relay_backoff(conn, task.id).await;
+                continue;
+            }
+        };
+
         let target_shard = crate::types::ShardId::new(task.target_shard);
         let Some(target_pool) = sharded_pool
             .as_ref()
@@ -2546,6 +2623,8 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                     )
                 })
         };
+        // Issue #2387: an operator SLA override of the target type wins.
+        let target_sla = effective_target_sla(&task.target_workflow_name, target_sla);
         let max_workflow_attempts_ceiling = GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING
             .read()
             .ok()
@@ -2568,6 +2647,10 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
 
         // Provenance ref is the triggering (source) execution id (#740).
         let source_exec_id_str = task.source_exec_id.to_string();
+        // The row keeps the source tenant (issue #1977). A row with no tenant
+        // starts an untenanted target. A missing source run is not read as an
+        // untenanted one.
+        let source_tenant = task.tenant.clone();
         let params = crate::execution::StartWorkflowParams {
             concurrency_key: task.concurrency_key,
             concurrency_limit: task
@@ -2584,6 +2667,8 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
             max_workflow_attempts_ceiling,
             start_source: crate::types::StartSource::CompletionTrigger,
             start_source_ref: Some(source_exec_id_str.as_str()),
+            // A target run belongs to the tenant of its source (issue #1977).
+            tenant: source_tenant.as_deref(),
             // `origin` and `completion_callbacks` keep their `None` default.
             // A completion-trigger start is not a schedule fire (issue #534).
             // Only builder-wide callback targets apply (issue #605).
@@ -2591,7 +2676,7 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                 &task.target_workflow_name,
                 &task.target_workflow_id,
                 crate::types::ExecutionId::new_for_shard(target_shard),
-                task.target_input,
+                target_input,
                 &queue_name,
             )
         };

@@ -90,6 +90,8 @@ const INIT_SQL: &str = concat!(
     // issue #1596 review: WorkflowExecution::as_select() also references
     // this column, for the same reason as the column above.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_by UUID NULL;\n",
+    // Issue #1977: the diesel insert and `as_select()` name this column too.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS tenant TEXT NULL;\n",
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260619000000_harvest_task_queue_created_at/up.sql"
@@ -246,6 +248,11 @@ const INIT_SQL: &str = concat!(
     // orders by it and `TaskQueueItem` selects it, so each claim in this suite
     // needs it. Added inline for the same reason as the columns above.
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS new_start BOOLEAN NOT NULL DEFAULT FALSE;\n",
+    // issue #1976: the fairness key on harvest_task_queue. Every enqueue
+    // inserts it and `TaskQueueItem` selects it.
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS fairness_key TEXT;\n",
+    // issue #2252: each enqueue inserts the decision partition.
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS decision_partition SMALLINT;\n",
 );
 
 type HarvestApiApp = axum::Router;
@@ -359,6 +366,8 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
+            tenant: None,
         },
         None,
     )

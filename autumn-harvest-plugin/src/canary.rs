@@ -24,6 +24,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use autumn_harvest::policy::MAX_INTERVAL_PERIOD;
 use autumn_harvest::prelude::*;
 use autumn_harvest::worker::DbPool;
 use chrono::{DateTime, Utc};
@@ -114,6 +115,8 @@ impl CanaryConfig {
     /// `per_probe_timeout` at or below the probe's own minimum runtime and
     /// false-fail a healthy pipeline (issue #796, AC6). **30s is recommended.**
     /// A fractional `interval` rounds up to the next whole second (issue #1967).
+    /// An `interval` above [`MAX_INTERVAL_PERIOD`] is **clamped down** (with a
+    /// warning), so the interval schedule validates (issue #2048).
     #[must_use]
     pub fn new(interval: Duration) -> Self {
         // An interval schedule takes whole seconds only (issue #1967). Round a
@@ -131,6 +134,17 @@ impl CanaryConfig {
                  healthy probe cannot false-fail its per-probe timeout (issue #796)"
             );
             MIN_CANARY_INTERVAL
+        } else {
+            interval
+        };
+        let interval = if interval > MAX_INTERVAL_PERIOD {
+            tracing::warn!(
+                requested_secs = interval.as_secs(),
+                max_secs = MAX_INTERVAL_PERIOD.as_secs(),
+                "synthetic liveness canary interval above the maximum; clamping down so the \
+                 interval schedule validates (issue #2048)"
+            );
+            MAX_INTERVAL_PERIOD
         } else {
             interval
         };
@@ -402,6 +416,8 @@ pub fn canary_activity_info() -> ActivityInfo {
         circuit_breaker: None,
         requires: None,
         handler: canary_activity_handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -755,18 +771,11 @@ const CANARY_ROW_CAP: i64 = 500;
 /// prefix predicate, not a `LIKE` whose `_` wildcards would over-match the
 /// underscore-laden prefix).
 async fn load_canary_rows(conn: &mut AsyncPgConnection) -> Result<Vec<CanaryRow>, String> {
-    let rows: Vec<CanaryRowDb> = diesel::sql_query(
-        "SELECT queue_name, state, started_at, completed_at \
-         FROM harvest_workflow_executions \
-         WHERE starts_with(workflow_name, $1) \
-         ORDER BY completed_at DESC NULLS LAST \
-         LIMIT $2",
-    )
-    .bind::<Text, _>(autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX)
-    .bind::<diesel::sql_types::BigInt, _>(CANARY_ROW_CAP)
-    .load(conn)
-    .await
-    .map_err(|e| e.to_string())?;
+    let rows: Vec<CanaryRowDb> = diesel::sql_query(autumn_harvest::canary::CANARY_ROWS_SQL)
+        .bind::<diesel::sql_types::BigInt, _>(CANARY_ROW_CAP)
+        .load(conn)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(rows
         .into_iter()
@@ -1020,6 +1029,15 @@ mod tests {
         // Issue #1967: an interval schedule takes whole seconds only.
         let cfg = CanaryConfig::new(Duration::from_millis(90_500));
         assert_eq!(cfg.interval(), Duration::from_secs(91));
+        let built = register_canary(HarvestBuilder::default(), &cfg).try_build();
+        assert!(built.is_ok(), "got: {:?}", built.err());
+    }
+
+    #[test]
+    fn a_huge_canary_interval_still_builds() {
+        // Issue #2048: an interval schedule has a longest period.
+        let cfg = CanaryConfig::new(Duration::from_secs(4_000_000_000));
+        assert_eq!(cfg.interval(), autumn_harvest::policy::MAX_INTERVAL_PERIOD);
         let built = register_canary(HarvestBuilder::default(), &cfg).try_build();
         assert!(built.is_ok(), "got: {:?}", built.err());
     }

@@ -1,0 +1,32 @@
+# Ledger profiles for `autumn-harvest/src/concurrency.rs`. See `docs/ledger/README.md`.
+
+["active_runs_for_key"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/concurrency.md"
+
+["dry_run_supersede_credit"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/concurrency.md"
+
+["lock_concurrency_key"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["try_claim_candidate_row"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/concurrency.md"

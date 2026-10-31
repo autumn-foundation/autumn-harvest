@@ -1,0 +1,17 @@
+harvest_task_queue_concurrency_key_running idx_scan=0 size_bytes=8192
+harvest_task_queue_pkey idx_scan=0 size_bytes=311296
+harvest_task_queue_required_build_id_pending idx_scan=0 size_bytes=8192
+harvest_task_queue_running_worker_idx idx_scan=0 size_bytes=16384
+harvest_task_queue_schedule_to_close_idx idx_scan=0 size_bytes=8192
+idx_harvest_task_queue_rate_limit_key_live idx_scan=0 size_bytes=8192
+idx_harvest_tq_activity_id idx_scan=0 size_bytes=16384
+idx_harvest_tq_activity_pause idx_scan=0 size_bytes=16384
+idx_harvest_tq_capability_miss_workers idx_scan=0 size_bytes=8192
+idx_harvest_tq_coverage_sample idx_scan=0 size_bytes=65536
+idx_harvest_tq_live_created idx_scan=0 size_bytes=73728
+idx_harvest_tq_poll idx_scan=0 size_bytes=65536
+idx_harvest_tq_running_started idx_scan=0 size_bytes=16384
+idx_harvest_tq_session_active idx_scan=2 size_bytes=16384
+idx_harvest_tq_sticky_poll idx_scan=0 size_bytes=16384
+idx_harvest_tq_terminal_completed_at idx_scan=0 size_bytes=204800
+idx_harvest_tq_workflow idx_scan=0 size_bytes=57344

@@ -1,0 +1,8 @@
+# Ledger profiles for `autumn-harvest/src/pool.rs`. See `docs/ledger/README.md`.
+
+["with_engine_timeouts"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"

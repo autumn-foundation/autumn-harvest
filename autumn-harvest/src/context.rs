@@ -29,7 +29,8 @@ use crate::replay::{
 use crate::signal_handler::{BoxSignalHandler, SignalHandlerRegistry, invoke_signal_handler};
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalCancelId,
-    ExternalSignalId, ExternalTarget, IdempotencyKey, SessionId, TimerId, UpdateId,
+    ExternalSignalId, ExternalTarget, IdempotencyKey, SessionId, StartProvenance, StartSource,
+    TimerId, UpdateId,
 };
 use crate::update::{BoxUpdateHandler, BoxUpdateValidator, UpdateRegistry};
 
@@ -162,6 +163,29 @@ pub const DEFAULT_CURRENT_DETAILS_CAP_BYTES: usize = 1024;
 ///
 /// [`publish_progress`]: WorkflowContext::publish_progress
 pub const PROGRESS_CHUNK_MAX_BYTES: usize = 7000;
+
+/// Per-execution cap on stored durable stream chunks (issue #1974).
+///
+/// The store drops chunks above the cap and stores one terminal marker. The
+/// context queues at most `cap + 1` commands in one cycle, so the store can
+/// see the overflow.
+pub const DURABLE_STREAM_MAX_CHUNKS: u32 = 10_000;
+
+/// Serialize a progress chunk and apply [`PROGRESS_CHUNK_MAX_BYTES`].
+///
+/// An oversize chunk becomes a truncation marker. The chunk slot stays, and
+/// the client sees that the content was cut (issues #791 and #1974).
+fn cap_progress_chunk(chunk: &impl serde::Serialize) -> HarvestResult<Value> {
+    let value = serde_json::to_value(chunk).map_err(HarvestError::Serialization)?;
+    let serialized_len = serde_json::to_vec(&value).map_or(usize::MAX, |v| v.len());
+    if serialized_len > PROGRESS_CHUNK_MAX_BYTES {
+        return Ok(serde_json::json!({
+            "_harvest_progress_truncated": true,
+            "bytes": serialized_len,
+        }));
+    }
+    Ok(value)
+}
 
 /// Bits reserved for the per-cycle local index in a progress `seq` (issue #791).
 ///
@@ -389,7 +413,7 @@ impl WorkflowHistoryPolicy {
 }
 
 #[cfg(feature = "db")]
-type ActivityCancellationPool =
+pub(crate) type ActivityCancellationPool =
     diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>;
 
 #[cfg(feature = "db")]
@@ -419,6 +443,10 @@ pub struct TransactionalState {
     /// inside the transaction so an oversized result is caught before
     /// `ActivityCompleted` is committed.
     pub(crate) max_result_bytes: u64,
+    /// The task row asks for the fan-out result writer (issue #1986).
+    pub(crate) result_writer: bool,
+    /// The worker's offloader, whose store the result writer uses.
+    pub(crate) offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
 }
 const LOCAL_ACTIVITY_HEARTBEAT_REASON: &str =
     "local activities do not support heartbeats; use a regular activity";
@@ -453,6 +481,28 @@ fn should_check_durable_cancellation(
 // ---------------------------------------------------------------------------
 // WorkflowCommand -- commands emitted during live execution
 // ---------------------------------------------------------------------------
+
+/// Why a [`WorkflowCommand::CancelRaceLosers`] cancels its operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LoserCancelReason {
+    /// A sibling branch of a race won.
+    RaceLoser,
+    /// The cancellation scope that started the operations was cancelled
+    /// (issue #1984).
+    ScopeCancelled,
+}
+
+impl LoserCancelReason {
+    /// The error text of the synthetic terminal that the worker records.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::RaceLoser => "lost race to a sibling branch",
+            Self::ScopeCancelled => "cancelled by its cancellation scope",
+        }
+    }
+}
 
 /// A command emitted by the workflow coroutine during live (non-replay) execution.
 ///
@@ -494,6 +544,11 @@ pub enum WorkflowCommand {
         /// dispatch, which continues to use the activity's registered
         /// `default_schedule_to_start`.
         schedule_to_start_override: Option<std::time::Duration>,
+        /// Write the result through the `PayloadStore` (issue #1986).
+        ///
+        /// When `true`, the worker records a `StoredResult` reference, not
+        /// the value. Only a fan-out with `write_results` sets it.
+        result_writer: bool,
         /// The worker sends the result back through this channel.
         result_tx: oneshot::Sender<Result<Value, String>>,
     },
@@ -703,6 +758,19 @@ pub enum WorkflowCommand {
         /// marker).
         chunk: Value,
     },
+    /// Store one durable output-stream chunk (issue #1974).
+    ///
+    /// Emitted by [`WorkflowContext::publish_durable_progress`] during live
+    /// execution only. Bookkeeping: no result channel, no suspension shape and
+    /// no `harvest_events` row. The worker writes it to
+    /// `harvest_stream_chunks` in the persist transaction.
+    PublishDurableProgress {
+        /// The 0-based call ordinal. A re-drive gets the same offset again,
+        /// so the store keeps the first copy.
+        offset: u64,
+        /// The chunk, already size-capped like a best-effort chunk.
+        chunk: Value,
+    },
     /// Persist one author-emitted log line to the durable per-execution log
     /// store (issue #790).
     ///
@@ -841,7 +909,12 @@ pub enum WorkflowCommand {
     ///   necessary terminal event to the parent's history and is idempotent
     ///   against an already-terminal child.
     /// - `timers`: deleting the still-pending `harvest_timers` row.
+    ///
+    /// A cancellation scope (issue #1984) pushes the same command for its
+    /// members. `reason` selects the text of the synthetic terminals.
     CancelRaceLosers {
+        /// Why the operations are cancelled.
+        reason: LoserCancelReason,
         /// Activity execution IDs of losing activity branches still open
         /// (`PENDING`/`RUNNING`) at race-resolution time.
         activities: Vec<ActivityExecId>,
@@ -965,6 +1038,7 @@ impl WorkflowCommand {
             | Self::UpsertSearchAttributes { .. }
             | Self::SetCurrentDetails { .. }
             | Self::PublishProgress { .. }
+            | Self::PublishDurableProgress { .. }
             | Self::RecordLog { .. }
             | Self::SpawnDetachedChildWorkflow { .. }
             | Self::CancelRaceLosers { .. }
@@ -1082,6 +1156,11 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("seq", seq)
                 .field("chunk", chunk)
                 .finish(),
+            Self::PublishDurableProgress { offset, chunk } => f
+                .debug_struct("PublishDurableProgress")
+                .field("offset", offset)
+                .field("chunk", chunk)
+                .finish(),
             Self::RecordLog {
                 seq,
                 level,
@@ -1136,11 +1215,13 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("already_requested", already_requested)
                 .finish_non_exhaustive(),
             Self::CancelRaceLosers {
+                reason,
                 activities,
                 children,
                 timers,
             } => f
                 .debug_struct("CancelRaceLosers")
+                .field("reason", reason)
                 .field("activities", activities)
                 .field("children", children)
                 .field("timers", timers)
@@ -1241,6 +1322,17 @@ impl Drop for ParkToken {
     }
 }
 
+/// The result of [`WorkflowContext::record_entity_snapshot`] (issue #2259).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EntitySnapshot {
+    /// A replay read this recorded snapshot.
+    Recorded(Value),
+    /// The live run recorded this snapshot.
+    Live(Value),
+    /// The history predates snapshots at this position. Nothing is recorded.
+    Absent,
+}
+
 // ---------------------------------------------------------------------------
 // Cancellable / renewable durable timers (issue #768)
 // ---------------------------------------------------------------------------
@@ -1265,6 +1357,17 @@ pub enum TimerOutcome {
 /// does **not** override the recorded fire-vs-cancel race: `await_timer_fire`
 /// always consults recorded history first (`match_timer_or_cancel`) and only
 /// falls back to this state when history holds no resolving event yet.
+/// The handle timer state before a timer command that a scope body pushes
+/// (issue #1984).
+#[derive(Debug)]
+struct TimerUndo {
+    /// The cancellable scopes around the push, innermost last.
+    scopes: Vec<u32>,
+    timer_id: String,
+    state: Option<TimerLogicalState>,
+    epoch: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimerLogicalState {
     /// The timer is armed (or has been re-armed by `reset`) and awaiting a fire.
@@ -1391,6 +1494,7 @@ impl<'a> MutexHandle<'a> {
     /// # Errors
     ///
     /// - [`HarvestError::MutexSelfDeadlock`] if the workflow already holds `key`.
+    /// - [`HarvestError::Config`] inside a cancellation scope (issue #1984).
     /// - [`HarvestError::NonDeterministic`] if recorded history diverges from the
     ///   expected `MutexGranted` for this key.
     pub async fn acquire(self) -> HarvestResult<MutexGuard<'a>> {
@@ -1405,6 +1509,12 @@ impl<'a> MutexHandle<'a> {
                 key: self.key.clone(),
             });
         }
+
+        // Issue #1984: a cancelled scope drops a parked acquire. Its waiter
+        // row then stays at the head of the FIFO queue and blocks the key.
+        // So a scope cannot acquire a mutex.
+        self.context
+            .reject_in_cancellable_scope(&format!("ctx.mutex({}).acquire()", self.key))?;
 
         match self
             .context
@@ -1809,6 +1919,25 @@ impl RaceBuilder<'_> {
     }
 }
 
+/// Counts one `ctx.race()` call in flight while it lives (issue #2007).
+///
+/// The race future holds it across its awaits. Dropping the future, or the
+/// end of the race, drops it.
+struct OpenRace<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> OpenRace<'a> {
+    fn enter(count: &'a std::sync::atomic::AtomicUsize) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for OpenRace<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The live-mode receiving end of one race branch (issue #950).
 ///
 /// The four branch kinds park on channels of three different payload types
@@ -1913,6 +2042,19 @@ const RESERVED_SEARCH_ATTR_KEYS: &[&str] = &[
 ];
 
 const RESERVED_SEARCH_ATTR_PREFIX: &str = "_harvest";
+
+/// Copy the test harness clock for an update handler context (issue #1991).
+///
+/// The handler gets its own counter, so a timer in the handler cannot move
+/// the clock of the workflow body.
+#[cfg(any(test, feature = "testing"))]
+fn snapshot_timer_clock(
+    elapsed: &Arc<std::sync::atomic::AtomicU64>,
+) -> Arc<std::sync::atomic::AtomicU64> {
+    Arc::new(std::sync::atomic::AtomicU64::new(
+        elapsed.load(std::sync::atomic::Ordering::Relaxed),
+    ))
+}
 
 fn validate_search_attr_key(key: &str) -> HarvestResult<()> {
     if key.is_empty() {
@@ -2219,13 +2361,15 @@ impl WorkflowLogger<'_> {
         // `max_lines` would make the store's `admit == lines.len()` and the
         // truncation marker would never fire, turning AC4's visible overflow
         // into silent loss.
-        let queued = self
-            .ctx
-            .log_commands_queued
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if queued > u64::from(policy.max_lines()) {
+        //
+        // A call over the bound queues nothing, so it does not count. The
+        // counter then equals the queued `RecordLog` commands, and a scope
+        // cancel that withdraws them gives back the whole budget (#1984).
+        let queued = &self.ctx.log_commands_queued;
+        if queued.load(std::sync::atomic::Ordering::Relaxed) > u64::from(policy.max_lines()) {
             return;
         }
+        queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let capped = truncate_on_char_boundary(message, policy.max_message_bytes);
         // `seq` IS the call ordinal: a deterministic identity for this logical
@@ -2278,23 +2422,34 @@ pub(crate) const SESSION_ACQUIRE_ACTIVITY_NAME: &str = "__harvest_session_acquir
 /// like a member activity, so only the host frees its own in-process slot.
 pub(crate) const SESSION_RELEASE_ACTIVITY_NAME: &str = "__harvest_session_release";
 
-/// Returns `true` when `name` is one of the two reserved worker-session
-/// internal activity names (issue #606): `__harvest_session_acquire` or
-/// `__harvest_session_release`.
+/// Reserved activity name for the release that a dropped [`Session`] issues
+/// (issue #2193).
 ///
-/// Both are always registered in `HandlerRegistry::activities` (so the
-/// enqueue-time handler lookup never hard-fails on them) with
-/// `default_queue: None`, but they are dispatched on the *caller-supplied*
-/// session queue (`SessionOptions::queue`) at the point `create_session`/
-/// `Session::complete` is called, never on a fixed queue of their own. A
-/// preflight/readiness check deriving "queues this deployment needs a
-/// worker listening on" from every registered activity's
-/// `default_queue.unwrap_or("default")` must exclude these two names —
-/// otherwise a deployment with no session-based workflow at all is
-/// spuriously reported as requiring a worker on `"default"`.
+/// No body awaits it. Replay treats its records as transparent, so it never
+/// shifts a positional match.
+pub(crate) const SESSION_DROP_RELEASE_ACTIVITY_NAME: &str = "__harvest_session_drop_release";
+
+/// Returns `true` when `name` is one of the reserved worker-session internal
+/// activity names (issue #606): `__harvest_session_acquire`,
+/// `__harvest_session_release` or `__harvest_session_drop_release` (#2193).
+///
+/// All three are always registered in `HandlerRegistry::activities`. The
+/// enqueue-time handler lookup then never hard-fails on them. Each has
+/// `default_queue: None`. Each is dispatched on the *caller-supplied* session
+/// queue (`SessionOptions::queue`) at the point `create_session`,
+/// `Session::complete` or a session drop runs. None uses a fixed queue of its
+/// own.
+///
+/// A preflight or readiness check can derive the queues that a deployment
+/// needs a worker on. It reads `default_queue.unwrap_or("default")` from every
+/// registered activity. That check must exclude these three names. Otherwise a
+/// deployment with no session-based workflow is wrongly reported as requiring
+/// a worker on `"default"`.
 #[must_use]
 pub fn is_reserved_session_activity_name(name: &str) -> bool {
-    name == SESSION_ACQUIRE_ACTIVITY_NAME || name == SESSION_RELEASE_ACTIVITY_NAME
+    name == SESSION_ACQUIRE_ACTIVITY_NAME
+        || name == SESSION_RELEASE_ACTIVITY_NAME
+        || name == SESSION_DROP_RELEASE_ACTIVITY_NAME
 }
 
 /// Default session acquisition timeout.
@@ -2583,11 +2738,43 @@ impl Default for SessionOptions {
 /// Borrows the owning [`WorkflowContext`] for its lifetime, mirroring
 /// [`RaceBuilder`]'s shape — a session cannot outlive the workflow function
 /// invocation that created it.
+///
+/// Dropping a session without [`Self::complete`] releases its host slot
+/// (issue #2193). This covers a cancelled future, a race loser and a
+/// `select!` branch. The release runs at the next suspension. A run that ends
+/// first leaves the session to the broken-session scanner.
 pub struct Session<'a> {
     ctx: &'a WorkflowContext,
     id: SessionId,
     host_worker_id: String,
     queue: String,
+    /// Set when [`Self::complete`] has dispatched the release (issue #2193).
+    settled: bool,
+}
+
+impl Drop for Session<'_> {
+    /// Releases the session when its owner drops it (issue #2193).
+    ///
+    /// The release is an activity that no body awaits. It does nothing when:
+    ///
+    /// - [`Self::complete`] already dispatched the release;
+    /// - a panic is unwinding, because the cycle discards its commands;
+    /// - the cycle is suspending, because the executor drops the handler
+    ///   future at each park and the session stays open;
+    /// - history already holds a drop release for the session.
+    fn drop(&mut self) {
+        // A panicking cycle discards its commands. A lock that the panic
+        // poisoned must not abort the process from inside the unwind.
+        if self.settled
+            || std::thread::panicking()
+            || self.ctx.is_suspending()
+            || self.ctx.history_released_session(self.id)
+        {
+            return;
+        }
+        self.ctx
+            .push_drop_release(self.id, self.host_worker_id.clone(), self.queue.clone());
+    }
 }
 
 impl Session<'_> {
@@ -2639,6 +2826,7 @@ impl Session<'_> {
                 Some(self.id),
                 Some(self.host_worker_id.clone()),
                 None,
+                false,
             )
             .await
             .map_err(|err| self.broken_session_error(err))?;
@@ -2669,6 +2857,7 @@ impl Session<'_> {
                 Some(self.id),
                 Some(self.host_worker_id.clone()),
                 None,
+                false,
             )
             .await
             .map_err(|err| self.broken_session_error(err))
@@ -2718,8 +2907,13 @@ impl Session<'_> {
     /// Returns [`HarvestError::SessionBroken`] if the host worker died or
     /// drained before release could complete — the slot is still reclaimed
     /// by the broken-session scanner in that case.
-    pub async fn complete(self) -> HarvestResult<()> {
-        self.ctx
+    ///
+    /// Dropping the returned future before the dispatch returns releases the
+    /// session on drop (issue #2193). Any result of the dispatch, an error
+    /// included, settles the session.
+    pub async fn complete(mut self) -> HarvestResult<()> {
+        let released = self
+            .ctx
             .execute_activity_raw_full(
                 SESSION_RELEASE_ACTIVITY_NAME,
                 Value::from(self.id.to_string()),
@@ -2729,9 +2923,12 @@ impl Session<'_> {
                 Some(self.id),
                 Some(self.host_worker_id.clone()),
                 None,
+                false,
             )
-            .await
-            .map_err(|err| self.broken_session_error(err))?;
+            .await;
+        // A drop of this future before this point releases the session.
+        self.settled = true;
+        released.map_err(|err| self.broken_session_error(err))?;
         Ok(())
     }
 }
@@ -2762,6 +2959,26 @@ pub(crate) struct SagaUnwindObservation {
     pub(crate) counted: bool,
 }
 
+/// A buffered command and the cancellation scopes that issued it (issue #1984).
+struct BufferedCommand {
+    /// The push order. A scope cancel keeps it with each record it withdraws.
+    order: u64,
+    cmd: WorkflowCommand,
+    scopes: Vec<u32>,
+}
+
+/// How a pending cancel request shows to the workflow body (issue #1984).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingCancel {
+    /// No pending request. A cancellation reason, if any, is recorded.
+    None,
+    /// A pending request. A non-cancellable block hides it from its body.
+    Pending,
+    /// A pending request while the history holds an open block. The body
+    /// does not see it, so a check before the block replays as it ran.
+    BehindOpenBlock,
+}
+
 /// Context passed to every workflow function.
 ///
 /// In **replay mode** (resuming from Postgres history): commands are matched
@@ -2779,9 +2996,14 @@ pub struct WorkflowContext {
     /// Replay engine -- matches commands against recorded event history.
     matcher: Mutex<HistoryMatcher>,
     /// Commands accumulated during live execution, drained by the worker.
-    commands: Mutex<Vec<WorkflowCommand>>,
+    /// Each command keeps the cancellation scopes that issued it (issue #1984).
+    commands: Mutex<Vec<BufferedCommand>>,
     /// Harvest futures parked with no result channel (issue #1797).
     parks: ParkCounter,
+    /// Keys of the promises this run has made, named or generated (issue
+    /// #1985). A key settles once, so a second handle for it would wait
+    /// forever.
+    promise_keys: Mutex<std::collections::HashSet<String>>,
     /// Deterministic "now" -- the timestamp from the `WorkflowStarted` event.
     start_time: DateTime<Utc>,
     /// History-size thresholds visible to author code.
@@ -2865,6 +3087,23 @@ pub struct WorkflowContext {
     /// stable, unique `race:{seq}` / `race_winner:{seq}` marker names across
     /// replays, mirroring `fan_out_seq`.
     race_seq: Mutex<u32>,
+    /// Sequence counter for `ctx.cancellation_scope()` (issue #1984).
+    scope_seq: Mutex<u32>,
+    /// Sequence counter for `ctx.non_cancellable()` (issue #1984).
+    shield_seq: Mutex<u32>,
+    /// The scopes and shields whose body is polled now, innermost last.
+    scope_stack: Mutex<Vec<crate::cancellation_scope::ScopeFrame>>,
+    /// Every scope of this run, so a resident cycle can drop the members
+    /// that resolved (issue #1984).
+    live_scopes: Mutex<Vec<std::sync::Weak<crate::cancellation_scope::ScopeShared>>>,
+    /// The number of `ctx.race()` calls in flight (issue #2007). A race
+    /// that suspends cannot stay resident.
+    open_races: std::sync::atomic::AtomicUsize,
+    /// Set while a resident cycle runs with re-parked siblings (issue #2008).
+    /// Such a cycle must not read the replay position.
+    speculative: std::sync::atomic::AtomicBool,
+    /// Set when a speculative cycle reads the replay position.
+    speculation_read_position: std::sync::atomic::AtomicBool,
     /// Monotonically increasing counter for naming worker-session identity
     /// markers (issue #606). Each `create_session()` call increments this once
     /// so each session has a stable, unique `session:{seq}` marker name across
@@ -2894,6 +3133,16 @@ pub struct WorkflowContext {
     /// epoch (in the high bits) is what carries monotonicity across cycles.
     /// Not part of replay state: `publish_progress` is a no-op during replay.
     progress_local_index: std::sync::atomic::AtomicU64,
+    /// 0-based call ordinal of `publish_durable_progress` (issue #1974).
+    ///
+    /// It is the chunk offset. Each call claims one value, also during replay.
+    /// A re-drive re-runs the body from the top, so a chunk gets the same
+    /// offset again. The epoch `seq` of `publish_progress` cannot do this.
+    /// See `log_call_ordinal` for the cases that move the epoch.
+    durable_progress_ordinal: std::sync::atomic::AtomicU64,
+    /// Count of `PublishDurableProgress` commands queued this cycle
+    /// (issue #1974). It bounds memory at `DURABLE_STREAM_MAX_CHUNKS + 1`.
+    durable_progress_queued: std::sync::atomic::AtomicU64,
     /// 0-based **call ordinal** for durable-log `seq` generation (issue #790):
     /// the count of `ctx.log_*` calls made so far by *this run of the workflow
     /// body*.
@@ -2953,6 +3202,15 @@ pub struct WorkflowContext {
     /// `cancel(); await_fire()` (live or on replay) resolves
     /// [`TimerOutcome::Cancelled`] instead of re-arming a cancelled timer.
     cancellable_timer_state: Mutex<std::collections::HashMap<String, TimerLogicalState>>,
+    /// The arm count of each handle timer id (issue #1984). A scope cancel uses
+    /// it to cancel only the arm that its body made.
+    timer_arm_epochs: Mutex<std::collections::HashMap<String, u64>>,
+    /// The timer state before each timer command that a scope body pushes
+    /// this cycle (issue #1984). A scope cancel restores the entries of the
+    /// commands that it withdraws.
+    timer_undo: Mutex<Vec<TimerUndo>>,
+    /// The next push order of a buffered command (issue #1984).
+    command_order: std::sync::atomic::AtomicU64,
     /// Per-run set of `timer_id`s used by the classic `ctx.timer`/`sleep_until`
     /// API this task (issue #768, Codex P2 round 16). Populated by
     /// [`Self::timer`]; consulted by [`Self::start_timer`] / [`Self::reset_timer`]
@@ -3016,10 +3274,14 @@ pub struct WorkflowContext {
     /// `return Err(..)` paths cannot leak one.
     signal_pump_hold: std::sync::atomic::AtomicUsize,
     /// Cancellation reason captured from a `WorkflowCancelled` event in history,
-    /// if any. When set, `is_cancelled()` returns true and `check_cancellation()`
+    /// or a pending request from `WorkflowExecuteSpanMeta::cancellation_reason`
+    /// (issue #2021). A recorded event wins. When set, `is_cancelled()` returns true and `check_cancellation()`
     /// yields [`HarvestError::Cancelled`]. Cooperative: the workflow function is
     /// expected to consult these at strategic points to run cleanup logic.
     cancellation_reason: Option<String>,
+    /// Whether `cancellation_reason` is a pending request, not a recorded
+    /// `WorkflowCancelled`, and where the body sees it (issue #1984).
+    cancellation_pending: PendingCancel,
     /// When `true`, activity and local-activity dispatch compares the input
     /// payload against what was recorded in history, in addition to the name.
     /// Set by the `WorkflowReplayer` to detect non-deterministic input changes.
@@ -3028,6 +3290,10 @@ pub struct WorkflowContext {
     /// canary, allowing it to suspend at the end of its history without throwing
     /// non-determinism errors.
     canary_mode: bool,
+    /// When set, the executor runs each admitted update that has no result at
+    /// the end of the cycle (issue #2035). Only the worker sets it. A replay
+    /// gate leaves it `None`, so a gate never runs a handler.
+    update_dispatch: Option<crate::update::UpdateDispatch>,
     // ── Payload size caps (issue #252) ────────────────────────────────
     /// Logical workflow type name for use in `PayloadTooLarge` errors.
     /// Empty string when not known (legacy contexts, update handlers).
@@ -3101,8 +3367,20 @@ pub struct WorkflowContext {
     /// `None` = production behavior (`ctx.now()` always returns `start_time`).
     /// `Some` = test harness advancing-clock mode; incremented each time a
     /// durable timer resolves from history so `ctx.now()` reflects virtual elapsed time.
+    ///
+    /// Shared through an `Arc`, so a declarative update handler can read the
+    /// clock when it runs (issue #1991).
     #[cfg(any(test, feature = "testing"))]
-    timer_clock_elapsed_secs: Option<std::sync::atomic::AtomicU64>,
+    timer_clock_elapsed_secs: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// `Some` in a workflow simulation run (issue #2033): a seeded generator
+    /// and the virtual time in milliseconds. A live built-in side effect then
+    /// reads them, so a seed replays.
+    #[cfg(any(test, feature = "testing"))]
+    side_effect_rng: Option<Arc<(Mutex<crate::dst::SplitMix64>, i64)>>,
+    /// The clock of the decision cycle in epoch milliseconds, when the
+    /// runtime fixes one (issue #2276). A live clock read then returns it.
+    /// The SQLite runtime sets it, so its timers and clock reads agree.
+    drive_clock_ms: Option<i64>,
     /// Metrics recorder for user-emitted custom business metrics (issue #532).
     /// Defaults to [`NoOpMetrics`](crate::telemetry::NoOpMetrics) when the
     /// worker has no telemetry configured.  Workflow metrics are replay-safe:
@@ -3119,6 +3397,12 @@ pub struct WorkflowContext {
     /// query/update throwaway (`new_for_handler`), replayer, and test contexts
     /// that never went through the worker.
     parent_execution_id: Option<ExecutionId>,
+    /// How this run started and which run it continued from (issue #2082).
+    /// Threaded from the execution row's `start_source` and
+    /// `continued_from_exec_id` columns. The row never changes after the insert,
+    /// so the value is replay-stable. Unknown for contexts that never went
+    /// through the worker.
+    start_provenance: StartProvenance,
 }
 
 /// A read-only, replay-safe snapshot of a workflow run's system metadata
@@ -3158,6 +3442,8 @@ pub struct WorkflowContext {
 /// - `is_replaying` → **(c)** observability-only — the replay indicator itself
 ///   (carved out of the branch-safe guarantee below).
 /// - `parent_execution_id` → **(a)** threaded — the row `parent_id` column.
+/// - `start_source`, `continued_from` → **(a)** threaded — the row `start_source`
+///   and `continued_from_exec_id` columns (issue #2082).
 ///
 /// ```rust,ignore
 /// #[workflow]
@@ -3210,6 +3496,14 @@ pub struct WorkflowExecutionInfo {
     /// The execution id of the parent workflow that spawned this run, or `None`
     /// for a top-level run ("no parent").
     pub parent_execution_id: Option<ExecutionId>,
+    /// How this run started (issue #2082). [`StartSource::Unknown`] when the
+    /// source is not recorded, as for a run from before the column existed.
+    /// A continue-as-new successor reports [`StartSource::ContinueAsNew`].
+    pub start_source: StartSource,
+    /// The run that continued as new into this one, or `None` (issue #2082).
+    /// It is `Some` for a continue-as-new or cross-type continuation successor.
+    /// A workflow retry of a successor reports `None`.
+    pub continued_from: Option<ExecutionId>,
 }
 
 /// RAII guard returned by `WorkflowContext::hold_signal_pump` (issue #1252).
@@ -3283,6 +3577,11 @@ impl WorkflowContext {
     /// strict replay the matcher is never locked, so no `pump_signal_handlers`
     /// side effect is introduced on the non-strict path.
     fn strict_replay_no_match_is_divergence(&self) -> bool {
+        // Issue #1984: a replayed scope cancel cuts history at its horizon.
+        // The live cycle parked there, so a no-match there is not drift.
+        if self.replays_a_scope_cancel() {
+            return false;
+        }
         self.strict_replay
             && !(self.canary_mode && self.match_history(|m| m.position() >= m.len()))
             // Issue #952 — the FAILING-FRONTIER exception. A history sealed by a
@@ -3338,8 +3637,22 @@ impl WorkflowContext {
     /// The frontier question that actually holds for a signal wait is whether
     /// any matching signal remains available at all. Mirrors the #779 fix, which
     /// exempted the child-timeout race's `InProgress` arm for the same reason.
-    fn check_strict_replay_signal_no_match(&self, signal_name: &str) -> HarvestResult<()> {
-        if self.canary_mode && !self.match_history(|m| m.has_unconsumed_signal(signal_name)) {
+    ///
+    /// For a payload-matching wait (issue #1985), only a signal whose event
+    /// index is in `accepted` counts as available.
+    fn check_strict_replay_signal_no_match(
+        &self,
+        signal_name: &str,
+        accepted: Option<&std::collections::HashSet<usize>>,
+    ) -> HarvestResult<()> {
+        if self.canary_mode
+            && !self.match_history(|m| {
+                accepted.map_or_else(
+                    || m.has_unconsumed_signal(signal_name),
+                    |set| m.has_unconsumed_signal_accepting(signal_name, set),
+                )
+            })
+        {
             return Ok(());
         }
         self.check_strict_replay_no_match(&format!("WaitForSignal({signal_name})"))
@@ -3349,6 +3662,10 @@ impl WorkflowContext {
     where
         F: FnOnce(&mut HistoryMatcher) -> R,
     {
+        // Every public history read and every command match passes here. In
+        // a speculative cycle each one counts as a position read (issue
+        // #2008).
+        self.note_position_read();
         let result = {
             let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
             f(&mut matcher)
@@ -3513,6 +3830,7 @@ impl WorkflowContext {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn for_replay_with_state_and_history_policy(
         exec_id: ExecutionId,
         events: Vec<WorkflowEvent>,
@@ -3556,6 +3874,7 @@ impl WorkflowContext {
             matcher: Mutex::new(matcher),
             commands: Mutex::new(Vec::new()),
             parks: ParkCounter::default(),
+            promise_keys: Mutex::default(),
             start_time,
             history_policy,
             execution_timeout: None,
@@ -3568,14 +3887,26 @@ impl WorkflowContext {
             child_placement_seq: Mutex::new(0),
             shard_router: None,
             race_seq: Mutex::new(0),
+            scope_seq: Mutex::new(0),
+            shield_seq: Mutex::new(0),
+            scope_stack: Mutex::new(Vec::new()),
+            live_scopes: Mutex::new(Vec::new()),
+            open_races: std::sync::atomic::AtomicUsize::new(0),
+            speculative: std::sync::atomic::AtomicBool::new(false),
+            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_ordinal: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_queued: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
             log_commands_queued: std::sync::atomic::AtomicU64::new(0),
             log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
+            timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
+            timer_undo: Mutex::new(Vec::new()),
+            command_order: std::sync::atomic::AtomicU64::new(0),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
@@ -3587,8 +3918,10 @@ impl WorkflowContext {
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason,
+            cancellation_pending: PendingCancel::None,
             strict_replay: false,
             canary_mode: false,
+            update_dispatch: None,
             workflow_name: String::new(),
             queue_name: String::new(),
             workflow_id: String::new(),
@@ -3610,8 +3943,12 @@ impl WorkflowContext {
             scheduled_time,
             #[cfg(any(test, feature = "testing"))]
             timer_clock_elapsed_secs: None,
+            #[cfg(any(test, feature = "testing"))]
+            side_effect_rng: None,
+            drive_clock_ms: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             parent_execution_id: None,
+            start_provenance: StartProvenance::default(),
         }
     }
 
@@ -3679,7 +4016,15 @@ impl WorkflowContext {
     /// The read locks the matcher directly, so it runs no signal-handler
     /// pump. A pump here could dispatch a signal handler after the cycle
     /// ends. The read does not move the cursor.
-    pub(crate) fn first_unconsumed_command_event(&self) -> Option<(usize, String)> {
+    ///
+    /// The `SQLite` query replay uses it to refuse a drifted running run
+    /// (issue #2022), as the drive does.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher mutex is poisoned.
+    #[must_use]
+    pub fn first_unconsumed_command_event(&self) -> Option<(usize, String)> {
         self.matcher
             .lock()
             .expect("matcher lock poisoned")
@@ -3729,6 +4074,7 @@ impl WorkflowContext {
             matcher: Mutex::new(crate::replay::HistoryMatcher::new(vec![])),
             commands: Mutex::new(Vec::new()),
             parks: ParkCounter::default(),
+            promise_keys: Mutex::default(),
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
             execution_timeout: None,
@@ -3741,14 +4087,26 @@ impl WorkflowContext {
             child_placement_seq: Mutex::new(0),
             shard_router: None,
             race_seq: Mutex::new(0),
+            scope_seq: Mutex::new(0),
+            shield_seq: Mutex::new(0),
+            scope_stack: Mutex::new(Vec::new()),
+            live_scopes: Mutex::new(Vec::new()),
+            open_races: std::sync::atomic::AtomicUsize::new(0),
+            speculative: std::sync::atomic::AtomicBool::new(false),
+            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_ordinal: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_queued: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
             log_commands_queued: std::sync::atomic::AtomicU64::new(0),
             log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
+            timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
+            timer_undo: Mutex::new(Vec::new()),
+            command_order: std::sync::atomic::AtomicU64::new(0),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
@@ -3760,8 +4118,10 @@ impl WorkflowContext {
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason,
+            cancellation_pending: PendingCancel::None,
             strict_replay: false,
             canary_mode: false,
+            update_dispatch: None,
             workflow_name: String::new(),
             queue_name: String::new(),
             workflow_id: String::new(),
@@ -3783,8 +4143,12 @@ impl WorkflowContext {
             scheduled_time: None,
             #[cfg(any(test, feature = "testing"))]
             timer_clock_elapsed_secs: None,
+            #[cfg(any(test, feature = "testing"))]
+            side_effect_rng: None,
+            drive_clock_ms: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             parent_execution_id: None,
+            start_provenance: StartProvenance::default(),
         })
     }
 
@@ -3800,6 +4164,7 @@ impl WorkflowContext {
             matcher: Mutex::new(HistoryMatcher::new(vec![])),
             commands: Mutex::new(Vec::new()),
             parks: ParkCounter::default(),
+            promise_keys: Mutex::default(),
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
             execution_timeout: None,
@@ -3812,14 +4177,26 @@ impl WorkflowContext {
             child_placement_seq: Mutex::new(0),
             shard_router: None,
             race_seq: Mutex::new(0),
+            scope_seq: Mutex::new(0),
+            shield_seq: Mutex::new(0),
+            scope_stack: Mutex::new(Vec::new()),
+            live_scopes: Mutex::new(Vec::new()),
+            open_races: std::sync::atomic::AtomicUsize::new(0),
+            speculative: std::sync::atomic::AtomicBool::new(false),
+            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
             session_seq: Mutex::new(0),
             business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_ordinal: std::sync::atomic::AtomicU64::new(0),
+            durable_progress_queued: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
             log_commands_queued: std::sync::atomic::AtomicU64::new(0),
             log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
+            timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
+            timer_undo: Mutex::new(Vec::new()),
+            command_order: std::sync::atomic::AtomicU64::new(0),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
@@ -3831,8 +4208,10 @@ impl WorkflowContext {
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason: None,
+            cancellation_pending: PendingCancel::None,
             strict_replay: false,
             canary_mode: false,
+            update_dispatch: None,
             workflow_name: String::new(),
             queue_name: String::new(),
             workflow_id: String::new(),
@@ -3854,8 +4233,12 @@ impl WorkflowContext {
             scheduled_time: None,
             #[cfg(any(test, feature = "testing"))]
             timer_clock_elapsed_secs: None,
+            #[cfg(any(test, feature = "testing"))]
+            side_effect_rng: None,
+            drive_clock_ms: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             parent_execution_id: None,
+            start_provenance: StartProvenance::default(),
         }
     }
 
@@ -3869,8 +4252,76 @@ impl WorkflowContext {
     #[must_use]
     #[allow(clippy::missing_const_for_fn)]
     pub fn with_advancing_timer_clock(mut self) -> Self {
-        self.timer_clock_elapsed_secs = Some(std::sync::atomic::AtomicU64::new(0));
+        self.timer_clock_elapsed_secs = Some(Arc::new(std::sync::atomic::AtomicU64::new(0)));
         self
+    }
+
+    /// Draw live built-in side effects from a generator seeded with `seed`
+    /// (issue #2033, test harness only).
+    ///
+    /// `new_uuid`, the `random_*` helpers and the `system_*` clock reads then
+    /// give the same value on each run of a simulation seed. A clock read
+    /// returns `now`, the virtual time of the cycle. Production leaves it unset.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub(crate) fn with_seeded_side_effects(mut self, seed: u64, now: DateTime<Utc>) -> Self {
+        let rng = Mutex::new(crate::dst::SplitMix64::new(seed));
+        self.side_effect_rng = Some(Arc::new((rng, now.timestamp_millis())));
+        self
+    }
+
+    /// The next seeded draw and the virtual time of a simulation run.
+    ///
+    /// It returns `None` outside a run, so each caller keeps its live source.
+    #[cfg_attr(
+        not(any(test, feature = "testing")),
+        allow(clippy::unused_self, clippy::missing_const_for_fn)
+    )]
+    fn seeded_draw(&self) -> Option<(u64, i64)> {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(seeded) = &self.side_effect_rng {
+            let mut rng = seeded
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            return Some((rng.next_u64(), seeded.1));
+        }
+        None
+    }
+
+    /// The live value of a clock read: the virtual time in a simulation run.
+    fn live_now_millis(&self) -> i64 {
+        self.seeded_draw().map_or_else(
+            || {
+                self.drive_clock_ms
+                    .unwrap_or_else(|| Utc::now().timestamp_millis())
+            },
+            |(_, now)| now,
+        )
+    }
+
+    /// Fix the clock of this decision cycle (issue #2276).
+    ///
+    /// A live `system_now` then returns `now`, as the timers of the cycle do.
+    /// A recorded read still replays its recorded value. `None` reads the
+    /// wall clock. The SQLite runtime sets it on each cycle.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_drive_clock(mut self, now: Option<DateTime<Utc>>) -> Self {
+        self.drive_clock_ms = now.map(|now| now.timestamp_millis());
+        self
+    }
+
+    /// The live value of `new_uuid`. In a simulation run it is a seeded v7
+    /// UUID at the virtual time, so its time order still holds.
+    fn live_uuid(&self) -> uuid::Uuid {
+        self.seeded_draw()
+            .map_or_else(uuid::Uuid::now_v7, |(bits, now)| {
+                let mut random = [0_u8; 10];
+                random[..8].copy_from_slice(&bits.to_be_bytes());
+                let millis = u64::try_from(now).unwrap_or_default();
+                uuid::Builder::from_unix_timestamp_millis(millis, &random).into_uuid()
+            })
     }
 
     /// Advance the virtual timer clock by `duration_secs` (no-op in production).
@@ -3980,6 +4431,37 @@ impl WorkflowContext {
         matches!(self.payload_offload_threshold, Some(t) if observed > t)
     }
 
+    /// The history policy this run runs under.
+    pub(crate) const fn history_policy(&self) -> WorkflowHistoryPolicy {
+        self.history_policy
+    }
+
+    /// Serialized bytes of the history loaded for this task.
+    ///
+    /// It reads only the loaded events, so the result is the same on each
+    /// call within one task (issue #1975).
+    pub(crate) fn loaded_history_bytes(&self) -> u64 {
+        self.match_history(|matcher| matcher.loaded_bytes())
+    }
+
+    /// The largest same-type continue-as-new input this run can write.
+    ///
+    /// Returns `None` when every size is accepted. That is true when the cap
+    /// is `0`. It is also true when the offload threshold is at or below the
+    /// cap, because each input above the cap is then offloaded. A higher
+    /// threshold leaves a size band that is rejected, so the cap applies.
+    /// The entity loop uses it to size a checkpoint (issue #1975).
+    pub(crate) const fn continue_as_new_input_budget(&self) -> Option<u64> {
+        let cap = self.payload_max_workflow_input;
+        if cap == 0 {
+            return None;
+        }
+        match self.payload_offload_threshold {
+            Some(threshold) if threshold <= cap => None,
+            _ => Some(cap),
+        }
+    }
+
     /// Add or replace a per-activity input cap override.
     ///
     /// The effective cap is `max(global, override)` — overrides can only raise,
@@ -4055,6 +4537,20 @@ impl WorkflowContext {
         self
     }
 
+    /// Set how this run started and which run it continued from (issue #2082).
+    ///
+    /// Threaded by the executor from
+    /// [`WorkflowExecuteSpanMeta::start_provenance`](crate::executor::WorkflowExecuteSpanMeta),
+    /// which the worker reads from the execution row. The default is an unknown
+    /// source with no predecessor. Surfaced through [`info()`](Self::info),
+    /// [`start_source()`](Self::start_source) and
+    /// [`continued_from()`](Self::continued_from).
+    #[must_use]
+    pub const fn with_start_provenance(mut self, provenance: StartProvenance) -> Self {
+        self.start_provenance = provenance;
+        self
+    }
+
     /// Set the effective execution-timeout budget for deadline-aware
     /// continue-as-new (issue #772).
     ///
@@ -4092,6 +4588,62 @@ impl WorkflowContext {
     pub const fn with_deadline(mut self, deadline_at: Option<DateTime<Utc>>) -> Self {
         self.deadline_at = deadline_at;
         self
+    }
+
+    /// Set a cancel request that the history does not hold yet (issue #2021).
+    ///
+    /// A `WorkflowCancelled` event in the history wins, so this call cannot
+    /// replace a recorded reason. `None` changes nothing. A backend that
+    /// rebuilds a context outside the executor, such as for an update, calls
+    /// it directly.
+    ///
+    /// Issue #1984: a history with an open non-cancellable block hides the
+    /// request for the whole replay. A check before the block then reads as it
+    /// did when the block opened. The request shows once no block is open.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher mutex is poisoned.
+    #[must_use]
+    pub fn with_pending_cancellation(mut self, reason: Option<String>) -> Self {
+        if self.cancellation_reason.is_none() {
+            self.cancellation_pending = if reason.is_none() {
+                PendingCancel::None
+            } else if self
+                .matcher
+                .lock()
+                .expect("matcher lock poisoned")
+                .open_non_cancellable_blocks()
+                > 0
+            {
+                PendingCancel::BehindOpenBlock
+            } else {
+                PendingCancel::Pending
+            };
+            self.cancellation_reason = reason;
+        }
+        self
+    }
+
+    /// Let the executor run admitted updates at the end of each cycle
+    /// (issue #2035).
+    ///
+    /// The worker calls this for a live decision. A replay gate does not.
+    /// `dispatch` holds the end of the workflow-task budget. The dispatch
+    /// stops early, so the cycle persists before the budget ends.
+    #[must_use]
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the worker dispatches updates.
+    pub(crate) const fn with_update_dispatch(
+        mut self,
+        dispatch: crate::update::UpdateDispatch,
+    ) -> Self {
+        self.update_dispatch = Some(dispatch);
+        self
+    }
+
+    /// How the executor dispatches admitted updates, or `None` when it does not.
+    pub(crate) const fn update_dispatch(&self) -> Option<crate::update::UpdateDispatch> {
+        self.update_dispatch
     }
 
     /// Set the shard the parent row lives on right now (issue #1405).
@@ -4326,6 +4878,18 @@ impl WorkflowContext {
         self.parent_execution_id
     }
 
+    /// How this run started (issue #2082).
+    #[must_use]
+    pub const fn start_source(&self) -> StartSource {
+        self.start_provenance.source
+    }
+
+    /// The run that continued as new into this one, or `None` (issue #2082).
+    #[must_use]
+    pub const fn continued_from(&self) -> Option<ExecutionId> {
+        self.start_provenance.continued_from
+    }
+
     /// A read-only, replay-safe snapshot of this run's system metadata
     /// (issue #698).
     ///
@@ -4394,6 +4958,8 @@ impl WorkflowContext {
             history_event_count,
             is_replaying,
             parent_execution_id: self.parent_execution_id(),
+            start_source: self.start_source(),
+            continued_from: self.continued_from(),
         }
     }
 
@@ -4551,14 +5117,18 @@ impl WorkflowContext {
     /// The current cursor position in the history events during replay.
     #[must_use]
     pub fn replay_position(&self) -> usize {
+        self.note_position_read();
         self.match_history(|m| m.position())
     }
 
     /// Number of events currently loaded in this workflow execution history.
     ///
-    /// This is replay-safe: it is computed from the in-memory history snapshot
-    /// loaded before the current workflow task, not from a side-effecting
-    /// counter maintained by author code.
+    /// The count is the size of the history loaded for this task. It is not the
+    /// position the code has reached, and it grows from task to task. A replay
+    /// can read a larger value than the live run read at the same code
+    /// position. Do not branch workflow commands on it. Use
+    /// [`should_continue_as_new`](Self::should_continue_as_new), which records
+    /// its answer (issue #2080).
     ///
     /// **Note:** this routes through [`match_history`](Self::match_history), so
     /// its `pump_signal_handlers` post-hook runs — a call here can dispatch a
@@ -4576,7 +5146,8 @@ impl WorkflowContext {
     /// Two independent triggers, either of which is sufficient:
     ///
     /// 1. **History size** — [`Self::history_event_count`] exceeds the configured
-    ///    soft continue-as-new threshold (the pre-issue-#772 behaviour).
+    ///    soft continue-as-new threshold. The engine reads the count only at the
+    ///    live frontier. It records the answer (issue #2080).
     /// 2. **Deadline fraction** (issue #772) — the run has consumed at least
     ///    [`WorkflowHistoryPolicy::continue_as_new_deadline_fraction`] of its
     ///    `execution_timeout` budget. This lets a **long-lived, low-event**
@@ -4596,12 +5167,20 @@ impl WorkflowContext {
     ///
     /// ## Replay determinism
     ///
+    /// The loaded event count grows from task to task. The history-size
+    /// trigger therefore never reads it on replay. Each live call records its
+    /// answer as a side effect, and a replay reads it back at the same
+    /// position. A loop that calls this method once per iteration replays
+    /// clean under any threshold.
+    ///
+    /// A history from before issue #2080 has no record. A checkpoint event at
+    /// the cursor reads as `true`. Any other event reads as `false`.
+    ///
     /// The deadline check consults the replay-safe recorded clock via a
     /// **tolerant** read ([`deadline_clock_read`](Self::deadline_clock_read)),
     /// so its answer is deterministic across replays and workers. A workflow
-    /// with **no** `execution_timeout` records zero side-effects here and
-    /// behaves exactly as before (AC4). The two triggers are combined without
-    /// short-circuiting the deadline check, so a timeout-bearing workflow reads
+    /// with **no** `execution_timeout` records no deadline side-effect (AC4).
+    /// The two triggers are combined without short-circuiting the deadline check, so a timeout-bearing workflow reads
     /// the deadline clock regardless of the event-count branch — keeping the
     /// recorded side-effect stream a pure function of the recorded history at
     /// the cursor, not of the (task-varying) event count.
@@ -4615,11 +5194,142 @@ impl WorkflowContext {
     /// its frontier.
     #[must_use]
     pub fn should_continue_as_new(&self) -> bool {
-        let by_events =
-            self.history_event_count() > self.history_policy.continue_as_new_threshold();
+        let by_events = self.history_size_trigger();
         // Evaluate the deadline branch unconditionally (bound before the `||`)
         // so the tolerant clock read it performs is not gated by the
         // event-count trigger.
+        let by_deadline = self.deadline_fraction_reached();
+        by_events || by_deadline
+    }
+
+    /// The history-size trigger of [`should_continue_as_new`](Self::should_continue_as_new)
+    /// (issue #2080).
+    ///
+    /// The loaded event count grows from task to task, so a replay cannot
+    /// rederive a live answer from it. At the live frontier this reads the
+    /// count and records the answer as a side effect. A replay reads that
+    /// record at the same position.
+    fn history_size_trigger(&self) -> bool {
+        match self.match_history(HistoryMatcher::match_continue_as_new_decision) {
+            crate::replay::ContinueAsNewMatch::True => true,
+            crate::replay::ContinueAsNewMatch::False => false,
+            crate::replay::ContinueAsNewMatch::Frontier => {
+                // Issue #1984: a cancelled scope captured the answer of its
+                // cancelling cycle. The replay of the scope body reads it, as
+                // the other recorded decisions do.
+                let due = self
+                    .captured_or_drift(self.captured_scope_record(
+                        crate::event::SideEffectKind::Custom,
+                        Some(crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME),
+                    ))
+                    .and_then(|value| {
+                        let due = value.as_bool();
+                        if due.is_none() {
+                            self.record_deferred_nd(
+                                "side-effect drift mismatch: the continue-as-new decision that \
+                                 a scope cancel recorded is not a boolean"
+                                    .to_string(),
+                            );
+                        }
+                        due
+                    })
+                    .unwrap_or_else(|| self.history_size_exceeded());
+                self.push_command(WorkflowCommand::RecordSideEffect {
+                    kind: crate::event::SideEffectKind::Custom,
+                    name: Some(crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME.to_string()),
+                    value: serde_json::Value::Bool(due),
+                });
+                due
+            }
+        }
+    }
+
+    /// Record or replay one keyed-entity state snapshot (issue #2259).
+    ///
+    /// `value` is the live snapshot. A replay returns the recorded one. A
+    /// history from before issue #2259 has no snapshot at this position, so
+    /// the call records nothing.
+    ///
+    /// A live value past the depth cap or the side-effect cap is not stored.
+    /// The call records `omitted(reason)` in its place, so the history stays
+    /// loadable. A cancelled scope replays the value it captured.
+    ///
+    /// # Errors
+    ///
+    /// A non-determinism error when a cancelled scope captured another record
+    /// here.
+    pub(crate) fn record_entity_snapshot(
+        &self,
+        name: &str,
+        value: Value,
+        omitted: impl FnOnce(&'static str) -> Value,
+    ) -> HarvestResult<EntitySnapshot> {
+        match self.match_history(|m| m.match_entity_snapshot(name)) {
+            crate::replay::EntitySnapshotMatch::Matched { value } => {
+                Ok(EntitySnapshot::Recorded(value))
+            }
+            crate::replay::EntitySnapshotMatch::NotRecorded => Ok(EntitySnapshot::Absent),
+            crate::replay::EntitySnapshotMatch::Diverged { actual } => {
+                self.record_deferred_nd(format!(
+                    "side-effect drift mismatch: expected SideEffectRecorded(entity_state:{name}), \
+                     got SideEffectRecorded(entity_state:{actual})"
+                ));
+                Ok(EntitySnapshot::Absent)
+            }
+            crate::replay::EntitySnapshotMatch::Frontier => {
+                let kind = crate::event::SideEffectKind::EntityState;
+                let (stored, snapshot) = match self.captured_scope_record(kind, Some(name)) {
+                    crate::cancellation_scope::Captured::NotReplaying => {
+                        let size =
+                            serde_json::to_string(&value).map_or(u64::MAX, |s| s.len() as u64);
+                        let stored = if crate::payload_depth::nests_past_cap(&value) {
+                            omitted("too_deep")
+                        } else if size > self.payload_max_side_effect {
+                            omitted("too_large")
+                        } else {
+                            value
+                        };
+                        (stored.clone(), EntitySnapshot::Live(stored))
+                    }
+                    // A captured value replays as recorded, as a recorded one does.
+                    crate::cancellation_scope::Captured::Value(value) => {
+                        (value.clone(), EntitySnapshot::Recorded(value))
+                    }
+                    crate::cancellation_scope::Captured::Drift(drift) => {
+                        return Err(self.scope_nd_error(
+                            format!("non-deterministic replay: {drift}"),
+                            format!("SideEffectRecorded(entity_state:{name})"),
+                        ));
+                    }
+                };
+                self.push_command(WorkflowCommand::RecordSideEffect {
+                    kind,
+                    name: Some(name.to_string()),
+                    value: stored,
+                });
+                Ok(snapshot)
+            }
+        }
+    }
+
+    /// Record a non-determinism error that the executor reports after the
+    /// cycle. The entity loop calls it when a recorded snapshot does not
+    /// decode.
+    pub(crate) fn record_entity_drift(&self, msg: String) {
+        self.record_deferred_nd(msg);
+    }
+
+    fn history_size_exceeded(&self) -> bool {
+        self.history_event_count() > self.history_policy.continue_as_new_threshold()
+    }
+
+    /// Like [`should_continue_as_new`](Self::should_continue_as_new), but it
+    /// records no history-size decision. A replay can read a different answer.
+    /// Use it only when the caller records its own decision, as the entity
+    /// loop does. The deadline clock read still happens, so a replay consumes
+    /// the same events.
+    pub(crate) fn continue_as_new_hint(&self) -> bool {
+        let by_events = self.history_size_exceeded();
         let by_deadline = self.deadline_fraction_reached();
         by_events || by_deadline
     }
@@ -4747,7 +5457,23 @@ impl WorkflowContext {
                 // `Utc::now()` exactly as before — `system_now`'s #384
                 // host-wall-clock contract is untouched (this internal probe is
                 // the only reader that consults the virtual clock).
-                let millis = self.deadline_frontier_now_millis();
+                let millis = self
+                    .captured_or_drift(self.captured_scope_record(
+                        crate::event::SideEffectKind::Now,
+                        Some(crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME),
+                    ))
+                    .and_then(|value| {
+                        let millis = value.as_i64();
+                        if millis.is_none() {
+                            self.record_deferred_nd(
+                                "side-effect drift mismatch: the deadline clock that a scope \
+                                 cancel recorded is not a millisecond count"
+                                    .to_string(),
+                            );
+                        }
+                        millis
+                    })
+                    .unwrap_or_else(|| self.deadline_frontier_now_millis());
                 // Record the fresh clock read like `system_now` does at its
                 // `NoMatch` (frontier) branch — append the value + push the
                 // `RecordSideEffect` bookkeeping command — but under the reserved
@@ -4819,8 +5545,55 @@ impl WorkflowContext {
     /// ones that lock the matcher directly rather than calling
     /// [`Self::is_replaying`] — so the two spellings can never drift.
     pub(crate) fn replay_suppresses_side_effects(&self) -> bool {
+        // A speculative cycle may be dropped, so it fires no side effect.
+        if self.note_position_read() {
+            return true;
+        }
+        // Issue #1984: the side effects of a replayed cancel already fired.
+        if self.replays_a_scope_cancel() {
+            return true;
+        }
         let matcher = self.matcher.lock().expect("matcher lock poisoned");
         matcher.is_replaying() || matcher.has_terminal_failure_tail()
+    }
+
+    /// Whether a scope body re-runs the cycle of a recorded cancel (issue
+    /// #1984). The matcher stops at the cancel horizon, so the body sees a
+    /// live frontier, but the live cycle already fired its side effects.
+    pub(crate) fn replays_a_scope_cancel(&self) -> bool {
+        let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
+        crate::cancellation_scope::replays_a_cancel(&stack)
+    }
+
+    /// Replay gate of [`publish_durable_progress`](Self::publish_durable_progress)
+    /// (issue #1974).
+    ///
+    /// The raw cursor check of [`Self::replay_suppresses_side_effects`] counts
+    /// a signal or an update that waits at the cursor as history to replay.
+    /// Code before the matching `wait_for_signal` then looks replayed, also
+    /// on its first run, and its chunks are never stored. A best-effort side
+    /// effect can accept that loss. A durable chunk cannot.
+    ///
+    /// So this gate asks whether `prepare_match` would still report replay.
+    /// It skips the same signal and update events, but it only reads the
+    /// matcher. It moves no cursor and fills no stash. Thus later code sees
+    /// the same `ctx.is_replaying()` value with or without a durable call.
+    ///
+    /// A speculative resident cycle (issue #2008) can see another replay
+    /// position than a cold replay. The gate then counts as a position read
+    /// and stores nothing. The resume declines, and a cold replay stores the
+    /// chunk at the same offset.
+    pub(crate) fn durable_replay_suppresses(&self) -> bool {
+        if self.note_position_read() {
+            return true;
+        }
+        // Issue #1984: a replayed cancel withdraws the chunk again, so the
+        // chunk is not serialized. The offset is claimed before this check.
+        if self.replays_a_scope_cancel() {
+            return true;
+        }
+        let matcher = self.matcher.lock().expect("matcher lock poisoned");
+        matcher.would_replay_after_prepare() || matcher.has_terminal_failure_tail()
     }
 
     /// Cursor-only "is there recorded history left to consume?" — the
@@ -4830,6 +5603,7 @@ impl WorkflowContext {
     /// Used only where the question really is "did the matcher run off the end
     /// of recorded history?", never as a replay-suppression guard.
     fn at_history_frontier(&self) -> bool {
+        self.note_position_read();
         !self
             .matcher
             .lock()
@@ -4928,8 +5702,9 @@ impl WorkflowContext {
 
     // ── Cancellation ──────────────────────────────────────────────────
 
-    /// Returns `true` if a `WorkflowCancelled` event is present in the event
-    /// history backing this context.
+    /// Returns `true` if a `WorkflowCancelled` event is in the history.
+    /// It also returns `true` when the backend passes a pending cancel request
+    /// (issue #2021).
     ///
     /// Workflows performing long-running loops or multi-step orchestration
     /// should check this periodically and bail out with cleanup when it
@@ -4937,9 +5712,30 @@ impl WorkflowContext {
     /// [`HarvestError::Cancelled`] when their result channels are dropped as
     /// part of the cancellation flow; this accessor is the analogous hook
     /// for code paths that never suspend.
+    ///
+    /// A pending request is hidden inside a non-cancellable block (issue
+    /// #1984), so the block's cleanup does not stop on it.
     #[must_use]
-    pub const fn is_cancelled(&self) -> bool {
-        self.cancellation_reason.is_some()
+    pub fn is_cancelled(&self) -> bool {
+        self.visible_cancellation_reason().is_some()
+    }
+
+    /// The cancellation reason that the workflow body sees (issue #1984).
+    fn visible_cancellation_reason(&self) -> Option<&str> {
+        if self.cancellation_pending == PendingCancel::BehindOpenBlock {
+            return None;
+        }
+        if self.cancellation_pending == PendingCancel::Pending
+            && self
+                .scope_stack
+                .lock()
+                .expect("scope stack lock poisoned")
+                .iter()
+                .any(|frame| matches!(frame, crate::cancellation_scope::ScopeFrame::Shield))
+        {
+            return None;
+        }
+        self.cancellation_reason.as_deref()
     }
 
     /// Recorded cancellation reason when [`is_cancelled`](Self::is_cancelled)
@@ -4949,7 +5745,7 @@ impl WorkflowContext {
     /// to read the original message or reason that initiated the abort.
     #[must_use]
     pub fn cancellation_reason(&self) -> Option<&str> {
-        self.cancellation_reason.as_deref()
+        self.visible_cancellation_reason()
     }
 
     /// Fail fast with [`HarvestError::Cancelled`] when the workflow has been
@@ -4979,10 +5775,10 @@ impl WorkflowContext {
     ///
     /// # Errors
     ///
-    /// Returns [`HarvestError::Cancelled`] if a `WorkflowCancelled` event is
-    /// present in the event history.
+    /// Returns [`HarvestError::Cancelled`] when
+    /// [`is_cancelled`](Self::is_cancelled) is true.
     pub fn check_cancellation(&self) -> HarvestResult<()> {
-        if let Some(reason) = self.cancellation_reason.as_deref() {
+        if let Some(reason) = self.visible_cancellation_reason() {
             return Err(HarvestError::Cancelled(reason.to_string()));
         }
         Ok(())
@@ -5137,23 +5933,46 @@ impl WorkflowContext {
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match(&format!("SideEffectRecorded({id})"))?;
 
-                let result = f();
-                let output = serde_json::to_value(&result)?;
+                // An invalid captured value fails as a recorded one does. Drift
+                // fails before `f` runs.
+                let (result, output) = match self
+                    .captured_scope_record(crate::event::SideEffectKind::Custom, Some(id))
+                {
+                    crate::cancellation_scope::Captured::NotReplaying => {
+                        let result = f();
+                        let output = serde_json::to_value(&result)?;
+                        self.check_payload_depth(PayloadKind::SideEffectValue, None, &output)?;
 
-                // Enforce side-effect payload cap before recording.
-                // SideEffectRecorded events are written via pre_suspension_events_from_commands
-                // using plain store::append_events (no offloader), so the offload bypass must
-                // NOT apply here even when a PayloadStore is configured.
-                let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
-                if observed > self.payload_max_side_effect {
-                    return Err(HarvestError::PayloadTooLarge {
-                        kind: PayloadKind::SideEffectValue,
-                        observed_bytes: observed,
-                        cap_bytes: self.payload_max_side_effect,
-                        workflow_type: self.workflow_name.clone(),
-                        activity_name: None,
-                    });
-                }
+                        // Enforce side-effect payload cap before recording.
+                        // SideEffectRecorded events are written via pre_suspension_events_from_commands
+                        // using plain store::append_events (no offloader), so the offload bypass must
+                        // NOT apply here even when a PayloadStore is configured.
+                        let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
+                        if observed > self.payload_max_side_effect {
+                            return Err(HarvestError::PayloadTooLarge {
+                                kind: PayloadKind::SideEffectValue,
+                                observed_bytes: observed,
+                                cap_bytes: self.payload_max_side_effect,
+                                workflow_type: self.workflow_name.clone(),
+                                activity_name: None,
+                            });
+                        }
+                        (result, output)
+                    }
+                    // A captured value replays as recorded, as a recorded one does.
+                    // The live cap does not apply to it again.
+                    crate::cancellation_scope::Captured::Value(value) => {
+                        let result = serde_json::from_value::<T>(value.clone())
+                            .map_err(HarvestError::Serialization)?;
+                        (result, value)
+                    }
+                    crate::cancellation_scope::Captured::Drift(drift) => {
+                        return Err(self.scope_nd_error(
+                            format!("non-deterministic replay: {drift}"),
+                            format!("SideEffectRecorded({id})"),
+                        ));
+                    }
+                };
 
                 self.push_command(WorkflowCommand::RecordSideEffect {
                     kind: crate::event::SideEffectKind::Custom,
@@ -5293,7 +6112,21 @@ impl WorkflowContext {
                         kind.as_str()
                     ));
                 }
-                let result = f();
+                // An invalid captured value is drift, as a recorded one is.
+                let result = self
+                    .captured_or_drift(self.captured_scope_record(kind, None))
+                    .and_then(|value| match serde_json::from_value::<T>(value) {
+                        Ok(value) if is_valid(&value) => Some(value),
+                        _ => {
+                            self.record_deferred_nd(format!(
+                                "side-effect drift mismatch: the {} value that a scope cancel \
+                                 recorded is not valid now",
+                                kind.as_str()
+                            ));
+                            None
+                        }
+                    })
+                    .unwrap_or_else(f);
                 // Built-in values (timestamps, UUIDs, u64/f64) always serialise.
                 let value = serde_json::to_value(&result)
                     .expect("built-in side-effect value must serialise");
@@ -5326,9 +6159,8 @@ impl WorkflowContext {
     /// Panics if the internal matcher or commands mutex is poisoned.
     #[must_use]
     pub fn system_now(&self) -> DateTime<Utc> {
-        let millis = self.capture_builtin(crate::event::SideEffectKind::Now, || {
-            Utc::now().timestamp_millis()
-        });
+        let millis =
+            self.capture_builtin(crate::event::SideEffectKind::Now, || self.live_now_millis());
         DateTime::from_timestamp_millis(millis).unwrap_or(self.start_time)
     }
 
@@ -5343,9 +6175,8 @@ impl WorkflowContext {
     /// Panics if the internal matcher or commands mutex is poisoned.
     #[must_use]
     pub fn system_time_now(&self) -> std::time::SystemTime {
-        let millis = self.capture_builtin(crate::event::SideEffectKind::Now, || {
-            Utc::now().timestamp_millis()
-        });
+        let millis =
+            self.capture_builtin(crate::event::SideEffectKind::Now, || self.live_now_millis());
         let millis_u64 = u64::try_from(millis.max(0)).unwrap_or(0);
         std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis_u64)
     }
@@ -5363,7 +6194,7 @@ impl WorkflowContext {
     /// Panics if the internal matcher or commands mutex is poisoned.
     #[must_use]
     pub fn new_uuid(&self) -> uuid::Uuid {
-        self.capture_builtin(crate::event::SideEffectKind::Uuid, uuid::Uuid::now_v7)
+        self.capture_builtin(crate::event::SideEffectKind::Uuid, || self.live_uuid())
     }
 
     /// Deterministic random `u64`, captured once and replayed verbatim.
@@ -5378,7 +6209,8 @@ impl WorkflowContext {
     #[must_use]
     pub fn random_u64(&self) -> u64 {
         self.capture_builtin(crate::event::SideEffectKind::Random, || {
-            rand::random::<u64>()
+            self.seeded_draw()
+                .map_or_else(rand::random::<u64>, |(bits, _)| bits)
         })
     }
 
@@ -5398,7 +6230,14 @@ impl WorkflowContext {
         self.capture_builtin_validated(
             crate::event::SideEffectKind::Random,
             |v: &f64| (0.0..1.0).contains(v),
-            rand::random::<f64>,
+            || {
+                // The top 53 bits give a uniform value in [0, 1).
+                #[allow(clippy::cast_precision_loss)]
+                self.seeded_draw()
+                    .map_or_else(rand::random::<f64>, |(bits, _)| {
+                        (bits >> 11) as f64 / (1_u64 << 53) as f64
+                    })
+            },
         )
     }
 
@@ -5473,7 +6312,30 @@ impl WorkflowContext {
                             .to_string(),
                     );
                 }
-                let result = rand::Rng::gen_range(&mut rand::thread_rng(), range);
+                // A simulation run draws its seed first, as the live cycle did,
+                // so a captured value leaves later seeded draws in step.
+                let seeded = self.seeded_draw();
+                // An invalid captured value is drift, as a recorded one is.
+                let captured = self
+                    .captured_or_drift(self.captured_scope_record(SideEffectKind::Random, None))
+                    .and_then(|value| match serde_json::from_value::<T>(value) {
+                        Ok(value) if range.contains(&value) => Some(value),
+                        _ => {
+                            self.record_deferred_nd(
+                                "side-effect drift mismatch: the random value that a scope \
+                                 cancel recorded is not in the current range"
+                                    .to_string(),
+                            );
+                            None
+                        }
+                    });
+                let result = captured.unwrap_or_else(|| match seeded {
+                    Some((seed, _)) => rand::Rng::gen_range(
+                        &mut <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed),
+                        range,
+                    ),
+                    None => rand::Rng::gen_range(&mut rand::thread_rng(), range),
+                });
                 let value = serde_json::to_value(&result)
                     .expect("built-in side-effect value must serialise");
                 self.push_command(WorkflowCommand::RecordSideEffect {
@@ -5538,7 +6400,37 @@ impl WorkflowContext {
             min <= max,
             "version gate '{change_id}': min version {min} must not exceed max version {max}"
         );
-        let version = self.match_history(|m| m.match_version(change_id, min, max));
+        let (live, version) = self.match_history(|m| {
+            let live = m.version_gate_is_live();
+            (live, m.match_version(change_id, min, max))
+        });
+
+        // Issue #1984: a scope cancel withdrew the gate's marker. Replay keeps
+        // the version that the live cycle chose, even after a deploy moves the
+        // range. `match_version` returns a recorded marker the same way.
+        // A gate that matched its marker in history takes no captured record.
+        if live
+            && let Some(captured) = self
+                .captured_or_drift(
+                    self.captured_scope_marker(&crate::replay::version_marker_name(change_id)),
+                )
+                .and_then(|details| {
+                    let version = details.as_u64().and_then(|v| u32::try_from(v).ok());
+                    if version.is_none() {
+                        self.record_deferred_nd(format!(
+                            "version gate '{change_id}': the version that a scope cancel \
+                             recorded is not a version number"
+                        ));
+                    }
+                    version
+                })
+        {
+            self.push_command(WorkflowCommand::RecordMarker {
+                name: crate::replay::version_marker_name(change_id),
+                details: Value::from(u64::from(captured)),
+            });
+            return captured;
+        }
 
         // During live execution (matcher returned max_version and is past
         // history), emit a marker so future replays see this version.
@@ -5738,6 +6630,17 @@ impl WorkflowContext {
         self.match_history(|m| {
             m.deprecate_patch(patch_id);
         });
+        // Issue #1984: a scope that replays a cancel holds the gate markers of
+        // that cycle as captured records. The deprecation drops them there too.
+        crate::cancellation_scope::drop_captured_gate(
+            &self.live_scopes.lock().expect("live scopes lock poisoned"),
+            patch_id,
+        );
+    }
+
+    /// Whether this replay cycle deprecated the gate `patch_id` (issue #1984).
+    pub(crate) fn patch_is_deprecated(&self, patch_id: &str) -> bool {
+        self.match_history_unpumped(|m| m.patch_is_deprecated(patch_id))
     }
 
     // ── Saga compensation observability (issue #801) ──────────────────
@@ -5831,15 +6734,20 @@ impl WorkflowContext {
                 // terminal `WorkflowCancelled` the lookahead skips), NOT a
                 // live unwind — never count it retroactively, never push a
                 // fresh marker command mid-replay (Codex P2, PR #973 review).
-                if self.is_replay_probe() {
+                // A replayed scope cancel (issue #1984) holds the marker and
+                // checks it against its capture. The live cycle counted it.
+                let replayed_cancel = self.replays_a_scope_cancel();
+                if self.is_replay_probe() && !replayed_cancel {
                     false
                 } else {
                     self.push_command(WorkflowCommand::RecordMarker {
                         name,
                         details: Value::from(pending as u64),
                     });
-                    self.metrics
-                        .record_saga_compensated(&self.workflow_name, &self.queue_name);
+                    if !replayed_cancel {
+                        self.metrics
+                            .record_saga_compensated(&self.workflow_name, &self.queue_name);
+                    }
                     true
                 }
             }
@@ -5885,14 +6793,18 @@ impl WorkflowContext {
             // probe never records into a frontier, even for a counted unwind
             // (its `counted` came from a marker already in history).
             SagaMarkerMatch::LiveFrontier | SagaMarkerMatch::DrainedSignalFrontier
-                if observation.counted && !self.is_replay_probe() =>
+                if observation.counted
+                    && (!self.is_replay_probe() || self.replays_a_scope_cancel()) =>
             {
                 self.push_command(WorkflowCommand::RecordMarker {
                     name,
                     details: Value::from(error_count as u64),
                 });
-                self.metrics
-                    .record_saga_compensation_failed(&self.workflow_name, &self.queue_name);
+                // A replayed scope cancel counted the failure live (issue #1984).
+                if !self.replays_a_scope_cancel() {
+                    self.metrics
+                        .record_saga_compensation_failed(&self.workflow_name, &self.queue_name);
+                }
             }
             // Silent otherwise: Recorded (already counted on the cycle that
             // first recorded the marker), an uncounted unwind's frontier
@@ -5930,7 +6842,7 @@ impl WorkflowContext {
         input: Value,
         queue: &str,
     ) -> HarvestResult<Value> {
-        self.execute_activity_raw_full(name, input, queue, None, None, None, None, None)
+        self.execute_activity_raw_full(name, input, queue, None, None, None, None, None, false)
             .await
     }
 
@@ -5956,6 +6868,7 @@ impl WorkflowContext {
             None,
             None,
             None,
+            false,
         )
         .await
     }
@@ -5980,6 +6893,7 @@ impl WorkflowContext {
         session_id: Option<SessionId>,
         session_worker_id: Option<String>,
         schedule_to_start_override: Option<std::time::Duration>,
+        result_writer: bool,
     ) -> HarvestResult<Value> {
         let history_match = if self.strict_replay {
             self.match_history(|m| m.match_activity_strict(name, &input))
@@ -6048,6 +6962,7 @@ impl WorkflowContext {
                 )
             }
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ActivityInput, Some(name), &input)?;
                 self.check_strict_replay_no_match(&format!("ActivityScheduled({name})"))?;
 
                 // Enforce activity input payload cap before scheduling.
@@ -6059,9 +6974,12 @@ impl WorkflowContext {
                         .map_or(global, |ov| global.max(ov))
                 };
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
+                // Issue #1984: a scope that replays its cancel holds this
+                // dispatch. The cap applied when the cancelling cycle made it.
                 if effective_cap > 0
                     && observed > effective_cap
                     && !self.offload_will_apply(observed)
+                    && !self.replays_a_scope_cancel()
                 {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ActivityInput,
@@ -6084,6 +7002,7 @@ impl WorkflowContext {
                     session_id,
                     session_worker_id,
                     schedule_to_start_override,
+                    result_writer,
                     result_tx: tx,
                 });
                 match rx.await {
@@ -6366,6 +7285,7 @@ impl WorkflowContext {
             }
 
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ActivityInput, Some(name), &input)?;
                 self.check_strict_replay_no_match(&format!("LocalActivityScheduled({name})"))?;
 
                 // Enforce activity input payload cap for local activities too.
@@ -6380,7 +7300,9 @@ impl WorkflowContext {
                 // Local activities are written with plain store::append_events (no
                 // offloader), so the offload bypass must NOT apply here even when a
                 // PayloadStore is configured. Always enforce the cap.
-                if effective_cap > 0 && observed > effective_cap {
+                // Issue #1984: a scope that replays its cancel holds this
+                // dispatch. The cap applied when the cancelling cycle made it.
+                if effective_cap > 0 && observed > effective_cap && !self.replays_a_scope_cancel() {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ActivityInput,
                         observed_bytes: observed,
@@ -7029,10 +7951,23 @@ impl WorkflowContext {
     /// it is driven purely by the workflow's own `start_timer`/`cancel_timer`/
     /// `reset_timer` calls in program order.
     fn set_timer_logical_state(&self, timer_id: &str, state: TimerLogicalState) {
+        let armed = matches!(state, TimerLogicalState::Armed { .. });
         self.cancellable_timer_state
             .lock()
             .expect("cancellable_timer_state lock poisoned")
             .insert(timer_id.to_string(), state);
+        // Issue #1984: a scope cancel also cancels the timers that its body arms.
+        if armed {
+            let epoch = *self
+                .timer_arm_epochs
+                .lock()
+                .expect("timer_arm_epochs lock poisoned")
+                .entry(timer_id.to_string())
+                .and_modify(|epoch| *epoch += 1)
+                .or_insert(1);
+            let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
+            crate::cancellation_scope::note_armed_timer(&stack, timer_id, epoch);
+        }
     }
 
     /// Clear the logical lifecycle entry for `timer_id` (issue #768).
@@ -7049,6 +7984,159 @@ impl WorkflowContext {
             .lock()
             .expect("cancellable_timer_state lock poisoned")
             .remove(timer_id);
+    }
+
+    /// The value that a cancelled scope recorded here, on replay (issue #1984).
+    fn captured_scope_record(
+        &self,
+        kind: crate::event::SideEffectKind,
+        name: Option<&str>,
+    ) -> crate::cancellation_scope::Captured {
+        let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
+        crate::cancellation_scope::take_captured_side_effect(&stack, kind, name)
+    }
+
+    /// The marker details that a cancelled scope recorded here, on replay
+    /// (issue #1984).
+    fn captured_scope_marker(&self, name: &str) -> crate::cancellation_scope::Captured {
+        let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
+        crate::cancellation_scope::take_captured_marker(&stack, name)
+    }
+
+    /// The captured value, if any. Drift is deferred non-determinism, and the
+    /// primitive then runs as usual until the task fails.
+    fn captured_or_drift(&self, captured: crate::cancellation_scope::Captured) -> Option<Value> {
+        match captured {
+            crate::cancellation_scope::Captured::NotReplaying => None,
+            crate::cancellation_scope::Captured::Value(value) => Some(value),
+            crate::cancellation_scope::Captured::Drift(drift) => {
+                self.record_deferred_nd(format!("non-deterministic replay: {drift}"));
+                None
+            }
+        }
+    }
+
+    /// Record the state of `timer_id` before a scope body changes it.
+    fn journal_timer_undo(&self, scopes: Vec<u32>, timer_id: String) {
+        let state = self
+            .cancellable_timer_state
+            .lock()
+            .expect("cancellable_timer_state lock poisoned")
+            .get(&timer_id)
+            .copied();
+        let epoch = self
+            .timer_arm_epochs
+            .lock()
+            .expect("timer_arm_epochs lock poisoned")
+            .get(&timer_id)
+            .copied();
+        self.timer_undo
+            .lock()
+            .expect("timer_undo lock poisoned")
+            .push(TimerUndo {
+                scopes,
+                timer_id,
+                state,
+                epoch,
+            });
+    }
+
+    /// Restore the timer state that the withdrawn commands of scope `seq`
+    /// changed (issue #1984).
+    ///
+    /// A withdrawn `CancelTimer` or arm never reaches the worker, so its
+    /// durable row is unchanged. Replay holds the same commands, so it
+    /// restores the same entries. The newest entry is restored first.
+    pub(crate) fn undo_scope_timer_mutations(&self, seq: u32) {
+        let undone: Vec<TimerUndo> = {
+            let mut journal = self.timer_undo.lock().expect("timer_undo lock poisoned");
+            let (undone, kept) = std::mem::take(&mut *journal)
+                .into_iter()
+                .partition(|entry| entry.scopes.contains(&seq));
+            *journal = kept;
+            undone
+        };
+        for entry in undone.into_iter().rev() {
+            {
+                let mut states = self
+                    .cancellable_timer_state
+                    .lock()
+                    .expect("cancellable_timer_state lock poisoned");
+                match entry.state {
+                    Some(state) => states.insert(entry.timer_id.clone(), state),
+                    None => states.remove(&entry.timer_id),
+                };
+            }
+            let undone = {
+                let mut epochs = self
+                    .timer_arm_epochs
+                    .lock()
+                    .expect("timer_arm_epochs lock poisoned");
+                let undone = epochs.get(&entry.timer_id).copied();
+                match entry.epoch {
+                    Some(epoch) => epochs.insert(entry.timer_id.clone(), epoch),
+                    None => epochs.remove(&entry.timer_id),
+                };
+                undone
+            };
+            if let Some(undone) = undone.filter(|epoch| Some(*epoch) != entry.epoch) {
+                crate::cancellation_scope::rewind_armed_timer(
+                    &self.live_scopes.lock().expect("live scopes lock poisoned"),
+                    seq,
+                    &entry.timer_id,
+                    undone,
+                    entry.epoch,
+                );
+            }
+        }
+    }
+
+    /// Mark each armed cancellable timer in `timer_ids` as cancelled (issue #1984).
+    ///
+    /// A scope cancel deletes the durable rows of its member timers. A later
+    /// await or re-arm of the same id must not treat the timer as still armed.
+    /// Live and replay call this with the same recorded list.
+    pub(crate) fn mark_scope_timers_cancelled(&self, timer_ids: &[TimerId]) {
+        let mut state = self
+            .cancellable_timer_state
+            .lock()
+            .expect("cancellable_timer_state lock poisoned");
+        for timer_id in timer_ids {
+            if let Some(entry) = state.get_mut(timer_id.as_str())
+                && matches!(entry, TimerLogicalState::Armed { .. })
+            {
+                *entry = TimerLogicalState::Cancelled;
+            }
+        }
+    }
+
+    /// Mark each recorded arm cancelled while it is still the current arm (issue #1984).
+    ///
+    /// A later arm of the same id has a new epoch, so a scope cancel leaves it.
+    pub(crate) fn mark_scope_arms_cancelled(&self, arms: &[(TimerId, u64)]) {
+        let current = self.current_scope_arms(arms);
+        self.mark_scope_timers_cancelled(&current);
+    }
+
+    /// The current arm epoch of the handle timer `timer_id` (issue #1984).
+    pub(crate) fn timer_arm_epoch(&self, timer_id: &TimerId) -> Option<u64> {
+        self.timer_arm_epochs
+            .lock()
+            .expect("timer_arm_epochs lock poisoned")
+            .get(timer_id.as_str())
+            .copied()
+    }
+
+    /// The timers in `arms` whose recorded arm is still the current arm (issue #1984).
+    pub(crate) fn current_scope_arms(&self, arms: &[(TimerId, u64)]) -> Vec<TimerId> {
+        let epochs = self
+            .timer_arm_epochs
+            .lock()
+            .expect("timer_arm_epochs lock poisoned");
+        arms.iter()
+            .filter(|(id, epoch)| epochs.get(id.as_str()) == Some(epoch))
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Whether the workflow logically cancelled `timer_id` this task without a
@@ -7205,10 +8293,11 @@ impl WorkflowContext {
 
     /// Returns why this context cannot stay resident, or `None` (issue #1798).
     ///
-    /// A resident workflow resumes its parked future with one new result. A
+    /// A resident workflow resumes its parked future with new results. A
     /// warm decision must then equal a cold replay. Each state below can make
     /// a cold replay read the new events in a way that a parked future cannot:
     ///
+    /// - An open `ctx.race()` settles by a winner marker and cancels losers.
     /// - A held park token resolves only by a replay match.
     /// - A push signal handler runs inside history matching.
     /// - A held mutex depends on the suspension flag of each cycle.
@@ -7216,22 +8305,35 @@ impl WorkflowContext {
     ///   test-clock context changes how replay reads events.
     /// - Unread history means that the cursor is not at the live frontier.
     ///
+    /// The result is the miss reason of the `harvest.workflow.resident`
+    /// counter (issue #2007).
+    ///
     /// # Panics
     ///
     /// Panics if an internal mutex is poisoned.
-    pub(crate) fn resident_blocker(&self) -> Option<&'static str> {
-        if self.parks.is_held() {
-            return Some("a park token is held");
+    pub(crate) fn resident_blocker(&self) -> Option<crate::telemetry::ResidentOutcome> {
+        use crate::telemetry::ResidentOutcome;
+        if self.has_open_race() {
+            return Some(ResidentOutcome::Race);
         }
-        if self.strict_replay || self.canary_mode {
-            return Some("strict or canary replay");
+        if !self
+            .held_mutex_keys
+            .lock()
+            .expect("held_mutex_keys lock poisoned")
+            .is_empty()
+        {
+            return Some(ResidentOutcome::Mutex);
+        }
+        if self.parks.is_held()
+            || self.strict_replay
+            || self.canary_mode
+            || self.cancellation_reason.is_some()
+        {
+            return Some(ResidentOutcome::Blocked);
         }
         #[cfg(any(test, feature = "testing"))]
         if self.timer_clock_elapsed_secs.is_some() {
-            return Some("the advancing test clock is on");
-        }
-        if self.cancellation_reason.is_some() {
-            return Some("the run is cancelled");
+            return Some(ResidentOutcome::Blocked);
         }
         if !self
             .signal_registry
@@ -7240,15 +8342,7 @@ impl WorkflowContext {
             .list_names()
             .is_empty()
         {
-            return Some("a push signal handler is registered");
-        }
-        if !self
-            .held_mutex_keys
-            .lock()
-            .expect("held_mutex_keys lock poisoned")
-            .is_empty()
-        {
-            return Some("a durable mutex is held");
+            return Some(ResidentOutcome::Blocked);
         }
         if self
             .nd_details
@@ -7261,7 +8355,7 @@ impl WorkflowContext {
                 .expect("deferred_nd_error lock poisoned")
                 .is_some()
         {
-            return Some("a non-determinism record is set");
+            return Some(ResidentOutcome::Blocked);
         }
         if self
             .matcher
@@ -7269,7 +8363,7 @@ impl WorkflowContext {
             .expect("matcher lock poisoned")
             .has_buffered_history()
         {
-            return Some("history is not fully read");
+            return Some(ResidentOutcome::Blocked);
         }
         None
     }
@@ -7287,20 +8381,71 @@ impl WorkflowContext {
     /// replay. The call ordinals and sequence counters keep their values. A
     /// replay from the top counts up to the same values.
     ///
+    /// Last, it queues `waits`: the commands that park unresolved activities
+    /// of a join again (issue #2008). A cold replay emits the same commands.
+    /// A cycle with waits is speculative until [`Self::end_speculation`].
+    ///
     /// # Panics
     ///
     /// Panics if the matcher mutex is poisoned.
     #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
-    pub(crate) fn begin_resident_cycle(&self, delta: &[WorkflowEvent]) {
+    pub(crate) fn begin_resident_cycle(
+        &self,
+        delta: &[WorkflowEvent],
+        waits: Vec<WorkflowCommand>,
+    ) {
         self.set_suspending(false);
         self.log_commands_queued
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.progress_local_index
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.durable_progress_queued
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         self.matcher
             .lock()
             .expect("matcher lock poisoned")
             .append_consumed(delta);
+        crate::cancellation_scope::drop_resolved_members(
+            &mut self.live_scopes.lock().expect("live scopes lock poisoned"),
+            delta,
+        );
+        // The last cycle persisted its commands, so no undo entry applies now.
+        self.timer_undo
+            .lock()
+            .expect("timer_undo lock poisoned")
+            .clear();
+        self.speculative
+            .store(!waits.is_empty(), std::sync::atomic::Ordering::SeqCst);
+        self.speculation_read_position
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        for wait in waits {
+            self.push_command(wait);
+        }
+    }
+
+    /// Records a read of the replay position in a speculative cycle.
+    ///
+    /// A warm cycle with re-parked siblings consumed the whole delta, but a
+    /// cold replay can stop its cursor at a sibling command (issue #2008).
+    /// So such a read can differ, and the resume must decline. Returns
+    /// whether the cycle is speculative.
+    fn note_position_read(&self) -> bool {
+        let speculative = self.speculative.load(std::sync::atomic::Ordering::SeqCst);
+        if speculative {
+            self.speculation_read_position
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        speculative
+    }
+
+    /// Ends a speculative cycle (issue #2008). Returns whether it read the
+    /// replay position.
+    #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
+    pub(crate) fn end_speculation(&self) -> bool {
+        self.speculative
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.speculation_read_position
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether a non-blocking signal claim probed `signal_name` with a scan
@@ -7736,7 +8881,9 @@ impl WorkflowContext {
         placement: &crate::shard::ChildPlacement,
         workflow_name: &str,
     ) -> HarvestResult<()> {
-        if placement.is_parent_shard() {
+        // Issue #1984: a scope that replays its cancel holds this dispatch.
+        // The placement resolved when the cancelling cycle made it.
+        if placement.is_parent_shard() || self.replays_a_scope_cancel() {
             return Ok(());
         }
         // The key is irrelevant to every failure mode this is checking for; a
@@ -7788,7 +8935,9 @@ impl WorkflowContext {
         let parent_shard = self
             .current_shard_id
             .unwrap_or_else(|| self.exec_id.shard());
-        if placement.is_parent_shard() {
+        // Issue #1984: a scope that replays its cancel discards this id with
+        // the held command. The router can have changed since the cancel.
+        if placement.is_parent_shard() || self.replays_a_scope_cancel() {
             return Ok(ExecutionId::new_for_shard(parent_shard));
         }
         let key = crate::shard::child_placement_key(self.exec_id, seq);
@@ -7979,6 +9128,7 @@ impl WorkflowContext {
                 }
             }
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
                 self.check_strict_replay_no_match(&format!(
                     "ChildWorkflowStarted({workflow_name})"
                 ))?;
@@ -7986,8 +9136,12 @@ impl WorkflowContext {
                 // Enforce child-workflow input payload cap before scheduling.
                 // ChildWorkflowStarted is written to the parent's history via
                 // append_single_event (plain), so the offload bypass must NOT apply here.
+                // Issue #1984: a scope that replays its cancel holds this
+                // dispatch. The cap applied when the cancelling cycle made it.
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input
+                if self.payload_max_workflow_input > 0
+                    && observed > self.payload_max_workflow_input
+                    && !self.replays_a_scope_cancel()
                 {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ChildWorkflowInput,
@@ -8120,6 +9274,10 @@ impl WorkflowContext {
         parent_close_policy: crate::types::ParentClosePolicy,
         placement: &crate::shard::ChildPlacement,
     ) -> HarvestResult<ExecutionId> {
+        // Issue #1984: a scope cancel withdraws the spawn, but the body has
+        // the minted id. Replay mints another one, so code after the scope
+        // would see a different child.
+        self.reject_in_cancellable_scope("ctx.spawn_child_workflow_detached")?;
         // Advance on every invocation, before the matcher — see
         // `next_child_placement_seq`.
         let placement_seq = self.next_child_placement_seq();
@@ -8133,6 +9291,7 @@ impl WorkflowContext {
                 Ok(child_id)
             }
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
                 self.check_strict_replay_no_match(&format!(
                     "ChildWorkflowSpawnedDetached({workflow_name})"
                 ))?;
@@ -8228,6 +9387,9 @@ impl WorkflowContext {
     where
         I: serde::Serialize,
     {
+        // Issue #1984: reject before the input serializes. A scope cancel
+        // replays this call, and a rejected spawn must not run a serializer.
+        self.reject_in_cancellable_scope("ctx.spawn_child_workflow_detached")?;
         let json_input = serde_json::to_value(input).map_err(HarvestError::Serialization)?;
         self.spawn_child_workflow_detached_raw_placed(
             info.name,
@@ -8585,7 +9747,10 @@ impl WorkflowContext {
         // this does not claim replay-safety across a cap change (see the
         // fan-out `validate_child_payload_caps` note).
         let fresh_dispatch = !self.match_history(|m| m.peek_child_start_at_cursor(&timer_id));
-        if fresh_dispatch {
+        // Issue #1984: a scope that replays its cancel holds this dispatch.
+        // The cap applied when the cancelling cycle made it.
+        if fresh_dispatch && !self.replays_a_scope_cancel() {
+            self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
             let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
             if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input {
                 return Err(HarvestError::PayloadTooLarge {
@@ -8616,6 +9781,7 @@ impl WorkflowContext {
             // bookkeeping-only command.
             ChildOrTimerMatch::ChildCompleted { output } => {
                 self.push_command(WorkflowCommand::CancelRaceLosers {
+                    reason: LoserCancelReason::RaceLoser,
                     activities: Vec::new(),
                     children: Vec::new(),
                     timers: vec![TimerId::new(&timer_id)],
@@ -8631,6 +9797,7 @@ impl WorkflowContext {
                 // Child wins — tear down the deadline timer (see the
                 // `ChildCompleted` branch above for the retention rationale).
                 self.push_command(WorkflowCommand::CancelRaceLosers {
+                    reason: LoserCancelReason::RaceLoser,
                     activities: Vec::new(),
                     children: Vec::new(),
                     timers: vec![TimerId::new(&timer_id)],
@@ -8659,6 +9826,7 @@ impl WorkflowContext {
                 // re-push so strict replay sees no spurious bookkeeping command.
                 if !child_already_terminal {
                     self.push_command(WorkflowCommand::CancelRaceLosers {
+                        reason: LoserCancelReason::RaceLoser,
                         activities: Vec::new(),
                         children: vec![child_id],
                         timers: Vec::new(),
@@ -9086,10 +10254,141 @@ impl WorkflowContext {
     ///
     /// Panics if the internal replay matcher mutex is poisoned.
     pub async fn wait_for_signal(&self, signal_name: &str) -> HarvestResult<Value> {
-        let history_match = self.match_history(|m| m.match_signal(signal_name));
+        match self.begin_signal_wait(signal_name, None)? {
+            Ok(payload) => Ok(payload),
+            Err(rx) => Self::finish_signal_wait(signal_name, rx).await,
+        }
+    }
+
+    /// Wait for the first `signal_name` signal whose payload satisfies
+    /// `predicate` (issue #1985).
+    ///
+    /// This is the payload-matching event wait, like Cloudflare
+    /// `step.waitForEvent`. A same-name signal that fails the predicate is
+    /// not consumed. It stays buffered, and a later wait for that name can
+    /// take it. Signals keep their recorded order.
+    /// The buffer belongs to the current run. Continue-as-new does not move
+    /// a rejected signal to the next run.
+    ///
+    /// # Determinism contract
+    ///
+    /// `predicate` must be a pure function of the payload. Replay runs it
+    /// again over the recorded `SignalReceived` events. A changed predicate
+    /// can take a different event, and replay then reports drift.
+    ///
+    /// Do not register a push signal handler for the same name. The handler
+    /// claims every buffered signal of that name.
+    ///
+    /// ```rust,no_run
+    /// # async fn example(ctx: &autumn_harvest::WorkflowContext) -> autumn_harvest::HarvestResult<()> {
+    /// let order = ctx
+    ///     .wait_for_signal_matching("order", |p| p["id"] == 42)
+    ///     .await?;
+    /// # let _ = order;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Same as [`wait_for_signal`](Self::wait_for_signal).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn wait_for_signal_matching<F>(
+        &self,
+        signal_name: &str,
+        predicate: F,
+    ) -> HarvestResult<Value>
+    where
+        F: Fn(&Value) -> bool + Send,
+    {
+        match self.begin_signal_wait(signal_name, Some(&predicate))? {
+            Ok(payload) => Ok(payload),
+            Err(rx) => Self::finish_signal_wait(signal_name, rx).await,
+        }
+    }
+
+    /// Typed form of [`wait_for_signal_matching`](Self::wait_for_signal_matching)
+    /// (issue #1985).
+    ///
+    /// A payload that does not decode into `O` is a non-match. It stays
+    /// buffered, as a payload that fails `predicate` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if the matched payload cannot
+    /// be decoded. Propagates all errors from
+    /// [`wait_for_signal`](Self::wait_for_signal).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn receive_signal_matching<O, F>(
+        &self,
+        signal_name: &str,
+        predicate: F,
+    ) -> HarvestResult<O>
+    where
+        O: serde::de::DeserializeOwned,
+        F: Fn(&O) -> bool + Send,
+    {
+        let raw = self
+            .wait_for_signal_matching(signal_name, move |payload| {
+                serde_json::from_value::<O>(payload.clone()).is_ok_and(|typed| predicate(&typed))
+            })
+            .await?;
+        Ok(serde_json::from_value(raw)?)
+    }
+
+    /// Matches a signal wait against history (issue #1985).
+    ///
+    /// Returns `Ok(Ok(payload))` for a recorded match. Returns `Ok(Err(rx))`
+    /// after it pushes `WaitForSignal`. The caller then awaits `rx`. The
+    /// predicate is not held across the await, so it needs no `Sync` bound.
+    ///
+    /// The predicate runs with no matcher lock held. It may call back into
+    /// the context, and a panic in it does not poison the matcher lock.
+    #[allow(clippy::type_complexity)]
+    fn begin_signal_wait(
+        &self,
+        signal_name: &str,
+        predicate: Option<&dyn Fn(&Value) -> bool>,
+    ) -> HarvestResult<Result<Value, oneshot::Receiver<Value>>> {
+        // Candidates are in match order. The predicate stops at the first
+        // accepted payload, so it never sees a later signal. Each candidate is
+        // cloned under the lock and tested after the lock is released. The
+        // cursor resumes each lookup, so the scan stays linear.
+        let accepted: Option<std::collections::HashSet<usize>> = predicate.map(|accepts| {
+            let mut cursor = crate::replay::SignalCandidateCursor::default();
+            std::iter::from_fn(|| {
+                let (next, index, payload) = self
+                    .matcher
+                    .lock()
+                    .expect("matcher lock poisoned")
+                    .next_signal_candidate(signal_name, cursor)?;
+                cursor = next;
+                Some((index, payload))
+            })
+            .find(|(_, payload)| accepts(payload))
+            .map(|(index, _)| index)
+            .into_iter()
+            .collect()
+        });
+        let history_match = self.match_history(|m| match &accepted {
+            Some(set) => {
+                let found = m.match_signal_accepting(signal_name, set);
+                if matches!(found, HistoryMatch::NoMatch) {
+                    m.note_predicate_signal_wait(signal_name);
+                }
+                found
+            }
+            None => m.match_signal(signal_name),
+        });
 
         match history_match {
-            HistoryMatch::Matched { output } => Ok(output),
+            HistoryMatch::Matched { output } => Ok(Ok(output)),
             HistoryMatch::Diverged {
                 expected,
                 actual,
@@ -9122,20 +10421,181 @@ impl WorkflowContext {
                 ))
             }
             HistoryMatch::NoMatch => {
-                self.check_strict_replay_signal_no_match(signal_name)?;
+                self.check_strict_replay_signal_no_match(signal_name, accepted.as_ref())?;
 
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::WaitForSignal {
                     signal_name: signal_name.to_string(),
                     result_tx: tx,
                 });
-                rx.await.map_err(|_| {
-                    HarvestError::Cancelled(format!(
-                        "signal '{signal_name}' cancelled: result channel dropped"
-                    ))
-                })
+                Ok(Err(rx))
             }
         }
+    }
+
+    /// Awaits the result channel of a parked signal wait.
+    async fn finish_signal_wait(
+        signal_name: &str,
+        rx: oneshot::Receiver<Value>,
+    ) -> HarvestResult<Value> {
+        rx.await.map_err(|_| {
+            HarvestError::Cancelled(format!(
+                "signal '{signal_name}' cancelled: result channel dropped"
+            ))
+        })
+    }
+
+    // ── Durable promises (issue #1985) ─────────────────────────────────────
+
+    /// A durable promise with the key `key` in this run.
+    ///
+    /// The key is part of the token, so a caller that knows the run can build
+    /// the token. Use [`new_promise`](Self::new_promise) for a key that
+    /// nobody can guess. A key settles once per run. See
+    /// [`crate::durable_promise`].
+    ///
+    /// Each call records the token in one `SideEffectRecorded` event. Replay
+    /// reads the token from history, so it does not depend on the execution
+    /// id of the replaying run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Config`] if `key` is empty, longer than
+    /// [`crate::durable_promise::MAX_PROMISE_KEY_LEN`] bytes, or holds a
+    /// character outside `[A-Za-z0-9._:-]`. Also returns it if this run
+    /// already has a handle for `key`. A key settles once, so a second
+    /// handle would wait forever. Keep the first handle and wait on it again.
+    /// Returns the errors of [`side_effect`](Self::side_effect).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub fn promise(
+        &self,
+        key: impl Into<String>,
+    ) -> HarvestResult<crate::durable_promise::DurablePromise<'_>> {
+        let fresh = crate::durable_promise::PromiseId::new(self.execution_id(), key)
+            .map_err(|e| HarvestError::Config(e.to_string()))?;
+        // Refuse before the token is recorded, so the refusal leaves no event.
+        let first_handle = self
+            .promise_keys
+            .lock()
+            .expect("promise key set poisoned")
+            .insert(fresh.key().to_owned());
+        if !first_handle {
+            return Err(HarvestError::Config(format!(
+                "promise key '{}' already has a handle in this run; wait on that handle",
+                fresh.key()
+            )));
+        }
+        let promise = self.record_promise(|| fresh)?;
+        // A reset fork replays the source run's token. Its key can differ from
+        // `key` when the key names the run. Register the recorded key too, so
+        // a second handle for it is refused in the fork as in the source run.
+        self.promise_keys
+            .lock()
+            .expect("promise key set poisoned")
+            .insert(promise.id().key().to_owned());
+        Ok(promise)
+    }
+
+    /// A durable promise with a new `UUIDv7` key.
+    ///
+    /// This is the Restate awakeable shape. Send `promise.id().to_string()`
+    /// to the caller that settles it. The token is recorded as for
+    /// [`promise`](Self::promise).
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`side_effect`](Self::side_effect).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub fn new_promise(&self) -> HarvestResult<crate::durable_promise::DurablePromise<'_>> {
+        let execution_id = self.execution_id();
+        let promise = self.record_promise(|| {
+            crate::durable_promise::PromiseId::from_uuid(execution_id, uuid::Uuid::now_v7())
+        })?;
+        // Register the recorded key, so `promise` refuses a second handle for
+        // it. Replay records the same key, so the set is the same.
+        self.promise_keys
+            .lock()
+            .expect("promise key set poisoned")
+            .insert(promise.id().key().to_owned());
+        Ok(promise)
+    }
+
+    /// Records a promise token once and returns the recorded token on replay.
+    ///
+    /// A reset fork replays the carried history under a new execution id.
+    /// The recorded token keeps its activity inputs byte-identical.
+    fn record_promise<F>(
+        &self,
+        mint: F,
+    ) -> HarvestResult<crate::durable_promise::DurablePromise<'_>>
+    where
+        F: FnOnce() -> crate::durable_promise::PromiseId,
+    {
+        let id = self.side_effect(crate::durable_promise::PROMISE_SIDE_EFFECT_NAME, mint)?;
+        Ok(crate::durable_promise::DurablePromise::new(self, id))
+    }
+
+    /// Resolves a durable promise that another run created.
+    ///
+    /// The settlement is a signal to that run with the promise idempotency
+    /// key, so only the first settlement wins. See
+    /// [`signal_external_workflow_with_idempotency`](Self::signal_external_workflow_with_idempotency).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `value` cannot be
+    /// serialized. Same as
+    /// [`signal_external_workflow`](Self::signal_external_workflow) otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn resolve_promise<P: serde::Serialize>(
+        &self,
+        id: &crate::durable_promise::PromiseId,
+        value: P,
+    ) -> HarvestResult<()> {
+        let settlement =
+            crate::durable_promise::PromiseSettlement::resolved(serde_json::to_value(value)?);
+        self.settle_promise(id, &settlement).await
+    }
+
+    /// Rejects a durable promise that another run created.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`resolve_promise`](Self::resolve_promise).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn reject_promise(
+        &self,
+        id: &crate::durable_promise::PromiseId,
+        error: impl Into<String>,
+    ) -> HarvestResult<()> {
+        let settlement = crate::durable_promise::PromiseSettlement::rejected(error);
+        self.settle_promise(id, &settlement).await
+    }
+
+    async fn settle_promise(
+        &self,
+        id: &crate::durable_promise::PromiseId,
+        settlement: &crate::durable_promise::PromiseSettlement,
+    ) -> HarvestResult<()> {
+        self.signal_external_workflow_with_idempotency(
+            id.execution_id(),
+            &id.signal_name(),
+            settlement.to_value(),
+            id.idempotency_key(),
+        )
+        .await
     }
 
     /// Wait for a named signal, but give up after `timeout` and return `None`.
@@ -9289,6 +10749,7 @@ impl WorkflowContext {
                 // mixed batch.)
                 if self.match_history(|m| m.history_contains_timer_started(&timer_id)) {
                     self.push_command(WorkflowCommand::CancelRaceLosers {
+                        reason: LoserCancelReason::RaceLoser,
                         activities: Vec::new(),
                         children: Vec::new(),
                         timers: vec![TimerId::new(&timer_id)],
@@ -9623,6 +11084,7 @@ impl WorkflowContext {
     ) -> HarvestResult<()> {
         use crate::replay::HistoryMatch;
 
+        self.reject_in_cancellable_scope("ctx.signal_external_workflow")?;
         let history_match = self.match_history(|m| m.match_external_signal(&target, signal_name));
 
         match history_match {
@@ -9673,10 +11135,20 @@ impl WorkflowContext {
 
             // First live call: generate a new signal_id and dispatch.
             HistoryMatch::NoMatch => {
+                let payload_json = serde_json::to_value(&payload)?;
+                self.check_payload_depth(PayloadKind::SignalPayload, None, &payload_json)?;
                 self.check_strict_replay_no_match(&format!(
                     "ExternalSignalRequested(target={target}, signal={signal_name})"
                 ))?;
-                let payload_json = serde_json::to_value(&payload)?;
+                // Issue #1985: a broken promise signal is the sender's bug.
+                // Refuse it here, before a request is recorded. The outbox
+                // would otherwise report it as a target state, such as
+                // `not_running`.
+                crate::durable_promise::settlement_idempotency_key(
+                    signal_name,
+                    &payload_json,
+                    idempotency_key.as_deref(),
+                )?;
                 let observed = serde_json::to_string(&payload_json).map_or(0, |s| s.len() as u64);
                 if self.payload_max_signal > 0 && observed > self.payload_max_signal {
                     return Err(HarvestError::PayloadTooLarge {
@@ -9889,6 +11361,7 @@ impl WorkflowContext {
     async fn request_cancel_external_target(&self, target: ExternalTarget) -> HarvestResult<()> {
         use crate::replay::HistoryMatch;
 
+        self.reject_in_cancellable_scope("ctx.request_cancel_external_workflow")?;
         let history_match = self.match_history(|m| m.match_external_cancel(&target));
 
         match history_match {
@@ -10048,6 +11521,7 @@ impl WorkflowContext {
             });
         }
 
+        self.reject_in_cancellable_scope("ctx.await_external_workflow")?;
         let history_match = self.match_history(|m| m.match_external_await(target));
 
         match history_match {
@@ -10213,45 +11687,50 @@ impl WorkflowContext {
         *seq
     }
 
-    /// Record or verify the fan-out count in event history.
+    /// Check an activity fan-out against history, then record its marker.
     ///
-    /// On **live execution** (past end of history): pushes a `RecordMarker`
-    /// command so future replays can verify the collection length, and
-    /// returns `Ok(true)` — this is the very first time this fan-out group
-    /// has ever been dispatched, which callers use to gate one-time,
-    /// pre-dispatch validation that must never re-run on replay.
-    ///
-    /// On **replay**: matches the `MarkerRecorded` event and compares the
-    /// recorded count with the current count, returning `Ok(false)` on a
-    /// match. Returns a [`HarvestError::NonDeterministic`] when they differ.
-    ///
-    /// Used as-is by the activity fan-out methods, which have no pre-dispatch
-    /// validation step to sequence around the marker. Child fan-out instead
-    /// uses [`peek_fan_out_count`](Self::peek_fan_out_count) +
-    /// [`record_fan_out_marker`](Self::record_fan_out_marker) so the marker
-    /// is recorded only *after* payload validation succeeds — see those
-    /// methods' docs for why.
-    fn check_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<bool> {
+    /// A fresh dispatch first checks every input against the depth cap
+    /// (issue #2224). A deep input then fails the whole fan-out before the
+    /// marker or any earlier activity is queued.
+    fn check_activity_fan_out(
+        &self,
+        seq: u32,
+        activities: &[(String, Value, String)],
+    ) -> HarvestResult<bool> {
+        let count = activities.len();
         let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
         if fresh_dispatch {
+            self.check_activity_fan_out_depth(activities)?;
             self.record_fan_out_marker(seq, count);
         }
         Ok(fresh_dispatch)
     }
 
+    /// Check every input of a fresh activity fan-out against the depth cap
+    /// (issue #2224). The caller records no marker before this check passes.
+    fn check_activity_fan_out_depth(
+        &self,
+        activities: &[(String, Value, String)],
+    ) -> HarvestResult<()> {
+        for (name, input, _) in activities {
+            self.check_payload_depth(PayloadKind::ActivityInput, Some(name), input)?;
+        }
+        Ok(())
+    }
+
     /// Check the fan-out count against event history **without** pushing the
     /// `RecordMarker` command on a fresh dispatch.
     ///
-    /// Splitting this out of [`check_fan_out_count`](Self::check_fan_out_count)
-    /// lets a caller run additional validation (e.g. the child fan-out
-    /// payload-cap pre-check) *between* determining "this is a fresh
-    /// dispatch" and actually committing the `fan_out:{n}` marker to the
-    /// command list — so a validation failure discovered in between never
-    /// leaves a persisted marker with no corresponding dispatch attempt. A
-    /// terminal execution whose history contains a `fan_out:{n}` marker but
-    /// no children would otherwise be replayed by matching the marker
-    /// (`fresh_dispatch == false`) and then diverging when it tries to
-    /// re-derive a `ChildWorkflowStarted` that was never recorded.
+    /// A caller can run more validation after this check. An example is the
+    /// payload-cap pre-check of a fan-out. The check runs between "this is a
+    /// fresh dispatch" and the commit of the `fan_out:{n}` marker.
+    ///
+    /// A validation failure in between then leaves no marker without a
+    /// dispatch attempt. Such a marker is a hazard. A terminal execution whose
+    /// history holds a `fan_out:{n}` marker but no children would replay by
+    /// matching the marker (`fresh_dispatch == false`). It would then diverge
+    /// when it tries to re-derive a `ChildWorkflowStarted` that was never
+    /// recorded.
     fn peek_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<bool> {
         let marker_result = self.match_history(|m| m.match_fan_out_marker(seq, count));
         match marker_result {
@@ -10284,6 +11763,62 @@ impl WorkflowContext {
             name: format!("fan_out:{seq}"),
             details: Value::from(count as u64),
         });
+    }
+
+    /// The writer mode of a fan-out, as history records it (issue #1986).
+    ///
+    /// A fresh dispatch with the writer records `fan_out_writer:{seq}` right
+    /// after the `fan_out:{seq}` marker. Replay reads the mode from history,
+    /// not from the current options. A deploy can change the option for an
+    /// in-flight run. Replay then still reads each recorded item as recorded.
+    fn fan_out_writer_mode(&self, seq: u32, fresh: bool, wanted: bool) -> bool {
+        let name = format!("fan_out_writer:{seq}");
+        if fresh {
+            if wanted {
+                self.push_command(WorkflowCommand::RecordMarker {
+                    name,
+                    details: Value::from(1u64),
+                });
+            }
+            return wanted;
+        }
+        matches!(
+            self.match_history(|m| m.match_u64_marker(&name, 1)),
+            HistoryMatch::Matched { .. }
+        )
+    }
+
+    /// Record or verify the stop marker of a fan-out (issue #1986).
+    ///
+    /// A fan-out that stops on its failure tolerance records how many slots
+    /// it dispatched. Replay reads the count ahead of the slots, through
+    /// `peek_u64_marker_ahead`, so the recorded prefix never takes an
+    /// activity that the workflow scheduled after the stop.
+    fn record_fan_out_stop(&self, name: &str, dispatched: usize) -> HarvestResult<()> {
+        let dispatched = dispatched as u64;
+        match self.match_history(|m| m.match_u64_marker(name, dispatched)) {
+            HistoryMatch::NoMatch => {
+                self.push_command(WorkflowCommand::RecordMarker {
+                    name: name.to_string(),
+                    details: Value::from(dispatched),
+                });
+                Ok(())
+            }
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
+                format!(
+                    "{name}: the fan-out stopped with {expected} but history has {actual}; \
+                     use ctx.version() to guard a tolerance change for in-flight runs"
+                ),
+                event_index,
+                Some(expected),
+                Some(actual),
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Record or verify a condition-skip decision for a DAG node in event history.
@@ -10399,8 +11934,7 @@ impl WorkflowContext {
         self.check_cancellation()?;
 
         let seq = self.next_fan_out_seq();
-        let count = activities.len();
-        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -10467,8 +12001,7 @@ impl WorkflowContext {
         self.check_cancellation()?;
 
         let seq = self.next_fan_out_seq();
-        let count = activities.len();
-        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -10479,17 +12012,10 @@ impl WorkflowContext {
             .map(|(name, input, queue)| {
                 let retry = retry.clone();
                 async move {
-                    match self
-                        .execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
-                        .await
-                    {
-                        Ok(v) => Ok(Ok(v)),
-                        Err(
-                            e
-                            @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. }),
-                        ) => Ok(Err(e.to_string())),
-                        Err(e) => Err(e),
-                    }
+                    classify_fan_out_slot(
+                        self.execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
+                            .await,
+                    )
                 }
             })
             .collect();
@@ -10697,7 +12223,7 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
-        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -10813,7 +12339,7 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
-        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -10829,13 +12355,7 @@ impl WorkflowContext {
         // Per-slot classification shared by both phases: engine errors abort the
         // fan-out (`Err`); an activity failure/timeout is captured in the slot
         // (`Ok(Err(..))`) so `try_join_all` never short-circuits.
-        let classify = |slot: HarvestResult<Value>| match slot {
-            Ok(v) => Ok(Ok(v)),
-            Err(e @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. })) => {
-                Ok(Err(e.to_string()))
-            }
-            Err(e) => Err(e),
-        };
+        let classify = classify_fan_out_slot;
 
         let mut activities = activities;
         let mut results = Vec::with_capacity(count);
@@ -10999,6 +12519,270 @@ impl WorkflowContext {
         Ok(typed)
     }
 
+    // ── Fan-out with options (issue #1986) ───────────────────────────────
+
+    /// Execute N activities in parallel with [`FanOutOptions`].
+    ///
+    /// [`FanOutOptions`]: crate::fan_out::FanOutOptions
+    ///
+    /// The options add three things to the collect-all fan-out:
+    ///
+    /// - **Window.** `max_in_flight` limits the items in flight, as
+    ///   [`execute_activity_fan_out_collect_raw_windowed`](Self::execute_activity_fan_out_collect_raw_windowed)
+    ///   does. A value of 0 counts as 1.
+    /// - **Failure tolerance.** The fan-out completes when at most N items
+    ///   fail. It fails with
+    ///   [`HarvestError::FanOutFailureThresholdExceeded`] when more fail. A
+    ///   windowed fan-out then dispatches no further wave. The stop cancels
+    ///   the activities still in flight, as `ctx.race()` cancels its losers.
+    /// - **Result writer.** The worker writes each result through the
+    ///   `PayloadStore`. History records a small
+    ///   [`StoredResult`](crate::fan_out::StoredResult) for the item, not the
+    ///   value. Its size does not depend on the result. An activity worker
+    ///   without a store records the value inline.
+    ///
+    /// The returned [`FanOutResults`](crate::fan_out::FanOutResults) is the
+    /// manifest. It holds one item per input, in input order.
+    ///
+    /// # Replay safety
+    ///
+    /// The fan-out records the same `fan_out:{n}` marker as the other
+    /// helpers. History records neither the window nor the tolerance.
+    ///
+    /// Each wave polls every slot before it counts the failures. So the
+    /// fan-out consumes every recorded slot of the wave, and a workflow can
+    /// catch the threshold error and go on (issue #1791). Failures only
+    /// accumulate, so a replay that sees more results makes the same decision.
+    ///
+    /// A fan-out that stops records a `fan_out_stop:{n}` marker with the
+    /// number of slots it dispatched. Replay reads it ahead, so the fan-out
+    /// never takes an activity that the workflow scheduled after the stop. The
+    /// stop also consumes the start events of its slots that still run, and
+    /// removes their waits. Change a tolerance for in-flight runs behind
+    /// `ctx.version()`. History records the writer mode, so a change to it
+    /// needs no guard.
+    ///
+    /// Do not run a windowed fan-out in a `join!` with other activity
+    /// dispatch. On resume, it treats the recorded schedules after it as its
+    /// own. The `_windowed` helpers have the same limit (issue #750).
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::FanOutFailureThresholdExceeded`] when more items
+    ///   fail than the tolerance allows. Only `ActivityFailed` and `Timeout`
+    ///   count as item failures.
+    /// - [`HarvestError::Config`] on a fresh dispatch with the result writer
+    ///   and no `PayloadStore`. The check does not run on replay.
+    /// - [`HarvestError::NonDeterministic`] if `activities.len()` differs
+    ///   from the recorded count.
+    /// - [`HarvestError::Cancelled`] if the workflow was cancelled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn execute_activity_fan_out_raw_with(
+        &self,
+        activities: Vec<(String, Value, String)>,
+        options: &crate::fan_out::FanOutOptions,
+    ) -> HarvestResult<crate::fan_out::FanOutResults<Value>> {
+        let (slots, tolerated, writer) = self
+            .fan_out_with_impl(activities, options, None, None)
+            .await?;
+        let items = slots
+            .into_iter()
+            .map(|slot| fan_out_item(slot, writer, Ok))
+            .collect::<HarvestResult<Vec<_>>>()?;
+        Ok(crate::fan_out::FanOutResults::new(items, tolerated))
+    }
+
+    /// Typed sibling of
+    /// [`execute_activity_fan_out_raw_with`](Self::execute_activity_fan_out_raw_with).
+    ///
+    /// All slots share the same `ActivityInfo`. An inline value decodes to
+    /// `O`. A stored result stays a reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Config`] for a local activity, and
+    /// [`HarvestError::Serialization`] if an input does not serialize or an
+    /// inline value does not decode. Propagates the errors of
+    /// [`execute_activity_fan_out_raw_with`](Self::execute_activity_fan_out_raw_with).
+    pub async fn execute_activity_fan_out_with<I, O>(
+        &self,
+        info: &crate::info::ActivityInfo,
+        inputs: Vec<I>,
+        options: &crate::fan_out::FanOutOptions,
+    ) -> HarvestResult<crate::fan_out::FanOutResults<O>>
+    where
+        I: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
+        if info.is_local {
+            return Err(HarvestError::Config(format!(
+                "activity '{}' is marked local = true; fan-out requires remote activities",
+                info.name
+            )));
+        }
+        let queue = info.default_queue.unwrap_or("default").to_string();
+        let activities = inputs
+            .into_iter()
+            .map(|i| {
+                let json_input = serde_json::to_value(i)?;
+                Ok((info.name.to_string(), json_input, queue.clone()))
+            })
+            .collect::<Result<Vec<_>, serde_json::Error>>()?;
+
+        let (slots, tolerated, writer) = self
+            .fan_out_with_impl(
+                activities,
+                options,
+                info.default_retry_policy.clone(),
+                info.default_start_to_close,
+            )
+            .await?;
+        let items = slots
+            .into_iter()
+            .map(|slot| {
+                fan_out_item(slot, writer, |v| {
+                    serde_json::from_value(v).map_err(HarvestError::Serialization)
+                })
+            })
+            .collect::<HarvestResult<Vec<_>>>()?;
+        Ok(crate::fan_out::FanOutResults::new(items, tolerated))
+    }
+
+    /// Shared body of the fan-out helpers that take options.
+    ///
+    /// Returns the classified slots in input order, the tolerated count and
+    /// the writer mode that history records.
+    /// The structure is the windowed fan-out's: resume the recorded prefix,
+    /// then dispatch the rest in waves. No window means one wave.
+    async fn fan_out_with_impl(
+        &self,
+        activities: Vec<(String, Value, String)>,
+        options: &crate::fan_out::FanOutOptions,
+        retry: Option<crate::policy::RetryPolicy>,
+        timeout: Option<std::time::Duration>,
+    ) -> HarvestResult<(Vec<Result<Value, String>>, usize, bool)> {
+        self.check_cancellation()?;
+
+        let seq = self.next_fan_out_seq();
+        let count = activities.len();
+        // Check the store before the marker, so a failed check records
+        // nothing. Replay does not check again: the store can change.
+        let fresh = self.peek_fan_out_count(seq, count)?;
+        if fresh {
+            if options.result_writer() && self.payload_offload_threshold.is_none() {
+                return Err(HarvestError::Config(
+                    "a fan-out with a result writer needs a PayloadStore; \
+                     register one with HarvestBuilder::payload_store"
+                        .into(),
+                ));
+            }
+            self.check_activity_fan_out_depth(&activities)?;
+            self.record_fan_out_marker(seq, count);
+        }
+        let writer = self.fan_out_writer_mode(seq, fresh, options.result_writer());
+
+        let tolerated = options.tolerance().max_failures(count);
+        if activities.is_empty() {
+            return Ok((Vec::new(), tolerated, writer));
+        }
+        let window = options.max_in_flight().map_or(count, |w| w.max(1));
+
+        // The recorded prefix holds only this fan-out's slots. A fan-out that
+        // stopped recorded how many slots it dispatched. The prefix stops
+        // there, so it never takes an activity that the workflow scheduled
+        // after a caught threshold error.
+        let stop_marker = format!("fan_out_stop:{seq}");
+        let dispatched_before_stop = self
+            .match_history(|m| m.peek_u64_marker_ahead(&stop_marker))
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(count)
+            .min(count);
+        let prefix_ids =
+            self.match_history(|m| m.pending_scheduled_activity_ids(dispatched_before_stop));
+
+        let dispatch = |(name, input, queue): (String, Value, String)| {
+            let retry = retry.clone();
+            async move {
+                classify_fan_out_slot(
+                    self.execute_activity_raw_full(
+                        &name, input, &queue, retry, timeout, None, None, None, writer,
+                    )
+                    .await,
+                )
+            }
+        };
+
+        let mut activities = activities;
+        let mut results = Vec::with_capacity(count);
+        let mut failures = 0;
+        let limit = FailureLimit {
+            tolerated,
+            total: count,
+        };
+        // Phase 1 resumes the recorded prefix as one batch. Phase 2 sends the
+        // rest in waves. See `fan_out_raw_windowed_impl` for why.
+        let joined = async {
+            if !prefix_ids.is_empty() {
+                self.check_cancellation()?;
+                let wave = activities
+                    .drain(..prefix_ids.len())
+                    .map(&dispatch)
+                    .collect();
+                join_fan_out_wave(wave, &mut failures, limit, &mut results).await?;
+            }
+            while !activities.is_empty() {
+                self.check_cancellation()?;
+                let take = window.min(activities.len());
+                let wave = activities.drain(..take).map(&dispatch).collect();
+                join_fan_out_wave(wave, &mut failures, limit, &mut results).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(HarvestError::FanOutFailureThresholdExceeded { .. }) = &joined {
+            // A slot still in flight leaves its start and heartbeat events in
+            // front of the cursor. Consume them, so the step after a caught
+            // error does not diverge on them (as `ctx.race()` does, issue
+            // #1126). Only a recorded slot can be in flight at a stop.
+            self.match_history(|m| m.consume_race_loser_frontier(&prefix_ids, &[]));
+            // Nothing waits on an abandoned slot. Its `WaitForActivity` would
+            // read as a new command to strict replay, so remove it, as
+            // `AwaitConditionTimeoutFut` removes a stale `StartTimer`.
+            let candidates: std::collections::HashSet<_> = prefix_ids.iter().collect();
+            let mut in_flight = Vec::new();
+            self.commands
+                .lock()
+                .expect("commands lock poisoned")
+                .retain(|buffered| match &buffered.cmd {
+                    WorkflowCommand::WaitForActivity { activity_id, .. }
+                        if candidates.contains(activity_id) =>
+                    {
+                        in_flight.push(*activity_id);
+                        false
+                    }
+                    _ => true,
+                });
+            // Cancel the slots still in flight, as `ctx.race()` cancels its
+            // losers. The worker cancels each open task row and records a
+            // terminal for it. So no result can arrive after the workflow
+            // ends, where replay would not consume it.
+            if !in_flight.is_empty() {
+                self.push_command(WorkflowCommand::CancelRaceLosers {
+                    reason: LoserCancelReason::RaceLoser,
+                    activities: in_flight,
+                    children: Vec::new(),
+                    timers: Vec::new(),
+                });
+            }
+            self.record_fan_out_stop(&stop_marker, count - activities.len())?;
+        }
+        joined?;
+        Ok((results, tolerated, writer))
+    }
+
     // ── Fan-out / parallel child workflows (issue #601) ──────────────────
 
     /// Validate every child's serialized input against the payload cap
@@ -11031,7 +12815,15 @@ impl WorkflowContext {
         fresh_dispatch: bool,
         children: &[(String, Value)],
     ) -> HarvestResult<()> {
-        if !fresh_dispatch || self.payload_max_workflow_input == 0 {
+        // Issue #1984: a scope that replays its cancel holds these dispatches.
+        // The cap applied when the cancelling cycle made them.
+        if fresh_dispatch && !self.replays_a_scope_cancel() {
+            for (_, input) in children {
+                self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, input)?;
+            }
+        }
+        if !fresh_dispatch || self.payload_max_workflow_input == 0 || self.replays_a_scope_cancel()
+        {
             return Ok(());
         }
         for (_, input) in children {
@@ -11435,6 +13227,11 @@ impl WorkflowContext {
 
     // ── Race / select (issue #600) ───────────────────────────────────────────
 
+    /// Whether a `ctx.race()` call is in flight (issue #2007).
+    pub(crate) fn has_open_race(&self) -> bool {
+        self.open_races.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
     /// Generate the next race sequence number for marker naming (mirrors
     /// `next_fan_out_seq`).
     fn next_race_seq(&self) -> u32 {
@@ -11457,6 +13254,7 @@ impl WorkflowContext {
 
     #[allow(clippy::too_many_lines)]
     async fn race_impl(&self, branches: Vec<RaceBranch>) -> HarvestResult<RaceWinner> {
+        let _open = OpenRace::enter(&self.open_races);
         self.check_cancellation()?;
 
         if branches.is_empty() {
@@ -11862,12 +13660,16 @@ impl WorkflowContext {
         // open marker below, or a branch's own schedule/start command in
         // Phase B). An oversized branch must abort this race with zero
         // durable trace -- see the comment on `needs_open_marker` above.
+        // Issue #1984: a scope that replays its cancel holds these dispatches.
+        // The caps applied when the cancelling cycle made them.
+        let replays_a_scope_cancel = self.replays_a_scope_cancel();
         for dispatch in &to_dispatch {
-            if !dispatch.is_new {
+            if !dispatch.is_new || replays_a_scope_cancel {
                 continue;
             }
             match &branches[dispatch.index].kind {
                 RaceBranchKind::Activity { name, input, .. } => {
+                    self.check_payload_depth(PayloadKind::ActivityInput, Some(name), input)?;
                     let effective_cap = {
                         let global = self.payload_max_activity_input;
                         self.activity_input_cap_overrides
@@ -11890,6 +13692,7 @@ impl WorkflowContext {
                     }
                 }
                 RaceBranchKind::ChildWorkflow { input, .. } => {
+                    self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, input)?;
                     let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
                     if self.payload_max_workflow_input > 0
                         && observed > self.payload_max_workflow_input
@@ -12002,6 +13805,7 @@ impl WorkflowContext {
                             session_id: None,
                             session_worker_id: None,
                             schedule_to_start_override: None,
+                            result_writer: false,
                             result_tx: tx,
                         });
                     } else {
@@ -12149,6 +13953,7 @@ impl WorkflowContext {
             self.match_history(|m| m.consume_race_loser_frontier(&activities, &children));
             if !activities.is_empty() || !children.is_empty() || !timers.is_empty() {
                 self.push_command(WorkflowCommand::CancelRaceLosers {
+                    reason: LoserCancelReason::RaceLoser,
                     activities,
                     children,
                     timers,
@@ -12330,8 +14135,13 @@ impl WorkflowContext {
     /// - [`HarvestError::SessionBroken`] if the session's host worker dies or
     ///   drains before the acquire activity's result is recorded (surfaced
     ///   identically to a broken session discovered later, mid-pipeline).
+    /// - [`HarvestError::Config`] if called inside a cancellation scope
+    ///   (issue #1984).
     pub async fn create_session(&self, options: SessionOptions) -> HarvestResult<Session<'_>> {
         self.check_cancellation()?;
+        // Issue #1984: a scope cancel drops the body, and a dropped session is
+        // never released. Reject the operation, as for a mutex.
+        self.reject_in_cancellable_scope("ctx.create_session")?;
 
         let seq = self.next_session_seq();
         let session_id = self.resolve_session_id(seq)?;
@@ -12380,7 +14190,42 @@ impl WorkflowContext {
             id: session_id,
             host_worker_id,
             queue: options.queue,
+            settled: false,
         })
+    }
+
+    /// Whether history already holds a drop release for `session` (issue
+    /// #2193).
+    ///
+    /// This reads the matcher directly. The read moves no cursor and runs no
+    /// signal handler.
+    fn history_released_session(&self, session: SessionId) -> bool {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .has_drop_release(session)
+    }
+
+    /// Push the release of a dropped [`Session`] (issue #2193).
+    ///
+    /// The command is hard-pinned to the host, like any session activity. Its
+    /// receiver is closed, so no body awaits the result.
+    fn push_drop_release(&self, session: SessionId, host_worker_id: String, queue: String) {
+        let (result_tx, result_rx) = oneshot::channel();
+        drop(result_rx);
+        self.push_command(WorkflowCommand::ScheduleActivity {
+            activity_id: self.next_activity_id(),
+            name: SESSION_DROP_RELEASE_ACTIVITY_NAME.to_string(),
+            input: Value::from(session.to_string()),
+            queue,
+            retry_policy_override: None,
+            start_to_close_override: None,
+            session_id: Some(session),
+            session_worker_id: Some(host_worker_id),
+            schedule_to_start_override: None,
+            result_writer: false,
+            result_tx,
+        });
     }
 
     /// Dispatch the internal session-acquire activity and resolve it to a
@@ -12403,6 +14248,7 @@ impl WorkflowContext {
                 None,
                 None,
                 Some(options.acquisition_timeout),
+                false,
             )
             .await?;
         raw.as_str().map(str::to_string).ok_or_else(|| {
@@ -12513,6 +14359,7 @@ impl WorkflowContext {
             }
 
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ActivityInput, Some(name), &input)?;
                 self.check_strict_replay_no_match(&format!("ExternalActivityScheduled({name})"))?;
 
                 // First time — generate a fresh token and schedule.
@@ -12553,6 +14400,34 @@ impl WorkflowContext {
                 )
             }
         }
+    }
+
+    /// Call a task on a remote MCP or A2A server and wait for it to end
+    /// (issue #2006).
+    ///
+    /// The start activity records the remote task handle. An external
+    /// activity then journals the handle as a task token, and the workflow
+    /// suspends with no worker slot. A
+    /// [`RemoteTaskPoller`](crate::remote_task::RemoteTaskPoller) or a push
+    /// settles the token. Replay reads both steps from history.
+    ///
+    /// A tool result with `isError: true` returns `Ok` with
+    /// [`is_error`](crate::remote_task::RemoteTaskOutcome::is_error) set.
+    /// See `docs/remote-tasks.md`.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::ActivityFailed`] when the start fails, or when the
+    ///   remote server fails or cancels the task.
+    /// - [`HarvestError::Timeout`] when the task does not end within
+    ///   [`RemoteTaskCall::timeout`](crate::remote_task::RemoteTaskCall::timeout).
+    /// - [`HarvestError::NonDeterministic`] when history does not match.
+    /// - [`HarvestError::Serialization`] when a recorded value does not decode.
+    pub async fn call_remote_task(
+        &self,
+        call: &crate::remote_task::RemoteTaskCall,
+    ) -> HarvestResult<crate::remote_task::RemoteTaskOutcome> {
+        crate::remote_task::call(self, call).await
     }
 
     // ── Continue-as-new ───────────────────────────────────────────────
@@ -12836,6 +14711,7 @@ impl WorkflowContext {
                 ))
             }
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::WorkflowInput, None, &input)?;
                 self.check_strict_replay_no_match("ContinueAsNew")?;
                 // Issue #1161: check the cap only for a SAME-type
                 // continuation. `self.payload_max_workflow_input` is
@@ -12849,9 +14725,12 @@ impl WorkflowContext {
                 // TARGET type's `max_input_bytes` correctly.
                 if new_workflow_type.is_none() {
                     let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
+                    // Issue #1984: a scope that replays its cancel holds this
+                    // command. The cap applied when the cancelling cycle made it.
                     if self.payload_max_workflow_input > 0
                         && observed > self.payload_max_workflow_input
                         && !self.offload_will_apply(observed)
+                        && !self.replays_a_scope_cancel()
                     {
                         return Err(HarvestError::PayloadTooLarge {
                             kind: crate::error::PayloadKind::WorkflowInput,
@@ -13136,6 +15015,11 @@ impl WorkflowContext {
         // `new_for_handler` inits it to `None`; without this the update-handler
         // path (unlike the workflow body) would never see the parent.
         let parent_execution_id = self.parent_execution_id;
+        let start_provenance = self.start_provenance;
+        // Issue #1991: the test harness clock. The handler reads it when it
+        // runs, so its `ctx.now()` matches the workflow body.
+        #[cfg(any(test, feature = "testing"))]
+        let timer_clock = self.timer_clock_elapsed_secs.clone();
 
         let boxed_handler: crate::update::BoxUpdateHandler = std::sync::Arc::new(move |input| {
             let mut ctx = Self::new_for_handler(
@@ -13163,6 +15047,11 @@ impl WorkflowContext {
                 inner.current_shard_id = current_shard_id;
                 // Issue #698: inherit the spawning parent's execution id.
                 inner.parent_execution_id = parent_execution_id;
+                inner.start_provenance = start_provenance;
+                #[cfg(any(test, feature = "testing"))]
+                {
+                    inner.timer_clock_elapsed_secs = timer_clock.as_ref().map(snapshot_timer_clock);
+                }
             }
             handler_fn(ctx, input)
         });
@@ -13241,6 +15130,14 @@ impl WorkflowContext {
                 // Issue #698: inherit the spawning parent's execution id so
                 // `ctx.info().parent_execution_id` is visible inside the handler.
                 inner.parent_execution_id = self.parent_execution_id;
+                inner.start_provenance = self.start_provenance;
+                #[cfg(any(test, feature = "testing"))]
+                {
+                    inner.timer_clock_elapsed_secs = self
+                        .timer_clock_elapsed_secs
+                        .as_ref()
+                        .map(snapshot_timer_clock);
+                }
             }
             h(ctx, input)
         })
@@ -13374,19 +15271,22 @@ impl WorkflowContext {
             }
         }
 
-        // Live path: invoke the registered handler.
-        let handler_opt = {
-            let registry = self
-                .update_registry
-                .lock()
-                .expect("update_registry lock poisoned");
-            registry.get_handler(name)
-        };
+        // Issue #1984: a scope cancel would drop a running handler, and the
+        // admitted update would wait forever. So the update fails at once.
+        // Its result survives the cancel, as `withdraw_scope_commands` keeps it.
+        if self.in_cancellable_scope() {
+            let result = Err(format!(
+                "update '{name}' cannot run inside a cancellation scope"
+            ));
+            self.push_command(WorkflowCommand::RecordUpdateResult {
+                update_id,
+                result: result.clone(),
+            });
+            return result;
+        }
 
-        let result = match handler_opt {
-            Some(handler) => handler(input).await,
-            None => Err(format!("update handler '{name}' not found")),
-        };
+        // Live path: invoke the registered handler.
+        let result = self.run_update_handler(name, input).await;
 
         // Durably record the terminal result so the worker can append
         // UpdateCompleted/UpdateFailed before persisting other side effects.
@@ -13396,6 +15296,53 @@ impl WorkflowContext {
         });
 
         result
+    }
+
+    /// Run the registered handler for `name`. This call does not read history.
+    ///
+    /// Returns `Err("update handler 'name' not found")` if no handler has the
+    /// name.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal update registry mutex is poisoned.
+    pub(crate) async fn run_update_handler(
+        &self,
+        name: &str,
+        input: Value,
+    ) -> Result<Value, String> {
+        let handler = self
+            .update_registry
+            .lock()
+            .expect("update_registry lock poisoned")
+            .get_handler(name);
+        match handler {
+            // A result nested past the depth cap cannot be read back, so the
+            // update fails instead (issue #2224). Both update paths run here.
+            Some(handler) => match handler(input).await {
+                Ok(output) if crate::payload_depth::nests_past_cap(&output) => Err(format!(
+                    "payload too deep: update '{name}' result nests more than {} levels",
+                    crate::payload_depth::MAX_PAYLOAD_DEPTH
+                )),
+                other => other,
+            },
+            None => Err(format!("update handler '{name}' not found")),
+        }
+    }
+
+    /// List the admitted updates that have no result in the loaded history,
+    /// in history order (issue #2035).
+    ///
+    /// This read does not move the replay position.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher mutex is poisoned.
+    pub(crate) fn pending_updates(&self) -> Vec<(UpdateId, String, Value)> {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .drain_admitted_updates()
     }
 
     // ── Signal handlers (issue #546) ────────────────────────────────────
@@ -13725,24 +15672,69 @@ impl WorkflowContext {
             let matcher = self.matcher.lock().expect("matcher lock poisoned");
             matcher.event_count()
         };
-        // Serialize the caller's chunk (the only fallible step).
-        let mut value = serde_json::to_value(&chunk).map_err(HarvestError::Serialization)?;
-        // Cap the serialized size below the Postgres NOTIFY payload limit.
-        // Oversize chunks are REPLACED with a truncation marker (never silently
-        // dropped) so the ordered seq slot survives and the SSE client learns
-        // content was cut.
-        let serialized_len = serde_json::to_vec(&value).map_or(usize::MAX, |v| v.len());
-        if serialized_len > PROGRESS_CHUNK_MAX_BYTES {
-            value = serde_json::json!({
-                "_harvest_progress_truncated": true,
-                "bytes": serialized_len,
-            });
-        }
+        let value = cap_progress_chunk(&chunk)?;
         let local_index = self
             .progress_local_index
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let seq = encode_progress_seq(epoch, local_index);
         self.push_command(WorkflowCommand::PublishProgress { seq, chunk: value });
+        Ok(())
+    }
+
+    /// Publish a durable, resumable output chunk (issue #1974).
+    ///
+    /// This is the opt-in durable mode of [`publish_progress`](Self::publish_progress).
+    /// The worker stores the chunk in `harvest_stream_chunks` in the same
+    /// transaction as the decision cycle. A reader of
+    /// `GET /workflows/{id}/stream/durable` gets every stored chunk in order.
+    /// It can disconnect and resume after its last offset.
+    ///
+    /// - **Offset**: the 0-based ordinal of this call in the workflow body.
+    ///   The SSE `id:` carries it. A re-drive gives a chunk the same offset,
+    ///   and the store keeps the first copy.
+    ///   The store never fills an offset below the highest stored offset. A
+    ///   chunk after a failed call can therefore be lost to a reader.
+    /// - **Determinism**: the content can change between runs. The number and
+    ///   order of calls must be deterministic, as for any workflow code.
+    /// - **Replay-neutral**: during replay the call claims its offset and
+    ///   pushes no command. No event goes to `harvest_events`.
+    /// - **Bounded**: [`DURABLE_STREAM_MAX_CHUNKS`] chunks per execution, then
+    ///   one terminal marker. A chunk above [`PROGRESS_CHUNK_MAX_BYTES`]
+    ///   becomes a truncation marker, as in the best-effort mode.
+    /// - **Postgres only**: the SQLite runtime ignores the chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `chunk` cannot be
+    /// serialized. On replay it returns `Ok(())` without touching `chunk`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher mutex is poisoned.
+    pub fn publish_durable_progress(&self, chunk: impl serde::Serialize) -> HarvestResult<()> {
+        // Claim the offset first, also on replay. Otherwise each later chunk
+        // moves down one offset and collides with a stored row.
+        let offset = self
+            .durable_progress_ordinal
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.durable_replay_suppresses() {
+            return Ok(());
+        }
+        // Bound the queue at cap + 1. The extra command lets the store see
+        // the overflow and write its marker. Check first, so a call over the
+        // bound does no serialization. Take the slot only after serialization
+        // succeeds, because a failed call queues nothing.
+        let queued = &self.durable_progress_queued;
+        if queued.load(std::sync::atomic::Ordering::Relaxed) > u64::from(DURABLE_STREAM_MAX_CHUNKS)
+        {
+            return Ok(());
+        }
+        let value = cap_progress_chunk(&chunk)?;
+        queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.push_command(WorkflowCommand::PublishDurableProgress {
+            offset,
+            chunk: value,
+        });
         Ok(())
     }
 
@@ -13760,6 +15752,9 @@ impl WorkflowContext {
     pub fn drain_commands(&self) -> Vec<WorkflowCommand> {
         let mut cmds = self.commands.lock().expect("commands lock poisoned");
         std::mem::take(&mut *cmds)
+            .into_iter()
+            .map(|buffered| buffered.cmd)
+            .collect()
     }
 
     /// Non-consuming count of the pending command buffer: returns how many
@@ -13792,11 +15787,33 @@ impl WorkflowContext {
             .lock()
             .expect("commands lock poisoned")
             .iter()
-            .filter(|c| pred(c))
+            .filter(|buffered| pred(&buffered.cmd))
             .count()
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
+
+    /// Refuse a payload that nests past the depth cap (issue #2224).
+    ///
+    /// A scope that replays its cancel holds its dispatches (issue #1984). The
+    /// cap applied when the cancelling cycle made them, so the check skips them
+    /// and an older recorded cancel still replays.
+    fn check_payload_depth(
+        &self,
+        kind: PayloadKind,
+        activity_name: Option<&str>,
+        value: &Value,
+    ) -> HarvestResult<()> {
+        if !self.replays_a_scope_cancel() && crate::payload_depth::nests_past_cap(value) {
+            return Err(HarvestError::PayloadTooDeep {
+                kind,
+                cap_depth: crate::payload_depth::MAX_PAYLOAD_DEPTH,
+                workflow_type: self.workflow_name.clone(),
+                activity_name: activity_name.map(str::to_string),
+            });
+        }
+        Ok(())
+    }
 
     /// Generate the next sequential activity execution ID.
     fn next_activity_id(&self) -> ActivityExecId {
@@ -13842,15 +15859,287 @@ impl WorkflowContext {
                 .lock()
                 .expect("commands lock poisoned")
                 .iter()
-                .any(WorkflowCommand::awaits_result)
+                .any(|buffered| buffered.cmd.awaits_result())
+            // Issue #1984: a replayed scope that never gets its recorded cancel
+            // holds the body's park. The cycle suspends, and the skipped-command
+            // check then reports the unconsumed cancel marker as drift.
+            || crate::cancellation_scope::holds_a_park(
+                &self.live_scopes.lock().expect("live scopes lock poisoned"),
+            )
     }
 
     /// Push a command onto the pending commands queue.
-    fn push_command(&self, cmd: WorkflowCommand) {
-        self.commands
+    ///
+    /// The scopes on the scope stack see the command first (issue #1984). A
+    /// scope that holds commands keeps it, and the worker never gets it.
+    pub(crate) fn push_command(&self, cmd: WorkflowCommand) {
+        let timer_id = match &cmd {
+            WorkflowCommand::CancelTimer { timer_id }
+            | WorkflowCommand::ArmTimer {
+                timer_id,
+                for_await: false,
+                ..
+            } => Some(timer_id.as_str().to_string()),
+            _ => None,
+        };
+        let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
+        let scopes = crate::cancellation_scope::cancellable_seqs(&stack);
+        let drift = crate::cancellation_scope::captured_marker_drift(&stack, &cmd);
+        let routed = crate::cancellation_scope::route_command(&stack, cmd);
+        drop(stack);
+        if let Some(drift) = drift {
+            self.record_deferred_nd(format!("non-deterministic replay: {drift}"));
+        }
+        // The caller changes the timer state after this push.
+        if let Some(timer_id) = timer_id
+            && !scopes.is_empty()
+        {
+            self.journal_timer_undo(scopes, timer_id);
+        }
+        if let Some((cmd, scopes)) = routed {
+            self.commands
+                .lock()
+                .expect("commands lock poisoned")
+                .push(BufferedCommand {
+                    order: self
+                        .command_order
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    cmd,
+                    scopes,
+                });
+        }
+    }
+
+    // ── Cancellation scope support (issue #1984) ──────────────────────
+
+    /// Next cancellation-scope sequence number.
+    pub(crate) fn next_scope_seq(&self) -> u32 {
+        let mut seq = self.scope_seq.lock().expect("scope_seq lock poisoned");
+        *seq += 1;
+        *seq
+    }
+
+    /// Remember `scope` so a resident cycle can update its members.
+    pub(crate) fn register_scope(
+        &self,
+        scope: &std::sync::Arc<crate::cancellation_scope::ScopeShared>,
+    ) {
+        self.live_scopes
             .lock()
-            .expect("commands lock poisoned")
-            .push(cmd);
+            .expect("live scopes lock poisoned")
+            .push(std::sync::Arc::downgrade(scope));
+    }
+
+    /// Next non-cancellable block sequence number.
+    pub(crate) fn next_shield_seq(&self) -> u32 {
+        let mut seq = self.shield_seq.lock().expect("shield_seq lock poisoned");
+        *seq += 1;
+        *seq
+    }
+
+    /// Run `f` with `frame` on top of the scope stack.
+    pub(crate) fn with_scope_frame<R>(
+        &self,
+        frame: crate::cancellation_scope::ScopeFrame,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        struct Pop<'a>(&'a Mutex<Vec<crate::cancellation_scope::ScopeFrame>>);
+        impl Drop for Pop<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut stack) = self.0.lock() {
+                    stack.pop();
+                }
+            }
+        }
+        self.scope_stack
+            .lock()
+            .expect("scope stack lock poisoned")
+            .push(frame);
+        let _pop = Pop(&self.scope_stack);
+        f()
+    }
+
+    /// Reject `operation` inside a cancellable scope (issue #1984).
+    ///
+    /// A cancelled scope drops its body. The operations named here have a
+    /// durable result that arrives later, and that late result would stay
+    /// unconsumed on replay. So a scope cannot start them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Config`] inside a cancellable scope.
+    pub(crate) fn reject_in_cancellable_scope(&self, operation: &str) -> HarvestResult<()> {
+        if self.in_cancellable_scope() {
+            return Err(HarvestError::Config(format!(
+                "{operation} cannot run inside a cancellation scope"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether a cancellable scope is on the scope stack.
+    pub(crate) fn in_cancellable_scope(&self) -> bool {
+        self.scope_stack
+            .lock()
+            .expect("scope stack lock poisoned")
+            .iter()
+            .any(crate::cancellation_scope::ScopeFrame::is_cancellable)
+    }
+
+    /// The number of history events that this cycle can see.
+    pub(crate) fn history_len(&self) -> usize {
+        self.matcher.lock().expect("matcher lock poisoned").len()
+    }
+
+    /// Run `f` while the matcher sees only the first `horizon` events.
+    ///
+    /// A cancelled scope replays its body this way. The body then sees the
+    /// history that it saw when the scope was cancelled live.
+    pub(crate) fn with_history_horizon<R>(&self, horizon: usize, f: impl FnOnce() -> R) -> R {
+        struct Restore<'a> {
+            matcher: &'a Mutex<HistoryMatcher>,
+            cut: Option<crate::replay::ViewCut>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                if let (Some(cut), Ok(mut matcher)) = (self.cut.take(), self.matcher.lock()) {
+                    matcher.restore_view(cut);
+                }
+            }
+        }
+        let cut = self
+            .matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .cut_view(horizon);
+        let _restore = Restore {
+            matcher: &self.matcher,
+            cut,
+        };
+        f()
+    }
+
+    /// Remove the buffered commands that scope `seq` issued, and return them.
+    ///
+    /// `ReleaseMutex` stays, so a guard dropped in the body still releases.
+    /// `RecordUpdateResult` stays, so an admitted update gets its terminal.
+    pub(crate) fn withdraw_scope_commands(&self, seq: u32) -> Vec<(u64, WorkflowCommand)> {
+        let mut cmds = self.commands.lock().expect("commands lock poisoned");
+        let (withdrawn, kept): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut *cmds)
+                .into_iter()
+                .partition(|buffered| {
+                    buffered.scopes.contains(&seq)
+                        && !matches!(
+                            buffered.cmd,
+                            WorkflowCommand::ReleaseMutex { .. }
+                                | WorkflowCommand::RecordUpdateResult { .. }
+                        )
+                });
+        *cmds = kept;
+        drop(cmds);
+        // A withdrawn chunk or log line leaves the queue, so it no longer
+        // counts toward the queue bound of this cycle.
+        for buffered in &withdrawn {
+            let counter = match buffered.cmd {
+                WorkflowCommand::PublishDurableProgress { .. } => &self.durable_progress_queued,
+                WorkflowCommand::RecordLog { .. } => &self.log_commands_queued,
+                _ => continue,
+            };
+            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        withdrawn
+            .into_iter()
+            .map(|buffered| (buffered.order, buffered.cmd))
+            .collect()
+    }
+
+    /// Keep only the members that are still open in history.
+    pub(crate) fn open_scope_members(
+        &self,
+        members: &crate::cancellation_scope::ScopeMembers,
+    ) -> crate::cancellation_scope::ScopeMembers {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .open_members(members)
+    }
+
+    /// Find the details of an unconsumed marker without consuming it.
+    ///
+    /// The read does not pump signal handlers. A scope peeks before it cuts
+    /// history at its horizon, and a signal past the horizon must wait.
+    pub(crate) fn peek_marker_details(&self, name: &str) -> Option<Value> {
+        self.match_history_unpumped(|m| m.unconsumed_marker_details(name))
+    }
+
+    /// Whether an unconsumed marker with this name is in history.
+    ///
+    /// The read does not pump signal handlers, as a scope or shield marker
+    /// lookup does not (issue #1984).
+    pub(crate) fn has_unconsumed_marker(&self, name: &str) -> bool {
+        self.match_history_unpumped(|m| m.has_unconsumed_marker(name))
+    }
+
+    /// Consume the marker `name`, tolerating interleaved sibling events.
+    ///
+    /// Returns the marker's index and details, or `None` at the frontier.
+    pub(crate) fn take_marker(&self, name: &str) -> Option<(usize, Value)> {
+        self.match_history_unpumped(|m| m.take_marker(name))
+    }
+
+    /// Whether the cycle parks on Harvest work (issue #1984 tests).
+    #[cfg(test)]
+    pub(crate) fn parks_on_harvest_work(&self) -> bool {
+        self.has_parked_harvest_future()
+    }
+
+    /// The durable chunks queued this cycle (issue #1984 tests).
+    #[cfg(test)]
+    pub(crate) fn durable_chunks_queued(&self) -> u64 {
+        self.durable_progress_queued
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Run `f` on the matcher, but do not pump signal handlers (issue #1984).
+    ///
+    /// A scope or shield marker can lie past signals that other writers
+    /// appended after the recording cycle. That cycle did not see them.
+    /// Their handlers therefore run at the next history read, after the
+    /// marker, as in the live run.
+    fn match_history_unpumped<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut HistoryMatcher) -> R,
+    {
+        self.note_position_read();
+        let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
+        f(&mut matcher)
+    }
+
+    /// Consume the events of a cancelled scope's members on replay.
+    pub(crate) fn consume_scope_members(
+        &self,
+        members: &crate::cancellation_scope::ScopeMembers,
+        timer_window: std::ops::Range<usize>,
+    ) {
+        self.match_history_unpumped(|m| m.consume_scope_members(members, timer_window));
+    }
+
+    /// Consume the start and heartbeat events of members cancelled live.
+    pub(crate) fn consume_cancelled_member_frontier(
+        &self,
+        members: &crate::cancellation_scope::ScopeMembers,
+    ) {
+        // Unpumped, as the replay path is: a live cancel runs no signal
+        // handler that its replay would run only after the scope.
+        self.match_history_unpumped(|m| {
+            m.consume_race_loser_frontier(&members.activities, &members.children);
+        });
+    }
+
+    /// Build a non-determinism error for a scope or a shield.
+    pub(crate) fn scope_nd_error(&self, reason: String, expected: String) -> HarvestError {
+        self.nd_error(reason, None, Some(expected), Some("no match".to_string()))
     }
 }
 
@@ -13915,8 +16204,8 @@ where
             }
             // Unconditionally clean up any stale StartTimer command pushed to commands queue.
             if let Ok(mut cmds) = this.context.commands.lock() {
-                cmds.retain(|cmd| {
-                    if let WorkflowCommand::StartTimer { timer_id: id, .. } = cmd {
+                cmds.retain(|buffered| {
+                    if let WorkflowCommand::StartTimer { timer_id: id, .. } = &buffered.cmd {
                         id.as_str() != this.timer_id
                     } else {
                         true
@@ -14332,6 +16621,110 @@ impl From<crate::heartbeat::HeartbeatSlot> for HeartbeatSink {
     }
 }
 
+/// The failure limit of one fan-out (issue #1986).
+#[derive(Clone, Copy)]
+struct FailureLimit {
+    tolerated: usize,
+    total: usize,
+}
+
+/// Split a fan-out slot outcome into an item failure or an engine error.
+///
+/// `ActivityFailed` and `Timeout` are item failures. Every other error
+/// aborts the fan-out, as in the collect-all helpers.
+fn classify_fan_out_slot(slot: HarvestResult<Value>) -> HarvestResult<Result<Value, String>> {
+    match slot {
+        Ok(v) => Ok(Ok(v)),
+        Err(e @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. })) => {
+            Ok(Err(e.to_string()))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Map one classified slot to a manifest item.
+///
+/// With the result writer, a recorded `StoredResult` becomes `Stored`. Any
+/// other value goes through `decode`.
+fn fan_out_item<T>(
+    slot: Result<Value, String>,
+    writer: bool,
+    decode: impl FnOnce(Value) -> HarvestResult<T>,
+) -> HarvestResult<crate::fan_out::FanOutItem<T>> {
+    use crate::fan_out::{FanOutItem, StoredResult};
+    match slot {
+        Err(error) => Ok(FanOutItem::Failed(error)),
+        Ok(value) => StoredResult::from_recorded_value(&value)
+            .filter(|_| writer)
+            .map_or_else(
+                || decode(value).map(FanOutItem::Value),
+                |stored| Ok(FanOutItem::Stored(stored)),
+            ),
+    }
+}
+
+/// Join one fan-out wave and apply the failure limit (issue #1986).
+///
+/// Every wake polls every slot before it decides. `try_join_all` stops at
+/// the first error and leaves later slots unpolled. Their recorded events
+/// are then unconsumed, and a workflow that catches the error drifts (issue
+/// #1791). An engine error still aborts at once, as in the collect-all
+/// helpers.
+async fn join_fan_out_wave<F>(
+    wave: Vec<F>,
+    failures: &mut usize,
+    limit: FailureLimit,
+    results: &mut Vec<Result<Value, String>>,
+) -> HarvestResult<()>
+where
+    F: std::future::Future<Output = HarvestResult<Result<Value, String>>>,
+{
+    use std::task::Poll;
+
+    let mut slots: Vec<_> = wave
+        .into_iter()
+        .map(|f| Box::pin(futures::future::maybe_done(f)))
+        .collect();
+    let prior = *failures;
+    let wave_failures = std::future::poll_fn(|cx| {
+        let mut pending = false;
+        let mut wave_failures = 0;
+        for slot in &mut slots {
+            if slot.as_mut().poll(cx).is_pending() {
+                pending = true;
+                continue;
+            }
+            match slot.as_mut().output_mut() {
+                Some(Ok(Err(_))) => wave_failures += 1,
+                Some(Err(_)) => {
+                    if let Some(Err(error)) = slot.as_mut().take_output() {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if prior + wave_failures > limit.tolerated {
+            Poll::Ready(Err(HarvestError::FanOutFailureThresholdExceeded {
+                tolerated: limit.tolerated,
+                total: limit.total,
+            }))
+        } else if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(wave_failures))
+        }
+    })
+    .await?;
+    *failures = prior + wave_failures;
+    for slot in &mut slots {
+        if let Some(outcome) = slot.as_mut().take_output() {
+            results.push(outcome?);
+        }
+    }
+    Ok(())
+}
+
 /// Context passed to every activity function.
 ///
 /// Activities may perform I/O, call external services, and interact with the
@@ -14461,6 +16854,18 @@ pub struct ActivityContext {
     /// is available, so the first liveness ping (before any manual heartbeat)
     /// preserves the durable checkpoint (issue #151).
     last_heartbeat_payload: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    /// The LLM calls this attempt recorded (issue #1996).
+    ///
+    /// The engine takes them when the attempt completes and writes them to
+    /// `harvest_llm_ledger` in the completion transaction.
+    llm_calls: crate::llm_ledger::LlmCallSlot,
+    /// Where the live chunks of [`Self::publish_progress`] go (issue #2268).
+    /// Set once: by [`Self::with_progress_sink`], or at the first chunk.
+    progress_sink: std::sync::OnceLock<
+        Option<std::sync::Arc<dyn crate::activity_progress::ActivityProgressSink>>,
+    >,
+    /// The index of the next live chunk of this attempt.
+    progress_index: std::sync::atomic::AtomicU64,
 }
 
 /// RAII guard returned by [`ActivityContext::start_auto_heartbeat`] /
@@ -14557,6 +16962,9 @@ impl ActivityContext {
             deadline: None,
             heartbeat_timeout: None,
             last_heartbeat_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            llm_calls: crate::llm_ledger::LlmCallSlot::new(),
+            progress_sink: std::sync::OnceLock::new(),
+            progress_index: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -14613,10 +17021,12 @@ impl ActivityContext {
             deadline: None,
             heartbeat_timeout: None,
             last_heartbeat_payload,
+            llm_calls: crate::llm_ledger::LlmCallSlot::new(),
+            progress_sink: std::sync::OnceLock::new(),
+            progress_index: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    #[cfg_attr(not(feature = "db"), allow(dead_code))]
     pub(crate) fn new_local_activity(
         state: SharedState,
         cancel: tokio_util::sync::CancellationToken,
@@ -14652,7 +17062,67 @@ impl ActivityContext {
             deadline: None,
             heartbeat_timeout: None,
             last_heartbeat_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            llm_calls: crate::llm_ledger::LlmCallSlot::new(),
+            progress_sink: std::sync::OnceLock::new(),
+            progress_index: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Build a context for an embedded backend, such as `autumn-harvest-sqlite`
+    /// (issue #2024).
+    ///
+    /// The backend drains `heartbeat_tx` and persists each payload.
+    /// `heartbeat_details` is the checkpoint of the previous attempt. The
+    /// idempotency key derives from `identity.activity_id`, as in the
+    /// Postgres worker. The cancellation token never fires.
+    ///
+    /// Not for activity authors. A test builds a context with
+    /// [`new_test`](Self::new_test) instead.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_embedded(
+        state: SharedState,
+        identity: ActivityIdentity,
+        heartbeat_tx: tokio::sync::mpsc::Sender<serde_json::Value>,
+        heartbeat_details: Option<serde_json::Value>,
+    ) -> Self {
+        let key = IdempotencyKey::from_activity_exec_id(identity.activity_id);
+        Self::new(
+            state,
+            Some(heartbeat_tx.into()),
+            tokio_util::sync::CancellationToken::new(),
+            identity,
+        )
+        .seed_heartbeat_details(heartbeat_details)
+        .with_idempotency_key(key)
+    }
+
+    /// Build a local-activity context for an embedded backend, such as
+    /// `autumn-harvest-sqlite` (issue #2029).
+    ///
+    /// The context is the one the Postgres worker builds for its inline
+    /// local-activity path. `is_local()` is `true`, and a heartbeat reports
+    /// that local activities do not support it. The idempotency key derives
+    /// from `identity.activity_id`. The cancellation token never fires.
+    ///
+    /// Not for activity authors.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_embedded_local(state: SharedState, identity: ActivityIdentity) -> Self {
+        let key = IdempotencyKey::from_activity_exec_id(identity.activity_id);
+        Self::new_local_activity(state, tokio_util::sync::CancellationToken::new(), identity)
+            .with_idempotency_key(key)
+    }
+
+    /// Seed the checkpoint of the previous attempt and the auto-heartbeat
+    /// re-send cell (issues #151, #682).
+    fn seed_heartbeat_details(mut self, details: Option<serde_json::Value>) -> Self {
+        self.heartbeat_details.clone_from(&details);
+        *self
+            .last_heartbeat_payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = details;
+        self
     }
 
     /// Attach a trace context carrier captured from the task payload so the
@@ -14783,6 +17253,78 @@ impl ActivityContext {
     pub const fn with_attempt(mut self, attempt: u32) -> Self {
         self.attempt = Some(attempt);
         self
+    }
+
+    /// Send the live chunks of [`Self::publish_progress`] to `sink` (issue
+    /// #2268). A test or an embedded runtime sets it. On Postgres the
+    /// default sink sends each chunk with `pg_notify`.
+    #[must_use]
+    pub fn with_progress_sink(
+        self,
+        sink: std::sync::Arc<dyn crate::activity_progress::ActivityProgressSink>,
+    ) -> Self {
+        let _ = self.progress_sink.set(Some(sink));
+        self
+    }
+
+    /// Publish a live, best-effort chunk while the activity runs (issue
+    /// #2268), for example a model token.
+    ///
+    /// Nothing is stored: no event, no `harvest_stream_chunks` row. The
+    /// call does not wait for a reader and never fails the activity. A chunk
+    /// with no sink, or over a full queue, drops. Each chunk carries the
+    /// activity, the attempt and its index in the attempt, so a reader can
+    /// drop the partial output of a failed attempt. A chunk over
+    /// [`PROGRESS_CHUNK_MAX_BYTES`] becomes a truncation marker.
+    ///
+    /// On Postgres the chunk goes to the progress channel of the run, which
+    /// `GET /workflows/{id}/stream` reads. See
+    /// [`activity_progress`](crate::activity_progress).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `chunk` cannot be
+    /// serialized.
+    pub fn publish_progress(&self, chunk: impl serde::Serialize) -> HarvestResult<()> {
+        let value = cap_progress_chunk(&chunk)?;
+        let sink = self
+            .progress_sink
+            .get_or_init(|| self.default_progress_sink());
+        let Some(sink) = sink else {
+            return Ok(());
+        };
+        let index = self
+            .progress_index
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        sink.publish(crate::activity_progress::ActivityProgress {
+            execution_id: self.identity.execution_id,
+            activity_id: self.identity.activity_id,
+            activity_type: self.identity.activity_type.clone(),
+            attempt: self.attempt.unwrap_or(1),
+            index,
+            chunk: value,
+        });
+        Ok(())
+    }
+
+    /// The sink of a context with no sink set: `pg_notify` when the context
+    /// has a database pool and a Tokio runtime runs, else none.
+    #[cfg_attr(
+        not(feature = "db"),
+        allow(clippy::unused_self, clippy::missing_const_for_fn)
+    )]
+    fn default_progress_sink(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::activity_progress::ActivityProgressSink>> {
+        #[cfg(feature = "db")]
+        if let Some(state) = self.transactional_state.as_ref()
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
+            return Some(std::sync::Arc::new(
+                crate::activity_progress::NotifyProgressSink::spawn(state.pool.clone()),
+            ));
+        }
+        None
     }
 
     /// Set the error message from the most recent failed attempt.
@@ -14969,6 +17511,49 @@ impl ActivityContext {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    // ── Agent cost ledger (issue #1996) ───────────────────────────────────────
+
+    /// Record one model call for the agent cost ledger (issue #1996).
+    ///
+    /// The engine writes the call to `harvest_llm_ledger` when this attempt
+    /// completes. The row commits with the completion event. A failed attempt
+    /// writes no row. The ledger is outside the event payload, so the codec
+    /// does not encrypt it.
+    ///
+    /// A call with no latency gets the time since the previous call, or
+    /// since the attempt started.
+    ///
+    /// In a [`Self::run_transactional`] activity, record the calls before the
+    /// commit. The commit writes the calls that exist at that time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::llm_ledger::LlmCallError`] when the call fails its
+    /// check, or when this attempt already recorded
+    /// [`crate::llm_ledger::MAX_LLM_CALLS_PER_ATTEMPT`] calls. The error
+    /// converts to a non-retryable activity failure, so `?` in an activity
+    /// fails the attempt without a retry.
+    pub fn record_llm_call(
+        &self,
+        call: crate::llm_ledger::LlmCall,
+    ) -> Result<(), crate::llm_ledger::LlmCallError> {
+        self.llm_calls.record(call)
+    }
+
+    /// The LLM calls this attempt recorded so far (issue #1996).
+    #[must_use]
+    pub fn llm_calls(&self) -> Vec<crate::llm_ledger::LlmCall> {
+        self.llm_calls.snapshot()
+    }
+
+    /// Take the recorded calls and empty the slot.
+    ///
+    /// The engine calls this when it writes the completion.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    pub(crate) fn take_llm_calls(&self) -> Vec<crate::llm_ledger::LlmCall> {
+        self.llm_calls.take()
+    }
+
     /// The stable idempotency key for this logical activity invocation.
     ///
     /// Identical across all retry attempts for the same logical invocation
@@ -15152,6 +17737,63 @@ impl ActivityContext {
         self.identity.activity_id
     }
 
+    /// Refuse this LLM step when its run or its tenant has spent a budget
+    /// (issue #1997).
+    ///
+    /// Call it before the model call, and record the call with
+    /// [`Self::record_llm_call`] after it. The caps come from the
+    /// [`QuotaPolicy`](crate::quota::QuotaPolicy) of the workflow type. With
+    /// no LLM cap, it returns at once and reads no row. A spent cap gives a
+    /// non-retryable failure payload of type
+    /// [`ERROR_TYPE_LLM_BUDGET_EXCEEDED`](crate::llm_budget::ERROR_TYPE_LLM_BUDGET_EXCEEDED).
+    /// A failed read gives a retryable payload of type
+    /// [`ERROR_TYPE_LLM_BUDGET_CHECK_FAILED`](crate::llm_budget::ERROR_TYPE_LLM_BUDGET_CHECK_FAILED).
+    ///
+    /// A context with no database, such as a test context or a local
+    /// activity, always passes. The check reads the policy in this process.
+    /// A worker that does not register the workflow type passes, and logs one
+    /// warning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an activity error payload, for use with `?` in the body.
+    // Without `db`, the body has no await: it always passes.
+    #[cfg_attr(
+        not(feature = "db"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
+    pub async fn check_llm_budget(&self) -> Result<(), String> {
+        #[cfg(feature = "db")]
+        if let Some(state) = self.transactional_state.as_ref()
+            && let Some(policy) = crate::llm_budget::policy_for(self.workflow_type())
+        {
+            use crate::failure::IntoActivityErrorString as _;
+
+            let spend = async {
+                let mut conn = crate::pool::acquire_within_pool_bound(&state.pool).await?;
+                crate::llm_budget::load_llm_spend(
+                    &mut conn,
+                    state.exec_id,
+                    policy.tenant_llm_window_secs,
+                    policy.has_tenant_llm_cap(),
+                )
+                .await
+            }
+            .await
+            .map_err(|error| crate::llm_budget::check_failed(&error).into_error_payload())?;
+            if let Some(violation) = crate::llm_budget::check_llm_budget(&spend, &policy) {
+                self.metrics
+                    .record_quota_rejected(self.workflow_type(), violation.resource.as_str());
+                return Err(
+                    crate::llm_budget::LlmBudgetExceeded::from_violation(violation)
+                        .into_failure()
+                        .into_error_payload(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// `true` when this activity is running inline as a local activity.
     ///
     /// Local activities run on the workflow worker task and are never enqueued
@@ -15307,6 +17949,59 @@ impl ActivityContext {
         self.state.get(&TypeId::of::<T>())?.downcast_ref::<T>()
     }
 
+    /// Read the verified tenant of the run that owns this activity (issue
+    /// #1998).
+    ///
+    /// The value comes from `harvest_workflow_executions.tenant` (issue #1977).
+    /// Each call runs one query. History does not record the value, so replay
+    /// never depends on it.
+    ///
+    /// Returns `Ok(None)` for a run with no tenant. It also returns `Ok(None)`
+    /// for a test context and for a build without the `db` feature.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::Config`] for a local activity. It has no pool, so it
+    ///   cannot read the row.
+    /// - A [`HarvestError`] when the pool or the read fails, or when the row is
+    ///   not on this shard, for example during a rebalance.
+    // Without `db` the body has no `.await`, so both no-await lints fire.
+    #[cfg_attr(
+        not(feature = "db"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
+    pub async fn run_tenant(&self) -> HarvestResult<Option<String>> {
+        // A local activity runs inside a tenant run, so `None` would be false.
+        if self.is_local {
+            return Err(HarvestError::Config(
+                "a local activity cannot read the run tenant".to_owned(),
+            ));
+        }
+        #[cfg(feature = "db")]
+        if let Some(txn) = &self.transactional_state {
+            use crate::schema::harvest_workflow_executions::dsl::{
+                harvest_workflow_executions, tenant,
+            };
+            use diesel::{QueryDsl as _, prelude::OptionalExtension as _};
+            use diesel_async::RunQueryDsl as _;
+
+            let mut conn = crate::replication::fenced_checkout(&txn.pool).await?;
+            let found: Option<Option<String>> = harvest_workflow_executions
+                .find(txn.exec_id.as_uuid())
+                .select(tenant)
+                .first(&mut *conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            // A missing row is not "no tenant". The run can be on another
+            // shard, so the caller must not guess.
+            return found.ok_or_else(|| {
+                HarvestError::Database(format!("execution {} is not on this shard", txn.exec_id))
+            });
+        }
+        Ok(None)
+    }
+
     /// Return the heartbeat payload durably persisted by the previous attempt.
     ///
     /// This is a snapshot captured before the current attempt starts. Heartbeats
@@ -15347,6 +18042,11 @@ impl ActivityContext {
     /// [`Self::heartbeat_details`]. Always check the return value — an
     /// `Err(ActivityCancelled)` means the owning workflow was cancelled and the
     /// activity should wind down promptly.
+    ///
+    /// A payload nested more than [`MAX_PAYLOAD_DEPTH`](crate::payload_depth::MAX_PAYLOAD_DEPTH)
+    /// levels is dropped with a warning (issue #2225). This call still returns
+    /// `Ok`. The flush then refreshes the heartbeat time only, so the activity
+    /// stays alive and the previous checkpoint stays.
     ///
     /// Within a single attempt, heartbeat payloads are last-write-wins and are
     /// not read back through this context. Call [`Self::heartbeat_details`] at
@@ -15774,7 +18474,11 @@ impl ActivityContext {
     /// * this context has no transactional pool attached (e.g. test contexts
     ///   or local activities),
     /// * a DB connection cannot be acquired from the pool,
-    /// * `f` returns `Err(e)` (the user error is propagated as-is), or
+    /// * `f` returns `Err(e)` (the user error is propagated as-is),
+    /// * the result nests more than
+    ///   [`MAX_PAYLOAD_DEPTH`](crate::payload_depth::MAX_PAYLOAD_DEPTH) levels
+    ///   (issue #2225). The transaction rolls back, and the error is a
+    ///   non-retryable `PayloadTooDeep` failure, or
     /// * the harvest finalization (event append / task complete / workflow wake)
     ///   fails.
     ///
@@ -15852,6 +18556,12 @@ impl ActivityContext {
         // observes a `set_active_key` that lands mid-activity.
         let codecs = self.payload_codecs.clone();
         let max_result_bytes = txn.max_result_bytes;
+        let result_writer = txn.result_writer;
+        let writer_store = txn
+            .offloader
+            .as_ref()
+            .filter(|_| result_writer)
+            .map(|offloader| Arc::clone(offloader.store()));
 
         let mut conn = crate::replication::fenced_checkout(&txn.pool)
             .await
@@ -15864,21 +18574,67 @@ impl ActivityContext {
         // to a no-op passthrough when nested. So a nested transaction's
         // hint would flush with the outer task's outcome, instead of this
         // transaction's own.
+        // Issue #1996: how many recorded LLM calls the commit writes.
+        let committed_llm_calls = std::sync::atomic::AtomicUsize::new(0);
         let result = crate::dispatch::buffered_checkpoint(Box::pin(
             conn.transaction::<T, TxError, _>(async |conn| {
                 // Run user domain writes.
                 let user_result = f(conn).await.map_err(TxError::User)?;
 
                 // Serialize the result for the event log.
-                let output =
+                let mut output =
                     serde_json::to_value(&user_result).map_err(HarvestError::Serialization)?;
+
+                // Issue #2225: a result nested past the depth cap cannot be read
+                // back from the history. Roll back before the upload and the
+                // commit, so no user write commits and no blob is stored.
+                if crate::payload_depth::nests_past_cap(&output) {
+                    return Err(TxError::Payload(
+                        crate::payload_depth::too_deep_failure_payload("transactional activity"),
+                    ));
+                }
+
+                // Issue #1986: a fan-out row with the result writer records a
+                // reference. The upload runs before the execution row lock.
+                // Its reference row commits with the event, so retention can
+                // delete the blob. A rollback leaves one blob without a row,
+                // as a rolled-back offload does.
+                let stored = match &writer_store {
+                    Some(store) => Some(
+                        crate::fan_out::StoredResult::write(
+                            store.as_ref(),
+                            &codecs,
+                            activity_id,
+                            &output,
+                        )
+                        .await?,
+                    ),
+                    None => None,
+                };
+                if result_writer
+                    && stored.is_none()
+                    && output.get(crate::fan_out::STORED_RESULT_KEY).is_some()
+                {
+                    use crate::failure::IntoActivityErrorString as _;
+                    return Err(TxError::Payload(
+                        crate::failure::ActivityFailure::non_retryable(
+                            "ReservedResultKey",
+                            format!(
+                                "transactional activity result carries the reserved key \
+                                 '{}' and this worker has no PayloadStore to write it",
+                                crate::fan_out::STORED_RESULT_KEY
+                            ),
+                        )
+                        .into_error_payload(),
+                    ));
+                }
 
                 // Enforce the result-size cap before committing.  The worker's
                 // post-handler cap check runs after the handler returns, which
                 // is too late for transactional activities — the event would
                 // already be committed.  Rolling back here ensures an oversized
                 // result never lands in harvest_events.
-                if max_result_bytes > 0 {
+                if max_result_bytes > 0 && stored.is_none() {
                     let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
                     if observed > max_result_bytes {
                         use crate::failure::IntoActivityErrorString as _;
@@ -15933,6 +18689,20 @@ impl ActivityContext {
                     }
                 }
 
+                if let Some(stored) = &stored {
+                    crate::store::insert_payload_refs(
+                        conn,
+                        exec_id,
+                        &[crate::payload_store::OffloadedRef {
+                            blob_key: stored.key.clone(),
+                            store_id: stored.store_id.clone(),
+                            byte_len: stored.len,
+                        }],
+                    )
+                    .await?;
+                    output = stored.to_recorded_value();
+                }
+
                 // Append ActivityCompleted within the same transaction.
                 let completion_event = crate::event::WorkflowEvent::ActivityCompleted {
                     activity_id,
@@ -15947,10 +18717,27 @@ impl ActivityContext {
                 )
                 .await?;
 
+                // Issue #1996: the recorded LLM calls commit with the event.
+                // A copy, so a rollback keeps them in the slot. The slot is
+                // emptied only after the commit.
+                let llm_calls = self.llm_calls();
+                crate::llm_ledger::insert_ledger_rows(
+                    conn,
+                    exec_id,
+                    history.next_event_id,
+                    &self.identity.activity_type,
+                    &llm_calls,
+                )
+                .await?;
+                committed_llm_calls.store(llm_calls.len(), std::sync::atomic::Ordering::SeqCst);
+
                 // Mark the task COMPLETED. The row lock above keeps the claim
                 // current, so a lost lease here is a bug, and the error rolls
                 // back.
-                crate::queue::complete_claimed_task(conn, &claim, output)
+                // The row stores the result in the column form (issue #2043).
+                let row_output =
+                    crate::queue::activity_row_output(&codecs, &output, stored.is_some())?;
+                crate::queue::complete_claimed_task(conn, &claim, row_output)
                     .await?
                     .require_applied(task_id)?;
 
@@ -15973,6 +18760,11 @@ impl ActivityContext {
                 // leaves it false so the failure flows through the normal path.
                 self.transactional_commit_occurred
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+                // The commit wrote the first calls of the slot (issue #1996).
+                // A call recorded during the commit stays, so the worker logs
+                // it as dropped.
+                self.llm_calls
+                    .remove_first(committed_llm_calls.load(std::sync::atomic::Ordering::SeqCst));
                 Ok(value)
             }
             Err(e) => Err(match e {
@@ -16098,13 +18890,8 @@ impl ActivityContext {
     /// including [`heartbeat_details`](Self::heartbeat_details).
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
-    pub fn with_heartbeat_details(mut self, details: Option<serde_json::Value>) -> Self {
-        self.heartbeat_details.clone_from(&details);
-        *self
-            .last_heartbeat_payload
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = details;
-        self
+    pub fn with_heartbeat_details(self, details: Option<serde_json::Value>) -> Self {
+        self.seed_heartbeat_details(details)
     }
 
     /// Like [`new_test`](Self::new_test) but with a caller-supplied identity, so
@@ -16121,6 +18908,30 @@ impl ActivityContext {
             identity,
         )
         .with_idempotency_key(key)
+        .with_attempt(1)
+        .with_max_attempts(1)
+    }
+
+    /// Like [`new_test`](Self::new_test) but with registered state, so a test
+    /// can run an activity that reads [`state`](Self::state) (issue #1973).
+    ///
+    /// Build `state` the way `HarvestBuilder::state` does: one boxed value per
+    /// type, keyed by its `TypeId`.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn new_test_with_state(state: SharedState) -> Self {
+        let id = ActivityExecId::new();
+        let identity = ActivityIdentity {
+            activity_id: id,
+            ..ActivityIdentity::for_test()
+        };
+        Self::new(
+            state,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            identity,
+        )
+        .with_idempotency_key(IdempotencyKey::from_activity_exec_id(id))
         .with_attempt(1)
         .with_max_attempts(1)
     }
@@ -16151,6 +18962,52 @@ mod tests {
     use crate::types::{ActivityExecId, ShardId};
     use chrono::Utc;
     use std::time::Duration;
+
+    // ── Embedded-backend context (issue #2024) ──────────────────────────────
+
+    #[tokio::test]
+    async fn an_embedded_context_heartbeats_and_resumes() {
+        let identity = ActivityIdentity::for_test();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let ctx = ActivityContext::new_embedded(
+            empty_shared_state(),
+            identity.clone(),
+            tx,
+            Some(serde_json::json!({"done": 2})),
+        );
+
+        let resumed: Option<Value> = ctx.heartbeat_details().unwrap();
+        assert_eq!(resumed, Some(serde_json::json!({"done": 2})));
+        ctx.heartbeat(serde_json::json!({"done": 3})).await.unwrap();
+        assert_eq!(rx.recv().await, Some(serde_json::json!({"done": 3})));
+        assert_eq!(
+            ctx.idempotency_key().unwrap(),
+            &IdempotencyKey::from_activity_exec_id(identity.activity_id)
+        );
+        assert_eq!(ctx.identity(), identity);
+        assert!(!ctx.is_local());
+        assert!(!ctx.is_cancelled());
+        ctx.check_cancellation().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_embedded_context_reports_a_closed_sink_as_cancelled() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let ctx = ActivityContext::new_embedded(
+            empty_shared_state(),
+            ActivityIdentity::for_test(),
+            tx,
+            None,
+        );
+
+        let resumed: Option<Value> = ctx.heartbeat_details().unwrap();
+        assert_eq!(resumed, None);
+        assert!(matches!(
+            ctx.heartbeat(1).await,
+            Err(HarvestError::ActivityCancelled(_))
+        ));
+    }
 
     // ── Signal handlers (issue #546) ────────────────────────────────────────
 
@@ -16957,36 +19814,238 @@ mod tests {
         );
     }
 
-    #[test]
-    fn workflow_context_should_continue_as_new_uses_soft_threshold() {
-        let events = vec![
-            WorkflowEvent::WorkflowStarted {
-                input: Value::Null,
-                timestamp: Utc::now(),
-                last_completion_result: None,
-                last_error: None,
-                scheduled_time: None,
-            },
-            WorkflowEvent::MarkerRecorded {
-                name: "poll-cycle".into(),
-                details: serde_json::json!({"n": 1}),
-            },
-            WorkflowEvent::MarkerRecorded {
-                name: "poll-cycle".into(),
-                details: serde_json::json!({"n": 2}),
-            },
-        ];
-        let policy = WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
-
-        let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+    /// A replay context with `extra` marker events after the start event.
+    /// The cursor starts at the first event.
+    fn ctx_with_extra_events(extra: usize, threshold: u64) -> WorkflowContext {
+        let mut events = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }];
+        events.extend((0..extra).map(|n| WorkflowEvent::MarkerRecorded {
+            name: "poll-cycle".into(),
+            details: serde_json::json!({ "n": n }),
+        }));
+        WorkflowContext::for_replay_with_state_and_history_policy(
             ExecutionId::new(),
             events,
             empty_shared_state(),
-            policy,
-        );
+            WorkflowHistoryPolicy::default().with_continue_as_new_threshold(threshold),
+        )
+    }
 
-        assert_eq!(ctx.history_event_count(), 3);
+    fn next_side_effect() -> WorkflowEvent {
+        WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Custom,
+            name: Some("next".to_string()),
+            value: serde_json::json!(7),
+        }
+    }
+
+    fn continue_decision(value: bool) -> WorkflowEvent {
+        WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Custom,
+            name: Some(crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME.to_string()),
+            value: serde_json::json!(value),
+        }
+    }
+
+    #[test]
+    fn should_continue_as_new_records_a_live_true_decision() {
+        let ctx = ctx_with_extra_events(0, 0);
+        assert_eq!(ctx.history_event_count(), 1);
         assert!(ctx.should_continue_as_new());
+        let cmds = ctx.drain_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [WorkflowCommand::RecordSideEffect {
+                    kind: crate::event::SideEffectKind::Custom,
+                    name: Some(name),
+                    value,
+                }] if name == crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME
+                    && value == &serde_json::json!(true)
+            ),
+            "a live true decision records one side effect, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn should_continue_as_new_reads_a_legacy_checkpoint_after_the_deadline_probe() {
+        // A history from before #2080 with an execution timeout holds the
+        // deadline clock read, then the checkpoint.
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let ctx = deadline_ctx(
+            t0,
+            vec![
+                recorded_now(t0),
+                WorkflowEvent::WorkflowContinuedAsNew {
+                    new_exec_id: ExecutionId::new(),
+                    input: Value::Null,
+                    new_workflow_type: None,
+                },
+            ],
+            Some(chrono::Duration::seconds(30)),
+        );
+        assert!(ctx.should_continue_as_new());
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn should_continue_as_new_replays_the_decision_before_the_deadline_probe() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let ctx = deadline_ctx(
+            t0,
+            vec![
+                continue_decision(true),
+                recorded_now(t0),
+                next_side_effect(),
+            ],
+            Some(chrono::Duration::seconds(30)),
+        );
+        assert!(ctx.should_continue_as_new());
+        assert!(ctx.drain_commands().is_empty());
+        assert_eq!(ctx.side_effect("next", || 0).unwrap(), 7);
+    }
+
+    #[test]
+    fn should_continue_as_new_dispatches_signal_handlers_like_history_event_count() {
+        // Both calls pass through `match_history`, so a signal at the cursor
+        // reaches its handler at the same point as before issue #2080.
+        let dispatched = |call: fn(&WorkflowContext)| {
+            let events = vec![
+                WorkflowEvent::WorkflowStarted {
+                    input: Value::Null,
+                    timestamp: Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
+                    scheduled_time: None,
+                },
+                WorkflowEvent::SignalReceived {
+                    signal_name: "cancel".into(),
+                    payload: serde_json::json!(1),
+                },
+                next_side_effect(),
+            ];
+            let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+            let received: Arc<std::sync::Mutex<Vec<Value>>> =
+                Arc::new(std::sync::Mutex::new(vec![]));
+            let sink = received.clone();
+            ctx.register_signal_handler_raw("cancel", move |payload: Value| {
+                sink.lock().unwrap().push(payload);
+            });
+            call(&ctx);
+            let count = received.lock().unwrap().len();
+            assert_eq!(ctx.side_effect("next", || 0).unwrap(), 7);
+            count
+        };
+        let old = dispatched(|ctx| {
+            let _ = ctx.history_event_count();
+        });
+        let new = dispatched(|ctx| {
+            assert!(!ctx.should_continue_as_new());
+        });
+        assert_eq!(new, old, "the dispatch point must not move");
+    }
+
+    #[test]
+    fn should_continue_as_new_keeps_false_positions_apart_across_signals() {
+        // A signal-driven loop calls the method between signals, with no other
+        // command in between. Each call owns its own decision (issue #2080).
+        let signal = |n: i64| WorkflowEvent::SignalReceived {
+            signal_name: "op".into(),
+            payload: serde_json::json!(n),
+        };
+        let ctx = deadline_ctx_with_policy(
+            Utc::now(),
+            vec![
+                continue_decision(false),
+                signal(1),
+                continue_decision(false),
+                signal(2),
+                continue_decision(true),
+            ],
+            None,
+            WorkflowHistoryPolicy::default(),
+        );
+        assert!(!ctx.should_continue_as_new());
+        assert!(!ctx.should_continue_as_new());
+        assert!(ctx.should_continue_as_new());
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn should_continue_as_new_records_a_live_false_decision() {
+        let ctx = WorkflowContext::new_test();
+        assert!(!ctx.should_continue_as_new());
+        let cmds = ctx.drain_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [WorkflowCommand::RecordSideEffect {
+                    kind: crate::event::SideEffectKind::Custom,
+                    name: Some(name),
+                    value,
+                }] if name == crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME
+                    && value == &serde_json::json!(false)
+            ),
+            "a live false decision records one side effect, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn should_continue_as_new_reads_a_recorded_false_as_false() {
+        let ctx = deadline_ctx_with_policy(
+            Utc::now(),
+            vec![continue_decision(false), next_side_effect()],
+            None,
+            WorkflowHistoryPolicy::default(),
+        );
+        assert!(!ctx.should_continue_as_new());
+        assert_eq!(ctx.side_effect("next", || 0).unwrap(), 7);
+    }
+
+    #[test]
+    fn should_continue_as_new_ignores_history_that_grows_after_the_call() {
+        // Three events are loaded and the threshold is two. The cursor is
+        // still inside the history, so the live answer was false (issue #2080).
+        let ctx = ctx_with_extra_events(2, 2);
+        assert_eq!(ctx.history_event_count(), 3);
+        assert!(!ctx.should_continue_as_new());
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn should_continue_as_new_replays_a_recorded_true_decision() {
+        let ctx = deadline_ctx_with_policy(
+            Utc::now(),
+            vec![continue_decision(true), next_side_effect()],
+            None,
+            WorkflowHistoryPolicy::default(),
+        );
+        assert!(ctx.should_continue_as_new());
+        assert!(ctx.drain_commands().is_empty());
+        // The decision event is consumed. The next side effect still matches.
+        assert_eq!(ctx.side_effect("next", || 0).unwrap(), 7);
+    }
+
+    #[test]
+    fn should_continue_as_new_reads_a_legacy_checkpoint_as_true() {
+        // A history that predates the decision event ends in the checkpoint.
+        let ctx = deadline_ctx_with_policy(
+            Utc::now(),
+            vec![WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: ExecutionId::new(),
+                input: Value::Null,
+                new_workflow_type: None,
+            }],
+            None,
+            WorkflowHistoryPolicy::default(),
+        );
+        assert!(ctx.should_continue_as_new());
+        assert!(ctx.drain_commands().is_empty());
     }
 
     #[test]
@@ -17360,6 +20419,44 @@ mod tests {
         );
     }
 
+    /// Issue #2082: a declarative update handler sees the start source of its run.
+    #[tokio::test]
+    async fn update_handler_inherits_start_provenance() {
+        #[allow(clippy::needless_pass_by_value)]
+        fn source_probe_handler(
+            ctx: std::sync::Arc<WorkflowContext>,
+            _input: Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>>
+        {
+            let source = ctx.info().start_source.as_str();
+            Box::pin(async move { Ok(serde_json::json!(source)) })
+        }
+
+        let info = crate::info::UpdateHandlerInfo {
+            name: "source_probe",
+            workflow: "wf",
+            module: "test",
+            input_type_hint: "",
+            output_type_hint: "string",
+            has_validator: false,
+            handler: source_probe_handler,
+            validator: None,
+            mcp: false,
+            description: None,
+            arg_schema: None,
+            response_schema: None,
+        };
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started_event()])
+            .with_start_provenance(StartProvenance::fresh(StartSource::SignalWithStart));
+        ctx.register_declarative_update_handler(&info);
+        let result = ctx
+            .invoke_update("source_probe", Value::Null)
+            .expect("handler registered")
+            .await;
+        assert_eq!(result, Ok(serde_json::json!("signal_with_start")));
+    }
+
     #[test]
     fn time_until_deadline_uses_recorded_clock() {
         let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
@@ -17421,46 +20518,29 @@ mod tests {
     }
 
     #[test]
-    fn should_continue_as_new_no_timeout_records_no_event_and_is_false() {
-        // AC4: a workflow with NO execution_timeout behaves exactly as today
-        // and records ZERO new side-effect events.
+    fn should_continue_as_new_no_timeout_records_no_deadline_event() {
+        // A workflow with no execution_timeout records no deadline clock read.
+        // It records only the history-size decision.
         let ctx = WorkflowContext::new_test();
         assert!(!ctx.should_continue_as_new());
+        let cmds = ctx.drain_commands();
         assert!(
-            ctx.drain_commands().is_empty(),
-            "should_continue_as_new must not record a side-effect when there is no deadline"
+            cmds.iter().all(|c| !matches!(
+                c,
+                WorkflowCommand::RecordSideEffect {
+                    kind: crate::event::SideEffectKind::Now,
+                    ..
+                }
+            )),
+            "no deadline clock read without a deadline, got {cmds:?}"
         );
     }
 
     #[test]
     fn should_continue_as_new_still_trips_on_history_count() {
-        // Existing behaviour preserved: the event-count trigger fires
-        // independently of the deadline path (no execution_timeout here).
-        let events = vec![
-            WorkflowEvent::WorkflowStarted {
-                input: Value::Null,
-                timestamp: Utc::now(),
-                last_completion_result: None,
-                last_error: None,
-                scheduled_time: None,
-            },
-            WorkflowEvent::MarkerRecorded {
-                name: "poll".into(),
-                details: serde_json::json!({"n": 1}),
-            },
-            WorkflowEvent::MarkerRecorded {
-                name: "poll".into(),
-                details: serde_json::json!({"n": 2}),
-            },
-        ];
-        let policy = WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
-        let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
-            ExecutionId::new(),
-            events,
-            empty_shared_state(),
-            policy,
-        );
-        assert!(ctx.should_continue_as_new());
+        // The event-count trigger fires at the frontier, independent of the
+        // deadline path (no execution_timeout here).
+        assert!(ctx_with_extra_events(0, 0).should_continue_as_new());
     }
 
     #[test]
@@ -17660,14 +20740,27 @@ mod tests {
             "a run past its deadline must trip the deadline branch"
         );
         let cmds = ctx.drain_commands();
+        // The history-size decision comes first, then the deadline clock read.
         assert_eq!(
             cmds.len(),
-            1,
-            "the frontier read must record exactly one command, got {cmds:?}"
+            2,
+            "the frontier read must record the decision and one clock read, got {cmds:?}"
         );
         assert!(
             matches!(
                 &cmds[0],
+                WorkflowCommand::RecordSideEffect {
+                    kind: crate::event::SideEffectKind::Custom,
+                    name: Some(name),
+                    ..
+                } if name == crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME
+            ),
+            "the first command must be the decision, got {:?}",
+            cmds[0]
+        );
+        assert!(
+            matches!(
+                &cmds[1],
                 WorkflowCommand::RecordSideEffect {
                     kind: crate::event::SideEffectKind::Now,
                     name: Some(name),
@@ -17675,7 +20768,7 @@ mod tests {
                 } if name == crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME
             ),
             "the recorded command must be a sentinel-named Now side-effect, got {:?}",
-            cmds[0]
+            cmds[1]
         );
     }
 
@@ -22457,6 +25550,128 @@ mod tests {
         assert_eq!(payload, serde_json::json!({"ok": true}));
     }
 
+    // ── wait_for_signal_matching / receive_signal_matching (issue #1985) ──
+
+    fn order_signal(payload: Value) -> WorkflowEvent {
+        WorkflowEvent::SignalReceived {
+            signal_name: "order".to_string(),
+            payload,
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_matching_returns_the_first_matching_payload() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started_event(),
+                order_signal(serde_json::json!({"id": 41})),
+                order_signal(serde_json::json!({"id": 42})),
+            ],
+        );
+        let payload = ctx
+            .wait_for_signal_matching("order", |p| p["id"] == 42)
+            .await
+            .expect("the matching signal replays");
+        assert_eq!(payload, serde_json::json!({"id": 42}));
+        let skipped = ctx.wait_for_signal("order").await.expect("still buffered");
+        assert_eq!(skipped, serde_json::json!({"id": 41}));
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_matching_parks_without_a_match() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![started_event(), order_signal(serde_json::json!({"id": 41}))],
+        );
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            ctx.wait_for_signal_matching("order", |p| p["id"] == 42),
+        )
+        .await;
+        assert!(parked.is_err(), "the wait must park: {parked:?}");
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::WaitForSignal { signal_name, .. } if signal_name == "order"
+            )),
+            "the park reuses WaitForSignal: {commands:?}"
+        );
+        assert!(
+            ctx.signal_probed_at_frontier("order"),
+            "a predicate wait must stop a warm resume"
+        );
+        assert!(
+            !ctx.history_has_unconsumed_events(),
+            "the rejected signal is not drift"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_matching_predicate_may_call_the_context() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started_event(),
+                order_signal(serde_json::json!({"id": 41})),
+                order_signal(serde_json::json!({"id": 42})),
+            ],
+        );
+        let matched = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.wait_for_signal_matching("order", |p| !ctx.is_replaying() || p["id"] == 42),
+        )
+        .await
+        .expect("a predicate that reads the context must not deadlock")
+        .expect("the matching signal replays");
+        assert_eq!(matched, serde_json::json!({"id": 42}));
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_matching_stops_at_the_first_match() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started_event(),
+                order_signal(serde_json::json!({"id": 42})),
+                order_signal(serde_json::json!("not an order")),
+            ],
+        );
+        let matched = ctx
+            .wait_for_signal_matching("order", |p| {
+                p["id"]
+                    .as_u64()
+                    .expect("the predicate never sees a later payload")
+                    == 42
+            })
+            .await
+            .expect("the first signal matches");
+        assert_eq!(matched, serde_json::json!({"id": 42}));
+    }
+
+    #[derive(Debug, serde::Deserialize, PartialEq)]
+    struct Order {
+        id: u64,
+    }
+
+    #[tokio::test]
+    async fn receive_signal_matching_skips_a_payload_that_does_not_decode() {
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started_event(),
+                order_signal(serde_json::json!("not an order")),
+                order_signal(serde_json::json!({"id": 42})),
+            ],
+        );
+        let order: Order = ctx
+            .receive_signal_matching("order", |o: &Order| o.id == 42)
+            .await
+            .expect("the decodable match replays");
+        assert_eq!(order, Order { id: 42 });
+    }
+
     // ── wait_for_signal_timeout / receive_signal_timeout (issue #476) ──────
 
     #[tokio::test]
@@ -22500,6 +25715,7 @@ mod tests {
             activities,
             children,
             timers,
+            ..
         } = &commands[0]
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
@@ -22561,6 +25777,7 @@ mod tests {
             activities,
             children,
             timers,
+            ..
         } = &commands[0]
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
@@ -23427,6 +26644,7 @@ mod tests {
             activities,
             children,
             timers,
+            ..
         } = &commands[0]
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
@@ -23484,6 +26702,7 @@ mod tests {
             activities,
             children,
             timers,
+            ..
         } = &commands[0]
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
@@ -23716,6 +26935,7 @@ mod tests {
             activities,
             children,
             timers,
+            ..
         } = &commands[0]
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
@@ -25292,6 +28512,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -25322,6 +28544,38 @@ mod tests {
             error_schema: None,
             retry_policy: None,
         }
+    }
+
+    /// A typed detached spawn in a scope fails before its input serializes
+    /// (issue #1984).
+    #[tokio::test]
+    async fn a_typed_detached_spawn_in_a_scope_does_not_serialize() {
+        struct Counted<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl serde::Serialize for Counted<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                s.serialize_unit()
+            }
+        }
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let ctx = WorkflowContext::new_test();
+        let info = make_workflow_info("audit_trail");
+        let spawned = ctx
+            .cancellation_scope()
+            .run(async {
+                ctx.spawn_child_workflow_detached(
+                    &info,
+                    Counted(&calls),
+                    crate::ParentClosePolicy::Abandon,
+                )
+            })
+            .await
+            .expect("the scope completes");
+        assert!(
+            matches!(spawned, Err(HarvestError::Config(_))),
+            "{spawned:?}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -25747,6 +29001,284 @@ mod tests {
         assert!(encode_progress_seq(5, 1) > encode_progress_seq(5, 0));
         // Deterministic on a crash-retry of the same cycle: same inputs → same seq.
         assert_eq!(encode_progress_seq(7, 3), encode_progress_seq(7, 3));
+    }
+
+    // ── Durable output streams (issue #1974) ──────────────────────────
+
+    /// Collect every `PublishDurableProgress` command as `(offset, chunk)`.
+    fn durable_chunks(cmds: &[WorkflowCommand]) -> Vec<(u64, Value)> {
+        cmds.iter()
+            .filter_map(|cmd| match cmd {
+                WorkflowCommand::PublishDurableProgress { offset, chunk } => {
+                    Some((*offset, chunk.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn durable_progress_offsets_start_at_zero_and_increase_by_one() {
+        let ctx = WorkflowContext::new_test();
+        ctx.publish_durable_progress(serde_json::json!("a"))
+            .expect("first");
+        ctx.publish_durable_progress(serde_json::json!("b"))
+            .expect("second");
+        let chunks = durable_chunks(&ctx.drain_commands());
+        assert_eq!(
+            chunks,
+            vec![(0, serde_json::json!("a")), (1, serde_json::json!("b"))]
+        );
+    }
+
+    #[test]
+    fn durable_progress_does_not_change_the_best_effort_command() {
+        let ctx = WorkflowContext::new_test();
+        ctx.publish_progress(serde_json::json!("x")).expect("live");
+        let cmds = ctx.drain_commands();
+        assert_eq!(durable_chunks(&cmds), Vec::new());
+        assert!(matches!(
+            cmds.as_slice(),
+            [WorkflowCommand::PublishProgress { .. }]
+        ));
+    }
+
+    #[test]
+    fn durable_progress_is_suppressed_during_replay_but_claims_an_offset() {
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let side_effect = WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Uuid,
+            name: None,
+            value: serde_json::json!("00000000-0000-7000-8000-000000000000"),
+        };
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started, side_effect]);
+        assert!(ctx.is_replaying(), "the side effect is not consumed yet");
+        ctx.publish_durable_progress(serde_json::json!("old"))
+            .expect("replay call");
+        let _ = ctx.new_uuid();
+        assert!(!ctx.is_replaying(), "the cycle is at the frontier");
+        ctx.publish_durable_progress(serde_json::json!("new"))
+            .expect("live call");
+        assert_eq!(
+            durable_chunks(&ctx.drain_commands()),
+            vec![(1, serde_json::json!("new"))],
+            "the replayed call pushes nothing but still claims offset 0"
+        );
+    }
+
+    #[test]
+    fn durable_progress_is_live_when_a_buffered_signal_waits_at_the_cursor() {
+        // Regression (issue #1974 review). A signal that arrives before the
+        // first cycle sits at the cursor. The raw cursor check then reports
+        // replay, and the chunks before `wait_for_signal` were never stored.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let signal = WorkflowEvent::SignalReceived {
+            signal_name: "go".to_string(),
+            payload: serde_json::json!({}),
+        };
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started, signal]);
+        ctx.publish_durable_progress(serde_json::json!("first"))
+            .expect("publish");
+        assert_eq!(
+            durable_chunks(&ctx.drain_commands()),
+            vec![(0, serde_json::json!("first"))],
+            "a buffered signal is not replayed history, so the chunk is live"
+        );
+    }
+
+    #[test]
+    fn durable_progress_does_not_change_is_replaying() {
+        // Regression (issue #1974 review). The durable gate must only read
+        // the matcher. A gate that moves the cursor makes later code see
+        // `is_replaying() == false` early, so a guarded side effect runs twice.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let signal = WorkflowEvent::SignalReceived {
+            signal_name: "go".to_string(),
+            payload: serde_json::json!({}),
+        };
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started, signal]);
+        let before = ctx.is_replaying();
+        ctx.publish_durable_progress(serde_json::json!("first"))
+            .expect("publish");
+        assert_eq!(
+            ctx.is_replaying(),
+            before,
+            "the durable call moved the cursor"
+        );
+        assert_eq!(
+            durable_chunks(&ctx.drain_commands()),
+            vec![(0, serde_json::json!("first"))],
+            "the chunk is still live"
+        );
+    }
+
+    #[test]
+    fn durable_progress_offset_is_stable_when_the_cycle_appends_an_event() {
+        // The ephemeral epoch seq fails this case. The same chunk gets a new
+        // value in cycle 2, so the store holds it twice.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let cycle1 = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()]);
+        cycle1
+            .publish_durable_progress(serde_json::json!("A"))
+            .expect("A");
+        let _ = cycle1.new_uuid();
+        cycle1
+            .publish_durable_progress(serde_json::json!("B"))
+            .expect("B");
+        let first = durable_chunks(&cycle1.drain_commands());
+        assert_eq!(first.len(), 2, "both chunks are live in cycle 1");
+
+        let side_effect = WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Uuid,
+            name: None,
+            value: serde_json::json!("00000000-0000-7000-8000-000000000000"),
+        };
+        let cycle2 = WorkflowContext::for_replay(ExecutionId::new(), vec![started, side_effect]);
+        cycle2
+            .publish_durable_progress(serde_json::json!("A"))
+            .expect("A");
+        let _ = cycle2.new_uuid();
+        cycle2
+            .publish_durable_progress(serde_json::json!("B"))
+            .expect("B");
+        let second = durable_chunks(&cycle2.drain_commands());
+        assert_eq!(second.len(), 1, "only B is live in cycle 2");
+        assert_eq!(second[0], first[1], "B keeps its offset across cycles");
+    }
+
+    #[test]
+    fn durable_progress_offset_is_stable_across_a_pause_resume() {
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let before = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()]);
+        before
+            .publish_durable_progress(serde_json::json!("waiting"))
+            .expect("before");
+        let now = Utc::now();
+        let after = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started,
+                WorkflowEvent::WorkflowExecutionPaused {
+                    paused_at: now,
+                    reason: None,
+                    actor: "operator".to_string(),
+                },
+                WorkflowEvent::WorkflowExecutionResumed {
+                    resumed_at: now,
+                    actor: "operator".to_string(),
+                },
+            ],
+        );
+        after
+            .publish_durable_progress(serde_json::json!("waiting"))
+            .expect("after");
+        let before_chunks = durable_chunks(&before.drain_commands());
+        assert_eq!(before_chunks.len(), 1, "the chunk is live before the pause");
+        assert_eq!(
+            before_chunks,
+            durable_chunks(&after.drain_commands()),
+            "a pause and resume must not move the offset"
+        );
+    }
+
+    #[test]
+    fn durable_progress_offset_continues_across_a_resident_cycle() {
+        let ctx = WorkflowContext::new_test();
+        ctx.publish_durable_progress(serde_json::json!(0))
+            .expect("cycle 1");
+        let _ = ctx.drain_commands();
+        ctx.begin_resident_cycle(&[], Vec::new());
+        ctx.publish_durable_progress(serde_json::json!(1))
+            .expect("cycle 2");
+        assert_eq!(
+            durable_chunks(&ctx.drain_commands()),
+            vec![(1, serde_json::json!(1))],
+            "a resident cycle does not re-run the body, so the counter continues"
+        );
+        ctx.begin_resident_cycle(&[], Vec::new());
+        assert_eq!(
+            ctx.durable_progress_queued
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the queue bound is per cycle, so a resident cycle resets it"
+        );
+    }
+
+    #[test]
+    fn durable_progress_in_a_speculative_cycle_reads_the_position() {
+        let ctx = WorkflowContext::new_test();
+        let (result_tx, _result_rx) = tokio::sync::oneshot::channel();
+        ctx.begin_resident_cycle(
+            &[],
+            vec![WorkflowCommand::WaitForActivity {
+                activity_id: ActivityExecId::new(),
+                result_tx,
+            }],
+        );
+        let _ = ctx.drain_commands();
+        ctx.publish_durable_progress(serde_json::json!("chunk"))
+            .expect("publish");
+        assert!(
+            durable_chunks(&ctx.drain_commands()).is_empty(),
+            "a speculative cycle may be dropped, so it queues no chunk"
+        );
+        assert!(
+            ctx.end_speculation(),
+            "the gate reads the replay position, so the resume must decline"
+        );
+    }
+
+    #[test]
+    fn durable_progress_oversize_chunk_becomes_truncation_marker() {
+        let ctx = WorkflowContext::new_test();
+        let huge = "x".repeat(PROGRESS_CHUNK_MAX_BYTES + 1);
+        ctx.publish_durable_progress(Value::String(huge))
+            .expect("oversize publish succeeds");
+        let chunks = durable_chunks(&ctx.drain_commands());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].0, 0, "the marker keeps the offset");
+        assert_eq!(
+            chunks[0].1.get("_harvest_progress_truncated"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn a_failed_serialization_does_not_use_a_queue_slot() {
+        // Regression (issue #1974 review). A failed call queues nothing, so it
+        // must not use a slot. Otherwise the overflow command is lost and the
+        // store never writes its marker.
+        let ctx = WorkflowContext::new_test();
+        let unserializable: std::collections::BTreeMap<(i32, i32), i32> =
+            std::iter::once(((1, 2), 3)).collect();
+        assert!(ctx.publish_durable_progress(unserializable).is_err());
+        let cap = u64::from(DURABLE_STREAM_MAX_CHUNKS);
+        for i in 0..=cap {
+            ctx.publish_durable_progress(i).expect("publish");
+        }
+        let queued = durable_chunks(&ctx.drain_commands()).len();
+        assert_eq!(
+            u64::try_from(queued).expect("fits"),
+            cap + 1,
+            "all cap + 1 good chunks are queued"
+        );
+    }
+
+    #[test]
+    fn durable_progress_queue_is_bounded_at_cap_plus_one() {
+        let ctx = WorkflowContext::new_test();
+        let cap = u64::from(DURABLE_STREAM_MAX_CHUNKS);
+        for i in 0..cap + 5 {
+            ctx.publish_durable_progress(i).expect("publish");
+        }
+        let chunks = durable_chunks(&ctx.drain_commands());
+        let queued = u64::try_from(chunks.len()).expect("fits");
+        assert_eq!(
+            queued,
+            cap + 1,
+            "one extra command lets the store detect overflow and write its marker"
+        );
+        assert_eq!(chunks.last().map(|c| c.0), Some(cap));
     }
 
     // ── Durable workflow logs (issue #790) ────────────────────────────
@@ -28035,7 +31567,7 @@ mod tests {
         assert!(
             commands.iter().any(|c| matches!(
                 c,
-                WorkflowCommand::CancelRaceLosers { activities, children, timers }
+                WorkflowCommand::CancelRaceLosers { activities, children, timers, .. }
                     if activities.is_empty()
                         && children.is_empty()
                         && timers == &vec![TimerId::new(&timer_id)]
@@ -28728,6 +32260,218 @@ mod tests {
         }
     }
 
+    // ── Release on drop (issue #2193) ────────────────────────────────────
+
+    /// History of a run that holds one open session on `gpu-workers`.
+    fn open_session_history(session_uuid: uuid::Uuid) -> Vec<WorkflowEvent> {
+        let acquire_id = ActivityExecId::new();
+        vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(session_uuid.to_string()),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: acquire_id,
+                name: SESSION_ACQUIRE_ACTIVITY_NAME.to_string(),
+                input: Value::Null,
+                queue: "gpu-workers".to_string(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: acquire_id,
+                output: serde_json::json!("worker-42"),
+            },
+        ]
+    }
+
+    /// The drop releases among `commands`.
+    fn drop_releases(commands: &[WorkflowCommand]) -> Vec<&WorkflowCommand> {
+        commands
+            .iter()
+            .filter(|cmd| {
+                matches!(
+                    cmd,
+                    WorkflowCommand::ScheduleActivity { name, .. }
+                        if name == SESSION_DROP_RELEASE_ACTIVITY_NAME
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn dropping_a_session_issues_one_pinned_release() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), open_session_history(session_uuid));
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        drop(session);
+
+        let commands = ctx.drain_commands();
+        let releases = drop_releases(&commands);
+        assert_eq!(releases.len(), 1, "one release per dropped session");
+        let WorkflowCommand::ScheduleActivity {
+            queue,
+            input,
+            session_id,
+            session_worker_id,
+            ..
+        } = releases[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(queue, "gpu-workers");
+        assert_eq!(input, &Value::from(session_uuid.to_string()));
+        assert_eq!(*session_id, Some(SessionId::from_uuid(session_uuid)));
+        assert_eq!(session_worker_id.as_deref(), Some("worker-42"));
+        assert!(
+            !releases[0].awaits_result(),
+            "no body awaits a drop release"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_session_issues_no_drop_release() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let release_id = ActivityExecId::new();
+        let mut events = open_session_history(session_uuid);
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: release_id,
+            name: SESSION_RELEASE_ACTIVITY_NAME.to_string(),
+            input: Value::from(session_uuid.to_string()),
+            queue: "gpu-workers".to_string(),
+        });
+        events.push(WorkflowEvent::ActivityCompleted {
+            activity_id: release_id,
+            output: Value::Null,
+        });
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        session.complete().await.unwrap();
+
+        assert!(drop_releases(&ctx.drain_commands()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_complete_future_releases_the_session() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), open_session_history(session_uuid));
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(20), session.complete()).await;
+        assert!(result.is_err(), "complete() must still be waiting");
+
+        let commands = ctx.drain_commands();
+        assert_eq!(drop_releases(&commands).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_suspending_cycle_issues_no_drop_release() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), open_session_history(session_uuid));
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        ctx.set_suspending(true);
+        drop(session);
+
+        assert!(drop_releases(&ctx.drain_commands()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_panic_that_unwinds_a_session_issues_no_drop_release() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), open_session_history(session_uuid));
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = session;
+            panic!("workflow panic");
+        }));
+
+        assert!(unwound.is_err());
+        assert!(drop_releases(&ctx.drain_commands()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_complete_future_after_its_release_was_scheduled_still_releases() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let release_id = ActivityExecId::new();
+        let mut events = open_session_history(session_uuid);
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: release_id,
+            name: SESSION_RELEASE_ACTIVITY_NAME.to_string(),
+            input: Value::from(session_uuid.to_string()),
+            queue: "gpu-workers".to_string(),
+        });
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(20), session.complete()).await;
+        assert!(result.is_err(), "the release has no result yet");
+
+        // The host handler is idempotent, so a second release is safe.
+        assert_eq!(drop_releases(&ctx.drain_commands()).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_drop_release_is_a_reserved_name() {
+        assert!(is_reserved_session_activity_name(
+            SESSION_DROP_RELEASE_ACTIVITY_NAME
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_recorded_drop_release_is_not_issued_again() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let release_id = ActivityExecId::new();
+        let mut events = open_session_history(session_uuid);
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: release_id,
+            name: SESSION_DROP_RELEASE_ACTIVITY_NAME.to_string(),
+            input: Value::from(session_uuid.to_string()),
+            queue: "gpu-workers".to_string(),
+        });
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        drop(session);
+
+        assert!(drop_releases(&ctx.drain_commands()).is_empty());
+    }
+
     #[tokio::test]
     async fn create_session_checks_cancellation_before_dispatch() {
         let events = vec![
@@ -29191,6 +32935,31 @@ mod tests {
         let orphan = WorkflowContext::new_test();
         assert_eq!(orphan.info().parent_execution_id, None);
         assert_eq!(orphan.parent_execution_id(), None);
+    }
+
+    /// Issue #2082: the default start provenance is unknown and has no predecessor.
+    #[test]
+    fn info_start_provenance_defaults_to_unknown() {
+        let info = WorkflowContext::new_test().info();
+        assert_eq!(info.start_source, StartSource::Unknown);
+        assert_eq!(info.continued_from, None);
+    }
+
+    /// Issue #2082: a threaded provenance shows in `info()` and the accessors.
+    /// Two contexts built from the same input report the same provenance.
+    #[test]
+    fn info_reports_configured_start_provenance() {
+        let predecessor = ExecutionId::new();
+        let provenance = StartProvenance::continued_from(predecessor);
+        let build = || WorkflowContext::new_test().with_start_provenance(provenance);
+        let ctx = build();
+        assert_eq!(ctx.info().start_source, StartSource::ContinueAsNew);
+        assert_eq!(ctx.info().continued_from, Some(predecessor));
+        assert_eq!(ctx.start_source(), StartSource::ContinueAsNew);
+        assert_eq!(ctx.continued_from(), Some(predecessor));
+        let again = build().info();
+        assert_eq!(again.start_source, ctx.info().start_source);
+        assert_eq!(again.continued_from, ctx.info().continued_from);
     }
 
     /// AC5/AC6 (zero footprint): calling `info()` emits no commands and leaves
@@ -29934,6 +33703,25 @@ mod activity_info_tests {
         assert!(local.info().is_local);
     }
 
+    /// Issue #1998: a test context has no run, and a local activity cannot
+    /// read its run.
+    #[tokio::test]
+    async fn run_tenant_is_none_for_a_test_context_and_refused_for_a_local_one() {
+        assert_eq!(
+            ActivityContext::new_test().run_tenant().await.unwrap(),
+            None
+        );
+        let local = ActivityContext::new_local_activity(
+            crate::context::empty_shared_state(),
+            tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
+        );
+        assert!(matches!(
+            local.run_tenant().await,
+            Err(crate::error::HarvestError::Config(_))
+        ));
+    }
+
     /// AC2: no `start_to_close` configured -> unbounded.
     #[test]
     fn deadline_and_time_remaining_are_none_when_unbounded() {
@@ -29985,11 +33773,300 @@ mod activity_info_tests {
         assert_eq!(info.task_id, None);
     }
 
+    /// `new_test_with_state()` exposes the state it was given, and nothing else.
+    #[test]
+    fn new_test_with_state_exposes_its_state() {
+        let mut map: crate::context::SharedStateMap = std::collections::HashMap::new();
+        map.insert(std::any::TypeId::of::<u32>(), Box::new(7_u32));
+        let ctx = ActivityContext::new_test_with_state(std::sync::Arc::new(map));
+        assert_eq!(ctx.state::<u32>(), Some(&7));
+        assert_eq!(ctx.state::<String>(), None);
+        assert_eq!(ctx.info().attempt, 1);
+    }
+
     #[test]
     fn info_is_clone_and_eq() {
         let info = configured().info();
         assert_eq!(info.clone(), info);
         let identity = info.identity();
         assert_eq!(identity.clone(), identity);
+    }
+}
+
+/// A workflow-side payload nested past the depth cap is refused at the call
+/// site (issue #2224). Each test checks the cap, one level over it, and that
+/// the refusal queues no command.
+#[cfg(test)]
+mod payload_depth_tests {
+    use super::*;
+    use crate::error::PayloadKind;
+    use crate::payload_depth::MAX_PAYLOAD_DEPTH;
+
+    fn nested(depth: usize) -> Value {
+        let mut value = serde_json::json!(1);
+        for _ in 0..depth {
+            value = Value::Array(vec![value]);
+        }
+        value
+    }
+
+    fn assert_too_deep(err: &HarvestError, expected: &PayloadKind) {
+        match err {
+            HarvestError::PayloadTooDeep {
+                kind, cap_depth, ..
+            } => {
+                assert_eq!(kind, expected);
+                assert_eq!(*cap_depth, MAX_PAYLOAD_DEPTH);
+            }
+            other => panic!("expected PayloadTooDeep, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .execute_activity_raw("a", nested(MAX_PAYLOAD_DEPTH + 1), "default")
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_activity_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .execute_local_activity_raw("a", nested(MAX_PAYLOAD_DEPTH + 1), None, None)
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .spawn_child_workflow_raw("c", nested(MAX_PAYLOAD_DEPTH + 1))
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_timeout_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .spawn_child_workflow_timeout(
+                "c",
+                nested(MAX_PAYLOAD_DEPTH + 1),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn detached_child_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .spawn_child_workflow_detached_raw(
+                "c",
+                nested(MAX_PAYLOAD_DEPTH + 1),
+                crate::types::ParentClosePolicy::default(),
+            )
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn continue_as_new_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .continue_as_new(nested(MAX_PAYLOAD_DEPTH + 1))
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::WorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn side_effect_value_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .side_effect("s", || nested(MAX_PAYLOAD_DEPTH + 1))
+            .expect_err("a deep value must be refused");
+        assert_too_deep(&err, &PayloadKind::SideEffectValue);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn side_effect_value_at_the_cap_is_recorded() {
+        let ctx = WorkflowContext::new_test();
+        ctx.side_effect("s", || nested(MAX_PAYLOAD_DEPTH))
+            .expect("a value at the cap is accepted");
+        assert_eq!(ctx.drain_commands().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn race_activity_branch_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .race()
+            .activity_raw("a", nested(MAX_PAYLOAD_DEPTH + 1), "default")
+            .timer(std::time::Duration::from_secs(60))
+            .run()
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn race_child_branch_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .race()
+            .child_workflow_raw("c", nested(MAX_PAYLOAD_DEPTH + 1))
+            .timer(std::time::Duration::from_secs(60))
+            .run()
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_fan_out_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .spawn_child_workflow_fan_out_raw(vec![
+                ("c".to_string(), serde_json::json!(1)),
+                ("c".to_string(), nested(MAX_PAYLOAD_DEPTH + 1)),
+            ])
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+    }
+
+    #[tokio::test]
+    async fn activity_fan_out_over_the_cap_queues_nothing() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .execute_activity_fan_out_raw(vec![
+                ("a".to_string(), serde_json::json!(1), "default".to_string()),
+                (
+                    "a".to_string(),
+                    nested(MAX_PAYLOAD_DEPTH + 1),
+                    "default".to_string(),
+                ),
+            ])
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no marker and no earlier activity is queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn option_based_activity_fan_out_over_the_cap_queues_nothing() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .execute_activity_fan_out_raw_with(
+                vec![
+                    ("a".to_string(), serde_json::json!(1), "default".to_string()),
+                    (
+                        "a".to_string(),
+                        nested(MAX_PAYLOAD_DEPTH + 1),
+                        "default".to_string(),
+                    ),
+                ],
+                &crate::fan_out::FanOutOptions::new(),
+            )
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no marker and no earlier activity is queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_replay_reproduces_the_refusal_not_a_divergence() {
+        let ctx = WorkflowContext::for_replay_strict(crate::types::ExecutionId::new(), Vec::new());
+        let err = ctx
+            .execute_activity_raw("a", nested(MAX_PAYLOAD_DEPTH + 1), "default")
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+    }
+
+    #[tokio::test]
+    async fn external_signal_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .signal_external_workflow(
+                crate::types::ExecutionId::new(),
+                "go",
+                nested(MAX_PAYLOAD_DEPTH + 1),
+            )
+            .await
+            .expect_err("a deep payload must be refused");
+        assert_too_deep(&err, &PayloadKind::SignalPayload);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inputs_at_the_cap_are_not_refused_for_depth() {
+        let ctx = WorkflowContext::new_test();
+        let deep = nested(MAX_PAYLOAD_DEPTH);
+        let wait = std::time::Duration::from_millis(100);
+        // Each call parks on its result. A depth refusal returns at once.
+        assert!(
+            tokio::time::timeout(wait, ctx.execute_activity_raw("a", deep.clone(), "default"))
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(
+                wait,
+                ctx.execute_local_activity_raw("a", deep.clone(), None, None)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            tokio::time::timeout(wait, ctx.continue_as_new(deep.clone()))
+                .await
+                .is_err()
+        );
+        let commands = ctx.drain_commands();
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::ScheduleActivity { .. }))
+                && commands
+                    .iter()
+                    .any(|c| matches!(c, WorkflowCommand::ContinueAsNew { .. })),
+            "the calls must queue their commands: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_input_at_the_cap_is_not_refused_for_depth() {
+        let ctx = WorkflowContext::new_test();
+        let fut = ctx.spawn_child_workflow_raw("c", nested(MAX_PAYLOAD_DEPTH));
+        let res = tokio::time::timeout(std::time::Duration::from_millis(200), fut).await;
+        // The call parks on the child result. A depth refusal returns at once.
+        assert!(res.is_err(), "a value at the cap must be accepted");
+        assert_eq!(ctx.drain_commands().len(), 1);
     }
 }

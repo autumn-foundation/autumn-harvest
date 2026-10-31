@@ -49,16 +49,30 @@ pub mod dag_retry;
 /// run`. Development and evaluation only; see the module docs.
 #[cfg(feature = "dev-runtime")]
 pub mod dev;
+/// Durable routes: an Autumn route that runs as a keyed Harvest workflow.
+pub mod durable_route;
 /// One entry point for a standalone embedding (issue #1613).
 pub mod embedding;
+/// One test suite for every KMS binding (issue #1981).
+#[cfg(all(test, any(feature = "aws-kms", feature = "vault-transit")))]
+mod kms_conformance;
 pub mod lineage;
+#[cfg(feature = "object-store")]
+pub mod object_store;
+/// OIDC login for Vantage and the management API (issue #1978).
+#[cfg(feature = "oidc")]
+pub mod oidc;
 pub mod outbox;
+mod overrides_api;
 pub mod plugin;
 pub mod preflight;
 pub mod prelude;
 /// Fleet-wide task-queue coverage read model (issue #774).
 pub mod queue_coverage;
 pub mod replay_diagnosis;
+/// Custom roles for the management API and Vantage (issue #1978).
+pub mod roles;
+mod run_defaults_api;
 pub mod runner;
 /// Cross-site request rejection for Vantage and DLQ mutations (issue #1278).
 pub mod same_origin;
@@ -73,10 +87,16 @@ pub mod status_summary;
 /// pair list (issue #1151, extracted from the issue #774 `queue-coverage`
 /// fix).
 pub mod strict_query;
+/// Tenant binding for the management API (issue #1977).
+pub mod tenant;
 pub mod ui;
 pub mod usage;
+#[cfg(feature = "vault-transit")]
+pub mod vault_transit;
 pub mod version_gate_retirement;
 pub mod version_usage;
+/// The `filter` grammar of `GET /workflows` (issue #1982).
+mod visibility_query;
 pub mod workflow_count;
 pub mod workflow_reachability;
 
@@ -89,6 +109,14 @@ pub mod webhook_receiver;
 
 #[cfg(feature = "mcp")]
 pub mod mcp_tools;
+
+/// MCP Tasks for `#[workflow(mcp)]` workflows (issue #2005).
+#[cfg(feature = "mcp")]
+pub mod mcp_tasks;
+
+/// JSON-RPC client for remote MCP and A2A tasks (issue #2006).
+#[cfg(feature = "mcp")]
+pub mod remote_tasks;
 
 /// OpenAPI 3.1 document for the management API (issue #694).
 ///

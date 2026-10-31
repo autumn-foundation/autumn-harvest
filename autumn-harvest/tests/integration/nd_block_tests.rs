@@ -318,6 +318,7 @@ fn make_worker_with_sticky(
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 10,
             max_concurrent_activities: 20,
+            max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
             poll_interval: Duration::from_millis(50),
             shutdown_timeout: Duration::from_secs(2),
             cancellation_grace_period: Duration::from_secs(2),
@@ -341,6 +342,7 @@ fn make_worker_with_sticky(
             max_workflow_history_events: None,
             slot_tuner: None,
             max_concurrent_sessions: 0,
+            fairness_keys: false,
         },
         registry,
     )
@@ -405,6 +407,8 @@ async fn start_workflow(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -1415,6 +1419,8 @@ const fn nowhere_activity(name: &'static str) -> ActivityInfo {
         max_result_bytes: None,
         requires: None,
         handler: never_finishing_activity,
+        input_schema: None,
+        output_schema: None,
     }
 }
 

@@ -150,6 +150,8 @@ fn telem_child_wf<'a>(
     Box::pin(async move { Ok(Value::Null) })
 }
 
+// Two full `ActivityInfo` literals make this long. Splitting it adds nothing.
+#[allow(clippy::too_many_lines)]
 fn build_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
@@ -230,6 +232,8 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 circuit_breaker: None,
                 requires: None,
                 handler: telem_activity,
+                input_schema: None,
+                output_schema: None,
             },
             ActivityInfo {
                 name: "telem_act_b",
@@ -252,6 +256,8 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 circuit_breaker: None,
                 requires: None,
                 handler: telem_activity,
+                input_schema: None,
+                output_schema: None,
             },
         ],
     ))
@@ -353,6 +359,8 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     start_source: autumn_harvest::StartSource::Api,
                     start_source_ref: None,
                     started_by: None,
+                    fairness_key: None,
+                    tenant: None,
                 },
                 None,
             )
@@ -374,6 +382,8 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         notification_database_url: None,
                         max_concurrent_workflows: 2,
                         max_concurrent_activities: 4,
+                        max_concurrent_claims:
+                            autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                         poll_interval: Duration::from_millis(25),
                         shutdown_timeout: Duration::from_secs(2),
                         cancellation_grace_period: Duration::from_secs(1),
@@ -400,6 +410,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         sharded_pool: None,
                         slot_tuner: None,
                         max_concurrent_sessions: 0,
+                        fairness_keys: false,
                     },
                     registry,
                 )

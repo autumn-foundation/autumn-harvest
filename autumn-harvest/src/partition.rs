@@ -238,15 +238,18 @@ const EXEC_FK_TRIGGER: &str = "harvest_events_exec_fk_trg";
 const EXEC_FK_TRIGGER_TGTYPE: i16 = 7;
 
 /// A SQL predicate that is true unless `tg` is harvest's own append-only
-/// guard (issue #1817). Expects the aliases `tg` (`pg_trigger`), `p`
-/// (`pg_proc`) and `c` (`pg_class`).
+/// guard (issue #1817) or entity projection trigger (issue #2259). Expects
+/// the aliases `tg` (`pg_trigger`), `p` (`pg_proc`) and `c` (`pg_class`).
 ///
-/// Each conversion reinstalls the guard, so it is not an operator trigger.
-/// The exemption checks the whole identity, as for [`EXEC_FK_TRIGGER`]:
-/// name, function, schema, shape, no arguments, no `WHEN` clause, and the
-/// plain enabled state.
+/// Each conversion reinstalls both, so neither is an operator trigger.
+/// The exemption checks the identity, as for [`EXEC_FK_TRIGGER`]: name,
+/// function, schema, shape, no arguments, and the plain enabled state. The
+/// guard has no `WHEN` clause. The projection trigger must have one. Its text
+/// is not compared, because Postgres versions print it differently. A
+/// conversion replaces it with the canonical clause.
 fn not_the_append_only_guard_sql() -> String {
     use crate::append_only::{GUARD_FUNCTION, GUARD_TRIGGER, GUARD_TRIGGER_TGTYPE};
+    use crate::entity_state::{PROJECTION_FUNCTION, PROJECTION_TRIGGER, PROJECTION_TRIGGER_TGTYPE};
     format!(
         "NOT (tg.tgname = '{GUARD_TRIGGER}' \
          AND p.proname = '{GUARD_FUNCTION}' \
@@ -254,6 +257,13 @@ fn not_the_append_only_guard_sql() -> String {
          AND tg.tgtype = {GUARD_TRIGGER_TGTYPE} \
          AND tg.tgnargs = 0 \
          AND tg.tgqual IS NULL \
+         AND tg.tgenabled = 'O') \
+         AND NOT (tg.tgname = '{PROJECTION_TRIGGER}' \
+         AND p.proname = '{PROJECTION_FUNCTION}' \
+         AND p.pronamespace = c.relnamespace \
+         AND tg.tgtype = {PROJECTION_TRIGGER_TGTYPE} \
+         AND tg.tgnargs = 0 \
+         AND tg.tgqual IS NOT NULL \
          AND tg.tgenabled = 'O')"
     )
 }
@@ -351,12 +361,38 @@ pub const RECHECK_REASON: &str = "lock not acquired, or an owner appeared before
 /// than silently skipped so a hand-made partition shows up.
 pub const UNBOUNDED_REASON: &str = "unbounded upper bound";
 
+/// The export to the partition archiver, or its read-back, failed (issue
+/// #2009). The reported text adds the cause after a colon.
+pub const EXPORT_FAILED_REASON: &str = "export failed";
+
+/// The hash under the drop lock does not match the export (issue #2009). A
+/// row changed after the export, so the next pass exports again.
+pub const CHANGED_REASON: &str = "changed since export";
+
+/// The checksum under the drop lock ran past `exact_scan_timeout` (issue
+/// #2009). Raise the timeout or narrow the cohort width.
+pub const EXPORT_CHECK_BUDGET_REASON: &str = "export check exceeded its budget";
+
+/// A process exported this shard before, but this sweep has no archiver
+/// (issue #2009). It drops nothing, so no partition is lost unexported.
+pub const EXPORT_REQUIRED_REASON: &str = "export required, but no archiver is set";
+
+/// Another process holds the export lock of this shard in a conflicting mode
+/// (issue #2009). An exporter holds it exclusive. A sweep with no archiver
+/// holds it shared.
+pub const EXPORT_BUSY_REASON: &str = "another process holds the export lock of this shard";
+
 /// Every reason [`sweep`] can report. Used by the documentation guard.
 pub const SWEEP_REASONS: &[&str] = &[
     OWNED_REASON,
     SCAN_BUDGET_REASON,
     RECHECK_REASON,
     UNBOUNDED_REASON,
+    EXPORT_FAILED_REASON,
+    CHANGED_REASON,
+    EXPORT_CHECK_BUDGET_REASON,
+    EXPORT_REQUIRED_REASON,
+    EXPORT_BUSY_REASON,
 ];
 
 // ── Cohort algebra (pure) ──────────────────────────────────────────────────
@@ -640,6 +676,10 @@ pub struct SweepOutcome {
     pub blocked: Vec<String>,
     /// Orphan rows removed by the opt-in straggler fallback.
     pub straggler_rows_deleted: usize,
+    /// The manifest key of each partition this pass exported and then
+    /// dropped (issue #2009). Empty when no archiver is set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exported: Vec<String>,
     /// Where the NEXT pass should resume its evaluation: the cohort upper
     /// bound of the last partition this pass actually evaluated (dropped
     /// or blocked).
@@ -2353,22 +2393,28 @@ async fn refuse_if_operator_triggers(
             "triggers are"
         },
         triggers.join(", "),
-        // Issue #1817: the conversion reinstalls harvest's own guard, so
-        // recreating it by hand afterward fails with "already exists".
-        if triggers
-            .iter()
-            .any(|t| t == crate::append_only::GUARD_TRIGGER)
-        {
-            format!(
-                " {} is harvest's append-only guard in a changed state. Re-enable it \
-                 (`ALTER TABLE harvest_events ENABLE TRIGGER {}`) or drop it. The \
-                 conversion reinstalls it, so do not recreate it.",
-                crate::append_only::GUARD_TRIGGER,
-                crate::append_only::GUARD_TRIGGER
-            )
-        } else {
-            String::new()
-        }
+        // Issue #1817, issue #2259: the conversion reinstalls harvest's own
+        // triggers, so recreating one by hand afterward fails with "already
+        // exists".
+        [
+            (crate::append_only::GUARD_TRIGGER, "append-only guard"),
+            (
+                crate::entity_state::PROJECTION_TRIGGER,
+                "entity projection trigger"
+            ),
+        ]
+        .into_iter()
+        .filter(|(name, _)| triggers.iter().any(|t| t == name))
+        .fold(String::new(), |mut hint, (name, what)| {
+            use std::fmt::Write as _;
+            let _ = write!(
+                hint,
+                " {name} is harvest's {what} in a changed state. Re-enable it \
+                 (`ALTER TABLE harvest_events ENABLE TRIGGER {name}`) or drop it. The \
+                 conversion reinstalls it, so do not recreate it."
+            );
+            hint
+        })
     )))
 }
 
@@ -2558,6 +2604,8 @@ pub fn enable_sql(opts: &EnableOptions) -> String {
     let not_the_guard = not_the_append_only_guard_sql();
     let create_guard = crate::append_only::create_guard_trigger_sql();
     let guard = crate::append_only::GUARD_TRIGGER;
+    let create_projection = crate::entity_state::create_projection_trigger_sql();
+    let projection = crate::entity_state::PROJECTION_TRIGGER;
     // Review finding: the view, trigger and unique-index rechecks below
     // all close the same preflight-to-lock gap for a publication too.
     // See `incompatible_publications` for why a leaf-publishing
@@ -2969,6 +3017,9 @@ harvest_events afterward, if it is still needed), then re-run.', bad_con;
     -- Issue #1817: `LIKE` copies no triggers, so install the append-only
     -- guard on the new parent. Postgres clones it onto each partition.
     EXECUTE '{create_guard}';
+    -- Issue #2259: the entity projection trigger too. Its `WHEN` clause has
+    -- quotes, so a dollar quote holds it.
+    EXECUTE $harvest_projection_2259${create_projection}$harvest_projection_2259$;
 
     -- The sweeper's tier-1 drop gate reads
     -- `harvest_workflow_executions (created_at)`; without this index that probe
@@ -3053,6 +3104,7 @@ harvest_events afterward, if it is still needed), then re-run.', bad_con;
         -- partition already has a trigger of that name, so drop the old copy
         -- first. The lock this block holds closes the gap between the two.
         EXECUTE 'DROP TRIGGER IF EXISTS {guard} ON {LEGACY_PARTITION}';
+        EXECUTE 'DROP TRIGGER IF EXISTS {projection} ON {LEGACY_PARTITION}';
         EXECUTE format(
             'ALTER TABLE harvest_events ATTACH PARTITION {LEGACY_PARTITION} '
             || 'FOR VALUES FROM (MINVALUE) TO (%L)', cutover);
@@ -3315,7 +3367,7 @@ pub fn cohort_function_sql(width_secs: i64) -> String {
 // Same gating as `compare_partitions`: every caller is behind `db`, and the
 // escaping test is behind `test`.
 #[cfg(any(feature = "db", test))]
-fn quote_ident(ident: &str) -> String {
+pub(crate) fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
@@ -3419,7 +3471,7 @@ async fn bounded_rename_name(
 }
 
 #[cfg(feature = "db")]
-async fn exec(conn: &mut AsyncPgConnection, sql: &str) -> HarvestResult<()> {
+pub(crate) async fn exec(conn: &mut AsyncPgConnection, sql: &str) -> HarvestResult<()> {
     diesel::sql_query(sql)
         .execute(conn)
         .await
@@ -3940,6 +3992,9 @@ pub async fn disable_partitioning(
             // append-only guard on the flat table. Keep it after the `cohort`
             // reset above: the guard rejects a `cohort` change.
             exec(conn, &crate::append_only::create_guard_trigger_sql()).await?;
+            // Issue #2259: the entity projection trigger. The rows are
+            // already copied, so it fires for no old row.
+            exec(conn, &crate::entity_state::create_projection_trigger_sql()).await?;
             exec(
                 conn,
                 "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_pkey PRIMARY KEY (id)",
@@ -4034,7 +4089,7 @@ pub async fn evaluate(
     opts: &SweepOptions,
     resume_after: Option<DateTime<Utc>>,
 ) -> HarvestResult<SweepOutcome> {
-    sweep_inner(conn, now, opts, false, resume_after, None, None).await
+    sweep_inner(conn, now, opts, false, resume_after, None, None, None).await
 }
 
 /// Drop every fully-reclaimable cohort partition, oldest first.
@@ -4066,6 +4121,15 @@ pub async fn evaluate(
 /// it back in. That way a permanently blocked oldest run cannot starve
 /// every later partition of ever being attempted.
 ///
+/// # Cancellation
+///
+/// With no transaction open on `conn`, an applying pass holds a session
+/// advisory lock (issue #2009). If you cancel the pass, close the connection
+/// too. A pooled connection that keeps the lock makes other sweeps on the
+/// shard report [`EXPORT_BUSY_REASON`] until its session ends. Inside a
+/// Diesel transaction, the pass holds a transaction lock only, and your
+/// commit or rollback releases it.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] on a catalog failure. A per-partition lock
@@ -4078,7 +4142,46 @@ pub async fn sweep(
     opts: &SweepOptions,
     resume_after: Option<DateTime<Utc>>,
 ) -> HarvestResult<SweepOutcome> {
-    sweep_inner(conn, now, opts, true, resume_after, None, None).await
+    sweep_inner(conn, now, opts, true, resume_after, None, None, None).await
+}
+
+/// The same as [`sweep`], but export each partition before it drops it
+/// (issue #2009).
+///
+/// See [`crate::partition_archive`] for the order of the steps.
+///
+/// # Cancellation
+///
+/// With no transaction open on `conn`, an applying pass holds a session
+/// advisory lock (issue #2009). If you cancel the pass, close the connection
+/// too. A pooled connection that keeps the lock makes other sweeps on the
+/// shard report [`EXPORT_BUSY_REASON`] until its session ends. Inside a
+/// Diesel transaction, the pass holds a transaction lock only, and your
+/// commit or rollback releases it.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] on a catalog failure. An export failure is
+/// not an error. It goes into [`SweepOutcome::blocked`].
+#[cfg(feature = "db")]
+pub async fn sweep_exporting(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+    opts: &SweepOptions,
+    resume_after: Option<DateTime<Utc>>,
+    export: &crate::partition_archive::PartitionExport,
+) -> HarvestResult<SweepOutcome> {
+    sweep_inner(
+        conn,
+        now,
+        opts,
+        true,
+        resume_after,
+        None,
+        Some(export),
+        None,
+    )
+    .await
 }
 
 /// The shared body of [`sweep`] and [`evaluate`].
@@ -4096,7 +4199,12 @@ pub async fn sweep(
 /// it is part of a multi-pass catch-up cycle already in flight. `None`
 /// starts (or continues, if this pass does not truncate) with no cycle
 /// active.
+///
+/// `export`, when set, exports each droppable partition before the drop
+/// (issue #2009). It also turns off the straggler `DELETE`, because no export
+/// holds the rows that delete removes.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn sweep_inner(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
@@ -4104,6 +4212,7 @@ async fn sweep_inner(
     apply: bool,
     resume_after: Option<DateTime<Utc>>,
     catch_up_target: Option<DateTime<Utc>>,
+    export: Option<&crate::partition_archive::PartitionExport>,
     mut progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<SweepOutcome> {
     let mut outcome = SweepOutcome::default();
@@ -4125,106 +4234,167 @@ async fn sweep_inner(
     let mut attempts = 0usize;
     let mut last_attempted: Option<DateTime<Utc>> = None;
     let mut reached_end = true;
-    for part in parts {
-        // The DEFAULT partition is structural: dropping it would make an
-        // append for an uncovered cohort fail outright. It is drained, never
-        // dropped.
-        if part.is_default {
-            continue;
-        }
-        // Only cohorts entirely in the past are candidates. A partition still
-        // accepting writes can always gain a row between the gate check and the
-        // drop.
-        let Some(upper) = part.upper else {
-            outcome
-                .blocked
-                .push(format!("{} ({UNBOUNDED_REASON})", part.name));
-            continue;
-        };
-        if skipping {
-            if resume_after.is_some_and(|cursor| upper <= cursor) {
+    // Issue #2009: resolve the export gate once per applying pass. It can
+    // hold a session lock, so every path below must reach the release.
+    let gate = if apply {
+        crate::partition_archive::ExportGate::resolve(conn, export).await?
+    } else {
+        crate::partition_archive::ExportGate::read_only(conn).await?
+    };
+    let mut exports = 0usize;
+    let looped: HarvestResult<()> = async {
+        for part in parts {
+            // The DEFAULT partition is structural: dropping it would make an
+            // append for an uncovered cohort fail outright. It is drained, never
+            // dropped.
+            if part.is_default {
                 continue;
             }
-            skipping = false;
-        }
-        if upper > now {
-            continue;
-        }
-
-        // Checked here, after the cheap skips above, not at the top of the
-        // loop. A tick can exhaust its budget on exactly the last eligible
-        // partition. It must not then report `truncated` just because the
-        // remaining partitions in the list are DEFAULT or still open.
-        // Those cost nothing and were never going to be attempted anyway.
-        if outcome.dropped.len() >= opts.max_drops || attempts >= opts.max_attempts {
-            outcome.truncated = true;
-            reached_end = false;
-            break;
-        }
-
-        // Counted here, not at the top of the loop. This is the gate
-        // evaluation the budget exists to bound, up to a tier-3 scan under
-        // `exact_scan_timeout`. A blocked partition costs exactly as much as
-        // a dropped one. The cheap skips above (DEFAULT, still open,
-        // unbounded) reach no such scan and do not spend the budget.
-        attempts += 1;
-        // Review finding: a per-shard tick before this whole pass starts
-        // is not bounded progress. Up to `max_attempts` partitions at
-        // `exact_scan_timeout` each can still run past the liveness
-        // scanner's staleness threshold before the pass returns. Ticking
-        // once per attempted partition here bounds the gap between proofs
-        // of life to one gate evaluation, not one whole pass.
-        if let Some(cb) = &mut progress {
-            cb();
-        }
-        // Review finding: a fixed oldest-first restart every pass cannot
-        // converge past a permanently blocked oldest run — see
-        // `SweepOutcome::next_resume`. Recorded before the outcome of
-        // THIS partition is known. A pass that ends by hitting budget on
-        // the very next iteration then still resumes after this one,
-        // rather than re-attempting it.
-        last_attempted = Some(upper);
-        if let Some(reason) =
-            cohort_occupancy(conn, &EventScope::cohort(part.lower, upper), upper, opts).await?
-        {
-            outcome.blocked.push(format!("{} ({reason})", part.name));
-            // Deliberately NOT after a scan timeout. That reason means the
-            // partition was too big to prove anything about; following it with
-            // an unbounded orphan DELETE over that same partition inverts the
-            // "bounded pass, retry next tick" contract this module is built on.
-            if apply
-                && reason != SCAN_BUDGET_REASON
-                && let Some(grace) = opts.straggler_grace
-                && let Ok(grace) = chrono::Duration::from_std(grace)
-                && upper + grace <= now
-            {
-                outcome.straggler_rows_deleted += delete_orphan_rows(
-                    conn,
-                    part.lower,
-                    upper,
-                    opts.straggler_batch,
-                    opts.exact_scan_timeout,
-                    reborrow_progress(&mut progress),
-                )
-                .await?;
+            // Only cohorts entirely in the past are candidates. A partition still
+            // accepting writes can always gain a row between the gate check and the
+            // drop.
+            let Some(upper) = part.upper else {
+                outcome
+                    .blocked
+                    .push(format!("{} ({UNBOUNDED_REASON})", part.name));
+                continue;
+            };
+            if skipping {
+                if resume_after.is_some_and(|cursor| upper <= cursor) {
+                    continue;
+                }
+                skipping = false;
             }
-            continue;
-        }
+            if upper > now {
+                continue;
+            }
 
-        if !apply {
-            // Read-only: report the partition as droppable without taking a
-            // lock or issuing DDL.
-            outcome.dropped.push(part.name);
-            continue;
+            // Checked here, after the cheap skips above, not at the top of the
+            // loop. A tick can exhaust its budget on exactly the last eligible
+            // partition. It must not then report `truncated` just because the
+            // remaining partitions in the list are DEFAULT or still open.
+            // Those cost nothing and were never going to be attempted anyway.
+            if outcome.dropped.len() >= opts.max_drops || attempts >= opts.max_attempts {
+                outcome.truncated = true;
+                reached_end = false;
+                break;
+            }
+
+            // Issue #2009: with no export possible, nothing may drop. The gate
+            // check costs nothing, so it spends no budget.
+            if let Some(reason) = gate.blocks_drops() {
+                outcome.blocked.push(format!("{} ({reason})", part.name));
+                continue;
+            }
+
+            // Counted here, not at the top of the loop. This is the gate
+            // evaluation the budget exists to bound, up to a tier-3 scan under
+            // `exact_scan_timeout`. A blocked partition costs exactly as much as
+            // a dropped one. The cheap skips above (DEFAULT, still open,
+            // unbounded) reach no such scan and do not spend the budget.
+            attempts += 1;
+            // Review finding: a per-shard tick before this whole pass starts
+            // is not bounded progress. Up to `max_attempts` partitions at
+            // `exact_scan_timeout` each can still run past the liveness
+            // scanner's staleness threshold before the pass returns. Ticking
+            // once per attempted partition here bounds the gap between proofs
+            // of life to one gate evaluation, not one whole pass.
+            if let Some(cb) = &mut progress {
+                cb();
+            }
+            // Review finding: a fixed oldest-first restart every pass cannot
+            // converge past a permanently blocked oldest run — see
+            // `SweepOutcome::next_resume`. Recorded before the outcome of
+            // THIS partition is known. A pass that ends by hitting budget on
+            // the very next iteration then still resumes after this one,
+            // rather than re-attempting it.
+            let prev_attempted = last_attempted;
+            last_attempted = Some(upper);
+            if let Some(reason) =
+                cohort_occupancy(conn, &EventScope::cohort(part.lower, upper), upper, opts).await?
+            {
+                outcome.blocked.push(format!("{} ({reason})", part.name));
+                // Deliberately NOT after a scan timeout. That reason means the
+                // partition was too big to prove anything about; following it with
+                // an unbounded orphan DELETE over that same partition inverts the
+                // "bounded pass, retry next tick" contract this module is built on.
+                if apply
+                    && gate.allows_straggler_delete()
+                    && reason != SCAN_BUDGET_REASON
+                    && let Some(grace) = opts.straggler_grace
+                    && let Ok(grace) = chrono::Duration::from_std(grace)
+                    && upper + grace <= now
+                {
+                    outcome.straggler_rows_deleted += delete_orphan_rows(
+                        conn,
+                        part.lower,
+                        upper,
+                        opts.straggler_batch,
+                        opts.exact_scan_timeout,
+                        reborrow_progress(&mut progress),
+                    )
+                    .await?;
+                }
+                continue;
+            }
+
+            if !apply {
+                // Read-only: report the partition as droppable without taking a
+                // lock or issuing DDL. On a marked shard a sweep with no
+                // archiver drops nothing, so the report says so (issue #2009).
+                if gate.marked() {
+                    outcome
+                        .blocked
+                        .push(format!("{} ({EXPORT_REQUIRED_REASON})", part.name));
+                } else {
+                    outcome.dropped.push(part.name);
+                }
+                continue;
+            }
+            let crate::partition_archive::ExportGate::Active(export) = &gate else {
+                let result = drop_partition(conn, &part, upper, opts, None).await?;
+                if result == DropOutcome::Dropped {
+                    outcome.dropped.push(part.name);
+                } else {
+                    outcome
+                        .blocked
+                        .push(format!("{} ({})", part.name, result.reason()));
+                }
+                continue;
+            };
+            // Issue #2009: export, read back and check before the drop.
+            let step = export_and_drop(
+                conn,
+                export,
+                &part,
+                upper,
+                opts,
+                &mut exports,
+                reborrow_progress(&mut progress),
+            )
+            .await?;
+            match step {
+                ExportStep::Budget => {
+                    // Not attempted after all, so the next pass resumes here.
+                    last_attempted = prev_attempted;
+                    outcome.truncated = true;
+                    reached_end = false;
+                    break;
+                }
+                ExportStep::Dropped(key) => {
+                    outcome.exported.push(key);
+                    outcome.dropped.push(part.name);
+                }
+                ExportStep::Blocked(reason) => {
+                    outcome.blocked.push(format!("{} ({reason})", part.name));
+                }
+            }
         }
-        if drop_partition(conn, &part, upper, opts).await? {
-            outcome.dropped.push(part.name);
-        } else {
-            outcome
-                .blocked
-                .push(format!("{} ({RECHECK_REASON})", part.name));
-        }
+        Ok(())
     }
+    .await;
+    gate.release(conn).await;
+    looped?;
     // `reached_end` is true whenever the loop ran out of partitions
     // before it ran out of budget, truncated or not. Either way there is
     // no later partition this pass left unvisited, in THIS pass's own
@@ -4248,6 +4418,68 @@ async fn sweep_inner(
     outcome.next_resume = if caught_up { None } else { last_attempted };
     outcome.catch_up_target = if caught_up { None } else { Some(target) };
     Ok(outcome)
+}
+
+/// What [`export_and_drop`] did with one partition.
+#[cfg(feature = "db")]
+enum ExportStep {
+    /// The pass has no export budget left. Nothing was tried.
+    Budget,
+    /// The partition is gone. Its export is at this manifest key.
+    Dropped(String),
+    /// The partition stays, for this reason.
+    Blocked(String),
+}
+
+/// Export partition `part`, or reuse an earlier export, then drop it
+/// (issue #2009).
+///
+/// An earlier export that still reads back clean is used again. A failed
+/// drop leaves its export in place for the next pass. A reused export that
+/// is stale gets one new export in the same pass, so it cannot block the
+/// partition forever. `exports` counts the new exports of this pass.
+#[cfg(feature = "db")]
+async fn export_and_drop(
+    conn: &mut AsyncPgConnection,
+    export: &crate::partition_archive::PartitionExport,
+    part: &PartitionInfo,
+    upper: DateTime<Utc>,
+    opts: &SweepOptions,
+    exports: &mut usize,
+    mut progress: Option<&mut (dyn FnMut() + Send)>,
+) -> HarvestResult<ExportStep> {
+    use crate::partition_archive::{export_partition, reusable_export};
+    let failed = |cause: String| ExportStep::Blocked(format!("{EXPORT_FAILED_REASON}: {cause}"));
+    let reused = reusable_export(export, part, upper, reborrow_progress(&mut progress)).await;
+    let fresh = reused.is_none();
+    let manifest = match reused {
+        Some(m) => m,
+        None if *exports >= export.max_exports_per_pass => return Ok(ExportStep::Budget),
+        None => {
+            *exports += 1;
+            match export_partition(conn, export, part, upper, reborrow_progress(&mut progress))
+                .await
+            {
+                Ok(m) => m,
+                Err(cause) => return Ok(failed(cause)),
+            }
+        }
+    };
+    let mut manifest = manifest;
+    let mut result = drop_partition(conn, part, upper, opts, Some(&manifest)).await?;
+    if result == DropOutcome::Changed && !fresh && *exports < export.max_exports_per_pass {
+        *exports += 1;
+        manifest = match export_partition(conn, export, part, upper, progress).await {
+            Ok(m) => m,
+            Err(cause) => return Ok(failed(cause)),
+        };
+        result = drop_partition(conn, part, upper, opts, Some(&manifest)).await?;
+    }
+    Ok(if result == DropOutcome::Dropped {
+        ExportStep::Dropped(manifest.key())
+    } else {
+        ExportStep::Blocked(result.reason().to_string())
+    })
 }
 
 /// Where an occupancy proof looks for events.
@@ -4645,70 +4877,144 @@ async fn drop_partition(
     part: &PartitionInfo,
     upper: DateTime<Utc>,
     opts: &SweepOptions,
-) -> HarvestResult<bool> {
+    manifest: Option<&crate::partition_archive::PartitionManifest>,
+) -> HarvestResult<DropOutcome> {
     let ms = u64::try_from(opts.lock_timeout.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let scan_ms = u64::try_from(opts.exact_scan_timeout.as_millis())
         .unwrap_or(u64::MAX)
         .max(1);
     let name = part.name.clone();
     let opts = *opts;
-    let result = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
-        exec(conn, &format!("SET LOCAL lock_timeout = '{ms}ms'")).await?;
-        // Taken explicitly, before the re-check, rather than relying on the
-        // DROP to take it afterwards — the whole point is that the check runs
-        // under a lock that freezes this partition's contents.
-        exec(
-            conn,
-            &format!("LOCK TABLE {} IN SHARE MODE", quote_ident(&name)),
-        )
-        .await?;
+    let result = Box::pin(
+        conn.transaction::<DropOutcome, HarvestError, _>(async |conn| {
+            exec(conn, &format!("SET LOCAL lock_timeout = '{ms}ms'")).await?;
+            // Taken explicitly, before the re-check, rather than relying on the
+            // DROP to take it afterwards — the whole point is that the check runs
+            // under a lock that freezes this partition's contents.
+            exec(
+                conn,
+                &format!("LOCK TABLE {} IN SHARE MODE", quote_ident(&name)),
+            )
+            .await?;
 
-        // The SAME three-tier proof, re-run under the lock — not a narrower
-        // one. An earlier revision bailed out whenever more executions survived
-        // than `owner_probe_cap`, which is precisely the condition under which
-        // the gate had used the exact scan: every partition that needed tier 3
-        // to prove itself droppable was then rejected here, forever, so
-        // reclamation stopped entirely on high-volume or legal-hold-heavy
-        // shards — the deployments this feature exists for.
-        if cohort_occupancy(conn, &EventScope::partition(&name), upper, &opts)
-            .await?
-            .is_some()
-        {
-            return Ok(false);
-        }
+            // The SAME three-tier proof, re-run under the lock — not a narrower
+            // one. An earlier revision bailed out whenever more executions survived
+            // than `owner_probe_cap`, which is precisely the condition under which
+            // the gate had used the exact scan: every partition that needed tier 3
+            // to prove itself droppable was then rejected here, forever, so
+            // reclamation stopped entirely on high-volume or legal-hold-heavy
+            // shards — the deployments this feature exists for.
+            if cohort_occupancy(conn, &EventScope::partition(&name), upper, &opts)
+                .await?
+                .is_some()
+            {
+                return Ok(DropOutcome::Recheck);
+            }
 
-        // A near-zero bound on the lock UPGRADE, separate from the bound on
-        // acquiring the SHARE above, because the two cost different things.
-        //
-        // Waiting for `SHARE` is free to bystanders: it conflicts with
-        // `ROW EXCLUSIVE` — writers to this closed cohort, of which there are
-        // none — and not with `ACCESS SHARE`, so a pending `SHARE` request
-        // queues nobody behind it.
-        //
-        // The `DROP`'s upgrade to `ACCESS EXCLUSIVE` is the opposite. Postgres
-        // queues a new request behind an existing *waiter* it conflicts with,
-        // not merely behind held locks, so while this upgrade waits — for one
-        // long history query still holding `ACCESS SHARE` on this child — every
-        // append's cross-partition uniqueness probe, which takes `ACCESS SHARE`
-        // on every child, queues behind it. Whatever cohort it is writing.
-        // Bounding that by `lock_timeout` would stall the whole shard for two
-        // seconds per drop attempt, per tick.
-        //
-        // So the upgrade gets one brief attempt and the partition waits for the
-        // next tick, where reclamation is bounded and retried by design.
-        let upgrade_ms = ms.min(DROP_UPGRADE_TIMEOUT_MS);
-        exec(conn, &format!("SET LOCAL lock_timeout = '{upgrade_ms}ms'")).await?;
-        exec(
-            conn,
-            &format!("DROP TABLE IF EXISTS {}", quote_ident(&name)),
-        )
-        .await?;
-        Ok(true)
-    }))
+            // Issue #2009: the export ran with no lock. `SHARE` now blocks every
+            // row change, so a matching checksum proves that the export holds
+            // what the drop removes. The check is one statement, bounded like
+            // the exact scan, so `SHARE` is held no longer than tier 3 holds it.
+            if let Some(manifest) = manifest {
+                let bound = format!("{scan_ms}ms");
+                let (rows, checksum) = crate::partition_archive::with_local_settings(
+                    conn,
+                    &[("statement_timeout", &bound), ("TimeZone", "UTC")],
+                    async |conn| crate::partition_archive::locked_checksum(conn, &name).await,
+                )
+                .await
+                .map_err(|e| match e {
+                    HarvestError::Database(msg) if is_statement_timeout(&msg) => {
+                        HarvestError::Database(format!("{EXPORT_CHECK_TIMEOUT_TAG}: {msg}"))
+                    }
+                    other => other,
+                })?;
+                if rows != manifest.row_count || checksum != manifest.row_checksum {
+                    return Ok(DropOutcome::Changed);
+                }
+                // The drop log row commits with the drop, or not at all.
+                crate::partition_archive::record_drop(conn, manifest).await?;
+            }
+
+            // A near-zero bound on the lock UPGRADE, separate from the bound on
+            // acquiring the SHARE above, because the two cost different things.
+            //
+            // Waiting for `SHARE` is free to bystanders: it conflicts with
+            // `ROW EXCLUSIVE` — writers to this closed cohort, of which there are
+            // none — and not with `ACCESS SHARE`, so a pending `SHARE` request
+            // queues nobody behind it.
+            //
+            // The `DROP`'s upgrade to `ACCESS EXCLUSIVE` is the opposite. Postgres
+            // queues a new request behind an existing *waiter* it conflicts with,
+            // not merely behind held locks, so while this upgrade waits — for one
+            // long history query still holding `ACCESS SHARE` on this child — every
+            // append's cross-partition uniqueness probe, which takes `ACCESS SHARE`
+            // on every child, queues behind it. Whatever cohort it is writing.
+            // Bounding that by `lock_timeout` would stall the whole shard for two
+            // seconds per drop attempt, per tick.
+            //
+            // So the upgrade gets one brief attempt and the partition waits for the
+            // next tick, where reclamation is bounded and retried by design.
+            let upgrade_ms = ms.min(DROP_UPGRADE_TIMEOUT_MS);
+            exec(conn, &format!("SET LOCAL lock_timeout = '{upgrade_ms}ms'")).await?;
+            exec(
+                conn,
+                &format!("DROP TABLE IF EXISTS {}", quote_ident(&name)),
+            )
+            .await?;
+            Ok(DropOutcome::Dropped)
+        }),
+    )
     .await;
     match result {
-        Ok(dropped) => Ok(dropped),
-        Err(HarvestError::Database(msg)) if is_lock_timeout(&msg) || is_deadlock(&msg) => Ok(false),
+        Ok(outcome) => Ok(outcome),
+        Err(HarvestError::Database(msg)) if msg.starts_with(EXPORT_CHECK_TIMEOUT_TAG) => {
+            Ok(DropOutcome::CheckBudget)
+        }
+        Err(HarvestError::Database(msg)) if is_lock_timeout(&msg) || is_deadlock(&msg) => {
+            Ok(DropOutcome::Recheck)
+        }
+        Err(HarvestError::Database(msg)) if is_statement_timeout(&msg) => {
+            Ok(DropOutcome::ScanBudget)
+        }
         Err(e) => Err(e),
+    }
+}
+
+/// Marks a `statement_timeout` in the export check, so the caller can tell
+/// it from a timeout in the ownership check.
+#[cfg(feature = "db")]
+const EXPORT_CHECK_TIMEOUT_TAG: &str = "harvest export check timed out";
+
+/// What one [`drop_partition`] attempt did.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropOutcome {
+    /// The partition is gone.
+    Dropped,
+    /// The lock timed out, or the re-check found an owner.
+    Recheck,
+    /// The hash under the lock does not match the export (issue #2009).
+    Changed,
+    /// A query under the lock ran past its `statement_timeout`.
+    ScanBudget,
+    /// The export check under the lock ran past its `statement_timeout`
+    /// (issue #2009).
+    CheckBudget,
+}
+
+#[cfg(feature = "db")]
+impl DropOutcome {
+    /// The blocked reason of an attempt that did not drop.
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Dropped | Self::Recheck => RECHECK_REASON,
+            Self::Changed => CHANGED_REASON,
+            Self::ScanBudget => SCAN_BUDGET_REASON,
+            Self::CheckBudget => EXPORT_CHECK_BUDGET_REASON,
+        }
     }
 }
 
@@ -5220,6 +5526,15 @@ async fn maintenance_owner_gap(
 /// [`SweepOutcome::catch_up_target`] for what they do and who should persist
 /// them across calls.
 ///
+/// # Cancellation
+///
+/// With no transaction open on `conn`, an applying pass holds a session
+/// advisory lock (issue #2009). If you cancel the pass, close the connection
+/// too. A pooled connection that keeps the lock makes other sweeps on the
+/// shard report [`EXPORT_BUSY_REASON`] until its session ends. Inside a
+/// Diesel transaction, the pass holds a transaction lock only, and your
+/// commit or rollback releases it.
+///
 /// # Errors
 ///
 /// [`HarvestError::Database`] on a catalog or DDL failure.
@@ -5240,6 +5555,7 @@ pub async fn maintain(
         sweep_opts,
         resume_after,
         catch_up_target,
+        None,
         &mut progress,
     )
     .await
@@ -5256,6 +5572,15 @@ pub async fn maintain(
 /// instead of [`maintain`] for that reason. A caller that reports liveness
 /// can then space its proofs of life by one partition attempt, not one
 /// whole pass.
+///
+/// # Cancellation
+///
+/// With no transaction open on `conn`, an applying pass holds a session
+/// advisory lock (issue #2009). If you cancel the pass, close the connection
+/// too. A pooled connection that keeps the lock makes other sweeps on the
+/// shard report [`EXPORT_BUSY_REASON`] until its session ends. Inside a
+/// Diesel transaction, the pass holds a transaction lock only, and your
+/// commit or rollback releases it.
 ///
 /// # Errors
 ///
@@ -5278,6 +5603,51 @@ pub async fn maintain_with_progress(
         sweep_opts,
         resume_after,
         catch_up_target,
+        None,
+        &mut progress,
+    )
+    .await
+}
+
+/// The same as [`maintain_with_progress`], but the sweep step exports each
+/// partition before it drops it (issue #2009).
+///
+/// `export` `None` is the same as [`maintain_with_progress`].
+///
+/// # Cancellation
+///
+/// With no transaction open on `conn`, an applying pass holds a session
+/// advisory lock (issue #2009). If you cancel the pass, close the connection
+/// too. A pooled connection that keeps the lock makes other sweeps on the
+/// shard report [`EXPORT_BUSY_REASON`] until its session ends. Inside a
+/// Diesel transaction, the pass holds a transaction lock only, and your
+/// commit or rollback releases it.
+///
+/// # Errors
+///
+/// [`HarvestError::Database`] on a catalog or DDL failure. An export failure
+/// is not an error. It goes into [`SweepOutcome::blocked`].
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
+pub async fn maintain_exporting(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+    lookahead_cohorts: u32,
+    sweep_opts: &SweepOptions,
+    resume_after: Option<DateTime<Utc>>,
+    catch_up_target: Option<DateTime<Utc>>,
+    export: Option<&crate::partition_archive::PartitionExport>,
+    progress: &mut (dyn FnMut() + Send),
+) -> HarvestResult<MaintenanceOutcome> {
+    let mut progress: Option<&mut (dyn FnMut() + Send)> = Some(progress);
+    maintain_inner(
+        conn,
+        now,
+        lookahead_cohorts,
+        sweep_opts,
+        resume_after,
+        catch_up_target,
+        export,
         &mut progress,
     )
     .await
@@ -5309,6 +5679,7 @@ fn reborrow_progress<'a>(
 }
 
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
 async fn maintain_inner(
     conn: &mut AsyncPgConnection,
     now: DateTime<Utc>,
@@ -5316,6 +5687,7 @@ async fn maintain_inner(
     sweep_opts: &SweepOptions,
     resume_after: Option<DateTime<Utc>>,
     catch_up_target: Option<DateTime<Utc>>,
+    export: Option<&crate::partition_archive::PartitionExport>,
     progress: &mut Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<MaintenanceOutcome> {
     if !detect_layout(conn).await?.is_partitioned() {
@@ -5380,6 +5752,7 @@ async fn maintain_inner(
         true,
         resume_after,
         catch_up_target,
+        export,
         reborrow_progress(progress),
     )
     .await?;
@@ -6534,6 +6907,8 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
         // Issue #1817: `LIKE` copies no triggers. Install the append-only
         // guard on the new parent. Postgres clones it onto each partition.
         step(4, crate::append_only::create_guard_trigger_sql()),
+        // Issue #2259: and the entity projection trigger.
+        step(4, crate::entity_state::create_projection_trigger_sql()),
         step(
             4,
             format!("CREATE TABLE {DEFAULT_PARTITION} PARTITION OF harvest_events DEFAULT"),
@@ -6545,6 +6920,13 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
             format!(
                 "DROP TRIGGER IF EXISTS {} ON {LEGACY_PARTITION}",
                 crate::append_only::GUARD_TRIGGER
+            ),
+        ),
+        step(
+            4,
+            format!(
+                "DROP TRIGGER IF EXISTS {} ON {LEGACY_PARTITION}",
+                crate::entity_state::PROJECTION_TRIGGER
             ),
         ),
         step(
@@ -6693,6 +7075,42 @@ pub fn migration_plan(opts: &EnableOptions, now: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each layout path installs the entity projection trigger next to the
+    /// guard, and drops the old copy before the legacy table attaches (issue
+    /// #2259).
+    #[test]
+    fn every_layout_path_reinstalls_the_projection_trigger() {
+        use crate::entity_state::{PROJECTION_TRIGGER, create_projection_trigger_sql};
+        let create = create_projection_trigger_sql();
+        let steps = migration_plan_steps(&EnableOptions::default(), Utc::now());
+        let position = |needle: &str| {
+            steps
+                .iter()
+                .position(|step| step.sql.contains(needle))
+                .unwrap_or_else(|| panic!("no plan step holds {needle}"))
+        };
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.phase == 4 && step.sql == create)
+        );
+        let drop = format!("DROP TRIGGER IF EXISTS {PROJECTION_TRIGGER} ON {LEGACY_PARTITION}");
+        assert!(position(&drop) < position("ALTER TABLE harvest_events ATTACH PARTITION"));
+
+        let script = enable_sql(&EnableOptions::default());
+        assert!(script.contains(&format!(
+            "$harvest_projection_2259${create}$harvest_projection_2259$"
+        )));
+        let drop_in_script = script
+            .find(&drop)
+            .expect("the script drops the legacy copy");
+        assert!(drop_in_script < script.rfind("ATTACH PARTITION").expect("attach"));
+
+        let exempt = not_the_append_only_guard_sql();
+        assert!(exempt.contains(PROJECTION_TRIGGER));
+        assert!(exempt.contains(crate::append_only::GUARD_TRIGGER));
+    }
 
     #[test]
     fn failed_reports_the_layout_as_unknown_not_unpartitioned() {

@@ -15,6 +15,7 @@ The thresholds are starter defaults, not universal SLOs. Tune them to workload
 volume, downstream SLAs, deployment topology, queue count, shard count, and the
 cadence of your scheduled workflows. A queue that normally drains 10 tasks per
 minute should not page on the same backlog depth as a queue that drains 10,000.
+The depth gauge stops at 10,000, so keep each depth threshold at or below it.
 
 ## Dependency Tags
 

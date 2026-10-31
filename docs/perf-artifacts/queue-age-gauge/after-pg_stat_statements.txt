@@ -1,0 +1,42 @@
+-- after: pending=20000, 10 ticks x 4 workers, depth + age + claim + complete per worker tick
+calls=40 buffers=106095 wal_bytes=0 | WITH queues AS ( SELECT DISTINCT queue_name FROM unnest($1::text[]) AS u(queue_name) ), seek AS ( SELECT q.queue_name, c.scheduled_at, c.cre
+calls=40 buffers=78426 wal_bytes=23724 | WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_queues AS MA
+calls=40 buffers=32623 wal_bytes=1824 | SELECT queue_name, COUNT(*)::BIGINT AS depth FROM harvest_task_queue WHERE queue_name = ANY($1) AND state = $2 AND scheduled_at <= NOW() GRO
+calls=40 buffers=616 wal_bytes=18650 | UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("harvest_ta
+calls=40 buffers=200 wal_bytes=0 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8
+calls=28 buffers=140 wal_bytes=0 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8
+calls=12 buffers=48 wal_bytes=0 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8
+calls=40 buffers=0 wal_bytes=0 | BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+calls=40 buffers=0 wal_bytes=0 | COMMIT
+calls=40 buffers=0 wal_bytes=0 | SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired
+calls=40 buffers=0 wal_bytes=0 | SET LOCAL enable_bitmapscan = off
+calls=40 buffers=0 wal_bytes=0 | SET LOCAL jit = off
+calls=40 buffers=0 wal_bytes=0 | SET LOCAL plan_cache_mode = force_generic_plan
+-- after: pending=100000, 10 ticks x 4 workers, depth + age + claim + complete per worker tick
+calls=40 buffers=95049 wal_bytes=26672 | WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_queues AS MA
+calls=40 buffers=65057 wal_bytes=0 | WITH queues AS ( SELECT DISTINCT queue_name FROM unnest($1::text[]) AS u(queue_name) ), seek AS ( SELECT q.queue_name, c.scheduled_at, c.cre
+calls=40 buffers=61527 wal_bytes=1596 | SELECT queue_name, COUNT(*)::BIGINT AS depth FROM harvest_task_queue WHERE queue_name = ANY($1) AND state = $2 AND scheduled_at <= NOW() GRO
+calls=40 buffers=653 wal_bytes=18370 | UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("harvest_ta
+calls=40 buffers=240 wal_bytes=0 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8
+calls=25 buffers=150 wal_bytes=0 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8
+calls=15 buffers=90 wal_bytes=0 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8
+calls=40 buffers=0 wal_bytes=0 | BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+calls=40 buffers=0 wal_bytes=0 | COMMIT
+calls=40 buffers=0 wal_bytes=0 | SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired
+calls=40 buffers=0 wal_bytes=0 | SET LOCAL enable_bitmapscan = off
+calls=40 buffers=0 wal_bytes=0 | SET LOCAL jit = off
+calls=40 buffers=0 wal_bytes=0 | SET LOCAL plan_cache_mode = force_generic_plan
+-- after: pending=300000, 10 ticks x 4 workers, depth + age + claim + complete per worker tick
+calls=40 buffers=126271 wal_bytes=1539 | SELECT queue_name, COUNT(*)::BIGINT AS depth FROM harvest_task_queue WHERE queue_name = ANY($1) AND state = $2 AND scheduled_at <= NOW() GRO
+calls=40 buffers=124799 wal_bytes=549127 | WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_queues AS MA
+calls=40 buffers=86532 wal_bytes=0 | WITH queues AS ( SELECT DISTINCT queue_name FROM unnest($1::text[]) AS u(queue_name) ), seek AS ( SELECT q.queue_name, c.scheduled_at, c.cre
+calls=40 buffers=678 wal_bytes=160231 | UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("harvest_ta
+calls=40 buffers=240 wal_bytes=0 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8
+calls=25 buffers=150 wal_bytes=0 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8
+calls=15 buffers=90 wal_bytes=0 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8
+calls=40 buffers=0 wal_bytes=0 | BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+calls=40 buffers=0 wal_bytes=0 | COMMIT
+calls=40 buffers=0 wal_bytes=0 | SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired
+calls=40 buffers=0 wal_bytes=0 | SET LOCAL enable_bitmapscan = off
+calls=40 buffers=0 wal_bytes=0 | SET LOCAL jit = off
+calls=40 buffers=0 wal_bytes=0 | SET LOCAL plan_cache_mode = force_generic_plan

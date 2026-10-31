@@ -375,6 +375,11 @@ async fn observe_migration_shard(
     }
 }
 
+/// This function is a sibling of `shard_health.rs`'s `required_migration_versions`.
+/// Both copies form one clone class (issue #2358).
+/// The two bodies must stay byte-identical.
+/// `docs/audits/required-migration-versions-sync.py` fails CI when they differ.
+/// A fix here must land in both files in the same change.
 fn required_migration_versions() -> Result<Vec<String>, String> {
     let migrations = <diesel_migrations::EmbeddedMigrations as MigrationSource<Pg>>::migrations(
         &autumn_harvest::MIGRATIONS,
@@ -415,6 +420,19 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
     ("harvest_schedules", &["SELECT", "INSERT", "UPDATE"]),
+    // Each scheduler pass reads the operator overrides, and a missing grant
+    // skips every pass (issue #2385). `PATCH /dags/{dag_name}` writes and
+    // deletes rows.
+    (
+        "harvest_schedule_overrides",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
+    // Every refresh loop reads the run-default overrides (issue #2387). The
+    // run-defaults PATCH writes and deletes rows.
+    (
+        "harvest_run_default_overrides",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
     ("harvest_signals", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_timers", &["SELECT", "INSERT", "UPDATE", "DELETE"]),
     ("harvest_dead_letters", &["SELECT", "INSERT", "DELETE"]),
@@ -439,6 +457,43 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     // (issue #1795). A missing grant does not stop enforcement: the worker
     // fails open and every replica runs every pass, as before the lease.
     ("harvest_scanner_leases", &["SELECT", "INSERT", "UPDATE"]),
+    // The DR bump ends every owner lease in its transaction (issue #2251). A
+    // missing grant fails the bump. In owner mode (issue #2252), each
+    // decision locks a row FOR KEY SHARE, which needs UPDATE, and each
+    // renewal updates rows. The migration seeds every row, so no INSERT is
+    // needed.
+    ("harvest_decision_owner", &["SELECT", "UPDATE"]),
+    // Each owned claim reads the owner-mode switch, and each owner loop
+    // reads it once a second (issue #2252). Only the operator's enable step
+    // writes it.
+    ("harvest_decision_owner_mode", &["SELECT"]),
+    // Each owner loop records itself as a live candidate once a second, and
+    // deletes its row at shutdown (issue #2252).
+    (
+        "harvest_decision_owner_candidates",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
+    // The entity projection trigger upserts a row in each transaction that
+    // appends an entity snapshot (issue #2259). It runs as the inserting
+    // role, so a missing grant fails that append. Codec rotation and erasure
+    // update rows. Each shard-move cutover and staged-copy cleanup deletes
+    // from the table, and Postgres checks DELETE even when no row matches.
+    (
+        "harvest_entity_state",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
+    // Every completion that recorded an LLM call inserts here, in the
+    // completion transaction (issue #1996). A missing grant rolls back the
+    // completion, and the activity runs and pays again. `GET /admin/usage`
+    // reads it, and a shard move deletes a discarded staged copy.
+    ("harvest_llm_ledger", &["SELECT", "INSERT", "DELETE"]),
+    // Every applying partition sweep reads the export marker, and an
+    // exporting sweep writes it (issue #2009). A missing grant fails every
+    // partition maintenance pass.
+    ("harvest_partition_export", &["SELECT", "INSERT"]),
+    // The drop of an exported partition inserts its record here, in the
+    // drop transaction (issue #2009).
+    ("harvest_partition_exports", &["SELECT", "INSERT"]),
     // Claim-path gate tables. The claim CTE reads all four unconditionally on
     // every poll, so a storage role missing `SELECT` on any one of them makes
     // `claim_task` error and the worker claim *nothing* -- a missing grant
@@ -458,6 +513,17 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     ),
     (
         "harvest_build_compat",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
+    // Fairness keys (issue #1976). A fair claim reads both tables and upserts
+    // the state row of the key it claims. Prune deletes idle state rows. The
+    // weight API writes the overrides.
+    (
+        "harvest_fairness_state",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
+    (
+        "harvest_fairness_weights",
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
     (
@@ -2406,6 +2472,10 @@ mod tests {
         assert!(sql.contains("harvest_workers"));
         assert!(sql.contains("harvest_activity_pauses"));
         assert!(sql.contains("harvest_queue_pauses"));
+        assert!(
+            sql.contains("harvest_llm_ledger"),
+            "a completion that records an LLM call writes the ledger (issue #1996)"
+        );
         assert!(sql.contains("INSERT"));
         assert!(sql.contains("UPDATE"));
         assert!(sql.contains("DELETE"));
@@ -2436,6 +2506,22 @@ mod tests {
     /// a new gate table to the claim path *cannot* silently skip the probe:
     /// this test fails until the table is registered here (issue #807 review,
     /// Codex P1).
+    /// Every applying partition sweep reads the export marker, and an
+    /// exporting sweep writes it (issue #2009).
+    #[test]
+    fn the_partition_export_marker_is_covered_by_the_privilege_probe() {
+        let covered = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
+            .iter()
+            .find(|(name, _)| *name == "harvest_partition_export")
+            .map(|(_, privileges)| *privileges);
+        assert_eq!(covered, Some(&["SELECT", "INSERT"][..]));
+        let log = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
+            .iter()
+            .find(|(name, _)| *name == "harvest_partition_exports")
+            .map(|(_, privileges)| *privileges);
+        assert_eq!(log, Some(&["SELECT", "INSERT"][..]));
+    }
+
     #[test]
     fn every_table_the_claim_path_reads_is_covered_by_the_privilege_probe() {
         let sql = autumn_harvest::queue::claim_task_query();

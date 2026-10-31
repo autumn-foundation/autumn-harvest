@@ -27,8 +27,11 @@
 //!   other caller. Read the embedder's own claims from `extensions`.
 //! - `route_class`: from [`autumn_harvest::audit::CLASSIFIED_ROUTES`].
 //!   An unclassified path is `Mutating`.
-//! - `tenant_key`: the [`autumn_harvest::audit::HEADER_TENANT`] header.
-//!   The caller declares it. Harvest does not bind it to stored executions.
+//! - `tenant_key`: the verified tenant, when the credential carries one
+//!   (issue #1977). `tenant_verified` is then `true`. See [`crate::tenant`].
+//!   Otherwise it is the [`autumn_harvest::audit::HEADER_TENANT`] header,
+//!   and `tenant_verified` is `false`. The caller declares that header, so
+//!   do not grant access on an unverified tenant.
 //! - `shard`: read only from a source the route's handler uses. One source is
 //!   an execution id in the path, also under `/ui`. The others are a shard
 //!   query parameter or body field on the routes in `SHARD_SOURCES`. `None`
@@ -72,7 +75,7 @@ use crate::api::{
 use crate::api_token::{TokenPrincipal, TokenScope};
 
 /// Longest accepted [`HEADER_TENANT`] value, in bytes.
-pub const MAX_TENANT_KEY_LEN: usize = 128;
+pub const MAX_TENANT_KEY_LEN: usize = autumn_harvest::tenant::MAX_TENANT_LEN;
 
 /// Longest request path an audit row records.
 const MAX_AUDITED_PATH_LEN: usize = 256;
@@ -129,10 +132,24 @@ pub struct AuthzRequest<'a> {
     pub principal: AuthzPrincipal,
     /// The route class of `method` and `path`.
     pub route_class: RouteClass,
-    /// The caller-declared tenant key, trimmed.
+    /// The tenant key. It is the verified tenant when `tenant_verified` is
+    /// `true`. Otherwise it is the caller-declared header, trimmed.
     pub tenant_key: Option<&'a str>,
+    /// Whether a credential verified `tenant_key` (issue #1977).
+    pub tenant_verified: bool,
     /// The shard this call is about, if the request names one.
     pub shard: Option<ShardId>,
+    /// The business key in the body (issue #2081).
+    ///
+    /// Set only on `start`, `signal-with-start` and `update-with-start`. It is
+    /// the raw `workflow_id` the handler reads. `None` means the body has no
+    /// usable key. On `start`, that can also mean an auto-generated id.
+    pub workflow_id: Option<&'a str>,
+    /// Whether the body carries start input (issue #2081).
+    ///
+    /// That is `input` on `start`, and `start_input` on the two with-start
+    /// routes. A `null` value counts as absent. Always `false` on other routes.
+    pub start_input_present: bool,
     /// The HTTP method.
     pub method: &'a Method,
     /// The path, relative to the management API mount.
@@ -156,17 +173,36 @@ impl<'a> AuthzRequest<'a> {
             principal,
             route_class,
             tenant_key: None,
+            tenant_verified: false,
             shard: None,
+            workflow_id: None,
+            start_input_present: false,
             method,
             path,
             extensions,
         }
     }
 
-    /// Set the tenant key.
+    /// Set an unverified tenant key.
     #[must_use]
     pub const fn with_tenant_key(mut self, tenant_key: Option<&'a str>) -> Self {
         self.tenant_key = tenant_key;
+        self.tenant_verified = false;
+        self
+    }
+
+    /// Set a verified tenant key (issue #1977).
+    #[must_use]
+    pub const fn with_verified_tenant(mut self, tenant: &'a str) -> Self {
+        self.tenant_key = Some(tenant);
+        self.tenant_verified = true;
+        self
+    }
+
+    /// Set the tenant key. `verified` applies only to a present key.
+    const fn with_tenant(mut self, tenant: Option<&'a str>, verified: bool) -> Self {
+        self.tenant_key = tenant;
+        self.tenant_verified = verified && tenant.is_some();
         self
     }
 
@@ -174,6 +210,20 @@ impl<'a> AuthzRequest<'a> {
     #[must_use]
     pub const fn with_shard(mut self, shard: Option<ShardId>) -> Self {
         self.shard = shard;
+        self
+    }
+
+    /// Set the body business key (issue #2081).
+    #[must_use]
+    pub const fn with_workflow_id(mut self, workflow_id: Option<&'a str>) -> Self {
+        self.workflow_id = workflow_id;
+        self
+    }
+
+    /// Set whether the body carries start input (issue #2081).
+    #[must_use]
+    pub const fn with_start_input_present(mut self, present: bool) -> Self {
+        self.start_input_present = present;
         self
     }
 }
@@ -661,6 +711,77 @@ fn start_body_shard(api_state: &HarvestApiState, body: &[u8]) -> Option<ShardId>
         .ok()
 }
 
+/// Routes whose body carries a business key (issue #2081).
+///
+/// The second value is the body field that holds the start input. Each
+/// template must be in [`autumn_harvest::audit::CLASSIFIED_ROUTES`].
+pub(crate) const WORKFLOW_ID_ROUTES: &[(&str, StartInput)] = &[
+    ("POST /workflows/{workflow_name}/start", StartInput::Input),
+    (
+        "POST /workflows/{workflow_name}/signal-with-start",
+        StartInput::StartInput,
+    ),
+    (
+        "POST /workflows/{workflow_name}/update-with-start",
+        StartInput::StartInput,
+    ),
+];
+
+/// Which body field holds the start input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartInput {
+    /// `input`, on `start`.
+    Input,
+    /// `start_input`, on the with-start routes.
+    StartInput,
+}
+
+/// The start input field of `method` and `path`, if the route has a key.
+fn workflow_id_route(method: &Method, path: &str) -> Option<StartInput> {
+    static MATCHERS: std::sync::OnceLock<RouteMatchers<StartInput>> = std::sync::OnceLock::new();
+    let matchers = MATCHERS.get_or_init(|| {
+        build_route_matchers("WORKFLOW_ID_ROUTES", WORKFLOW_ID_ROUTES.iter().copied())
+    });
+    match_route(matchers, method, path).map(|m| *m.value)
+}
+
+/// The body fields the hook reads. The handlers read the same names, so a
+/// body they reject names no key here.
+#[derive(serde::Deserialize)]
+struct BodyKeyFields {
+    #[serde(default)]
+    workflow_id: Option<String>,
+    #[serde(default)]
+    input: Option<serde_json::Value>,
+    #[serde(default)]
+    start_input: Option<serde_json::Value>,
+}
+
+/// The business key and start-input presence read from a start-family body.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BodyKey {
+    workflow_id: Option<String>,
+    start_input_present: bool,
+}
+
+/// Read the business key from `body`.
+///
+/// A body that does not parse names no key. The handler rejects it. A repeated
+/// key fails the parse, as it does in the handler.
+fn read_body_key(input: StartInput, body: &[u8]) -> BodyKey {
+    let Ok(fields) = serde_json::from_slice::<BodyKeyFields>(body) else {
+        return BodyKey::default();
+    };
+    let input = match input {
+        StartInput::Input => fields.input,
+        StartInput::StartInput => fields.start_input,
+    };
+    BodyKey {
+        workflow_id: fields.workflow_id,
+        start_input_present: input.is_some(),
+    }
+}
+
 /// The shard one body `field` names, from a JSON or a form body.
 fn body_field_shard(field: &str, form: bool, is_form: bool, body: &[u8]) -> Option<ShardId> {
     if form && is_form {
@@ -679,6 +800,13 @@ fn body_field_shard(field: &str, form: bool, is_form: bool, body: &[u8]) -> Opti
 ///
 /// A repeated header is refused, because two layers could each read a
 /// different value.
+///
+/// Sibling of `tenant.rs`'s `declared_tenant` (clone class, tracked in issue
+/// #2341). The two bodies differ only in the one spelling `MAX_TENANT_KEY_LEN`
+/// forces (that constant is itself `autumn_harvest::tenant::MAX_TENANT_LEN`).
+/// `docs/audits/tenant-header-validation-sync.py` normalizes that one name and
+/// gates CI on the rest staying byte-identical. A fix here must land in both
+/// files in the same change.
 fn tenant_key(request: &Request) -> Result<Option<String>, ()> {
     let mut values = request.headers().get_all(HEADER_TENANT).iter();
     let Some(raw) = values.next() else {
@@ -694,6 +822,21 @@ fn tenant_key(request: &Request) -> Result<Option<String>, ()> {
     Ok(Some(value.to_string()))
 }
 
+/// The tenant the hook sees, and whether a credential verified it.
+///
+/// A verified tenant replaces the header (issue #1977). The tenant binding
+/// layer has already refused a header that names another tenant. `Err`
+/// means an unusable header.
+fn request_tenant(request: &Request) -> Result<(Option<String>, bool), ()> {
+    request
+        .extensions()
+        .get::<crate::tenant::VerifiedTenant>()
+        .map_or_else(
+            || tenant_key(request).map(|t| (t, false)),
+            |t| Ok((Some(t.as_str().to_string()), true)),
+        )
+}
+
 fn forbidden() -> Response {
     (
         StatusCode::FORBIDDEN,
@@ -702,7 +845,7 @@ fn forbidden() -> Response {
         .into_response()
 }
 
-fn bad_tenant() -> Response {
+pub(crate) fn bad_tenant() -> Response {
     (
         StatusCode::BAD_REQUEST,
         axum::Json(serde_json::json!({
@@ -715,6 +858,40 @@ fn bad_tenant() -> Response {
 }
 
 // ── Middleware ────────────────────────────────────────────────────────────────
+
+/// Buffer the body when a shard or a key comes from it.
+///
+/// The body is read under the app's own limit, then put back for the handler.
+/// Shards found go into `shards`. `Err` is the body-limit rejection.
+#[allow(clippy::result_large_err)]
+async fn buffer_body(
+    api_state: &HarvestApiState,
+    request: Request,
+    source: Option<ShardSource>,
+    key_input: Option<StartInput>,
+    shards: &mut Vec<ShardId>,
+) -> Result<(Request, BodyKey), Response> {
+    let reads_body = key_input.is_some()
+        || matches!(
+            source,
+            Some(ShardSource::StartBody | ShardSource::Body { .. })
+        );
+    if !reads_body {
+        return Ok((request, BodyKey::default()));
+    }
+    let is_form = is_form_urlencoded(request.headers());
+    let (parts, body) = request.into_parts();
+    let bytes = Bytes::from_request(Request::from_parts(parts.clone(), body), &())
+        .await
+        .map_err(IntoResponse::into_response)?;
+    shards.extend(match source {
+        Some(ShardSource::StartBody) => start_body_shard(api_state, &bytes),
+        Some(ShardSource::Body { field, form }) => body_field_shard(field, form, is_form, &bytes),
+        _ => None,
+    });
+    let body_key = key_input.map_or_else(BodyKey::default, |input| read_body_key(input, &bytes));
+    Ok((Request::from_parts(parts, Body::from(bytes)), body_key))
+}
 
 /// The authorizer layer (issue #1803).
 ///
@@ -729,7 +906,7 @@ pub(crate) async fn enforce_authorizer(
     if *request.method() == Method::OPTIONS {
         return next.run(request).await;
     }
-    let Ok(tenant) = tenant_key(&request) else {
+    let Ok((tenant, tenant_verified)) = request_tenant(&request) else {
         return bad_tenant();
     };
 
@@ -741,30 +918,15 @@ pub(crate) async fn enforce_authorizer(
     };
 
     let source = shard_source(&method, &path);
-    let request = match source {
-        None | Some(ShardSource::FanOut) => request,
-        Some(ShardSource::Query(keys)) => {
-            shards.extend(query_shards(request.uri().query(), keys));
-            request
-        }
-        Some(source) => {
-            // Buffer the body under the app's own limit, read the shard, then
-            // put the body back for the handler.
-            let is_form = is_form_urlencoded(request.headers());
-            let (parts, body) = request.into_parts();
-            let bytes =
-                match Bytes::from_request(Request::from_parts(parts.clone(), body), &()).await {
-                    Ok(bytes) => bytes,
-                    Err(rejection) => return rejection.into_response(),
-                };
-            shards.extend(match source {
-                ShardSource::StartBody => start_body_shard(&api_state, &bytes),
-                ShardSource::Body { field, form } => body_field_shard(field, form, is_form, &bytes),
-                ShardSource::Query(_) | ShardSource::FanOut => None,
-            });
-            Request::from_parts(parts, Body::from(bytes))
-        }
-    };
+    let key_input = workflow_id_route(&method, &path);
+    if let Some(ShardSource::Query(keys)) = source {
+        shards.extend(query_shards(request.uri().query(), keys));
+    }
+    let (request, body_key) =
+        match buffer_body(&api_state, request, source, key_input, &mut shards).await {
+            Ok(read) => read,
+            Err(response) => return response,
+        };
     shards.sort_unstable_by_key(|s| s.as_i32());
     shards.dedup();
 
@@ -790,8 +952,10 @@ pub(crate) async fn enforce_authorizer(
 
     for shard in candidates {
         let authz = AuthzRequest::new(principal, route_class, &method, &path, request.extensions())
-            .with_tenant_key(tenant.as_deref())
-            .with_shard(shard);
+            .with_tenant(tenant.as_deref(), tenant_verified)
+            .with_shard(shard)
+            .with_workflow_id(body_key.workflow_id.as_deref())
+            .with_start_input_present(body_key.start_input_present);
         let AuthzDecision::Deny(reason) = authorizer.0.authorize(&authz).await else {
             continue;
         };
@@ -983,6 +1147,138 @@ mod tests {
             start_body_shard(&state, br#"{"residency_key": "eu"}"#),
             None
         );
+    }
+
+    #[test]
+    fn workflow_id_routes_are_classified_routes() {
+        for (template, _) in WORKFLOW_ID_ROUTES {
+            assert!(
+                autumn_harvest::audit::CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, _)| r == template),
+                "{template} must be a classified route"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_id_route_matches_only_start_family() {
+        assert_eq!(
+            workflow_id_route(&Method::POST, "/workflows/wf/start"),
+            Some(StartInput::Input)
+        );
+        for path in [
+            "/workflows/wf/signal-with-start",
+            "/workflows/wf/update-with-start",
+        ] {
+            assert_eq!(
+                workflow_id_route(&Method::POST, path),
+                Some(StartInput::StartInput),
+                "{path}"
+            );
+        }
+        assert_eq!(workflow_id_route(&Method::GET, "/workflows/wf/start"), None);
+        assert_eq!(workflow_id_route(&Method::GET, "/workflows"), None);
+        assert_eq!(
+            workflow_id_route(&Method::POST, "/workflows/x/signal/s"),
+            None
+        );
+        assert_eq!(
+            workflow_id_route(&Method::POST, "/ui/workflows/wf/start"),
+            None
+        );
+    }
+
+    #[test]
+    fn read_body_key_reads_the_key_and_input_presence() {
+        let key = |input, body: &[u8]| read_body_key(input, body);
+        let found = |id: &str, present| BodyKey {
+            workflow_id: Some(id.to_string()),
+            start_input_present: present,
+        };
+        assert_eq!(
+            key(
+                StartInput::StartInput,
+                br#"{"workflow_id": "acme/1", "start_input": {"a": 1}}"#
+            ),
+            found("acme/1", true)
+        );
+        assert_eq!(
+            key(StartInput::Input, br#"{"workflow_id": "a", "input": 0}"#),
+            found("a", true)
+        );
+        // The id is raw. The handler does not trim it.
+        assert_eq!(
+            key(StartInput::StartInput, br#"{"workflow_id": " a "}"#),
+            found(" a ", false)
+        );
+        // A null input counts as absent, as it does in the handler.
+        assert_eq!(
+            key(
+                StartInput::StartInput,
+                br#"{"workflow_id": "a", "start_input": null}"#
+            ),
+            found("a", false)
+        );
+        // Only the field of the route counts.
+        assert_eq!(
+            key(
+                StartInput::StartInput,
+                br#"{"workflow_id": "a", "input": 1}"#
+            ),
+            found("a", false)
+        );
+        // A key nested in the input is not the business key.
+        assert_eq!(
+            key(
+                StartInput::StartInput,
+                br#"{"start_input": {"workflow_id": "inner"}}"#
+            ),
+            BodyKey {
+                workflow_id: None,
+                start_input_present: true
+            }
+        );
+    }
+
+    #[test]
+    fn read_body_key_names_nothing_for_a_body_the_handler_rejects() {
+        for body in [
+            &br"{}"[..],
+            b"not json",
+            b"",
+            br#"{"workflow_id": 5}"#,
+            br#"{"workflow_id": null}"#,
+            // A repeated key. The handler rejects it, so the hook picks none.
+            br#"{"workflow_id": "a", "workflow_id": "b"}"#,
+        ] {
+            assert_eq!(
+                read_body_key(StartInput::StartInput, body).workflow_id,
+                None,
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn builders_set_the_body_key() {
+        let ext = Extensions::new();
+        let method = Method::POST;
+        let req = AuthzRequest::new(
+            AuthzPrincipal::Embedder,
+            RouteClass::Mutating,
+            &method,
+            "/workflows/e/signal-with-start",
+            &ext,
+        );
+        assert_eq!(req.workflow_id, None);
+        assert!(!req.start_input_present);
+        let req = req
+            .with_workflow_id(Some("acme/1"))
+            .with_start_input_present(true);
+        assert_eq!(req.workflow_id, Some("acme/1"));
+        assert!(req.start_input_present);
     }
 
     #[test]

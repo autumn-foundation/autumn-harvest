@@ -86,6 +86,9 @@ if caller.is_support_engineer() {
   stay reachable). The gate applies to both the tool's own HTTP path and the
   `/mcp` JSON-RPC `tools/call` envelope (autumn-web re-dispatches the envelope
   through the same route). See *MCP tool routes* below.
+- **Receives `403 Forbidden` on the MCP Tasks route** — when
+  [`mcp_tasks()`](./mcp-tools.md#mcp-tasks-issue-2005) is enabled. Every
+  JSON-RPC method on that route counts as a mutation, `tasks/get` included.
 
 The `403` is distinct from the anonymous `401` the admin gate returns, so an
 authenticated-but-insufficient read-only principal is distinguishable from an
@@ -156,8 +159,11 @@ gate closes both the direct-HTTP and the envelope invocation paths. When
 
 The nested `/ui` sub-router's paths are not part of `CLASSIFIED_ROUTES`, so under
 fail-closed enforcement a read-only principal receives `403` on `/ui`. Admins
-reach `/ui` unchanged. Classifying the UI routes so read-only principals can view
-(but not act through) the dashboard is a documented follow-up.
+reach `/ui` unchanged.
+
+[Custom roles](./security-posture.md#custom-roles) (issue #1978) close this
+gap. The built-in `harvest-viewer` role reads every Vantage page and gets
+`403` on every Vantage form post.
 
 ## Known limitation: read-capability breadth
 

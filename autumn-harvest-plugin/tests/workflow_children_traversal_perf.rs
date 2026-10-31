@@ -249,6 +249,7 @@ async fn insert_root(conn: &mut AsyncPgConnection, root: ExecutionId) {
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(wfx::table)
         .values(&row)
@@ -307,6 +308,7 @@ async fn bulk_insert(conns: &mut [AsyncPgConnection; 2], nodes: &[Node], workflo
                     start_source: None,
                     start_source_ref: None,
                     started_by: None,
+                    tenant: None,
                 })
                 .collect();
             diesel::insert_into(wfx::table)

@@ -1,0 +1,49 @@
+# Ledger profiles for `autumn-harvest/src/audit_chain.rs`. See `docs/ledger/README.md`.
+
+["any_chained_row"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_chain.md"
+
+["other_live_cursor"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_export_cursor"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_chain.md"
+
+["reanchor_shard_chain"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_export_cursor"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_chain.md"
+
+["stamp_chain"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_chain.md"
+
+["verify_shard_chain_with"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_export_cursor", "harvest_audit_log"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_chain.md"
+
+["write_checkpoint"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_audit_export_cursor"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_chain.md"

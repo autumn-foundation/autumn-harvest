@@ -219,6 +219,16 @@ pub struct HistoryExportDocument {
     /// [`testing::HistorySnapshot::parent_execution_id`]: crate::testing::HistorySnapshot::parent_execution_id
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_execution_id: Option<ExecutionId>,
+    /// How the run started (issue #2082), from the `start_source` and
+    /// `continued_from_exec_id` columns. Like `parent_execution_id`, no
+    /// `WorkflowEvent` holds it, so it rides the export. The name matches
+    /// [`testing::HistorySnapshot::start_provenance`], so a replay of the export
+    /// takes the same branch as the live run. `None` for a legacy export.
+    /// Non-payload metadata, so it is never redacted.
+    ///
+    /// [`testing::HistorySnapshot::start_provenance`]: crate::testing::HistorySnapshot::start_provenance
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_provenance: Option<crate::types::StartProvenance>,
 }
 
 /// Input needed to export one workflow execution history.
@@ -272,6 +282,9 @@ pub struct HistoryExportRequest {
     /// `execution_timeout`/`deadline_at`: the value lives in no `WorkflowEvent`,
     /// so it must be carried explicitly on the request.
     pub parent_execution_id: Option<ExecutionId>,
+    /// How the run started (issue #2082), from the execution row. `None` when the
+    /// caller has no row, as for a legacy export.
+    pub start_provenance: Option<crate::types::StartProvenance>,
 }
 
 /// History export failure modes.
@@ -288,6 +301,32 @@ pub enum HistoryExportError {
         /// Caller-selected size limit.
         max_bytes: usize,
     },
+}
+
+/// The headers an export document carries for a stored header cell
+/// (issue #2043).
+///
+/// A clear map reads as it always did. A codec envelope decodes only when the
+/// caller passes a decoder, which is the read-path gate of issue #608. With no
+/// decoder, or with a cell the decoder cannot read, the document carries no
+/// headers. Plaintext headers never reach an export that a caller may not
+/// decode, and never reach cold storage.
+///
+/// A decode adds to `outcome`, so the read audit counts a header-only decode
+/// like any other (issue #608).
+#[must_use]
+pub fn export_headers(
+    stored: Option<&Value>,
+    decoder: Option<&crate::payload_codec::PayloadCodecs>,
+    outcome: &mut LossyDecodeOutcome,
+) -> Option<HashMap<String, String>> {
+    let stored = stored?;
+    if crate::payload_codec::is_codec_envelope(stored) {
+        let mut cell = stored.clone();
+        *outcome = outcome.merged(decoder?.decode_value_lossy(&mut cell));
+        return serde_json::from_value(cell).ok();
+    }
+    serde_json::from_value(stored.clone()).ok()
 }
 
 /// Build a replay-compatible history export document.
@@ -390,6 +429,8 @@ pub fn export_history_decoded(
         // child's exported history round-trips its `parent_execution_id` into the
         // JSON replay path, exactly like the deadline metadata above.
         parent_execution_id: request.parent_execution_id,
+        // Start provenance (issue #2082) — non-payload metadata, never redacted.
+        start_provenance: request.start_provenance,
     };
 
     let actual_bytes = measure_export_bytes(&mut document)?;
@@ -516,6 +557,22 @@ fn measure_export_bytes(document: &mut HistoryExportDocument) -> Result<usize, H
     Ok(previous)
 }
 
+impl HistoryExportDocument {
+    /// Recompute `size_limit.actual_bytes` after a change to the document.
+    ///
+    /// A read path that decodes payload fields changes the byte count. Call
+    /// this after the change, so the field states the size of the document
+    /// that the caller gets (issue #1983).
+    ///
+    /// # Errors
+    ///
+    /// [`HistoryExportError::Serialization`] when the document does not
+    /// serialize.
+    pub fn remeasure(&mut self) -> Result<usize, HistoryExportError> {
+        measure_export_bytes(self)
+    }
+}
+
 fn history_state_is_terminal(state: &str) -> bool {
     matches!(
         state,
@@ -569,6 +626,7 @@ impl MermaidExporter {
                 | WorkflowEvent::WorkflowCompleted { .. }
                 | WorkflowEvent::WorkflowFailed { .. }
                 | WorkflowEvent::WorkflowCancelled { .. }
+                | WorkflowEvent::WorkflowCancelRequested { .. }
                 | WorkflowEvent::WorkflowContinuedAsNew { .. }
                 | WorkflowEvent::WorkflowResetFork { .. }
                 | WorkflowEvent::WorkflowResetTerminated { .. }
@@ -578,6 +636,10 @@ impl MermaidExporter {
                 | WorkflowEvent::WorkflowRedriven { .. }
                 | WorkflowEvent::WorkflowRetryScheduled { .. } => {
                     self.handle_workflow_event(event)?;
+                }
+                WorkflowEvent::WorkflowForked { .. }
+                | WorkflowEvent::ForkActivityResultOverridden { .. } => {
+                    self.handle_fork_event(event)?;
                 }
                 WorkflowEvent::ActivityScheduled { .. }
                 | WorkflowEvent::ActivityStarted { .. }
@@ -660,6 +722,13 @@ impl MermaidExporter {
                 writeln!(
                     self.out,
                     "    Note over WF: Workflow Cancelled: {safe_reason}"
+                )?;
+            }
+            WorkflowEvent::WorkflowCancelRequested { reason } => {
+                let safe_reason = reason.replace('\n', " ").replace('"', "'");
+                writeln!(
+                    self.out,
+                    "    Note over WF: Cancel Requested: {safe_reason}"
                 )?;
             }
             WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => {
@@ -902,6 +971,40 @@ impl MermaidExporter {
                 writeln!(
                     self.out,
                     "    Note right of WF: Cascade Applied to Child {child_id}: {action}"
+                )?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    /// Fork events of issue #2000.
+    fn handle_fork_event(&mut self, event: &WorkflowEvent) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::WorkflowForked {
+                forked_from_exec_id,
+                fork_event_id,
+                effects,
+                reason,
+                ..
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Forked from {forked_from_exec_id} at event {fork_event_id} \
+                     ({} effects): {}",
+                    effects.as_str(),
+                    mermaid_text(reason),
+                )?;
+            }
+            WorkflowEvent::ForkActivityResultOverridden {
+                activity_name,
+                occurrence,
+                ..
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Fork override: {} #{occurrence}",
+                    mermaid_text(activity_name),
                 )?;
             }
             _ => unreachable!(),
@@ -1247,6 +1350,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1301,6 +1405,7 @@ mod tests {
             context_headers: None,
             execution_timeout: Some(timeout),
             deadline_at: Some(deadline),
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1362,6 +1467,7 @@ mod tests {
                 context_headers: None,
                 execution_timeout: None,
                 deadline_at: None,
+                start_provenance: None,
                 parent_execution_id: None,
                 workflow_id: None,
                 queue_name: Some("priority-queue".to_string()),
@@ -1410,6 +1516,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1457,6 +1564,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: Some(parent),
             workflow_id: None,
             queue_name: None,
@@ -1551,6 +1659,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1613,6 +1722,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1653,6 +1763,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1822,6 +1933,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1853,6 +1965,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1910,6 +2023,44 @@ mod tests {
         })
     }
 
+    // --- issue #2043: header cells in an export.
+
+    #[test]
+    fn export_headers_reads_a_clear_map() {
+        let stored = serde_json::json!({"x-tenant": "acme"});
+        let mut outcome = LossyDecodeOutcome::default();
+        let headers = export_headers(Some(&stored), None, &mut outcome).expect("a clear map");
+        assert_eq!(headers.get("x-tenant").map(String::as_str), Some("acme"));
+        assert!(export_headers(None, None, &mut outcome).is_none());
+        assert!(!outcome.touched(), "a clear map is not a decode");
+    }
+
+    #[test]
+    fn export_headers_leaves_an_envelope_out_without_a_decoder() {
+        let stored = fixed_plaintext_envelope(8);
+        let mut outcome = LossyDecodeOutcome::default();
+        assert!(export_headers(Some(&stored), None, &mut outcome).is_none());
+        assert!(!outcome.touched());
+    }
+
+    #[test]
+    fn export_headers_decodes_an_envelope_for_a_decoder() {
+        let stored = fixed_plaintext_envelope(8);
+        let decoder = fixed_plaintext_registry(r#"{"x-tenant":"acme"}"#);
+        let mut outcome = LossyDecodeOutcome::default();
+        let headers = export_headers(Some(&stored), Some(&decoder), &mut outcome).expect("decoded");
+        assert_eq!(headers.get("x-tenant").map(String::as_str), Some("acme"));
+        assert_eq!(outcome.decoded, 1, "the audit counts a header-only decode");
+    }
+
+    #[test]
+    fn export_headers_leaves_out_an_envelope_the_decoder_cannot_read() {
+        let stored = fixed_plaintext_envelope(8);
+        let identity_only = PayloadCodecs::default();
+        let mut outcome = LossyDecodeOutcome::default();
+        assert!(export_headers(Some(&stored), Some(&identity_only), &mut outcome).is_none());
+    }
+
     fn envelope_export_request(envelope: Value, max_bytes: usize) -> HistoryExportRequest {
         use crate::types::ExecutionId;
         HistoryExportRequest {
@@ -1924,6 +2075,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,

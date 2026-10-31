@@ -1,0 +1,17 @@
+# Ledger profiles for `autumn-harvest/src/remote_task_db.rs`. See `docs/ledger/README.md`.
+
+["load_handle"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/remote_task_db.md"
+
+["pending_page"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_external_tasks", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/remote_task_db.md"

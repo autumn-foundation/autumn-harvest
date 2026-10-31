@@ -1,0 +1,88 @@
+# Ledger profiles for `autumn-harvest/src/throttle.rs`. See `docs/ledger/README.md`.
+
+["delete_throttle_row"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_start_throttle"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/throttle.md"
+
+["existing_pending_throttle_for_workflow_id"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_start_throttle"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/throttle.md"
+
+["fire_due_on_conn"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_rate_limit_buckets", "harvest_start_throttle"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/throttle.md"
+
+["insert_pending_throttle_row"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_start_throttle"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/throttle.md"
+
+["list_pending_throttle"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_start_throttle"]
+measured = "unmeasured"
+
+["pending_backlog_exists"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_start_throttle"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/throttle.md"
+
+["pending_throttle_count_for_workflow"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_start_throttle"]
+measured = "docs/performance-schedule-overdue-aux.md"
+plan = "docs/ledger/plans/autumn-harvest/throttle.md"
+
+["pending_throttle_counts_for_workflows"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_start_throttle"]
+measured = "docs/performance-schedule-overdue-aux.md"
+plan = "docs/ledger/plans/autumn-harvest/throttle.md"
+
+["pre_lock_rate_limit_buckets_for_claimed_batch"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_rate_limit_buckets"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/throttle.md"
+
+["redefer_throttle_row"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_start_throttle"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/throttle.md"
+
+["throttle_backlog_by_key"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_rate_limit_buckets", "harvest_start_throttle"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/throttle.md"

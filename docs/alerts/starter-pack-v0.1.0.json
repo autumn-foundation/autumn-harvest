@@ -182,7 +182,7 @@
       "id": "harvest_queue_backlog_growth",
       "status": "enforceable",
       "signal_source": "ADR-0001/#138 gauge harvest.queue.depth sampled per configured queue. Secondary signal \u2014 superseded as primary page by harvest_queue_schedule_to_start_high (#501).",
-      "default_threshold": "Ticket when queue depth stays above 100 pending tasks and continues growing for 10 minutes. Tune absolute depth per queue throughput. Prefer the schedule-to-start p99 alert as the primary page.",
+      "default_threshold": "Ticket when queue depth stays above 100 pending tasks and continues growing for 10 minutes. At the gauge cap of 10,000 the depth cannot grow, so the rule tickets when the gauge holds at the cap for 10 minutes on a queue that is not paused. Tune absolute depth per queue throughput, at or below the cap. Prefer the schedule-to-start p99 alert as the primary page.",
       "severity": "ticket",
       "owner_persona": "workflow on-call",
       "description": "Pending task count is growing faster than workers can claim and complete work. Use this as a secondary/corroborating signal; the schedule-to-start p99 alert is the primary capacity page.",
@@ -192,6 +192,11 @@
           "ref": "#138",
           "status": "shipped",
           "surface": "METRIC_QUEUE_DEPTH / harvest.queue.depth"
+        },
+        {
+          "ref": "#619",
+          "status": "shipped",
+          "surface": "METRIC_QUEUE_PAUSED / harvest.queue.paused: leaves a paused queue out at the depth cap (#2356)"
         },
         {
           "ref": "ADR-0001",
@@ -206,11 +211,12 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Prometheus exporters commonly expose harvest.queue.depth as harvest_queue_depth. Label only by bounded queue names. This depth+derivative heuristic is throughput-specific; use harvest_queue_schedule_to_start_high for the latency-based primary page.",
+        "notes": "Prometheus exporters commonly expose harvest.queue.depth as harvest_queue_depth. Label only by bounded queue names. This depth+derivative heuristic is throughput-specific; use harvest_queue_schedule_to_start_high for the latency-based primary page. The gauge stops at 10,000 (issue #2356), so it shows no growth above that. While the gauge holds at the cap for the whole window, the rule fires on the level: a backlog of 10,000 or more for 10 minutes, growing or not. A paused queue is left out, because harvest_queue_paused_too_long covers it. Each depth series matches the pause gauge of its own scrape target, so a pause in another deployment with the same queue name does not count. The pause gauge has no shard label, so a pause on one shard leaves the whole queue out. A threshold above 10,000 can never fire. For a queue that normally holds more than 10,000 tasks, drop this rule and rely on harvest_queue_schedule_to_start_high. For an exact count above the cap, scrape harvest_queue_backlog from GET /admin/queues/scaling?format=prometheus.",
         "expressions": [
           {
             "kind": "promql",
-            "expr": "max_over_time(harvest_queue_depth{queue=\"default\"}[10m]) > 100 and deriv(harvest_queue_depth{queue=\"default\"}[10m]) > 0"
+            "expr": "max_over_time(harvest_queue_depth{queue=\"default\"}[10m]) > 100 and (deriv(harvest_queue_depth{queue=\"default\"}[10m]) > 0 or (min_over_time(harvest_queue_depth{queue=\"default\"}[10m]) >= 10000 unless harvest_queue_paused{queue=\"default\"} > 0))",
+            "note": "Pair with `for: 10m`. A new series at the cap then cannot fire on its first sample. docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml tests this rule with promtool."
           }
         ]
       },
@@ -1623,16 +1629,16 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "The p99 rule needs histogram bucket boundaries on the metrics-rs Prometheus exporter (set_buckets_for_metric for harvest_db_query_duration). The built-in scrape endpoint renders no _bucket series, so use the average fallback there. The op label is bounded to claim, persist, scan and heartbeat.",
+        "notes": "The p99 rule needs histogram bucket boundaries on the metrics-rs Prometheus exporter (set_buckets_for_metric for harvest_db_query_duration). The built-in scrape endpoint renders no _bucket series, so use the average fallback there. The op label is bounded to claim, take, persist, scan and heartbeat. A take is the claim by execution of an owner decider (issue #2255).",
         "expressions": [
           {
             "kind": "promql",
-            "expr": "histogram_quantile(0.99, sum by (le, instance, op, shard) (rate(harvest_db_query_duration_bucket{op=~\"claim|persist\"}[5m]))) > 0.5",
+            "expr": "histogram_quantile(0.99, sum by (le, instance, op, shard) (rate(harvest_db_query_duration_bucket{op=~\"claim|take|persist\"}[5m]))) > 0.5",
             "for": "10m"
           },
           {
             "kind": "promql",
-            "expr": "sum by (instance, op, shard) (rate(harvest_db_query_duration_sum{op=~\"claim|persist\"}[5m])) / sum by (instance, op, shard) (rate(harvest_db_query_duration_count{op=~\"claim|persist\"}[5m])) > 0.25",
+            "expr": "sum by (instance, op, shard) (rate(harvest_db_query_duration_sum{op=~\"claim|take|persist\"}[5m])) / sum by (instance, op, shard) (rate(harvest_db_query_duration_count{op=~\"claim|take|persist\"}[5m])) > 0.25",
             "for": "10m",
             "note": "Bucket-less fallback: the average duration. Use it on the built-in scrape endpoint, which renders only _sum and _count."
           }

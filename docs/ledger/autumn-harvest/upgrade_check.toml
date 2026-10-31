@@ -1,0 +1,22 @@
+# Ledger profiles for `autumn-harvest/src/upgrade_check.rs`. See `docs/ledger/README.md`.
+
+["UpgradeCheck::read_run"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["UpgradeCheck::run_shard"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["load_pending_signals"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_signals"]
+measured = "unmeasured"

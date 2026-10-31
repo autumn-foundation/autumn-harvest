@@ -71,13 +71,15 @@ their exports are byte-identical to before.
 
 ### Deliberately undecoded surfaces
 
-Two payload-carrying read surfaces are **not** decoded, by design, even with
-the flag on and an admin session:
+These payload-carrying read surfaces are **not** decoded, by design, even
+with the flag on and an admin session:
 
 | Surface | Rationale |
 |---|---|
 | `GET /workflows` (the list endpoint, including the stalled-workflow loader) | Row counts are unbounded and each row flattens a full execution (input/output/memo/search_attrs/error); per-row decoding would put an O(rows × fields) codec cost on the fleet-navigation path. Lists are navigational — click through to the describe/detail views, which decode. |
 | `GET /dags/{dag_name}/runs` | Same shape and rationale: an unbounded list of full execution rows used for navigation; the per-run detail surfaces decode. |
+| `GET /workflows/summaries` | Same rationale: an unbounded list. Its `result` field copies the execution output verbatim, so it shows an envelope when column encoding is on (issue #1979). |
+| MCP `{wf}_status` and `{wf}_watch` | These tools have no session, so the admin gate cannot run. They report the stored output (issue #1979). |
 
 On an encrypted deployment these list responses show stored envelopes for the
 same executions whose detail views show plaintext — that is expected, not a
@@ -156,10 +158,25 @@ Two attribution details:
 - `GET /dead-letters/aggregate` is unchanged: `failure_signature` groups over
   the stored (possibly ciphertext) error first-line. Counts and ids remain
   correct; signatures on an encrypted deployment group by ciphertext shape.
-- The engine's own write paths currently persist with identity codecs;
-  envelopes appear wherever a writer (e.g. the client handle path or a future
-  write-side integration) stored them. The read path decodes any envelope it
-  finds and passes everything else through untouched.
+- With column encoding on (issue #1979, issue #2043), the engine writes
+  envelopes into the covered columns. These include the execution
+  `input`, `output` and `memo`, signal payloads, dead-letter inputs and task
+  rows. The surfaces above decode them under the same rules. A
+  non-admin caller, and the undecoded list surfaces, see the envelopes. See
+  the column coverage table in `docs/security-posture.md`.
+- The schedule API and the UI show the stored envelope for a schedule input
+  (issue #2043). A history export decodes context headers only when the caller
+  may decode. Without that, the export document carries no headers.
+- A column write can wrap the whole value in one envelope: the column codec,
+  or an identity escape while the switch is off. A column read removes that
+  layer first, then applies the walk below. So a decoded column shows the
+  same value with the switch off or on, and the same value as a row written
+  before issue #1979.
+- The walk runs twice on a column: once for the column layer, once for the
+  value inside. A business value that is itself an envelope therefore decodes
+  on an admin read (issue #2054). The strict engine read returns it as
+  written. The difference is intended. A row from before issue #1979 has no
+  column layer, and its nested envelopes must still decode.
 - Because the walk is envelope-driven, business data stored as plaintext that
   happens to be byte-for-byte a codec envelope — at any nesting depth — is
   transformed on the decoded view: decoded when its `codec_id` is registered,

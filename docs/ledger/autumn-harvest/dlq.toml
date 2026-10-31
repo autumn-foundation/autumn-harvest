@@ -1,0 +1,97 @@
+# Ledger profiles for `autumn-harvest/src/dlq.rs`. See `docs/ledger/README.md`.
+
+["aggregate_dead_letters"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters", "harvest_workflow_executions"]
+measured = "docs/performance-dlq-aggregate.md"
+plan = "docs/ledger/plans/autumn-harvest/dlq.md"
+
+["count_bulk_filter_matches"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/dlq.md"
+
+["count_redrive_filter_matches"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/dlq.md"
+
+["dead_letter_count"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/dlq.md"
+
+["dead_letter_with_codecs"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_dead_letters", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/dlq.md"
+
+["discard_dead_letters_batch"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_dead_letters"]
+measured = "docs/performance-dlq-bulk-discard.md"
+plan = "docs/ledger/plans/autumn-harvest/dlq.md"
+
+["list_dead_letters"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/dlq.md"
+
+["load_workflow_names"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/dlq.md"
+
+["query_dead_letters_for_bulk"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/dlq.md"
+
+["query_dead_letters_for_redrive"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/dlq.md"
+
+["redrive_dead_letter_at"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_dead_letters", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/dlq.md"
+
+["replay_dead_letter_at"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_dead_letters", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/dlq.md"

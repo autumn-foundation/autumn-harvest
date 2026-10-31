@@ -3,6 +3,11 @@
 //! These tests need no database. `docs/testing/simulation.md` lists the
 //! environment variables and the replay command.
 
+mod group;
+mod owner;
+mod speculate;
+mod world;
+
 use autumn_harvest::dst::{
     self, ClaimStore, Fencing, Invariant, Outcome, SeedPlan, SimConfig, SimReport, WriteOutcome,
 };

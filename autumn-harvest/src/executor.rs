@@ -378,7 +378,8 @@ fn encode_workflow_panic(message: String) -> String {
         .into_workflow_error_payload()
 }
 
-/// Caller-supplied metadata recorded onto the `harvest.workflow.execute` span.
+/// Caller-supplied metadata for the `harvest.workflow.execute` span, and context
+/// inputs the executor threads into [`WorkflowContext`].
 pub struct WorkflowExecuteSpanMeta {
     /// Logical workflow name (recorded as `harvest.workflow.id`).
     pub workflow_name: String,
@@ -389,6 +390,10 @@ pub struct WorkflowExecuteSpanMeta {
     pub shard_id: i64,
     /// Task queue name (recorded as `harvest.queue`).
     pub queue_name: String,
+    /// The clock of the cycle, when the runtime fixes one (issue #2276). A
+    /// live `system_now` then returns it. The SQLite runtime sets it, so the
+    /// clock reads of a workflow agree with its timers.
+    pub drive_clock: Option<chrono::DateTime<chrono::Utc>>,
     /// Whether this cycle is a deterministic replay (recorded as `harvest.replay`).
     pub is_replay: bool,
     /// W3C traceparent linking back to the original trace, present only on
@@ -413,6 +418,16 @@ pub struct WorkflowExecuteSpanMeta {
     /// execution row's `parent_id` column so a child workflow can identify its
     /// spawner via `ctx.info()` / `ctx.parent_execution_id()`.
     pub parent_execution_id: Option<ExecutionId>,
+    /// How this run started and its predecessor (issue #2082). The worker reads
+    /// it from the `start_source` and `continued_from_exec_id` columns.
+    pub start_provenance: crate::types::StartProvenance,
+    /// A cancel request that is not yet in the history (issue #2021).
+    ///
+    /// The SQLite backend stores a cooperative cancel outside the event log.
+    /// It appends `WorkflowCancelled` only when it seals the run. This field
+    /// lets the body read the request through `ctx.cancellation_reason()`.
+    /// A recorded `WorkflowCancelled` event wins. Every other caller passes `None`.
+    pub cancellation_reason: Option<String>,
 }
 
 /// Classification of a bounded, read-only query-replay drive (issue #612).
@@ -476,6 +491,9 @@ pub enum QueryReplayOutcome {
 ///   completing path doesn't call this function at all any more, so the
 ///   question doesn't arise there — every command past the frontier is
 ///   tolerated, bookkeeping or not.)
+/// - A drop release (issue #2193): the `ScheduleActivity` that a dropped
+///   `Session` issues. A run that ends first never records it, so a replay of
+///   that run must not flag it.
 ///
 /// This is the **single source of truth** for two callers that must agree, so
 /// the command classification is never re-enumerated by hand:
@@ -490,12 +508,22 @@ pub enum QueryReplayOutcome {
 ///   deadline (case 2 → [`TimedOut`](QueryReplayOutcome::TimedOut)) or a
 ///   command-less cold park such as `await_condition` that suspends immediately
 ///   (case 3 → [`Suspended`](QueryReplayOutcome::Suspended)).
-pub(crate) const fn is_replay_significant_command(cmd: &WorkflowCommand) -> bool {
+pub(crate) fn is_replay_significant_command(cmd: &WorkflowCommand) -> bool {
+    // A run that ends first never records a drop release (issue #2193).
+    // A replay of that run issues it as a new command.
+    if matches!(
+        cmd,
+        WorkflowCommand::ScheduleActivity { name, .. }
+            if name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME
+    ) {
+        return false;
+    }
     !matches!(
         cmd,
         WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ReleaseMutex { .. }
@@ -1071,10 +1099,17 @@ pub async fn run_workflow_with_context(
 /// everything it touches: the ungated [`ReplayDeclarativeHandlers`] and
 /// [`ReplayPayloadLimits`] structs, and the ungated
 /// `WorkflowContext::register_declarative_{query,update}_handler` it calls.
+///
+/// It also installs the candidate's shard router, when there is one. A fresh
+/// child spawn with a non-default placement needs it (issue #1995).
 pub(crate) fn register_declarative_handlers(
-    ctx: &WorkflowContext,
+    ctx: WorkflowContext,
     handlers: ReplayDeclarativeHandlers<'_>,
-) {
+) -> WorkflowContext {
+    let ctx = match handlers.router {
+        Some(router) => ctx.with_shard_router(router.clone()),
+        None => ctx,
+    };
     let wf_name = ctx.workflow_type();
     for h in handlers.queries.iter().filter(|h| h.workflow == wf_name) {
         ctx.register_declarative_query_handler(h);
@@ -1082,6 +1117,7 @@ pub(crate) fn register_declarative_handlers(
     for h in handlers.updates.iter().filter(|h| h.workflow == wf_name) {
         ctx.register_declarative_update_handler(h);
     }
+    ctx
 }
 
 /// The candidate build's declarative `#[query]` / `#[update]` handlers, carried
@@ -1111,6 +1147,12 @@ pub struct ReplayDeclarativeHandlers<'a> {
     pub queries: &'a [&'a crate::info::QueryHandlerInfo],
     /// Declarative update handlers to register before the workflow body runs.
     pub updates: &'a [&'a crate::info::UpdateHandlerInfo],
+    /// The candidate worker's shard router. `None` leaves the context on the
+    /// process-global router, as before.
+    pub router: Option<&'a crate::shard::ShardRouter>,
+    /// How the replayed run started (issue #2082). The row holds it, not the
+    /// history, so a replay needs it to reach the same branch as the live run.
+    pub start_provenance: crate::types::StartProvenance,
 }
 
 /// The **candidate** worker's payload limits, applied to a replay context.
@@ -1243,6 +1285,7 @@ pub async fn run_workflow_strict(
         .with_execution_timeout(execution_timeout)
         .with_deadline(deadline_at)
         .with_parent_execution_id(parent_execution_id)
+        .with_start_provenance(declarative_handlers.start_provenance)
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id.unwrap_or_default())
         .with_queue_name(queue_name.unwrap_or_default())
@@ -1260,7 +1303,7 @@ pub async fn run_workflow_strict(
     // Mirror the live worker: register declarative handlers before any workflow
     // code runs, so a body that branches on `ctx.list_query_names()` sees the
     // candidate's registrations rather than an empty registry.
-    register_declarative_handlers(&ctx, declarative_handlers);
+    let ctx = register_declarative_handlers(ctx, declarative_handlers);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
 
@@ -1314,6 +1357,7 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
         .with_execution_timeout(execution_timeout)
         .with_deadline(deadline_at)
         .with_parent_execution_id(parent_execution_id)
+        .with_start_provenance(declarative_handlers.start_provenance)
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id.unwrap_or_default())
         .with_queue_name(queue_name.unwrap_or_default())
@@ -1331,7 +1375,7 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
     // Mirror the live worker: register declarative handlers before any workflow
     // code runs, so a body that branches on `ctx.list_query_names()` sees the
     // candidate's registrations rather than an empty registry.
-    register_declarative_handlers(&ctx, declarative_handlers);
+    let ctx = register_declarative_handlers(ctx, declarative_handlers);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
 
@@ -1635,6 +1679,7 @@ pub(crate) async fn run_workflow_canary(
         .with_execution_timeout(execution_timeout)
         .with_deadline(deadline_at)
         .with_parent_execution_id(parent_execution_id)
+        .with_start_provenance(declarative_handlers.start_provenance)
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id.unwrap_or_default())
         .with_queue_name(queue_name.unwrap_or_default())
@@ -1652,7 +1697,7 @@ pub(crate) async fn run_workflow_canary(
     // Mirror the live worker: register declarative handlers before any workflow
     // code runs, so a body that branches on `ctx.list_query_names()` sees the
     // candidate's registrations rather than an empty registry.
-    register_declarative_handlers(&ctx, declarative_handlers);
+    let ctx = register_declarative_handlers(ctx, declarative_handlers);
 
     let span = tracing::info_span!(
         "harvest.workflow.execute",
@@ -1909,8 +1954,32 @@ pub async fn run_workflow_with_state_advancing_clock(
     tracing::Span,
     Option<crate::shard::ShardRouter>,
 ) {
-    use crate::context::WorkflowContext;
-    let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+    let ctx = advancing_clock_context(
+        exec_id,
+        history,
+        state,
+        span_meta,
+        metrics,
+        workflow_log_policy,
+    );
+    drive_workflow(ctx, handler, input, span_meta).await
+}
+
+/// Builds the advancing-clock replay context that one `WorkflowTestEnv`
+/// cycle runs on.
+///
+/// The test harness also uses it to rebuild state for a mid-run query or
+/// update (issue #1991). Both paths then replay the same history the same way.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn advancing_clock_context(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    state: SharedState,
+    span_meta: Option<&WorkflowExecuteSpanMeta>,
+    metrics: std::sync::Arc<dyn MetricsRecorder>,
+    workflow_log_policy: Option<crate::context::WorkflowLogPolicy>,
+) -> crate::context::WorkflowContext {
+    crate::context::WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
         history,
         state,
@@ -1934,6 +2003,9 @@ pub async fn run_workflow_with_state_advancing_clock(
     // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
     // the timeout scanner rather than a stale start+timeout recompute.
     .with_deadline(span_meta.and_then(|m| m.deadline_at))
+    .with_drive_clock(span_meta.and_then(|m| m.drive_clock))
+    // Issue #2021: a cancel request the history does not hold yet.
+    .with_pending_cancellation(span_meta.and_then(|m| m.cancellation_reason.clone()))
     // Issue #1405: thread the row's current shard. A `ParentShard` child
     // then places on where this run actually lives, not the origin bits
     // `exec_id` encodes. Lets a WorkflowTestEnv run exercise a rebalanced
@@ -1946,6 +2018,7 @@ pub async fn run_workflow_with_state_advancing_clock(
     // Issue #698: thread the spawning parent's execution id so a child workflow
     // can read it via `ctx.info()` / `ctx.parent_execution_id()`.
     .with_parent_execution_id(span_meta.and_then(|m| m.parent_execution_id))
+    .with_start_provenance(span_meta.map(|m| m.start_provenance).unwrap_or_default())
     // Issue #798: thread the worker build id (mirrors the caps sibling
     // `run_workflow_with_state_history_policy_and_caps`, which already does) so a
     // `WorkflowTestEnv::with_build_id` run can exercise a build-gated workflow.
@@ -1954,8 +2027,7 @@ pub async fn run_workflow_with_state_advancing_clock(
     .with_build_id(span_meta.and_then(|m| m.build_id.clone()))
     .with_metrics(metrics)
     // Issue #790.
-    .with_log_policy(workflow_log_policy);
-    drive_workflow(ctx, handler, input, span_meta).await
+    .with_log_policy(workflow_log_policy)
 }
 
 /// Like [`run_workflow_with_state`] but installs explicit history guardrails,
@@ -2130,6 +2202,7 @@ pub(crate) fn build_task_context(
     // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
     // the timeout scanner rather than a stale start+timeout recompute.
     .with_deadline(span_meta.and_then(|m| m.deadline_at))
+    .with_drive_clock(span_meta.and_then(|m| m.drive_clock))
     // Issue #1405: thread the row's current shard (`span_meta.shard_id` is
     // read live from the execution row, see worker.rs). A `ParentShard`
     // child then places where this run actually lives, not the origin bits
@@ -2142,6 +2215,9 @@ pub(crate) fn build_task_context(
     // Issue #698: thread the spawning parent's execution id so a child workflow
     // can read it via `ctx.info()` / `ctx.parent_execution_id()`.
     .with_parent_execution_id(span_meta.and_then(|m| m.parent_execution_id))
+    .with_start_provenance(span_meta.map(|m| m.start_provenance).unwrap_or_default())
+    // Issue #2021: a cancel request the history does not hold yet.
+    .with_pending_cancellation(span_meta.and_then(|m| m.cancellation_reason.clone()))
     .with_payload_caps(
         max_activity_input_bytes,
         0,
@@ -2241,10 +2317,15 @@ pub(crate) struct DriveResult {
     pub(crate) span: tracing::Span,
     /// The explicit context-local router, if any. See [`run_workflow_with_state`].
     pub(crate) router: Option<crate::shard::ShardRouter>,
-    /// The suspended workflow, kept for the next decision (issue #1798).
+    /// The suspended workflow kept for the next decision, or why it was
+    /// not kept (issue #1798, issue #2007).
     #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))]
     // Resident paths need the worker or the test harness.
-    pub(crate) resident: Option<crate::resident::ResidentWorkflow>,
+    pub(crate) resident: crate::resident::Residency,
+    /// `true` when admitted updates remain after the dispatch window closed
+    /// (issue #2035). The worker wakes the task, so a later cycle runs them.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the worker reads it.
+    pub(crate) updates_deferred: bool,
 }
 
 impl DriveResult {
@@ -2263,8 +2344,9 @@ impl DriveResult {
 /// Core executor body: emit the `OTel` span, run the handler cycle, and return
 /// the outcome.  Shared by all public entry points so the advancing-clock
 /// variant (`run_workflow_with_state_advancing_clock`) does not duplicate the
-/// span/cycle/drain logic.
-async fn drive_workflow(
+/// span/cycle/drain logic. The test harness also calls it for each
+/// `WorkflowTestRun` cycle.
+pub(crate) async fn drive_workflow(
     ctx: WorkflowContext,
     handler: WorkflowHandlerFn,
     input: Value,
@@ -2373,12 +2455,35 @@ async fn drive_cycle(
     // after the cycle, as before issue #1798.
     let keep = keep.filter(|_| matches!(cycle_result, HandlerCycleResult::Suspended));
     let future = keep.is_some().then_some(future);
-    let (mut outcome, pending) = span_handle.in_scope(|| classify_cycle(&ctx, cycle_result));
+    let (mut outcome, mut pending) = span_handle.in_scope(|| classify_cycle(&ctx, cycle_result));
+    // A warm cycle replays nothing, so it has no pending update. The resident
+    // path declines a delta that holds `UpdateAdmitted`. A cycle that ran an
+    // update is never kept resident, because `RecordUpdateResult` is not a
+    // resident command. A cycle that deferred an update is never kept resident
+    // either (below). Skipping the dispatch also saves a history scan on each
+    // warm decision.
+    let warm = replay == Some(false);
+    let updates_deferred = if warm {
+        false
+    } else {
+        crate::update::dispatch_pending_updates(&ctx, &mut outcome, &mut pending)
+            .instrument(span_handle.clone())
+            .await
+    };
     let resident = match (future, keep) {
-        (Some(future), Some(key)) => {
-            crate::resident::ResidentWorkflow::capture(&ctx, future, &mut outcome, key)
+        // A redundant wake resumes an activity wait warm, and a warm cycle
+        // skips the dispatch. A deferred update therefore needs a cold cycle
+        // to run (issue #2035).
+        (Some(_), Some(_)) if updates_deferred => {
+            crate::resident::Residency::Missed(crate::telemetry::ResidentOutcome::Blocked)
         }
-        _ => None,
+        (Some(future), Some(key)) => {
+            match crate::resident::ResidentWorkflow::capture(&ctx, future, &mut outcome, key) {
+                Ok(workflow) => crate::resident::Residency::Parked(workflow),
+                Err(miss) => crate::resident::Residency::Missed(miss),
+            }
+        }
+        _ => crate::resident::Residency::Unknown,
     };
 
     // Issue #1263 items 11/15/17: carry the EXPLICIT context-local router
@@ -2396,6 +2501,7 @@ async fn drive_cycle(
         span: span_handle,
         router,
         resident,
+        updates_deferred,
     }
 }
 
@@ -3447,13 +3553,107 @@ mod tests {
             workflow_id: String::new(),
             shard_id: 0,
             queue_name: queue_name.to_owned(),
+            drive_clock: None,
             is_replay: false,
             link_traceparent: None,
             build_id: None,
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            start_provenance: crate::types::StartProvenance::default(),
+            cancellation_reason: None,
         }
+    }
+
+    // ── Cancellation seam (issue #2021) ───────────────────────────────────
+
+    /// Returns the reason `ctx.cancellation_reason()` reports.
+    fn reports_cancellation<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move { Ok(serde_json::json!(ctx.cancellation_reason())) })
+    }
+
+    async fn reported_cancellation(
+        history: Vec<WorkflowEvent>,
+        seam: Option<&str>,
+        meta: bool,
+    ) -> Value {
+        let mut span_meta = span_meta("wf", "q");
+        span_meta.cancellation_reason = seam.map(str::to_owned);
+        let (outcome, _, _, _) = run_workflow_with_state_and_history_policy(
+            ExecutionId::new(),
+            history,
+            reports_cancellation,
+            Value::Null,
+            empty_shared_state(),
+            WorkflowHistoryPolicy::default(),
+            meta.then_some(&span_meta),
+            &[],
+            &[],
+            std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+        )
+        .await;
+        match outcome {
+            WorkflowOutcome::Completed { output, .. } => output,
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    fn started_only() -> Vec<WorkflowEvent> {
+        started_then_late_signal()[..1].to_vec()
+    }
+
+    #[tokio::test]
+    async fn the_span_meta_reason_reaches_the_context() {
+        let reason = reported_cancellation(started_only(), Some("stop"), true).await;
+        assert_eq!(reason, serde_json::json!("stop"));
+    }
+
+    #[tokio::test]
+    async fn no_span_meta_reason_keeps_the_context_uncancelled() {
+        assert_eq!(
+            reported_cancellation(started_only(), None, true).await,
+            Value::Null
+        );
+        assert_eq!(
+            reported_cancellation(started_only(), None, false).await,
+            Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn the_advancing_clock_path_also_reads_the_span_meta_reason() {
+        let mut meta = span_meta("wf", "q");
+        meta.cancellation_reason = Some("stop".into());
+        let (outcome, _, _, _) = run_workflow_with_state_advancing_clock(
+            ExecutionId::new(),
+            started_only(),
+            reports_cancellation,
+            Value::Null,
+            empty_shared_state(),
+            Some(&meta),
+            std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(outcome, WorkflowOutcome::Completed { ref output, .. } if *output == serde_json::json!("stop")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recorded_cancel_wins_over_the_span_meta_reason() {
+        let mut history = started_only();
+        history.push(WorkflowEvent::WorkflowCancelled {
+            reason: "recorded".into(),
+        });
+        let reason = reported_cancellation(history.clone(), Some("seam"), true).await;
+        assert_eq!(reason, serde_json::json!("recorded"));
+        let reason = reported_cancellation(history, None, true).await;
+        assert_eq!(reason, serde_json::json!("recorded"));
     }
 
     fn started_then_late_signal() -> Vec<WorkflowEvent> {
@@ -4102,6 +4302,179 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["dropped", "send_email"], "got {outcome:?}");
+    }
+
+    /// History with a started run and one acquired session on `gpu`.
+    fn open_session_events() -> Vec<WorkflowEvent> {
+        let acquire_id = ActivityExecId::new();
+        vec![
+            started(),
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(uuid::Uuid::new_v4().to_string()),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: acquire_id,
+                name: crate::context::SESSION_ACQUIRE_ACTIVITY_NAME.into(),
+                input: Value::Null,
+                queue: "gpu".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: acquire_id,
+                output: serde_json::json!("worker-1"),
+            },
+        ]
+    }
+
+    /// Opens the session, drops it, then schedules `next`.
+    fn drop_session_then_step_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let session = ctx
+                .create_session(crate::context::SessionOptions::new("gpu"))
+                .await
+                .map_err(|e| e.to_string())?;
+            drop(session);
+            ctx.execute_activity_raw("next", Value::Null, "default")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Opens the session, then waits on a member activity with it live.
+    fn hold_session_across_park_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let session = ctx
+                .create_session(crate::context::SessionOptions::new("gpu"))
+                .await
+                .map_err(|e| e.to_string())?;
+            session
+                .execute_activity_raw("member", Value::Null, "gpu")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn scheduled_names(outcome: &WorkflowOutcome) -> Vec<&str> {
+        let WorkflowOutcome::Suspended { commands } = outcome else {
+            panic!("expected a suspension, got {outcome:?}");
+        };
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::ScheduleActivity { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Issue #2193: a session that the body drops mid-run is released in the
+    /// same cycle that parks.
+    #[tokio::test]
+    async fn a_session_dropped_before_a_park_is_released() {
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            open_session_events(),
+            drop_session_then_step_workflow,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            scheduled_names(&outcome),
+            [crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME, "next"]
+        );
+    }
+
+    /// Opens two sessions, drops both, then schedules `next`.
+    fn drop_two_sessions_then_step_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let first = ctx
+                .create_session(crate::context::SessionOptions::new("gpu"))
+                .await
+                .map_err(|e| e.to_string())?;
+            let second = ctx
+                .create_session(crate::context::SessionOptions::new("gpu"))
+                .await
+                .map_err(|e| e.to_string())?;
+            drop(first);
+            drop(second);
+            ctx.execute_activity_raw("next", Value::Null, "default")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Issue #2193: each dropped session gets its own release.
+    #[tokio::test]
+    async fn two_sessions_dropped_in_one_cycle_get_two_releases() {
+        let mut events = open_session_events();
+        let second_acquire = ActivityExecId::new();
+        events.push(WorkflowEvent::MarkerRecorded {
+            name: "session:2".into(),
+            details: Value::from(uuid::Uuid::new_v4().to_string()),
+        });
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: second_acquire,
+            name: crate::context::SESSION_ACQUIRE_ACTIVITY_NAME.into(),
+            input: Value::Null,
+            queue: "gpu".into(),
+        });
+        events.push(WorkflowEvent::ActivityCompleted {
+            activity_id: second_acquire,
+            output: serde_json::json!("worker-1"),
+        });
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            events,
+            drop_two_sessions_then_step_workflow,
+            Value::Null,
+        )
+        .await;
+        let release = crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME;
+        assert_eq!(scheduled_names(&outcome), [release, release, "next"]);
+    }
+
+    /// Issue #2193: the executor drops the handler future at each park. That
+    /// drop must not release a session that the body still holds.
+    #[tokio::test]
+    async fn a_session_held_across_a_park_is_not_released() {
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            open_session_events(),
+            hold_session_across_park_workflow,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(scheduled_names(&outcome), ["member"]);
+    }
+
+    /// Issue #2193: a completed run never records the release, so replay must
+    /// not count it as a new command.
+    #[test]
+    fn a_drop_release_is_not_a_replay_significant_command() {
+        let (result_tx, _rx) = tokio::sync::oneshot::channel();
+        let release = WorkflowCommand::ScheduleActivity {
+            activity_id: ActivityExecId::new(),
+            name: crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME.to_string(),
+            input: Value::Null,
+            queue: "gpu".to_string(),
+            retry_policy_override: None,
+            start_to_close_override: None,
+            session_id: None,
+            session_worker_id: None,
+            schedule_to_start_override: None,
+            result_writer: false,
+            result_tx,
+        };
+        assert!(!is_replay_significant_command(&release));
     }
 
     /// Waits on a foreign step, then panics.

@@ -26,12 +26,26 @@ the PAUSED skip. The other six are present in the query and held constant, so
 this page says nothing about what they cost in *that* table; see
 [known limitations](#known-limitations).
 
+Three later gates are not in the table. They are the expired-run gate
+(#1824), the saturated-activity gate (#1836) and the owner gate of owner
+mode (#2252).
+[The expired-run section](#the-continuation-band-and-the-expired-run-gate-issue-1824)
+measures the first.
+[What the seek window does not establish](#what-the-seek-window-does-not-establish)
+gives a buffer count for the owner gate. No section measures the
+saturated-activity gate.
+
 > **Looking for end-to-end numbers?** This page measures the claim and enqueue
 > path in isolation. [`benchmarks.md`](benchmarks.md) publishes what the engine
 > does end to end — workflows/sec, dispatch and signal latency, replay
 > throughput — at 1, 2 and 4 shards, with a one-command reproduction. The two
 > are complements: when an end-to-end number there moves, this page is where you
 > find out whether the claim path is why.
+
+> **Looking for a query that this page does not cover?** Every function
+> that sends SQL has a [Ledger profile](ledger/README.md). The profile names
+> the tables, what makes the query run, and the page that measures it, or
+> `unmeasured`.
 
 > **These are starter reference numbers, not an SLO.** They were taken on one
 > machine with one Postgres configuration (below). Your hardware, your
@@ -48,6 +62,10 @@ this page says nothing about what they cost in *that* table; see
   claim does not spill. At 100K, 8 claimers sustain 573 claims/s against 1.2 before. The
   full scan that the rest of this page measures now runs only as a
   fallback. See [the seek window](#the-seek-window-issue-1971).
+* **A worker now runs up to `max_concurrent_claims` claims at once (default
+  2).** One serial loop kept 0.94 claims in flight and capped throughput. On
+  assay #14's workload, two loops raise throughput 21% to 35%, and four
+  loops 39% to 59%. See [claim concurrency](#claim-concurrency).
 * **Before issue #1971, claim latency scaled superlinearly with
   pending-backlog depth.** The bullets below describe the full scan. 1k → 10k
   rows (10x) costs ~19x latency; 10k → 100k (10x) costs a further ~15x. Claim
@@ -1104,6 +1122,13 @@ Docker daemon for its testcontainer fallback — not both.
 
 ### Known limitation: cost scales with distinct concurrency-key cardinality
 
+> **Follow-up (issue #1971):** this limit now applies to the full scan only.
+> The default claim reads `concurrency_running_counts` only when it falls
+> back. Its window scan runs the same per-row lookup on `seek_running_counts`.
+> That CTE counts the `RUNNING` rows of the window keys only. A fair claim
+> and an ageing claim still run the full scan. See
+> [when the window falls back](#when-the-window-falls-back).
+
 The committed hot-contention fixture above uses 256 distinct concurrency
 keys — the harness's fixed `KEY_CARDINALITY` constant
 (`tests/integration/claim_bench_support.rs`) — and at that cardinality the
@@ -1297,7 +1322,7 @@ No index can remove the sort. The sticky `CASE` key already forces it. See
 The sections above measure the full scan. Since issue #1971, the default
 claim runs that scan only as a fallback. It first reads a bounded **seek
 window** from the head of each polled queue. The claim order does not
-change. Design record: [`DESIGN-1971.md`](../DESIGN-1971.md).
+change. Design record: [`docs/design/DESIGN-1971.md`](design/DESIGN-1971.md).
 
 ### Mechanism
 
@@ -1486,13 +1511,13 @@ row-local gates do not catch. These rows are:
 - rows on a saturated concurrency key, or with an empty rate-limit bucket;
 - rows with a build or capability mismatch;
 - rows of a paused workflow or an expired run;
-- rows locked by other claimers. The guard passes only the rows that sort
-  before the last row of every full head. When gates reject the other rows
-  of the tightest head, that set can be smaller than the number of claims
-  in flight.
+- rows locked by other claimers, past the deep window. Since issue #2420,
+  held window rows start a deep window first. See
+  [held claims](#held-claims-issue-2420).
 
 Priority ageing also falls back. The fallback costs the full scan plus the
-window.
+window. A fallback with no held row also pays for `seek_held`, one more
+check of the window rows.
 
 Measured with 200 rows on a saturated concurrency key at the head of the
 queues:
@@ -1527,6 +1552,45 @@ it takes the lock after the commit and sees this claim. Every claim path
 runs the re-check: the default, the by-id and the batched claim. Claims
 without a capped key pay nothing.
 
+### Held claims (issue #2420)
+
+A peer claim holds its row lock until it commits. The head scan is a plain
+read, so it still returns that row. Before issue #2420, 32 claims in flight
+on one head could lock every window row of that head. The claim then ran
+the full scan. A slow claim keeps more claims in flight, so the cost fed
+itself.
+
+Now the claim reads a deep window first. It runs only when the window found
+no candidate and a guarded window row passes every claim gate. So it runs
+only for a head that peers hold, never for a head that a gate blocks. Each
+held head reads at most `queue::CLAIM_DEEP_SEEK_WINDOW` (256) rows. The
+claim order does not change. See
+[`DESIGN-1971.md` §5](design/DESIGN-1971.md#5-held-claims-issue-2420).
+
+`held_claims_on_one_head_keep_the_claim_off_the_full_scan` holds K real
+claim transactions open on one queue of the issue #1956 fixture. All the
+priority-2 rows sit in one head, so the held claims lock its front. Then
+one more claim runs. PG16, warm cache:
+
+| pending rows | K | before | after |
+|--:|--:|--:|--:|
+| 10,000 | 0 | — | 260 buffers |
+| 10,000 | 32 | — | 1,732 buffers |
+| 10,000 | 64 | — | 1,766 buffers |
+| 100,000 | 0 | 263 buffers | 264 buffers |
+| 100,000 | 32 | 106,467 buffers, 2,259 temp blocks, full scan | 1,727 buffers |
+| 100,000 | 64 | 106,534 buffers, 2,259 temp blocks, full scan | 1,772 buffers |
+
+The held cost does not grow with K or with the backlog depth. Most of it is
+the deep candidate scan: one primary-key probe for each of the 256 deep
+rows, about 4 buffers each. A claim whose window finds a row pays nothing
+for the deep window. When the window finds no row, `seek_held` checks the
+window rows once more. The deep window reads rows only for a held head.
+
+The guard still cuts the deep rows at the last row of every other full
+head. When gates reject the rows of that head, fewer held claims can cause
+the fallback.
+
 ### Costs of the seek window
 
 - **One more index.** `idx_harvest_tq_claim_seek` is a partial index on
@@ -1549,7 +1613,7 @@ without a capped key pay nothing.
 
 - **A blocked head is still O(backlog).** A fully blocked head falls back
   to the full scan. Moving parked rows out of the ready index would remove
-  that. See the follow-ups in [`DESIGN-1971.md`](../DESIGN-1971.md).
+  that. See the follow-ups in [`docs/design/DESIGN-1971.md`](design/DESIGN-1971.md).
 - **Ageing is still O(backlog).** With `priority_aging_secs` set, every
   claim runs the full scan, as before.
 - **A long run of skipped rows.** A head scan reads past each row that a
@@ -1558,6 +1622,26 @@ without a capped key pay nothing.
   head makes each claim read the whole run. Live pins last one sticky
   timeout, so they follow the claim rate. Session pins and paused
   activities do not.
+- **Workflow rows of other owners.** In owner mode (issue #2252), the
+  owned claim skips each workflow row of another owner's partition. With N
+  owners, a workflow head reads about 32 × N rows. A dead owner's rows wait
+  at the head until a peer acquires its partitions, so each claim reads
+  them until then. A review run on PG16 read 381 buffers against 119 for
+  the legacy claim, with 4,900 foreign rows ahead of 100 owned ones.
+  Issue #2255 moves the workflow take to the owner decider. Where it runs,
+  the claim loops claim activities only and read no workflow head. The
+  decider scan never reads the rows of another owner. The owned claim and
+  this cost remain on a worker with queue weights, fairness keys or
+  priority ageing on. They also remain on a worker with no LISTEN/NOTIFY
+  URL for the database, which runs no owner wake.
+- **256 or more held claims on one head.** The deep window reads at most
+  `queue::CLAIM_DEEP_SEEK_WINDOW` (256) rows of a held head. When peers
+  hold all of them, the claim falls back to the full scan. Rows that the
+  claim gates reject lower that number. Up to K = 64 the claim stays at
+  about 1,770 buffers at 100K pending rows. See
+  [held claims](#held-claims-issue-2420).
+- **A held pin head.** The deep window reads queue heads only. A full pin
+  head with every row held still falls back.
 - **A large live pin set.** The pin head reads every live pin of this
   worker. More than 32 of them that pass the gates also make every rank-0
   row wait for the fallback.
@@ -1582,6 +1666,180 @@ without a capped key pay nothing.
   timed](#what-is-actually-timed) explains.
 - **A production fleet.** The fixture follows issue #1956's shape, but no
   production trace was replayed.
+
+## Fairness keys (issue #1976)
+
+Fairness keys are off by default. Off, the claim statement is unchanged. On,
+the claim adds three things. See [Fairness keys](fairness-keys.md).
+
+A fair claim does not use [the seek window](#the-seek-window-issue-1971).
+The lag can put any row of the backlog first, so the window guard cannot
+prove a fair pick. The fair claim empties the window and runs the full scan,
+as a claim with priority ageing does. Its cost therefore grows with the
+backlog.
+
+- **One map per claim.** An uncorrelated subquery maps each key in debt to
+  its lag. It runs once per claim, as an `InitPlan`.
+- **One sort term.** Each candidate row looks up its key's lag.
+- **One upsert.** After the rechecks, the claim charges the claimed key's
+  state row.
+
+Run it with `HARVEST_CLAIM_BENCH_SECTION=fairness cargo bench -p
+autumn-harvest --features db --bench claim_bench`. Measured on the reference
+environment, with 8 claimers and a 90 s budget per row. The baseline is the
+default claim, which the seek window serves:
+
+| Backlog | Keys | Queues | Baseline p50 | Fair p50 | Delta |
+|--:|--:|--:|--:|--:|--:|
+| 1,000 | 256 | 1 | 5.48 ms | 11.50 ms | +110% |
+| 10,000 | 256 | 1 | 5.84 ms | 51.83 ms | +788% |
+| 10,000 | 10,000 | 1 | 6.30 ms | 59.97 ms | +851% |
+| 1,000 | 256 | 4 | 7.77 ms | 7.74 ms | -0% |
+| 10,000 | 256 | 4 | 8.46 ms | 18.95 ms | +124% |
+| 10,000 | 1 | 4 | 7.63 ms | 20.25 ms | +165% |
+| 10,000 | 10,000 | 4 | 8.70 ms | 18.54 ms | +113% |
+| 100,000 | 256 | 4 | 8.00 ms | 132.02 ms | +1551% |
+
+- **The baseline stays flat. The fair claim grows with the backlog.** The
+  seek window reads a bounded head of each queue. A fair claim reads every
+  eligible row, as a claim with priority ageing does. At 100,000 rows the
+  fair claim takes 132 ms against 8 ms.
+- **Read the 1-queue rows for the cost of one statement.** The 4-queue rows
+  run one fair statement per queue. Each one sorts a quarter of the backlog,
+  so they grow more slowly.
+- **The key count does not drive the cost.** The map lookup is a binary
+  search. 10,000 keys cost about the same as 256 keys.
+- **Before issue #1971** the default claim ran the full scan too. The fair
+  SQL then cost 8% to 27% more than the default claim on one queue.
+- **A bounded fair claim needs its own window.** It would need a head per
+  key and a guard on the lag. That is a separate change.
+
+### Rejected forms of the lag lookup
+
+The claim filters estimate one candidate row. With that estimate, the
+planner runs any join on the lag table as a nested loop. It reads the lag
+table again for each candidate row.
+
+| Form | Result |
+|---|---|
+| Join on a CTE of the state rows | A nested loop. About 2x the claim time. |
+| `jsonb` map in a CTE, cross-joined | One copy of the map per row. 4.4 s per claim at 10,000 keys. |
+| Join on a derived table | A hash join only with good statistics. In the benchmark, a nested loop: 9,707 rescans, 1.1 s per claim, +238% at 10,000 rows. |
+| `jsonb` map in an `InitPlan` | Built once. Chosen. |
+
+## Claim concurrency
+
+Assay #14 measured the claim-loop occupancy of one worker: claims per second
+times the mean claim time. It read 0.91 to 0.99 in every harvest run. That
+fits one claim in flight at a time. A worker now runs up to
+`max_concurrent_claims` claims at once, 2 by default. Design record:
+[`docs/design/DESIGN-claim-concurrency.md`](design/DESIGN-claim-concurrency.md).
+
+### Mechanism
+
+- The poll loop is the **leader**. It keeps the listener, the timer and the
+  capacity wake. After a successful Postgres claim it wakes one follower.
+- A **follower** claims until a claim returns nothing. It wakes one more
+  follower after each success. It has no timer and no listener, so an idle
+  worker polls at the single-loop rate.
+- Each loop takes its own permits before it claims, so the loops never
+  claim past the local slots.
+- The claim statement does not change. Two loops can take rows slightly out
+  of order, as two workers can (see [fairness](#fairness)).
+
+### Method
+
+The harvest `postgres` arm of assay #14, unchanged except for one setting:
+[`apparatus.patch`](perf-artifacts/claim-concurrency/apparatus.patch) reads
+the claim cap from `ASSAY14_MAX_CONCURRENT_CLAIMS`. One release binary runs
+caps 1, 2 and 4. Cap 1 is the old serial loop. Temporal 1.25.2 runs on the
+same box in the same session, through assay #11's runner.
+[`run.sh`](perf-artifacts/claim-concurrency/run.sh) runs three rounds.
+[`grade.py`](perf-artifacts/claim-concurrency/grade.py) prints the tables.
+
+**Claims in flight** is the claim count times the mean claim time, divided
+by the elapsed time. One serial loop cannot exceed 1.
+
+Host: 4 logical CPUs (Intel Xeon @ 2.10 GHz). PostgreSQL 16.15 with
+`fsync=off`, `synchronous_commit=off` and `max_connections=300`. One worker,
+8 workflow slots, 16 activity slots, 32 connections, 25 ms poll. Three
+rounds on 2026-10-09, 17:45 to 18:08 UTC. All 84 runs are valid. Raw output:
+[`results/raw/`](perf-artifacts/claim-concurrency/results/raw/). Graded:
+[`results/graded.md`](perf-artifacts/claim-concurrency/results/graded.md).
+
+### Results
+
+Completed workflows/sec, the mean of three runs:
+
+| depth | Temporal | 1 loop | 2 loops (default) | 4 loops |
+|--:|--:|--:|--:|--:|
+| 250 | 31.85 | 32.97 | 44.54 | 48.21 |
+| 500 | 37.29 | 34.97 | 42.34 | 48.49 |
+| 1,000 | 34.63 | 34.37 | 43.80 | 51.21 |
+| 2,000 | 35.13 | 32.09 | 41.76 | 51.10 |
+
+Temporal over harvest:
+
+| depth | 1 loop | 2 loops | 4 loops |
+|--:|--:|--:|--:|
+| 250 | 0.97x | 0.72x | 0.66x |
+| 500 | 1.07x | 0.88x | 0.77x |
+| 1,000 | 1.01x | 0.79x | 0.68x |
+| 2,000 | 1.09x | 0.84x | 0.69x |
+
+Claims in flight, mean claim time and mean pool connections in use:
+
+| depth | in flight 1 / 2 / 4 | claim ms 1 / 2 / 4 | connections 1 / 2 / 4 |
+|--:|--:|--:|--:|
+| 250 | 0.92 / 1.84 / 3.30 | 3.99 / 5.84 / 8.84 | 3.7 / 6.4 / 11.4 |
+| 500 | 0.93 / 1.84 / 3.18 | 3.78 / 6.16 / 8.49 | 3.6 / 6.6 / 11.0 |
+| 1,000 | 0.94 / 1.86 / 3.17 | 3.90 / 6.02 / 7.97 | 3.7 / 6.8 / 11.1 |
+| 2,000 | 0.94 / 1.87 / 3.36 | 4.20 / 6.35 / 8.78 | 3.8 / 6.8 / 11.7 |
+
+What the tables show:
+
+- **One loop reproduces assay #14's ceiling.** It keeps 0.92 to 0.94 claims
+  in flight, the same occupancy as the assay.
+- **Two loops keep about two claims in flight.** Throughput rises 21% to
+  35%. Harvest then runs 1.14x to 1.39x as fast as Temporal on this box.
+- **Four loops keep about 3.3 claims in flight.** Throughput rises 39% to
+  59%. The gain per loop falls, because the claims now contend on the
+  database. The mean claim time rises from about 4 ms to about 9 ms.
+- **Each loop holds about one more connection.** Size the pool for the slots
+  plus `max_concurrent_claims`.
+- **Depth does not change the result.** The seek window keeps the claim
+  flat from 250 to 2,000 rows (see [the seek window](#the-seek-window-issue-1971)).
+
+The default is 2. It clears the measured ceiling at the cost of one
+connection. Raise it to 4 when the pool and the database have room. Watch
+`sum without (kind) (rate(harvest_db_query_duration_sum{op="claim"}[5m]))`
+per worker: it is the mean claims in flight. Each claim kind has its own
+series since issue #2248, so the sum over `kind` is needed. Divide it by `max_concurrent_claims` for the
+occupancy of each loop.
+
+### Dispatch latency with two loops (issue #2418)
+
+This measurement counted throughput only. At a paced start rate, the first
+cut of two loops raised the activity dispatch p50 of the e2e bench from
+13.6 ms to 66.3 ms. Both loops drained the workflow backlog, then the leader
+slept the NOTIFY settle while the activities committed. A workflow task of
+the worker that ends now wakes the leader with no settle. On the same box,
+two loops then give a p50 of 8.1 ms and a p99 of 14.1 ms.
+
+Issue #2422 then made a NOTIFY poll before it settles. The settle runs only
+after an empty poll. A signal to an idle worker then no longer waits the
+whole 50 to 75 ms settle.
+
+### What the measurement does not establish
+
+- **Another box.** This host is not assay #14's host. Temporal reads 31.9 to
+  37.3 here, against 24.8 to 28.7 in assay #14. Only ratios from one box
+  compare.
+- **A tuned Temporal.** The Temporal arm runs at its defaults, as in assay
+  #11.
+- **Other shapes.** One worker, one queue and three activities per workflow.
+  A hot concurrency key or a rate-limited activity gains less, because the
+  loops contend for one advisory lock or one bucket row.
 
 ## Enqueue throughput
 
@@ -2031,6 +2289,10 @@ from the benchmark are directly comparable.
     dropping this predicate alone would not recover the cheap plan, while
     this page measures what it costs to keep it, holding the already-collapsed
     plan shape fixed.
+    **Follow-up (issue #1971):** these figures predate the seek window and
+    the fillfactor of 80 that issue #1811 set. The default claim now runs the
+    full scan measured here only as a fallback. See
+    [the seek window](#the-seek-window-issue-1971).
   * **Worker sessions (#606)** — measured directly, on a genuinely different
     axis from issue #1177 just below: `docs/performance-worker-sessions.md`
     seeds `session_id` and `sticky_worker_id`/`sticky_until`/`sticky_timeout`
@@ -2053,6 +2315,10 @@ from the benchmark are directly comparable.
     sessions' predicate, like `schedule_to_close`'s and sticky routing's,
     independently defeats sort-elision (see immediately below); the two are
     answers to different questions about the same predicate.
+    **Follow-up (issue #1971):** these figures predate the seek window and
+    the fillfactor of 80 that issue #1811 set. The default claim now runs the
+    full scan measured here only as a fallback. See
+    [the seek window](#the-seek-window-issue-1971).
   * **Sticky routing (#235)** — measured directly:
     [`docs/performance-sticky-routing.md`](performance-sticky-routing.md)
     seeds `sticky_worker_id`/`sticky_until`/`sticky_timeout` (session_id left
@@ -2091,6 +2357,10 @@ from the benchmark are directly comparable.
     replacing one unsupported cost claim with another would have been no
     improvement, which is why all three now carry a real measurement
     instead.
+    **Follow-up (issue #1971):** these figures predate the seek window and
+    the fillfactor of 80 that issue #1811 set. The default claim now runs the
+    full scan measured here only as a fallback. See
+    [the seek window](#the-seek-window-issue-1971).
 * **Queue count is a parameter, but it is not swept.** `Scenario.queues`
   parameterizes how many distinct queues the backlog spreads across, and every
   published row holds it at 4. Backlog depth and claimer count *are* varied.
@@ -2123,6 +2393,11 @@ from the benchmark are directly comparable.
   [the concurrency-key gate fix](#the-concurrency-key-gate-fix).
 * `autumn-harvest/scripts/concurrency_key_claim_perf_repro.sh` — regenerates
   that evidence from a clean checkout.
+* `docs/perf-artifacts/claim-paused-gate/` — the PAUSED-run gate after the
+  `idx_harvest_we_paused` partial index (issue #2212, PR #2215). With 50
+  PAUSED-run tasks at the queue head, claim buffers fall from 6,515 to 1,289
+  at 1,000,000 executions. The claimed ids are identical. Its `run.sh`
+  regenerates the evidence.
 * [`docs/performance-capability-labels.md`](performance-capability-labels.md) — the capability-labels claim
   predicate (#382) measurement referenced above.
 * `docs/perf-artifacts/capability-labels-claim-predicate/` — committed
@@ -2148,7 +2423,7 @@ from the benchmark are directly comparable.
   per RUNNING execution on every timeout-scanner tick.
 * Issue #1177 — reproduction and full `EXPLAIN` captures for
   [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
-* [`DESIGN-1971.md`](../DESIGN-1971.md) — the planning record and design of
+* [`docs/design/DESIGN-1971.md`](design/DESIGN-1971.md) — the planning record and design of
   [the seek window](#the-seek-window-issue-1971).
 * [`docs/performance-claim-batched-seek-and-refine.md`](performance-claim-batched-seek-and-refine.md) —
   issue #1340's batched seek-and-refine claim (`queue::claim_task_batched`,
@@ -2161,6 +2436,9 @@ from the benchmark are directly comparable.
 * [`docs/performance-task-queue-hygiene.md`](performance-task-queue-hygiene.md) —
   claim latency after 1M terminal task rows, before and after the
   terminal-task janitor and table tuning (issue #1811).
+* [`docs/performance-deep-backlog.md`](performance-deep-backlog.md) — the claim
+  path on a seeded, skewed 1M-row backlog with 10% dead tuples (issue #1956).
+  It measures the depth scaling that issue #1340 left open.
 
 ### Other profiling notes
 
@@ -2186,6 +2464,8 @@ standalone note rather than part of the claim-path attribution table above:
   correctness bug, caught by review before it shipped.
 * [`docs/performance-dag-graph.md`](performance-dag-graph.md) — hoisting a
   per-node rebuild out of `GET /dag-run-graph` (issue #690).
+* [`docs/performance-dag-build-simulate.md`](performance-dag-build-simulate.md) —
+  `DagBuilder::build` and `DagSimulator::run`; a negative result.
 * [`docs/performance-dlq-aggregate.md`](performance-dlq-aggregate.md) — DLQ
   aggregate grouping (issue #385/#613); a measured fix that was reverted after
   review found a regressing input shape — a negative result.
@@ -2202,6 +2482,11 @@ standalone note rather than part of the claim-path attribution table above:
   (issue #1194).
 * [`docs/performance-workflow-children-traversal.md`](performance-workflow-children-traversal.md)
   — batching the N+1 in `GET /workflows/{id}/children?depth=N` (issue #786-adjacent).
+* [`docs/performance-history-bloat-filter.md`](performance-history-bloat-filter.md)
+  — the `min_history_events` and `history_bloat_min_events` filters of three
+  `autumn-harvest-plugin/src/api.rs` queries. `COUNT(*) >= N` counted every
+  event of a run. A bounded `EXISTS (... OFFSET N-1 LIMIT 1)` reads at most N
+  rows (buffers 3,976 → 94 on a 448,175-event run, -97.6%). Shipped.
 * [`docs/performance-schedule-overdue-aux.md`](performance-schedule-overdue-aux.md)
   — the same N+1 shape in `GET /admin/schedules`'s overdue-aux computation
   (issue #696).
@@ -2222,7 +2507,9 @@ standalone note rather than part of the claim-path attribution table above:
   — `reconcile_quota_keys_from` candidate-scan cost under mixed-deployment
   skew (issue #1226 follow-up); confirms the scaling risk is a permanent
   per-tick cost, not a rollout expense, and diagnoses a planner
-  cardinality misestimate as the cause. No fix ships in this pass.
+  cardinality misestimate as the cause. That pass shipped no fix. Issue #1631
+  (PR #1855) later made the scan seek once per registered name. A tick now
+  reads at most `batch_size` rows per name.
 * [`docs/performance-codec-rotation-reencrypt.md`](performance-codec-rotation-reencrypt.md)
   — skipping a JSON round-trip in the codec-key-rotation re-encryption sweep
   (issue #948).
@@ -2255,6 +2542,11 @@ standalone note rather than part of the claim-path attribution table above:
   one statement per key (`calls` -66.7% at every swept size; buffers flat
   by design, so the fix is measured in DB-socket syscalls instead: `sendto`
   -44.5%, `recvfrom` -40.9%).
+* [`docs/performance-broken-session-scan.md`](performance-broken-session-scan.md)
+  — the two `harvest_task_queue.session_id` seeks in
+  `sessions::enforce_broken_sessions`, which had no index after migration
+  `20261003201739`. A partial index cut their buffers by 99.7% and the
+  pass total by 91.4% at 1,600 broken sessions, with identical outcomes.
 * [`docs/performance-mutex-terminal-sweep-table-present.md`](performance-mutex-terminal-sweep-table-present.md)
   — `mutex::sweep_terminal_holder_and_wake`, reached from the workflow
   completion-trigger evaluator (skipped on a successfully-retried failure),
@@ -2309,10 +2601,6 @@ standalone note rather than part of the claim-path attribution table above:
   `shard_rebalance::history_fingerprint`, the replay-determinism check a
   shard migration runs on both sides of a copy (`docs/sharding.md`), fixed
   by reusing one buffer across events (alloc bytes -16.45%).
-* [`docs/performance-timeline-acckey-hash.md`](performance-timeline-acckey-hash.md)
-  — SipHash over `AccKey` in `timeline::derive_timeline`, the read model behind
-  `GET /workflows/{id}/timeline` (issue #739), replaced by one 128-bit hash
-  write per key (instructions -8.3%).
 * [`docs/performance-lineage.md`](performance-lineage.md) — the `visited`/
   `next`/`node.children` vecs in `lineage::LineageWalk`/
   `LineageTreeReport::finish`, the in-memory half of
@@ -2356,6 +2644,12 @@ standalone note rather than part of the claim-path attribution table above:
   `serde_json::Value` clone eliminated by taking the field by value
   (`std::mem::take`) instead of borrowing it from the event tree the caller
   already owns (instructions -36.89%, allocation blocks -52.05%).
+* [`docs/performance-decode-event-payload-move.md`](performance-decode-event-payload-move.md)
+  — `PayloadCodecs::decode_event` moves each payload tree into its field
+  instead of letting serde rebuild it (issue #2136). `decode_event` drops
+  54.3% of its instructions in `payload_codec_profile`. The note also
+  records the allocator and `preserve_order` alternatives measured for that
+  issue.
 * [`docs/performance-parent-close-cascade-unfinished-handlers.md`](performance-parent-close-cascade-unfinished-handlers.md)
   — the per-child `harvest_events` N+1 in
   `check_and_report_unfinished_handlers`'s parent-close-cascade callers,
@@ -2365,6 +2659,157 @@ standalone note rather than part of the claim-path attribution table above:
   400→4 at a 400-child fixture, 100 executions per chunk).
 * [`docs/performance-timeline-acckey-hash.md`](performance-timeline-acckey-hash.md)
   — the three-write derived `Hash` for `timeline::AccKey`, the lookup key of
-  `derive_timeline` behind `GET /workflows/{id}/timeline` (PR #1894);
+  `derive_timeline` behind `GET /workflows/{id}/timeline` (issue #739, PR #1894);
   replaced by a manual impl that writes one 128-bit value (instructions
   -8.3%, callgrind).
+* [`docs/performance-metrics-rs-labels.md`](performance-metrics-rs-labels.md)
+  — two per-attempt string allocations. `MetricsRsRecorder` label values are
+  interned as `&'static str` (instructions -10.97%, allocation blocks
+  -66.65%). `CircuitBreakerRegistry` seeds its states, so its hot paths
+  allocate no key (instructions -16.41%, allocation blocks -99.90%).
+* [`docs/performance-standalone-activity-overhead.md`](performance-standalone-activity-overhead.md)
+  — the cost of a one-step workflow against a bare activity (issue #1987).
+  It writes 17 rows per job with a regular activity and 10 with a local
+  activity. A bare task row writes 3, and a modelled standalone job 6.
+  [ADR 0007](adr/0007-standalone-activity.md) records the decision.
+* [`docs/performance-audit-chain-verify.md`](performance-audit-chain-verify.md)
+  — `ChainVerifier::push` in the audit-export chain check recomputed the keyed
+  HMAC state for every row. It now sets each key up once and streams the
+  canonical row into the MAC (instructions -21.3%, allocation blocks -77.8%).
+* [`docs/performance-timeout-refill-shared-page.md`](performance-timeout-refill-shared-page.md)
+  — before issue #2126, the four task-timeout lanes read one page of live
+  rows four times per pass. Lanes at one position now share one refill
+  statement (refill buffers -75% at 100,000 live rows, `pg_stat_statements`).
+* [`docs/performance-queue-age-gauge.md`](performance-queue-age-gauge.md)
+  — before issue #2339, `oldest_pending_ages` read every eligible pending row
+  on each sampler tick. It now seeks the oldest 32 rows per queue and falls back
+  to the full read only when it cannot settle the answer (age buffers -88.8%,
+  -98.6% and -99.5% at 20k, 100k and 300k pending rows, `pg_stat_statements`).
+* [`docs/performance-queue-depth-gauge.md`](performance-queue-depth-gauge.md)
+  — before issue #2356, the depth gauge counted every eligible pending row on
+  each sampler tick. It now counts each queue up to 10,000 rows, by a walk of
+  the index or one pass (depth buffers +7.6%, -20.1% and -36.7% at 20k, 100k
+  and 300k pending rows; 22,744 to 114 for one queue of 1,000,000 rows).
+* [`docs/performance-stream-append-count.md`](performance-stream-append-count.md)
+  — `append_stream_chunks` counted every stored chunk of a run on each append.
+  It now skips the count while the offset span plus the new chunks fits the cap
+  (count buffers -99.8%, total buffers -35.5% over full stream lifetimes).
+* [`docs/performance-sla-breach-scan.md`](performance-sla-breach-scan.md)
+  — the soft-SLA breach scan read the whole executions table on every timeout
+  tick, because the planner could not prove its predicate implies the partial
+  index's. It now repeats the index clause and uses the index (buffers
+  19,887 → 1 at 1,000,000 executions, `EXPLAIN (ANALYZE, BUFFERS)`).
+* [`docs/performance-analyzer-large-payload.md`](performance-analyzer-large-payload.md)
+  — `LargePayloadRule` in `HistoryAnalyzer::analyze` built the JSON text of
+  each payload to measure it. A counting writer now measures it with no text
+  (instructions -77.5%, allocated bytes -97.6%, PR #2287).
+* [`docs/performance-debug-diff-redaction-probe.md`](performance-debug-diff-redaction-probe.md)
+  — `debugger::is_redacted_export` in `harvest debug diff` parsed each
+  snapshot into a `Value` tree to read one key. A map visitor now reads the
+  key with no tree (pipeline instructions -23.7%, allocation blocks -16.5%,
+  PR #2292).
+* [`docs/performance-chrome-trace-export.md`](performance-chrome-trace-export.md)
+  — `trace_export::export_chrome_trace` returned `json!(events)`, which
+  copied the finished event tree. It now moves the vector into
+  `Value::Array` (instructions -34.8%, allocation blocks -35.4%, PR #2279).
+* [`docs/performance-fork-scheduled-occurrence.md`](performance-fork-scheduled-occurrence.md)
+  — `fork::scheduled_occurrence` hashed every scheduled activity name to
+  count one name. Two passes with no map replace it (instructions -49.2% at
+  K=1000, PR #2214). The cost stays quadratic in K.
+* [`docs/performance-decision-owner-baseline.md`](performance-decision-owner-baseline.md)
+  — the baseline for the decision owner (issue #2248): claim latency by
+  task kind on the assay #14 shape, the phases of the decision persist, and
+  a criterion bench of the second fence row. Owner mode with DR on adds
+  two statements and about 20% to the persist at one writer, so it fails
+  the stage 1b bar of 10%. Issue #2255 fuses the two into one statement.
+  The persist then passes the bar, at 9.3% faster than DR alone.
+* [`docs/performance-owner-failover.md`](performance-owner-failover.md)
+  — owner failover on real Postgres (issue #2254): a frozen owner, `kill -9`
+  and a scale-out from 4 to 8 workers. All four tests pass. After a kill,
+  the next decision runs in 10.2 s to 10.3 s, inside the 11 s bound. After
+  issue #2296, a re-run settles the scale-out in 5.3 s to 5.5 s, not 8.4 s
+  to 9.8 s.
+* [`docs/performance-owner-decider.md`](performance-owner-decider.md)
+  — stage 1b of the decision owner (issue #2255). The owner decider takes
+  workflow tasks by execution, so the claim loops claim 3 tasks per
+  3-activity workflow instead of 7. On a 4-CPU host the CPU limits the gain
+  to 1.27x at one claim loop. The fused fence result is on the page. A
+  re-run after issues #2296 and #2308 gives 1.28x at one claim loop.
+* [`docs/performance-match-activity-fanout.md`](performance-match-activity-fanout.md)
+  — `HistoryMatcher::match_activity` on a fan-out history (issue #2330). The
+  terminal scan reads a position index, so a fan-out replay is no longer
+  quadratic. At N=1000 it costs 72% fewer instructions. A sequential history
+  costs 0.7% more. Issue #2338 moves the external stash, timer fire
+  and child terminal scans onto the same index. At N=1000 a fan-out after one
+  external signal costs 80% fewer instructions. Shipped. Before issue #2330,
+  PR #2303 hashed event positions without `SipHash` (instructions -61.6% at
+  N=1000).
+* [`docs/performance-payload-depth.md`](performance-payload-depth.md)
+  — the depth walk that the worker runs on every activity result (issue
+  #2312). The walk is 10.6% of a harness that only clones and checks. The one
+  idea saves at most 18.5% of the walk, so it stays unbuilt. The production
+  impact is undetermined. A negative result.
+* [`docs/performance-group-commit.md`](performance-group-commit.md)
+  — group commit of one decision partition (issue #2256). Waiting decisions
+  share one transaction, with a savepoint each. Paired bursts give 1.16x
+  throughput at 16 writers and 1.33x at 64. A lone decision keeps its p50
+  (0.998 of the lane with grouping off).
+* [`docs/performance-fork-resolve-shapes.md`](performance-fork-resolve-shapes.md)
+  — `fork::resolve_activity` and `settle_holds` on five recorded-fork decision
+  shapes (issue #2000). The race-loser hold and scope-cancel paths are cubic in
+  K: one sibling scan in `source_race_winner` is 91.85% of the run at K=800.
+  Serve, override and miss stay quadratic. Baseline only, no code change.
+* [`docs/performance-fork-validate.md`](performance-fork-validate.md)
+  — the pure checks of one fork request, `reset::resolve_reset_point` then
+  `fork::validate_fork` (issue #2000). The cost is linear in the history:
+  4,006 to 4,576 `Ir` per event with `LastWorkflowTask`, which runs
+  `boundary_validity` twice. At P=16,500 that pass is 96.6% to 98.2% of the
+  cost, mostly allocator and `format!` work on its pending keys. Baseline only.
+* [`docs/performance-owner-kernels.md`](performance-owner-kernels.md)
+  — the pure decision-owner kernels around each decision (issues #2249,
+  #2256): partition hash 366 `Ir`, claim mask 5,844 `Ir` at 512 held
+  partitions, lone batch plan 112 `Ir`. Baseline only. `plan_batch` drains a
+  queue with D(D−1)/2 execution comparisons, and one renewal scans its
+  tenures in O(H²).
+* [`docs/performance-owner-disk-cache.md`](performance-owner-disk-cache.md)
+  — `OwnerDiskCache` store, append, load and entity row (issue #2258); a
+  baseline. A fresh store costs about 17,300 instructions per event and a
+  load about 17,200, both linear. An append decision costs about 196,000, and
+  its two new events are at most 21.75% of it. Uncached SQL parses and two SHA-256
+  hashes lead the fixed cost.
+* [`docs/performance-entity-sql.md`](performance-entity-sql.md)
+  — `entity_sql::run`, the read-only SQL over one entity state (issue
+  #2260); a baseline. Each query has a fixed cost of 411,663 instructions.
+  The open, the setup statements and the close are 86.57% of a point query.
+  A `json_each` scan adds about 8,179 per item and stays linear.
+* [`docs/performance-entity-snapshot-replay.md`](performance-entity-snapshot-replay.md)
+  — the cold replay of keyed-entity state snapshots (issue #2259) through
+  `executor::run_workflow`: O(M×S) at about 172 `Ir` per snapshot byte.
+  Baseline only. Skipping the discarded live snapshot, publishing the query
+  view lazily and counting loaded bytes at load bound a 56.6% saving.
+* [`docs/performance-agent-model-turn.md`](performance-agent-model-turn.md)
+  — `AgentHarness::model_turn`, the activity side of one agent model turn
+  (issues #1973, #2264); baseline only. The delta form re-hashes the whole
+  prefix on every turn (`harness.rs:433`), so a run of T turns costs O(T²):
+  82.9% of all `Ir` at T=200, and 21x the full-form body. Ideas with upper
+  bounds, none implemented.
+* [`docs/performance-agent-loop-replay.md`](performance-agent-loop-replay.md)
+  — the replay of a recorded `agent_loop` run, the workflow side of the
+  agent loop (issue #1973). The replay is quadratic in the tool rounds. Each
+  round serializes the whole request twice and clones the transcript twice.
+  The two serializations are 55.5% of the replay at N=100. Baseline only.
+* [`docs/performance-durable-agent-replay.md`](performance-durable-agent-replay.md)
+  — the replay of a durable `agent` run, one op per user message (issue
+  #2263), measured with a fixed hash seed. Past the 200-message window an op
+  costs about 18.0M instructions, so the replay is linear in the ops until
+  the entity checkpoint continues the run near op 288. The transcript digest
+  is 34.4% of the replay at 200 ops, and the entity snapshot work 27.0%.
+  Baseline only.
+* [`docs/performance-analyzer-large-payload.md`](performance-analyzer-large-payload.md)
+  — `LargePayloadRule` in `HistoryAnalyzer::analyze`. It counts payload bytes
+  without building the JSON text. Instructions fall from 1.32G to 298M, and
+  allocated bytes fall 97.6%.
+* [`docs/performance-debug-diff-redaction-probe.md`](performance-debug-diff-redaction-probe.md)
+  — `debugger::is_redacted_export`, the first step of `harvest debug diff`.
+  It reads one top-level key without building a `Value` tree. The probe
+  cost 29% of the pipeline before the change.

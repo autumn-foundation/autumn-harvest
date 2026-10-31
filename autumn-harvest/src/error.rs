@@ -330,6 +330,18 @@ pub enum HarvestError {
         compensation_errors: Vec<String>,
     },
 
+    /// More fan-out items failed than the tolerance allows (issue #1986).
+    ///
+    /// The error carries no failure count. A replay that sees more results
+    /// gives a higher count, and a workflow that branches on it drifts.
+    #[error("fan-out failed: more than {tolerated} of {total} items failed")]
+    FanOutFailureThresholdExceeded {
+        /// The largest number of failures the fan-out tolerates.
+        tolerated: usize,
+        /// The number of items in the fan-out.
+        total: usize,
+    },
+
     /// The workflow's published input schema (issue #373) rejected
     /// `start_input` on a **genuine fresh start** initiated through
     /// [`crate::execution::signal_with_start_workflow_execution`].
@@ -389,6 +401,14 @@ pub enum HarvestError {
         /// The `codec_id` stored alongside it.
         codec_id: String,
     },
+
+    /// A payload codec failed to encode or decode a value (issue #2065).
+    ///
+    /// Use [`HarvestError::is_codec_failure`] to test for this error and for
+    /// the unknown-codec errors. A codec failure says nothing about the target
+    /// of an operation, so a caller must not treat it as a terminal state.
+    #[error("payload codec failure: {0}")]
+    Codec(String),
 
     /// Retiring a codec key was refused because stored rows still reference it
     /// (issue #948).
@@ -536,6 +556,20 @@ pub enum HarvestError {
         existing_state: String,
     },
 
+    /// A start with a tenant met a prior run of another tenant (issue #1977).
+    ///
+    /// The start changes nothing: it does not attach to, cancel, replace or
+    /// seal the prior run. A run with no tenant counts as another tenant. The
+    /// error names no execution, so a caller learns only that the id is in
+    /// use.
+    #[error("workflow id {workflow_name}/{workflow_id} is in use by a run of another tenant")]
+    TenantConflict {
+        /// The workflow type of the start.
+        workflow_name: String,
+        /// The business key of the start.
+        workflow_id: String,
+    },
+
     /// An update request was rejected by the handler's validator before being
     /// admitted to the workflow's event history.
     ///
@@ -655,6 +689,28 @@ pub enum HarvestError {
         activity_name: Option<String>,
     },
 
+    /// A workflow-side payload nests deeper than
+    /// [`MAX_PAYLOAD_DEPTH`](crate::payload_depth::MAX_PAYLOAD_DEPTH)
+    /// (issue #2224).
+    ///
+    /// `serde_json` cannot read a value nested past 128 levels. The context
+    /// refuses the value at the call site, so no command and no event is
+    /// written. The workflow can handle the error.
+    #[error(
+        "payload too deep: {kind} for workflow '{workflow_type}' nests more than \
+         {cap_depth} levels"
+    )]
+    PayloadTooDeep {
+        /// The payload boundary that was violated.
+        kind: PayloadKind,
+        /// The deepest nesting that a payload may have.
+        cap_depth: usize,
+        /// The workflow type name that issued the payload.
+        workflow_type: String,
+        /// The activity name, when the violation is activity-scoped.
+        activity_name: Option<String>,
+    },
+
     /// A new workflow start was blocked by an active admission gate (issue #377).
     ///
     /// Returned by the admission check when at least one active gate matches
@@ -758,6 +814,28 @@ pub enum HarvestError {
         /// The generation the database currently reports, or `None` when the
         /// fencing row is absent.
         current: Option<i64>,
+    },
+
+    /// The decision partition moved to another owner (issue #2251).
+    ///
+    /// The commit fence raises it when the owner row holds another holder
+    /// or another epoch than the decision pinned. The decision transaction
+    /// rolls back as a whole, so it writes nothing. It is terminal for the
+    /// tenure, not for the workflow. The worker unloads the partition and
+    /// never retries at the stale epoch. `current` is `None` when the row
+    /// is missing, or when the late fence could not lock it.
+    #[error(
+        "decision partition {partition} is fenced: this owner pinned epoch {pinned}, the row \
+         is at {}; unload the partition and do not retry",
+        current.map_or_else(|| "an unknown epoch".to_string(), |e| e.to_string())
+    )]
+    OwnershipLost {
+        /// The fenced partition.
+        partition: crate::decision_owner::DecisionPartition,
+        /// The epoch that the decision pinned.
+        pinned: crate::decision_owner::OwnerEpoch,
+        /// The epoch of the owner row, when the fence read it.
+        current: Option<crate::decision_owner::OwnerEpoch>,
     },
 
     /// A shard this operation must reach is not available from this process.
@@ -1429,6 +1507,20 @@ impl HarvestError {
         matches!(self, Self::ShardUnavailable { .. })
     }
 
+    /// Did a payload codec fail to encode or decode a value (issue #2065)?
+    ///
+    /// True for [`HarvestError::Codec`], [`HarvestError::UnknownCodecKey`] and
+    /// [`HarvestError::UnknownPayloadCodec`]. A key outage ends, and an operator
+    /// can add a missing key. So the operation is retryable and is not a
+    /// verdict on its target.
+    #[must_use]
+    pub const fn is_codec_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Codec(_) | Self::UnknownCodecKey { .. } | Self::UnknownPayloadCodec { .. }
+        )
+    }
+
     /// Is this a [`HarvestError::PoolAcquireTimeout`]?
     #[must_use]
     pub const fn is_pool_acquire_timeout(&self) -> bool {
@@ -1528,6 +1620,26 @@ impl HarvestError {
     pub const fn suspended_claim_ambiguous(&self) -> Option<Uuid> {
         match self {
             Self::SuspendedClaimAmbiguous { task_id } => Some(*task_id),
+            _ => None,
+        }
+    }
+
+    /// Classify this error as a fenced decision (issue #2251).
+    ///
+    /// Returns the partition and the pinned epoch for
+    /// [`Self::OwnershipLost`], and `None` for every other variant. The
+    /// dispatcher unloads that tenure. No path fails the run on it.
+    #[must_use]
+    pub const fn ownership_lost(
+        &self,
+    ) -> Option<(
+        crate::decision_owner::DecisionPartition,
+        crate::decision_owner::OwnerEpoch,
+    )> {
+        match self {
+            Self::OwnershipLost {
+                partition, pinned, ..
+            } => Some((*partition, *pinned)),
             _ => None,
         }
     }

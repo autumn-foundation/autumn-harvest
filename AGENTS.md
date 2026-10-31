@@ -18,3 +18,9 @@
 - Open pull requests as ready for review by default.
 - Create a draft PR only when the user explicitly asks for a draft.
 - Never change an existing PR between draft and ready-for-review unless the user explicitly requests that state change.
+
+## Document Placement
+
+- Never write a design record, plan or note at the repository root.
+- A design record (`DESIGN-<issue>.md`) goes in `docs/design/`. See `docs/design/README.md` for the other homes.
+- `docs/audits/root-files.py` fails CI on a root file that is not in its allow list.

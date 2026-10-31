@@ -14,6 +14,10 @@ categories = ["asynchronous", "database"]
 [features]
 default = ["db", "unified-dag-execution", "tls"]
 unified-dag-execution = ["autumn-harvest-macros/unified-dag-execution"]
+# The Ledger census hook (issues #2414 and #2429). It records each SQL
+# statement and its caller when `HARVEST_LEDGER_CENSUS` is set. It hooks
+# Diesel and SQLite. Only a census run enables it.
+ledger-census = ["db", "dep:rusqlite", "rusqlite/trace"]
 db = [
     "dep:deadpool",
     "dep:diesel",
@@ -42,7 +46,7 @@ fuzzing = ["testing", "dep:arbitrary", "chrono/arbitrary", "uuid/arbitrary"]
 # migration, no engine-runtime change. Depends on `testing` for `HistorySnapshot`
 # and the `WorkflowReplayer` handler-registration surface.
 debugger = ["testing"]
-metrics-rs = ["dep:metrics"]
+metrics-rs = ["dep:metrics", "dep:foldhash"]
 # Enables `WorkflowInfo::with_schemas::<I, O, E>()` for automatic JSON Schema
 # generation from types that derive `schemars::JsonSchema` (issue #373).
 schema = ["dep:schemars"]
@@ -55,6 +59,16 @@ schema = ["dep:schemars"]
 # --workspace`, default features, never compiles wasmtime). See
 # docs/rnd/wasm-activities-spike.md.
 wasm-activities = ["dep:wasmtime", "dep:wat", "db", "dep:ed25519-dalek"]
+# Sandboxed code activities. An activity runs code that an agent wrote in a
+# Firecracker microVM, or in a Linux process sandbox for development. Off by
+# default. It needs no database. `libc` is already in the lockfile, so the
+# feature adds no new crate. See docs/sandbox-activities.md.
+sandbox-activities = ["dep:libc"]
+# Contention-adaptive atomicity R&D spike (issue #2012). Physical backout,
+# a saga or a hybrid per workflow, with a measurement harness. Off by
+# default. No production path calls it. It adds no dependency.
+# See docs/rnd/contention-adaptive-atomicity.md.
+atomicity-spike = ["db"]
 # Hot code swap for workflow definitions via runtime modules (issue #967).
 #
 # R&D spike. Hosts `#[workflow]` logic as a runtime-loaded WebAssembly module
@@ -77,26 +91,30 @@ hot-code-swap = ["wasm-activities"]
 # const-check when this feature is off, so a non-chaos build has no hot-path
 # cost (AC2/AC6). Requires `db` (the reproducers drive real Postgres paths).
 chaos = ["db"]
+# The owner-local disk cache (issue #2258). Off by default. It needs owner
+# mode and a directory. Both crates are already in the lockfile through
+# `autumn-harvest-sqlite`. See docs/adr/0012-owner-disk-cache.md.
+owner-disk-cache = ["db", "dep:rusqlite", "dep:fs4"]
 
 [dependencies]
-autumn-harvest-macros = { version = "0.7.0", path = "../autumn-harvest-macros" }
+autumn-harvest-macros = { version = "0.8.0", path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
 async-trait = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 sha2 = "0.11"
 hmac = "0.13"
-# AES-256-GCM payload codec (issue #1825). `autumn-web` already pins 0.10.3 in
+# AES-256-GCM payload codec (issue #1825). `autumn-web` 0.9 keeps its own 0.10.3 in
 # the lockfile. No default features: the codec reads nonces from `rand`'s
 # `OsRng`, so `aead/getrandom` is not needed.
-aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"] }
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc", "zeroize"] }
 # `aes-gcm`'s own `zeroize` feature clears only a temporary key. These turn on
 # `ZeroizeOnDrop` for the AES round keys and the GHASH state. All three crates
 # are already in the lockfile through `aes-gcm`.
-aes = { version = "0.8.4", features = ["zeroize"] }
-ghash = { version = "0.5.1", default-features = false, features = ["zeroize"] }
+aes = { version = "0.9.2", features = ["zeroize"] }
+ghash = { version = "0.6.0", default-features = false, features = ["zeroize"] }
 polyval = { version = "0.7.3", default-features = false, features = ["zeroize"] }
 # Clears data-key bytes on drop (issue #1825). Already in the lockfile.
 zeroize = "1"
@@ -131,26 +149,72 @@ percent-encoding = { version = "2", optional = true }
 # The `tls` feature. These are the versions the CLI already uses for
 # `harvest migrate` (issue #1240), so the lockfile gets no new crate.
 # `default-features = false` keeps `aws-lc-rs` out of the build.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+# 0.23.46 is the first release with the RUSTSEC-2026-0346 to 0349 fixes.
+# The floor keeps a downstream consumer off a vulnerable 0.23.x, because
+# only the manifest constraint reaches it.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 tokio-postgres-rustls = { version = "0.14", optional = true }
 # 0.24.6 is the first non-yanked 0.24.x release; pin the floor for the same
 # reason as tokio-postgres above (a downstream lockfile shouldn't be able to
 # freshly resolve the yanked 0.24.5).
 metrics = { version = "0.24.6", optional = true }
+# Hashes the `metrics-rs` label interner. SipHash cost more than the copy it saves.
+foldhash = { version = "0.2", optional = true }
 schemars = { version = "0.8", optional = true }
 # wasmtime 48's own minimum Rust is 1.95, so the `wasm-activities` feature that
 # enables these has an effective MSRV of 1.95 (the crate's core MSRV stays 1.88).
 # 48.0.3 is the first 48.x release with the RUSTSEC-2026-0316 fix (46.x has no
-# patched release); pin the floor so a downstream consumer enabling
+# patched release). 48.0.6 is the first with the RUSTSEC-2026-0363 and
+# RUSTSEC-2026-0364 fixes. 48.0.7 is the first with the RUSTSEC-2026-0378 and
+# RUSTSEC-2026-0379 fixes. 48.0.8 is the first with the RUSTSEC-2026-0422 to
+# RUSTSEC-2026-0424 fixes. Pin the floor so a downstream consumer enabling
 # `wasm-activities` can't silently resolve back to a vulnerable 48.0.x (same
 # reasoning as tokio-postgres above -- a workspace's own Cargo.lock never
 # propagates to downstream consumers, only the manifest constraint does).
-wasmtime = { version = "48.0.4", optional = true }
+# Default features minus `cache`. Harvest keeps compiled modules in memory
+# (`WasmModuleStore`) and never reads wasmtime's on-disk cache. That cache is
+# the only path to `zstd` 0.13, which carries RUSTSEC-2026-0391 and
+# RUSTSEC-2026-0395 to -0410. No wasmtime release depends on the patched
+# `zstd` 0.14, so dropping the feature removes the crate from the graph.
+wasmtime = { version = "48.0.8", optional = true, default-features = false, features = [
+    "addr2line",
+    "anyhow",
+    "async",
+    "backtrace",
+    "component-model",
+    "component-model-async",
+    "compile-time-builtins",
+    "coredump",
+    "cranelift",
+    "debug",
+    "debug-builtins",
+    "demangle",
+    "gc",
+    "gc-copying",
+    "gc-drc",
+    "gc-null",
+    "parallel-compilation",
+    "pooling-allocator",
+    "profiling",
+    "runtime",
+    "stack-switching",
+    "std",
+    "threads",
+    "wat",
+    "wit-parser",
+] }
 wat = { version = "1", optional = true }
+# Process limits, signals and namespaces for `sandbox-activities`. The
+# lockfile already holds this crate through tokio.
+libc = { version = "0.2", optional = true }
 # Publisher signatures on WASM modules (issue #1838). The lockfile already
 # holds this version through `jsonwebtoken`, so it adds no new crate.
-ed25519-dalek = { version = "2.2", optional = true }
+ed25519-dalek = { version = "3.0", optional = true }
+# The owner-local disk cache (issue #2258): one SQLite file per partition and
+# an exclusive lock on a sidecar file.
+rusqlite = { workspace = true, optional = true, features = ["hooks", "limits"] }
+fs4 = { version = "1.1", default-features = false, features = ["sync"], optional = true }
 
 [[test]]
 name = "integration"
@@ -171,8 +235,30 @@ path = "tests/property/mod.rs"
 name = "dst"
 path = "tests/dst/main.rs"
 
+# Stateright model checks of the DST oracles. Exhaustive within a bound, so
+# they complement the seeded sweeps above. Needs no database. See
+# docs/testing/stateright.md.
+[[test]]
+name = "stateright"
+path = "tests/stateright/main.rs"
+
 [[bench]]
 name = "metrics_noop"
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for the label values `MetricsRsRecorder` builds on every activity attempt.
+# See `benches/metrics_rs_labels_profile.rs`.
+[[bench]]
+name = "metrics_rs_labels_profile"
+required-features = ["metrics-rs"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for the four `CircuitBreakerRegistry` calls the worker makes per attempt.
+# See `benches/circuit_breaker_dispatch_profile.rs`.
+[[bench]]
+name = "circuit_breaker_dispatch_profile"
 harness = false
 
 # End-to-end benchmark suite (issue #941). `harness = false`: every scenario is
@@ -187,6 +273,11 @@ required-features = ["db", "testing"]
 [[example]]
 name = "signal_with_start_webhook"
 required-features = ["db"]
+
+# Issue #1995: the upgrade-check command of a candidate build.
+[[example]]
+name = "upgrade_check"
+required-features = ["db", "testing"]
 
 [[example]]
 name = "update_with_start_cart"
@@ -284,7 +375,7 @@ required-features = ["debugger"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trybuild = "1"
 tempfile = "3"
@@ -322,6 +413,15 @@ serde_yaml = "0.9"
 [target.'cfg(not(loom))'.dev-dependencies]
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+
+# Runs the real `agent_loop` on a Postgres worker to measure the resident hit
+# rate (issue #2013). The loom and shuttle models never use it.
+[target.'cfg(not(any(loom, shuttle)))'.dev-dependencies]
+autumn-harvest-agent = { version = "0.8.0", path = "../autumn-harvest-agent" }
+# Explores every interleaving of the DST oracles within a bound (the
+# `stateright` test target). Dev-only, so it never ships. The loom and Shuttle
+# builds skip it, so `--cfg loom` cannot reach its dependencies.
+stateright = "0.31.0"
 
 # loom is only pulled in under `RUSTFLAGS="--cfg loom"`. It must live under a
 # `cfg(loom)` target dependency rather than `[dev-dependencies]` because the
@@ -374,6 +474,13 @@ name = "history_fingerprint_profile"
 required-features = ["testing"]
 harness = false
 
+# Deterministic profiling harness for `debugger::diff_traces`, the engine
+# behind `harvest debug diff`. See `benches/debugger_diff_profile.rs`.
+[[bench]]
+name = "debugger_diff_profile"
+required-features = ["debugger"]
+harness = false
+
 # Isolates build_history's own inclusive cost (see the doc comment) so
 # history_fingerprint_profile.rs's workload-share claim in
 # docs/performance-history-fingerprint.md rests on a real measurement, not a
@@ -395,6 +502,17 @@ required-features = ["db"]
 harness = false
 [[bench]]
 name = "notify_commit_bench"
+required-features = ["db"]
+harness = false
+
+# Decision persist latency with zero, one and two fence rows (issue #2248).
+# Criterion repeats an append safely: each run adds rows and drains nothing.
+[[bench]]
+name = "decision_fence_bench"
+required-features = ["db"]
+harness = false
+[[bench]]
+name = "group_commit_bench"
 required-features = ["db"]
 harness = false
 
@@ -501,6 +619,13 @@ name = "stall_diagnosis_profile"
 harness = false
 
 # Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `analyzer::HistoryAnalyzer::analyze` with the built-in rules. No feature
+# requirement. See `benches/analyzer_profile.rs`.
+[[bench]]
+name = "analyzer_profile"
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
 # for `codec_rotation::{has_non_active_key, reencrypt_event_payload_fields_under}`
 # -- the per-row body of the lazy codec-key re-encryption sweep (issue #948).
 # No feature requirement: both functions are pure and unconditional (the
@@ -549,6 +674,13 @@ harness = false
 name = "history_export_profile"
 harness = false
 
+# Deterministic instruction/allocation-count harness for the recorded-fork
+# activity resolution (issue #2000). Drive it under valgrind.
+[[bench]]
+name = "fork_resolve_profile"
+required-features = ["db"]
+harness = false
+
 # Deterministic (non-criterion) instruction/allocation-count profiling harness
 # for `queue_fairness::{effective_queue_weights, weighted_queue_order}` --
 # the weighted-random queue-selection step `Worker::poll_once` runs on every
@@ -581,5 +713,113 @@ harness = false
 name = "payload_codec_profile"
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `payload_depth::refuse_deep_result`, which the worker runs on every
+# successful activity result. No feature requirement: the module is pure. See
+# `benches/payload_depth_profile.rs`.
+[[bench]]
+name = "payload_depth_profile"
+harness = false
+
 [lints]
 workspace = true
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `audit_chain::ChainVerifier` -- the keyed hash-chain check over exported
+# audit rows. See `benches/audit_chain_verify_profile.rs`.
+[[bench]]
+name = "audit_chain_verify_profile"
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `DagBuilder::build` and `DagSimulator::run`. See
+# `benches/dag_simulator_profile.rs`.
+[[bench]]
+name = "dag_simulator_profile"
+required-features = ["testing"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count harness for the
+# static DAG tooling: `DagLinter`, `DagProfiler` and `export_chrome_trace`.
+[[bench]]
+name = "dag_tooling_profile"
+required-features = ["testing"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `HistoryMatcher::match_activity`, the non-strict activity matcher.
+# Drive it under `valgrind --tool=callgrind` / `--tool=dhat`. See
+# `benches/match_activity_profile.rs`.
+[[bench]]
+name = "match_activity_profile"
+required-features = ["testing"]
+harness = false
+
+# Deterministic (non-criterion) instruction-count profiling harness for the
+# timer fire scan and the child terminal scan (issue #2338). Drive it under
+# `valgrind --tool=callgrind`. See `benches/timer_child_fanout_profile.rs`.
+[[bench]]
+name = "timer_child_fanout_profile"
+required-features = ["testing"]
+harness = false
+
+# Deterministic (non-criterion) instruction-count profiling harness for the
+# external stash of `HistoryMatcher` (issue #2346). Drive it under
+# `valgrind --tool=callgrind`. See `benches/external_stash_profile.rs`.
+[[bench]]
+name = "external_stash_profile"
+required-features = ["testing"]
+harness = false
+
+# Deterministic instruction-count harness for `fork::validate_fork` and
+# `reset::resolve_reset_point`, the pure checks of one fork request (issue
+# #2000). Drive it under valgrind. See `benches/fork_validate_profile.rs`.
+[[bench]]
+name = "fork_validate_profile"
+required-features = ["db"]
+harness = false
+
+# Deterministic instruction-count harness for the decision-owner kernels:
+# the partition hash, the owned-claim mask, the group-commit batch plan and
+# the lease-write sort (issues #2249, #2256). Pure, so no feature. See
+# `benches/owner_kernels_profile.rs`.
+[[bench]]
+name = "owner_kernels_profile"
+harness = false
+
+# Deterministic instruction-count harness for `OwnerDiskCache::store` and
+# `load` (issue #2258). It writes a real SQLite file and opens no Postgres
+# connection. See `benches/owner_disk_cache_profile.rs`.
+[[bench]]
+name = "owner_disk_cache_profile"
+required-features = ["owner-disk-cache"]
+harness = false
+
+# Deterministic instruction-count harness for `entity_sql::run`, the SQL
+# query over one entity state (issue #2260). It opens an in-memory SQLite
+# database only. See `benches/entity_sql_profile.rs`.
+[[bench]]
+name = "entity_sql_profile"
+required-features = ["owner-disk-cache"]
+harness = false
+
+# Deterministic instruction-count harness for the replay of entity snapshot
+# events (issue #2259). See `benches/entity_snapshot_replay_profile.rs`.
+[[bench]]
+name = "entity_snapshot_replay_profile"
+required-features = ["testing"]
+harness = false
+
+# Deterministic profiling harness for the signal wait scan
+# (`HistoryMatcher::match_signal`). See `benches/signal_wait_profile.rs`.
+[[bench]]
+name = "signal_wait_profile"
+required-features = ["testing"]
+harness = false
+
+# Deterministic profiling harness for the recorded-update lookup
+# (`HistoryMatcher::match_update`). See `benches/update_lookup_profile.rs`.
+[[bench]]
+name = "update_lookup_profile"
+required-features = ["testing"]
+harness = false

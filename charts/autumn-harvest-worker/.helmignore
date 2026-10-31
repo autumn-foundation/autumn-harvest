@@ -1,0 +1,6 @@
+# Files that `helm package` leaves out.
+ci/
+.DS_Store
+*.tmp
+*.orig
+*.rej

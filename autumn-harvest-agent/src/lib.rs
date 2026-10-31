@@ -1,0 +1,152 @@
+//! A durable agent loop for autumn-harvest.
+//!
+//! The agent loop is a workflow. Each model call and each tool call is an
+//! activity. A tool call that the policy gates waits on a durable signal with
+//! a deadline. A crash costs at most the one step that was in flight: replay
+//! reads every completed model call, policy decision and tool call from
+//! history.
+//!
+//! The crate owns its agent primitives: [`AgentModel`], [`Tool`],
+//! [`ToolPolicy`], [`Approval`] and the message types. It also has the
+//! always-on primitives: [`heartbeat`], [`followup`], [`delivery`],
+//! [`memory`] and [`loop_guard`]. [`ResponseCache`] serves an identical
+//! model call across runs. The `eval` feature adds the `eval` module.
+//! That module re-drives a recorded run with a candidate model or prompt.
+//! The `sandbox` feature adds the `sandbox` module. Its `SandboxTool` runs
+//! agent code in a sandbox.
+//!
+//! A durable [`Agent`] (issue #2263) is a named, long-lived actor. It is the
+//! agent loop inside a keyed entity: the workflow `agent`, with its
+//! [`AgentId`] `<kind>/<name>` as the workflow id. It handles one op at a
+//! time from a durable inbox, and it survives a crash. A message can queue,
+//! steer the running op, or interrupt it (issue #2265). See section 15 of
+//! `docs/agent-adapter.md`.
+//!
+//! The [`mesh`] module lets a run delegate a task to a [`Peer`]. A
+//! [`Mandate`] bounds the delegation tree. The [`flow`] module gates a
+//! dangerous sequence of tool calls with [`FlowRules`].
+//!
+//! The crate depends on the core engine only, with no default features. It
+//! has no Autumn plugin dependency.
+//! An app implements [`AgentModel`] for its provider, or bridges a framework
+//! it already uses.
+//!
+//! # Use it on SQLite
+//!
+//! ```no_run
+//! # #[cfg(feature = "sqlite")]
+//! # async fn demo(model: std::sync::Arc<dyn autumn_harvest_agent::AgentModel>)
+//! # -> Result<(), autumn_harvest_sqlite::SqliteError> {
+//! use std::sync::Arc;
+//! use autumn_harvest_agent::{AgentHarness, AgentTask, sqlite};
+//! use autumn_harvest_sqlite::{RunState, SqliteRuntime};
+//!
+//! let mut rt = SqliteRuntime::open("agent.db")?;
+//! sqlite::register(&mut rt, Arc::new(AgentHarness::new(model)));
+//! let exec = sqlite::start(&mut rt, &AgentTask::new("Summarise the README"))?;
+//! if let RunState::Completed(report) = rt.run_until_blocked(exec).await? {
+//!     println!("{report}");
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Use it on Postgres
+//!
+//! Register the workflows and the activities, and install the harness as
+//! worker state:
+//!
+//! ```
+//! # fn demo(model: std::sync::Arc<dyn autumn_harvest_agent::AgentModel>) {
+//! use autumn_harvest::builder::HarvestBuilder;
+//! use autumn_harvest_agent::{AgentHarness, activities, workflows};
+//!
+//! let built = HarvestBuilder::new()
+//!     .workflows(workflows())
+//!     .activities(activities())
+//!     .state(AgentHarness::new(model))
+//!     .build();
+//! assert!(built.state::<AgentHarness>().is_some());
+//! # }
+//! ```
+//!
+//! See `docs/agent-adapter.md` for the whole pattern.
+
+pub mod agent;
+pub mod approval;
+pub mod bounds;
+pub mod delivery;
+pub mod error;
+#[cfg(feature = "eval")]
+pub mod eval;
+pub mod flow;
+pub mod followup;
+pub mod harness;
+pub mod heartbeat;
+pub mod live;
+pub mod loop_guard;
+pub mod memory;
+pub mod mesh;
+pub mod mesh_control;
+pub mod message;
+pub mod model;
+pub mod policy;
+pub mod response_cache;
+#[cfg(feature = "sandbox")]
+pub mod sandbox;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
+pub mod tool;
+pub mod transcript;
+pub mod types;
+pub mod workflow;
+pub mod workspace;
+
+pub use agent::{
+    AGENT_WORKFLOW_NAME, Agent, AgentHeartbeat, AgentId, AgentIdError, AgentMemory, AgentOp,
+    AgentProfile, AgentState, AgentStatus, Control, HeartbeatSetting, INTERRUPT_SIGNAL, Interrupt,
+    PeerEnvelope, PeerReply, STEER_SIGNAL, Steer, Urgency, UserMessage, agent, agent_info,
+    agent_memory_reset, agent_memory_reset_info, agent_profile, agent_profile_info,
+    agent_workspace_floor, agent_workspace_floor_info, agent_workspace_reset,
+    agent_workspace_reset_info, agent_workspace_retain, agent_workspace_retain_info,
+};
+pub use approval::Approval;
+pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
+pub use error::{AgentError, ErrorKind};
+pub use flow::{FlowRule, FlowRules, Recheck, Released};
+pub use followup::Followups;
+pub use harness::{AgentHarness, DEFAULT_MODEL};
+pub use heartbeat::{
+    HEARTBEAT_WORKFLOW_NAME, HeartbeatReport, HeartbeatTask, Precheck, agent_heartbeat,
+    agent_heartbeat_info,
+};
+pub use live::{LiveEvent, LiveSink, TurnText};
+pub use loop_guard::LoopGuard;
+pub use memory::{EditKey, InMemoryMemoryStore, MemoryBlock, MemoryScope, MemoryStore};
+pub use mesh::{DelegationRecord, MANDATE_META_KEY, Mandate, Peer, Refusal};
+pub use mesh_control::{BudgetPeriod, MeshBudget, MeshPause, MeshSpend, Spend};
+pub use message::{
+    ChatMessage, ChatRole, ContentPart, RunId, SessionId, StopReason, TokenUsage, ToolCall,
+    ToolDefinition,
+};
+pub use model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
+pub use policy::{AllowAll, Rule, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
+pub use response_cache::{
+    CacheIndex, CacheKey, CacheScope, InMemoryCacheIndex, KeyTenant, ResponseCache,
+};
+pub use tool::{FnTool, Tool, ToolContext, ToolEffect};
+pub use transcript::{InMemoryTranscriptStore, PrefixRef, TranscriptStore};
+pub use types::{
+    AgentReport, AgentStop, AgentTask, MAX_PARALLEL_CHILDREN, ModelTurn, ModelTurnRequest,
+    RunIdSource, ToolCallRequest, ToolOutcome,
+};
+pub use workflow::{
+    WORKFLOW_NAME, activities, agent_deliver, agent_deliver_info, agent_discover_peers,
+    agent_discover_peers_info, agent_loop, agent_loop_info, agent_memory_snapshot,
+    agent_memory_snapshot_info, agent_model_turn, agent_model_turn_info, agent_precheck,
+    agent_precheck_info, agent_tool_call, agent_tool_call_info, workflows,
+};
+pub use workspace::{
+    DirWorkspaceBlobs, InMemoryWorkspaceBlobs, Workspace, WorkspaceBlobs, WorkspaceFile,
+    WorkspaceHandle, WorkspaceMount, WorkspaceRef, WorkspaceStore,
+};

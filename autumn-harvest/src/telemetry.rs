@@ -200,7 +200,21 @@ pub const METRIC_TIMER_STARTED: &str = "harvest.timer.started";
 pub const METRIC_TIMER_DURATION: &str = "harvest.timer.duration";
 
 /// Gauge: current number of pending (unclaimed) tasks in a queue.
+///
+/// The value is at most [`QUEUE_DEPTH_CAP`] (issue #2356).
 pub const METRIC_QUEUE_DEPTH: &str = "harvest.queue.depth";
+
+/// The highest value of [`METRIC_QUEUE_DEPTH`] (issue #2356).
+///
+/// The sampler counts each queue up to this cap, so its cost does not grow
+/// with the backlog. Below the cap the gauge is exact. At the cap it means
+/// "this many or more". The guard `queue_depth_alerts_sit_below_the_gauge_cap`
+/// keeps each depth threshold of the starter alert pack at or below the cap.
+pub const QUEUE_DEPTH_CAP: std::num::NonZeroU32 = match std::num::NonZeroU32::new(10_000) {
+    Some(cap) => cap,
+    // Const evaluation stops the build here, so no run reaches this arm.
+    None => panic!("QUEUE_DEPTH_CAP must not be zero"),
+};
 
 /// Histogram: wall-clock seconds a task waited between becoming eligible
 /// (`scheduled_at`) and being claimed by a worker (`started_at`).
@@ -322,16 +336,28 @@ pub const METRIC_DB_POOL_WAIT: &str = "harvest.db.pool.wait_duration";
 /// Histogram: seconds that one database operation takes (issue #1815).
 ///
 /// Labelled `{op}`, one of [`DbOp::as_str`]. Each op times one unit of work,
-/// not one SQL statement. Do not mix this up with [`METRIC_QUERY_DURATION`],
+/// not one SQL statement. A `claim` sample also carries `kind`, one of
+/// [`ClaimKind::as_str`] (issue #2248). Do not mix this up with [`METRIC_QUERY_DURATION`],
 /// which times workflow query handlers.
 pub const METRIC_DB_QUERY_DURATION: &str = "harvest.db.query.duration";
 
-/// Gauge: poll loops that claim work from a queue on this worker (issue #1815).
+/// Histogram: seconds that one phase of a decision persist takes (issue
+/// #2248).
 ///
-/// Labelled `{queue}`. One poll loop claims from all the worker's queues, so
-/// each queue reports the same count. The count covers every worker that
-/// shares the metrics recorder. It drops when a worker drains. This is the Harvest form of
-/// `temporal_num_pollers`.
+/// Labelled `{phase, shard}`, one of [`PersistPhase::as_str`]. Each decision
+/// persist records every phase once, so the phases of one persist add up to
+/// its `persist` sample on [`METRIC_DB_QUERY_DURATION`]. A terminal failure
+/// write records no phase, so the phase count can be lower than the
+/// `persist` count.
+pub const METRIC_DB_PERSIST_PHASE_DURATION: &str = "harvest.db.persist.phase_duration";
+
+/// Gauge: claim loops that claim work from a queue on this worker (issue #1815).
+///
+/// Labelled `{queue}`. Each claim loop claims from all the worker's queues,
+/// so each queue reports the same count. A worker runs
+/// `max_concurrent_claims` loops, 2 by default. An idle follower still counts.
+/// The count covers every worker that shares the metrics recorder. It drops
+/// when a worker drains. This is the Harvest form of `temporal_num_pollers`.
 pub const METRIC_WORKER_POLLERS: &str = "harvest.worker.pollers";
 
 /// Gauge: 1 when this worker is an outlier against its peers, else 0 (issue
@@ -606,6 +632,10 @@ pub const METRIC_RATE_LIMIT_BUCKETS_DELETED: &str = "harvest.retention.rate_limi
 /// Real deletes only, never a `dry_run` preview.
 pub const METRIC_TERMINAL_TASKS_DELETED: &str = "harvest.retention.terminal_tasks_deleted";
 
+/// Counter of payload blobs the orphan sweep handled (issue #2123), labeled
+/// `store.id` and `outcome` (`found` / `deleted` / `failed`).
+pub const METRIC_PAYLOAD_ORPHANS: &str = "harvest.retention.payload_orphans";
+
 /// Histogram: wall-clock latency of query handler invocations (seconds).
 ///
 /// Labelled with `query.name` (low-cardinality handler name registered by the
@@ -627,6 +657,31 @@ pub const METRIC_WORKFLOW_CACHE_HIT: &str = "harvest.workflow.cache_hit";
 /// Labeled by `workflow` (workflow name). `execution.id` stays span-only per
 /// the existing cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_CACHE_MISS: &str = "harvest.workflow.cache_miss";
+
+/// Counter: one per workflow decision attempt on a worker with resident
+/// state on (issue #2007).
+///
+/// Labels: `workflow`, `queue` and `outcome`. The [`ResidentOutcome`] enum
+/// bounds `outcome`. `hit` means that the decision resumed a resident
+/// workflow. Each other value names why it replayed.
+pub const METRIC_WORKFLOW_RESIDENT: &str = "harvest.workflow.resident";
+
+/// Histogram: seconds from the start of a decision to the end of its first
+/// drive (issue #2257).
+///
+/// Labels: those of [`METRIC_WORKFLOW_RESIDENT`]. The worker records one
+/// sample with each count. The window holds the cache take, the history
+/// load, the wake ingest, the pre-drive writes and the first drive. The
+/// stage 2 gate reads the p99 of `outcome="cold"`. The `hit` p99 shows the
+/// part that a disk cache does not save.
+pub const METRIC_WORKFLOW_RESIDENT_DURATION: &str = "harvest.workflow.resident.duration";
+
+/// Counter: one owner disk-cache read on a memory miss (issue #2258).
+///
+/// Labels: `workflow`, `queue` and `outcome`. The outcome is `hit`, `miss`,
+/// `stale` or `corrupt`. A `stale` or `corrupt` read purged the entry, and
+/// the decision loaded from Postgres.
+pub const METRIC_WORKFLOW_DISK_CACHE: &str = "harvest.workflow.disk_cache";
 
 /// Counter: incremented once per `signal_external_workflow` call after the
 /// terminal outcome is recorded in `harvest_events`.
@@ -1241,11 +1296,15 @@ pub const METRIC_ADMISSION_GATES_ACTIVE: &str = "harvest.admission.gates_active"
 /// its resolved per-tenant [`crate::quota::QuotaPolicy`] key is at or over
 /// one of its declared caps (issue #946).
 ///
+/// It also counts each LLM step that an LLM budget refuses (issue #1997).
+///
 /// Labels:
 ///   - `"workflow"` (= [`METRIC_LABEL_WORKFLOW`]) — the workflow type name.
-///   - `"resource"` (= [`METRIC_LABEL_RESOURCE`]) — which cap was exhausted
-///     (`"active_executions"`, `"history_bytes"`, or `"dead_letters"`, per
-///     [`crate::quota::QuotaResource::as_str`]).
+///   - `"resource"` (= [`METRIC_LABEL_RESOURCE`]) — which cap was exhausted,
+///     per [`crate::quota::QuotaResource::as_str`]. A start rejection gives
+///     `"active_executions"`, `"history_bytes"` or `"dead_letters"`. An LLM
+///     refusal gives `"run_llm_tokens"`, `"run_llm_cost_usd_micros"`,
+///     `"tenant_llm_tokens"` or `"tenant_llm_cost_usd_micros"`.
 ///
 /// The *resolved tenant key* is deliberately **not** a label — it is
 /// caller/tenant-controlled input and would be unbounded cardinality. Per-key
@@ -1562,6 +1621,21 @@ pub const METRIC_SCANNER_TICK: &str = "harvest.scanner.tick";
 /// The `role` label is [`METRIC_LABEL_ROLE`].
 pub const METRIC_SCANNER_PASS: &str = "harvest.scanner.pass";
 
+/// Counter: a decision commit failed its owner fence (issue #2251).
+///
+/// Label: `shard`. Each sample is one decision that wrote nothing. The
+/// worker unloads the partition when the fenced tenure is still current. It
+/// re-pends the task when it still holds the claim. A steady rate points to
+/// lease flaps or a frozen owner. See ADR 0009 decision 7.
+pub const METRIC_DECISION_OWNER_FENCED: &str = "harvest.decision_owner.fenced";
+
+/// Counter: a foreign write woke the owner of its partition (issue #2253).
+///
+/// Labels: `shard` and `kind`. The kind is `wake` for a plain wake, or
+/// `evict` for a state change that dropped a cache entry. A steady `evict`
+/// rate points to operator actions or foreign terminals. See ADR 0009.
+pub const METRIC_DECISION_OWNER_WOKEN: &str = "harvest.decision_owner.woken";
+
 /// Counter: a pool acquire hit its bound (issue #1788).
 ///
 /// Labelled `{site}`: `claim` or `heartbeat_flush`. A steady rate means the
@@ -1857,6 +1931,76 @@ impl std::fmt::Display for WebhookOutcome {
     }
 }
 
+/// The result of one workflow decision for the resident path (issue #2007).
+///
+/// It is the `outcome` label of [`METRIC_WORKFLOW_RESIDENT`]. The set is
+/// closed, so the label cardinality is bounded (ADR-0001 §7). Each value
+/// other than [`Self::Hit`] names why the decision replayed history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ResidentOutcome {
+    /// The decision resumed the resident workflow.
+    Hit,
+    /// The worker held no resident state for the run, for example after a
+    /// cache miss or on the first decision.
+    Cold,
+    /// The resident workflow did not resume. The delta, the context inputs
+    /// or the warm cycle failed a check. See `resident::ResumeDeclined`.
+    Declined,
+    /// The last suspension awaited more than one command, in a shape that
+    /// the resident path does not cover.
+    MultiAwait,
+    /// The last suspension was inside `ctx.race()`.
+    Race,
+    /// The last suspension held or acquired a durable mutex.
+    Mutex,
+    /// The workflow runs in a hot-swap module, which binds around one drive.
+    HotSwap,
+    /// Another context state blocked the capture, such as a park token, a
+    /// push signal handler, unread history or a deferred update.
+    Blocked,
+    /// The last suspension had a command that the resident path does not
+    /// cover, such as a child workflow or a local activity.
+    Unsupported,
+}
+
+impl ResidentOutcome {
+    /// Every value, in label order.
+    pub const ALL: [Self; 9] = [
+        Self::Hit,
+        Self::Cold,
+        Self::Declined,
+        Self::MultiAwait,
+        Self::Race,
+        Self::Mutex,
+        Self::HotSwap,
+        Self::Blocked,
+        Self::Unsupported,
+    ];
+
+    /// The stable `outcome` label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Cold => "cold",
+            Self::Declined => "declined",
+            Self::MultiAwait => "multi_await",
+            Self::Race => "race",
+            Self::Mutex => "mutex",
+            Self::HotSwap => "hot_swap",
+            Self::Blocked => "blocked",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+impl std::fmt::Display for ResidentOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Bounded terminal outcomes for one message consumed by a broker event-source
 /// connector (issue #944), used as the `outcome` label on
 /// [`METRIC_CONNECTOR_DISPATCHED`].
@@ -2058,6 +2202,9 @@ pub const METRIC_LABEL_SLOT_TYPE: &str = "slot_type";
 pub const METRIC_LABEL_DECISION: &str = "decision";
 /// Metric label: the database operation, bounded by [`DbOp`] (issue #1815).
 pub const METRIC_LABEL_OP: &str = "op";
+/// Metric label: the phase of a decision persist, bounded by [`PersistPhase`]
+/// (issue #2248).
+pub const METRIC_LABEL_PHASE: &str = "phase";
 /// Metric label: the outlier dimension, bounded by
 /// [`OutlierDimension`](crate::worker_outlier::OutlierDimension) (issue #1815).
 pub const METRIC_LABEL_DIMENSION: &str = "dimension";
@@ -2696,6 +2843,131 @@ impl DbOp {
     }
 }
 
+/// The `op` label of an owner take on [`METRIC_DB_QUERY_DURATION`] (issue
+/// #2255). See [`MetricsRecorder::record_owner_take_duration`].
+pub const DB_OP_TAKE: &str = "take";
+
+/// What one claim returned (issue #2248), used as the bounded `kind` label of
+/// a `claim` sample on [`METRIC_DB_QUERY_DURATION`].
+///
+/// Workflow and activity tasks share one table and one claim statement. The
+/// label shows the latency of each kind apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimKind {
+    /// The claim returned a workflow task.
+    Workflow,
+    /// The claim returned an activity task.
+    Activity,
+    /// The claim found no task. A claim by id of a row that another worker
+    /// took also reads as empty.
+    Empty,
+    /// The claim failed.
+    Error,
+}
+
+impl ClaimKind {
+    /// Every kind, in a stable order.
+    pub const ALL: [Self; 4] = [Self::Workflow, Self::Activity, Self::Empty, Self::Error];
+
+    /// Stable string representation, suitable for metric tag values.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+            Self::Activity => "activity",
+            Self::Empty => "empty",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// One phase of a decision persist (issue #2248), used as the bounded `phase`
+/// label on [`METRIC_DB_PERSIST_PHASE_DURATION`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistPhase {
+    /// The DR generation check and the owner fence.
+    Fence,
+    /// The inserts into `harvest_events`.
+    Events,
+    /// The inserts into `harvest_task_queue`.
+    Tasks,
+    /// The stage of the post-commit wakes, the in-transaction fallback, and
+    /// the progress wakes of a stream.
+    Notify,
+    /// The `COMMIT` or `ROLLBACK` statement.
+    Commit,
+    /// The rest of the transaction: `BEGIN`, row locks, updates and reads.
+    Other,
+}
+
+impl PersistPhase {
+    /// Every phase, in a stable order.
+    pub const ALL: [Self; 6] = [
+        Self::Fence,
+        Self::Events,
+        Self::Tasks,
+        Self::Notify,
+        Self::Commit,
+        Self::Other,
+    ];
+
+    /// The phases that a timer measures inside the transaction body.
+    // Only the persist path of the `db` feature reads it.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    pub(crate) const TIMED: [Self; 4] = [Self::Fence, Self::Events, Self::Tasks, Self::Notify];
+
+    /// Stable string representation, suitable for metric tag values.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fence => "fence",
+            Self::Events => "events",
+            Self::Tasks => "tasks",
+            Self::Notify => "notify",
+            Self::Commit => "commit",
+            Self::Other => "other",
+        }
+    }
+
+    /// The index of a timed phase in [`Self::TIMED`]. `None` for the
+    /// commit and the rest.
+    #[must_use]
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    pub(crate) const fn timed_index(self) -> Option<usize> {
+        match self {
+            Self::Fence => Some(0),
+            Self::Events => Some(1),
+            Self::Tasks => Some(2),
+            Self::Notify => Some(3),
+            Self::Commit | Self::Other => None,
+        }
+    }
+}
+
+/// Split one persist of `total` seconds into its phases (issue #2248).
+///
+/// `timed` holds the sums of [`PersistPhase::TIMED`], in that order.
+/// `commit` is the time after the transaction body. `other` is the rest of
+/// `total`. Clock reads can make the parts exceed `total` by a little, so
+/// `other` is never below zero.
+#[must_use]
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+pub(crate) fn persist_phase_breakdown(
+    total: f64,
+    timed: [f64; PersistPhase::TIMED.len()],
+    commit: f64,
+) -> [(PersistPhase, f64); 6] {
+    let measured: f64 = timed.iter().sum::<f64>() + commit;
+    [
+        (PersistPhase::Fence, timed[0]),
+        (PersistPhase::Events, timed[1]),
+        (PersistPhase::Tasks, timed[2]),
+        (PersistPhase::Notify, timed[3]),
+        (PersistPhase::Commit, commit),
+        (PersistPhase::Other, (total - measured).max(0.0)),
+    ]
+}
+
 /// The operator action taken on an activity-type pause (issue #807), used as
 /// the bounded `action` label on [`METRIC_ACTIVITY_PAUSE_ACTIONS`].
 ///
@@ -2802,7 +3074,8 @@ pub trait MetricsRecorder: Send + Sync {
     }
 
     /// A fresh workflow start was rejected because its resolved per-tenant
-    /// quota key is at or over a declared cap (issue #946).
+    /// quota key is at or over a declared cap (issue #946). An LLM budget
+    /// also calls it for each refused LLM step (issue #1997).
     ///
     /// `workflow` is the workflow type name; `resource` is the bounded
     /// [`crate::quota::QuotaResource::as_str`] value naming the exhausted
@@ -3120,6 +3393,8 @@ pub trait MetricsRecorder: Send + Sync {
     }
 
     /// A periodic snapshot of queued pending task count.
+    ///
+    /// `depth` is at most [`QUEUE_DEPTH_CAP`] (issue #2356).
     fn record_queue_depth(&self, queue_name: &str, depth: u64) {
         let _ = (queue_name, depth);
     }
@@ -3189,6 +3464,21 @@ pub trait MetricsRecorder: Send + Sync {
     /// bounded. Additive with a no-op default.
     fn record_scanner_pass(&self, scanner: &str, shard: &str, role: &str) {
         let _ = (scanner, shard, role);
+    }
+
+    /// A decision commit failed its owner fence on `shard` (issue #2251).
+    ///
+    /// See [`METRIC_DECISION_OWNER_FENCED`]. Additive with a no-op default.
+    fn record_decision_owner_fenced(&self, shard: &str) {
+        let _ = shard;
+    }
+
+    /// A foreign write woke the owner on `shard` (issue #2253). `kind` is
+    /// `wake` or `evict`.
+    ///
+    /// See [`METRIC_DECISION_OWNER_WOKEN`]. Additive with a no-op default.
+    fn record_decision_owner_woken(&self, shard: &str, kind: &str) {
+        let _ = (shard, kind);
     }
 
     /// A background control loop registered itself, before its first
@@ -3305,6 +3595,15 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to [`METRIC_TERMINAL_TASKS_DELETED`]. Real deletes only.
     fn record_terminal_tasks_deleted(&self, state: &str, count: u64) {
         let _ = (state, count);
+    }
+
+    /// Number of orphaned payload blobs one sweep tick handled, per outcome
+    /// (issue #2123).
+    ///
+    /// Maps to [`METRIC_PAYLOAD_ORPHANS`]. `outcome` is `found`, `deleted` or
+    /// `failed`. Real deletes only: a dry run records nothing.
+    fn record_payload_orphans(&self, store_id: &str, outcome: &str, count: u64) {
+        let _ = (store_id, outcome, count);
     }
 
     /// Current number of RUNNING tasks for a concurrency group key.
@@ -3551,7 +3850,39 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (op, shard, seconds);
     }
 
-    /// The poll loops on this worker that claim from `queue` (issue #1815).
+    /// The duration of one claim and the kind that it returned (issue
+    /// #2248).
+    ///
+    /// Maps to the histogram `harvest_db_query_duration{op="claim", kind,
+    /// shard}`. The default records a plain `claim` sample through
+    /// [`Self::record_db_query_duration`], so a recorder that predates the
+    /// kind still sees every claim.
+    fn record_claim_duration(&self, kind: ClaimKind, shard: u16, seconds: f64) {
+        let _ = kind;
+        self.record_db_query_duration(DbOp::Claim, shard, seconds);
+    }
+
+    /// The duration of one owner take and the kind that it returned (issue
+    /// #2255).
+    ///
+    /// An owner decider takes a known workflow task by its execution id. A
+    /// take reads no queue head, so it is not a claim. Maps to the histogram
+    /// `harvest_db_query_duration{op="take", kind, shard}`. The kind is
+    /// `workflow`, `empty` or `error`. The default records nothing, so the
+    /// claim count of an older recorder does not change.
+    fn record_owner_take_duration(&self, kind: ClaimKind, shard: u16, seconds: f64) {
+        let _ = (kind, shard, seconds);
+    }
+
+    /// The duration of one phase of a decision persist (issue #2248).
+    ///
+    /// Maps to the histogram `harvest_db_persist_phase_duration{phase,
+    /// shard}`. Each decision persist records every phase once.
+    fn record_persist_phase(&self, phase: PersistPhase, shard: u16, seconds: f64) {
+        let _ = (phase, shard, seconds);
+    }
+
+    /// The claim loops on this worker that claim from `queue` (issue #1815).
     ///
     /// Maps to the gauge `harvest_worker_pollers{queue}`.
     fn record_worker_pollers(&self, queue: &str, pollers: u64) {
@@ -3706,9 +4037,9 @@ pub trait MetricsRecorder: Send + Sync {
 
     /// A task was dispatched from the given shard (issue #961).
     ///
-    /// Recorded once per dispatched task by the worker's poll loop, which is
-    /// the only place that knows which shard the claim came from (a task row
-    /// carries no `shard_id` column — "which shard" *is* "which pool").
+    /// The claim loop that claimed the task records it once. Only that loop
+    /// knows which shard the claim came from. A task row carries no
+    /// `shard_id` column, so "which shard" *is* "which pool".
     /// Lets operators confirm no assigned shard is being starved (AC5).
     ///
     /// Maps to the counter [`METRIC_SHARD_DISPATCHED`].
@@ -3843,6 +4174,50 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the counter `harvest.workflow.cache_miss{workflow}`.
     fn record_workflow_cache_miss(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
+    }
+
+    /// A workflow decision ran on a worker with resident state on (issue
+    /// #2007).
+    ///
+    /// The worker calls this once per decision attempt, after its first
+    /// drive. A decision that does not commit runs again and records again.
+    /// `outcome` is [`ResidentOutcome::Hit`] when the decision resumed a
+    /// resident workflow, or the reason why it replayed history.
+    ///
+    /// Maps to the counter [`METRIC_WORKFLOW_RESIDENT`] with labels
+    /// `workflow`, `queue` and `outcome`.
+    fn record_workflow_resident(&self, workflow_name: &str, queue: &str, outcome: ResidentOutcome) {
+        let _ = (workflow_name, queue, outcome);
+    }
+
+    /// The time of one decision up to the end of its first drive (issue
+    /// #2257).
+    ///
+    /// The clock starts before the history load and stops before any write
+    /// after the drive. The worker calls this with each
+    /// [`Self::record_workflow_resident`] call and the same `outcome`.
+    ///
+    /// Maps to the histogram [`METRIC_WORKFLOW_RESIDENT_DURATION`], in
+    /// seconds.
+    fn record_workflow_resident_duration(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        outcome: ResidentOutcome,
+        seconds: f64,
+    ) {
+        let _ = (workflow_name, queue, outcome, seconds);
+    }
+
+    /// An owner read its disk cache on a memory miss (issue #2258).
+    ///
+    /// `outcome` is `hit`, `miss`, `stale` or `corrupt`. A memory miss in
+    /// owner mode with a disk cache records one read.
+    ///
+    /// Maps to the counter [`METRIC_WORKFLOW_DISK_CACHE`] with labels
+    /// `workflow`, `queue` and `outcome`.
+    fn record_workflow_disk_cache(&self, workflow_name: &str, queue: &str, outcome: &str) {
+        let _ = (workflow_name, queue, outcome);
     }
 
     /// A workflow execution was terminated because its `deadline_at` elapsed.
@@ -4361,11 +4736,11 @@ pub trait MetricsRecorder: Send + Sync {
     /// Whether this recorder actually forwards samples anywhere.
     ///
     /// Defaults to `true` for every real recorder. [`NoOpMetrics`] overrides it to
-    /// `false` so callers can skip *expensive sample-production work* (e.g. the
-    /// per-poll-interval `oldest_pending_ages` / `queue_depths` sampler SQL) when
-    /// no recorder is configured — the per-event `record_*` calls are already
-    /// zero-cost, but the queries that feed gauges are not. Treat this as a hint
-    /// for guarding observation work, never for changing engine behavior.
+    /// `false` so callers can skip *expensive sample-production work*, such as
+    /// the `oldest_pending_ages` and `bounded_queue_depths` sampler SQL. The
+    /// per-event `record_*` calls are already zero-cost, but the queries that
+    /// feed gauges are not. Treat this as a hint for guarding observation work,
+    /// never for changing engine behavior.
     fn is_enabled(&self) -> bool {
         true
     }
@@ -4840,6 +5215,7 @@ mod tests {
             METRIC_TERMINAL_TASKS_DELETED,
             "harvest.retention.terminal_tasks_deleted"
         );
+        assert_eq!(METRIC_PAYLOAD_ORPHANS, "harvest.retention.payload_orphans");
         // issue #618: exempt-by-design start producers increment this counter.
         assert_eq!(METRIC_ADMISSION_BYPASSED, "harvest.admission.bypassed");
         assert_eq!(METRIC_LABEL_PRODUCER, "producer");
@@ -4912,6 +5288,101 @@ mod tests {
         rec.record_worker_outlier(crate::worker_outlier::OutlierDimension::FailureRatio, true);
     }
 
+    /// Issue #2248: the claim kind and persist phase labels are bounded.
+    #[test]
+    fn claim_kind_and_persist_phase_labels_are_bounded() {
+        let kinds: Vec<&str> = ClaimKind::ALL.iter().map(|k| k.as_str()).collect();
+        assert_eq!(kinds, ["workflow", "activity", "empty", "error"]);
+        let phases: Vec<&str> = PersistPhase::ALL.iter().map(|p| p.as_str()).collect();
+        assert_eq!(
+            phases,
+            ["fence", "events", "tasks", "notify", "commit", "other"]
+        );
+        assert_eq!(
+            METRIC_DB_PERSIST_PHASE_DURATION,
+            "harvest.db.persist.phase_duration"
+        );
+        assert_eq!(METRIC_LABEL_PHASE, "phase");
+        assert_eq!(METRIC_LABEL_KIND, "kind");
+    }
+
+    /// A recorder that keeps the op of each query sample.
+    #[derive(Default)]
+    struct OpRecorder(std::sync::Mutex<Vec<DbOp>>);
+
+    impl MetricsRecorder for OpRecorder {
+        fn record_db_query_duration(&self, op: DbOp, _shard: u16, _seconds: f64) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(op);
+        }
+    }
+
+    /// Issue #2248: a recorder written before the claim kind still sees
+    /// every claim as a `claim` query sample.
+    #[test]
+    fn a_claim_sample_reaches_an_old_recorder_as_a_claim_query() {
+        let rec = OpRecorder::default();
+        for kind in ClaimKind::ALL {
+            rec.record_claim_duration(kind, 0, 0.001);
+        }
+        rec.record_persist_phase(PersistPhase::Commit, 0, 0.001);
+        let ops = rec.0.lock().expect("ops").clone();
+        assert_eq!(ops, [DbOp::Claim; 4], "a phase sample is no query sample");
+        NoOpMetrics.record_claim_duration(ClaimKind::Empty, 0, 0.001);
+        NoOpMetrics.record_persist_phase(PersistPhase::Fence, 0, 0.001);
+    }
+
+    /// Issue #2248: `other` is the rest of the total, and the phases add up
+    /// to the total.
+    #[test]
+    fn a_persist_breakdown_adds_up_to_its_total() {
+        let parts = persist_phase_breakdown(0.010, [0.001, 0.002, 0.003, 0.0005], 0.0015);
+        let get = |phase: PersistPhase| {
+            parts
+                .iter()
+                .find(|(p, _)| *p == phase)
+                .map(|(_, s)| *s)
+                .expect("each phase is present")
+        };
+        assert_eq!(parts.len(), PersistPhase::ALL.len());
+        assert!((get(PersistPhase::Fence) - 0.001).abs() < 1e-12);
+        assert!((get(PersistPhase::Commit) - 0.0015).abs() < 1e-12);
+        assert!((get(PersistPhase::Other) - 0.002).abs() < 1e-12);
+        let sum: f64 = parts.iter().map(|(_, s)| s).sum();
+        assert!((sum - 0.010).abs() < 1e-12, "{sum}");
+    }
+
+    /// Clock jitter can make the parts exceed the total. `other` then reads
+    /// zero, never a negative time.
+    #[test]
+    fn a_persist_breakdown_never_reports_a_negative_rest() {
+        let parts = persist_phase_breakdown(0.001, [0.001, 0.0, 0.0, 0.0], 0.0001);
+        let other = parts
+            .iter()
+            .find(|(p, _)| *p == PersistPhase::Other)
+            .map(|(_, s)| *s);
+        assert_eq!(other, Some(0.0));
+    }
+
+    proptest::proptest! {
+        /// Each part is not negative. When the timed parts fit in the total,
+        /// the parts add up to the total.
+        #[test]
+        fn persist_breakdown_bounds(
+            total in 0.0f64..1.0,
+            timed in proptest::array::uniform4(0.0f64..0.3),
+            commit in 0.0f64..0.3,
+        ) {
+            let parts = persist_phase_breakdown(total, timed, commit);
+            proptest::prop_assert!(parts.iter().all(|(_, s)| *s >= 0.0));
+            let measured: f64 = timed.iter().sum::<f64>() + commit;
+            let sum: f64 = parts.iter().map(|(_, s)| s).sum();
+            proptest::prop_assert!((sum - total.max(measured)).abs() < 1e-9);
+        }
+    }
+
     #[test]
     fn record_canary_metrics_have_noop_defaults() {
         // Synthetic liveness-canary metrics (issue #796) must exist as no-op
@@ -4957,6 +5428,47 @@ mod tests {
         assert_eq!(METRIC_LABEL_ACTIVITY, "activity");
         assert_eq!(METRIC_LABEL_QUEUE, "queue");
         assert_eq!(METRIC_LABEL_BUILD_ID, "build_id");
+    }
+
+    #[test]
+    fn resident_outcome_labels_are_stable_and_distinct() {
+        // Dashboards and alerts key on these strings (issue #2007).
+        let labels: Vec<&str> = ResidentOutcome::ALL.iter().map(|o| o.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "hit",
+                "cold",
+                "declined",
+                "multi_await",
+                "race",
+                "mutex",
+                "hot_swap",
+                "blocked",
+                "unsupported",
+            ]
+        );
+        assert_eq!(METRIC_WORKFLOW_RESIDENT, "harvest.workflow.resident");
+        assert_eq!(
+            METRIC_WORKFLOW_RESIDENT_DURATION,
+            "harvest.workflow.resident.duration"
+        );
+        assert_eq!(METRIC_WORKFLOW_DISK_CACHE, "harvest.workflow.disk_cache");
+        assert_eq!(ResidentOutcome::MultiAwait.to_string(), "multi_await");
+        // An exhaustive match: a new variant must join `ALL`.
+        for outcome in ResidentOutcome::ALL {
+            match outcome {
+                ResidentOutcome::Hit
+                | ResidentOutcome::Cold
+                | ResidentOutcome::Declined
+                | ResidentOutcome::MultiAwait
+                | ResidentOutcome::Race
+                | ResidentOutcome::Mutex
+                | ResidentOutcome::HotSwap
+                | ResidentOutcome::Blocked
+                | ResidentOutcome::Unsupported => {}
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

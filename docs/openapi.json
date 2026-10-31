@@ -18,7 +18,7 @@
     "description": "Generated from `docs/api-contract.json` (contract version 2). Do not edit by hand. Regenerate with `scripts/regenerate-openapi.sh`.\n\nEvery path is relative to the prefix the embedder passes to `HarvestPlugin::api`, `/api/harvest` by convention.\n\nAuth: Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate. The optional API rate limiter (issue #1827) can answer 429 with a Retry-After header in whole seconds on any route that is not PublicSafe. Its body is {\"error\": \"rate limited\", \"route_class\", \"retry_after_secs\"}. See docs/security-posture.md#api-rate-limiting.",
     "summary": "Control-plane HTTP API for autumn-harvest durable workflows.",
     "title": "Harvest management API",
-    "version": "0.7.0",
+    "version": "0.8.0",
     "x-harvest-contract-version": "2"
   },
   "openapi": "3.1.0",
@@ -1768,7 +1768,7 @@
     },
     "/admin/config": {
       "get": {
-        "description": "Return the resolved effective runtime configuration of the fleet, secret-free. Secret-bearing configuration (LISTEN/NOTIFY database URLs, per-shard notification URLs, and the sharded pool handle) is surfaced only as presence booleans and counts — never a value — so a connection string can never appear in the response. Durations are reported as whole milliseconds with a _ms suffix; unset Option ceilings serialize as explicit JSON null. Top-level sections: worker (resolved WorkerConfig), payload_caps (size caps + server-side ceilings), shard_topology (readable/writable/default shards, the declared residency_key → shard map, issue #697 — diff residency_map across replicas to catch a fleet deployed with conflicting maps, which would otherwise place the same residency_key in different jurisdictions while reporting identical topology — and shard_forwards, the declared retired-shard → successor map, issue #964: empty until a shard is decommissioned, and diffed across replicas for the same reason, since replicas that disagree would answer the same ExecutionId from different databases — and reserved_shards, the shards reserved for pinned tenant-cell work, issue #1837: unpinned starts never land on them, so diff it across replicas too), features (compiled-in core-crate feature flags), pool (resolved database pool sizing).",
+        "description": "Return the resolved effective runtime configuration of the fleet, secret-free. Secret-bearing configuration (LISTEN/NOTIFY database URLs, per-shard notification URLs, and the sharded pool handle) is surfaced only as presence booleans and counts — never a value — so a connection string can never appear in the response. Durations are reported as whole milliseconds with a _ms suffix; unset Option ceilings serialize as explicit JSON null. Top-level sections: worker (resolved WorkerConfig), payload_caps (size caps + server-side ceilings), shard_topology (readable/writable/default shards, the declared residency_key → shard map, issue #697 — diff residency_map across replicas to catch a fleet deployed with conflicting maps, which would otherwise place the same residency_key in different jurisdictions while reporting identical topology — and shard_forwards, the declared retired-shard → successor map, issue #964: empty until a shard is decommissioned, and diffed across replicas for the same reason, since replicas that disagree would answer the same ExecutionId from different databases — and reserved_shards, the shards reserved for pinned tenant-cell work, issue #1837: unpinned starts never land on them, so diff it across replicas too), features (compiled-in core-crate feature flags), pool (resolved database pool sizing). overrides (issue #2388) holds the counts of the stored operator overrides: schedule_overrides, run_default_overrides and unavailable_shards. It is null when the runtime has no storage pool. GET /admin/overrides lists them.",
         "operationId": "get_admin_config",
         "responses": {
           "200": {
@@ -1777,6 +1777,7 @@
                 "schema": {
                   "properties": {
                     "features": {},
+                    "overrides": {},
                     "payload_caps": {},
                     "pool": {},
                     "shard_topology": {},
@@ -2420,6 +2421,38 @@
         "x-harvest-route-class": "read_only"
       }
     },
+    "/admin/overrides": {
+      "get": {
+        "description": "List every operator override (issue #2388). schedule_overrides holds each DAG and workflow schedule override (issues #2385 and #2386), read from every shard pool: kind, name, fields (the stored override fields by their PATCH names), reason, updated_by, created_at, updated_at and shard_ids. run_default_overrides holds each run-default override (issue #2387) from the default shard: workflow_name, sla_secs, execution_timeout_secs, reason, updated_by and updated_at. unavailable_shards names each shard that could not be read; its overrides are absent from the list.",
+        "operationId": "get_admin_overrides",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "run_default_overrides": {},
+                    "schedule_overrides": {},
+                    "unavailable_shards": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "Harvest runtime has no storage pool."
+          }
+        },
+        "summary": "List every operator override (issue #2388).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
+      }
+    },
     "/admin/preflight": {
       "get": {
         "description": "Run deployment readiness preflight checks: database connectivity, migration status, shard health, and worker coverage.",
@@ -2629,6 +2662,254 @@
         "x-harvest-idempotency": "Read-only; always idempotent.",
         "x-harvest-read-only": true,
         "x-harvest-route-class": "read_only"
+      }
+    },
+    "/admin/queues/{queue_name}/fairness": {
+      "get": {
+        "description": "Show the fairness key weights and the claim state of one task queue (issue #1976). Each shard keeps its own weights and state. An unreachable shard makes the response partial. Admin only.",
+        "operationId": "get_admin_queues_by_queue_name_fairness",
+        "parameters": [
+          {
+            "description": "The task queue, matched exactly. A name with leading or trailing whitespace is a 400.",
+            "in": "path",
+            "name": "queue_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "queue_name": {},
+                    "state": {},
+                    "status": {},
+                    "unavailable_shards": {},
+                    "weights": {},
+                    "weights_uniform": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Each weights entry has queue_name, fairness_key, weight, updated_by and updated_at. The list holds one entry for each key, from the lowest shard that has it. weights_uniform is false when the shards do not hold the same weights. Each state entry has shard_id, queue_name, fairness_key, pass, last_start, lag and updated_at. The claim serves keys with a smaller lag first. A key with no override has weight 1."
+          },
+          "400": {
+            "description": "Blank or oversized queue name."
+          },
+          "401": {
+            "description": "Admin access required."
+          },
+          "503": {
+            "description": "Harvest storage pool is not configured."
+          }
+        },
+        "summary": "Show the fairness key weights and the claim state of one task queue (issue #1976).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-idempotency": "Read-only; always idempotent.",
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
+      }
+    },
+    "/admin/queues/{queue_name}/fairness/{fairness_key}": {
+      "delete": {
+        "description": "Clear the weight of one fairness key in a task queue (issue #1976). The key goes back to weight 1 at its next claim. The clear goes to every shard. Admin only. Audited as `fairness.weight.clear`, rejected attempts included.",
+        "operationId": "delete_admin_queues_by_queue_name_fairness_by_fairness_key",
+        "parameters": [
+          {
+            "description": "The task queue, matched exactly. A name with leading or trailing whitespace is a 400.",
+            "in": "path",
+            "name": "queue_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The fairness key, matched exactly. An empty key, the key `.` or `..`, a key with outer whitespace or a control character, or a key longer than 256 bytes is a 400.",
+            "in": "path",
+            "name": "fairness_key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "cleared": {},
+                    "fairness_key": {},
+                    "ok": {},
+                    "partial_failures": {},
+                    "queue_name": {},
+                    "status": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "cleared is true when at least one shard held an override. A full clear returns ok: true and status: \"complete\", and omits partial_failures. A clear that reaches only some shards returns 207 with ok: false and status: \"partial\". The override stays on the shards that partial_failures names. Send the request again; it is idempotent."
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "cleared": {},
+                    "fairness_key": {},
+                    "ok": {},
+                    "partial_failures": {
+                      "description": "The shards that the clear did not reach. Present only on this status.",
+                      "type": "string"
+                    },
+                    "queue_name": {},
+                    "status": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The clear reached only some shards. The body is the 200 body plus partial_failures, which names the shards that did not apply it."
+          },
+          "400": {
+            "description": "Blank or oversized queue name, or an invalid fairness key."
+          },
+          "401": {
+            "description": "Admin access required."
+          },
+          "500": {
+            "description": "Every shard failed. The override was not cleared."
+          },
+          "503": {
+            "description": "Harvest storage pool is not configured."
+          }
+        },
+        "summary": "Clear the weight of one fairness key in a task queue (issue #1976).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-idempotency": "Clearing a key with no override returns 200 with cleared: false.",
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
+      },
+      "post": {
+        "description": "Set the weight of one fairness key in a task queue (issue #1976). A key with weight w gets w claims for each claim of a key with weight 1, while both have work. The weight applies at the next claim of the key. No worker restart is necessary. The write goes to every shard. Admin only. Audited as `fairness.weight.set`, rejected attempts included.",
+        "operationId": "post_admin_queues_by_queue_name_fairness_by_fairness_key",
+        "parameters": [
+          {
+            "description": "The task queue, matched exactly. A name with leading or trailing whitespace is a 400.",
+            "in": "path",
+            "name": "queue_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The fairness key, matched exactly. An empty key, the key `.` or `..`, a key with outer whitespace or a control character, or a key longer than 256 bytes is a 400.",
+            "in": "path",
+            "name": "fairness_key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "weight": {
+                    "description": "The weight, a finite number from 0.001 to 1000. An unknown field is a 400."
+                  }
+                },
+                "required": [
+                  "weight"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "fairness_key": {},
+                    "ok": {},
+                    "partial_failures": {},
+                    "queue_name": {},
+                    "status": {},
+                    "updated_at": {},
+                    "updated_by": {},
+                    "weight": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The body is the stored override, from the first shard that applied it. updated_by is the authenticated actor. A full write returns ok: true and status: \"complete\", and omits partial_failures. A write that reaches only some shards returns 207 with ok: false and status: \"partial\". Send the request again; it is idempotent. A shard at the override cap makes it a 409. A failure on every shard that is not the cap is a 500."
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "fairness_key": {},
+                    "ok": {},
+                    "partial_failures": {
+                      "description": "The shards that the write did not reach. Present only on this status.",
+                      "type": "string"
+                    },
+                    "queue_name": {},
+                    "status": {},
+                    "updated_at": {},
+                    "updated_by": {},
+                    "weight": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The write reached only some shards. The body is the 200 body plus partial_failures, which names the shards that did not apply it."
+          },
+          "400": {
+            "description": "Blank or oversized queue name, invalid fairness key, weight out of range, or malformed body."
+          },
+          "401": {
+            "description": "Admin access required."
+          },
+          "409": {
+            "description": "At least one shard already holds 1000 overrides for the queue and refused a new key. A retry does not converge. Clear an override on that shard first. When some shards applied the weight, the body is the 207 body. When no shard applied it, the body is a problem response."
+          },
+          "500": {
+            "description": "Every shard failed. No weight is in effect."
+          },
+          "503": {
+            "description": "Harvest storage pool is not configured."
+          }
+        },
+        "summary": "Set the weight of one fairness key in a task queue (issue #1976).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-idempotency": "Setting the same weight again returns 200 and writes the same row. updated_by and updated_at change to the latest caller.",
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/queues/{queue_name}/pause": {
@@ -3354,7 +3635,7 @@
                     "type": "integer"
                   },
                   "overlap_policy": {
-                    "description": "One of: skip, buffer_one, buffer_all, cancel_other, terminate_other. Defaults to skip.",
+                    "description": "One of: skip, buffer_one, buffer_all, cancel_other, terminate_other, allow_all. Defaults to skip.",
                     "type": "string"
                   },
                   "paused": {
@@ -3480,7 +3761,7 @@
                     "type": "integer"
                   },
                   "overlap_policy": {
-                    "description": "What to do when a fire lands while the previous run is still going: skip, buffer_one, buffer_all, or allow_all.",
+                    "description": "What to do when a fire lands while the previous run is still going: skip, buffer_one, buffer_all, cancel_other, terminate_other or allow_all.",
                     "type": "string"
                   },
                   "paused": {
@@ -3684,7 +3965,7 @@
         "x-harvest-route-class": "read_only"
       },
       "patch": {
-        "description": "Partially update an existing workflow schedule in place (issue #771). Only provided fields change; the schedule_id is never changed, so #488 carryover lineage, the sched:{schedule_id}: workflow-id namespace, and run history are preserved. The workflow type is NOT editable (400). DAG schedules are owned by PATCH /dags/{dag_name} (400). Nullable fields (calendar, consecutive_failure_limit, end_at, max_runs, catchup_policy, retry_policy) are tri-state: omitting the field leaves it unchanged, an explicit JSON null clears it. The merged spec is validated before any write, so a 400 writes nothing. Changing the schedule expression recomputes next_run_at anchored at now (elapsed slots are never retroactively fired); other edits preserve the pending next_run_at. Anti-race with the scheduler tick: an edit is rejected 409 while a fire claim is live, an expired claim is fenced (token nulled) so a straggler fire cannot finalize over the edit, and a tick that wins its claim re-reads the row before firing, so a fire that lands concurrently with the edit always dispatches the committed new input/queue/policies.",
+        "description": "Partially update an existing workflow schedule in place (issue #771). Only provided fields change; the schedule_id is never changed, so #488 carryover lineage, the sched:{schedule_id}: workflow-id namespace, and run history are preserved. The workflow type is NOT editable (400). DAG schedules are owned by PATCH /dags/{dag_name} (400). Nullable fields (calendar, consecutive_failure_limit, end_at, max_runs, catchup_policy, retry_policy) are tri-state: omitting the field leaves it unchanged, an explicit JSON null clears it. The merged spec is validated before any write, so a 400 writes nothing. Changing the schedule expression recomputes next_run_at anchored at now (elapsed slots are never retroactively fired); other edits preserve the pending next_run_at. Anti-race with the scheduler tick: an edit is rejected 409 while a fire claim is live, an expired claim is fenced (token nulled) so a straggler fire cannot finalize over the edit, and a tick that wins its claim re-reads the row before firing, so a fire that lands concurrently with the edit always dispatches the committed new input/queue/policies. A schedule declared in code (WorkerBuilder::workflow_schedule) converges to its code value on every tick, so for it the request writes an operator override instead of a row edit (issue #2386): the override wins over code and survives a restart, clear_override returns to code, and input returns 400.",
         "operationId": "patch_admin_schedules_by_id",
         "parameters": [
           {
@@ -3717,6 +3998,9 @@
                   "catchup_window_secs": {
                     "description": "Window length in seconds for catchup_policy = window; re-windows an already-'window' policy when sent alone, ignored for other modes (issue #484)."
                   },
+                  "clear_override": {
+                    "description": "Code-declared schedule only (issue #2386): delete the stored operator override, so the schedule returns to its code value. Takes no other field except reason (400 otherwise). 400 on a schedule made through the API."
+                  },
                   "consecutive_failure_limit": {
                     "description": "New auto-pause threshold (issue #360). Tri-state: omit = unchanged, explicit null = disable auto-pause."
                   },
@@ -3736,10 +4020,13 @@
                     "description": "New total run budget (issue #478). Tri-state: omit = unchanged, explicit null (or 0) = remove the budget."
                   },
                   "overlap_policy": {
-                    "description": "New overlap policy: skip, buffer_one, buffer_all, cancel_other, terminate_other (issue #241)."
+                    "description": "New overlap policy: skip, buffer_one, buffer_all, cancel_other, terminate_other or allow_all (issues #241, #1985)."
                   },
                   "queue_name": {
                     "description": "New task queue name for scheduled runs."
+                  },
+                  "reason": {
+                    "description": "Code-declared schedule only (issue #2386): the operator reason stored with the override. 400 on a schedule made through the API."
                   },
                   "retry_policy": {
                     "description": "New schedule-level workflow retry policy (issue #523). Tri-state: omit = unchanged, explicit null = clear."
@@ -4889,7 +5176,7 @@
     },
     "/admin/tokens": {
       "get": {
-        "description": "List all scoped API tokens as metadata only (issue #942). The plaintext secret and its hash are never returned — only id, name, scope, created_at, expires_at, last_used_at, revoked_at.",
+        "description": "List all scoped API tokens as metadata only (issue #942). The plaintext secret and its hash are never returned — only id, name, scope, created_at, expires_at, last_used_at, revoked_at and tenant (issue #1977).",
         "operationId": "get_admin_tokens",
         "responses": {
           "200": {
@@ -4936,6 +5223,9 @@
                   },
                   "scope": {
                     "description": "Verb-level scope: 'read' (default), 'mutate' or 'admin'."
+                  },
+                  "tenant": {
+                    "description": "Tenant claim (issue #1977). 1 to 128 bytes of visible ASCII, with no spaces. A tenant-bound token reaches only the runs of its tenant, through the tenant-scoped routes. Omit it for an operator token."
                   }
                 },
                 "required": [
@@ -4960,7 +5250,8 @@
                     "name": {},
                     "revoked_at": {},
                     "scope": {},
-                    "secret": {}
+                    "secret": {},
+                    "tenant": {}
                   },
                   "type": "object"
                 }
@@ -4969,7 +5260,7 @@
             "description": "Success."
           },
           "400": {
-            "description": "Unknown scope (expected 'read', 'mutate' or 'admin')."
+            "description": "Unknown scope (expected 'read', 'mutate' or 'admin'), or an invalid tenant."
           },
           "401": {
             "description": "Unauthenticated request."
@@ -5046,7 +5337,7 @@
     },
     "/admin/usage": {
       "get": {
-        "description": "Historical per-tenant/per-workflow usage report (issue #596): the historical companion to the point-in-time GET /admin/concurrency endpoint. Aggregates already-durable data (harvest_workflow_executions + harvest_events) over a required [from, to] window, grouped by workflow_name (default) or a search_attr:<key> tenant key, fanned out and summed across every shard. workflow_starts counts by started_at in the window; completed/failed/cancelled/timed_out count by completed_at in the window and matching terminal state; activity_executions counts ActivityStarted events (one per dispatch attempt) in the window; activity_executions_failed counts terminal ActivityFailed/ActivityTimedOut events in the window; activity_compute_seconds sums each activity's final-attempt start-to-terminal wall-clock span for terminal events in the window. Local and externally-completed activities are excluded (no ActivityStarted event). Executions lacking the requested search_attr key are grouped under the literal group \"(unattributed)\" rather than dropped. An unreachable shard is named in unavailable_shards rather than failing the call wholesale. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
+        "description": "Historical per-tenant/per-workflow usage report (issue #596): the historical companion to the point-in-time GET /admin/concurrency endpoint. Aggregates already-durable data (harvest_workflow_executions, harvest_events and harvest_llm_ledger) over a required [from, to] window, grouped by workflow_name (default) or a search_attr:<key> tenant key, fanned out and summed across every shard. workflow_starts counts by started_at in the window; completed/failed/cancelled/timed_out count the durable terminal events (WorkflowCompleted/WorkflowFailed/WorkflowCancelled/WorkflowExecutionTimedOut) whose timestamp falls in the window; activity_executions counts ActivityStarted events (one per dispatch attempt) in the window; activity_executions_failed counts terminal ActivityFailed/ActivityTimedOut events in the window; activity_compute_seconds sums each activity's final-attempt start-to-terminal wall-clock span for terminal events in the window. Local and externally-completed activities are excluded (no ActivityStarted event). llm_calls, llm_input_tokens, llm_output_tokens, llm_cost_usd_micros (millionths of a US dollar), llm_unpriced_calls and llm_latency_ms sum the agent cost ledger rows (issue #1996) whose recorded_at falls in the window; the report skips a shard move's staged target copy and counts the sealed source until the move is done, so one shard reports each run. Executions lacking the requested search_attr key are grouped under the literal group \"(unattributed)\" rather than dropped. An unreachable shard is named in unavailable_shards rather than failing the call wholesale. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
         "operationId": "get_admin_usage",
         "parameters": [
           {
@@ -5325,6 +5616,129 @@
         ],
         "x-harvest-read-only": true,
         "x-harvest-route-class": "read_only"
+      }
+    },
+    "/admin/workflow-types/{workflow_name}/run-defaults": {
+      "get": {
+        "description": "Read the run defaults of one workflow type (issue #2387). code holds the sla_secs and execution_timeout_secs declared in code. override holds the stored operator override (sla_secs, execution_timeout_secs, reason, updated_by, updated_at), or null. effective holds the values a new run takes: the override, then code. The start clamps still apply after it: sla is clamped to execution_timeout, and the fleet ceiling caps execution_timeout.",
+        "operationId": "get_admin_workflow_types_by_workflow_name_run_defaults",
+        "parameters": [
+          {
+            "description": "Registered workflow type name. A DAG uses its own name.",
+            "in": "path",
+            "name": "workflow_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "code": {},
+                    "effective": {},
+                    "override": {},
+                    "workflow_name": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "404": {
+            "description": "Workflow type not registered in this process."
+          },
+          "500": {
+            "description": "Database error."
+          }
+        },
+        "summary": "Read the run defaults of one workflow type (issue #2387).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
+      },
+      "patch": {
+        "description": "Set, change or clear the run-default override of one workflow type (issue #2387). The override wins over the code value for every new run and survives a restart. It reaches this process at once and every other process within its refresh period (about 5 seconds). Each duration is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. With recompute_in_flight, the SLA deadline of each RUNNING, SUSPENDED or PAUSED run of the type that has not breached moves to the new effective SLA, on every shard, and the response gains recompute (moved_runs, unavailable_shards, superseded). A recompute stops when a newer change to the type replaces its SLA, and then reports superseded true. A hard deadline_at never changes. The response has the same shape as GET.",
+        "operationId": "patch_admin_workflow_types_by_workflow_name_run_defaults",
+        "parameters": [
+          {
+            "description": "Registered workflow type name. A DAG uses its own name.",
+            "in": "path",
+            "name": "workflow_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "clear_override": {
+                    "description": "true deletes the stored override before the other fields merge."
+                  },
+                  "execution_timeout_secs": {
+                    "description": "Override hard execution timeout in whole seconds, from 1 to 3153600000 (100 years). null returns to code."
+                  },
+                  "reason": {
+                    "description": "Operator reason stored with the override."
+                  },
+                  "recompute_in_flight": {
+                    "description": "true also moves the SLA deadline of the in-flight runs of the type. Default false: the change applies to new runs only."
+                  },
+                  "sla_secs": {
+                    "description": "Override soft SLA in whole seconds, from 1 to 3153600000 (100 years). null returns to code."
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "code": {},
+                    "effective": {},
+                    "override": {},
+                    "workflow_name": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "Empty patch, unknown field, or a duration of zero or past 100 years."
+          },
+          "404": {
+            "description": "Workflow type not registered in this process."
+          },
+          "500": {
+            "description": "Database error."
+          }
+        },
+        "summary": "Set, change or clear the run-default override of one workflow type (issue #2387).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-idempotency": "Idempotent: applying the same override twice is a no-op.",
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
       }
     },
     "/admin/workflows/replay-canary": {
@@ -5946,7 +6360,7 @@
     },
     "/dags/{dag_name}": {
       "patch": {
-        "description": "Update mutable DAG configuration fields (currently: pause/unpause).",
+        "description": "Update mutable DAG configuration: pause or resume, and set or clear an operator schedule override (issue #2385). An override wins over the code value and survives a restart. Each override field is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. The response is the DAG schedule row with the effective values.",
         "operationId": "patch_dags_by_dag_name",
         "parameters": [
           {
@@ -5964,13 +6378,37 @@
             "application/json": {
               "schema": {
                 "properties": {
+                  "buffer_all_max": {
+                    "description": "Override buffer cap under buffer_all. null returns to code."
+                  },
+                  "catchup": {
+                    "description": "Override catchup flag. null returns to code."
+                  },
+                  "clear_override": {
+                    "description": "true returns every field to its code value. Cannot be combined with an override field."
+                  },
+                  "jitter_secs": {
+                    "description": "Override fire jitter in seconds. null returns to code."
+                  },
+                  "max_active_runs": {
+                    "description": "Override run cap. null returns to code."
+                  },
+                  "overlap_policy": {
+                    "description": "Override overlap policy: skip, buffer_one, buffer_all, cancel_other, terminate_other or allow_all. null returns to code."
+                  },
                   "paused": {
                     "description": "true to pause the DAG, false to resume it."
+                  },
+                  "reason": {
+                    "description": "Operator reason stored with the override."
+                  },
+                  "schedule_expr": {
+                    "description": "Override cadence: bare cron, cron:<expr>, cron_tz:<tz>:<expr>, interval:<secs> or manual. null returns to the code cadence."
+                  },
+                  "timezone": {
+                    "description": "IANA timezone of a cron schedule_expr. Valid only with a schedule_expr value."
                   }
                 },
-                "required": [
-                  "paused"
-                ],
                 "type": "object"
               }
             }
@@ -5988,6 +6426,9 @@
             },
             "description": "Success."
           },
+          "400": {
+            "description": "Empty patch, unknown field, or an invalid override value."
+          },
           "404": {
             "description": "DAG not found."
           },
@@ -5995,11 +6436,11 @@
             "description": "Database error."
           }
         },
-        "summary": "Update mutable DAG configuration fields (currently: pause/unpause).",
+        "summary": "Update mutable DAG configuration: pause or resume, and set or clear an operator schedule override (issue #2385).",
         "tags": [
           "dag"
         ],
-        "x-harvest-idempotency": "Idempotent: applying the same pause state twice is a no-op.",
+        "x-harvest-idempotency": "Idempotent: applying the same pause state or the same override twice is a no-op.",
         "x-harvest-read-only": false,
         "x-harvest-route-class": "mutating"
       }
@@ -7678,6 +8119,20 @@
             "style": "form"
           },
           {
+            "description": "Filter expression with AND, OR and parentheses (issue #1982). AND binds tighter than OR. Fields: attrs.<key> (=, !=, >, >=, <, <=, IN, EXISTS), state, workflow_name, workflow_id, owner, severity (=, !=, IN), started_at (>, >=, <, <= with an RFC 3339 string). Values: a quoted string, a number, true or false. <> is the same as !=. A filter with OR must find each row through an index: each OR branch, or the whole filter, holds an attrs.* predicate or workflow_name with = or IN. The parameter is repeatable. Each value joins the query with AND. An empty value is ignored. Limits: 2048 bytes, 8 levels and 100 IN values for each value, and 32 predicates for the request. state = 'MIGRATED' gets 400; use state=MIGRATED. Errors return 400. Example: attrs.phase = 'blocked' OR (workflow_name = 'payment' AND attrs.amount > 10000).",
+            "explode": true,
+            "in": "query",
+            "name": "filter",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "style": "form"
+          },
+          {
             "description": "Maximum number of results to return (legacy; use page_size for paginated access).",
             "in": "query",
             "name": "limit",
@@ -7768,7 +8223,7 @@
             }
           },
           {
-            "description": "Filter by workflow-start provenance (issue #740). One of the bounded StartSource set: api, schedule, backfill, signal_with_start, update_with_start, completion_trigger, webhook, child, batch, continue_as_new, reset, outbox, or 'unknown' (matches NULL / pre-upgrade rows). Any other value returns 400.",
+            "description": "Filter by workflow-start provenance (issue #740). One of the bounded StartSource set: api, schedule, backfill, signal_with_start, update_with_start, completion_trigger, webhook, broker, child, batch, continue_as_new, reset, rerun, outbox, transactional, fork, or 'unknown' (matches NULL / pre-upgrade rows). Any other value returns 400.",
             "in": "query",
             "name": "start_source",
             "required": false,
@@ -7906,7 +8361,7 @@
                 }
               }
             },
-            "description": "Success."
+            "description": "Each item has exec_id and outcome: reset | previewed | skipped. A skipped item has skip_reason.type: terminal_source | child_workflow | erased_source | empty_history | continue_as_new | no_matching_activity | invalid_boundary | infrastructure_error. Only infrastructure_error can clear on a plain retry. No run with PII-erased payloads is forked (issue #1999). The checks run in this order: state, child, erasure. So an erased child reports child_workflow, an erased COMPLETED or TERMINATED run reports terminal_source, and any other erased run reports erased_source, in a preview and in a real reset."
           },
           "400": {
             "description": "Empty filter or cohort exceeds DEFAULT_BATCH_RESET_MAX_COHORT (1000)."
@@ -7940,7 +8395,7 @@
                     "description": "true = all-or-nothing; false = best-effort per-item results."
                   },
                   "items": {
-                    "description": "Array of { workflow_name, workflow_id?, input?, search_attributes?, idempotency_key? } objects."
+                    "description": "Array of { workflow_name, workflow_id?, input?, search_attributes?, idempotency_key?, context_headers?, priority?, fairness_key? } objects. An item with an invalid fairness_key, or a fairness_key on a throttled workflow, is rejected before any item starts."
                   }
                 },
                 "required": [
@@ -8257,6 +8712,7 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "deferred": {},
                     "execution_id": {},
                     "failed_task_count": {},
                     "newly_cancelled": {},
@@ -9382,6 +9838,38 @@
         "x-harvest-route-class": "read_only"
       }
     },
+    "/workflows/changes/stream": {
+      "get": {
+        "description": "Server-Sent Events signal for live list views (issue #1982). Listens to the harvest_events LISTEN/NOTIFY channel on each shard, the channel of the #324 stream. Sends event:changed with data {\"notifications\": n}, the count of notifications since the last frame, at most once each second. One notification can cover more than one event of a run. A frame names no execution and holds no payload. A client fetches the list again. Sends event:stream-error and closes when a shard listener closes, so the client connects again. The stream sends a :ping comment every 15 s by default. Admin-gated, the same as GET /executions/{exec_id}/events/stream. Each stream holds one dedicated LISTEN connection for each shard.",
+        "operationId": "get_workflows_changes_stream",
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "description": "Server-sent event frames. See the response description.",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Content-Type: text/event-stream. Frames: event:changed (data {\"notifications\": n}), or a final event:stream-error (data {\"error\": \"listener_closed\", \"retry\": true})."
+          },
+          "401": {
+            "description": "Unauthenticated request."
+          },
+          "503": {
+            "description": "SSE notification URL not configured, or a shard listener is not available."
+          }
+        },
+        "summary": "Server-Sent Events signal for live list views (issue #1982).",
+        "tags": [
+          "workflow"
+        ],
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only",
+        "x-harvest-stream": true
+      }
+    },
     "/workflows/count": {
       "get": {
         "description": "Grouped execution-count fleet snapshot (issue #544): counts harvest_workflow_executions rows grouped by state and/or workflow_name across all shards, computed with a per-shard SQL GROUP BY and summed in-process. Eventually-consistent point-in-time snapshot; no replay or ordering guarantee under concurrent writes. An unreachable shard is named in unavailable_shards rather than failing the call wholesale. A malformed percent-encoded query-string byte sequence (an invalid UTF-8 byte, or an incomplete/non-hex `%` escape) is rejected with a 400 before any parameter is parsed, rather than silently substituting the Unicode replacement character and proceeding with a wrong-but-plausible value (issue #1151, sweeping the issue #774 `queue-coverage` fix to every other raw-pairs route).",
@@ -10077,6 +10565,10 @@
                             "null"
                           ]
                         },
+                        "tenant": {
+                          "description": "Verified tenant of the run (issue #1977). Omitted when the run has none.",
+                          "type": "string"
+                        },
                         "triage_note": {
                           "type": "string"
                         },
@@ -10398,6 +10890,54 @@
         "x-harvest-route-class": "mutating"
       }
     },
+    "/workflows/{id}/archived-history": {
+      "get": {
+        "description": "Read back the archived history of a run (issue #1983). Retention archives a finished run through the configured HistoryArchiver, then deletes it from Postgres. This route reads the archive only, so it serves a pruned run. The response is the HistoryExportDocument that retention archived. Payload fields decode under the same admin and decode-on-read gate as GET /workflows/{id}/history; otherwise they stay in their stored form. Admin only.",
+        "operationId": "get_workflows_by_id_archived_history",
+        "parameters": [
+          {
+            "description": "Execution UUID.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Shape is documented in the response description, not as a schema."
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "Malformed execution ID."
+          },
+          "401": {
+            "description": "Caller lacks Harvest admin access."
+          },
+          "404": {
+            "description": "The archive holds no document for this execution."
+          },
+          "503": {
+            "description": "No history archiver is configured, the archiver cannot read back, the store failed, or the read timed out."
+          }
+        },
+        "summary": "Read back the archived history of a run (issue #1983).",
+        "tags": [
+          "workflow"
+        ],
+        "x-harvest-idempotency": "Fully idempotent; read-only.",
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
+      }
+    },
     "/workflows/{id}/awaitables": {
       "get": {
         "description": "Open-awaitables diagnostic (issue #615): names every open awaitable the execution is currently parked on, across six categories — pending activities (regular/local/external), unfired durable timers, awaited-but-unfulfilled signals (by name), pending child workflows (name + child exec id), unresolved await_condition parks, and pending updates — plus mutex acquires (#691) and external-workflow operations (#757) when present. The wait-set is derived by replaying recorded history read-only to the current suspension point (the #612 drive machinery), so it sees awaited-but-ABSENT inputs the side tables cannot (an unsent signal, a never-true condition). Each awaitable carries kind, name/identifier, a since timestamp derived from recorded history, and a deadline where one applies (timer fire time, signal/child race deadline, external schedule-to-close, activity schedule-to-close/start-to-close from the task row). Payload-free: names, ids, and timestamps only — never inputs/payloads/update args — so read-path payload decoding (issue #608) is deliberately skipped. Admin-gated (the eligibility endpoints' posture). Terminal executions return 200 with an empty awaitables list and wait_set = \"terminal\". Each category is bounded to the first category_cap entries with overflow reported in truncated/truncated_kinds. When the replay drive is unavailable (handler not registered on this node, classic DAG, encrypted history without decode, replay timeout/panic, a detected replay divergence, or a replay that reaches terminal on a non-terminal run), wait_set degrades to \"history_only\" with wait_set_reason naming why — activities/timers/children/updates still report from the event-log scan, but awaited-unsent signals and await_condition parks are not observable in that mode. Read path is shard-local (routed via the exec id's embedded shard); no cross-shard fan-out. Appends no events, performs no writes, adds no new WorkflowEvent variant.",
@@ -10495,6 +11035,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "deferred": {
+                      "description": "An open non-cancellable block deferred the cancel (issue #1984). The run keeps running, and state is its live state.",
+                      "type": "boolean"
+                    },
                     "execution_id": {
                       "description": "The attempt that was stopped. A UUID.",
                       "type": "string"
@@ -10521,7 +11065,8 @@
                     "state",
                     "reason",
                     "newly_cancelled",
-                    "failed_task_count"
+                    "failed_task_count",
+                    "deferred"
                   ],
                   "type": "object"
                 }
@@ -10534,6 +11079,10 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "deferred": {
+                      "description": "An open non-cancellable block deferred the cancel (issue #1984). The run keeps running, and state is its live state.",
+                      "type": "boolean"
+                    },
                     "execution_id": {
                       "description": "The attempt that was stopped. A UUID.",
                       "type": "string"
@@ -10560,7 +11109,8 @@
                     "state",
                     "reason",
                     "newly_cancelled",
-                    "failed_task_count"
+                    "failed_task_count",
+                    "deferred"
                   ],
                   "type": "object"
                 }
@@ -10940,16 +11490,19 @@
                     "children": {},
                     "completion_deliveries_scrubbed": {},
                     "dead_letters_scrubbed": {},
+                    "entity_states_scrubbed": {},
                     "events_scrubbed": {},
                     "execution_id": {},
                     "execution_row_scrubbed": {},
                     "failures": {},
                     "fields_tombstoned": {},
+                    "ledger_rows_deleted": {},
                     "logs_deleted": {},
                     "prior_residences": {},
                     "retired_residences": {},
                     "signals_scrubbed": {},
                     "skipped_children": {},
+                    "stream_chunks_deleted": {},
                     "summary_scrubbed": {}
                   },
                   "type": "object"
@@ -10976,6 +11529,110 @@
           "workflow"
         ],
         "x-harvest-idempotency": "Idempotent: re-running on an already-erased execution returns fields_tombstoned=0, no error.",
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
+      }
+    },
+    "/workflows/{id}/fork": {
+      "post": {
+        "description": "Non-destructive fork of a workflow execution (issue #2000). Copy a history prefix of the source to a NEW execution with a NEW workflow id. The source is never changed, so a run in any state can be forked, including COMPLETED and TERMINATED. Admin-only. Provenance on the fork is start_source='fork', start_source_ref=<source execution id>; its history holds a WorkflowForked marker that names the source. effects defaults to recorded: a remote activity takes a caller override, or the result that the source recorded for the same name, occurrence and input; with neither it fails non-retryably with error_type ForkEffectUnavailable and never runs. In recorded mode, a local activity, a child workflow, an external activity, an external signal, an external cancel, a continue-as-new or a mutex acquire fails the fork run before it runs; a race branch that lost in the source stays pending; and the fork sends no completion callback and fires no completion trigger. A reset of a fork keeps start_source='fork'. Erasure of a source does not reach its forks. effects=live runs effects for real.",
+        "operationId": "post_workflows_by_id_fork",
+        "parameters": [
+          {
+            "description": "Execution UUID of the source run.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "activity_overrides": {
+                    "description": "Array of {activity_name, occurrence, output}. occurrence is the 1-based count of ActivityScheduled events with that name. The activity returns output and never runs, in both effects modes. The occurrence must come after the fork point. At most 1,000 entries; more returns 400. Each output must pass the result byte cap of its activity, unless a payload store offloads it, or the request returns 400."
+                  },
+                  "effects": {
+                    "description": "recorded (the default) or live. live runs activities and other effects for real."
+                  },
+                  "fork_point": {
+                    "description": "Where the fork starts, as a reset_point: {\"type\":\"event_id\",\"event_id\":N}, {\"type\":\"first_activity_run\",\"activity_name\":\"name\"} or {\"type\":\"last_workflow_task\"}. Omitted = event 0 (WorkflowStarted). The point must be a clean decision boundary before any terminal event, and the carried history must hold no MutexGranted."
+                  },
+                  "input": {
+                    "description": "Replacement input for the fork. Needs fork point 0. It must pass the workflow input schema and byte cap. A JSON null means no override."
+                  },
+                  "operator_id": {
+                    "description": "Identity of the operator."
+                  },
+                  "reason": {
+                    "description": "Reason for the fork, recorded in the marker and the audit log."
+                  },
+                  "workflow_id": {
+                    "description": "Business key of the fork. Omitted = <source workflow_id>-fork-<uuid>. The source key, and an explicit empty or blank id, are refused with 400. A key that another run holds returns 409; a run holds its key unless it continued as new or was terminated."
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "effects": {},
+                    "events_carried_over": {},
+                    "fork_event_id": {},
+                    "forked_from_exec_id": {},
+                    "new_exec_id": {},
+                    "workflow_id": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "Malformed execution id or body; invalid fork point; continue-as-new history; an input override that needs fork point 0 or fails the input schema or byte cap; an invalid activity override."
+          },
+          "401": {
+            "description": "Admin authentication required."
+          },
+          "404": {
+            "description": "Execution not found, or the workflow type of the source is not registered on this node (a fork would fail on every worker, as for a rerun)."
+          },
+          "409": {
+            "description": "The source, or a run in its fork lineage, had its payloads erased (issue #495); recorded mode cannot serve an effect after the fork point (fork with effects=live); the carried history holds a mutex grant; the workflow id is in use on any shard, or a shard it routes to cannot be checked; the source shard is draining; the fork lineage is deeper than 64 links or reaches a run that no longer exists on this shard, after retention or a shard migration; or the fork history reaches the history event or byte cap of the worker."
+          },
+          "413": {
+            "description": "The quota key that the fork input resolves exceeds its byte cap (issue #946)."
+          },
+          "422": {
+            "description": "effects=live and a completion callback target that the fork inherits from its source is no longer admissible under the live SSRF policy (as for a rerun, issue #605). Body: {error: \"completion callback target rejected\", url, rejection}, where `rejection` is a machine-readable SsrfRejection object. A recorded fork sends no callback, so it is never refused for this. Nothing is created."
+          },
+          "429": {
+            "description": "The fork would exceed the tenant quota of its workflow type (issue #946), or load shedding refuses new starts on its queue (issue #1794). A fork counts as an active run of its quota key."
+          },
+          "500": {
+            "description": "Database error."
+          },
+          "503": {
+            "description": "An admission gate blocks new starts for the fork (issue #618), a shard migration moved the source during the fork (retry; the retry follows the forwarding pointer), the node has not finished start-up, or the audit insert failed. The fork commits with its audit row, so no fork exists after a 503, and a retry is safe."
+          }
+        },
+        "summary": "Non-destructive fork of a workflow execution (issue #2000).",
+        "tags": [
+          "workflow"
+        ],
+        "x-harvest-idempotency": "Not idempotent: each call creates a distinct new execution.",
         "x-harvest-read-only": false,
         "x-harvest-route-class": "mutating"
       }
@@ -11896,7 +12553,7 @@
             "description": "Execution not found."
           },
           "409": {
-            "description": "The source execution is terminal, or it holds a durable mutex that the reset cannot take."
+            "description": "The source execution is terminal, it holds a durable mutex that the reset cannot take, or its payloads were erased."
           },
           "500": {
             "description": "Database error."
@@ -12305,6 +12962,71 @@
           }
         },
         "summary": "Server-Sent Events stream of the EPHEMERAL live-output progress chunks a running workflow publishes via ctx.publish_progress (issue #791).",
+        "tags": [
+          "workflow"
+        ],
+        "x-harvest-idempotency": "Fully idempotent; read-only.",
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only",
+        "x-harvest-stream": true
+      }
+    },
+    "/workflows/{id}/stream/durable": {
+      "get": {
+        "description": "Server-Sent Events stream of the DURABLE output chunks a workflow stores via ctx.publish_durable_progress (issue #1974). The worker stores each chunk in harvest_stream_chunks in the same transaction as its decision cycle. Each chunk has a 0-based offset, the call ordinal, which is the SSE id. The stream sends every stored chunk above the resume cursor in offset order, then tails new chunks. A reader that disconnects resumes with ?after=<offset> or the Last-Event-ID header. It gets every later chunk with no gap and no duplicate. The producer waits for a slow client and drops no chunk. A client that takes no frame for 60 s loses the stream and resumes. A run that is terminal at connect streams its stored chunks, then event:end, with no LISTEN connection. Chunks are not in harvest_events and do not count toward the history caps. A stream holds at most 10000 chunks. Above the cap the newest are dropped, and one terminal marker frame is stored at offset 9223372036854775807. AUTH: the route has the posture of GET /workflows/{id}/stream and is NOT admin-gated. exec_id is a bearer capability for ALL stored chunk content. Embedders that expose sensitive output MUST add per-execution authorization. A reader of a live run holds one Postgres LISTEN connection, so cap concurrent streams per user.",
+        "operationId": "get_workflows_by_id_stream_durable",
+        "parameters": [
+          {
+            "description": "Execution UUID.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exclusive resume offset. The stream sends chunks with a higher offset. It wins over the Last-Event-ID header. Omit both to start at the first chunk.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Exclusive resume offset that a browser EventSource sends on reconnect. The after query parameter wins when both are present.",
+            "in": "header",
+            "name": "Last-Event-ID",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "description": "Server-sent event frames. See the response description.",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Content-Type: text/event-stream. Frames: event:progress (id = the chunk offset, data = the stored chunk JSON), a terminal event:end with {\"reason\": <terminal-state>}, or event:error. Offsets increase with each publish call. A call that fails to serialize leaves its offset unused, so resume by the last offset received, not by a count. The first stored copy of a chunk is canonical. Delivery is at-least-once across reconnects, so dedup by offset. A cap marker has data {\"_harvest_stream_truncated\": true, \"max_chunks\": N}."
+          },
+          "400": {
+            "description": "Malformed execution ID, or an after or Last-Event-ID value that is not a non-negative integer."
+          },
+          "404": {
+            "description": "Execution not found."
+          },
+          "503": {
+            "description": "Streaming is unavailable server-side (retriable) for a live run: the LISTEN/NOTIFY notification URL is not configured, or that database is unreachable. A terminal run needs no LISTEN connection, so it never gets this response."
+          }
+        },
+        "summary": "Server-Sent Events stream of the DURABLE output chunks a workflow stores via ctx.publish_durable_progress (issue #1974).",
         "tags": [
           "workflow"
         ],
@@ -13098,6 +13820,10 @@
                   "execution_timeout_secs": {
                     "description": "Overall execution timeout in seconds."
                   },
+                  "fairness_key": {
+                    "description": "The fairness key of the run (issue #1976). A worker with fairness keys on rotates claims across the keys of a queue in weighted round robin. Omitted takes the run's quota key. Must be non-empty, must not be `.` or `..`, must have no outer whitespace or control character, and must be at most 256 bytes. A key bounds load, not access.",
+                    "type": "string"
+                  },
                   "idempotency_key": {
                     "description": "Request-scoped idempotency key (issue #808). Two starts carrying the same key within the retention window (default 24h) converge on exactly one execution: the first creates it, the second returns the same execution_id as a no-op (200, no second WorkflowStarted, no second task). Dedup scope is (workflow_name, idempotency_key), independent of workflow_id, and short-circuits the reuse_policy matrix. A committed keyed replay short-circuits to the 200 no-op before fresh-start-only validations (input-schema #373, completion-callback SSRF #605, delay/start_at) and before the admission gate #377, returning the original execution regardless of the retry's body; a genuinely fresh keyed start (no live claim) still runs every validation and the gate. The `Idempotency-Key` request header takes precedence over this body field; a present-but-empty key returns 400. Mutually exclusive with a throttle/debounce/batch policy (400 if combined). Shard routing: a keyed start with an OMITTED (auto-generated) workflow_id routes by the key so same-key retries co-locate and dedup; a keyed start with an EXPLICIT workflow_id routes by workflow_id (preserving the reuse_policy matrix and the shard-local (workflow_name, workflow_id) uniqueness invariant). For dedup to converge across a delivery's retries, be consistent about supplying vs. omitting workflow_id."
                   },
@@ -13312,7 +14038,7 @@
             "description": "The start was DEFERRED by a debounce, event-batch or start-throttle policy, so no execution exists yet and the body carries no execution_id. Exactly one of debounced, batched or throttled is true, and the remaining fields are the ones that policy reports. A batch admission that flushed immediately returns 201 with execution_id instead."
           },
           "400": {
-            "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, when input exceeds the workflow input cap, when idempotency_key is empty, when idempotency_key is combined with a throttle/debounce/batch policy (issue #808), when conflict_policy is an unknown value, when a non-default conflict_policy is combined with a throttle/debounce/batch policy (issue #685), when shard_id and residency_key are both supplied, when shard_id is negative / the reserved routing sentinel / outside readable_shards / drained out of writable_shards, or when residency_key is blank or undeclared (issue #697)."
+            "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, when input exceeds the workflow input cap, when idempotency_key is empty, when idempotency_key is combined with a throttle/debounce/batch policy (issue #808), when conflict_policy is an unknown value, when a non-default conflict_policy is combined with a throttle/debounce/batch policy (issue #685), when shard_id and residency_key are both supplied, when shard_id is negative / the reserved routing sentinel / outside readable_shards / drained out of writable_shards, or when residency_key is blank or undeclared (issue #697). Also returned when a tenant-bound caller starts a throttled, debounced or batched workflow (issue #1977)."
           },
           "401": {
             "description": "Requires admin authentication only when the request can forcibly cancel a currently-ACTIVE (RUNNING/PAUSED) prior — i.e. the resolved active-conflict behavior is Terminate (issue #685): conflict_policy=terminate_existing (any reuse_policy), or reuse_policy=terminate_if_running with the default/omitted conflict_policy. Non-destructive combinations — e.g. reuse_policy=terminate_if_running combined with conflict_policy=use_existing (the idempotent-starter shape) or conflict_policy=fail — cannot cancel a live run and do NOT require admin. Returned when admin is required and admin auth is absent. Outside the dev profile, with no declared auth boundary, also returned to any caller with no scoped token or admin session (issue #1802)."
@@ -13321,7 +14047,7 @@
             "description": "Workflow function not registered."
           },
           "409": {
-            "description": "Duplicate workflow_id with conflicting reuse policy, or conflict_policy=fail over an ACTIVE (RUNNING/PAUSED) prior (issue #685)."
+            "description": "Duplicate workflow_id with conflicting reuse policy, or conflict_policy=fail over an ACTIVE (RUNNING/PAUSED) prior (issue #685). Also returned to a tenant-bound caller when the start resolves to a run of another tenant. That body names no execution (issue #1977)."
           },
           "413": {
             "description": "The serialized workflow input exceeds max_workflow_input_bytes."

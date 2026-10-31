@@ -387,6 +387,8 @@ fn act(
         max_result_bytes: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -834,6 +836,8 @@ async fn start(url: &str, workflow_name: &str, workflow_id: &str, input: Value) 
             start_source: StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -1586,7 +1590,6 @@ async fn reset_rejected_while_holder_holds_mutex() {
             operator_id: "op".into(),
             signal_reapply: ResetSignalReapplyPolicy::default(),
             allow_terminal_source: false,
-            refuse_erased_source: false,
         },
     )
     .await;
@@ -1639,7 +1642,6 @@ async fn reset_after_release_succeeds() {
                 operator_id: "op".into(),
                 signal_reapply: ResetSignalReapplyPolicy::default(),
                 allow_terminal_source: false,
-                refuse_erased_source: false,
             },
         )
         .await;
@@ -1661,7 +1663,6 @@ async fn reset_after_release_succeeds() {
             operator_id: "op".into(),
             signal_reapply: ResetSignalReapplyPolicy::default(),
             allow_terminal_source: false,
-            refuse_erased_source: false,
         },
         None,
     )

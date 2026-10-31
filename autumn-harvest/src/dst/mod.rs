@@ -16,23 +16,48 @@
 //! operation then breaks the build of the Postgres replay until it gets a
 //! replay step.
 //!
+//! The [`world`] module drives whole actors instead (issue #2002). Its
+//! Postgres world runs the real `worker.rs` poll loop.
+//!
+//! The [`owner`] module models the fenced owner lease of a decision
+//! partition (issue #2250). It drives the four nemeses of
+//! `formal/tla/OwnerLease.tla`.
+//!
+//! The [`group`] module models group commit of one decision partition
+//! (issue #2256). A batch holds the decisions of several executions.
+//!
+//! The [`speculate`] module models speculative decisions over an in-flight
+//! commit (issue #2011). It is an R&D spike with no database.
+//!
+//! The `stateright` test target visits every schedule of [`OracleStore`] and
+//! [`owner::OracleOwnerStore`] within a bound. A sweep here picks one
+//! schedule per seed. The models judge a run with [`Ghost`], as [`run`] does.
+//!
 //! See `docs/testing/simulation.md` and
 //! `docs/adr/0004-deterministic-simulation-testing.md`.
 
+#[macro_use]
+mod named;
+
+mod fair;
+pub mod group;
 mod invariant;
+pub mod owner;
 mod rng;
 mod sim;
+pub mod speculate;
 mod store;
 mod sweep;
+pub mod world;
 
-pub use invariant::{Invariant, Violation};
+pub use invariant::{Ghost, Invariant, Live, Violation, WriteKind};
 pub use rng::SplitMix64;
 pub use sim::{SimConfig, SimReport, SimStats, StepRecord, run, run_with};
 pub use store::{
     Claim, ClaimStore, Fencing, Op, OracleStore, Orphan, Outcome, Row, TaskState, WriteOutcome,
 };
 pub use sweep::{
-    CHECKS_VAR, FENCING_VAR, Nondeterminism, SEED_BASE_VAR, SEED_VAR, SEEDS_VAR, SeedPlan,
-    SweepFailure, SweepSummary, TAIL_LINES, config_from_env, config_from_vars, first_divergence,
-    repro_command, run_twice, run_twice_with, sweep,
+    CHECKS_VAR, DST_SEED_VARS, FENCING_VAR, Nondeterminism, SEED_BASE_VAR, SEED_VAR, SEEDS_VAR,
+    SeedPlan, SeedVars, SweepFailure, SweepSummary, TAIL_LINES, config_from_env, config_from_vars,
+    first_divergence, repro_command, run_twice, run_twice_with, sweep,
 };

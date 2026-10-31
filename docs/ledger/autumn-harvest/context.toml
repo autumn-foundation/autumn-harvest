@@ -1,0 +1,9 @@
+# Ledger profiles for `autumn-harvest/src/context.rs`. See `docs/ledger/README.md`.
+
+["ActivityContext::run_tenant"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/context.md"

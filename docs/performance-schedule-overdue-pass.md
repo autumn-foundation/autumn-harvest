@@ -145,8 +145,10 @@ same fixture, same harness, before vs. after:
 
 Calls collapse to a **constant 4** regardless of `n` (matching the
 aux-lookup fix's own "4 SQL calls" result exactly, as expected — it is the
-same three batched lookups plus the one schedule-list query) — the O(n) → O(1)
-asymptotic shape is demonstrated directly across the three swept sizes, not
+same three batched lookups. The throttle lookup issues two statements: a
+`to_regclass` check and a count. The harness counts the schedule-list query
+separately, in `schedules_list_calls`) — the O(n) → O(1) asymptotic shape is
+demonstrated directly across the three swept sizes, not
 inferred from a single before/after pair. This clears the impact floor
 several times over: an N+1 elimination (statement count drops from O(schedules)
 to O(1) per shard) alone clears it, and the buffer reduction separately

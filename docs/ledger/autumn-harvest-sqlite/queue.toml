@@ -1,0 +1,209 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/queue.rs`. See `docs/ledger/README.md`.
+
+["arm_awaited_timer"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["cancel_activity_task"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["claim_next_ready_task_tx"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_tasks"]
+measured = "docs/performance-sqlite-runtime-drive.md"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["delete_pending_tasks_for_execution"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["delete_pending_timer"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["delete_undelivered_signals_for_execution"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["delete_unfired_timers_for_execution"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["due_timers"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["due_timers_with_deadlines"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["enqueue_activity"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "docs/performance-sqlite-runtime-drive.md"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["enqueue_timer"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["finish_task"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["freeze_task_defaults"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["has_pending_activity"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["has_unfired_timer"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["mark_timer_fired"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["move_all_signals_to_retry"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["move_undelivered_signals"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["next_task_seq"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["next_timer_arm_seq"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["pending_tasks"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["reclaim_orphaned_running"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["reclaim_running_for_execution"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["record_heartbeat"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["requeue_task"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"
+
+["requeue_task_to_back"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/queue.md"

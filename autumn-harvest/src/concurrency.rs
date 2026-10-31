@@ -135,7 +135,9 @@ impl ConcurrencyPolicy {
 ///
 /// `existing_others` counts the non-terminal runs for the key **excluding** the
 /// run being admitted. The admitted run itself always survives (latest-wins), so
-/// the shed count is `(existing_others + 1).saturating_sub(max(limit, 1))`.
+/// the shed count is `existing_others.saturating_sub(max(limit, 1) - 1)`.
+/// That is `(existing_others + 1) - cap` without the `+ 1`, so it cannot
+/// overflow at `usize::MAX`.
 ///
 /// A `limit` of `0` is clamped to `1`: a literal zero would demand cancelling
 /// every run *including the one we just admitted*, which is never the intent.
@@ -144,7 +146,7 @@ pub const fn supersede_count(existing_others: usize, limit: u32) -> usize {
     let effective = if limit == 0 { 1 } else { limit };
     // `as usize` is lossless on every supported target (>= 32-bit pointers).
     let cap = effective as usize;
-    (existing_others + 1).saturating_sub(cap)
+    existing_others.saturating_sub(cap - 1)
 }
 
 /// Shed decision for one latest-wins supersede pass (issue #811, Codex round 2).
@@ -172,7 +174,7 @@ pub const fn supersede_count(existing_others: usize, limit: u32) -> usize {
 #[must_use]
 pub const fn supersede_plan(candidates: usize, protected: usize, limit: u32) -> SupersedePlan {
     let target = {
-        let raw = supersede_count(candidates + protected, limit);
+        let raw = supersede_count(candidates.saturating_add(protected), limit);
         if raw > SUPERSEDE_SCAN_LIMIT {
             SUPERSEDE_SCAN_LIMIT
         } else {
@@ -902,8 +904,10 @@ async fn supersede_inner(
             continue;
         }
 
+        // Issue #1984: a supersede must free the slot now, so an open
+        // non-cancellable block does not defer it.
         let (cancelled, mut deferred, mut checks, _terminal_metric) =
-            match crate::execution::cancel_workflow_execution_collect(
+            match crate::execution::cancel_workflow_execution_collect_now(
                 conn,
                 candidate.exec_id,
                 SUPERSEDE_CANCEL_REASON,
@@ -967,6 +971,64 @@ async fn supersede_inner(
     }
 
     Ok(outcome)
+}
+
+/// Kani proofs of the latest-wins shed plan (issue #811).
+///
+/// The `kani` CI job runs them. See `docs/testing/formal-methods.md`.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// The shed count is the least that leaves at most `cap` runs, the
+    /// admitted run included. It holds at `usize::MAX`, where adding the
+    /// admitted run to the count would overflow.
+    #[kani::proof]
+    fn supersede_count_sheds_exactly_down_to_the_cap() {
+        let existing_others: usize = kani::any();
+        let limit: u32 = kani::any();
+        let shed = supersede_count(existing_others, limit);
+        let cap = usize::try_from(limit.max(1)).unwrap_or(usize::MAX);
+        assert!(shed <= existing_others);
+        let surviving_others = existing_others - shed;
+        assert!(surviving_others < cap);
+        if shed > 0 {
+            assert_eq!(surviving_others, cap - 1);
+        }
+        kani::cover!(existing_others == usize::MAX && shed == usize::MAX);
+    }
+
+    /// A plan never sheds more than the candidates or the scan limit. A
+    /// limit of 0 acts as 1. When the plan sheds its full target, the key
+    /// ends at or under its limit, the admitted run included.
+    #[kani::proof]
+    fn supersede_plan_sheds_only_candidates_and_meets_the_limit() {
+        let candidates: usize = kani::any();
+        let protected: usize = kani::any();
+        let limit: u32 = kani::any();
+        let plan = supersede_plan(candidates, protected, limit);
+        assert!(plan.shed <= plan.target);
+        assert!(plan.target <= SUPERSEDE_SCAN_LIMIT);
+        assert!(plan.shed <= candidates);
+        if limit == 0 {
+            assert_eq!(plan, supersede_plan(candidates, protected, 1));
+        }
+        let population = candidates
+            .checked_add(protected)
+            .and_then(|n| n.checked_add(1));
+        if let Some(population) = population
+            && plan.shed == plan.target
+            && plan.target < SUPERSEDE_SCAN_LIMIT
+        {
+            let cap = usize::try_from(limit.max(1)).unwrap_or(usize::MAX);
+            assert!(population - plan.shed <= cap);
+        }
+        if plan.shed < plan.target {
+            assert_eq!(plan.shed, candidates);
+        }
+        kani::cover!(plan.shed < plan.target);
+        kani::cover!(plan.shed > 0 && plan.shed == plan.target);
+    }
 }
 
 #[cfg(test)]
@@ -1197,6 +1259,12 @@ mod tests {
     #[test]
     fn supersede_count_saturates_on_absurd_limit() {
         assert_eq!(supersede_count(3, u32::MAX), 0);
+    }
+
+    #[test]
+    fn supersede_count_keeps_only_the_admitted_run_at_usize_max() {
+        assert_eq!(supersede_count(usize::MAX, 1), usize::MAX);
+        assert_eq!(supersede_count(usize::MAX, 2), usize::MAX - 1);
     }
 
     #[test]

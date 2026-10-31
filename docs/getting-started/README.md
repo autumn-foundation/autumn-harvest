@@ -59,11 +59,14 @@ Start with [Chapter 1 →](01-project-skeleton.md)
 - **Disaster recovery.** [`cross-region-dr.md`](../cross-region-dr.md) — per-shard
   cross-region replication, a fencing mechanism, a measured RPO, and the
   operator-initiated failover runbook.
-- **Upgrading.** [`upgrading/0.7.0.md`](../upgrading/0.7.0.md) is the current
-  0.6.0 → 0.7.0 upgrade guide — the `autumn-web` 0.8 bump, fail-closed
-  mutations and the new runtime defaults. [`upgrading/0.6.0.md`](../upgrading/0.6.0.md)
-  covers the previous 0.5.0 → 0.6.0 hop: the `autumn-web` 0.7 bump and the move
-  to Autumn-owned plugin migrations.
+- **Upgrading.** [`upgrading/0.8.0.md`](../upgrading/0.8.0.md) is the current
+  0.7.0 → 0.8.0 upgrade guide — the `autumn-web` 0.9 bump, the `prod` profile's
+  strict config check and the new runtime defaults.
+  [`upgrading/0.7.0.md`](../upgrading/0.7.0.md) covers the previous
+  0.6.0 → 0.7.0 hop: the `autumn-web` 0.8 bump, fail-closed mutations and the
+  0.7.0 runtime defaults. [`upgrading/0.6.0.md`](../upgrading/0.6.0.md) covers
+  the 0.5.0 → 0.6.0 hop: the `autumn-web` 0.7 bump and the move to
+  Autumn-owned plugin migrations.
 - **Reference example.** [`examples/billing-autumn-web/`](../../examples/billing-autumn-web/)
   is a full subscription-checkout integration: outbox → workflow start, saga
   compensation, child workflow, version gate, signal handoff, and a scheduled
@@ -90,7 +93,7 @@ Start with [Chapter 1 →](01-project-skeleton.md)
   `execution_id` in a log aggregator.
 - **Performance.** [`performance.md`](../performance.md) publishes measured
   task-claim and enqueue baselines, attributes cost to five representative
-  claim-path predicates (five others are evaluated on every claim but left on
+  claim-path predicates (the others are evaluated on every claim but left on
   their cheapest null/empty path, so they are not measured — the page names
   them), and explains the CI-gated budget — read it before deciding whether a
   deep backlog means you need another shard.

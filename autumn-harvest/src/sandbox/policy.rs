@@ -1,0 +1,1116 @@
+//! The operator policy that bounds each sandbox run.
+//!
+//! The operator writes the policy. The agent writes the request. A request
+//! can ask for less than the policy allows, never more. A value over a policy
+//! ceiling is a non-retryable denial, not a silent clamp, so the agent sees
+//! the limit and can correct its request.
+
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use super::error::SandboxError;
+use super::request::{MAX_EXEC_STRING_BYTES, MAX_NAME_BYTES};
+
+/// How strongly a backend isolates code from the host.
+///
+/// The order is significant: `Process < MicroVm`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationLevel {
+    /// A Linux process with resource limits and namespaces. It shares the
+    /// host kernel. It is not a boundary for hostile code.
+    Process,
+    /// A Firecracker microVM with its own guest kernel.
+    MicroVm,
+}
+
+impl std::fmt::Display for IsolationLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Process => "process",
+            Self::MicroVm => "micro_vm",
+        })
+    }
+}
+
+/// Network access for sandboxed code.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkPolicy {
+    /// No network. This is the default.
+    #[default]
+    Deny,
+    /// The network that the operator configured on the backend.
+    Allow,
+}
+
+/// The resource limits of one run.
+///
+/// Each field is a hard limit that the backend enforces. The fields are plain
+/// integers, so the limits cross the guest protocol as plain JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxLimits {
+    /// Wall-clock time of the run, in milliseconds.
+    pub wall_clock_ms: u64,
+    /// CPU time of the run, in seconds. In a microVM, all processes of the
+    /// run share it. The process backend shares it only with a cgroup root.
+    /// Without one, each process gets this limit.
+    pub cpu_seconds: u64,
+    /// Memory of the code, in bytes. A run cgroup bounds it exactly. Without
+    /// one, the data rlimit adds room for JIT reservations.
+    pub memory_bytes: u64,
+    /// Processes and threads that the code can have at one time.
+    pub max_processes: u32,
+    /// Size of one file that the code writes, in bytes.
+    pub max_file_bytes: u64,
+    /// Open file descriptors of one process.
+    pub max_open_files: u32,
+    /// Bytes of stdout, and separately of stderr, that the outcome keeps.
+    pub max_output_bytes: u64,
+}
+
+impl SandboxLimits {
+    /// The wall-clock limit as a [`Duration`].
+    #[must_use]
+    pub const fn wall_clock(&self) -> Duration {
+        Duration::from_millis(self.wall_clock_ms)
+    }
+}
+
+/// The fewest open file descriptors that a policy may give the code.
+///
+/// A run starts with stdin, stdout and stderr. The loader then opens the
+/// libraries, and the runtime opens the code file. Node 22 needs about 24
+/// to start, so 64 leaves room for each built-in runtime.
+pub const MIN_OPEN_FILES: u32 = 64;
+
+/// The largest byte limit of a policy: 1 PiB.
+///
+/// A larger memory or file size limit could reach `u64::MAX`, which is
+/// `RLIM_INFINITY` and removes the limit. A file size limit above `i64::MAX`
+/// also reads as negative in the kernel, which fails each write.
+pub const MAX_LIMIT_BYTES: u64 = 1 << 50;
+
+/// The largest CPU limit of a policy, in seconds. The hard CPU rlimit is one
+/// second more, so a larger value could reach `RLIM_INFINITY`.
+pub const MAX_CPU_SECONDS: u64 = u32::MAX as u64;
+
+/// The most open files that a policy can allow: the Linux default of
+/// `fs.nr_open`. `setrlimit` refuses more, even to root, and the host cannot
+/// read the value of a guest kernel.
+pub const MAX_OPEN_FILES: u32 = 1 << 20;
+
+/// The limits that a request gets when it asks for none.
+pub const DEFAULT_LIMITS: SandboxLimits = SandboxLimits {
+    wall_clock_ms: 30_000,
+    cpu_seconds: 30,
+    memory_bytes: 512 * 1024 * 1024,
+    max_processes: 64,
+    max_file_bytes: 64 * 1024 * 1024,
+    max_open_files: 256,
+    max_output_bytes: 256 * 1024,
+};
+
+/// The highest limits that a request can ask for under the default policy.
+pub const MAX_LIMITS: SandboxLimits = SandboxLimits {
+    wall_clock_ms: 300_000,
+    cpu_seconds: 300,
+    memory_bytes: 2 * 1024 * 1024 * 1024,
+    max_processes: 256,
+    max_file_bytes: 256 * 1024 * 1024,
+    max_open_files: 1024,
+    max_output_bytes: 1024 * 1024,
+};
+
+/// How to run the code of one runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSpec {
+    /// The command and its fixed arguments. The code file and the request
+    /// arguments follow them.
+    pub argv: Vec<String>,
+    /// The name of the file that holds the code, in the work directory.
+    pub file_name: String,
+}
+
+impl RuntimeSpec {
+    /// A runtime that runs `file_name` with `argv`.
+    #[must_use]
+    pub fn new(argv: &[&str], file_name: &str) -> Self {
+        Self {
+            argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+            file_name: file_name.to_owned(),
+        }
+    }
+}
+
+/// The size bounds of a request and of its outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SizeBounds {
+    /// Files in a request, the code file included.
+    pub max_files: usize,
+    /// Bytes of the code, the files and stdin together.
+    pub max_input_bytes: u64,
+    /// Arguments in a request.
+    pub max_args: usize,
+    /// Bytes of all arguments together.
+    pub max_arg_bytes: usize,
+    /// Environment variables in a request.
+    pub max_env: usize,
+    /// Bytes of all environment names and values together.
+    pub max_env_bytes: usize,
+    /// Output files that a request can ask for.
+    pub max_outputs: usize,
+    /// Bytes of one output file that the outcome can return.
+    pub max_output_file_bytes: u64,
+    /// Bytes of all output files that the outcome can return.
+    pub max_output_files_total_bytes: u64,
+}
+
+/// The most files in a request, the code file included.
+///
+/// The guest `/work` tmpfs holds [`WORK_MAX_INODES`] inodes. The root and the
+/// two work directories take three. Each file can take one inode for each
+/// path component, up to [`MAX_PATH_DEPTH`].
+///
+/// [`WORK_MAX_INODES`]: super::guest::WORK_MAX_INODES
+/// [`MAX_PATH_DEPTH`]: super::request::MAX_PATH_DEPTH
+pub const MAX_REQUEST_FILES: usize =
+    (super::guest::WORK_MAX_INODES as usize - 3) / super::request::MAX_PATH_DEPTH;
+
+/// The largest page of a Linux guest, in bytes. An `aarch64` kernel can use
+/// 64 KiB pages.
+pub const MAX_PAGE_BYTES: u64 = 64 * 1024;
+
+/// The default size bounds.
+pub const DEFAULT_SIZE_BOUNDS: SizeBounds = SizeBounds {
+    max_files: 64,
+    max_input_bytes: 1024 * 1024,
+    max_args: 64,
+    max_arg_bytes: 64 * 1024,
+    max_env: 64,
+    max_env_bytes: 64 * 1024,
+    max_outputs: 16,
+    max_output_file_bytes: 256 * 1024,
+    max_output_files_total_bytes: 512 * 1024,
+};
+
+/// The operator policy for one sandbox runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxPolicy {
+    /// The runtimes that a request can name, by name.
+    pub runtimes: BTreeMap<String, RuntimeSpec>,
+    /// The limits that a request gets when it asks for none.
+    pub default_limits: SandboxLimits,
+    /// The highest limits that a request can ask for.
+    pub max_limits: SandboxLimits,
+    /// The size bounds of a request and of its outcome.
+    pub sizes: SizeBounds,
+    /// Network access for the code.
+    pub network: NetworkPolicy,
+    /// The weakest isolation that this policy accepts from a backend.
+    pub min_isolation: IsolationLevel,
+    /// The `PATH` that the code sees.
+    pub path_env: String,
+}
+
+impl Default for SandboxPolicy {
+    /// The production default: microVM isolation, no network, and the
+    /// `python3`, `node`, `bash` and `sh` runtimes.
+    fn default() -> Self {
+        Self {
+            runtimes: default_runtimes(),
+            default_limits: DEFAULT_LIMITS,
+            max_limits: MAX_LIMITS,
+            sizes: DEFAULT_SIZE_BOUNDS,
+            network: NetworkPolicy::Deny,
+            min_isolation: IsolationLevel::MicroVm,
+            path_env: "/usr/local/bin:/usr/bin:/bin".to_owned(),
+        }
+    }
+}
+
+/// The built-in runtimes.
+///
+/// `python3 -I` ignores the `PYTHON*` variables and the user site directory.
+/// `-B` writes no bytecode files, and `-u` keeps the output unbuffered, so a
+/// killed run keeps the output that it printed.
+fn default_runtimes() -> BTreeMap<String, RuntimeSpec> {
+    let mut runtimes = BTreeMap::new();
+    runtimes.insert(
+        "python3".to_owned(),
+        RuntimeSpec::new(&["python3", "-I", "-B", "-u"], "main.py"),
+    );
+    runtimes.insert("node".to_owned(), RuntimeSpec::new(&["node"], "main.js"));
+    runtimes.insert(
+        "bash".to_owned(),
+        RuntimeSpec::new(&["bash", "--noprofile", "--norc"], "main.sh"),
+    );
+    runtimes.insert("sh".to_owned(), RuntimeSpec::new(&["sh"], "main.sh"));
+    runtimes
+}
+
+impl SandboxPolicy {
+    /// The default policy, with process isolation allowed.
+    ///
+    /// Use it for development and tests only. A process sandbox shares the
+    /// host kernel, so it does not contain hostile code.
+    #[must_use]
+    pub fn for_development() -> Self {
+        Self {
+            min_isolation: IsolationLevel::Process,
+            ..Self::default()
+        }
+    }
+
+    /// Add or replace a runtime.
+    #[must_use]
+    pub fn with_runtime(mut self, name: impl Into<String>, spec: RuntimeSpec) -> Self {
+        self.runtimes.insert(name.into(), spec);
+        self
+    }
+
+    /// Set the network policy.
+    #[must_use]
+    pub const fn with_network(mut self, network: NetworkPolicy) -> Self {
+        self.network = network;
+        self
+    }
+
+    /// Set the default and the highest limits.
+    #[must_use]
+    pub const fn with_limits(mut self, default_limits: SandboxLimits, max: SandboxLimits) -> Self {
+        self.default_limits = default_limits;
+        self.max_limits = max;
+        self
+    }
+
+    /// Set the size bounds.
+    #[must_use]
+    pub const fn with_sizes(mut self, sizes: SizeBounds) -> Self {
+        self.sizes = sizes;
+        self
+    }
+
+    /// Check that the policy is consistent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Config`] for one of these defects:
+    ///
+    /// - a default limit is over its ceiling, or a limit is zero;
+    /// - the default `max_open_files` is below [`MIN_OPEN_FILES`];
+    /// - the size bounds allow no file, so no code file;
+    /// - no runtime exists;
+    /// - a runtime name or spec is not valid;
+    /// - a runtime with the largest request is over the total exec limit.
+    pub fn validate(&self) -> Result<(), SandboxError> {
+        if self.runtimes.is_empty() {
+            return Err(SandboxError::Config("the policy names no runtime".into()));
+        }
+        for (name, spec) in &self.runtimes {
+            if !is_valid_runtime_name(name) {
+                return Err(SandboxError::Config(format!(
+                    "runtime name {name:?} is not 1 to 32 bytes of a-z, 0-9, '_' or '-'"
+                )));
+            }
+            if spec.argv.is_empty() || spec.argv.iter().any(|a| a.is_empty() || a.contains('\0')) {
+                return Err(SandboxError::Config(format!(
+                    "runtime {name:?} needs a command, and no argument may be empty or hold NUL"
+                )));
+            }
+            super::request::validate_relative_path(&spec.file_name).map_err(|e| {
+                SandboxError::Config(format!("runtime {name:?} has a bad file name: {e}"))
+            })?;
+            // Exec refuses a longer path with `ENAMETOOLONG` on each run.
+            let command = &spec.argv[0];
+            if command.len() >= EXEC_PATH_MAX
+                || command.split('/').any(|part| part.len() > MAX_NAME_BYTES)
+            {
+                return Err(SandboxError::Config(format!(
+                    "runtime {name:?} has a command path over the Linux limits: {} bytes in \
+                     all, and {MAX_NAME_BYTES} bytes a component",
+                    EXEC_PATH_MAX - 1
+                )));
+            }
+            if spec.argv.iter().any(|a| a.len() > MAX_EXEC_STRING_BYTES) {
+                return Err(SandboxError::Config(format!(
+                    "runtime {name:?} has an argument over the exec limit of \
+                     {MAX_EXEC_STRING_BYTES} bytes"
+                )));
+            }
+        }
+        for (field, default, max) in limit_pairs(&self.default_limits, &self.max_limits) {
+            if default == 0 || max == 0 {
+                return Err(SandboxError::Config(format!(
+                    "limit {field} must not be zero"
+                )));
+            }
+            if default > max {
+                return Err(SandboxError::Config(format!(
+                    "default {field} {default} exceeds its ceiling {max}"
+                )));
+            }
+        }
+        self.check_limit_ceilings()?;
+        // Each run gets the default, because a request cannot set this limit.
+        // Fewer descriptors fail each run before the code starts.
+        if self.default_limits.max_open_files < MIN_OPEN_FILES {
+            return Err(SandboxError::Config(format!(
+                "limit max_open_files must be at least {MIN_OPEN_FILES}, so a runtime can start \
+                 and open the code file"
+            )));
+        }
+        if self.path_env.contains('\0') {
+            return Err(SandboxError::Config("the PATH value holds NUL".into()));
+        }
+        if "PATH=".len() + self.path_env.len() > MAX_EXEC_STRING_BYTES {
+            return Err(SandboxError::Config(format!(
+                "the PATH value is over the exec limit of {MAX_EXEC_STRING_BYTES} bytes"
+            )));
+        }
+        // Linux also limits all exec strings together. Each runtime must
+        // take the largest request without `E2BIG`.
+        for (name, spec) in &self.runtimes {
+            let total = self.max_exec_bytes(spec);
+            if total > count(MAX_EXEC_TOTAL_BYTES) {
+                return Err(SandboxError::Config(format!(
+                    "runtime {name:?} with the largest request passes {total} bytes to exec, \
+                     over the total exec limit of {MAX_EXEC_TOTAL_BYTES}"
+                )));
+            }
+        }
+        self.check_entry_counts()?;
+        // Each request and each outcome must fit one guest frame. Otherwise
+        // an accepted request fails late, as a retryable fault.
+        let frame = u64::try_from(super::protocol::MAX_FRAME_BYTES).unwrap_or(u64::MAX);
+        for (what, bound) in [
+            ("request", self.max_request_json_bytes()),
+            ("outcome", self.max_outcome_json_bytes()),
+        ] {
+            if bound > frame {
+                return Err(SandboxError::Config(format!(
+                    "the size bounds allow a {what} of {bound} bytes, over the {frame}-byte guest \
+                     frame; lower the bounds"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The most bytes that the JSON of one outcome can have.
+    ///
+    /// JSON escapes one byte of text into at most six bytes. Base64 makes
+    /// three bytes into four. The sum bounds the outcome, so an activity can
+    /// raise its result cap to fit it.
+    #[must_use]
+    pub fn max_outcome_json_bytes(&self) -> u64 {
+        // Each kept stream byte can decode to three bytes of U+FFFD, and each
+        // of those can escape to six bytes of JSON.
+        let streams = self.max_limits.max_output_bytes.saturating_mul(2 * 3 * 6);
+        // The collector caps each read by the budget left, so the total
+        // bounds the file bytes. A larger cap for one file adds nothing.
+        let files = self
+            .sizes
+            .max_output_files_total_bytes
+            .div_ceil(3)
+            .saturating_mul(4);
+        // Each output appears once, returned or skipped, with an escaped
+        // path, an escaped skip reason and its JSON structure.
+        let reason = u64::try_from(super::outcome::MAX_SKIP_REASON_BYTES).unwrap_or(u64::MAX);
+        let per_output = path_json_bytes()
+            .saturating_add(reason.saturating_mul(6))
+            .saturating_add(ITEM_JSON_BYTES);
+        let outputs = count(self.sizes.max_outputs).saturating_mul(per_output);
+        streams
+            .saturating_add(files)
+            .saturating_add(outputs)
+            .saturating_add(OUTCOME_ENVELOPE_BYTES)
+    }
+
+    /// Check that no limit passes what the kernel or the engine can hold.
+    fn check_limit_ceilings(&self) -> Result<(), SandboxError> {
+        // The default is at most the ceiling, so the ceiling bounds both.
+        // An rlimit of `RLIM_INFINITY` would remove the limit with no error.
+        let max = &self.max_limits;
+        for (field, value, ceiling) in [
+            ("cpu_seconds", max.cpu_seconds, MAX_CPU_SECONDS),
+            ("memory_bytes", max.memory_bytes, MAX_LIMIT_BYTES),
+            ("max_file_bytes", max.max_file_bytes, MAX_LIMIT_BYTES),
+        ] {
+            if value > ceiling {
+                return Err(SandboxError::Config(format!(
+                    "limit {field} is {value}, above its ceiling of {ceiling}, near the \
+                     RLIM_INFINITY that would remove the limit"
+                )));
+            }
+        }
+        if self.max_limits.max_open_files > MAX_OPEN_FILES {
+            return Err(SandboxError::Config(format!(
+                "limit max_open_files is {}, above the {MAX_OPEN_FILES} of the default \
+                 fs.nr_open, so setrlimit would fail each run",
+                self.max_limits.max_open_files
+            )));
+        }
+        // The engine adds the attempt time to the current time.
+        if self.max_limits.wall_clock() > super::MAX_TIMEOUT {
+            return Err(SandboxError::Config(format!(
+                "limit wall_clock_ms is {}, above the {} ms of MAX_TIMEOUT",
+                self.max_limits.wall_clock_ms,
+                super::MAX_TIMEOUT.as_millis()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Check the file and output counts of a request.
+    fn check_entry_counts(&self) -> Result<(), SandboxError> {
+        // The code file counts as one file. Without it, each request is a
+        // denial.
+        if self.sizes.max_files == 0 {
+            return Err(SandboxError::Config(
+                "the policy allows no file, and the code file counts as one".into(),
+            ));
+        }
+        // More files can use up the inodes of the guest work directory, and
+        // each run would fail with `ENOSPC`.
+        if self.sizes.max_files > MAX_REQUEST_FILES {
+            return Err(SandboxError::Config(format!(
+                "the policy allows {} files, but the guest work directory has inodes for at \
+                 most {MAX_REQUEST_FILES}",
+                self.sizes.max_files
+            )));
+        }
+        // The outcome decoder stops at this cap, so a request may not ask for
+        // more outputs.
+        let cap = super::outcome::MAX_OUTPUT_ENTRIES;
+        if self.sizes.max_outputs > cap {
+            return Err(SandboxError::Config(format!(
+                "the policy allows {} outputs, over the {cap} that an outcome holds",
+                self.sizes.max_outputs
+            )));
+        }
+        Ok(())
+    }
+
+    /// The most `/work` bytes that the input files of one run can take.
+    ///
+    /// The code, the files and stdin count as input bytes. A tmpfs gives each
+    /// file whole pages, so each file can add up to one page.
+    #[must_use]
+    pub fn max_work_input_bytes(&self) -> u64 {
+        count(self.sizes.max_files)
+            .saturating_mul(MAX_PAGE_BYTES)
+            .saturating_add(self.sizes.max_input_bytes)
+    }
+
+    /// The most bytes that one run of any runtime passes to exec.
+    #[must_use]
+    pub fn max_exec_total_bytes(&self) -> u64 {
+        self.runtimes
+            .values()
+            .map(|spec| self.max_exec_bytes(spec))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The most bytes that one run of `spec` passes to exec. Each string
+    /// adds a NUL and a pointer, and each variable adds `=`.
+    fn max_exec_bytes(&self, spec: &RuntimeSpec) -> u64 {
+        let string = |len: usize| count(len).saturating_add(count(EXEC_STRING_OVERHEAD));
+        let strings = |n: usize, extra: usize| {
+            count(n).saturating_mul(count(EXEC_STRING_OVERHEAD.saturating_add(extra)))
+        };
+        let fixed = spec
+            .argv
+            .iter()
+            .map(|arg| string(arg.len()))
+            .fold(string(spec.file_name.len()), u64::saturating_add);
+        let args = count(self.sizes.max_arg_bytes).saturating_add(strings(self.sizes.max_args, 0));
+        let env = count(self.sizes.max_env_bytes).saturating_add(strings(self.sizes.max_env, 1));
+        let engine = count(MAX_ENGINE_ENV_BYTES).saturating_add(strings(MAX_ENGINE_ENV_VARS, 1));
+        fixed
+            .saturating_add(args)
+            .saturating_add(env)
+            .saturating_add(engine)
+            .saturating_add(string("PATH=".len() + self.path_env.len()))
+            .saturating_add(count(EXECUTOR_ENV_BYTES))
+            .saturating_add(count(EXEC_FILENAME_BYTES))
+    }
+
+    /// The most bytes that the JSON of one request can have.
+    #[must_use]
+    pub fn max_request_json_bytes(&self) -> u64 {
+        // Text escapes to at most six bytes a byte, and base64 to 4/3, so six
+        // times the input covers both. Arguments and variables escape too.
+        let input = self.sizes.max_input_bytes.saturating_mul(6);
+        let args = u64::try_from(self.sizes.max_arg_bytes).unwrap_or(u64::MAX);
+        let env = u64::try_from(self.sizes.max_env_bytes).unwrap_or(u64::MAX);
+        // Each file and each output adds an escaped path. Each item of any
+        // list adds its JSON structure.
+        let paths = count(self.sizes.max_files)
+            .saturating_add(count(self.sizes.max_outputs))
+            .saturating_mul(path_json_bytes());
+        let items = count(self.sizes.max_files)
+            .saturating_add(count(self.sizes.max_outputs))
+            .saturating_add(count(self.sizes.max_args))
+            .saturating_add(count(self.sizes.max_env))
+            .saturating_mul(ITEM_JSON_BYTES);
+        // The plan also holds the command of the largest runtime and the
+        // `PATH` value, escaped.
+        let runtime = self
+            .runtimes
+            .values()
+            .map(|spec| {
+                spec.argv
+                    .iter()
+                    .map(|arg| count(arg.len()).saturating_add(ITEM_JSON_BYTES))
+                    .fold(count(spec.file_name.len()), u64::saturating_add)
+            })
+            .max()
+            .unwrap_or(0);
+        let host = runtime
+            .saturating_add(count(self.path_env.len()))
+            .saturating_mul(6);
+        // The runtime adds the engine variables after this check.
+        let engine = count(MAX_ENGINE_ENV_BYTES)
+            .saturating_mul(6)
+            .saturating_add(count(MAX_ENGINE_ENV_VARS).saturating_mul(ITEM_JSON_BYTES));
+        input
+            .saturating_add(args.saturating_add(env).saturating_mul(6))
+            .saturating_add(paths)
+            .saturating_add(items)
+            .saturating_add(host)
+            .saturating_add(engine)
+            .saturating_add(OUTCOME_ENVELOPE_BYTES)
+    }
+}
+
+/// The most bytes that exec takes for all arguments and variables together.
+/// Linux allows a quarter of the stack limit. That is 2 MiB for the default
+/// stack limit of 8 MiB.
+pub const MAX_EXEC_TOTAL_BYTES: usize = 2 * 1024 * 1024;
+
+/// The Linux `PATH_MAX`: the longest path that exec takes, with its NUL.
+const EXEC_PATH_MAX: usize = 4096;
+
+/// The executable path that exec also copies: `PATH_MAX` bytes and a NUL.
+/// A longer path fails with `ENAMETOOLONG`.
+const EXEC_FILENAME_BYTES: usize = EXEC_PATH_MAX + 1;
+
+/// The bytes that exec adds to each string: a NUL and a pointer.
+const EXEC_STRING_OVERHEAD: usize = 1 + 8;
+
+/// The bytes of the variables that the executor sets, other than `PATH`.
+/// Three of them hold the work path, which is shorter than `PATH_MAX`.
+const EXECUTOR_ENV_BYTES: usize = 4 * (4096 + 16);
+
+/// The most engine variables, such as `HARVEST_ATTEMPT`, that one run gets.
+pub const MAX_ENGINE_ENV_VARS: usize = 8;
+
+/// The most bytes of all engine variables of one run, names and values. The
+/// engine sets an idempotency key and an attempt number, far under this.
+pub const MAX_ENGINE_ENV_BYTES: usize = 4096;
+
+/// Check that `name` is a valid runtime name: 1 to 32 bytes of `a-z`, `0-9`,
+/// `_` or `-`.
+#[must_use]
+pub fn is_valid_runtime_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// Room for the fixed fields of an outcome or a request, in bytes.
+const OUTCOME_ENVELOPE_BYTES: u64 = 64 * 1024;
+
+/// Room for the JSON structure of one list item: keys, quotes, braces and
+/// commas.
+const ITEM_JSON_BYTES: u64 = 64;
+
+/// The most bytes of one escaped path in JSON.
+fn path_json_bytes() -> u64 {
+    u64::try_from(super::request::MAX_PATH_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(6)
+}
+
+/// A count as `u64`.
+fn count(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// Each limit as `(name, default, ceiling)`.
+fn limit_pairs(default: &SandboxLimits, max: &SandboxLimits) -> [(&'static str, u64, u64); 7] {
+    [
+        ("wall_clock_ms", default.wall_clock_ms, max.wall_clock_ms),
+        ("cpu_seconds", default.cpu_seconds, max.cpu_seconds),
+        ("memory_bytes", default.memory_bytes, max.memory_bytes),
+        (
+            "max_processes",
+            u64::from(default.max_processes),
+            u64::from(max.max_processes),
+        ),
+        ("max_file_bytes", default.max_file_bytes, max.max_file_bytes),
+        (
+            "max_open_files",
+            u64::from(default.max_open_files),
+            u64::from(max.max_open_files),
+        ),
+        (
+            "max_output_bytes",
+            default.max_output_bytes,
+            max.max_output_bytes,
+        ),
+    ]
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_policy_requires_a_microvm_and_denies_the_network() {
+        let policy = SandboxPolicy::default();
+        assert_eq!(policy.min_isolation, IsolationLevel::MicroVm);
+        assert_eq!(policy.network, NetworkPolicy::Deny);
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn the_development_policy_allows_process_isolation() {
+        let policy = SandboxPolicy::for_development();
+        assert_eq!(policy.min_isolation, IsolationLevel::Process);
+        assert_eq!(policy.network, NetworkPolicy::Deny);
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn the_default_policy_has_the_four_builtin_runtimes() {
+        let policy = SandboxPolicy::default();
+        let names: Vec<&str> = policy.runtimes.keys().map(String::as_str).collect();
+        assert_eq!(names, ["bash", "node", "python3", "sh"]);
+        assert_eq!(policy.runtimes["python3"].file_name, "main.py");
+    }
+
+    #[test]
+    fn microvm_isolation_is_stronger_than_process_isolation() {
+        assert!(IsolationLevel::Process < IsolationLevel::MicroVm);
+    }
+
+    #[test]
+    fn a_default_limit_over_its_ceiling_is_a_config_error() {
+        let mut low = MAX_LIMITS;
+        low.wall_clock_ms = 1_000;
+        let policy = SandboxPolicy::default().with_limits(DEFAULT_LIMITS, low);
+        let err = policy
+            .validate()
+            .expect_err("the default exceeds the ceiling");
+        assert!(matches!(err, SandboxError::Config(ref m) if m.contains("wall_clock_ms")));
+    }
+
+    #[test]
+    fn bounds_that_cannot_fit_a_guest_frame_are_a_config_error() {
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_input_bytes = 64 * 1024 * 1024;
+        let policy = SandboxPolicy::default().with_sizes(sizes);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("frame")),
+            "a request"
+        );
+        let mut max = MAX_LIMITS;
+        max.max_output_bytes = 4 * 1024 * 1024;
+        let policy = SandboxPolicy::default().with_limits(DEFAULT_LIMITS, max);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("frame")),
+            "an outcome"
+        );
+        SandboxPolicy::default().validate().unwrap();
+    }
+
+    #[test]
+    fn a_zero_limit_is_a_config_error() {
+        let mut zero = DEFAULT_LIMITS;
+        zero.memory_bytes = 0;
+        let policy = SandboxPolicy::default().with_limits(zero, MAX_LIMITS);
+        assert!(matches!(policy.validate(), Err(SandboxError::Config(_))));
+    }
+
+    #[test]
+    fn a_policy_without_runtimes_is_a_config_error() {
+        let mut policy = SandboxPolicy::default();
+        policy.runtimes.clear();
+        assert!(matches!(policy.validate(), Err(SandboxError::Config(_))));
+    }
+
+    #[test]
+    fn a_runtime_with_an_unsafe_file_name_is_a_config_error() {
+        let policy =
+            SandboxPolicy::default().with_runtime("evil", RuntimeSpec::new(&["sh"], "../main.sh"));
+        assert!(matches!(policy.validate(), Err(SandboxError::Config(_))));
+        let policy = SandboxPolicy::default().with_runtime("empty", RuntimeSpec::new(&[], "a.sh"));
+        assert!(matches!(policy.validate(), Err(SandboxError::Config(_))));
+    }
+
+    #[test]
+    fn runtime_names_are_short_lowercase_tokens() {
+        assert!(is_valid_runtime_name("python3"));
+        assert!(is_valid_runtime_name("go-1_22"));
+        assert!(!is_valid_runtime_name(""));
+        assert!(!is_valid_runtime_name("Python"));
+        assert!(!is_valid_runtime_name("py thon"));
+        assert!(!is_valid_runtime_name(&"a".repeat(33)));
+        let policy =
+            SandboxPolicy::default().with_runtime("Bad Name", RuntimeSpec::new(&["sh"], "a"));
+        assert!(matches!(policy.validate(), Err(SandboxError::Config(_))));
+    }
+
+    #[test]
+    fn the_outcome_bound_covers_escaped_streams_and_encoded_files() {
+        let policy = SandboxPolicy::default();
+        let streams = 2 * 6 * policy.max_limits.max_output_bytes;
+        let files = policy.sizes.max_output_files_total_bytes.div_ceil(3) * 4;
+        assert!(policy.max_outcome_json_bytes() >= streams + files);
+    }
+
+    #[test]
+    fn the_outcome_bound_sizes_files_by_the_total_budget() {
+        // The collector never returns more file bytes than the total budget.
+        // A larger cap for one file does not make the outcome larger.
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_output_file_bytes = 1 << 40;
+        let policy = SandboxPolicy::default().with_sizes(sizes);
+        assert_eq!(
+            policy.max_outcome_json_bytes(),
+            SandboxPolicy::default().max_outcome_json_bytes()
+        );
+        policy.validate().unwrap();
+    }
+
+    #[test]
+    fn a_runtime_too_large_for_a_frame_is_a_config_error() {
+        // The runtime fits exec, but it takes the largest request over a frame.
+        let frame = u64::try_from(crate::sandbox::protocol::MAX_FRAME_BYTES).unwrap();
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        let rest = SandboxPolicy::default().max_request_json_bytes() - sizes.max_input_bytes * 6;
+        // Leave 1 MiB of the frame free. The runtime takes about 9 MiB of it.
+        sizes.max_input_bytes = (frame - rest - (1 << 20)) / 6;
+        let fits = SandboxPolicy::default().with_sizes(sizes);
+        fits.validate().unwrap();
+        let mut argv = vec!["sh".to_owned()];
+        argv.extend(std::iter::repeat_n("x".repeat(100 * 1024), 15));
+        let policy = fits.with_runtime(
+            "big",
+            RuntimeSpec {
+                argv,
+                file_name: "main.sh".into(),
+            },
+        );
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("frame")),
+            "{:?}",
+            policy.validate()
+        );
+    }
+
+    #[test]
+    fn a_runtime_command_past_the_path_limits_is_a_config_error() {
+        let with_command = |command: String| {
+            SandboxPolicy::default().with_runtime(
+                "long",
+                RuntimeSpec {
+                    argv: vec![command],
+                    file_name: "main".into(),
+                },
+            )
+        };
+        let path = |parts: usize| format!("/{}", vec!["y".repeat(200); parts].join("/"));
+        // `NAME_MAX` is 255 bytes, and `PATH_MAX` holds 4095 and a NUL.
+        for command in ["x".repeat(256), path(21)] {
+            let result = with_command(command).validate();
+            assert!(
+                matches!(result, Err(SandboxError::Config(ref m)) if m.contains("path")),
+                "{result:?}"
+            );
+        }
+        with_command("x".repeat(255)).validate().unwrap();
+        with_command(path(20)).validate().unwrap();
+    }
+
+    #[test]
+    fn a_runtime_string_over_the_exec_limit_is_a_config_error() {
+        use crate::sandbox::request::MAX_EXEC_STRING_BYTES;
+        let with_arg = |arg: String| {
+            SandboxPolicy::default().with_runtime(
+                "big",
+                RuntimeSpec {
+                    argv: vec!["sh".into(), arg],
+                    file_name: "main.sh".into(),
+                },
+            )
+        };
+        with_arg("x".repeat(MAX_EXEC_STRING_BYTES))
+            .validate()
+            .unwrap();
+        let over = with_arg("x".repeat(MAX_EXEC_STRING_BYTES + 1)).validate();
+        assert!(
+            matches!(over, Err(SandboxError::Config(ref m)) if m.contains("exec")),
+            "{over:?}"
+        );
+        // The process gets `PATH=` and the value as one string.
+        let policy = SandboxPolicy {
+            path_env: "x".repeat(MAX_EXEC_STRING_BYTES - "PATH=".len() + 1),
+            ..SandboxPolicy::default()
+        };
+        let over = policy.validate();
+        assert!(
+            matches!(over, Err(SandboxError::Config(ref m)) if m.contains("exec")),
+            "{over:?}"
+        );
+    }
+
+    #[test]
+    fn an_argument_or_variable_over_the_exec_limit_is_denied() {
+        use crate::sandbox::request::{MAX_EXEC_STRING_BYTES, SandboxRequest};
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_arg_bytes = 512 * 1024;
+        sizes.max_env_bytes = 512 * 1024;
+        let policy = SandboxPolicy::default().with_sizes(sizes);
+        policy.validate().unwrap();
+        let request = SandboxRequest::new("sh", "");
+        let fits = request.clone().with_arg("x".repeat(MAX_EXEC_STRING_BYTES));
+        policy.plan(&fits).unwrap();
+        let fits = request
+            .clone()
+            .with_env("A", "x".repeat(MAX_EXEC_STRING_BYTES - 2));
+        policy.plan(&fits).unwrap();
+        // A variable reaches exec as `NAME=value`.
+        for over in [
+            request
+                .clone()
+                .with_arg("x".repeat(MAX_EXEC_STRING_BYTES + 1)),
+            request.with_env("A", "x".repeat(MAX_EXEC_STRING_BYTES - 1)),
+        ] {
+            let result = policy.plan(&over);
+            assert!(
+                matches!(result, Err(SandboxError::Denied(ref m)) if m.contains("exec")),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_exec_bound_counts_the_executable_path() {
+        let mut policy = SandboxPolicy::default();
+        policy.runtimes.clear();
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_args = 0;
+        sizes.max_arg_bytes = 0;
+        sizes.max_env = 0;
+        sizes.max_env_bytes = 0;
+        let policy = policy
+            .with_runtime("sh", RuntimeSpec::new(&["sh"], "main.sh"))
+            .with_sizes(sizes);
+        // `sh` and `main.sh` each add a NUL and a pointer.
+        let argv = (2 + 9) + (7 + 9);
+        let path = "PATH=".len() + policy.path_env.len() + 9;
+        let engine = MAX_ENGINE_ENV_BYTES + MAX_ENGINE_ENV_VARS * 10;
+        // Exec also copies the executable path: `PATH_MAX` and a NUL.
+        let filename = 4096 + 1;
+        assert_eq!(
+            policy.max_exec_total_bytes(),
+            count(argv + path + engine + EXECUTOR_ENV_BYTES + filename)
+        );
+    }
+
+    #[test]
+    fn exec_strings_past_the_total_limit_are_a_config_error() {
+        // Each argument fits the string limit, but all of them do not fit
+        // the total limit of execve.
+        let arg = "a".repeat(100 * 1024);
+        let argv: Vec<&str> = std::iter::once("sh")
+            .chain(std::iter::repeat_n(arg.as_str(), 70))
+            .collect();
+        let policy = SandboxPolicy::default().with_runtime("big", RuntimeSpec::new(&argv, "x"));
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("exec")),
+            "{:?}",
+            policy.validate()
+        );
+        // The request bounds count too.
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_arg_bytes = 3 * 1024 * 1024;
+        let policy = SandboxPolicy::default().with_sizes(sizes);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("exec")),
+            "{:?}",
+            policy.validate()
+        );
+        SandboxPolicy::default().validate().unwrap();
+    }
+
+    #[test]
+    fn a_policy_cannot_allow_more_outputs_than_an_outcome_holds() {
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_outputs = crate::sandbox::outcome::MAX_OUTPUT_ENTRIES + 1;
+        sizes.max_output_file_bytes = 1;
+        sizes.max_output_files_total_bytes = 1;
+        let policy = SandboxPolicy::default().with_sizes(sizes);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("outputs")),
+            "{:?}",
+            policy.validate()
+        );
+    }
+
+    #[test]
+    fn a_policy_limit_past_the_kernel_or_the_engine_is_a_config_error() {
+        // `setrlimit` refuses more files than `fs.nr_open`, 1 << 20 by default.
+        let mut limits = MAX_LIMITS;
+        limits.max_open_files = (1 << 20) + 1;
+        let policy = SandboxPolicy::default().with_limits(DEFAULT_LIMITS, limits);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("nr_open")),
+            "{:?}",
+            policy.validate()
+        );
+        // A wall clock of decades is no bound, and the attempt must fit.
+        let mut limits = MAX_LIMITS;
+        limits.wall_clock_ms = 1_000_000_000_000;
+        let policy = SandboxPolicy::default().with_limits(DEFAULT_LIMITS, limits);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("wall_clock_ms")),
+            "{:?}",
+            policy.validate()
+        );
+    }
+
+    #[test]
+    fn a_limit_that_reaches_rlim_infinity_is_a_config_error() {
+        // `u64::MAX` is `RLIM_INFINITY`, which removes the limit. The data
+        // rlimit adds headroom, so a smaller memory size can reach it too.
+        type Set = fn(&mut SandboxLimits);
+        let cases: [(&str, Set); 3] = [
+            ("cpu_seconds", |l| l.cpu_seconds = u64::MAX),
+            ("memory_bytes", |l| l.memory_bytes = u64::MAX - 1),
+            ("max_file_bytes", |l| l.max_file_bytes = u64::MAX),
+        ];
+        for (field, set) in cases {
+            let mut limits = MAX_LIMITS;
+            set(&mut limits);
+            let policy = SandboxPolicy::default().with_limits(DEFAULT_LIMITS, limits);
+            assert!(
+                matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains(field)),
+                "{field}: {:?}",
+                policy.validate()
+            );
+        }
+    }
+
+    #[test]
+    fn a_policy_must_allow_the_descriptors_that_a_runtime_needs() {
+        let mut limits = DEFAULT_LIMITS;
+        limits.max_open_files = 3;
+        let policy = SandboxPolicy::default().with_limits(limits, MAX_LIMITS);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("max_open_files") && m.contains("64")),
+            "{:?}",
+            policy.validate()
+        );
+        limits.max_open_files = MIN_OPEN_FILES;
+        SandboxPolicy::default()
+            .with_limits(limits, MAX_LIMITS)
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn a_policy_cannot_allow_more_files_than_the_guest_inodes_hold() {
+        // The root and the two work directories take three inodes. Each file
+        // can take one inode for each path component.
+        let inodes = crate::sandbox::guest::WORK_MAX_INODES as usize;
+        let cap = (inodes - 3) / crate::sandbox::request::MAX_PATH_DEPTH;
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_files = cap + 1;
+        let policy = SandboxPolicy::default().with_sizes(sizes);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("files")),
+            "{:?}",
+            policy.validate()
+        );
+        sizes.max_files = cap;
+        SandboxPolicy::default()
+            .with_sizes(sizes)
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn a_policy_must_allow_the_code_file() {
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_files = 0;
+        let policy = SandboxPolicy::default().with_sizes(sizes);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("code file")),
+            "{:?}",
+            policy.validate()
+        );
+        sizes.max_files = 1;
+        SandboxPolicy::default()
+            .with_sizes(sizes)
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn the_bounds_count_each_path_and_each_item() {
+        let base = SandboxPolicy::default();
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_outputs += 1;
+        let more = SandboxPolicy::default().with_sizes(sizes);
+        let path = u64::try_from(crate::sandbox::request::MAX_PATH_BYTES).unwrap();
+        assert!(more.max_request_json_bytes() >= base.max_request_json_bytes() + 6 * path);
+        assert!(more.max_outcome_json_bytes() >= base.max_outcome_json_bytes() + 6 * path);
+    }
+
+    #[test]
+    fn the_request_bound_covers_the_engine_variables() {
+        // A policy with no input, arguments, variables, files or outputs
+        // still sends the engine variables, escaped.
+        let mut policy = SandboxPolicy::default();
+        policy.sizes.max_input_bytes = 0;
+        policy.sizes.max_arg_bytes = 0;
+        policy.sizes.max_env_bytes = 0;
+        policy.sizes.max_files = 0;
+        policy.sizes.max_outputs = 0;
+        policy.sizes.max_args = 0;
+        policy.sizes.max_env = 0;
+        let engine = u64::try_from(MAX_ENGINE_ENV_BYTES * 6).unwrap();
+        assert!(
+            policy.max_request_json_bytes() >= engine + OUTCOME_ENVELOPE_BYTES,
+            "{}",
+            policy.max_request_json_bytes()
+        );
+    }
+
+    #[test]
+    fn the_request_bound_covers_escaped_input() {
+        let policy = SandboxPolicy::default();
+        assert!(policy.max_request_json_bytes() >= 6 * policy.sizes.max_input_bytes);
+    }
+
+    #[test]
+    fn limits_round_trip_through_json() {
+        let json = serde_json::to_value(DEFAULT_LIMITS).unwrap();
+        assert_eq!(json["wall_clock_ms"], 30_000);
+        let back: SandboxLimits = serde_json::from_value(json).unwrap();
+        assert_eq!(back, DEFAULT_LIMITS);
+        assert_eq!(DEFAULT_LIMITS.wall_clock(), Duration::from_secs(30));
+    }
+}

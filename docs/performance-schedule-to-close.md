@@ -23,6 +23,15 @@ the partial index's own page count on its own (see [Plan](#plan) and
 is reported as an absolute count instead of a floor-compared
 percentage). No fix is proposed or needed.
 
+> **Follow-up (issue #1971):** the claim plans and buffer deltas on this page
+> measure the full scan. The default claim now reads a bounded seek window
+> first, and runs the full scan only as a fallback. The window applies the
+> same `schedule_to_close_at` test to each row it reads. Migration
+> `20261003201739` (issue #1811) later set the table's fillfactor to 80.
+> That migration and later ones also changed the index set that
+> [Plan](#plan) lists. The captures on this page predate these changes. See
+> [the seek window](performance.md#the-seek-window-issue-1971).
+
 **A late-round methodology fix changed several of this page's headline
 numbers substantially, including the real-drain aggregate below.** The
 fix's own before/after artifacts are no longer committed (this repro
@@ -311,6 +320,22 @@ satisfies this predicate and is never a member of this index, before or
 after a claim. A `schedule-to-close` row satisfies it both before
 (`state = 'PENDING'`) and after (`state = 'RUNNING'`) the claim `UPDATE` --
 its logical index membership doesn't change.
+
+**Later schema changes.** The index inventory below describes the schema
+of the committed run, from 2026-09-06. Migration `20261003201739`
+(issue #1811) later replaced `idx_harvest_tq_running` with
+`idx_harvest_tq_running_started`. It also dropped
+`idx_harvest_task_queue_rate_limit_key` and
+`harvest_task_queue_session_id_pending`, and set fillfactor 80 on the
+table. Later migrations added more indexes, for example
+`idx_harvest_tq_claim_seek` (issue #1971) and
+`idx_harvest_tq_session_active` (issue #2069). No index that these
+migrations add or drop depends on `schedule_to_close_at`. `state` is still
+a key column of `idx_harvest_tq_poll`, so the claim `UPDATE` is still never
+HOT. The corroboration output in [Write-side cost](#write-side-cost) also
+comes from the 2026-09-06 run. [Reproduce](#reproduce) requires a re-run of
+both corroboration scripts after a change like these. Until that re-run,
+treat those page counts as stale.
 
 The claim `UPDATE` changes `state`, and `state` is a key column of
 `idx_harvest_tq_poll`, `idx_harvest_tq_running`, and
@@ -781,7 +806,7 @@ measured: within a single transaction (no commit boundaries in between),
 whether the 10,000 rows are touched by one bulk statement or by 10,000
 individual per-row statements changes neither the heap-page-growth, the
 index-page-growth, nor the total-footprint outcome. The heap figures are close to the `EXPLAIN` band
-above (2.6-7.5%) -- this is the row-width component, and it is unaffected by
+above (3.6-7.5%) -- this is the row-width component, and it is unaffected by
 whether the seeded deadline values are distinct or constant (heap-page
 count depends on total row *width*, not on how compressible the *index*
 built over one column happens to be). **The index figures are the cleanest

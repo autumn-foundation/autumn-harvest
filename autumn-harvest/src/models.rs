@@ -18,8 +18,8 @@ use crate::schema::{
     harvest_events, harvest_execution_summaries, harvest_external_tasks, harvest_mutex_locks,
     harvest_mutex_waiters, harvest_payload_refs, harvest_rate_limit_buckets,
     harvest_schedule_decisions, harvest_schedules, harvest_sessions, harvest_signals,
-    harvest_task_queue, harvest_timers, harvest_wasm_modules, harvest_workers,
-    harvest_workflow_executions, harvest_workflow_logs,
+    harvest_stream_chunks, harvest_task_queue, harvest_timers, harvest_wasm_modules,
+    harvest_workers, harvest_workflow_executions, harvest_workflow_logs,
 };
 use crate::shared_json::SharedJson;
 
@@ -267,6 +267,34 @@ pub struct WorkflowExecution {
     /// cross-database write and no retry race.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub staging_vacated_by: Option<Uuid>,
+    /// Verified tenant of the run (issue #1977). `None` means no tenant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+}
+
+impl WorkflowExecution {
+    /// Decode the codec columns in place: `input`, `output` and `memo`
+    /// (issue #1979).
+    ///
+    /// Call this before the engine reads a column's meaning. A value that is
+    /// not an envelope stays as it is.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::decode_column`](crate::payload_codec::PayloadCodecs::decode_column).
+    /// On error the row is left unchanged.
+    pub fn decode_columns(
+        &mut self,
+        codecs: &crate::payload_codec::PayloadCodecs,
+    ) -> crate::error::HarvestResult<()> {
+        let input = codecs.decode_column(&self.input)?;
+        let output = codecs.decode_column_opt(self.output.as_ref())?;
+        let memo = codecs.decode_column_opt(self.memo.as_ref())?;
+        self.input = input;
+        self.output = output;
+        self.memo = memo;
+        Ok(())
+    }
 }
 
 impl WorkflowExecution {
@@ -379,6 +407,10 @@ pub struct NewWorkflowExecution<'a> {
     /// required for the quota-usage aggregate queries in `quota.rs` to find
     /// this execution's active-executions/history-bytes contribution.
     pub quota_key: Option<&'a str>,
+    /// Verified tenant of the run (issue #1977). `None` means no tenant.
+    /// The start path sets it from [`crate::StartWorkflowParams::tenant`].
+    /// Every path that derives a run from another run copies it.
+    pub tenant: Option<&'a str>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────
@@ -598,6 +630,10 @@ pub struct TaskQueueItem {
     /// #1824). See [`crate::queue::CLAIM_ORDER_DUE_SQL`].
     #[serde(default)]
     pub new_start: bool,
+    /// The fairness key of the task (issue #1976). `None` is the default
+    /// key. See [`crate::queue_fairness::FairClock`].
+    #[serde(default)]
+    pub fairness_key: Option<String>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -642,6 +678,11 @@ pub struct NewTaskQueueItem<'a> {
     /// `true` on the first workflow task of a freshly admitted run (issue
     /// #1824).
     pub new_start: bool,
+    /// The fairness key of the task (issue #1976).
+    pub fairness_key: Option<&'a str>,
+    /// The decision partition of a workflow task (issue #2252). `None` for
+    /// an activity, or when the writer does not know the workflow id.
+    pub decision_partition: Option<i16>,
 }
 
 /// Database representation of a rate limit bucket.
@@ -1186,6 +1227,9 @@ pub struct ApiToken {
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
     pub created_by: String,
+    /// Tenant claim of the token (issue #1977). `None` means not
+    /// tenant-bound.
+    pub tenant: Option<String>,
 }
 
 /// Insert struct for minting a new API token (issue #942).
@@ -1200,6 +1244,9 @@ pub struct NewApiToken<'a> {
     pub scope: &'a str,
     pub expires_at: Option<DateTime<Utc>>,
     pub created_by: &'a str,
+    /// Tenant claim of the token (issue #1977). `None` means not
+    /// tenant-bound.
+    pub tenant: Option<&'a str>,
 }
 
 impl std::fmt::Debug for NewApiToken<'_> {
@@ -1210,6 +1257,7 @@ impl std::fmt::Debug for NewApiToken<'_> {
             .field("scope", &self.scope)
             .field("expires_at", &self.expires_at)
             .field("created_by", &self.created_by)
+            .field("tenant", &self.tenant)
             .finish()
     }
 }
@@ -1449,6 +1497,8 @@ pub struct CompletionTriggerOutboxDb {
     pub max_workflow_input_bytes: i64,
     pub created_at: DateTime<Utc>,
     pub next_attempt_at: Option<DateTime<Utc>>,
+    /// Tenant of the source run (issue #1977). The target run gets it.
+    pub tenant: Option<String>,
 }
 
 /// Insertable model for registering a deferred completion trigger outbox task.
@@ -1466,6 +1516,8 @@ pub struct NewCompletionTriggerOutboxDb {
     pub concurrency_limit: Option<i32>,
     pub priority: serde_json::Value,
     pub max_workflow_input_bytes: i64,
+    /// Tenant of the source run (issue #1977). The target run gets it.
+    pub tenant: Option<String>,
 }
 
 // ── Cross-shard child workflows (issue #956) ─────────────────────────────────
@@ -1492,6 +1544,8 @@ pub struct CrossShardChildRow {
     pub attempts: i32,
     pub last_error: Option<String>,
     pub last_attempt_at: Option<DateTime<Utc>>,
+    /// The reason that the parent gave its cancel. `None` = the generic text.
+    pub cancel_reason: Option<String>,
 }
 
 /// Insertable form of [`CrossShardChildRow`], written inside the parent's own
@@ -1570,7 +1624,8 @@ pub struct CompletionDelivery {
     pub target_url: String,
     pub event_filter: serde_json::Value,
     pub terminal_state: String,
-    /// Frozen `CompletionEnvelope` JSON, signed and `POSTed` verbatim on every
+    /// Frozen `CompletionEnvelope` JSON in the column form (issue #2043). The
+    /// scanner decodes it, then signs and `POST`s the plain body on every
     /// attempt, including redeliveries.
     pub payload: serde_json::Value,
     /// `PENDING` | `INFLIGHT` | `DELIVERED` | `FAILED`.
@@ -1897,6 +1952,29 @@ pub struct NewHarvestWorkflowLog {
     pub message: String,
 }
 
+/// One stored durable output-stream chunk (issue #1974).
+#[derive(Debug, Clone, Queryable, Selectable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_stream_chunks)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestStreamChunk {
+    pub id: i64,
+    pub workflow_exec_id: Uuid,
+    pub stream_offset: i64,
+    pub chunk: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insert struct for one durable output-stream chunk (issue #1974).
+///
+/// Postgres fills `id` and `created_at`.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_stream_chunks)]
+pub struct NewHarvestStreamChunk<'a> {
+    pub workflow_exec_id: Uuid,
+    pub stream_offset: i64,
+    pub chunk: &'a serde_json::Value,
+}
+
 #[cfg(test)]
 mod effective_terminal_state_tests {
     use super::WorkflowExecution;
@@ -1969,6 +2047,7 @@ mod effective_terminal_state_tests {
             migrated_run_terminal_state: None,
             staging_vacated_state: None,
             staging_vacated_by: None,
+            tenant: None,
         }
     }
 

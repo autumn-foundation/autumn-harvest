@@ -26,6 +26,24 @@ fn repo_root() -> PathBuf {
 
 /// Read a file with line endings normalised to `\n`, so a `\n`-anchored
 /// needle does not silently miss on a Windows checkout.
+/// The shipped-work entry for issue #953, collated from its changelog fragment.
+///
+/// An entry starts at a `- **` line that cites the issue. It ends at the next
+/// `- **` line in the first column.
+fn shipped_work_entry(text: &str, issue: &str) -> String {
+    let cite = format!("see issue {issue}");
+    let mut lines = text
+        .lines()
+        .skip_while(|l| !(l.starts_with("- **") && l.contains(&cite)));
+    let first = lines
+        .next()
+        .unwrap_or_else(|| panic!("docs/shipped-work.md has no entry for issue {issue}"));
+    std::iter::once(first)
+        .chain(lines.take_while(|l| !l.starts_with("- **")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn read_normalized(path: &Path) -> String {
     std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
@@ -136,8 +154,8 @@ fn published_doc_names_the_index_cost() {
 
 #[test]
 fn changelog_fragment_names_the_index_cost() {
-    let path = repo_root().join("docs/changelog.d/pr-953-audit-export.md");
-    let text = read_normalized(&path);
+    let path = repo_root().join("docs/shipped-work.md");
+    let text = shipped_work_entry(&read_normalized(&path), "#953");
     assert!(
         !contains_collapsed(&text, "Opt-in and zero-cost when unconfigured"),
         "{}: the opt-in bullet must not claim zero cost without a caveat",

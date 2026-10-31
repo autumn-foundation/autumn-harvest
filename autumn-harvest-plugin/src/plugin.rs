@@ -225,6 +225,10 @@ pub struct HarvestPlugin {
     mcp_tools_enabled: bool,
     /// Optional prefix override for the generated MCP tool routes.
     mcp_tools_prefix: Option<String>,
+    /// Serve the MCP Tasks route (issue #2005). Set via [`Self::mcp_tasks`].
+    mcp_tasks_enabled: bool,
+    /// Optional path override for the MCP Tasks route.
+    mcp_tasks_path: Option<String>,
     /// Deployment-level opt-in for operator read-path payload decoding
     /// (issue #608). Set via [`Self::decode_payloads_on_read`]; default off.
     decode_payloads_on_read: bool,
@@ -242,6 +246,13 @@ pub struct HarvestPlugin {
     /// The per-client API rate limiter (issue #1827). Set via
     /// [`Self::with_api_rate_limit`]. `None` installs no layer.
     api_rate_limit: Option<crate::api_rate_limit::ApiRateLimit>,
+    /// The custom roles (issue #1978). Set via [`Self::with_roles`] or
+    /// `api_with_oidc`. `None` installs no layer.
+    roles: Option<crate::roles::HarvestRoles>,
+    /// The OIDC login (issue #1978). Set via `api_with_oidc`. It declares the
+    /// auth boundary.
+    #[cfg(feature = "oidc")]
+    oidc: Option<crate::oidc::OidcLogin>,
     /// Opt-out that opens mutating routes with no auth (issue #1802). Set
     /// true by [`Self::allow_unauthenticated_mutations`]. Default off.
     allow_unauthenticated_mutations: bool,
@@ -273,6 +284,15 @@ pub struct HarvestPlugin {
     /// startup gate already refuses this case earlier. It only matters if
     /// ambient configuration changed in the narrow window since.
     require_embedded_harvest_mode: bool,
+    /// The cap on durable-route requests that wait at the same time. Set via
+    /// [`Self::durable_route_max_waiters`].
+    durable_route_max_waiters: usize,
+    /// The cap on the continue-as-new steps of one durable-route wait. Set
+    /// via [`Self::durable_route_max_chain_steps`].
+    durable_route_max_chain_steps: usize,
+    /// The cap on live durable streams. Set via
+    /// [`Self::durable_route_max_streams`].
+    durable_route_max_streams: usize,
 }
 
 /// One registered broker connector: a binding plus the source that feeds it.
@@ -340,11 +360,16 @@ impl HarvestPlugin {
             mcp_tool_middleware: None,
             mcp_tools_enabled: false,
             mcp_tools_prefix: None,
+            mcp_tasks_enabled: false,
+            mcp_tasks_path: None,
             decode_payloads_on_read: false,
             role_auth_enabled: false,
             api_tokens_enabled: false,
             authorizer: None,
             api_rate_limit: None,
+            roles: None,
+            #[cfg(feature = "oidc")]
+            oidc: None,
             allow_unauthenticated_mutations: false,
             status_thresholds: crate::status_summary::StatusThresholds::default(),
             canary_config: None,
@@ -355,6 +380,9 @@ impl HarvestPlugin {
             #[cfg(feature = "metrics")]
             metrics_scrape_enabled: false,
             require_embedded_harvest_mode: false,
+            durable_route_max_waiters: crate::durable_route::DEFAULT_MAX_WAITERS,
+            durable_route_max_chain_steps: crate::durable_route::DEFAULT_MAX_CHAIN_STEPS,
+            durable_route_max_streams: crate::durable_route::DEFAULT_MAX_STREAMS,
         }
     }
 
@@ -460,6 +488,54 @@ impl HarvestPlugin {
         self
     }
 
+    /// Cap the durable-route requests that wait for a result at the same time
+    /// in this process. The default is
+    /// [`DEFAULT_MAX_WAITERS`](crate::durable_route::DEFAULT_MAX_WAITERS).
+    ///
+    /// Each waiting request holds one Postgres `LISTEN` connection. A request
+    /// that finds the cap full answers pending at once. `0` means that no
+    /// request waits. A completed run needs no wait, so its retry still gets
+    /// the result.
+    #[must_use]
+    pub const fn durable_route_max_waiters(mut self, max_waiters: usize) -> Self {
+        self.durable_route_max_waiters = max_waiters;
+        self
+    }
+
+    /// Cap the continue-as-new steps that one durable-route request follows.
+    /// The default is
+    /// [`DEFAULT_MAX_CHAIN_STEPS`](crate::durable_route::DEFAULT_MAX_CHAIN_STEPS).
+    ///
+    /// Each step is one successor lookup. A step follows a chain to its newest
+    /// run of the same type, or across one change of workflow type or one
+    /// workflow-level retry. A chain needs at most one step more than its
+    /// changes of type and its retries. Past the cap, a walk that met a live
+    /// run answers pending. A walk that read only ended runs answers `500`
+    /// `result-unavailable`, because every retry repeats it. A value below 1
+    /// counts as 1, so a finished chain of one type resolves.
+    ///
+    /// A durable stream counts one step for each run of the lineage, a
+    /// same-type successor too. Past the cap, the stream ends with
+    /// `result-unavailable`.
+    #[must_use]
+    pub const fn durable_route_max_chain_steps(mut self, steps: usize) -> Self {
+        self.durable_route_max_chain_steps = if steps == 0 { 1 } else { steps };
+        self
+    }
+
+    /// Cap the durable streams in this process. The default is
+    /// [`DEFAULT_MAX_STREAMS`](crate::durable_route::DEFAULT_MAX_STREAMS).
+    ///
+    /// Each stream takes a slot, and a stream of a live run also holds one
+    /// Postgres `LISTEN` connection. A stream request that finds the cap
+    /// full answers `202` pending with `Retry-After: 1`. `0` turns streams
+    /// off. The cap is for each process, not for each principal.
+    #[must_use]
+    pub const fn durable_route_max_streams(mut self, max_streams: usize) -> Self {
+        self.durable_route_max_streams = max_streams;
+        self
+    }
+
     /// Enable the **opt-in durable per-execution workflow log sink** (issue
     /// #790).
     ///
@@ -530,6 +606,12 @@ impl HarvestPlugin {
             Send + 'static,
     {
         self.api_path = Some(path.into());
+        // Issue #1978: host auth and OIDC login are alternatives. The last
+        // call wins.
+        #[cfg(feature = "oidc")]
+        {
+            self.oidc = None;
+        }
         let mcp_middleware = middleware.clone();
         self.mcp_tool_middleware = Some(std::sync::Arc::new(move |method_router| {
             method_router.layer(mcp_middleware.clone())
@@ -629,6 +711,46 @@ impl HarvestPlugin {
         self
     }
 
+    /// Install custom roles on the management API and Vantage (issue #1978).
+    ///
+    /// Each request needs a role that allows its route. Host middleware gives
+    /// the roles, through a [`crate::roles::RoleGrant`] extension or the
+    /// session key [`crate::roles::SESSION_ROLES_KEY`]. A verified token skips
+    /// the check. See [`crate::roles`].
+    ///
+    /// Default off: with no roles the router is byte-for-byte unchanged.
+    #[must_use]
+    pub fn with_roles(mut self, roles: crate::roles::HarvestRoles) -> Self {
+        self.roles = Some(roles);
+        self
+    }
+
+    /// Mount the management API under `path`, with OIDC login for Vantage and
+    /// the API (issue #1978).
+    ///
+    /// It adds the login routes under `path`, a session boundary, and the
+    /// role layer with the roles of `login`. Those roles replace any set by
+    /// [`Self::with_roles`]. It declares the auth boundary.
+    /// The generated MCP tool routes get the same session check: a `GET`
+    /// tool needs a `read` role, any other tool a `mutate` role.
+    ///
+    /// It replaces an earlier [`Self::api_with_auth`] or
+    /// [`Self::api_with_role_auth`], read-only layer included. A later
+    /// [`Self::api_with_auth`] replaces it. See [`crate::oidc`].
+    #[cfg(feature = "oidc")]
+    #[must_use]
+    pub fn api_with_oidc(mut self, path: impl Into<String>, login: crate::oidc::OidcLogin) -> Self {
+        self.api_path = Some(path.into());
+        self.api_middleware = None;
+        // The read-only role of `api_with_role_auth` reads host session keys.
+        // The login replaces that host auth, so the custom roles decide alone.
+        self.role_auth_enabled = false;
+        // `build` installs the OIDC tool gate. It needs the API state.
+        self.mcp_tool_middleware = None;
+        self.oidc = Some(login);
+        self
+    }
+
     /// Rate-limit each client of the management API (issue #1827).
     ///
     /// Each verified API token, or each client IP without one, gets one
@@ -703,6 +825,28 @@ impl HarvestPlugin {
     pub fn mcp_tools_at(mut self, prefix: impl Into<String>) -> Self {
         self.mcp_tools_enabled = true;
         self.mcp_tools_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Serve each `#[workflow(mcp)]` workflow as an MCP Task (issue #2005).
+    ///
+    /// The route speaks JSON-RPC at `{tools prefix}/tasks`, default
+    /// `/api/harvest/mcp/tasks`. Point an MCP client with the
+    /// `io.modelcontextprotocol/tasks` extension at it. See
+    /// `docs/mcp-tools.md`.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub const fn mcp_tasks(mut self) -> Self {
+        self.mcp_tasks_enabled = true;
+        self
+    }
+
+    /// Like [`Self::mcp_tasks`], with the route at `path`.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mcp_tasks_at(mut self, path: impl Into<String>) -> Self {
+        self.mcp_tasks_enabled = true;
+        self.mcp_tasks_path = Some(path.into());
         self
     }
 
@@ -1167,7 +1311,7 @@ const fn mcp_tools_unprotected(mcp_tools_enabled: bool, has_tool_middleware: boo
 ///
 /// It must equal the `autumn-web` requirement in this crate's `Cargo.toml`.
 /// A unit test enforces that, so a dependency bump cannot leave it stale.
-pub const AUTUMN_WEB_REQUIREMENT: &str = "0.8";
+pub const AUTUMN_WEB_REQUIREMENT: &str = "0.9";
 
 /// The compatibility contract that [`HarvestPlugin`] declares to Autumn.
 ///
@@ -1198,11 +1342,16 @@ impl Plugin for HarvestPlugin {
             mcp_tool_middleware,
             mcp_tools_enabled,
             mcp_tools_prefix,
+            mcp_tasks_enabled,
+            mcp_tasks_path,
             decode_payloads_on_read,
             role_auth_enabled,
             api_tokens_enabled,
             authorizer,
             api_rate_limit,
+            roles,
+            #[cfg(feature = "oidc")]
+            oidc,
             allow_unauthenticated_mutations,
             status_thresholds,
             canary_config,
@@ -1213,9 +1362,26 @@ impl Plugin for HarvestPlugin {
             #[cfg(feature = "metrics")]
             metrics_scrape_enabled,
             require_embedded_harvest_mode,
+            durable_route_max_waiters,
+            durable_route_max_chain_steps,
+            durable_route_max_streams,
         } = self;
         #[cfg(not(feature = "mcp"))]
-        let _ = (mcp_tool_middleware, mcp_tools_enabled, mcp_tools_prefix);
+        let _ = (
+            mcp_tool_middleware,
+            mcp_tools_enabled,
+            mcp_tools_prefix,
+            mcp_tasks_enabled,
+            mcp_tasks_path,
+        );
+        // Issue #1978: an OIDC login brings its own role set. A later
+        // `api_with_auth` clears the login, and with it these roles.
+        #[cfg(feature = "oidc")]
+        let roles = oidc.as_ref().map(|login| login.roles().clone()).or(roles);
+
+        // The `prod` profile of autumn-web 0.9 refuses an undeclared top-level
+        // table. Declaring `[harvest]` keeps the strict check on every other key.
+        let app = app.config_section(crate::config::HARVEST_CONFIG_ROOT);
 
         // Autumn owns migrations for every set that lives in the application
         // database (since autumn-web 0.7). See `register_plugin_migrations`.
@@ -1465,7 +1631,7 @@ impl Plugin for HarvestPlugin {
         // `mount_mcp` can project them into the tool catalog; handlers fail
         // closed until `on_startup` installs the runtime.
         #[cfg(feature = "mcp")]
-        let mcp_routes = if mcp_tools_enabled {
+        let mcp_routes = if mcp_tools_enabled || mcp_tasks_enabled {
             // Codex review (PR #908, P1): `HarvestPlugin` cannot detect or
             // intercept `AppBuilder::secure_mcp(...)` -- that's configured on
             // the outer app builder, after this `Plugin::build` call returns
@@ -1474,6 +1640,17 @@ impl Plugin for HarvestPlugin {
             // envelope, not a generated tool route's own direct HTTP path
             // (these are registered via `AppBuilder::routes`, not `nest`).
             // Surface the gap loudly at startup instead of leaving it silent.
+            // Issue #1978: custom roles also gate the tool routes. The role
+            // gate sits inside the host auth layer, which sets the roles. An
+            // OIDC mount has its own tool gate, which checks the session too.
+            #[cfg(feature = "oidc")]
+            let mcp_tool_middleware = oidc.as_ref().map_or_else(
+                || with_mcp_tool_roles(mcp_tool_middleware, roles.clone(), &api_state),
+                |login| Some(oidc_mcp_tool_gate(api_state.clone(), login.clone())),
+            );
+            #[cfg(not(feature = "oidc"))]
+            let mcp_tool_middleware =
+                with_mcp_tool_roles(mcp_tool_middleware, roles.clone(), &api_state);
             if mcp_tools_unprotected(mcp_tools_enabled, mcp_tool_middleware.is_some()) {
                 tracing::warn!(
                     "HarvestPlugin::mcp_tools() is enabled with no HarvestPlugin::api_with_auth(..) \
@@ -1483,6 +1660,14 @@ impl Plugin for HarvestPlugin {
                      with no admin session (issue #1802). In the dev profile, or with \
                      allow_unauthenticated_mutations(), they are reachable UNAUTHENTICATED. \
                      Configure HarvestPlugin::api_with_auth(path, mw) to protect them."
+                );
+            }
+            // Issue #2005: `secure_mcp` never covers the task route either.
+            if mcp_tools_unprotected(mcp_tasks_enabled, mcp_tool_middleware.is_some()) {
+                tracing::warn!(
+                    "HarvestPlugin::mcp_tasks() is enabled with no HarvestPlugin::api_with_auth(..) \
+                     configured. Outside the dev profile the task route answers 401 to a caller \
+                     with no admin session. Configure api_with_auth(path, mw) to protect it."
                 );
             }
             let prefix =
@@ -1498,18 +1683,40 @@ impl Plugin for HarvestPlugin {
                 builder.update_handlers(),
                 builder.dag_infos(),
             );
-            crate::mcp_tools::record_schemas(&descriptors);
-            Some(crate::mcp_tools::build_mcp_tool_routes(
-                &prefix,
-                &descriptors,
-                &api_state,
-                mcp_tool_middleware.as_ref(),
-                // Issue #776 (F1): gate mutating MCP tools for read-only
-                // principals. These routes are app-level (outside the
-                // `enforce_read_only_class` layer on the nested management
-                // router), so the read-only class boundary is applied here too.
-                role_auth_enabled,
-            ))
+            let mut routes = if mcp_tools_enabled {
+                crate::mcp_tools::record_schemas(&descriptors);
+                crate::mcp_tools::build_mcp_tool_routes(
+                    &prefix,
+                    &descriptors,
+                    &api_state,
+                    mcp_tool_middleware.as_ref(),
+                    // Issue #776 (F1): gate mutating MCP tools for read-only
+                    // principals. These routes are app-level (outside the
+                    // `enforce_read_only_class` layer on the nested management
+                    // router), so the read-only class boundary is applied here too.
+                    role_auth_enabled,
+                )
+            } else {
+                Vec::new()
+            };
+            if mcp_tasks_enabled {
+                let path = mcp_tasks_path.unwrap_or_else(|| crate::mcp_tasks::tasks_path(&prefix));
+                // The task route exposes only `start_{wf}`, so a collision
+                // among the other `/mcp` tool names must not drop a workflow.
+                let task_descriptors = crate::mcp_tools::collect_task_descriptors(
+                    builder.workflow_infos(),
+                    builder.update_handlers(),
+                    builder.dag_infos(),
+                );
+                routes.push(crate::mcp_tasks::build_mcp_task_route(
+                    &path,
+                    &task_descriptors,
+                    &api_state,
+                    mcp_tool_middleware.as_ref(),
+                    role_auth_enabled,
+                ));
+            }
+            Some(routes)
         } else {
             None
         };
@@ -1541,22 +1748,50 @@ impl Plugin for HarvestPlugin {
         // issue #377: arm fail-closed so any request in the window between
         // HTTP server bind and the boot-time gate load is safely rejected.
         api_state.arm_gate_cache_fail_closed();
-        api_state.set_admin_auth_boundary(api_middleware.is_some());
+        #[cfg(feature = "oidc")]
+        let auth_boundary = api_middleware.is_some() || oidc.is_some();
+        #[cfg(not(feature = "oidc"))]
+        let auth_boundary = api_middleware.is_some();
+        api_state.set_admin_auth_boundary(auth_boundary);
 
         let startup_slot = Arc::clone(&slot);
         let shutdown_slot = Arc::clone(&slot);
         let startup_api_state = api_state.clone();
         let shutdown_api_state = api_state.clone();
+        // One waiter cap and one stream cap for the process. They outlive a
+        // runtime restart.
+        let durable_waiters = Arc::new(tokio::sync::Semaphore::new(
+            durable_route_max_waiters.min(tokio::sync::Semaphore::MAX_PERMITS),
+        ));
+        let durable_streams = Arc::new(tokio::sync::Semaphore::new(
+            durable_route_max_streams.min(tokio::sync::Semaphore::MAX_PERMITS),
+        ));
 
         let app = app
             .on_startup(move |state| {
                 let slot = Arc::clone(&startup_slot);
                 let api_state = startup_api_state.clone();
+                let durable_waiters = Arc::clone(&durable_waiters);
+                let durable_streams = Arc::clone(&durable_streams);
                 async move {
                     tracing::info!("on_startup hook: executing start_harvest_runtime");
                     // `start_harvest_runtime` returns a large future (clippy::large_futures under
                     // the workspace pedantic lints); box it to keep this closure's future small.
                     let res = Box::pin(start_harvest_runtime(&state, &slot, &api_state)).await;
+                    // Durable routes answer 503 until the runtime is ready.
+                    let limits = crate::durable_route::DurableRouteLimits {
+                        waiters: durable_waiters,
+                        streams: durable_streams,
+                        max_chain_steps: durable_route_max_chain_steps,
+                    };
+                    // A stream without this URL polls the table.
+                    let notify_url = |shard| api_state.sse_notification_url(shard).ok();
+                    if res.is_ok() && !crate::durable_route::install(&state, limits, notify_url) {
+                        tracing::warn!(
+                            "on_startup hook: durable routes are off; the Harvest client or pool \
+                             is missing"
+                        );
+                    }
                     match &res {
                         Ok(()) => tracing::info!(
                             "on_startup hook: start_harvest_runtime completed successfully"
@@ -1595,9 +1830,9 @@ impl Plugin for HarvestPlugin {
             let router = harvest_api_router(api_state.clone()).nest("/ui", ui_router);
             // The layer stack and its load-bearing ordering live in
             // `apply_admin_auth_layers`, which the standalone mount path also
-            // calls (issue #1608), so the two cannot drift. Neither layer is
-            // installed unless its opt-in is set, so the default and
-            // api_with_auth paths are byte-for-byte unchanged (AC6, AC7).
+            // calls (issue #1608), so the two cannot drift. Only the tenant
+            // binding layer (issue #1977) is always installed. It passes a
+            // request with no verified tenant unchanged.
             let mut router = crate::api::apply_admin_auth_layers(
                 router,
                 &api_state,
@@ -1606,10 +1841,15 @@ impl Plugin for HarvestPlugin {
                     read_only_role: role_auth_enabled,
                     authorizer,
                     rate_limit: api_rate_limit,
+                    roles,
                 },
             );
             if let Some(mw) = api_middleware {
                 router = mw(router);
+            }
+            #[cfg(feature = "oidc")]
+            if let Some(login) = &oidc {
+                router = crate::oidc::apply_oidc(router, login, api_tokens_enabled);
             }
             // `AppBuilder::nest` takes a `Router<AppState>`. The router is
             // `Router<()>`, so it declares the state type it never reads
@@ -1617,10 +1857,52 @@ impl Plugin for HarvestPlugin {
             // extractor for it.
             app.nest(&path, router.with_state(()))
         } else {
-            let _ = (api_tokens_enabled, authorizer, api_rate_limit);
+            let _ = (api_tokens_enabled, authorizer, api_rate_limit, roles);
             app
         }
     }
+}
+
+/// Put the custom-role gate inside the tool-route auth layer (issue #1978).
+///
+/// `outer` is the host auth layer, if any. It runs first and sets the roles.
+/// With no roles, `outer` is returned unchanged.
+#[cfg(feature = "mcp")]
+fn with_mcp_tool_roles(
+    outer: Option<McpToolMiddlewareFn>,
+    roles: Option<crate::roles::HarvestRoles>,
+    api_state: &HarvestApiState,
+) -> Option<McpToolMiddlewareFn> {
+    let Some(roles) = roles else {
+        return outer;
+    };
+    let api_state = api_state.clone();
+    let composed: McpToolMiddlewareFn = Arc::new(move |method_router| {
+        let gated =
+            method_router.layer(autumn_web::reexports::axum::middleware::from_fn_with_state(
+                (api_state.clone(), roles.clone()),
+                crate::roles::enforce_mcp_tool_roles,
+            ));
+        let Some(outer) = &outer else {
+            return gated;
+        };
+        outer(gated)
+    });
+    Some(composed)
+}
+
+/// The OIDC session and role gate on each tool route (issue #1978).
+#[cfg(all(feature = "mcp", feature = "oidc"))]
+fn oidc_mcp_tool_gate(
+    api_state: HarvestApiState,
+    login: crate::oidc::OidcLogin,
+) -> McpToolMiddlewareFn {
+    Arc::new(move |method_router| {
+        method_router.layer(autumn_web::reexports::axum::middleware::from_fn_with_state(
+            (api_state.clone(), login.clone()),
+            crate::oidc::gate_mcp_tool,
+        ))
+    })
 }
 
 /// The application configuration this startup hook should read.
@@ -2004,6 +2286,8 @@ async fn start_harvest_runtime(
     // workers actually poll instead of the (possibly unset or stale)
     // process-global default.
     .with_queues(runner.api_runtime().queues().iter().map(String::as_str))
+    // Issue #2387: the registry's run-default overrides apply here too.
+    .with_run_defaults(Arc::clone(runner.api_runtime().registry().run_defaults()))
     .with_max_workflow_input_bytes(max_workflow_input_bytes)
     .with_max_workflow_execution_timeout(max_workflow_execution_timeout)
     .with_max_workflow_chain_timeout(max_workflow_chain_timeout)
@@ -2058,7 +2342,8 @@ async fn start_harvest_runtime(
                                 wf.owner,
                                 wf.runbook_url,
                                 wf.severity,
-                                wf.sla,
+                                // Issue #2387: an operator SLA override wins.
+                                registry.apply_run_defaults(wf.name, None, wf.sla).1,
                                 wf.retry_policy.clone(),
                             )
                         })
@@ -2725,7 +3010,7 @@ mod tests {
         use autumn_web::plugin_contract::{ContractVerdict, evaluate};
 
         let contract = harvest_plugin_contract();
-        for other in ["0.7.0", "0.9.0"] {
+        for other in ["0.8.0", "0.10.0"] {
             assert!(
                 matches!(evaluate(&contract, other), ContractVerdict::Incompatible(_)),
                 "autumn-web {other} must be outside the declared range"
@@ -3005,6 +3290,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -3218,6 +3505,158 @@ mod tests {
         );
     }
 
+    #[test]
+    fn with_roles_sets_the_role_set() {
+        let plugin = HarvestPlugin::new();
+        assert!(plugin.roles.is_none());
+        let plugin = plugin.with_roles(crate::roles::HarvestRoles::builtin());
+        assert!(plugin.roles.is_some());
+    }
+
+    /// Issue #1978: with custom roles, a tool route needs a role whose scope
+    /// fits the method.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn mcp_tool_routes_get_the_role_gate() {
+        use autumn_web::reexports::axum;
+        use tower::ServiceExt;
+
+        let state = HarvestApiState::new();
+        assert!(with_mcp_tool_roles(None, None, &state).is_none());
+        let gate = with_mcp_tool_roles(None, Some(crate::roles::HarvestRoles::builtin()), &state)
+            .expect("roles add a gate");
+        let tool: axum::routing::MethodRouter<AppState> =
+            axum::routing::get(|| async { "status" }).post(|| async { "start" });
+        let app = axum::Router::new()
+            .route("/tool", gate(tool))
+            .with_state(AppState::for_test());
+        let call = |method: axum::http::Method, role: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let mut request = axum::http::Request::builder()
+                    .method(method)
+                    .uri("/tool")
+                    .body(axum::body::Body::empty())
+                    .expect("request");
+                if let Some(role) = role {
+                    request
+                        .extensions_mut()
+                        .insert(crate::roles::RoleGrant::new([role]));
+                }
+                app.oneshot(request).await.expect("served").status()
+            }
+        };
+        let ok = axum::http::StatusCode::OK;
+        let forbidden = axum::http::StatusCode::FORBIDDEN;
+        let viewer = Some(crate::roles::ROLE_VIEWER);
+        let operator = Some(crate::roles::ROLE_OPERATOR);
+        assert_eq!(call(axum::http::Method::GET, viewer).await, ok);
+        assert_eq!(call(axum::http::Method::POST, viewer).await, forbidden);
+        assert_eq!(call(axum::http::Method::POST, operator).await, ok);
+        assert_eq!(call(axum::http::Method::GET, None).await, forbidden);
+    }
+
+    #[cfg(feature = "oidc")]
+    fn oidc_login() -> crate::oidc::OidcLogin {
+        let provider = crate::oidc::OAuth2ProviderConfig {
+            client_id: "c".to_string(),
+            client_secret: "s".to_string(),
+            authorize_url: "https://idp.example.com/authorize".to_string(),
+            token_url: "https://idp.example.com/token".to_string(),
+            userinfo_url: None,
+            redirect_uri: "https://h.example.com/api/auth/oidc/callback".to_string(),
+            scope: "openid".to_string(),
+            issuer: Some("https://idp.example.com".to_string()),
+            jwks_url: Some("https://idp.example.com/jwks".to_string()),
+            discovery_url: None,
+        };
+        crate::oidc::OidcLogin::new(
+            provider,
+            crate::roles::HarvestRoles::builtin(),
+            crate::roles::ClaimRoleMap::new(),
+        )
+        .expect("valid login")
+    }
+
+    /// Issue #1978: under OIDC, each tool route needs a live principal and a
+    /// role whose scope fits the method.
+    #[cfg(all(feature = "mcp", feature = "oidc"))]
+    #[tokio::test]
+    async fn api_with_oidc_gates_generated_tool_routes() {
+        use autumn_web::reexports::axum;
+        use tower::ServiceExt;
+
+        let gate = oidc_mcp_tool_gate(HarvestApiState::new(), oidc_login());
+        let tool: axum::routing::MethodRouter<AppState> =
+            axum::routing::get(|| async { "status" }).post(|| async { "start" });
+        let app = axum::Router::new()
+            .route("/tool", gate(tool))
+            .with_state(AppState::for_test());
+        let call = |method: axum::http::Method, role: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let mut request = axum::http::Request::builder()
+                    .method(method)
+                    .uri("/tool")
+                    .body(axum::body::Body::empty())
+                    .expect("request");
+                if let Some(role) = role {
+                    request
+                        .extensions_mut()
+                        .insert(crate::roles::RoleGrant::new([role]));
+                }
+                app.oneshot(request).await.expect("served").status()
+            }
+        };
+        let viewer = Some(crate::roles::ROLE_VIEWER);
+        let operator = Some(crate::roles::ROLE_OPERATOR);
+        assert_eq!(
+            call(axum::http::Method::POST, None).await,
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(axum::http::Method::GET, viewer).await,
+            axum::http::StatusCode::OK
+        );
+        assert_eq!(
+            call(axum::http::Method::POST, viewer).await,
+            axum::http::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(axum::http::Method::POST, operator).await,
+            axum::http::StatusCode::OK
+        );
+    }
+
+    #[cfg(feature = "oidc")]
+    #[test]
+    fn api_with_oidc_replaces_the_legacy_read_only_role() {
+        let plugin = HarvestPlugin::new()
+            .api_with_role_auth("/api", autumn_web::auth::RequireAuth::new("test"));
+        assert!(plugin.role_auth_enabled);
+        let plugin = plugin.api_with_oidc("/api", oidc_login());
+        assert!(!plugin.role_auth_enabled);
+    }
+
+    #[cfg(feature = "oidc")]
+    #[test]
+    fn api_with_oidc_takes_its_roles_and_yields_to_host_auth() {
+        let plugin = HarvestPlugin::new()
+            .api_with_auth("/old", autumn_web::auth::RequireAuth::new("test"))
+            .api_with_oidc("/api", oidc_login());
+        assert_eq!(plugin.api_path.as_deref(), Some("/api"));
+        assert!(plugin.api_middleware.is_none());
+        assert!(plugin.oidc.is_some());
+        // `build` takes the roles from the login. `with_roles` stays unset.
+        assert!(plugin.roles.is_none());
+
+        // Host auth replaces the login, and with it the login's roles.
+        let plugin = plugin.api_with_auth("/api", autumn_web::auth::RequireAuth::new("test"));
+        assert!(plugin.oidc.is_none());
+        assert!(plugin.roles.is_none());
+        assert!(plugin.api_middleware.is_some());
+    }
+
     /// Regression test (issue #597, PR #908 review): `mcp_tools()` combined
     /// with no `api_with_auth(..)` must be flagged so the generated tool
     /// routes' unauthenticated-at-their-own-path gap is never silent.
@@ -3298,6 +3737,16 @@ mod tests {
         );
 
         assert!(app.has_plugin(std::any::type_name::<HarvestPlugin>()));
+    }
+
+    /// Under `strict_config`, an undeclared `[harvest]` table stops the boot.
+    /// The `prod` profile turns that check on since autumn-web 0.9.
+    #[test]
+    fn harvest_plugin_build_declares_the_harvest_config_section() {
+        let app =
+            autumn_web::app().plugin(HarvestPlugin::new().workflows(vec![fake_workflow_info()]));
+
+        assert!(app.has_config_section(crate::config::HARVEST_CONFIG_ROOT));
     }
 
     #[tokio::test]
@@ -4089,5 +4538,37 @@ mod tests {
             "the FIRST registration would have resolved differently -- which is \
              exactly the silent bug last-wins resolution prevents",
         );
+    }
+
+    // AC-78
+    #[test]
+    fn durable_route_limits_have_defaults_and_a_floor() {
+        let plugin = HarvestPlugin::new();
+        assert_eq!(crate::durable_route::DEFAULT_MAX_WAITERS, 32);
+        assert_eq!(crate::durable_route::DEFAULT_MAX_CHAIN_STEPS, 1024);
+        assert_eq!(
+            plugin.durable_route_max_waiters,
+            crate::durable_route::DEFAULT_MAX_WAITERS
+        );
+        assert_eq!(
+            plugin.durable_route_max_chain_steps,
+            crate::durable_route::DEFAULT_MAX_CHAIN_STEPS
+        );
+        let set = HarvestPlugin::new()
+            .durable_route_max_waiters(0)
+            .durable_route_max_chain_steps(7);
+        assert_eq!(set.durable_route_max_waiters, 0);
+        assert_eq!(set.durable_route_max_chain_steps, 7);
+        // Zero steps would answer pending for every run, so it counts as one.
+        let floor = HarvestPlugin::new().durable_route_max_chain_steps(0);
+        assert_eq!(floor.durable_route_max_chain_steps, 1);
+        // SAC-20: the stream cap.
+        assert_eq!(crate::durable_route::DEFAULT_MAX_STREAMS, 32);
+        assert_eq!(
+            plugin.durable_route_max_streams,
+            crate::durable_route::DEFAULT_MAX_STREAMS
+        );
+        let none = HarvestPlugin::new().durable_route_max_streams(0);
+        assert_eq!(none.durable_route_max_streams, 0);
     }
 }

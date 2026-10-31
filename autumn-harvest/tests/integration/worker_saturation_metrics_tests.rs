@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
-use autumn_harvest::telemetry::{DbOp, MetricsRecorder, NoOpPropagator, TelemetryConfig};
+use autumn_harvest::telemetry::{
+    ClaimKind, DbOp, MetricsRecorder, NoOpPropagator, PersistPhase, TelemetryConfig,
+};
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::worker_outlier::{
@@ -174,6 +176,7 @@ fn cohort_with_freshness(queue: &str, peer_stale_secs: i64) -> String {
         slots: workers::SlotPolicy::of(1, 1, None),
         session_slots: 0,
         priority_aging_secs: None,
+        fairness_keys: false,
         ineligible_activities: &[],
         shard_assignments: &[],
         registered_workflows: &[],
@@ -643,6 +646,7 @@ async fn a_long_cohort_key_still_stores() {
         slots: workers::SlotPolicy::of(1, 1, None),
         session_slots: 0,
         priority_aging_secs: None,
+        fairness_keys: false,
         ineligible_activities: &[],
         shard_assignments: &[],
         registered_workflows: &[],
@@ -938,6 +942,8 @@ fn activity_info() -> ActivityInfo {
         max_result_bytes: None,
         requires: None,
         handler: failing_activity,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -1022,6 +1028,8 @@ fn start_params<'a>(
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
+        tenant: None,
     }
 }
 
@@ -1162,6 +1170,23 @@ async fn a_direct_scanner_pass_labels_its_assigned_shards() {
     );
 }
 
+/// Each claim loop counts once, so the steady pollers count is the claim cap.
+fn assert_every_claim_loop_polls(metrics: &Recording, queue: &str) {
+    let most_pollers = metrics
+        .samples()
+        .into_iter()
+        .filter_map(|s| match s {
+            Sample::Pollers { queue: q, pollers } if q == queue => Some(pollers),
+            _ => None,
+        })
+        .max();
+    assert_eq!(
+        most_pollers,
+        u64::try_from(autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS).ok(),
+        "every claim loop counts as a poller"
+    );
+}
+
 /// A running worker emits the pool, wait, query, poller and outlier metrics,
 /// and its heartbeat publishes a task-stats row that counts the failed
 /// activity attempts.
@@ -1240,10 +1265,6 @@ async fn running_worker_emits_saturation_metrics_and_publishes_task_stats() {
         Sample::Query(DbOp::Claim.as_str()),
         Sample::Query(DbOp::Persist.as_str()),
         Sample::Query(DbOp::Heartbeat.as_str()),
-        Sample::Pollers {
-            queue: queue.clone(),
-            pollers: 1,
-        },
         Sample::Outlier {
             dimension: OutlierDimension::FailureRatio,
             flagged: false,
@@ -1255,6 +1276,7 @@ async fn running_worker_emits_saturation_metrics_and_publishes_task_stats() {
     ] {
         assert!(metrics.has(&wanted), "missing {wanted:?}");
     }
+    assert_every_claim_loop_polls(&metrics, &queue);
     // A single-pool worker tags every wait with its own pool. The
     // process-global sharded pool does not change the label.
     assert!(
@@ -1538,12 +1560,18 @@ async fn a_terminal_failure_write_records_a_persist_sample() {
 const HANGING_WORKFLOW: &str = "saturation_hanging_wf";
 const HANGING_ACTIVITY: &str = "saturation_hanging_activity";
 
+/// Hang until the worker cancels the attempt. A fixed sleep races the
+/// timeout scanner. If the sleep ends first, the attempt succeeds. The bound
+/// only stops a broken scanner from hanging the test.
 fn hangs<'a>(
-    _ctx: &'a ActivityContext,
+    ctx: &'a ActivityContext,
     _input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !ctx.is_cancelled() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         Ok(serde_json::json!({}))
     })
 }
@@ -1583,7 +1611,11 @@ async fn a_scanner_enforced_activity_timeout_counts_as_a_failure() {
             name: HANGING_ACTIVITY,
             handler: hangs,
             default_retry_policy: Some(RetryPolicy::fixed(1, Duration::from_millis(10))),
-            default_start_to_close: Some(Duration::from_millis(300)),
+            // The deadline counts from the claim, not from the handler start.
+            // A timeout before the handler starts is not a failure, by design
+            // (issue #1785). The lag from claim to handler start can pass
+            // 500ms on a loaded runner, so the deadline leaves a wide margin.
+            default_start_to_close: Some(Duration::from_secs(3)),
             ..activity_info()
         }])
         .worker(WorkerConfig::default().with_queues([queue.as_str()]))
@@ -1785,5 +1817,103 @@ async fn status_keeps_each_cohort_for_its_own_freshness_window() {
         find(&per_cohort, &id),
         Some(stats),
         "the cohort's own 120 second limit keeps the row"
+    );
+}
+
+/// The claim kinds and persist phases that one worker records (issue #2248).
+#[derive(Default)]
+struct ClaimSplit {
+    claims: Mutex<Vec<ClaimKind>>,
+    persists: Mutex<Vec<f64>>,
+    phases: Mutex<Vec<(PersistPhase, f64)>>,
+}
+
+impl MetricsRecorder for ClaimSplit {
+    fn record_db_query_duration(&self, op: DbOp, _shard: u16, seconds: f64) {
+        if op == DbOp::Persist {
+            self.persists.lock().unwrap().push(seconds);
+        }
+    }
+
+    fn record_claim_duration(&self, kind: ClaimKind, _shard: u16, _seconds: f64) {
+        self.claims.lock().unwrap().push(kind);
+    }
+
+    fn record_persist_phase(&self, phase: PersistPhase, _shard: u16, seconds: f64) {
+        self.phases.lock().unwrap().push((phase, seconds));
+    }
+}
+
+/// Issue #2248: each claim sample names the kind of task that it claimed,
+/// and each decision persist records every phase once. The phases of all
+/// persists add up to no more than the persist totals.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_splits_claims_by_kind_and_persists_by_phase() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool: DbPool = build_test_pool(&url);
+    let mut conn = connect(&url).await;
+    let queue = unique_id("split-q");
+    let worker_id = unique_id("split-w");
+    let recorder = Arc::new(ClaimSplit::default());
+    let worker = build_worker_on(
+        &queue,
+        &worker_id,
+        Arc::clone(&recorder) as Arc<dyn MetricsRecorder>,
+        ActivityInfo {
+            handler: uncounted_failing_activity,
+            ..activity_info()
+        },
+        None,
+    );
+
+    let exec_id = ExecutionId::new();
+    let workflow_id = unique_id("split-wf");
+    start_or_load_workflow_execution(&mut conn, start_params(exec_id, &workflow_id, &queue), None)
+        .await
+        .expect("start workflow");
+    let runner = Arc::clone(&worker);
+    let run_pool = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&run_pool).await });
+    wait_for_execution_state_with_timeout(&url, exec_id, "FAILED", Duration::from_secs(30)).await;
+    worker.shutdown();
+    handle.await.expect("worker joins");
+
+    let claims = recorder.claims.lock().unwrap().clone();
+    let count = |kind: ClaimKind| claims.iter().filter(|k| **k == kind).count();
+    assert!(count(ClaimKind::Workflow) >= 2, "{claims:?}");
+    assert_eq!(count(ClaimKind::Activity), 2, "one per attempt: {claims:?}");
+    assert!(count(ClaimKind::Empty) >= 1, "an idle poll: {claims:?}");
+
+    let phases = recorder.phases.lock().unwrap().clone();
+    let persists = recorder.persists.lock().unwrap().clone();
+    let per_phase = |phase: PersistPhase| phases.iter().filter(|(p, _)| *p == phase).count();
+    let decisions = per_phase(PersistPhase::Commit);
+    assert!(decisions >= 2, "a decision per workflow task: {phases:?}");
+    for phase in PersistPhase::ALL {
+        assert_eq!(per_phase(phase), decisions, "{phase:?} once per persist");
+    }
+    assert!(
+        decisions <= persists.len(),
+        "a phase set belongs to a persist"
+    );
+    let sum_of = |phase: PersistPhase| -> f64 {
+        phases
+            .iter()
+            .filter(|(p, _)| *p == phase)
+            .map(|(_, s)| s)
+            .sum()
+    };
+    for phase in [
+        PersistPhase::Events,
+        PersistPhase::Tasks,
+        PersistPhase::Commit,
+    ] {
+        assert!(sum_of(phase) > 0.0, "{phase:?} takes time");
+    }
+    let phase_total: f64 = phases.iter().map(|(_, s)| s).sum();
+    let persist_total: f64 = persists.iter().sum();
+    assert!(
+        phase_total <= persist_total + 1e-6,
+        "phases {phase_total} within persists {persist_total}"
     );
 }

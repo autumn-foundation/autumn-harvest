@@ -69,7 +69,7 @@ they read `pg_replication_slots`, which covers both.
 ### Logical replication does not replicate sequences
 
 **If you choose logical, this is the step that will bite you.** `harvest_events.id`,
-`harvest_workflow_logs.id`, and `harvest_mutex_waiters.id` are `BIGSERIAL`.
+`harvest_workflow_logs.id`, `harvest_stream_chunks.id`, and `harvest_mutex_waiters.id` are `BIGSERIAL`.
 Logical replication copies the *rows*, including those id values, but it does
 not advance the standby's sequences. A promoted logical standby therefore holds
 a full copy of `harvest_events` while `harvest_events_id_seq` still sits where
@@ -370,6 +370,11 @@ fail with a lock timeout. Run `harvest dr fence` again. After the bump gets
 the lock, it waits 6 more seconds before it commits. A pass that lost its
 barrier stops in that time, and it ends the backends of the statements it
 sent.
+
+The bump also ends every decision owner lease on the database, in the same
+transaction (issue #2251, ADR 0009 decision 4). Workers of the promoted
+region then acquire at once. The role that runs the bump needs `SELECT` and
+`UPDATE` on `harvest_decision_owner`.
 
 These direct-database commands are exempt, by design:
 

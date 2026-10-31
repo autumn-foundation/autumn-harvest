@@ -1,0 +1,159 @@
+# Ledger profiles for `autumn-harvest/src/audit_export.rs`. See `docs/ledger/README.md`.
+
+["apply_outcome"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_audit_export_cursor"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["audit_table_schema"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["build_unexported_index"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["claim_shard_chained"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_audit_export_cursor", "harvest_audit_log"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["connect_index_builder"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["count_redrive_recoverable"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["database_identity"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["decommission_cursor_locked"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_audit_export_cursor"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["emit_lag_and_observed"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_export_cursor"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["ensure_cursor_row"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_audit_export_cursor", "harvest_audit_log"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["ensure_unexported_index"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["export_lag_seconds"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["export_status"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_export_cursor"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["pending_and_lag"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["reactivate_cursor_locked"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_audit_export_cursor"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["redrive_window_truncated"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_purge_watermark"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["release_claim"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_audit_export_cursor"]
+measured = "unmeasured"
+
+["repair_and_build_unexported_index"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["ddl"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+
+["rewind_cursor_locked"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_audit_export_cursor", "harvest_audit_log"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"
+
+["unexported_index_valid"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit_export.md"

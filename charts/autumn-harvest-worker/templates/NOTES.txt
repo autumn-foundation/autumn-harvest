@@ -1,0 +1,25 @@
+The Harvest worker {{ include "harvest-worker.fullname" . }} is installed.
+
+Image: {{ include "harvest-worker.image" . }}
+Profile: {{ .Values.profile }}
+{{- if .Values.migrations.enabled }}
+Migrations: the pre-install and pre-upgrade hook ran `harvest migrate run`.
+{{- else }}
+Migrations: off. Run `harvest migrate run` before you roll the worker.
+{{- end }}
+
+Check readiness:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "harvest-worker.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} port-forward service/{{ include "harvest-worker.fullname" . }} {{ .Values.service.port }}
+  curl -s http://127.0.0.1:{{ .Values.service.port }}{{ .Values.probes.basePath }}/health/ready
+{{- if ne (include "harvest-worker.isDev" .) "true" }}
+
+Outside `dev`, each admin route needs an API token. Seed the first one on
+your workstation. The command uses no network, and the secret stays out of
+the pod logs:
+
+  docker run --rm {{ include "harvest-worker.image" . }} harvest token bootstrap
+
+Run the printed INSERT statement against the database, and keep the secret.
+{{- end }}

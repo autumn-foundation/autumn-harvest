@@ -1705,6 +1705,45 @@ async fn rerun_writes_audit_row() {
     assert_eq!(rows[0].actor, TEST_ACTOR);
 }
 
+/// Issue #1979: a re-run whose stored input cannot be decoded is rejected and
+/// audited like every other rejection.
+#[tokio::test]
+async fn rerun_of_an_undecodable_input_writes_a_failed_audit_row() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_undecodable_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    // An envelope for a codec this node does not have.
+    let wf_id = unique("rr-undecodable");
+    let source = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id,
+        "FAILED",
+        Seed {
+            input: Some(json!({
+                "_harvest_codec_envelope": 1,
+                "codec_id": "missing-codec",
+                "data": "AAAA",
+            })),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_ne!(status, StatusCode::CREATED, "{body}");
+
+    let rows = audit_rows(&mut conn, "workflow.rerun", &source).await;
+    assert_eq!(rows.len(), 1, "the rejection is audited: {rows:?}");
+    assert_eq!(rows[0].status, "failed");
+    assert_eq!(
+        rows[0].error_summary.as_deref(),
+        Some("stored input could not be decoded")
+    );
+}
+
 /// R-16: an explicit `input` override replaces the clone and never mutates the
 /// source row's own input.
 #[tokio::test]
@@ -3934,4 +3973,43 @@ async fn rerun_with_empty_workflow_id_override_is_rejected_400() {
         "COMPLETED",
         "a rejected override must not seal or touch the source"
     );
+}
+
+/// A re-run takes the source run's quota key as its fairness key (issue
+/// #1976). It must not derive a new key from the current policy or input.
+#[tokio::test]
+async fn rerun_keeps_the_source_quota_key_as_its_fairness_key() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_fair_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let source = seed_terminal(&mut conn, wf, &unique("rr-fair"), "COMPLETED").await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET quota_key = 'tenant-q' WHERE id = $1::uuid",
+    )
+    .bind::<Text, _>(&source)
+    .execute(&mut conn)
+    .await
+    .expect("set the source quota key");
+
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let new_id = body["execution_id"].as_str().expect("execution_id");
+
+    #[derive(diesel::QueryableByName)]
+    struct KeyRow {
+        #[diesel(sql_type = Nullable<Text>)]
+        fairness_key: Option<String>,
+    }
+    let rows: Vec<KeyRow> = diesel::sql_query(
+        "SELECT fairness_key FROM harvest_task_queue WHERE workflow_exec_id = $1::uuid",
+    )
+    .bind::<Text, _>(new_id)
+    .get_results(&mut conn)
+    .await
+    .expect("load task keys");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].fairness_key.as_deref(), Some("tenant-q"));
 }

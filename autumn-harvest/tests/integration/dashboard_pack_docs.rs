@@ -76,6 +76,8 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_workflow_nondeterministic_block_total",
     "harvest_workflow_cache_hit_total",
     "harvest_workflow_cache_miss_total",
+    "harvest_workflow_resident_total",
+    "harvest_workflow_disk_cache_total",
     "harvest_workflow_external_signal_sent_total",
     "harvest_workflow_timeout_total",
     "harvest_workflow_chain_timeout_total",
@@ -92,6 +94,8 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_quota_supersede_credit_not_shed_total",
     "harvest_scanner_tick_total",
     "harvest_scanner_pass_total",
+    "harvest_decision_owner_fenced_total",
+    "harvest_decision_owner_woken_total",
     "harvest_db_pool_acquire_timeout_total",
     "harvest_db_transaction_retry_total",
     "harvest_db_transaction_retry_exhausted_total",
@@ -131,6 +135,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_retention_summary_deleted_total",
     "harvest_retention_rate_limit_buckets_deleted_total",
     "harvest_retention_terminal_tasks_deleted_total",
+    "harvest_retention_payload_orphans_total",
     "harvest_task_quarantined_total",
     "harvest_task_capability_miss_total",
     "harvest_dlq_redriven_total",
@@ -158,6 +163,9 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_workflow_duration_bucket",
     "harvest_workflow_duration_count",
     "harvest_workflow_duration_sum",
+    "harvest_workflow_resident_duration_bucket",
+    "harvest_workflow_resident_duration_count",
+    "harvest_workflow_resident_duration_sum",
     "harvest_workflow_history_size_bucket",
     "harvest_workflow_history_size_count",
     "harvest_workflow_history_size_sum",
@@ -221,6 +229,10 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_db_query_duration_bucket",
     "harvest_db_query_duration_count",
     "harvest_db_query_duration_sum",
+    // Issue #2248 — decision persist phases.
+    "harvest_db_persist_phase_duration_bucket",
+    "harvest_db_persist_phase_duration_count",
+    "harvest_db_persist_phase_duration_sum",
     "harvest_worker_pollers",
     "harvest_worker_outlier",
     // Issue #954 — cross-region DR. Four gauges (bare) and one counter.
@@ -297,6 +309,18 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_workflow_cache_hit", &["workflow", "queue"]),
     ("harvest_workflow_cache_miss", &["workflow", "queue"]),
     (
+        "harvest_workflow_resident",
+        &["workflow", "queue", "outcome"],
+    ),
+    (
+        "harvest_workflow_resident_duration",
+        &["workflow", "queue", "outcome"],
+    ),
+    (
+        "harvest_workflow_disk_cache",
+        &["workflow", "queue", "outcome"],
+    ),
+    (
         "harvest_workflow_external_signal_sent",
         &["outcome", "reason_code"],
     ),
@@ -343,6 +367,8 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_scanner_tick", &["scanner", "shard"]),
     // Scanner election role per tick (issue #1795). Bounded labels.
     ("harvest_scanner_pass", &["scanner", "shard", "role"]),
+    ("harvest_decision_owner_fenced", &["shard"]),
+    ("harvest_decision_owner_woken", &["shard", "kind"]),
     ("harvest_db_pool_acquire_timeout", &["site"]),
     ("harvest_db_transaction_retry", &["site", "reason"]),
     (
@@ -394,7 +420,9 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_db_pool_in_use", &["shard"]),
     ("harvest_db_pool_idle", &["shard"]),
     ("harvest_db_pool_wait_duration", &["shard"]),
-    ("harvest_db_query_duration", &["op"]),
+    ("harvest_db_query_duration", &["op", "kind"]),
+    // Issue #2248. `phase` is bounded by the `PersistPhase` enum.
+    ("harvest_db_persist_phase_duration", &["phase"]),
     ("harvest_worker_pollers", &["queue"]),
     ("harvest_worker_outlier", &["dimension"]),
     // Issue #954 — cross-region DR. All `{shard}`-only: a standby's
@@ -433,6 +461,10 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_retention_summary_deleted", &["workflow"]),
     ("harvest_retention_rate_limit_buckets_deleted", &["family"]),
     ("harvest_retention_terminal_tasks_deleted", &["state"]),
+    (
+        "harvest_retention_payload_orphans",
+        &["store_id", "outcome"],
+    ),
     ("harvest_query_duration", &["query_name", "status"]),
     ("harvest_task_quarantined", &["queue", "reason"]),
     (

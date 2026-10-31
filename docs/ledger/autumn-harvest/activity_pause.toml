@@ -1,0 +1,41 @@
+# Ledger profiles for `autumn-harvest/src/activity_pause.rs`. See `docs/ledger/README.md`.
+
+["is_activity_paused"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_activity_pauses"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/activity_pause.md"
+
+["list_paused_activities"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_activity_pauses", "harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/activity_pause.md"
+
+["pause_activity"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_activity_pauses", "harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/activity_pause.md"
+
+["paused_activity_names"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_activity_pauses"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/activity_pause.md"
+
+["resume_activity"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_activity_pauses", "harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/activity_pause.md"

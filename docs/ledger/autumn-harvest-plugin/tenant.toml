@@ -1,0 +1,9 @@
+# Ledger profiles for `autumn-harvest-plugin/src/tenant.rs`. See `docs/ledger/README.md`.
+
+["stored_tenant"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/tenant.md"

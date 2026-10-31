@@ -1,0 +1,34 @@
+[package]
+name = "autumn-harvest-conformance"
+description = "Cross-backend conformance suite: one workflow corpus on Postgres and SQLite (issue #2030)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+readme = "README.md"
+
+[dependencies]
+
+# The suite lives in `tests/conformance/`. Each test runs a scenario on a
+# testcontainers Postgres and on an in-memory SQLite runtime, then compares.
+[dev-dependencies]
+autumn-harvest = { version = "0.8.0", path = "../autumn-harvest", features = ["db", "testing", "debugger"] }
+autumn-harvest-sqlite = { version = "0.8.0", path = "../autumn-harvest-sqlite" }
+chrono = { workspace = true }
+deadpool = { workspace = true }
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+serde_json = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+uuid = { workspace = true }
+
+[[test]]
+name = "conformance"
+path = "tests/conformance/main.rs"
+
+[lints]
+workspace = true

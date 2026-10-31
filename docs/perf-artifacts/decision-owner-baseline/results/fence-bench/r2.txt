@@ -1,0 +1,127 @@
+Gnuplot not found, using plotters backend
+Benchmarking decision_persist/generation/writers/1
+decision_persist/generation/writers/1
+                        time:   [4.2387 ms 4.3431 ms 4.4551 ms]
+                        change: [−3.1085% +0.3421% +4.1452%] (p = 0.86 > 0.05)
+                        No change in performance detected.
+Found 6 outliers among 100 measurements (6.00%)
+  5 (5.00%) high mild
+  1 (1.00%) high severe
+Benchmarking decision_persist/generation/writers/8-shared
+decision_persist/generation/writers/8-shared
+                        time:   [6.4938 ms 6.7571 ms 7.0326 ms]
+                        change: [−13.032% −7.1244% +0.0317%] (p = 0.04 < 0.05)
+                        Change within noise threshold.
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+
+Benchmarking decision_persist/generation_owner/writers/1
+decision_persist/generation_owner/writers/1
+                        time:   [4.7239 ms 4.8118 ms 4.9022 ms]
+                        change: [−14.327% −11.496% −8.6608%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+Benchmarking decision_persist/generation_owner/writers/8-shared
+
+Warning: Unable to complete 100 samples in 6.0s. You may wish to increase target time to 6.1s, enable flat sampling, or reduce sample count to 70.
+decision_persist/generation_owner/writers/8-shared
+                        time:   [9.6713 ms 10.006 ms 10.342 ms]
+                        change: [−9.6738% −5.6098% −1.4333%] (p = 0.01 < 0.05)
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+Benchmarking decision_persist/generation_owner/writers/8-spread
+decision_persist/generation_owner/writers/8-spread
+                        time:   [10.960 ms 11.352 ms 11.710 ms]
+                        change: [−8.3497% −1.9205% +4.5243%] (p = 0.58 > 0.05)
+                        No change in performance detected.
+
+Benchmarking decision_persist/none/writers/1
+decision_persist/none/writers/1
+                        time:   [3.7642 ms 3.8621 ms 3.9627 ms]
+                        change: [+5.2833% +9.6587% +14.322%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Benchmarking decision_persist/none/writers/8-shared
+decision_persist/none/writers/8-shared
+                        time:   [4.7896 ms 5.1207 ms 5.4821 ms]
+                        change: [−43.791% −39.860% −36.002%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+Benchmarking decision_persist/generation_plain_owner_row/writers/1
+decision_persist/generation_plain_owner_row/writers/1
+                        time:   [4.6810 ms 4.7990 ms 4.9293 ms]
+                        change: [+0.0656% +3.5029% +7.2291%] (p = 0.04 < 0.05)
+                        Change within noise threshold.
+Found 3 outliers among 100 measurements (3.00%)
+  2 (2.00%) high mild
+  1 (1.00%) high severe
+Benchmarking decision_persist/generation_plain_owner_row/writers/8-shared
+
+Warning: Unable to complete 100 samples in 6.0s. You may wish to increase target time to 6.1s, enable flat sampling, or reduce sample count to 70.
+decision_persist/generation_plain_owner_row/writers/8-shared
+                        time:   [9.1872 ms 9.7127 ms 10.258 ms]
+                        change: [+15.451% +20.297% +26.144%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high mild
+Benchmarking decision_persist/generation_plain_owner_row/writers/8-spread
+
+Warning: Unable to complete 100 samples in 6.0s. You may wish to increase target time to 6.2s, enable flat sampling, or reduce sample count to 60.
+decision_persist/generation_plain_owner_row/writers/8-spread
+                        time:   [9.7180 ms 10.145 ms 10.557 ms]
+                        change: [−7.7110% −2.7092% +2.2806%] (p = 0.31 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+Benchmarking decision_persist/generation_owner_refence/writers/1
+decision_persist/generation_owner_refence/writers/1
+                        time:   [6.0801 ms 6.3156 ms 6.5990 ms]
+                        change: [+0.6470% +5.2940% +10.385%] (p = 0.03 < 0.05)
+                        Change within noise threshold.
+Found 6 outliers among 100 measurements (6.00%)
+  4 (4.00%) high mild
+  2 (2.00%) high severe
+Benchmarking decision_persist/generation_owner_refence/writers/8-shared
+
+Warning: Unable to complete 100 samples in 6.0s. You may wish to increase target time to 6.8s, enable flat sampling, or reduce sample count to 60.
+decision_persist/generation_owner_refence/writers/8-shared
+                        time:   [11.512 ms 12.035 ms 12.543 ms]
+                        change: [+0.5278% +6.0325% +12.930%] (p = 0.05 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking decision_persist/generation_owner_refence/writers/8-spread
+
+Warning: Unable to complete 100 samples in 6.0s. You may wish to increase target time to 6.4s, enable flat sampling, or reduce sample count to 60.
+decision_persist/generation_owner_refence/writers/8-spread
+                        time:   [10.627 ms 11.083 ms 11.539 ms]
+                        change: [−9.8275% −4.6837% +0.9938%] (p = 0.10 > 0.05)
+                        No change in performance detected.
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high mild
+
+Benchmarking decision_persist/owner/writers/1
+decision_persist/owner/writers/1
+                        time:   [4.1141 ms 4.2203 ms 4.3311 ms]
+                        change: [−4.7279% −1.0743% +2.5464%] (p = 0.56 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+Benchmarking decision_persist/owner/writers/8-shared
+decision_persist/owner/writers/8-shared
+                        time:   [9.4923 ms 9.8332 ms 10.155 ms]
+                        change: [−3.0328% +2.7768% +8.5079%] (p = 0.35 > 0.05)
+                        No change in performance detected.
+Benchmarking decision_persist/owner/writers/8-spread
+decision_persist/owner/writers/8-spread
+                        time:   [9.2133 ms 9.6230 ms 10.056 ms]
+                        change: [−13.907% −8.9913% −3.6992%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+

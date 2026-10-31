@@ -1,0 +1,73 @@
+# Ledger profiles for `autumn-harvest/src/queue_pause.rs`. See `docs/ledger/README.md`.
+
+["is_queue_paused"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_queue_pauses"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue_pause.md"
+
+["list_paused_queues"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_queue_pauses", "harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue_pause.md"
+
+["lock_queue_for_pause"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue_pause.md"
+
+["lock_queue_for_timeout_recheck"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue_pause.md"
+
+["notify_resumed_queue"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue_pause.md"
+
+["pause_queue"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_queue_pauses", "harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue_pause.md"
+
+["paused_queue_names"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_queue_pauses"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue_pause.md"
+
+["resume_queue"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_queue_pauses", "harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue_pause.md"
+
+["try_lock_queue_for_claim"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/queue_pause.md"

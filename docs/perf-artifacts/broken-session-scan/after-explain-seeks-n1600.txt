@@ -1,0 +1,28 @@
+=== running-member probe ===
+SELECT EXISTS (SELECT 1 FROM harvest_task_queue WHERE session_id = '00000020-0000-0000-0000-000000000010' AND state = 'RUNNING')
+Result  (cost=8.30..8.31 rows=1 width=1) (actual time=0.020..0.020 rows=1 loops=1)
+  Output: $0
+  Buffers: shared hit=3
+  InitPlan 1 (returns $0)
+    ->  Index Scan using idx_harvest_tq_session_active on public.harvest_task_queue  (cost=0.28..8.30 rows=1 width=0) (actual time=0.018..0.018 rows=1 loops=1)
+          Index Cond: (harvest_task_queue.session_id = '00000020-0000-0000-0000-000000000010'::uuid)
+          Filter: (harvest_task_queue.state = 'RUNNING'::text)
+          Buffers: shared hit=3
+Query Identifier: 3565519885320919334
+Planning:
+  Buffers: shared hit=291
+Planning Time: 0.693 ms
+Execution Time: 0.032 ms
+
+=== member-task load ===
+SELECT * FROM harvest_task_queue WHERE session_id = '00000020-0000-0000-0000-000000000000' AND state IN ('PENDING', 'RUNNING')
+Index Scan using idx_harvest_tq_session_active on public.harvest_task_queue  (cost=0.28..8.30 rows=1 width=659) (actual time=0.006..0.007 rows=1 loops=1)
+  Output: id, queue_name, task_type, workflow_exec_id, activity_name, input, state, priority, worker_id, attempt, max_attempts, scheduled_at, started_at, completed_at, last_heartbeat_at, heartbeat_timeout, start_to_close, schedule_to_start, retry_policy, output, error, sticky_worker_id, sticky_until, sticky_timeout, trace_context, concurrency_key, concurrency_cap, heartbeat_details, required_build_id, activity_id, rate_limit_key, crash_strikes, schedule_to_close_at, required_capabilities, context_headers, created_at, wake_requested, session_id, capability_misses, capability_miss_workers, capability_miss_handler, timer_fires_at, new_start
+  Index Cond: (harvest_task_queue.session_id = '00000020-0000-0000-0000-000000000000'::uuid)
+  Buffers: shared hit=3
+Query Identifier: 5849799844760088894
+Planning:
+  Buffers: shared hit=186
+Planning Time: 0.282 ms
+Execution Time: 0.019 ms
+

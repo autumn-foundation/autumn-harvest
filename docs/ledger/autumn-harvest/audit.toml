@@ -1,0 +1,33 @@
+# Ledger profiles for `autumn-harvest/src/audit.rs`. See `docs/ledger/README.md`.
+
+["insert_audit_row"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit.md"
+
+["insert_audit_rows"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit.md"
+
+["list_audit"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit.md"
+
+["purge_old_audit_records"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_audit_export_cursor", "harvest_audit_log", "harvest_audit_purge_watermark"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/audit.md"

@@ -121,6 +121,12 @@ pub struct StartWorkflowParams<'a> {
     /// replay determinism. Defaults to [`Priority::Normal`] so pre-upgrade
     /// callers that do not set this field are unaffected.
     pub priority: Priority,
+    /// The fairness key of the run (issue #1976).
+    ///
+    /// Stored on the run's task rows. A worker with fairness keys on rotates
+    /// its claims across the keys of a queue. `None` takes the run's quota
+    /// key, if any. The key does not change the event history or replay.
+    pub fairness_key: Option<String>,
     /// Maximum allowed byte size for the workflow input payload (issue #252).
     ///
     /// Enforced only on the fresh-insert path: duplicate collisions resolve
@@ -198,6 +204,50 @@ pub struct StartWorkflowParams<'a> {
     /// Optional human/operator attribution for the start (issue #740). `None`
     /// when absent.
     pub started_by: Option<&'a str>,
+    /// Verified tenant of the new run (issue #1977). `None` means no tenant.
+    ///
+    /// Set it only from a verified source: a tenant-bound credential, or
+    /// trusted in-process code. Never set it from caller input. The retention
+    /// janitor and the management API tenant check trust this value.
+    /// [`crate::tenant::validate_tenant`] must accept it, or the start fails.
+    pub tenant: Option<&'a str>,
+}
+
+/// Refuse a tenant-bound start whose prior run has another tenant (issue
+/// #1977).
+///
+/// A start with no tenant is trusted code, so it passes. A prior run with no
+/// tenant counts as another tenant.
+fn refuse_other_tenant(
+    request: &StartWorkflowParams<'_>,
+    existing: &WorkflowExecution,
+) -> HarvestResult<()> {
+    match request.tenant {
+        Some(tenant) if existing.tenant.as_deref() != Some(tenant) => {
+            Err(HarvestError::TenantConflict {
+                workflow_name: request.workflow_name.to_string(),
+                workflow_id: request.workflow_id.to_string(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Refuse a tenant-bound start whose idempotency claim names a run of another
+/// tenant (issue #1977).
+///
+/// Idempotency keys are shared across tenants. A duplicate must not hand one
+/// tenant the run of another.
+pub(crate) async fn refuse_other_tenant_claim(
+    conn: &mut AsyncPgConnection,
+    request: &StartWorkflowParams<'_>,
+    claimed: ExecutionId,
+) -> HarvestResult<()> {
+    if request.tenant.is_none() {
+        return Ok(());
+    }
+    let existing = load_execution(conn, claimed).await?;
+    refuse_other_tenant(request, &existing)
 }
 
 /// Origin marker for a normal scheduler-tick fire (issue #534).
@@ -274,6 +324,7 @@ impl<'a> StartWorkflowParams<'a> {
             concurrency_limit: None,
             concurrency_on_conflict: ConcurrencyOnConflict::default(),
             priority: Priority::default(),
+            fairness_key: None,
             max_workflow_input_bytes: 0,
             start_at: None,
             delay: None,
@@ -294,6 +345,7 @@ impl<'a> StartWorkflowParams<'a> {
             start_source: StartSource::default(),
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         }
     }
 
@@ -397,9 +449,10 @@ impl StartedWorkflowExecution {
 pub struct CancelledWorkflowExecution {
     /// Cancelled workflow execution ID.
     pub exec_id: ExecutionId,
-    /// Final execution state.
+    /// Final execution state, or the live state when `deferred` is `true`.
     pub state: String,
-    /// Stored cancellation reason.
+    /// Stored cancellation reason. When `deferred` is `true`, the reason
+    /// that the deferred cancel will apply.
     pub reason: String,
     /// `true` when this request performed the terminal transition.
     pub newly_cancelled: bool,
@@ -412,6 +465,10 @@ pub struct CancelledWorkflowExecution {
     pub queue_name: String,
     /// The state the execution was in before this transition.
     pub prior_state: String,
+    /// `true` when an open non-cancellable block deferred the cancel
+    /// (issue #1984). The run keeps running and `state` is its live state.
+    /// The engine cancels the run when the last open block closes.
+    pub deferred: bool,
 }
 
 impl CancelledWorkflowExecution {
@@ -437,6 +494,23 @@ impl CancelledWorkflowExecution {
             workflow_name: execution.workflow_name,
             queue_name: execution.queue_name,
             prior_state: execution.state,
+            deferred: false,
+        }
+    }
+
+    /// Result for a cancel that an open non-cancellable block deferred
+    /// (issue #1984).
+    fn deferred(exec_id: ExecutionId, execution: WorkflowExecution, reason: String) -> Self {
+        Self {
+            exec_id,
+            state: execution.state.clone(),
+            reason,
+            newly_cancelled: false,
+            failed_task_count: 0,
+            workflow_name: execution.workflow_name,
+            queue_name: execution.queue_name,
+            prior_state: execution.state,
+            deferred: true,
         }
     }
 
@@ -488,7 +562,146 @@ impl CancelledWorkflowExecution {
             workflow_name,
             queue_name,
             prior_state,
+            deferred: false,
         }
+    }
+}
+
+/// The deferred-cancel state of one history (issue #1984).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DeferredCancelState {
+    /// Non-cancellable blocks that opened and did not close.
+    pub(crate) open_blocks: usize,
+    /// The reason of the first `WorkflowCancelRequested`, if any.
+    pub(crate) requested: Option<String>,
+}
+
+impl DeferredCancelState {
+    pub(crate) fn of(events: &[WorkflowEvent]) -> Self {
+        let mut requested = None;
+        for event in events {
+            match event {
+                WorkflowEvent::WorkflowCancelRequested { reason } if requested.is_none() => {
+                    requested = Some(reason.clone());
+                }
+                // A reset or a fork copies the source history. A request from
+                // the source run does not apply to the new run.
+                WorkflowEvent::WorkflowResetFork { .. } | WorkflowEvent::WorkflowForked { .. } => {
+                    requested = None;
+                }
+                _ => {}
+            }
+        }
+        Self {
+            open_blocks: crate::cancellation_scope::open_non_cancellable_blocks(events),
+            requested,
+        }
+    }
+}
+
+#[cfg(test)]
+mod deferred_cancel_state_tests {
+    use super::DeferredCancelState;
+    use crate::event::WorkflowEvent;
+
+    fn marker(name: &str) -> WorkflowEvent {
+        WorkflowEvent::MarkerRecorded {
+            name: name.into(),
+            details: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn counts_blocks_that_opened_and_did_not_close() {
+        let events = [
+            marker("non_cancellable_open:1"),
+            marker("non_cancellable_close:1"),
+            marker("non_cancellable_open:2"),
+            WorkflowEvent::WorkflowCancelRequested {
+                reason: "first".into(),
+            },
+            WorkflowEvent::WorkflowCancelRequested {
+                reason: "second".into(),
+            },
+            marker("race:1"),
+        ];
+
+        let state = DeferredCancelState::of(&events);
+
+        assert_eq!(state.open_blocks, 1);
+        assert_eq!(state.requested.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn a_reset_fork_drops_a_request_from_the_source_run() {
+        let events = [
+            marker("non_cancellable_open:1"),
+            WorkflowEvent::WorkflowCancelRequested {
+                reason: "source".into(),
+            },
+            WorkflowEvent::WorkflowResetFork {
+                reset_from_exec_id: crate::types::ExecutionId::new(),
+                reset_to_event_id: 1,
+                reason: "replay".into(),
+                operator_id: "ops".into(),
+            },
+        ];
+
+        let state = DeferredCancelState::of(&events);
+
+        assert_eq!(state.open_blocks, 1);
+        assert_eq!(state.requested, None);
+    }
+
+    #[test]
+    fn a_fork_drops_a_request_from_the_source_run() {
+        let events = [
+            marker("non_cancellable_open:1"),
+            WorkflowEvent::WorkflowCancelRequested {
+                reason: "source".into(),
+            },
+            WorkflowEvent::WorkflowForked {
+                forked_from_exec_id: crate::types::ExecutionId::new(),
+                fork_event_id: 2,
+                effects: crate::event::ForkEffects::Recorded,
+                reason: "debug".into(),
+                operator_id: "ops".into(),
+            },
+        ];
+
+        let state = DeferredCancelState::of(&events);
+
+        assert_eq!(state.open_blocks, 1);
+        assert_eq!(state.requested, None);
+    }
+
+    #[test]
+    fn a_request_after_the_fork_marker_applies_to_the_fork() {
+        let events = [
+            WorkflowEvent::WorkflowForked {
+                forked_from_exec_id: crate::types::ExecutionId::new(),
+                fork_event_id: 1,
+                effects: crate::event::ForkEffects::Recorded,
+                reason: "debug".into(),
+                operator_id: "ops".into(),
+            },
+            marker("non_cancellable_open:1"),
+            WorkflowEvent::WorkflowCancelRequested {
+                reason: "fork".into(),
+            },
+        ];
+
+        let state = DeferredCancelState::of(&events);
+
+        assert_eq!(state.requested.as_deref(), Some("fork"));
+    }
+
+    #[test]
+    fn no_block_and_no_request_is_the_default() {
+        assert_eq!(
+            DeferredCancelState::of(&[marker("race:1")]),
+            DeferredCancelState::default()
+        );
     }
 }
 
@@ -556,6 +769,7 @@ mod start_params_new_tests {
             concurrency_limit,
             concurrency_on_conflict,
             priority,
+            fairness_key,
             max_workflow_input_bytes,
             start_at,
             delay,
@@ -576,6 +790,7 @@ mod start_params_new_tests {
             start_source,
             start_source_ref,
             started_by,
+            tenant,
         } = StartWorkflowParams::new("wf", "wf-1", exec_id, input.clone(), "default");
 
         assert_eq!(workflow_name, "wf");
@@ -599,6 +814,7 @@ mod start_params_new_tests {
         assert!(concurrency_limit.is_none());
         assert_eq!(concurrency_on_conflict, ConcurrencyOnConflict::Defer);
         assert_eq!(priority, Priority::Normal);
+        assert_eq!(fairness_key, None);
         assert_eq!(max_workflow_input_bytes, 0);
         assert!(start_at.is_none());
         assert!(delay.is_none());
@@ -619,6 +835,7 @@ mod start_params_new_tests {
         assert_eq!(start_source, StartSource::Unknown);
         assert!(start_source_ref.is_none());
         assert!(started_by.is_none());
+        assert!(tenant.is_none());
     }
 
     /// Struct-update syntax overrides only the named fields.
@@ -743,7 +960,7 @@ fn evaluate_start_gate(
 /// The manual gate runs first and returns [`HarvestError::AdmissionBlocked`].
 /// Load shedding (issue #1794) runs second and returns
 /// [`HarvestError::LoadShed`]. Each refusal records its metric once.
-fn admit_fresh_start(
+pub(crate) fn admit_fresh_start(
     mode: crate::admission_gate::GateMode,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     workflow_name: &str,
@@ -1162,6 +1379,12 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     if request.workflow_id.is_empty() {
         return Err(HarvestError::EmptyWorkflowId);
     }
+    // Every start path funnels through here, so one check covers them all.
+    if let Some(tenant) = request.tenant
+        && let Err(e) = crate::tenant::validate_tenant(tenant)
+    {
+        return Err(HarvestError::Config(format!("invalid tenant: {e}")));
+    }
 
     // Validate delayed start parameters (issue #322)
     if request.start_at.is_some() && request.delay.is_some() {
@@ -1257,12 +1480,16 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     // an array as its input. This fix must not do that. Only
     // `event_batch.rs`'s own known-shape aggregate is ever unwrapped this
     // way.
-    let quota_key: Option<String> = quota_policy.and_then(|p| {
-        crate::quota::resolve_quota_key(
-            p.key_expr,
-            quota_key_input_override.unwrap_or(&request.input),
-        )
-    });
+    // A run-only LLM policy does not use the key (issue #1997), so the key
+    // is neither resolved nor checked.
+    let quota_key: Option<String> = quota_policy
+        .filter(crate::quota::QuotaPolicy::uses_key)
+        .and_then(|p| {
+            crate::quota::resolve_quota_key(
+                p.key_expr,
+                quota_key_input_override.unwrap_or(&request.input),
+            )
+        });
     // A resolved key is stamped onto the row for EVERY admission that has
     // one -- including a retry-exempt admission below, which still tags its
     // row for future usage accounting -- so this bound must be checked
@@ -1273,6 +1500,10 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     // typed rejection (issue #946 Codex review, "bound resolved quota keys
     // before indexing them"). Rejecting rather than truncating/hashing is
     // deliberate -- see `quota::MAX_QUOTA_KEY_BYTES`'s doc comment for why.
+    // An explicit fairness key is caller input. Check it before any DB work.
+    if let Some(key) = request.fairness_key.as_deref() {
+        crate::queue_fairness::validate_fairness_key(key)?;
+    }
     if let Some(key) = quota_key.as_deref()
         && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
     {
@@ -1345,6 +1576,13 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         && terminate_via_pre_check
         && !reject_fresh_if_debounced
     {
+        // A tenant conflict outranks a closed gate (issue #1977).
+        if request.tenant.is_some()
+            && let Some(prior) =
+                try_load_by_key(conn, request.workflow_name, request.workflow_id).await?
+        {
+            refuse_other_tenant(&request, &prior)?;
+        }
         admit_fresh_start(
             mode,
             metrics,
@@ -1375,8 +1613,31 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     // hold a lock across the gap to the later authoritative check. A
     // non-quota-governed request (`quota_key.is_none()`, the common case)
     // keeps the pre-check-cancel shortcut byte-for-byte unchanged.
+
+    // Encode `input` and `memo` now, but hold a failure (issue #2054). A
+    // duplicate start writes nothing, so a broken codec must not change its
+    // result. Each branch that writes a run raises the held error first.
+    let (encoded_input, encoded_memo, encoded_headers, encode_failure) = match codecs
+        .encode_shared_column(&request.input)
+        .and_then(|input| {
+            let memo = codecs.encode_column_opt(request.memo.as_ref())?;
+            let headers = request
+                .context_headers
+                .as_ref()
+                .map(|headers| codecs.encode_headers(headers))
+                .transpose()?;
+            Ok((input, memo, headers))
+        }) {
+        Ok((input, memo, headers)) => (input, memo, headers, None),
+        // The placeholder is never stored: every write path checks the held error.
+        Err(error) => (serde_json::Value::Null.into(), None, None, Some(error)),
+    };
+
     if terminate_via_pre_check
         && quota_key.is_none()
+        // The pre-check cancel is durable. Skip it when this start cannot
+        // write a replacement; the locked branch below then refuses first.
+        && encode_failure.is_none()
         // Skip the pre-check cancellation when we're going to reject this fresh
         // start for a debounced workflow — otherwise we'd cancel the prior run
         // (Transaction 1) and then reject, leaving it cancelled with no successor.
@@ -1385,11 +1646,13 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             try_load_by_key(conn, request.workflow_name, request.workflow_id).await?
         && matches!(existing.state.as_str(), "RUNNING" | "PAUSED")
     {
+        // Never cancel a run of another tenant (issue #1977).
+        refuse_other_tenant(&request, &existing)?;
         let existing_exec_id = ExecutionId::from_uuid(existing.id);
         // Ignore Config errors: the execution may have transitioned to a terminal
         // state between the pre-check and the cancel lock. In that race the prior
         // run is already done, so we just continue to the start transaction below.
-        match cancel_workflow_execution_collect(
+        match cancel_workflow_execution_collect_now(
             conn,
             existing_exec_id,
             "terminated to start new execution",
@@ -1465,24 +1728,21 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         workflow_id: request.workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: shard_id_value,
-        input: request.input.clone(),
+        input: encoded_input,
         parent_id: request.parent_id,
         queue_name: request.queue_name,
         execution_timeout: effective_timeout,
         deadline_at,
         sla: effective_sla,
         sla_deadline_at,
-        memo: request.memo.clone(),
+        memo: encoded_memo,
         search_attrs: request.search_attrs.clone(),
         assigned_build_id: assigned_build.clone(),
         parent_close_policy: None, // root or awaited child; detached uses worker path
         owner: request.owner,
         runbook_url: request.runbook_url,
         severity: request.severity,
-        context_headers: request
-            .context_headers
-            .as_ref()
-            .map(|h| serde_json::to_value(h).unwrap_or(serde_json::Value::Null)),
+        context_headers: encoded_headers,
         schedule_id: request.schedule_id,
         scheduled_for: request.scheduled_for,
         workflow_attempt: request.workflow_attempt.cast_signed(),
@@ -1501,19 +1761,27 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         start_source_ref: request.start_source_ref,
         started_by: request.started_by,
         quota_key: quota_key.as_deref(),
+        tenant: request.tenant,
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
         TaskType::Workflow,
-        request.input.clone(),
+        row.input.clone(),
     );
     enqueue.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue = enqueue.with_decision_partition(request.workflow_id);
     enqueue.required_build_id = assigned_build.clone();
     // ADR-0001 §3: store the caller's trace context so the worker can restore it.
     enqueue.trace_context.clone_from(&request.trace_context);
     enqueue.concurrency_key.clone_from(&request.concurrency_key);
     enqueue.max_concurrent = request.concurrency_limit;
     enqueue.priority = request.priority.as_i32();
+    // The run's fairness key: the explicit key, else the quota key (issue
+    // #1976). Activities take it from this row.
+    enqueue.fairness_key = crate::queue_fairness::fairness_key_for(
+        request.fairness_key.as_deref(),
+        quota_key.as_deref(),
+    );
     // A fresh admission yields to continuations at claim (issue #1824). A
     // workflow retry continues a failed run, so it does not yield.
     enqueue.new_start = request.retry_of_exec_id.is_none();
@@ -1529,6 +1797,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     ), HarvestError, _>(async |conn| {
         let row = row;
         let enqueue = enqueue;
+        let mut encode_failure = encode_failure;
         let quota_key = quota_key.clone();
         // `gate`, `metrics`, `shard_id_value`, `quota_policy`, and
         // `quota_enforcement_policy` (issue #946) are all `Copy`, so the
@@ -1636,6 +1905,9 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                     .optional()
                     .map_err(database_error)?;
                 if let Some(seal) = reconciled_seal {
+                    // A seal of another tenant is still that tenant's run
+                    // (issue #1977). Do not report, attach to or replace it.
+                    refuse_other_tenant(&request, &seal)?;
                     if request.reuse_policy == WorkflowIdReusePolicy::RejectDuplicate {
                         // Report the effective terminal state, not the
                         // seal's own `MIGRATED` marker (issue #1596 review,
@@ -1712,6 +1984,10 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                 request.workflow_id,
             )
             .await?;
+            // A tenant conflict outranks a closed gate (issue #1977).
+            if let Some(prior) = prior.as_ref() {
+                refuse_other_tenant(&request, prior)?;
+            }
             if start_will_create_new_execution(
                 prior.as_ref().map(|e| e.state.as_str()),
                 request.reuse_policy,
@@ -1735,14 +2011,31 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         // `TERMINATED`). A previously sealed continue-as-new chain or reset
         // source therefore does not block reusing the same
         // (workflow_name, workflow_id).
-        let inserted = diesel::insert_into(harvest_workflow_executions::table)
-            .values(&row)
-            .on_conflict_do_nothing()
-            .returning(WorkflowExecution::as_returning())
-            .get_result(conn)
-            .await
-            .optional()
-            .map_err(database_error)?;
+        let inserted = if encode_failure.is_some() {
+            // The row holds a placeholder, so probe instead of insert. The
+            // probe sees what the unique index would reject. With no
+            // occupant this start needs a new run, so raise the codec error.
+            if try_load_active_execution_for_update(
+                conn,
+                request.workflow_name,
+                request.workflow_id,
+            )
+            .await?
+            .is_none()
+            {
+                refuse_unencoded(&mut encode_failure)?;
+            }
+            None
+        } else {
+            diesel::insert_into(harvest_workflow_executions::table)
+                .values(&row)
+                .on_conflict_do_nothing()
+                .returning(WorkflowExecution::as_returning())
+                .get_result(conn)
+                .await
+                .optional()
+                .map_err(database_error)?
+        };
 
         if let Some(execution) = inserted {
             // Atomic debounce gate: this INSERT is a fresh start. For a
@@ -1841,7 +2134,14 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             // guard — the new row has state RUNNING, not COMPLETED, so it
             // can never match, but the explicit exclusion is defensive.
             let (carryover_result, carryover_error) = if let Some(sched_id) = request.schedule_id {
-                resolve_carryover(conn, sched_id, exec_id.as_uuid(), request.scheduled_for).await?
+                resolve_carryover(
+                    conn,
+                    sched_id,
+                    exec_id.as_uuid(),
+                    request.scheduled_for,
+                    codecs,
+                )
+                .await?
             } else {
                 (None, None)
             };
@@ -1966,6 +2266,11 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         // attached to a dead seal permanently. `migrated_run_terminal_at`
         // is the reconciler's record that the live copy has finished;
         // treat that exactly like any other terminal prior below.
+        // Issue #1977: a tenant-bound start must not attach to, cancel,
+        // replace or seal a run of another tenant. The row lock is held, so
+        // the check and every branch below see the same row.
+        refuse_other_tenant(&request, &existing)?;
+
         let seal_observed_terminal =
             existing.state == "MIGRATED" && existing.migrated_run_terminal_at.is_some();
 
@@ -2055,6 +2360,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                             ),
                         });
                     }
+                    refuse_unencoded(&mut encode_failure)?;
                     let mut tx_cancel_metrics = vec![StartCancelledRun::terminated(
                         existing.workflow_name.clone(),
                         existing.queue_name.clone(),
@@ -2135,6 +2441,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                                 });
                             }
                             // Only these two explicitly abnormal states start fresh.
+                            refuse_unencoded(&mut encode_failure)?;
                             let (started_wf, mut deferred, credited_ids) = replace_execution(
                                 conn,
                                 existing,
@@ -2192,6 +2499,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                             workflow_id: request.workflow_id.to_string(),
                         });
                     }
+                    refuse_unencoded(&mut encode_failure)?;
                     let (started_wf, mut extra_deferred, credited_ids) = replace_execution(
                         conn,
                         existing,
@@ -2269,6 +2577,13 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             Err(e)
         }
     }
+}
+
+/// Raise the encode error a start held back (issue #2054).
+///
+/// Call it before any write of the start's payload columns.
+fn refuse_unencoded(held: &mut Option<HarvestError>) -> HarvestResult<()> {
+    held.take().map_or(Ok(()), Err)
 }
 
 /// Start a workflow execution or load the existing one, applying the caller's
@@ -2505,16 +2820,19 @@ pub async fn start_or_load_workflow_execution_idempotent_with_codecs(
                     exec_id,
                     workflow_id,
                     state,
-                } => Ok((
-                    IdempotentStartOutcome::Deduplicated {
-                        exec_id,
-                        workflow_id,
-                        state,
-                    },
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                )),
+                } => {
+                    refuse_other_tenant_claim(conn, &request, exec_id).await?;
+                    Ok((
+                        IdempotentStartOutcome::Deduplicated {
+                            exec_id,
+                            workflow_id,
+                            state,
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ))
+                }
                 crate::start_idempotency::StartIdempotencyReservation::Reserved => {
                     let workflow_name = request.workflow_name;
                     let (started, ds, dc, cm) =
@@ -3491,7 +3809,14 @@ async fn replace_execution(
     // the rerun (and any continue-as-new fork from it) must see the previous fire's
     // carryover rather than behaving like a first scheduled run.
     let (carryover_result, carryover_error) = if let Some(sched_id) = request.schedule_id {
-        resolve_carryover(conn, sched_id, new_exec_id.as_uuid(), request.scheduled_for).await?
+        resolve_carryover(
+            conn,
+            sched_id,
+            new_exec_id.as_uuid(),
+            request.scheduled_for,
+            codecs,
+        )
+        .await?
     } else {
         (None, None)
     };
@@ -3703,7 +4028,9 @@ async fn notify_awaited_parent_of_child_terminal(
 /// # Errors
 ///
 /// Same as [`cancel_workflow_execution`].
-#[allow(clippy::too_many_lines)]
+///
+/// An open non-cancellable block defers the cancel (issue #1984). See
+/// [`CancelledWorkflowExecution::deferred`].
 pub async fn cancel_workflow_execution_collect(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -3714,12 +4041,108 @@ pub async fn cancel_workflow_execution_collect(
     // recorder instead of unconditionally falling back to the process-global
     // one. `None` at every call site that never had a recorder in scope.
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
-) -> HarvestResult<(
+) -> HarvestResult<CancelCollected> {
+    cancel_workflow_execution_collect_mode(conn, exec_id, reason, metrics, true).await
+}
+
+/// The result of [`cancel_workflow_execution_collect`]: the cancel, the
+/// deferred starts, the handler checks and the terminal metric labels.
+pub type CancelCollected = (
     CancelledWorkflowExecution,
     Vec<DeferredTriggerStart>,
     Vec<(ExecutionId, String)>,
     Option<(String, String)>,
-)> {
+);
+
+/// [`cancel_workflow_execution_collect`] that an open non-cancellable block
+/// does not defer (issue #1984).
+///
+/// For a caller that must end the run now: a start policy that replaces the
+/// running execution.
+///
+/// # Errors
+///
+/// Same as [`cancel_workflow_execution`].
+pub async fn cancel_workflow_execution_collect_now(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    reason: &str,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) -> HarvestResult<CancelCollected> {
+    cancel_workflow_execution_collect_mode(conn, exec_id, reason, metrics, false).await
+}
+
+/// Complete a deferred cancel when no non-cancellable block is open
+/// (issue #1984).
+///
+/// The worker calls this inside a decision transaction that closed a block.
+/// Returns `None` when no cancel is pending or a block is still open.
+///
+/// # Errors
+///
+/// Same as [`cancel_workflow_execution`].
+pub(crate) async fn complete_deferred_cancel(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) -> HarvestResult<Option<CancelCollected>> {
+    let history = store::load_history_undecoded(conn, exec_id).await?;
+    let state = DeferredCancelState::of(&history.events);
+    match state.requested {
+        Some(reason) if state.open_blocks == 0 => {
+            cancel_workflow_execution_collect_mode(conn, exec_id, &reason, metrics, true)
+                .await
+                .map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Defer a cancel while the run has an open non-cancellable block
+/// (issue #1984).
+///
+/// The first request is recorded as `WorkflowCancelRequested`, and a later
+/// request adds nothing. State and tasks stay as they are. A paused run
+/// cannot close its block, so its cancel is not deferred. Returns the reason
+/// that the deferred cancel will apply, or `None` when the cancel goes ahead.
+async fn defer_cancel_for_open_block(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    state: &str,
+    history: &store::EventHistory,
+    reason: &str,
+) -> HarvestResult<Option<String>> {
+    if state != "RUNNING" {
+        return Ok(None);
+    }
+    let pending = DeferredCancelState::of(&history.events);
+    if pending.open_blocks == 0 {
+        return Ok(None);
+    }
+    if let Some(first) = pending.requested {
+        return Ok(Some(first));
+    }
+    store::append_events_with_codecs(
+        conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowCancelRequested {
+            reason: reason.to_string(),
+        }],
+        history.next_event_id,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await?;
+    Ok(Some(reason.to_string()))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn cancel_workflow_execution_collect_mode(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    reason: &str,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    defer_for_open_blocks: bool,
+) -> HarvestResult<CancelCollected> {
     let reason = reason.trim();
     let reason = if reason.is_empty() {
         "workflow cancellation requested".to_string()
@@ -3782,6 +4205,23 @@ pub async fn cancel_workflow_execution_collect(
                 }
             }
 
+            // Undecoded: this reads `next_event_id` and the marker names only
+            // (see the loader's docs). Payload codecs never encode those.
+            let history = store::load_history_undecoded(conn, exec_id).await?;
+
+            // Issue #1984: an open non-cancellable block defers the cancel.
+            if defer_for_open_blocks
+                && let Some(applied) =
+                    defer_cancel_for_open_block(conn, exec_id, &execution.state, &history, &reason)
+                        .await?
+            {
+                return Ok((
+                    CancelledWorkflowExecution::deferred(exec_id, execution, applied),
+                    Vec::new(),
+                    Vec::new(),
+                ));
+            }
+
             let deleted_pending = diesel::delete(
                 crate::schema::harvest_task_queue::table
                     .filter(
@@ -3796,8 +4236,6 @@ pub async fn cancel_workflow_execution_collect(
             .await
             .map_err(database_error)?;
 
-            // Undecoded: this reads `next_event_id` only (see the loader's docs).
-            let history = store::load_history_undecoded(conn, exec_id).await?;
             store::append_events(
                 conn,
                 exec_id,
@@ -4873,6 +5311,23 @@ pub fn pause_timeout_exceeded(
     chrono::Duration::from_std(max).is_ok_and(|max| now - paused_at >= max)
 }
 
+/// Reject a pause while a deferred cancel is pending (issue #1984).
+///
+/// A paused run claims no task, so its open block cannot close. A pending
+/// cancel would then wait without end.
+fn reject_pause_with_pending_cancel(
+    exec_id: ExecutionId,
+    events: &[WorkflowEvent],
+) -> HarvestResult<()> {
+    if DeferredCancelState::of(events).requested.is_some() {
+        return Err(HarvestError::Config(format!(
+            "workflow execution {exec_id} has a pending cancel; it completes when its \
+             non-cancellable block closes, so the run cannot be paused"
+        )));
+    }
+    Ok(())
+}
+
 /// Pause a running workflow execution (issue #383).
 ///
 /// Pausing is a durable, **non-terminal** transition: it appends a
@@ -4950,8 +5405,10 @@ pub async fn pause_workflow_execution(
                 }
             }
 
-            // Undecoded: this reads `next_event_id` only (see the loader's docs).
+            // Undecoded: this reads `next_event_id` and the event types only
+            // (see the loader's docs).
             let history = store::load_history_undecoded(conn, exec_id).await?;
+            reject_pause_with_pending_cancel(exec_id, &history.events)?;
             store::append_events(
                 conn,
                 exec_id,
@@ -5634,6 +6091,18 @@ pub async fn annotate_workflow_execution(
                     .await
                     .map_err(database_error)?;
             }
+            // A triage update appends no event, but `owner` and `severity`
+            // are list filters (issue #1982). A zero-count wake on the
+            // events channel tells live list views to fetch again.
+            if !changed_fields.is_empty() {
+                crate::notify::notify_workflow_events_appended(
+                    conn,
+                    exec_id.as_uuid(),
+                    0,
+                    "WorkflowTriaged",
+                )
+                .await?;
+            }
 
             Ok(TriageOutcome {
                 execution_id: exec_id.to_string(),
@@ -5979,6 +6448,26 @@ async fn cascade_cancel_detached_child(
 ) -> HarvestResult<(bool, Vec<DeferredTriggerStart>, Vec<(ExecutionId, String)>)> {
     let mut deferred_starts = Vec::new();
     let mut closed_executions = Vec::new();
+
+    // Issue #1984: an open non-cancellable block defers this cancel, as it
+    // does for a cross-shard child.
+    let state: Option<String> = harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(harvest_workflow_executions::state)
+        .for_update()
+        .first(conn)
+        .await
+        .optional()
+        .map_err(database_error)?;
+    if let Some(state) = state {
+        let history = store::load_history_undecoded(conn, exec_id).await?;
+        if defer_cancel_for_open_block(conn, exec_id, &state, &history, reason)
+            .await?
+            .is_some()
+        {
+            return Ok((true, deferred_starts, closed_executions));
+        }
+    }
 
     let updated = diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
@@ -6777,8 +7266,9 @@ fn should_escalate_terminal_prior(
 ///
 /// A with-start call always begins a fresh chain origin, so the macro sets no
 /// inherited chain deadline (issue #617). The start step enforces the input
-/// cap, so the macro sets none. The macro leaves priority and `started_by` at
-/// their defaults.
+/// cap, so the macro sets none. The macro leaves priority, the fairness key
+/// and `started_by` at their defaults. The run then takes its quota key as
+/// its fairness key.
 macro_rules! with_start_params {
     ($request:ident, $exec_id:expr, $policy:expr, $source:expr, $source_ref:expr) => {
         crate::execution::StartWorkflowParams {
@@ -6802,6 +7292,7 @@ macro_rules! with_start_params {
             concurrency_limit: $request.concurrency_limit,
             concurrency_on_conflict: $request.concurrency_on_conflict,
             priority: crate::types::Priority::default(),
+            fairness_key: None,
             max_workflow_input_bytes: 0,
             start_at: None,
             delay: None,
@@ -6825,6 +7316,7 @@ macro_rules! with_start_params {
             start_source: $source,
             start_source_ref: $source_ref,
             started_by: None,
+            tenant: $request.tenant,
         }
     };
 }
@@ -7108,6 +7600,9 @@ pub struct SignalWithStartParams<'a> {
     /// coordinates, and the documented provenance query would return a
     /// different string for the two binding kinds.
     pub start_source_ref_override: Option<String>,
+    /// Tenant of a fresh run (issue #1977). An attach ignores it. See
+    /// [`StartWorkflowParams::tenant`].
+    pub tenant: Option<&'a str>,
 }
 
 /// Result of a [`signal_with_start_workflow_execution`] call.
@@ -7301,9 +7796,23 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
             // deadlock. One lock order, taken first everywhere, closes it.
             lock_execution_admission(conn, request.workflow_name, request.workflow_id).await?;
 
+            // Issue #1985: a durable promise settles once on this path too.
+            // The settlement rules can force or refuse the signal key.
+            let signal_key = crate::durable_promise::settlement_idempotency_key(
+                request.signal_name,
+                &request.signal_payload,
+                request.idempotency_key.as_deref(),
+            )?
+            .map(str::to_owned);
+
             // Cross-execution dedupe: scope by (workflow_name, workflow_id, key)
             // so escalation/reset paths on a new exec_id don't re-queue the signal.
-            if let Some(key) = request.idempotency_key.as_deref()
+            // A promise belongs to one run, so its key dedupes per execution
+            // only, at the insert below (issue #1985).
+            let promise_signal = request
+                .signal_name
+                .starts_with(crate::durable_promise::PROMISE_SIGNAL_PREFIX);
+            if let Some(key) = signal_key.as_deref().filter(|_| !promise_signal)
                 && let Some(prior) = lookup_idempotent_signal_dedupe(
                     conn,
                     request.workflow_name,
@@ -7340,7 +7849,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
                 && matches!(prior.state.as_str(), "RUNNING" | "PAUSED")
             {
                 let prior_exec_id = ExecutionId::from_uuid(prior.id);
-                match cancel_workflow_execution_collect(
+                match cancel_workflow_execution_collect_now(
                     conn,
                     prior_exec_id,
                     "terminated by signal-with-start",
@@ -7394,6 +7903,27 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
             )
             .await?;
 
+            // Issue #1985: a promise skips the cross-run dedupe above. A retry
+            // against the same run must still dedupe before the payload cap,
+            // so a tightened cap cannot turn a settled retry into an error.
+            if promise_signal
+                && !started.created
+                && let Some(key) = signal_key.as_deref()
+                && crate::signal::signal_idempotency_key_exists(conn, started.exec_id, key).await?
+            {
+                return Ok((
+                    SignalWithStartOutcome {
+                        exec_id: started.exec_id,
+                        workflow_name: started.workflow_name,
+                        workflow_id: started.workflow_id,
+                        state: started.state,
+                        started_fresh: false,
+                        signal_delivered: false,
+                    },
+                    effects,
+                ));
+            }
+
             // Check signal payload cap here — after start/attach/AlreadyExists
             // resolution — so RejectDuplicate conflicts surface as 409 AlreadyExists
             // rather than 413 PayloadTooLarge when the payload happens to be oversized.
@@ -7413,7 +7943,8 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
                     started.exec_id,
                     request.signal_name,
                     request.signal_payload,
-                    request.idempotency_key.as_deref(),
+                    signal_key.as_deref(),
+                    codecs,
                 )
                 .await?
             } else {
@@ -7537,7 +8068,7 @@ pub struct RerunOutcome {
 /// matches the fail-closed posture the pre-#1308 hash rejection took for
 /// every divergent override. So an embedder that never wires one up sees no
 /// behavior change.
-async fn rerun_cross_shard_occupancy(
+pub(crate) async fn rerun_cross_shard_occupancy(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     target_wf_id: &str,
@@ -7972,11 +8503,18 @@ pub async fn rerun_workflow_execution_with_codecs(
             // polluting `?search_attr=` filtering and misleading compliance
             // tooling into believing the new run had been erased. Drop them.
             // (`context_headers` is NULLed rather than tombstoned by the row
-            // scrub, so it needs no equivalent test.)
-            let source_memo = source
-                .memo
-                .clone()
+            // scrub. So it needs no equivalent test.)
+            //
+            // The start path below encodes memo and input itself, so it needs
+            // the plaintext (issue #1979). A tombstone is not an envelope, so
+            // it decodes to itself and the filter still sees it.
+            let source_memo = codecs
+                .decode_column_opt(source.memo.as_ref())?
                 .filter(|v| !crate::erase::is_erasure_tombstone(v));
+            let source_input = match &request.input_override {
+                Some(input) => input.clone(),
+                None => codecs.decode_column(&source.input)?,
+            };
 
             // Strip the six replay-non-determinism diagnostic keys (issue #603):
             // a re-run has never diverged, so it must not display a phantom
@@ -8003,12 +8541,16 @@ pub async fn rerun_workflow_execution_with_codecs(
             // than degrading the re-run, matching the repo's fail-loud posture.
             let rerun_context_headers = match source.context_headers.clone() {
                 None => None,
-                Some(v) => Some(serde_json::from_value(v).map_err(|e| {
-                    HarvestError::Config(format!(
-                        "source execution {source_exec_id} has an unparseable stored \
-                         `context_headers` value ({e}); re-run cannot faithfully clone it"
-                    ))
-                })?),
+                // The start path encodes the headers again (issue #2043). The
+                // error text names no value, because the value is plaintext.
+                Some(v) => Some(serde_json::from_value(codecs.decode_column(&v)?).map_err(
+                    |_| {
+                        HarvestError::Config(format!(
+                            "source execution {source_exec_id} has an unparseable stored \
+                             `context_headers` value; re-run cannot faithfully clone it"
+                        ))
+                    },
+                )?),
             };
             let rerun_retry_policy = match source.workflow_retry_policy.clone() {
                 None => None,
@@ -8026,14 +8568,9 @@ pub async fn rerun_workflow_execution_with_codecs(
                 workflow_id: target_wf_id,
                 // Stay on the source's shard: a re-run is the same logical work.
                 exec_id: ExecutionId::new_for_shard(source_shard),
-                // VERBATIM — never decoded. `source.input` is byte-for-byte what
-                // the original start wrote, so decoding here would corrupt an
-                // encrypting deployment's re-run (and re-encrypt on write).
-                input: request
-                    .input_override
-                    .clone()
-                    .unwrap_or_else(|| source.input.clone())
-                    .into(),
+                // Decoded above. The start path encodes it once more, under
+                // the active key (issue #1979).
+                input: source_input.into(),
                 parent_id: None,
                 queue_name: &source.queue_name,
                 // The row value IS the effective (already ceiling-clamped) timeout.
@@ -8054,6 +8591,12 @@ pub async fn rerun_workflow_execution_with_codecs(
                 // Documented gap: priority (issue #249) lives on the task-queue
                 // row, not the execution row, so it cannot be recovered here.
                 priority: Priority::default(),
+                // The re-run keeps the source run's tenant: a valid source
+                // quota key is its fairness key (issue #1976).
+                fairness_key: crate::queue_fairness::fairness_key_for(
+                    None,
+                    source.quota_key.as_deref(),
+                ),
                 max_workflow_input_bytes: request.max_workflow_input_bytes,
                 start_at: None,
                 delay: None,
@@ -8078,6 +8621,8 @@ pub async fn rerun_workflow_execution_with_codecs(
                 start_source: StartSource::Rerun,
                 start_source_ref: Some(source_exec_id_str.as_str()),
                 started_by: request.started_by,
+                // A re-run belongs to the tenant of its source (issue #1977).
+                tenant: source.tenant.as_deref(),
             };
 
             let (started, deferred_starts, deferred_checks, cancel_metrics) =
@@ -8331,7 +8876,13 @@ pub async fn lookup_idempotent_signal_dedupe(
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
         .filter(harvest_signals::idempotency_key.eq(idempotency_key))
-        .order_by(harvest_signals::received_at.desc())
+        // A reset with the `Buffer` policy copies a keyed row onto the fork
+        // with the source `received_at` (issue #2004). The source row stays.
+        // On a tie, the newer execution is the live run.
+        .order_by((
+            harvest_signals::received_at.desc(),
+            harvest_workflow_executions::created_at.desc(),
+        ))
         .select(WorkflowExecution::as_select())
         .first(conn)
         .await
@@ -8347,11 +8898,12 @@ async fn stage_signal_with_idempotency(
     signal_name: &str,
     payload: serde_json::Value,
     idempotency_key: Option<&str>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
     let row = NewHarvestSignal {
         workflow_exec_id: exec_id.as_uuid(),
         signal_name,
-        payload,
+        payload: codecs.encode_column(&payload)?,
         idempotency_key,
     };
 
@@ -8483,6 +9035,9 @@ pub struct UpdateWithStartParams<'a> {
     /// so an attach/idempotent call is preserved while a fresh start is rejected
     /// — decided atomically under this call's lock (issue #499).
     pub reject_fresh_if_debounced: bool,
+    /// Tenant of a fresh run (issue #1977). An attach ignores it. See
+    /// [`StartWorkflowParams::tenant`].
+    pub tenant: Option<&'a str>,
 }
 
 /// Result of an [`update_with_start_workflow_execution`] call.
@@ -8852,7 +9407,8 @@ pub async fn lookup_idempotent_update_dedupe(
 /// wins rather than an arbitrary older terminated row.
 ///
 /// Returns `(last_completion_result, last_error)` where:
-/// - `last_completion_result` = `output` of the highest earlier-slot COMPLETED fire.
+/// - `last_completion_result` = `output` of the highest earlier-slot COMPLETED fire,
+///   decoded with `codecs` (issue #1979).
 /// - `last_error` = `error` of the highest earlier-slot terminal fire if it was
 ///   `FAILED`/`TIMED_OUT`; `None` if that fire `COMPLETED`/`CANCELLED`/`TERMINATED`.
 async fn resolve_carryover(
@@ -8860,6 +9416,7 @@ async fn resolve_carryover(
     schedule_id: uuid::Uuid,
     current_exec_id: uuid::Uuid,
     current_scheduled_for: Option<chrono::DateTime<chrono::Utc>>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(Option<serde_json::Value>, Option<String>)> {
     use crate::schema::harvest_workflow_executions::dsl;
     use diesel::prelude::*;
@@ -8889,6 +9446,9 @@ async fn resolve_carryover(
         .optional()
         .map_err(database_error)?
         .flatten();
+    // The new `WorkflowStarted` event encodes the carryover itself, so it
+    // needs the plaintext, not a stored envelope (issue #1979).
+    let last_completion_result = codecs.decode_column_opt(last_completion_result.as_ref())?;
 
     // Highest earlier-slot terminal fire for this schedule, across *all* terminal states
     // (COMPLETED, FAILED, TIMED_OUT, CANCELLED, TERMINATED). Surfacing an error only
@@ -9710,9 +10270,60 @@ pub enum ExternalAwaitReadResult {
 /// is followed through its successor chain (same-shard) to the true terminal.
 ///
 /// **Never mutates the target or creates any linkage** — a pure read.
+///
+/// This form decodes the target's output with the identity registry. An
+/// envelope under another codec reads as still pending. Use
+/// [`read_external_await_outcome_with_codecs`] on a deployment that encodes
+/// columns (issue #1979).
+///
+/// # Errors
+///
+/// As [`read_external_await_outcome_with_codecs`].
 pub async fn read_external_await_outcome(
     conn: &mut AsyncPgConnection,
     target: ExecutionId,
+) -> HarvestResult<ExternalAwaitReadResult> {
+    read_external_await_outcome_with_codecs(conn, target, &store::DEFAULT_PAYLOAD_CODECS).await
+}
+
+/// The target's decoded output for an external await (issue #1979), or
+/// `None` when this registry cannot decode it.
+///
+/// A missing key must not fail the whole outbox tick, so the caller keeps the
+/// await pending. The codec error text is not logged.
+fn decoded_await_output(
+    codecs: &crate::payload_codec::PayloadCodecs,
+    target: ExecutionId,
+    execution: &WorkflowExecution,
+) -> Option<serde_json::Value> {
+    codecs
+        .decode_column_opt(execution.output.as_ref())
+        .map_or_else(
+            |_| {
+                tracing::warn!(
+                    target_exec_id = %target,
+                    "external await: the target output could not be decoded; staying pending"
+                );
+                None
+            },
+            |output| Some(output.unwrap_or(serde_json::Value::Null)),
+        )
+}
+
+/// [`read_external_await_outcome`], decoding the target's output column with
+/// `codecs` (issue #1979).
+///
+/// An output this registry cannot decode reads as
+/// [`ExternalAwaitReadResult::NotYetTerminal`], so the await stays pending
+/// and the outbox retries it.
+///
+/// # Errors
+///
+/// Propagates database failures.
+pub async fn read_external_await_outcome_with_codecs(
+    conn: &mut AsyncPgConnection,
+    target: ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<ExternalAwaitReadResult> {
     let mut current = target;
     for hop in 0..AWAIT_OUTCOME_CHAIN_MAX_HOPS {
@@ -9737,14 +10348,14 @@ pub async fn read_external_await_outcome(
         let state = reported_outcome_state(conn, current, &execution.state).await?;
         let outcome = match state {
             "COMPLETED" => {
-                // The target's `output` row column is read RAW. Core
-                // `append_events`/`load_history` use the identity codec (payload
-                // codecs are a plugin-layer concern), so on a codec-encrypting
-                // deployment this is the ciphertext envelope — the awaiter freezes
-                // it inflated into its own history, mirroring the `FAILED`-path
-                // `details` caveat below. A large output is copied inline without
-                // offloading (a documented future optimization — issue #757).
-                ExternalAwaitOutcome::Completed(execution.output.unwrap_or(serde_json::Value::Null))
+                // The `output` column can hold an envelope (issue #1979). The
+                // awaiter freezes the plaintext into its history, where the
+                // event codec encodes it again. A large output is copied
+                // inline, not offloaded (issue #757).
+                let Some(output) = decoded_await_output(codecs, current, &execution) else {
+                    return Ok(ExternalAwaitReadResult::NotYetTerminal);
+                };
+                ExternalAwaitOutcome::Completed(output)
             }
             "FAILED" => {
                 // The typed failure cause (issue #767) lives in the terminal
@@ -10539,6 +11150,7 @@ mod with_start_shared_unit_tests {
             workflow_retry_policy: Some(serde_json::json!({"max_attempts": 3})),
             max_workflow_attempts_ceiling: Some(4),
             reject_fresh_if_debounced: false,
+            tenant: None,
         }
     }
 

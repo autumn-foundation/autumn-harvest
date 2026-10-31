@@ -1,0 +1,97 @@
+# Ledger profiles for `autumn-harvest/src/retention.rs`. See `docs/ledger/README.md`.
+
+["delete_candidate_execution"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_completion_deliveries", "harvest_dead_letters", "harvest_execution_summaries", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/retention.md"
+
+["legal_hold_db::load_hold_for_update"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/retention.md"
+
+["legal_hold_db::release_legal_hold"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/retention.md"
+
+["legal_hold_db::set_legal_hold"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/retention.md"
+
+["list_execution_summaries"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_execution_summaries"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/retention.md"
+
+["purge_expired_summaries"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_execution_summaries"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/retention.md"
+
+["purge_expired_trigger_fires"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_completion_trigger_fires", "harvest_completion_trigger_outbox", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/retention.md"
+
+["read_candidate_hold"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/retention.md"
+
+["release_retention_leases"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/retention.md"
+
+["routine_skip_candidate"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/retention.md"
+
+["run_shard_tick"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_completion_deliveries", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/retention.md"
+
+["should_skip_candidate"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_signals", "harvest_task_queue", "harvest_timers", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/retention.md"

@@ -1,0 +1,9 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/retention.rs`. See `docs/ledger/README.md`.
+
+["purge_terminal"]
+driver = "per_tick"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/retention.md"

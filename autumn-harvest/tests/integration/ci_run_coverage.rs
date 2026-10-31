@@ -98,6 +98,7 @@ const LIVE_DB_TOKENS: &[&str] = &[
     "testcontainers",
     "setup_test_database_url(",
     "setup_test_database_url_or_env(",
+    "FixtureServer::start(",
 ];
 
 /// Drop whole-line comments (`//`, `///`, `//!`) so container tokens that
@@ -169,17 +170,9 @@ fn is_db_harness_only(source: &str) -> bool {
 // This guard PROVED it bites: during development `nd_block_tests` was left
 // out and the guard failed naming it (the TDD red step).
 
-// mcp_tools_integration / webhook_durable_integration: paved-path DB tests
-// (autumn_web::test::TestDb + run_pending(MIGRATIONS)) that are feature-gated
-// AND have every test #[ignore]d, so no CI run can execute them. Issue #1959
-// tracks the fix.
-const ALLOWLIST_MCP_IGNORED_REASON: &str = "mcp-feature-gated (only `compileonly` in the manifest) AND all tests are #[ignore]d \
-     (TestDb/run_pending paved-path DB harness) — no CI run can execute it; tracked in #1959";
 const ALLOWLIST_KAFKA_BROKER_REASON: &str = "kafka-feature-gated: DOES run in CI, via a dedicated Linux-only \
      ci.yml step (it needs an apt libcurl/cmake install first, and the manifest's compile mode would try to build \
      vendored librdkafka on macOS/Windows). Not a coverage gap — see the `Run plugin Kafka broker connector tests` step.";
-const ALLOWLIST_WEBHOOKS_IGNORED_REASON: &str = "webhooks-feature-gated — not run in CI (no manifest row) — AND all tests are #[ignore]d \
-     (TestDb/run_pending paved-path DB harness); tracked in #1959";
 const ALLOWLIST_CHAOS_REASON: &str = "chaos-feature-gated (issue #940): not in the manifest's `test` job. \
      The `chaos` feature is off by default, and the seeded sweep is slow, so each PR does not run it. \
      It runs only in the nightly and manual job in .github/workflows/chaos.yml, with at least 5 seeds. \
@@ -199,20 +192,19 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "core:audit_log_unexported_idx_write_cost_perf",
         ALLOWLIST_EVIDENCE_HARNESS_REASON,
     ),
+    (
+        "core:broken_session_scan_perf",
+        ALLOWLIST_EVIDENCE_HARNESS_REASON,
+    ),
     ("core:chaos_tests", ALLOWLIST_CHAOS_REASON),
     // ── plugin (autumn-harvest-plugin/tests) ──
     (
         "plugin:connector_kafka_broker",
         ALLOWLIST_KAFKA_BROKER_REASON,
     ),
-    ("plugin:mcp_tools_integration", ALLOWLIST_MCP_IGNORED_REASON),
     (
         "plugin:outbox_start_relay_perf",
         ALLOWLIST_PERF_EVIDENCE_REASON,
-    ),
-    (
-        "plugin:webhook_durable_integration",
-        ALLOWLIST_WEBHOOKS_IGNORED_REASON,
     ),
     // `webhook_receiver_integration` is intentionally absent: its current-thread
     // `TestApp::plugin` deadlock was fixed (multi-thread flavor) and its tests
@@ -237,7 +229,9 @@ const ALLOWLIST: &[(&str, &str)] = &[
 /// for suites that CI already ran.
 /// Then 6: issue #1799 wired the other 49 suites, 27 core and 22 plugin.
 /// Four of them needed a test fix first.
-const ALLOWLIST_MAX_LEN: usize = 6;
+/// Then 4: issue #1959 wired `plugin:mcp_tools_integration` and
+/// `plugin:webhook_durable_integration`. No debt entry is left.
+const ALLOWLIST_MAX_LEN: usize = 5;
 
 fn allowlisted(key: &str) -> bool {
     ALLOWLIST.iter().any(|&(k, _)| k == key)
@@ -249,8 +243,9 @@ fn allowlisted(key: &str) -> bool {
 struct SuiteRow {
     /// `linux` | `linuxpart` | `allos` | `compileonly`.
     osclass: String,
-    /// `autumn-harvest` | `autumn-harvest-plugin` | `autumn-harvest-redis` |
-    /// `standalone-runner`.
+    /// `autumn-harvest` | `autumn-harvest-conformance` | `autumn-harvest-plugin`
+    /// | `autumn-harvest-redis` | `agent-mesh` | `history-load-gate`
+    /// | `standalone-runner`.
     krate: String,
     /// The `--test <target>` binary (core suites use `integration`).
     target: String,
@@ -305,8 +300,14 @@ fn parse_manifest() -> Vec<SuiteRow> {
     const VALID_OSCLASS: &[&str] = &["linux", "linuxpart", "allos", "compileonly"];
     const VALID_CRATE: &[&str] = &[
         "autumn-harvest",
+        // Issue #2030: the cross-backend conformance suite.
+        "autumn-harvest-conformance",
         "autumn-harvest-plugin",
         "autumn-harvest-redis",
+        // Issue #2276: the capstone's Postgres suite.
+        "agent-mesh",
+        // Issue #2257: the measurement crate's Postgres suite.
+        "history-load-gate",
         // Issue #1615: the example's live-Postgres acceptance suite.
         "standalone-runner",
     ];
@@ -424,6 +425,10 @@ fn plugin_required_features(source: &str) -> Vec<String> {
                 "metrics",
                 "unified-dag-execution",
                 "dev-runtime",
+                "oidc",
+                // Issue #1983: the object-store emulator suites.
+                "s3",
+                "gcs",
             ] {
                 let needle = format!("feature = \"{feat}\"");
                 if seg.contains(&needle) {
@@ -517,20 +522,19 @@ fn manifest_parser_finds_known_rows() {
 
 #[test]
 fn compileonly_row_is_not_credited_as_covered() {
-    let rows = parse_manifest();
-    // `mcp_tools_integration` is `compileonly` in the manifest — it must not be
-    // treated as covered.
+    let row = |osclass: &str| SuiteRow {
+        osclass: osclass.into(),
+        krate: "autumn-harvest-plugin".into(),
+        target: "some_db_suite".into(),
+        features: "-".into(),
+        filter: "-".into(),
+    };
     assert!(
-        rows.iter()
-            .any(|r| r.target == "mcp_tools_integration" && r.osclass == "compileonly"),
-        "expected `mcp_tools_integration` to be a `compileonly` manifest row"
-    );
-    assert!(
-        !plugin_covered(&rows, "mcp_tools_integration", &[]),
+        !plugin_covered(&[row("compileonly")], "some_db_suite", &[]),
         "a `compileonly` target must NOT be credited as covered"
     );
     // Sanity: a genuine `linux` run target IS covered.
-    assert!(plugin_covered(&rows, "api_scheduler_integration", &[]));
+    assert!(plugin_covered(&[row("linux")], "some_db_suite", &[]));
 }
 
 // ── A `module::filter` sub-selection must not credit the whole module ────────
@@ -661,22 +665,19 @@ fn allos_row_without_db_does_not_cover_a_db_module() {
 // ── Fail-CLOSED classifier & honesty about env-gated / no-DB HTTP tests ──────
 
 #[test]
-fn paved_path_db_tests_are_classified_and_flagged_all_ignored() {
+fn paved_path_db_tests_are_classified_as_db_gated() {
     let dir = plugin_tests_dir();
-    // These spin a real container via `autumn_web::test::TestDb` +
-    // `run_pending(MIGRATIONS)` — the paved path the original three-token list
-    // missed. They must now classify as DB tests, and each is fully `#[ignore]`d.
-    // (`webhook_receiver_integration` was un-ignored + wired to a `linux`
-    // manifest row, so it no longer belongs in this all-ignored list.)
-    for stem in ["mcp_tools_integration", "webhook_durable_integration"] {
+    // These suites migrate with `run_pending(MIGRATIONS)`, the paved path that
+    // the original three-token list missed. They must classify as DB tests.
+    for stem in [
+        "mcp_tools_integration",
+        "webhook_durable_integration",
+        "webhook_receiver_integration",
+    ] {
         let src = read_source(&dir.join(format!("{stem}.rs")));
         assert!(
             needs_live_db(&src),
-            "{stem} uses the TestDb/run_pending paved DB path and must be classified as DB-gated"
-        );
-        assert!(
-            all_tests_ignored(&src),
-            "{stem}: all its tests are #[ignore]d — a run could not execute it"
+            "{stem} uses the run_pending paved DB path and must be classified as DB-gated"
         );
     }
 }
@@ -701,6 +702,11 @@ fn all_tests_ignored_counts_code_and_not_prose() {
     assert!(
         !all_tests_ignored(source),
         "a doc comment that names an ignored case must not hide the live case"
+    );
+    let every_case_ignored = "#[tokio::test]\n#[ignore = \"docker\"]\nasync fn a() {}\n";
+    assert!(
+        all_tests_ignored(every_case_ignored),
+        "a suite that ignores every test runs nothing"
     );
 }
 
@@ -863,6 +869,60 @@ fn issue_1799_suites_have_covering_rows() {
     }
 }
 
+/// Plugin suites that issue #1959 wired, with the features each row needs.
+///
+/// `mcp_tools_integration` gates two DAG tests on `unified-dag-execution`.
+/// Its file `cfg` names only `mcp`, so the list names the second feature.
+const ISSUE_1959_PLUGIN: &[(&str, &[&str])] = &[
+    ("mcp_tools_integration", &["mcp", "unified-dag-execution"]),
+    ("webhook_durable_integration", &["webhooks"]),
+];
+
+/// The suites that issue #1959 wired must run in CI and must keep their three
+/// fixes. On a current-thread runtime, `TestApp::plugin` deadlocks. `TestDb`
+/// and an untagged `Postgres::default()` start Postgres 11, where the worker
+/// claim query fails on `MATERIALIZED`. A `run_pending` call for the Harvest
+/// set after the framework set skips six Harvest migrations that share a
+/// framework version.
+#[test]
+fn issue_1959_suites_run_in_ci() {
+    let rows = parse_manifest();
+    for &(stem, required) in ISSUE_1959_PLUGIN {
+        let src = read_source(&plugin_tests_dir().join(format!("{stem}.rs")));
+        let code = strip_line_comments(&src);
+        let required: Vec<String> = required.iter().map(ToString::to_string).collect();
+        assert!(
+            plugin_covered(&rows, stem, &required),
+            "plugin:{stem} needs a covering `linux` manifest row with {required:?}"
+        );
+        assert!(
+            !all_tests_ignored(&src),
+            "plugin:{stem} must not `#[ignore]` every test"
+        );
+        assert!(
+            !allowlisted(&format!("plugin:{stem}")),
+            "plugin:{stem} is wired; remove its ALLOWLIST entry and lower ALLOWLIST_MAX_LEN"
+        );
+        assert_eq!(
+            code.matches("#[tokio::test").count(),
+            code.matches("#[tokio::test(flavor = \"multi_thread\"")
+                .count(),
+            "plugin:{stem} must use the multi-thread flavor for every test"
+        );
+        assert!(
+            !code.contains("TestDb::") && code.contains(".with_tag(\"16\")"),
+            "plugin:{stem} must pin Postgres 16, not the `TestDb` default (Postgres 11)"
+        );
+        assert!(
+            code.contains("test_init_sql()")
+                && !code
+                    .replace("FRAMEWORK_MIGRATIONS", "")
+                    .contains("MIGRATIONS"),
+            "plugin:{stem} must load the Harvest schema with `test_init_sql()`"
+        );
+    }
+}
+
 #[test]
 fn claim_budget_gate_has_a_covering_manifest_row() {
     // The gate is the whole point of issue #786; it must actually run in CI.
@@ -895,6 +955,150 @@ fn standalone_runner_test_targets_have_a_running_row() {
                 && r.osclass == "linux"
                 && r.filter == "-"),
             "examples/standalone-runner/tests/{target}.rs needs a `linux standalone-runner {target}` row"
+        );
+    }
+}
+
+/// Issue #2257. The Postgres suite of the `history-load-gate` example runs
+/// from a manifest row. Without one, its tests never run in CI.
+#[test]
+fn history_load_gate_postgres_suite_has_a_running_row() {
+    let rows = parse_manifest();
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/history-load-gate/tests");
+    let targets: Vec<String> = std::fs::read_dir(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension()? == "rs").then(|| path.file_stem()?.to_str().map(str::to_owned))?
+        })
+        .collect();
+    assert!(!targets.is_empty(), "the example has a Postgres suite");
+    for target in targets {
+        assert!(
+            rows.iter().any(|r| r.krate == "history-load-gate"
+                && r.target == target
+                && r.osclass == "linux"
+                && r.filter == "-"),
+            "examples/history-load-gate/tests/{target}.rs needs a `linux history-load-gate {target}` row"
+        );
+    }
+}
+
+/// The name of the `ci.yml` step that runs the offline suites of the
+/// `agent-mesh` capstone (issue #2276).
+const AGENT_MESH_STEP: &str = "Run agent-mesh example tests (issue #2276)";
+
+/// The `run:` line of the `ci.yml` step named `name`, if the step has one.
+fn ci_step_run<'a>(name: &str) -> Option<&'a str> {
+    let mut lines = CI_YAML.lines().skip_while(|line| {
+        line.trim_start()
+            .strip_prefix("- name:")
+            .is_none_or(|rest| rest.trim().trim_matches('"') != name)
+    });
+    lines.next()?;
+    lines
+        .take_while(|line| !line.trim_start().starts_with("- name:"))
+        .find_map(|line| line.trim_start().strip_prefix("run:"))
+        .map(str::trim)
+}
+
+/// Issue #2276. Each test target of the `agent-mesh` capstone runs in CI.
+/// The Postgres suite runs from a `linux` manifest row. The offline suites
+/// run from one `ci.yml` step, which names each target by hand. A new
+/// target with neither would never run.
+#[test]
+fn agent_mesh_test_targets_each_have_a_runner() {
+    let rows = parse_manifest();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/agent-mesh/tests");
+    let mut targets: Vec<String> = std::fs::read_dir(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension()? == "rs").then(|| path.file_stem()?.to_str().map(str::to_owned))?
+        })
+        .collect();
+    targets.sort();
+    assert!(
+        targets.iter().any(|target| target == "postgres"),
+        "the capstone has a Postgres suite: {targets:?}"
+    );
+    let run = ci_step_run(AGENT_MESH_STEP)
+        .unwrap_or_else(|| panic!("ci.yml needs a `{AGENT_MESH_STEP}` step with a `run:` line"));
+    let named: Vec<&str> = run
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter(|pair| pair[0] == "--test")
+        .map(|pair| pair[1])
+        .collect();
+    for target in &targets {
+        if target == "postgres" {
+            assert!(
+                rows.iter().any(|r| r.krate == "agent-mesh"
+                    && r.target == "postgres"
+                    && r.osclass == "linux"
+                    && r.filter == "-"),
+                "examples/agent-mesh/tests/postgres.rs needs a `linux agent-mesh postgres` row"
+            );
+            assert!(
+                !named.contains(&"postgres"),
+                "the `{AGENT_MESH_STEP}` step must not run the Postgres suite: it needs a database"
+            );
+        } else {
+            assert!(
+                named.contains(&target.as_str()),
+                "examples/agent-mesh/tests/{target}.rs needs `--test {target}` in the \
+                 `{AGENT_MESH_STEP}` step of ci.yml: {run}"
+            );
+        }
+    }
+}
+
+/// Issue #2030. The cross-backend conformance suite runs from a `linux` row,
+/// so it runs on every PR that changes code. The live-DB scan reads only the
+/// core and plugin tests, so a deleted row would go unseen.
+#[test]
+fn conformance_suite_has_a_running_row() {
+    let rows = parse_manifest();
+    let manifest =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../autumn-harvest-conformance/Cargo.toml");
+    let toml = std::fs::read_to_string(&manifest)
+        .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+    assert!(
+        toml.contains("name = \"conformance\""),
+        "the conformance crate declares its `conformance` test target"
+    );
+    assert!(
+        rows.iter().any(|r| r.krate == "autumn-harvest-conformance"
+            && r.target == "conformance"
+            && r.osclass == "linux"
+            && r.filter == "-"),
+        "the conformance suite needs a `linux autumn-harvest-conformance conformance - -` row"
+    );
+}
+
+/// Issue #1978: the auth suites need no database, so the live-DB sweep skips
+/// them. A missing row, or a row without the `oidc` feature, would then run
+/// zero tests and stay green. This guard pins both rows.
+#[test]
+fn auth_role_and_oidc_suites_have_running_rows() {
+    let rows = parse_manifest();
+    for (stem, required) in [("custom_roles", &[][..]), ("oidc_login", &["oidc"][..])] {
+        let path = plugin_tests_dir().join(format!("{stem}.rs"));
+        let source = read_source(&path);
+        let gated = plugin_required_features(&source);
+        assert_eq!(
+            gated,
+            required
+                .iter()
+                .map(|f| (*f).to_string())
+                .collect::<Vec<_>>(),
+            "{stem}.rs feature gate"
+        );
+        assert!(
+            plugin_covered(&rows, stem, &gated),
+            "autumn-harvest-plugin/tests/{stem}.rs needs a running manifest row with features {required:?}"
         );
     }
 }
@@ -1287,7 +1491,6 @@ fn names_an_owner_needs_a_login_or_an_issue_number() {
 #[test]
 fn a_new_reason_counts_as_debt() {
     assert!(entry_is_debt("a reason that no list names"));
-    assert!(entry_is_debt(ALLOWLIST_MCP_IGNORED_REASON));
     assert!(!entry_is_debt(ALLOWLIST_CHAOS_REASON));
 }
 
@@ -1632,10 +1835,77 @@ pub const SHELL_OPERATORS: &[&str] = &[";", "&", "|", "\n", "`", "$("];
 /// An `if` can skip the step on the nightly. A `continue-on-error` makes a
 /// failed suite look green to the watchdog, which counts successful runs.
 pub fn ungated(node: &serde_yaml::Value) -> bool {
-    let soft = node
-        .get("continue-on-error")
-        .is_some_and(|v| v.as_bool() != Some(false));
-    node.get("if").is_none() && !soft
+    node.get("if").is_none() && !soft(node)
+}
+
+/// The draft-skip condition that `ci.yml` uses. A schedule always runs.
+pub const DRAFT_SKIP: &str =
+    "github.event_name != 'pull_request' || github.event.pull_request.draft == false";
+
+/// True when a job has no `continue-on-error` and no `if` but [`DRAFT_SKIP`].
+pub fn runs_on_every_schedule(job: &serde_yaml::Value) -> bool {
+    !soft(job)
+        && matches!(
+            job.get("if").map(serde_yaml::Value::as_str),
+            None | Some(Some(DRAFT_SKIP))
+        )
+}
+
+/// True when a job or step sets `continue-on-error` to anything but `false`.
+pub fn soft(node: &serde_yaml::Value) -> bool {
+    node.get("continue-on-error")
+        .is_some_and(|v| v.as_bool() != Some(false))
+}
+
+/// The steps of a parsed workflow job.
+pub fn steps(job: &serde_yaml::Value) -> Vec<&serde_yaml::Value> {
+    job.get("steps")
+        .and_then(serde_yaml::Value::as_sequence)
+        .map(|s| s.iter().collect())
+        .unwrap_or_default()
+}
+
+/// The string at `path` under `node`, or `""` when a key is missing.
+pub fn str_at<'a>(node: &'a serde_yaml::Value, path: &[&str]) -> &'a str {
+    let mut cur = node;
+    for key in path {
+        match cur.get(key) {
+            Some(next) => cur = next,
+            None => return "",
+        }
+    }
+    cur.as_str().unwrap_or("")
+}
+
+/// The names in a job's `needs`, a string or a list.
+pub fn job_needs(job: &serde_yaml::Value) -> BTreeSet<&str> {
+    match job.get("needs") {
+        Some(serde_yaml::Value::String(s)) => BTreeSet::from([s.as_str()]),
+        Some(serde_yaml::Value::Sequence(s)) => s.iter().filter_map(|n| n.as_str()).collect(),
+        _ => BTreeSet::new(),
+    }
+}
+
+/// True when `pin` is a dated nightly, such as `nightly-2026-08-14`.
+///
+/// A newer nightly can fail to compile the crate, so a pin must be a date.
+pub fn dated_nightly(pin: &str) -> bool {
+    pin.strip_prefix("nightly-")
+        .is_some_and(|d| d.len() == 10 && d.chars().all(|c| c.is_ascii_digit() || c == '-'))
+}
+
+/// True when a job needs each of `needs` and opens an issue after a failed
+/// scheduled run. GitHub tells only the last editor of a cron about a failure.
+pub fn alerts_on_scheduled_failure(job: &serde_yaml::Value, needs: &[&str]) -> bool {
+    let condition = str_at(job, &["if"]);
+    let listed = job_needs(job);
+    needs.iter().all(|n| listed.contains(n))
+        && condition.contains("failure()")
+        && condition.contains("'schedule'")
+        && str_at(job, &["permissions", "issues"]) == "write"
+        && steps(job)
+            .iter()
+            .any(|s| str_at(s, &["run"]).contains("gh issue create"))
 }
 
 /// True when an ungated step in an ungated job runs the whole `chaos_tests`

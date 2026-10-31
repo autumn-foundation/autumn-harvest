@@ -1,0 +1,145 @@
+# Ledger profiles for `autumn-harvest/src/timeout.rs`. See `docs/ledger/README.md`.
+
+["commit_workflow_execution_timeout"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["enforce_external_awaits_outbox"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["enforce_external_cancels_outbox"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["enforce_external_signals_outbox"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "docs/performance-external-outbox-scan.md"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["enforce_external_task_timeouts"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_external_tasks", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["enforce_workflow_execution_timeouts"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["enforce_workflow_history_ceiling_with_codecs"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_events", "harvest_task_queue", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["enforce_workflow_sla_breaches"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "docs/performance-sla-breach-scan.md"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["find_timed_out_tasks"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["find_timed_out_tasks_batch"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["force_fail_activity"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["lapsed_moves"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["lock_task_for_timeout"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["lock_workflow_execution_row_and_load_history"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["schedule_to_start_still_expired"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["schedule_to_start_still_expired_unlocked"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["task_state_for_update"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"
+
+["update_workflow_execution_timed_out"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/timeout.md"

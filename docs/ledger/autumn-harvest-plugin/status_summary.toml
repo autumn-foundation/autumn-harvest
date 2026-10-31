@@ -1,0 +1,17 @@
+# Ledger profiles for `autumn-harvest-plugin/src/status_summary.rs`. See `docs/ledger/README.md`.
+
+["count_stalled_candidates"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_signals", "harvest_task_queue", "harvest_timers", "harvest_workflow_executions"]
+measured = "docs/performance-status-summary-stalled.md"
+plan = "docs/ledger/plans/autumn-harvest-plugin/status_summary.md"
+
+["dlq_newest_age_secs"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/status_summary.md"

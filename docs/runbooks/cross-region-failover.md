@@ -33,7 +33,9 @@ Companion documents:
 ordinary writable database, so it can be fenced before it is promoted, and the
 order above is literal. A **physical** standby is read-only until
 `pg_ctl promote` — `harvest dr fence` issues `LOCK TABLE` and `UPDATE`, so it
-would simply fail there. On that topology the order is *isolate → promote →
+would simply fail there. The same transaction also ends every decision owner
+lease (issue #2251), so its role needs `SELECT` and `UPDATE` on
+`harvest_decision_owner`. On that topology the order is *isolate → promote →
 fence*, and step 1 below says so.
 
 The safety property is identical either way, because it does not depend on

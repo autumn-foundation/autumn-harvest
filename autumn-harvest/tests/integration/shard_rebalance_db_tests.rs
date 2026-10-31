@@ -293,6 +293,7 @@ async fn insert_execution_with_id(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -644,6 +645,273 @@ async fn a_timer_parked_execution_migrates_end_to_end() {
     .await
     .expect("search attrs");
     assert_eq!(attrs.value.as_deref(), Some("acme"));
+}
+
+/// Issue #1996: the agent cost ledger moves with the run. A row left on the
+/// source would drop out of the usage report of the target shard.
+#[tokio::test]
+async fn the_llm_ledger_moves_with_the_run() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "entity-ledger").await;
+    let mut source = shards.source().await;
+    diesel::sql_query(
+        "INSERT INTO harvest_llm_ledger \
+             (workflow_exec_id, event_id, call_index, activity_name, model, \
+              input_tokens, output_tokens, cost_usd_micros, latency_ms) \
+         VALUES ($1, 1, 0, 'llm_step', 'model-moved', 120, 30, 450, 800)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("seed a ledger row");
+
+    let outcome = migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migration must not error");
+    assert!(
+        matches!(outcome, MigrationOutcome::Migrated { .. }),
+        "expected a completed migration, got {outcome:?}"
+    );
+
+    let mut target = shards.target().await;
+    let moved: ScalarText = diesel::sql_query(
+        "SELECT concat_ws('/', event_id, call_index, activity_name, model, input_tokens, \
+                output_tokens, cost_usd_micros, latency_ms) AS value \
+           FROM harvest_llm_ledger WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(&mut target)
+    .await
+    .expect("the ledger row is on the target");
+    assert_eq!(
+        moved.value.as_deref(),
+        Some("1/0/llm_step/model-moved/120/30/450/800")
+    );
+
+    // The sealed source keeps its copy, but only the target reports it.
+    let query = autumn_harvest::usage::UsageQuery {
+        group_by: autumn_harvest::usage::UsageGroupBy::WorkflowName,
+        from: Utc::now() - Duration::hours(1),
+        to: Utc::now() + Duration::hours(1),
+    };
+    let llm_calls = |rows: Vec<autumn_harvest::usage::UsageShardRow>| {
+        rows.iter()
+            .filter(|row| row.group == "entity_flow")
+            .map(|row| row.llm_calls)
+            .sum::<i64>()
+    };
+    let on_source =
+        autumn_harvest::usage::load_usage_grouped(&mut source, SOURCE.as_i32(), &query, 100)
+            .await
+            .expect("usage on the source");
+    let on_target =
+        autumn_harvest::usage::load_usage_grouped(&mut target, TARGET.as_i32(), &query, 100)
+            .await
+            .expect("usage on the target");
+    assert_eq!(llm_calls(on_source), 0, "the sealed source reports nothing");
+    assert_eq!(llm_calls(on_target), 1, "the target reports the call once");
+}
+
+/// Issue #1974: a decision between verification and cutover can store
+/// durable stream chunks and park again with no new event. The history guard
+/// then still passes. Activation copies such chunks from the sealed source,
+/// so the target misses none.
+#[tokio::test]
+async fn activation_copies_stream_chunks_written_after_verification() {
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "entity-stream").await;
+    let mut source = shards.source().await;
+    let mut target = shards.target().await;
+    let chunk = |offset: i64| store::DurableStreamChunk {
+        offset,
+        chunk: json!({ "token": offset }),
+    };
+    // Offset 1 failed to serialize in its first run, so the stream has a hole.
+    // The append path never fills it later (issue #2083).
+    store::append_stream_chunks(&mut source, exec_id, &[chunk(0), chunk(2)], 100)
+        .await
+        .expect("chunks before staging");
+
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+
+    // An eventless decision on the source after verification adds offsets 3
+    // and 4. Activation copies both, and the hole at offset 1 stays empty.
+    store::append_stream_chunks(&mut source, exec_id, &[chunk(3), chunk(4)], 100)
+        .await
+        .expect("chunks after verification");
+
+    assert!(
+        commit_cutover(&mut source, exec_id, TARGET)
+            .await
+            .expect("cutover"),
+        "no event was appended, so the history guard passes"
+    );
+    activate_target(&mut source, &mut target, exec_id)
+        .await
+        .expect("activate");
+
+    let offsets: Vec<i64> = store::load_stream_chunks(&mut target, exec_id, None, 100)
+        .await
+        .expect("target chunks")
+        .into_iter()
+        .map(|row| row.stream_offset)
+        .collect();
+    assert_eq!(
+        offsets,
+        vec![0, 2, 3, 4],
+        "the target must miss no chunk that the source stored"
+    );
+}
+
+/// Stage a copy, store `chunk(0)` on the source, cut over, then terminate the
+/// staged target. Activation is left to the caller.
+async fn terminated_target_with_late_chunk(
+    shards: &TwoShards,
+    entity: &str,
+) -> (ExecutionId, AsyncPgConnection, AsyncPgConnection) {
+    let exec_id = quiescent_fixture(shards, entity).await;
+    let (mut source, mut target) = (shards.source().await, shards.target().await);
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+    let late = store::DurableStreamChunk {
+        offset: 0,
+        chunk: json!({ "email": "alice@example.com" }),
+    };
+    store::append_stream_chunks(&mut source, exec_id, &[late], 100)
+        .await
+        .expect("chunk after verification");
+    assert!(
+        commit_cutover(&mut source, exec_id, TARGET)
+            .await
+            .expect("cutover")
+    );
+    diesel::sql_query("UPDATE harvest_workflow_executions SET state = 'TERMINATED' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut target)
+        .await
+        .expect("force-terminate the staged copy");
+    (exec_id, source, target)
+}
+
+/// Issue #2128: an operator can terminate the staged target before
+/// activation. The terminated target is not erased, so activation must still
+/// copy the late chunks. Otherwise the forwarded durable read ends without them.
+#[tokio::test]
+async fn activation_copies_late_stream_chunks_over_a_terminated_target() {
+    let shards = setup_two_shards().await;
+    let (exec_id, mut source, mut target) =
+        terminated_target_with_late_chunk(&shards, "entity-stream-terminated").await;
+
+    activate_target(&mut source, &mut target, exec_id)
+        .await
+        .expect("activation over a terminated target");
+
+    let offsets: Vec<i64> = store::load_stream_chunks(&mut target, exec_id, None, 100)
+        .await
+        .expect("target chunks")
+        .into_iter()
+        .map(|row| row.stream_offset)
+        .collect();
+    assert_eq!(
+        offsets,
+        vec![0],
+        "the terminated target must keep the chunk"
+    );
+}
+
+/// Issue #2128: erasure between terminate and activation must win. Activation
+/// must not restore erased author output.
+#[tokio::test]
+async fn activation_copies_no_stream_chunks_over_an_erased_target() {
+    let shards = setup_two_shards().await;
+    let (exec_id, mut source, mut target) =
+        terminated_target_with_late_chunk(&shards, "entity-stream-erased").await;
+    autumn_harvest::erase::erase_workflow_payloads(&mut target, exec_id, "test erasure")
+        .await
+        .expect("erase the terminated target");
+
+    activate_target(&mut source, &mut target, exec_id)
+        .await
+        .expect("activation over an erased target");
+
+    assert_eq!(
+        store::load_stream_chunks(&mut target, exec_id, None, 100)
+            .await
+            .expect("target chunks")
+            .len(),
+        0,
+        "activation must not restore chunks over an erased target"
+    );
+}
+
+/// Issue #2128: an erasure that holds the target row lock when activation
+/// starts must win. Activation waits for the lock, reads the erased input,
+/// and copies nothing.
+#[tokio::test]
+async fn activation_waits_for_an_erasure_holding_the_target_row() {
+    let shards = setup_two_shards().await;
+    let (exec_id, mut source, mut target) =
+        terminated_target_with_late_chunk(&shards, "entity-stream-erasure-race").await;
+    let mut eraser = shards.target().await;
+    diesel::sql_query("BEGIN")
+        .execute(&mut eraser)
+        .await
+        .expect("begin the erasure");
+    diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut eraser)
+        .await
+        .expect("lock the target row");
+
+    let activation = tokio::spawn(async move {
+        activate_target(&mut source, &mut target, exec_id)
+            .await
+            .expect("activation after the erasure");
+        target
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !activation.is_finished(),
+        "activation must wait for the lock"
+    );
+
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+            SET input = '{\"_harvest_erased\": true}'::jsonb WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut eraser)
+    .await
+    .expect("tombstone the input");
+    diesel::sql_query("COMMIT")
+        .execute(&mut eraser)
+        .await
+        .expect("commit the erasure");
+
+    let mut target = activation.await.expect("activation task");
+    assert_eq!(
+        store::load_stream_chunks(&mut target, exec_id, None, 100)
+            .await
+            .expect("target chunks")
+            .len(),
+        0,
+        "activation must not restore chunks after a concurrent erasure"
+    );
 }
 
 /// Issue #1317 review, P1: a retained terminal copy of an UNRELATED
@@ -4719,6 +4987,7 @@ fn signal_with_start_allow_duplicate<'a>(
         workflow_info: None,
         start_source_override: None,
         start_source_ref_override: None,
+        tenant: None,
     }
 }
 
@@ -5063,6 +5332,8 @@ fn terminate_existing_start<'a>(
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
+        tenant: None,
     }
 }
 
@@ -5192,6 +5463,115 @@ async fn a_schedule_attributed_execution_is_refused_by_the_sql_predicate_too() {
 
     // And a real migration refuses it rather than moving it away from the
     // schedule whose overlap enforcement is shard-local.
+    let outcome = migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate must not error, only decline");
+    assert!(
+        matches!(outcome, MigrationOutcome::Skipped { .. }),
+        "expected a skip with named blockers, got {outcome:?}"
+    );
+    assert_eq!(authoritative_shards(&shards, exec_id).await, vec![SOURCE]);
+}
+
+#[tokio::test]
+async fn a_fork_is_refused_by_the_sql_predicate_too() {
+    // A fork reads its source and walks its lineage on its own shard (issue
+    // #2000). Neither the pure predicate nor the cutover SQL moves it.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "forked-run").await;
+
+    let mut source = shards.source().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET start_source = 'fork', \
+         start_source_ref = gen_random_uuid()::text WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("mark the run as a fork");
+
+    let verdict = assess_quiescence(&observe_quiescence(&mut source, exec_id).await.expect("obs"));
+    assert!(verdict.blockers().contains(&QuiescenceBlocker::ForkLineage));
+
+    let outcome = migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate must not error, only decline");
+    assert!(
+        matches!(outcome, MigrationOutcome::Skipped { .. }),
+        "expected a skip with named blockers, got {outcome:?}"
+    );
+    assert_eq!(authoritative_shards(&shards, exec_id).await, vec![SOURCE]);
+}
+
+#[tokio::test]
+async fn the_source_of_a_live_fork_is_refused_by_the_sql_predicate_too() {
+    // A recorded fork reads its source on its own shard (issue #2000). The
+    // source stays there while the fork is live, and may move after that.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "fork-source").await;
+    let fork_id = quiescent_fixture(&shards, "fork-of-source").await;
+
+    let mut source = shards.source().await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET start_source = 'fork', \
+         start_source_ref = $2 WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(fork_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(exec_id.as_uuid().to_string())
+    .execute(&mut source)
+    .await
+    .expect("mark the second run as a fork of the first");
+
+    let verdict = assess_quiescence(&observe_quiescence(&mut source, exec_id).await.expect("obs"));
+    assert!(verdict.blockers().contains(&QuiescenceBlocker::LiveFork));
+    let outcome = migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migrate must not error, only decline");
+    assert!(
+        matches!(outcome, MigrationOutcome::Skipped { .. }),
+        "expected a skip with named blockers, got {outcome:?}"
+    );
+    assert_eq!(authoritative_shards(&shards, exec_id).await, vec![SOURCE]);
+
+    diesel::sql_query("UPDATE harvest_workflow_executions SET state = 'COMPLETED' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(fork_id.as_uuid())
+        .execute(&mut source)
+        .await
+        .expect("complete the fork");
+    let verdict = assess_quiescence(&observe_quiescence(&mut source, exec_id).await.expect("obs"));
+    assert!(
+        verdict.is_eligible(),
+        "a terminal fork reads no source: {:?}",
+        verdict.blockers()
+    );
+}
+
+#[tokio::test]
+async fn the_source_of_a_reset_fork_is_refused_too() {
+    // A reset of a fork names the sealed fork as its source. Its marker names
+    // the original source, which it reads (issue #2000). So the predicate
+    // walks the fork lineage past the sealed fork.
+    let shards = setup_two_shards().await;
+    let exec_id = quiescent_fixture(&shards, "lineage-source").await;
+    let sealed = quiescent_fixture(&shards, "sealed-fork").await;
+    let reset = quiescent_fixture(&shards, "reset-of-fork").await;
+
+    let mut source = shards.source().await;
+    for (fork, of, state) in [(sealed, exec_id, "TERMINATED"), (reset, sealed, "RUNNING")] {
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions SET start_source = 'fork', \
+             start_source_ref = $2, state = $3 WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(fork.as_uuid())
+        .bind::<diesel::sql_types::Text, _>(of.as_uuid().to_string())
+        .bind::<diesel::sql_types::Text, _>(state)
+        .execute(&mut source)
+        .await
+        .expect("mark the fork lineage");
+    }
+
+    let verdict = assess_quiescence(&observe_quiescence(&mut source, exec_id).await.expect("obs"));
+    assert!(verdict.blockers().contains(&QuiescenceBlocker::LiveFork));
     let outcome = migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
         .await
         .expect("migrate must not error, only decline");

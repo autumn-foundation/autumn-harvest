@@ -1,0 +1,313 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/store.rs`. See `docs/ledger/README.md`.
+
+["append_event_seq"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["cancel_request"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["copy_inherited_fields"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["execution_error"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["execution_exists"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["execution_input"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "docs/performance-sqlite-runtime-drive.md"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["execution_output"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "docs/performance-sqlite-runtime-drive.md"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["execution_state"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["find_active_execution_by_key"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["find_active_executions_by_key"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["find_signal_key_in_chain"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions", "harvest_signals"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["for_each_pending_signal"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["has_signal_key"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["insert_child_execution"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["insert_execution_with_config"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["last_event"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["load_attempts"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_activity_attempts"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["load_history_sized"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["mark_signal_delivered"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["next_seq"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "docs/performance-sqlite-runtime-drive.md"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["parent_link"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["record_attempt"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_activity_attempts"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["request_cancel"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_events", "harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["resolve_run_by_key"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["run_config"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["running_detached_children"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["running_executions"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["seal_execution"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["set_cancelled"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["set_completed"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["set_failed"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["set_local_retry_at"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["set_schedule_name"]
+driver = "per_tick"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["set_start_fields"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["set_terminal_with_reason"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["stage_signal"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["upsert_search_attrs"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["workflow_id_of"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "docs/performance-sqlite-runtime-drive.md"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["workflow_name_of"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "docs/performance-sqlite-runtime-drive.md"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"

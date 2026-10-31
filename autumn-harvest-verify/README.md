@@ -18,9 +18,10 @@ to command-emitting **sinks**. Every `#[workflow]` fn gets one of three verdicts
 * `unknown` — with the analysis boundary named. One of fourteen
   (`cargo harvest-verify --list-boundaries`), all fourteen reachable.
 
-The knowledge is **data, not code**: `harvest-verify.model.toml` classifies all
-160 public `WorkflowContext` methods, and `--model extra.toml` overlays new rows
-without a tool release.
+The knowledge is **data, not code**: `harvest-verify.model.toml` classifies
+every public `WorkflowContext` method, and `--model extra.toml` overlays new
+rows without a tool release. A test fails when a public method has no row in
+the built-in model.
 
 ## Quick start
 
@@ -70,6 +71,31 @@ thing that noticed. Fixed here, and written up as
 `docs/rnd/determinism-static-analysis.md` §A measured instance of coverage rot;
 it is the most useful result the prototype has produced.
 
+## Since the audited revision
+
+Proving the autoresearch capstone on `rustc 1.99.0` found three soundness bugs,
+each now fixed and pinned by a seeded corpus case that the audited build got
+wrong:
+
+* **An `async fn` helper dropped its arguments.** A call to an `async fn`
+  resolves to its coroutine, and the call's arguments were seeded onto the
+  coroutine's parameters by position. A clock value passed as the third
+  argument was lost (`wf_async_helper_argument`).
+* **The `[[reduction]] path = "fold"` row was live.** It was kept as a
+  "documented non-rule", but with no receiver it cleared hash order through
+  every `fold` (`wf_hashmap_keys_fold`).
+* **A bare sanitizer or reduction row shadowed a first-party fn.** A helper
+  named `count` was summarized by the `count` row, and its body was never read
+  (`wf_helper_named_count`).
+
+Recursion is now solved as a bounded fixpoint rather than cut
+(`wf_recursive_relay`). A cycle is keyed on the body and its substitution, so
+a recursive call under another generic instantiation is analyzed in its own
+right (`wf_recursive_instantiation`). Six analyzer gaps that made correct code `unknown` are
+closed, each with a clean corpus case: a `const` argument, a std method on a
+trimmed parameter, an inherent float method, a derived `ne`/`lt`, a trusted
+`async fn` future, and a char literal that holds a bracket.
+
 ## Layout
 
 | Path | What it is |
@@ -78,7 +104,7 @@ it is the most useful result the prototype has produced.
 | `src/resolve/` | Call-target resolution: impl bodies by source span via `syn`, closures, async bodies, generic substitution, RTA-lite devirtualization. |
 | `src/analysis/` | Taint, summaries, control dependence and verdicts. |
 | `src/model/`, `harvest-verify.model.toml` | The sanctioned/source/sink model, as data. |
-| `corpus/` | Five crates: 29 seeded bugs the syntactic layer provably misses, 13 clean cases, 4 boundary cases, plus two helper crates for real cross-crate hops. `corpus/expectations.toml` is the oracle. **Deliberately pathological code**: the corpus crates carry no `[lints] workspace = true` and are not clippy-clean, and they are only ever built as rlibs (or `cargo check`ed) on Linux CI — never linked, and never built on macOS or Windows. |
+| `corpus/` | Five crates: seeded bugs the syntactic layer provably misses, clean cases and boundary cases, plus two helper crates for real cross-crate hops. `corpus/expectations.toml` is the oracle. It has one row per case, with its expected verdict. **Deliberately pathological code**: the corpus crates carry no `[lints] workspace = true` and are not clippy-clean, and they are only ever built as rlibs (or `cargo check`ed) on Linux CI — never linked, and never built on macOS or Windows. |
 
 ## Docs
 

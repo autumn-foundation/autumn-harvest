@@ -419,7 +419,8 @@ means the worker itself is the bottleneck — not the queue or the database.
 3. Run `harvest concurrency status --output json` (`GET /api/harvest/admin/concurrency`)
    to check whether per-key concurrency limits are deferring work on top of the
    slot pressure.
-4. Compare `harvest.queue.depth` for the same queue:
+4. Compare `harvest.queue.depth` for the same queue. The gauge stops at
+   10,000, so above that read the trend of `harvest.queue.oldest_pending_age`:
    - **Slots saturated AND backlog growing** → worker is the bottleneck; raise
      `max_concurrent_workflows` / `max_concurrent_activities` or add workers.
    - **Backlog growing but slots are free** → bottleneck is downstream
@@ -503,6 +504,22 @@ added, or if the queue backs a customer-facing workflow with a breached SLA.
 `harvest_queue_schedule_to_start_high` (#501). Use this as a corroborating
 signal or as a fallback when histogram metrics are not yet wired.
 
+The depth gauge stops at 10,000 (#2356). Above that value it shows no growth.
+So while the gauge holds at 10,000 for the whole window, the rule fires on the
+level: a backlog of 10,000 or more for 10 minutes, growing or not. A paused
+queue is left out, because `harvest_queue_paused_too_long` covers it. Each
+depth series matches the pause gauge of its own scrape target, so a pause in
+another deployment with the same queue name does not count. Another deliberate
+hold, such as an activity pause, still fires it. The pause gauge has no shard
+label. So a pause on one shard leaves the whole queue out, while the other
+shards still dispatch. During such a hold, read `harvest_queue_backlog` or the
+schedule-to-start alert. To tell growth from
+a drain at the cap, read the trend of `harvest_queue_oldest_pending_age`, or
+scrape the exact `harvest_queue_backlog` from
+`GET /admin/queues/scaling?format=prometheus`.
+`docs/alerts/starter-pack-v0.1.0.backlog-growth.test.yml` tests each case
+with promtool.
+
 ### Triage steps
 
 1. Check the alert labels for the queue.
@@ -519,7 +536,10 @@ routing for part of the fleet.
 ### False positives
 
 Batch windows can create expected short spikes. Alert only when depth stays
-high and growth remains positive for the rule window.
+high and growth remains positive for the rule window. At the cap the rule
+fires on the level, so a deep backlog that drains slowly fires too. A queue
+that normally holds more than 10,000 tasks stays at the cap. For such a queue,
+drop the depth rule and rely on the schedule-to-start alert.
 
 ### Safe actions
 
@@ -1790,7 +1810,8 @@ value. Alert on `max by (queue) (harvest_queue_paused) > 0` with `for: 1h`
 
 5. **Confirm the thaw.** `harvest queue list-paused` should now be empty and the
    `harvest_queue_depth` / `harvest_queue_oldest_pending_age` panels should
-   start falling.
+   start falling. A held backlog above 10,000 keeps the depth panel flat at the
+   cap until it drains below 10,000 (#2356). The age panel shows the drain first.
 
 ### Likely causes
 
@@ -3250,7 +3271,8 @@ This is a health signal, not a durability one. Nothing is lost.
    change means a burst; a steady climb means sustained saturation.
 3. Compare against `harvest.queue.depth` for the queues that process
    serves. A rising backlog alongside dropped hints confirms the publisher
-   cannot keep up with the enqueue rate.
+   cannot keep up with the enqueue rate. The depth gauge stops at 10,000, so
+   above that read `harvest.queue.oldest_pending_age`.
 4. Check the Redis endpoint's own latency and error rate. A slow or
    degraded Redis backs up the publisher queue from the other end.
 
@@ -3422,8 +3444,9 @@ deployment. A worker with
 a slot tuner is keyed on the tuner's band, its initial target per kind and
 the tuner's `policy()` instead, because the tuner sizes its slots from there. Session capacity counts
 too, because session member activities are pinned to the session's host. So do
-`priority_aging_secs` and the activities the worker's labels make it
-ineligible for, because the claim query orders and filters tasks by them. So
+`priority_aging_secs`, `fairness_keys` and the activities the worker's labels
+make it ineligible for, because the claim query orders and filters tasks by
+them. So
 do the shards and the registered handlers, because a task without a handler is
 released and never counts. So do the circuit-breaker policies, because an
 activity with a breaker skips the claim-time rate-limit gate. The open state
@@ -3440,7 +3463,9 @@ and the quarantine limits (`workflow_panic_max_attempts`,
 `poison_pill_threshold`). So does `cancellation_grace_period`: a timed-out
 activity that ignores its cancellation runs that long before the timeout is
 recorded. So does `dr_fencing`: a fenced worker checks its shard generation
-in each claim query and before each history persist. So do the payload caps, the history policy, the
+in each claim query and before each history persist. So does
+`max_concurrent_claims`: more claim loops fill the slots faster under a
+backlog. So do the payload caps, the history policy, the
 payload offloader, the registered payload codecs and default codec, the
 registered and active codec keys, the activity interceptor chain
 and each activity's own caps, rate and concurrency limits and WASM binding.
@@ -3528,13 +3553,16 @@ that slow queries hold connections too long.
    longer, so slow queries and pool waits often rise together.
 3. Count connections on the database:
    `SELECT state, count(*) FROM pg_stat_activity GROUP BY state;`.
-4. Compare the pool size with the worker's slot counts. Each in-flight task
-   can hold a connection.
+4. Compare the pool size with the worker's slot counts plus its
+   `max_concurrent_claims`. Each in-flight task and each in-flight claim can
+   hold a connection.
 
 ### Likely causes
 
 - The worker pool size, `HarvestPoolConfig::worker_pool_size` per shard, is
-  smaller than the worker's concurrency needs.
+  smaller than the worker's concurrency needs. Count the claim loops too:
+  `max_concurrent_claims`, 2 by default. In embedded mode the worker shares
+  the application pool.
 - Slow queries or lock waits hold connections for longer than usual.
 - A connection leak in an activity that calls `run_transactional` and does
   not finish.
@@ -3564,7 +3592,10 @@ are fast.
 `harvest.db.query.duration{op, shard}` times four ops (issue #1815). They
 are one claim, one workflow-task persist transaction, one timeout-scanner
 pass and one activity heartbeat write. Each op is a unit of work, not one SQL
-statement. The rule watches `claim` and `persist`, because they set
+statement. A `claim` sample also has a `kind` label (issue #2248). Split
+by `kind` to see whether workflow or activity claims are slow. In owner mode
+a fifth op, `take`, times the claim by execution of an owner decider (issue
+#2255). The rule watches `claim`, `take` and `persist`, because they set
 throughput. It keeps the `instance` and `shard` labels, so one slow replica,
 or one slow shard of a multi-shard worker, fires it alone.
 

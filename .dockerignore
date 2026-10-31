@@ -1,0 +1,12 @@
+# Build context of the worker image (issue #1989). Keep the context small and
+# keep local secrets out of it.
+.git
+.claude
+**/.env*
+/agentd.db*
+/agentd.sock*
+**/target
+**/node_modules
+clients/typescript/dist
+research_notes
+reports

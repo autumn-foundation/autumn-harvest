@@ -17,6 +17,9 @@ use crate::types::ExecutionId;
 
 /// Queue a workflow signal for durable delivery and wake the parked workflow.
 ///
+/// This form takes no codec registry, so it stores the payload in clear. Use
+/// [`send_signal_with_codecs`] to honour column encoding (issue #1979).
+///
 /// # Errors
 ///
 /// Returns [`HarvestError::NotFound`](crate::error::HarvestError::NotFound) if
@@ -33,9 +36,34 @@ pub async fn send_signal(
     signal_name: &str,
     payload: serde_json::Value,
 ) -> HarvestResult<()> {
+    send_signal_with_codecs(
+        conn,
+        exec_id,
+        signal_name,
+        payload,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`send_signal`], encoding the payload column with `codecs` (issue #1979).
+///
+/// The payload is stored as an envelope only while column encoding is on.
+///
+/// # Errors
+///
+/// As [`send_signal`], plus a codec error when the payload cannot be encoded.
+#[cfg(feature = "db")]
+pub async fn send_signal_with_codecs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    signal_name: &str,
+    payload: serde_json::Value,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
     // With no key the partial unique index excludes the NULL row, so every
     // insert succeeds — the legacy at-least-once contract. Bool discarded.
-    send_signal_idempotent(conn, exec_id, signal_name, payload, None)
+    send_signal_idempotent_with_codecs(conn, exec_id, signal_name, payload, None, codecs)
         .await
         .map(|_delivered| ())
 }
@@ -46,6 +74,10 @@ pub async fn send_signal(
 /// and `Ok(false)` when the key collided with an already-staged signal. A
 /// `None` key always inserts, so the return is always `Ok(true)`. Dedupe scope
 /// is shard-local, keyed on `(workflow_exec_id, idempotency_key)`.
+///
+/// This form takes no codec registry, so it stores the payload in clear.
+/// Use [`send_signal_idempotent_with_codecs`] to honour column
+/// encoding (issue #1979).
 ///
 /// # Errors
 ///
@@ -64,12 +96,125 @@ pub async fn send_signal_idempotent(
     payload: serde_json::Value,
     idempotency_key: Option<&str>,
 ) -> HarvestResult<bool> {
+    send_signal_idempotent_with_codecs(
+        conn,
+        exec_id,
+        signal_name,
+        payload,
+        idempotency_key,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// Refuse a signal for an execution that cannot accept one (issue #2065).
+///
+/// The insert path runs it after the insert. A codec failure runs it first, so
+/// a terminal target still reports its terminal state, not the codec failure.
+#[cfg(feature = "db")]
+fn signal_state_refusal(
+    exec_id: ExecutionId,
+    execution: &crate::models::WorkflowExecution,
+) -> HarvestResult<()> {
+    match execution.state.as_str() {
+        // PAUSED is a non-terminal active state: a paused workflow
+        // waiting on a signal must still accept (buffer) it so it is
+        // delivered on resume. The wake after the insert re-pends the task, which
+        // the claim gate defers until the execution is RUNNING.
+        "RUNNING" | "PAUSED" => {}
+        // Issue #964. Neither is terminal, and calling them terminal is the
+        // damaging answer: a caller that sees "terminal" reasonably stops
+        // retrying, and the outbox records `target_terminal` in the
+        // sender's history for a workflow that is alive.
+        //
+        // `MIGRATED` — the run was rebalanced onto another shard; this row
+        // is the seal it left behind. The caller reached the wrong database
+        // and should re-resolve through the forwarding pointer.
+        // `MIGRATING` — a staged copy that is not live yet; it becomes
+        // claimable at activation, moments away.
+        //
+        // Both are reported as `ShardUnavailable`, which is the engine's
+        // existing RETRYABLE classification (`HarvestError::is_shard_unavailable`),
+        // so the outbox leaves the row pending and tries again rather than
+        // failing the delivery permanently.
+        //
+        // `MIGRATING` covers two different moments (issue #1317). This
+        // row cannot tell them apart. `commit_cutover` writes only the
+        // SOURCE database, on purpose. That lets it commit even when
+        // the target is briefly unreachable. No distributed two-phase
+        // commit is needed.
+        //
+        // A connection resolved to the target sees the same
+        // `MIGRATING` row in both moments: before cutover, and after
+        // cutover but before activation.
+        //
+        // Accepting the write in the first moment is not safe. If the
+        // migration later aborts, the staged copy is discarded. This
+        // signal would go with it. The caller would see `Ok` for a
+        // signal that silently never existed.
+        //
+        // Refusing in the second moment is suboptimal, not unsafe.
+        // Activation normally follows cutover in the same call.
+        // `resume_incomplete_migrations` finishes the pair after a
+        // crash in between.
+        //
+        // Telling the two moments apart needs a source connection, or
+        // a target-side marker from `commit_cutover`. Callers of this
+        // function are not guaranteed a source connection. A
+        // target-side marker would revive the two-phase dependency
+        // cutover deliberately avoids. So this refuses both,
+        // retryably, rather than risk the unsafe one.
+        state @ ("MIGRATED" | "MIGRATING") => {
+            return Err(HarvestError::ShardUnavailable {
+                shard_id: exec_id.shard().as_i32(),
+                reason: format!(
+                    "workflow execution {exec_id} is mid shard-rebalance on this shard \
+                 ({state}); re-resolve it through its forwarding pointer and retry"
+                ),
+            });
+        }
+        "CANCELLED" => {
+            return Err(HarvestError::Cancelled(
+                execution
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("workflow execution {exec_id} is cancelled")),
+            ));
+        }
+        state => {
+            return Err(HarvestError::Config(format!(
+                "workflow execution {exec_id} is terminal ({state})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// [`send_signal_idempotent`], encoding the payload column with `codecs`
+/// (issue #1979).
+///
+/// # Errors
+///
+/// As [`send_signal_idempotent`], plus a codec error when the payload
+/// cannot be encoded.
+#[cfg(feature = "db")]
+pub async fn send_signal_idempotent_with_codecs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    signal_name: &str,
+    payload: serde_json::Value,
+    idempotency_key: Option<&str>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<bool> {
     use crate::schema::harvest_signals;
     use crate::schema::harvest_workflow_executions;
 
     // An empty key is not in the partial index's NULL exclusion, so it would
     // collide across unrelated signals — treat it as no key (at-least-once).
     let idempotency_key = idempotency_key.filter(|k| !k.is_empty());
+    // Issue #1985: a durable promise settles once on every signal path.
+    let idempotency_key =
+        crate::durable_promise::settlement_idempotency_key(signal_name, &payload, idempotency_key)?;
 
     // The wake at the end of this transaction re-pends a parked workflow task,
     // so it raises a dispatch hint (issue #1312). A hint published before the
@@ -90,6 +235,27 @@ pub async fn send_signal_idempotent(
                 .map_err(crate::error::database_error)?
                 .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
+            // A keyed retry of a signal that already landed must still dedupe
+            // to `Ok(false)` when the codec fails now (issue #1979).
+            let payload = match codecs.encode_column(&payload) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    if let Some(key) = idempotency_key
+                        && signal_idempotency_key_exists(conn, exec_id, key).await?
+                    {
+                        return Ok(false);
+                    }
+                    // A terminal target is a verdict. A codec failure is not.
+                    // A shard move is not a verdict either, so the codec
+                    // failure stays and the request stays pending.
+                    if let Err(refusal) = signal_state_refusal(exec_id, &execution)
+                        && !refusal.is_shard_unavailable()
+                    {
+                        return Err(refusal);
+                    }
+                    return Err(error);
+                }
+            };
             let row = NewHarvestSignal {
                 workflow_exec_id: exec_id.as_uuid(),
                 signal_name,
@@ -119,74 +285,7 @@ pub async fn send_signal_idempotent(
 
             // Fresh row: the execution must be able to accept it. Returning Err
             // here rolls back the transaction, undoing the insert above.
-            match execution.state.as_str() {
-                // PAUSED is a non-terminal active state: a paused workflow
-                // waiting on a signal must still accept (buffer) it so it is
-                // delivered on resume. The wake below re-pends the task, which
-                // the claim gate defers until the execution is RUNNING.
-                "RUNNING" | "PAUSED" => {}
-                // Issue #964. Neither is terminal, and calling them terminal is the
-                // damaging answer: a caller that sees "terminal" reasonably stops
-                // retrying, and the outbox records `target_terminal` in the
-                // sender's history for a workflow that is alive.
-                //
-                // `MIGRATED` — the run was rebalanced onto another shard; this row
-                // is the seal it left behind. The caller reached the wrong database
-                // and should re-resolve through the forwarding pointer.
-                // `MIGRATING` — a staged copy that is not live yet; it becomes
-                // claimable at activation, moments away.
-                //
-                // Both are reported as `ShardUnavailable`, which is the engine's
-                // existing RETRYABLE classification (`HarvestError::is_shard_unavailable`),
-                // so the outbox leaves the row pending and tries again rather than
-                // failing the delivery permanently.
-                //
-                // `MIGRATING` covers two different moments (issue #1317). This
-                // row cannot tell them apart. `commit_cutover` writes only the
-                // SOURCE database, on purpose. That lets it commit even when
-                // the target is briefly unreachable. No distributed two-phase
-                // commit is needed.
-                //
-                // A connection resolved to the target sees the same
-                // `MIGRATING` row in both moments: before cutover, and after
-                // cutover but before activation.
-                //
-                // Accepting the write in the first moment is not safe. If the
-                // migration later aborts, the staged copy is discarded. This
-                // signal would go with it. The caller would see `Ok` for a
-                // signal that silently never existed.
-                //
-                // Refusing in the second moment is suboptimal, not unsafe.
-                // Activation normally follows cutover in the same call.
-                // `resume_incomplete_migrations` finishes the pair after a
-                // crash in between.
-                //
-                // Telling the two moments apart needs a source connection, or
-                // a target-side marker from `commit_cutover`. Callers of this
-                // function are not guaranteed a source connection. A
-                // target-side marker would revive the two-phase dependency
-                // cutover deliberately avoids. So this refuses both,
-                // retryably, rather than risk the unsafe one.
-                state @ ("MIGRATED" | "MIGRATING") => {
-                    return Err(HarvestError::ShardUnavailable {
-                        shard_id: exec_id.shard().as_i32(),
-                        reason: format!(
-                            "workflow execution {exec_id} is mid shard-rebalance on this shard \
-                         ({state}); re-resolve it through its forwarding pointer and retry"
-                        ),
-                    });
-                }
-                "CANCELLED" => {
-                    return Err(HarvestError::Cancelled(execution.error.unwrap_or_else(
-                        || format!("workflow execution {exec_id} is cancelled"),
-                    )));
-                }
-                state => {
-                    return Err(HarvestError::Config(format!(
-                        "workflow execution {exec_id} is terminal ({state})"
-                    )));
-                }
-            }
+            signal_state_refusal(exec_id, &execution)?;
 
             // ADR-0001 §2.5: harvest.signal.send — PRODUCER, emitted only for an
             // accepted signal. in_scope is synchronous so EnteredSpan (!Send) is
@@ -252,6 +351,10 @@ pub struct RoutedSignalDelivery {
 /// freshly resolved live attempt; neither can double-deliver, because a
 /// re-drive only ever follows a delivery that was *not* queued.
 ///
+/// This form takes no codec registry, so it stores the payload in clear.
+/// Use [`send_signal_to_live_attempt_with_codecs`] to honour column
+/// encoding (issue #1979).
+///
 /// # Errors
 ///
 /// Returns [`HarvestError::NotFound`](crate::error::HarvestError::NotFound) if
@@ -265,6 +368,33 @@ pub async fn send_signal_to_live_attempt(
     signal_name: &str,
     payload: serde_json::Value,
     idempotency_key: Option<&str>,
+) -> HarvestResult<RoutedSignalDelivery> {
+    send_signal_to_live_attempt_with_codecs(
+        conn,
+        exec_id,
+        signal_name,
+        payload,
+        idempotency_key,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`send_signal_to_live_attempt`], encoding the payload column with `codecs`
+/// (issue #1979).
+///
+/// # Errors
+///
+/// As [`send_signal_to_live_attempt`], plus a codec error when the payload
+/// cannot be encoded.
+#[cfg(feature = "db")]
+pub async fn send_signal_to_live_attempt_with_codecs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    signal_name: &str,
+    payload: serde_json::Value,
+    idempotency_key: Option<&str>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<RoutedSignalDelivery> {
     // `conn` is supplied by the caller (generated typed-signal code predating
     // sharding), so its shard is not known here. `resolve_live_attempt_id_best_effort`
@@ -283,7 +413,16 @@ pub async fn send_signal_to_live_attempt(
     // own. Holding both open at once can deadlock a pool-size-one shard
     // against itself.
     drop(rebind);
-    send_signal_from_resolved(conn, exec_id, target, signal_name, payload, idempotency_key).await
+    send_signal_from_resolved_with_codecs(
+        conn,
+        exec_id,
+        target,
+        signal_name,
+        payload,
+        idempotency_key,
+        codecs,
+    )
+    .await
 }
 
 /// [`send_signal_to_live_attempt`] for a caller that has **already** resolved
@@ -307,6 +446,10 @@ pub async fn send_signal_to_live_attempt(
 /// that moved shards mid-resolution leaves `conn` on the ORIGINAL shard,
 /// not the resolved one.
 ///
+/// This form takes no codec registry, so it stores the payload in clear.
+/// Use [`send_signal_from_resolved_with_codecs`] to honour column
+/// encoding (issue #1979).
+///
 /// # Errors
 ///
 /// See [`send_signal_to_live_attempt`].
@@ -319,6 +462,35 @@ pub async fn send_signal_from_resolved(
     payload: serde_json::Value,
     idempotency_key: Option<&str>,
 ) -> HarvestResult<RoutedSignalDelivery> {
+    send_signal_from_resolved_with_codecs(
+        conn,
+        logical_exec_id,
+        resolved,
+        signal_name,
+        payload,
+        idempotency_key,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`send_signal_from_resolved`], encoding the payload column with `codecs`
+/// (issue #1979).
+///
+/// # Errors
+///
+/// As [`send_signal_from_resolved`], plus a codec error when the payload
+/// cannot be encoded.
+#[cfg(feature = "db")]
+pub async fn send_signal_from_resolved_with_codecs(
+    conn: &mut AsyncPgConnection,
+    logical_exec_id: ExecutionId,
+    resolved: ExecutionId,
+    signal_name: &str,
+    payload: serde_json::Value,
+    idempotency_key: Option<&str>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<RoutedSignalDelivery> {
     let exec_id = logical_exec_id;
     let mut target = resolved;
     let mut rebind = crate::execution::bind_to_shard_best_effort(conn, target).await?;
@@ -327,12 +499,13 @@ pub async fn send_signal_from_resolved(
             Some(fresh) => fresh,
             None => conn,
         };
-        match send_signal_idempotent(
+        match send_signal_idempotent_with_codecs(
             active,
             target,
             signal_name,
             payload.clone(),
             idempotency_key,
+            codecs,
         )
         .await
         {
@@ -382,8 +555,15 @@ pub async fn send_signal_from_resolved(
         Some(fresh) => fresh,
         None => conn,
     };
-    let delivered =
-        send_signal_idempotent(active, target, signal_name, payload, idempotency_key).await?;
+    let delivered = send_signal_idempotent_with_codecs(
+        active,
+        target,
+        signal_name,
+        payload,
+        idempotency_key,
+        codecs,
+    )
+    .await?;
     Ok(RoutedSignalDelivery { target, delivered })
 }
 
@@ -509,6 +689,10 @@ pub enum ByIdSignalOutcome {
 /// purpose, issue #244) before ever attempting a fresh insert against the
 /// freshly-resolved run.
 ///
+/// This form takes no codec registry, so it stores the payload in clear.
+/// Use [`resolve_and_signal_by_workflow_id_with_codecs`] to honour column
+/// encoding (issue #1979).
+///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] for persistence failures. Every other
@@ -523,6 +707,35 @@ pub async fn resolve_and_signal_by_workflow_id(
     payload: serde_json::Value,
     idempotency_key: Option<&str>,
 ) -> HarvestResult<ByIdSignalOutcome> {
+    resolve_and_signal_by_workflow_id_with_codecs(
+        conn,
+        workflow_name,
+        workflow_id,
+        signal_name,
+        payload,
+        idempotency_key,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`resolve_and_signal_by_workflow_id`], encoding the payload column with `codecs`
+/// (issue #1979).
+///
+/// # Errors
+///
+/// As [`resolve_and_signal_by_workflow_id`], plus a codec error when the payload
+/// cannot be encoded.
+#[cfg(feature = "db")]
+pub async fn resolve_and_signal_by_workflow_id_with_codecs(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+    signal_name: &str,
+    payload: serde_json::Value,
+    idempotency_key: Option<&str>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<ByIdSignalOutcome> {
     let Some(run) =
         crate::execution::resolve_execution_id_by_workflow_id(conn, workflow_name, workflow_id)
             .await?
@@ -530,11 +743,26 @@ pub async fn resolve_and_signal_by_workflow_id(
         return Ok(ByIdSignalOutcome::NoRunFound);
     };
 
+    // Issue #1985: apply the promise settlement rules before the dedupe
+    // probe. A refusal ends as a refused insert below would.
+    let idempotency_key = match crate::durable_promise::settlement_idempotency_key(
+        signal_name,
+        &payload,
+        idempotency_key,
+    ) {
+        Ok(key) => key,
+        Err(HarvestError::Config(_)) => return Ok(ByIdSignalOutcome::NotRunning),
+        Err(e) => return Err(e),
+    };
+    // A promise belongs to one run, so its key dedupes per execution only,
+    // at the insert (issue #1985).
+    let promise_signal = signal_name.starts_with(crate::durable_promise::PROMISE_SIGNAL_PREFIX);
+
     // Cross-execution dedup: a keyed request already delivered to ANY
     // execution in this (workflow_name, workflow_id) chain — including a
     // predecessor sealed by a continue-as-new that raced ahead of this
     // retry — is reported as already-delivered without a fresh insert.
-    if let Some(key) = idempotency_key.filter(|k| !k.is_empty())
+    if let Some(key) = idempotency_key.filter(|k| !k.is_empty() && !promise_signal)
         && crate::execution::lookup_idempotent_signal_dedupe(conn, workflow_name, workflow_id, key)
             .await?
             .is_some()
@@ -542,7 +770,16 @@ pub async fn resolve_and_signal_by_workflow_id(
         return Ok(ByIdSignalOutcome::Delivered);
     }
 
-    match send_signal_idempotent(conn, run.exec_id, signal_name, payload, idempotency_key).await {
+    match send_signal_idempotent_with_codecs(
+        conn,
+        run.exec_id,
+        signal_name,
+        payload,
+        idempotency_key,
+        codecs,
+    )
+    .await
+    {
         Ok(_delivered_or_deduped) => Ok(ByIdSignalOutcome::Delivered),
         Err(HarvestError::NotFound(_)) => {
             // Vanishingly unlikely (the row existed a moment ago under this
@@ -606,6 +843,29 @@ pub async fn signal_idempotency_key_exists(
         dsl::harvest_signals
             .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
             .filter(dsl::idempotency_key.eq(idempotency_key)),
+    ))
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
+/// Report whether an execution has an unconsumed signal (issue #2079).
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) if
+/// the query fails.
+#[cfg(feature = "db")]
+pub async fn has_pending_signals(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_signals::dsl;
+
+    diesel::select(diesel::dsl::exists(
+        dsl::harvest_signals
+            .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(dsl::consumed.eq(false)),
     ))
     .get_result(conn)
     .await

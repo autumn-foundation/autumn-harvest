@@ -1,0 +1,1075 @@
+//! The payloads the loop records in history.
+//!
+//! This crate owns these types and every type they hold. Their serde shape
+//! is a contract with recorded history.
+//!
+//! Replay reads these payloads back. Add a field only with `#[serde(default)]`,
+//! so that a history written before the field still decodes.
+
+use std::collections::BTreeSet;
+use std::time::Duration;
+
+use crate::flow::Released;
+use crate::followup::Followups;
+use crate::loop_guard::LoopGuard;
+use crate::memory::MemoryScope;
+use crate::mesh::{DelegationRecord, Mandate};
+use crate::message::ToolDefinition;
+use crate::message::{
+    ChatMessage, ChatRole, ContentPart, SessionId, StopReason, TokenUsage, ToolCall,
+};
+use crate::policy::ToolDecision;
+use crate::workspace::{WorkspaceMount, WorkspaceRef};
+use serde::{Deserialize, Serialize};
+
+/// The default bound on tool rounds.
+pub const DEFAULT_MAX_STEPS: u32 = 8;
+
+/// The default time a gated call waits for a decision: one hour.
+pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 3_600;
+
+/// The bound on [`AgentTask::parallel_children`]. A larger value counts as
+/// this one.
+pub const MAX_PARALLEL_CHILDREN: u32 = 16;
+
+/// The input of one agent run: the workflow input.
+// The flags are independent switches on a recorded payload. A flat bool per
+// switch keeps the wire shape plain, so the lint is allowed here.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentTask {
+    /// The user message that starts this run.
+    pub input: String,
+    /// The system prompt, if any.
+    #[serde(default)]
+    pub system: Option<String>,
+    /// Earlier turns to continue, without the system prompt.
+    #[serde(default)]
+    pub history: Vec<ChatMessage>,
+    /// The session this run belongs to. Tools and the policy see it.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+    /// The bound on tool rounds in one segment. The model may answer once
+    /// more after it. Each follow-up segment starts a new count.
+    pub max_steps: u32,
+    /// The bound on provider-reported tokens for the whole run, follow-ups
+    /// included.
+    #[serde(default)]
+    pub max_total_tokens: Option<u32>,
+    /// The output cap of one model call.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    /// How long a gated call waits for a decision before it is denied.
+    pub approval_timeout_secs: u64,
+    /// The activity-input cap of the workers, in bytes. Set it when the
+    /// workers use a cap other than the engine default. The loop stops with
+    /// `TranscriptFull` before it sends a request over this size. A cap of
+    /// zero is no cap, as in the engine.
+    #[serde(default)]
+    pub max_request_bytes: Option<u64>,
+    /// Send the final answer to the harness delivery.
+    #[serde(default)]
+    pub deliver: bool,
+    /// The memory scope. With a scope, the run reads a memory snapshot and
+    /// gets the `memory` tool. A read-only or unattended segment gets the
+    /// tool only with
+    /// [`unattended_memory_writes`](Self::unattended_memory_writes).
+    #[serde(default)]
+    pub memory_scope: Option<MemoryScope>,
+    /// The follow-up settings. With settings, the run gets the
+    /// `schedule_followup` tool.
+    #[serde(default)]
+    pub followups: Option<Followups>,
+    /// The loop guard. [`AgentTask::new`] turns it on. A recorded task with
+    /// no `loop_guard` field decodes with the guard off, so a run started
+    /// before the guard existed replays as it ran.
+    #[serde(default = "LoopGuard::disabled")]
+    pub loop_guard: LoopGuard,
+    /// Refuse every tool call that writes or acts outside the app.
+    #[serde(default)]
+    pub read_only: bool,
+    /// No person watches this run. A heartbeat tick sets it. Every
+    /// follow-up segment is unattended too.
+    #[serde(default)]
+    pub unattended: bool,
+    /// Let a read-only or unattended segment write its memory.
+    ///
+    /// Off by default. Such a run often reads untrusted data, such as an
+    /// inbox. A note it writes shows in the system prompt of every later run
+    /// in the scope, and those runs can have write tools.
+    #[serde(default)]
+    pub unattended_memory_writes: bool,
+    /// Where the run id comes from. [`AgentTask::new`] uses the execution
+    /// id. A recorded task with no field keeps the workflow id, so a run
+    /// started before the change replays as it ran.
+    #[serde(default)]
+    pub run_id_source: RunIdSource,
+    /// Measure a tool round against the whole next request (issue #2040).
+    /// [`AgentTask::new`] turns it on. A recorded task with no field measures
+    /// the results alone and reads a zero request cap as a limit of zero
+    /// bytes. A run started before the change then replays as it ran.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub whole_request_budget: bool,
+    /// The tenant that scopes the response cache.
+    ///
+    /// On Postgres, the verified tenant of the run wins over this field. Set
+    /// it on SQLite, or for a run that has no verified tenant.
+    ///
+    /// A `QuotaPolicy` on `agent_loop` with the key `"tenant"` reads it for
+    /// the tenant LLM budgets (issue #1997).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// The authority of the root agent in a delegation tree. With a mandate
+    /// that names peers, the run gets the `delegate` tool. See
+    /// [`mesh`](crate::mesh).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mandate: Option<Mandate>,
+    /// The flow labels that earlier runs of this conversation exercised.
+    /// Pass [`AgentReport::flow_labels`] here when you pass the transcript as
+    /// the history. See [`flow`](crate::flow).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
+    /// Stream the text of each model turn (issue #2268): live chunks while
+    /// the model writes, and the durable text of each finished turn. See
+    /// [`live`](crate::live).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stream: bool,
+    /// The mesh of the run (issue #2272). Each model turn carries it, so a
+    /// mesh budget applies to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<String>,
+    /// The memory lives in the state of a durable agent (issue #2273). The
+    /// workflow runs the `memory` tool itself.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub memory_in_state: bool,
+    /// Record only the messages that each model turn adds (issue #2264).
+    /// [`AgentTask::new`] turns it on. A recorded task with no field sends
+    /// the whole transcript, so a run started before the change replays as
+    /// it ran. See [`transcript`](crate::transcript).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transcript_delta: bool,
+    /// The most delegations of one model turn that run at the same time
+    /// (issue #2270). Each runs as a child `agent_loop` run. Zero or one runs
+    /// them one after another, inline. The bound is
+    /// [`MAX_PARALLEL_CHILDREN`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub parallel_children: u32,
+    /// The name of the harness model that runs this task (issue #2271).
+    /// `None` is [`DEFAULT_MODEL`](crate::DEFAULT_MODEL). A delegated child
+    /// keeps it unless its peer names a model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The workspace of the run and its head (issue #2274). A tool that
+    /// opts in reads and writes its files. A delegated child has none. See
+    /// [`workspace`](crate::workspace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceMount>,
+    /// The workflow ids that wait on this run (issue #2269). A fan-out
+    /// child gets the chain of its parent, so a send back up the chain
+    /// fails as a deadlock.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting: Vec<String>,
+    /// End a failed run with a report of stop [`AgentStop::Failed`], not an
+    /// error (issue #2328). A parent sets it on a fan-out child, so the
+    /// parent keeps the usage and the labels of the failed run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub report_failure: bool,
+}
+
+/// Where the run id of a task comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunIdSource {
+    /// The workflow id. A later run can reuse it, so two runs can share a run
+    /// id. Only a task recorded before the execution id decodes to it.
+    #[default]
+    WorkflowId,
+    /// The execution id, which no other run shares.
+    ExecutionId,
+}
+
+impl AgentTask {
+    /// A task with the default bounds.
+    #[must_use]
+    pub fn new(input: impl Into<String>) -> Self {
+        Self {
+            input: input.into(),
+            system: None,
+            history: Vec::new(),
+            session_id: None,
+            max_steps: DEFAULT_MAX_STEPS,
+            max_total_tokens: None,
+            max_output_tokens: None,
+            approval_timeout_secs: DEFAULT_APPROVAL_TIMEOUT_SECS,
+            max_request_bytes: None,
+            deliver: false,
+            memory_scope: None,
+            followups: None,
+            loop_guard: LoopGuard::default(),
+            read_only: false,
+            unattended: false,
+            unattended_memory_writes: false,
+            run_id_source: RunIdSource::ExecutionId,
+            whole_request_budget: true,
+            tenant: None,
+            mandate: None,
+            flow_labels: BTreeSet::new(),
+            stream: false,
+            mesh: None,
+            memory_in_state: false,
+            transcript_delta: true,
+            parallel_children: 0,
+            model: None,
+            workspace: None,
+            waiting: Vec::new(),
+            report_failure: false,
+        }
+    }
+
+    /// Give the run the workspace `scope`, from its head `head` (issue
+    /// #2274).
+    #[must_use]
+    pub fn workspace(mut self, scope: impl Into<String>, head: Option<WorkspaceRef>) -> Self {
+        self.workspace = Some(WorkspaceMount {
+            scope: scope.into(),
+            head,
+            generation: 0,
+        });
+        self
+    }
+
+    /// Record only the messages that each model turn adds, or the whole
+    /// transcript. See [`transcript_delta`](Self::transcript_delta).
+    #[must_use]
+    pub const fn transcript_delta(mut self, on: bool) -> Self {
+        self.transcript_delta = on;
+        self
+    }
+
+    /// Stream the text of each model turn. See [`stream`](Self::stream).
+    #[must_use]
+    pub const fn stream(mut self) -> Self {
+        self.stream = true;
+        self
+    }
+
+    /// Run up to `n` delegations of one model turn at the same time. See
+    /// [`parallel_children`](Self::parallel_children).
+    #[must_use]
+    pub const fn parallel_children(mut self, n: u32) -> Self {
+        self.parallel_children = n;
+        self
+    }
+
+    /// Run the task on the harness model `name`. See [`model`](Self::model).
+    #[must_use]
+    pub fn model(mut self, name: impl Into<String>) -> Self {
+        self.model = Some(name.into());
+        self
+    }
+
+    /// Start with the flow labels that earlier runs exercised. See
+    /// [`flow_labels`](Self::flow_labels).
+    #[must_use]
+    pub fn flow_labels<I, S>(mut self, labels: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.flow_labels = labels.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set the mandate of the root agent. See [`mandate`](Self::mandate).
+    #[must_use]
+    pub fn mandate(mut self, mandate: Mandate) -> Self {
+        self.mandate = Some(mandate);
+        self
+    }
+
+    /// Set the tenant that scopes the response cache. See
+    /// [`tenant`](Self::tenant).
+    #[must_use]
+    pub fn tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
+        self
+    }
+
+    /// Send the final answer to the harness delivery.
+    #[must_use]
+    pub const fn deliver(mut self) -> Self {
+        self.deliver = true;
+        self
+    }
+
+    /// Read and write the memory of this scope.
+    #[must_use]
+    pub fn memory(mut self, scope: MemoryScope) -> Self {
+        self.memory_scope = Some(scope);
+        self
+    }
+
+    /// Let the agent schedule follow-ups.
+    #[must_use]
+    pub const fn followups(mut self, followups: Followups) -> Self {
+        self.followups = Some(followups);
+        self
+    }
+
+    /// Set the loop guard.
+    #[must_use]
+    pub const fn loop_guard(mut self, guard: LoopGuard) -> Self {
+        self.loop_guard = guard;
+        self
+    }
+
+    /// Refuse every tool call that writes or acts outside the app.
+    #[must_use]
+    pub const fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
+
+    /// The memory scope whose `memory` tool this task offers, if any.
+    pub(crate) fn memory_tool_scope(&self) -> Option<MemoryScope> {
+        self.memory_writable()
+            .then(|| self.memory_scope.clone())
+            .flatten()
+    }
+
+    /// Whether this run may write its memory. A read-only or unattended
+    /// segment writes only with `unattended_memory_writes`.
+    pub(crate) const fn memory_writable(&self) -> bool {
+        !(self.read_only || self.unattended) || self.unattended_memory_writes
+    }
+
+    /// Mark the run as one that no person watches.
+    #[must_use]
+    pub const fn unattended(mut self) -> Self {
+        self.unattended = true;
+        self
+    }
+
+    /// Let a read-only or unattended segment write its memory. See
+    /// [`unattended_memory_writes`](Self::unattended_memory_writes).
+    #[must_use]
+    pub const fn unattended_memory_writes(mut self) -> Self {
+        self.unattended_memory_writes = true;
+        self
+    }
+
+    /// Set the system prompt.
+    #[must_use]
+    pub fn system(mut self, system: impl Into<String>) -> Self {
+        self.system = Some(system.into());
+        self
+    }
+
+    /// Continue from earlier turns.
+    #[must_use]
+    pub fn history(mut self, history: Vec<ChatMessage>) -> Self {
+        self.history = history;
+        self
+    }
+
+    /// Bind the run to a session.
+    #[must_use]
+    pub fn session(mut self, session_id: SessionId) -> Self {
+        self.session_id = Some(session_id);
+        self
+    }
+
+    /// Set the bound on tool rounds.
+    #[must_use]
+    pub const fn max_steps(mut self, max_steps: u32) -> Self {
+        self.max_steps = max_steps;
+        self
+    }
+
+    /// Set the bound on provider-reported tokens for the run.
+    #[must_use]
+    pub const fn max_total_tokens(mut self, max: u32) -> Self {
+        self.max_total_tokens = Some(max);
+        self
+    }
+
+    /// Set the output cap of one model call.
+    #[must_use]
+    pub const fn max_output_tokens(mut self, max: u32) -> Self {
+        self.max_output_tokens = Some(max);
+        self
+    }
+
+    /// Set how long a gated call waits for a decision.
+    ///
+    /// The value rounds up to whole seconds, so a short wait never becomes
+    /// an immediate deny.
+    #[must_use]
+    pub const fn approval_timeout(mut self, timeout: Duration) -> Self {
+        self.approval_timeout_secs = Self::new_timeout_secs(timeout);
+        self
+    }
+
+    /// `timeout` in whole seconds, rounded up.
+    pub(crate) const fn new_timeout_secs(timeout: Duration) -> u64 {
+        let partial = if timeout.subsec_nanos() > 0 { 1 } else { 0 };
+        timeout.as_secs().saturating_add(partial)
+    }
+
+    /// Set the activity-input cap of the workers, in bytes. Zero is no cap.
+    ///
+    /// A worker with a payload store offloads a large input, and the engine
+    /// skips its cap for it. The loop cannot see the store, so set zero for
+    /// such a worker.
+    #[must_use]
+    pub const fn max_request_bytes(mut self, bytes: u64) -> Self {
+        self.max_request_bytes = Some(bytes);
+        self
+    }
+
+    /// The request cap the loop enforces.
+    #[must_use]
+    pub fn request_cap(&self) -> u64 {
+        self.max_request_bytes
+            .unwrap_or(autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES)
+    }
+}
+
+/// The input of one model-turn activity.
+// The flags are independent switches on a recorded payload, as in
+// `AgentTask`.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelTurnRequest {
+    /// The execution id. Tools and the policy see it as the run id.
+    pub run_id: String,
+    /// The session the run belongs to.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+    /// Tool rounds used in this segment before this turn.
+    pub steps_used: u32,
+    /// The bound on tool rounds in one segment.
+    pub max_steps: u32,
+    /// Tokens the run spent before this turn, earlier segments included.
+    pub usage: TokenUsage,
+    /// The whole conversation so far, the system prompt first.
+    pub messages: Vec<ChatMessage>,
+    /// The output cap of this call.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    /// Apply read-only rules on top of the harness policy.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
+    /// The memory scope whose `memory` tool this turn offers, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_scope: Option<MemoryScope>,
+    /// Tools that the workflow handles itself, such as `schedule_followup`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_tools: Vec<ToolDefinition>,
+    /// The tenant of [`AgentTask::tenant`]. It scopes the response cache. On
+    /// Postgres, the verified tenant of the run wins over it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// The agent that holds the mandate of this run, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The harness tools that this agent may call. `None` means every tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<BTreeSet<String>>,
+    /// The flow labels that the run tree has exercised before this turn.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
+    /// The flow rules that a person released in the run tree before this
+    /// turn. See [`Recheck::UntilApproved`](crate::Recheck::UntilApproved).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_released: Released,
+    /// Record which tool calls opt in to an interrupt (issue #2265). Only a
+    /// durable agent sets it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interruptible: bool,
+    /// The mesh of the run (issue #2272). A mesh budget checks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<String>,
+    /// Publish the live text of this turn from the activity (issue #2268).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stream: bool,
+    /// The prefix of the window that `messages` follow (issue #2264). With
+    /// a prefix, `messages` holds only the messages after it. The activity
+    /// reads the prefix from the transcript store of the harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<crate::transcript::PrefixRef>,
+    /// Keep the window of this turn in the transcript store, so the next
+    /// turn can send a delta.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub remember: bool,
+    /// The name of the harness model for this turn (issue #2271). `None` is
+    /// [`DEFAULT_MODEL`](crate::DEFAULT_MODEL). The input records it, so
+    /// replay asks the same model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// The recorded result of one model-turn activity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelTurn {
+    /// The assistant content, as the client returned it.
+    pub content: Vec<ContentPart>,
+    /// Why the model stopped.
+    pub stop: StopReason,
+    /// Provider-reported tokens for this call.
+    pub usage: TokenUsage,
+    /// The policy decision for each tool call of [`content`](Self::content),
+    /// in order. Replay reads it and does not ask the policy again.
+    ///
+    /// The calls themselves are read from `content`, so the arguments are
+    /// recorded once.
+    pub decisions: Vec<ToolDecision>,
+    /// `true` when the response cache gave the answer. No model call ran,
+    /// so `usage` is zero.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cache_hit: bool,
+    /// The flow labels of each tool call, in order. Empty when the harness
+    /// has no flow rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<BTreeSet<String>>,
+    /// The flow rules that an approval of each tool call releases, in order.
+    /// Empty when no rule of the harness can be released.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub releases: Vec<Released>,
+    /// `true` when the reply did not fit the result cap, even with its
+    /// decision reasons cut. The activity then drops the reply: `content`,
+    /// `decisions`, `labels` and `releases` are empty, and `usage` stays, so
+    /// the paid call is still counted. The loop ends under
+    /// [`AgentStop::ReplyTooLarge`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub oversized: bool,
+    /// For each tool call, whether an interrupt may cancel it (issue #2265).
+    /// Empty unless the request set `interruptible`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interruptible: Vec<bool>,
+}
+
+impl ModelTurn {
+    /// The typed outcome for a reply that is too large to record.
+    ///
+    /// It keeps the usage, the stop reason and `cache_hit`, so the paid call
+    /// stays counted. Everything else is dropped.
+    #[must_use]
+    pub(crate) fn into_oversized(self) -> Self {
+        Self {
+            content: Vec::new(),
+            stop: self.stop,
+            usage: self.usage,
+            decisions: Vec::new(),
+            cache_hit: self.cache_hit,
+            labels: Vec::new(),
+            releases: Vec::new(),
+            oversized: true,
+            interruptible: Vec::new(),
+        }
+    }
+
+    /// The tool calls of the turn, in order.
+    #[must_use]
+    pub fn calls(&self) -> Vec<ToolCall> {
+        self.content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Some(ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                }),
+                ContentPart::Text(_) | ContentPart::ToolResult { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The text parts of the turn, joined.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text(text) => Some(text.as_str()),
+                ContentPart::ToolCall { .. } | ContentPart::ToolResult { .. } => None,
+            })
+            .collect()
+    }
+}
+
+/// The input of one tool-call activity.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallRequest {
+    /// The execution id: the run id.
+    pub run_id: String,
+    /// The session the run belongs to.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+    /// The tool round (0-based) that issued the call, counted across
+    /// segments.
+    pub step: u32,
+    /// The call to run, with the arguments a reviewer may have edited.
+    pub call: ToolCall,
+    /// The memory scope whose `memory` tool this call may use, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_scope: Option<MemoryScope>,
+    /// Refuse a tool that writes or acts outside, whatever the recorded
+    /// decision says.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
+    /// The harness tools that this agent may call. `None` means every tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<BTreeSet<String>>,
+    /// The flow labels that the decision recorded for the call. The tool-call
+    /// activity refuses a tool whose labels grew after the decision. `None`
+    /// when the decision had no flow rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeSet<String>>,
+    /// The flow labels of the run tree, for a `memory` call. A note keeps
+    /// them (issue #2272).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
+    /// The workspace of the run, for a tool that opts in (issue #2274).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceMount>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) const fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+/// The recorded result of one tool call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutcome {
+    /// The text the model receives as the tool result.
+    pub content: String,
+    /// `true` when the call failed, or was denied, rejected, or not decided.
+    pub is_error: bool,
+    /// The new head of the workspace, when the call changed it (issue
+    /// #2274). History records it, so it becomes the head of the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceRef>,
+}
+
+impl ToolOutcome {
+    /// A successful result.
+    #[must_use]
+    pub fn ok(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            workspace: None,
+        }
+    }
+
+    /// An error result. The model reads the message and can choose again.
+    #[must_use]
+    pub fn error(message: &str) -> Self {
+        Self {
+            content: serde_json::json!({ "error": message }).to_string(),
+            is_error: true,
+            workspace: None,
+        }
+    }
+}
+
+/// Why a run ended.
+///
+/// Later releases can add a reason, so a `match` needs a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AgentStop {
+    /// The model gave a final answer.
+    Completed,
+    /// The last turn hit the output cap. The answer is cut short.
+    OutputCapped,
+    /// The model asked for tools after the last permitted tool round.
+    StepsExhausted,
+    /// The run spent more tokens than `max_total_tokens`.
+    TokensExhausted,
+    /// The next request was too large to record. It was not sent.
+    TranscriptFull,
+    /// The model reply was too large to record, even with its decision
+    /// reasons cut. The reply is dropped. The call is still counted in the
+    /// usage.
+    ReplyTooLarge,
+    /// A run or tenant LLM budget refuses the next model call (issue
+    /// #1997). The adapter does not send the call.
+    BudgetExceeded,
+    /// The model repeated the same tool call with the same result too often.
+    LoopDetected,
+    /// A person interrupted a durable agent mid-op (issue #2265).
+    Interrupted,
+    /// The run failed. The report holds the error and what the run spent
+    /// before it failed (issue #2328). Only a task with `report_failure`
+    /// ends under it.
+    Failed,
+}
+
+/// The workflow output: how the run ended and what it produced.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentReport {
+    /// Why the run ended.
+    pub stop: AgentStop,
+    /// The last text the model produced.
+    pub text: String,
+    /// Tool rounds used in the whole run, follow-ups and delegations
+    /// included. Each agent has its own step bound.
+    pub steps_used: u32,
+    /// Tool calls answered in the whole run, delegations included, whether
+    /// they ran or not. A round cut at the request cap answers its remaining
+    /// calls with an error.
+    pub tool_calls: u32,
+    /// Provider-reported tokens for the whole run, follow-ups included.
+    pub usage: TokenUsage,
+    /// The transcript without the system prompt. Pass it as the history of the
+    /// next run to continue the conversation.
+    pub messages: Vec<ChatMessage>,
+    /// Follow-ups that ran before this report.
+    #[serde(default)]
+    pub followups: u32,
+    /// The last segment booked a follow-up, but it ended under a stop other
+    /// than `completed`, so the follow-up did not run.
+    #[serde(default)]
+    pub followup_dropped: bool,
+    /// Each delegation of the run tree, refused ones too, in the order each
+    /// ended.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegations: Vec<DelegationRecord>,
+    /// The flow labels that the run tree exercised, with the labels of the
+    /// task. Pass them to the next run of this conversation.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
+    /// The run id of the run, as tools and the policy saw it. A parent reads
+    /// it from the report of a child run (issue #2270).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// The head of the workspace when the run ended (issue #2274).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceRef>,
+    /// The error of a run that ended under [`AgentStop::Failed`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The transcript without system messages.
+pub(crate) fn without_system(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    messages
+        .iter()
+        .filter(|message| message.role != ChatRole::System)
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_task_without_optional_fields_decodes() {
+        let task: AgentTask = serde_json::from_value(json!({
+            "input": "hi",
+            "max_steps": 2,
+            "approval_timeout_secs": 5,
+        }))
+        .unwrap();
+        assert_eq!(task.input, "hi");
+        assert_eq!(task.history, Vec::new());
+        assert_eq!(task.max_total_tokens, None);
+    }
+
+    #[test]
+    fn the_failure_flag_is_off_by_default_and_not_written_when_off() {
+        let task = AgentTask::new("hi");
+        assert!(!task.report_failure);
+        assert!(json!(task).get("report_failure").is_none());
+        let mut flagged = task;
+        flagged.report_failure = true;
+        let back: AgentTask = serde_json::from_value(json!(flagged)).unwrap();
+        assert!(back.report_failure);
+    }
+
+    #[test]
+    fn the_builder_sets_every_bound() {
+        let task = AgentTask::new("go")
+            .system("s")
+            .session(SessionId::new("s1"))
+            .max_steps(3)
+            .max_total_tokens(10)
+            .max_output_tokens(5)
+            .approval_timeout(Duration::from_secs(7));
+        assert_eq!(task.system.as_deref(), Some("s"));
+        assert_eq!(task.max_steps, 3);
+        assert_eq!(task.max_total_tokens, Some(10));
+        assert_eq!(task.max_output_tokens, Some(5));
+        assert_eq!(task.approval_timeout_secs, 7);
+        assert!(task.session_id.is_some());
+    }
+
+    #[test]
+    fn a_short_approval_timeout_rounds_up() {
+        let task = AgentTask::new("go").approval_timeout(Duration::from_millis(500));
+        assert_eq!(task.approval_timeout_secs, 1);
+        let task = AgentTask::new("go").approval_timeout(Duration::from_secs(2));
+        assert_eq!(task.approval_timeout_secs, 2);
+    }
+
+    #[test]
+    fn the_request_cap_defaults_to_the_engine_cap() {
+        let task = AgentTask::new("go");
+        assert_eq!(
+            task.request_cap(),
+            autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES
+        );
+        assert_eq!(task.max_request_bytes(10).request_cap(), 10);
+    }
+
+    #[test]
+    fn stop_names_are_stable_in_history() {
+        assert_eq!(json!(AgentStop::TranscriptFull), json!("transcript_full"));
+        assert_eq!(json!(AgentStop::BudgetExceeded), json!("budget_exceeded"));
+        assert_eq!(json!(AgentStop::ReplyTooLarge), json!("reply_too_large"));
+        assert_eq!(json!(AgentStop::Failed), json!("failed"));
+    }
+
+    #[test]
+    fn the_oversized_flag_is_recorded_only_when_set() {
+        let turn = json!({
+            "content": [], "stop": "end_turn",
+            "usage": {
+                "input_tokens": 1, "output_tokens": 2,
+                "cache_read_tokens": 0, "cache_write_tokens": 0,
+            },
+            "decisions": [],
+        });
+        let decoded: ModelTurn = serde_json::from_value(turn.clone()).unwrap();
+        assert!(!decoded.oversized);
+        // A recorded turn from before the flag encodes as it was written.
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), turn);
+        let dropped = ModelTurn {
+            oversized: true,
+            interruptible: Vec::new(),
+            ..decoded
+        };
+        let value = serde_json::to_value(&dropped).unwrap();
+        assert_eq!(value["oversized"], true);
+        assert_eq!(serde_json::from_value::<ModelTurn>(value).unwrap(), dropped);
+    }
+
+    #[test]
+    fn the_tenant_is_in_the_input_only_when_set() {
+        let plain = serde_json::to_value(AgentTask::new("go")).unwrap();
+        assert!(plain.get("tenant").is_none());
+        let task = AgentTask::new("go").tenant("acme");
+        let value = serde_json::to_value(&task).unwrap();
+        assert_eq!(value["tenant"], "acme");
+        assert_eq!(
+            autumn_harvest::quota::resolve_quota_key("tenant", &value).as_deref(),
+            Some("acme")
+        );
+        let back: AgentTask = serde_json::from_value(value).unwrap();
+        assert_eq!(back.tenant.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn an_error_outcome_is_json_the_model_can_read() {
+        let outcome = ToolOutcome::error("no \"quotes\" lost");
+        assert!(outcome.is_error);
+        let value: serde_json::Value = serde_json::from_str(&outcome.content).unwrap();
+        assert_eq!(value["error"], "no \"quotes\" lost");
+    }
+
+    #[test]
+    fn turn_text_joins_only_text_parts() {
+        let turn = ModelTurn {
+            content: vec![
+                ContentPart::Text("a".into()),
+                ContentPart::ToolCall {
+                    id: "c".into(),
+                    name: "t".into(),
+                    arguments: json!({}),
+                },
+                ContentPart::Text("b".into()),
+            ],
+            stop: StopReason::ToolUse,
+            usage: TokenUsage::default(),
+            decisions: vec![ToolDecision::Allow],
+            cache_hit: false,
+            labels: Vec::new(),
+            releases: Vec::new(),
+            oversized: false,
+            interruptible: Vec::new(),
+        };
+        assert_eq!(turn.text(), "ab");
+        let calls = turn.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c");
+    }
+
+    #[test]
+    fn requests_from_before_the_always_on_fields_decode_and_encode_alike() {
+        let old = json!({
+            "run_id": "r", "steps_used": 0, "max_steps": 8,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "messages": [],
+        });
+        let request: ModelTurnRequest = serde_json::from_value(old).unwrap();
+        assert!(!request.read_only);
+        let mut encoded = serde_json::to_value(&request).unwrap();
+        // The new fields are left out at their defaults, so a recorded input
+        // from before them still matches on strict replay.
+        let fields = encoded.as_object_mut().unwrap();
+        for key in [
+            "read_only",
+            "memory_scope",
+            "extra_tools",
+            "tenant",
+            "agent",
+            "allowed_tools",
+            "flow_labels",
+            "flow_released",
+        ] {
+            assert!(!fields.contains_key(key), "{key}");
+        }
+        let old_call = json!({
+            "run_id": "r", "step": 0,
+            "call": {"id": "c", "name": "t", "arguments": {}},
+        });
+        let call: ToolCallRequest = serde_json::from_value(old_call).unwrap();
+        let encoded = serde_json::to_value(&call).unwrap();
+        assert!(encoded.get("read_only").is_none());
+        assert!(encoded.get("memory_scope").is_none());
+        assert!(encoded.get("allowed_tools").is_none());
+        assert!(encoded.get("labels").is_none());
+    }
+
+    #[test]
+    fn a_task_and_a_report_with_no_mesh_keep_the_recorded_shape() {
+        let task = AgentTask::new("go");
+        let encoded = serde_json::to_value(&task).unwrap();
+        assert!(encoded.get("mandate").is_none());
+        assert!(encoded.get("flow_labels").is_none());
+        let old = json!({"input": "go", "max_steps": 8, "approval_timeout_secs": 60});
+        let decoded: AgentTask = serde_json::from_value(old).unwrap();
+        assert_eq!(decoded.mandate, None);
+        assert_eq!(decoded.flow_labels, BTreeSet::new());
+        let with = AgentTask::new("go").mandate(Mandate::new("planner"));
+        let back: AgentTask = serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+        assert_eq!(back.mandate, Some(Mandate::new("planner")));
+
+        let report = json!({
+            "stop": "completed", "text": "hi", "steps_used": 0, "tool_calls": 0,
+            "usage": {"input_tokens": 0, "output_tokens": 0}, "messages": [],
+            "followups": 0, "followup_dropped": false,
+        });
+        let decoded: AgentReport = serde_json::from_value(report).unwrap();
+        assert_eq!(decoded.delegations, Vec::new());
+        assert_eq!(decoded.flow_labels, BTreeSet::new());
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert!(encoded.get("delegations").is_none());
+        assert!(encoded.get("flow_labels").is_none());
+
+        let turn = json!({
+            "content": [], "stop": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+            "decisions": [],
+        });
+        let decoded: ModelTurn = serde_json::from_value(turn).unwrap();
+        assert_eq!(decoded.labels, Vec::<BTreeSet<String>>::new());
+        assert_eq!(decoded.releases, Vec::<Released>::new());
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("releases")
+                .is_none()
+        );
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("labels")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_cache_fields_keep_the_recorded_shape() {
+        let task = AgentTask::new("hi");
+        assert!(serde_json::to_value(&task).unwrap().get("tenant").is_none());
+        let old = serde_json::to_value(&task).unwrap();
+        let decoded: AgentTask = serde_json::from_value(old).unwrap();
+        assert_eq!(decoded.tenant, None);
+        assert_eq!(
+            AgentTask::new("hi").tenant("t").tenant.as_deref(),
+            Some("t")
+        );
+
+        let turn = json!({
+            "content": [], "stop": "end_turn",
+            "usage": {
+                "input_tokens": 1, "output_tokens": 2,
+                "cache_read_tokens": 0, "cache_write_tokens": 0,
+            },
+            "decisions": [],
+        });
+        let decoded: ModelTurn = serde_json::from_value(turn.clone()).unwrap();
+        assert!(!decoded.cache_hit);
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), turn);
+        let hit = ModelTurn {
+            cache_hit: true,
+            ..decoded
+        };
+        assert_eq!(serde_json::to_value(&hit).unwrap()["cache_hit"], true);
+    }
+
+    #[test]
+    fn a_report_from_before_the_always_on_fields_decodes() {
+        let old = json!({
+            "stop": "completed", "text": "hi", "steps_used": 0, "tool_calls": 0,
+            "usage": {"input_tokens": 0, "output_tokens": 0}, "messages": [],
+        });
+        let report: AgentReport = serde_json::from_value(old).unwrap();
+        assert_eq!(report.followups, 0);
+        assert!(!report.followup_dropped);
+    }
+
+    #[test]
+    fn a_task_from_before_the_loop_guard_replays_without_it() {
+        let old = json!({"input": "go", "max_steps": 8, "approval_timeout_secs": 60});
+        let task: AgentTask = serde_json::from_value(old).unwrap();
+        assert_eq!(task.loop_guard, LoopGuard::disabled());
+        assert_eq!(AgentTask::new("go").loop_guard, LoopGuard::default());
+    }
+
+    #[test]
+    fn a_task_from_before_the_whole_request_budget_measures_results_only() {
+        let old = json!({"input": "go", "max_steps": 8, "approval_timeout_secs": 60});
+        let task: AgentTask = serde_json::from_value(old).unwrap();
+        assert!(!task.whole_request_budget);
+        // A task that leaves the flag off encodes as it was recorded.
+        let encoded = serde_json::to_value(&task).unwrap();
+        assert!(encoded.get("whole_request_budget").is_none());
+        assert!(AgentTask::new("go").whole_request_budget);
+    }
+
+    #[test]
+    fn a_task_from_before_execution_ids_keeps_the_workflow_id() {
+        let old = json!({"input": "go", "max_steps": 8, "approval_timeout_secs": 60});
+        let task: AgentTask = serde_json::from_value(old).unwrap();
+        assert_eq!(task.run_id_source, RunIdSource::WorkflowId);
+        assert_eq!(AgentTask::new("go").run_id_source, RunIdSource::ExecutionId);
+    }
+}

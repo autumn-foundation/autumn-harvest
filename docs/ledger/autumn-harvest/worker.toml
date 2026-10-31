@@ -1,0 +1,325 @@
+# Ledger profiles for `autumn-harvest/src/worker.rs`. See `docs/ledger/README.md`.
+
+["AbandonedDispatchPlan::resolve"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["block_workflow_for_non_determinism"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["check_paused_and_park"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["claim_failed_its_task"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["clear_nd_block"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["create_detached_child_executions"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["db_clock_now"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["dead_letter_for_history_cap"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["detached_child_quota_lock_keys"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["fail_activities_for_broken_sessions"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_sessions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["ingest_due_timers_and_signals"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["insert_awaited_child_execution"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["load_unfired_timers_by_id"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_timers"]
+measured = "docs/performance-mixed-suspension-timer-batch.md"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["load_workflow_execution"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["lock_workflow_execution_row_and_load_history"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["lock_workflow_execution_row_only"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["materialize_due_child_timeout_deadlines"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_timers", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["new_child_workflow_event_count"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["owning_execution_is_paused"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["parent_is_on_another_shard"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["persist_activity_wait_park"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["persist_all_started_child_workflows"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["persist_child_timeout_race"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue", "harvest_timers", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["persist_mixed_suspension_batch"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue", "harvest_timers", "harvest_workflow_executions"]
+measured = "docs/performance-activity-fanout-enqueue.md"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["persist_started_timer"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_events", "harvest_task_queue", "harvest_timers"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["persist_workflow_continue_as_new_with_verdict"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_signals", "harvest_workflow_executions"]
+measured = "docs/performance-mutex-terminal-sweep-table-present.md"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["plan_timer_lifecycle"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+
+["process_workflow_task"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "docs/performance-owner-kernels.md"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["quarantine_workflow_task_timeout_outcome"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["read_lost_start"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["read_session_after_inserts"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_sessions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["reset_timed_out_workflow_task"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["resolve_successor_slot"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["sample_active_workflow_counts"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["sample_history_oversized_counts"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "docs/performance-metrics-sampler-guard.md"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["suspended_command_event_count"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_timers"]
+measured = "docs/performance-mixed-suspension-timer-batch.md"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["task_state_and_deadline_for_update"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["update_workflow_execution_completed"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["update_workflow_execution_failed"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["workflow_execution_transition_error"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"
+
+["workflow_task_timeout_metric_names"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/worker.md"

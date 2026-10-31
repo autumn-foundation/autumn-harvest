@@ -56,27 +56,31 @@ multi-shard pool, run one invocation per shard, each with its own
 **These crates.** The Axum types come from the `autumn_web::reexports::axum`
 re-export, so the version always matches the router. The `path` keys point
 into a checkout of this repository, next to your crate. Remove them to build
-against the 0.7.0 release from crates.io.
+against the 0.8.0 release from crates.io.
 
 ```toml
 [dependencies]
-autumn-harvest = { version = "0.7.0", path = "../autumn-harvest/autumn-harvest" }
+autumn-harvest = { version = "0.8.0", path = "../autumn-harvest/autumn-harvest" }
 # `metrics` adds the Prometheus recorder. `webhooks` adds webhook receivers.
-autumn-harvest-plugin = { version = "0.7.0", path = "../autumn-harvest/autumn-harvest-plugin", features = ["metrics", "webhooks"] }
-autumn-web = "0.8"
+autumn-harvest-plugin = { version = "0.8.0", path = "../autumn-harvest/autumn-harvest-plugin", features = ["metrics", "webhooks"] }
+autumn-web = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ```
 
 `autumn-web` is still a dependency, because `autumn-harvest-plugin` uses its
-types. Your code does not call `AppBuilder`. Issue #1615 tracks an embedding
-with no `autumn-web` in its `Cargo.toml`.
+types. Your code does not call `AppBuilder`.
+[`examples/standalone-runner`](../examples/standalone-runner/) names no
+`autumn-web` in its `Cargo.toml` (issue #1615). A unit test fails if its
+manifest names `autumn-web`.
 
 **A database pool.** `HarvestRunnerResources::new` takes an
 `autumn_harvest::worker::DbPool`. The fork chapter builds one through the
 `diesel_async` re-export of the core crate, with a size cap of 10. See its
 [`main.rs`](getting-started/standalone-axum.md#3-the-server). A production pool
-also needs timeouts and TLS. `autumn_web::db::create_pool` sets both, and
-[`examples/standalone-runner`](../examples/standalone-runner/) uses it.
+also needs timeouts and TLS. `autumn_web::db::create_pool` sets both.
+[`examples/standalone-runner`](../examples/standalone-runner/) sets both
+without `autumn-web`. Its `db.rs` bounds each checkout and opens every
+connection through `autumn_harvest::pg_tls`.
 
 **A runtime config in code.** `HarvestPlugin` loads all of `[harvest]` from
 `autumn.toml` and the environment. `HarvestEmbedding` reads only
@@ -548,3 +552,10 @@ These features need autumn-web. `HarvestEmbedding` does not provide them:
 [Start the runtime](#start-the-runtime) itself. For example, it must load the
 admission gates at boot. The module docs of `autumn_harvest::admission_gate`
 explain why. Use `HarvestEmbedding` unless you need a different order.
+
+`harvest_api_router` binds a tenant itself. If your middleware sets
+`VerifiedTenant`, the router refuses a request for another tenant's run. It
+also refuses the list and admin routes. The answers are the same as those of
+`HarvestEmbedding`. The `/ui` router that you nest next to it gets no binding,
+so do not mount Vantage for a tenant-bound caller. A raw mount has no rate
+limiter, so add your own.

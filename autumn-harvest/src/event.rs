@@ -63,6 +63,11 @@ pub enum SideEffectKind {
     Random,
     /// `ctx.side_effect(name, f)` — an author-named one-shot value capture.
     Custom,
+    /// A keyed-entity state snapshot (issue #2259).
+    ///
+    /// Only the entity loop records it. A trigger copies it into
+    /// `harvest_entity_state`. See `docs/adr/0006-keyed-entity.md`.
+    EntityState,
 }
 
 impl SideEffectKind {
@@ -77,6 +82,7 @@ impl SideEffectKind {
             Self::Uuid => "uuid",
             Self::Random => "random",
             Self::Custom => "custom",
+            Self::EntityState => "entity_state",
         }
     }
 }
@@ -159,6 +165,14 @@ pub enum WorkflowEvent {
     },
     /// The workflow was intentionally cancelled (e.g., via API or parent workflow).
     WorkflowCancelled {
+        /// The reason given for cancellation.
+        reason: String,
+    },
+    /// A cancel arrived while a non-cancellable block was open (issue #1984).
+    ///
+    /// The run keeps running. The engine cancels it when the last open block
+    /// closes. Replay skips this event: no workflow command matches it.
+    WorkflowCancelRequested {
         /// The reason given for cancellation.
         reason: String,
     },
@@ -957,6 +971,65 @@ pub enum WorkflowEvent {
         /// Id of the worker that made the decision.
         worker_id: WorkerId,
     },
+
+    // ── Workflow fork (issue #2000) ───────────────────────────────────────────
+    /// Marker on a fork, just after the history that the fork carries over.
+    ///
+    /// It names the source. The fork never changes the source. Replay skips
+    /// this event, because no workflow command makes it.
+    WorkflowForked {
+        /// The source execution.
+        forked_from_exec_id: ExecutionId,
+        /// Last source event copied into this fork.
+        fork_event_id: i64,
+        /// How the fork resolves an effect after the fork point.
+        effects: ForkEffects,
+        /// Operator-supplied reason.
+        reason: String,
+        /// Operator identity for audit.
+        operator_id: String,
+    },
+    /// A result that the caller of a fork sets for one activity.
+    ///
+    /// It replaces the result of occurrence `occurrence` of `activity_name`.
+    /// Replay skips this event. `output` is a payload field, so the codec
+    /// encodes it and erasure replaces it with a tombstone.
+    ForkActivityResultOverridden {
+        /// Name of the activity.
+        activity_name: String,
+        /// 1-based count of `ActivityScheduled` events with this name.
+        occurrence: u32,
+        /// The result that the activity returns in the fork.
+        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
+        output: serde_json::Value,
+    },
+}
+
+/// How a fork resolves an effect after its fork point (issue #2000).
+///
+/// **Append-only invariant:** never remove or rename a variant. Stored
+/// `WorkflowForked` events hold the serialized name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
+pub enum ForkEffects {
+    /// The default. An activity takes the result that the source recorded, or
+    /// a caller override. With neither, the activity fails and never runs.
+    #[default]
+    Recorded,
+    /// An activity runs for real. The caller must ask for this mode.
+    Live,
+}
+
+impl ForkEffects {
+    /// Stable wire label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::Live => "live",
+        }
+    }
 }
 
 impl WorkflowEvent {
@@ -1040,6 +1113,7 @@ impl WorkflowEvent {
             Self::WorkflowCompleted { .. } => "WorkflowCompleted",
             Self::WorkflowFailed { .. } => "WorkflowFailed",
             Self::WorkflowCancelled { .. } => "WorkflowCancelled",
+            Self::WorkflowCancelRequested { .. } => "WorkflowCancelRequested",
             Self::ActivityScheduled { .. } => "ActivityScheduled",
             Self::ActivityStarted { .. } => "ActivityStarted",
             Self::ActivityCompleted { .. } => "ActivityCompleted",
@@ -1087,6 +1161,96 @@ impl WorkflowEvent {
             Self::ExternalAwaitFailed { .. } => "ExternalAwaitFailed",
             Self::MutexGranted { .. } => "MutexGranted",
             Self::DecisionCommitted { .. } => "DecisionCommitted",
+            Self::WorkflowForked { .. } => "WorkflowForked",
+            Self::ForkActivityResultOverridden { .. } => "ForkActivityResultOverridden",
+        }
+    }
+
+    /// The payload field this event stores under the wire key `key`.
+    ///
+    /// The keys are `payload_store::PAYLOAD_FIELD_KEYS`. Returns `None` when
+    /// this variant has no field by that name.
+    ///
+    /// The codec read path uses this to move each payload tree into the
+    /// decoded event. Serde would otherwise rebuild every tree node by node.
+    /// A payload field that is missing here reads back as null, so a new
+    /// payload field must be added to this match. The match names every
+    /// variant, so a new variant does not compile until someone sorts it.
+    pub(crate) fn payload_slot_mut(&mut self, key: &str) -> Option<PayloadSlot<'_>> {
+        match self {
+            Self::WorkflowStarted {
+                input,
+                last_completion_result,
+                ..
+            } => match key {
+                "input" => Some(PayloadSlot::Required(input)),
+                "last_completion_result" => Some(PayloadSlot::Optional(last_completion_result)),
+                _ => None,
+            },
+            Self::ActivityAwaitingExternal { input, .. }
+            | Self::ActivityScheduled { input, .. }
+            | Self::ChildWorkflowSpawnedDetached { input, .. }
+            | Self::ChildWorkflowStarted { input, .. }
+            | Self::LocalActivityScheduled { input, .. }
+            | Self::UpdateAdmitted { input, .. }
+            | Self::WorkflowContinuedAsNew { input, .. } => {
+                (key == "input").then_some(PayloadSlot::Required(input))
+            }
+            Self::ActivityCompleted { output, .. }
+            | Self::ActivityCompletedExternally { output, .. }
+            | Self::ChildWorkflowCompleted { output, .. }
+            | Self::ExternalAwaitResolved { output, .. }
+            | Self::ForkActivityResultOverridden { output, .. }
+            | Self::LocalActivityCompleted { output, .. }
+            | Self::UpdateCompleted { output, .. }
+            | Self::WorkflowCompleted { output } => {
+                (key == "output").then_some(PayloadSlot::Required(output))
+            }
+            Self::ActivityHeartbeat { details, .. } | Self::MarkerRecorded { details, .. } => {
+                (key == "details").then_some(PayloadSlot::Required(details))
+            }
+            Self::ActivityFailed { details, .. }
+            | Self::ChildWorkflowFailed { details, .. }
+            | Self::ExternalAwaitFailed { details, .. }
+            | Self::WorkflowFailed { details, .. } => {
+                (key == "details").then_some(PayloadSlot::Optional(details))
+            }
+            Self::ExternalSignalRequested { payload, .. }
+            | Self::SignalReceived { payload, .. } => {
+                (key == "payload").then_some(PayloadSlot::Required(payload))
+            }
+            Self::SideEffectRecorded { value, .. } => {
+                (key == "value").then_some(PayloadSlot::Required(value))
+            }
+            Self::ActivityExternalDeadlineExtended { .. }
+            | Self::ActivityFailedExternally { .. }
+            | Self::ActivityStarted { .. }
+            | Self::ActivityTimedOut { .. }
+            | Self::ChildWorkflowCascadeApplied { .. }
+            | Self::DecisionCommitted { .. }
+            | Self::ExternalAwaitRequested { .. }
+            | Self::ExternalCancelDelivered { .. }
+            | Self::ExternalCancelFailed { .. }
+            | Self::ExternalCancelRequested { .. }
+            | Self::ExternalSignalDelivered { .. }
+            | Self::ExternalSignalFailed { .. }
+            | Self::LocalActivityExhausted { .. }
+            | Self::LocalActivityFailed { .. }
+            | Self::MutexGranted { .. }
+            | Self::TimerCancelled { .. }
+            | Self::TimerFired { .. }
+            | Self::TimerStarted { .. }
+            | Self::UpdateFailed { .. }
+            | Self::WorkflowCancelled { .. }
+            | Self::WorkflowCancelRequested { .. }
+            | Self::WorkflowExecutionPaused { .. }
+            | Self::WorkflowExecutionResumed { .. }
+            | Self::WorkflowExecutionTimedOut { .. }
+            | Self::WorkflowForked { .. }
+            | Self::WorkflowRedriven { .. }
+            | Self::WorkflowResetFork { .. }
+            | Self::WorkflowResetTerminated { .. }
+            | Self::WorkflowRetryScheduled { .. } => None,
         }
     }
 
@@ -1119,6 +1283,133 @@ impl WorkflowEvent {
                 | Self::WorkflowRetryScheduled { .. }
         )
     }
+
+    /// Whether this event changes the state of the run, so the owner drops
+    /// its cache entry (issue #2253).
+    ///
+    /// A terminal, a pause, a resume and a redrive change the run row as
+    /// well as its history. A foreign writer appends each of them. A cache
+    /// hit whose delta holds one replays cold, so a lost wake cannot leave a
+    /// stale entry in use.
+    #[must_use]
+    pub const fn evicts_owner_cache(&self) -> bool {
+        self.is_terminal_lifecycle()
+            || matches!(
+                self,
+                Self::WorkflowExecutionPaused { .. }
+                    | Self::WorkflowExecutionResumed { .. }
+                    | Self::WorkflowRedriven { .. }
+            )
+    }
+
+    /// The payload field that `key` names on this variant, if it has one.
+    ///
+    /// `key` is one of [`crate::payload_store::PAYLOAD_FIELD_KEYS`], the wire
+    /// name of the field. `PayloadCodecs::decode_event` uses this to move a
+    /// parsed payload tree into place instead of rebuilding it.
+    ///
+    /// The match is exhaustive, so a new variant must state its payload
+    /// fields here. A missed field costs speed, not data: the decoder falls
+    /// back to a full decode when a payload finds no slot.
+    pub(crate) fn payload_slot(&mut self, key: &str) -> Option<PayloadSlot<'_>> {
+        fn named<'a>(name: &str, key: &str, slot: PayloadSlot<'a>) -> Option<PayloadSlot<'a>> {
+            (name == key).then_some(slot)
+        }
+        match self {
+            Self::WorkflowStarted {
+                input,
+                last_completion_result,
+                ..
+            } => match key {
+                "input" => Some(PayloadSlot::Required(input)),
+                "last_completion_result" => Some(PayloadSlot::Optional(last_completion_result)),
+                _ => None,
+            },
+            Self::ActivityScheduled { input, .. }
+            | Self::ChildWorkflowStarted { input, .. }
+            | Self::WorkflowContinuedAsNew { input, .. }
+            | Self::LocalActivityScheduled { input, .. }
+            | Self::ActivityAwaitingExternal { input, .. }
+            | Self::UpdateAdmitted { input, .. }
+            | Self::ChildWorkflowSpawnedDetached { input, .. } => {
+                named("input", key, PayloadSlot::Required(input))
+            }
+            Self::WorkflowCompleted { output }
+            | Self::ActivityCompleted { output, .. }
+            | Self::ChildWorkflowCompleted { output, .. }
+            | Self::LocalActivityCompleted { output, .. }
+            | Self::ActivityCompletedExternally { output, .. }
+            | Self::UpdateCompleted { output, .. }
+            | Self::ExternalAwaitResolved { output, .. }
+            | Self::ForkActivityResultOverridden { output, .. } => {
+                named("output", key, PayloadSlot::Required(output))
+            }
+            Self::ActivityHeartbeat { details, .. } | Self::MarkerRecorded { details, .. } => {
+                named("details", key, PayloadSlot::Required(details))
+            }
+            Self::WorkflowFailed { details, .. }
+            | Self::ActivityFailed { details, .. }
+            | Self::ChildWorkflowFailed { details, .. }
+            | Self::ExternalAwaitFailed { details, .. } => {
+                named("details", key, PayloadSlot::Optional(details))
+            }
+            Self::SignalReceived { payload, .. }
+            | Self::ExternalSignalRequested { payload, .. } => {
+                named("payload", key, PayloadSlot::Required(payload))
+            }
+            Self::SideEffectRecorded { value, .. } => {
+                named("value", key, PayloadSlot::Required(value))
+            }
+            Self::WorkflowCancelled { .. }
+            | Self::WorkflowCancelRequested { .. }
+            | Self::ActivityStarted { .. }
+            | Self::ActivityTimedOut { .. }
+            | Self::TimerStarted { .. }
+            | Self::TimerFired { .. }
+            | Self::LocalActivityFailed { .. }
+            | Self::ActivityFailedExternally { .. }
+            | Self::ActivityExternalDeadlineExtended { .. }
+            | Self::UpdateFailed { .. }
+            | Self::WorkflowResetFork { .. }
+            | Self::WorkflowResetTerminated { .. }
+            | Self::LocalActivityExhausted { .. }
+            | Self::ExternalSignalDelivered { .. }
+            | Self::ExternalSignalFailed { .. }
+            | Self::WorkflowExecutionTimedOut { .. }
+            | Self::ChildWorkflowCascadeApplied { .. }
+            | Self::WorkflowExecutionPaused { .. }
+            | Self::WorkflowExecutionResumed { .. }
+            | Self::ExternalCancelRequested { .. }
+            | Self::ExternalCancelDelivered { .. }
+            | Self::ExternalCancelFailed { .. }
+            | Self::WorkflowRedriven { .. }
+            | Self::WorkflowRetryScheduled { .. }
+            | Self::TimerCancelled { .. }
+            | Self::ExternalAwaitRequested { .. }
+            | Self::MutexGranted { .. }
+            | Self::DecisionCommitted { .. }
+            | Self::WorkflowForked { .. } => None,
+        }
+    }
+}
+
+/// A payload field of a [`WorkflowEvent`], as [`WorkflowEvent::payload_slot`]
+/// and [`WorkflowEvent::payload_slot_mut`] return it.
+pub(crate) enum PayloadSlot<'a> {
+    /// A field typed `Value`. A JSON `null` decodes to `Value::Null`.
+    Required(&'a mut serde_json::Value),
+    /// A field typed `Option<Value>`. A JSON `null` decodes to `None`.
+    Optional(&'a mut Option<serde_json::Value>),
+}
+
+impl PayloadSlot<'_> {
+    /// Store `payload` exactly as serde would decode it into this field.
+    pub(crate) fn fill(self, payload: serde_json::Value) {
+        match self {
+            Self::Required(field) => *field = payload,
+            Self::Optional(field) => *field = (!payload.is_null()).then_some(payload),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1126,6 +1417,51 @@ mod tests {
     use super::*;
     use crate::types::ActivityExecId;
     use chrono::Utc;
+
+    /// Issue #2253: a state change evicts the owner's cache entry. A plain
+    /// result does not.
+    #[test]
+    fn a_state_change_evicts_the_owner_cache() {
+        let now = Utc::now();
+        let evicting = [
+            WorkflowEvent::WorkflowExecutionPaused {
+                paused_at: now,
+                reason: None,
+                actor: "oncall".into(),
+            },
+            WorkflowEvent::WorkflowCancelled {
+                reason: "stop".into(),
+            },
+            WorkflowEvent::WorkflowCompleted {
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::WorkflowExecutionResumed {
+                resumed_at: now,
+                actor: "oncall".into(),
+            },
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: now,
+                dead_letter_id: uuid::Uuid::nil(),
+                reason: None,
+            },
+        ];
+        for event in &evicting {
+            assert!(event.evicts_owner_cache(), "{}", event.type_name());
+        }
+        let plain = [
+            WorkflowEvent::ActivityCompleted {
+                activity_id: ActivityExecId::new(),
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: serde_json::Value::Null,
+            },
+        ];
+        for event in &plain {
+            assert!(!event.evicts_owner_cache(), "{}", event.type_name());
+        }
+    }
 
     // ── WorkflowFailed / ChildWorkflowFailed typed-failure tests (issue #767) ─
 
@@ -1757,11 +2093,23 @@ mod tests {
                 build_id: crate::types::BuildId::new("b-1"),
                 worker_id: WorkerId::new("w-1"),
             },
+            WorkflowEvent::WorkflowForked {
+                forked_from_exec_id: ExecutionId::new(),
+                fork_event_id: 0,
+                effects: ForkEffects::Recorded,
+                reason: "r".into(),
+                operator_id: "o".into(),
+            },
+            WorkflowEvent::ForkActivityResultOverridden {
+                activity_name: "a".into(),
+                occurrence: 1,
+                output: serde_json::Value::Null,
+            },
         ];
 
-        assert_eq!(events.len(), 50);
+        assert_eq!(events.len(), 52);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 50, "duplicate type names detected");
+        assert_eq!(names.len(), 52, "duplicate type names detected");
     }
 
     // ── TimerCancelled tests (issue #768) ─────────────────────────────────────

@@ -73,7 +73,9 @@ LATERAL` accounts for the large majority of total buffers (before the fix:
 `loops=529,869` in this run -- while every other CTE (`execution_starts`,
 `terminal_counts`, `reset_terminated_execs`) is a single indexed scan over
 `harvest_workflow_executions`/`harvest_events` already covered by the 2026-07
-migration.
+migration. The current query also has an `llm_metrics` CTE over
+`harvest_llm_ledger` (issue #1996). It postdates this measurement, so no
+figure on this page includes it.
 
 ## 🧭 Plan
 

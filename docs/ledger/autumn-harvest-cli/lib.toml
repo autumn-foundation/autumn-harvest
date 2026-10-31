@@ -1,0 +1,15 @@
+# Ledger profiles for `autumn-harvest-cli/src/lib.rs`. See `docs/ledger/README.md`.
+
+["dr_connect_read_only"]
+driver = "per_request"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["dr_write_posture"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"

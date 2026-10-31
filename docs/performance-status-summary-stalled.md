@@ -53,12 +53,12 @@ active-execution count, which is deployment-specific.
   cross over (see
   [Where this could stop being a win](#where-this-could-stop-being-a-win)).
 * **Result-equivalence**: the true-positive/healthy split (30 stalled, 0 of
-  the 2,970 healthy rows) is asserted identical in both regimes and in a
+  the 2,970 healthy rows) is asserted identical in all three regimes and in a
   small always-run fixture
   (`count_stalled_candidates_matches_seeded_true_positives_small_fixture`).
   Boundary and multiplicity edge cases (event just inside/outside the
   window, an old event alongside a fresh one) are covered by
-  `status_summary_localpg.rs::stalled_workflows_recent_event_boundary_and_multiplicity`.
+  phases (g)-(i) of `status_summary_localpg.rs::admin_status_localpg_end_to_end`.
   The pre-existing `GET /admin/status` and `GET /workflows?no_progress_minutes=N`
   integration suites pass unmodified against the fixed query.
 * **Scope**: only `count_stalled_candidates` was rewritten.
@@ -236,10 +236,10 @@ positive, none of the healthy executions — asserted directly in
 `capture_regime`'s evidence-capture path. Boundary conditions (an event
 just inside/just outside the 60-minute default window) and multiplicity
 (an old event coexisting with a fresh one on the same execution) are
-covered by `status_summary_localpg.rs`'s
-`stalled_workflows_recent_event_boundary_and_multiplicity`. The pre-existing
-`admin_status_localpg_end_to_end` and `status_summary_integration.rs` /
-`stalled_workflow_tests.rs` suites pass unmodified.
+covered by phases (g)-(i) of `status_summary_localpg.rs`'s
+`admin_status_localpg_end_to_end`. Its pre-existing phases (a)-(e) and the
+`status_summary_integration.rs` / `stalled_workflow_tests.rs` suites pass
+unmodified.
 
 ## Write cost
 

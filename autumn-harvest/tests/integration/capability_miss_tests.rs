@@ -278,6 +278,7 @@ fn build_worker_tuned(
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -303,6 +304,7 @@ fn build_worker_tuned(
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             registry,
         )
@@ -373,6 +375,7 @@ async fn seed_execution(
         start_source: None,
         start_source_ref: None,
         started_by: None,
+        tenant: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -1186,6 +1189,8 @@ fn activity_info(
         max_result_bytes: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -3041,7 +3046,7 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
                 &autumn_harvest::payload_codec::PayloadCodecs::default(),
             )
             .await
-            .expect_err("SKIP LOCKED never waits, so the row reads as contended immediately")
+            .expect_err("the guard waits at most its bound, so the held row reads as contended")
             .suspended_claim_ambiguous()
             .expect("must be the ambiguous-claim sentinel");
             let probe_elapsed = probe_started.elapsed();
@@ -3080,9 +3085,9 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
         .expect("the guarded write and its release fallback must not error");
     assert!(
         probe_elapsed < Duration::from_millis(250),
-        "the ambiguity probe must never wait on the row's lock -- it took \
+        "the ambiguity probe must wait no longer than its bound -- it took \
          {probe_elapsed:?}, but the lock was held for 300ms before this test even \
-         released it, so a probe that blocked would exceed that bound"
+         released it, so a probe that blocked until the commit would exceed 250ms"
     );
     assert!(
         released,
@@ -3252,7 +3257,8 @@ async fn an_ambiguous_claim_rolls_back_every_earlier_write_in_the_same_transacti
 ///
 /// The production fix's two-call split makes that cycle structurally
 /// impossible: `fail_suspended_workflow_if_still_claimed`'s own probe is
-/// `SKIP LOCKED` (never blocks, so it never becomes half of a cycle), and the
+/// `SKIP LOCKED`, then a wait bounded far below `deadlock_timeout` (issue
+/// #2252). It ends first, so it never closes a cycle. The
 /// blocking release only runs *after* the whole enclosing transaction --
 /// execution-row lock included -- has already ended. This test drives both
 /// halves of the would-be cycle concurrently and for real: connection A locks
@@ -3306,7 +3312,7 @@ async fn a_task_row_first_peer_touching_the_execution_row_never_deadlocks_the_re
                 &autumn_harvest::payload_codec::PayloadCodecs::default(),
             )
             .await
-            .expect_err("SKIP LOCKED never waits, so the row reads as contended immediately")
+            .expect_err("the guard waits at most its bound, so the held row reads as contended")
             .suspended_claim_ambiguous()
             .expect("must be the ambiguous-claim sentinel");
 

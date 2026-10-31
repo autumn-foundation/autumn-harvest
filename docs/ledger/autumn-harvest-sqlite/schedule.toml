@@ -1,0 +1,97 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/schedule.rs`. See `docs/ledger/README.md`.
+
+["active_runs"]
+driver = "per_tick"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/schedule.md"
+
+["advance"]
+driver = "per_tick"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/schedule.md"
+
+["clear_override"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/schedule.md"
+
+["delete"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_schedule_overrides", "harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/schedule.md"
+
+["due_names"]
+driver = "per_tick"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/schedule.md"
+
+["list"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/schedule.md"
+
+["load_code"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/schedule.md"
+
+["load_due"]
+driver = "per_tick"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/schedule.md"
+
+["load_override"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/schedule.md"
+
+["set_override"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_schedule_overrides", "harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/schedule.md"
+
+["set_paused"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/schedule.md"
+
+["write_row"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/schedule.md"

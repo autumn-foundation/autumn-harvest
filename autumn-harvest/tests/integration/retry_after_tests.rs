@@ -124,6 +124,7 @@ mod replay_tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -412,6 +413,8 @@ mod db_tests {
             max_result_bytes: None,
             requires: None,
             handler,
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -479,6 +482,8 @@ mod db_tests {
             max_result_bytes: None,
             requires: None,
             handler,
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -494,6 +499,7 @@ mod db_tests {
                     notification_database_url: None,
                     max_concurrent_workflows: 1,
                     max_concurrent_activities: 1,
+                    max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                     poll_interval: Duration::from_millis(25),
                     shutdown_timeout: Duration::from_secs(1),
                     cancellation_grace_period: Duration::from_secs(1),
@@ -519,6 +525,7 @@ mod db_tests {
                     sharded_pool: None,
                     slot_tuner: None,
                     max_concurrent_sessions: 0,
+                    fairness_keys: false,
                 },
                 registry,
             )
@@ -573,6 +580,7 @@ mod db_tests {
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         };
         diesel::insert_into(harvest_workflow_executions::table)
             .values(&row)

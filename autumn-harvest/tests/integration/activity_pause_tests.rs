@@ -30,7 +30,7 @@
 //! the full migration bundle.
 
 use autumn_harvest::activity_pause;
-use autumn_harvest::queue::{self, EnqueueParams, TaskType, claim_task};
+use autumn_harvest::queue::{self, EnqueueParams, TaskClaim, TaskType, claim_task};
 use autumn_harvest::queue_pause;
 use autumn_harvest::timeout::{self, TimeoutReason};
 use diesel_async::AsyncPgConnection;
@@ -400,7 +400,9 @@ async fn pause_does_not_abort_in_flight_instances() {
         "AC4 — a pause must not abort an in-flight instance"
     );
 
-    queue::complete_task(&mut conn, in_flight, serde_json::json!({"ok": true}))
+    // `claim_one` claims as `w1`. A first claim has attempt 1.
+    let claim = TaskClaim::new(in_flight, "w1", 1);
+    queue::complete_task(&mut conn, &claim, serde_json::json!({"ok": true}))
         .await
         .expect("in-flight task must still be completable while its type is paused");
     assert_eq!(

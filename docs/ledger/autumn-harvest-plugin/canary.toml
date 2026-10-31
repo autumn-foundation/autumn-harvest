@@ -1,0 +1,9 @@
+# Ledger profiles for `autumn-harvest-plugin/src/canary.rs`. See `docs/ledger/README.md`.
+
+["load_canary_rows"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/canary.md"

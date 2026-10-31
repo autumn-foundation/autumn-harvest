@@ -361,24 +361,37 @@ deployment stores. It is the **activation** that must come last.
 
 ### ⚠️ What "zero" does and does not authorise
 
-The gate proves one specific thing: **no `harvest_events` row on any expected
-shard still references the key.** That is what the sweep converts, so that is
-what the census counts. It is *not* a licence to destroy the key material yet,
-because a codec envelope can also be sitting in places this feature does not
-sweep:
+The gate proves one specific thing: **no `harvest_events` row and no codec
+column cell on any expected shard still references the key.** That is what the
+sweep converts, so that is what the census counts. The codec columns are listed
+in `codec_rotation::CODEC_COLUMNS` (issue #1979). It is *not* a licence to
+destroy the key material yet, because a codec envelope can also be sitting in
+places this feature does not sweep:
 
 - **Offloaded blobs** (issue #524). Offload composes *after* codec encode, so
   the ciphertext — and its key id — lives in your `PayloadStore`, while the DB
   row holds only a reference envelope. Those are the *large* payloads, and they
   are explicitly out of scope here (embedder-owned storage). Re-encrypt or
   re-key them yourself before retiring.
-- **Codec-encoded columns outside the event log**:
-  `harvest_workflow_executions.{input,output,memo,search_attrs,error}`,
-  `harvest_execution_summaries.{result,search_attrs}`,
-  `harvest_dead_letters.{input,error}`, `harvest_signals.payload`, and
-  `harvest_completion_deliveries.payload` are all decoded on the read path
-  (`decode_workflow_execution_fields` and friends) and are **not** swept or
-  censused.
+- **Columns outside `CODEC_COLUMNS`.** The sweep and the census cover the
+  entries of `codec_rotation::CODEC_COLUMNS` (issue #1979, issue #2043). They
+  cover workflow and activity task rows. The coverage table in
+  `docs/security-posture.md` names each column that stays clear. Harvest
+  writes no envelope to any other column.
+- **Start options.** The `start_options` of a debounce, throttle or batch row
+  hold the headers and the memo as two envelopes. The census and the sweep
+  cover both keys. The other keys stay as they are.
+- **Buffers and arrays.** An event batch buffer holds one envelope for each
+  element. The census counts a buffer row once for each key. One swap converts
+  every envelope element. A buffer with an element that does not decode stays
+  as it is, and the pass does not complete.
+- **Rows from before issue #2043.** A clear value written before that issue
+  can have the shape of an envelope. The census counts it and the sweep
+  converts it. A retired codec id makes that cell unresolved. Wait for task
+  retention, or run terminal task GC, before you retire a key. An envelope that a writer
+  outside Harvest put there is not swept or censused. A
+  `harvest_shard_migrations.staged_task` snapshot can hold a task row's
+  envelope during a shard move. Do not retire a key during a shard move.
 - **Nested envelopes.** The census and the sweep classify a payload field by its
   *top-level* envelope. A field whose decoded plaintext itself contains an
   envelope — e.g. an `ExternalAwaitResolved.output` frozen from another

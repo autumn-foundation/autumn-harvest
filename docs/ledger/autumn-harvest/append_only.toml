@@ -1,0 +1,16 @@
+# Ledger profiles for `autumn-harvest/src/append_only.rs`. See `docs/ledger/README.md`.
+
+["set"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/append_only.md"
+
+["with_guard_off"]
+driver = "test_support"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"

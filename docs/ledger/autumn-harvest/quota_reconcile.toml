@@ -1,0 +1,9 @@
+# Ledger profiles for `autumn-harvest/src/quota_reconcile.rs`. See `docs/ledger/README.md`.
+
+["reconcile_quota_keys_from_with_codecs"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/quota_reconcile.md"

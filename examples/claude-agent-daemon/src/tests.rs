@@ -18,10 +18,11 @@ use crate::guard;
 use crate::inspect;
 use crate::protocol::{self, Request, Response};
 use crate::session::{
-    self, ApprovalDecision, SIGNAL_TOOL_APPROVAL, SessionReport, SessionTask, ToolCall,
-    ToolOutcome, ToolRequest, TurnReply, TurnRequest, WORKFLOW_NAME,
+    self, ApprovalDecision, SessionReport, SessionTask, ToolCall, ToolOutcome, ToolRequest,
+    TurnReply, TurnRequest, WORKFLOW_NAME,
 };
 use crate::tools;
+use autumn_harvest_agent::approval::SIGNAL_TOOL_APPROVAL;
 
 /// The resolved workspace identity a session records.
 fn workspace_id(workspace: &Path) -> String {
@@ -87,8 +88,8 @@ fn counting_model(
 fn runtime(db: &Path, workspace: &Path, calls: &Arc<AtomicUsize>) -> SqliteRuntime {
     let mut rt = SqliteRuntime::open(db).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), counting_model(calls.clone()));
-    rt.register_activity(
+    rt.register_activity_with_body(&session::claude_turn_info(), counting_model(calls.clone()));
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.to_path_buf()),
     );
@@ -260,8 +261,8 @@ async fn a_transcript_too_large_to_send_ends_the_session() {
 
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), model);
-    rt.register_activity(
+    rt.register_activity_with_body(&session::claude_turn_info(), model);
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -358,6 +359,37 @@ async fn a_denied_call_is_reported_to_the_model_and_the_session_continues() {
         report.answer.contains("NOT recorded"),
         "a denied write must be reported as such: {}",
         report.answer
+    );
+}
+
+/// The approval wait comes from the agent adapter (issue #1973). A payload
+/// that is not an `ApprovalDecision` still fails the session, as before, and
+/// never releases the write.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_decision_fails_the_session_and_never_writes() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+    std::fs::write(workspace.join("README.md"), "hello").expect("the fixture is written");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut rt = runtime(&dir.path().join("agentd.db"), &workspace, &calls);
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task(&workspace))
+        .expect("the session starts");
+    let signal = drive_to_approval(&mut rt, exec).await;
+
+    rt.send_signal(exec, &signal, json!({"verdict": "approve"}))
+        .expect("the signal is recorded");
+    let state = rt.run_until_blocked(exec).await.expect("the run finishes");
+
+    assert!(
+        matches!(state, RunState::Failed(ref e) if e.contains("not readable")),
+        "expected a failed session, got {state:?}"
+    );
+    assert!(
+        !workspace.join("agent-notes.md").exists(),
+        "an unreadable decision must not release the write"
     );
 }
 
@@ -864,7 +896,7 @@ async fn a_truncated_turn_never_reports_a_clean_finish() {
     // `max_tokens` stop reason the API reports for a truncated turn.
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), |_input| {
+    rt.register_activity_with_body(&session::claude_turn_info(), |_input| {
         serde_json::to_value(TurnReply {
             content: json!([{ "type": "text", "text": "half an ans" }]),
             stop_reason: "max_tokens".to_string(),
@@ -873,7 +905,7 @@ async fn a_truncated_turn_never_reports_a_clean_finish() {
         })
         .map_err(|e| format!("bad reply: {e}"))
     });
-    rt.register_activity(
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -1955,7 +1987,7 @@ async fn the_full_view_shows_a_write_that_the_status_trims() {
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
     let written = payload.clone();
-    rt.register_activity(&session::claude_turn_info(), move |_input| {
+    rt.register_activity_with_body(&session::claude_turn_info(), move |_input| {
         let input = json!({ "path": "notes.md", "content": written });
         serde_json::to_value(TurnReply {
             content: json!([
@@ -1971,7 +2003,7 @@ async fn the_full_view_shows_a_write_that_the_status_trims() {
         })
         .map_err(|e| format!("bad reply: {e}"))
     });
-    rt.register_activity(
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -2156,8 +2188,8 @@ async fn a_session_refuses_to_continue_on_another_model() {
 
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), claude::activity_body(model));
-    rt.register_activity(
+    rt.register_activity_with_body(&session::claude_turn_info(), claude::activity_body(model));
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -3000,7 +3032,7 @@ fn a_goal_opening_with_a_nul_is_measured_whole() {
         .expect("the blank session is recorded");
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let running = inspect::running(&reader, WORKFLOW_NAME).expect("the query runs");
     let goal_of = |exec: &str| {
         running
@@ -3108,7 +3140,7 @@ fn a_recorded_task_rust_cannot_read_is_never_enlisted() {
     );
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let running = inspect::running(&reader, WORKFLOW_NAME).expect("the query still answers");
     assert!(enlisted(&running, "good"), "a readable task is enlisted");
     for row in ["bad-goal", "bad-workspace", "bad-spare", "raw-bytes"] {
@@ -3170,7 +3202,7 @@ fn a_task_document_in_the_wrong_storage_class_is_never_enlisted() {
     );
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let running = inspect::running(&reader, WORKFLOW_NAME).expect("the query still answers");
     assert!(enlisted(&running, "good"), "a readable task is enlisted");
     assert!(
@@ -3267,7 +3299,7 @@ fn a_goal_of_unicode_space_is_refused_as_submit_refuses_it() {
         .expect("the session is recorded");
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let running = inspect::running(&reader, WORKFLOW_NAME).expect("the query runs");
     let unicode_goal = |exec: &str| {
         running
@@ -3422,9 +3454,8 @@ fn a_directory_entry_holding_a_line_break_is_counted_and_not_named() {
 ///
 /// An index on the workflow name cannot answer `ORDER BY rowid`. A lookup
 /// through it therefore sorts every matching session in a temporary B-tree
-/// before the LIMIT applies. Matching the name by its bytes takes it out of
-/// the planner's index choice, which leaves the rowid walk the listing
-/// already wants.
+/// before the LIMIT applies. The session listing now runs in the backend,
+/// and `autumn-harvest-sqlite` carries its plan test (issue #2027).
 ///
 /// The test reads the PRODUCTION query strings and asks the database how it
 /// would run them. The fixture carries the schema shapes and the index the
@@ -3434,11 +3465,7 @@ fn a_directory_entry_holding_a_line_break_is_counted_and_not_named() {
 fn every_paged_query_is_planned_as_a_seek() {
     let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
     conn.execute_batch(
-        "CREATE TABLE harvest_executions (exec_id TEXT, workflow_name TEXT, \
-         workflow_id TEXT, state TEXT, input_json TEXT, output_json TEXT, error TEXT);
-         CREATE INDEX idx_harvest_executions_key \
-             ON harvest_executions (workflow_name, workflow_id);
-         CREATE TABLE harvest_events (exec_id TEXT NOT NULL, seq INTEGER NOT NULL, \
+        "CREATE TABLE harvest_events (exec_id TEXT NOT NULL, seq INTEGER NOT NULL, \
          event_json TEXT NOT NULL, PRIMARY KEY (exec_id, seq));",
     )
     .expect("the fixture schema is created");
@@ -3456,7 +3483,6 @@ fn every_paged_query_is_planned_as_a_seek() {
     };
 
     let top = crate::inspect::no_cursor(None);
-    let turn_ceiling = i64::from(u32::MAX);
     let cases = [
         (
             "events",
@@ -3484,20 +3510,6 @@ fn every_paged_query_is_planned_as_a_seek() {
             crate::inspect::UNCLASSIFIED_AFTER_QUERY,
             vec![&"exec-1" as &dyn rusqlite::ToSql, &7_i64],
             "seq>?",
-        ),
-        (
-            "sessions",
-            crate::inspect::SESSIONS_QUERY,
-            vec![
-                &"agent_session" as &dyn rusqlite::ToSql,
-                &201_i64,
-                &2000_i64,
-                &top,
-                &crate::inspect::COUNTER_CEILING,
-                &turn_ceiling,
-                &crate::inspect::TIMEOUT_CEILING,
-            ],
-            "rowid<?",
         ),
     ];
     for (name, sql, params, bound) in cases {
@@ -3861,7 +3873,7 @@ fn a_damaged_row_does_not_hide_the_listing() {
         .expect("the damaged report is recorded");
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
     assert_eq!(listed.len(), 3, "every row is still named");
     let row = |exec: &str| listed_row(&listed, exec);
@@ -3939,7 +3951,7 @@ fn a_row_that_cannot_be_read_is_read_as_nothing() {
         .expect("the surrogate row is recorded");
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
     assert_eq!(listed.len(), 3, "every row is still named");
     let row = |exec: &str| listed_row(&listed, exec);
@@ -4036,7 +4048,7 @@ fn a_listed_document_in_the_wrong_storage_class_reads_as_nothing() {
     );
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
     assert_eq!(listed.len(), 3, "every row is still named");
     let row = |exec: &str| listed_row(&listed, exec);
@@ -4125,7 +4137,7 @@ fn a_listed_counter_outside_the_rust_range_is_no_report() {
     }
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
     let row = |exec: &str| listed_row(&listed, exec);
     assert_eq!(
@@ -4230,7 +4242,7 @@ fn a_listed_field_of_malformed_bytes_is_not_shown_as_its_prefix() {
     );
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
     let row = listed_row(&listed, "bad-suffix");
     assert!(
@@ -5303,7 +5315,7 @@ fn a_listing_shows_a_goal_that_holds_a_nul() {
         .expect("the session is recorded");
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let listed = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing answers");
     let row = listed.first().expect("the session is listed");
     assert_eq!(
@@ -6124,7 +6136,7 @@ fn a_listing_walks_back_through_its_cursor() {
     }
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let all = inspect::executions(&reader, WORKFLOW_NAME, None).expect("the listing reads");
     assert_eq!(all.len(), 5, "the fixture holds five sessions");
     assert_eq!(
@@ -6196,7 +6208,7 @@ fn a_full_page_carries_its_cursor() {
     }
     drop(writer);
 
-    let reader = rusqlite::Connection::open(&db).expect("the database opens");
+    let reader = inspect::open(&db).expect("the reader opens");
     let parked = daemon::Parked::new();
     let (shown, more, older) =
         daemon::sessions(&reader, &parked, false, None).expect("the listing reads");
@@ -7251,7 +7263,7 @@ async fn a_tool_call_under_an_unknown_stop_reason_is_not_run() {
     // still not what the stop reason asked for, so it must not run.
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), |_input| {
+    rt.register_activity_with_body(&session::claude_turn_info(), |_input| {
         serde_json::to_value(TurnReply {
             content: json!([]),
             stop_reason: "pause_turn".to_string(),
@@ -7264,7 +7276,7 @@ async fn a_tool_call_under_an_unknown_stop_reason_is_not_run() {
         })
         .map_err(|e| format!("bad reply: {e}"))
     });
-    rt.register_activity(
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -9323,14 +9335,16 @@ async fn a_reply_the_engine_cannot_load_offers_no_call() {
     );
     drop(reader);
 
-    let writer = rusqlite::Connection::open(&db).expect("the database opens");
-    writer
-        .execute(
+    // The append-only guard refuses the rewrite, so the fixture turns it off.
+    let mut writer = rusqlite::Connection::open(&db).expect("the database opens");
+    autumn_harvest_sqlite::append_only::with_guard_off(&mut writer, |tx| {
+        tx.execute(
             "UPDATE harvest_events SET event_json = cast(event_json as blob) \
              WHERE exec_id = ?1 AND seq = ?2",
             rusqlite::params![exec_id, seq],
         )
-        .expect("the row is rewritten");
+    })
+    .expect("the row is rewritten");
     let class: String = writer
         .query_row(
             "SELECT typeof(event_json) FROM harvest_events WHERE exec_id = ?1 AND seq = ?2",
@@ -9424,7 +9438,7 @@ async fn a_row_after_the_reply_the_engine_cannot_load_offers_no_call() {
     drop(reader);
 
     // One row AFTER the reply changes class. Nothing else is touched.
-    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    let mut writer = rusqlite::Connection::open(&db).expect("the database opens");
     let target: i64 = writer
         .query_row(
             "SELECT min(seq) FROM harvest_events WHERE exec_id = ?1 AND seq > ?2",
@@ -9432,13 +9446,15 @@ async fn a_row_after_the_reply_the_engine_cannot_load_offers_no_call() {
             |row| row.get(0),
         )
         .expect("a row follows the reply");
-    writer
-        .execute(
+    // The append-only guard refuses the rewrite, so the fixture turns it off.
+    autumn_harvest_sqlite::append_only::with_guard_off(&mut writer, |tx| {
+        tx.execute(
             "UPDATE harvest_events SET event_json = cast(event_json as blob) \
              WHERE exec_id = ?1 AND seq = ?2",
             rusqlite::params![exec_id, target],
         )
-        .expect("the row is rewritten");
+    })
+    .expect("the row is rewritten");
     let class: String = writer
         .query_row(
             "SELECT typeof(event_json) FROM harvest_events WHERE exec_id = ?1 AND seq = ?2",
@@ -11437,6 +11453,63 @@ fn a_history_is_read_with_the_engines_own_type() {
 /// signal, `receive_signal_timeout` failed, `agent_session` propagated that,
 /// and the runtime sealed the session `FAILED`. A session a repair could have
 /// saved was made terminal.
+/// Each drive reads every staged row of a session, of any name (issue #2020).
+/// A readable decision beside an unreadable row of another name still fails
+/// every drive, so the restart must refuse the session.
+#[test]
+fn an_unreadable_staged_row_of_another_name_is_refused() {
+    let armed = "tool_approval:2:0:toolu_x";
+    let conn = rusqlite::Connection::open_in_memory().expect("the database opens");
+    conn.execute_batch(
+        "CREATE TABLE harvest_timers (timer_id TEXT, exec_id TEXT, fire_at INTEGER, \
+         fired INTEGER NOT NULL DEFAULT 0, arm_seq INTEGER, \
+         PRIMARY KEY (exec_id, timer_id)); \
+         CREATE TABLE harvest_events (exec_id TEXT, seq INTEGER, event_json TEXT, \
+         PRIMARY KEY (exec_id, seq)); \
+         CREATE TABLE harvest_signals (signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+         exec_id TEXT NOT NULL, name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+         delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0); \
+         CREATE TABLE harvest_tasks (task_id TEXT PRIMARY KEY, exec_id TEXT NOT NULL, \
+         activity_id TEXT NOT NULL, name TEXT NOT NULL, input_json TEXT NOT NULL, \
+         queue TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL, \
+         run_at INTEGER NOT NULL, seq INTEGER NOT NULL, max_attempts INTEGER, \
+         retry_policy_json TEXT, start_to_close_ms INTEGER, \
+         scheduled_at INTEGER NOT NULL)",
+    )
+    .expect("the fixture tables are created");
+    conn.execute(
+        "INSERT INTO harvest_timers VALUES (?1, 'e', 9999, 0, 2)",
+        [format!("__signal_timeout:2:{armed}")],
+    )
+    .expect("the armed timer is recorded");
+    conn.execute(
+        "INSERT INTO harvest_signals (exec_id, name, payload_json) VALUES ('e', ?1, ?2)",
+        rusqlite::params![armed, r#"{"approved":true}"#],
+    )
+    .expect("the decision is staged");
+    // A payload that is not JSON, and an arrival time that is not an integer.
+    for (label, payload, received_at) in [
+        ("text that is not JSON", "{not json", "0"),
+        ("an arrival time that is text", "{}", "'soon'"),
+    ] {
+        let sql = format!(
+            "INSERT INTO harvest_signals (exec_id, name, payload_json, received_at) \
+             VALUES ('e', 'noise', ?1, {received_at})"
+        );
+        conn.execute(&sql, [payload])
+            .expect("the unreadable row is staged");
+
+        let refused = inspect::outstanding_signal(&conn, "e", 1_000)
+            .expect_err("an unreadable row of any name must refuse the restart");
+        assert!(
+            refused.contains("noise") && refused.contains("every drive fails"),
+            "[{label}] the refusal must name the row and say why: {refused}"
+        );
+        conn.execute("DELETE FROM harvest_signals WHERE name = 'noise'", [])
+            .expect("the row is removed");
+    }
+}
+
 #[test]
 fn a_staged_decision_is_read_as_the_type_the_workflow_asks_for() {
     let armed = "tool_approval:2:0:toolu_x";
@@ -11786,8 +11859,8 @@ async fn one_turn_runs_no_more_calls_than_a_turn_may_run() {
 
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), model);
-    rt.register_activity(
+    rt.register_activity_with_body(&session::claude_turn_info(), model);
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -12019,8 +12092,8 @@ async fn a_batch_of_exactly_the_bound_is_answered() {
 
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity(&session::claude_turn_info(), model);
-    rt.register_activity(
+    rt.register_activity_with_body(&session::claude_turn_info(), model);
+    rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
     );
@@ -12654,8 +12727,14 @@ fn a_refusal_the_api_sends_is_accepted() {
 ///
 /// The listing showed a plausible prefix for bytes nobody wrote, and called
 /// the row sound, while the status refused the same field.
+///
+/// Since issue #2027 the listing decodes each field whole, so no byte budget
+/// exists. The two fixtures keep the old budget as their size, because that
+/// is the edge the fault lived at.
 #[test]
 fn a_cut_is_proven_by_the_length_and_not_by_the_size() {
+    // The byte budget the listing once asked the database for.
+    const OLD_LISTED_BYTES: usize = (inspect::MAX_LISTED_CHARS as usize + 1) * 4;
     let dir = tempfile::tempdir().expect("a temporary directory");
     let db = dir.path().join("cuts.db");
     let writer = rusqlite::Connection::open(&db).expect("the database opens");
@@ -12663,13 +12742,11 @@ fn a_cut_is_proven_by_the_length_and_not_by_the_size() {
 
     // EXACTLY the budget, ending inside a character. Nothing follows it, so
     // no cut happened and the broken tail is damage.
-    let mut exact = "x"
-        .repeat(inspect::MAX_LISTED_BYTES as usize - 1)
-        .into_bytes();
+    let mut exact = "x".repeat(OLD_LISTED_BYTES - 1).into_bytes();
     exact.push(0xE2);
     // LONGER than the budget, and every character whole. The database cuts
     // it, and the cut lands inside the last character it returns.
-    let long = "é".repeat(inspect::MAX_LISTED_BYTES as usize).into_bytes();
+    let long = "é".repeat(OLD_LISTED_BYTES).into_bytes();
     for (exec, bytes) in [("exact", &exact), ("long", &long)] {
         writer
             .execute(
@@ -12803,5 +12880,52 @@ fn a_pending_task_the_backend_cannot_claim_refuses_the_restart() {
         inspect::outstanding_signal(&running, "e", 1_000).expect("the wait query runs"),
         None,
         "a row the backend no longer claims is not this check's business"
+    );
+}
+
+/// Issue #2027: the daemon reads executions through the backend only.
+///
+/// The test reads every production source file, in every directory under
+/// `src`. It drops each comment, then every quote, backslash, comma and
+/// space. A table name split across a line continuation or a `concat!` still
+/// reads as one word then. A comment may still name the table.
+#[test]
+fn the_daemon_source_does_not_read_the_executions_table() {
+    fn sources(dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("the source directory reads") {
+            let path = entry.expect("the entry reads").path();
+            if path.is_dir() {
+                sources(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && path.file_name().is_some_and(|name| name != "tests.rs")
+            {
+                found.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    sources(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    assert!(!files.is_empty(), "the guard must read some source");
+    let mut offenders = Vec::new();
+    for path in files {
+        let text = std::fs::read_to_string(&path).expect("the source file reads");
+        let code: String = text
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .concat()
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\\' | ',' | '+') && !c.is_whitespace())
+            .collect();
+        if code.contains("harvest_executions") {
+            offenders.push(path.display().to_string());
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "the daemon reads harvest_executions directly: {offenders:?}"
     );
 }

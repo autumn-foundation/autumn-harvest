@@ -34,6 +34,8 @@ New route families added in **0.5.0** (all in the contract; each has a CLI verb)
 - `GET /admin/config` — redacted effective runtime config (#695).
 - `GET /admin/usage` — per-tenant/per-workflow historical usage report (#596).
 - `GET /admin/workflow-types/reachability` — safe-handler-removal pre-flight (#520).
+- `GET` / `PATCH /admin/workflow-types/{workflow_name}/run-defaults` — runtime SLA and execution-timeout override (#2387).
+- `GET /admin/overrides` — every schedule and run-default override, with actor, reason and time (#2388).
 - `GET /dags/{dag_name}/runs/{run_exec_id}` — DAG run graph view (#690).
 
 ## Authorization: token scopes and the authorizer hook
@@ -50,9 +52,18 @@ for the full model.
   deny. A deny answers `403` with
   `{"error":"forbidden by authorization policy"}`.
 
-Send a tenant key in the `x-harvest-tenant` header. With a hook installed, a
-value that is repeated, blank, holds a non-ASCII byte, or is longer than 128
-bytes gets `400`. Without a hook, Harvest ignores the header.
+- **Tenant binding** (issue #1977). A token minted with `tenant`, or a
+  request that the embedder marks with `VerifiedTenant`, is bound to one
+  tenant. It reaches only the tenant-scoped routes, and only runs of its
+  tenant. Every other route answers `403`. A run of another tenant answers
+  `404`. See
+  [`security-posture.md`](security-posture.md#tenant-binding-issue-1977).
+
+Send a tenant key in the `x-harvest-tenant` header. A bad value gets `400`
+when a hook is installed or the caller is tenant-bound. A value is bad when
+it is repeated, blank, non-ASCII, or longer than 128 bytes. A bound caller
+that names another tenant gets `403`. For an unbound caller, the hook sees
+the header as an unverified tenant. Without a hook, Harvest ignores it.
 
 | Request | Shard the hook sees |
 |---|---|
@@ -262,6 +273,53 @@ The command exits cleanly when the server sends `event: stream-end`.
 
 ---
 
+## Workflow change stream
+
+> Issue #1982. A live signal for list views, such as the Vantage workflow list.
+
+```
+GET /workflows/changes/stream
+```
+
+The stream listens to the `harvest_events` channel on each shard. That is the
+channel of the [execution event stream](#sse-execution-event-stream). It sends
+one frame for each burst of changes, at most once each second:
+
+```
+event: changed
+data: {"notifications":3}
+```
+
+`notifications` is the count of `harvest_events` notifications since the
+last frame. One notification can cover more than one event of a run. A frame
+names no execution and holds no payload. A client fetches the list again.
+
+A triage update (`PATCH /workflows/{id}/triage`) and a search attribute
+update can append no event. Each sends a notification too, because those
+fields are list filters.
+Some other row changes send no notification, for example a legal hold. The
+Vantage list shows them at its next 60 s safety fetch.
+
+When a shard listener closes, the stream sends one frame and ends. The client
+then connects again:
+
+```
+event: stream-error
+data: {"error":"listener_closed","retry":true}
+```
+
+| Status | Meaning |
+|--------|---------|
+| `200` | The stream is open (`text/event-stream`). Keepalive `: ping` comments every 15 s (default). |
+| `401` | No admin access. The route uses the same gate as the execution event stream. |
+| `503` | No notification URL is set, or a shard listener is not available. |
+
+Each open stream holds one `LISTEN` connection for each shard. The stream
+waits at most 5 s for each shard connection. The
+[proxy notes](#reverse-proxy-and-cdn-notes) above apply.
+
+---
+
 ## Addressing workflows by business id (`/workflows/by-id/...`)
 
 Embedders assign their own business `workflow_id` at start (e.g. `order-12345`,
@@ -360,6 +418,9 @@ would signal the sealed predecessor. The business-id form always resolves to the
 **live successor** (the active run), so `POST P/signal/...` reaches the current
 run 100% of the time across a fork.
 
+[Workflow reset](workflow-reset.md) lists every fork surface and the rules
+they share, such as the refusal of a PII-erased source.
+
 **Resolve-then-act is a best-effort snapshot.** A by-id mutate resolves
 `(workflow_name, workflow_id)` to an `exec_id` and then delegates to the exec-id
 handler as two steps. Between resolution and the delegated action the run can
@@ -417,6 +478,7 @@ curl -i "$BASE/workflows/by-id/order_flow/does-not-exist"   # HTTP 404
 | `limit` | integer | Maximum rows to return (default 200, max 200) |
 | `search_attr` | repeated | `key:value` pairs against `search_attrs` JSONB (exact-match equality; value is always a string) |
 | `search_attr_filter` | repeated | Typed comparison/set predicate `key:op:value` against `search_attrs` JSONB. See [Typed search-attribute predicates](#typed-search-attribute-predicates-get-workflows). |
+| `filter` | repeated | Expression with `AND`, `OR` and parentheses over search attributes and system fields. See [Filter expressions](#filter-expressions-get-workflows). |
 | `no_progress_minutes` | integer | Return stalled workflows with no task activity for N minutes |
 | `sla_breached` | bool | Filter to executions that have breached their SLA |
 | `page_size` | integer | Per-page limit for keyset pagination (1–200; overrides `limit`). Presence activates the opt-in paginated envelope. |
@@ -494,7 +556,8 @@ curl "/workflows?state=RUNNING&page_size=50&cursor=abc123"
 
 Each `search_attr_filter` value has the form `key:op:value`. The param is
 repeatable; multiple predicates are combined with **AND** (matching the repeated
-`search_attr` semantics). Disjunction (OR) is out of scope in this slice.
+`search_attr` semantics). For `OR` and groups, use the `filter` parameter
+([Filter expressions](#filter-expressions-get-workflows), issue #1982).
 
 | `op` | Value | Meaning |
 |------|-------|---------|
@@ -561,8 +624,93 @@ curl "/workflows?search_attr_filter=amount:gt:lots"
 
 The `harvest workflow list` CLI accepts the same syntax via the repeatable
 `--search-attr-filter key:op:value` flag (forwarded verbatim to this param). The
-embedded Vantage UI workflows list defers to the equality-only `search_attr`
-filter in this slice; a predicate-aware UI form is a follow-up.
+Vantage workflow list takes a `filter` expression (see below).
+
+### Filter expressions (`GET /workflows`)
+
+> Issue #1982. The `filter` parameter joins predicates with `AND`, `OR` and
+> parentheses.
+
+`AND` binds tighter than `OR`. So `a OR b AND c` means `a OR (b AND c)`.
+Keywords are not case-sensitive. The parameter is repeatable. Each value joins
+the query with `AND`, the same as every other parameter.
+
+```text
+filter    = or_expr
+or_expr   = and_expr { "OR" and_expr }
+and_expr  = term { "AND" term }
+term      = "(" or_expr ")" | predicate
+predicate = field op value
+          | field "IN" "(" value { "," value } ")"
+          | attr "EXISTS"
+field     = attr | system
+attr      = "attrs." ( key | quoted-string )
+system    = "state" | "workflow_name" | "workflow_id" | "owner" | "severity" | "started_at"
+key       = a letter or "_", then letters, digits, "_" or "-"
+op        = "=" | "!=" | "<>" | ">" | ">=" | "<" | "<="
+value     = quoted-string | number | "true" | "false"
+```
+
+| Field | Operators | Value |
+|-------|-----------|-------|
+| `attrs.<key>` | `=`, `!=`, `IN`, `EXISTS` | string, number or boolean |
+| `attrs.<key>` | `>`, `>=`, `<`, `<=` | number |
+| `state` | `=`, `!=`, `IN` | a state name, for example `'RUNNING'` |
+| `workflow_name`, `workflow_id`, `owner`, `severity` | `=`, `!=`, `IN` | string |
+| `started_at` | `>`, `>=`, `<`, `<=` | RFC 3339 string |
+
+**Types.** Quotes decide the type. `attrs.n = 100` matches the number `100`.
+`attrs.n = '100'` matches the string `"100"`. A number keeps all its digits,
+so `attrs.n = 12345678901234567890123` matches only that number. A number is
+1024 bytes or fewer. A string takes single or double quotes. A backslash
+escapes the next character. `attrs."my key"` names a key that is not a plain
+word.
+
+**Semantics.** Attribute predicates have the same meaning as the
+[typed predicates](#typed-search-attribute-predicates-get-workflows). `!=`
+matches a row that has the field and a different value. So `owner != 'ops'`
+does not match a row with no owner. `<>` is the same as `!=`. A comparison
+matches number-typed values only. Only top-level keys are filterable. A
+nested `attrs.a.b` gets `400`.
+
+**Index rule.** A filter with `OR` must find each row that it matches through
+an index. An index predicate is an `attrs.*` predicate, or `workflow_name`
+with `=` or `IN`. Each `OR` branch can hold one, and Postgres then joins the
+index scans with `BitmapOr`. One predicate on the whole filter is also
+enough, as in `attrs.tenant = 'acme' AND (state = 'FAILED' OR owner = 'x')`.
+`attrs.a = 1 OR state = 'RUNNING'` gets `400`, because it costs a full scan
+of the table. A filter with no `OR` needs no index predicate. The rule reads
+all `filter` values of a request together, joined with `AND`.
+
+**Limits.** A filter value holds at most 2048 bytes, 8 levels of parentheses
+and 100 `IN` values. All `filter` values of a request hold at most 32
+predicates. A filter over a limit gets `400`.
+
+**Errors.** A syntax error gets `400`, and the message gives the byte offset.
+A number outside the range of a 64-bit float, such as `1e400`, also gets
+`400`. So does a string with a control character. An empty `filter` value is ignored.
+
+**States.** The default list hides `MIGRATED` rows, so `state = 'MIGRATED'`
+and an `IN` list with `MIGRATED` get `400`. `state != 'MIGRATED'` is valid. Use the `state=MIGRATED` parameter. The stalled list
+(`no_progress_minutes`) shows `RUNNING` and `SUSPENDED` rows. The `state=PAUSED`
+parameter adds paused rows. A `state` predicate in `filter` cannot widen that
+set.
+
+**Canary runs.** The default list hides the synthetic liveness canary runs.
+A filter that names a canary workflow with `workflow_name =` or `IN` shows
+the runs of that workflow, the same as the `workflow_name=` parameter.
+
+```bash
+# Blocked runs, or large payments:
+curl "/workflows?filter=attrs.phase%20%3D%20'blocked'%20OR%20(workflow_name%20%3D%20'payment'%20AND%20attrs.amount%20%3E%2010000)"
+
+# The same with curl encoding the text:
+curl -G /workflows \
+  --data-urlencode "filter=attrs.phase = 'blocked' OR (workflow_name = 'payment' AND attrs.amount > 10000)"
+```
+
+`GET /workflows/count` ignores `filter` and counts every row. The CLI has no
+`filter` flag yet.
 
 ## Workflow Stack (describe)
 
@@ -712,6 +860,29 @@ Each entry in `events`:
 | `type` | string | Event discriminator (e.g. `TimerStarted`, `ActivityCompleted`). |
 | `data` | object | Event payload (the `data` object from the adjacently-tagged stored JSON). |
 
+### Archived history (issue #1983)
+
+```
+GET /workflows/{id}/archived-history
+```
+
+Returns the `HistoryExportDocument` that retention archived for a run. The
+route reads the configured `HistoryArchiver` only. It works after retention
+deletes the run from Postgres. Admin only.
+
+| Status | When |
+|--------|------|
+| 200 | The archive holds the run. The body is the document. |
+| 400 | The id is not a valid execution UUID. |
+| 401 | The caller is not a Harvest admin. |
+| 404 | The archive holds no document for the run. |
+| 503 | No archiver is set, the archiver cannot read back, the store fails, or the read times out. |
+
+Payload fields decode under the same gate as `GET /workflows/{id}/history`.
+Otherwise they stay in their stored form, for example codec envelopes. The
+read times out after `archival_timeout_secs`. Vantage shows the same document
+at `/ui/workflows/{id}/archived-history`. See [`docs/archival.md`](archival.md).
+
 ### `get_workflow` truncation contract
 
 `GET /workflows/{id}` now bounds `history` to the first **100** events and adds two
@@ -784,6 +955,15 @@ earlier attempt stays readable after that attempt fails and a retry starts. See
   "workflow_state": "FAILED"
 }
 ```
+
+## Fork a run (`POST /workflows/{id}/fork`)
+
+A fork copies the start of a run to a new execution with a new workflow id.
+The source does not change, so a run in any state can be forked. By default,
+the fork takes each activity result from the source record and never runs an
+effect for real. `"effects": "live"` opts in to real effects. An erased source
+is always refused. See the [fork runbook](runbooks/fork-a-run.md) (issue
+#2000).
 
 ## Signal delivery (`POST /workflows/{id}/signal/{signal_name}`)
 

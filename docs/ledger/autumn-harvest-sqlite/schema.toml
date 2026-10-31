@@ -1,0 +1,45 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/schema.rs`. See `docs/ledger/README.md`.
+
+["add_column_if_absent"]
+driver = "setup"
+backend = ["sqlite"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["add_schedule_code"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["ddl", "read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/schema.md"
+
+["add_signal_key"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["ddl"]
+tables = ["harvest_executions", "harvest_signals"]
+measured = "unmeasured"
+
+["back_fill_promise_keys"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/schema.md"
+
+["column_exists"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["migrate"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["ddl"]
+tables = ["harvest_executions", "harvest_schedules", "harvest_tasks"]
+measured = "unmeasured"

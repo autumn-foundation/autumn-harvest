@@ -1233,6 +1233,167 @@ fn dag_commands_match_dag_management_routes() {
     assert_eq!(unpause_request.body, Some(json!({ "paused": false })));
 }
 
+/// Issue #2388: `dags set-schedule` sends one PATCH with each given field.
+#[test]
+fn dag_set_schedule_maps_to_one_patch() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "dags",
+        "set-schedule",
+        "nightly_etl",
+        "--cron",
+        "0 3 * * *",
+        "--timezone",
+        "Europe/Berlin",
+        "--catchup",
+        "true",
+        "--max-active-runs",
+        "2",
+        "--reason",
+        "incident 42",
+    ])
+    .expect("dag set-schedule args should parse");
+    let request = cli
+        .api_request()
+        .expect("set-schedule request should build");
+
+    assert_eq!(request.method, ApiMethod::Patch);
+    assert_eq!(request.path, "/dags/nightly_etl");
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "schedule_expr": "cron:0 3 * * *",
+            "timezone": "Europe/Berlin",
+            "catchup": true,
+            "max_active_runs": 2,
+            "reason": "incident 42",
+        }))
+    );
+
+    let interval = Cli::try_parse_from([
+        "harvest",
+        "dag",
+        "set-schedule",
+        "nightly_etl",
+        "--interval",
+        "600",
+        "--overlap-policy",
+        "buffer_all",
+        "--buffer-all-max",
+        "3",
+        "--jitter-secs",
+        "0",
+    ])
+    .expect("interval args should parse")
+    .api_request()
+    .expect("interval request should build");
+    assert_eq!(
+        interval.body,
+        Some(json!({
+            "schedule_expr": "interval:600",
+            "overlap_policy": "buffer_all",
+            "buffer_all_max": 3,
+            "jitter_secs": 0,
+        }))
+    );
+
+    let manual = Cli::try_parse_from(["harvest", "dag", "set-schedule", "nightly_etl", "--manual"])
+        .expect("manual args should parse")
+        .api_request()
+        .expect("manual request should build");
+    assert_eq!(manual.body, Some(json!({ "schedule_expr": "manual" })));
+}
+
+/// A `set-schedule` with no field, or with two cadences, is refused locally.
+#[test]
+fn dag_set_schedule_refuses_an_empty_or_ambiguous_change() {
+    let empty = Cli::try_parse_from([
+        "harvest",
+        "dag",
+        "set-schedule",
+        "nightly_etl",
+        "--reason",
+        "x",
+    ])
+    .expect("args parse");
+    assert!(
+        empty.api_request().is_err(),
+        "a reason alone changes nothing"
+    );
+
+    assert!(
+        Cli::try_parse_from([
+            "harvest",
+            "dag",
+            "set-schedule",
+            "nightly_etl",
+            "--cron",
+            "0 3 * * *",
+            "--interval",
+            "60",
+        ])
+        .is_err(),
+        "two cadences conflict"
+    );
+    assert!(
+        Cli::try_parse_from([
+            "harvest",
+            "dag",
+            "set-schedule",
+            "nightly_etl",
+            "--interval",
+            "60",
+            "--timezone",
+            "UTC",
+        ])
+        .expect("args parse")
+        .api_request()
+        .is_err(),
+        "a timezone needs a cron expression"
+    );
+}
+
+/// Issue #2388: `dags clear-override` sends `clear_override` only.
+#[test]
+fn dag_clear_override_maps_to_one_patch() {
+    let cli = Cli::try_parse_from(["harvest", "dags", "clear-override", "nightly_etl"])
+        .expect("clear-override args should parse");
+    let request = cli
+        .api_request()
+        .expect("clear-override request should build");
+    assert_eq!(request.method, ApiMethod::Patch);
+    assert_eq!(request.path, "/dags/nightly_etl");
+    assert_eq!(request.body, Some(json!({ "clear_override": true })));
+
+    let with_reason = Cli::try_parse_from([
+        "harvest",
+        "dag",
+        "clear-override",
+        "nightly_etl",
+        "--reason",
+        "incident over",
+    ])
+    .expect("args parse")
+    .api_request()
+    .expect("request builds");
+    assert_eq!(
+        with_reason.body,
+        Some(json!({ "clear_override": true, "reason": "incident over" }))
+    );
+}
+
+/// Issue #2388: `overrides list` reads the override list.
+#[test]
+fn overrides_list_maps_to_the_admin_route() {
+    let request = Cli::try_parse_from(["harvest", "overrides", "list"])
+        .expect("overrides list args should parse")
+        .api_request()
+        .expect("overrides list request should build");
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/overrides");
+    assert_eq!(request.body, None);
+}
+
 #[test]
 fn dag_retry_maps_to_retry_route() {
     let cli = Cli::try_parse_from([
@@ -3047,6 +3208,163 @@ fn queue_pause_requires_a_reason() {
         Cli::try_parse_from(["harvest", "queue", "pause", "email-workers"]).is_err(),
         "queue pause must require --reason"
     );
+}
+
+// ── Fairness key weights (issue #1976) ────────────────────────────────────────
+
+#[test]
+fn queue_fairness_show_maps_to_the_read_route() {
+    let cli = Cli::try_parse_from(["harvest", "queue", "fairness", "show", "email-workers"])
+        .expect("queue fairness show args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/queues/email-workers/fairness");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn queue_fairness_set_maps_to_post_with_weight() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "fairness",
+        "set",
+        "email-workers",
+        "tenant-a",
+        "--weight",
+        "2.5",
+    ])
+    .expect("queue fairness set args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/admin/queues/email-workers/fairness/tenant-a"
+    );
+    assert_eq!(request.body, Some(json!({ "weight": 2.5 })));
+}
+
+#[test]
+fn queue_fairness_set_requires_a_weight() {
+    assert!(
+        Cli::try_parse_from([
+            "harvest",
+            "queue",
+            "fairness",
+            "set",
+            "email-workers",
+            "tenant-a",
+        ])
+        .is_err(),
+        "queue fairness set must require --weight"
+    );
+}
+
+#[test]
+fn queue_fairness_clear_maps_to_delete_with_no_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "fairness",
+        "clear",
+        "email-workers",
+        "tenant-a",
+    ])
+    .expect("queue fairness clear args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Delete);
+    assert_eq!(
+        request.path,
+        "/admin/queues/email-workers/fairness/tenant-a"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn queue_fairness_percent_encodes_the_queue_and_the_key() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "fairness",
+        "set",
+        "email workers/eu",
+        "tenant a/b",
+        "--weight",
+        "3",
+    ])
+    .expect("queue fairness set args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.path, "/admin/queues/email%20workers%2Feu/fairness/tenant%20a%2Fb",
+        "a space or slash must not break out of either path segment"
+    );
+}
+
+#[test]
+fn queue_fairness_rejects_url_dot_segment_names() {
+    // The URL parser removes `.` and `..` segments after the path is built.
+    // So a dot-segment queue or key would reach a different route.
+    for dot in [".", ".."] {
+        let key_err = Cli::try_parse_from([
+            "harvest",
+            "queue",
+            "fairness",
+            "clear",
+            "email-workers",
+            dot,
+        ])
+        .expect("queue fairness clear args should parse")
+        .api_request()
+        .expect_err("a dot-segment fairness key must be rejected");
+        assert!(
+            key_err.to_string().contains("invalid fairness key"),
+            "unexpected error for key {dot:?}: {key_err}"
+        );
+
+        let queue_err = Cli::try_parse_from(["harvest", "queue", "fairness", "show", dot])
+            .expect("queue fairness show args should parse")
+            .api_request()
+            .expect_err("a dot-segment queue name must be rejected");
+        assert!(
+            queue_err.to_string().contains("invalid queue name"),
+            "unexpected error for queue {dot:?}: {queue_err}"
+        );
+    }
+}
+
+#[test]
+fn queue_fairness_accepts_percent_spelled_keys() {
+    // The core validator accepts these keys as literals. `path_segment`
+    // encodes `%`, so the route receives them intact (issue #2097).
+    for (key, encoded) in [
+        ("%2e", "%252e"),
+        ("%2E", "%252E"),
+        (".%2e", ".%252e"),
+        ("%2e.", "%252e."),
+        ("%2e%2e", "%252e%252e"),
+        (".%2E", ".%252E"),
+        ("%2e%2E", "%252e%252E"),
+    ] {
+        for verb in ["set", "clear"] {
+            let mut args = vec!["harvest", "queue", "fairness", verb, "q", key];
+            if verb == "set" {
+                args.extend(["--weight", "2"]);
+            }
+            let request = Cli::try_parse_from(args)
+                .expect("queue fairness args should parse")
+                .api_request()
+                .unwrap_or_else(|e| panic!("key {key:?} must build for {verb}: {e}"));
+            assert_eq!(request.path, format!("/admin/queues/q/fairness/{encoded}"));
+        }
+    }
 }
 
 // ── Per-activity-type pause/resume (issue #807) ───────────────────────────────

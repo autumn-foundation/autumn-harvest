@@ -29,9 +29,12 @@ use std::rc::Rc;
 
 use crate::mir::ast::{BasicBlock, Body, Local, Operand, Place, Projection, Statement, Terminator};
 use crate::model::callee::CalleePath;
-use crate::model::{CallClass, ForbiddenRule, Model, SanitizerRule, SinkRule, SourceRule};
-use crate::resolve::{Ambiguity, Program, Resolution, Substitution};
-use crate::util::{last_segment, peel_refs, strip_generics_everywhere};
+use crate::model::{
+    CallClass, CtxMethodRule, ForbiddenRule, Model, SanitizerRule, SinkRule, SourceRule,
+};
+use crate::resolve::{Ambiguity, Program, Resolution, Substitution, is_coroutine_span};
+use crate::structure::{Recorder, SinkSite};
+use crate::util::{crate_root, last_segment, peel_refs, split_last, strip_generics_everywhere};
 use crate::verdict::{Boundary, BoundaryKind, Finding, FindingKind, Hop, Site, TaintKind};
 
 use super::control::ControlGraph;
@@ -65,6 +68,12 @@ fn read_operand(
 
 /// Body analyses per workflow entry.
 const BUDGET: u32 = 6000;
+/// Rounds of the fixpoint that solves one recursive cycle.
+///
+/// Each round can only add facts, over a finite set of sources, so the
+/// iteration converges. The cap bounds the cost when a cycle carries many
+/// sources. A cycle that hits it is a `recursion` boundary.
+const MAX_RECURSION_ROUNDS: u32 = 8;
 /// Native recursion depth of [`Analyzer::analyze_body`] before it gives up.
 ///
 /// The analyzer descends into callees on the *native* stack, so a long enough
@@ -175,6 +184,8 @@ struct InvokedArgument<'i> {
     has_env: bool,
     /// `[ambiguous closure (N candidates, unioned)]`, or empty.
     note: &'i str,
+    /// This pass reports boundaries.
+    emit: bool,
 }
 
 /// Everything about one call site that is fixed once `(body, substitution)` is:
@@ -204,6 +215,17 @@ impl<'m> CallClasses<'m> {
     fn sink(&self) -> Option<&'m SinkRule> {
         self.classes.iter().find_map(|c| match c {
             CallClass::Sink(rule) => Some(*rule),
+            _ => None,
+        })
+    }
+
+    /// A clean ctx method that can suspend the workflow without a command
+    /// (issue #1995): its row carries a `step`.
+    fn suspending_ctx_method(&self) -> Option<&'m CtxMethodRule> {
+        self.classes.iter().find_map(|c| match c {
+            CallClass::Sanctioned(rule) | CallClass::NonSink(rule) if rule.step.is_some() => {
+                Some(*rule)
+            }
             _ => None,
         })
     }
@@ -240,11 +262,13 @@ impl<'m> CallClasses<'m> {
         })
     }
 
-    /// The call registers a handler closure, which is analyzed entry-adjacent.
-    fn registers_handler(&self) -> bool {
-        self.classes
-            .iter()
-            .any(|c| matches!(c, CallClass::HandlerRegistration(_)))
+    /// The `[[handler_registration]]` row, if the call registers a handler
+    /// closure. That closure is analyzed entry-adjacent.
+    fn handler_registration(&self) -> Option<&'m CtxMethodRule> {
+        self.classes.iter().find_map(|c| match c {
+            CallClass::HandlerRegistration(rule) => Some(*rule),
+            _ => None,
+        })
     }
 
     /// The call is a ctx primitive whose return value is recorded in history
@@ -281,12 +305,21 @@ pub struct Analyzer<'a> {
     program: &'a Program,
     model: &'a Model,
     memo: HashMap<String, BodyOutcome>,
+    /// Each memo key, in insertion order. A round of a recursive fixpoint
+    /// drops the keys that the round before it inserted.
+    memo_log: Vec<String>,
+    /// Activation key → what re-entering it saw, while its recursive cycle
+    /// is being solved.
+    reentries: HashMap<String, Reentry>,
     /// Per-call-site classification, keyed on `body|block|substitution`.
     classes: HashMap<String, Rc<CallClasses<'a>>>,
     /// Per-call-site resolution, keyed the same way.
     targets: HashMap<String, Rc<CallTarget>>,
+    /// The activation keys of the bodies being analyzed, outermost first.
     stack: Vec<String>,
     budget: u32,
+    /// The interior-mutable type names, computed on first use (issue #2010).
+    interior: Option<Vec<String>>,
     /// Findings collected across every body reached from this entry.
     pub findings: Vec<Finding>,
     /// Boundaries collected across every body reached from this entry.
@@ -294,6 +327,8 @@ pub struct Analyzer<'a> {
     /// Report warnings: name collisions the analysis had to resolve
     /// conservatively. Deduplicated, because the fixpoint revisits a block.
     pub warnings: BTreeSet<String>,
+    /// The bodies, call edges and sink sites this walk visited (issue #1995).
+    pub recorder: Recorder,
 }
 
 impl<'a> Analyzer<'a> {
@@ -303,13 +338,17 @@ impl<'a> Analyzer<'a> {
             program,
             model,
             memo: HashMap::new(),
+            memo_log: Vec::new(),
+            reentries: HashMap::new(),
             classes: HashMap::new(),
             targets: HashMap::new(),
             stack: Vec::new(),
             budget: BUDGET,
+            interior: None,
             findings: Vec::new(),
             boundaries: Vec::new(),
             warnings: BTreeSet::new(),
+            recorder: Recorder::default(),
         }
     }
 
@@ -321,13 +360,25 @@ impl<'a> Analyzer<'a> {
         args: &[TaintSet],
         hops: &[Hop],
     ) -> BodyOutcome {
+        self.recorder.bodies.insert(path.to_string());
         let key = memo_key(path, subst, args);
         if let Some(cached) = self.memo.get(&key) {
             return cached.clone();
         }
-        if self.stack.iter().any(|frame| frame == path) {
-            self.push_boundary(BoundaryKind::Recursion, path, path, "bb0");
-            return conservative(args);
+        // A body already on the stack is not entered again. The call returns
+        // the cycle's current summary, and the outer activation iterates
+        // until that summary holds (see `solve_body`). The key carries the
+        // substitution. A call of the same generic body under another
+        // substitution can select other impls, so it is a new activation.
+        let activation = activation_key(path, subst);
+        if self.stack.contains(&activation) {
+            let entry = self.reentries.entry(activation).or_default();
+            join_args(&mut entry.args, args);
+            // The pass-through of the old cut stays as a floor, so a round
+            // never returns less than the cut would have.
+            let mut outcome = entry.outcome.clone();
+            join_outcome(&mut outcome, &conservative(args));
+            return outcome;
         }
         if self.stack.len() >= MAX_DEPTH {
             self.push_boundary(
@@ -348,10 +399,77 @@ impl<'a> Analyzer<'a> {
             return conservative(args);
         }
         self.budget = self.budget.saturating_sub(1);
-        self.stack.push(path.to_string());
-        let outcome = self.run_body(path, subst, args, hops);
+        self.stack.push(activation.clone());
+        let outcome = self.solve_body(path, &activation, subst, args, hops);
         self.stack.pop();
-        self.memo.insert(key, outcome.clone());
+        self.memo.insert(key.clone(), outcome.clone());
+        self.memo_log.push(key);
+        outcome
+    }
+
+    /// Is this call to `target` a call of an `async fn` itself, rather than a
+    /// poll of its future?
+    ///
+    /// `target` is then the coroutine, whose first parameter is
+    /// `Pin<&mut {async fn body of f()}>`. A poll or an `into_future` prints
+    /// that future type in its callee path. A call of `f` does not.
+    fn is_async_fn_call(&self, printed: &str, target: &str) -> bool {
+        !printed.contains("{async fn body of")
+            && self
+                .program
+                .body(target)
+                .and_then(|body| body.params.first())
+                .is_some_and(|(_, ty)| {
+                    let ty = ty.trim();
+                    ty.contains("Pin<&mut {async fn body of") && ty.ends_with("()}>")
+                })
+    }
+
+    /// Run `path`, and solve its recursive cycle when the run re-enters it.
+    ///
+    /// A re-entry records its argument taint and returns the summary of the
+    /// round before, joined with a pass-through of its arguments. The first
+    /// round has only the pass-through. Each round then runs the body again
+    /// with the joined argument taint. The fixpoint holds when a round adds no
+    /// fact to either.
+    ///
+    /// A round can only under-report while the summary is short, so no
+    /// round invents a finding. The memo entries that a round inserted were
+    /// computed against the short summary, so the next round drops them.
+    fn solve_body(
+        &mut self,
+        path: &str,
+        activation: &str,
+        subst: &Substitution,
+        args: &[TaintSet],
+        hops: &[Hop],
+    ) -> BodyOutcome {
+        let log_start = self.memo_log.len();
+        let mut current = args.to_vec();
+        let mut outcome = self.run_body(path, subst, &current, hops);
+        for _ in 0..MAX_RECURSION_ROUNDS {
+            let Some(entry) = self.reentries.get_mut(activation) else {
+                return outcome;
+            };
+            let mut grew = join_args(&mut current, &entry.args);
+            grew |= join_outcome(&mut entry.outcome, &outcome);
+            if !grew {
+                self.reentries.remove(activation);
+                return outcome;
+            }
+            for key in self.memo_log.drain(log_start..) {
+                self.memo.remove(&key);
+            }
+            outcome = self.run_body(path, subst, &current, hops);
+        }
+        self.reentries.remove(activation);
+        self.push_boundary(
+            BoundaryKind::Recursion,
+            &format!("recursive cycle at {path} did not converge in {MAX_RECURSION_ROUNDS} rounds"),
+            path,
+            "bb0",
+        );
+        join_outcome(&mut outcome, &conservative(&current));
         outcome
     }
 
@@ -613,7 +731,9 @@ impl<'a> Analyzer<'a> {
                 };
                 changed |= self.transfer_call(frame, call, state, report.as_deref_mut());
             }
-            Terminator::SwitchInt { operand, targets } => {
+            Terminator::SwitchInt {
+                operand, targets, ..
+            } => {
                 if targets.len() >= 2
                     && let Some(report) = report
                 {
@@ -725,31 +845,27 @@ impl<'a> Analyzer<'a> {
 
         if let Some(rule) = site.sink() {
             let offset = usize::from(site.parsed.receiver.is_some());
-            if emit {
-                let at = Self::site(frame.path, &frame.block.label, &site.printed);
-                self.record_sink(rule, offset, call.args, &arg_taints, &at);
-                if let Some(report) = report {
-                    report.sinks.push(SinkRecord {
-                        block: frame.block.label.clone(),
-                        site: at,
-                    });
-                }
-            }
-            let opaque: BTreeSet<usize> = rule
-                .opaque_closure_args
-                .iter()
-                .map(|index| index.saturating_add(offset))
-                .collect();
-            self.descend_closures(frame, call, &arg_taints, state, &opaque, emit);
+            self.transfer_sink(
+                frame,
+                call,
+                rule,
+                offset,
+                &site.printed,
+                &arg_taints,
+                state,
+                report,
+            );
             // A command's result is recorded in history and replayed verbatim.
             return false;
         }
 
-        if site.registers_handler() {
+        if let Some(rule) = site.handler_registration() {
+            self.record_handler(frame, rule);
             self.descend_closures(frame, call, &arg_taints, state, &BTreeSet::new(), emit);
             return false;
         }
 
+        self.record_ctx_step(frame, site.suspending_ctx_method());
         if site.is_clean_ctx_call() {
             return false;
         }
@@ -768,11 +884,18 @@ impl<'a> Analyzer<'a> {
             );
         }
 
-        if let Some(rule) = site.sanitizer() {
+        // A bare `sort` or `count` row describes std. A first-party fn of
+        // that name has a body here, which is analyzed instead, exactly as
+        // for a source row.
+        if let Some(rule) = site.sanitizer()
+            && self.bare_row_applies(frame, &site.printed, &rule.path, rule.receiver.as_deref())
+        {
             return self.transfer_sanitizer(frame, call, rule, &arg_taints, state, emit);
         }
 
-        if let Some(rule) = site.reduction() {
+        if let Some(rule) = site.reduction()
+            && self.bare_row_applies(frame, &site.printed, &rule.path, rule.receiver.as_deref())
+        {
             let mut cleared = BTreeSet::new();
             cleared.insert(rule.clears);
             return state.add(call.dest, &union.without(&cleared));
@@ -793,6 +916,72 @@ impl<'a> Analyzer<'a> {
 
         // Nothing in the model decides this call: follow it.
         self.follow_call(frame, call, &site.printed, &arg_taints, state, report)
+    }
+
+    /// Record a sink call site and descend into the closures it takes. The
+    /// `offset` is 1 for a method call, whose receiver is argument 0.
+    #[allow(clippy::too_many_arguments)]
+    fn transfer_sink(
+        &mut self,
+        frame: Frame<'_>,
+        call: CallOperands<'_>,
+        rule: &SinkRule,
+        offset: usize,
+        printed: &str,
+        arg_taints: &[TaintSet],
+        state: &mut TaintState,
+        report: Option<&mut Report<'_>>,
+    ) {
+        let emit = report.is_some();
+        self.record_step_site(frame, rule, offset);
+        if emit {
+            let at = Self::site(frame.path, &frame.block.label, printed);
+            self.record_sink(rule, offset, call.args, arg_taints, &at);
+            if let Some(report) = report {
+                report.sinks.push(SinkRecord {
+                    block: frame.block.label.clone(),
+                    site: at,
+                });
+            }
+        }
+        let opaque: BTreeSet<usize> = rule
+            .opaque_closure_args
+            .iter()
+            .map(|index| index.saturating_add(offset))
+            .collect();
+        self.descend_closures(frame, call, arg_taints, state, &opaque, emit);
+    }
+
+    /// Keep a suspending ctx call for the structure manifest (issue #1995). It
+    /// has no step key.
+    fn record_ctx_step(&mut self, frame: Frame<'_>, rule: Option<&CtxMethodRule>) {
+        let Some(rule) = rule else {
+            return;
+        };
+        self.recorder.sinks.insert(SinkSite {
+            body: frame.path.to_string(),
+            block: frame.block.label.clone(),
+            sink: rule.path.clone(),
+            step: rule.step.clone(),
+            key_arg: None,
+        });
+    }
+
+    /// Keep a handler registration for the structure manifest (issue #2010).
+    fn record_handler(&mut self, frame: Frame<'_>, rule: &CtxMethodRule) {
+        self.recorder
+            .handler(frame.path, &frame.block.label, &rule.path);
+    }
+
+    /// Keep a sink call site for the structure manifest (issue #1995).
+    fn record_step_site(&mut self, frame: Frame<'_>, rule: &SinkRule, offset: usize) {
+        self.recorder.sinks.insert(SinkSite {
+            body: frame.path.to_string(),
+            block: frame.block.label.clone(),
+            sink: rule.path.clone(),
+            step: rule.step.clone(),
+            key_arg: Some(rule.step_key_arg.saturating_add(offset)),
+        });
     }
 
     /// A `[[forbidden]]` effect is a finding on reachability alone, and it also
@@ -1014,9 +1203,24 @@ impl<'a> Analyzer<'a> {
         };
         let mut inner_hops = frame.hops.to_vec();
         inner_hops.push(hop.clone());
-        let seeded: Vec<TaintSet> = arg_taints.iter().map(|set| set.with_hop(&hop)).collect();
+        // A call to an `async fn` resolves to its coroutine, whose parameters
+        // are the pinned future and the context, not the call's arguments.
+        // The future holds every argument, so their union seeds the future
+        // parameter, and the future that the call returns carries it too.
+        let captured = self
+            .is_async_fn_call(printed, target)
+            .then(|| union_of(arg_taints));
+        let seeded: Vec<TaintSet> = captured.as_ref().map_or_else(
+            || arg_taints.iter().map(|set| set.with_hop(&hop)).collect(),
+            |union| vec![union.with_hop(&hop)],
+        );
+        self.recorder
+            .edge(frame.path, &frame.block.label, target, printed);
         let outcome = self.analyze_body(target, subst, &seeded, &inner_hops);
         let mut changed = state.add(call.dest, &outcome.ret);
+        if let Some(union) = &captured {
+            changed |= state.add(call.dest, union);
+        }
         changed |= Self::write_back_refs(
             frame.body,
             call.args,
@@ -1252,9 +1456,9 @@ impl<'a> Analyzer<'a> {
         {
             return false;
         }
-        // (2) A primitive self type, or a receiver the call site declares with
-        // a std-rooted path.
-        if PRIMITIVE_TYPES.contains(&receiver) {
+        // (2) A language type or a trusted trimmed name as the self type, or a
+        // receiver the call site declares with a std-rooted path.
+        if self.is_trusted_receiver_type(parsed) {
             return true;
         }
         // The receiver ARGUMENT: `_1` of a method call is the self value, and
@@ -1294,6 +1498,57 @@ impl<'a> Analyzer<'a> {
             }
         }
         false
+    }
+
+    /// The part of factor (2) that needs only the callee path. Used for a
+    /// direct call and for a bare `fn`-item callback, which has no receiver
+    /// argument to read.
+    ///
+    /// A primitive, a slice, an array or a tuple is a language type. Its
+    /// inherent methods live in core and alloc (`slice::<impl [T]>::to_vec`).
+    ///
+    /// A trimmed receiver (`Vec::<Row>::push`) is trusted when every rooted
+    /// spelling of its name in the dumps is. The signature of a helper prints
+    /// its parameters trimmed (`fn remember(_1: &mut Vec<Row>)`), so no
+    /// declaration at the site names a root. A `let` declaration elsewhere
+    /// names the same type in full, and rustc trims only a unique name.
+    ///
+    /// An impl of a first-party trait on the receiver is in the analyzed set,
+    /// and is never trusted here.
+    fn is_trusted_receiver_type(&self, parsed: &CalleePath) -> bool {
+        let Some(receiver) = parsed.receiver.as_deref() else {
+            return false;
+        };
+        if let Some(trait_name) = parsed.trait_.as_deref()
+            && self
+                .program
+                .has_impl_method(receiver, Some(trait_name), parsed.last_segment())
+        {
+            return false;
+        }
+        if PRIMITIVE_TYPES.contains(&receiver) || receiver.starts_with(['[', '(']) {
+            return true;
+        }
+        // The future of a method with no body here, as
+        // `<{async fn body of Saga<'_>::step<..>()} as IntoFuture>::into_future`.
+        // Polling it runs that method, so the method's owner decides. Its
+        // closure arguments were followed where the method was called.
+        if receiver == "{async fn body}" {
+            return parsed
+                .receiver_path
+                .as_deref()
+                .and_then(async_fn_owner)
+                .is_some_and(|owner| {
+                    self.program
+                        .trimmed_type_is_trusted(owner, |root| self.is_trusted_root(root))
+                });
+        }
+        let spelled = parsed.receiver_path.as_deref().unwrap_or(receiver);
+        spelled == receiver
+            && receiver.starts_with(|c: char| c.is_ascii_uppercase())
+            && self
+                .program
+                .trimmed_type_is_trusted(receiver, |root| self.is_trusted_root(root))
     }
 
     /// `std`/`core`/`alloc` or a `[[trusted]]` crate.
@@ -1395,6 +1650,8 @@ impl<'a> Analyzer<'a> {
                     .read_at(place, false, &frame.block.label, frame.graph)
                     .with_hop(&hop),
             ];
+            self.recorder
+                .drop_edge(frame.path, &frame.block.label, target);
             let outcome = self.analyze_body(target, &Substitution::new(), &seeded, &inner_hops);
             changed |= state.add(place, &outcome.ret);
             if let Some(written) = outcome.out.get(&0) {
@@ -1520,6 +1777,7 @@ impl<'a> Analyzer<'a> {
                         target: &target,
                         has_env,
                         note: &note,
+                        emit,
                     },
                     arg_taints,
                     state,
@@ -1587,7 +1845,10 @@ impl<'a> Analyzer<'a> {
         {
             return;
         }
-        if emit && !self.is_trusted_bodyless_path(&printed, &parsed) {
+        if emit
+            && !self.is_trusted_bodyless_path(&printed, &parsed)
+            && !self.is_trusted_receiver_type(&parsed)
+        {
             self.push_boundary(
                 BoundaryKind::ExternalCrateBody,
                 &printed,
@@ -1616,6 +1877,7 @@ impl<'a> Analyzer<'a> {
                 target,
                 has_env,
                 note,
+                emit,
             } = invoked;
             let hop = Hop {
                 function: frame.path.to_string(),
@@ -1652,8 +1914,13 @@ impl<'a> Analyzer<'a> {
             while seeded.len() < callee_body.params.len() {
                 seeded.push(others.with_hop(&hop));
             }
+            self.recorder
+                .closure_edge(frame.path, &frame.block.label, target);
+            self.recorder
+                .argument(frame.path, &frame.block.label, index, target);
             let outcome = self.analyze_body(target, &Substitution::new(), &seeded, &inner_hops);
             out.absorb(&outcome.ret);
+            self.follow_returned_future(target, callee_body, &outcome.ret, &inner_hops, emit, out);
             // What the closure wrote through its environment is written back
             // onto the locals it captured, which is the only way a capture-by-
             // reference mutation reaches the caller.
@@ -1661,6 +1928,210 @@ impl<'a> Analyzer<'a> {
                 Self::write_back_closure_captures(frame.body, operand, written, state);
             }
         }
+    }
+
+    /// Analyze the `async` block that an invoked closure returns (issue
+    /// #2010). The body of an `async` closure is followed the same way.
+    ///
+    /// The callee that invoked the closure also polls the future it returns.
+    /// When that callee has no body here, as `Saga::step` has none, no poll
+    /// call reaches the coroutine body. So the body is analyzed here, as the
+    /// poll would run it. Parameter 0 is the future, so it carries the taint
+    /// of the closure result.
+    ///
+    /// Only a block in the closure itself is followed. A block built in
+    /// another crate has no body here, and its builder was already analyzed
+    /// or reported at its own call. A write through a `&mut` capture of the
+    /// block cannot reach the caller, so such a capture is a boundary.
+    fn follow_returned_future(
+        &mut self,
+        closure: &str,
+        body: &Body,
+        ret: &TaintSet,
+        hops: &[Hop],
+        emit: bool,
+        out: &mut TaintSet,
+    ) {
+        let block = returning_block(body);
+        let interior_names = self.interior_types();
+        let interior: Vec<&str> = interior_names.iter().map(String::as_str).collect();
+        let inner = brace_form(&body.return_ty)
+            .filter(|span| is_coroutine_span(span) && has_source_span(span));
+        // The block itself, behind `&mut`, `Pin` or `Box` at most, is polled
+        // as it is. Any other type around it has a `poll` of its own.
+        if is_coroutine_span(future_target(&body.return_ty)) {
+            if let Some(span) = &inner {
+                self.follow_block(closure, span, &block, ret, hops, emit, out);
+            }
+        } else {
+            let followed = match self.follow_named_future(closure, body, ret, hops, &block, out) {
+                Ok(followed) => followed,
+                Err((kind, detail)) => {
+                    if emit {
+                        self.push_boundary(kind, &detail, closure, &block);
+                    }
+                    false
+                }
+            };
+            if let Some(span) = &inner {
+                self.follow_block(closure, span, &block, ret, hops, emit, out);
+            }
+            // The type name can hide what the future holds, as `SharedFuture`
+            // hides an `Arc<Mutex<_>>`. So the values that build it count too.
+            if emit
+                && followed
+                && (may_write_through(&body.return_ty, &interior)
+                    || captures_mut_ref(body, &interior))
+            {
+                let detail = format!("{} can write through its fields", body.return_ty.trim());
+                self.push_boundary(BoundaryKind::UnresolvedCallback, &detail, closure, &block);
+            }
+            if emit && !followed && inner.is_some() {
+                let detail = format!("{} wraps an `async` block", body.return_ty.trim());
+                self.push_boundary(BoundaryKind::UnresolvedCallback, &detail, closure, &block);
+            }
+        }
+        if emit && inner.is_some() && captures_mut_ref(body, &interior) {
+            let detail = format!("{} captures a `&mut` reference", body.return_ty.trim());
+            self.push_boundary(BoundaryKind::UnresolvedCallback, &detail, closure, &block);
+        }
+    }
+
+    /// Analyze the coroutine of the `async` block `span`, nested under
+    /// `closure`, or report a boundary when no such body exists.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the hop chain and taint sinks of one closure invocation"
+    )]
+    fn follow_block(
+        &mut self,
+        closure: &str,
+        span: &str,
+        block: &str,
+        ret: &TaintSet,
+        hops: &[Hop],
+        emit: bool,
+        out: &mut TaintSet,
+    ) {
+        let coroutines = self.program.nested_coroutines(closure, span);
+        if coroutines.is_empty() && emit {
+            self.push_boundary(BoundaryKind::UnresolvedCallback, span, closure, block);
+        }
+        for coroutine in coroutines {
+            self.recorder.future_edge(closure, block, &coroutine);
+            let params = self.program.body(&coroutine).map_or(0, |b| b.params.len());
+            let mut seeded = vec![ret.clone()];
+            seeded.resize(params.max(1), TaintSet::new());
+            let outcome = self.analyze_body(&coroutine, &Substitution::new(), &seeded, hops);
+            out.absorb(&outcome.ret);
+        }
+    }
+
+    /// The names of the model's interior-mutable types, and of each local
+    /// type whose fields can write, as `struct Shared(Arc<Mutex<u64>>)`.
+    fn interior_types(&mut self) -> Vec<String> {
+        if let Some(names) = &self.interior {
+            return names.clone();
+        }
+        // `UnsafeCell` is the root of all interior mutability. The model lists
+        // only the safe wrappers, so it is added here.
+        let model: Vec<&str> = self
+            .model
+            .ambient_type
+            .iter()
+            .map(|rule| rule.name.as_str())
+            .chain(["UnsafeCell", "SyncUnsafeCell"])
+            .collect();
+        let local = self.program.writable_types(&model);
+        let names: Vec<String> = model
+            .iter()
+            .map(|n| (*n).to_string())
+            .chain(local)
+            .collect();
+        self.interior = Some(names.clone());
+        names
+    }
+
+    /// Analyze the `Future::poll` impl of a named type that an invoked
+    /// closure returns, when that impl has a body here (issue #2010). Return
+    /// true when one was followed.
+    ///
+    /// A first-party type with no such impl is not a future, so nothing is
+    /// followed. A type of an untrusted crate can be built with no call, as
+    /// a unit struct is. Its `poll` has no body here, so it is an error that
+    /// carries the boundary. A `poll` that resolves to a boundary is one too.
+    fn follow_named_future(
+        &mut self,
+        closure: &str,
+        body: &Body,
+        ret: &TaintSet,
+        hops: &[Hop],
+        block: &str,
+        out: &mut TaintSet,
+    ) -> Result<bool, (BoundaryKind, String)> {
+        // `&mut F`, `Pin<&mut F>` and `Box<F>` forward `Future` to `F`.
+        let ty = future_target(body.return_ty.trim());
+        // A shared reference is a future only by an `impl Future for &T`.
+        // A local impl is not followed, and an untrusted crate has no body.
+        // Either way it is a boundary.
+        if let Some((layers, referent)) = shared_referent(ty) {
+            let full = body
+                .locals
+                .get(&Local(0))
+                .and_then(|local| shared_referent(future_target(local)))
+                .map_or_else(|| referent.clone(), |(_, full)| full);
+            if let Some(root) = crate_root(&full)
+                && !self.is_trusted_root(root)
+                && !self.program.is_first_party_type(&full)
+            {
+                let detail = format!("<{layers}{full} as std::future::Future>::poll");
+                return Err((BoundaryKind::ExternalCrateBody, detail));
+            }
+            let name = last_segment(&referent);
+            if self.program.sources_impl_future(&format!("{layers}{name}")) {
+                let detail = format!("<{ty} as std::future::Future>::poll");
+                return Err((BoundaryKind::UnresolvedCallback, detail));
+            }
+            return Ok(false);
+        }
+        if ty.is_empty() || ty.starts_with('(') {
+            return Ok(false);
+        }
+        // The signature trims a dependency type to `Tick`. The `_0` local
+        // prints it in full, as `dep::Tick`. A same-named local impl must not
+        // stand in for the `poll` of that dependency.
+        let full = body
+            .locals
+            .get(&Local(0))
+            .map_or(ty, |local| future_target(local));
+        if let Some(root) = crate_root(full)
+            && !self.is_trusted_root(root)
+            && !self.program.is_first_party_type(full)
+        {
+            let detail = format!("<{full} as std::future::Future>::poll");
+            return Err((BoundaryKind::ExternalCrateBody, detail));
+        }
+        let poll = format!("<{ty} as std::future::Future>::poll");
+        let targets = match self.program.resolve_call(closure, &poll) {
+            Resolution::Body(target) => vec![target],
+            Resolution::Bodies(targets, _) => targets,
+            Resolution::Boundary(kind, detail) => return Err((kind, detail)),
+            // The sources implement `Future` for it, but no `poll` body is
+            // here, as with a partial MIR input.
+            Resolution::External(_) if self.program.sources_impl_future(ty) => {
+                return Err((BoundaryKind::MissingBody, poll));
+            }
+            Resolution::External(_) => return Ok(false),
+        };
+        for target in targets {
+            self.recorder.future_edge(closure, block, &target);
+            let params = self.program.body(&target).map_or(0, |b| b.params.len());
+            let mut seeded = vec![ret.clone()];
+            seeded.resize(params.max(1), TaintSet::new());
+            let outcome = self.analyze_body(&target, &Substitution::new(), &seeded, hops);
+            out.absorb(&outcome.ret);
+        }
+        Ok(true)
     }
 
     /// The callee path a bare `fn` item argument names, and where it
@@ -1693,10 +2164,13 @@ impl<'a> Analyzer<'a> {
                 // for one.
                 let text = frame.subst.apply(text);
                 let trimmed = text.trim();
-                trimmed
-                    .strip_prefix("const ")
-                    .unwrap_or(trimmed)
-                    .to_string()
+                let candidate = trimmed.strip_prefix("const ").unwrap_or(trimmed);
+                // A `const` item reads a value that rustc fixed at compile
+                // time. It is not a callback, so no call is followed.
+                if self.program.names_const_item(candidate) {
+                    return None;
+                }
+                candidate.to_string()
             }
             Operand::Copy(place) | Operand::Move(place) => {
                 let declared = frame.body.locals.get(&place.local)?;
@@ -2156,6 +2630,19 @@ const PRIMITIVE_TYPES: &[&str] = &[
     "f64", "bool", "char", "str",
 ];
 
+/// The trimmed owner type of the method whose future `form` names:
+/// `{async fn body of Saga::step()}` → `Saga`.
+///
+/// A free function has no owner, and a rooted owner (`a::Saga`) is not
+/// trimmed. Both give `None`.
+fn async_fn_owner(form: &str) -> Option<&str> {
+    let inner = form
+        .strip_prefix("{async fn body of ")?
+        .strip_suffix("()}")?;
+    let (owner, _method) = split_last(inner)?;
+    (!owner.contains("::") && owner.starts_with(|c: char| c.is_ascii_uppercase())).then_some(owner)
+}
+
 /// Every crate root spelled in a path or type text: each identifier that is
 /// followed by `::` and is itself the *start* of a path.
 ///
@@ -2369,7 +2856,10 @@ fn implicit_flow(
 fn tainted_branches(body: &Body, state: &TaintState, graph: &ControlGraph) -> Vec<BranchRecord> {
     let mut out = Vec::new();
     for block in &body.blocks {
-        let Terminator::SwitchInt { operand, targets } = &block.terminator else {
+        let Terminator::SwitchInt {
+            operand, targets, ..
+        } = &block.terminator
+        else {
             continue;
         };
         if targets.len() < 2 {
@@ -2537,6 +3027,11 @@ fn same_type_name(declared: &str, pointee: &str) -> bool {
     !want.is_empty() && crate::model::callee::TypeName::parse(declared).name == want
 }
 
+/// The key of one activation of `path`: the body and its substitution.
+fn activation_key(path: &str, subst: &Substitution) -> String {
+    format!("{path}|{}", subst.key())
+}
+
 fn memo_key(path: &str, subst: &Substitution, args: &[TaintSet]) -> String {
     let mut key = String::with_capacity(path.len().saturating_add(32));
     key.push_str(path);
@@ -2563,6 +3058,40 @@ fn conservative(args: &[TaintSet]) -> BodyOutcome {
         out,
         has_sink: false,
     }
+}
+
+/// What re-entering a body on the stack saw, while its cycle is solved.
+#[derive(Debug, Default)]
+struct Reentry {
+    /// The join of the argument taint of every re-entry.
+    args: Vec<TaintSet>,
+    /// The summary that a re-entry returns.
+    outcome: BodyOutcome,
+}
+
+/// Join `other` into `into` by position. True when a fact was added.
+fn join_args(into: &mut Vec<TaintSet>, other: &[TaintSet]) -> bool {
+    if into.len() < other.len() {
+        into.resize(other.len(), TaintSet::new());
+    }
+    let mut grew = false;
+    for (have, add) in into.iter_mut().zip(other) {
+        grew |= have.absorb(add);
+    }
+    grew
+}
+
+/// Join `other` into `into`. True when a fact or a sink was added.
+fn join_outcome(into: &mut BodyOutcome, other: &BodyOutcome) -> bool {
+    let mut grew = into.ret.absorb(&other.ret);
+    for (index, set) in &other.out {
+        grew |= into.out.entry(*index).or_default().absorb(set);
+    }
+    if other.has_sink && !into.has_sink {
+        into.has_sink = true;
+        grew = true;
+    }
+    grew
 }
 
 fn union_of(sets: &[TaintSet]) -> TaintSet {
@@ -2604,13 +3133,227 @@ fn first_sentence(reason: &str) -> &str {
     )
 }
 
+/// The value `body` returns reads a local that can write through a
+/// reference, such as an `async` block that captures `&mut seen`.
+///
+/// A capture can write back only through a reference. A `&mut` can hide in a
+/// named type, as in `Refs<'_>`, so any capture type that holds a lifetime
+/// counts. A type that names an interior-mutable type of the model's
+/// `[[ambient_type]]` table counts too, owned or shared. `&Cell<u64>` and an
+/// `Arc<Mutex<u64>>` clone each reach state the caller reads. Any other
+/// shared `&T`, or owned type with no lifetime, holds no writable reference.
+///
+/// A capture can be a projection of the closure environment, as in
+/// `move (_1.0: &mut u64)`. Its local is the closure, so the type is read
+/// from the place annotation in the text as well.
+///
+/// The block can reach `_0` through a temporary, a tuple or a call. So each
+/// coroutine aggregate the closure builds is read, not only the value it
+/// returns. A call that writes `_0`, such as `SharedFuture::new(handle)`,
+/// has its arguments read too. An argument whose type is not printed counts
+/// as one that can write.
+fn captures_mut_ref(body: &Body, interior: &[&str]) -> bool {
+    let call_writes = body
+        .blocks
+        .iter()
+        .filter_map(|block| match &block.terminator {
+            Terminator::Call { dest, args, .. }
+                if dest.local == Local(0) && dest.projections.is_empty() =>
+            {
+                Some(args)
+            }
+            _ => None,
+        })
+        .flatten()
+        .filter_map(operand_place)
+        .any(|place| {
+            place_type(body, place)
+                .is_none_or(|ty| may_write_through(ty, interior) || hides_captures(ty))
+        });
+    call_writes
+        || body
+            .blocks
+            .iter()
+            .flat_map(|block| &block.statements)
+            .filter_map(|statement| match statement {
+                Statement::Assign { dest, rvalue }
+                    if (dest.local == Local(0) && dest.projections.is_empty())
+                        || rvalue.text.trim_start().starts_with("{coroutine@") =>
+                {
+                    Some(rvalue)
+                }
+                _ => None,
+            })
+            .any(|rvalue| {
+                let places = || rvalue.reads.iter().filter_map(operand_place);
+                let root_types = places()
+                    .filter_map(|place| body.locals.get(&place.local))
+                    .map(String::as_str);
+                // A projected read, as `(_1.0: u64)`, has its own type in an
+                // annotation. Its root can be the closure itself.
+                let own_types = places()
+                    .filter(|place| place.projections.is_empty())
+                    .filter_map(|place| body.locals.get(&place.local))
+                    .map(String::as_str)
+                    .chain(annotated_types(&rvalue.text));
+                root_types
+                    .chain(annotated_types(&rvalue.text))
+                    .any(|ty| may_write_through(ty, interior))
+                    || own_types.into_iter().any(hides_captures)
+            })
+}
+
+/// A closure, `async` closure or `async` block type hides its own captures,
+/// and they can write.
+fn hides_captures(ty: &str) -> bool {
+    [
+        "{closure@",
+        "{async closure@",
+        "{async block@",
+        "{coroutine@",
+    ]
+    .iter()
+    .any(|spelling| ty.contains(spelling))
+}
+
+/// The type of `place` in `body`, when MIR prints it.
+///
+/// A plain local has its declared type. A field of a local, as `_1.0`, has
+/// no local of its own. MIR prints its type in an annotation, as
+/// `(_1.0: Arc<u64>)`, which the body text holds.
+fn place_type<'b>(body: &'b Body, place: &Place) -> Option<&'b str> {
+    let key = match place.projections.as_slice() {
+        [] => return body.locals.get(&place.local).map(String::as_str),
+        [Projection::Field(field)] => format!("(_{}.{field}: ", place.local.0),
+        [Projection::Deref, Projection::Field(field)] => {
+            format!("((*_{}).{field}: ", place.local.0)
+        }
+        _ => return None,
+    };
+    let at = body.text.find(&key)?.saturating_add(key.len());
+    let rest = body.text.get(at..)?;
+    let mut depth = 0_usize;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' | '<' | '[' | '{' => depth = depth.saturating_add(1),
+            ')' if depth == 0 => return rest.get(..i),
+            ')' | '>' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Each place annotation type in `text`, as `T` in `(_1.0: T)`.
+fn annotated_types(text: &str) -> impl Iterator<Item = &str> {
+    text.match_indices(": ").filter_map(move |(at, _)| {
+        let rest = text.get(at.saturating_add(2)..)?;
+        let end = rest.find([')', ',', '}']).unwrap_or(rest.len());
+        rest.get(..end)
+    })
+}
+
+/// A value of type `ty` can hold a reference that writes. See
+/// [`captures_mut_ref`].
+fn may_write_through(ty: &str, interior: &[&str]) -> bool {
+    let ty = ty.trim();
+    // A raw `*mut` pointer writes as a `&mut` reference does.
+    if ty.contains("&mut") || ty.contains("*mut") {
+        return true;
+    }
+    // A trait object hides its type. Its methods can write through `&self`.
+    if ty
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|w| w == "dyn")
+    {
+        return true;
+    }
+    let names_interior = ty
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|word| interior.contains(&word));
+    if names_interior {
+        return true;
+    }
+    !ty.starts_with('&') && ty.contains('\'')
+}
+
+/// The type whose `Future` impl a returned value forwards to. `&mut F`,
+/// `Pin<&mut F>`, `Pin<Box<F>>` and `Box<F>` all forward to `F`.
+fn future_target(ty: &str) -> &str {
+    let mut ty = ty.trim();
+    loop {
+        let inner = ty
+            .strip_prefix("&mut ")
+            .or_else(|| wrapper_inner(ty, "Pin"))
+            .or_else(|| wrapper_inner(ty, "Box"));
+        match inner {
+            Some(inner) => ty = inner.trim(),
+            None => return ty,
+        }
+    }
+}
+
+/// `T` of `W<T>` or of `path::W<T>`.
+fn wrapper_inner<'t>(ty: &'t str, wrapper: &str) -> Option<&'t str> {
+    let open = ty.find('<')?;
+    let head = ty.get(..open)?;
+    if head != wrapper && !head.ends_with(&format!("::{wrapper}")) {
+        return None;
+    }
+    ty.get(open.saturating_add(1)..)?.strip_suffix('>')
+}
+
+/// The label of the block that writes the return place `_0`, or `bb0`.
+fn returning_block(body: &Body) -> String {
+    body.blocks
+        .iter()
+        .find(|block| {
+            block.statements.iter().any(|statement| {
+                matches!(statement, Statement::Assign { dest, .. }
+                    if dest.local == Local(0) && dest.projections.is_empty())
+            })
+        })
+        .map_or_else(|| "bb0".to_string(), |block| block.label.clone())
+}
+
 /// The `{closure@..}` / `{async block@..}` brace form inside a type, if any.
+///
+/// Each `{..}` group is read whole, nested groups included (issue #2010). A
+/// cut at the first `}` gives a broken span and a false
+/// `unresolved-callback` boundary. A `{async fn body of f<..>}` group is
+/// skipped. It is the future of an `async fn`, and the closures in its
+/// generic arguments went to the call that built it.
 fn brace_form(ty: &str) -> Option<String> {
-    let at = ty.find('{')?;
-    let rest = ty.get(at..)?;
-    let end = rest.find('}')?;
-    let form = rest.get(..end.saturating_add(1))?;
-    form.contains('@').then(|| form.to_string())
+    let mut rest = ty;
+    loop {
+        let at = rest.find('{')?;
+        rest = rest.get(at..)?;
+        let len = balanced_group_len(rest)?;
+        let form = rest.get(..len)?;
+        if !form.starts_with("{async fn body of ") && form.contains('@') {
+            return Some(form.to_string());
+        }
+        rest = rest.get(len..)?;
+    }
+}
+
+/// The byte length of the `{..}` group at the start of `text`, nested groups
+/// included.
+fn balanced_group_len(text: &str) -> Option<usize> {
+    let mut depth = 0_usize;
+    for (i, c) in text.char_indices() {
+        match c {
+            '{' => depth = depth.saturating_add(1),
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i.saturating_add(1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 const fn operand_place(operand: &Operand) -> Option<&Place> {
@@ -2638,4 +3381,128 @@ fn source_hint(path: &str) -> Option<String> {
         .trim_start_matches('@');
     let head = rest.split(": ").next()?;
     (!head.is_empty()).then(|| head.to_string())
+}
+
+/// The shared reference layers of a type and its referent, as `&&` and
+/// `dep::Tick` for `&'a &dep::Tick<u8>`. No lifetime and no generics stay.
+fn shared_referent(ty: &str) -> Option<(String, String)> {
+    let mut layers = String::new();
+    let mut referent = ty.trim();
+    while let Some(rest) = referent.strip_prefix('&') {
+        let rest = rest.trim_start();
+        // `&'a T` names its lifetime first.
+        let rest = rest
+            .strip_prefix('\'')
+            .map_or(rest, |r| r.split_once(' ').map_or("", |(_, ty)| ty));
+        if rest.starts_with("mut ") {
+            break;
+        }
+        layers.push('&');
+        referent = rest.trim_start();
+    }
+    if layers.is_empty() {
+        return None;
+    }
+    Some((layers, strip_generics_everywhere(referent.trim())))
+}
+
+/// Does `span` end in a source span, as `{async block@a.rs:5:6: 5:9}` does?
+///
+/// A block of another crate prints its def path instead, as
+/// `{async block@dep::f::{closure#0}}`. A module file can lack the `.rs`
+/// extension, so the test reads the `line:col: line:col` shape.
+fn has_source_span(span: &str) -> bool {
+    let Some(inner) = span.strip_suffix('}') else {
+        return false;
+    };
+    let Some((start, end)) = inner.rsplit_once(": ") else {
+        return false;
+    };
+    let number = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+    // The last two `:` parts of `text` are a line and a column.
+    let ends_in_pair = |text: &str| {
+        text.rsplit_once(':').is_some_and(|(rest, col)| {
+            number(col) && rest.rsplit_once(':').is_some_and(|(_, line)| number(line))
+        })
+    };
+    let end_pair = end
+        .split_once(':')
+        .is_some_and(|(l, c)| number(l) && number(c));
+    end_pair && ends_in_pair(start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_forwarding_wrapper_names_its_future() {
+        assert_eq!(future_target("&mut ClockFuture"), "ClockFuture");
+        assert_eq!(future_target("Pin<&mut ClockFuture>"), "ClockFuture");
+        assert_eq!(
+            future_target("std::pin::Pin<std::boxed::Box<ClockFuture>>"),
+            "ClockFuture"
+        );
+        assert_eq!(future_target("Result<u64, String>"), "Result<u64, String>");
+    }
+
+    #[test]
+    fn a_shared_reference_keeps_each_layer() {
+        let pair = |l: &str, r: &str| Some((l.to_string(), r.to_string()));
+        assert_eq!(shared_referent("&dep::Tick<u8>"), pair("&", "dep::Tick"));
+        assert_eq!(shared_referent("&'a &Tick"), pair("&&", "Tick"));
+        assert_eq!(shared_referent("& &'static Tick"), pair("&&", "Tick"));
+        assert_eq!(shared_referent("Tick"), None);
+    }
+
+    #[test]
+    fn a_capture_that_can_hold_a_mut_ref_may_write_through() {
+        let interior = ["Cell", "RefCell", "Mutex"];
+        assert!(may_write_through("std::sync::Arc<dyn Writer>", &interior));
+        assert!(!may_write_through("Dynamo", &interior));
+        assert!(may_write_through("&mut u64", &interior));
+        assert!(may_write_through("(&mut u64,)", &interior));
+        assert!(may_write_through("Refs<'_>", &interior));
+        assert!(may_write_through("&std::cell::Cell<u64>", &interior));
+        assert!(may_write_through("&std::sync::Mutex<u64>", &interior));
+        assert!(may_write_through(
+            "std::sync::Arc<std::sync::Mutex<u64>>",
+            &interior
+        ));
+        assert!(!may_write_through("&WorkflowContext", &interior));
+        assert!(!may_write_through("&Refs<'_>", &interior));
+        assert!(!may_write_through("&CellPhone", &interior));
+        assert!(!may_write_through("u64", &interior));
+        assert!(!may_write_through("std::string::String", &interior));
+    }
+
+    #[test]
+    fn a_source_span_needs_no_rs_extension() {
+        assert!(has_source_span("{async block@a.rs:5:6: 5:9}"));
+        assert!(has_source_span("{async block@src/noext:12:26: 12:31}"));
+        assert!(!has_source_span("{async block@dep::f::{closure#0}}"));
+        assert!(!has_source_span("{async block@a.rs:5:6}"));
+    }
+
+    #[test]
+    fn brace_form_skips_an_async_fn_body_group() {
+        assert_eq!(
+            brace_form("{async fn body of Saga<'_>::step<u64, {closure@a.rs:1:2: 1:4}>()}"),
+            None
+        );
+        assert_eq!(
+            brace_form("Map<{async fn body of f()}, {closure@a.rs:3:4: 3:9}>").as_deref(),
+            Some("{closure@a.rs:3:4: 3:9}")
+        );
+        assert_eq!(
+            brace_form("Pin<&mut {async block@a.rs:5:6: 5:9}>").as_deref(),
+            Some("{async block@a.rs:5:6: 5:9}")
+        );
+        assert_eq!(
+            brace_form("{async block@WorkflowContext::rpit_block::{closure#0}}").as_deref(),
+            Some("{async block@WorkflowContext::rpit_block::{closure#0}}")
+        );
+        assert_eq!(balanced_group_len("{a{b}c}d"), Some(7));
+        assert_eq!(balanced_group_len("{a{b}"), None);
+    }
 }

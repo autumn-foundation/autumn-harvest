@@ -20,8 +20,10 @@ execution pause, circuit breaker, schedule-to-close and due time. Every write
 to workflow state and history stays in the Postgres transactions that exist
 today.
 
-The channel removes one cost, and only one: the backlog scan and sort that the
-Postgres claim performs on every claim.
+The channel removes one cost, and only one: the search for a claimable row.
+Since issue #1971, the default Postgres claim bounds that search with a window
+at the head of each queue. It scans and sorts the backlog only as a fallback.
+A claim with fairness keys or priority ageing always runs that scan.
 
 ## When to use it
 
@@ -316,6 +318,9 @@ fails startup instead, in every mode.
   cache hint, never a correctness rule.
 - **No new event variant and no migration.** The channel adds nothing to
   `harvest_events` and nothing to the schema.
+- **One claim loop per channel.** The follower claim loops of
+  `max_concurrent_claims` claim only through Postgres, so they stay idle on a
+  shard with a channel. In degraded mode the leader drains Postgres alone.
 
 ## How to turn it off
 

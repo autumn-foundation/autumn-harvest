@@ -1,0 +1,9 @@
+# Ledger profiles for `autumn-harvest/src/llm_ledger.rs`. See `docs/ledger/README.md`.
+
+["insert_ledger_rows"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_llm_ledger"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/llm_ledger.md"

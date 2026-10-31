@@ -1,0 +1,6 @@
+{"spec":"ActivityClaim","case":"one claim starts, beats and finishes","checks":{"fixed":"accept"}}
+{"op":"init","state":"PENDING","worker":null,"attempt":0,"strikes":0,"terminal":0,"actor":null}
+{"op":"write","state":"RUNNING","worker":"w1","attempt":1,"strikes":0,"terminal":0,"actor":null}
+{"op":"start","state":"RUNNING","worker":"w1","attempt":1,"strikes":0,"terminal":0,"actor":{"worker":"w1","attempt":1}}
+{"op":"heartbeat","state":"RUNNING","worker":"w1","attempt":1,"strikes":0,"terminal":0,"actor":{"worker":"w1","attempt":1}}
+{"op":"write","state":"COMPLETED","worker":"w1","attempt":1,"strikes":0,"terminal":1,"actor":{"worker":"w1","attempt":1}}

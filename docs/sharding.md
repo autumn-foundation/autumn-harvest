@@ -7,11 +7,37 @@ Harvest can spread workflow state across N independent Postgres databases (shard
 For the full sharding architecture, see [`docs/architecture.md`](architecture.md#sharding) §Sharding and `autumn-harvest/src/shard.rs`.
 
 **When should you shard?** [`performance.md`](performance.md) publishes measured
-task-claim latency against pending-backlog depth. Claim cost grows superlinearly
-with backlog depth and every worker pays the full scan, so beyond a certain depth
-adding workers stops helping and sharding (or shedding the backlog) is the
-answer. Measure your own steady-state backlog against that table before
-provisioning a second shard.
+task-claim latency against pending-backlog depth. Since issue #1971, the default
+claim reads a bounded [seek window](performance.md#the-seek-window-issue-1971)
+first. Its cost stays nearly flat from 1K to 1M pending rows. The full scan
+still runs as a fallback. Its cost grows superlinearly with backlog depth. A
+blocked queue head can send a claim to it. With `priority_aging_secs` set or
+fairness keys on, every claim runs it. Every worker pays that cost on each such
+claim, so past a certain depth adding workers stops helping. Sharding (or
+shedding the backlog) is then the answer. Measure your own steady-state backlog
+against that table before provisioning a second shard.
+
+## Glossary
+
+Epic #2247 adds owner mode. Issues #2251 and #2252 build stage 1a. It is
+off until an operator turns it on per database.
+[ADR 0009](adr/0009-decision-owner.md) records the decisions behind it.
+
+- **Shard**: a logical shard, usually one Postgres database. An
+  execution's history, tasks, timers and signals all live on one shard.
+  Colocated shards share one database.
+- **Decision partition**: a fixed hash bucket of executions inside one
+  physical database. Each database has 512. The hash input is
+  `workflow_id`.
+- **Owner**: the worker that holds the lease of a decision partition. Only
+  the owner commits decisions for the executions in it.
+- **Owner row** (owner lease): the row in the shard database that names
+  the owner, its epoch and its lease end.
+- **Owner epoch**: a counter that each acquisition increments. Each
+  decision commit checks it, so a stale owner cannot commit.
+- **Foreign writer**: code that appends to a history outside the owner's
+  decision, such as an activity completion. It takes no owner row.
+- **Owner mode**: the per-database switch that turns the owner model on.
 
 ---
 
@@ -402,6 +428,9 @@ it.
 
 Distributed counting across shards requires either a coordination service (Redis, a dedicated Postgres coordinator) or accepting bounded inaccuracy (approximate counts via gossip). Both add operational complexity that conflicts with Harvest's goal of being a Postgres-native engine. Cross-shard global limits are therefore **out of scope** for this feature; the per-shard guarantee is the contract.
 
+[Fairness keys](fairness-keys.md) (issue #1976) are shard-local too. Each
+shard keeps its own key state.
+
 If you need approximate cross-shard fair-share rather than a hard global cap, the metrics observable via `GET /admin/concurrency` can feed an external rate limiter in the layer above Harvest.
 
 ### Worker crash and slot release
@@ -731,6 +760,8 @@ time.
 | Queued for no durable mutex | The grant is delivered by waking the waiter **on this shard**, so a migrated waiter's grant would be delivered to a sealed row — a lost wake. |
 | No dead-letter rows | Redriving a DLQ entry enqueues a task on this shard, which after a migration would target a sealed row. Redrive or discard it first. |
 | Not schedule-attributed (`schedule_id IS NULL`) | A schedule row does not move with its runs, and its overlap enforcement is **shard-local**: the tick counts `RUNNING`/`PAUSED` executions on its own shard for `max_active_runs`, and `CancelOther`/`TerminateOther` cancel priors with the same shard-local query. After a migration the local row reads `MIGRATED`, so the schedule stops counting the still-running copy and stops cancelling it — silently exceeding its own cap, or starting a run without terminating the prior it was told to replace. Making this safe means teaching schedule overlap enforcement to see forwarded residences, which is a change to the scheduler rather than to this feature. |
+| Not a fork (`start_source` is not `fork`, issue #2000) | A recorded fork reads its source, and a new fork walks the fork lineage, on the shard of the fork. Only the fork moves, so on the target both lookups would miss: every recorded result would fail closed, and an erased ancestor would go unseen. |
+| Not in the fork lineage of a live fork (issue #2000) | A recorded fork reads the outcomes of its source on the shard of the fork. A migrated source records later outcomes on the target, so the fork would fail closed. A reset of a fork reads the source of the fork it resets, so the check walks the lineage up, for at most 64 links. The partial index on `start_source` keeps the walk small. |
 | No live children, **including paused ones** | A paused child still completes eventually, and its terminal appends to the parent's history on the shard the parent used to be on. |
 
 **A run waiting on a timer or a signal IS migratable — that is the point.** Both
@@ -843,9 +874,12 @@ The loop reports as scanner `rebalance_resume` in `scanner_liveness` and in
 | Durable timers | ✅ verbatim, including `fires_at` | none |
 | Signals, including `idempotency_key` | ✅ verbatim | none |
 | Payload refs (`harvest_payload_refs`) | ✅ | none — the blob store is shard-external |
+| Agent cost ledger (`harvest_llm_ledger`, issue #1996) | ✅ verbatim, including `recorded_at` | none — the usage report counts the source until the move is done, then the target |
 | The parked workflow task row | ✅ | none |
 | Terminal task rows (activity history) | ❌ stays on the sealed source | none — the durable record is in `harvest_events` |
 | Workflow logs | ✅ | none — copied for a privacy reason as much as an operational one: they are free text, so a PII sink, and `erase.rs` scrubs them via the execution's own shard. Logs left behind would be out of reach of an erasure issued against the run. |
+| Durable stream chunks (`harvest_stream_chunks`, #1974) | ✅ in pages of 1,000 rows, and again at activation, so a chunk stored after verification is not lost | none — copied for the same reason as the logs: they are author output, and erasure must reach them |
+| Entity state projection (`harvest_entity_state`, #2259) | ✅ rebuilt, not copied: the projection trigger on the target writes the row as the event copy inserts each snapshot | none — the target row is the last snapshot of the copied history. The cutover deletes the row of the sealed source run. An aborted copy gives the target row back to the runs that stay there. |
 | Start idempotency keys | ❌ | none for an existing run: a keyed start still hashes to the same shard |
 | Debounce rows | ❌ | at most one extra debounced start per key immediately after the move |
 | Start-throttle tokens, rate-limit buckets | ❌ | already per-shard; unaffected for an existing run |
@@ -1065,7 +1099,13 @@ Response:
       "timed_out": 3,
       "activity_executions": 51820,
       "activity_executions_failed": 340,
-      "activity_compute_seconds": 918422.7
+      "activity_compute_seconds": 918422.7,
+      "llm_calls": 1290,
+      "llm_input_tokens": 3812400,
+      "llm_output_tokens": 640150,
+      "llm_cost_usd_micros": 21037500,
+      "llm_unpriced_calls": 0,
+      "llm_latency_ms": 1543200
     }
   ],
   "unavailable_shards": []
@@ -1082,6 +1122,7 @@ Executions that lack the requested `search_attrs` key are grouped under the lite
 - `activity_executions_failed`: count of terminal `ActivityFailed`/`ActivityTimedOut` events in the window that have a matching `ActivityStarted` (non-final retry attempts emit no event, so this counts exhausted-retry-or-timeout only). The start-match requirement excludes external activities, whose `ActivityTimedOut` can be appended with no `ActivityStarted` at all.
 - `activity_compute_seconds`: for each activity whose terminal event falls in the window, the wall-clock span from that activity's most recent (final-attempt) start to its terminal event, summed. Retry backoff wall time is excluded by construction.
 - Local activities and externally-completed activities are excluded from the activity counters — they never emit `ActivityStarted`, so they're not worker compute.
+- `llm_calls`, `llm_input_tokens`, `llm_output_tokens`, `llm_cost_usd_micros`, `llm_unpriced_calls` and `llm_latency_ms` (issue #1996): sums over the agent cost ledger rows whose `recorded_at` falls in the window. Cost is in millionths of a US dollar. A row with no cost counts in `llm_unpriced_calls`. The report skips a shard move's staged target copy and counts the sealed source until the move is done, so one shard reports each run. See [the agent cost ledger](llm-cost-ledger.md).
 
 **Window ceiling**: a `from`/`to` window wider than a configurable ceiling (default 90 days, `HarvestApiState::set_usage_window_ceiling`) is rejected with `400`, naming the ceiling, so an operator cannot accidentally trigger a full-table scan across every shard.
 
@@ -1232,6 +1273,17 @@ predicate text, so every shard derives the identical typed comparison and the
 merged result is deterministic. Numeric comparison matches only number-typed
 stored values; a value stored as a string on one shard is excluded uniformly on
 all shards, never a partial false match.
+
+### Filter expressions (`filter`, issue #1982)
+
+A `filter` expression compiles to one parenthesized fragment in the same
+per-shard `WHERE` clause. Its attribute leaves use the SQL in the table above.
+Every key and value is a bound parameter. The merge, the cursor and the
+partial-availability rules do not change.
+
+A filter with `OR` must find each row through an attribute predicate or
+`workflow_name` with `=` or `IN`. So each shard can use its indexes, for
+example with `BitmapOr`, and an `OR` never forces a full scan of a shard.
 
 ---
 

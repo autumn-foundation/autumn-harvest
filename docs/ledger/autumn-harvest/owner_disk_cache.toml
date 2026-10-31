@@ -1,0 +1,80 @@
+# Ledger profiles for `autumn-harvest/src/owner_disk_cache.rs`. See `docs/ledger/README.md`.
+
+["DiskTier::reconcile"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/owner_disk_cache.md"
+
+["OwnerDiskCache::create_file"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["ddl", "read", "write"]
+tables = ["harvest_cache_runs", "harvest_cache_stamp", "harvest_entity_projection", "harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/owner_disk_cache.md"
+
+["OwnerDiskCache::delete_run"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_cache_runs", "harvest_entity_projection", "harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/owner_disk_cache.md"
+
+["OwnerDiskCache::purge_entity"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_entity_projection"]
+measured = "unmeasured"
+
+["OwnerDiskCache::read_entity"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["entity", "harvest_entity_projection"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/owner_disk_cache.md"
+
+["OwnerDiskCache::read_events"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/owner_disk_cache.md"
+
+["OwnerDiskCache::read_file_stamp"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_cache_stamp"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/owner_disk_cache.md"
+
+["OwnerDiskCache::read_run_stamp"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_cache_runs"]
+measured = "docs/performance-owner-disk-cache.md"
+plan = "docs/ledger/plans/autumn-harvest/owner_disk_cache.md"
+
+["OwnerDiskCache::write_entity"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["entity", "harvest_entity_projection"]
+measured = "docs/performance-owner-disk-cache.md"
+plan = "docs/ledger/plans/autumn-harvest/owner_disk_cache.md"
+
+["OwnerDiskCache::write_run"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_cache_runs", "harvest_events"]
+measured = "docs/performance-owner-disk-cache.md"
+plan = "docs/ledger/plans/autumn-harvest/owner_disk_cache.md"

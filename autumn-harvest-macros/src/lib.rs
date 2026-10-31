@@ -1,8 +1,9 @@
 //! Procedural macros for the `autumn-harvest` workflow engine.
 //!
 //! This crate provides attribute macros to define workflows, activities, DAGs,
-//! query handlers, and update handlers, as well as collection macros to bundle
-//! them for registration.
+//! query handlers, update handlers, signal handlers, and webhook trigger
+//! mappings. It also provides collection macros to bundle them for
+//! registration.
 
 use proc_macro::TokenStream;
 

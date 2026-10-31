@@ -185,6 +185,17 @@ write-path win, not just a neutral one.
 
 ## Scope: why NOTIFY stays per-row
 
+> **Update (issue #1796):** PR #1875 changed the wake path after this
+> capture. Each row now stages a note through
+> `notify::notify_task_enqueued_for`. The chaos-drop hook still runs once
+> per row, so each row's note drops independently. A post-commit sender,
+> which `notify::register_pool` starts, sends the committed notes in one
+> statement, with one wake per queue. With a ready sender, the write
+> transaction sends no `pg_notify`. Without one, the fallback sends on the
+> write connection. Inside a transaction, that send runs in a savepoint.
+> The `request_calls` figures above measure the path before this change.
+> The harness registers no pool, so a re-run measures the fallback.
+
 `enqueue()`/`enqueue_batch` also call `notify::notify_task_enqueued`
 once per row, unchanged by this fix. `notify_tasks_enqueued` already
 exists for a *different* shape: several queue names sharing **one**

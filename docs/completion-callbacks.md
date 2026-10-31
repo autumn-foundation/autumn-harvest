@@ -9,6 +9,10 @@ an embedder registers a **completion callback target** (URL + terminal-state
 filter) and Harvest durably POSTs a signed, fixed JSON envelope to it the
 moment the workflow reaches a terminal state.
 
+A fork with the default `recorded` effects (issue #2000) is the exception.
+It enqueues no delivery, so it never notifies an outside system. A `live`
+fork delivers as usual. See the [fork runbook](runbooks/fork-a-run.md).
+
 **Invariant: no new `WorkflowEvent` variant, zero replay-determinism impact.**
 Callback registration is execution metadata (a `completion_callbacks` column
 on `harvest_workflow_executions`); delivery is a post-terminal operational

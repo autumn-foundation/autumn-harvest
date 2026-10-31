@@ -11,6 +11,8 @@ When a workflow execution finishes in a terminal state:
 2. **Cross-Shard Out-of-Band Starts**: If the target routes to a different shard, the engine handles the start out-of-band by spawning an asynchronous Tokio task that obtains a database connection from `GLOBAL_SHARDED_POOL` for the target shard and inserts the target execution.
 3. **Idempotency & Deduplication**: To prevent duplicate executions in the event of retried transactions or worker crashes, the engine writes to the `harvest_completion_trigger_fires` ledger table on the source shard under a unique constraint: `(source_exec_id, trigger_id)`. A trigger fires exactly once per source execution run.
 
+A fork with the default `recorded` effects (issue #2000) fires no trigger, so it starts no target execution. A `live` fork fires triggers as usual. See the [fork runbook](runbooks/fork-a-run.md).
+
 ### No new event variant
 
 Trigger evaluation introduces **no new `WorkflowEvent` variant**. The source emits nothing extra on completion, and the target's start emits its own ordinary `WorkflowStarted`. The append-only event contract is preserved by construction — completion triggers are a registry plus a fire ledger layered *outside* the event log.

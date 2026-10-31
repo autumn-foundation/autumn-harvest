@@ -1,0 +1,151 @@
+# Ledger profiles for `autumn-harvest/src/replication.rs`. See `docs/ledger/README.md`.
+
+["db::advance_sequences_in_transaction"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
+
+["db::assert_database_fence"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_shard_generation"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
+
+["db::assert_generation"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_shard_generation"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
+
+["db::assert_no_unpinned_rows"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_shard_generation"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
+
+["db::begin_guard_transaction"]
+driver = "per_task"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["db::begin_pass_on"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
+
+["db::bump_generation"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_shard_generation"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
+
+["db::current_generation"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_shard_generation"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
+
+["db::end_backend"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
+
+["db::ensure_generation_row"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_shard_generation"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
+
+["db::freeze_generation_rows_on"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_shard_generation"]
+measured = "unmeasured"
+
+["db::generation_shard_ids"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_shard_generation"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
+
+["db::heartbeat_reading"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_replication_heartbeat", "harvest_shard_generation"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
+
+["db::hold_in_pass"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
+
+["db::keep_guard_alive"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
+
+["db::measure_rpo"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
+
+["db::probe_dr_markers"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_shard_generation"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
+
+["db::query_replication_status"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"
+
+["db::record_replication_heartbeat"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_replication_heartbeat", "harvest_shard_generation"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/replication.md"

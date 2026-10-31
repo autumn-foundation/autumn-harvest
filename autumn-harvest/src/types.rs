@@ -1035,9 +1035,14 @@ pub enum StartSource {
     /// (issue #763), so the run commits or rolls back together with the
     /// caller's own domain write.
     Transactional,
+    /// A non-destructive fork of another run (issue #2000). The source stays
+    /// unchanged. `start_source_ref` holds the source execution id.
+    Fork,
     /// Provenance is unknown (a NULL / pre-upgrade column, or an unrecognized
-    /// stored value). This is the default.
+    /// stored value). This is the default. A source from a newer version
+    /// decodes to this variant too.
     #[default]
+    #[serde(other)]
     Unknown,
 }
 
@@ -1064,8 +1069,23 @@ impl StartSource {
             Self::Rerun => "rerun",
             Self::Outbox => "outbox",
             Self::Transactional => "transactional",
+            Self::Fork => "fork",
             Self::Unknown => "unknown",
         }
+    }
+
+    /// Whether a caller of this start path chooses the run input.
+    ///
+    /// A keyed entity treats such an input as untrusted. The engine builds the
+    /// input of a continue-as-new run. An operator sets the input of a reset or
+    /// a re-run. [`Self::Unknown`] is a run from before the source was
+    /// recorded, so it counts as trusted.
+    #[must_use]
+    pub const fn carries_caller_input(&self) -> bool {
+        !matches!(
+            self,
+            Self::ContinueAsNew | Self::Reset | Self::Rerun | Self::Unknown
+        )
     }
 
     /// Parse a stored/source string into a [`StartSource`].
@@ -1091,7 +1111,57 @@ impl StartSource {
             "rerun" => Self::Rerun,
             "outbox" => Self::Outbox,
             "transactional" => Self::Transactional,
+            "fork" => Self::Fork,
             _ => Self::Unknown,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StartProvenance
+// ---------------------------------------------------------------------------
+
+/// Where a run came from (issue #2082).
+///
+/// Workflow code reads it through `ctx.info()`. It comes from the execution
+/// row, which never changes after the insert, so a replay sees the same value.
+/// The default is an unknown source with no predecessor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct StartProvenance {
+    /// How the run started.
+    #[serde(default)]
+    pub source: StartSource,
+    /// The run that continued as new into this one. `None` for any other start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_from: Option<ExecutionId>,
+}
+
+impl StartProvenance {
+    /// A start from `source` with no predecessor.
+    #[must_use]
+    pub const fn fresh(source: StartSource) -> Self {
+        Self {
+            source,
+            continued_from: None,
+        }
+    }
+
+    /// A continue-as-new successor of `predecessor`.
+    #[must_use]
+    pub const fn continued_from(predecessor: ExecutionId) -> Self {
+        Self {
+            source: StartSource::ContinueAsNew,
+            continued_from: Some(predecessor),
+        }
+    }
+
+    /// Read the provenance from the `start_source` and `continued_from_exec_id`
+    /// columns. A missing or unknown source maps to [`StartSource::Unknown`].
+    #[must_use]
+    pub fn from_row(start_source: Option<&str>, continued_from: Option<Uuid>) -> Self {
+        Self {
+            source: start_source.map_or(StartSource::Unknown, StartSource::from_str),
+            continued_from: continued_from.map(ExecutionId::from_uuid),
         }
     }
 }
@@ -1482,6 +1552,34 @@ impl<'de> serde::Deserialize<'de> for Priority {
     }
 }
 
+/// Kani proofs of the shard bytes in an execution id.
+///
+/// The `kani` CI job runs them. See `docs/testing/formal-methods.md`.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// An id built for an encodable shard decodes to that shard, for every
+    /// UUID. The other 14 bytes of the UUID are kept.
+    ///
+    /// A shard that is not encodable keeps only its low 16 bits. The
+    /// decoded value is still in `0..=0xFFFF`, so a decode cannot panic.
+    #[kani::proof]
+    fn execution_id_round_trips_every_encodable_shard() {
+        let bytes: [u8; 16] = kani::any();
+        let shard = ShardId::new(kani::any());
+        let id = ExecutionId::new_with_shard_bytes(Uuid::from_bytes(bytes), shard);
+        let decoded = id.shard().as_i32();
+        assert!((0..=0xFFFF).contains(&decoded));
+        assert_eq!(id.as_uuid().as_bytes()[2..], bytes[2..]);
+        if crate::shard::is_encodable_shard(shard) {
+            assert_eq!(id.shard(), shard);
+            assert!(!id.shard().is_unencoded());
+        }
+        kani::cover!(shard.as_i32() > 0xFFFF && decoded < 0xFFFF);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1803,6 +1901,18 @@ mod tests {
     }
 
     #[test]
+    fn an_unrecognized_serialized_source_decodes_to_unknown() {
+        let source: StartSource = serde_json::from_value(serde_json::json!("from_the_future"))
+            .expect("an unknown source must not fail");
+        assert_eq!(source, StartSource::Unknown);
+        let provenance: StartProvenance = serde_json::from_value(
+            serde_json::json!({"source": "from_the_future", "continued_from": null}),
+        )
+        .expect("an unknown source must not fail a snapshot");
+        assert_eq!(provenance.source, StartSource::Unknown);
+    }
+
+    #[test]
     fn start_source_as_str_from_str_round_trip() {
         let all = [
             StartSource::Api,
@@ -1819,6 +1929,7 @@ mod tests {
             StartSource::Rerun,
             StartSource::Outbox,
             StartSource::Transactional,
+            StartSource::Fork,
             StartSource::Unknown,
         ];
         for src in all {
@@ -1836,6 +1947,47 @@ mod tests {
         assert_eq!(StartSource::from_str(""), StartSource::Unknown);
         assert_eq!(StartSource::from_str("API"), StartSource::Unknown);
         assert_eq!(StartSource::from_str("unknown"), StartSource::Unknown);
+    }
+
+    #[test]
+    fn caller_input_sources_are_the_client_reachable_ones() {
+        for src in [
+            StartSource::Api,
+            StartSource::Schedule,
+            StartSource::Backfill,
+            StartSource::SignalWithStart,
+            StartSource::UpdateWithStart,
+            StartSource::CompletionTrigger,
+            StartSource::Webhook,
+            StartSource::Broker,
+            StartSource::Child,
+            StartSource::Batch,
+            StartSource::Outbox,
+            StartSource::Transactional,
+        ] {
+            assert!(src.carries_caller_input(), "{src:?}");
+        }
+        for src in [
+            StartSource::ContinueAsNew,
+            StartSource::Reset,
+            StartSource::Rerun,
+            StartSource::Unknown,
+        ] {
+            assert!(!src.carries_caller_input(), "{src:?}");
+        }
+    }
+
+    #[test]
+    fn start_provenance_reads_the_row_columns() {
+        let pred = uuid::Uuid::new_v4();
+        let p = StartProvenance::from_row(Some("continue_as_new"), Some(pred));
+        assert_eq!(p.source, StartSource::ContinueAsNew);
+        assert_eq!(p.continued_from, Some(ExecutionId::from_uuid(pred)));
+        assert_eq!(
+            StartProvenance::from_row(None, None),
+            StartProvenance::default()
+        );
+        assert_eq!(StartProvenance::default().source, StartSource::Unknown);
     }
 
     #[test]

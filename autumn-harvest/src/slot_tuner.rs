@@ -865,6 +865,71 @@ pub fn spawn_slot_tuner_loop(
     })
 }
 
+/// Kani proofs of the slot band kernels (issue #548).
+///
+/// The `kani` CI job runs them. See `docs/testing/formal-methods.md`. The
+/// Shuttle models in `tests/shuttle_models.rs` cover the semaphore.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn any_action() -> SlotTunerAction {
+        match kani::any::<u8>() % 3 {
+            0 => SlotTunerAction::Grow(kani::any()),
+            1 => SlotTunerAction::Shrink(kani::any()),
+            _ => SlotTunerAction::Hold,
+        }
+    }
+
+    /// A tuner step lands in the band, even a degenerate band. The decision
+    /// names the move that took effect. Inside the band, a grow never
+    /// lowers the target, a shrink never raises it, and a hold keeps it.
+    #[kani::proof]
+    fn apply_action_stays_in_band_and_reports_the_move() {
+        let current: usize = kani::any();
+        let (min, max): (usize, usize) = (kani::any(), kani::any());
+        let action = any_action();
+        let (next, decision) = apply_action(current, action, min, max);
+        let (lo, hi) = effective_band(min, max);
+        assert!(lo <= hi && hi == max);
+        assert!(lo <= next && next <= hi);
+        match decision {
+            TunerDecision::Hold => assert_eq!(next, current),
+            TunerDecision::Grow => assert!(next > current),
+            TunerDecision::Shrink => assert!(next < current),
+        }
+        if lo <= current && current <= hi {
+            match action {
+                SlotTunerAction::Grow(_) => assert!(next >= current),
+                SlotTunerAction::Shrink(_) => assert!(next <= current),
+                SlotTunerAction::Hold => assert_eq!(next, current),
+            }
+        }
+        kani::cover!(min > max && decision == TunerDecision::Shrink);
+    }
+
+    /// The initial target lands in the band. A target that is already in
+    /// the band keeps its value.
+    #[kani::proof]
+    fn initial_target_lands_in_the_band() {
+        let (configured, min, max): (usize, usize, usize) = (kani::any(), kani::any(), kani::any());
+        let target = initial_target(configured, min, max);
+        let (lo, hi) = effective_band(min, max);
+        assert!(lo <= target && target <= hi);
+        assert_eq!(initial_target(target, min, max), target);
+    }
+
+    /// `in_use + available == target` for every semaphore reading, and no
+    /// step underflows.
+    #[kani::proof]
+    fn slot_occupancy_partitions_the_target() {
+        let target: usize = kani::any();
+        let (in_use, available) = slot_occupancy(target, kani::any());
+        assert_eq!(u128::from(in_use) + u128::from(available), target as u128);
+        kani::cover!(in_use == 0 && available > 0);
+    }
+}
+
 #[cfg(test)]
 impl TunedSlot {
     fn new_for_test(runtime: TunedSlotRuntime, slot_type: SlotType) -> Self {

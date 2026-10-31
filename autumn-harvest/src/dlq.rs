@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::error::{HarvestError, HarvestResult};
 use crate::models::{DeadLetter, NewDeadLetter};
+use crate::payload_codec::PayloadCodecs;
 use crate::queue::{EnqueueParams, TaskType};
 use crate::worker::HandlerRegistry;
 
@@ -285,11 +286,24 @@ pub fn redrive_spread_offset(
 ) -> std::time::Duration {
     let count = u128::try_from(count.max(1)).unwrap_or(u128::MAX);
     let index = u128::try_from(index).unwrap_or(u128::MAX);
-    let slot = window.as_nanos() / count;
-    // `mix64` is below 2^64, so the jitter is below one slot.
-    let jitter = (slot * u128::from(mix64(seed))) >> 64;
-    let nanos = slot.saturating_mul(index).saturating_add(jitter);
+    let nanos = spread_offset_nanos(index, count, window.as_nanos(), mix64(seed));
     std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+}
+
+/// The offset of slot `index` of `count` in a window of `window` ns.
+///
+/// The jitter is `floor(slot * mix / 2^64)`, so it is below one slot. The
+/// product `slot * mix` can pass `u128::MAX` for a long window. The code
+/// therefore splits `slot` at bit 64, and no step can overflow.
+/// `formal/verus/src/dlq_spread.rs` proves both claims for every input.
+///
+/// `count` must not be 0.
+fn spread_offset_nanos(index: u128, count: u128, window: u128, mix: u64) -> u128 {
+    let slot = window / count;
+    let mix = u128::from(mix);
+    let high = (slot >> 64) * mix;
+    let low = ((slot & u128::from(u64::MAX)) * mix) >> 64;
+    slot.saturating_mul(index).saturating_add(high + low)
 }
 
 /// The `scheduled_at` for each row of a bulk redrive (issue #1832).
@@ -319,6 +333,8 @@ pub fn redrive_schedule(
 }
 
 /// The `SplitMix64` finalizer. It spreads close seeds over all of `u64`.
+///
+/// It is a bijection. `formal/verus/src/mixers.rs` proves it.
 const fn mix64(seed: u64) -> u64 {
     let mut z = seed;
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -552,19 +568,76 @@ fn to_host_clock(
 ///
 /// Set `max_attempts` to the recorded attempt count, with a minimum of one.
 /// `not_before` sets `scheduled_at`. `None` keeps the immediate default.
+///
+/// The params carry the decoded input (issue #1979), so a concurrency key
+/// resolves against the plaintext. The returned flag says whether the decode
+/// worked. When it did not, for example in a process with no codec registry,
+/// the params keep the stored bytes, as a replay did before. Call
+/// [`seal_requeued_input`] before the enqueue.
 fn requeue_params(
     entry: DeadLetter,
     task_type: TaskType,
     not_before: Option<DateTime<Utc>>,
-) -> EnqueueParams {
-    let mut params = EnqueueParams::new(entry.queue_name, task_type, entry.input);
+    codecs: &PayloadCodecs,
+) -> (EnqueueParams, bool) {
+    let (input, decoded) = match codecs.decode_column(&entry.input) {
+        Ok(input) => (input, true),
+        Err(_) => (entry.input, false),
+    };
+    let mut params = EnqueueParams::new(entry.queue_name, task_type, input);
     params.workflow_exec_id = entry.workflow_exec_id;
     params.activity_name = entry.activity_name;
     params.max_attempts = entry.attempts.max(1);
+    // The dead letter keeps the run's quota key. A valid quota key is the
+    // redriven task's fairness key (issue #1976).
+    params.fairness_key = crate::queue_fairness::fairness_key_for(None, entry.quota_key.as_deref());
     if let Some(at) = not_before {
         params.scheduled_at = at;
     }
-    params
+    (params, decoded)
+}
+
+/// Encode a requeued task's input as the enqueue does (issue #1979, issue
+/// #2043).
+///
+/// A task row stores its input in the column form, an activity row too. So
+/// the requeued input follows the column switch. Input that was not decoded
+/// is already the stored form, so it stays as it is.
+fn seal_requeued_input(
+    params: &mut EnqueueParams,
+    decoded: bool,
+    codecs: &PayloadCodecs,
+) -> HarvestResult<()> {
+    if decoded {
+        params.input = codecs.encode_shared_column(&params.input)?;
+    }
+    Ok(())
+}
+
+/// The codec registry a replay decodes with: the handler registry's, else
+/// the identity default. With the default, an encrypted entry does not
+/// decode, so the replay requeues its stored bytes.
+fn replay_codecs(registry: Option<&HandlerRegistry>) -> &PayloadCodecs {
+    registry.map_or(&*crate::store::DEFAULT_PAYLOAD_CODECS, |reg| {
+        reg.payload_codecs()
+    })
+}
+
+/// The input as a dead-letter row stores it (issue #1979, issue #2043).
+///
+/// Every caller passes the input as its source row stores it. That is the
+/// column form, for a workflow task, an activity task and a callback
+/// delivery. So the input is decoded once before it is encoded, which keeps
+/// the row to one envelope layer. An input this registry cannot decode is
+/// already ciphertext, so it is kept as it is. A quarantine must not fail on
+/// a missing key.
+fn dead_letter_input(
+    codecs: &PayloadCodecs,
+    input: &serde_json::Value,
+) -> HarvestResult<serde_json::Value> {
+    codecs
+        .decode_column(input)
+        .map_or_else(|_| Ok(input.clone()), |plain| codecs.encode_column(&plain))
 }
 
 fn dead_letter_task_type(dead_letter_id: Uuid, task_type: &str) -> HarvestResult<TaskType> {
@@ -583,6 +656,11 @@ fn dead_letter_task_type(dead_letter_id: Uuid, task_type: &str) -> HarvestResult
 ///
 /// Mirrors [`NewDeadLetter`] but owns its strings, making it easier to
 /// construct from runtime data without lifetime gymnastics.
+///
+/// `input` is the input as the source row stores it (issue #2043). That is
+/// the column form for a workflow task, an activity task and a callback
+/// delivery. The writer decodes it once and then encodes it, so the dead
+/// letter keeps one envelope layer.
 ///
 /// ## Examples
 ///
@@ -630,12 +708,32 @@ pub struct NewDeadLetterEntry {
 /// free. When `workflow_exec_id` is `None` (a non-workflow-scoped task), both
 /// columns are left `NULL`.
 ///
+/// This form does not encode the input. It stores the input as it arrives,
+/// so a stored envelope stays an envelope. Use [`dead_letter_with_codecs`] to
+/// honour column encoding (issue #1979).
+///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] on insert failure.
 pub async fn dead_letter(
     conn: &mut AsyncPgConnection,
     entry: &NewDeadLetterEntry,
+) -> HarvestResult<Uuid> {
+    dead_letter_with_codecs(conn, entry, &crate::store::DEFAULT_PAYLOAD_CODECS).await
+}
+
+/// [`dead_letter`], encoding the input column with `codecs` (issue #1979).
+///
+/// `entry.input` may be plaintext or the stored form of a task row. Either
+/// way the row gets one envelope layer while column encoding is on.
+///
+/// # Errors
+///
+/// As [`dead_letter`], plus a codec error when the input cannot be encoded.
+pub async fn dead_letter_with_codecs(
+    conn: &mut AsyncPgConnection,
+    entry: &NewDeadLetterEntry,
+    codecs: &PayloadCodecs,
 ) -> HarvestResult<Uuid> {
     use crate::schema::harvest_dead_letters;
     use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
@@ -660,7 +758,7 @@ pub async fn dead_letter(
         task_type: &entry.task_type,
         workflow_exec_id: entry.workflow_exec_id,
         activity_name: entry.activity_name.as_deref(),
-        input: entry.input.clone(),
+        input: dead_letter_input(codecs, &entry.input)?,
         error: &entry.error,
         attempts: entry.attempts,
         owner: entry.owner.as_deref(),
@@ -800,7 +898,8 @@ pub async fn replay_dead_letter_at(
 
             let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
-            let mut params = requeue_params(entry, task_type, not_before);
+            let codecs = replay_codecs(registry);
+            let (mut params, decoded) = requeue_params(entry, task_type, not_before, codecs);
 
             // Restore required_build_id and concurrency policy from the owning
             // execution so the replayed task is subject to the same constraints.
@@ -842,6 +941,7 @@ pub async fn replay_dead_letter_at(
                     // per task_type, so mixing them would throttle activities
                     // against the wrong budget).
                     if task_type == TaskType::Workflow
+                        && decoded
                         && let Some(reg) = registry
                         && let Some(info) = reg.workflows.get(&workflow_name)
                         && let Some(policy) = &info.concurrency
@@ -855,6 +955,7 @@ pub async fn replay_dead_letter_at(
                 }
             }
 
+            seal_requeued_input(&mut params, decoded, codecs)?;
             let task_id = crate::queue::enqueue(conn, &params).await?;
             let deleted = diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
                 .execute(conn)
@@ -892,6 +993,22 @@ pub async fn replay_dead_letter_at(
 /// cost). `BulkDlqFilter::effective_limit` caps rows *acted on*, not rows
 /// *scanned*; narrow with the SQL-expressible filters (queue/activity/workflow/
 /// time window/`min_attempts`) on large DLQs.
+///
+/// Clone-class note: the six-filter chain (`activity_name` through
+/// `failed_before`) below repeats verbatim in [`query_dead_letters_for_bulk`].
+/// Apply any change to one of those filters to both functions.
+///
+/// Two instances only, co-changed together each time (issue #613 added
+/// `queue_name`/`min_attempts` to both in the same commit).
+///
+/// `api.rs`'s `apply_api_bulk_filters` applies the same predicate set over a
+/// richer type. jscpd does not pair it with either copy here. It is not a
+/// third textual instance, so the merge-evidence bar (rule of three, or a
+/// missed-fix) is not met yet.
+///
+/// PR #824 attempted this exact extraction. It was closed unmerged with no
+/// technical objection on record (stale, not rejected). Re-run jscpd before
+/// retrying it, so a new third instance or missed-fix is not missed.
 ///
 /// # Errors
 ///
@@ -950,6 +1067,11 @@ pub async fn count_bulk_filter_matches(
 
 /// Query dead-letter rows matching `filter`, ordered oldest-first, up to
 /// `filter.effective_limit()` rows.
+///
+/// Clone-class note: the six-filter chain below repeats verbatim in
+/// [`count_bulk_filter_matches`]. Apply any change to one of those filters
+/// to both functions. Two instances only, so the merge-evidence bar is not
+/// met yet. See the note on `count_bulk_filter_matches`.
 async fn query_dead_letters_for_bulk(
     conn: &mut AsyncPgConnection,
     filter: &BulkDlqFilter,
@@ -1352,6 +1474,9 @@ pub async fn redrive_dead_letter(
 /// # Errors
 ///
 /// The same as [`redrive_dead_letter`].
+// The issue #1979 decode flag puts this one line over the limit. The redrive
+// is one transaction's worth of steps, and splitting it would hide their order.
+#[allow(clippy::too_many_lines)]
 pub async fn redrive_dead_letter_at(
     conn: &mut AsyncPgConnection,
     dead_letter_id: Uuid,
@@ -1400,7 +1525,8 @@ pub async fn redrive_dead_letter_at(
 
             let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
-            let mut params = requeue_params(entry, task_type, not_before);
+            let codecs = replay_codecs(registry);
+            let (mut params, decoded) = requeue_params(entry, task_type, not_before, codecs);
 
             if let Some(exec_uuid) = params.workflow_exec_id {
                 use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
@@ -1459,6 +1585,7 @@ pub async fn redrive_dead_letter_at(
 
                 params.required_build_id = build_id;
                 if task_type == TaskType::Workflow
+                    && decoded
                     && let Some(reg) = registry
                     && let Some(info) = reg.workflows.get(&workflow_name)
                     && let Some(policy) = &info.concurrency
@@ -1469,6 +1596,7 @@ pub async fn redrive_dead_letter_at(
                 }
             }
 
+            seal_requeued_input(&mut params, decoded, codecs)?;
             let task_id = crate::queue::enqueue(conn, &params).await?;
             diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
                 .execute(conn)
@@ -2415,6 +2543,90 @@ async fn load_workflow_names(
 mod tests {
     use super::*;
 
+    fn aead_codecs() -> PayloadCodecs {
+        let codecs = PayloadCodecs::default();
+        let key = crate::aead_codec::DataKey::from_bytes(&[0x11; 32]).expect("key");
+        crate::aead_codec::AeadCodec::new("k1", &key)
+            .expect("codec")
+            .register_with(&codecs)
+            .expect("register");
+        codecs.set_column_encoding(true);
+        codecs
+    }
+
+    /// A task row stores its input as an envelope (issue #2043). The dead
+    /// letter takes that stored form and keeps one envelope layer. A clear
+    /// input gets one layer too.
+    #[test]
+    fn a_stored_input_keeps_one_envelope_layer() {
+        let codecs = aead_codecs();
+        let plain = serde_json::json!({"ssn": "123-45-6789"});
+        let stored = codecs.encode_column(&plain).expect("encode");
+        for input in [&stored, &plain] {
+            let kept = dead_letter_input(&codecs, input).expect("input");
+            assert!(crate::payload_codec::is_codec_envelope(&kept), "{kept}");
+            assert_eq!(
+                codecs.decode_column(&kept).expect("decode"),
+                plain,
+                "the input must decode once to the plaintext"
+            );
+        }
+    }
+
+    /// An input that this registry cannot decode is already ciphertext. A
+    /// quarantine keeps it and does not fail.
+    #[test]
+    fn an_undecodable_stored_input_is_kept_as_it_is() {
+        let writer = aead_codecs();
+        let stored = writer
+            .encode_column(&serde_json::json!({"ssn": "123-45-6789"}))
+            .expect("encode");
+        let reader = PayloadCodecs::default();
+        let kept = dead_letter_input(&reader, &stored).expect("input");
+        assert_eq!(kept, stored);
+    }
+
+    fn dead_letter_with_quota_key(quota_key: Option<&str>) -> DeadLetter {
+        DeadLetter {
+            id: Uuid::nil(),
+            original_task_id: Uuid::nil(),
+            queue_name: "q".into(),
+            task_type: "workflow".into(),
+            workflow_exec_id: None,
+            activity_name: None,
+            input: serde_json::json!({}),
+            error: String::new(),
+            attempts: 1,
+            failed_at: Utc::now(),
+            owner: None,
+            severity: None,
+            workflow_name: None,
+            quota_key: quota_key.map(str::to_owned),
+        }
+    }
+
+    /// A redrive takes a valid quota key as its fairness key. An invalid
+    /// quota key gives the default key, which the weight API can address
+    /// (issue #1976).
+    #[test]
+    fn redrive_uses_only_a_valid_quota_key_as_its_fairness_key() {
+        let codecs = PayloadCodecs::default();
+        let key_of = |quota_key: Option<&str>| {
+            let (params, _) = requeue_params(
+                dead_letter_with_quota_key(quota_key),
+                TaskType::Workflow,
+                None,
+                &codecs,
+            );
+            params.fairness_key
+        };
+        assert_eq!(key_of(Some("tenant-a")).as_deref(), Some("tenant-a"));
+        for bad in ["", " x", "..", "a\u{7}b"] {
+            assert_eq!(key_of(Some(bad)), None, "quota key {bad:?}");
+        }
+        assert_eq!(key_of(None), None);
+    }
+
     // ── Redrive filter unit tests (issue #510) ───────────────────────────────
 
     #[test]
@@ -2606,6 +2818,31 @@ mod tests {
         assert_eq!(back, reason);
         assert_eq!(dlq_reason(&json), "history_bytes_cap_exceeded");
         assert_eq!(error_class(&json), "HistoryBytesCapExceeded");
+    }
+
+    #[test]
+    fn history_cap_reasons_keep_the_bytes_the_sqlite_backend_mirrors() {
+        // Issue #2023: `autumn_harvest_sqlite::HistoryCapReason` writes these
+        // exact bytes. Its own test pins the same literals.
+        let events = DeadLetterReason::HistoryCapExceeded {
+            count: 12_001,
+            cap: 12_000,
+            workflow_type: "billing_poll".into(),
+        };
+        let bytes = DeadLetterReason::HistoryBytesCapExceeded {
+            bytes: 52_428_801,
+            cap: 52_428_800,
+            workflow_type: "billing_poll".into(),
+        };
+
+        assert_eq!(
+            events.to_string(),
+            r#"{"type":"HistoryCapExceeded","count":12001,"cap":12000,"workflow_type":"billing_poll"}"#
+        );
+        assert_eq!(
+            bytes.to_string(),
+            r#"{"type":"HistoryBytesCapExceeded","bytes":52428801,"cap":52428800,"workflow_type":"billing_poll"}"#
+        );
     }
 
     #[test]
@@ -2835,6 +3072,30 @@ mod tests {
             redrive_spread_offset(3, 10, window, 42),
             "the offset is deterministic"
         );
+    }
+
+    /// A window of 2^40 s made `slot * mix64(seed)` pass `u128::MAX`. A
+    /// debug build panicked, and a release build wrapped the jitter.
+    #[test]
+    fn spread_offset_does_not_overflow_for_a_long_window() {
+        let window = StdDuration::from_secs(1 << 40);
+        for seed in [1, 7, u64::MAX] {
+            let offset = redrive_spread_offset(0, 1, window, seed);
+            assert!(offset < window, "seed {seed}: {offset:?} >= {window:?}");
+        }
+        assert!(redrive_spread_offset(0, 1, StdDuration::MAX, u64::MAX) < StdDuration::MAX);
+    }
+
+    /// The split product equals the plain one when the plain one fits.
+    #[test]
+    fn spread_offset_nanos_matches_the_unsplit_formula() {
+        for slot in [0_u128, 1, 999, 60_000_000_000, u128::from(u64::MAX)] {
+            for seed in [0, 1, 42, u64::MAX] {
+                let mix = mix64(seed);
+                let plain = (slot * u128::from(mix)) >> 64;
+                assert_eq!(spread_offset_nanos(0, 1, slot, mix), plain);
+            }
+        }
     }
 
     #[test]

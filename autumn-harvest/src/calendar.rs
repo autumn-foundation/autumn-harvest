@@ -151,6 +151,24 @@ fn apply_skip_policy_indexed(
     })
 }
 
+/// Returns the date that a calendar tests for a fire time (issue #2332).
+///
+/// A `CronInTimezone` schedule uses the date in its own timezone. Every other
+/// schedule uses the UTC date. An unknown timezone also falls back to UTC, as
+/// the rebase helpers do.
+#[must_use]
+pub fn schedule_local_date(
+    ts: chrono::DateTime<chrono::Utc>,
+    schedule: Option<&crate::policy::Schedule>,
+) -> NaiveDate {
+    if let Some(crate::policy::Schedule::CronInTimezone { tz, .. }) = schedule
+        && let Ok(tz) = tz.parse::<chrono_tz::Tz>()
+    {
+        return ts.with_timezone(&tz).date_naive();
+    }
+    ts.date_naive()
+}
+
 /// Returns `true` when the calendar name implies Saturday/Sunday are always excluded.
 ///
 /// Used to derive the `exclude_weekends` flag without a separate DB lookup.
@@ -605,14 +623,16 @@ pub fn next_business_day_at_or_after(
 
 /// Rebase a `DateTime<Utc>` to a different date, preserving the time-of-day.
 ///
-/// For `CronInTimezone` schedules the wall-clock time in the schedule's timezone
-/// is preserved across DST boundaries instead of the raw UTC clock time. Falls
-/// back to naive UTC rebasing for plain `Cron`/`Interval`/`None` schedules.
+/// For `CronInTimezone` schedules `date` is a date in the schedule's timezone.
+/// The wall-clock time in that timezone is preserved across DST boundaries
+/// instead of the raw UTC clock time. A time inside a DST gap does not exist.
+/// It moves forward to the first time that exists, on the same local day.
+/// Other schedules rebase on the UTC date and time.
 ///
-/// Returns the original datetime if the date cannot be combined with the time.
+/// Returns the UTC rebase when the local time cannot be built within two hours.
 #[cfg(feature = "db")]
 #[must_use]
-fn rebase_to_date(
+pub(crate) fn rebase_to_date(
     ts: chrono::DateTime<chrono::Utc>,
     date: NaiveDate,
     schedule: Option<&crate::policy::Schedule>,
@@ -620,13 +640,14 @@ fn rebase_to_date(
     if let Some(crate::policy::Schedule::CronInTimezone { tz, .. }) = schedule
         && let Ok(tz) = tz.parse::<chrono_tz::Tz>()
     {
-        let local_ts = ts.with_timezone(&tz);
-        if let Some(local_dt) = date
-            .and_time(local_ts.time())
-            .and_local_timezone(tz)
-            .earliest()
-        {
-            return local_dt.with_timezone(&chrono::Utc);
+        let wanted = date.and_time(ts.with_timezone(&tz).time());
+        for hours in 0..=2 {
+            if let Some(local_dt) = (wanted + chrono::Duration::hours(hours))
+                .and_local_timezone(tz)
+                .earliest()
+            {
+                return local_dt.with_timezone(&chrono::Utc);
+            }
         }
     }
     let naive = date.and_time(ts.time());
@@ -690,7 +711,7 @@ pub fn preview_schedule_firings(
             break;
         };
         cursor = fire_time;
-        let fire_date = fire_time.date_naive();
+        let fire_date = schedule_local_date(fire_time, Some(schedule));
 
         let (effective_at, reason) = calendar_name.map_or_else(
             || (Some(fire_time), "Fired".to_string()),
@@ -770,7 +791,7 @@ pub fn plan_backfill_with_calendar(
     let pairs = raw
         .into_iter()
         .filter_map(|ts| {
-            let date = ts.date_naive();
+            let date = schedule_local_date(ts, schedule);
             apply_skip_policy_indexed(date, skip_policy, &excluded, exclude_weekends).map(
                 |adj_date| {
                     if adj_date == date {
@@ -1884,6 +1905,48 @@ mod tests {
         );
     }
 
+    // ── schedule_local_date (issue #2332) ─────────────────────────────────────
+
+    #[test]
+    fn schedule_local_date_uses_the_schedule_timezone() {
+        use crate::policy::Schedule;
+        let tz = |name: &str| Schedule::CronInTimezone {
+            expr: "0 8 * * 1-5".into(),
+            tz: name.into(),
+        };
+        let ts = "2026-01-04T23:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        assert_eq!(
+            schedule_local_date(ts, Some(&tz("Asia/Tokyo"))),
+            date("2026-01-05")
+        );
+        assert_eq!(
+            schedule_local_date(ts, Some(&tz("America/Los_Angeles"))),
+            date("2026-01-04")
+        );
+    }
+
+    #[test]
+    fn schedule_local_date_falls_back_to_utc() {
+        use crate::policy::Schedule;
+        let ts = "2026-01-04T23:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let bad_tz = Schedule::CronInTimezone {
+            expr: "0 8 * * 1-5".into(),
+            tz: "Not/AZone".into(),
+        };
+        for s in [
+            None,
+            Some(Schedule::Cron("0 8 * * 1-5".into())),
+            Some(Schedule::Manual),
+            Some(bad_tz),
+        ] {
+            assert_eq!(schedule_local_date(ts, s.as_ref()), date("2026-01-04"));
+        }
+    }
+
     // ── preview_schedule_firings ──────────────────────────────────────────────
 
     #[cfg(feature = "db")]
@@ -1891,6 +1954,116 @@ mod tests {
         use super::*;
         use crate::policy::Schedule;
         use chrono::Utc;
+
+        fn utc(s: &str) -> chrono::DateTime<Utc> {
+            s.parse().unwrap()
+        }
+
+        fn tz_cron(expr: &str, tz: &str) -> Schedule {
+            Schedule::CronInTimezone {
+                expr: expr.into(),
+                tz: tz.into(),
+            }
+        }
+
+        // Issue #2332: the calendar tests the schedule's local date.
+        #[test]
+        fn rebase_into_a_dst_gap_keeps_the_target_local_day() {
+            // Sydney skips 02:00 to 03:00 on Sun 2026-10-04.
+            let s = tz_cron("30 2 * * *", "Australia/Sydney");
+            let slot = utc("2026-10-02T16:30:00Z"); // Sat 3 Oct 02:30 AEST
+            let shifted = rebase_to_date(slot, date("2026-10-04"), Some(&s));
+            let local = shifted.with_timezone(&chrono_tz::Australia::Sydney);
+            assert_eq!(local.date_naive(), date("2026-10-04"));
+            assert_eq!(local.format("%H:%M").to_string(), "03:30");
+        }
+
+        #[test]
+        fn preview_weekday_tokyo_cron_is_not_skipped_by_weekends_off() {
+            let s = tz_cron("0 8 * * 1-5", "Asia/Tokyo");
+            let p = preview_schedule_firings(
+                &s,
+                utc("2026-01-01T00:00:00Z"),
+                6,
+                Some("weekends-off"),
+                &[],
+                SkipPolicy::Skip,
+            );
+            assert_eq!(p.len(), 6);
+            for e in &p {
+                assert_eq!(e.reason, "Fired", "{e:?}");
+                assert_eq!(e.effective_at, Some(e.scheduled_at));
+            }
+        }
+
+        #[test]
+        fn preview_weekday_los_angeles_evening_cron_is_not_skipped_by_weekends_off() {
+            let s = tz_cron("0 20 * * 1-5", "America/Los_Angeles");
+            let p = preview_schedule_firings(
+                &s,
+                utc("2026-01-01T00:00:00Z"),
+                5,
+                Some("weekends-off"),
+                &[],
+                SkipPolicy::Skip,
+            );
+            assert_eq!(p.len(), 5);
+            assert!(p.iter().all(|e| e.reason == "Fired"), "{p:?}");
+        }
+
+        #[test]
+        fn preview_holiday_exclusion_hits_the_local_day_only() {
+            let s = tz_cron("0 8 * * 1-5", "Asia/Tokyo");
+            let p = preview_schedule_firings(
+                &s,
+                utc("2026-01-01T00:00:00Z"),
+                3,
+                Some("holidays"),
+                &excluded(&["2026-01-05"]),
+                SkipPolicy::Skip,
+            );
+            // Local Fri 2 Jan, Mon 5 Jan, Tue 6 Jan.
+            assert_eq!(p[0].reason, "Fired");
+            assert_eq!(p[1].scheduled_at, utc("2026-01-04T23:00:00Z"));
+            assert_eq!(p[1].reason, "SkippedByCalendar:holidays");
+            assert_eq!(p[2].reason, "Fired");
+        }
+
+        #[test]
+        fn preview_shift_uses_the_local_date_and_keeps_local_time() {
+            let s = tz_cron("0 8 * * 1-5", "Asia/Tokyo");
+            let p = preview_schedule_firings(
+                &s,
+                utc("2026-01-07T00:00:00Z"),
+                2,
+                Some("holidays"),
+                &excluded(&["2026-01-09"]),
+                SkipPolicy::RunNextBusinessDay,
+            );
+            // Local Thu 8 Jan fires. Local Fri 9 Jan moves to Mon 12 Jan 08:00 JST.
+            assert_eq!(p[0].reason, "Fired");
+            assert_eq!(p[1].scheduled_at, utc("2026-01-08T23:00:00Z"));
+            assert_eq!(p[1].effective_at, Some(utc("2026-01-11T23:00:00Z")));
+            assert_eq!(p[1].reason, "DeferredFrom:2026-01-09");
+        }
+
+        #[test]
+        fn backfill_weekday_tokyo_cron_is_not_dropped_by_weekends_off() {
+            let s = tz_cron("0 8 * * 1-5", "Asia/Tokyo");
+            let slots = plan_backfill_with_calendar(
+                Some(&s),
+                utc("2026-01-01T00:00:00Z"),
+                utc("2026-01-10T00:00:00Z"),
+                100,
+                &[],
+                SkipPolicy::Skip,
+                true,
+            )
+            .unwrap();
+            // Local Fri 2 Jan, then Mon 5 to Fri 9 Jan.
+            assert_eq!(slots.len(), 6);
+            assert!(slots.iter().all(|(orig, fire)| orig == fire));
+        }
 
         #[test]
         fn preview_firings_no_calendar_all_fired() {

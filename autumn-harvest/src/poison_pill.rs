@@ -499,9 +499,28 @@ mod scanner {
                 .await
                 .optional()
                 .map_err(crate::error::database_error)?;
+            if updated.is_some() {
+                wake_owner_of_workflow_task(conn, task).await?;
+            }
             Ok(updated.is_some())
         }))
         .await
+    }
+
+    /// Wake the owner of the run of a re-pended workflow task (issue #2253).
+    ///
+    /// The dead worker can be the old owner, so the new owner must learn
+    /// that the task is claimable again. An activity task wakes no owner.
+    async fn wake_owner_of_workflow_task(
+        conn: &mut AsyncPgConnection,
+        task: &TaskQueueItem,
+    ) -> HarvestResult<()> {
+        match task.workflow_exec_id {
+            Some(exec_id) if task.task_type == "workflow" => {
+                crate::notify::notify_owner(conn, exec_id, false).await
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Re-queue a `workflow` task stuck `RUNNING` past the stuck-running
@@ -597,6 +616,7 @@ mod scanner {
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
+            wake_owner_of_workflow_task(conn, task).await?;
             Ok(true)
         }))
         .await
@@ -817,7 +837,7 @@ mod scanner {
         // Issue #1243: forwarded to the owning-workflow failure write.
         codecs: &crate::payload_codec::PayloadCodecs,
     ) -> HarvestResult<QuarantineOutcome> {
-        use crate::dlq::{DeadLetterReason, NewDeadLetterEntry, dead_letter};
+        use crate::dlq::{DeadLetterReason, NewDeadLetterEntry, dead_letter_with_codecs};
         use crate::schema::harvest_task_queue::dsl;
 
         let reason = DeadLetterReason::PoisonPill {
@@ -944,7 +964,7 @@ mod scanner {
                         return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
                     }
 
-                    dead_letter(conn, &entry).await?;
+                    dead_letter_with_codecs(conn, &entry, codecs).await?;
 
                     diesel::update(dsl::harvest_task_queue.find(task_id))
                         .set((

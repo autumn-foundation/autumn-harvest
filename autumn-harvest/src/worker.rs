@@ -52,7 +52,8 @@ use crate::signal;
 use crate::store;
 use crate::telemetry::{
     ATTR_ACTIVITY_NAME, ATTR_ATTEMPT, ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID,
-    ATTR_WORKFLOW_ID, ActivityStatus, DbOp, SlotType, TraceContextCarrier, WorkflowStatus,
+    ATTR_WORKFLOW_ID, ActivityStatus, ClaimKind, DbOp, PersistPhase, ResidentOutcome, SlotType,
+    TraceContextCarrier, WorkflowStatus,
 };
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, ParentClosePolicy, ShardId,
@@ -81,6 +82,8 @@ pub type DbPool = deadpool::managed::Pool<
 /// [`WorkerRuntimeConfig`] — whose conversion writes the write-once
 /// `GLOBAL_DEFAULT_WORKFLOW_QUEUE` and so must not run on a read-only path.
 pub const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+pub use crate::builder::DEFAULT_MAX_CONCURRENT_CLAIMS;
 
 /// Ceiling for the overdue-schedule gauge's adaptive sampling interval (issue
 /// #696).
@@ -167,6 +170,9 @@ pub struct WorkerRuntimeConfig {
     pub queues: Vec<String>,
     /// Optional per-queue dispatch weights (issue #515). Empty = default unchanged behaviour.
     pub queue_weights: std::collections::HashMap<String, u32>,
+    /// Rotate claims across fairness keys (issue #1976). `false` = the
+    /// unchanged claim statement.
+    pub fairness_keys: bool,
     /// Optional Postgres URL for LISTEN/NOTIFY wakeups.
     pub notification_database_url: Option<String>,
     /// Optional per-shard LISTEN/NOTIFY database URLs for multi-shard workers
@@ -176,6 +182,10 @@ pub struct WorkerRuntimeConfig {
     pub max_concurrent_workflows: usize,
     /// Maximum concurrent activity task executions.
     pub max_concurrent_activities: usize,
+    /// The most claims this worker runs at once. `1` is one serial claim
+    /// loop. Must be at least 1. See
+    /// [`crate::builder::WorkerConfig::max_concurrent_claims`].
+    pub max_concurrent_claims: usize,
     /// Interval between queue poll attempts when idle.
     pub poll_interval: Duration,
     /// Maximum time to wait for in-flight tasks during shutdown.
@@ -330,12 +340,19 @@ impl WorkerRuntimeConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`HarvestError::Config`] if `queues` is empty, or if
-    /// `cancellation_grace_period` exceeds [`MAX_CANCELLATION_GRACE_PERIOD`].
+    /// Returns [`HarvestError::Config`] if `queues` is empty, if
+    /// `max_concurrent_claims` is 0, or if `cancellation_grace_period`
+    /// exceeds [`MAX_CANCELLATION_GRACE_PERIOD`]. With `fairness_keys` on, it
+    /// also rejects a queue name that the weight API does not accept.
     pub fn validate(&self) -> HarvestResult<()> {
         if self.queues.is_empty() {
             return Err(HarvestError::Config(
                 "worker must poll at least one queue".into(),
+            ));
+        }
+        if self.max_concurrent_claims == 0 {
+            return Err(HarvestError::Config(
+                "max_concurrent_claims is 0; a worker needs at least one claim loop".into(),
             ));
         }
         if self.cancellation_grace_period > MAX_CANCELLATION_GRACE_PERIOD {
@@ -359,6 +376,26 @@ impl WorkerRuntimeConfig {
                         "queue_weights entry has no matching bound queue and will be ignored"
                     );
                 }
+            }
+        }
+        // Priority ageing sorts before the fairness lag (issue #1976). An old
+        // flood's rows then carry the largest ageing boost, so they can
+        // outrank a newer key until its rows age too. Warn, as the two do not
+        // combine well in a shared queue.
+        if self.fairness_keys && self.priority_aging_secs.is_some_and(|k| k > 0) {
+            tracing::warn!(
+                "fairness_keys and priority_aging_secs are both on: ageing sorts \
+                 before the fairness lag, so an old flood can outrank a newer key; \
+                 see docs/fairness-keys.md"
+            );
+        }
+        // A fair worker's queues must be names that the weight API accepts
+        // (issue #1976). Otherwise no operator could set a weight for their
+        // keys. The weight routes put the queue in a URL path segment. URL
+        // parsing removes `.` and `..` there, so those names are refused too.
+        if self.fairness_keys {
+            for queue in &self.queues {
+                crate::queue_fairness::validate_fairness_queue_name(queue)?;
             }
         }
         // A degenerate band (min_slots > max_slots, or a configured value
@@ -443,10 +480,12 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             worker_id: uuid::Uuid::new_v4().to_string(),
             queues: cfg.queues,
             queue_weights: cfg.queue_weights,
+            fairness_keys: cfg.fairness_keys,
             notification_database_url: cfg.notification_database_url,
             shard_notification_database_urls: cfg.shard_notification_database_urls,
             max_concurrent_workflows: cfg.max_concurrent_workflows,
             max_concurrent_activities: cfg.max_concurrent_activities,
+            max_concurrent_claims: cfg.max_concurrent_claims,
             poll_interval: DEFAULT_WORKER_POLL_INTERVAL,
             shutdown_timeout: cfg.shutdown_timeout,
             cancellation_grace_period: cfg.cancellation_grace_period,
@@ -543,6 +582,8 @@ fn session_internal_activity_info(name: &'static str) -> ActivityInfo {
         circuit_breaker: None,
         requires: None,
         handler: session_internal_stub_handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -588,6 +629,21 @@ pub struct HandlerRegistry {
     /// Per-activity-type adaptive concurrency limits (issue #1836). Off by
     /// default.
     adaptive_limits: Arc<crate::adaptive_limit::AdaptiveLimitRegistry>,
+    /// The owner tenures of this worker, one per decision partition (issue
+    /// #2251). Empty until the acquisition loop of issue #2252 fills it. A
+    /// decision of a held partition fences its commit with the tenure.
+    decision_owner: Arc<crate::decision_owner::OwnedPartitions>,
+    /// The directory of the owner-local disk cache (issue #2258). `None`
+    /// turns the cache off.
+    owner_disk_cache_dir: Option<std::path::PathBuf>,
+    /// The fewest events that a run needs before the disk cache keeps it.
+    owner_disk_cache_min_events: usize,
+    /// Whether the disk cache keeps an entity projection (issue #2260).
+    owner_entity_sql: bool,
+    /// The open disk cache. The workers of this registry share it, because
+    /// a process can lock a directory only once.
+    #[cfg(feature = "owner-disk-cache")]
+    owner_disk_cache: std::sync::Mutex<Option<Arc<crate::owner_disk_cache::OwnerDiskCache>>>,
     /// Maximum byte length for `current_details` strings passed to the
     /// workflow context (issue #473). Default: 1 KiB.
     pub max_current_details_bytes: usize,
@@ -697,6 +753,10 @@ pub struct HandlerRegistry {
     /// so a core path can enforce a rule the HTTP layer already enforces.
     /// Empty (the default) = no DAGs registered.
     dag_workflow_names: std::collections::HashSet<String>,
+    /// Operator overrides of per-type `sla` and `execution_timeout`
+    /// (issue #2387). Shared so that a refresh loop and the start paths read
+    /// one snapshot.
+    run_defaults: Arc<crate::run_defaults::RunDefaultsCache>,
 }
 
 impl HandlerRegistry {
@@ -787,6 +847,13 @@ impl HandlerRegistry {
                 .collect();
             *lock = Some(metadata);
         }
+        // Issue #2387: the completion-trigger path has no registry, so it
+        // reads the run-default overrides through a global, as it reads the
+        // metadata above.
+        let run_defaults: Arc<crate::run_defaults::RunDefaultsCache> = Arc::default();
+        if let Ok(mut lock) = crate::completion_trigger::GLOBAL_RUN_DEFAULTS.write() {
+            *lock = Some(Arc::clone(&run_defaults));
+        }
         let mut activities: HashMap<String, ActivityInfo> = activities
             .into_iter()
             .map(|a| (a.name.to_string(), a))
@@ -803,6 +870,7 @@ impl HandlerRegistry {
         for name in [
             crate::context::SESSION_ACQUIRE_ACTIVITY_NAME,
             crate::context::SESSION_RELEASE_ACTIVITY_NAME,
+            crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME,
         ] {
             activities.insert(name.to_string(), session_internal_activity_info(name));
         }
@@ -845,10 +913,17 @@ impl HandlerRegistry {
             )),
             retry_budgets,
             adaptive_limits,
+            decision_owner: Arc::default(),
+            owner_disk_cache_dir: None,
+            owner_disk_cache_min_events: crate::builder::DEFAULT_OWNER_DISK_CACHE_MIN_EVENTS,
+            owner_entity_sql: false,
+            #[cfg(feature = "owner-disk-cache")]
+            owner_disk_cache: std::sync::Mutex::new(None),
             max_workflow_attempts_ceiling: None,
             max_workflow_chain_timeout: None,
             max_workflow_execution_timeout: None,
             dag_workflow_names: std::collections::HashSet::new(),
+            run_defaults,
             payload_offloader: None,
             payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             activity_interceptors: Vec::new(),
@@ -992,6 +1067,29 @@ impl HandlerRegistry {
     {
         self.dag_workflow_names = names.into_iter().map(Into::into).collect();
         self
+    }
+
+    /// The run-default override cache of this registry (issue #2387).
+    #[must_use]
+    pub const fn run_defaults(&self) -> &Arc<crate::run_defaults::RunDefaultsCache> {
+        &self.run_defaults
+    }
+
+    /// The effective `(execution_timeout, sla)` of a workflow type
+    /// (issue #2387).
+    ///
+    /// `execution_timeout` and `sla` are the declared values. An operator
+    /// override in the cache wins over each one. A start path applies its
+    /// usual clamps to the result. The call reads memory only.
+    #[must_use]
+    pub fn apply_run_defaults(
+        &self,
+        workflow_name: &str,
+        execution_timeout: Option<std::time::Duration>,
+        sla: Option<std::time::Duration>,
+    ) -> (Option<std::time::Duration>, Option<std::time::Duration>) {
+        self.run_defaults
+            .apply(workflow_name, execution_timeout, sla)
     }
 
     /// Attach the large-payload offloader (issue #524).
@@ -1353,12 +1451,18 @@ impl HandlerRegistry {
                     ),
                     "dag": self.dag_workflow_names.contains(name),
                     // A detached child start and a continue-as-new enforce
-                    // the quota inside the task.
+                    // the quota inside the task. An LLM step enforces the LLM
+                    // caps inside its activity task (issue #1997).
                     "quota": info.quota.map(|quota| serde_json::json!([
                         quota.key_expr,
                         quota.max_active_executions,
                         quota.max_history_bytes,
                         quota.max_dead_letters,
+                        quota.max_run_llm_tokens,
+                        quota.max_run_llm_cost_usd_micros,
+                        quota.max_tenant_llm_tokens,
+                        quota.max_tenant_llm_cost_usd_micros,
+                        quota.tenant_llm_window_secs,
                     ])),
                     "execution_timeout": info
                         .execution_timeout
@@ -1465,11 +1569,72 @@ impl HandlerRegistry {
         self
     }
 
+    /// Set the directory of the owner-local disk cache, and the fewest
+    /// events that a run needs before the cache keeps it (issue #2258).
+    #[must_use]
+    pub fn with_owner_disk_cache(
+        mut self,
+        dir: Option<std::path::PathBuf>,
+        min_events: usize,
+    ) -> Self {
+        self.owner_disk_cache_dir = dir;
+        self.owner_disk_cache_min_events = min_events;
+        self
+    }
+
+    /// Keep an entity projection in the owner disk cache (issue #2260).
+    #[must_use]
+    pub const fn with_owner_entity_sql(mut self, on: bool) -> Self {
+        self.owner_entity_sql = on;
+        self
+    }
+
+    /// The directory of the owner-local disk cache, if set (issue #2258).
+    #[must_use]
+    pub fn owner_disk_cache_dir(&self) -> Option<&std::path::Path> {
+        self.owner_disk_cache_dir.as_deref()
+    }
+
+    /// Open the owner-local disk cache once, and share it (issue #2258).
+    ///
+    /// The open wipes the directory. A second worker on this registry gets
+    /// the same cache.
+    #[cfg(feature = "owner-disk-cache")]
+    fn open_owner_disk_cache(
+        &self,
+    ) -> HarvestResult<Option<Arc<crate::owner_disk_cache::OwnerDiskCache>>> {
+        let Some(dir) = self.owner_disk_cache_dir.as_deref() else {
+            return Ok(None);
+        };
+        let mut slot = self
+            .owner_disk_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(open) = slot.as_ref() {
+            return Ok(Some(Arc::clone(open)));
+        }
+        let open = Arc::new(crate::owner_disk_cache::OwnerDiskCache::open(dir)?);
+        *slot = Some(Arc::clone(&open));
+        drop(slot);
+        Ok(Some(open))
+    }
+
     /// Access the per-activity-type adaptive concurrency limits (issue
     /// #1836).
     #[must_use]
     pub fn adaptive_limits(&self) -> Arc<crate::adaptive_limit::AdaptiveLimitRegistry> {
         Arc::clone(&self.adaptive_limits)
+    }
+
+    /// The owner tenures of this worker (issue #2251).
+    ///
+    /// The worker reads a tenure at the start of each decision and drops it
+    /// when a commit is fenced.
+    #[must_use]
+    pub fn decision_owner(&self) -> Arc<crate::decision_owner::OwnedPartitions> {
+        // Issue #2252: inside a decision, the tenures of the worker that runs
+        // it. Two workers can share this registry.
+        crate::decision_owner::current_owned().unwrap_or_else(|| Arc::clone(&self.decision_owner))
     }
 
     /// History-size guardrails applied to workflow contexts run by this registry.
@@ -1537,12 +1702,14 @@ impl HandlerRegistry {
     #[must_use]
     pub fn resolve_dispatch_deadline(&self, name: &str) -> DispatchDeadline {
         let info = self.workflows.get(name);
-        let execution_timeout = info
-            .and_then(|info| info.execution_timeout)
-            .and_then(|d| chrono::Duration::from_std(d).ok());
-        let sla = info
-            .and_then(|info| info.sla)
-            .and_then(|d| chrono::Duration::from_std(d).ok());
+        // Issue #2387: an operator override wins over the declared value.
+        let (execution_timeout, sla) = self.apply_run_defaults(
+            name,
+            info.and_then(|info| info.execution_timeout),
+            info.and_then(|info| info.sla),
+        );
+        let execution_timeout = execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
+        let sla = sla.and_then(|d| chrono::Duration::from_std(d).ok());
         let max_execution_timeout_ceiling = self
             .max_workflow_execution_timeout
             .and_then(|d| chrono::Duration::from_std(d).ok());
@@ -1749,6 +1916,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("circuit_breakers", &self.circuit_breakers)
             .field("retry_budgets", &self.retry_budgets)
             .field("adaptive_limits", &self.adaptive_limits)
+            .field("decision_owner", &self.decision_owner)
             .field(
                 "max_workflow_attempts_ceiling",
                 &self.max_workflow_attempts_ceiling,
@@ -1788,6 +1956,22 @@ impl std::fmt::Debug for HandlerRegistry {
         // compiled-module cache, which is far more than a registry dump wants.
         #[cfg(feature = "hot-code-swap")]
         d.field("workflow_module_hosting", &self.module_host.is_some());
+        // Issue #2258: the directory, and whether a worker opened the cache.
+        d.field("owner_disk_cache_dir", &self.owner_disk_cache_dir);
+        d.field(
+            "owner_disk_cache_min_events",
+            &self.owner_disk_cache_min_events,
+        );
+        d.field("owner_entity_sql", &self.owner_entity_sql);
+        d.field("run_defaults", &self.run_defaults);
+        #[cfg(feature = "owner-disk-cache")]
+        d.field(
+            "owner_disk_cache_open",
+            &self
+                .owner_disk_cache
+                .try_lock()
+                .map_or(true, |open| open.is_some()),
+        );
         d.finish()
     }
 }
@@ -1828,6 +2012,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
         WorkflowCommand::SetCurrentDetails { .. } => "SetCurrentDetails",
         WorkflowCommand::PublishProgress { .. } => "PublishProgress",
+        WorkflowCommand::PublishDurableProgress { .. } => "PublishDurableProgress",
         WorkflowCommand::RecordLog { .. } => "RecordLog",
         WorkflowCommand::SignalExternalWorkflow { .. } => "SignalExternalWorkflow",
         WorkflowCommand::RequestCancelExternalWorkflow { .. } => "RequestCancelExternalWorkflow",
@@ -1896,6 +2081,7 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::PublishDurableProgress { .. }
                 | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
@@ -1919,6 +2105,7 @@ fn only_bookkeeping_commands(commands: &[WorkflowCommand]) -> bool {
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::PublishProgress { .. }
+                    | WorkflowCommand::PublishDurableProgress { .. }
                     | WorkflowCommand::RecordLog { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
@@ -1951,6 +2138,7 @@ fn should_handle_mutex_acquire(commands: &[WorkflowCommand]) -> bool {
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
@@ -1985,6 +2173,10 @@ struct ScheduledActivityCommand {
     /// internal session-acquire dispatch. `None` for every ordinary
     /// activity.
     schedule_to_start_override: Option<std::time::Duration>,
+    /// Write the result through the `PayloadStore` (issue #1986).
+    ///
+    /// `build_activity_enqueue_plan` adds `RESULT_WRITER_HEADER` to the row.
+    result_writer: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2027,13 +2219,16 @@ struct PreparedWorkflowTask {
     cold_history_bytes: Option<u64>,
     /// The byte mark taken with a warm cache entry (issue #1804).
     cached_history_bytes: Option<crate::cache::HistoryBytesMark>,
-    /// The resident workflow of a warm hit, if any (issue #1798).
-    resident: Option<crate::resident::ResidentWorkflow>,
+    /// The resident state of a warm hit (issue #1798, issue #2007).
+    resident: crate::resident::Residency,
     /// Index in `history_events` of the first event after the cached
     /// snapshot. The resident workflow resumes with the events from here.
     delta_start: usize,
     /// Whether this worker keeps workflows resident (issue #1798).
     resident_enabled: bool,
+    /// The outcome of the owner disk read on a memory miss (issue #2258).
+    /// `None` when no disk read ran.
+    disk_outcome: Option<&'static str>,
 }
 
 /// `#[doc(hidden)]`: test-support-reachable, not semver-stable surface --
@@ -2130,6 +2325,8 @@ struct DetachedSpawnPersistence<'a> {
     registry: &'a HandlerRegistry,
     parent_execution: &'a WorkflowExecution,
     execute_span: &'a tracing::Span,
+    // The parent task's fairness key (issue #1976).
+    parent_fairness_key: Option<&'a str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&'a crate::shard::ShardRouter>,
@@ -2147,6 +2344,7 @@ impl DetachedSpawnPersistence<'_> {
             self.parent_execution,
             commands,
             self.execute_span,
+            self.parent_fairness_key,
             self.resolved_router,
         )
         .await
@@ -2325,13 +2523,14 @@ const fn workflow_command_variant_index(cmd: &WorkflowCommand) -> usize {
         WorkflowCommand::CancelTimer { .. } => 23,
         WorkflowCommand::AcquireMutex { .. } => 24,
         WorkflowCommand::ReleaseMutex { .. } => 25,
+        WorkflowCommand::PublishDurableProgress { .. } => 26,
     }
 }
 
 /// Number of `WorkflowCommand` variants, as indexed by
 /// [`workflow_command_variant_index`].
 #[cfg(test)]
-const WORKFLOW_COMMAND_VARIANTS: usize = 26;
+const WORKFLOW_COMMAND_VARIANTS: usize = 27;
 
 impl TerminalCommandPolicy {
     /// Discriminant label, so the AC4 audit table can state each variant's
@@ -2350,11 +2549,55 @@ impl TerminalCommandPolicy {
     }
 }
 
+/// Whether `cmd` is the release of a dropped session (issue #2193).
+fn is_drop_release(cmd: &WorkflowCommand) -> bool {
+    matches!(
+        cmd,
+        WorkflowCommand::ScheduleActivity { name, .. }
+            if name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME
+    )
+}
+
+/// Drops the release of a dropped session from a suspension that has a
+/// dedicated persist path (issue #2193).
+///
+/// An inline local activity, a mutex acquire and an external activity each
+/// refuse a batch that holds another activity. The release is a cleanup, so
+/// the cycle discards it. The workflow wakes and replays the body. The
+/// dropped session drops again, and the next suspension issues the release.
+fn discard_drop_release_for_dedicated_shape(outcome: WorkflowOutcome) -> WorkflowOutcome {
+    match outcome {
+        WorkflowOutcome::Suspended { mut commands }
+            if commands.iter().any(|c| {
+                matches!(
+                    c,
+                    WorkflowCommand::RunLocalActivity { .. }
+                        | WorkflowCommand::AcquireMutex { .. }
+                        | WorkflowCommand::ScheduleExternalActivity { .. }
+                )
+            }) =>
+        {
+            commands.retain(|c| !is_drop_release(c));
+            WorkflowOutcome::Suspended { commands }
+        }
+        other => other,
+    }
+}
+
 /// The terminal-cycle policy for `cmd` — see [`TerminalCommandPolicy`].
 ///
 /// Exhaustive by construction (no `_` arm): this is the AC4 audit of issue #952
 /// as a compile-time invariant rather than a comment that can rot.
-pub(crate) const fn terminal_command_policy(cmd: &WorkflowCommand) -> TerminalCommandPolicy {
+pub(crate) fn terminal_command_policy(cmd: &WorkflowCommand) -> TerminalCommandPolicy {
+    // A dropped session's release (issue #2193) is a `ScheduleActivity` that
+    // no body awaits. The match below stays exhaustive for every other command.
+    if is_drop_release(cmd) {
+        return TerminalCommandPolicy::NoRecord(
+            "no body awaits a drop release, and the broken-session scanner reaps the \
+             session of a run that ends. A suspension records it. A terminal cycle \
+             would only add an abandoned pair that replay must skip",
+        );
+    }
     match cmd {
         // ── Recorded as pre-terminal events, in command-emission order ──────
         WorkflowCommand::RecordMarker { .. }
@@ -2387,6 +2630,9 @@ pub(crate) const fn terminal_command_policy(cmd: &WorkflowCommand) -> TerminalCo
         }
         WorkflowCommand::PublishProgress { .. } => {
             TerminalCommandPolicy::SidePath("notify_progress_from_commands")
+        }
+        WorkflowCommand::PublishDurableProgress { .. } => {
+            TerminalCommandPolicy::SidePath("persist_durable_stream_from_commands")
         }
         WorkflowCommand::CancelRaceLosers { .. } => {
             TerminalCommandPolicy::SidePath("apply_race_loser_cancellations")
@@ -2825,6 +3071,7 @@ fn extract_single_command<T>(
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::PublishDurableProgress { .. }
                 | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
@@ -2858,6 +3105,7 @@ fn extract_all_scheduled_activities(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
@@ -2874,6 +3122,7 @@ fn extract_all_scheduled_activities(
                 session_id,
                 session_worker_id,
                 schedule_to_start_override,
+                result_writer,
                 ..
             } => {
                 scheduled.push(ScheduledActivityCommand {
@@ -2886,6 +3135,7 @@ fn extract_all_scheduled_activities(
                     session_id: *session_id,
                     session_worker_id: session_worker_id.clone(),
                     schedule_to_start_override: *schedule_to_start_override,
+                    result_writer: *result_writer,
                 });
             }
             _ => return None,
@@ -2910,6 +3160,7 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
@@ -2970,6 +3221,7 @@ fn extract_started_timer_for_suspension(
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::PublishDurableProgress { .. }
                 | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
@@ -3000,6 +3252,7 @@ fn extract_all_started_child_workflows(
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::PublishProgress { .. }
+                    | WorkflowCommand::PublishDurableProgress { .. }
                     | WorkflowCommand::RecordLog { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
@@ -3125,6 +3378,7 @@ fn extract_child_timeout_race(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ReleaseMutex { .. } => {}
@@ -3236,6 +3490,7 @@ fn extract_mixed_suspension_batch(commands: &[WorkflowCommand]) -> Option<MixedS
                 session_id,
                 session_worker_id,
                 schedule_to_start_override,
+                result_writer,
                 ..
             } => batch.scheduled_activities.push(ScheduledActivityCommand {
                 activity_id: *activity_id,
@@ -3247,6 +3502,7 @@ fn extract_mixed_suspension_batch(commands: &[WorkflowCommand]) -> Option<MixedS
                 session_id: *session_id,
                 session_worker_id: session_worker_id.clone(),
                 schedule_to_start_override: *schedule_to_start_override,
+                result_writer: *result_writer,
             }),
             WorkflowCommand::WaitForActivity { activity_id, .. } => {
                 batch.activity_waits.push(*activity_id);
@@ -3280,6 +3536,7 @@ fn extract_mixed_suspension_batch(commands: &[WorkflowCommand]) -> Option<MixedS
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
@@ -3673,6 +3930,7 @@ fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCo
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::ReleaseMutex { .. } => {}
             // A resolved ctx.race() CAN co-batch CancelRaceLosers with a local
             // activity. The loser branches started on an earlier cycle, so no
@@ -4002,6 +4260,7 @@ fn split_mixed_signal_batch(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. } => {}
             other => remaining.push(other),
         }
@@ -4091,6 +4350,8 @@ async fn persist_external_signal_inline(
         crate::tx_retry::TxRetryPolicy::DEFAULT,
         async |conn| Box::pin(conn
         .transaction::<InlinePersistResult, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             // For await-bearing batches, take the awaiter row `FOR UPDATE`
             // lock and read the TRUE `next_event_id` under it. Whichever of
             // inline/outbox commits first, the other observes the terminal
@@ -4200,12 +4461,13 @@ async fn persist_external_signal_inline(
                         // both outcomes record `ExternalSignalDelivered`.
                         let terminal_opt = match &run.target {
                             crate::types::ExternalTarget::ExecutionId(target_id) => {
-                                match signal::send_signal_idempotent(
+                                match signal::send_signal_idempotent_with_codecs(
                                     conn,
                                     *target_id,
                                     &run.signal_name,
                                     run.payload,
                                     run.idempotency_key.as_deref(),
+                                    codecs,
                                 )
                                 .await
                                 {
@@ -4223,6 +4485,18 @@ async fn persist_external_signal_inline(
                                     Err(HarvestError::Database(e)) => {
                                         return Err(HarvestError::Database(e));
                                     }
+                                    // Issue #2251: a fence is never a delivery result.
+                                    Err(e @ HarvestError::OwnershipLost { .. }) => return Err(e),
+                                    // A codec failure says nothing about the
+                                    // target. Leave the request to the outbox
+                                    // (issue #2065).
+                                    Err(error) if error.is_codec_failure() => {
+                                        tracing::warn!(
+                                            signal_id = %run.signal_id,
+                                            "inline signal left pending, the payload codec failed"
+                                        );
+                                        None
+                                    }
                                     Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
                                         signal_id: run.signal_id,
                                         reason_code: "target_terminal".to_string(),
@@ -4233,13 +4507,14 @@ async fn persist_external_signal_inline(
                                 workflow_name,
                                 workflow_id,
                             } => {
-                                match signal::resolve_and_signal_by_workflow_id(
+                                match signal::resolve_and_signal_by_workflow_id_with_codecs(
                                     conn,
                                     workflow_name,
                                     workflow_id,
                                     &run.signal_name,
                                     run.payload,
                                     run.idempotency_key.as_deref(),
+                                    codecs,
                                 )
                                 .await
                                 {
@@ -4262,6 +4537,8 @@ async fn persist_external_signal_inline(
                                     Err(HarvestError::Database(e)) => {
                                         return Err(HarvestError::Database(e));
                                     }
+                                    // Issue #2251: a fence is never a delivery result.
+                                    Err(e @ HarvestError::OwnershipLost { .. }) => return Err(e),
                                     // No run has ever existed for this business
                                     // key, or the resolved run raced to a
                                     // CONTINUED_AS_NEW successor between
@@ -4346,6 +4623,8 @@ async fn persist_external_signal_inline(
                                     Err(HarvestError::Database(e)) => {
                                         return Err(HarvestError::Database(e));
                                     }
+                                    // Issue #2251: a fence is never a delivery result.
+                                    Err(e @ HarvestError::OwnershipLost { .. }) => return Err(e),
                                     Ok((_cancelled, deferred, checks, metrics_opt)) => {
                                         deferred_starts.extend(deferred);
                                         deferred_checks.extend(checks);
@@ -4401,6 +4680,8 @@ async fn persist_external_signal_inline(
                                     Err(HarvestError::Database(e)) => {
                                         return Err(HarvestError::Database(e));
                                     }
+                                    // Issue #2251: a fence is never a delivery result.
+                                    Err(e @ HarvestError::OwnershipLost { .. }) => return Err(e),
                                     // No run has ever existed for this business
                                     // key: leave for outbox grace window. A
                                     // resolved run that raced to a
@@ -4474,8 +4755,8 @@ async fn persist_external_signal_inline(
                         // it later. The value/error is stored INFLATED into the
                         // awaiter's own history (observe-only; never touches the
                         // target).
-                        let terminal_opt = match crate::execution::read_external_await_outcome(
-                            conn, run.target,
+                        let terminal_opt = match crate::execution::read_external_await_outcome_with_codecs(
+                            conn, run.target, codecs,
                         )
                         .await
                         {
@@ -4504,6 +4785,8 @@ async fn persist_external_signal_inline(
                             Err(HarvestError::Database(e)) => {
                                 return Err(HarvestError::Database(e));
                             }
+                            // Issue #2251: a fence is never a delivery result.
+                            Err(e @ HarvestError::OwnershipLost { .. }) => return Err(e),
                             // Still running/paused or not-found, or a non-DB
                             // read error → leave the bare Requested and let the
                             // outbox resolve it.
@@ -4754,10 +5037,19 @@ async fn append_frontier_resolution(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // Issue #1996: the activity name and the LLM calls that the first event,
+    // a `LocalActivityCompleted`, writes. `None` writes no ledger row.
+    ledger: Option<(&str, &[crate::llm_ledger::LlmCall])>,
 ) -> HarvestResult<()> {
     let owned: Vec<WorkflowEvent> = events.to_vec();
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         store::append_events_with_codecs(conn, exec_id, &owned, event_start, codecs).await?;
+        if let Some((activity_name, calls)) = ledger {
+            crate::llm_ledger::insert_ledger_rows(conn, exec_id, event_start, activity_name, calls)
+                .await?;
+        }
         queue::reset_capability_misses_after_inline_progress(
             conn,
             frontier.task_id,
@@ -4934,6 +5226,8 @@ async fn run_local_activity_inline(
             .map_err(|_| HarvestError::Config("event count overflow".into()))?;
         let (deferred, loser_events) =
             Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+                // Issue #2251: the owner fence comes first.
+                crate::replication::assert_decision_fence(conn).await?;
                 store::append_events_with_codecs(
                     conn,
                     exec_id,
@@ -5111,9 +5405,14 @@ async fn run_local_activity_inline(
             }
             Ok(fut) => {
                 use futures::FutureExt as _;
+                // Issue #2251: the handler is user code. It runs in a decision
+                // scope of its own that pins nothing, so its own writes are
+                // foreign writes and take no owner row.
                 let caught = tokio::time::timeout(
                     per_attempt_timeout,
-                    std::panic::AssertUnwindSafe(fut).catch_unwind(),
+                    crate::decision_owner::scope_decision(
+                        std::panic::AssertUnwindSafe(fut).catch_unwind(),
+                    ),
                 )
                 .await;
                 match caught {
@@ -5135,7 +5434,10 @@ async fn run_local_activity_inline(
             }
         };
 
-        match result {
+        // A result nested past the depth cap takes the `Err` branch below (issue
+        // #2225). The typed failure is non-retryable, so the activity ends on
+        // this attempt, as it does for a regular activity.
+        match crate::payload_depth::refuse_deep_result(&run.name, result) {
             Ok(output) => {
                 let completed_event = WorkflowEvent::LocalActivityCompleted {
                     activity_id: run.activity_id,
@@ -5151,6 +5453,7 @@ async fn run_local_activity_inline(
                     *next_event_id,
                     frontier,
                     registry.payload_codecs(),
+                    Some((run.name.as_str(), ctx.take_llm_calls().as_slice())),
                 )
                 .await?;
                 *next_event_id += 1;
@@ -5240,6 +5543,7 @@ async fn run_local_activity_inline(
                         *next_event_id,
                         frontier,
                         registry.payload_codecs(),
+                        None,
                     )
                     .await?;
                     *next_event_id += i32::try_from(terminal_pair.len())
@@ -6345,6 +6649,46 @@ async fn workflow_execution_transition_error(
         )
 }
 
+/// The input, memo and headers a workflow retry starts with, decoded
+/// (issue #1979, issue #2043).
+///
+/// The start path encodes them again. A value this registry cannot decode
+/// returns `None`, so the run fails without a retry. A missing key must not
+/// roll back the failure write. The codec error text is not logged.
+fn decode_retry_payload(
+    codecs: &crate::payload_codec::PayloadCodecs,
+    execution: &WorkflowExecution,
+) -> Option<RetryPayload> {
+    let decoded = codecs.decode_column(&execution.input).and_then(|input| {
+        let memo = codecs.decode_column_opt(execution.memo.as_ref())?;
+        let headers = execution
+            .context_headers
+            .as_ref()
+            .map(|stored| codecs.decode_headers(stored))
+            .transpose()?;
+        Ok((input, memo, headers))
+    });
+    if decoded.is_err() {
+        tracing::warn!(
+            exec_id = %execution.id,
+            "workflow retry skipped: the stored input, memo or headers could not be decoded"
+        );
+    }
+    decoded.ok()
+}
+
+/// What [`decode_retry_payload`] returns: input, memo and headers.
+type RetryPayload = (
+    serde_json::Value,
+    Option<serde_json::Value>,
+    Option<std::collections::HashMap<String, String>>,
+);
+
+/// Seal the execution row `COMPLETED` with `output`, which is the stored
+/// form. The caller encodes it with [`PayloadCodecs::encode_column`]
+/// (issue #1979).
+///
+/// [`PayloadCodecs::encode_column`]: crate::payload_codec::PayloadCodecs::encode_column
 async fn update_workflow_execution_completed(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -8185,6 +8529,7 @@ fn first_persist_capability_miss(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SignalExternalWorkflow { .. }
             | WorkflowCommand::RequestCancelExternalWorkflow { .. }
@@ -9157,6 +9502,51 @@ pub async fn check_paused_and_park(
     Ok(true)
 }
 
+/// Re-pend the task instead of sealing a run that has an unconsumed signal
+/// (issue #2079).
+///
+/// The task ingests the pending signals at its start. A signal that arrives
+/// later stays unconsumed. A complete or fail decision would seal the run
+/// over it, and the sender would never learn that the run did not read it.
+///
+/// The caller holds the execution row lock, and `send_signal` takes the same
+/// lock. So a signal is either visible here, or it commits after this
+/// transaction and finds a re-pended task to wake. The next pass ingests the
+/// signal and decides again. A signal that nothing reads is in history by
+/// then, so the run still ends.
+///
+/// Returns `true` when the task is re-pended and the decision is discarded.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::TerminalWriteClaimAmbiguous`] when the task claim
+/// moved to another worker, and a database error on query failure.
+async fn repend_for_late_signals(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    task_id: uuid::Uuid,
+    worker_id: &str,
+    crash_strikes: i32,
+    attempt: i32,
+    sticky_timeout: Duration,
+) -> HarvestResult<bool> {
+    if !signal::has_pending_signals(conn, exec_id).await? {
+        return Ok(false);
+    }
+    if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes, attempt).await?
+    {
+        return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+    }
+    let sticky = if sticky_timeout.is_zero() {
+        None
+    } else {
+        Some(queue::StickyHint::new(worker_id, sticky_timeout))
+    };
+    queue::park_workflow_task(conn, task_id, sticky).await?;
+    queue::wake_workflow_task(conn, exec_id).await?;
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn block_workflow_for_non_determinism(
     conn: &mut AsyncPgConnection,
@@ -9179,6 +9569,8 @@ async fn block_workflow_for_non_determinism(
 
     let parked_paused = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+        // Issue #2251: a block is a decision outcome, so it is fenced too.
+        crate::replication::assert_decision_fence(conn).await?;
         let error_owned = error_owned.clone();
         let patch = patch.clone();
         if check_paused_and_park(
@@ -9351,6 +9743,8 @@ pub async fn persist_workflow_completion(
     };
     let (deferred, closed_children, tx_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             // Issue #1184: re-derive the task-row claim under its own lock
             // before committing this completion. The execution row lock this
             // transaction holds says nothing about `harvest_task_queue`
@@ -9370,8 +9764,15 @@ pub async fn persist_workflow_completion(
                 codecs,
             )
             .await?;
-            update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
-            queue::complete_task(conn, task_id, output).await?;
+            // The row and the task get the same stored form (issue #1979).
+            let stored_output = codecs.encode_column(&output)?;
+            update_workflow_execution_completed(conn, exec_id, worker_id, &stored_output).await?;
+            queue::complete_task(
+                conn,
+                &queue::TaskClaim::new(task_id, worker_id, attempt),
+                stored_output,
+            )
+            .await?;
             let (mut deferred, closed_children) =
                 apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
@@ -9472,6 +9873,9 @@ pub async fn persist_workflow_failure(
     // Priority from the current task so the retry inherits the same queue priority
     // and is not silently demoted behind normal work (issue #523 P2).
     priority: crate::types::Priority,
+    // The current task's fairness key, so the retry stays with its tenant
+    // (issue #1976). `None` takes the retry's quota key.
+    fairness_key: Option<String>,
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
@@ -9600,6 +10004,8 @@ pub async fn persist_workflow_failure(
             Vec<(ExecutionId, String)>,
             Vec<crate::execution::StartCancelledRun>,
         ), HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             let decoded = decoded.clone();
             let retry_fire_info = retry_fire_info.clone();
             let exec_ref = execution;
@@ -9633,11 +10039,13 @@ pub async fn persist_workflow_failure(
             if let (Some(exec_ref), Some((rid, policy, attempt, fire_at, start_delay))) =
                 (exec_ref, retry_fire_info)
                 && attempt < policy.max_attempts
+                && let Some((retry_input, retry_memo, retry_headers)) =
+                    decode_retry_payload(codecs, exec_ref)
             {
                 let retry_workflow_id = rid.to_string();
                 let retry_params = crate::execution::StartWorkflowParams {
                     execution_timeout: exec_ref.execution_timeout,
-                    memo: exec_ref.memo.clone(),
+                    memo: retry_memo,
                     search_attrs: exec_ref.search_attrs.clone(),
                     // Workflow-level retry (issue #523) is the same logical run
                     // continuing, so the chain-scoped lifetime cap (issue #617)
@@ -9657,10 +10065,7 @@ pub async fn persist_workflow_failure(
                     owner: exec_ref.owner.as_deref(),
                     runbook_url: exec_ref.runbook_url.as_deref(),
                     severity: exec_ref.severity.as_deref(),
-                    context_headers: exec_ref
-                        .context_headers
-                        .clone()
-                        .and_then(|v| serde_json::from_value(v).ok()),
+                    context_headers: retry_headers,
                     sla: exec_ref.sla,
                     schedule_id: exec_ref.schedule_id,
                     scheduled_for: exec_ref.scheduled_for,
@@ -9679,11 +10084,15 @@ pub async fn persist_workflow_failure(
                     ),
                     start_source_ref: exec_ref.start_source_ref.as_deref(),
                     started_by: exec_ref.started_by.as_deref(),
+                    fairness_key: fairness_key.clone(),
+                    // A retry belongs to the tenant of the run it retries
+                    // (issue #1977).
+                    tenant: exec_ref.tenant.as_deref(),
                     ..crate::execution::StartWorkflowParams::new(
                         &exec_ref.workflow_name,
                         &retry_workflow_id,
                         rid,
-                        exec_ref.input.clone(),
+                        retry_input,
                         &exec_ref.queue_name,
                     )
                 };
@@ -9803,6 +10212,8 @@ pub async fn persist_workflow_failure(
     // report a terminal write that never landed.
     for check in deferred_checks {
         let _ = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await
         }))
         .await;
@@ -10238,7 +10649,16 @@ async fn persist_search_attrs_from_commands(
         _ => return Ok(()),
     };
 
-    store::update_search_attrs(conn, exec_id, &merged).await
+    // Issue #2251: a pinned decision writes the projection under its owner
+    // fence, so a stale owner cannot overwrite a newer value.
+    if crate::decision_owner::pinned_decision().is_none() {
+        return store::update_search_attrs(conn, exec_id, &merged).await;
+    }
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        crate::replication::assert_decision_fence(conn).await?;
+        store::update_search_attrs(conn, exec_id, &merged).await
+    }))
+    .await
 }
 
 /// The effective DB write resolved from the last `SetCurrentDetails` command
@@ -10308,16 +10728,20 @@ async fn persist_current_details_from_commands(
     exec_id: ExecutionId,
     commands: &[WorkflowCommand],
 ) -> HarvestResult<()> {
-    match latest_current_details_update(commands) {
-        CurrentDetailsUpdate::NoOp => {}
-        CurrentDetailsUpdate::Clear => {
-            store::update_current_details(conn, exec_id, None).await?;
-        }
-        CurrentDetailsUpdate::Set(details) => {
-            store::update_current_details(conn, exec_id, Some(details)).await?;
-        }
+    let details = match latest_current_details_update(commands) {
+        CurrentDetailsUpdate::NoOp => return Ok(()),
+        CurrentDetailsUpdate::Clear => None,
+        CurrentDetailsUpdate::Set(details) => Some(details),
+    };
+    // Issue #2251: under the owner fence, as for the search attributes.
+    if crate::decision_owner::pinned_decision().is_none() {
+        return store::update_current_details(conn, exec_id, details).await;
     }
-    Ok(())
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        crate::replication::assert_decision_fence(conn).await?;
+        store::update_current_details(conn, exec_id, details).await
+    }))
+    .await
 }
 
 /// Collect this cycle's [`WorkflowCommand::RecordLog`] commands into the
@@ -10382,6 +10806,8 @@ async fn persist_workflow_logs_from_commands(
         return;
     }
     let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |c| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(c).await?;
         store::append_workflow_logs(c, exec_id, &lines, max_lines).await?;
         Ok(())
     }))
@@ -10456,6 +10882,66 @@ async fn notify_progress_from_commands(
     }
 }
 
+/// Collect this cycle's durable stream chunks, in emission order (issue #1974).
+///
+/// Pure. The offset is a `u64` call ordinal and the column is an `i64`. The
+/// cast clamps below [`store::DURABLE_STREAM_TRUNCATION_OFFSET`], so a real
+/// chunk can never take the marker slot.
+fn collect_durable_stream_chunks(commands: &[WorkflowCommand]) -> Vec<store::DurableStreamChunk> {
+    commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::PublishDurableProgress { offset, chunk } => {
+                Some(store::DurableStreamChunk {
+                    offset: i64::try_from(*offset)
+                        .unwrap_or(i64::MAX)
+                        .min(store::DURABLE_STREAM_TRUNCATION_OFFSET - 1),
+                    chunk: chunk.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Store this cycle's durable stream chunks and wake their readers
+/// (issue #1974).
+///
+/// **Not best-effort.** The rows go into the persist transaction, and an
+/// error fails the cycle the same way as `persist_current_details_from_commands`.
+/// A committed cycle therefore holds all of its chunks, so a reader sees no
+/// gap. A cycle with no durable chunk runs no statement.
+///
+/// The wake is one note per cycle. The post-commit sender sends it after the
+/// write commits, so a full `NOTIFY` queue cannot fail the write (issue
+/// #1796). A reader treats the wake as a hint and reads the table.
+async fn persist_durable_stream_from_commands(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+) -> HarvestResult<()> {
+    let chunks = collect_durable_stream_chunks(commands);
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    // One transaction for the rows and the wake. The inline paths call this
+    // on a bare connection, and inside a persist transaction it is a
+    // savepoint.
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |c| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(c).await?;
+        store::append_stream_chunks(
+            c,
+            exec_id,
+            &chunks,
+            crate::context::DURABLE_STREAM_MAX_CHUNKS,
+        )
+        .await?;
+        crate::notify::notify_durable_stream(c, exec_id.as_uuid()).await
+    }))
+    .await
+}
+
 /// Per-decision-cycle ceiling on the number of `ctx.publish_progress` chunks the
 /// worker forwards as `pg_notify` round-trips (issue #791). Each chunk is one
 /// serial `SELECT pg_notify(...)` in the persist transaction; this bounds a
@@ -10499,6 +10985,8 @@ async fn persist_signal_wait_park(
     // silently discarded here.
     let (deferred, had_wake_requested) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             // Cancellable/renewable timer bookkeeping (issue #768): resolve
             // the ArmTimer/CancelTimer row mutations FIRST, then interleave
             // their TimerStarted/TimerCancelled events into the suspension
@@ -10655,6 +11143,8 @@ async fn process_mutex_releases_from_commands(
     // `ctx.run_transactional`'s own transactional-activity wake.
     let held_secs = crate::dispatch::buffered_checkpoint(Box::pin(
         conn.transaction::<Vec<f64>, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             let releases = releases.clone();
             let mut held = Vec::new();
             for (key, lock_seq) in releases {
@@ -10749,6 +11239,8 @@ async fn persist_mutex_acquire_park(
             Vec<crate::completion_trigger::DeferredTriggerStart>,
             MutexParkOutcome,
         ), HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             let key = key.clone();
             // Persist bookkeeping events (markers/side-effects/detached-spawn
             // + interleaved timer-lifecycle) in command order, mirroring the
@@ -10855,6 +11347,8 @@ async fn persist_activity_wait_park(
     let registry = detached_spawns.registry;
 
     let deferred = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         harvest_workflow_executions::table
             .find(exec_id.as_uuid())
             .for_update()
@@ -10928,11 +11422,15 @@ async fn persist_activity_wait_park(
 ///
 /// Extracted from [`persist_scheduled_activities`] (issue #950) so the
 /// generalized mixed-batch path enforces the identical guarantee.
+///
+/// The check skips each activity in `settled`. A fork record settled it, so
+/// no host runs it (issue #2000).
 async fn fail_activities_for_broken_sessions(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     scheduled_activities: &[ScheduledActivityCommand],
     activity_task_ids: &[uuid::Uuid],
+    settled: &std::collections::HashSet<ActivityExecId>,
     next_event_id: &mut i32,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
@@ -10967,12 +11465,22 @@ async fn fail_activities_for_broken_sessions(
 
     let mut synthesized = false;
     for (scheduled, activity_task_id) in scheduled_activities.iter().zip(activity_task_ids.iter()) {
+        if settled.contains(&scheduled.activity_id) {
+            continue;
+        }
         let Some(session_uuid) = scheduled.session_id.map(|id| id.as_uuid()) else {
             continue;
         };
         let Some(reason) = broken.get(&session_uuid) else {
             continue;
         };
+        // A drop release (issue #2193) has no awaiter. Its task is pinned to
+        // a host that may be gone, so nothing would claim it. Fail the task
+        // row and record no failure event. The run needs no wake.
+        if scheduled.name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME {
+            queue::fail_task(conn, *activity_task_id, reason).await?;
+            continue;
+        }
         let failed_event = WorkflowEvent::ActivityFailed {
             activity_id: scheduled.activity_id,
             error: reason.clone(),
@@ -10988,6 +11496,11 @@ async fn fail_activities_for_broken_sessions(
         synthesized = true;
     }
     Ok(synthesized)
+}
+
+/// The activity ids of `scheduled`, in command order.
+fn scheduled_activity_ids(scheduled: &[ScheduledActivityCommand]) -> Vec<ActivityExecId> {
+    scheduled.iter().map(|s| s.activity_id).collect()
 }
 
 /// The pre-transaction plan for a batch of `ScheduleActivity` commands:
@@ -11010,6 +11523,113 @@ struct ActivityEnqueuePlan {
     dynamic_rate_buckets: Vec<(String, f64, f64)>,
 }
 
+/// The context headers for one activity row (issue #1986).
+///
+/// Only the engine sets `RESULT_WRITER_HEADER`. A caller can set any
+/// execution header, so this function removes an inherited copy of the
+/// reserved header. A row with the result writer gets the header. The header
+/// rides in the row's existing `context_headers` column, so it needs no
+/// migration.
+///
+/// `stored` is the execution cell and `inherited` is the same cell decoded.
+/// A row that adds or removes nothing copies the stored cell, so it spends no
+/// new nonce and nests no second layer (issue #2043).
+///
+/// # Errors
+///
+/// [`HarvestError`] when the changed map does not encode.
+fn activity_row_context_headers(
+    stored: Option<&serde_json::Value>,
+    inherited: Option<&std::collections::HashMap<String, String>>,
+    result_writer: bool,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<Option<serde_json::Value>> {
+    let key = crate::fan_out::RESULT_WRITER_HEADER;
+    if !result_writer && !inherited.is_some_and(|headers| headers.contains_key(key)) {
+        return Ok(stored.cloned());
+    }
+    let mut headers = inherited.cloned().unwrap_or_default();
+    headers.remove(key);
+    if result_writer {
+        headers.insert(key.to_string(), "1".to_string());
+    }
+    codecs.encode_headers(&headers).map(Some)
+}
+
+#[cfg(test)]
+mod result_writer_header_tests {
+    use super::activity_row_context_headers;
+    use crate::fan_out::RESULT_WRITER_HEADER;
+    use crate::payload_codec::PayloadCodecs;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn map(value: &serde_json::Value) -> HashMap<String, String> {
+        serde_json::from_value(value.clone()).expect("a string map")
+    }
+
+    #[test]
+    fn a_plain_row_keeps_the_execution_headers() {
+        let codecs = PayloadCodecs::default();
+        let headers = json!({ "tenant": "a" });
+        let inherited = map(&headers);
+        assert_eq!(
+            activity_row_context_headers(Some(&headers), Some(&inherited), false, &codecs)
+                .expect("no encode"),
+            Some(headers)
+        );
+        assert_eq!(
+            activity_row_context_headers(None, None, false, &codecs).expect("no encode"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_writer_row_adds_the_header() {
+        let codecs = PayloadCodecs::default();
+        let headers = json!({ "tenant": "a" });
+        let inherited = map(&headers);
+        assert_eq!(
+            activity_row_context_headers(Some(&headers), Some(&inherited), true, &codecs)
+                .expect("encode"),
+            Some(json!({ "tenant": "a", RESULT_WRITER_HEADER: "1" }))
+        );
+        assert_eq!(
+            activity_row_context_headers(None, None, true, &codecs).expect("encode"),
+            Some(json!({ RESULT_WRITER_HEADER: "1" }))
+        );
+    }
+
+    /// A caller can set execution headers. A plain row never inherits the
+    /// reserved header, so a caller cannot turn on the writer.
+    #[test]
+    fn a_plain_row_drops_a_caller_supplied_writer_header() {
+        let codecs = PayloadCodecs::default();
+        let headers = json!({ "tenant": "a", RESULT_WRITER_HEADER: "1" });
+        let inherited = map(&headers);
+        assert_eq!(
+            activity_row_context_headers(Some(&headers), Some(&inherited), false, &codecs)
+                .expect("encode"),
+            Some(json!({ "tenant": "a" }))
+        );
+    }
+}
+
+/// Whether the task row asks the worker to write the result (issue #1986).
+///
+/// The marker rides inside the header cell, so the cell is decoded first
+/// (issue #2043). A cell that does not decode is not a writer row. The
+/// attempt fails on that cell before it reaches a place that matters.
+fn task_writes_result(task: &TaskQueueItem, codecs: &crate::payload_codec::PayloadCodecs) -> bool {
+    codecs
+        .decode_headers_opt(task.context_headers.as_ref())
+        .is_ok_and(|headers| {
+            headers
+                .get(crate::fan_out::RESULT_WRITER_HEADER)
+                .is_some_and(|value| value == "1")
+        })
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn build_activity_enqueue_plan(
     registry: &HandlerRegistry,
@@ -11018,6 +11638,7 @@ fn build_activity_enqueue_plan(
     execute_span: &tracing::Span,
     assigned_build_id: Option<&str>,
     parent_priority: i32,
+    parent_fairness_key: Option<&str>,
     context_headers: Option<&serde_json::Value>,
     workflow_input: &serde_json::Value,
 ) -> HarvestResult<ActivityEnqueuePlan> {
@@ -11025,6 +11646,11 @@ fn build_activity_enqueue_plan(
     // After the loop we interleave them with marker/detached-spawn events in full command order.
     let mut activity_events: Vec<WorkflowEvent> = Vec::with_capacity(scheduled_activities.len());
     let mut enqueued = Vec::with_capacity(scheduled_activities.len());
+    let mut decoded_input: Option<serde_json::Value> = None;
+    // Decode the execution headers once for the whole decision (issue #2043).
+    let inherited_headers = context_headers
+        .map(|stored| registry.payload_codecs().decode_headers(stored))
+        .transpose()?;
     // Dynamic per-key rate-limit buckets (issue #699) to lazily register inside
     // the enqueue transaction: `(bucket_key, refill_rate, burst)`. Deduped so a
     // fan-out of N activities sharing one resolved tenant key ensures the bucket
@@ -11053,11 +11679,19 @@ fn build_activity_enqueue_plan(
             scheduled.queue.clone()
         };
 
-        let mut params = queue::EnqueueParams::new(
-            queue_name.clone(),
-            TaskType::Activity,
-            scheduled.input.clone(),
-        );
+        // A reserved session activity carries a session id, not payload. Its
+        // row keeps the id as it is, so a missing key cannot fail the run.
+        let is_reserved = crate::context::is_reserved_session_activity_name(&scheduled.name);
+        // Any other row stores the input as the column form (issue #2043).
+        // The `ActivityScheduled` event below keeps the plain input, and the
+        // event codec encodes it.
+        let row_input = if is_reserved {
+            scheduled.input.clone()
+        } else {
+            registry.payload_codecs().encode_column(&scheduled.input)?
+        };
+        let mut params =
+            queue::EnqueueParams::new(queue_name.clone(), TaskType::Activity, row_input);
         params.workflow_exec_id = Some(exec_id.as_uuid());
         params.activity_name = Some(scheduled.name.clone());
         params.activity_id = Some(scheduled.activity_id.as_uuid());
@@ -11066,6 +11700,8 @@ fn build_activity_enqueue_plan(
         // workflows' activities are also claimed ahead of lower-priority work
         // on the same queue (issue #249).
         params.priority = parent_priority;
+        // The activity shares its workflow's tenant (issue #1976).
+        params.fairness_key = parent_fairness_key.map(str::to_owned);
 
         if let Some(requires) = activity.requires {
             let reqs = crate::eligibility::parse_requirements(requires).map_err(|err| {
@@ -11086,7 +11722,6 @@ fn build_activity_enqueue_plan(
         // floor. They must NOT inherit the builder-level default — fall back to
         // the pre-feature resolution (call-site override → activity default) for
         // them so an operator's floor never governs session acquire/release.
-        let is_reserved = crate::context::is_reserved_session_activity_name(&scheduled.name);
         let builder_retry_default = if is_reserved {
             None
         } else {
@@ -11194,7 +11829,13 @@ fn build_activity_enqueue_plan(
             // do NOT `.unwrap_or_default()` here, which would collapse both onto
             // the same `L0:` bucket. Takes priority over the static
             // `rate_limit_key` path entirely.
-            let resolved = crate::concurrency::resolve_concurrency_key(expr, workflow_input);
+            // The input can be a stored envelope (issue #1979). Decode it
+            // once, on first use, so a key resolves against the plaintext.
+            if decoded_input.is_none() {
+                decoded_input = Some(registry.payload_codecs().decode_column(workflow_input)?);
+            }
+            let plain_input = decoded_input.as_ref().unwrap_or(workflow_input);
+            let resolved = crate::concurrency::resolve_concurrency_key(expr, plain_input);
             let bucket_key = queue::dynamic_rate_bucket_key(expr, resolved.as_deref());
             // The bucket is ensured in the same transaction below, so the
             // fail-closed claim/dispatch gate always has a bucket row to read
@@ -11289,7 +11930,12 @@ fn build_activity_enqueue_plan(
             { ATTR_QUEUE } = %queue_name,
         )
         .in_scope(|| registry.telemetry().capture_trace_context());
-        params.context_headers = context_headers.cloned();
+        params.context_headers = activity_row_context_headers(
+            context_headers,
+            inherited_headers.as_ref(),
+            scheduled.result_writer,
+            registry.payload_codecs(),
+        )?;
         enqueued.push(params);
     }
 
@@ -11324,8 +11970,12 @@ async fn persist_scheduled_activities(
     execute_span: &tracing::Span,
     assigned_build_id: Option<&str>,
     parent_priority: i32,
+    parent_fairness_key: Option<&str>,
     context_headers: Option<&serde_json::Value>,
     workflow_input: &serde_json::Value,
+    // Issue #2000: `true` when the run is a fork, so a recorded fork serves
+    // each activity from its record instead of running it.
+    is_fork: bool,
 ) -> HarvestResult<()> {
     let ActivityEnqueuePlan {
         activity_events,
@@ -11338,6 +11988,7 @@ async fn persist_scheduled_activities(
         execute_span,
         assigned_build_id,
         parent_priority,
+        parent_fairness_key,
         context_headers,
         workflow_input,
     )?;
@@ -11352,8 +12003,10 @@ async fn persist_scheduled_activities(
     // activity-completion races, this is a *fresh* dispatch (the activities
     // being scheduled here cannot have completed yet), so no other in-band
     // check exists to catch it.
-    let (deferred, had_wake_requested, synthesized_broken_session_failure) =
+    let (deferred, had_wake_requested, synthesized_outcome) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             // Cancellable/renewable timer bookkeeping (issue #768): resolve
             // the ArmTimer/CancelTimer row mutations FIRST, then build the
             // event list in command emission order -- markers, detached-spawn
@@ -11411,6 +12064,18 @@ async fn persist_scheduled_activities(
             )
             .await?;
 
+            // Issue #2000: a fork resolves each activity from its record
+            // here. It runs before the session check, which skips each
+            // settled activity.
+            let fork = crate::fork::serve_recorded_activities(
+                conn,
+                exec_id,
+                is_fork,
+                &scheduled_activity_ids(scheduled_activities),
+                &mut race_next_event_id,
+                registry,
+            )
+            .await?;
             // Worker sessions (issue #606): fail any member activity whose
             // session already left ACTIVE, so the workflow observes
             // SessionBroken on its next decision cycle instead of hanging on a
@@ -11420,16 +12085,18 @@ async fn persist_scheduled_activities(
                 exec_id,
                 scheduled_activities,
                 &activity_task_ids,
+                &fork.settled,
                 &mut race_next_event_id,
                 registry.payload_codecs(),
             )
             .await?;
+            let served_from_fork = fork.served;
 
             let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
             Ok((
                 deferred,
                 had_wake_requested,
-                synthesized_broken_session_failure,
+                synthesized_broken_session_failure || served_from_fork,
             ))
         }))
         .await?;
@@ -11438,12 +12105,10 @@ async fn persist_scheduled_activities(
         start.spawn();
     }
 
-    // The synthesized SessionBroken failure(s) above are not tied to any
-    // external wake source (they were resolved entirely within this
-    // transaction), so the workflow must be woken unconditionally to
-    // observe them on its next decision cycle -- `had_wake_requested` alone
-    // would miss this case.
-    if had_wake_requested || synthesized_broken_session_failure {
+    // The transaction above resolved SessionBroken failures and fork outcomes
+    // itself. No external source wakes the workflow for them. So wake it
+    // here. `had_wake_requested` alone misses this case.
+    if had_wake_requested || synthesized_outcome {
         queue::wake_workflow_task(conn, exec_id).await?;
     }
 
@@ -11491,6 +12156,8 @@ async fn persist_started_timer(
     let (deferred, had_wake_requested) = Box::pin(conn
         .transaction::<_, HarvestError, _>(async |conn| {
         use crate::schema::harvest_task_queue::dsl as queue_dsl;
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
 
         // Cancellable/renewable timer bookkeeping (issue #768) for any
         // *other* timers' ArmTimer/CancelTimer commands in this batch (the
@@ -11732,6 +12399,8 @@ async fn persist_all_started_child_workflows(
     children: &[StartedChildWorkflowCommand],
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
+    // The parent's fairness key. A child inherits it (issue #1976).
+    parent_fairness_key: Option<&str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
@@ -11814,6 +12483,8 @@ async fn persist_all_started_child_workflows(
     let execute_span = execute_span.clone();
 
     let deferred = match Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         let children = children.clone();
         let pre_events_by_pos = pre_events_by_pos.clone();
         let start_child_cmd_indices = start_child_cmd_indices.clone();
@@ -12015,6 +12686,7 @@ async fn persist_all_started_child_workflows(
             parent_execution,
             commands,
             &execute_span,
+            parent_fairness_key,
             resolved_router,
         )
         .await?;
@@ -12052,14 +12724,16 @@ async fn persist_all_started_child_workflows(
                     .get(&child.child_id.as_uuid())
                     .cloned()
                     .flatten(),
+                parent_fairness_key,
             )?;
-            crate::cross_shard_child::record_cross_shard_child(
+            crate::cross_shard_child::record_cross_shard_child_with_codecs(
                 conn,
                 parent_exec_id,
                 child.child_id,
                 &child.workflow_name,
                 None, // awaited child
                 &spec,
+                registry.payload_codecs(),
             )
             .await?;
         }
@@ -12102,6 +12776,7 @@ async fn persist_all_started_child_workflows(
             // start path runs in `execution.rs`, applied per child here.
             let child_quota_key: Option<String> = defaults
                 .quota
+                .filter(crate::quota::QuotaPolicy::uses_key)
                 .and_then(|p| crate::quota::resolve_quota_key(p.key_expr, &child.input));
             if let Some(key) = child_quota_key.as_deref()
                 && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
@@ -12151,7 +12826,8 @@ async fn persist_all_started_child_workflows(
                 parent_exec_id,
                 parent_execution,
                 &parent_exec_id_str,
-            );
+                registry.payload_codecs(),
+            )?;
             let child_started_event = WorkflowEvent::WorkflowStarted {
                 input: child.input.clone(),
                 timestamp: chrono::Utc::now(),
@@ -12162,12 +12838,18 @@ async fn persist_all_started_child_workflows(
             let mut params = queue::EnqueueParams::new(
                 queue_name.clone(),
                 TaskType::Workflow,
-                child.input.clone(),
+                registry.payload_codecs().encode_column(&child.input)?,
             );
             params.workflow_exec_id = Some(child.child_id.as_uuid());
+            // A child's workflow id is its execution id.
+            params = params.with_decision_partition(&child.child_id.to_string());
             params.required_build_id = parent_execution.assigned_build_id.clone();
             (params.concurrency_key, params.max_concurrent) =
                 resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
+            params.fairness_key = crate::queue_fairness::fairness_key_for(
+                parent_fairness_key,
+                plan.child_quota_key.as_deref(),
+            );
             params.trace_context = child_trace_ctxs
                 .get(&child.child_id.as_uuid())
                 .cloned()
@@ -12258,9 +12940,10 @@ async fn persist_all_started_child_workflows(
                         parent_exec_id,
                         parent_execution,
                         &parent_exec_id_str,
+                        registry.payload_codecs(),
                     )
                 })
-                .collect();
+                .collect::<HarvestResult<_>>()?;
             diesel::insert_into(harvest_workflow_executions::table)
                 .values(&child_rows)
                 .execute(conn)
@@ -12299,21 +12982,27 @@ async fn persist_all_started_child_workflows(
                     let mut params = queue::EnqueueParams::new(
                         queue_name.clone(),
                         TaskType::Workflow,
-                        child.input.clone(),
+                        registry.payload_codecs().encode_column(&child.input)?,
                     );
                     params.workflow_exec_id = Some(child.child_id.as_uuid());
+                    // A child's workflow id is its execution id.
+                    params = params.with_decision_partition(&child.child_id.to_string());
                     params
                         .required_build_id
                         .clone_from(&parent_execution.assigned_build_id);
                     (params.concurrency_key, params.max_concurrent) =
                         resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
+                    params.fairness_key = crate::queue_fairness::fairness_key_for(
+                        parent_fairness_key,
+                        plan.child_quota_key.as_deref(),
+                    );
                     params.trace_context = child_trace_ctxs
                         .get(&child.child_id.as_uuid())
                         .cloned()
                         .flatten();
-                    params
+                    Ok(params)
                 })
-                .collect();
+                .collect::<HarvestResult<_>>()?;
             queue::enqueue_batch(conn, &enqueue_params).await?;
         }
 
@@ -12470,7 +13159,7 @@ const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
 
 /// [`NewWorkflowExecution`]'s field count. Pinned by a regression test
 /// below so an added column is caught, not silently under-counted.
-const NEW_WORKFLOW_EXECUTION_COLUMNS: usize = 35;
+const NEW_WORKFLOW_EXECUTION_COLUMNS: usize = 36;
 
 /// Rows per chunk, floored so `ROWS_PER_EXECUTION_INSERT_CHUNK *
 /// NEW_WORKFLOW_EXECUTION_COLUMNS` never reaches [`POSTGRES_MAX_BIND_PARAMS`].
@@ -12606,6 +13295,10 @@ fn cached_retry_policy<'a>(
 /// Shared by both the sequential and the batched-insert paths in
 /// `persist_all_started_child_workflows` (issue #1589). So the two paths
 /// cannot drift on which fields a child row carries.
+///
+/// # Errors
+///
+/// Fails when the codec cannot encode the child input (issue #1979).
 fn build_child_row<'p>(
     plan: &'p LocalChildPlan<'_>,
     shard_id: i32,
@@ -12613,7 +13306,8 @@ fn build_child_row<'p>(
     parent_exec_id: ExecutionId,
     parent_execution: &'p WorkflowExecution,
     parent_exec_id_str: &'p str,
-) -> NewWorkflowExecution<'p> {
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<NewWorkflowExecution<'p>> {
     let child = plan.child;
     // Absolute deadlines are anchored HERE, not read from `plan.defaults`
     // (Codex review, issue #1589). `plan.defaults` is resolved once, up
@@ -12634,7 +13328,7 @@ fn build_child_row<'p>(
         .defaults
         .chain_execution_timeout
         .and_then(|d| now.checked_add_signed(d));
-    NewWorkflowExecution {
+    Ok(NewWorkflowExecution {
         continued_from_exec_id: None,
         first_exec_id: None,
         chain_execution_timeout: plan.defaults.chain_execution_timeout,
@@ -12644,7 +13338,7 @@ fn build_child_row<'p>(
         workflow_id: &plan.child_workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id,
-        input: child.input.clone().into(),
+        input: codecs.encode_column(&child.input)?.into(),
         parent_id: Some(parent_exec_id.as_uuid()),
         queue_name,
         execution_timeout: plan.defaults.execution_timeout,
@@ -12673,7 +13367,9 @@ fn build_child_row<'p>(
         start_source_ref: Some(parent_exec_id_str),
         started_by: None,
         quota_key: plan.child_quota_key.as_deref(),
-    }
+        // A child belongs to the tenant of its parent (issue #1977).
+        tenant: parent_execution.tenant.as_deref(),
+    })
 }
 
 /// Apply `max_workflow_attempts_ceiling` to a detached child's serialized retry
@@ -12741,11 +13437,14 @@ fn cross_shard_child_spec(
     // placement changes WHERE a child runs, never what it is.
     parent_close_policy: Option<crate::types::ParentClosePolicy>,
     trace_context: Option<TraceContextCarrier>,
+    // The parent's fairness key. The child inherits it (issue #1976).
+    parent_fairness_key: Option<&str>,
 ) -> HarvestResult<crate::cross_shard_child::CrossShardChildSpec> {
     let detached = parent_close_policy.is_some();
     let defaults = resolve_child_workflow_defaults(registry, workflow_name);
     let quota_key: Option<String> = defaults
         .quota
+        .filter(crate::quota::QuotaPolicy::uses_key)
         .and_then(|p| crate::quota::resolve_quota_key(p.key_expr, input));
     if let Some(key) = quota_key.as_deref()
         && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
@@ -12764,7 +13463,15 @@ fn cross_shard_child_spec(
         input: input.clone(),
         queue_name: parent_execution.queue_name.clone(),
         assigned_build_id: parent_execution.assigned_build_id.clone(),
-        context_headers: parent_execution.context_headers.clone(),
+        // The spec is one encoded cell. It holds the headers in plaintext, so
+        // an old-key envelope cannot hide inside it from the rotation census.
+        // The relay encodes them again for the child row (issue #2043).
+        context_headers: parent_execution
+            .context_headers
+            .as_ref()
+            .map(|stored| registry.payload_codecs().decode_column(stored))
+            .transpose()?,
+        tenant: parent_execution.tenant.clone(),
         owner: defaults.owner.map(str::to_string),
         runbook_url: defaults.runbook_url.map(str::to_string),
         severity: defaults.severity.map(str::to_string),
@@ -12800,6 +13507,10 @@ fn cross_shard_child_spec(
             defaults.retry_policy.as_deref().cloned()
         },
         trace_context,
+        fairness_key: crate::queue_fairness::fairness_key_for(
+            parent_fairness_key,
+            quota_key.as_deref(),
+        ),
         quota_key,
         quota: defaults
             .quota
@@ -12875,6 +13586,9 @@ fn resolve_child_workflow_defaults(
             w.quota,
         )
     });
+    // Issue #2387: an operator override wins over the declared value.
+    let (execution_timeout, sla) =
+        registry.apply_run_defaults(workflow_name, execution_timeout, sla);
     let execution_timeout = execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
     let sla = sla.and_then(|d| chrono::Duration::from_std(d).ok());
     let deadline_at = execution_timeout.map(|d| chrono::Utc::now() + d);
@@ -12916,7 +13630,7 @@ fn resolve_child_workflow_defaults(
 // Long by construction (and longer since #956 added the cross-shard early
 // return): the body is dominated by a wide, fully-explicit `NewWorkflowExecution`
 // literal, matching its `persist_all_started_child_workflows` twin.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn insert_awaited_child_execution(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -12924,6 +13638,8 @@ async fn insert_awaited_child_execution(
     parent_exec_id: ExecutionId,
     child: &StartedChildWorkflowCommand,
     trace_context: Option<TraceContextCarrier>,
+    // The parent's fairness key. A child inherits it (issue #1976).
+    parent_fairness_key: Option<&str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
@@ -12951,14 +13667,16 @@ async fn insert_awaited_child_execution(
             &child.input,
             None, // awaited child
             trace_context,
+            parent_fairness_key,
         )?;
-        return crate::cross_shard_child::record_cross_shard_child(
+        return crate::cross_shard_child::record_cross_shard_child_with_codecs(
             conn,
             parent_exec_id,
             child.child_id,
             &child.workflow_name,
             None, // awaited child
             &spec,
+            registry.payload_codecs(),
         )
         .await;
     }
@@ -12975,6 +13693,7 @@ async fn insert_awaited_child_execution(
     // continue-as-new/reset/workflow-level-retry.
     let child_quota_key: Option<String> = defaults
         .quota
+        .filter(crate::quota::QuotaPolicy::uses_key)
         .and_then(|p| crate::quota::resolve_quota_key(p.key_expr, &child.input));
     if let Some(key) = child_quota_key.as_deref()
         && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
@@ -12997,7 +13716,10 @@ async fn insert_awaited_child_execution(
         workflow_id: &child_workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id,
-        input: child.input.clone().into(),
+        input: registry
+            .payload_codecs()
+            .encode_column(&child.input)?
+            .into(),
         parent_id: Some(parent_exec_id.as_uuid()),
         queue_name: &queue_name,
         execution_timeout: defaults.execution_timeout,
@@ -13025,6 +13747,8 @@ async fn insert_awaited_child_execution(
         start_source_ref: Some(parent_exec_id_str.as_str()),
         started_by: None,
         quota_key: child_quota_key.as_deref(),
+        // A child belongs to the tenant of its parent (issue #1977).
+        tenant: parent_execution.tenant.as_deref(),
     };
     let child_started_event = WorkflowEvent::WorkflowStarted {
         input: child.input.clone(),
@@ -13033,12 +13757,19 @@ async fn insert_awaited_child_execution(
         last_error: None,
         scheduled_time: None, // child workflows are not scheduler-fired
     };
-    let mut params =
-        queue::EnqueueParams::new(queue_name.clone(), TaskType::Workflow, child.input.clone());
+    let mut params = queue::EnqueueParams::new(
+        queue_name.clone(),
+        TaskType::Workflow,
+        registry.payload_codecs().encode_column(&child.input)?,
+    );
     params.workflow_exec_id = Some(child.child_id.as_uuid());
+    // A child's workflow id is its execution id.
+    params = params.with_decision_partition(&child.child_id.to_string());
     params.required_build_id = parent_execution.assigned_build_id.clone();
     (params.concurrency_key, params.max_concurrent) =
         resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
+    params.fairness_key =
+        crate::queue_fairness::fairness_key_for(parent_fairness_key, child_quota_key.as_deref());
     params.trace_context = trace_context;
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -13109,6 +13840,8 @@ async fn persist_child_timeout_race(
     timer: &StartedTimerCommand,
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
+    // The parent's fairness key. A child inherits it (issue #1976).
+    parent_fairness_key: Option<&str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
@@ -13131,6 +13864,8 @@ async fn persist_child_timeout_race(
     let (deferred, had_wake_requested) =
         match Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             use crate::schema::harvest_task_queue::dsl as queue_dsl;
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             let telemetry = telemetry.clone();
             let execute_span = execute_span.clone();
 
@@ -13271,6 +14006,7 @@ async fn persist_child_timeout_race(
                     parent_exec_id,
                     child,
                     child_trace_ctx,
+                    parent_fairness_key,
                     resolved_router,
                 )
                 .await?;
@@ -13460,6 +14196,7 @@ async fn persist_mixed_suspension_batch(
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
     parent_priority: i32,
+    parent_fairness_key: Option<&str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
@@ -13518,6 +14255,7 @@ async fn persist_mixed_suspension_batch(
         execute_span,
         parent_execution.assigned_build_id.as_deref(),
         parent_priority,
+        parent_fairness_key,
         parent_execution.context_headers.as_ref(),
         &parent_execution.input,
     )?;
@@ -13529,6 +14267,8 @@ async fn persist_mixed_suspension_batch(
 
     let outcome = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
         use crate::schema::harvest_task_queue::dsl as queue_dsl;
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         let execute_span = owned_execute_span.clone();
         let telemetry = telemetry.clone();
 
@@ -13789,23 +14529,37 @@ async fn persist_mixed_suspension_batch(
                 exec_id,
                 child,
                 trace_ctx,
+                parent_fairness_key,
                 resolved_router,
             )
             .await?;
         }
 
+        // Issue #2000: a fork resolves each activity from its record here,
+        // before the session check, exactly as on the plain path.
+        let fork = crate::fork::serve_recorded_activities(
+            conn,
+            exec_id,
+            crate::fork::is_fork(parent_execution),
+            &scheduled_activity_ids(&batch.scheduled_activities),
+            &mut next_event_id,
+            registry,
+        )
+        .await?;
         // Worker sessions (issue #606): fail any member activity whose session
         // already left ACTIVE so the workflow observes SessionBroken on its next
         // decision cycle instead of hanging on a task pinned to a dead host.
-        let synthesized_broken_session_failure = fail_activities_for_broken_sessions(
+        let broken_session_failure = fail_activities_for_broken_sessions(
             conn,
             exec_id,
             &batch.scheduled_activities,
             &activity_task_ids,
+            &fork.settled,
             &mut next_event_id,
             registry.payload_codecs(),
         )
         .await?;
+        let synthesized_broken_session_failure = broken_session_failure || fork.served;
 
         // ── park ────────────────────────────────────────────────────────────
         let deadline = timer_fire_instants
@@ -14048,14 +14802,17 @@ pub async fn ingest_due_timers_and_signals(
         .unzip();
     let fired_timer_ids: Vec<TimerId> = timer_entries.iter().map(|(id, _)| id.clone()).collect();
 
+    // The payload column can hold an envelope (issue #1979). The
+    // `SignalReceived` event gets the plaintext, which the event codec then
+    // encodes once.
     let (signal_ids, signal_entries): (Vec<_>, Vec<_>) = pending_signals
         .into_iter()
         .map(|signal| {
-            (
-                signal.id,
-                (signal.signal_name, signal.payload, signal.received_at),
-            )
+            let payload = codecs.decode_column(&signal.payload)?;
+            Ok((signal.id, (signal.signal_name, payload, signal.received_at)))
         })
+        .collect::<HarvestResult<Vec<_>>>()?
+        .into_iter()
         .unzip();
     let signal_names: Vec<String> = signal_entries
         .iter()
@@ -14065,18 +14822,25 @@ pub async fn ingest_due_timers_and_signals(
     let events = merge_wake_events(timer_entries, signal_entries);
 
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
-        store::append_events_with_codecs(conn, exec_id, &events, next_event_id, codecs).await?;
-        if !timer_row_ids.is_empty() {
-            diesel::update(dsl::harvest_timers.filter(dsl::id.eq_any(&timer_row_ids)))
-                .set(dsl::fired.eq(true))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-        }
-        if !signal_ids.is_empty() {
-            signal::mark_signals_consumed(conn, &signal_ids).await?;
-        }
-        Ok(())
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
+        // Issue #2255: the rest is fenced, so the append fences nothing again.
+        let fenced = crate::decision_owner::conn_id(conn);
+        crate::decision_owner::fenced_scope(fenced, async {
+            store::append_events_with_codecs(conn, exec_id, &events, next_event_id, codecs).await?;
+            if !timer_row_ids.is_empty() {
+                diesel::update(dsl::harvest_timers.filter(dsl::id.eq_any(&timer_row_ids)))
+                    .set(dsl::fired.eq(true))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
+            if !signal_ids.is_empty() {
+                signal::mark_signals_consumed(conn, &signal_ids).await?;
+            }
+            Ok(())
+        })
+        .await
     }))
     .await?;
 
@@ -14347,6 +15111,8 @@ pub async fn fail_task_and_execution_with_history(
     // transaction), so this is safe to call unconditionally regardless of
     // caller context.
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         // Issue #1184 self-review finding: `Unavailable`/`Loaded` both touch
         // the execution row (directly here, or via `persist_workflow_failure`
         // below), and this function is reached from callers -- notably
@@ -14432,6 +15198,7 @@ pub async fn fail_task_and_execution_with_history(
             None,
             None,
             crate::types::Priority::default(),
+            None,
             codecs,
             // `metrics: None` above -- nothing can ever be collected here.
             &mut Vec::new(),
@@ -14464,9 +15231,19 @@ pub async fn finalize_activity_completion(
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
-    finalize_activity_completion_write(conn, task, exec_id, activity_id, output, offloader, codecs)
-        .await
-        .map(|_| ())
+    finalize_activity_completion_write(
+        conn,
+        task,
+        exec_id,
+        activity_id,
+        output,
+        offloader,
+        codecs,
+        None,
+        &[],
+    )
+    .await
+    .map(|_| ())
 }
 
 /// [`finalize_activity_completion`], and whether the completion applied
@@ -14474,6 +15251,11 @@ pub async fn finalize_activity_completion(
 ///
 /// It returns [`queue::ClaimWrite::LeaseLost`] when this attempt no longer
 /// owns the outcome: the claim is lost, or the activity is no longer pending.
+///
+/// `stored` is the result writer's reference (issue #1986). When it is set,
+/// history records it in place of `output`, and the transaction adds its
+/// `harvest_payload_refs` row.
+#[allow(clippy::too_many_arguments)]
 async fn finalize_activity_completion_write(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -14482,58 +15264,103 @@ async fn finalize_activity_completion_write(
     output: serde_json::Value,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
     codecs: &crate::payload_codec::PayloadCodecs,
+    stored: Option<&crate::fan_out::StoredResult>,
+    // Issue #1996: written after the event, in the same transaction.
+    llm_calls: &[crate::llm_ledger::LlmCall],
 ) -> HarvestResult<queue::ClaimWrite> {
     let Some(activity_name) = task.activity_name.as_deref() else {
         return Ok(queue::ClaimWrite::LeaseLost);
     };
-    let completion_event = WorkflowEvent::ActivityCompleted {
-        activity_id,
-        output: output.clone(),
+
+    // The row stores the result in the column form (issue #2043). Encode it
+    // before the transaction, so the execution lock and the claim lock are not
+    // held across the encode. A stored-result reference stays as it is.
+    let encoded_row_output = if stored.is_some() {
+        None
+    } else {
+        Some(queue::activity_row_output(codecs, &output, false)?)
     };
 
     let result = Box::pin(
         conn.transaction::<queue::ClaimWrite, HarvestError, _>(async |conn| {
-            let output = output.clone();
-            let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
-            if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
-                return Ok(queue::ClaimWrite::LeaseLost);
-            }
-            // A lost lease is a no-op, not an error (issue #1789). The later
-            // claim owns the outcome of this activity.
-            if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
-                log_lease_lost(task, "activity completion");
-                return Ok(queue::ClaimWrite::LeaseLost);
-            }
-            store::append_events_offloaded_with_codecs(
-                conn,
-                exec_id,
-                &[completion_event],
-                history.next_event_id,
-                offloader,
-                codecs,
-            )
-            .await?;
-            queue::complete_claimed_task(conn, &claim_of_task(task)?, output)
-                .await?
-                .require_applied(task.id)?;
-            // Worker sessions (issue #606): a session member activity's
-            // completion pushes the session's lease forward, so a
-            // long-running but still-legitimate pipeline isn't reclaimed by
-            // the broken-session scanner's `expires_at < NOW()` check just
-            // because its steps individually outlast one sticky-timeout
-            // window. `task.session_id` is `None` for both ordinary
-            // activities and the reserved acquire/release activities
-            // themselves (neither is dispatched through `Session::
-            // execute_activity`), so this is scoped to genuine members only.
-            if let Some(session_uuid) = task.session_id {
-                crate::sessions::refresh_session_lease(
+            // Issue #2125: the event and the wake stage once, with the stamp
+            // of the event insert.
+            crate::notify::coalesced(conn, async |conn| {
+                let mut output = output.clone();
+                let history =
+                    lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
+                if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
+                    return Ok(queue::ClaimWrite::LeaseLost);
+                }
+                // A lost lease is a no-op, not an error (issue #1789). The later
+                // claim owns the outcome of this activity.
+                if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
+                    log_lease_lost(task, "activity completion");
+                    return Ok(queue::ClaimWrite::LeaseLost);
+                }
+                // The blob is already in the store (issue #1986). Its reference
+                // row commits with the event, so retention can delete the blob.
+                if let Some(stored) = stored {
+                    store::insert_payload_refs(
+                        conn,
+                        exec_id,
+                        &[crate::payload_store::OffloadedRef {
+                            blob_key: stored.key.clone(),
+                            store_id: stored.store_id.clone(),
+                            byte_len: stored.len,
+                        }],
+                    )
+                    .await?;
+                    output = stored.to_recorded_value();
+                }
+                let completion_event = WorkflowEvent::ActivityCompleted {
+                    activity_id,
+                    output: output.clone(),
+                };
+                // A stored reference is already out of line. Ordinary offload
+                // would upload it again under a low threshold.
+                let offloader = offloader.filter(|_| stored.is_none());
+                store::append_events_offloaded_with_codecs(
                     conn,
-                    crate::types::SessionId::from_uuid(session_uuid),
+                    exec_id,
+                    &[completion_event],
+                    history.next_event_id,
+                    offloader,
+                    codecs,
                 )
                 .await?;
-            }
-            queue::wake_workflow_task(conn, exec_id).await?;
-            Ok(queue::ClaimWrite::Applied)
+                crate::llm_ledger::insert_ledger_rows(
+                    conn,
+                    exec_id,
+                    history.next_event_id,
+                    activity_name,
+                    llm_calls,
+                )
+                .await?;
+                let row_output = encoded_row_output.clone().unwrap_or_else(|| output.clone());
+                queue::complete_claimed_task(conn, &claim_of_task(task)?, row_output)
+                    .await?
+                    .require_applied(task.id)?;
+                // Worker sessions (issue #606): a session member activity's
+                // completion pushes the session's lease forward, so a
+                // long-running but still-legitimate pipeline isn't reclaimed by
+                // the broken-session scanner's `expires_at < NOW()` check just
+                // because its steps individually outlast one sticky-timeout
+                // window. `task.session_id` is `None` for both ordinary
+                // activities and the reserved acquire/release activities
+                // themselves (neither is dispatched through `Session::
+                // execute_activity`), so this is scoped to genuine members only.
+                if let Some(session_uuid) = task.session_id {
+                    crate::sessions::refresh_session_lease(
+                        conn,
+                        crate::types::SessionId::from_uuid(session_uuid),
+                    )
+                    .await?;
+                }
+                queue::wake_workflow_task(conn, exec_id).await?;
+                Ok(queue::ClaimWrite::Applied)
+            })
+            .await
         }),
     )
     .await;
@@ -14608,43 +15435,49 @@ async fn finalize_activity_failure_write(
     // workflow propagates the error.
     let result = Box::pin(
         conn.transaction::<queue::ClaimWrite, HarvestError, _>(async |conn| {
-            let error = error.to_string();
-            let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
-            if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
-                return Ok(queue::ClaimWrite::LeaseLost);
-            }
-            // A lost lease is a no-op, not an error (issue #1789).
-            if let queue::ClaimLock::Lost { state } = lock_activity_claim(conn, task).await? {
-                log_lease_lost(task, "activity failure");
-                // If the task reached COMPLETED before the handler returned
-                // (e.g. via run_transactional) and the handler then returned
-                // Err, the error is discarded — the workflow already observed
-                // ActivityCompleted.  Emit a warning so the misuse is visible.
-                if state.as_deref() == Some("COMPLETED") {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        activity_name = %activity_name,
-                        "activity handler returned Err but task is already COMPLETED \
-                         (run_transactional committed it); the error is discarded and \
-                         the workflow observes ActivityCompleted — run_transactional \
-                         must be the final expression in the activity handler"
-                    );
+            // Issue #2125: the event and the wake stage once, with the stamp
+            // of the event insert.
+            crate::notify::coalesced(conn, async |conn| {
+                let error = error.to_string();
+                let history =
+                    lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
+                if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
+                    return Ok(queue::ClaimWrite::LeaseLost);
                 }
-                return Ok(queue::ClaimWrite::LeaseLost);
-            }
-            store::append_events_with_codecs(
-                conn,
-                exec_id,
-                &[failed_event],
-                history.next_event_id,
-                codecs,
-            )
-            .await?;
-            queue::fail_claimed_task(conn, &claim_of_task(task)?, &error)
-                .await?
-                .require_applied(task.id)?;
-            queue::wake_workflow_task(conn, exec_id).await?;
-            Ok(queue::ClaimWrite::Applied)
+                // A lost lease is a no-op, not an error (issue #1789).
+                if let queue::ClaimLock::Lost { state } = lock_activity_claim(conn, task).await? {
+                    log_lease_lost(task, "activity failure");
+                    // If the task reached COMPLETED before the handler returned
+                    // (e.g. via run_transactional) and the handler then returned
+                    // Err, the error is discarded — the workflow already observed
+                    // ActivityCompleted.  Emit a warning so the misuse is visible.
+                    if state.as_deref() == Some("COMPLETED") {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            activity_name = %activity_name,
+                            "activity handler returned Err but task is already COMPLETED \
+                             (run_transactional committed it); the error is discarded and \
+                             the workflow observes ActivityCompleted — run_transactional \
+                             must be the final expression in the activity handler"
+                        );
+                    }
+                    return Ok(queue::ClaimWrite::LeaseLost);
+                }
+                store::append_events_with_codecs(
+                    conn,
+                    exec_id,
+                    &[failed_event],
+                    history.next_event_id,
+                    codecs,
+                )
+                .await?;
+                queue::fail_claimed_task(conn, &claim_of_task(task)?, &error)
+                    .await?
+                    .require_applied(task.id)?;
+                queue::wake_workflow_task(conn, exec_id).await?;
+                Ok(queue::ClaimWrite::Applied)
+            })
+            .await
         }),
     )
     .await;
@@ -14996,6 +15829,8 @@ pub async fn persist_child_workflow_completion(
 
     let (deferred, closed_children, tx_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             let output = output.clone();
             // Issue #1184: same task-row ownership recheck as
             // `persist_workflow_completion` -- see its guard for the
@@ -15007,8 +15842,15 @@ pub async fn persist_child_workflow_completion(
             }
             store::append_events_with_codecs(conn, exec_id, &[event], next_event_id, codecs)
                 .await?;
-            update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
-            queue::complete_task(conn, task_id, output.clone()).await?;
+            // The row and the task get the same stored form (issue #1979).
+            let stored_output = codecs.encode_column(&output)?;
+            update_workflow_execution_completed(conn, exec_id, worker_id, &stored_output).await?;
+            queue::complete_task(
+                conn,
+                &queue::TaskClaim::new(task_id, worker_id, attempt),
+                stored_output,
+            )
+            .await?;
             let (mut deferred, closed_children) =
                 apply_parent_close_cascade(conn, exec_id, codecs).await?;
             let mut tx_cancel_metrics = Vec::new();
@@ -15079,6 +15921,8 @@ pub async fn persist_child_workflow_failure(
 
     let (deferred, closed_children, tx_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             let raw_error = error.to_string();
             let message = decoded.message.clone();
             // Issue #1184: same task-row ownership recheck as
@@ -15241,6 +16085,8 @@ async fn create_detached_child_executions(
     parent_execution: &WorkflowExecution,
     commands: &[WorkflowCommand],
     execute_span: &tracing::Span,
+    // The parent's fairness key. A child inherits it (issue #1976).
+    parent_fairness_key: Option<&str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
@@ -15330,14 +16176,16 @@ async fn create_detached_child_executions(
                     { ATTR_SHARD_ID } = child_id.shard().as_i32(),
                 )
                 .in_scope(|| registry.telemetry().capture_trace_context()),
+                parent_fairness_key,
             )?;
-            crate::cross_shard_child::record_cross_shard_child(
+            crate::cross_shard_child::record_cross_shard_child_with_codecs(
                 conn,
                 ExecutionId::from_uuid(parent_execution.id),
                 *child_id,
                 workflow_name,
                 Some(*parent_close_policy),
                 &spec,
+                registry.payload_codecs(),
             )
             .await?;
             continue;
@@ -15382,6 +16230,9 @@ async fn create_detached_child_executions(
             }
             p
         });
+        // Issue #2387: an operator SLA override wins over the declared one. A
+        // detached child resolves no `execution_timeout`, so only the SLA applies.
+        let (_, child_sla) = registry.apply_run_defaults(workflow_name, None, child_sla);
         let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
         let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
         // A detached child accumulates its own history/DLQ/active-execution
@@ -15392,8 +16243,9 @@ async fn create_detached_child_executions(
         // continue-as-new/reset/workflow-level-retry. `ParentClosePolicy`
         // (#347) governs the detached child's *lifecycle*, not its *tenant
         // capacity*, so the two concerns are orthogonal.
-        let child_quota_key: Option<String> =
-            detached_quota.and_then(|p| crate::quota::resolve_quota_key(p.key_expr, input));
+        let child_quota_key: Option<String> = detached_quota
+            .filter(crate::quota::QuotaPolicy::uses_key)
+            .and_then(|p| crate::quota::resolve_quota_key(p.key_expr, input));
         if let Some(key) = child_quota_key.as_deref()
             && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
         {
@@ -15418,7 +16270,7 @@ async fn create_detached_child_executions(
             workflow_id: &child_workflow_id,
             run_id: uuid::Uuid::new_v4(),
             shard_id: parent_execution.shard_id,
-            input: input.clone().into(),
+            input: registry.payload_codecs().encode_column(input)?.into(),
             parent_id: Some(parent_execution.id),
             queue_name: &parent_execution.queue_name,
             execution_timeout: None,
@@ -15447,6 +16299,8 @@ async fn create_detached_child_executions(
             start_source_ref: Some(parent_exec_id_str.as_str()),
             started_by: None,
             quota_key: child_quota_key.as_deref(),
+            // A detached child belongs to the tenant of its parent (issue #1977).
+            tenant: parent_execution.tenant.as_deref(),
         };
 
         diesel::insert_into(harvest_workflow_executions::table)
@@ -15504,12 +16358,17 @@ async fn create_detached_child_executions(
         let mut params = queue::EnqueueParams::new(
             parent_execution.queue_name.clone(),
             TaskType::Workflow,
-            input.clone(),
+            registry.payload_codecs().encode_column(input)?,
         );
         params.workflow_exec_id = Some(child_id.as_uuid());
+        params = params.with_decision_partition(&child_workflow_id);
         params.required_build_id = parent_execution.assigned_build_id.clone();
         (params.concurrency_key, params.max_concurrent) =
             resolve_workflow_concurrency(registry, workflow_name, input);
+        params.fairness_key = crate::queue_fairness::fairness_key_for(
+            parent_fairness_key,
+            child_quota_key.as_deref(),
+        );
         params.trace_context = tracing::info_span!(
             parent: execute_span,
             "harvest.child_workflow.start",
@@ -15813,6 +16672,21 @@ async fn record_schedule_to_close_activity_timeout(
     .await
 }
 
+/// Log the LLM calls an activity recorded after its transactional commit.
+///
+/// The commit already wrote the completion, so the engine drops these calls
+/// (issue #1996).
+fn warn_llm_calls_after_commit(activity_name: &str, dropped: usize) {
+    if dropped > 0 {
+        tracing::warn!(
+            activity = activity_name,
+            dropped,
+            "LLM calls recorded after run_transactional committed are not in the ledger; \
+             record them before the commit"
+        );
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_activity_result(
@@ -15831,13 +16705,41 @@ async fn handle_activity_result(
     // Issue #1243: configured codecs, so this write encodes under the
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // Issue #1986: whether the row asks for a result writer.
+    result_writer: bool,
+    // Issue #1986: the result writer's reference, written before the call.
+    stored: Option<&crate::fan_out::StoredResult>,
+    // Issue #1996: the LLM calls a completion writes with its event.
+    llm_calls: &[crate::llm_ledger::LlmCall],
 ) -> HarvestResult<queue::ClaimWrite> {
     match activity_result {
+        // Issue #1986: a writer row that this worker cannot write records the
+        // value inline. A value that carries the reserved key would then read
+        // as a reference, so it fails instead (compare issue #1758).
+        Ok(output)
+            if stored.is_none()
+                && result_writer
+                && output.get(crate::fan_out::STORED_RESULT_KEY).is_some() =>
+        {
+            use crate::failure::IntoActivityErrorString as _;
+            let error = crate::failure::ActivityFailure::non_retryable(
+                "ReservedResultKey",
+                format!(
+                    "activity '{activity_name_for_cap}' result carries the reserved key \
+                     '{}' and this worker has no PayloadStore to write it",
+                    crate::fan_out::STORED_RESULT_KEY
+                ),
+            )
+            .into_error_payload();
+            finalize_activity_failure_write(conn, task, exec_id, activity_id, &error, codecs).await
+        }
         Ok(output) => {
             let observed_bytes = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
             // Issue #524: an over-threshold result will be offloaded into a tiny
             // reference envelope, so it does not trip the #252 result cap.
-            let offload_applies = offloader.is_some_and(|o| observed_bytes > o.threshold());
+            // Issue #1986: a stored result is already out of line.
+            let offload_applies =
+                stored.is_some() || offloader.is_some_and(|o| observed_bytes > o.threshold());
             if max_result_bytes > 0 && observed_bytes > max_result_bytes && !offload_applies {
                 use crate::failure::IntoActivityErrorString as _;
                 let error = crate::failure::ActivityFailure::non_retryable(
@@ -15866,6 +16768,8 @@ async fn handle_activity_result(
                 output,
                 offloader,
                 codecs,
+                stored,
+                llm_calls,
             )
             .await
         }
@@ -15989,6 +16893,9 @@ pub async fn write_activity_result_for_task(
         &crate::telemetry::NoOpMetrics,
         crate::builder::DEFAULT_RETRY_AFTER_CEILING,
         codecs,
+        task_writes_result(task, codecs),
+        None,
+        &[],
     )
     .await
 }
@@ -16335,6 +17242,20 @@ fn is_worker_local_failure(error_type: &str) -> bool {
         crate::failure::ERROR_TYPE_WASM_TRAP,
         crate::failure::ERROR_TYPE_SANDBOX_DENIED,
         crate::failure::ERROR_TYPE_WASM_OUTPUT_TOO_LARGE,
+        crate::failure::ERROR_TYPE_WASM_JOURNAL_DIVERGENCE,
+    ]
+    .contains(&error_type)
+    {
+        return true;
+    }
+    // A sandbox fault, such as a host without KVM or a broken guest, is not
+    // pressure from a dependency either.
+    #[cfg(feature = "sandbox-activities")]
+    if [
+        crate::failure::ERROR_TYPE_SANDBOX_DENIED,
+        crate::failure::ERROR_TYPE_SANDBOX_UNAVAILABLE,
+        crate::failure::ERROR_TYPE_SANDBOX_PROTOCOL_VIOLATION,
+        crate::failure::ERROR_TYPE_SANDBOX_CANCELLED,
     ]
     .contains(&error_type)
     {
@@ -16700,6 +17621,7 @@ mod adaptive_limit_gate_tests {
             crate::failure::ERROR_TYPE_WASM_TRAP,
             crate::failure::ERROR_TYPE_SANDBOX_DENIED,
             crate::failure::ERROR_TYPE_WASM_OUTPUT_TOO_LARGE,
+            crate::failure::ERROR_TYPE_WASM_JOURNAL_DIVERGENCE,
         ] {
             assert_eq!(
                 limit_sample_outcome(
@@ -17471,6 +18393,72 @@ async fn record_session_acquire_schedule_to_start_timeout(
     crate::dispatch::settle_scope(result).await
 }
 
+/// The session id in a session task's input (issue #2043).
+///
+/// A new row keeps the id as it is. The decode only serves a row that holds a
+/// column form. An input that does not decode is not a valid session id.
+fn session_id_of_input(
+    input: &serde_json::Value,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> Option<crate::types::SessionId> {
+    codecs
+        .decode_column(input)
+        .ok()?
+        .as_str()?
+        .parse::<crate::types::SessionId>()
+        .ok()
+}
+
+#[cfg(test)]
+mod session_input_tests {
+    use super::session_id_of_input;
+    use crate::aead_codec::{AeadCodec, DataKey};
+    use crate::payload_codec::PayloadCodecs;
+    use crate::types::SessionId;
+    use serde_json::json;
+
+    fn aead_codecs() -> PayloadCodecs {
+        let codecs = PayloadCodecs::default();
+        let key = DataKey::from_bytes(&[0x21; 32]).expect("key");
+        AeadCodec::new("k1", &key)
+            .expect("codec")
+            .register_with(&codecs)
+            .expect("register");
+        codecs.set_column_encoding(true);
+        codecs
+    }
+
+    #[test]
+    fn a_clear_session_id_reads_back() {
+        let id = SessionId::new();
+        let input = json!(id.as_uuid().to_string());
+        assert_eq!(session_id_of_input(&input, &aead_codecs()), Some(id));
+    }
+
+    #[test]
+    fn an_encoded_session_id_reads_back() {
+        let codecs = aead_codecs();
+        let id = SessionId::new();
+        let stored = codecs
+            .encode_column(&json!(id.as_uuid().to_string()))
+            .expect("encode");
+        assert_eq!(session_id_of_input(&stored, &codecs), Some(id));
+    }
+
+    #[test]
+    fn an_input_that_does_not_decode_is_not_a_session_id() {
+        let id = SessionId::new();
+        let stored = aead_codecs()
+            .encode_column(&json!(id.as_uuid().to_string()))
+            .expect("encode");
+        assert_eq!(
+            session_id_of_input(&stored, &PayloadCodecs::default()),
+            None
+        );
+        assert_eq!(session_id_of_input(&json!(7), &aead_codecs()), None);
+    }
+}
+
 /// Handle the internal session-acquire activity (issue #606) -- see the
 /// interception in [`process_activity_task`].
 ///
@@ -17518,11 +18506,7 @@ async fn handle_session_acquire(
     };
     let activity_id = ActivityExecId::from_uuid(activity_uuid);
 
-    let Some(session_id) = task
-        .input
-        .as_str()
-        .and_then(|s| s.parse::<crate::types::SessionId>().ok())
-    else {
+    let Some(session_id) = session_id_of_input(&task.input, codecs) else {
         let error = "session-acquire task input is not a valid SessionId".to_string();
         fail_task_and_execution(&mut conn, task, worker_id, &error, codecs).await?;
         return Err(HarvestError::Config(error));
@@ -17704,17 +18688,37 @@ async fn handle_session_acquire(
         crate::telemetry::SessionAcquisitionOutcome::Acquired,
     );
     let output = serde_json::json!(actual_host);
-    finalize_activity_completion_write(&mut conn, task, exec_id, activity_id, output, None, codecs)
-        .await
-        .map(Some)
+    finalize_activity_completion_write(
+        &mut conn,
+        task,
+        exec_id,
+        activity_id,
+        output,
+        None,
+        codecs,
+        None,
+        &[],
+    )
+    .await
+    .map(Some)
 }
+
+/// How long a drop release waits before it checks again for a live member of
+/// its session (issue #2193).
+const SESSION_DROP_RELEASE_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Handle the internal session-release activity (issue #606), dispatched by
 /// [`crate::context::Session::complete`] and hard-pinned to the session's
-/// host worker.
+/// host worker. A dropped [`crate::context::Session`] dispatches the same
+/// handler under another name (issue #2193).
 ///
 /// Marks the `harvest_sessions` row `COMPLETED` and frees the in-process
 /// slot before completing the task normally.
+///
+/// A drop release first checks for a member task of the session that is
+/// still `PENDING` or `RUNNING`. If one exists, the release goes back to the
+/// queue for [`SESSION_DROP_RELEASE_RETRY_DELAY`] and the session keeps its
+/// slot (issue #2193). It returns `Ok(None)`, as any deferral does.
 async fn handle_session_release(
     pool: &DbPool,
     task: &TaskQueueItem,
@@ -17738,15 +18742,54 @@ async fn handle_session_release(
     };
     let activity_id = ActivityExecId::from_uuid(activity_uuid);
 
-    let Some(session_id) = task
-        .input
-        .as_str()
-        .and_then(|s| s.parse::<crate::types::SessionId>().ok())
-    else {
+    // No body awaits a drop release (issue #2193). A permanent error fails the
+    // task only, so a failed cleanup cannot fail a healthy run.
+    let best_effort =
+        task.activity_name.as_deref() == Some(crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME);
+
+    let Some(session_id) = session_id_of_input(&task.input, codecs) else {
         let error = "session-release task input is not a valid SessionId".to_string();
+        if best_effort {
+            return fail_task_only(&mut conn, task.id, &error)
+                .await
+                .map(|()| None);
+        }
         fail_task_and_execution(&mut conn, task, worker_id, &error, codecs).await?;
         return Err(HarvestError::Config(error));
     };
+
+    // A dropped owner can leave a member task queued or running (issue #2193).
+    // The release must not free the slot while that member can still run, so
+    // it goes back to the queue. The release that `complete()` awaits keeps
+    // its behavior.
+    if best_effort {
+        let live = match queue::session_has_other_live_tasks(
+            &mut conn,
+            exec_id.as_uuid(),
+            session_id.as_uuid(),
+            task.id,
+        )
+        .await
+        {
+            Ok(live) => live,
+            Err(error) if crate::pool::is_transient_db_error(&error) => return Err(error),
+            Err(error) => {
+                return fail_task_only(&mut conn, task.id, &error.to_string())
+                    .await
+                    .map(|()| None);
+            }
+        };
+        if live {
+            defer_unstarted_claim(
+                &mut conn,
+                task,
+                SESSION_DROP_RELEASE_RETRY_DELAY,
+                "session drop-release deferral",
+            )
+            .await?;
+            return Ok(None);
+        }
+    }
 
     if let Err(error) = crate::sessions::record_session_completed(&mut conn, session_id).await {
         // A transient failure (issue #1788) wrote nothing. Return it, and the
@@ -17755,6 +18798,11 @@ async fn handle_session_release(
             return Err(error);
         }
         let msg = error.to_string();
+        if best_effort {
+            return fail_task_only(&mut conn, task.id, &msg)
+                .await
+                .map(|()| None);
+        }
         fail_task_and_execution(&mut conn, task, worker_id, &msg, codecs).await?;
         return Err(error);
     }
@@ -17765,9 +18813,19 @@ async fn handle_session_release(
     crate::sessions::release_session_slot(session_slots_in_use, session_id);
 
     let output = serde_json::Value::Null;
-    finalize_activity_completion_write(&mut conn, task, exec_id, activity_id, output, None, codecs)
-        .await
-        .map(Some)
+    finalize_activity_completion_write(
+        &mut conn,
+        task,
+        exec_id,
+        activity_id,
+        output,
+        None,
+        codecs,
+        None,
+        &[],
+    )
+    .await
+    .map(Some)
 }
 
 /// Settle the local slot of a session acquire that failed on a transient
@@ -18136,6 +19194,107 @@ pub async fn handle_session_acquire_for_test(
     .map(|_| ())
 }
 
+/// Why an attempt ends before its handler runs.
+struct PreHandlerFailure {
+    /// The metric label.
+    error_type: &'static str,
+    /// Whether the retry policy skips this failure.
+    non_retryable: bool,
+    /// The failure text that the result carries.
+    payload: String,
+}
+
+/// Where a failed attempt reports its outcome (issue #1815).
+struct ActivityOutcomeSinks<'a> {
+    task_outcomes: &'a crate::worker_outlier::TaskOutcomeWindow,
+    deferred_failure: &'a DeferredActivityFailure,
+    outlier_clock: std::time::Instant,
+}
+
+/// End an attempt that fails before its handler runs.
+///
+/// The circuit breaker and a bad stored payload both use it. It records the
+/// failure metrics, writes the result, and reports the outcome.
+///
+/// `ActivityStarted` is already committed, and a start is not idempotent.
+/// So the write uses the same retries as a handler result (issue #1788). A
+/// released claim would append a second start. A rejection whose claim a later
+/// owner took is skipped, as for any attempt.
+async fn fail_attempt_before_handler(
+    pool: &DbPool,
+    registry: &HandlerRegistry,
+    attempt: &ActivityAttempt<'_>,
+    build_id: &str,
+    failure: PreHandlerFailure,
+    sinks: &ActivityOutcomeSinks<'_>,
+) -> HarvestResult<()> {
+    let PreHandlerFailure {
+        error_type,
+        non_retryable,
+        payload,
+    } = failure;
+    let ActivityAttempt {
+        task,
+        worker_id,
+        activity_name,
+        ..
+    } = *attempt;
+    let telemetry = registry.telemetry().clone();
+    let build_label = crate::telemetry::build_id_label(build_id);
+    let build_label = build_label.as_ref();
+    telemetry.metrics.record_activity_completed_for_build(
+        activity_name,
+        &task.queue_name,
+        build_label,
+        0.0,
+        ActivityStatus::Failed,
+        Some(error_type),
+    );
+    // The label follows the retry decision, as for a handler failure. It
+    // honours the typed flag and the policy's `non_retryable_errors` list. A
+    // policy that does not load leaves the typed flag.
+    let retry_policy =
+        retry_policy_or_fail_task(pool, task, worker_id, registry.payload_codecs()).await;
+    let non_retryable = non_retryable
+        || failure_is_non_retryable(
+            &payload,
+            retry_policy.as_ref().ok().and_then(Option::as_ref),
+        );
+    telemetry
+        .metrics
+        .record_activity_failed(activity_name, "", error_type, non_retryable);
+    telemetry.metrics.record_activity_attempt_for_build(
+        activity_name,
+        &task.queue_name,
+        build_label,
+        ActivityStatus::Failed,
+    );
+    let finalized = match retry_policy {
+        Ok(retry_policy) => {
+            write_activity_result(
+                pool,
+                registry,
+                attempt,
+                retry_policy.as_ref(),
+                &Err(payload),
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    let write = finalize_write_for_outcome(&finalized);
+    if let Some(failed) = activity_attempt_outcome(ActivityStatus::Failed, false, write, false) {
+        record_activity_outcome(
+            sinks.task_outcomes,
+            sinks.deferred_failure,
+            sinks.outlier_clock,
+            failed,
+            finalized.as_ref().err(),
+        );
+    }
+    finalized.map(|_| ())
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn process_activity_task(
     pool: &DbPool,
@@ -18191,7 +19350,9 @@ async fn process_activity_task(
             )
             .await,
         )
-    } else if activity_name == crate::context::SESSION_RELEASE_ACTIVITY_NAME {
+    } else if activity_name == crate::context::SESSION_RELEASE_ACTIVITY_NAME
+        || activity_name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME
+    {
         Some(
             handle_session_release(
                 pool,
@@ -18308,6 +19469,10 @@ async fn process_activity_task(
                         .telemetry()
                         .metrics
                         .record_activity_concurrency_deferred(activity_name);
+                    // Wake an idle poll loop when the row is due again.
+                    registry
+                        .adaptive_limits()
+                        .wake_when_deferral_due(retry_after);
                 }
                 return Ok(());
             }
@@ -18600,6 +19765,16 @@ async fn process_activity_task(
         ) + dispatched_at.elapsed().as_secs_f64(),
     );
 
+    let attempt = ActivityAttempt {
+        task,
+        exec_id,
+        activity_id,
+        worker_id,
+        activity_name,
+        llm_calls: &[],
+        // A failure written before the handler runs stores no result.
+        result_writer: false,
+    };
     if let crate::circuit_breaker::DispatchDecision::ShortCircuit {
         opened_at,
         retry_after,
@@ -18609,69 +19784,71 @@ async fn process_activity_task(
         let payload =
             crate::failure::ActivityFailure::circuit_open(activity_name, opened_at, retry_after)
                 .into_error_payload();
-        let telemetry = registry.telemetry().clone();
-        let build_label = crate::telemetry::build_id_label(build_id);
-        let build_label = build_label.as_ref();
-        telemetry.metrics.record_activity_completed_for_build(
-            activity_name,
-            &task.queue_name,
-            build_label,
-            0.0,
-            ActivityStatus::Failed,
-            Some(crate::failure::ERROR_TYPE_CIRCUIT_OPEN),
-        );
-        telemetry.metrics.record_activity_failed(
-            activity_name,
-            "",
-            crate::failure::ERROR_TYPE_CIRCUIT_OPEN,
-            true,
-        );
-        telemetry.metrics.record_activity_attempt_for_build(
-            activity_name,
-            &task.queue_name,
-            build_label,
-            ActivityStatus::Failed,
-        );
-        // `ActivityStarted` is already committed, and a start is not
-        // idempotent. So this write uses the same retries as a handler result
-        // (issue #1788). A released claim would append a second start.
-        let finalized = async {
-            let retry_policy =
-                retry_policy_or_fail_task(pool, task, worker_id, registry.payload_codecs()).await?;
-            let attempt = ActivityAttempt {
-                task,
-                exec_id,
-                activity_id,
-                worker_id,
-                activity_name,
-            };
-            write_activity_result(
-                pool,
-                registry,
-                &attempt,
-                retry_policy.as_ref(),
-                &Err(payload),
-            )
-            .await
-        }
-        .await;
-        // Issue #1815: a breaker is per worker, so a rejected attempt counts as
-        // a failure. Otherwise the ratio would improve while the worker rejects
-        // work. A rejection whose claim a later owner took is skipped, as for
-        // any attempt.
-        let write = finalize_write_for_outcome(&finalized);
-        if let Some(failed) = activity_attempt_outcome(ActivityStatus::Failed, false, write, false)
-        {
-            record_activity_outcome(
+        // Issue #1815: a breaker is per worker, so a rejected attempt counts
+        // as a failure. Otherwise the ratio would improve while the worker
+        // rejects work.
+        return fail_attempt_before_handler(
+            pool,
+            registry,
+            &attempt,
+            build_id,
+            PreHandlerFailure {
+                error_type: crate::failure::ERROR_TYPE_CIRCUIT_OPEN,
+                non_retryable: true,
+                payload,
+            },
+            &ActivityOutcomeSinks {
                 task_outcomes,
                 deferred_failure,
                 outlier_clock,
-                failed,
-                finalized.as_ref().err(),
-            );
-        }
-        return finalized.map(|_| ());
+            },
+        )
+        .await;
     }
+
+    // The row stores the input and the last checkpoint as the column form
+    // (issue #2043). The handler gets the plain values. A value that does not
+    // decode fails the attempt. The retry policy then applies, and an
+    // operator can restore the key.
+    let codecs = registry.payload_codecs();
+    let decoded = codecs.decode_column(&task.input).and_then(|input| {
+        let checkpoint = codecs.decode_column_opt(task.heartbeat_details.as_ref())?;
+        let headers = codecs.decode_headers_opt(task.context_headers.as_ref())?;
+        Ok((input, checkpoint, headers))
+    });
+    let (handler_input, previous_checkpoint, activity_headers) = match decoded {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            use crate::failure::IntoActivityErrorString as _;
+            tracing::warn!(
+                task_id = %task.id,
+                error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                "activity payload could not be decoded"
+            );
+            let payload = crate::failure::ActivityFailure::retryable(
+                crate::failure::ERROR_TYPE_PAYLOAD_DECODE_FAILED,
+                "the stored activity input, checkpoint or headers could not be decoded",
+            )
+            .into_error_payload();
+            return fail_attempt_before_handler(
+                pool,
+                registry,
+                &attempt,
+                build_id,
+                PreHandlerFailure {
+                    error_type: crate::failure::ERROR_TYPE_PAYLOAD_DECODE_FAILED,
+                    non_retryable: false,
+                    payload,
+                },
+                &ActivityOutcomeSinks {
+                    task_outcomes,
+                    deferred_failure,
+                    outlier_clock,
+                },
+            )
+            .await;
+        }
+    };
 
     // The context token is a child of the flusher token. A lost lease
     // cancels both. A drain cancels the context alone, so a handler that
@@ -18679,7 +19856,7 @@ async fn process_activity_task(
     let heartbeat_stop = CancellationToken::new();
     let cancel = heartbeat_stop.child_token();
     let activity_claim = claim_of_task(task)?;
-    let heartbeat_tx = crate::heartbeat::spawn_heartbeat_flusher_with(
+    let heartbeat_tx = crate::heartbeat::spawn_heartbeat_flusher_with_codecs(
         activity_claim.clone(),
         pool.clone(),
         heartbeat_stop.clone(),
@@ -18688,27 +19865,17 @@ async fn process_activity_task(
             metrics: Arc::clone(&registry.telemetry().metrics),
             shards: Arc::clone(pool_labels),
         },
+        codecs.clone(),
     );
     let trace_carrier = task
         .trace_context
         .as_ref()
         .and_then(TraceContextCarrier::from_json);
-    let activity_context_headers = task
-        .context_headers
-        .as_ref()
-        .and_then(|v| {
-            match serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()) {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to deserialize activity context headers; propagating empty map");
-                    None
-                }
-            }
-        })
-        .map_or_else(
-            || std::sync::Arc::new(std::collections::HashMap::new()),
-            std::sync::Arc::new,
-        );
+    // Read the writer marker from the decoded headers, once for the attempt.
+    let result_writer = activity_headers
+        .get(crate::fan_out::RESULT_WRITER_HEADER)
+        .is_some_and(|value| value == "1");
+    let activity_context_headers = std::sync::Arc::new(activity_headers);
     // Issue #783: identity is resolved from the row `append_activity_started_if_pending`
     // already locked (no extra query) plus the claimed task row.
     let activity_identity = ActivityIdentity::new(
@@ -18721,7 +19888,7 @@ async fn process_activity_task(
     let ctx = ActivityContext::new_with_cancellation_check(
         registry.shared_state(),
         Some(heartbeat_tx.into()),
-        task.heartbeat_details.clone(),
+        previous_checkpoint,
         cancel.clone(),
         activity_claim.clone(),
         pool.clone(),
@@ -18769,6 +19936,8 @@ async fn process_activity_task(
             activity_id,
             claim: activity_claim.clone(),
             max_result_bytes: effective_result_cap,
+            result_writer,
+            offloader: registry.payload_offloader_arc(),
         });
 
     let telemetry = registry.telemetry().clone();
@@ -18981,7 +20150,7 @@ async fn process_activity_task(
                 activity_interceptors,
                 &invocation,
                 &ctx,
-                task.input.clone(),
+                handler_input,
                 // `move` captures the resolved dispatch; it does NOT borrow
                 // `&ctx`, so it composes with the chain's own `&ctx` borrow. The
                 // explicit return type unifies the two `Box::pin` arms.
@@ -19021,7 +20190,7 @@ async fn process_activity_task(
                 activity_interceptors,
                 &invocation,
                 &ctx,
-                task.input.clone(),
+                handler_input,
                 |input| (activity_handler)(&ctx, input),
             )
         }),
@@ -19034,7 +20203,7 @@ async fn process_activity_task(
                 activity_interceptors,
                 &invocation,
                 &ctx,
-                task.input.clone(),
+                handler_input,
                 |input| (activity_handler)(&ctx, input),
             )
         })
@@ -19084,6 +20253,12 @@ async fn process_activity_task(
     // `heartbeat_stop.cancel()` below.
     let was_cancelled = cancel.is_cancelled();
 
+    // A result nested past the depth cap becomes a non-retryable failure (issue
+    // #2225). `serde_json` cannot read it back from the history, the offloader
+    // blob or the result writer. So the check runs before the byte cap and
+    // before any upload. It also runs when the byte cap is off.
+    let activity_result = crate::payload_depth::refuse_deep_result(activity_name, activity_result);
+
     // Pre-normalize oversized results to non-retryable failures BEFORE emitting
     // metrics so that an Ok result above the cap is counted as Failed, not Completed.
     // Issue #524: skip the cap when the offloader will handle the large payload —
@@ -19092,9 +20267,10 @@ async fn process_activity_task(
     let activity_result = match activity_result {
         Ok(output) if effective_result_cap > 0 => {
             let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
+            // Issue #1986: the result writer moves every result to the store.
             let offload_applies = registry
                 .payload_offloader()
-                .is_some_and(|o| observed > o.threshold());
+                .is_some_and(|o| observed > o.threshold() || result_writer);
             if observed > effective_result_cap && !offload_applies {
                 use crate::failure::IntoActivityErrorString as _;
                 let error = crate::failure::ActivityFailure::non_retryable(
@@ -19126,6 +20302,18 @@ async fn process_activity_task(
     // resolved. On non-`db` builds `run_transactional` does not exist, so the
     // flag is always false.
     let committed_transactionally = ctx.transactional_commit_occurred();
+    // Issue #1996: a completion writes the recorded LLM calls with its event.
+    // A failure drops them. A transactional commit already wrote its calls,
+    // so a call left in the slot came after the commit.
+    let llm_calls = ctx.take_llm_calls();
+    let llm_calls = if committed_transactionally {
+        warn_llm_calls_after_commit(activity_name, llm_calls.len());
+        Vec::new()
+    } else if activity_result.is_ok() {
+        llm_calls
+    } else {
+        Vec::new()
+    };
     // The adaptive limit reads a timeout as overload (issue #1836).
     let attempt_deadline = ctx.deadline();
 
@@ -19448,6 +20636,8 @@ async fn process_activity_task(
         activity_id,
         worker_id,
         activity_name,
+        llm_calls: &llm_calls,
+        result_writer,
     };
     let finalized = write_activity_result(
         pool,
@@ -19644,6 +20834,14 @@ struct ActivityAttempt<'a> {
     activity_id: ActivityExecId,
     worker_id: &'a str,
     activity_name: &'a str,
+    /// The LLM calls the attempt recorded (issue #1996). A completion
+    /// writes them with its event. A failure drops them.
+    llm_calls: &'a [crate::llm_ledger::LlmCall],
+    /// Whether the row asks the worker to write the result (issue #1986).
+    /// The attempt decodes the headers once and carries the answer here. A
+    /// later decode that fails cannot turn a writer row into a plain one
+    /// (issue #2043).
+    result_writer: bool,
 }
 
 /// Write the result of an activity attempt that has started (issue #1788).
@@ -19677,6 +20875,8 @@ async fn write_activity_result(
         activity_id,
         worker_id,
         activity_name,
+        llm_calls,
+        result_writer,
     } = *attempt_of;
     let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
     // A handler failure and an inline output upload nothing. The count
@@ -19686,6 +20886,22 @@ async fn write_activity_result(
         .map(crate::payload_store::PayloadOffloader::counting_uploads);
     let offloader = counted.as_ref().map(|(offloader, _)| offloader);
     let uploaded = || counted.as_ref().is_some_and(|(_, uploads)| uploads.any());
+    // Issue #1986: write the result once, before any lock is taken. Each try
+    // then records the same reference and uploads nothing, so the repeats stay
+    // safe. A lost claim leaves one blob without a reference row, as a
+    // rolled-back offload does.
+    let stored = match (activity_result, registry.payload_offloader()) {
+        (Ok(output), Some(offloader)) if result_writer => Some(
+            crate::fan_out::StoredResult::write(
+                offloader.store().as_ref(),
+                registry.payload_codecs(),
+                activity_id,
+                output,
+            )
+            .await?,
+        ),
+        _ => None,
+    };
     let mut attempt = 1;
     loop {
         let outcome = handle_activity_result(
@@ -19702,6 +20918,9 @@ async fn write_activity_result(
             registry.telemetry().metrics.as_ref(),
             registry.retry_after_ceiling,
             registry.payload_codecs(),
+            result_writer,
+            stored.as_ref(),
+            llm_calls,
         )
         .await;
         match outcome {
@@ -19771,6 +20990,8 @@ async fn persist_scheduled_external_activity(
         let token = scheduled.token;
         let registry = detached_spawns.registry;
         let deferred = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             let locked = external_task::find_by_token_locked(conn, token).await?;
 
             // Recompute the event offset inside the transaction: external
@@ -19844,6 +21065,8 @@ async fn persist_scheduled_external_activity(
     let registry = detached_spawns.registry;
     let (deferred, had_wake_requested) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             // Cancellable/renewable timer bookkeeping (issue #768): resolve
             // ArmTimer/CancelTimer row mutations FIRST, then build the event
             // list in command emission order so ScheduleExternalActivity's
@@ -19924,6 +21147,8 @@ async fn persist_bookkeeping_and_requeue_workflow(
     let registry = detached_spawns.registry;
 
     let deferred = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         // Cancellable/renewable timer bookkeeping (issue #768): resolve
         // the ArmTimer/CancelTimer row mutations FIRST, then interleave
         // their TimerStarted/TimerCancelled events into the suspension
@@ -20026,6 +21251,7 @@ pub async fn apply_race_loser_cancellations(
 
     for cmd in commands {
         let WorkflowCommand::CancelRaceLosers {
+            reason,
             activities,
             children,
             timers,
@@ -20040,11 +21266,12 @@ pub async fn apply_race_loser_cancellations(
             // terminal event already exists (or is about to be appended by
             // that in-flight completion write) and must not be duplicated.
             if let Some((activity_name, queue_name)) =
-                queue::cancel_activity_task(conn, *activity_id).await?
+                queue::cancel_activity_task_with_reason(conn, *activity_id, reason.message())
+                    .await?
             {
                 synthetic_events.push(WorkflowEvent::ActivityFailed {
                     activity_id: *activity_id,
-                    error: "lost race to a sibling branch".to_string(),
+                    error: reason.message().to_string(),
                     attempt: 1,
                     error_type: "Error".to_string(),
                     non_retryable: true,
@@ -20087,14 +21314,20 @@ pub async fn apply_race_loser_cancellations(
             // inline exactly as it was before this feature existed, touching no
             // new table.
             if crate::worker::parent_is_on_another_shard(conn, exec_id, *child_id).await?
-                && crate::cross_shard_child::request_cross_shard_cancel(conn, *child_id).await? > 0
+                && crate::cross_shard_child::request_cross_shard_cancel(
+                    conn,
+                    *child_id,
+                    Some(reason.message()),
+                )
+                .await?
+                    > 0
             {
                 continue;
             }
             match crate::execution::cancel_workflow_execution_collect(
                 conn,
                 *child_id,
-                "lost race to a sibling branch",
+                reason.message(),
                 Some(metrics.as_ref()),
             )
             .await
@@ -20753,6 +21986,19 @@ async fn handle_suspended_workflow(
         )
         .await;
     }
+    // Store durable stream chunks (issue #1974). An error fails the cycle.
+    if let Err(e) =
+        persist_durable_stream_from_commands(conn, context.persistence.exec_id, commands).await
+    {
+        return fail_execution_on_error(
+            conn,
+            context.persistence.task,
+            context.persistence.worker_id,
+            Err(e),
+            registry.payload_codecs(),
+        )
+        .await;
+    }
     // Persist durable workflow logs (issue #790) — best-effort, never fails
     // the cycle. No-op when the sink is disabled (the default).
     if let Some(policy) = registry.workflow_log_policy {
@@ -20795,6 +22041,7 @@ async fn handle_suspended_workflow(
         registry,
         parent_execution: context.execution,
         execute_span: context.execute_span,
+        parent_fairness_key: context.persistence.task.fairness_key.as_deref(),
         resolved_router,
     };
 
@@ -20836,8 +22083,10 @@ async fn handle_suspended_workflow(
             context.execute_span,
             context.execution.assigned_build_id.as_deref(),
             context.persistence.task.priority,
+            context.persistence.task.fairness_key.as_deref(),
             context.execution.context_headers.as_ref(),
             &context.execution.input,
+            crate::fork::is_fork(context.execution),
         )
         .await
     } else if let Some(activity_ids) = extract_all_activity_waits(commands) {
@@ -20867,6 +22116,7 @@ async fn handle_suspended_workflow(
             &timer,
             sticky,
             context.execute_span,
+            context.persistence.task.fairness_key.as_deref(),
             resolved_router,
         )
         .await;
@@ -20912,6 +22162,7 @@ async fn handle_suspended_workflow(
             &children,
             sticky,
             context.execute_span,
+            context.persistence.task.fairness_key.as_deref(),
             resolved_router,
         )
         .await
@@ -20962,6 +22213,7 @@ async fn handle_suspended_workflow(
             sticky,
             context.execute_span,
             context.persistence.task.priority,
+            context.persistence.task.fairness_key.as_deref(),
             resolved_router,
         )
         .await
@@ -21081,6 +22333,11 @@ pub async fn fail_execution_on_error<T>(
     // release-vs-escalate, and only the escalation branch routes back through
     // the terminal-failure path.
     if error.handler_not_registered().is_some() {
+        return Err(error);
+    }
+    // Issue #2251: a fenced decision wrote nothing, and another owner decides
+    // now. Failing the run here would be the stale write the fence stops.
+    if error.ownership_lost().is_some() {
         return Err(error);
     }
     // Issue #1182 (Codex review round 2): an ambiguous suspended-dispatch
@@ -21397,17 +22654,105 @@ async fn fail_workflow_execution_clearing_strikes<T>(
     fail_execution_on_error(conn, task, worker_id, result, codecs).await
 }
 
+/// Load the run of a task. A failed load fails the task.
+///
+/// Issue #2251: with owner mode on, a failed load can only re-pend the task.
+/// See [`load_failure_fails_task`]. `Ok(None)` is that re-pend.
 async fn load_task_execution(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     exec_id: ExecutionId,
-) -> HarvestResult<WorkflowExecution> {
+    owner_mode: bool,
+) -> HarvestResult<Option<WorkflowExecution>> {
     let error = match load_workflow_execution(conn, exec_id).await {
-        Ok(val) => return Ok(val),
+        Ok(val) => return Ok(Some(val)),
         Err(e) => e,
     };
+    if !load_failure_fails_task(owner_mode, &error) {
+        let Some(claim) = queue::TaskClaim::of(task) else {
+            return Err(error);
+        };
+        tracing::warn!(
+            task_id = %task.id,
+            error = %error,
+            "harvest: a run did not load in owner mode; the task is re-pended (issue #2251)"
+        );
+        let delay = fence_repend_delay(crate::decision_owner::OwnerEpoch::new(0));
+        queue::requeue_claimed_workflow_task_after_fence(conn, &claim, delay).await?;
+        return Ok(None);
+    }
     fail_task_only(conn, task.id, &error.to_string()).await?;
     Err(error)
+}
+
+/// Whether a failed run load may fail its task (issue #2251).
+///
+/// The fail write needs the tenure of the run. The tenure needs the workflow
+/// id, which the load did not return. With owner mode on, the write cannot
+/// fence, so the task re-pends. A missing run has no history to protect, so
+/// its task still fails. A re-pend of it would repeat forever.
+const fn load_failure_fails_task(owner_mode: bool, error: &HarvestError) -> bool {
+    !owner_mode || matches!(error, HarvestError::NotFound(_))
+}
+
+/// The delay of a re-pend after a fence (issue #2251).
+///
+/// A fence of a held tenure re-pends at once, for the new owner. With no
+/// tenure at all (epoch 0), this worker would claim the task again at once,
+/// so it waits a second. The owned claim of issue #2252 then skips such
+/// tasks.
+fn fence_repend_delay(pinned: crate::decision_owner::OwnerEpoch) -> chrono::Duration {
+    if pinned == crate::decision_owner::OwnerEpoch::new(0) {
+        chrono::Duration::seconds(1)
+    } else {
+        chrono::Duration::zero()
+    }
+}
+
+#[cfg(test)]
+mod owner_load_failure_tests {
+    use super::{HarvestError, fence_repend_delay, load_failure_fails_task};
+    use crate::decision_owner::OwnerEpoch;
+
+    #[test]
+    fn a_legacy_load_failure_fails_the_task() {
+        assert!(load_failure_fails_task(
+            false,
+            &HarvestError::Config("boom".into())
+        ));
+        assert!(load_failure_fails_task(
+            false,
+            &HarvestError::NotFound("run".into())
+        ));
+    }
+
+    #[test]
+    fn an_owner_mode_load_failure_repends_the_task() {
+        assert!(!load_failure_fails_task(
+            true,
+            &HarvestError::Config("boom".into())
+        ));
+    }
+
+    #[test]
+    fn an_owner_mode_missing_run_still_fails_its_task() {
+        assert!(load_failure_fails_task(
+            true,
+            &HarvestError::NotFound("run".into())
+        ));
+    }
+
+    #[test]
+    fn only_an_ownerless_fence_waits_before_the_repend() {
+        assert_eq!(
+            fence_repend_delay(OwnerEpoch::new(0)),
+            chrono::Duration::seconds(1)
+        );
+        assert_eq!(
+            fence_repend_delay(OwnerEpoch::new(7)),
+            chrono::Duration::zero()
+        );
+    }
 }
 
 async fn load_workflow_replay_state(
@@ -21465,20 +22810,258 @@ fn delta_is_contiguous(from_event_id: i32, delta: &store::EventHistory) -> bool 
         .is_ok_and(|span| span == delta.events.len())
 }
 
+/// The resident outcome of a warm hit before its first drive (issue #2007).
+///
+/// A parked workflow counts as a hit. A decline of its resume changes the
+/// outcome to [`ResidentOutcome::Declined`].
+const fn resident_outcome_before_drive(residency: &crate::resident::Residency) -> ResidentOutcome {
+    match residency {
+        crate::resident::Residency::Parked(_) => ResidentOutcome::Hit,
+        crate::resident::Residency::Missed(reason) => *reason,
+        crate::resident::Residency::Unknown => ResidentOutcome::Cold,
+    }
+}
+
+/// The resident state of a suspension that cannot stay resident (issue
+/// #2007). A hot-swap module wins over `reason`, because it binds around
+/// every drive.
+const fn final_miss(hot_swapped: bool, reason: ResidentOutcome) -> crate::resident::Residency {
+    crate::resident::Residency::Missed(if hot_swapped {
+        ResidentOutcome::HotSwap
+    } else {
+        reason
+    })
+}
+
+/// Sets its flag when it drops (issue #2260). An entity query holds one, so
+/// a dropped caller stops the query thread.
+#[cfg(feature = "owner-disk-cache")]
+#[derive(Default)]
+struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(feature = "owner-disk-cache")]
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The cache entry of a disk hit (issue #2258): the state, no resident
+/// workflow, the byte mark and the owner key.
+#[cfg(feature = "owner-disk-cache")]
+type DiskCacheEntry = (
+    crate::cache::CachedWorkflowState,
+    crate::resident::Residency,
+    Option<crate::cache::HistoryBytesMark>,
+    Option<crate::decision_owner::OwnerKey>,
+);
+
+/// Read the disk entry of a memory miss (issue #2258).
+///
+/// Only a decision with a pinned tenure reads the disk. Returns the entry,
+/// the Postgres delta after it and the outcome label. The label is `None`
+/// when no disk read ran.
+#[cfg(feature = "owner-disk-cache")]
+async fn read_disk_entry(
+    conn: &mut AsyncPgConnection,
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    key: crate::decision_owner::OwnerKey,
+    execution: &WorkflowExecution,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+) -> (
+    Option<DiskCacheEntry>,
+    Option<store::EventHistory>,
+    Option<&'static str>,
+) {
+    let Some(epoch) = crate::decision_owner::pinned_decision().map(|t| t.epoch()) else {
+        return (None, None, None);
+    };
+    let Some(disk) = workflow_cache.lock().await.disk() else {
+        return (None, None, None);
+    };
+    let exec_id = ExecutionId::from_uuid(execution.id);
+    let read = disk
+        .read(conn, key, epoch, exec_id, &execution.state, offloader)
+        .await;
+    let (entry, delta) = read
+        .entry
+        .map_or((None, None), |(state, history_bytes, delta)| {
+            (
+                Some((
+                    state,
+                    crate::resident::Residency::Unknown,
+                    history_bytes,
+                    Some(key),
+                )),
+                Some(delta),
+            )
+        });
+    (entry, delta, Some(read.outcome))
+}
+
+/// Write the disk entry of a committed decision, or purge it (issue #2258).
+///
+/// A suspension of a held tenure writes. Any other outcome purges. Returns
+/// the state for the memory cache, or `None` when the write task died.
+#[cfg(feature = "owner-disk-cache")]
+async fn write_disk_entry(
+    conn: &mut AsyncPgConnection,
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    exec_uuid: uuid::Uuid,
+    suspended: bool,
+    state: crate::cache::CachedWorkflowState,
+    history_bytes: Option<crate::cache::HistoryBytesMark>,
+    owner: CacheOwner<'_>,
+) -> Option<crate::cache::CachedWorkflowState> {
+    let Some(disk) = workflow_cache.lock().await.disk() else {
+        return Some(state);
+    };
+    match owner.pinned {
+        Some(epoch) if suspended && owner.may_cache() => {
+            // Issue #2260: the entity projection first. The commit wrote its
+            // Postgres row, so one read finds the new snapshot.
+            disk.apply_entity(conn, owner.key, epoch, exec_uuid, Arc::clone(owner.owned))
+                .await;
+            disk.write(
+                owner.key,
+                epoch,
+                exec_uuid,
+                state,
+                history_bytes,
+                Arc::clone(owner.owned),
+            )
+            .await
+        }
+        _ => {
+            disk.purge(exec_uuid).await;
+            Some(state)
+        }
+    }
+}
+
+/// Delete the disk entry of `exec_uuid`, if any (issue #2258).
+#[cfg(feature = "owner-disk-cache")]
+async fn purge_disk_entry(
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    exec_uuid: uuid::Uuid,
+) {
+    // Clone the tier first. The cache lock must not span the disk work.
+    let disk = workflow_cache.lock().await.disk();
+    if let Some(disk) = disk {
+        disk.purge(exec_uuid).await;
+    }
+}
+
+/// Delete the disk file of each partition in `keys` (issue #2258).
+///
+/// Call it after the tenure set drops the tenures. A disk write checks the
+/// tenure under the partition lock, so no write lands after the delete.
+#[cfg(feature = "owner-disk-cache")]
+async fn drop_disk_partitions(
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    keys: &[crate::decision_owner::OwnerKey],
+) {
+    // Clone the tier first. The cache lock must not span the disk work.
+    let disk = workflow_cache.lock().await.disk();
+    if let Some(disk) = disk {
+        disk.drop_partitions(keys).await;
+    }
+}
+
 /// Puts a taken cache entry back, and drops any displaced entry outside the
 /// lock (issue #1798).
 async fn put_back_cache_entry(
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     exec_uuid: uuid::Uuid,
     state: crate::cache::CachedWorkflowState,
-    resident: Option<crate::resident::ResidentWorkflow>,
+    resident: crate::resident::Residency,
     history_bytes: Option<crate::cache::HistoryBytesMark>,
+    // Issue #2251: the partition tag, so a fenced owner can drop the entry.
+    owner: CacheOwner<'_>,
 ) {
-    let displaced = workflow_cache
-        .lock()
-        .await
-        .insert_resident_with_history_bytes(exec_uuid, state, resident, history_bytes);
+    // The tenure check runs under the cache lock, so it cannot race the
+    // unload's eviction. The disk purge below reuses its result.
+    // Only the disk tier reads `may_cache` after the lock.
+    #[cfg_attr(not(feature = "owner-disk-cache"), allow(unused_variables))]
+    let (may_cache, displaced) = {
+        let mut guard = workflow_cache.lock().await;
+        let may_cache = owner.may_cache();
+        let displaced = if may_cache {
+            guard.insert_resident_with_history_bytes(
+                exec_uuid,
+                state,
+                resident,
+                history_bytes,
+                Some(owner.key),
+            )
+        } else {
+            guard.take(&exec_uuid)
+        };
+        (may_cache, displaced)
+    };
     drop(displaced);
+    // Issue #2258: a decision whose tenure ended keeps no disk entry.
+    #[cfg(feature = "owner-disk-cache")]
+    if !may_cache {
+        purge_disk_entry(workflow_cache, exec_uuid).await;
+    }
+}
+
+/// The owner side of a cache write (issue #2251).
+///
+/// The cache tags each entry with its partition. A decision whose tenure a
+/// fence dropped, or a newer tenure replaced, writes no entry. The check
+/// runs under the cache lock, so it cannot race the unload's eviction.
+#[derive(Clone, Copy)]
+struct CacheOwner<'a> {
+    key: crate::decision_owner::OwnerKey,
+    pinned: Option<crate::decision_owner::OwnerEpoch>,
+    owned: &'a Arc<crate::decision_owner::OwnedPartitions>,
+}
+
+impl CacheOwner<'_> {
+    fn may_cache(&self) -> bool {
+        self.owned.may_cache(self.key, self.pinned)
+    }
+}
+
+/// Pin the owner tenure of an execution for its decision (issue #2251).
+///
+/// With a tenure, each history write of the decision fences it. With owner
+/// mode on and no tenure, the decision must not write, so this fails closed
+/// with [`HarvestError::OwnershipLost`]. With owner mode off, it pins
+/// nothing and the decision runs as before.
+fn pin_owner_tenure(
+    owned: &crate::decision_owner::OwnedPartitions,
+    owner_shard: crate::types::ShardId,
+    workflow_id: &str,
+) -> HarvestResult<()> {
+    use crate::decision_owner::{DecisionPin, OwnerEpoch, OwnerKey, pin_decision};
+    let key = OwnerKey::of(owner_shard, workflow_id);
+    match owned.pin_for(key) {
+        DecisionPin::Legacy => {
+            let _ = pin_decision(None);
+            Ok(())
+        }
+        DecisionPin::Owned(tenure) => {
+            // Outside a decision scope a pin does nothing, so a held tenure
+            // would decide unfenced. Fail closed instead.
+            if pin_decision(Some(tenure.clone())) {
+                Ok(())
+            } else {
+                Err(HarvestError::OwnershipLost {
+                    partition: key.partition,
+                    pinned: tenure.epoch(),
+                    current: None,
+                })
+            }
+        }
+        DecisionPin::Unowned => Err(HarvestError::OwnershipLost {
+            partition: key.partition,
+            pinned: OwnerEpoch::new(0),
+            current: None,
+        }),
+    }
 }
 
 /// Prepare the workflow task, checking the in-process LRU cache first.
@@ -21501,7 +23084,12 @@ async fn put_back_cache_entry(
 ///
 /// A hit keeps its resident workflow only when the delta event ids run on
 /// from the cached `next_event_id` with no gap.
-#[allow(clippy::too_many_lines)]
+///
+/// In owner mode, a hit replays cold when its delta holds a state change,
+/// such as a pause (issue #2253). It also replays cold when its entry has
+/// another owner key. A foreign writer made that change. The owner wake was
+/// lost, or it came while a decision held the entry.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn prepare_workflow_task_with_cache(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -21511,6 +23099,10 @@ async fn prepare_workflow_task_with_cache(
     offloader: Option<&crate::payload_store::PayloadOffloader>,
     // Issue #1243: see `load_workflow_replay_state`.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // Issue #2251: the owner tenures of this worker, and the shard of the
+    // claim's pool that keys them.
+    owned: &Arc<crate::decision_owner::OwnedPartitions>,
+    owner_shard: crate::types::ShardId,
 ) -> HarvestResult<Option<PreparedWorkflowTask>> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let error = HarvestError::Config("workflow task missing workflow_exec_id".into());
@@ -21527,30 +23119,74 @@ async fn prepare_workflow_task_with_cache(
     } else {
         // Brief lock to take the entry without holding it during DB work.
         let mut guard = workflow_cache.lock().await;
-        (
-            guard.take_with_history_bytes(&exec_uuid),
-            guard.resident_enabled(),
-        )
+        (guard.take_entry(&exec_uuid), guard.resident_enabled())
     };
 
-    let execution = load_task_execution(conn, task, exec_id).await?;
+    // Issue #2251: in owner mode, a load failure re-pends instead of failing.
+    let Some(execution) =
+        load_task_execution(conn, task, exec_id, owned.owner_mode(owner_shard)).await?
+    else {
+        // A taken entry never outlives a cycle that did not commit.
+        drop(cached);
+        return Ok(None);
+    };
+    // Issue #2251: pin the tenure before the first history write. The wake
+    // ingest below then fences it too.
+    pin_owner_tenure(owned, owner_shard, &execution.workflow_id)?;
+    let key = crate::decision_owner::OwnerKey::of(owner_shard, &execution.workflow_id);
+    // Issue #2253: in owner mode, a foreign writer can leave an entry stale.
+    // With owner mode off, a hit behaves as before.
+    let owner_mode = owned.owner_mode(owner_shard);
+    // An entry of another database is stale. The run moved.
+    let cached =
+        cached.filter(|(.., entry_key)| !owner_mode || entry_key.is_none_or(|entry| entry == key));
+    // Issue #2258: on a memory miss, an owner reads its disk cache. A disk
+    // entry holds no resident workflow, so the decision replays it cold.
+    // The disk read also loads the delta, so the hit path skips that query.
+    #[cfg(feature = "owner-disk-cache")]
+    let (cached, mut disk_delta, disk_outcome) = match cached {
+        Some(entry) => (Some(entry), None, None),
+        None => read_disk_entry(conn, workflow_cache, key, &execution, offloader).await,
+    };
+    #[cfg(not(feature = "owner-disk-cache"))]
+    let (mut disk_delta, disk_outcome): (Option<store::EventHistory>, _) = (None, None);
 
-    if let Some((cached_state, mut resident, cached_history_bytes)) = cached {
-        // Cache hit path: first load any events already appended since the
-        // cache snapshot (e.g. by timeout.rs/external_task.rs via
-        // append_single_event), then ingest timers/signals at the REAL current
-        // next_event_id to avoid a unique-constraint collision on event_id.
-        let existing_delta_result = store::load_history_since_inflated(
-            conn,
-            exec_id,
-            cached_state.next_event_id,
-            codecs,
-            offloader,
-        )
-        .await;
+    // Cache hit path. Load the delta first: other writers can append after
+    // the snapshot. Then ingest timers and signals at the real
+    // `next_event_id`. This avoids a unique-key collision on `event_id`.
+    let mut hit = None;
+    if let Some((cached_state, resident, cached_history_bytes, _)) = cached {
+        let existing_delta_result = match disk_delta.take() {
+            Some(delta) => Ok(delta),
+            None => {
+                store::load_history_since_inflated(
+                    conn,
+                    exec_id,
+                    cached_state.next_event_id,
+                    codecs,
+                    offloader,
+                )
+                .await
+            }
+        };
         let existing_delta =
             fail_execution_on_error(conn, task, worker_id, existing_delta_result, codecs).await?;
+        // Issue #2253: a foreign writer changed the state of the run, for
+        // example a pause. The wake was lost, or it came while this decision
+        // held the entry. The decision drops the entry and replays cold.
+        if owner_mode
+            && existing_delta
+                .events
+                .iter()
+                .any(crate::event::WorkflowEvent::evicts_owner_cache)
+        {
+            drop((cached_state, resident));
+        } else {
+            hit = Some((cached_state, resident, cached_history_bytes, existing_delta));
+        }
+    }
 
+    if let Some((cached_state, mut resident, cached_history_bytes, existing_delta)) = hit {
         // Single chronological ingest of due timers + pending signals (see
         // merge_wake_events for the occurrence-order contract). A transient
         // event-id conflict with a concurrent append_single_event committer
@@ -21574,6 +23210,11 @@ async fn prepare_workflow_task_with_cache(
                 cached_state,
                 resident,
                 cached_history_bytes,
+                CacheOwner {
+                    key,
+                    pinned: crate::decision_owner::pinned_decision().map(|t| t.epoch()),
+                    owned,
+                },
             )
             .await;
             return Ok(None);
@@ -21596,7 +23237,9 @@ async fn prepare_workflow_task_with_cache(
         // delta is not the plain run of events the snapshot expects.
         let contiguous = delta_is_contiguous(cached_state.next_event_id, &existing_delta)
             && delta_is_contiguous(existing_delta.next_event_id, &after_ingest);
-        resident = resident.filter(|_| contiguous);
+        if !contiguous && resident.is_parked() {
+            resident = crate::resident::Residency::Missed(ResidentOutcome::Declined);
+        }
 
         // Reconstruct full history: cached snapshot + any pre-existing delta +
         // ingested timer/signal events.
@@ -21619,6 +23262,7 @@ async fn prepare_workflow_task_with_cache(
             resident,
             delta_start,
             resident_enabled,
+            disk_outcome,
         }))
     } else {
         // Cache miss path: full history load. A transient event-id conflict
@@ -21649,9 +23293,10 @@ async fn prepare_workflow_task_with_cache(
             was_cache_hit: false,
             cold_history_bytes: Some(history_bytes),
             cached_history_bytes: None,
-            resident: None,
+            resident: crate::resident::Residency::Unknown,
             delta_start,
             resident_enabled,
+            disk_outcome,
         }))
     }
 }
@@ -21700,6 +23345,7 @@ async fn reject_child_continue_as_new(
             None,
             None,
             crate::types::Priority::default(),
+            None,
             codecs,
             // `metrics: None` above -- nothing can ever be collected here.
             &mut Vec::new(),
@@ -21787,7 +23433,10 @@ async fn check_continue_as_new_type<'a>(
                 // `resolve_continue_as_new_successor_defaults` will actually
                 // store — otherwise a configured ceiling that makes the
                 // declaration perfectly valid would still be rejected.
-                info.execution_timeout
+                // Issue #2387: judge the operator override too.
+                registry
+                    .apply_run_defaults(info.name, info.execution_timeout, None)
+                    .0
                     .and_then(|d| chrono::Duration::from_std(d).ok())
                     .map(|t| {
                         registry
@@ -21938,6 +23587,7 @@ async fn resolve_continue_as_new_verdict(
                 .workflows
                 .get(target)
                 .and_then(|info| info.quota)
+                .filter(crate::quota::QuotaPolicy::uses_key)
                 .and_then(|policy| crate::quota::resolve_quota_key(policy.key_expr, input))
         },
     );
@@ -22004,8 +23654,9 @@ fn continue_as_new_certainly_redirects(
         Ok(ContinueAsNewTypeCheck::SameType) => return false,
         Ok(ContinueAsNewTypeCheck::CrossType(info)) => info,
     };
-    let effective_timeout = target_info
-        .execution_timeout
+    let effective_timeout = registry
+        .apply_run_defaults(target_info.name, target_info.execution_timeout, None)
+        .0
         .and_then(|d| chrono::Duration::from_std(d).ok())
         .map(|t| {
             registry
@@ -22032,6 +23683,7 @@ fn continue_as_new_certainly_redirects(
     }
     let quota_key = target_info
         .quota
+        .filter(crate::quota::QuotaPolicy::uses_key)
         .and_then(|policy| crate::quota::resolve_quota_key(policy.key_expr, input));
     if let Some(key) = quota_key.as_deref()
         && crate::quota::quota_key_over_cap(key).is_some()
@@ -22765,6 +24417,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
                 None,
                 None,
                 crate::types::Priority::default(),
+                None,
                 registry.payload_codecs(),
                 &mut Vec::new(),
             )
@@ -22855,9 +24508,18 @@ async fn persist_workflow_continue_as_new_with_verdict(
     // continuation, resolved from the target type's own `WorkflowInfo` for a
     // cross-type one. Per-run deadlines are re-anchored to the successor's start
     // in both cases.
+    // Issue #2387: a cross-type successor is a new run of its target type, so
+    // an operator override of that type applies. A same-type successor keeps
+    // the values of its run, as before.
+    let target_info = target_info.map(|info| {
+        let mut effective = info.clone();
+        (effective.execution_timeout, effective.sla) =
+            registry.apply_run_defaults(info.name, info.execution_timeout, info.sla);
+        effective
+    });
     let defaults = resolve_continue_as_new_successor_defaults(
         execution,
-        target_info,
+        target_info.as_ref(),
         registry
             .max_workflow_execution_timeout
             .and_then(|d| chrono::Duration::from_std(d).ok()),
@@ -22899,7 +24561,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
         workflow_id: &execution.workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: execution.shard_id,
-        input: input.clone().into(),
+        input: registry.payload_codecs().encode_column(&input)?.into(),
         parent_id: None,
         queue_name: &execution.queue_name,
         execution_timeout: defaults.execution_timeout,
@@ -22909,7 +24571,10 @@ async fn persist_workflow_continue_as_new_with_verdict(
         chain_deadline_at: defaults.chain_deadline_at,
         sla: defaults.sla,
         sla_deadline_at: defaults.sla_deadline_at,
-        memo: execution.memo.clone(),
+        // The successor is a new write: a clear legacy memo is encoded (issue #2065).
+        memo: registry
+            .payload_codecs()
+            .recode_column_opt_for_copy(execution.memo.as_ref())?,
         search_attrs: execution.search_attrs.clone(),
         assigned_build_id: execution.assigned_build_id.clone(),
         parent_close_policy: None, // root workflow
@@ -22948,6 +24613,8 @@ async fn persist_workflow_continue_as_new_with_verdict(
         start_source_ref: Some(predecessor_exec_id_str.as_str()),
         started_by: None,
         quota_key: successor_quota_key.as_deref(),
+        // A successor belongs to the tenant of its predecessor (issue #1977).
+        tenant: execution.tenant.as_deref(),
     };
     // Per-key concurrency (issue #247). Same-type: propagate the current task's
     // key so the continued run stays under the same fair-share cap. Cross-type
@@ -22968,15 +24635,29 @@ async fn persist_workflow_continue_as_new_with_verdict(
             |target| resolve_workflow_concurrency(registry, target, &input),
         );
 
-    let mut enqueue =
-        queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
+    let mut enqueue = queue::EnqueueParams::new(
+        execution.queue_name.clone(),
+        TaskType::Workflow,
+        registry.payload_codecs().encode_column(&input)?,
+    );
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
+    // Continue-as-new keeps the workflow id, so the successor keeps the
+    // partition (ADR 0009 decision 3).
+    enqueue = enqueue.with_decision_partition(&execution.workflow_id);
     enqueue.required_build_id = execution.assigned_build_id.clone();
     enqueue.concurrency_key = successor_concurrency_key;
     enqueue.max_concurrent = successor_concurrency_cap;
     enqueue.rate_limit_key = persistence.task.rate_limit_key.clone();
+    // The successor stays with its tenant, for a cross-type target too
+    // (issue #1976). With no key it takes its own quota key.
+    enqueue.fairness_key = crate::queue_fairness::fairness_key_for(
+        persistence.task.fairness_key.as_deref(),
+        successor_quota_key.as_deref(),
+    );
 
     Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         // Issue #1184: this transaction seals the predecessor
         // (CONTINUED_AS_NEW) and completes its task row -- an ordinary
         // terminal write not enumerated by name in the issue, but the same
@@ -23096,7 +24777,12 @@ async fn persist_workflow_continue_as_new_with_verdict(
         .map_err(crate::error::database_error)?;
 
         queue::enqueue(conn, &enqueue).await?;
-        queue::complete_task(conn, task_id, serde_json::Value::Null).await?;
+        queue::complete_task(
+            conn,
+            &queue::TaskClaim::new(task_id, worker_id, attempt),
+            serde_json::Value::Null,
+        )
+        .await?;
         Ok(false)
     }))
     .await
@@ -23307,6 +24993,7 @@ async fn persist_workflow_outcome(
                     .concurrency_cap
                     .and_then(|c| u32::try_from(c).ok()),
                 crate::types::Priority::from_i32(persistence.task.priority).unwrap_or_default(),
+                persistence.task.fairness_key.clone(),
                 registry.payload_codecs(),
                 pending_cancel_metrics,
             )
@@ -23587,6 +25274,10 @@ enum WorkflowPersistFlow {
     /// without persisting any new commands. Resume re-derives the decision on
     /// replay.
     ParkedPaused,
+    /// A complete or fail decision met an unconsumed signal (issue #2079). The
+    /// task was re-pended in the same transaction and the decision discarded.
+    /// The next task pass ingests the signal and decides again.
+    RependedForSignals,
     /// The decision was persisted under the execution row lock.
     /// `retry_scheduled` is `true` when a workflow-level retry was atomically
     /// started inside the failure transaction; the deferred schedule-failure
@@ -23617,6 +25308,9 @@ enum WorkflowPersistFlow {
         /// action it pre-computed for a plain `ContinuedAsNew`, using this
         /// flag, once this arm is reached.
         continue_as_new_redirected_to_failure: bool,
+        /// `true` when a deferred cancel (issue #1984) ended the run in place
+        /// of this cycle's failure or continue-as-new outcome.
+        deferred_cancel_ended_run: bool,
     },
 }
 
@@ -23687,6 +25381,17 @@ async fn run_deferred_schedule_counter(
     }
 }
 
+/// How a terminal cycle with commands ends its run.
+#[derive(Clone, Copy)]
+enum TerminalSeal<'a> {
+    /// Persist the outcome that the workflow returned.
+    Outcome,
+    /// A deferred cancel takes the cycle over (issue #1984). The cycle's
+    /// commands persist as for its outcome. The run then ends cancelled
+    /// with this reason, and the outcome is dropped.
+    DeferredCancel(&'a str),
+}
+
 /// Persist a terminal (or continue-as-new) outcome that also carries pending
 /// pre-suspension commands (update results, search-attr patches, detached
 /// children, fan-out markers).
@@ -23718,6 +25423,7 @@ async fn persist_terminal_outcome_commands(
     // `persist_workflow_outcome` — see either's identical parameter doc
     // (issue #1263 items 11/15/17).
     resolved_router: Option<&crate::shard::ShardRouter>,
+    seal: TerminalSeal<'_>,
 ) -> HarvestResult<(
     bool,
     Vec<(ExecutionId, Option<String>)>,
@@ -23744,6 +25450,7 @@ async fn persist_terminal_outcome_commands(
     .await?;
     persist_search_attrs_from_commands(conn, persistence.exec_id, pending_cmds).await?;
     persist_current_details_from_commands(conn, persistence.exec_id, pending_cmds).await?;
+    persist_durable_stream_from_commands(conn, persistence.exec_id, pending_cmds).await?;
     // Persist durable workflow logs (issue #790) — best-effort, never fails the cycle.
     if let Some(policy) = registry.workflow_log_policy {
         persist_workflow_logs_from_commands(
@@ -23784,8 +25491,13 @@ async fn persist_terminal_outcome_commands(
     // keyed `workflow_id = child_id.to_string()`. That is an opaque id
     // minted fresh for that spawn, never the predecessor's own
     // `workflow_id`, so it can never collide with the successor's slot.
-    let continue_as_new_verdict =
-        resolve_continue_as_new_verdict_for_outcome(conn, registry, execution, &outcome).await?;
+    // A deferred cancel ends the run, so it starts no successor.
+    let continue_as_new_verdict = match seal {
+        TerminalSeal::Outcome => {
+            resolve_continue_as_new_verdict_for_outcome(conn, registry, execution, &outcome).await?
+        }
+        TerminalSeal::DeferredCancel(_) => None,
+    };
     let will_redirect_to_failure = matches!(
         continue_as_new_verdict,
         Some(ContinueAsNewVerdict::Redirect(_))
@@ -23836,7 +25548,7 @@ async fn persist_terminal_outcome_commands(
     // function in. The returned starts are NOT spawned here — the caller
     // must only spawn them after that outer transaction commits (see
     // `apply_race_loser_cancellations`'s doc comment).
-    let (race_deferred_triggers, _race_loser_events) = apply_race_loser_cancellations(
+    let (mut race_deferred_triggers, _race_loser_events) = apply_race_loser_cancellations(
         conn,
         persistence.exec_id,
         pending_cmds,
@@ -23851,9 +25563,27 @@ async fn persist_terminal_outcome_commands(
         execution,
         pending_cmds,
         execute_span,
+        persistence.task.fairness_key.as_deref(),
         resolved_router,
     )
     .await?;
+
+    if let TerminalSeal::DeferredCancel(reason) = seal {
+        let (_, starts, checks, terminal_metric) =
+            crate::execution::cancel_workflow_execution_collect_now(
+                conn,
+                persistence.exec_id,
+                reason,
+                Some(registry.telemetry().metrics.as_ref()),
+            )
+            .await?;
+        pending_cancel_metrics.extend(terminal_metric.map(|(workflow_name, queue_name)| {
+            crate::execution::StartCancelledRun::terminated(workflow_name, queue_name)
+        }));
+        race_deferred_triggers.extend(starts);
+        let checks = checks.into_iter().map(|(id, name)| (id, Some(name)));
+        return Ok((false, checks.collect(), race_deferred_triggers));
+    }
 
     // `persist_search_attrs_from_commands` above wrote the UpsertSearchAttributes
     // patch to the DB, but `execution` is the row loaded before that update. A
@@ -24257,6 +25987,8 @@ async fn dead_letter_for_history_cap(
 
     let (deferred, closed_children, pending_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             crate::notify::coalesced(conn, async |conn| {
                 use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
                 let reason = reason.clone();
@@ -24290,7 +26022,7 @@ async fn dead_letter_for_history_cap(
                     .optional()
                     .map_err(crate::error::database_error)?
                     .unwrap_or((None, None));
-                dlq::dead_letter(
+                dlq::dead_letter_with_codecs(
                     conn,
                     &NewDeadLetterEntry {
                         original_task_id: task.id,
@@ -24304,6 +26036,7 @@ async fn dead_letter_for_history_cap(
                         owner,
                         severity,
                     },
+                    codecs,
                 )
                 .await?;
                 store::append_events_with_codecs(
@@ -24567,6 +26300,52 @@ impl HistoryCapBreach {
     }
 }
 
+/// End a run with a deferred cancel at the history hard cap (issue #1984).
+///
+/// An accepted deferred cancel wins over the cap, as on SQLite. The cap stops
+/// the cleanup, and the run ends cancelled instead of failed. Returns `None`
+/// when no cancel is pending, so the caller fails the run.
+async fn cancel_deferred_at_history_cap(
+    conn: &mut AsyncPgConnection,
+    telemetry: &crate::telemetry::TelemetryConfig,
+    execution: &WorkflowExecution,
+    exec_id: ExecutionId,
+    breach: HistoryCapBreach,
+) -> HarvestResult<Option<Vec<crate::completion_trigger::DeferredTriggerStart>>> {
+    let history = store::load_history_undecoded(conn, exec_id).await?;
+    let Some(reason) = crate::execution::DeferredCancelState::of(&history.events).requested else {
+        return Ok(None);
+    };
+    tracing::warn!(
+        exec_id = %exec_id,
+        workflow = %execution.workflow_name,
+        breach = ?breach,
+        "workflow history reached a hard cap with a deferred cancel; cancelling the run"
+    );
+    let (_, starts, checks, terminal_metric) =
+        crate::execution::cancel_workflow_execution_collect_now(
+            conn,
+            exec_id,
+            &reason,
+            Some(telemetry.metrics.as_ref()),
+        )
+        .await?;
+    let cancel_metrics: Vec<_> = terminal_metric
+        .map(|(workflow_name, queue_name)| {
+            crate::execution::StartCancelledRun::terminated(workflow_name, queue_name)
+        })
+        .into_iter()
+        .collect();
+    crate::execution::emit_start_cancel_metrics(&*telemetry.metrics, &cancel_metrics);
+    check_and_report_unfinished_handlers_batch_for_worker(
+        conn,
+        &checks,
+        Some(telemetry.metrics.as_ref()),
+    )
+    .await;
+    Ok(Some(starts))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fail_workflow_for_history_cap(
     conn: &mut AsyncPgConnection,
@@ -24583,6 +26362,13 @@ async fn fail_workflow_for_history_cap(
     // Issue #1815: the cap failure fails this workflow task terminally.
     cycle_failure: &CycleFailure,
 ) -> HarvestResult<Vec<crate::completion_trigger::DeferredTriggerStart>> {
+    // Issue #1984: an accepted deferred cancel wins over the cap.
+    if let Some(starts) =
+        cancel_deferred_at_history_cap(conn, telemetry, execution, exec_id, breach).await?
+    {
+        return Ok(starts);
+    }
+
     // Issue #1833: the cap failure is a terminal decision, so it ends with a
     // boundary when boundaries are on.
     let boundary =
@@ -24869,7 +26655,11 @@ async fn process_workflow_task(
     // deadlock or a contained panic. The run stays RUNNING, but the task
     // failed, so the worker's outcome window counts it unless the claim is lost.
     cycle_failure: &CycleFailure,
+    // Issue #2251: the shard of the claim's pool. See `process_task`.
+    owner_shard: crate::types::ShardId,
 ) -> HarvestResult<()> {
+    // Issue #2257: the resident duration starts before the history load.
+    let prepare_started = std::time::Instant::now();
     let Some(mut prepared) = prepare_workflow_task_with_cache(
         conn,
         task,
@@ -24878,6 +26668,8 @@ async fn process_workflow_task(
         sticky_timeout,
         registry.payload_offloader(),
         registry.payload_codecs(),
+        &registry.decision_owner(),
+        owner_shard,
     )
     .await?
     else {
@@ -24887,6 +26679,11 @@ async fn process_workflow_task(
         // load that advances past the winner's committed event.
         return Ok(());
     };
+    // Issue #2251: the cache tag of this run, and the epoch that `prepare`
+    // pinned.
+    let owner_key =
+        crate::decision_owner::OwnerKey::of(owner_shard, &prepared.execution.workflow_id);
+    let pinned_epoch = crate::decision_owner::pinned_decision().map(|t| t.epoch());
     let Some(workflow) = registry.workflows.get(&prepared.execution.workflow_name) else {
         // Issue #804 (AC1): this worker cannot run this type, but a peer on the
         // same queue may well be able to (a rolling deploy that introduces a new
@@ -24949,8 +26746,16 @@ async fn process_workflow_task(
 
     let telemetry = registry.telemetry().clone();
 
+    // Issue #2258: a disk hit is a memory miss. The disk counter records it.
+    if let Some(outcome) = prepared.disk_outcome {
+        telemetry.metrics.record_workflow_disk_cache(
+            &prepared.execution.workflow_name,
+            &task.queue_name,
+            outcome,
+        );
+    }
     // Emit cache hit/miss metric now that we know the workflow name.
-    if prepared.was_cache_hit {
+    if prepared.was_cache_hit && prepared.disk_outcome.is_none() {
         telemetry
             .metrics
             .record_workflow_cache_hit(&prepared.execution.workflow_name, &task.queue_name);
@@ -25114,16 +26919,29 @@ async fn process_workflow_task(
     let decision_start_event_id = prepared.next_event_id;
     // Issue #1798: the resident workflow of a warm hit. The first iteration
     // tries to resume it. A decline replays cold, as on a miss.
-    let mut warm_resident = prepared.resident.take();
-    // The resident workflow of the final cycle, kept for the next decision.
-    let mut final_resident: Option<crate::resident::ResidentWorkflow> = None;
+    let warm_residency = std::mem::take(&mut prepared.resident);
+    // Issue #2007: the resident outcome of this decision. The worker
+    // records it once, after the first drive.
+    let mut resident_outcome = prepared.resident_enabled.then(|| {
+        if prepared.was_cache_hit {
+            resident_outcome_before_drive(&warm_residency)
+        } else {
+            ResidentOutcome::Cold
+        }
+    });
+    let mut warm_resident = warm_residency.into_workflow();
+    // Issue #2035: set after the first drive of this decision. Only that drive
+    // may run an update past the dispatch window.
+    let mut drove_before = false;
+    // The resident state of the final cycle, kept for the next decision.
+    let mut final_resident: crate::resident::Residency;
     // A module-hosted workflow binds its module around one drive only, so
     // it cannot stay resident.
     #[cfg(feature = "hot-code-swap")]
-    let can_stay_resident =
-        prepared.resident_enabled && !crate::hot_swap::is_module_hosted(workflow.handler);
+    let hot_swapped = crate::hot_swap::is_module_hosted(workflow.handler);
     #[cfg(not(feature = "hot-code-swap"))]
-    let can_stay_resident = prepared.resident_enabled;
+    let hot_swapped = false;
+    let can_stay_resident = prepared.resident_enabled && !hot_swapped;
 
     // Issue #678/#1034: external-op ids resolved INLINE during this decision
     // cycle. Set by the mixed-signal arm below (any suspension whose command
@@ -25160,6 +26978,7 @@ async fn process_workflow_task(
             workflow_id: prepared.execution.workflow_id.clone(),
             shard_id: i64::from(prepared.execution.shard_id),
             queue_name: task.queue_name.clone(),
+            drive_clock: None,
             is_replay,
             link_traceparent: trace_carrier
                 .as_ref()
@@ -25180,6 +26999,14 @@ async fn process_workflow_task(
             // execution row so a child workflow can read it via `ctx.info()` /
             // `ctx.parent_execution_id()`. `None` for a top-level run.
             parent_execution_id: prepared.execution.parent_id.map(ExecutionId::from_uuid),
+            // Issue #2082: read the start source and predecessor from the row.
+            // A keyed entity uses them to tell a client start from a checkpoint.
+            start_provenance: crate::types::StartProvenance::from_row(
+                prepared.execution.start_source.as_deref(),
+                prepared.execution.continued_from_exec_id,
+            ),
+            // Issue #2021: Postgres records a cancel as an event in the history.
+            cancellation_reason: None,
         };
 
         // Filter declarative handlers to those that target this workflow type.
@@ -25195,20 +27022,19 @@ async fn process_workflow_task(
             .filter(|h| h.workflow == wf_name)
             .collect();
 
-        let exec_context_headers = prepared
-            .execution
-            .context_headers
-            .as_ref()
-            .and_then(|v| {
-                match serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()) {
-                    Ok(h) => Some(h),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to deserialize workflow execution context headers; propagating empty map");
-                        None
-                    }
-                }
-            })
-            .unwrap_or_default();
+        // A header can carry a tenant or a trace. A missing key fails the run,
+        // like a history that cannot be decoded. It never runs without the
+        // headers (issue #2043).
+        let exec_context_headers = fail_execution_on_error(
+            conn,
+            task,
+            worker_id,
+            registry
+                .payload_codecs()
+                .decode_headers_opt(prepared.execution.context_headers.as_ref()),
+            registry.payload_codecs(),
+        )
+        .await?;
 
         // Issue #967 (R&D spike, `hot-code-swap` feature): a module-hosted
         // workflow's handler is the `hot_swap::module_workflow_handler`
@@ -25237,6 +27063,18 @@ async fn process_workflow_task(
                 &exec_context_headers,
             )
         });
+        // The task row may hold the input as an envelope (issue #1979). The
+        // handler gets the plaintext. A missing key fails the run, exactly
+        // like a history that cannot be decoded.
+        let handler_input = fail_execution_on_error(
+            conn,
+            task,
+            worker_id,
+            registry.payload_codecs().decode_column(&task.input),
+            registry.payload_codecs(),
+        )
+        .await?;
+        let run_first = !std::mem::replace(&mut drove_before, true);
         let workflow_drive = async {
             if let Some(resident) = warm_resident.take() {
                 match resident
@@ -25248,11 +27086,14 @@ async fn process_workflow_task(
                     .await
                 {
                     Ok(drive) => return drive,
-                    Err(reason) => tracing::debug!(
-                        exec_id = %prepared.exec_id,
-                        ?reason,
-                        "resident workflow declined; replaying cold (issue #1798)"
-                    ),
+                    Err(reason) => {
+                        resident_outcome = Some(ResidentOutcome::Declined);
+                        tracing::debug!(
+                            exec_id = %prepared.exec_id,
+                            ?reason,
+                            "resident workflow declined; replaying cold (issue #1798)"
+                        );
+                    }
                 }
             }
             let ctx = crate::executor::build_task_context(
@@ -25282,11 +27123,18 @@ async fn process_workflow_task(
                 // consumed by the LOCAL activity path in `execute_local_activity_with_opts`.
                 registry.default_activity_retry_policy(),
                 registry.default_activity_start_to_close(),
-            );
+            )
+            // Issue #2035: a live decision runs the admitted updates. A replay
+            // gate does not, so it never runs a handler. The cut-off keeps the
+            // dispatch inside the workflow-task budget.
+            .with_update_dispatch(crate::update::UpdateDispatch {
+                cutoff: workflow_task_deadline,
+                run_first,
+            });
             crate::executor::drive_workflow_keep(
                 ctx,
                 workflow.handler,
-                task.input.clone(),
+                handler_input,
                 Some(&span_meta),
                 resident_key.clone(),
             )
@@ -25319,8 +27167,82 @@ async fn process_workflow_task(
             span: execute_span,
             router: resolved_router,
             resident: iter_resident,
+            updates_deferred,
         } = drive;
+        // Issue #2257: stop the clock at the end of the drive, before any
+        // write below.
+        let resident_secs = prepare_started.elapsed().as_secs_f64();
+        // Issue #2035: the dispatch window closed with updates left. This
+        // claimed row only records the wake. The park that ends the cycle then
+        // re-pends the task, and the next cycle runs the rest. A failed wake
+        // fails the cycle, so the retry runs the rest. A parked task with no
+        // wake would leave those updates waiting.
+        if updates_deferred {
+            queue::wake_workflow_task(conn, prepared.exec_id).await?;
+        }
+        // Issue #2007: one sample per decision, after its first drive.
+        // Issue #2257: its duration goes with it, under the same outcome.
+        if let Some(outcome) = resident_outcome.take() {
+            telemetry.metrics.record_workflow_resident(
+                &prepared.execution.workflow_name,
+                &task.queue_name,
+                outcome,
+            );
+            telemetry.metrics.record_workflow_resident_duration(
+                &prepared.execution.workflow_name,
+                &task.queue_name,
+                outcome,
+                resident_secs,
+            );
+        }
 
+        // Issue #2000: a recorded fork never runs an effect that it cannot
+        // serve from the record. It fails here, before any persist path.
+        if crate::fork::history_is_recorded_fork(&prepared.execution, &history_events)
+            && let Some(command) =
+                crate::fork::recorded_outcome_refusal(&run_outcome, &pending_cmds)
+        {
+            let refusal = HarvestError::Config(format!(
+                "recorded fork refused {command}: recorded mode cannot serve it, so \
+                 fork with effects = live to run it"
+            ));
+            // Issue #1984: with a deferred cancel pending, a failing cycle
+            // cancels the run. The refused cycle takes that path too, and
+            // none of its commands persist.
+            if crate::execution::DeferredCancelState::of(&history_events)
+                .requested
+                .is_some()
+            {
+                final_resident = if hot_swapped {
+                    final_miss(hot_swapped, ResidentOutcome::HotSwap)
+                } else {
+                    iter_resident
+                };
+                break (
+                    WorkflowOutcome::Failed {
+                        error: refusal.to_string(),
+                        non_deterministic_details: None,
+                        handler_panic: false,
+                        unhandled_signals: std::collections::BTreeMap::new(),
+                    },
+                    Vec::new(),
+                    execute_span,
+                    resolved_router,
+                );
+            }
+            return fail_workflow_execution_clearing_strikes(
+                conn,
+                task,
+                worker_id,
+                Err::<(), _>(refusal),
+                workflow_panic_strikes,
+                prepared.exec_id.as_uuid(),
+                registry.payload_codecs(),
+            )
+            .await;
+        }
+
+        let run_outcome = discard_drop_release_for_dedicated_shape(run_outcome);
         match run_outcome {
             WorkflowOutcome::Suspended { commands }
                 if commands
@@ -25378,6 +27300,8 @@ async fn process_workflow_task(
                 persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await?;
                 // Persist the current_details breadcrumb before inline execution (issue #473).
                 persist_current_details_from_commands(conn, prepared.exec_id, &commands).await?;
+                // Store durable stream chunks before inline execution (issue #1974).
+                persist_durable_stream_from_commands(conn, prepared.exec_id, &commands).await?;
                 // Persist durable workflow logs (issue #790) — best-effort, before inline run.
                 if let Some(policy) = registry.workflow_log_policy {
                     persist_workflow_logs_from_commands(
@@ -25549,6 +27473,7 @@ async fn process_workflow_task(
                     registry,
                     parent_execution: &prepared.execution,
                     execute_span: &detached_execute_span,
+                    parent_fairness_key: task.fairness_key.as_deref(),
                     resolved_router: resolved_router.as_ref(),
                 };
                 let local_batch = extract_run_local_activity(commands);
@@ -25730,6 +27655,7 @@ async fn process_workflow_task(
                             | WorkflowCommand::UpsertSearchAttributes { .. }
                             | WorkflowCommand::SetCurrentDetails { .. }
                             | WorkflowCommand::PublishProgress { .. }
+                            | WorkflowCommand::PublishDurableProgress { .. }
                             | WorkflowCommand::RecordLog { .. }
                             | WorkflowCommand::ReleaseMutex { .. }
                     )
@@ -25794,6 +27720,21 @@ async fn process_workflow_task(
                 }
                 if let Err(e) =
                     persist_current_details_from_commands(conn, prepared.exec_id, &commands).await
+                {
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                        registry.payload_codecs(),
+                    )
+                    .await;
+                }
+                // Store durable stream chunks (issue #1974). An error fails the cycle.
+                if let Err(e) =
+                    persist_durable_stream_from_commands(conn, prepared.exec_id, &commands).await
                 {
                     return fail_workflow_execution_clearing_strikes(
                         conn,
@@ -25977,6 +27918,8 @@ async fn process_workflow_task(
                     // Re-acquire a fresh execute_span so persist_workflow_outcome
                     // (via handle_suspended_workflow) gets a valid span reference.
                     let execute_span = tracing::Span::none();
+                    // Issue #2007: an external-op batch cannot stay resident.
+                    final_resident = final_miss(hot_swapped, ResidentOutcome::Unsupported);
                     break (
                         WorkflowOutcome::Suspended {
                             commands: reconstructed_commands,
@@ -26057,6 +28000,21 @@ async fn process_workflow_task(
                 }
                 if let Err(e) =
                     persist_current_details_from_commands(conn, prepared.exec_id, &commands).await
+                {
+                    return fail_workflow_execution_clearing_strikes(
+                        conn,
+                        task,
+                        worker_id,
+                        Err::<(), _>(e),
+                        workflow_panic_strikes,
+                        prepared.exec_id.as_uuid(),
+                        registry.payload_codecs(),
+                    )
+                    .await;
+                }
+                // Store durable stream chunks (issue #1974). An error fails the cycle.
+                if let Err(e) =
+                    persist_durable_stream_from_commands(conn, prepared.exec_id, &commands).await
                 {
                     return fail_workflow_execution_clearing_strikes(
                         conn,
@@ -26169,6 +28127,8 @@ async fn process_workflow_task(
                 // (via handle_suspended_workflow) gets a valid span reference.
                 // The original span was dropped above.
                 let execute_span = tracing::Span::none();
+                // Issue #2007: an external-op batch cannot stay resident.
+                final_resident = final_miss(hot_swapped, ResidentOutcome::Unsupported);
                 break (
                     WorkflowOutcome::Suspended {
                         commands: remaining_commands_with_unresolved,
@@ -26179,7 +28139,11 @@ async fn process_workflow_task(
                 );
             }
             other => {
-                final_resident = iter_resident;
+                final_resident = if hot_swapped {
+                    final_miss(hot_swapped, ResidentOutcome::HotSwap)
+                } else {
+                    iter_resident
+                };
                 break (other, pending_cmds, execute_span, resolved_router);
             }
         }
@@ -26238,6 +28202,8 @@ async fn process_workflow_task(
             // `resume_workflow_execution`'s own lock. A concurrent resume
             // therefore always commits its own wake after this park commits.
             let still_paused = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+                // Issue #2251: the owner fence comes before the row lock.
+                crate::replication::assert_decision_fence(conn).await?;
                 let parked = check_paused_and_park(
                     conn,
                     prepared.exec_id.as_uuid(),
@@ -26326,6 +28292,46 @@ async fn process_workflow_task(
     //
     // The requeue is fenced by the claim. The cycle ran for at least
     // `DEADLOCK_TIMEOUT`, so a reclaim can have moved the row meanwhile.
+    // Issue #1984: a deadlocked cycle cannot record the close of a block, so
+    // its retry keeps a deferred cancel waiting without end. The run is
+    // cancelled instead, as a failing cycle is. The deadlocked cycle's
+    // commands are still not trusted, so none of them persist.
+    //
+    // A panicked cycle is cancelled for the same reason. Its retry discards
+    // the close of the block too. The panic budget is local to the process,
+    // so a restart resets it and the cancel can wait without end.
+    let cancel_is_deferred = crate::execution::DeferredCancelState::of(&history_events)
+        .requested
+        .is_some();
+    let outcome = match outcome {
+        WorkflowOutcome::TaskFailed { error } if cancel_is_deferred => {
+            pending_cmds.clear();
+            WorkflowOutcome::Failed {
+                error,
+                non_deterministic_details: None,
+                handler_panic: false,
+                unhandled_signals: std::collections::BTreeMap::new(),
+            }
+        }
+        WorkflowOutcome::Failed {
+            error,
+            non_deterministic_details,
+            handler_panic: true,
+            unhandled_signals,
+        } if cancel_is_deferred => {
+            telemetry
+                .metrics
+                .record_workflow_panic(&prepared.execution.workflow_name, &task.queue_name);
+            pending_cmds.clear();
+            WorkflowOutcome::Failed {
+                error,
+                non_deterministic_details,
+                handler_panic: false,
+                unhandled_signals,
+            }
+        }
+        other => other,
+    };
     if let WorkflowOutcome::TaskFailed { error } = &outcome {
         clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
         let strikes = workflow_deadlock_strikes.record(prepared.exec_id.as_uuid());
@@ -26899,6 +28905,23 @@ async fn process_workflow_task(
     // failure must never roll back the persisted decision).
     let is_terminal_with_commands =
         !pending_cmds.is_empty() && !matches!(&outcome, WorkflowOutcome::Suspended { .. });
+    // Issue #1984: a cancel that an open non-cancellable block deferred. The
+    // request is in the history that this cycle replayed. A request that
+    // lands later makes this cycle's event ids collide, so the cycle retries
+    // and then sees it.
+    let deferred_cancel_reason =
+        crate::execution::DeferredCancelState::of(&history_events).requested;
+    // A run that stays running completes the cancel once no block is open.
+    let check_deferred_cancel =
+        deferred_cancel_reason.is_some() && matches!(&outcome, WorkflowOutcome::Suspended { .. });
+    // A run that would fail or continue as new is cancelled instead, so a
+    // retry or a successor run cannot drop the cancel.
+    let deferred_cancel_ends_run = deferred_cancel_reason.filter(|_| {
+        matches!(
+            &outcome,
+            WorkflowOutcome::Failed { .. } | WorkflowOutcome::ContinuedAsNew { .. }
+        )
+    });
     let counter_action = schedule_counter_action(&outcome);
     // Issue #684: collect update.completed/failed metric data now, while
     // `history_events`, `outcome`, and `pending_cmds` are all still in scope
@@ -26972,134 +28995,232 @@ async fn process_workflow_task(
 
     // Issue #1815: the `persist` op spans the whole transaction, COMMIT
     // included. The guard also records a transaction that a timeout cancels.
-    let persist_timer = PersistTimer::start();
+    let persist_timer = PersistTimer::start_decision();
     // Issue #1833: one merged wake per execution, also on the fallback path.
     let persist_flow = Box::pin(conn.transaction::<WorkflowPersistFlow, HarvestError, _>(
         async |conn| {
-            crate::notify::coalesced(conn, async |conn| {
-                if check_paused_and_park(
-                    conn,
-                    exec_uuid,
-                    task.id,
-                    worker_id,
-                    task.crash_strikes,
-                    task.attempt,
-                    sticky_timeout,
-                )
-                .await?
-                {
-                    // Inline local activities can have appended events already.
+            // Issue #2248: the body ends when this guard drops.
+            let _body = PersistBodyEnd;
+            // Issue #2251: in owner mode, the DR generation row and the owner
+            // row come first, before the execution row (ADR 0009 decision 6).
+            crate::replication::assert_decision_fence(conn).await?;
+            // Issue #2252: the rest of this transaction counts as fenced, so
+            // its nested writes send no second fence.
+            let fenced = crate::decision_owner::conn_id(conn);
+            Box::pin(crate::decision_owner::fenced_scope(
+                fenced,
+                crate::notify::coalesced(conn, async |conn| {
+                    if check_paused_and_park(
+                        conn,
+                        exec_uuid,
+                        task.id,
+                        worker_id,
+                        task.crash_strikes,
+                        task.attempt,
+                        sticky_timeout,
+                    )
+                    .await?
+                    {
+                        // Inline local activities can have appended events already.
+                        record_decision_boundary(
+                            conn,
+                            registry,
+                            prepared.exec_id,
+                            decision_start_event_id,
+                            inline_appends,
+                            true,
+                            worker_id,
+                            build_id,
+                        )
+                        .await?;
+                        return Ok(WorkflowPersistFlow::ParkedPaused);
+                    }
+
+                    // Issue #2079: do not seal a run over a signal it never read.
+                    if matches!(
+                        &outcome,
+                        WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. }
+                    ) && repend_for_late_signals(
+                        conn,
+                        prepared.exec_id,
+                        task.id,
+                        worker_id,
+                        task.crash_strikes,
+                        task.attempt,
+                        sticky_timeout,
+                    )
+                    .await?
+                    {
+                        record_decision_boundary(
+                            conn,
+                            registry,
+                            prepared.exec_id,
+                            decision_start_event_id,
+                            inline_appends,
+                            true,
+                            worker_id,
+                            build_id,
+                        )
+                        .await?;
+                        return Ok(WorkflowPersistFlow::RependedForSignals);
+                    }
+
+                    // Issue #1833: the boundary follows only rows this decision
+                    // writes. The execution row is locked now, and every history
+                    // writer takes that lock. So a row past this id is this
+                    // transaction's own. A row another writer committed after the
+                    // decision start does not count. Inline steps wrote before
+                    // the lock, so they keep the decision start.
+                    let boundary_floor =
+                        if inline_appends || !registry.history_policy().decision_boundaries() {
+                            decision_start_event_id
+                        } else {
+                            store::next_event_id_for(conn, prepared.exec_id).await?
+                        };
+
+                    // Issue #603: this cycle replayed cleanly (the ND gate above
+                    // did not fire), so if the execution was previously blocked on
+                    // replay non-determinism the offending build has been rolled
+                    // back or fixed — clear the block marker atomically with the
+                    // recovered cycle's persisted outcome. Guarded on
+                    // `was_nd_blocked` (captured *before* the in-memory mutation
+                    // above) rather than re-reading `execution_ref.nd_blocked_at`,
+                    // which is already `None` here by the time this runs — so
+                    // never-blocked executions still pay nothing, and a
+                    // previously-blocked one still gets its DB row cleared.
+                    if was_nd_blocked {
+                        clear_nd_block(conn, persistence.exec_id).await?;
+                    }
+
+                    let mut pending_cancel_metrics = Vec::new();
+                    if let Some(reason) = &deferred_cancel_ends_run {
+                        // The cycle's commands persist as for a terminal cycle:
+                        // update results, race-loser teardown, detached children,
+                        // search attributes, details, logs and progress. The run
+                        // then ends cancelled instead of with its outcome.
+                        let mut redirected = false;
+                        let (_, deferred_checks, race_deferred_triggers) =
+                            persist_terminal_outcome_commands(
+                                conn,
+                                registry,
+                                execution_ref,
+                                persistence,
+                                outcome,
+                                &pending_cmds,
+                                &recorded_dispatches,
+                                &execute_span,
+                                &mut pending_cancel_metrics,
+                                &mut redirected,
+                                resolved_router.as_ref(),
+                                TerminalSeal::DeferredCancel(reason),
+                            )
+                            .await?;
+                        return Ok(WorkflowPersistFlow::Persisted {
+                            retry_scheduled: false,
+                            deferred_checks,
+                            race_deferred_triggers,
+                            pending_cancel_metrics,
+                            continue_as_new_redirected_to_failure: false,
+                            deferred_cancel_ended_run: true,
+                        });
+                    }
+                    // Issue #1161: `false` unless the ContinuedAsNew outcome below
+                    // (reached via either branch) redirects to a terminal failure —
+                    // see `persist_workflow_outcome`'s parameter doc.
+                    let mut continue_as_new_redirected_to_failure = false;
+                    let (retry_scheduled, mut deferred_checks, mut race_deferred_triggers) =
+                        if is_terminal_with_commands {
+                            persist_terminal_outcome_commands(
+                                conn,
+                                registry,
+                                execution_ref,
+                                persistence,
+                                outcome,
+                                &pending_cmds,
+                                &recorded_dispatches,
+                                &execute_span,
+                                &mut pending_cancel_metrics,
+                                &mut continue_as_new_redirected_to_failure,
+                                resolved_router.as_ref(),
+                                TerminalSeal::Outcome,
+                            )
+                            .await?
+                        } else {
+                            let (retry_scheduled, deferred_checks) = persist_workflow_outcome(
+                                conn,
+                                registry,
+                                execution_ref,
+                                persistence,
+                                outcome,
+                                &execute_span,
+                                false,
+                                // Issue #678: carries any external-op terminal
+                                // resolved inline this cycle into the Suspended arm
+                                // so a mixed timer + external op self-wakes.
+                                resolved_inline_external,
+                                &mut pending_cancel_metrics,
+                                &mut continue_as_new_redirected_to_failure,
+                                resolved_router.as_ref(),
+                                // This path never computes an abandoned-dispatch
+                                // decision ahead of time (`is_terminal_with_commands`
+                                // is false here), so the arm resolves its own verdict.
+                                None,
+                            )
+                            .await?;
+                            (retry_scheduled, deferred_checks, Vec::new())
+                        };
                     record_decision_boundary(
                         conn,
                         registry,
                         prepared.exec_id,
-                        decision_start_event_id,
-                        inline_appends,
-                        true,
+                        boundary_floor,
+                        decision_appends,
+                        stays_running,
                         worker_id,
                         build_id,
                     )
                     .await?;
-                    return Ok(WorkflowPersistFlow::ParkedPaused);
-                }
-
-                // Issue #1833: the boundary follows only rows this decision
-                // writes. The execution row is locked now, and every history
-                // writer takes that lock. So a row past this id is this
-                // transaction's own. A row another writer committed after the
-                // decision start does not count. Inline steps wrote before
-                // the lock, so they keep the decision start.
-                let boundary_floor =
-                    if inline_appends || !registry.history_policy().decision_boundaries() {
-                        decision_start_event_id
-                    } else {
-                        store::next_event_id_for(conn, prepared.exec_id).await?
-                    };
-
-                // Issue #603: this cycle replayed cleanly (the ND gate above
-                // did not fire), so if the execution was previously blocked on
-                // replay non-determinism the offending build has been rolled
-                // back or fixed — clear the block marker atomically with the
-                // recovered cycle's persisted outcome. Guarded on
-                // `was_nd_blocked` (captured *before* the in-memory mutation
-                // above) rather than re-reading `execution_ref.nd_blocked_at`,
-                // which is already `None` here by the time this runs — so
-                // never-blocked executions still pay nothing, and a
-                // previously-blocked one still gets its DB row cleared.
-                if was_nd_blocked {
-                    clear_nd_block(conn, persistence.exec_id).await?;
-                }
-
-                let mut pending_cancel_metrics = Vec::new();
-                // Issue #1161: `false` unless the ContinuedAsNew outcome below
-                // (reached via either branch) redirects to a terminal failure —
-                // see `persist_workflow_outcome`'s parameter doc.
-                let mut continue_as_new_redirected_to_failure = false;
-                let (retry_scheduled, deferred_checks, race_deferred_triggers) =
-                    if is_terminal_with_commands {
-                        persist_terminal_outcome_commands(
-                            conn,
-                            registry,
-                            execution_ref,
-                            persistence,
-                            outcome,
-                            &pending_cmds,
-                            &recorded_dispatches,
-                            &execute_span,
-                            &mut pending_cancel_metrics,
-                            &mut continue_as_new_redirected_to_failure,
-                            resolved_router.as_ref(),
-                        )
-                        .await?
-                    } else {
-                        let (retry_scheduled, deferred_checks) = persist_workflow_outcome(
-                            conn,
-                            registry,
-                            execution_ref,
-                            persistence,
-                            outcome,
-                            &execute_span,
-                            false,
-                            // Issue #678: carries any external-op terminal
-                            // resolved inline this cycle into the Suspended arm
-                            // so a mixed timer + external op self-wakes.
-                            resolved_inline_external,
-                            &mut pending_cancel_metrics,
-                            &mut continue_as_new_redirected_to_failure,
-                            resolved_router.as_ref(),
-                            // This path never computes an abandoned-dispatch
-                            // decision ahead of time (`is_terminal_with_commands`
-                            // is false here), so the arm resolves its own verdict.
-                            None,
-                        )
-                        .await?;
-                        (retry_scheduled, deferred_checks, Vec::new())
-                    };
-                record_decision_boundary(
-                    conn,
-                    registry,
-                    prepared.exec_id,
-                    boundary_floor,
-                    decision_appends,
-                    stays_running,
-                    worker_id,
-                    build_id,
-                )
-                .await?;
-                // Chaos: kill/delay inside the persist transaction, after the
-                // outcome is written but before the outer commit — the #367 window
-                // (worker dies after claim, before the terminal is durable). A kill
-                // (owned conn in the reproducer's spawned task) rolls the persist
-                // back, leaving the task RUNNING with a dead worker (AC4).
-                crate::chaos_point!(WORKER_PERSIST_BEFORE_COMMIT);
-                Ok(WorkflowPersistFlow::Persisted {
-                    retry_scheduled,
-                    deferred_checks,
-                    race_deferred_triggers,
-                    pending_cancel_metrics,
-                    continue_as_new_redirected_to_failure,
-                })
-            })
+                    // Issue #1984: a cancel is pending. When no block is open after
+                    // this cycle, cancel the run in this same transaction.
+                    let mut deferred_cancel_ended_run = false;
+                    if check_deferred_cancel
+                        && let Some((_, starts, checks, terminal_metric)) =
+                            crate::execution::complete_deferred_cancel(
+                                conn,
+                                prepared.exec_id,
+                                Some(telemetry.metrics.as_ref()),
+                            )
+                            .await?
+                    {
+                        deferred_cancel_ended_run = true;
+                        race_deferred_triggers.extend(starts);
+                        deferred_checks
+                            .extend(checks.into_iter().map(|(id, name)| (id, Some(name))));
+                        if let Some((workflow_name, queue_name)) = terminal_metric {
+                            pending_cancel_metrics.push(
+                                crate::execution::StartCancelledRun::terminated(
+                                    workflow_name,
+                                    queue_name,
+                                ),
+                            );
+                        }
+                    }
+                    // Chaos: kill/delay inside the persist transaction, after the
+                    // outcome is written but before the outer commit — the #367 window
+                    // (worker dies after claim, before the terminal is durable). A kill
+                    // (owned conn in the reproducer's spawned task) rolls the persist
+                    // back, leaving the task RUNNING with a dead worker (AC4).
+                    crate::chaos_point!(WORKER_PERSIST_BEFORE_COMMIT);
+                    Ok(WorkflowPersistFlow::Persisted {
+                        retry_scheduled,
+                        deferred_checks,
+                        race_deferred_triggers,
+                        pending_cancel_metrics,
+                        continue_as_new_redirected_to_failure,
+                        deferred_cancel_ended_run,
+                    })
+                }),
+            ))
             .await
         },
     ))
@@ -27111,13 +29232,26 @@ async fn process_workflow_task(
 
     match persist_flow {
         Ok(WorkflowPersistFlow::ParkedPaused) => return Ok(()),
+        Ok(WorkflowPersistFlow::RependedForSignals) => {
+            // A handler panic marked the cycle failed. The run goes on.
+            cycle_failure.discarded();
+            return Ok(());
+        }
         Ok(WorkflowPersistFlow::Persisted {
             retry_scheduled,
             deferred_checks,
             race_deferred_triggers,
             pending_cancel_metrics,
             continue_as_new_redirected_to_failure,
+            deferred_cancel_ended_run,
         }) => {
+            // Issue #1984: the cycle cancelled the run instead of its own
+            // outcome. `pending_cancel_metrics` carries the terminal metric.
+            if deferred_cancel_ended_run {
+                pending_workflow_metrics.status = WorkflowStatus::Suspended;
+                pending_workflow_metrics.is_continued_as_new = false;
+                pending_workflow_metrics.terminal = TerminalMetricsKind::Suspended;
+            }
             // Issue #1161 (Codex P2 on PR #1399): a ContinuedAsNew outcome
             // redirected internally to a terminal failure. Correct the
             // metrics and schedule-failure-counter action this cycle
@@ -27165,15 +29299,21 @@ async fn process_workflow_task(
             // snapshot moves into the cache; nothing reads `history_events`
             // after this point.
             store_cache_entry(
+                conn,
                 &workflow_cache,
                 prepared.exec_id.as_uuid(),
-                pending_cache_update,
+                cache_update_after_persist(pending_cache_update, deferred_cancel_ended_run),
                 crate::cache::CachedWorkflowState {
                     events: std::mem::take(&mut history_events),
                     next_event_id,
                 },
-                final_resident.take(),
+                std::mem::take(&mut final_resident),
                 history_bytes,
+                CacheOwner {
+                    key: owner_key,
+                    pinned: pinned_epoch,
+                    owned: &registry.decision_owner(),
+                },
             )
             .await;
 
@@ -27216,7 +29356,7 @@ async fn process_workflow_task(
             // `counter_action` was pre-computed as `None` for the ORIGINAL
             // `ContinuedAsNew` outcome. That is wrong once this cycle's real
             // persisted result was a terminal failure.
-            let effective_counter = if retry_scheduled {
+            let effective_counter = if retry_scheduled || deferred_cancel_ended_run {
                 None
             } else if continue_as_new_redirected_to_failure {
                 Some(true)
@@ -27397,27 +29537,94 @@ async fn process_workflow_task(
 /// An entry that the update displaces drops after the lock is released.
 /// Dropping a resident workflow frees its future, its context and a copy of
 /// the history, which other tasks must not wait for (issue #1798).
+/// The cache update for a persisted cycle (issue #1984).
+///
+/// A deferred cancel ends a run whose own outcome is `Suspended`. The run is
+/// then terminal, so the cache evicts it instead of keeping it warm.
+const fn cache_update_after_persist(
+    pending: Option<bool>,
+    deferred_cancel_ended_run: bool,
+) -> Option<bool> {
+    match pending {
+        Some(_) if deferred_cancel_ended_run => Some(false),
+        other => other,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+// Only the disk tier uses `conn`, and it needs it mutably.
+#[cfg_attr(
+    not(feature = "owner-disk-cache"),
+    allow(unused_variables, clippy::needless_pass_by_ref_mut)
+)]
 async fn store_cache_entry(
+    // Issue #2260: the entity projection reads the committed row with it.
+    conn: &mut AsyncPgConnection,
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     exec_uuid: uuid::Uuid,
     suspended: Option<bool>,
     state: crate::cache::CachedWorkflowState,
-    resident: Option<crate::resident::ResidentWorkflow>,
+    resident: crate::resident::Residency,
     // Issue #1804: the byte mark measured at the start of this decision.
     history_bytes: Option<crate::cache::HistoryBytesMark>,
+    // Issue #2251: the partition tag, so a fenced owner can drop the entry.
+    owner: CacheOwner<'_>,
 ) {
     let Some(suspended) = suspended else {
         return;
     };
+    // Issue #2258: the disk tier first. A suspension writes its new events.
+    // A terminal run, or an ended tenure, purges the disk entry.
+    #[cfg(feature = "owner-disk-cache")]
+    let Some(state) = write_disk_entry(
+        conn,
+        workflow_cache,
+        exec_uuid,
+        suspended,
+        state,
+        history_bytes,
+        owner,
+    )
+    .await
+    else {
+        return;
+    };
     let displaced = {
         let mut guard = workflow_cache.lock().await;
-        if suspended {
-            guard.insert_resident_with_history_bytes(exec_uuid, state, resident, history_bytes)
+        if suspended && owner.may_cache() {
+            guard.insert_resident_with_history_bytes(
+                exec_uuid,
+                state,
+                resident,
+                history_bytes,
+                Some(owner.key),
+            )
         } else {
             guard.take(&exec_uuid)
         }
     };
     drop(displaced);
+}
+
+#[cfg(test)]
+mod cache_update_after_persist_tests {
+    use super::cache_update_after_persist;
+
+    #[test]
+    fn a_deferred_cancel_evicts_a_suspended_run() {
+        assert_eq!(cache_update_after_persist(Some(true), true), Some(false));
+    }
+
+    #[test]
+    fn a_plain_cycle_keeps_its_cache_update() {
+        assert_eq!(cache_update_after_persist(Some(true), false), Some(true));
+        assert_eq!(cache_update_after_persist(Some(false), false), Some(false));
+    }
+
+    #[test]
+    fn sticky_routing_off_never_touches_the_cache() {
+        assert_eq!(cache_update_after_persist(None, true), None);
+    }
 }
 
 /// What a dispatch actually did, so the poll loop can tell a task this worker
@@ -27475,6 +29682,10 @@ enum TaskDispatchOutcome {
     /// terminally (issue #1815). The failure is already persisted, so the
     /// dispatch site only counts it.
     FailedTerminally,
+    /// The decision commit lost its owner fence (issue #2251). It wrote
+    /// nothing, and the task is re-pended under its claim. The worker made
+    /// no error, so the dispatch site does not count it.
+    Fenced,
 }
 
 /// How a workflow cycle that returned `Ok` ended its task (issue #1815).
@@ -27508,6 +29719,12 @@ impl CycleFailure {
             Self::FAILED_TERMINALLY,
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    /// The cycle discarded its failure, because the task was re-pended
+    /// for a late signal (issue #2079).
+    fn discarded(&self) {
+        self.0.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The dispatch outcome of the cycle.
@@ -27720,6 +29937,9 @@ async fn process_task(
     pool_labels: &Arc<[u16]>,
     // Issue #1813: the drain's cancel for running activities.
     drain_cancel: &CancellationToken,
+    // Issue #2251: the shard of the pool that this task came from. It keys
+    // the owner tenure, because it names the database of the owner row.
+    owner_shard: crate::types::ShardId,
 ) -> HarvestResult<TaskDispatchOutcome> {
     // Issue #804 (Codex round-22 P2): the workflow path sets this when a
     // frontier reset commits, so the capability-miss interception below knows
@@ -27747,6 +29967,8 @@ async fn process_task(
                 // Issue #1815: every outcome persist of the cycle is timed
                 // under the pool's labels. See `PersistTiming`.
                 let timing = PersistTiming::new(&registry.telemetry().metrics, pool_labels);
+                // Issue #2251: the dispatch site opened the decision scope.
+                // The cycle pins its tenure there.
                 let outcome = Box::pin(PERSIST_TIMING.scope(
                     timing,
                     process_workflow_task(
@@ -27757,7 +29979,7 @@ async fn process_task(
                         build_id,
                         sticky_timeout,
                         max_local_activity_start_to_close,
-                        workflow_cache,
+                        Arc::clone(&workflow_cache),
                         dispatched_at,
                         &workflow_panic_strikes,
                         workflow_panic_max_attempts,
@@ -27765,6 +29987,7 @@ async fn process_task(
                         workflow_task_deadline,
                         &frontier_reset_committed,
                         &cycle_failure,
+                        owner_shard,
                     ),
                 ))
                 .await;
@@ -27831,6 +30054,16 @@ async fn process_task(
     let Err(error) = &outcome else {
         return Ok(cycle_failure.outcome());
     };
+    // Issue #2251: a fenced decision wrote nothing. Unload the partition and
+    // give the task back. Never retry at the stale epoch.
+    if let Some((partition, pinned)) = error.ownership_lost() {
+        let key = crate::decision_owner::OwnerKey {
+            shard: owner_shard,
+            partition,
+        };
+        return unload_fenced_partition(&mut conn, &registry, &workflow_cache, &task, key, pinned)
+            .await;
+    }
     // Issue #1182 (Codex review round 3): an ambiguous suspended-dispatch
     // claim is intercepted HERE -- after `run_under_workflow_body_budget`
     // has already returned -- rather than inside `process_workflow_task`.
@@ -27884,6 +30117,307 @@ async fn process_task(
         &resolved,
     );
     resolved
+}
+
+/// Drop a fenced tenure and the cache entries of its partition (issue #2251).
+///
+/// The worker drops its tenure when the tenure still pins `pinned`. It drops
+/// every cache entry of the partition unless a newer tenure holds it. A new
+/// tenure then starts cold. Returns `true` when this call dropped the tenure.
+async fn drop_fenced_tenure(
+    owned: &crate::decision_owner::OwnedPartitions,
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    key: crate::decision_owner::OwnerKey,
+    pinned: crate::decision_owner::OwnerEpoch,
+) -> bool {
+    // The decision is over. Later writes of this dispatch fence nothing.
+    let _ = crate::decision_owner::pin_decision(None);
+    let unloaded = owned.unload(key, pinned);
+    // Keep the entries of a newer tenure. Drop them in every other case, so
+    // a later tenure starts cold.
+    if unloaded || owned.tenure_for(key).is_none() {
+        // Drop the parked futures outside the cache lock.
+        let evicted = workflow_cache.lock().await.evict_partition(key);
+        drop(evicted);
+        // Issue #2258: delete the disk file of the partition too.
+        #[cfg(feature = "owner-disk-cache")]
+        drop_disk_partitions(workflow_cache, &[key]).await;
+    }
+    metrics.record_decision_owner_fenced(&key.shard.as_i32().to_string());
+    unloaded
+}
+
+/// The longest single wait of the owner wake task for a wake (issue #2253).
+/// A tenure change ends the wait sooner.
+const OWNER_WAKE_TICK: Duration = Duration::from_secs(1);
+
+/// How long the owner wake task waits after a failed connection.
+const OWNER_WAKE_RETRY: Duration = Duration::from_secs(1);
+
+/// What the owner wake task of one shard pool needs (issue #2253).
+struct OwnerWakes {
+    url: String,
+    shard: crate::types::ShardId,
+    owned: Arc<crate::decision_owner::OwnedPartitions>,
+    workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
+    woken: Arc<tokio::sync::Notify>,
+    /// The hints of the owner decider of `shard` (issue #2255).
+    hints: Arc<OwnerHints>,
+    /// The worker runs owner deciders. See `Worker::deciders_enabled`.
+    deciders: bool,
+    metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
+    shutdown: CancellationToken,
+    listening: Arc<std::sync::Mutex<std::collections::BTreeSet<crate::decision_owner::OwnerKey>>>,
+}
+
+impl OwnerWakes {
+    /// Listen on the owner channel of each partition that this worker owns
+    /// on `shard`, until shutdown (issue #2253).
+    ///
+    /// The task connects only while the worker holds a tenure on the shard.
+    /// With no tenure, it waits for a tenure change and does not poll. A
+    /// wake that it misses while it reconnects costs latency only. The poll
+    /// loop still claims, and a cache hit checks its delta.
+    async fn run(self) {
+        let mut listener: Option<crate::notify::OwnerWakeListener> = None;
+        let mut synced: Option<u64> = None;
+        while !self.shutdown.is_cancelled() {
+            // Arm the change wait first, then read the version. A change
+            // after the read still ends the wait below.
+            let changed = self.owned.changed();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let version = self.owned.version();
+            let wanted = self.owned.partitions_on(self.shard);
+            if wanted.is_empty() {
+                listener = None;
+                synced = None;
+                self.set_listening(&[]);
+                // No tenure: wait for one, with no poll.
+                tokio::select! {
+                    () = self.shutdown.cancelled() => break,
+                    () = changed => {}
+                }
+                continue;
+            }
+            let Some(open) = listener.as_mut() else {
+                match crate::notify::OwnerWakeListener::connect(&self.url).await {
+                    Ok(open) => listener = Some(open),
+                    Err(error) => {
+                        tracing::warn!(
+                            shard = self.shard.as_i32(),
+                            error = %error,
+                            "harvest: the owner wake listener cannot connect; retrying"
+                        );
+                        self.pause(OWNER_WAKE_RETRY).await;
+                    }
+                }
+                synced = None;
+                continue;
+            };
+            if synced != Some(version) {
+                if let Err(error) = sync_owner_channels(open, &wanted).await {
+                    tracing::warn!(
+                        shard = self.shard.as_i32(),
+                        error = %error,
+                        "harvest: the owner wake listener failed; reconnecting"
+                    );
+                    listener = None;
+                    self.set_listening(&[]);
+                    self.pause(OWNER_WAKE_RETRY).await;
+                    continue;
+                }
+                synced = Some(version);
+                self.set_listening(&wanted);
+            }
+            let wait = tokio::select! {
+                () = self.shutdown.cancelled() => break,
+                // A tenure change syncs the channels at once.
+                () = changed.as_mut() => continue,
+                wait = open.wait(OWNER_WAKE_TICK) => wait,
+            };
+            match wait {
+                crate::notify::OwnerWakeWait::Woken(wake) => self.handle(&wake).await,
+                crate::notify::OwnerWakeWait::TimedOut => {}
+                // A server that drops each connection must not cause a
+                // reconnect loop, so the retry waits first.
+                crate::notify::OwnerWakeWait::ChannelClosed => {
+                    listener = None;
+                    self.set_listening(&[]);
+                    self.pause(OWNER_WAKE_RETRY).await;
+                }
+            }
+        }
+    }
+
+    /// Publish the partitions that the listener listens on, for tests.
+    fn set_listening(&self, partitions: &[crate::decision_owner::DecisionPartition]) {
+        let mut listening = self
+            .listening
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        listening.retain(|key| key.shard != self.shard);
+        listening.extend(
+            partitions
+                .iter()
+                .map(|&partition| crate::decision_owner::OwnerKey {
+                    shard: self.shard,
+                    partition,
+                }),
+        );
+    }
+
+    /// Sleep for `wait`, or less at shutdown.
+    async fn pause(&self, wait: Duration) {
+        tokio::select! {
+            () = self.shutdown.cancelled() => {}
+            () = tokio::time::sleep(wait) => {}
+        }
+    }
+
+    /// Evict the entry of an evict wake, count the wake and hand the
+    /// execution to the owner decider. With owner mode off, wake the poll
+    /// loop too.
+    async fn handle(&self, wake: &crate::notify::OwnerWake) {
+        let kind = if wake.payload.evict {
+            // Drop the parked future outside the cache lock.
+            let taken = self
+                .workflow_cache
+                .lock()
+                .await
+                .take(&wake.payload.workflow_exec_id);
+            drop(taken);
+            // Issue #2258: a state change, a terminal one included, purges
+            // the disk entry. An erasure then finds no local copy.
+            #[cfg(feature = "owner-disk-cache")]
+            {
+                let disk = self.workflow_cache.lock().await.disk();
+                if let Some(disk) = disk {
+                    disk.purge_evicted(wake.payload.workflow_exec_id).await;
+                }
+            }
+            "evict"
+        } else {
+            "wake"
+        };
+        self.metrics
+            .record_decision_owner_woken(&self.shard.as_i32().to_string(), kind);
+        // Issue #2255: the decider takes the task of a woken run. An evict
+        // wake can mark a state change that needs a decision, such as a
+        // resume, so it is a hint too. Where the decider runs, the claim
+        // loops claim activities only, so the wake does not reach them.
+        self.hints.push(self.shard, wake.payload.workflow_exec_id);
+        if !self.deciders || self.owned.owned_claim(self.shard).is_none() {
+            self.woken.notify_one();
+        }
+    }
+}
+
+/// The execution ids that owner wakes name, per owner shard (issue #2255).
+///
+/// A hint is a reason to look, never a record of work. The durable record
+/// is the `PENDING` task row, and each signal is a `harvest_signals` row
+/// before its acknowledgement. A lost hint costs latency only, because the
+/// decider scans its partitions too. So the set is bounded, and a full set
+/// drops new hints.
+#[derive(Debug, Default)]
+struct OwnerHints {
+    pending: std::sync::Mutex<HashMap<crate::types::ShardId, HashSet<uuid::Uuid>>>,
+    /// Wakes the deciders. Each decider arms it before it reads the set.
+    pushed: tokio::sync::Notify,
+}
+
+/// The most hints that one owner shard keeps (issue #2255).
+const OWNER_HINTS_MAX: usize = 4096;
+
+impl OwnerHints {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<crate::types::ShardId, HashSet<uuid::Uuid>>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Add the hint `exec_id` for the decider of `shard`.
+    fn push(&self, shard: crate::types::ShardId, exec_id: uuid::Uuid) {
+        let mut pending = self.lock();
+        let set = pending.entry(shard).or_default();
+        if set.len() < OWNER_HINTS_MAX {
+            set.insert(exec_id);
+        }
+        drop(pending);
+        self.pushed.notify_waiters();
+    }
+
+    /// Take every hint of `shard`.
+    fn take(&self, shard: crate::types::ShardId) -> Vec<uuid::Uuid> {
+        self.lock()
+            .get_mut(&shard)
+            .map(|set| set.drain().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Make `listener` listen on exactly the channels of `wanted`.
+async fn sync_owner_channels(
+    listener: &mut crate::notify::OwnerWakeListener,
+    wanted: &[crate::decision_owner::DecisionPartition],
+) -> HarvestResult<()> {
+    for stale in listener.partitions() {
+        if !wanted.contains(&stale) {
+            listener.unlisten(stale).await?;
+        }
+    }
+    for &partition in wanted {
+        listener.listen(partition).await?;
+    }
+    Ok(())
+}
+
+/// Unload a fenced partition and re-pend its task (issue #2251).
+///
+/// The decision transaction rolled back, so it wrote nothing. The worker
+/// drops its tenure when the tenure still pins `pinned`. It drops every
+/// cache entry of the partition unless a newer tenure holds it. A new
+/// tenure then starts cold. The task goes back to `PENDING` under its
+/// claim, so the new owner can take it. A stale claim writes nothing.
+async fn unload_fenced_partition(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    task: &TaskQueueItem,
+    key: crate::decision_owner::OwnerKey,
+    pinned: crate::decision_owner::OwnerEpoch,
+) -> HarvestResult<TaskDispatchOutcome> {
+    let unloaded = drop_fenced_tenure(
+        &registry.decision_owner(),
+        workflow_cache,
+        &*registry.telemetry().metrics,
+        key,
+        pinned,
+    )
+    .await;
+    tracing::warn!(
+        task_id = %task.id,
+        %key,
+        %pinned,
+        unloaded,
+        "harvest: a decision lost its owner fence; the partition is unloaded and the task is \
+         re-pended (issue #2251)"
+    );
+    let Some(claim) = queue::TaskClaim::of(task) else {
+        return Ok(TaskDispatchOutcome::ClaimLostAfterFailure);
+    };
+    let delay = fence_repend_delay(pinned);
+    // Issue #2252: an owned claim may take an unstamped row. Stamp it, so
+    // the owner of its partition takes it next.
+    if queue::requeue_unowned_workflow_task(conn, &claim, key.partition, delay).await? {
+        Ok(TaskDispatchOutcome::Fenced)
+    } else {
+        Ok(TaskDispatchOutcome::ClaimLostAfterFailure)
+    }
 }
 
 /// The handler a claiming worker turned out not to register (issue #804).
@@ -28872,6 +31406,8 @@ where
     let error = error.to_string();
     Box::pin(
         conn.transaction::<TerminalWriteOutcome, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             // Lock the execution row FIRST (the documented execution -> task
             // order) and re-derive the event id under that lock. The preloaded
             // id was read *before* this transaction opened, so a parallel
@@ -29110,11 +31646,11 @@ async fn escalate_capability_miss(
 ///
 /// The sampler skips work entirely when the recorder is the default no-op
 /// implementation (`is_enabled() == false`), so unconfigured deployments pay no
-/// DB cost. This matters because the per-tick queries are not free: `queue_depths`
-/// is a `GROUP BY` aggregate and `oldest_pending_ages` scans eligible pending rows
-/// with correlated concurrency / rate-limit checks. Both feed gauges that are
-/// discarded by the no-op recorder, so issuing them would be pure waste (issue #501
-/// review).
+/// DB cost. This matters because the per-tick queries are not free.
+/// `bounded_queue_depths` reads up to `QUEUE_DEPTH_CAP` index entries per
+/// queue. `oldest_pending_ages` runs correlated concurrency / rate-limit checks.
+/// Both feed gauges that are discarded by the no-op recorder, so issuing them
+/// would be pure waste (issue #501 review).
 ///
 /// Stops when the cancellation token fires. Queues with zero pending rows are
 /// also reported (as depth 0) so gauges reset cleanly after drains.
@@ -29145,7 +31681,9 @@ fn spawn_queue_depth_sampler(
 
             // Aggregate across every shard: depth is summed (total backlog),
             // oldest-pending-age is the max (the single oldest task fleet-wide).
-            let mut depth_by_queue: std::collections::HashMap<String, i64> =
+            // The depth sum stops at `QUEUE_DEPTH_CAP`, as each shard count does
+            // (issue #2356).
+            let mut depth_by_queue: std::collections::HashMap<String, u64> =
                 std::collections::HashMap::new();
             let mut age_by_queue: std::collections::HashMap<String, f64> =
                 std::collections::HashMap::new();
@@ -29181,10 +31719,21 @@ fn spawn_queue_depth_sampler(
                         continue;
                     }
                 };
-                match queue::queue_depths(&mut conn, &queues).await {
+                match queue::bounded_queue_depths(
+                    &mut conn,
+                    &queues,
+                    crate::telemetry::QUEUE_DEPTH_CAP,
+                )
+                .await
+                {
                     Ok(depths) => {
                         for (queue_name, depth) in depths {
-                            *depth_by_queue.entry(queue_name).or_insert(0) += depth;
+                            let total = depth_by_queue.entry(queue_name).or_insert(0);
+                            *total = queue::add_bounded_depth(
+                                *total,
+                                u64::try_from(depth).unwrap_or(0),
+                                crate::telemetry::QUEUE_DEPTH_CAP.get(),
+                            );
                         }
                     }
                     Err(error) => {
@@ -29221,9 +31770,7 @@ fn spawn_queue_depth_sampler(
             // and age queries are scoped to `queues`, so no other queue appears.
             for queue_name in &queues {
                 let depth = depth_by_queue.get(queue_name).copied().unwrap_or(0);
-                telemetry
-                    .metrics
-                    .record_queue_depth(queue_name, u64::try_from(depth).unwrap_or(0));
+                telemetry.metrics.record_queue_depth(queue_name, depth);
                 let age = age_by_queue.get(queue_name).copied().unwrap_or(0.0);
                 telemetry
                     .metrics
@@ -29883,6 +32430,41 @@ fn spawn_worker_slot_sampler(
     })
 }
 
+/// Spawn the loop that keeps the run-default overrides current (issue #2387).
+///
+/// The start paths of a worker read the cache of its registry and send no
+/// query. So a worker with no scheduler still needs this loop. The loop reads
+/// the default pool, which holds the override table. A failed refresh keeps
+/// the last snapshot, and the next period retries.
+///
+/// Dropping the returned guard aborts the task.
+#[cfg(feature = "db")]
+fn spawn_run_defaults_refresh(
+    cache: Arc<crate::run_defaults::RunDefaultsCache>,
+    pool: DbPool,
+) -> AbortOnDrop {
+    AbortOnDrop::new(tokio::spawn(async move {
+        loop {
+            match pool.get().await {
+                Ok(mut conn) => {
+                    if let Err(error) = cache.refresh_if_stale(&mut conn).await {
+                        tracing::warn!(
+                            error = %error,
+                            "harvest: could not refresh run-default overrides; \
+                             keeping the last snapshot"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "harvest: no connection to refresh run-default overrides"
+                ),
+            }
+            tokio::time::sleep(crate::run_defaults::RUN_DEFAULTS_TTL).await;
+        }
+    }))
+}
+
 /// Spawn the DB-pool gauge sampler (issue #1815).
 ///
 /// Each tick reads `Pool::status()` for every `(shard, pool)` pair. That read
@@ -30067,7 +32649,7 @@ static POLLERS_BY_RECORDER: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<usize, RecorderPollers>>,
 > = std::sync::LazyLock::new(std::sync::Mutex::default);
 
-/// Counts one running poll loop and keeps `harvest.worker.pollers` current
+/// Counts one running claim loop and keeps `harvest.worker.pollers` current
 /// (issue #1815).
 ///
 /// The guard sets the gauge when its loop starts and again when the loop
@@ -30126,6 +32708,16 @@ impl Drop for PollerGuard {
     }
 }
 
+/// The kind of task that one claim returned (issue #2248).
+fn claim_kind(claimed: &HarvestResult<Option<TaskQueueItem>>) -> ClaimKind {
+    match claimed {
+        Ok(Some(task)) if task.task_type == TaskType::Workflow.as_str() => ClaimKind::Workflow,
+        Ok(Some(_)) => ClaimKind::Activity,
+        Ok(None) => ClaimKind::Empty,
+        Err(_) => ClaimKind::Error,
+    }
+}
+
 /// How one workflow-task cycle times its outcome persists (issue #1815).
 ///
 /// The dispatcher sets it around the cycle. The main persist transaction
@@ -30139,6 +32731,15 @@ struct PersistTiming {
     /// Set while a timer of the cycle runs. A write nested in a timed
     /// transaction is part of that sample, so it does not start another.
     running: std::cell::Cell<bool>,
+    /// Issue #2248: the seconds of each timed phase of the running timer,
+    /// in the order of [`PersistPhase::TIMED`].
+    phases: std::cell::Cell<[f64; PersistPhase::TIMED.len()]>,
+    /// The phase that a phase timer times now. A nested phase timer records
+    /// nothing, so no time counts twice.
+    phase: std::cell::Cell<Option<PersistPhase>>,
+    /// When the body of the decision transaction ended. Diesel sends
+    /// `COMMIT` or `ROLLBACK` after it.
+    body_end: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 impl PersistTiming {
@@ -30147,6 +32748,9 @@ impl PersistTiming {
             metrics: Arc::clone(metrics),
             labels: Arc::clone(labels),
             running: std::cell::Cell::new(false),
+            phases: std::cell::Cell::new([0.0; PersistPhase::TIMED.len()]),
+            phase: std::cell::Cell::new(None),
+            body_end: std::cell::Cell::new(None),
         }
     }
 }
@@ -30164,18 +32768,35 @@ struct PersistTimer {
     metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
     labels: Arc<[u16]>,
     started: std::time::Instant,
+    /// Issue #2248: the timer of a decision persist records its phases too.
+    decision: bool,
 }
 
 impl PersistTimer {
     /// Start a timer for this cycle. It is `None` outside a workflow-task
     /// cycle, and while another timer of the cycle runs.
     fn start() -> Option<Self> {
+        Self::start_as(false)
+    }
+
+    /// [`Self::start`] for the decision persist, which records its phases.
+    fn start_decision() -> Option<Self> {
+        Self::start_as(true)
+    }
+
+    fn start_as(decision: bool) -> Option<Self> {
         PERSIST_TIMING
             .try_with(|timing| {
-                (!timing.running.replace(true)).then(|| Self {
-                    metrics: Arc::clone(&timing.metrics),
-                    labels: Arc::clone(&timing.labels),
-                    started: std::time::Instant::now(),
+                (!timing.running.replace(true)).then(|| {
+                    timing.phases.set([0.0; PersistPhase::TIMED.len()]);
+                    timing.phase.set(None);
+                    timing.body_end.set(None);
+                    Self {
+                        metrics: Arc::clone(&timing.metrics),
+                        labels: Arc::clone(&timing.labels),
+                        started: std::time::Instant::now(),
+                        decision,
+                    }
                 })
             })
             .ok()
@@ -30185,13 +32806,199 @@ impl PersistTimer {
 
 impl Drop for PersistTimer {
     fn drop(&mut self) {
-        let elapsed = self.started.elapsed().as_secs_f64();
+        // One clock read for the total and the commit, so the phases add up
+        // to the total. Recording time then counts in neither.
+        let now = std::time::Instant::now();
+        let elapsed = now.saturating_duration_since(self.started).as_secs_f64();
+        // Outside the scope there is nothing to reset.
+        let body_end = PERSIST_TIMING
+            .try_with(|timing| {
+                timing.running.set(false);
+                (timing.phases.get(), timing.body_end.take())
+            })
+            .ok();
         for label in self.labels.iter() {
             self.metrics
                 .record_db_query_duration(DbOp::Persist, *label, elapsed);
         }
-        // Outside the scope there is nothing to reset.
-        let _ = PERSIST_TIMING.try_with(|timing| timing.running.set(false));
+        // Issue #2248: diesel sends `COMMIT` after the body ends. A persist
+        // that never reached its body, such as a failed `BEGIN`, has no
+        // commit time, and all its time counts as `other`.
+        let Some((phases, body_end)) = body_end.filter(|_| self.decision) else {
+            return;
+        };
+        let commit = body_end.map_or(0.0, |end| now.saturating_duration_since(end).as_secs_f64());
+        let parts = crate::telemetry::persist_phase_breakdown(elapsed, phases, commit);
+        for label in self.labels.iter() {
+            for (phase, seconds) in parts {
+                self.metrics.record_persist_phase(phase, *label, seconds);
+            }
+        }
+    }
+}
+
+/// Times one phase of a running decision persist (issue #2248).
+///
+/// Each chokepoint of a phase starts one. Outside a persist timer, or inside
+/// another phase timer, it is `None` and times nothing.
+pub(crate) struct PersistPhaseTimer {
+    index: usize,
+    started: std::time::Instant,
+}
+
+impl PersistPhaseTimer {
+    /// Start a timer for `phase`, a phase of [`PersistPhase::TIMED`].
+    pub(crate) fn start(phase: PersistPhase) -> Option<Self> {
+        let index = phase.timed_index()?;
+        PERSIST_TIMING
+            .try_with(|timing| {
+                (timing.running.get() && timing.phase.get().is_none()).then(|| {
+                    timing.phase.set(Some(phase));
+                    Self {
+                        index,
+                        started: std::time::Instant::now(),
+                    }
+                })
+            })
+            .ok()
+            .flatten()
+    }
+}
+
+impl Drop for PersistPhaseTimer {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let _ = PERSIST_TIMING.try_with(|timing| {
+            timing.phase.set(None);
+            let mut phases = timing.phases.get();
+            phases[self.index] += elapsed;
+            timing.phases.set(phases);
+        });
+    }
+}
+
+/// Marks the end of the decision transaction body when it drops (issue
+/// #2248). The persist timer then counts the rest as the commit.
+struct PersistBodyEnd;
+
+impl Drop for PersistBodyEnd {
+    fn drop(&mut self) {
+        let _ = PERSIST_TIMING.try_with(|timing| {
+            if timing.running.get() {
+                timing.body_end.set(Some(std::time::Instant::now()));
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod persist_phase_tests {
+    use super::*;
+    use crate::telemetry::MetricsRecorder;
+
+    /// Keeps the persist totals and the phases of each persist.
+    #[derive(Default)]
+    struct Phases {
+        persists: std::sync::Mutex<Vec<f64>>,
+        phases: std::sync::Mutex<Vec<(PersistPhase, f64)>>,
+    }
+
+    impl MetricsRecorder for Phases {
+        fn record_db_query_duration(&self, op: DbOp, _shard: u16, seconds: f64) {
+            if op == DbOp::Persist {
+                self.persists.lock().expect("lock").push(seconds);
+            }
+        }
+
+        fn record_persist_phase(&self, phase: PersistPhase, _shard: u16, seconds: f64) {
+            self.phases.lock().expect("lock").push((phase, seconds));
+        }
+    }
+
+    impl Phases {
+        fn of(&self, phase: PersistPhase) -> Vec<f64> {
+            self.phases
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|(p, _)| *p == phase)
+                .map(|(_, s)| *s)
+                .collect()
+        }
+    }
+
+    /// Run `body` inside a persist timing scope with one shard label.
+    async fn timed(recorder: &Arc<Phases>, body: impl std::future::Future<Output = ()>) {
+        let metrics: Arc<dyn MetricsRecorder> = Arc::clone(recorder) as Arc<dyn MetricsRecorder>;
+        let labels: Arc<[u16]> = Arc::from([0_u16]);
+        PERSIST_TIMING
+            .scope(PersistTiming::new(&metrics, &labels), body)
+            .await;
+    }
+
+    fn spin(micros: u64) {
+        let until = std::time::Instant::now() + std::time::Duration::from_micros(micros);
+        while std::time::Instant::now() < until {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// A nested phase timer records nothing, so the outer phase keeps the
+    /// time. The six phases add up to the persist total.
+    #[tokio::test]
+    async fn a_nested_phase_counts_once_and_the_phases_add_up() {
+        let recorder = Arc::new(Phases::default());
+        timed(&recorder, async {
+            let timer = PersistTimer::start_decision();
+            {
+                let _events = PersistPhaseTimer::start(PersistPhase::Events);
+                assert!(
+                    PersistPhaseTimer::start(PersistPhase::Fence).is_none(),
+                    "a nested phase timer times nothing"
+                );
+                spin(500);
+            }
+            drop(PersistBodyEnd);
+            spin(200);
+            drop(timer);
+        })
+        .await;
+        assert_eq!(recorder.of(PersistPhase::Fence), [0.0]);
+        assert!(recorder.of(PersistPhase::Events)[0] >= 0.000_5);
+        assert!(recorder.of(PersistPhase::Commit)[0] >= 0.000_2);
+        let total = recorder.persists.lock().expect("lock")[0];
+        let sum: f64 = recorder
+            .phases
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(_, s)| s)
+            .sum();
+        assert!((sum - total).abs() < 1e-9, "{sum} against {total}");
+    }
+
+    /// A decision persist that never reaches its body still records every
+    /// phase. A failure write records none. A phase timer outside a persist
+    /// times nothing.
+    #[tokio::test]
+    async fn only_a_decision_persist_records_phases_and_always_all_of_them() {
+        let recorder = Arc::new(Phases::default());
+        timed(&recorder, async {
+            assert!(PersistPhaseTimer::start(PersistPhase::Tasks).is_none());
+            drop(PersistTimer::start_decision());
+            drop(PersistTimer::start());
+        })
+        .await;
+        assert_eq!(recorder.persists.lock().expect("lock").len(), 2);
+        for phase in PersistPhase::ALL {
+            assert_eq!(recorder.of(phase).len(), 1, "{phase:?} once");
+        }
+        assert_eq!(
+            recorder.of(PersistPhase::Commit),
+            [0.0],
+            "no body, no commit"
+        );
+        assert!(PersistPhaseTimer::start(PersistPhase::Events).is_none());
     }
 }
 
@@ -30231,7 +33038,8 @@ pub enum ClaimRecovery {
 /// A completion is a success. An error, a body timeout, a re-pended failure
 /// and a terminal handler panic are failures. A release is neither, because
 /// the task did not run to a decision here. A failure whose claim a peer took
-/// is neither too, because a peer owns it.
+/// is neither too, because a peer owns it. A fenced decision is neither, as
+/// another owner decides now (issue #2251).
 const fn workflow_task_failed(outcome: &HarvestResult<TaskDispatchOutcome>) -> Option<bool> {
     match outcome {
         Ok(TaskDispatchOutcome::Completed) => Some(false),
@@ -30241,9 +33049,11 @@ const fn workflow_task_failed(outcome: &HarvestResult<TaskDispatchOutcome>) -> O
             | TaskDispatchOutcome::FailedTerminally,
         )
         | Err(_) => Some(true),
-        Ok(TaskDispatchOutcome::Released { .. } | TaskDispatchOutcome::ClaimLostAfterFailure) => {
-            None
-        }
+        Ok(
+            TaskDispatchOutcome::Released { .. }
+            | TaskDispatchOutcome::ClaimLostAfterFailure
+            | TaskDispatchOutcome::Fenced,
+        ) => None,
     }
 }
 
@@ -30867,6 +33677,36 @@ pub struct Worker {
     /// Wakes a saturated poll loop when a task releases its permit (issue
     /// #1787). See [`CapacityPermit`].
     capacity_freed: Arc<tokio::sync::Notify>,
+    /// Wakes every idle wait when a task deferred at its adaptive limit is
+    /// due (issue #1836). Unlike `capacity_freed`, no gate holds it back.
+    deferral_due: Arc<tokio::sync::Notify>,
+    /// Wakes every idle wait when a foreign write wakes this owner (issue
+    /// #2253). See [`OwnerWakes`].
+    owner_woken: Arc<tokio::sync::Notify>,
+    /// The execution ids that owner wakes name, per owner shard (issue
+    /// #2255). The owner decider of that shard takes their workflow tasks.
+    owner_hints: Arc<OwnerHints>,
+    /// Wakes the owner deciders when a workflow permit frees (issue #2255).
+    decider_capacity: Arc<tokio::sync::Notify>,
+    /// Wakes the leader's idle wait when a workflow task of this worker ends
+    /// (issue #2418). Its commit is visible, so the wake does not settle.
+    /// It also cuts a running settle short. See [`Worker::settle`].
+    decision_done: Arc<tokio::sync::Notify>,
+    /// The end of a settle that `decision_done` cut short (issue #2418).
+    /// The leader owes one poll at that instant.
+    owed_poll: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// A NOTIFY woke the leader, and its settle waits for an empty poll
+    /// (issue #2422). See [`Worker::settle_if_pending`].
+    settle_pending: AtomicBool,
+    /// The claim targets of the running claim loops (issue #2255). The run
+    /// path sets them.
+    claim_targets: std::sync::RwLock<Vec<Option<crate::types::ShardId>>>,
+    /// The owner shards with an owner wake task (issue #2255). A decider
+    /// runs only on these.
+    owner_wake_shards: std::sync::RwLock<HashSet<crate::types::ShardId>>,
+    /// The partitions that the owner wake tasks listen on (issue #2253).
+    owner_listening:
+        Arc<std::sync::Mutex<std::collections::BTreeSet<crate::decision_owner::OwnerKey>>>,
     /// Kinds the poll gate refused since the last claim of that kind (issue
     /// #1787). The slot tuner counts a claimed task's queue wait only when
     /// the gate held its kind back. Otherwise a NOTIFY delay reads as a
@@ -30874,8 +33714,21 @@ pub struct Worker {
     gate_refused: Arc<GateRefused>,
     /// A claim skipped a type at its adaptive limit since the last idle
     /// wait (issue #1836). The next idle wait then also wakes on
-    /// `capacity_freed`, even when the slot freed before the wait began.
+    /// `capacity_freed`, even when the slot freed before the wait began. A
+    /// wake on `capacity_freed` also clears it.
     limit_refused: AtomicBool,
+    /// The poll gate refused a kind, and no idle wait has woken on
+    /// `capacity_freed` since (issue #1787). An idle wait then also wakes on
+    /// `capacity_freed`, even when the permit freed during the claim. A read
+    /// does not clear the flag, so a refusal of another claim loop stays
+    /// armed. Only the wake clears it, because the next poll then sees the
+    /// gate again.
+    pool_refused: AtomicBool,
+    /// Arms an unbound idle wait when a refusal follows its snapshot (issue
+    /// #1787). `record_gate_refusal` and `claim_exclusions` fire it when
+    /// their flag turns on. `notify_waiters` stores no wake, so a refusal
+    /// never arms a wait that starts after it.
+    refusal_recorded: tokio::sync::Notify,
     /// Set the first time `spawn_monitoring_tasks` runs to completion (issue
     /// #548 review). Guards against a hypothetical second invocation (e.g. a
     /// future caller wrapping `run`/`run_with_listener` in a retry loop)
@@ -30913,6 +33766,15 @@ pub struct Worker {
     /// Wrapped in `Arc<tokio::sync::Mutex<_>>` so it can be shared across
     /// concurrently-running task handler futures without cloning the events.
     workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
+    /// The shard that keys the owner tenures of each claim target (issue
+    /// #2252). Colocated shards share one database, so they share one key.
+    /// A target with no entry keys by itself.
+    owner_shards:
+        std::sync::RwLock<std::collections::HashMap<crate::types::ShardId, crate::types::ShardId>>,
+    /// The owner tenures of this worker (issue #2252). The first worker on a
+    /// registry takes the registry's set. Another worker takes its own, so
+    /// two workers never share a holder token.
+    decision_owner: Arc<crate::decision_owner::OwnedPartitions>,
     /// In-process consecutive-timeout strike counter per workflow execution
     /// (issue #494).
     ///
@@ -32326,6 +35188,234 @@ impl UnstartedClaim {
     }
 }
 
+/// How often the owner loop scans its database (ADR 0009 decision 8).
+const OWNER_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The most partitions that one owner scan acquires (issue #2254).
+///
+/// The worker adopts each chunk before the next scan. So a takeover of
+/// 256 partitions decides after 32 acquisitions, not after 256.
+const OWNER_ACQUIRE_CHUNK: usize = 32;
+
+/// One database of a multi-shard worker (issue #2252).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnerGroup<P> {
+    /// The lowest claim target on the database. It keys the tenures of every
+    /// target there.
+    canonical: crate::types::ShardId,
+    /// The pool of the database.
+    pool: P,
+    /// The claim targets on the database.
+    members: Vec<crate::types::ShardId>,
+    /// The database also serves a shard that this worker does not target.
+    /// Its 512 owner rows serve that shard too, so this worker must not own
+    /// them (ADR 0009 decision 10).
+    split: bool,
+}
+
+/// Group the claim `targets` by database. `all` lists every shard of the
+/// process pool, and `same` says whether two shards reach one database.
+fn owner_groups<P: Clone>(
+    targets: &[(crate::types::ShardId, P)],
+    all: &[crate::types::ShardId],
+    same: impl Fn(crate::types::ShardId, crate::types::ShardId) -> bool,
+) -> Vec<OwnerGroup<P>> {
+    let mut groups: Vec<OwnerGroup<P>> = Vec::new();
+    for (shard, pool) in targets {
+        if let Some(group) = groups.iter_mut().find(|g| same(g.canonical, *shard)) {
+            group.members.push(*shard);
+            group.canonical = group.canonical.min(*shard);
+        } else {
+            groups.push(OwnerGroup {
+                canonical: *shard,
+                pool: pool.clone(),
+                members: vec![*shard],
+                split: false,
+            });
+        }
+    }
+    for group in &mut groups {
+        group.split = all
+            .iter()
+            .any(|shard| same(group.canonical, *shard) && !group.members.contains(shard));
+    }
+    groups
+}
+
+/// The owner loop of one database, as the run path holds it (issue #2252).
+struct OwnerLoopHandle {
+    state: Arc<tokio::sync::Mutex<crate::decision_owner::OwnerLoop>>,
+    stop: CancellationToken,
+    _task: AbortOnDrop,
+}
+
+/// One scan of an owner loop (issue #2252).
+///
+/// The cache entries of each dropped tenure go first. Then the entries of
+/// each new partition go, before the worker adopts its tenure. So a new
+/// tenure starts cold (rule R4 of ADR 0010).
+///
+/// After an acquisition, `woken` ends the idle wait of a claim loop. The
+/// new owner then claims the waiting tasks at once (issue #2254). Returns
+/// the sleep until the next scan. It is zero while free partitions remain
+/// beyond the acquisition chunk.
+async fn owner_scan(
+    state: &tokio::sync::Mutex<crate::decision_owner::OwnerLoop>,
+    pool: &DbPool,
+    cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    owned: &crate::decision_owner::OwnedPartitions,
+    woken: &tokio::sync::Notify,
+    worker_id: &str,
+) -> Duration {
+    // The loop lock stays held until the adoption ends. A release then
+    // never runs between an acquisition and its adoption.
+    let (conn, mut owner_loop) = conn_then_loop_lock(pool.get(), state).await;
+    let mut conn = match conn {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::warn!(worker_id = %worker_id, error = %e, "owner loop: no connection");
+            // Issue #2258: a partition without a live tenure keeps no disk
+            // file, even when the database is out of reach.
+            #[cfg(feature = "owner-disk-cache")]
+            {
+                let shard = owner_loop.shard();
+                drop(owner_loop);
+                drop_unowned_disk_partitions(cache, owned, shard).await;
+            }
+            return OWNER_SCAN_INTERVAL;
+        }
+    };
+    let tick = owner_loop.tick(&mut conn).await;
+    drop(conn);
+    let mut next_change = None;
+    let mut more = false;
+    match tick {
+        Ok(tick) => {
+            next_change = tick.next_change;
+            more = tick.more;
+            evict_owner_keys(cache, &tick.dropped).await;
+            let keys: Vec<_> = tick.acquired.iter().map(|(t, _)| t.key()).collect();
+            evict_owner_keys(cache, &keys).await;
+            let acquired = !tick.acquired.is_empty();
+            for (tenure, deadline) in tick.acquired {
+                owned.adopt_until(tenure, deadline);
+            }
+            if acquired {
+                woken.notify_one();
+            }
+        }
+        Err(e) => {
+            tracing::warn!(worker_id = %worker_id, error = %e, "owner loop scan failed");
+        }
+    }
+    #[cfg(feature = "owner-disk-cache")]
+    let shard = owner_loop.shard();
+    drop(owner_loop);
+    // Issue #2258: a failed tick loses the keys that it already dropped. So
+    // each scan compares the disk partitions with the live tenures instead.
+    #[cfg(feature = "owner-disk-cache")]
+    drop_unowned_disk_partitions(cache, owned, shard).await;
+    // Issue #2258: the backstop for a lost evict wake.
+    #[cfg(feature = "owner-disk-cache")]
+    reconcile_disk_cache(cache, pool, shard, worker_id).await;
+    if more {
+        return Duration::ZERO;
+    }
+    crate::decision_owner::next_scan_wait(next_change, OWNER_SCAN_INTERVAL)
+}
+
+/// Take a pool connection, then the owner-loop lock (issue #2252).
+///
+/// The scan and the release both use this order. A release that took the lock
+/// first could wait for the last connection. A scan could hold that connection
+/// and wait for the lock.
+async fn conn_then_loop_lock<C, S>(
+    conn: impl std::future::Future<Output = C>,
+    state: &tokio::sync::Mutex<S>,
+) -> (C, tokio::sync::MutexGuard<'_, S>) {
+    let conn = conn.await;
+    (conn, state.lock().await)
+}
+
+/// Delete the disk file of each partition of `shard` that has no live
+/// tenure (issue #2258).
+///
+/// The scan calls this each time, also when the database is out of reach or
+/// the tick fails. A partition with no live tenure can no longer decide, so
+/// it may now have another owner. No write can follow: a store checks the
+/// tenure under the partition lock.
+#[cfg(feature = "owner-disk-cache")]
+async fn drop_unowned_disk_partitions(
+    cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    owned: &crate::decision_owner::OwnedPartitions,
+    shard: crate::types::ShardId,
+) {
+    let disk = cache.lock().await.disk();
+    let Some(disk) = disk else {
+        return;
+    };
+    let unowned = crate::owner_disk_cache::unowned_partitions(
+        &disk.cache().cached_partitions(),
+        shard,
+        |key| {
+            matches!(
+                owned.pin_for(key),
+                crate::decision_owner::DecisionPin::Owned(_)
+            )
+        },
+    );
+    disk.drop_partitions(&unowned).await;
+}
+
+/// Reconcile the disk cache of `shard` when its interval is due (issue
+/// #2258).
+///
+/// The pass purges each cached run that is not `RUNNING`. It is the backstop
+/// for a lost evict wake. A failure waits for the next interval.
+#[cfg(feature = "owner-disk-cache")]
+async fn reconcile_disk_cache(
+    cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    pool: &DbPool,
+    shard: crate::types::ShardId,
+    worker_id: &str,
+) {
+    let Some(disk) = cache.lock().await.disk() else {
+        return;
+    };
+    if !disk.reconcile_due(shard) {
+        return;
+    }
+    let result = match pool.get().await {
+        Ok(mut conn) => disk.reconcile(&mut conn, Some(shard)).await,
+        Err(e) => Err(HarvestError::Database(e.to_string())),
+    };
+    match result {
+        Ok(0) => {}
+        Ok(purged) => {
+            tracing::info!(worker_id = %worker_id, purged, "owner disk cache: reconcile purged runs");
+        }
+        Err(e) => {
+            tracing::warn!(worker_id = %worker_id, error = %e, "owner disk cache: reconcile failed");
+        }
+    }
+}
+
+/// Drop the cache entries of each partition of `keys`.
+async fn evict_owner_keys(
+    cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    keys: &[crate::decision_owner::OwnerKey],
+) {
+    if keys.is_empty() {
+        return;
+    }
+    let closed = cache.lock().await.evict_partitions(keys);
+    // Each entry can hold a parked handler future. Drop them outside the lock.
+    drop(closed);
+    // Issue #2258: delete the disk file of each partition too.
+    #[cfg(feature = "owner-disk-cache")]
+    drop_disk_partitions(cache, keys).await;
+}
+
 /// Owns a task handle and aborts the task when dropped (issue #1552).
 ///
 /// A bare `JoinHandle` detaches its task on drop. Cancelling the future that
@@ -32378,6 +35468,427 @@ const fn dispatch_kind_admitted(
     }
 }
 
+/// Which claim loop runs a Postgres poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollRole {
+    /// The poll loop. It owns the listener, the timer and the capacity wake.
+    Leader,
+    /// A follower claim loop. See [`Worker::run_claim_followers`].
+    Follower,
+}
+
+/// Whether a follower claims on one target through Postgres.
+///
+/// The follower claims only where the leader polls Postgres. An unverified
+/// registration claims nothing (see [`may_claim_tasks`]). A per-shard
+/// channel, or a global channel the loop may use, takes the claims. This
+/// mirrors `run_poll_loop` and `run_poll_loop_multi`. A leader in degraded
+/// dispatch mode drains Postgres alone.
+const fn follower_polls_postgres(
+    registration_pending: bool,
+    per_shard_channel: bool,
+    usable_global_channel: bool,
+) -> bool {
+    may_claim_tasks(registration_pending) && !per_shard_channel && !usable_global_channel
+}
+
+/// Whether `claim_loops` in-flight claims can hold every connection of a
+/// pool of `max_size`.
+///
+/// A task, a heartbeat and a persist then wait behind the claims.
+const fn claim_loops_fill_pool(claim_loops: usize, max_size: usize) -> bool {
+    claim_loops >= max_size
+}
+
+/// One Postgres claim target of a follower claim loop.
+///
+/// See [`Worker::run_claim_followers`].
+struct ClaimTarget<'a> {
+    /// The shard that `pool` serves. `None` on a legacy single pool.
+    shard: Option<crate::types::ShardId>,
+    /// The pool the claim runs on.
+    pool: &'a DbPool,
+    /// Set while this shard's registration is not verified.
+    registration_pending: &'a AtomicBool,
+    /// The pool acquisition bound. See [`shard_acquire_bound`].
+    acquire_bound: Option<Duration>,
+    /// Whether the global dispatch channel may serve this target. Only the
+    /// single-pool loop allows it.
+    global_dispatch: bool,
+}
+
+/// One database of an owner decider (issue #2255). The decider idles while
+/// owner mode is off there.
+///
+/// See [`Worker::run_owner_decider`].
+struct DeciderTarget<'a> {
+    /// The claim target of `pool`. `None` on a legacy single pool.
+    shard: Option<crate::types::ShardId>,
+    /// The pool the takes and scans run on.
+    pool: &'a DbPool,
+    /// Set while this shard's registration is not verified.
+    registration_pending: &'a AtomicBool,
+    /// The pool acquisition bound. See [`shard_acquire_bound`].
+    acquire_bound: Option<Duration>,
+}
+
+/// The most rows that one owner scan returns (issue #2255).
+///
+/// A scan returns up to the workflow slot count, so a backlog drain scans
+/// once per batch, not once per decision.
+const OWNER_SCAN_LIMIT_MAX: usize = 64;
+
+/// The shortest gap between two safety scans of an owner decider (issue
+/// #2255).
+///
+/// While a listener receives the owner wakes, the wakes carry new work. The
+/// scan then only catches a lost wake. So a short poll interval must not
+/// scan each partition many times a second. The gap is this value or one
+/// poll interval, whichever is longer. A full scan and a due row still set
+/// an earlier scan. With no live listener, the scan polls.
+const OWNER_SCAN_SAFETY_MIN: Duration = Duration::from_secs(1);
+
+/// The longest backoff of an execution whose takes find nothing (issue
+/// #2255).
+const OWNER_TAKE_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// How often the decider logs a failure at warn level (issue #2255).
+const OWNER_DECIDER_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// One ended future of an owner decider (issue #2255).
+enum DeciderEvent {
+    /// A scan ended.
+    Scanned(HarvestResult<queue::OwnerScan>),
+    /// The take of one execution ended.
+    Taken(uuid::Uuid, OwnerTake),
+    /// A key lookup of hinted executions ended (issue #2308).
+    Keyed(Vec<uuid::Uuid>, HarvestResult<Vec<queue::OwnerRow>>),
+}
+
+/// The claim-order key of a ready execution (issue #2308): the higher
+/// effective priority first, then the earlier claim-order due time.
+type ReadyKey = (std::cmp::Reverse<i32>, chrono::DateTime<chrono::Utc>);
+
+/// The local state of one owner decider (issue #2255).
+///
+/// It holds execution ids and their claim keys only. The task rows hold the
+/// work.
+// struct_excessive_bools: each flag is an independent condition of the loop.
+// An enum of their product would have more states than the loop can reach.
+#[allow(clippy::struct_excessive_bools)]
+struct DeciderState {
+    poll: Duration,
+    /// Owner mode is on, and the decider runs.
+    active: bool,
+    /// The executions to take, best claim key first (issue #2308). `queued`
+    /// maps each one to its key.
+    ready: std::collections::BTreeSet<(ReadyKey, uuid::Uuid)>,
+    queued: HashMap<uuid::Uuid, ReadyKey>,
+    /// The hinted executions that wait for a key.
+    unkeyed: HashSet<uuid::Uuid>,
+    /// The executions of the key lookup in flight. A lookup runs while this
+    /// set is not empty.
+    keying_execs: HashSet<uuid::Uuid>,
+    /// A finished lookup grants one take pass. No new lookup starts and no
+    /// unkeyed hint blocks a take until [`Self::end_pass`]. So a steady
+    /// stream of hints cannot starve dispatch (issue #2308).
+    pass_granted: bool,
+    /// The executions with a take in flight.
+    in_flight: HashSet<uuid::Uuid>,
+    /// The executions that a wake named while their take ran.
+    rewake: HashSet<uuid::Uuid>,
+    /// The executions whose takes found nothing: the end of the backoff
+    /// and the number of misses in a row.
+    backoff: HashMap<uuid::Uuid, (std::time::Instant, u32)>,
+    /// A scan runs.
+    scanning: bool,
+    /// The time of the next scan.
+    scan_at: std::time::Instant,
+    /// A listener receives the owner wakes of this shard.
+    wakes_live: bool,
+    /// The last warn-level log.
+    warned: Option<std::time::Instant>,
+}
+
+impl DeciderState {
+    fn new(poll: Duration) -> Self {
+        Self {
+            poll,
+            active: false,
+            ready: std::collections::BTreeSet::new(),
+            queued: HashMap::new(),
+            unkeyed: HashSet::new(),
+            keying_execs: HashSet::new(),
+            pass_granted: false,
+            in_flight: HashSet::new(),
+            rewake: HashSet::new(),
+            backoff: HashMap::new(),
+            scanning: false,
+            scan_at: std::time::Instant::now(),
+            wakes_live: false,
+            warned: None,
+        }
+    }
+
+    /// Owner mode is on. On the change from off, scan at once.
+    const fn activate(&mut self, now: std::time::Instant) {
+        if !self.active {
+            self.active = true;
+            self.scan_at = now;
+        }
+    }
+
+    /// Owner mode is off. Forget every hint.
+    fn deactivate(&mut self) {
+        self.active = false;
+        self.ready.clear();
+        self.queued.clear();
+        self.unkeyed.clear();
+        self.pass_granted = false;
+        self.rewake.clear();
+        self.backoff.clear();
+    }
+
+    /// A new tenure brings a backlog that no wake named. Scan at once, with
+    /// no backoff.
+    fn tenure_changed(&mut self) {
+        self.scan_at = std::time::Instant::now();
+        self.backoff.clear();
+    }
+
+    /// Queue a ranked row. A new key replaces the old one. A full queue
+    /// drops its worst entry for a better row, and drops a row that is not
+    /// better: the scan finds it again.
+    fn queue(&mut self, row: queue::OwnerRow) {
+        self.insert(row.exec_id, (std::cmp::Reverse(row.priority), row.due_at));
+    }
+
+    /// Queue `exec` with `key`. See [`Self::queue`].
+    fn insert(&mut self, exec: uuid::Uuid, key: ReadyKey) {
+        self.unkeyed.remove(&exec);
+        if let Some(old) = self.queued.remove(&exec) {
+            self.ready.remove(&(old, exec));
+        } else if self.ready.len() >= OWNER_HINTS_MAX {
+            let Some(&(worst_key, worst)) = self.ready.last() else {
+                return;
+            };
+            if key >= worst_key {
+                return;
+            }
+            self.ready.remove(&(worst_key, worst));
+            self.queued.remove(&worst);
+        }
+        self.queued.insert(exec, key);
+        self.ready.insert((key, exec));
+    }
+
+    /// A wake named `exec`. A wake is news, so it ends the backoff. The
+    /// hint has no key yet. A wake during a take queues the execution again
+    /// after the take. A wake during a key lookup keeps the hint, because the
+    /// lookup may have read the row before the commit of the wake. A full
+    /// set drops the hint: the scan finds the row.
+    fn hint(&mut self, exec: uuid::Uuid) {
+        self.backoff.remove(&exec);
+        if self.in_flight.contains(&exec) {
+            self.rewake.insert(exec);
+        } else if !self.queued.contains_key(&exec) && self.unkeyed.len() < OWNER_HINTS_MAX {
+            self.unkeyed.insert(exec);
+        }
+    }
+
+    /// Start a key lookup for the unkeyed hints. Empty while one runs.
+    fn begin_keying(&mut self) -> Vec<uuid::Uuid> {
+        if self.pass_granted || !self.keying_execs.is_empty() || self.unkeyed.is_empty() {
+            return Vec::new();
+        }
+        let execs: Vec<_> = self.unkeyed.drain().collect();
+        self.keying_execs.extend(execs.iter().copied());
+        execs
+    }
+
+    /// A key lookup of `requested` ended. `None` is a failed lookup: queue
+    /// the hints unranked, so a wake is not lost. A scan key stays. A row that
+    /// the lookup did not return is not due, or it is gone. A wake that came
+    /// during the lookup keeps its hint. The scan finds the rest later.
+    fn keyed(&mut self, requested: &[uuid::Uuid], rows: Option<Vec<queue::OwnerRow>>) {
+        for exec in requested {
+            self.keying_execs.remove(exec);
+        }
+        self.pass_granted = true;
+        if !self.active {
+            return;
+        }
+        match rows {
+            Some(rows) => {
+                for row in rows {
+                    self.queue(row);
+                }
+            }
+            None => {
+                for exec in requested {
+                    if !self.queued.contains_key(exec) {
+                        self.insert_unranked(*exec);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether `free` permits cover every ready row, every hint and every
+    /// execution of the lookup in flight. Only then can the take order not
+    /// matter, so the lookup is skipped.
+    fn permits_cover_all(&self, free: usize) -> bool {
+        free >= self.ready.len() + self.unkeyed.len() + self.keying_execs.len()
+    }
+
+    /// Whether a hint waits for its key. A take must wait too. Else a ready
+    /// row of lower rank would take the permit that the hint should have.
+    fn ranking(&self) -> bool {
+        !self.keying_execs.is_empty() || (!self.unkeyed.is_empty() && !self.pass_granted)
+    }
+
+    /// The take pass of a finished lookup is over. The next lookup may start.
+    const fn end_pass(&mut self) {
+        self.pass_granted = false;
+    }
+
+    /// Queue `exec` with the key of a row that is due now at normal
+    /// priority.
+    fn insert_unranked(&mut self, exec: uuid::Uuid) {
+        self.insert(exec, (std::cmp::Reverse(0), chrono::Utc::now()));
+    }
+
+    /// Queue every unkeyed hint unranked. Free permits cover all of them, so
+    /// their order cannot matter and the lookup would only cost a statement.
+    fn rank_unkeyed_unranked(&mut self) {
+        let execs: Vec<_> = self.unkeyed.drain().collect();
+        for exec in execs {
+            self.insert_unranked(exec);
+        }
+    }
+
+    /// The best execution to take, skipping one that is in flight or backs
+    /// off.
+    fn pop(&mut self, now: std::time::Instant) -> Option<(uuid::Uuid, ReadyKey)> {
+        while let Some((key, exec)) = self.ready.pop_first() {
+            self.queued.remove(&exec);
+            let backs_off = self
+                .backoff
+                .get(&exec)
+                .is_some_and(|(until, _)| *until > now);
+            if !self.in_flight.contains(&exec) && !backs_off {
+                return Some((exec, key));
+            }
+        }
+        None
+    }
+
+    /// A take of `exec` claimed its row.
+    fn took(&mut self, exec: uuid::Uuid) {
+        self.in_flight.remove(&exec);
+        self.rewake.remove(&exec);
+        self.backoff.remove(&exec);
+    }
+
+    /// A take of `exec` found nothing or failed.
+    fn missed(&mut self, exec: uuid::Uuid, now: std::time::Instant) {
+        self.in_flight.remove(&exec);
+        if self.rewake.remove(&exec) {
+            self.hint(exec);
+            return;
+        }
+        let misses = self.backoff.get(&exec).map_or(0, |(_, misses)| misses + 1);
+        let wait = owner_take_backoff(self.poll, misses);
+        self.backoff.insert(exec, (now + wait, misses));
+    }
+
+    /// Record whether a listener receives the owner wakes. When it starts to
+    /// listen again, scan at once: a wake sent in the gap is lost.
+    const fn set_wakes_live(&mut self, live: bool, now: std::time::Instant) {
+        if live && !self.wakes_live {
+            self.scan_at = now;
+        }
+        self.wakes_live = live;
+    }
+
+    /// A scan ended. A full scan scans again when the queue drains. Else the
+    /// next scan runs at the first due row or after the gap, whichever comes
+    /// first. The gap is one poll interval, or the safety gap while wakes
+    /// are live.
+    fn scanned(&mut self, now: std::time::Instant, full: bool, next_due: Option<Duration>) {
+        self.scanning = false;
+        let safety = if self.wakes_live {
+            self.poll.max(OWNER_SCAN_SAFETY_MIN)
+        } else {
+            self.poll
+        };
+        self.scan_at = if full {
+            now
+        } else {
+            now + next_due.map_or(safety, |due| due.min(safety))
+        };
+    }
+
+    /// Whether a scan can start now, apart from its time.
+    fn can_scan(&self, limit: usize) -> bool {
+        !self.scanning && self.ready.len() < limit
+    }
+
+    /// Whether a scan starts now.
+    fn may_scan(&self, now: std::time::Instant, limit: usize) -> bool {
+        self.can_scan(limit) && now >= self.scan_at
+    }
+
+    /// The executions that a scan skips: queued, in flight or backing off.
+    /// Old backoff entries go, so the list stays bounded.
+    fn skip(&mut self, now: std::time::Instant) -> Vec<uuid::Uuid> {
+        let horizon = OWNER_TAKE_BACKOFF_MAX * 2;
+        self.backoff
+            .retain(|_, (until, _)| now.saturating_duration_since(*until) < horizon);
+        self.queued
+            .keys()
+            .chain(self.unkeyed.iter())
+            .chain(self.keying_execs.iter())
+            .chain(self.in_flight.iter())
+            .copied()
+            .chain(
+                self.backoff
+                    .iter()
+                    .filter(|(_, (until, _))| *until > now)
+                    .map(|(exec, _)| *exec),
+            )
+            .collect()
+    }
+
+    /// Whether a warn-level log is due. Other failures log at debug level.
+    fn may_warn(&mut self, now: std::time::Instant) -> bool {
+        let due = self
+            .warned
+            .is_none_or(|last| now.duration_since(last) >= OWNER_DECIDER_WARN_INTERVAL);
+        if due {
+            self.warned = Some(now);
+        }
+        due
+    }
+}
+
+/// The backoff after `misses` earlier misses in a row (issue #2255): one
+/// poll interval, doubled per miss, at most [`OWNER_TAKE_BACKOFF_MAX`].
+fn owner_take_backoff(poll: Duration, misses: u32) -> Duration {
+    poll.saturating_mul(1u32 << misses.min(16))
+        .min(OWNER_TAKE_BACKOFF_MAX)
+}
+
+/// What one owner take returned (issue #2255).
+enum OwnerTake {
+    /// The take claimed the row. The permit goes to its dispatch.
+    Taken(Box<TaskQueueItem>, tokio::sync::OwnedSemaphorePermit),
+    /// No row was `PENDING` and due, or a gate refused it.
+    Empty,
+    /// The take failed.
+    Failed(HarvestError),
+}
+
 /// What one Postgres poll may claim (issue #1787).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PollAdmission {
@@ -32402,6 +35913,20 @@ const fn poll_admission(free_workflow: usize, free_activity: usize) -> PollAdmis
         (true, true) => PollAdmission::Any,
         (true, false) => PollAdmission::Only(TaskType::Workflow),
         (false, true) => PollAdmission::Only(TaskType::Activity),
+    }
+}
+
+/// The gate record of a poll that claims activities only (issue #2255).
+///
+/// The owner decider takes the workflow tasks, so this poll refuses no
+/// workflow task. Only a missing activity permit is a refusal.
+const fn decider_gate(admission: PollAdmission) -> PollAdmission {
+    match admission {
+        PollAdmission::Saturated => PollAdmission::Only(crate::queue::TaskType::Workflow),
+        PollAdmission::Only(crate::queue::TaskType::Activity) | PollAdmission::Any => {
+            PollAdmission::Any
+        }
+        PollAdmission::Only(crate::queue::TaskType::Workflow) => admission,
     }
 }
 
@@ -32474,6 +35999,12 @@ impl PollPermits {
 struct CapacityPermit {
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     freed: Arc<tokio::sync::Notify>,
+    /// Also wakes the owner deciders when a workflow permit frees (issue
+    /// #2255). A claim loop then never takes their wake.
+    decider: Option<Arc<tokio::sync::Notify>>,
+    /// Also wakes the leader when a workflow permit frees (issue #2418).
+    /// The task has committed the tasks that it schedules.
+    leader: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl CapacityPermit {
@@ -32481,7 +36012,21 @@ impl CapacityPermit {
         Self {
             permit: Some(permit),
             freed: Arc::clone(freed),
+            decider: None,
+            leader: None,
         }
+    }
+
+    /// This permit, which also wakes the owner deciders on release.
+    fn waking_deciders(mut self, decider: Option<Arc<tokio::sync::Notify>>) -> Self {
+        self.decider = decider;
+        self
+    }
+
+    /// This permit, which also wakes the leader on release (issue #2418).
+    fn waking_leader(mut self, leader: Option<Arc<tokio::sync::Notify>>) -> Self {
+        self.leader = leader;
+        self
     }
 }
 
@@ -32489,6 +36034,47 @@ impl Drop for CapacityPermit {
     fn drop(&mut self) {
         drop(self.permit.take());
         self.freed.notify_one();
+        if let Some(decider) = &self.decider {
+            decider.notify_waiters();
+        }
+        // `notify_one` stores the wake while the leader polls. The leader
+        // then polls once more instead of a settle.
+        if let Some(leader) = &self.leader {
+            leader.notify_one();
+        }
+    }
+}
+
+/// The capacity part of one idle wait of a poll loop (issue #1787).
+///
+/// [`Worker::capacity_wait`] takes it just before the wait. A released
+/// permit or a freed limit slot ends a `bound` wait. An unbound wait first
+/// waits for a refusal after its snapshot. Another claim loop records one
+/// when the gate holds a kind back, or when an adaptive limit holds a type
+/// back. After that refusal, the wait acts like a bound wait.
+struct CapacityWait<'a> {
+    worker: &'a Worker,
+    bound: bool,
+    /// Created before `bound` is read. See [`Worker::capacity_wait`].
+    refused: tokio::sync::futures::Notified<'a>,
+}
+
+impl CapacityWait<'_> {
+    /// Resolve on a released permit or a freed limit slot. An unbound wait
+    /// first waits for a refusal after its snapshot. The wake clears both
+    /// refusal flags, and the loop then polls again.
+    ///
+    /// A refusal alone does not end the wait. A poll right after it would
+    /// meet the same full pool or limit, so it could not claim the refused
+    /// backlog. A release that `capacity_freed` stored before the refusal
+    /// still ends the wait at once, as it ends a bound wait. That costs one
+    /// poll.
+    async fn woken(self) {
+        if !self.bound {
+            self.refused.await;
+        }
+        self.worker.capacity_freed.notified().await;
+        self.worker.capacity_woke();
     }
 }
 
@@ -32627,10 +36213,11 @@ fn reference_outcome(
 /// [`Worker::dispatch_leases`] collects these across a whole read.
 /// It settles them in one `ack_many`/`release_many` call, instead of
 /// one channel round trip per lease (Codex review, issue #1429).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum ReferenceDisposition {
-    /// Claimed and dispatched. The lease still owes an `ack`.
-    Dispatched(crate::dispatch::DispatchLease),
+    /// Claimed. The caller starts the task at once. The lease still owes an
+    /// `ack`.
+    Dispatched(crate::dispatch::DispatchLease, Box<ClaimedReference>),
     /// Not claimed; the row is already terminal. The lease owes an `ack`.
     AlreadyTerminal(crate::dispatch::DispatchLease),
     /// Not claimed and retryable. The lease owes a `release` after this
@@ -32641,6 +36228,146 @@ enum ReferenceDisposition {
     /// recovery, not the common claim path this batches. Nothing left
     /// for the caller to settle.
     Handled,
+}
+
+/// The pools that refused a reference of one dispatch batch (issue #1429).
+///
+/// A pool refuses a reference when it has no free permit, or when the
+/// shard's share of it is spent. See [`Worker::wait_for_refused_permit`].
+#[derive(Debug, Clone, Copy, Default)]
+struct RefusedPools {
+    workflow: bool,
+    activity: bool,
+}
+
+impl RefusedPools {
+    /// Note a reference that went back with no claim attempt.
+    const fn note(&mut self, kind: Option<crate::dispatch::DispatchKind>) {
+        match kind {
+            Some(crate::dispatch::DispatchKind::Workflow) => self.workflow = true,
+            Some(crate::dispatch::DispatchKind::Activity) => self.activity = true,
+            None => {}
+        }
+    }
+}
+
+/// The longest wait of a single-shard reader after a batch that gave every
+/// reference back (issue #1429).
+///
+/// A free permit of the refused pool ends the wait at once. The cap bounds
+/// two costs of the wait. A reference of the other kind that arrives during
+/// the wait waits up to this long. A backlog of refused references ahead of
+/// a claimable one costs one wait per read. The cap is fixed, because
+/// `poll_interval` can be seconds. It keeps the reader under 100 reads per
+/// second while a pool is full.
+const DISPATCH_REFUSED_WAIT: Duration = Duration::from_millis(10);
+
+/// A task that a dispatch reference claimed, before the task starts.
+#[derive(Debug)]
+struct ClaimedReference {
+    task: TaskQueueItem,
+    reservation: Option<DispatchReservation>,
+}
+
+/// How long a hint for the own row of a task that a dispatch batch claimed
+/// waits for the batch to ack the task's reference.
+///
+/// A channel drops a publish for a reference that it has leased out. A task
+/// can put its own row back to `PENDING` within milliseconds. An activity
+/// that fails fast and retries does this. So does one that a limit defers.
+/// The batch acks its references after its last claim. A hint that the task
+/// published before that ack was lost, and the row waited for the reconcile
+/// sweep. A healthy ack takes milliseconds. The bound keeps a stalled
+/// channel from holding the hint for the whole batch timeout. The task never
+/// waits, so it cannot hold a pooled connection that the batch needs.
+const DISPATCH_HINT_ACK_WAIT: Duration = Duration::from_secs(1);
+
+/// The channel of a task that a dispatch batch claimed.
+///
+/// A hint that names the task's own row goes out after the batch acks the
+/// task's reference, or after [`DISPATCH_HINT_ACK_WAIT`]. Every other hint,
+/// and every other call, goes straight to the inner channel.
+#[derive(Debug)]
+struct AckGatedChannel {
+    inner: Arc<dyn crate::dispatch::TaskDispatch>,
+    own_row: uuid::Uuid,
+    acked: tokio::sync::watch::Receiver<bool>,
+}
+
+#[async_trait::async_trait]
+impl crate::dispatch::TaskDispatch for AckGatedChannel {
+    async fn publish(&self, hints: &[crate::dispatch::DispatchHint]) -> HarvestResult<()> {
+        if *self.acked.borrow() || hints.iter().all(|hint| hint.task_id != self.own_row) {
+            return self.inner.publish(hints).await;
+        }
+        // The hint for the own row waits off the task. The task may hold a
+        // pooled connection here, and the batch ack may wait for one.
+        let (own, others): (Vec<_>, Vec<_>) = hints
+            .iter()
+            .cloned()
+            .partition(|hint| hint.task_id == self.own_row);
+        let inner = Arc::clone(&self.inner);
+        let mut acked = self.acked.clone();
+        tokio::spawn(async move {
+            // A dropped sender means the batch ended, so the wait ends too.
+            let _ =
+                tokio::time::timeout(DISPATCH_HINT_ACK_WAIT, acked.wait_for(|acked| *acked)).await;
+            if let Err(error) = inner.publish(&own).await {
+                tracing::warn!(
+                    error = %error,
+                    "dispatch publish failed; the reconcile sweep republishes this row"
+                );
+            }
+        });
+        if others.is_empty() {
+            return Ok(());
+        }
+        self.inner.publish(&others).await
+    }
+
+    async fn next(
+        &self,
+        queues: &[String],
+        consumer: &str,
+        max: usize,
+        wait: Duration,
+    ) -> HarvestResult<Vec<crate::dispatch::DispatchLease>> {
+        self.inner.next(queues, consumer, max, wait).await
+    }
+
+    async fn ack(&self, lease: &crate::dispatch::DispatchLease) -> HarvestResult<()> {
+        self.inner.ack(lease).await
+    }
+
+    async fn release(
+        &self,
+        lease: &crate::dispatch::DispatchLease,
+        delay: Duration,
+    ) -> HarvestResult<()> {
+        self.inner.release(lease, delay).await
+    }
+
+    async fn ack_many(&self, leases: &[crate::dispatch::DispatchLease]) -> HarvestResult<()> {
+        self.inner.ack_many(leases).await
+    }
+
+    async fn release_many(
+        &self,
+        leases: &[(crate::dispatch::DispatchLease, Duration)],
+    ) -> HarvestResult<()> {
+        self.inner.release_many(leases).await
+    }
+
+    async fn maintain(
+        &self,
+        queues: &[String],
+    ) -> HarvestResult<crate::dispatch::DispatchMaintenance> {
+        self.inner.maintain(queues).await
+    }
+
+    fn next_round_trips(&self, queue_count: usize) -> usize {
+        self.inner.next_round_trips(queue_count)
+    }
 }
 
 impl Worker {
@@ -32819,19 +36546,58 @@ impl Worker {
         // The limit registry fires this wake when a limit slot frees (issue
         // #1836). That happens before the attempt writes its result.
         let capacity_freed = registry.adaptive_limits.slot_freed_notify();
+        let deferral_due = registry.adaptive_limits.deferral_due_notify();
 
         let workflow_parts =
             build_dispatch_semaphore(config.max_concurrent_workflows, config.slot_tuner.as_ref());
         let activity_parts =
             build_dispatch_semaphore(config.max_concurrent_activities, config.slot_tuner.as_ref());
-        let workflow_cache = Arc::new(tokio::sync::Mutex::new(
-            crate::cache::WorkflowCache::new(config.workflow_cache_size)
-                .with_resident(config.resident_workflows),
-        ));
+        let workflow_cache = crate::cache::WorkflowCache::new(config.workflow_cache_size)
+            .with_resident(config.resident_workflows);
+        // Issue #2258: the owner-local disk tier. The open wipes its directory.
+        #[cfg(feature = "owner-disk-cache")]
+        let workflow_cache =
+            workflow_cache.with_disk(registry.open_owner_disk_cache()?.map(|disk| {
+                crate::owner_disk_cache::DiskTier::new(
+                    disk,
+                    registry.payload_codecs().clone(),
+                    registry.owner_disk_cache_min_events,
+                )
+                .with_entity_sql(registry.owner_entity_sql)
+            }));
+        #[cfg(not(feature = "owner-disk-cache"))]
+        if let Some(dir) = registry.owner_disk_cache_dir() {
+            return Err(HarvestError::Config(format!(
+                "an owner disk cache directory is set ({}), but this build lacks the \
+                 `owner-disk-cache` feature (issue #2258)",
+                dir.display()
+            )));
+        }
+        // Issue #2260: the entity projection lives in the disk cache files.
+        if registry.owner_entity_sql && registry.owner_disk_cache_dir().is_none() {
+            return Err(HarvestError::Config(
+                "the owner entity SQL projection needs an owner disk cache directory \
+                 (issue #2260)"
+                    .to_string(),
+            ));
+        }
+        let workflow_cache = Arc::new(tokio::sync::Mutex::new(workflow_cache));
         // The window keeps each outcome until a heartbeat can publish it.
         let task_outcomes = crate::worker_outlier::TaskOutcomeWindow::for_heartbeat(
             config.worker_heartbeat_interval,
         );
+        // Issue #2252: the first worker on a registry takes its tenures. A
+        // second worker on the same registry takes a set of its own.
+        let decision_owner = {
+            let shared = registry.decision_owner();
+            if shared.try_claim() {
+                shared
+            } else {
+                let own = Arc::new(crate::decision_owner::OwnedPartitions::default());
+                let _ = own.try_claim();
+                own
+            }
+        };
         Ok(Self {
             config,
             registry,
@@ -32845,8 +36611,20 @@ impl Worker {
             dispatch_reserved_workflow: Arc::new(AtomicUsize::new(0)),
             dispatch_reserved_activity: Arc::new(AtomicUsize::new(0)),
             capacity_freed,
+            deferral_due,
+            owner_woken: Arc::new(tokio::sync::Notify::new()),
+            owner_hints: Arc::default(),
+            decider_capacity: Arc::new(tokio::sync::Notify::new()),
+            decision_done: Arc::new(tokio::sync::Notify::new()),
+            owed_poll: std::sync::Mutex::new(None),
+            settle_pending: AtomicBool::new(false),
+            claim_targets: std::sync::RwLock::default(),
+            owner_wake_shards: std::sync::RwLock::default(),
+            owner_listening: Arc::default(),
             gate_refused: Arc::new(GateRefused::default()),
             limit_refused: AtomicBool::new(false),
+            pool_refused: AtomicBool::new(false),
+            refusal_recorded: tokio::sync::Notify::new(),
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
             shutdown: CancellationToken::new(),
             drain_cancel: CancellationToken::new(),
@@ -32854,6 +36632,8 @@ impl Worker {
             remote_drain_deadline: Arc::new(Mutex::new(None)),
             drain_deadline_max: Arc::new(Mutex::new(None)),
             workflow_cache,
+            owner_shards: std::sync::RwLock::default(),
+            decision_owner,
             workflow_task_timeout_strikes: Arc::default(),
             workflow_panic_strikes: Arc::default(),
             workflow_deadlock_strikes: Arc::default(),
@@ -32863,6 +36643,213 @@ impl Worker {
             shard_dispatch,
             global_dispatch,
         })
+    }
+
+    /// Start the owner wake task of the pool of `shard` on `url` (issue
+    /// #2253). The task ends at shutdown or when the guard drops.
+    fn spawn_owner_wakes(&self, url: &str, shard: Option<crate::types::ShardId>) -> AbortOnDrop {
+        // Issue #2252: the tenures are per worker, keyed by the canonical
+        // shard of the database. The owner loops record that key first.
+        let owner_shard = self.owner_shard_of(shard);
+        self.owner_wake_shards
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(owner_shard);
+        let wakes = OwnerWakes {
+            url: url.to_string(),
+            shard: owner_shard,
+            owned: Arc::clone(&self.decision_owner),
+            workflow_cache: Arc::clone(&self.workflow_cache),
+            woken: Arc::clone(&self.owner_woken),
+            hints: Arc::clone(&self.owner_hints),
+            deciders: self.deciders_enabled(),
+            metrics: Arc::clone(&self.registry.telemetry().metrics),
+            shutdown: self.shutdown.clone(),
+            listening: Arc::clone(&self.owner_listening),
+        };
+        AbortOnDrop::new(tokio::spawn(wakes.run()))
+    }
+
+    /// Whether an owner wake task listens on a channel of `shard` (issue
+    /// #2255). The decider then scans at the safety gap only.
+    fn owner_wakes_live(&self, shard: crate::types::ShardId) -> bool {
+        self.owner_listening
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|key| key.shard == shard)
+    }
+
+    /// Whether an owner wake task listens on the channel of `key` (issue
+    /// #2253). Tests wait for it before a foreign write.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn owner_wake_listening(&self, key: crate::decision_owner::OwnerKey) -> bool {
+        self.owner_listening
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key)
+    }
+
+    /// Whether the workflow cache holds an entry for `exec_id` (issue
+    /// #2253). Tests use it to see an owner eviction.
+    #[doc(hidden)]
+    pub async fn has_cached_execution(&self, exec_id: ExecutionId) -> bool {
+        self.workflow_cache
+            .lock()
+            .await
+            .contains(&exec_id.as_uuid())
+    }
+
+    /// Whether the owner disk cache holds an entry for `exec_id` (issue
+    /// #2258). Tests use it.
+    #[cfg(feature = "owner-disk-cache")]
+    #[doc(hidden)]
+    pub async fn has_disk_cached_execution(&self, exec_id: ExecutionId) -> bool {
+        self.workflow_cache
+            .lock()
+            .await
+            .disk()
+            .is_some_and(|disk| disk.cache().contains(exec_id.as_uuid()))
+    }
+
+    /// Whether the owner disk cache holds an entity projection row for
+    /// `exec_id` (issue #2260). Tests use it.
+    #[cfg(feature = "owner-disk-cache")]
+    #[doc(hidden)]
+    pub async fn has_entity_projection(&self, exec_id: ExecutionId) -> bool {
+        self.workflow_cache
+            .lock()
+            .await
+            .disk()
+            .is_some_and(|disk| disk.cache().contains_entity(exec_id.as_uuid()))
+    }
+
+    /// The event id of the entity projection row of `exec_id`, if any
+    /// (issue #2260). Tests use it to see the apply after a commit.
+    #[cfg(feature = "owner-disk-cache")]
+    #[doc(hidden)]
+    pub async fn entity_projection_event(&self, exec_id: ExecutionId) -> Option<i32> {
+        self.workflow_cache
+            .lock()
+            .await
+            .disk()
+            .and_then(|disk| disk.cache().entity_event_id(exec_id.as_uuid()))
+    }
+
+    /// Run read-only SQL over the state of one keyed entity (issue #2260).
+    ///
+    /// The query reads the last state snapshot of the entity
+    /// `(workflow_name, workflow_id)`. On the owner of its partition, with
+    /// [`WorkerConfig::with_owner_entity_sql`] on, it reads the sealed row
+    /// of the projection file. Otherwise, or on a miss, it reads the
+    /// snapshot event from history in `pool`. An owner then seals that
+    /// snapshot into the file. `params` bind to `?1`, `?2` and so on.
+    ///
+    /// [`crate::entity_sql`] describes the table and the rules.
+    ///
+    /// [`WorkerConfig::with_owner_entity_sql`]: crate::builder::WorkerConfig::with_owner_entity_sql
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`EntitySqlError`](crate::entity_sql::EntitySqlError).
+    #[cfg(feature = "owner-disk-cache")]
+    pub async fn query_entity_sql(
+        &self,
+        pool: &DbPool,
+        workflow_name: &str,
+        workflow_id: &str,
+        sql: &str,
+        params: &[serde_json::Value],
+    ) -> Result<crate::entity_sql::EntitySqlRows, crate::entity_sql::EntitySqlError> {
+        // A permit bounds the queries of this process, the snapshot load
+        // included. It moves into the query thread, so it lives until the
+        // query stops.
+        let permit = crate::entity_sql::QUERY_SLOTS
+            .acquire()
+            .await
+            .map_err(|e| crate::entity_sql::EntitySqlError::Sql(e.to_string()))?;
+        let mut conn = pool
+            .get()
+            .await
+            .map_err(|e| HarvestError::Database(e.to_string()))?;
+        // Clone the tier first. The cache lock must not span the disk work.
+        let disk = self.workflow_cache.lock().await.disk();
+        let (record, source) = crate::owner_disk_cache::entity_record(
+            disk.as_ref(),
+            &mut conn,
+            self.entity_sql_owner_shard(),
+            // The tenures of this worker. Workers that share a registry each
+            // hold their own set.
+            Arc::clone(&self.decision_owner),
+            self.registry.payload_codecs(),
+            self.registry.payload_offloader(),
+            workflow_name,
+            workflow_id,
+        )
+        .await?;
+        drop(conn);
+        // A dropped caller cancels the query at its next progress check.
+        let cancel = CancelOnDrop::default();
+        let flag = Arc::clone(&cancel.0);
+        let sql = sql.to_string();
+        let params = params.to_vec();
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            crate::entity_sql::run_cancellable(&record, &sql, &params, source, &flag)
+        })
+        .await
+        .map_err(|e| crate::entity_sql::EntitySqlError::Sql(format!("the query task died: {e}")))?;
+        drop(cancel);
+        result
+    }
+
+    /// The owner shard of the database that an entity query reads (issue
+    /// #2260).
+    ///
+    /// A worker with one claim target knows it. A worker with several
+    /// cannot tell which one a pool serves, so it returns `None`. A query
+    /// then reads history and writes no file.
+    #[cfg(feature = "owner-disk-cache")]
+    fn entity_sql_owner_shard(&self) -> Option<crate::types::ShardId> {
+        let targets = self
+            .claim_targets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match targets.as_slice() {
+            [] => Some(self.owner_shard_of(None)),
+            [only] => Some(self.owner_shard_of(*only)),
+            _ => None,
+        }
+    }
+
+    /// Drop the memory entry of `exec_id` and keep its disk entry (issue
+    /// #2258). Tests use it to force a disk read.
+    #[cfg(feature = "owner-disk-cache")]
+    #[doc(hidden)]
+    pub async fn forget_cached_execution(&self, exec_id: ExecutionId) {
+        let taken = self.workflow_cache.lock().await.take(&exec_id.as_uuid());
+        drop(taken);
+    }
+
+    /// Run one reconcile pass of the owner disk cache on `pool`, for every
+    /// shard (issue #2258). Returns the number of runs purged. Tests use it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a pool or database error.
+    #[cfg(feature = "owner-disk-cache")]
+    #[doc(hidden)]
+    pub async fn reconcile_owner_disk_cache(&self, pool: &DbPool) -> HarvestResult<usize> {
+        let Some(disk) = self.workflow_cache.lock().await.disk() else {
+            return Ok(0);
+        };
+        let mut conn = pool
+            .get()
+            .await
+            .map_err(|e| HarvestError::Database(e.to_string()))?;
+        disk.reconcile(&mut conn, None).await
     }
 
     /// The global channel this worker is bound to (issue #1431).
@@ -33028,6 +37015,11 @@ impl Worker {
                 return;
             }
         }
+
+        // Issue #2387: the guard keeps the refresh loop alive for the run.
+        #[cfg(feature = "db")]
+        let _run_defaults =
+            spawn_run_defaults_refresh(Arc::clone(self.registry.run_defaults()), pool.clone());
 
         // Resolve the set of (ShardId, DbPool) claim targets from the sharded
         // pool when available, deduplicating by ShardId.
@@ -33268,6 +37260,13 @@ impl Worker {
                 }
                 None => None,
             };
+            // Issue #2253: the owner wakes use the URL of the queue
+            // listener, and the shard of the claim loop.
+            let poll_shard = match self.config.shard_assignments.as_slice() {
+                [shard, ..] => Some(*shard),
+                [] => None,
+            };
+            let _owner_wakes = listener_url.map(|url| self.spawn_owner_wakes(url, poll_shard));
             self.run_with_listener_bound(claim_pool, listener).await;
         }
     }
@@ -33504,7 +37503,19 @@ impl Worker {
             })
             .collect();
 
+        // Issue #2252: one owner loop per database. Colocated targets share
+        // its key.
+        let owner_loops = self.spawn_owner_loops(&shard_targets);
+
         let shard_listeners = self.build_shard_listeners(&shard_targets).await;
+        // Issue #2253: one owner wake task per shard with a listener URL.
+        let _owner_wakes: Vec<AbortOnDrop> = shard_targets
+            .iter()
+            .filter_map(|(shard, _)| {
+                multi_shard_listener_url(&self.config.shard_notification_database_urls, *shard)
+                    .map(|url| self.spawn_owner_wakes(url, Some(*shard)))
+            })
+            .collect();
 
         // Use each assigned shard's dispatch channel, captured once by
         // `Worker::new` and held for the whole loop (Codex review, issue
@@ -33522,13 +37533,49 @@ impl Worker {
             .map(|(shard, _)| self.shard_dispatch.get(shard).cloned())
             .collect();
 
-        self.run_poll_loop_multi(
-            shard_targets.clone(),
-            shard_listeners,
-            &registration_pending_per_shard,
-            &shard_dispatch,
-        )
-        .await;
+        // The followers poll Postgres where the leader would (no global
+        // channel on this path).
+        let more_work = tokio::sync::Notify::new();
+        let acquire_bound = shard_acquire_bound(true, self.config.poll_interval);
+        let claim_targets: Vec<ClaimTarget<'_>> = shard_targets
+            .iter()
+            .zip(&registration_pending_per_shard)
+            .map(|((shard, shard_pool), pending)| ClaimTarget {
+                shard: Some(*shard),
+                pool: shard_pool,
+                registration_pending: pending,
+                acquire_bound,
+                global_dispatch: false,
+            })
+            .collect();
+        self.warn_if_claim_loops_fill_pools(&claim_targets);
+        self.set_claim_targets(&claim_targets);
+        // Issue #2255: one owner decider per database. The canonical target
+        // of a colocated group runs it, because one scan serves the group.
+        let deciders: Vec<DeciderTarget<'_>> = claim_targets
+            .iter()
+            .filter(|target| {
+                self.owner_shard_of(target.shard)
+                    == crate::decision_owner::OwnerKey::pool_shard(target.shard)
+            })
+            .map(|target| DeciderTarget {
+                shard: target.shard,
+                pool: target.pool,
+                registration_pending: target.registration_pending,
+                acquire_bound: target.acquire_bound,
+            })
+            .collect();
+        tokio::join!(
+            self.run_poll_loop_multi(
+                shard_targets.clone(),
+                shard_listeners,
+                &registration_pending_per_shard,
+                &shard_dispatch,
+                &more_work,
+            ),
+            self.run_claim_followers(&claim_targets, &more_work),
+            self.run_owner_deciders(&deciders),
+        );
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received (multi-shard)");
 
@@ -33537,6 +37584,10 @@ impl Worker {
         let shutdown_acquire_bound = shard_acquire_bound(true, self.config.poll_interval);
         self.drain_releasing_sticky_pins(&shard_targets, shutdown_acquire_bound)
             .await;
+        for (pool, handle) in &owner_loops {
+            self.release_owner_partitions(pool, handle, shutdown_acquire_bound)
+                .await;
+        }
 
         // Stopped: mark every shard pool's worker row stopped, then cancel heartbeats.
         for (shard, shard_pool) in &shard_targets {
@@ -33572,12 +37623,16 @@ impl Worker {
     /// anywhere. When all shards are idle we `tokio::select!` across all
     /// per-shard listeners (falling back to a `poll_interval` sleep for shards
     /// without a listener) before the next full scan.
+    ///
+    /// A successful Postgres claim wakes one follower through `more_work`.
+    /// See [`Self::run_claim_followers`].
     async fn run_poll_loop_multi(
         &self,
         shard_targets: Vec<(crate::types::ShardId, DbPool)>,
         mut shard_listeners: Vec<Option<crate::notify::QueueListener>>,
         registration_pending_per_shard: &[Arc<AtomicBool>],
         shard_dispatch: &[Option<crate::dispatch::InstalledDispatch>],
+        more_work: &tokio::sync::Notify,
     ) {
         let _poller = self.poller_guard();
         let n = shard_targets.len();
@@ -33624,14 +37679,17 @@ impl Worker {
                     )
                     .await
                 } else {
-                    u32::from(
-                        self.poll_once(
+                    let claimed = self
+                        .poll_once(
                             &shard_targets[idx].1,
                             shard_acquire_bound(true, self.config.poll_interval),
                             Some(shard_targets[idx].0),
                         )
-                        .await,
-                    )
+                        .await;
+                    if claimed {
+                        more_work.notify_one();
+                    }
+                    u32::from(claimed)
                 };
                 if dispatched > 0 {
                     any_claimed = true;
@@ -33654,39 +37712,56 @@ impl Worker {
             // shard in round-robin order regardless of which fired a NOTIFY.
             start_idx = (start_idx + 1) % n;
 
+            // A NOTIFY polled first, and that poll was empty (issue #2422).
+            if self.settle_if_pending().await {
+                continue;
+            }
+
             // All shards idle — poll all per-shard listeners in round-robin
             // with a short per-listener timeout (fix #6). Notifications are
             // buffered in each listener's channel so no wake-up is lost.
             // Sequential round-robin avoids borrow-checker issues with
             // select_all over &mut references while still letting any listener
             // wake the loop.
-            let poll_interval = self.config.poll_interval;
-            let shutdown = &self.shutdown;
             // A full pool also wakes on a released permit (issue #1787).
-            let capacity_bound = self.capacity_bound();
+            let capacity = self.capacity_wait();
 
             if shard_listeners.iter().all(Option::is_none) {
-                tokio::select! {
-                    () = shutdown.cancelled() => break,
-                    () = self.capacity_freed.notified(), if capacity_bound => {}
-                    () = tokio::time::sleep(poll_interval) => {}
+                if self.wait_without_listeners(capacity).await {
+                    break;
                 }
             } else {
-                self.wait_on_shard_listeners(&mut shard_listeners, capacity_bound)
+                self.wait_on_shard_listeners(&mut shard_listeners, capacity)
                     .await;
             }
+        }
+    }
+
+    /// Wait for one `poll_interval` when no shard has a listener (extracted
+    /// from [`Self::run_poll_loop_multi`]).
+    ///
+    /// Any local wake ends the wait early. A cut settle still owes its poll
+    /// here (issue #2418). Returns `true` on shutdown.
+    async fn wait_without_listeners(&self, capacity: CapacityWait<'_>) -> bool {
+        tokio::select! {
+            () = self.shutdown.cancelled() => true,
+            () = capacity.woken() => false,
+            () = self.deferral_due.notified() => false,
+            () = self.decision_done.notified() => false,
+            () = self.owed_poll() => false,
+            () = self.owner_woken.notified() => false,
+            () = tokio::time::sleep(self.config.poll_interval) => false,
         }
     }
 
     /// Wait on every per-shard listener in round-robin, for up to one
     /// `poll_interval` (extracted from [`Self::run_poll_loop_multi`]).
     ///
-    /// With `capacity_bound`, a released permit also ends the wait (issue
-    /// #1787).
+    /// `capacity` can also end the wait (issue #1787).
     async fn wait_on_shard_listeners(
         &self,
         shard_listeners: &mut [Option<crate::notify::QueueListener>],
-        capacity_bound: bool,
+        capacity: CapacityWait<'_>,
     ) {
         let poll_interval = self.config.poll_interval;
         let shutdown = &self.shutdown;
@@ -33694,13 +37769,27 @@ impl Worker {
         let per_check = Duration::from_millis(10).min(poll_interval);
         let deadline = tokio::time::Instant::now() + poll_interval;
         let mut notified = false;
+        let capacity = capacity.woken();
+        tokio::pin!(capacity);
 
         'notify_wait: while tokio::time::Instant::now() < deadline && !shutdown.is_cancelled() {
             // One check per round of listener slices. A released
             // permit waits at most one round.
-            if capacity_bound
-                && futures::FutureExt::now_or_never(self.capacity_freed.notified()).is_some()
+            if futures::FutureExt::now_or_never(capacity.as_mut()).is_some() {
+                break 'notify_wait;
+            }
+            if futures::FutureExt::now_or_never(self.deferral_due.notified()).is_some() {
+                break 'notify_wait;
+            }
+            // Issue #2418: a local commit is visible, so it does not settle.
+            if futures::FutureExt::now_or_never(self.decision_done.notified()).is_some()
+                || futures::FutureExt::now_or_never(self.owed_poll()).is_some()
             {
+                break 'notify_wait;
+            }
+            // An owner wake is a NOTIFY too, so it settles (issue #2253).
+            if futures::FutureExt::now_or_never(self.owner_woken.notified()).is_some() {
+                notified = true;
                 break 'notify_wait;
             }
             let mut broken_idx: Option<usize> = None;
@@ -33735,7 +37824,7 @@ impl Worker {
             }
         }
         if notified {
-            tokio::time::sleep(crate::notify::settle_delay()).await;
+            self.settle_pending.store(true, Ordering::Relaxed);
         }
     }
 
@@ -33851,6 +37940,10 @@ impl Worker {
         // A direct caller of this entry point skips `run`, so bind here too
         // (issue #1431).
         self.register_notify_pools(pool);
+        // It also skips the run-default refresh loop of `run` (issue #2387).
+        #[cfg(feature = "db")]
+        let _run_defaults =
+            spawn_run_defaults_refresh(Arc::clone(self.registry.run_defaults()), pool.clone());
         let bound = self.bound_channel();
         crate::dispatch::with_bound_channel(
             bound,
@@ -34004,6 +38097,13 @@ impl Worker {
             [shard, ..] => Some(*shard),
             [] => None,
         };
+        // Issue #2252: the owner loop of this pool's database. Every
+        // assignment of a single pool shares it, so one key serves them all.
+        let owner_loop = self.spawn_owner_loop(
+            pool,
+            crate::decision_owner::OwnerKey::pool_shard(poll_shard),
+            self.single_pool_splits_a_group(pool),
+        );
 
         // Decide the dispatch span once, here, and hold it for the whole loop
         // (issue #1312). It stops a wide-span worker from using a global
@@ -34011,7 +38111,7 @@ impl Worker {
         // coverage.
         let dispatch_allowed = self.dispatch_span_allowed();
 
-        self.run_poll_loop(
+        self.run_single_pool_claim_loops(
             pool,
             poll_shard,
             listener,
@@ -34037,6 +38137,9 @@ impl Worker {
         };
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
         tokio::join!(bookkeeping, self.drain_in_flight());
+        // Issue #2252: no decision of this worker runs now, so hand the
+        // partitions over in one statement.
+        self.release_owner_partitions(pool, &owner_loop, None).await;
         // A single pool names its shard through the default pin.
         self.keep_lease_while_handlers_run(vec![(None, pool.clone())]);
 
@@ -34123,6 +38226,202 @@ impl Worker {
                 "refusing to start: cross-region DR fencing could not be resolved"
             );
         })
+    }
+
+    /// Start the owner loop of one database (issue #2252).
+    ///
+    /// `owner_shard` keys the tenures of the database. `refuse` keeps owner
+    /// mode off for this worker there, for a split colocated group (ADR 0009
+    /// decision 10). The loop scans every [`OWNER_SCAN_INTERVAL`], or sooner
+    /// when a foreign lease ends first (issue #2254). It stops at shutdown.
+    /// [`Self::release_owner_partitions`] then releases its partitions after
+    /// the drain.
+    fn spawn_owner_loop(
+        &self,
+        pool: &DbPool,
+        owner_shard: crate::types::ShardId,
+        refuse: bool,
+    ) -> OwnerLoopHandle {
+        let mut owner_loop = crate::decision_owner::OwnerLoop::new(
+            owner_shard,
+            &self.config.worker_id,
+            crate::decision_owner::OwnerLeaseConfig::default(),
+            Arc::clone(&self.decision_owner),
+        )
+        // Peers are judged on the fleet-wide cadence, as the capability-miss
+        // lookup does. A fast local heartbeat must not make a peer look dead.
+        .with_live_within(Duration::from_secs(
+            u64::try_from(capability_miss_fleet_stale_secs(
+                self.config.worker_heartbeat_interval,
+            ))
+            .unwrap_or(1),
+        ))
+        .with_acquire_chunk(OWNER_ACQUIRE_CHUNK);
+        // A worker that cannot run a workflow task must not own partitions.
+        // It still claims in the owned form, so the guard never blocks its
+        // activity claims.
+        if refuse || !self.can_own_partitions() {
+            owner_loop.refuse();
+        }
+        let state = Arc::new(tokio::sync::Mutex::new(owner_loop));
+        let stop = CancellationToken::new();
+        let task = {
+            let state = Arc::clone(&state);
+            let stop = stop.clone();
+            let pool = pool.clone();
+            let cache = Arc::clone(&self.workflow_cache);
+            let owned = Arc::clone(&self.decision_owner);
+            let woken = Arc::clone(&self.owner_woken);
+            let worker_id = self.config.worker_id.clone();
+            AbortOnDrop::new(tokio::spawn(async move {
+                loop {
+                    let wait = owner_scan(&state, &pool, &cache, &owned, &woken, &worker_id).await;
+                    // A zero wait is ready at once. The stop must still win.
+                    tokio::select! {
+                        biased;
+                        () = stop.cancelled() => return,
+                        () = tokio::time::sleep(wait) => {}
+                    }
+                }
+            }))
+        };
+        OwnerLoopHandle {
+            state,
+            stop,
+            _task: task,
+        }
+    }
+
+    /// The labels this worker writes to `harvest_workers` (issue #2252).
+    ///
+    /// They are the configured labels plus
+    /// [`crate::decision_owner::OWNER_HANDLERS_LABEL`]. The enable step of
+    /// owner mode compares that label across the live fleet.
+    fn fleet_labels(&self) -> std::collections::HashMap<String, String> {
+        let mut labels = self.config.labels.clone();
+        let handlers = if self.can_own_partitions() {
+            crate::decision_owner::handler_set_fingerprint(
+                self.registry.workflows.keys().map(String::as_str),
+                self.registry.activities.keys().map(String::as_str),
+            )
+        } else {
+            crate::decision_owner::NO_OWNED_HANDLERS.to_string()
+        };
+        labels.insert(
+            crate::decision_owner::OWNER_HANDLERS_LABEL.to_string(),
+            handlers,
+        );
+        labels
+    }
+
+    /// Whether this worker can own decision partitions (issue #2252).
+    ///
+    /// An owner claims every workflow task of its partitions. A worker with
+    /// no workflow slot or no workflow type would strand them.
+    fn can_own_partitions(&self) -> bool {
+        self.config.max_concurrent_workflows > 0 && !self.registry.workflows.is_empty()
+    }
+
+    /// Release every owned partition of `handle` (ADR 0009 decision 9).
+    ///
+    /// The worker calls this after its drain, so no decision of its own still
+    /// runs. The loop lock waits for a scan in progress, and the release
+    /// stops the loop for good. A failed release lapses within one TTL.
+    async fn release_owner_partitions(
+        &self,
+        pool: &DbPool,
+        handle: &OwnerLoopHandle,
+        acquire_bound: Option<Duration>,
+    ) {
+        handle.stop.cancel();
+        let conn = async {
+            match acquire_bound {
+                Some(bound) => tokio::time::timeout(bound, pool.get())
+                    .await
+                    .map_err(|_| HarvestError::Database("owner release: pool timeout".to_string()))
+                    .and_then(|r| r.map_err(|e| HarvestError::Database(e.to_string()))),
+                None => pool
+                    .get()
+                    .await
+                    .map_err(|e| HarvestError::Database(e.to_string())),
+            }
+        };
+        let (conn, mut owner_loop) = conn_then_loop_lock(conn, &handle.state).await;
+        let released = match conn {
+            Ok(mut conn) => owner_loop.release_everything(&mut conn).await,
+            Err(e) => Err(e),
+        };
+        drop(owner_loop);
+        match released {
+            Ok(keys) => evict_owner_keys(&self.workflow_cache, &keys).await,
+            Err(e) => tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %e,
+                "failed to release decision partitions; their leases lapse within one TTL"
+            ),
+        }
+    }
+
+    /// Whether the database of `pool` serves a shard of the process pool
+    /// that this worker does not target (ADR 0009 decision 10).
+    ///
+    /// Several assignments of one plain pool share its database, so they
+    /// form one group.
+    fn single_pool_splits_a_group(&self, pool: &DbPool) -> bool {
+        let Some(sharded) = self.config.sharded_pool.as_ref() else {
+            return false;
+        };
+        let targets: Vec<(crate::types::ShardId, DbPool)> = self
+            .config
+            .shard_assignments
+            .iter()
+            .map(|shard| (*shard, pool.clone()))
+            .collect();
+        let assigned = &self.config.shard_assignments;
+        owner_groups(&targets, &sharded.shard_ids(), |a, b| {
+            a == b
+                || (assigned.contains(&a) && assigned.contains(&b))
+                || sharded.same_physical_pool(a, b)
+        })
+        .iter()
+        .any(|group| group.split)
+    }
+
+    /// Start one owner loop per database of `targets` (issue #2252).
+    fn spawn_owner_loops(
+        &self,
+        targets: &[(crate::types::ShardId, DbPool)],
+    ) -> Vec<(DbPool, OwnerLoopHandle)> {
+        // `same_physical_pool` reads the DSN groups of the pool. Two pools
+        // that `from_dsns` built for one database are one group there.
+        let sharded = self.config.sharded_pool.as_ref();
+        let all = sharded
+            .map(crate::shard::ShardedDbPool::shard_ids)
+            .unwrap_or_default();
+        let groups = owner_groups(targets, &all, |a, b| {
+            a == b || sharded.is_some_and(|pool| pool.same_physical_pool(a, b))
+        });
+        let mut map = std::collections::HashMap::new();
+        let mut handles = Vec::with_capacity(groups.len());
+        for group in groups {
+            if group.split {
+                tracing::error!(
+                    worker_id = %self.config.worker_id,
+                    shards = ?group.members.iter().map(|s| s.as_i32()).collect::<Vec<_>>(),
+                    "owner mode refused on a database: this worker covers only part of its \
+                     colocated shards (ADR 0009 decision 10)"
+                );
+            }
+            for member in &group.members {
+                map.insert(*member, group.canonical);
+            }
+            let handle = self.spawn_owner_loop(&group.pool, group.canonical, group.split);
+            handles.push((group.pool, handle));
+        }
+        if let Ok(mut owner_shards) = self.owner_shards.write() {
+            *owner_shards = map;
+        }
+        handles
     }
 
     /// Re-probe the shards this worker held at startup (issue #1823).
@@ -34451,6 +38750,7 @@ impl Worker {
                     self.config.worker_heartbeat_interval,
                     crate::quota_reconcile::QUOTA_RECONCILE_DEFAULT_BATCH,
                     *shard,
+                    self.registry.payload_codecs().clone(),
                 )
             })
             .collect();
@@ -34933,7 +39233,7 @@ impl Worker {
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 build_id: self.config.build_id.clone(),
                 deployment_name: self.config.deployment_name.clone(),
-                labels: self.config.labels.clone(),
+                labels: self.fleet_labels(),
                 max_concurrent_sessions: self.config.max_concurrent_sessions,
             },
             Arc::clone(&self.workflow_semaphore),
@@ -34970,6 +39270,7 @@ impl Worker {
                     ),
                     session_slots: self.config.max_concurrent_sessions,
                     priority_aging_secs: self.config.priority_aging_secs,
+                    fairness_keys: self.config.fairness_keys,
                     ineligible_activities: &self.ineligible_activities,
                     shard_assignments: &self.config.shard_assignments,
                     registered_workflows: &registered_workflows,
@@ -34999,6 +39300,7 @@ impl Worker {
                         // only a database with a DR marker (issue #1823).
                         // The fence is pinned before the heartbeat starts.
                         dr_fencing: crate::replication::FenceRegistry::is_enabled(),
+                        claim_loops: self.config.max_concurrent_claims,
                     },
                     payload: self.registry.payload_policy(),
                 }),
@@ -35202,6 +39504,9 @@ impl Worker {
         // `DISPATCH_READ_MAX` separate acknowledgement round trips, despite
         // `ack_many` already existing on the trait.
         let mut to_ack: Vec<crate::dispatch::DispatchLease> = Vec::new();
+        // Opens after the batch ack. A task of this batch holds a hint for
+        // its own row until then. See [`DISPATCH_HINT_ACK_WAIT`].
+        let (acked_tx, acked_rx) = tokio::sync::watch::channel(false);
         // Each kind's fair share of this batch, snapshotted once per shard's
         // turn. See [`dispatch_kind_within_share`] for why the read-size
         // share is not enough on its own (Codex review, issue #1429).
@@ -35214,6 +39519,7 @@ impl Worker {
                 .div_ceil(divisor);
         let mut claimed_workflow = 0usize;
         let mut claimed_activity = 0usize;
+        let mut refused = RefusedPools::default();
         let mut leases = leases.into_iter();
         while let Some(lease) = leases.next() {
             if self.shutdown.is_cancelled() {
@@ -35237,6 +39543,7 @@ impl Worker {
                 // No permit for this pool, or this shard's own share of it is
                 // already spent this batch. Give the reference straight
                 // back, so a peer with capacity reads it on its next poll.
+                refused.note(lease.kind);
                 to_release.push((lease, Duration::ZERO));
                 continue;
             }
@@ -35256,7 +39563,15 @@ impl Worker {
                 .consume_reference(pool, shard, installed, lease, reservation, shard_count)
                 .await
             {
-                ReferenceDisposition::Dispatched(lease) => {
+                ReferenceDisposition::Dispatched(lease, claimed) => {
+                    self.dispatch_task(
+                        claimed.task,
+                        pool,
+                        shard,
+                        claimed.reservation,
+                        None,
+                        Some(acked_rx.clone()),
+                    );
                     dispatched += 1;
                     // Only a reference this shard actually dispatched spends
                     // its share of the pool (Codex review, issue #1429). A
@@ -35278,6 +39593,60 @@ impl Worker {
                 ReferenceDisposition::Handled => {}
             }
         }
+        self.settle_leases(state, installed, &to_ack, &to_release, &acked_tx)
+            .await;
+        // A multi-shard turn that dispatched nothing returns to its round,
+        // and the round waits when every shard is idle. A wait here would
+        // delay the turn of a busy shard.
+        if dispatched == 0 && shard_count == 1 {
+            let wait = installed.settings.poll_interval.min(DISPATCH_REFUSED_WAIT);
+            self.wait_for_refused_permit(refused, wait).await;
+        }
+        dispatched
+    }
+
+    /// Wait until a pool that refused a reference of one batch frees a
+    /// permit (issue #1429). `wait` caps the wait.
+    ///
+    /// The batch gives such a reference straight back, so a peer with a
+    /// permit can read it. The other pool can still have free permits, so
+    /// the next read still runs. Without this wait, the reader read the same
+    /// reference again at once and gave it back again. That loop made
+    /// thousands of channel calls per second. A channel call that completes
+    /// without a yield then starved the tasks of this worker.
+    async fn wait_for_refused_permit(&self, refused: RefusedPools, wait: Duration) {
+        if !refused.workflow && !refused.activity {
+            return;
+        }
+        // A refused pool can still show a free permit. A claimed task holds
+        // it as a reservation until its first poll, or the permit freed
+        // after the check. The reader yields, so that task can run, and the
+        // next read sees the pool again.
+        let shows_permit = (refused.workflow && self.workflow_semaphore.available_permits() > 0)
+            || (refused.activity && self.activity_semaphore.available_permits() > 0);
+        if shows_permit {
+            tokio::task::yield_now().await;
+            return;
+        }
+        tokio::select! {
+            () = self.shutdown.cancelled() => {}
+            () = tokio::time::sleep(wait) => {}
+            Ok(permit) = self.workflow_semaphore.acquire(), if refused.workflow => drop(permit),
+            Ok(permit) = self.activity_semaphore.acquire(), if refused.activity => drop(permit),
+        }
+    }
+
+    /// Settle one batch of [`Self::dispatch_leases`] in one `ack_many` and one
+    /// `release_many` call (issue #1429). The ack opens `acked` for the tasks
+    /// of the batch. See [`DISPATCH_HINT_ACK_WAIT`].
+    async fn settle_leases(
+        &self,
+        state: &mut DispatchLoopState,
+        installed: &crate::dispatch::InstalledDispatch,
+        to_ack: &[crate::dispatch::DispatchLease],
+        to_release: &[(crate::dispatch::DispatchLease, Duration)],
+        acked: &tokio::sync::watch::Sender<bool>,
+    ) {
         // A failed batched call is still self-healing. A stuck ack costs one
         // redelivery; a stuck release costs one visibility-timeout wait. So
         // neither error changes what this call returns. But swallowing it
@@ -35298,12 +39667,14 @@ impl Worker {
             // follow-up) — whichever this installed channel actually costs.
             let timeout = dispatch_batch_timeout(queues.len(), 2, to_ack.len());
             if let Err(error) =
-                dispatch_call_with_timeout(installed.channel.ack_many(&to_ack), "ack", timeout)
-                    .await
+                dispatch_call_with_timeout(installed.channel.ack_many(to_ack), "ack", timeout).await
             {
                 self.log_dispatch_error(state, &error, "dispatch batched ack failed");
             }
         }
+        // A failed ack opens the gate too. Its references come back by
+        // redelivery, and the reader acks a row that is not `PENDING`.
+        let _ = acked.send(true);
         if !to_release.is_empty() {
             let queues: HashSet<&str> = to_release
                 .iter()
@@ -35311,7 +39682,7 @@ impl Worker {
                 .collect();
             let timeout = dispatch_batch_timeout(queues.len(), 1, to_release.len());
             if let Err(error) = dispatch_call_with_timeout(
-                installed.channel.release_many(&to_release),
+                installed.channel.release_many(to_release),
                 "release",
                 timeout,
             )
@@ -35320,7 +39691,6 @@ impl Worker {
                 self.log_dispatch_error(state, &error, "dispatch batched release failed");
             }
         }
-        dispatched
     }
 
     /// Permits of one pool that no claimed task has reserved yet.
@@ -35399,11 +39769,29 @@ impl Worker {
         // idle, so it always waits, unchanged.
         if idle {
             let wait = dispatch_read_block(shard_count, self.config.poll_interval);
-            // A full pool also wakes on a released permit (issue #1787).
-            let capacity_bound = self.capacity_bound();
+            // A full pool also wakes on a released permit (issue #1787). A
+            // multi-shard turn waits at most 10 ms here, so it leaves that
+            // wake to the idle wait of its round. Here it would clear the
+            // flag and take the stored wake of an earlier gated shard.
+            let capacity = (shard_count == 1).then(|| self.capacity_wait());
             tokio::select! {
                 () = self.shutdown.cancelled() => {}
-                () = self.capacity_freed.notified(), if capacity_bound => {}
+                () = async {
+                    match capacity {
+                        Some(capacity) => capacity.woken().await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
+                () = self.deferral_due.notified() => {}
+                // A multi-shard turn leaves the owner wake to the idle wait
+                // of its round, as it does the capacity wake (issue #2253).
+                () = async {
+                    if shard_count == 1 {
+                        self.owner_woken.notified().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {}
                 () = tokio::time::sleep(wait) => {}
             }
         }
@@ -35489,7 +39877,7 @@ impl Worker {
         let claim_started = std::time::Instant::now();
         let claimed = self
             .claim_with_conflict_retry(&mut conn, async |conn| {
-                queue::claim_task_by_id_on_shard(
+                queue::claim_task_by_id_with_owner(
                     conn,
                     lease.task_id,
                     &self.config.queues,
@@ -35499,11 +39887,13 @@ impl Worker {
                     circuit_breakers.tracked_activity_names(),
                     &exclusions,
                     shard,
+                    self.claim_fairness(),
+                    self.owned_claim(shard).as_ref(),
                 )
                 .await
             })
             .await;
-        self.record_db_op(DbOp::Claim, shard, claim_started);
+        self.record_claim(shard, claim_started, &claimed);
 
         match claimed {
             Ok(Some(task)) => {
@@ -35525,8 +39915,10 @@ impl Worker {
                     queue = %task.queue_name,
                     "claimed task (dispatch)"
                 );
-                self.dispatch_task(task, pool, shard, reservation, None);
-                ReferenceDisposition::Dispatched(lease)
+                ReferenceDisposition::Dispatched(
+                    lease,
+                    Box::new(ClaimedReference { task, reservation }),
+                )
             }
             Ok(None) => {
                 let probe = match queue::dispatch_probe(
@@ -35760,6 +40152,7 @@ impl Worker {
         mut listener: Option<crate::notify::QueueListener>,
         registration_pending: &AtomicBool,
         dispatch_allowed: bool,
+        more_work: &tokio::sync::Notify,
     ) {
         let _poller = self.poller_guard();
         // Dispatch-channel state for this loop (issue #1312). All three are
@@ -35846,6 +40239,8 @@ impl Worker {
                 )
                 .await
             {
+                // More work may wait. Wake one follower claim loop.
+                more_work.notify_one();
                 // Per-shard dispatch counter (issue #961, AC5). Emitted on the
                 // single-shard path too, so `harvest.shard.dispatched` is a
                 // uniform series across deployment shapes whenever the worker
@@ -35876,12 +40271,7 @@ impl Worker {
                         .wait_for_notification(self.config.poll_interval)
                         .await
                     {
-                        Ok(Some(_)) => {
-                            // Host clocks can run ahead of the database NOW(). A
-                            // jittered delay lets a new task become claimable,
-                            // and spreads the claims of many workers (issue #1796).
-                            tokio::time::sleep(crate::notify::settle_delay()).await;
-                        }
+                        Ok(Some(_)) => return true,
                         Ok(None) => {}
                         Err(error) => {
                             tracing::warn!(
@@ -35895,13 +40285,105 @@ impl Worker {
                 } else {
                     tokio::time::sleep(self.config.poll_interval).await;
                 }
+                false
             };
-            // A full pool also wakes on a released permit (issue #1787).
-            let capacity_bound = self.capacity_bound();
-            tokio::select! {
-                () = self.capacity_freed.notified(), if capacity_bound => {}
-                () = idle_wait => {}
+            self.idle_wait_then_settle(idle_wait).await;
+        }
+    }
+
+    /// One idle wait of the single-pool leader (issues #1787, #1796).
+    ///
+    /// `idle` waits on the listener or the timer. It returns `true` on a
+    /// NOTIFY. A released permit or a due deferral also ends the wait.
+    ///
+    /// A NOTIFY returns at once, so the leader polls first (issue #2422).
+    /// The next call after an empty poll sleeps the settle delay instead of
+    /// a wait. Host clocks can run ahead of the database `NOW()`. The
+    /// jittered delay lets such a task become claimable. Only a workflow
+    /// task of this worker that ends cuts it short (issue #2418). An earlier
+    /// wake leaves the NOTIFY queued for the next wait.
+    async fn idle_wait_then_settle(&self, idle: impl std::future::Future<Output = bool>) {
+        if self.settle_if_pending().await {
+            return;
+        }
+        // A full pool also wakes on a released permit (issue #1787).
+        let capacity = self.capacity_wait();
+        let notified = tokio::select! {
+            () = capacity.woken() => false,
+            () = self.deferral_due.notified() => false,
+            // Issue #2418: a local commit is visible, so it does not settle.
+            () = self.decision_done.notified() => false,
+            () = self.owed_poll() => false,
+            // An owner wake is a NOTIFY too, so it settles (issue #2253).
+            () = self.owner_woken.notified() => true,
+            notified = idle => notified,
+        };
+        if notified {
+            self.settle_pending.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Run the settle that a NOTIFY left pending, and report whether it ran
+    /// (issue #2422).
+    ///
+    /// A NOTIFY polls first. A row that the database clock stamped is
+    /// claimable at once, so that poll takes it with no delay. Only an empty
+    /// poll then settles, and the loop polls again after it. So a row that a
+    /// host clock stamped ahead of the database still gets its margin.
+    ///
+    /// Before, every NOTIFY slept the settle before its first poll. A signal
+    /// to an idle worker waited 50 ms at least.
+    async fn settle_if_pending(&self) -> bool {
+        if !self.settle_pending.swap(false, Ordering::Relaxed) {
+            return false;
+        }
+        self.settle().await;
+        true
+    }
+
+    /// Sleep the settle delay after a NOTIFY (issue #2418).
+    ///
+    /// A workflow task of this worker that ends cuts the delay short. Its
+    /// commit is visible, so the tasks that it schedules need no settle.
+    /// The NOTIFY can name another row that is not claimable yet. So a cut
+    /// settle owes one more poll at its original end.
+    ///
+    /// Without the cut, two claim loops drain the workflow backlog and then
+    /// both go idle. Each activity committed in the settle waits for it, so
+    /// the dispatch p50 rose from 13 ms to 66 ms.
+    async fn settle(&self) {
+        let end = tokio::time::Instant::now() + crate::notify::settle_delay();
+        tokio::select! {
+            () = tokio::time::sleep_until(end) => {}
+            () = self.decision_done.notified() => {
+                let mut owed = self
+                    .owed_poll
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Keep the later end. A row due at the earlier end is still
+                // pending then, so one poll covers both.
+                *owed = Some(owed.map_or(end, |at| at.max(end)));
             }
+        }
+    }
+
+    /// Resolve at the poll that a cut settle owes, and clear it (issue
+    /// #2418). Pending forever when no poll is owed.
+    async fn owed_poll(&self) {
+        let at = *self
+            .owed_poll
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(at) = at else {
+            return std::future::pending().await;
+        };
+        tokio::time::sleep_until(at).await;
+        let mut owed = self
+            .owed_poll
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *owed == Some(at) {
+            *owed = None;
         }
     }
 
@@ -36183,7 +40665,7 @@ impl Worker {
             version: Some(version.to_string()),
             build_id: self.config.build_id.clone(),
             deployment_name: self.config.deployment_name.clone(),
-            labels: self.config.labels.clone(),
+            labels: self.fleet_labels(),
             max_concurrent_sessions: self.config.max_concurrent_sessions,
         };
         match acquire_shard_conn(pool, acquire_bound).await {
@@ -36505,6 +40987,57 @@ impl Worker {
         }
     }
 
+    /// Whether this worker runs owner deciders at all (issue #2255).
+    ///
+    /// A worker with queue weights, fairness keys or priority ageing keeps
+    /// the owned claim of issue #2252. Its claim loops then take workflow
+    /// tasks in the weighted queue order. They apply the fairness lags of
+    /// issue #1976 and the ageing boost (issue #2308). A decider ignores all
+    /// three. Ageing reorders every pending row, so no bounded scan can sort
+    /// it.
+    fn deciders_enabled(&self) -> bool {
+        self.config.queue_weights.is_empty()
+            && !self.config.fairness_keys
+            && self.config.priority_aging_secs.is_none_or(|secs| secs == 0)
+    }
+
+    /// Whether an owner decider runs for the claim target `shard` (issue
+    /// #2255).
+    ///
+    /// It runs only where an owner wake task runs. With no wake, a decider
+    /// finds each row by a scan, and a scan with a take costs more than one
+    /// head claim. The claim loops then keep the owned claim of #2252.
+    fn decider_runs_on(&self, shard: Option<crate::types::ShardId>) -> bool {
+        self.deciders_enabled()
+            && self
+                .owner_wake_shards
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&self.owner_shard_of(shard))
+    }
+
+    /// Whether an owner decider takes the workflow tasks of every claim
+    /// target of this worker (issue #2255).
+    fn deciders_take_every_workflow(&self) -> bool {
+        let targets = self
+            .claim_targets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !targets.is_empty()
+            && targets
+                .iter()
+                .all(|shard| self.decider_runs_on(*shard) && self.owned_claim(*shard).is_some())
+    }
+
+    /// What a Postgres poll may claim where the owner decider runs (issue
+    /// #2255): activities only.
+    fn activity_admission_now(&self) -> PollAdmission {
+        poll_admission(
+            0,
+            Self::free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity),
+        )
+    }
+
     /// What a Postgres poll may claim now. See [`poll_admission`].
     fn poll_admission_now(&self) -> PollAdmission {
         poll_admission(
@@ -36527,16 +41060,74 @@ impl Worker {
     /// wake, because `Notify` stores it until the wait polls it. The attempt
     /// frees its limit slot before its dispatch permit, so the wake finds
     /// the slot free.
+    ///
+    /// Also true when the gate refused a kind and no wait has woken on
+    /// `capacity_freed` since. A permit can free while the gated poll
+    /// claims. The pools then look free here, but the backlog of the refused
+    /// kind still waits. `Notify` stores the release, so the wait finds it.
+    /// The flag is read after the pools, so a refusal between the two reads
+    /// still counts. A refusal after both reads arms the wait through
+    /// `refusal_recorded`. See [`Worker::capacity_wait`].
     fn capacity_bound(&self) -> bool {
         let limit_refused = self.limit_refused.swap(false, Ordering::Relaxed);
-        self.poll_admission_now() != PollAdmission::Any
+        // Issue #2255: where the owner deciders take every workflow task, a
+        // full workflow pool refuses no claim of a claim loop.
+        let pools_full = if self.deciders_take_every_workflow() {
+            self.activity_admission_now() == PollAdmission::Saturated
+        } else {
+            self.poll_admission_now() != PollAdmission::Any
+        };
+        pools_full
             || limit_refused
+            || AtomicBool::load(&self.pool_refused, Ordering::Relaxed)
             || self.registry.adaptive_limits.any_saturated()
+    }
+
+    /// Take the capacity part of one idle wait (issue #1787). See
+    /// [`CapacityWait`].
+    ///
+    /// The wait registers for a refusal before it reads `capacity_bound`.
+    /// Another claim loop can record a refusal just after that read. A
+    /// `Notified` future receives each `notify_waiters` call made after its
+    /// creation, so that refusal still arms the wait.
+    fn capacity_wait(&self) -> CapacityWait<'_> {
+        self.capacity_wait_after(|| {})
+    }
+
+    /// [`Self::capacity_wait`], with a hook that runs right after the read.
+    /// A test records a refusal there. The hook moves with the read, so the
+    /// test pins that the registration comes first.
+    fn capacity_wait_after(&self, after_read: impl FnOnce()) -> CapacityWait<'_> {
+        let refused = self.refusal_recorded.notified();
+        let bound = {
+            let bound = self.capacity_bound();
+            after_read();
+            bound
+        };
+        CapacityWait {
+            worker: self,
+            bound,
+            refused,
+        }
+    }
+
+    /// An idle wait woke on `capacity_freed` (issue #1787). The next poll
+    /// sees the gate and the limits again, so both refusal flags have done
+    /// their work. That poll sets `limit_refused` again while a type is at
+    /// its limit. A poll of another shard cannot claim the refused backlog,
+    /// so no poll clears `pool_refused`.
+    fn capacity_woke(&self) {
+        self.pool_refused.store(false, Ordering::Relaxed);
+        self.limit_refused.store(false, Ordering::Relaxed);
     }
 
     /// Mark each kind the gate refuses (issue #1787). See `gate_refused`.
     fn record_gate_refusal(&self, admission: PollAdmission) {
         use crate::queue::TaskType;
+        // The `Notify` orders the flag write before the wake.
+        if admission != PollAdmission::Any && !self.pool_refused.swap(true, Ordering::Relaxed) {
+            self.refusal_recorded.notify_waiters();
+        }
         let (workflow, activity) = match admission {
             PollAdmission::Saturated => (true, true),
             PollAdmission::Any => (false, false),
@@ -36589,20 +41180,22 @@ impl Worker {
         PollerGuard::new(&self.config.queues, &self.registry.telemetry().metrics)
     }
 
-    /// Record the duration of one database op on `shard` that began at
-    /// `started` (issue #1815). The shard labels match the pool-wait ones.
-    fn record_db_op(
+    /// Record one claim on `shard` that began at `started` (issues #1815
+    /// and #2248). The shard labels match the pool-wait ones. The `kind`
+    /// label names what the claim returned.
+    fn record_claim(
         &self,
-        op: DbOp,
         shard: Option<crate::types::ShardId>,
         started: std::time::Instant,
+        claimed: &HarvestResult<Option<TaskQueueItem>>,
     ) {
+        let kind = claim_kind(claimed);
         let elapsed = started.elapsed().as_secs_f64();
         for label in self.pool_labels(shard).iter() {
             self.registry
                 .telemetry()
                 .metrics
-                .record_db_query_duration(op, *label, elapsed);
+                .record_claim_duration(kind, *label, elapsed);
         }
     }
 
@@ -36634,6 +41227,33 @@ impl Worker {
         .await
     }
 
+    /// The claim's fairness mode, from [`WorkerRuntimeConfig::fairness_keys`]
+    /// (issue #1976).
+    const fn claim_fairness(&self) -> queue::ClaimFairness {
+        if self.config.fairness_keys {
+            queue::ClaimFairness::Keys
+        } else {
+            queue::ClaimFairness::Off
+        }
+    }
+
+    /// The shard that keys the owner tenures of claim target `shard` (issue
+    /// #2252).
+    fn owner_shard_of(&self, shard: Option<crate::types::ShardId>) -> crate::types::ShardId {
+        let key = crate::decision_owner::OwnerKey::pool_shard(shard);
+        self.owner_shards
+            .read()
+            .ok()
+            .and_then(|map| map.get(&key).copied())
+            .unwrap_or(key)
+    }
+
+    /// The owned claim of claim target `shard`, or `None` when owner mode is
+    /// off there (issue #2252).
+    fn owned_claim(&self, shard: Option<crate::types::ShardId>) -> Option<queue::OwnedClaim> {
+        self.decision_owner.owned_claim(self.owner_shard_of(shard))
+    }
+
     /// The activity names that a claim must skip: the names with unmet
     /// requirements, plus the types at their adaptive limit (issue #1836).
     fn claim_exclusions(&self) -> std::borrow::Cow<'_, [String]> {
@@ -36643,10 +41263,504 @@ impl Worker {
             return std::borrow::Cow::Borrowed(&self.ineligible_activities);
         }
         let exclusions = claim_exclusions(&self.ineligible_activities, limits.saturated());
-        if matches!(exclusions, std::borrow::Cow::Owned(_)) {
-            self.limit_refused.store(true, Ordering::Relaxed);
+        if matches!(exclusions, std::borrow::Cow::Owned(_))
+            && !self.limit_refused.swap(true, Ordering::Relaxed)
+        {
+            self.refusal_recorded.notify_waiters();
         }
         exclusions
+    }
+
+    /// Run the single-pool leader loop and its followers until shutdown.
+    async fn run_single_pool_claim_loops(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+        listener: Option<crate::notify::QueueListener>,
+        registration_pending: &AtomicBool,
+        dispatch_allowed: bool,
+    ) {
+        let more_work = tokio::sync::Notify::new();
+        let claim_targets = [ClaimTarget {
+            shard,
+            pool,
+            registration_pending,
+            acquire_bound: shard_acquire_bound(false, self.config.poll_interval),
+            global_dispatch: dispatch_allowed,
+        }];
+        self.warn_if_claim_loops_fill_pools(&claim_targets);
+        self.set_claim_targets(&claim_targets);
+        let deciders = [DeciderTarget {
+            shard,
+            pool,
+            registration_pending,
+            acquire_bound: shard_acquire_bound(false, self.config.poll_interval),
+        }];
+        tokio::join!(
+            self.run_poll_loop(
+                pool,
+                shard,
+                listener,
+                registration_pending,
+                dispatch_allowed,
+                &more_work,
+            ),
+            self.run_claim_followers(&claim_targets, &more_work),
+            self.run_owner_deciders(&deciders),
+        );
+    }
+
+    /// Record the claim targets of the claim loops (issue #2255).
+    fn set_claim_targets(&self, targets: &[ClaimTarget<'_>]) {
+        *self
+            .claim_targets
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            targets.iter().map(|target| target.shard).collect();
+    }
+
+    /// Warn when the claim loops alone can hold every connection of a claim
+    /// pool. See [`claim_loops_fill_pool`].
+    fn warn_if_claim_loops_fill_pools(&self, targets: &[ClaimTarget<'_>]) {
+        let claim_loops = self.config.max_concurrent_claims;
+        for target in targets {
+            let max_size = target.pool.status().max_size;
+            if claim_loops_fill_pool(claim_loops, max_size) {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    shard = ?target.shard,
+                    max_concurrent_claims = claim_loops,
+                    pool_max_size = max_size,
+                    "the claim loops can hold every pool connection; tasks, heartbeats and \
+                     persists then wait behind them. Use a larger pool or lower \
+                     max_concurrent_claims"
+                );
+            }
+        }
+    }
+
+    /// Run `max_concurrent_claims - 1` follower claim loops beside the leader.
+    ///
+    /// Assay #14 measured claim-loop occupancy at 0.94, which fits one claim
+    /// in flight. That loop capped throughput. A follower adds a claim in flight only while claims return
+    /// work. The leader alone still guarantees progress, so a follower needs
+    /// no timer and no listener. See `docs/design/DESIGN-claim-concurrency.md`.
+    ///
+    /// The caller joins this future with the leader. The drain therefore
+    /// starts only after every claim loop returns.
+    async fn run_claim_followers(
+        &self,
+        targets: &[ClaimTarget<'_>],
+        more_work: &tokio::sync::Notify,
+    ) {
+        let followers = self.config.max_concurrent_claims.saturating_sub(1);
+        futures::future::join_all(
+            (0..followers).map(|_| self.run_claim_follower(targets, more_work)),
+        )
+        .await;
+    }
+
+    /// One follower claim loop.
+    ///
+    /// It waits for a wake from a successful claim. It then claims until a
+    /// claim returns nothing, and wakes one more follower after each success.
+    async fn run_claim_follower(
+        &self,
+        targets: &[ClaimTarget<'_>],
+        more_work: &tokio::sync::Notify,
+    ) {
+        let _poller = self.poller_guard();
+        let mut start = 0usize;
+        loop {
+            tokio::select! {
+                biased;
+                () = self.shutdown.cancelled() => return,
+                () = more_work.notified() => {}
+            }
+            while !self.shutdown.is_cancelled() && self.follower_claim(targets, &mut start).await {
+                more_work.notify_one();
+            }
+            // This run ended on an empty claim or on shutdown. A wake stored
+            // during the run would only cost one more empty claim. The next
+            // success wakes a follower again.
+            let _ = futures::FutureExt::now_or_never(more_work.notified());
+        }
+    }
+
+    /// One follower claim attempt over `targets`, from a rotating start.
+    ///
+    /// A follower claims only where the leader polls Postgres. It skips a
+    /// target with an unverified registration or with a dispatch channel.
+    /// Returns `true` when it claimed and dispatched one task.
+    async fn follower_claim(&self, targets: &[ClaimTarget<'_>], start: &mut usize) -> bool {
+        let n = targets.len();
+        for i in 0..n {
+            if self.shutdown.is_cancelled() {
+                return false;
+            }
+            let idx = (*start + i) % n;
+            let target = &targets[idx];
+            // Fully qualified: diesel's `RunQueryDsl::load` shadows it.
+            let pending = AtomicBool::load(target.registration_pending, Ordering::Relaxed);
+            let per_shard_channel = target
+                .shard
+                .is_some_and(|shard| self.shard_dispatch.contains_key(&shard));
+            // Read the global channel only where it may serve, as the leader does.
+            let global_channel = target.global_dispatch && self.global_dispatch_binding().is_some();
+            if !follower_polls_postgres(pending, per_shard_channel, global_channel) {
+                continue;
+            }
+            if self
+                .poll_once_as(
+                    PollRole::Follower,
+                    target.pool,
+                    target.acquire_bound,
+                    target.shard,
+                )
+                .await
+            {
+                if let Some(shard) = target.shard {
+                    self.record_shard_dispatched_many(shard, 1);
+                }
+                *start = (idx + 1) % n;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Run one owner decider per owned database until shutdown (issue
+    /// #2255).
+    ///
+    /// The caller joins this future with the claim loops. The drain then
+    /// starts only after every decider returns.
+    async fn run_owner_deciders(&self, targets: &[DeciderTarget<'_>]) {
+        if !self.deciders_enabled() {
+            return;
+        }
+        futures::future::join_all(targets.iter().map(|target| self.run_owner_decider(target)))
+            .await;
+    }
+
+    /// One owner decider: it takes the workflow tasks of its partitions off
+    /// the claim path (issue #2255).
+    ///
+    /// It learns of work from two sources. An owner wake names an execution.
+    /// A scan reads the pending workflow rows of its partitions by due time.
+    /// The scan runs at each tenure change and after a full scan. It also
+    /// runs at the next due time, at most one scan gap apart. The gap is one
+    /// poll interval, or [`OWNER_SCAN_SAFETY_MIN`] while wakes are live. So
+    /// a lost wake, a due timer and the backlog of a new partition all reach
+    /// it.
+    ///
+    /// Each take is the owned by-execution claim. Takes and scans run as
+    /// futures beside the loop, so a scan never stalls a take. The workflow
+    /// permits bound the takes. The row serializes the decisions of one
+    /// execution, so the decider never runs two at once.
+    ///
+    /// The decider holds execution ids only. It acknowledges nothing, so a
+    /// lost hint costs latency, not work (restate#4566). With owner mode off
+    /// on its database, it waits and sends no query.
+    // too_many_lines: one loop arms the wakes, starts the scans and takes, and
+    // waits. Split, the arming and the wait would sit apart from each other.
+    #[allow(clippy::too_many_lines)]
+    async fn run_owner_decider(&self, target: &DeciderTarget<'_>) {
+        use futures::StreamExt as _;
+        // The run path spawns the owner wake tasks before the deciders.
+        if !self.decider_runs_on(target.shard) {
+            return;
+        }
+        let owner_shard = self.owner_shard_of(target.shard);
+        let poll = self.config.poll_interval;
+        let limit = self
+            .config
+            .max_concurrent_workflows
+            .clamp(1, OWNER_SCAN_LIMIT_MAX);
+        let mut events: futures::stream::FuturesUnordered<
+            std::pin::Pin<Box<dyn std::future::Future<Output = DeciderEvent> + Send + '_>>,
+        > = futures::stream::FuturesUnordered::new();
+        let mut state = DeciderState::new(poll);
+        loop {
+            // Arm each wake before the reads, so a change after a read still
+            // ends the wait below.
+            let changed = self.decision_owner.changed();
+            let pushed = self.owner_hints.pushed.notified();
+            let freed = self.decider_capacity.notified();
+            tokio::pin!(changed, pushed, freed);
+            changed.as_mut().enable();
+            pushed.as_mut().enable();
+            freed.as_mut().enable();
+            if self.shutdown.is_cancelled() {
+                break;
+            }
+            let now = std::time::Instant::now();
+            let pending = AtomicBool::load(target.registration_pending, Ordering::Relaxed);
+            let owned = self
+                .owned_claim(target.shard)
+                .filter(|_| may_claim_tasks(pending) && self.decider_runs_on(target.shard));
+            let mut blocked = false;
+            if let Some(owned) = owned {
+                state.activate(now);
+                state.set_wakes_live(self.owner_wakes_live(owner_shard), now);
+                for exec in self.owner_hints.take(owner_shard) {
+                    state.hint(exec);
+                }
+                let owned = Arc::new(owned);
+                if state.may_scan(now, limit) {
+                    state.scanning = true;
+                    let skip = state.skip(now);
+                    let owned = Arc::clone(&owned);
+                    events.push(Box::pin(async move {
+                        DeciderEvent::Scanned(
+                            self.owner_scan_once(target, &owned, &skip, limit).await,
+                        )
+                    }));
+                }
+                // Order matters only when the hints compete for permits. With
+                // enough free permits, take them at once and skip the lookup.
+                let free =
+                    Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow);
+                if state.permits_cover_all(free) {
+                    state.rank_unkeyed_unranked();
+                } else {
+                    let execs = state.begin_keying();
+                    if !execs.is_empty() {
+                        events.push(Box::pin(async move {
+                            let keys = self.owner_keys_once(target, &execs).await;
+                            DeciderEvent::Keyed(execs, keys)
+                        }));
+                    }
+                }
+                // A lookup in flight can name a row that outranks the ready
+                // ones, so no take starts until the hints have keys.
+                while !state.ready.is_empty() && !state.ranking() {
+                    if Self::free_permits(
+                        &self.workflow_semaphore,
+                        &self.dispatch_reserved_workflow,
+                    ) == 0
+                    {
+                        blocked = true;
+                        break;
+                    }
+                    let Some((exec, key)) = state.pop(now) else {
+                        break;
+                    };
+                    let Ok(permit) = Arc::clone(&self.workflow_semaphore).try_acquire_owned()
+                    else {
+                        state.insert(exec, key);
+                        blocked = true;
+                        break;
+                    };
+                    state.in_flight.insert(exec);
+                    let owned = Arc::clone(&owned);
+                    events.push(Box::pin(async move {
+                        DeciderEvent::Taken(
+                            exec,
+                            self.owner_take(target, exec, &owned, permit).await,
+                        )
+                    }));
+                }
+                state.end_pass();
+                if blocked {
+                    // The slot tuner reads a refused kind as backlog (#548).
+                    AtomicBool::store(&self.gate_refused.workflow, true, Ordering::Relaxed);
+                }
+            } else {
+                // Owner mode is off here, or the registration is pending. The
+                // claim loops take the workflow tasks.
+                state.deactivate();
+                let _ = self.owner_hints.take(owner_shard);
+            }
+            let wait = if state.active && !blocked && state.can_scan(limit) {
+                state
+                    .scan_at
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(poll)
+            } else {
+                poll
+            };
+            tokio::select! {
+                biased;
+                () = self.shutdown.cancelled() => break,
+                Some(event) = events.next(), if !events.is_empty() => {
+                    self.finish_decider_event(target, event, &mut state, limit);
+                }
+                () = changed => state.tenure_changed(),
+                () = pushed => {}
+                () = freed => {}
+                () = tokio::time::sleep(wait) => {}
+            }
+        }
+        // A take that already claimed its row must still dispatch it. The
+        // dispatch gives the claim back at shutdown, so the row is not lost.
+        while let Some(event) = events.next().await {
+            self.finish_decider_event(target, event, &mut state, limit);
+        }
+    }
+
+    /// One scan of the decider's partitions (issue #2255).
+    async fn owner_scan_once(
+        &self,
+        target: &DeciderTarget<'_>,
+        owned: &queue::OwnedClaim,
+        skip: &[uuid::Uuid],
+        limit: usize,
+    ) -> HarvestResult<queue::OwnerScan> {
+        let mut conn = self
+            .acquire_timed(target.pool, target.acquire_bound, target.shard)
+            .await?;
+        queue::owner_scan(&mut conn, &self.config.queues, owned, skip, limit).await
+    }
+
+    /// The claim-order keys of hinted executions (issue #2308).
+    async fn owner_keys_once(
+        &self,
+        target: &DeciderTarget<'_>,
+        execs: &[uuid::Uuid],
+    ) -> HarvestResult<Vec<queue::OwnerRow>> {
+        let mut conn = self
+            .acquire_timed(target.pool, target.acquire_bound, target.shard)
+            .await?;
+        queue::owner_keys(&mut conn, execs).await
+    }
+
+    /// One owner take of the workflow task of `exec` (issue #2255).
+    ///
+    /// The permit stays with a claimed row. It frees when the take finds no
+    /// row.
+    async fn owner_take(
+        &self,
+        target: &DeciderTarget<'_>,
+        exec: uuid::Uuid,
+        owned: &queue::OwnedClaim,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> OwnerTake {
+        let started = std::time::Instant::now();
+        let mut conn = match self
+            .acquire_timed(target.pool, target.acquire_bound, target.shard)
+            .await
+        {
+            Ok(conn) => conn,
+            Err(error) => {
+                if error.is_pool_acquire_timeout() {
+                    self.registry
+                        .telemetry()
+                        .metrics
+                        .record_db_pool_acquire_timeout(SITE_CLAIM);
+                }
+                return OwnerTake::Failed(error);
+            }
+        };
+        let circuit_breakers = self.registry.circuit_breakers();
+        let circuit_breaker_activities = circuit_breakers.tracked_activity_names();
+        let exclusions = self.claim_exclusions();
+        let taken = self
+            .claim_with_conflict_retry(&mut conn, async |conn| {
+                queue::claim_workflow_task_of_execution(
+                    conn,
+                    exec,
+                    &self.config.queues,
+                    &self.config.worker_id,
+                    &self.config.build_id,
+                    circuit_breaker_activities,
+                    &exclusions,
+                    target.shard,
+                    self.claim_fairness(),
+                    owned,
+                )
+                .await
+            })
+            .await;
+        drop(conn);
+        let kind = claim_kind(&taken);
+        let elapsed = started.elapsed().as_secs_f64();
+        for label in self.pool_labels(target.shard).iter() {
+            self.registry
+                .telemetry()
+                .metrics
+                .record_owner_take_duration(kind, *label, elapsed);
+        }
+        match taken {
+            Ok(Some(task)) => OwnerTake::Taken(Box::new(task), permit),
+            Ok(None) => OwnerTake::Empty,
+            Err(error) => OwnerTake::Failed(error),
+        }
+    }
+
+    /// Apply one ended scan or take to the decider state (issue #2255).
+    ///
+    /// A taken row dispatches as a claimed row does. A take finds nothing
+    /// when a gate refused the row, when its decision still runs, or when
+    /// the row is not due yet. The decider then skips the execution in its
+    /// scans, for a time that doubles with each miss. So a refused row
+    /// cannot hold the head of each scan. A wake that came during the take
+    /// queues the execution again at once.
+    fn finish_decider_event(
+        &self,
+        target: &DeciderTarget<'_>,
+        event: DeciderEvent,
+        state: &mut DeciderState,
+        limit: usize,
+    ) {
+        let now = std::time::Instant::now();
+        match event {
+            DeciderEvent::Scanned(Ok(scan)) => {
+                let full = scan.due.len() >= limit;
+                for row in scan.due {
+                    state.queue(row);
+                }
+                state.scanned(now, full, scan.next_due);
+            }
+            DeciderEvent::Scanned(Err(error)) => {
+                state.scanned(now, false, None);
+                if state.may_warn(now) {
+                    tracing::warn!(
+                        worker_id = %self.config.worker_id,
+                        error = %error,
+                        "owner decider scan failed"
+                    );
+                }
+            }
+            DeciderEvent::Keyed(execs, Ok(rows)) => state.keyed(&execs, Some(rows)),
+            DeciderEvent::Keyed(execs, Err(error)) => {
+                state.keyed(&execs, None);
+                if state.may_warn(now) {
+                    tracing::warn!(
+                        worker_id = %self.config.worker_id,
+                        error = %error,
+                        "owner decider key lookup failed"
+                    );
+                }
+            }
+            DeciderEvent::Taken(exec, OwnerTake::Taken(task, permit)) => {
+                state.took(exec);
+                tracing::debug!(
+                    task_id = %task.id,
+                    workflow_exec_id = %exec,
+                    "owner took workflow task"
+                );
+                if let Some(shard) = target.shard {
+                    self.record_shard_dispatched_many(shard, 1);
+                }
+                self.dispatch_task(*task, target.pool, target.shard, None, Some(permit), None);
+            }
+            DeciderEvent::Taken(exec, OwnerTake::Empty) => {
+                state.missed(exec, now);
+                self.capacity_freed.notify_one();
+            }
+            DeciderEvent::Taken(exec, OwnerTake::Failed(error)) => {
+                state.missed(exec, now);
+                self.capacity_freed.notify_one();
+                if state.may_warn(now) {
+                    tracing::warn!(
+                        worker_id = %self.config.worker_id,
+                        workflow_exec_id = %exec,
+                        error = %error,
+                        "owner take failed"
+                    );
+                }
+            }
+        }
     }
 
     /// Execute a single poll iteration.
@@ -36661,12 +41775,28 @@ impl Worker {
     /// exhausted pool on one shard cannot park the loop and strand its peers.
     /// See `shard_acquire_bound`. A timeout increments
     /// `harvest.db.pool_acquire_timeout{site="claim"}`.
+    async fn poll_once(
+        &self,
+        pool: &DbPool,
+        acquire_bound: Option<Duration>,
+        shard: Option<crate::types::ShardId>,
+    ) -> bool {
+        self.poll_once_as(PollRole::Leader, pool, acquire_bound, shard)
+            .await
+    }
+
+    /// [`Self::poll_once`] for one claim loop `role`.
+    ///
+    /// Only the leader runs the throttle check after an empty claim. A
+    /// follower ends each run with an empty claim, so its check would repeat
+    /// the leader's and count each throttled key once more.
     // significant_drop_tightening: `permits` holds `OwnedSemaphorePermit`s
     // across the claim on purpose (issue #1787). An earlier drop would let a
     // slot tuner shrink take the permit of a row this poll then claims.
     #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
-    async fn poll_once(
+    async fn poll_once_as(
         &self,
+        role: PollRole,
         pool: &DbPool,
         acquire_bound: Option<Duration>,
         shard: Option<crate::types::ShardId>,
@@ -36675,13 +41805,27 @@ impl Worker {
         // [`poll_admission`]. The read honors dispatch-channel reservations.
         // The poll then holds a real permit of each admitted kind across the
         // claim. See [`PollPermits`]. A saturated poll takes no connection.
+        //
+        // Issue #2255: in owner mode the owner decider takes the workflow
+        // tasks. This poll then claims activities only, and takes no
+        // workflow permit.
+        let owned = self.owned_claim(shard);
+        let decider_runs = owned.is_some() && self.decider_runs_on(shard);
         let mut permits = PollPermits::acquire(
-            self.poll_admission_now(),
+            if decider_runs {
+                self.activity_admission_now()
+            } else {
+                self.poll_admission_now()
+            },
             &self.workflow_semaphore,
             &self.activity_semaphore,
         );
         let admission = permits.admission();
-        self.record_gate_refusal(admission);
+        self.record_gate_refusal(if decider_runs {
+            decider_gate(admission)
+        } else {
+            admission
+        });
         let kind = match admission {
             PollAdmission::Saturated => return false,
             PollAdmission::Any => None,
@@ -36744,7 +41888,7 @@ impl Worker {
                 let claim_started = std::time::Instant::now();
                 let claimed = self
                     .claim_with_conflict_retry(&mut conn, async |conn| {
-                        queue::claim_task_of_kind_on_shard(
+                        queue::claim_task_with_owner(
                             conn,
                             &single_queue,
                             &self.config.worker_id,
@@ -36754,11 +41898,13 @@ impl Worker {
                             &exclusions,
                             shard,
                             kind,
+                            self.claim_fairness(),
+                            owned.as_ref(),
                         )
                         .await
                     })
                     .await;
-                self.record_db_op(DbOp::Claim, shard, claim_started);
+                self.record_claim(shard, claim_started, &claimed);
                 match claimed {
                     Ok(Some(task)) => {
                         tracing::debug!(
@@ -36768,7 +41914,7 @@ impl Worker {
                             "claimed task (weighted)"
                         );
                         let permit = permits.take(&task.task_type);
-                        self.dispatch_task(task, pool, shard, None, permit);
+                        self.dispatch_task(task, pool, shard, None, permit, None);
                         return true;
                     }
                     Ok(None) => {
@@ -36786,7 +41932,9 @@ impl Worker {
             }
 
             // All queues tried — emit throttle metrics and report idle.
-            self.emit_throttle_metrics(&mut conn).await;
+            if role == PollRole::Leader {
+                self.emit_throttle_metrics(&mut conn).await;
+            }
             return false;
         }
 
@@ -36794,7 +41942,7 @@ impl Worker {
         let claim_started = std::time::Instant::now();
         let claimed = self
             .claim_with_conflict_retry(&mut conn, async |conn| {
-                queue::claim_task_of_kind_on_shard(
+                queue::claim_task_with_owner(
                     conn,
                     &self.config.queues,
                     &self.config.worker_id,
@@ -36804,11 +41952,13 @@ impl Worker {
                     &exclusions,
                     shard,
                     kind,
+                    self.claim_fairness(),
+                    owned.as_ref(),
                 )
                 .await
             })
             .await;
-        self.record_db_op(DbOp::Claim, shard, claim_started);
+        self.record_claim(shard, claim_started, &claimed);
         match claimed {
             Ok(Some(task)) => {
                 tracing::debug!(
@@ -36823,11 +41973,13 @@ impl Worker {
                 // includes the `PENDING` wait behind a saturated worker (issue
                 // #1787) and the short permit wait after the claim.
                 let permit = permits.take(&task.task_type);
-                self.dispatch_task(task, pool, shard, None, permit);
+                self.dispatch_task(task, pool, shard, None, permit, None);
                 true
             }
             Ok(None) => {
-                self.emit_throttle_metrics(&mut conn).await;
+                if role == PollRole::Leader {
+                    self.emit_throttle_metrics(&mut conn).await;
+                }
                 false
             }
             Err(e) => {
@@ -36852,6 +42004,7 @@ impl Worker {
         shard: Option<crate::types::ShardId>,
         reservation: Option<DispatchReservation>,
         held_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        acked: Option<tokio::sync::watch::Receiver<bool>>,
     ) {
         // Debug-only tripwire (issue #548 review): dispatch must never race
         // ahead of `spawn_monitoring_tasks`, which withholds a tuned
@@ -36898,6 +42051,12 @@ impl Worker {
         let shutdown = self.shutdown.clone();
         let max_concurrent_sessions = self.config.max_concurrent_sessions;
         let capacity_freed = Arc::clone(&self.capacity_freed);
+        // Issue #2255: a freed workflow permit also wakes the owner deciders.
+        let decider_wake =
+            matches!(kind, ClaimedTaskKind::Workflow).then(|| Arc::clone(&self.decider_capacity));
+        // Issue #2418: a workflow task that ends wakes the leader too.
+        let leader_wake =
+            matches!(kind, ClaimedTaskKind::Workflow).then(|| Arc::clone(&self.decision_done));
         // The row waited in `PENDING` from eligibility to claim. Database
         // clocks measure this wait. The poll gate holds a backlog in
         // `PENDING`, not at the permit (issue #1787). The tuner signal below
@@ -36927,6 +42086,8 @@ impl Worker {
 
         let pool = pool.clone();
         let pool_labels = self.pool_labels(shard);
+        // Issue #2251: the owner key names the database of the claim.
+        let owner_shard = self.owner_shard_of(shard);
         let registry = Arc::clone(&self.registry);
         let task_id = task.id;
         let task_type = task.task_type.clone();
@@ -36984,6 +42145,7 @@ impl Worker {
         };
         let exec_id_for_timeout = task.workflow_exec_id;
         let telemetry = Arc::clone(&self.registry);
+        let decision_owner = Arc::clone(&self.decision_owner);
         let task_outcomes = Arc::clone(&self.task_outcomes);
 
         // Monotonic instant captured the moment this worker received the claimed
@@ -37028,7 +42190,9 @@ impl Worker {
                     }
                 },
                 &capacity_freed,
-            );
+            )
+            .waking_deciders(decider_wake)
+            .waking_leader(leader_wake);
             // The permit is held, so the reference no longer needs a
             // reservation against it (issue #1312). The early return above
             // drops it too, so a closed semaphore cannot leak one.
@@ -37089,31 +42253,40 @@ impl Worker {
                 // blameless cleanup cancelled — banking a timeout strike it did
                 // not earn and, at `poison_pill_threshold`, terminally failing
                 // an execution whose body had completed.
-                let outcome = process_task(
-                    &pool,
-                    Arc::clone(&registry),
-                    task,
-                    &worker_id,
-                    &build_id,
-                    cancellation_grace_period,
-                    sticky_timeout,
-                    max_local_activity_start_to_close,
-                    workflow_cache,
-                    dispatched_at,
-                    max_concurrent_sessions,
-                    &session_slots_in_use,
-                    &shutdown,
-                    Arc::clone(&panic_strikes),
-                    workflow_panic_max_attempts,
-                    Arc::clone(&deadlock_strikes),
-                    workflow_task_deadline,
-                    capability_miss_policy,
-                    Some(workflow_task_timeout),
-                    &task_outcomes,
-                    &deferred_failure,
-                    &pool_labels,
-                    &drain_cancel,
-                )
+                // Issue #2251: one decision scope covers the cycle and the
+                // terminal writes that follow it in `process_task`. A fenced
+                // quarantine unloads the partition from this cache.
+                #[cfg(feature = "db")]
+                let quarantine_cache = Arc::clone(&workflow_cache);
+                let outcome = Box::pin(crate::decision_owner::scope_decision_for(
+                    Arc::clone(&decision_owner),
+                    process_task(
+                        &pool,
+                        Arc::clone(&registry),
+                        task,
+                        &worker_id,
+                        &build_id,
+                        cancellation_grace_period,
+                        sticky_timeout,
+                        max_local_activity_start_to_close,
+                        workflow_cache,
+                        dispatched_at,
+                        max_concurrent_sessions,
+                        &session_slots_in_use,
+                        &shutdown,
+                        Arc::clone(&panic_strikes),
+                        workflow_panic_max_attempts,
+                        Arc::clone(&deadlock_strikes),
+                        workflow_task_deadline,
+                        capability_miss_policy,
+                        Some(workflow_task_timeout),
+                        &task_outcomes,
+                        &deferred_failure,
+                        &pool_labels,
+                        &drain_cancel,
+                        owner_shard,
+                    ),
+                ))
                 .await;
                 // Issue #1815: a success counts now. A failure counts after
                 // its claim-fenced recovery, below.
@@ -37152,10 +42325,14 @@ impl Worker {
                             dispatched_at.elapsed(),
                         );
                     }
-                    Ok(TaskDispatchOutcome::ClaimLostAfterFailure) => {
+                    Ok(
+                        TaskDispatchOutcome::ClaimLostAfterFailure | TaskDispatchOutcome::Fenced,
+                    ) => {
                         // Issue #1815: the failed task's re-pend found a peer
                         // owns the claim, so the window skips it. It is not a
-                        // timeout, so the timeout strike still clears.
+                        // timeout, so the timeout strike still clears. A
+                        // fenced decision takes this arm too (issue #2251).
+                        // It is not a timeout either.
                         if let Some(exec_id) = exec_id_for_timeout {
                             timeout_strikes
                                 .lock()
@@ -37317,7 +42494,10 @@ impl Worker {
                                         exec_id,
                                     );
                                 }
-                                let recovery = quarantine_workflow_task_timeout_outcome(
+                                // Issue #2251: the terminal write fences the
+                                // run's tenure.
+                                let owned = Arc::clone(&decision_owner);
+                                let recovery = quarantine_workflow_task_timeout_owned(
                                     &pool,
                                     task_id,
                                     exec_id_for_timeout,
@@ -37333,6 +42513,9 @@ impl Worker {
                                     // `telemetry` is the Arc<HandlerRegistry>
                                     // captured above (issue #1243).
                                     telemetry.payload_codecs(),
+                                    &owned,
+                                    owner_shard,
+                                    &quarantine_cache,
                                 )
                                 .await;
                                 // No commit: put the strikes back so the next
@@ -37374,35 +42557,40 @@ impl Worker {
                 }
             } else {
                 // No timeout configured, or not a workflow task: run unbounded.
-                let outcome = process_task(
-                    &pool,
-                    registry,
-                    task,
-                    &worker_id,
-                    &build_id,
-                    cancellation_grace_period,
-                    sticky_timeout,
-                    max_local_activity_start_to_close,
-                    workflow_cache,
-                    dispatched_at,
-                    max_concurrent_sessions,
-                    &session_slots_in_use,
-                    &shutdown,
-                    panic_strikes,
-                    workflow_panic_max_attempts,
-                    deadlock_strikes,
-                    // No enclosing workflow-task budget on this arm, so the
-                    // local per-attempt budget is the only clock (issue #783).
-                    None,
-                    capability_miss_policy,
-                    // Same reason: this arm is the "no timeout configured, or
-                    // not a workflow task" path, which was never wrapped.
-                    None,
-                    &task_outcomes,
-                    &deferred_failure,
-                    &pool_labels,
-                    &drain_cancel,
-                )
+                // Issue #2251: the decision scope, as on the timed arm.
+                let outcome = Box::pin(crate::decision_owner::scope_decision_for(
+                    Arc::clone(&decision_owner),
+                    process_task(
+                        &pool,
+                        registry,
+                        task,
+                        &worker_id,
+                        &build_id,
+                        cancellation_grace_period,
+                        sticky_timeout,
+                        max_local_activity_start_to_close,
+                        workflow_cache,
+                        dispatched_at,
+                        max_concurrent_sessions,
+                        &session_slots_in_use,
+                        &shutdown,
+                        panic_strikes,
+                        workflow_panic_max_attempts,
+                        deadlock_strikes,
+                        // No enclosing workflow-task budget on this arm, so the
+                        // local per-attempt budget is the only clock (issue #783).
+                        None,
+                        capability_miss_policy,
+                        // Same reason: this arm is the "no timeout configured, or
+                        // not a workflow task" path, which was never wrapped.
+                        None,
+                        &task_outcomes,
+                        &deferred_failure,
+                        &pool_labels,
+                        &drain_cancel,
+                        owner_shard,
+                    ),
+                ))
                 .await;
                 // An activity records its own attempt in `process_activity_task`.
                 // Issue #1815: a workflow success counts now. A workflow
@@ -37487,8 +42675,18 @@ impl Worker {
         };
         // Every publish from this task body uses this worker's bound channel,
         // not the live slot (issue #1431). Another runtime can replace the
-        // slot after this worker starts.
-        let bound_channel = self.bound_channel();
+        // slot after this worker starts. A task that a dispatch batch claimed
+        // holds a hint for its own row until the batch ack. See
+        // [`DISPATCH_HINT_ACK_WAIT`].
+        let bound_channel = match (self.bound_channel(), acked) {
+            (Some(inner), Some(acked)) => Some(Arc::new(AckGatedChannel {
+                inner,
+                own_row: task_id,
+                acked,
+            })
+                as Arc<dyn crate::dispatch::TaskDispatch>),
+            (channel, _) => channel,
+        };
         let live = LiveClaim::new(
             &self.dispatched.live,
             claim_started_at.map(|started_at| (task_id, claim_attempt, started_at)),
@@ -37772,11 +42970,74 @@ impl Worker {
     async fn close_workflow_cache(&self) {
         let closed = self.workflow_cache.lock().await.close();
         drop(closed);
+        // Issue #2258: a stopped worker owns no partition, so it keeps no
+        // disk file.
+        #[cfg(feature = "owner-disk-cache")]
+        {
+            let disk = self.workflow_cache.lock().await.disk();
+            if let Some(disk) = disk {
+                disk.close().await;
+            }
+        }
     }
 
     /// Request graceful shutdown of this worker.
     pub fn shutdown(&self) {
         self.shutdown.cancel();
+    }
+
+    /// Run one poll-loop iteration and wait for the task it claims.
+    ///
+    /// This is a hook for the world simulation of issue #2002. It is not a
+    /// stable API. It runs the Postgres path of `run_poll_loop` once, for
+    /// the first assigned shard only. The simulator then runs one actor at a
+    /// time, so a seed fixes the order of every claim and every decision.
+    ///
+    /// Call [`Self::dst_register`] first. Never call this on a worker that
+    /// runs [`Self::run`]: a drain closes the same task tracker.
+    ///
+    /// Returns `true` when the poll claimed a task. Returns `false` with no
+    /// claim when the worker is not registered, has a slot tuner, or shuts
+    /// down.
+    #[doc(hidden)]
+    pub async fn dst_poll_once(&self, pool: &DbPool) -> bool {
+        let registered = std::sync::atomic::AtomicBool::load(
+            &self.monitoring_started,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        if !registered || self.config.slot_tuner.is_some() || self.shutdown.is_cancelled() {
+            return false;
+        }
+        let shard = match self.config.shard_assignments.as_slice() {
+            [shard, ..] => Some(*shard),
+            [] => None,
+        };
+        let claimed = self.poll_once(pool, None, shard).await;
+        // A closed tracker waits for every body that it holds. It then
+        // reopens, so the next poll can spawn again.
+        self.dispatched.tracker.close();
+        self.dispatched.tracker.wait().await;
+        self.dispatched.tracker.reopen();
+        claimed
+    }
+
+    /// Write this worker's liveness row, as `run` does at startup.
+    ///
+    /// This is a hook for the world simulation of issue #2002. It is not a
+    /// stable API. Returns `true` when the row is written.
+    ///
+    /// The simulation starts no monitoring task. A slot tuner needs those
+    /// tasks to withhold permits, so a worker with a tuner returns `false`.
+    #[doc(hidden)]
+    pub async fn dst_register(&self, pool: &DbPool) -> bool {
+        if self.config.slot_tuner.is_some() {
+            return false;
+        }
+        // No tuner means no permit to withhold, so dispatch may start.
+        self.monitoring_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // `register_in_fleet` returns whether a retry is pending.
+        !self.register_in_fleet(pool, None).await
     }
 }
 
@@ -38065,9 +43326,73 @@ pub async fn quarantine_workflow_task_timeout(
         queue_name,
         metrics,
         codecs,
+        None,
     )
     .await
         == ClaimRecovery::Applied
+}
+
+/// The quarantine that the worker runs, in the decision scope of the run
+/// (issue #2251).
+///
+/// The terminal write fences the tenure of the run in `owned`, keyed by the
+/// shard of the claim's pool. With owner mode on and no tenure, it writes
+/// nothing and re-pends the task under its claim. A fenced tenure also
+/// re-pends the task, after the worker unloads the partition from `owned`
+/// and `workflow_cache`. Both return [`ClaimRecovery::ClaimLost`], because
+/// the next owner decides.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn quarantine_workflow_task_timeout_owned(
+    pool: &DbPool,
+    task_id: uuid::Uuid,
+    exec_id_opt: Option<uuid::Uuid>,
+    worker_id: &str,
+    attempt: i32,
+    build_id: &str,
+    new_strikes: i32,
+    timeout_secs: u64,
+    workflow_name: &str,
+    queue_name: &str,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    codecs: &crate::payload_codec::PayloadCodecs,
+    owned: &crate::decision_owner::OwnedPartitions,
+    owner_shard: crate::types::ShardId,
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+) -> ClaimRecovery {
+    Box::pin(crate::decision_owner::scope_decision(
+        quarantine_workflow_task_timeout_outcome(
+            pool,
+            task_id,
+            exec_id_opt,
+            worker_id,
+            attempt,
+            build_id,
+            new_strikes,
+            timeout_secs,
+            workflow_name,
+            queue_name,
+            metrics,
+            codecs,
+            Some(QuarantineOwner {
+                owned,
+                shard: owner_shard,
+                workflow_cache,
+            }),
+        ),
+    ))
+    .await
+}
+
+/// The owner side of a body-timeout quarantine (issue #2251).
+///
+/// `owned` holds the tenures, keyed by `shard`. A fence unloads the tenure
+/// and drops the cache entries of its partition from `workflow_cache`.
+#[derive(Clone, Copy)]
+struct QuarantineOwner<'a> {
+    owned: &'a crate::decision_owner::OwnedPartitions,
+    shard: crate::types::ShardId,
+    workflow_cache: &'a tokio::sync::Mutex<crate::cache::WorkflowCache>,
 }
 
 /// [`quarantine_workflow_task_timeout`], which also tells a lost claim from
@@ -38089,6 +43414,9 @@ async fn quarantine_workflow_task_timeout_outcome(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // Issue #2251: the owner side. The terminal write is a decision write,
+    // so it fences the tenure of the run.
+    owner_scope: Option<QuarantineOwner<'_>>,
 ) -> ClaimRecovery {
     use crate::schema::harvest_task_queue::dsl as task_dsl;
     use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
@@ -38213,6 +43541,22 @@ async fn quarantine_workflow_task_timeout_outcome(
         None => (None, None),
     };
 
+    // Issue #2251: pin the tenure of the run before its terminal write. With
+    // owner mode on and no tenure, another owner decides. Write nothing, and
+    // re-pend the task under its claim for that owner. A claim left RUNNING
+    // would wait for the stuck-task sweep.
+    if let Some(owner) = owner_scope
+        && exec_exists
+        && let Err(error) = pin_owner_tenure(owner.owned, owner.shard, &workflow_id_str)
+    {
+        let pinned = match error {
+            HarvestError::OwnershipLost { pinned, .. } => pinned,
+            _ => crate::decision_owner::OwnerEpoch::new(0),
+        };
+        let claim = queue::TaskClaim::new(task_id, worker_id, attempt);
+        return repend_fenced_quarantine(&mut conn, &claim, pinned).await;
+    }
+
     let entry = crate::dlq::NewDeadLetterEntry {
         original_task_id: task_id,
         queue_name: queue_name.to_string(),
@@ -38233,6 +43577,8 @@ async fn quarantine_workflow_task_timeout_outcome(
         Vec<(ExecutionId, String)>,
         Vec<crate::execution::StartCancelledRun>,
     )>, HarvestError, _>(async |conn| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         let error_msg = error_msg.clone();
         let entry = entry.clone();
         let worker_id = worker_id.to_string();
@@ -38241,7 +43587,7 @@ async fn quarantine_workflow_task_timeout_outcome(
         if let queue::ClaimLock::Lost { .. } = queue::lock_claim_for_update(conn, &claim).await? {
             return Ok(None);
         }
-        dlq::dead_letter(conn, &entry).await?;
+        dlq::dead_letter_with_codecs(conn, &entry, codecs).await?;
         queue::fail_task(conn, task_id, &error_msg).await?;
 
         let (deferred, queue_used, closed_children, pending_cancel_metrics) =
@@ -38468,6 +43814,32 @@ async fn quarantine_workflow_task_timeout_outcome(
                 start.spawn();
             }
         }
+        // Issue #2251: a takeover fenced the pinned tenure after the pin.
+        // The transaction wrote nothing. Unload the partition, as the
+        // dispatcher does, and re-pend the task for the new owner.
+        Err(HarvestError::OwnershipLost {
+            partition, pinned, ..
+        }) => {
+            // With no owner side, nothing pins a tenure, so no fence fails.
+            let Some(owner) = owner_scope else {
+                return ClaimRecovery::Failed;
+            };
+            let key = crate::decision_owner::OwnerKey {
+                shard: owner.shard,
+                partition,
+            };
+            let unloaded =
+                drop_fenced_tenure(owner.owned, owner.workflow_cache, metrics, key, pinned).await;
+            tracing::warn!(
+                task_id = %task_id,
+                %key,
+                %pinned,
+                unloaded,
+                "workflow task timeout quarantine: the owner fence failed; the partition is \
+                 unloaded and the task is re-pended (issue #2251)"
+            );
+            return repend_fenced_quarantine(&mut conn, &claim, pinned).await;
+        }
         Err(e) => {
             tracing::error!(
                 task_id = %task_id,
@@ -38478,6 +43850,30 @@ async fn quarantine_workflow_task_timeout_outcome(
         }
     }
     ClaimRecovery::Applied
+}
+
+/// Re-pend a fenced quarantine under its claim (issue #2251).
+///
+/// The task is then no longer this worker's, so a done re-pend returns
+/// [`ClaimRecovery::ClaimLost`]. So does a claim that a peer already holds.
+/// A failed write returns [`ClaimRecovery::Failed`].
+async fn repend_fenced_quarantine(
+    conn: &mut AsyncPgConnection,
+    claim: &queue::TaskClaim,
+    pinned: crate::decision_owner::OwnerEpoch,
+) -> ClaimRecovery {
+    let delay = fence_repend_delay(pinned);
+    match queue::requeue_claimed_workflow_task_after_fence(conn, claim, delay).await {
+        Ok(_) => ClaimRecovery::ClaimLost,
+        Err(error) => {
+            tracing::error!(
+                task_id = %claim.task_id,
+                error = %error,
+                "workflow task timeout quarantine: the fenced re-pend failed"
+            );
+            ClaimRecovery::Failed
+        }
+    }
 }
 
 /// Whether the dispatch error path releases the claim after `error`.
@@ -38823,6 +44219,7 @@ pub async fn chaos_drive_one_workflow_task(
             None,
             &frontier_reset_committed,
             &cycle_failure,
+            crate::types::ShardId::UNENCODED,
         ))
         .await
     })
@@ -38891,6 +44288,7 @@ pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
             None,
             &frontier_reset_committed,
             &cycle_failure,
+            crate::types::ShardId::UNENCODED,
         ));
         let cancelled_at_hold = tokio::select! {
             () = hold.reached() => true,
@@ -39119,6 +44517,7 @@ mod tests {
             start_source_ref: None,
             started_by: None,
             quota_key: None,
+            tenant: None,
         };
         let crate::models::NewWorkflowExecution {
             id: _,
@@ -39156,9 +44555,10 @@ mod tests {
             start_source_ref: _,
             started_by: _,
             quota_key: _,
+            tenant: _,
         } = sample;
         const {
-            assert!(NEW_WORKFLOW_EXECUTION_COLUMNS == 35);
+            assert!(NEW_WORKFLOW_EXECUTION_COLUMNS == 36);
             assert!(
                 ROWS_PER_EXECUTION_INSERT_CHUNK * NEW_WORKFLOW_EXECUTION_COLUMNS
                     <= POSTGRES_MAX_BIND_PARAMS
@@ -40405,7 +45805,13 @@ mod tests {
             interval,
         );
 
-        advance_sampler_ticks(interval, 5).await;
+        // The accept is real loopback I/O, not paused time. A slow runner can
+        // land it after a fixed tick count. So the test ticks until the
+        // accept lands, under a deadline in real time.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while listener.touch_count() == 0 && std::time::Instant::now() < deadline {
+            advance_sampler_ticks(interval, 1).await;
+        }
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
         listener.stop();
@@ -40509,6 +45915,7 @@ mod tests {
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 10,
             max_concurrent_activities: 20,
+            max_concurrent_claims: DEFAULT_MAX_CONCURRENT_CLAIMS,
             poll_interval: Duration::from_millis(100),
             shutdown_timeout: Duration::from_secs(5),
             cancellation_grace_period: Duration::from_secs(5),
@@ -40536,6 +45943,7 @@ mod tests {
             max_concurrent_sessions: 0,
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
             scanner: crate::scanner_lease::ScannerConfig::default(),
+            fairness_keys: false,
         }
     }
 
@@ -40611,6 +46019,26 @@ mod tests {
         );
     }
 
+    /// A fair worker only polls queues whose keys the weight API can address
+    /// (issue #1976).
+    #[test]
+    fn runtime_config_validate_checks_queue_names_with_fairness_keys() {
+        let mut cfg = default_runtime_config();
+        cfg.queues = vec![" padded ".to_owned()];
+        assert!(cfg.validate().is_ok(), "fairness off accepts any name");
+        cfg.fairness_keys = true;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("fairness_keys"), "{err}");
+        // A URL drops a dot segment, so the weight routes cannot name it.
+        for dots in [".", ".."] {
+            cfg.queues = vec![dots.to_owned()];
+            let err = cfg.validate().unwrap_err();
+            assert!(err.to_string().contains("dot segment"), "{err}");
+        }
+        cfg.queues = vec!["shared".to_owned()];
+        assert!(cfg.validate().is_ok());
+    }
+
     #[test]
     fn runtime_config_validate_rejects_zero_max_slots() {
         let mut cfg = default_runtime_config();
@@ -40620,6 +46048,16 @@ mod tests {
         // a worker that can never dispatch a task must never look healthy.
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("max_slots is 0"));
+    }
+
+    #[test]
+    fn runtime_config_validate_rejects_zero_claim_loops() {
+        let mut cfg = default_runtime_config();
+        cfg.max_concurrent_claims = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("max_concurrent_claims is 0"));
+        cfg.max_concurrent_claims = 1;
+        assert!(cfg.validate().is_ok(), "one serial claim loop is valid");
     }
 
     #[test]
@@ -41240,6 +46678,58 @@ mod tests {
 
     // ── merge_wake_events (issue #476 review) ─────────────────────────────
 
+    /// The workflow simulation orders an ingest with its own model (issue
+    /// #2033). This differential test ties that model to the worker.
+    ///
+    /// The worker side loads due timers as the SQL does: `fires_at <= NOW()`,
+    /// ordered by `(fires_at, timer_id)`. Signals arrive in `received_at`
+    /// order. `workflow_sim_ingest_tests` checks the rule on the real ingest.
+    #[test]
+    fn sim_wake_order_matches_merge_wake_events() {
+        let base = chrono::Utc::now();
+        let at = |secs: u64| base + chrono::Duration::seconds(i64::try_from(secs).unwrap());
+        for seed in 0..2_000 {
+            let mut rng = crate::dst::SplitMix64::new(seed);
+            let clock = rng.below(8);
+            let timers: Vec<(TimerId, u64)> = (0..rng.below(4))
+                .map(|i| {
+                    (
+                        TimerId::new(format!("t{}", rng.below(3) * 10 + i)),
+                        rng.below(10),
+                    )
+                })
+                .collect();
+            let mut received: Vec<u64> = (0..rng.below(4)).map(|_| rng.below(10)).collect();
+            received.sort_unstable();
+            let signals: Vec<(String, serde_json::Value, u64)> = received
+                .iter()
+                .enumerate()
+                .map(|(i, &secs)| (format!("s{i}"), serde_json::json!(i), secs))
+                .collect();
+
+            let mut due: Vec<(TimerId, chrono::DateTime<chrono::Utc>)> = timers
+                .iter()
+                .filter(|(_, deadline)| *deadline <= clock)
+                .map(|(id, deadline)| (id.clone(), at(*deadline)))
+                .collect();
+            due.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
+            let worker = merge_wake_events(
+                due,
+                signals
+                    .iter()
+                    .map(|(name, payload, secs)| (name.clone(), payload.clone(), at(*secs)))
+                    .collect(),
+            );
+
+            let sim = crate::testing::sim::wake_order(clock, &timers, &signals);
+            assert_eq!(
+                serde_json::to_value(&sim).unwrap(),
+                serde_json::to_value(&worker).unwrap(),
+                "seed {seed}: clock {clock}, timers {timers:?}, signals {signals:?}"
+            );
+        }
+    }
+
     #[test]
     fn merge_wake_events_signal_before_deadline_is_recorded_first() {
         let fires_at = chrono::Utc::now();
@@ -41383,9 +46873,13 @@ mod tests {
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 5,
             max_concurrent_activities: 15,
+            max_concurrent_claims: 3,
             shutdown_timeout: Duration::from_secs(60),
             workflow_cache_size: 500,
             resident_workflows: true,
+            owner_disk_cache: None,
+            owner_disk_cache_min_events: crate::builder::DEFAULT_OWNER_DISK_CACHE_MIN_EVENTS,
+            owner_entity_sql: false,
             sticky_timeout: Duration::from_secs(3),
             cancellation_grace_period: Duration::from_secs(10),
             shard_assignments: vec![crate::types::ShardId::new(0)],
@@ -41418,6 +46912,7 @@ mod tests {
             adaptive_limit: crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
             #[cfg(feature = "db")]
             sharded_pool: None,
+            fairness_keys: false,
         };
 
         let runtime_cfg: WorkerRuntimeConfig = builder_cfg.into();
@@ -41429,6 +46924,7 @@ mod tests {
         );
         assert_eq!(runtime_cfg.max_concurrent_workflows, 5);
         assert_eq!(runtime_cfg.max_concurrent_activities, 15);
+        assert_eq!(runtime_cfg.max_concurrent_claims, 3);
         assert_eq!(runtime_cfg.shutdown_timeout, Duration::from_secs(60));
         assert_eq!(runtime_cfg.poll_interval, Duration::from_millis(500));
         assert_eq!(
@@ -41772,6 +47268,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let registry = HandlerRegistry::new(vec![wf], vec![act]);
@@ -41800,6 +47298,11 @@ mod tests {
                 .activities
                 .contains_key(crate::context::SESSION_RELEASE_ACTIVITY_NAME)
         );
+        assert!(
+            registry
+                .activities
+                .contains_key(crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME)
+        );
     }
 
     #[test]
@@ -41808,6 +47311,7 @@ mod tests {
         for name in [
             crate::context::SESSION_ACQUIRE_ACTIVITY_NAME,
             crate::context::SESSION_RELEASE_ACTIVITY_NAME,
+            crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME,
         ] {
             let info = registry
                 .activities
@@ -41878,6 +47382,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }
         }
         let global = crate::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
@@ -41972,6 +47478,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }
         }
 
@@ -42019,6 +47527,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }
         }
 
@@ -43003,6 +48513,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -44178,6 +49690,7 @@ mod tests {
                 details: serde_json::json!(0),
             },
             WorkflowCommand::CancelRaceLosers {
+                reason: crate::context::LoserCancelReason::RaceLoser,
                 activities: vec![crate::types::ActivityExecId::new()],
                 children: vec![],
                 timers: vec![],
@@ -44195,6 +49708,7 @@ mod tests {
                 details: serde_json::json!(2),
             },
             WorkflowCommand::CancelRaceLosers {
+                reason: crate::context::LoserCancelReason::RaceLoser,
                 activities: vec![crate::types::ActivityExecId::new()],
                 children: vec![],
                 timers: vec![],
@@ -44209,6 +49723,7 @@ mod tests {
                 session_id: None,
                 session_worker_id: None,
                 schedule_to_start_override: None,
+                result_writer: false,
                 result_tx: tx,
             },
         ];
@@ -44231,6 +49746,7 @@ mod tests {
             session_id: Some(session_id),
             session_worker_id: Some("worker-7".to_string()),
             schedule_to_start_override: Some(std::time::Duration::from_secs(30)),
+            result_writer: false,
             result_tx: tx,
         }];
         let scheduled = extract_all_scheduled_activities(&commands)
@@ -44248,6 +49764,7 @@ mod tests {
     fn extract_all_activity_waits_tolerates_cancel_race_losers() {
         let commands = vec![
             WorkflowCommand::CancelRaceLosers {
+                reason: crate::context::LoserCancelReason::RaceLoser,
                 activities: vec![crate::types::ActivityExecId::new()],
                 children: vec![],
                 timers: vec![],
@@ -44263,6 +49780,7 @@ mod tests {
     #[test]
     fn workflow_command_name_covers_cancel_race_losers() {
         let cmd = WorkflowCommand::CancelRaceLosers {
+            reason: crate::context::LoserCancelReason::RaceLoser,
             activities: vec![],
             children: vec![],
             timers: vec![],
@@ -44303,6 +49821,7 @@ mod tests {
         }];
         commands.extend(child_timeout_batch());
         commands.push(WorkflowCommand::CancelRaceLosers {
+            reason: crate::context::LoserCancelReason::RaceLoser,
             activities: vec![],
             children: vec![],
             timers: vec![],
@@ -44333,6 +49852,7 @@ mod tests {
             session_id: None,
             session_worker_id: None,
             schedule_to_start_override: None,
+            result_writer: false,
             result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
         });
         assert!(
@@ -44463,6 +49983,7 @@ mod tests {
             session_id: None,
             session_worker_id: None,
             schedule_to_start_override: None,
+            result_writer: false,
             result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
         }
     }
@@ -44605,6 +50126,7 @@ mod tests {
                 details: serde_json::json!(2u64),
             },
             WorkflowCommand::CancelRaceLosers {
+                reason: crate::context::LoserCancelReason::RaceLoser,
                 activities: vec![crate::types::ActivityExecId::new()],
                 children: vec![],
                 timers: vec![],
@@ -45069,6 +50591,48 @@ mod tests {
         );
     }
 
+    /// Issue #2193: a batch with a dedicated persist path drops the release.
+    /// Every other batch keeps it. An ordinary activity is never dropped.
+    #[test]
+    fn a_dedicated_shape_discards_the_drop_release() {
+        let release = || schedule_activity_cmd(crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME);
+        let names = |outcome: WorkflowOutcome| -> Vec<&'static str> {
+            let WorkflowOutcome::Suspended { commands } = outcome else {
+                panic!("expected a suspension");
+            };
+            commands.iter().map(workflow_command_name).collect()
+        };
+
+        let local = discard_drop_release_for_dedicated_shape(WorkflowOutcome::Suspended {
+            commands: vec![release(), run_local_cmd("format_data")],
+        });
+        assert_eq!(names(local), ["RunLocalActivity"]);
+
+        let external = discard_drop_release_for_dedicated_shape(WorkflowOutcome::Suspended {
+            commands: vec![
+                release(),
+                WorkflowCommand::AcquireMutex {
+                    key: "k".to_string(),
+                    result_tx: tokio::sync::oneshot::channel().0,
+                },
+            ],
+        });
+        assert_eq!(names(external), ["AcquireMutex"]);
+
+        let kept = discard_drop_release_for_dedicated_shape(WorkflowOutcome::Suspended {
+            commands: vec![release(), schedule_activity_cmd("charge")],
+        });
+        assert_eq!(names(kept), ["ScheduleActivity", "ScheduleActivity"]);
+
+        let ordinary = discard_drop_release_for_dedicated_shape(WorkflowOutcome::Suspended {
+            commands: vec![
+                schedule_activity_cmd("charge"),
+                run_local_cmd("format_data"),
+            ],
+        });
+        assert_eq!(names(ordinary), ["ScheduleActivity", "RunLocalActivity"]);
+    }
+
     #[test]
     fn extract_run_local_activity_preserves_detached_after_local_command() {
         let child_id = ExecutionId::new();
@@ -45203,6 +50767,7 @@ mod tests {
         let loser_activity_id = crate::types::ActivityExecId::new();
         let commands = vec![
             WorkflowCommand::CancelRaceLosers {
+                reason: crate::context::LoserCancelReason::RaceLoser,
                 activities: vec![loser_activity_id],
                 children: Vec::new(),
                 timers: vec![crate::types::TimerId::new("loser-timer")],
@@ -45232,7 +50797,7 @@ mod tests {
         assert!(
             matches!(
                 batch.race_loser_commands.as_slice(),
-                [WorkflowCommand::CancelRaceLosers { activities, children, timers }]
+                [WorkflowCommand::CancelRaceLosers { activities, children, timers, .. }]
                     if activities == &[loser_activity_id]
                         && children.is_empty()
                         && timers.len() == 1
@@ -45371,6 +50936,8 @@ mod tests {
             circuit_breaker: None,
             requires: Some("gpu = true"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![act]));
         match Worker::new(default_runtime_config(), registry) {
@@ -45402,6 +50969,8 @@ mod tests {
             circuit_breaker: None,
             requires: Some("gpu = true"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let act2 = ActivityInfo {
@@ -45425,6 +50994,8 @@ mod tests {
             circuit_breaker: None,
             requires: Some("region in [us-east-1, us-west-2]"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![act1, act2]));
@@ -45513,6 +51084,30 @@ mod tests {
                 assert_eq!(delay, nd_block_backoff_jittered(count, &test_task(exec)));
             }
         }
+    }
+
+    fn claim_task(task_type: &str) -> TaskQueueItem {
+        TaskQueueItem {
+            task_type: task_type.to_owned(),
+            ..retry_after_test_task(1, 3)
+        }
+    }
+
+    /// Issue #2248: the claim kind follows the claimed row.
+    #[test]
+    fn a_claim_kind_names_what_the_claim_returned() {
+        assert_eq!(
+            claim_kind(&Ok(Some(claim_task("workflow")))),
+            crate::telemetry::ClaimKind::Workflow
+        );
+        assert_eq!(
+            claim_kind(&Ok(Some(claim_task("activity")))),
+            crate::telemetry::ClaimKind::Activity
+        );
+        assert_eq!(claim_kind(&Ok(None)), crate::telemetry::ClaimKind::Empty);
+        let failed: HarvestResult<Option<TaskQueueItem>> =
+            Err(crate::error::HarvestError::Database("boom".to_owned()));
+        assert_eq!(claim_kind(&failed), crate::telemetry::ClaimKind::Error);
     }
 
     /// A workflow task for execution `n`, like the task an ND block or a panic sees.
@@ -47347,6 +52942,75 @@ mod tests {
     }
 
     #[test]
+    fn colocated_targets_share_one_owner_key() {
+        use crate::types::ShardId;
+        // Shards 1 and 2 share database "a". Shard 3 has database "b".
+        let targets = [
+            (ShardId::new(2), "a"),
+            (ShardId::new(1), "a"),
+            (ShardId::new(3), "b"),
+        ];
+        let db = |s: ShardId| if s.as_i32() == 3 { "b" } else { "a" };
+        let all = [ShardId::new(1), ShardId::new(2), ShardId::new(3)];
+        let groups = owner_groups(&targets, &all, |x, y| db(x) == db(y));
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0].canonical,
+            ShardId::new(1),
+            "the lowest shard keys the database"
+        );
+        assert_eq!(groups[0].members, vec![ShardId::new(2), ShardId::new(1)]);
+        assert!(!groups[0].split);
+        assert_eq!(groups[1].canonical, ShardId::new(3));
+    }
+
+    #[test]
+    fn a_split_colocated_group_refuses_owner_mode() {
+        use crate::types::ShardId;
+        let all = [ShardId::new(1), ShardId::new(2), ShardId::new(3)];
+        let targets = [(ShardId::new(1), "a"), (ShardId::new(3), "b")];
+        let db = |s: ShardId| if s.as_i32() == 3 { "b" } else { "a" };
+        let groups = owner_groups(&targets, &all, |x, y| db(x) == db(y));
+        assert!(
+            groups[0].split,
+            "shard 2 shares database a but is not a target"
+        );
+        assert!(!groups[1].split);
+    }
+
+    /// A scan and a release share a one-connection pool (issue #2252). The
+    /// scan waits for the connection first. Each takes the connection, then
+    /// the loop lock, so neither waits on the other forever.
+    #[tokio::test]
+    async fn the_scan_and_the_release_take_the_connection_before_the_loop_lock() {
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let state = Arc::new(tokio::sync::Mutex::new(0_u32));
+        let held = Arc::clone(&pool).acquire_owned().await.expect("permit");
+        let user = |pool: Arc<tokio::sync::Semaphore>, state: Arc<tokio::sync::Mutex<u32>>| {
+            tokio::spawn(async move {
+                let (conn, mut guard) =
+                    conn_then_loop_lock(pool.acquire_owned(), state.as_ref()).await;
+                *guard += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                drop(conn);
+            })
+        };
+        let scan = user(Arc::clone(&pool), Arc::clone(&state));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let release = user(Arc::clone(&pool), Arc::clone(&state));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            scan.await.expect("scan");
+            release.await.expect("release");
+        })
+        .await
+        .expect("the scan and the release both finish");
+        assert_eq!(*state.lock().await, 2);
+    }
+
+    #[test]
     fn worker_stale_secs_doubles_the_heartbeat_interval_with_a_floor() {
         assert_eq!(worker_stale_secs(Duration::from_secs(30)), 60);
         // Sub-second interval keeps a 1s floor rather than collapsing to 0.
@@ -47393,6 +53057,34 @@ mod tests {
             "pre-fix, the claimant's own window was narrower than the default \
              peer's -- without that gap this test proves nothing"
         );
+    }
+
+    /// A follower polls Postgres only where the leader would.
+    #[test]
+    fn a_follower_polls_postgres_only_where_the_leader_does() {
+        // (registration pending, per-shard channel, usable global channel)
+        for (pending, per_shard, global, polls) in [
+            (false, false, false, true),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, true, true, false),
+            (true, true, true, false),
+        ] {
+            assert_eq!(
+                follower_polls_postgres(pending, per_shard, global),
+                polls,
+                "pending={pending} per_shard={per_shard} global={global}"
+            );
+        }
+    }
+
+    #[test]
+    fn claim_loops_that_can_fill_the_pool_are_flagged() {
+        assert!(!claim_loops_fill_pool(2, 10));
+        assert!(!claim_loops_fill_pool(9, 10));
+        assert!(claim_loops_fill_pool(10, 10));
+        assert!(claim_loops_fill_pool(4, 2));
     }
 
     #[test]
@@ -47498,6 +53190,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }],
         )
     }
@@ -47516,6 +53210,7 @@ mod tests {
             session_id: None,
             session_worker_id: None,
             schedule_to_start_override: None,
+            result_writer: false,
             result_tx,
         }
     }
@@ -49769,6 +55464,7 @@ mod tests {
             timed_out_claims: None,
             handler_started_at: None,
             new_start: false,
+            fairness_key: None,
         }
     }
 
@@ -50234,6 +55930,7 @@ mod tests {
             migrated_run_terminal_state: None,
             staging_vacated_state: None,
             staging_vacated_by: None,
+            tenant: None,
         }
     }
 
@@ -51219,8 +56916,17 @@ mod tests {
                 "side-path",
             ),
             (
+                "PublishDurableProgress",
+                WorkflowCommand::PublishDurableProgress {
+                    offset: 1,
+                    chunk: Value::Null,
+                },
+                "side-path",
+            ),
+            (
                 "CancelRaceLosers",
                 WorkflowCommand::CancelRaceLosers {
+                    reason: crate::context::LoserCancelReason::RaceLoser,
                     activities: Vec::new(),
                     children: Vec::new(),
                     timers: Vec::new(),
@@ -51377,6 +57083,7 @@ mod tests {
             session_id: None,
             session_worker_id: None,
             schedule_to_start_override: None,
+            result_writer: false,
             result_tx: oneshot::channel::<Result<Value, String>>().0,
         }
     }
@@ -51459,6 +57166,10 @@ mod tests {
             ("SetCurrentDetails", "persist_current_details_from_commands"),
             ("RecordLog", "persist_workflow_logs_from_commands"),
             ("PublishProgress", "notify_progress_from_commands"),
+            (
+                "PublishDurableProgress",
+                "persist_durable_stream_from_commands",
+            ),
             ("CancelRaceLosers", "apply_race_loser_cancellations"),
             ("ReleaseMutex", "mutex::sweep_terminal_holder_and_wake"),
         ];
@@ -51568,6 +57279,26 @@ mod tests {
             .len(),
             2
         );
+    }
+
+    /// Issue #2193: no body awaits a drop release, so a failing cycle records
+    /// no abandoned pair for it and no counter includes it.
+    #[test]
+    fn a_failed_cycle_records_nothing_for_a_drop_release() {
+        let plan = AbandonedDispatchPlan::with_started_children([]);
+        let release = abandoned_activity_cmd(
+            crate::types::ActivityExecId::new(),
+            crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME,
+        );
+        assert_eq!(
+            terminal_command_policy(&release).kind(),
+            "no-record",
+            "the drop release is not an abandoned dispatch"
+        );
+        assert!(abandoned_dispatch_events(&release, &plan).is_empty());
+        let batch = [release];
+        assert_eq!(abandoned_dispatch_event_count(&batch), 0);
+        assert_eq!(abandoned_dispatch_event_count_for_plan(&batch, &plan), 0);
     }
 
     #[test]
@@ -52149,6 +57880,7 @@ mod tests {
                 context_headers: None,
                 execution_timeout: None,
                 deadline_at: None,
+                start_provenance: None,
                 parent_execution_id: None,
                 workflow_id: None,
                 queue_name: None,
@@ -52456,6 +58188,384 @@ mod tests {
         assert_eq!(poll_admission(3, 5), PollAdmission::Any);
     }
 
+    /// Where the owner decider runs, a poll claims activities only (issue
+    /// #2255). Only a missing activity permit counts as a gate refusal, so
+    /// a full workflow pool does not mark a refused kind.
+    #[test]
+    fn a_decider_poll_refuses_only_a_missing_activity_permit() {
+        use crate::queue::TaskType;
+        assert_eq!(
+            decider_gate(PollAdmission::Only(TaskType::Activity)),
+            PollAdmission::Any,
+            "an activity permit is all such a poll needs"
+        );
+        assert_eq!(
+            decider_gate(PollAdmission::Saturated),
+            PollAdmission::Only(TaskType::Workflow),
+            "no activity permit refuses the activity kind only"
+        );
+        assert_eq!(decider_gate(PollAdmission::Any), PollAdmission::Any);
+    }
+
+    /// A ranked row of the decider (issue #2308).
+    fn row(priority: i32, age_secs: i64, new_start: bool) -> crate::queue::OwnerRow {
+        let handicap = if new_start {
+            i64::from(crate::queue::NEW_START_HANDICAP_SECS)
+        } else {
+            0
+        };
+        crate::queue::OwnerRow {
+            exec_id: uuid::Uuid::new_v4(),
+            priority,
+            due_at: chrono::Utc::now() - chrono::Duration::seconds(age_secs - handicap),
+        }
+    }
+
+    /// The decider state skips an in-flight or backing-off execution, and a
+    /// wake during a take queues it again (issue #2255).
+    #[test]
+    fn decider_state_backs_off_and_requeues_a_rewoken_take() {
+        let poll = Duration::from_millis(25);
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(poll);
+        let row = row(0, 5, false);
+        let exec = row.exec_id;
+        state.queue(row);
+        state.queue(row);
+        assert_eq!(state.ready.len(), 1, "a queued execution is queued once");
+        assert_eq!(state.pop(now).map(|(e, _)| e), Some(exec));
+        state.in_flight.insert(exec);
+        state.hint(exec);
+        assert!(
+            state.unkeyed.is_empty(),
+            "a wake during a take waits for it"
+        );
+        state.missed(exec, now);
+        assert!(
+            state.unkeyed.contains(&exec),
+            "the wake asks for a key again"
+        );
+        state.unkeyed.clear();
+        state.in_flight.insert(exec);
+        state.missed(exec, now);
+        assert!(state.skip(now).contains(&exec), "a miss backs off");
+        state.queue(row);
+        assert_eq!(state.pop(now), None, "a backing-off execution is skipped");
+        state.hint(exec);
+        state.queue(row);
+        assert_eq!(
+            state.pop(now).map(|(e, _)| e),
+            Some(exec),
+            "a wake ends the backoff"
+        );
+    }
+
+    /// The ready set pops in claim order (issue #2308): priority, then the
+    /// due time with the new-start handicap.
+    #[test]
+    fn decider_state_pops_in_claim_order() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        let old_low = row(0, 100, false);
+        let new_high = row(5, 1, false);
+        let continuation = row(0, 40, false);
+        let fresh_start = row(0, 50, true);
+        for r in [old_low, fresh_start, continuation, new_high] {
+            state.queue(r);
+        }
+        let order: Vec<_> = std::iter::from_fn(|| state.pop(now).map(|(e, _)| e)).collect();
+        assert_eq!(
+            order,
+            vec![
+                new_high.exec_id,
+                old_low.exec_id,
+                continuation.exec_id,
+                fresh_start.exec_id
+            ],
+            "a 50 s start sorts as 20 s old: after a 40 s continuation"
+        );
+    }
+
+    /// A fresher key replaces the old one, and a full queue drops its worst
+    /// entry for a better row, never the reverse (issue #2308).
+    #[test]
+    fn decider_state_keeps_the_best_rows_when_full() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        let mut moved = row(0, 10, false);
+        state.queue(moved);
+        moved.priority = 9;
+        state.queue(moved);
+        assert_eq!(state.ready.len(), 1, "one entry per execution");
+        assert_eq!(state.pop(now).map(|(_, k)| k.0), Some(std::cmp::Reverse(9)));
+        for _ in 0..OWNER_HINTS_MAX {
+            state.queue(row(0, 10, false));
+        }
+        let worse = row(-1, 10, false);
+        state.queue(worse);
+        assert!(
+            !state.queued.contains_key(&worse.exec_id),
+            "worse is dropped"
+        );
+        let better = row(7, 1, false);
+        state.queue(better);
+        assert_eq!(state.ready.len(), OWNER_HINTS_MAX, "the bound holds");
+        assert_eq!(state.pop(now).map(|(e, _)| e), Some(better.exec_id));
+    }
+
+    /// A hint has no key. It waits in the unkeyed set, which scans skip, until
+    /// a lookup ranks it (issue #2308).
+    #[test]
+    fn decider_state_holds_a_hint_until_it_has_a_key() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        state.activate(now);
+        let exec = uuid::Uuid::new_v4();
+        state.hint(exec);
+        state.hint(exec);
+        assert!(state.ready.is_empty());
+        assert!(state.skip(now).contains(&exec), "a scan skips a hint");
+        assert_eq!(state.begin_keying(), vec![exec], "one lookup, once");
+        assert!(!state.keying_execs.is_empty());
+        assert!(state.begin_keying().is_empty(), "one lookup at a time");
+        let ranked = crate::queue::OwnerRow {
+            exec_id: exec,
+            ..row(3, 1, false)
+        };
+        let gone = uuid::Uuid::new_v4();
+        state.keyed(&[exec, gone], Some(vec![ranked]));
+        assert!(state.keying_execs.is_empty());
+        assert_eq!(state.pop(now).map(|(e, _)| e), Some(exec));
+        assert!(
+            !state.skip(now).contains(&gone),
+            "a vanished row is forgotten"
+        );
+        state.hint(gone);
+        state.begin_keying();
+        state.keyed(&[gone], None);
+        assert_eq!(
+            state.pop(now).map(|(e, _)| e),
+            Some(gone),
+            "a failed lookup queues the hint unranked"
+        );
+    }
+
+    /// A wake during a key lookup keeps its hint, and the hint set is bounded
+    /// (issue #2308).
+    #[test]
+    fn decider_state_keeps_a_wake_that_comes_during_a_lookup() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        state.activate(now);
+        let exec = uuid::Uuid::new_v4();
+        state.hint(exec);
+        let requested = state.begin_keying();
+        state.hint(exec);
+        state.keyed(&requested, Some(Vec::new()));
+        assert!(
+            state.unkeyed.contains(&exec),
+            "the lookup missed the new row"
+        );
+        for _ in 0..OWNER_HINTS_MAX + 10 {
+            state.hint(uuid::Uuid::new_v4());
+        }
+        assert_eq!(state.unkeyed.len(), OWNER_HINTS_MAX, "the set is bounded");
+    }
+
+    /// A failed lookup does not downgrade a key that a scan gave (issue
+    /// #2308).
+    #[test]
+    fn decider_state_keeps_a_scan_key_when_the_lookup_fails() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        state.activate(now);
+        let ranked = row(9, 1, false);
+        state.hint(ranked.exec_id);
+        let requested = state.begin_keying();
+        state.queue(ranked);
+        state.keyed(&requested, None);
+        assert_eq!(
+            state.pop(now).map(|(_, key)| key.0),
+            Some(std::cmp::Reverse(9)),
+            "the scan key stays"
+        );
+    }
+
+    /// Free permits cover every hint: queue them unranked at once (issue
+    /// #2308).
+    #[test]
+    fn decider_state_ranks_hints_unranked_when_permits_are_free() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        state.hint(a);
+        state.hint(b);
+        state.rank_unkeyed_unranked();
+        assert!(state.unkeyed.is_empty() && state.begin_keying().is_empty());
+        assert!(state.pop(now).is_some() && state.pop(now).is_some());
+    }
+
+    /// A take waits while a hint has no key. Else a ready row of lower rank
+    /// would take the permit that the hint should have (issue #2308).
+    #[test]
+    fn decider_state_defers_takes_while_hints_wait_for_a_key() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        state.activate(now);
+        state.queue(row(0, 10, false));
+        assert!(!state.ranking(), "a ranked set may take");
+        let exec = uuid::Uuid::new_v4();
+        state.hint(exec);
+        assert!(state.ranking(), "an unkeyed hint blocks a take");
+        let requested = state.begin_keying();
+        assert!(state.ranking(), "a lookup in flight blocks a take");
+        state.keyed(
+            &requested,
+            Some(vec![crate::queue::OwnerRow {
+                exec_id: exec,
+                ..row(5, 1, false)
+            }]),
+        );
+        assert!(!state.ranking(), "a ranked hint ends the wait");
+        assert_eq!(
+            state.pop(now).map(|(e, _)| e),
+            Some(exec),
+            "the best goes first"
+        );
+    }
+
+    /// Free permits cover the ready rows, the hints and the lookup in flight.
+    /// Only then does the take order not matter (issue #2308).
+    #[test]
+    fn decider_state_counts_a_lookup_in_flight_against_free_permits() {
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        state.activate(std::time::Instant::now());
+        let first = uuid::Uuid::new_v4();
+        state.hint(first);
+        let requested = state.begin_keying();
+        state.hint(uuid::Uuid::new_v4());
+        assert!(!state.permits_cover_all(1), "one permit, two executions");
+        assert!(state.permits_cover_all(2));
+        state.keyed(&requested, Some(Vec::new()));
+        assert!(
+            state.permits_cover_all(1),
+            "the lookup ended; one hint is left"
+        );
+    }
+
+    /// Each finished lookup grants one take pass. Else a steady stream of
+    /// new hints would start lookup after lookup and starve dispatch (issue
+    /// #2308).
+    #[test]
+    fn decider_state_grants_a_take_pass_between_lookups() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        state.activate(now);
+        let ranked = row(5, 1, false);
+        let first = ranked.exec_id;
+        state.hint(first);
+        let requested = state.begin_keying();
+        state.keyed(&requested, Some(vec![ranked]));
+        let late = uuid::Uuid::new_v4();
+        state.hint(late);
+        assert!(
+            state.begin_keying().is_empty(),
+            "no new lookup before a pass"
+        );
+        assert!(!state.ranking(), "the ranked set may take");
+        assert_eq!(state.pop(now).map(|(e, _)| e), Some(first));
+        state.end_pass();
+        assert_eq!(state.begin_keying(), vec![late], "the next lookup follows");
+        assert!(state.ranking());
+    }
+
+    /// A miss doubles the backoff up to its cap (issue #2255).
+    #[test]
+    fn owner_take_backoff_doubles_to_its_cap() {
+        let poll = Duration::from_millis(25);
+        assert_eq!(owner_take_backoff(poll, 0), poll);
+        assert_eq!(owner_take_backoff(poll, 1), poll * 2);
+        assert_eq!(owner_take_backoff(poll, 3), poll * 8);
+        assert_eq!(owner_take_backoff(poll, 40), OWNER_TAKE_BACKOFF_MAX);
+    }
+
+    /// The decider scans when due and never while a scan runs or its queue
+    /// is full (issue #2255).
+    #[test]
+    fn decider_state_scans_only_when_it_can() {
+        let poll = Duration::from_millis(25);
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(poll);
+        state.activate(now);
+        assert!(state.may_scan(now, 2));
+        state.scanning = true;
+        assert!(!state.may_scan(now, 2), "one scan at a time");
+        state.scanning = false;
+        state.queue(row(0, 1, false));
+        state.queue(row(0, 2, false));
+        assert!(!state.may_scan(now, 2), "a full queue scans no more");
+        state.deactivate();
+        assert!(state.ready.is_empty() && !state.active);
+    }
+
+    /// With live wakes, a scan with nothing more to find waits for the
+    /// safety gap, not one short poll. A full scan and a due row still set
+    /// the next scan. With no live wakes, the scan polls (issue #2255).
+    #[test]
+    fn decider_state_schedules_the_safety_scan_apart_from_a_short_poll() {
+        let poll = Duration::from_millis(25);
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(poll);
+        state.scanned(now, false, None);
+        assert_eq!(state.scan_at, now + poll, "no live wakes: the scan polls");
+        let later = now + Duration::from_secs(5);
+        state.set_wakes_live(true, later);
+        assert_eq!(state.scan_at, later, "live wakes again: scan at once");
+        state.set_wakes_live(true, later + poll);
+        assert_eq!(state.scan_at, later, "no change: no extra scan");
+        state.scanned(now, false, None);
+        assert_eq!(
+            state.scan_at,
+            now + OWNER_SCAN_SAFETY_MIN,
+            "the safety scan"
+        );
+        state.scanned(now, true, None);
+        assert_eq!(state.scan_at, now, "a full scan scans again at once");
+        let due = Duration::from_millis(300);
+        state.scanned(now, false, Some(due));
+        assert_eq!(state.scan_at, now + due, "a due row sets the next scan");
+        state.scanned(now, false, Some(Duration::from_secs(60)));
+        assert_eq!(
+            state.scan_at,
+            now + OWNER_SCAN_SAFETY_MIN,
+            "at most the safety interval"
+        );
+        let slow = Duration::from_secs(5);
+        let mut state = DeciderState::new(slow);
+        state.set_wakes_live(true, now);
+        state.scanned(now, false, None);
+        assert_eq!(state.scan_at, now + slow, "a longer poll interval wins");
+    }
+
+    /// Owner hints dedupe per shard and drain once (issue #2255).
+    #[test]
+    fn owner_hints_dedupe_per_shard_and_drain_once() {
+        let hints = OwnerHints::default();
+        let a = crate::types::ShardId::new(0);
+        let b = crate::types::ShardId::new(1);
+        let exec = uuid::Uuid::new_v4();
+        hints.push(a, exec);
+        hints.push(a, exec);
+        hints.push(b, uuid::Uuid::new_v4());
+        assert_eq!(hints.take(a), vec![exec]);
+        assert!(hints.take(a).is_empty(), "a take drains the set");
+        assert_eq!(hints.take(b).len(), 1, "each shard keeps its own set");
+        for _ in 0..OWNER_HINTS_MAX + 10 {
+            hints.push(a, uuid::Uuid::new_v4());
+        }
+        assert_eq!(hints.take(a).len(), OWNER_HINTS_MAX, "the set is bounded");
+    }
+
     /// A poll holds one real permit of each kind it may claim. The claimed
     /// kind keeps its permit. The other permit goes back at once.
     #[allow(clippy::significant_drop_tightening)]
@@ -52499,6 +58609,544 @@ mod tests {
         assert_eq!(permits.admission(), PollAdmission::Only(TaskType::Workflow));
         let none = PollPermits::acquire(PollAdmission::Any, &workflow, &activity);
         assert_eq!(none.admission(), PollAdmission::Saturated);
+    }
+
+    /// A permit that frees while a gated poll claims must still wake the idle
+    /// wait (issue #1787). The pools then look free when the wait begins.
+    /// Without the wake, the backlog of the gated kind waits one poll
+    /// interval.
+    #[test]
+    fn a_permit_freed_during_a_gated_poll_still_wakes_the_idle_wait() {
+        use crate::queue::TaskType;
+        let mut cfg = default_runtime_config();
+        cfg.max_concurrent_activities = 1;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+
+        let running = Arc::clone(&worker.activity_semaphore)
+            .try_acquire_owned()
+            .expect("one activity permit");
+        let admission = worker.poll_admission_now();
+        assert_eq!(admission, PollAdmission::Only(TaskType::Workflow));
+        worker.record_gate_refusal(admission);
+        // The running activity ends during the claim of the gated poll.
+        drop(running);
+        assert_eq!(worker.poll_admission_now(), PollAdmission::Any);
+        assert!(
+            worker.capacity_bound(),
+            "the idle wait after a gated poll must wake on a freed permit"
+        );
+        // A read does not clear the flag, and neither does a poll that may
+        // claim any kind. The wake on the freed permit does.
+        assert!(worker.capacity_bound());
+        worker.record_gate_refusal(PollAdmission::Any);
+        assert!(worker.capacity_bound());
+        worker.capacity_woke();
+        assert!(!worker.capacity_bound());
+    }
+
+    /// A refusal that another claim loop records while the leader decides
+    /// its wait stays armed for the next decision (issue #1787).
+    #[test]
+    fn a_refusal_stays_armed_until_a_wait_wakes_on_it() {
+        use crate::queue::TaskType;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        assert!(!worker.capacity_bound());
+        // A follower's poll is refused between two reads of the leader.
+        worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        assert!(worker.capacity_bound());
+        assert!(
+            worker.capacity_bound(),
+            "a read of the leader must not clear a refusal of another loop"
+        );
+    }
+
+    /// A refusal that a follower records after the leader takes its snapshot
+    /// arms the leader's idle wait on a released permit (issue #1787).
+    /// Without it, the refused backlog waits up to one poll interval.
+    #[test]
+    fn a_refusal_after_the_snapshot_arms_the_wake_on_a_released_permit() {
+        use crate::queue::TaskType;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        let wait = worker.capacity_wait();
+        assert!(
+            !wait.bound,
+            "free pools and no refusal: no wake on a permit"
+        );
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        assert!(futures::FutureExt::now_or_never(woken.as_mut()).is_none());
+        // A follower's poll is refused after the snapshot.
+        worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_none(),
+            "a refusal alone does not end the wait"
+        );
+        // The running task of the refused kind ends.
+        worker.capacity_freed.notify_one();
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_some(),
+            "a refusal after the snapshot must arm the wake on a released permit"
+        );
+        assert!(
+            !AtomicBool::load(&worker.pool_refused, Ordering::Relaxed),
+            "the wake on a released permit clears the refusal flag"
+        );
+    }
+
+    /// The wait registers for a refusal before it reads `capacity_bound`
+    /// (issue #1787). A refusal right after the read still arms it.
+    #[test]
+    fn a_refusal_right_after_the_read_still_arms_the_wait() {
+        use crate::queue::TaskType;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        let wait = worker.capacity_wait_after(|| {
+            worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        });
+        assert!(!wait.bound, "the read came before the refusal");
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        worker.capacity_freed.notify_one();
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_some(),
+            "a refusal between the read and the wait must arm the wait"
+        );
+    }
+
+    /// A claim that skips a type at its adaptive limit after the snapshot
+    /// also arms the idle wait (issue #1836). The freed limit slot then
+    /// ends it.
+    #[test]
+    fn a_limit_refusal_after_the_snapshot_arms_the_wake_on_a_freed_slot() {
+        use crate::adaptive_limit::{Acquire, AdaptiveLimitConfig};
+        use crate::policy::AdaptiveLimitPolicy;
+        let registry = Arc::new(
+            HandlerRegistry::new(vec![], vec![]).with_adaptive_limit(
+                AdaptiveLimitConfig::disabled()
+                    .with_activity("capped", Some(AdaptiveLimitPolicy::new(1, 1))),
+            ),
+        );
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        let wait = worker.capacity_wait();
+        assert!(!wait.bound, "no type at its limit: no wake on a permit");
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        let Acquire::Acquired(slot) = worker.registry.adaptive_limits.try_acquire("capped") else {
+            panic!("the first attempt takes the one slot");
+        };
+        // A follower's claim skips the type at its limit.
+        assert!(matches!(
+            worker.claim_exclusions(),
+            std::borrow::Cow::Owned(_)
+        ));
+        assert!(futures::FutureExt::now_or_never(woken.as_mut()).is_none());
+        drop(slot);
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_some(),
+            "a limit refusal after the snapshot must arm the wake on a freed slot"
+        );
+        assert!(
+            !AtomicBool::load(&worker.limit_refused, Ordering::Relaxed),
+            "the wake clears the limit refusal too"
+        );
+    }
+
+    /// A limit refusal before the snapshot does not arm a later unbound
+    /// wait (issue #1836). `notify_waiters` stores no wake for it.
+    #[test]
+    fn an_earlier_limit_refusal_does_not_arm_a_later_wait() {
+        use crate::adaptive_limit::{Acquire, AdaptiveLimitConfig};
+        use crate::policy::AdaptiveLimitPolicy;
+        let registry = Arc::new(
+            HandlerRegistry::new(vec![], vec![]).with_adaptive_limit(
+                AdaptiveLimitConfig::disabled()
+                    .with_activity("capped", Some(AdaptiveLimitPolicy::new(1, 1))),
+            ),
+        );
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        let Acquire::Acquired(slot) = worker.registry.adaptive_limits.try_acquire("capped") else {
+            panic!("the first attempt takes the one slot");
+        };
+        assert!(matches!(
+            worker.claim_exclusions(),
+            std::borrow::Cow::Owned(_)
+        ));
+        // The freed slot stores a wake on `capacity_freed`.
+        drop(slot);
+        assert!(worker.capacity_bound(), "the limit refusal binds this read");
+        let wait = worker.capacity_wait();
+        assert!(!wait.bound);
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_none(),
+            "an earlier limit refusal must not arm a later wait"
+        );
+    }
+
+    /// A refusal before the snapshot does not arm a later unbound wait. Only
+    /// a refusal after that snapshot does (issue #1787).
+    #[test]
+    fn an_earlier_refusal_does_not_arm_a_later_wait() {
+        use crate::queue::TaskType;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        worker.capacity_woke();
+        let wait = worker.capacity_wait();
+        assert!(!wait.bound);
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        worker.capacity_freed.notify_one();
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_none(),
+            "an earlier refusal must not arm a later wait"
+        );
+    }
+
+    /// A refusal does not end a bound wait. A released permit ends it and
+    /// clears the flag (issue #1787).
+    #[test]
+    fn a_bound_wait_ends_on_a_released_permit_only() {
+        use crate::queue::TaskType;
+        let mut cfg = default_runtime_config();
+        cfg.max_concurrent_activities = 1;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+
+        let running = Arc::clone(&worker.activity_semaphore)
+            .try_acquire_owned()
+            .expect("one activity permit");
+        let wait = worker.capacity_wait();
+        assert!(wait.bound, "a full pool binds the wait");
+        assert!(!AtomicBool::load(&worker.pool_refused, Ordering::Relaxed));
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        assert!(futures::FutureExt::now_or_never(woken.as_mut()).is_none());
+        // This refusal turns the flag on, so it fires the refusal wake.
+        worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        assert!(AtomicBool::load(&worker.pool_refused, Ordering::Relaxed));
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_none(),
+            "a refusal must not end a bound wait"
+        );
+        drop(running);
+        worker.capacity_freed.notify_one();
+        assert!(futures::FutureExt::now_or_never(woken.as_mut()).is_some());
+        assert!(
+            !AtomicBool::load(&worker.pool_refused, Ordering::Relaxed),
+            "the wake on a released permit clears the refusal flag"
+        );
+    }
+
+    /// A bound wait ends on a released permit with no refusal (issue #1787).
+    #[test]
+    fn a_bound_wait_ends_on_a_released_permit_without_a_refusal() {
+        let mut cfg = default_runtime_config();
+        cfg.max_concurrent_activities = 1;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+
+        let _running = Arc::clone(&worker.activity_semaphore)
+            .try_acquire_owned()
+            .expect("one activity permit");
+        let wait = worker.capacity_wait();
+        assert!(wait.bound, "a full pool binds the wait");
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        assert!(futures::FutureExt::now_or_never(woken.as_mut()).is_none());
+        worker.capacity_freed.notify_one();
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_some(),
+            "a released permit must end a bound wait"
+        );
+    }
+
+    /// A NOTIFY polls before it settles (issue #2422). The wait returns at
+    /// the NOTIFY. The next wait, after an empty poll, is the settle.
+    #[tokio::test(start_paused = true)]
+    async fn a_notify_polls_before_it_settles() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        let start = tokio::time::Instant::now();
+        worker
+            .idle_wait_then_settle(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                true
+            })
+            .await;
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(10),
+            "a NOTIFY must return at once, so the leader polls first"
+        );
+
+        // The poll was empty. The next wait settles and has no other wake.
+        worker
+            .idle_wait_then_settle(std::future::pending::<bool>())
+            .await;
+        let waited = start.elapsed().saturating_sub(Duration::from_millis(10));
+        assert!(
+            waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
+            "an empty poll after a NOTIFY must settle, waited {waited:?}"
+        );
+
+        // The settle is spent. A later wait does not settle again.
+        let later = tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(std::future::pending::<bool>()),
+        )
+        .await;
+        assert!(later.is_err(), "one NOTIFY must settle once only");
+    }
+
+    /// A released permit during the settle delay does not cut it short
+    /// (issue #1796). An idle wait with no NOTIFY does not settle.
+    #[tokio::test(start_paused = true)]
+    async fn a_released_permit_does_not_cut_the_settle_delay_short() {
+        let mut cfg = default_runtime_config();
+        cfg.max_concurrent_activities = 1;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+        let _running = Arc::clone(&worker.activity_semaphore)
+            .try_acquire_owned()
+            .expect("one activity permit");
+
+        // A NOTIFY at 10 ms, then a released permit at 20 ms.
+        let start = tokio::time::Instant::now();
+        let notify = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            true
+        };
+        let freed = Arc::clone(&worker.capacity_freed);
+        let release = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            freed.notify_one();
+        };
+        // The NOTIFY returns at once (issue #2422). The settle follows the
+        // empty poll.
+        let settle = async {
+            worker.idle_wait_then_settle(notify).await;
+            worker
+                .idle_wait_then_settle(std::future::pending::<bool>())
+                .await;
+        };
+        tokio::join!(settle, release);
+        assert!(
+            start.elapsed() >= Duration::from_millis(10) + crate::notify::SETTLE_DELAY_MIN,
+            "the settle delay must run in full after a NOTIFY"
+        );
+
+        let start = tokio::time::Instant::now();
+        worker.idle_wait_then_settle(async { false }).await;
+        assert!(
+            start.elapsed() < crate::notify::SETTLE_DELAY_MIN,
+            "an idle wait with no NOTIFY must not settle"
+        );
+    }
+
+    /// A workflow task of this worker that ends wakes the idle wait, with
+    /// no settle (issue #2418). Its commit is visible already.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_decision_end_wakes_the_idle_wait_without_a_settle() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        let start = tokio::time::Instant::now();
+        let done = Arc::clone(&worker.decision_done);
+        let end = async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            done.notify_one();
+        };
+        tokio::join!(
+            worker.idle_wait_then_settle(std::future::pending::<bool>()),
+            end
+        );
+        assert!(
+            start.elapsed() < crate::notify::SETTLE_DELAY_MIN,
+            "a local decision end must wake the wait at once, waited {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A local decision end cuts a running settle short (issue #2418). The
+    /// cut settle owes one poll at its original end, so the NOTIFY that
+    /// started it still gets a poll once its row is claimable.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_decision_end_cuts_the_settle_short_and_owes_a_poll() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        // A NOTIFY at 10 ms, then a local decision end at 20 ms.
+        let start = tokio::time::Instant::now();
+        let notify = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            true
+        };
+        let done = Arc::clone(&worker.decision_done);
+        let end = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            done.notify_one();
+        };
+        // The NOTIFY returns at once (issue #2422). The settle follows the
+        // empty poll.
+        let settle = async {
+            worker.idle_wait_then_settle(notify).await;
+            worker
+                .idle_wait_then_settle(std::future::pending::<bool>())
+                .await;
+        };
+        tokio::join!(settle, end);
+        assert!(
+            start.elapsed() < Duration::from_millis(10) + crate::notify::SETTLE_DELAY_MIN,
+            "a local decision end must cut the settle short, waited {:?}",
+            start.elapsed()
+        );
+
+        // The next wait has no other wake. It ends when the settle would have.
+        worker
+            .idle_wait_then_settle(std::future::pending::<bool>())
+            .await;
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(10) + crate::notify::SETTLE_DELAY_MIN
+                && waited <= Duration::from_millis(10) + crate::notify::SETTLE_DELAY_MAX,
+            "the owed poll must come at the end of the cut settle, came at {waited:?}"
+        );
+
+        // The owed poll is paid. A later wait does not wake for it again.
+        let later = tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(std::future::pending::<bool>()),
+        )
+        .await;
+        assert!(later.is_err(), "an owed poll must wake one wait only");
+    }
+
+    /// Two cut settles owe one poll at the later end (issue #2418). A poll
+    /// at the earlier end could miss the row of the second NOTIFY.
+    #[tokio::test(start_paused = true)]
+    async fn two_cut_settles_owe_a_poll_at_the_later_end() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        let start = tokio::time::Instant::now();
+        worker.decision_done.notify_one();
+        worker.settle().await;
+        // The second settle starts past the latest end of the first.
+        tokio::time::sleep(crate::notify::SETTLE_DELAY_MAX).await;
+        let second = tokio::time::Instant::now();
+        worker.decision_done.notify_one();
+        worker.settle().await;
+
+        worker
+            .idle_wait_then_settle(std::future::pending::<bool>())
+            .await;
+        let waited = second.elapsed();
+        assert!(
+            waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
+            "the owed poll must come at the end of the later settle, came {waited:?} after it began \
+             ({:?} after the first)",
+            start.elapsed()
+        );
+    }
+
+    /// A multi-shard worker that lost every listener still takes the poll
+    /// that a cut settle owes (issue #2418). It does not wait the whole
+    /// poll interval.
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_settle_owes_its_poll_with_no_listener() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let mut config = default_runtime_config();
+        config.poll_interval = Duration::from_secs(5);
+        let worker = Worker::new(config, registry).expect("valid config");
+
+        let start = tokio::time::Instant::now();
+        worker.decision_done.notify_one();
+        worker.settle().await;
+        let shut = worker.wait_without_listeners(worker.capacity_wait()).await;
+        let waited = start.elapsed();
+        assert!(!shut, "the wait must not report a shutdown");
+        assert!(
+            waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
+            "the owed poll must come at the end of the cut settle, came after {waited:?}"
+        );
+    }
+
+    /// Only a workflow permit wakes the leader on release (issue #2418). A
+    /// workflow task commits the tasks that it schedules. An activity
+    /// commits none.
+    #[tokio::test]
+    async fn a_released_workflow_permit_wakes_the_leader() {
+        let semaphore = Arc::new(Semaphore::new(2));
+        let freed = Arc::new(tokio::sync::Notify::new());
+        let done = Arc::new(tokio::sync::Notify::new());
+        let activity = CapacityPermit::new(
+            Arc::clone(&semaphore)
+                .acquire_owned()
+                .await
+                .expect("permit"),
+            &freed,
+        );
+        drop(activity);
+        assert!(
+            futures::FutureExt::now_or_never(done.notified()).is_none(),
+            "an activity permit must not wake the leader"
+        );
+        let workflow = CapacityPermit::new(
+            Arc::clone(&semaphore)
+                .acquire_owned()
+                .await
+                .expect("permit"),
+            &freed,
+        )
+        .waking_leader(Some(Arc::clone(&done)));
+        drop(workflow);
+        assert!(
+            futures::FutureExt::now_or_never(done.notified()).is_some(),
+            "a workflow permit must wake the leader on release"
+        );
+    }
+
+    /// The short closing wait of a multi-shard turn leaves the capacity
+    /// wake to the round's own idle wait (issue #1787). Otherwise a gated
+    /// poll on one shard loses its wake to the drain of the next shard.
+    #[tokio::test(start_paused = true)]
+    async fn a_multi_shard_drain_leaves_the_capacity_wake_to_the_round() {
+        use crate::queue::TaskType;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("listener has a local address");
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(format!("postgres://silent@{addr}/silent"));
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting");
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        // An earlier shard's poll was gated, and its permit then freed.
+        worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        assert_eq!(worker.poll_admission_now(), PollAdmission::Any);
+        let dispatched = worker.drain_postgres(&pool, None, 2).await;
+        assert_eq!(dispatched, 0);
+        assert!(
+            worker.capacity_bound(),
+            "the round's idle wait must still wake on the freed permit"
+        );
     }
 
     /// A slot tuner shrink cannot take the permit a poll holds for its claim

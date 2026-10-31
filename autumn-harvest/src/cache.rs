@@ -27,8 +27,9 @@ use lru::LruCache;
 use std::num::NonZeroUsize;
 use uuid::Uuid;
 
+use crate::decision_owner::OwnerKey;
 use crate::event::WorkflowEvent;
-use crate::resident::ResidentWorkflow;
+use crate::resident::Residency;
 
 /// Cached state for a suspended workflow execution.
 ///
@@ -67,17 +68,23 @@ pub(crate) struct HistoryBytesMark {
     pub(crate) warm_steps: u32,
 }
 
-/// One cache entry: the event snapshot, the resident workflow if any, and
-/// the stored-history byte mark if any.
+/// One cache entry: the event snapshot, the resident state of its
+/// suspension, and the stored-history byte mark if any.
 struct CacheEntry {
     state: CachedWorkflowState,
-    resident: Option<ResidentWorkflow>,
+    resident: Residency,
     // Only the `db` worker reads the mark.
     #[cfg_attr(not(feature = "db"), allow(dead_code))]
     history_bytes: Option<HistoryBytesMark>,
+    /// The shard and decision partition of the execution, if the caller
+    /// knows them (issue #2251). A fenced owner drops each entry of its
+    /// partition. Only the db-gated worker reads the key.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    owner_key: Option<OwnerKey>,
 }
 
-/// The entries that [`WorkflowCache::close`] removed (issue #1798).
+/// The entries that [`WorkflowCache::close`] (issue #1798) or
+/// [`WorkflowCache::evict_partition`] (issue #2251) removed.
 ///
 /// Dropping the value drops each parked handler future and its context.
 pub(crate) struct ClosedEntries(#[allow(dead_code)] LruCache<Uuid, CacheEntry>);
@@ -97,6 +104,10 @@ impl ClosedEntries {
 pub struct WorkflowCache {
     inner: LruCache<Uuid, CacheEntry>,
     resident_enabled: bool,
+    /// The owner-local disk tier (issue #2258). The worker clones it under
+    /// the cache lock and does all disk work outside the lock.
+    #[cfg(feature = "owner-disk-cache")]
+    disk: Option<crate::owner_disk_cache::DiskTier>,
 }
 
 impl WorkflowCache {
@@ -127,7 +138,23 @@ impl WorkflowCache {
         Self {
             inner: LruCache::new(cap),
             resident_enabled: true,
+            #[cfg(feature = "owner-disk-cache")]
+            disk: None,
         }
+    }
+
+    /// Attach the owner-local disk tier (issue #2258).
+    #[cfg(feature = "owner-disk-cache")]
+    #[must_use]
+    pub(crate) fn with_disk(mut self, disk: Option<crate::owner_disk_cache::DiskTier>) -> Self {
+        self.disk = disk;
+        self
+    }
+
+    /// The owner-local disk tier, if any (issue #2258).
+    #[cfg(feature = "owner-disk-cache")]
+    pub(crate) fn disk(&self) -> Option<crate::owner_disk_cache::DiskTier> {
+        self.disk.clone()
     }
 
     /// Sets whether entries keep the suspended workflow resident (issue
@@ -168,10 +195,10 @@ impl WorkflowCache {
     /// cache.insert(Uuid::new_v4(), state);
     /// ```
     pub fn insert(&mut self, exec_id: Uuid, state: CachedWorkflowState) {
-        let _displaced = self.insert_resident(exec_id, state, None);
+        let _displaced = self.insert_resident(exec_id, state, Residency::Unknown);
     }
 
-    /// Inserts a snapshot with the resident workflow of its suspension
+    /// Inserts a snapshot with the resident state of its suspension
     /// (issue #1798).
     ///
     /// When resident state is off, `resident` is not stored. An existing
@@ -182,21 +209,27 @@ impl WorkflowCache {
         &mut self,
         exec_id: Uuid,
         state: CachedWorkflowState,
-        resident: Option<ResidentWorkflow>,
-    ) -> Option<(CachedWorkflowState, Option<ResidentWorkflow>)> {
-        self.insert_resident_with_history_bytes(exec_id, state, resident, None)
+        resident: Residency,
+    ) -> Option<(CachedWorkflowState, Residency)> {
+        self.insert_resident_with_history_bytes(exec_id, state, resident, None, None)
     }
 
     /// [`Self::insert_resident`] that also stores the stored-history byte
-    /// mark of the snapshot (issue #1804).
+    /// mark of the snapshot (issue #1804) and the decision partition of the
+    /// execution (issue #2251).
     pub(crate) fn insert_resident_with_history_bytes(
         &mut self,
         exec_id: Uuid,
         state: CachedWorkflowState,
-        resident: Option<ResidentWorkflow>,
+        resident: Residency,
         history_bytes: Option<HistoryBytesMark>,
-    ) -> Option<(CachedWorkflowState, Option<ResidentWorkflow>)> {
-        let resident = resident.filter(|_| self.resident_enabled);
+        owner_key: Option<OwnerKey>,
+    ) -> Option<(CachedWorkflowState, Residency)> {
+        let resident = if self.resident_enabled {
+            resident
+        } else {
+            Residency::Unknown
+        };
         if self
             .inner
             .peek(&exec_id)
@@ -211,21 +244,19 @@ impl WorkflowCache {
                     state,
                     resident,
                     history_bytes,
+                    owner_key,
                 },
             )
             .map(|(_, entry)| (entry.state, entry.resident))
     }
 
-    /// Removes an entry and returns its snapshot and resident workflow
+    /// Removes an entry and returns its snapshot and resident state
     /// (issue #1798).
     ///
     /// The worker takes the entry on a hit, so no other task can resume the
     /// same parked future.
     #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker takes entries.
-    pub(crate) fn take(
-        &mut self,
-        exec_id: &Uuid,
-    ) -> Option<(CachedWorkflowState, Option<ResidentWorkflow>)> {
+    pub(crate) fn take(&mut self, exec_id: &Uuid) -> Option<(CachedWorkflowState, Residency)> {
         self.take_with_history_bytes(exec_id)
             .map(|(state, resident, _)| (state, resident))
     }
@@ -236,14 +267,32 @@ impl WorkflowCache {
     pub(crate) fn take_with_history_bytes(
         &mut self,
         exec_id: &Uuid,
+    ) -> Option<(CachedWorkflowState, Residency, Option<HistoryBytesMark>)> {
+        self.take_entry(exec_id)
+            .map(|(state, resident, history_bytes, _)| (state, resident, history_bytes))
+    }
+
+    /// [`Self::take_with_history_bytes`] that also returns the owner key of
+    /// the entry (issue #2253). A decision of another key must not use the
+    /// entry: the run moved to another database.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker takes entries.
+    pub(crate) fn take_entry(
+        &mut self,
+        exec_id: &Uuid,
     ) -> Option<(
         CachedWorkflowState,
-        Option<ResidentWorkflow>,
+        Residency,
         Option<HistoryBytesMark>,
+        Option<OwnerKey>,
     )> {
-        self.inner
-            .pop(exec_id)
-            .map(|entry| (entry.state, entry.resident, entry.history_bytes))
+        self.inner.pop(exec_id).map(|entry| {
+            (
+                entry.state,
+                entry.resident,
+                entry.history_bytes,
+                entry.owner_key,
+            )
+        })
     }
 
     /// Closes the cache when the worker stops (issue #1798).
@@ -257,6 +306,56 @@ impl WorkflowCache {
         self.resident_enabled = false;
         let empty = LruCache::new(self.inner.cap());
         ClosedEntries(std::mem::replace(&mut self.inner, empty))
+    }
+
+    /// Removes every entry of the partition `key` (issue #2251).
+    ///
+    /// A fenced owner calls this when it unloads the partition. A new
+    /// tenure then starts cold, as rule R4 of the lease ADR requires. The
+    /// caller drops the returned entries outside the cache lock, because
+    /// each one can hold a parked handler future.
+    #[must_use = "drop the evicted entries outside the cache lock"]
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker unloads a partition.
+    pub(crate) fn evict_partition(&mut self, key: OwnerKey) -> ClosedEntries {
+        let doomed: Vec<Uuid> = self
+            .inner
+            .iter()
+            .filter(|(_, entry)| entry.owner_key == Some(key))
+            .map(|(id, _)| *id)
+            .collect();
+        let cap = NonZeroUsize::new(doomed.len()).unwrap_or(NonZeroUsize::MIN);
+        let mut evicted = LruCache::new(cap);
+        for id in doomed {
+            if let Some(entry) = self.inner.pop(&id) {
+                evicted.push(id, entry);
+            }
+        }
+        ClosedEntries(evicted)
+    }
+
+    /// Drop every entry of each partition in `keys`, in one pass (issue
+    /// #2252).
+    ///
+    /// The owner loop drops many partitions at once on a release or a
+    /// switch-off. One pass keeps the cache lock short.
+    #[must_use = "drop the evicted entries outside the cache lock"]
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker unloads a partition.
+    pub(crate) fn evict_partitions(&mut self, keys: &[OwnerKey]) -> ClosedEntries {
+        let keys: std::collections::HashSet<OwnerKey> = keys.iter().copied().collect();
+        let doomed: Vec<Uuid> = self
+            .inner
+            .iter()
+            .filter(|(_, entry)| entry.owner_key.is_some_and(|k| keys.contains(&k)))
+            .map(|(id, _)| *id)
+            .collect();
+        let cap = NonZeroUsize::new(doomed.len()).unwrap_or(NonZeroUsize::MIN);
+        let mut evicted = LruCache::new(cap);
+        for id in doomed {
+            if let Some(entry) = self.inner.pop(&id) {
+                evicted.push(id, entry);
+            }
+        }
+        ClosedEntries(evicted)
     }
 
     /// Look up a cached workflow state, marking it as recently used.
@@ -275,6 +374,23 @@ impl WorkflowCache {
     #[must_use]
     pub fn get(&mut self, exec_id: &Uuid) -> Option<&CachedWorkflowState> {
         self.inner.get(exec_id).map(|entry| &entry.state)
+    }
+
+    /// Whether the cache holds an entry for `exec_id`. The check does not
+    /// change the LRU order.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use uuid::Uuid;
+    /// use autumn_harvest::cache::WorkflowCache;
+    ///
+    /// let cache = WorkflowCache::new(10);
+    /// assert!(!cache.contains(&Uuid::new_v4()));
+    /// ```
+    #[must_use]
+    pub fn contains(&self, exec_id: &Uuid) -> bool {
+        self.inner.contains(exec_id)
     }
 
     /// Remove a cached workflow state, returning it if present.
@@ -326,11 +442,14 @@ impl WorkflowCache {
 
 impl std::fmt::Debug for WorkflowCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WorkflowCache")
-            .field("len", &self.inner.len())
+        let mut d = f.debug_struct("WorkflowCache");
+        d.field("len", &self.inner.len())
             .field("cap", &self.inner.cap())
-            .field("resident_enabled", &self.resident_enabled)
-            .finish()
+            .field("resident_enabled", &self.resident_enabled);
+        // Issue #2258: whether an owner disk tier is attached.
+        #[cfg(feature = "owner-disk-cache")]
+        d.field("disk", &self.disk.is_some());
+        d.finish()
     }
 }
 
@@ -341,6 +460,7 @@ impl std::fmt::Debug for WorkflowCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resident::ResidentWorkflow;
 
     fn make_state(next_event_id: i32) -> CachedWorkflowState {
         CachedWorkflowState {
@@ -416,7 +536,13 @@ mod tests {
             warm_steps: 0,
         };
 
-        let _ = cache.insert_resident_with_history_bytes(id, make_state(7), None, Some(mark));
+        let _ = cache.insert_resident_with_history_bytes(
+            id,
+            make_state(7),
+            Residency::Unknown,
+            Some(mark),
+            None,
+        );
         let (_, _, taken) = cache.take_with_history_bytes(&id).expect("entry");
         assert_eq!(taken, Some(mark), "the take returns the mark");
         assert!(
@@ -427,6 +553,97 @@ mod tests {
         cache.insert(id, make_state(8));
         let (_, _, taken) = cache.take_with_history_bytes(&id).expect("entry");
         assert_eq!(taken, None, "a plain insert stores no mark");
+    }
+
+    /// Issue #2253: a take returns the owner key, so a decision can refuse
+    /// an entry of another database. `contains` keeps the entry.
+    #[test]
+    fn take_entry_returns_the_owner_key() {
+        use crate::decision_owner::DecisionPartition;
+        use crate::types::ShardId;
+        let key = OwnerKey {
+            shard: ShardId::new(1),
+            partition: DecisionPartition::new(3).expect("in range"),
+        };
+        let mut cache = WorkflowCache::new(4);
+        let id = Uuid::new_v4();
+        let _ = cache.insert_resident_with_history_bytes(
+            id,
+            make_state(2),
+            Residency::Unknown,
+            None,
+            Some(key),
+        );
+        assert!(cache.contains(&id), "contains keeps the entry");
+        let (_, _, _, taken) = cache.take_entry(&id).expect("entry");
+        assert_eq!(taken, Some(key));
+        assert!(!cache.contains(&id), "a take removes the entry");
+    }
+
+    #[test]
+    fn evict_partitions_drops_each_listed_partition_in_one_pass() {
+        use crate::decision_owner::DecisionPartition;
+        use crate::types::ShardId;
+        let key = |p| OwnerKey {
+            shard: ShardId::new(0),
+            partition: DecisionPartition::new(p).expect("in range"),
+        };
+        let mut cache = WorkflowCache::new(8);
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        for (id, p) in ids.iter().zip([1, 2, 3]) {
+            let _ = cache.insert_resident_with_history_bytes(
+                *id,
+                make_state(1),
+                Residency::Unknown,
+                None,
+                Some(key(p)),
+            );
+        }
+        let evicted = cache.evict_partitions(&[key(1), key(3)]);
+        assert_eq!(evicted.len(), 2);
+        drop(evicted);
+        assert!(cache.get(&ids[0]).is_none());
+        assert!(cache.get(&ids[1]).is_some());
+        assert!(cache.get(&ids[2]).is_none());
+    }
+
+    #[test]
+    fn evict_partition_drops_only_that_partition() {
+        use crate::decision_owner::DecisionPartition;
+        use crate::types::ShardId;
+        let key = |shard, n| OwnerKey {
+            shard: ShardId::new(shard),
+            partition: DecisionPartition::new(n).expect("in range"),
+        };
+        let mut cache = WorkflowCache::new(8);
+        let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let (first, second, other, untagged, remote) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+        let tags = [
+            (first, Some(key(0, 3))),
+            (second, Some(key(0, 3))),
+            (other, Some(key(0, 4))),
+            (untagged, None),
+            (remote, Some(key(1, 3))),
+        ];
+        for (id, partition) in tags {
+            let _ = cache.insert_resident_with_history_bytes(
+                id,
+                make_state(1),
+                Residency::Unknown,
+                None,
+                partition,
+            );
+        }
+        let evicted = cache.evict_partition(key(0, 3));
+        assert_eq!(evicted.len(), 2);
+        assert!(cache.get(&first).is_none() && cache.get(&second).is_none());
+        assert!(cache.get(&other).is_some(), "another partition stays");
+        assert!(cache.get(&untagged).is_some(), "an untagged entry stays");
+        assert!(
+            cache.get(&remote).is_some(),
+            "partition 3 of another database stays"
+        );
+        assert_eq!(cache.evict_partition(key(0, 9)).len(), 0);
     }
 
     #[test]
@@ -508,18 +725,25 @@ mod tests {
     async fn take_removes_the_entry_with_its_resident_workflow() {
         let mut cache = WorkflowCache::new(5);
         let id = Uuid::new_v4();
-        cache.insert_resident(id, make_state(7), Some(resident().await));
+        cache.insert_resident(id, make_state(7), Residency::Parked(resident().await));
 
         let (state, live) = cache.take(&id).expect("entry is present");
         assert_eq!(state.next_event_id, 7);
-        assert!(live.is_some(), "the resident workflow comes with the entry");
+        assert!(
+            live.is_parked(),
+            "the resident workflow comes with the entry"
+        );
         assert!(cache.take(&id).is_none(), "a take removes the entry");
     }
 
     #[tokio::test]
     async fn close_releases_every_entry_and_stops_resident_capture() {
         let mut cache = WorkflowCache::new(5);
-        cache.insert_resident(Uuid::new_v4(), make_state(3), Some(resident().await));
+        cache.insert_resident(
+            Uuid::new_v4(),
+            make_state(3),
+            Residency::Parked(resident().await),
+        );
         cache.insert(Uuid::new_v4(), make_state(5));
 
         let closed = cache.close();
@@ -530,9 +754,32 @@ mod tests {
 
         // A task that outlives the shutdown drain cannot park a future again.
         let id = Uuid::new_v4();
-        cache.insert_resident(id, make_state(7), Some(resident().await));
+        cache.insert_resident(id, make_state(7), Residency::Parked(resident().await));
         let (_, live) = cache.take(&id).expect("the snapshot is kept");
-        assert!(live.is_none(), "a closed cache keeps no resident workflow");
+        assert!(
+            !live.is_parked(),
+            "a closed cache keeps no resident workflow"
+        );
+    }
+
+    #[test]
+    fn an_entry_keeps_the_miss_reason_of_its_suspension() {
+        // Issue #2007: the next decision reports why it replays.
+        let mut cache = WorkflowCache::new(5);
+        let id = Uuid::new_v4();
+        cache.insert_resident(
+            id,
+            make_state(7),
+            Residency::Missed(crate::telemetry::ResidentOutcome::Race),
+        );
+        let (_, residency) = cache.take(&id).expect("entry is present");
+        assert!(
+            matches!(
+                residency,
+                Residency::Missed(crate::telemetry::ResidentOutcome::Race)
+            ),
+            "{residency:?}"
+        );
     }
 
     #[test]
@@ -540,7 +787,7 @@ mod tests {
         let mut cache = WorkflowCache::new(5);
         let id = Uuid::new_v4();
         cache.insert(id, make_state(9));
-        let refused = cache.insert_resident(id, make_state(4), None);
+        let refused = cache.insert_resident(id, make_state(4), Residency::Unknown);
 
         assert_eq!(refused.map(|(state, _)| state.next_event_id), Some(4));
         assert_eq!(cache.get(&id).map(|state| state.next_event_id), Some(9));
@@ -550,12 +797,12 @@ mod tests {
     async fn disabled_resident_state_keeps_only_the_snapshot() {
         let mut cache = WorkflowCache::new(5).with_resident(false);
         let id = Uuid::new_v4();
-        cache.insert_resident(id, make_state(7), Some(resident().await));
+        cache.insert_resident(id, make_state(7), Residency::Parked(resident().await));
 
         let (state, live) = cache.take(&id).expect("entry is present");
         assert_eq!(state.next_event_id, 7);
         assert!(
-            live.is_none(),
+            !live.is_parked(),
             "a disabled cache must drop the resident workflow"
         );
     }

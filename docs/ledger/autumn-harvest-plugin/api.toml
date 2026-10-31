@@ -1,0 +1,521 @@
+# Ledger profiles for `autumn-harvest-plugin/src/api.rs`. See `docs/ledger/README.md`.
+
+["batch_reset_workflows"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "docs/performance-fork-validate.md"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["batch_start_workflows"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["build_awaitables_report"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue", "harvest_timers"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["build_diagnosis_report"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_task_queue", "harvest_timers", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["check_ready_database"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["clear_rate_limit_pacing_override"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_rate_limit_buckets"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["clear_stale_max_runs_exhaustion_stmt!"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["clear_start_throttle_pacing_override"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_rate_limit_buckets"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["count_api_bulk_filter_matches"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters"]
+measured = "docs/performance-dlq-bulk-discard.md"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["count_existing_in_window"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["create_completion_trigger"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_completion_triggers"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["delete_schedule"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["evaluate_eligibility_for_shard"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_rate_limit_buckets", "harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["explain_workflow_list"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["gather_run_chain_rows"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["get_aggregated_scaling_signals"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workers"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["get_schedule"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "docs/performance-schedule-overdue-aux.md"
+
+["get_schedule_decisions"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedule_decisions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["get_start_throttle_pacing_override"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_rate_limit_buckets"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["get_task_eligibility"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["get_update_result"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["get_workflow_stack"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_rate_limit_buckets", "harvest_signals", "harvest_task_queue", "harvest_timers", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["list_completion_triggers"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_completion_triggers"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["list_dag_runs"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["list_dead_letters"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["list_fleet_decisions"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedule_decisions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["list_rate_limits"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_rate_limit_buckets"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["load_execution"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["load_history_bloat_workflows"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "docs/performance-history-bloat-filter.md"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["load_history_export_candidates"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["load_history_sample_candidates"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["load_recent_backfills"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_backfill_log"]
+measured = "docs/performance-schedule-overdue-aux.md"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["load_schedule_overdue_aux_by_shard"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "docs/performance-schedule-overdue-aux.md"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["load_schedules_from_shards"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["load_stalled_workflows"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_signals", "harvest_task_queue", "harvest_timers", "harvest_workflow_executions"]
+measured = "docs/performance-status-summary-stalled.md"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["load_workflows"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "docs/performance-history-bloat-filter.md"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["patch_dag"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["poll_update_result"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
+["probe_committed_start_replay"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["progress_stream_end_reason"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["query_dead_letters_for_api_bulk"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letters"]
+measured = "docs/performance-dlq-bulk-discard.md"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["query_running_count"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["rate_limit_gate_status"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_rate_limit_buckets"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["rearm_backfill_next_run_stmt!"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["reconstruct_legacy_run_chain"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["reject_inadmissible_fork_callbacks"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["release_backfill_budget_slot"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["reload_execution_deadline"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["reserve_backfill_budget_slot"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["reserve_backfill_budget_slot_stmt!"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["resolve_schedule_with_shard"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["rollback_manual_trigger_budget"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["running_counts_for_concurrency_keys"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["schedule_backfill_inner"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["set_rate_limit"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_rate_limit_buckets"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["set_rate_limit_pacing_override"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_rate_limit_buckets"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["set_schedule_paused"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["set_start_throttle_pacing_override"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_rate_limit_buckets"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["signal_with_start_workflow"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["start_workflow"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["transition_backfill_exhausted_if_reached"]
+driver = "per_request"
+backend = ["postgres"]
+kind = []
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["transition_backfill_exhausted_stmt!"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
+["trigger_schedule_now"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_schedules", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["update_with_start_workflow"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["upsert_workflow_schedule_and_read_back"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "docs/performance-schedule-overdue-aux.md"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"
+
+["write_backfill_log"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_backfill_log"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-plugin/api.md"

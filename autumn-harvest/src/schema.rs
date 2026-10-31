@@ -211,6 +211,13 @@ diesel::table! {
         /// row's marker with a direct match on the vacating migration's own
         /// execution id, with no cross-database write and no retry race.
         staging_vacated_by -> Nullable<Uuid>,
+        /// Verified tenant of the run (issue #1977). A start by a tenant-bound
+        /// caller sets it. Children, retries, continue-as-new, reset and re-run
+        /// copy it from the source run. NULL means the run has no tenant.
+        ///
+        /// The 65th column. The workspace enables diesel's
+        /// `128-column-tables` feature for it.
+        tenant -> Nullable<Text>,
     }
 }
 
@@ -332,6 +339,12 @@ diesel::table! {
         /// (issue #1824). Set only by the workflow start path. The claim
         /// order reads it while `attempt = 0`.
         new_start -> Bool,
+        /// The fairness key of the task (issue #1976). `NULL` is the
+        /// default key.
+        fairness_key -> Nullable<Text>,
+        /// The decision partition of a workflow task (issue #2252). `NULL`
+        /// means not stamped. An owned claim may take such a row.
+        decision_partition -> Nullable<Int2>,
     }
 }
 
@@ -357,6 +370,45 @@ diesel::table! {
         calendar_name -> Text,
         excluded_date -> Date,
         created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Operator overrides for per-type run defaults (issue #2387). A NULL
+    /// column inherits the code value.
+    harvest_run_default_overrides (workflow_name) {
+        workflow_name -> Text,
+        sla_secs -> Nullable<Int8>,
+        execution_timeout_secs -> Nullable<Int8>,
+        reason -> Nullable<Text>,
+        updated_by -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Operator overrides for code-declared schedules (issue #2385). A NULL
+    /// column inherits the code value.
+    harvest_schedule_overrides (kind, name) {
+        kind -> Text,
+        name -> Text,
+        schedule_expr -> Nullable<Text>,
+        catchup -> Nullable<Bool>,
+        max_active_runs -> Nullable<Int4>,
+        jitter_secs -> Nullable<Int8>,
+        overlap_policy -> Nullable<Text>,
+        buffer_all_max -> Nullable<Int4>,
+        reason -> Nullable<Text>,
+        updated_by -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+        /// Workflow-only override fields as one JSON object (issue #2386).
+        workflow_fields -> Jsonb,
     }
 }
 
@@ -698,6 +750,9 @@ diesel::table! {
         last_used_at -> Nullable<Timestamptz>,
         revoked_at -> Nullable<Timestamptz>,
         created_by -> Text,
+        /// Tenant claim of the token (issue #1977). NULL means not
+        /// tenant-bound.
+        tenant -> Nullable<Text>,
     }
 }
 
@@ -840,6 +895,8 @@ diesel::table! {
         /// #1227, Finding 4). The claim query can then exclude the row until
         /// its backoff elapses, instead of leaving it to dominate every batch.
         next_attempt_at -> Nullable<Timestamptz>,
+        /// Tenant of the source run (issue #1977). The target run gets it.
+        tenant -> Nullable<Text>,
     }
 }
 
@@ -874,6 +931,9 @@ diesel::table! {
         attempts -> Integer,
         last_error -> Nullable<Text>,
         last_attempt_at -> Nullable<Timestamptz>,
+        /// The reason that the parent gave its cancel (issue #2194).
+        /// NULL = use the generic parent-cancel text.
+        cancel_reason -> Nullable<Text>,
     }
 }
 
@@ -1029,7 +1089,8 @@ diesel::table! {
         target_url       -> Text,
         event_filter     -> Jsonb,
         terminal_state   -> Text,
-        /// Frozen `CompletionEnvelope` JSON, signed and `POSTed` verbatim on
+        /// Frozen `CompletionEnvelope` JSON in the column form (issue #2043).
+        /// The scanner decodes it, then signs and `POST`s the plain body on
         /// every attempt (including redeliveries).
         payload          -> Jsonb,
         /// PENDING | INFLIGHT | DELIVERED | FAILED
@@ -1196,6 +1257,45 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    /// Agent cost ledger (issue #1996): one row per LLM call that an
+    /// activity records.
+    ///
+    /// The completion transaction writes it. `event_id` names the completion
+    /// event. The table is outside `harvest_events` and in clear.
+    harvest_llm_ledger (workflow_exec_id, event_id, call_index) {
+        workflow_exec_id -> Uuid,
+        event_id         -> Int4,
+        call_index       -> Int4,
+        activity_name    -> Text,
+        model            -> Text,
+        input_tokens     -> Int8,
+        output_tokens    -> Int8,
+        cost_usd_micros  -> Nullable<Int8>,
+        latency_ms       -> Int8,
+        recorded_at      -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Durable workflow output-stream chunks (issue #1974).
+    ///
+    /// Written in the worker persist transaction by
+    /// `ctx.publish_durable_progress`. Not part of `harvest_events` and never
+    /// replayed. `stream_offset` is the call ordinal and the resume cursor.
+    harvest_stream_chunks (id) {
+        id               -> Int8,
+        workflow_exec_id -> Uuid,
+        stream_offset    -> Int8,
+        chunk            -> Jsonb,
+        created_at       -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     /// Durable resume cursor for the lazy payload-codec re-encryption sweep
     /// (issue #948).
     ///
@@ -1282,7 +1382,32 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// The keyed-entity state projection (issue #2259). A trigger on
+    /// `harvest_events` writes each row. See `crate::entity_state`.
+    harvest_entity_state (id) {
+        id -> Uuid,
+        workflow_name -> Text,
+        workflow_id -> Text,
+        /// The run that wrote the row. The row goes with its run.
+        execution_id -> Uuid,
+        /// The history position of the snapshot in that run.
+        event_id -> Int4,
+        /// `harvest_events.id` of the snapshot. It orders the runs of a key.
+        event_row_id -> Int8,
+        /// The snapshot ended the entity.
+        deleted -> Bool,
+        /// The event `value`, byte for byte. A codec envelope when a codec is set.
+        snapshot -> Jsonb,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::joinable!(harvest_stream_chunks -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_workflow_logs -> harvest_workflow_executions (workflow_exec_id));
+diesel::joinable!(harvest_llm_ledger -> harvest_workflow_executions (workflow_exec_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
@@ -1305,6 +1430,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_calendars,
     harvest_calendar_exclusions,
     harvest_schedule_decisions,
+    harvest_run_default_overrides,
+    harvest_schedule_overrides,
     harvest_rate_limit_buckets,
     harvest_completion_triggers,
     harvest_completion_trigger_fires,
@@ -1322,7 +1449,10 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_wasm_modules,
     harvest_mutex_locks,
     harvest_mutex_waiters,
+    harvest_stream_chunks,
     harvest_workflow_logs,
+    harvest_llm_ledger,
     harvest_codec_rotation_cursor,
     harvest_codec_key_state,
+    harvest_entity_state,
 );

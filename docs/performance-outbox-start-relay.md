@@ -26,7 +26,8 @@ each row, dispatches the workflow start, then records the outcome.
   drain's own statement calls and 46.0% of its buffers -- both comfortably
   over the 5%/5% floor.
 * **The fix**: one `UPDATE ... FROM UNNEST($1::bigint[], ...)` call per
-  outcome (delivered, failed) per drain, instead of one call per row.
+  outcome (delivered, failed) per chunk of at most `OUTBOX_MARK_FLUSH_EVERY`
+  (8) outcomes, instead of one call per row.
   `UNNEST` keeps the statement text fixed regardless of batch size, so this
   stays one prepared-statement shape.
 * **Mark-step statement count goes from `n` to `ceil(n / 8)` per claim

@@ -1,5 +1,5 @@
 //! Registration-time rejection of unsupported `WorkflowInfo`-level features
-//! (Codex #1069 P2, `runtime.rs:602` `execution_timeout` / `:686` `retry_policy`).
+//! (Codex #1069 P2). Issue #2029 honors `execution_timeout` and `retry_policy`.
 //!
 //! [`SqliteRuntime::register_workflow`] retains ONLY `name` + `handler`, so every
 //! other execution- or admission-affecting `WorkflowInfo` field would otherwise be
@@ -21,7 +21,9 @@ use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use serde_json::json;
 
-// ── Rejected: execution_timeout (Codex #1069 P2, runtime.rs:602) ───────────────
+// ── Honored: execution_timeout and workflow-level retry (issue #2029) ─────────
+// They panicked at registration before issue #2029. `execution_timeout.rs` and
+// `workflow_retry.rs` cover their behavior.
 
 #[workflow(execution_timeout = "30s")]
 async fn timed_wf(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
@@ -29,28 +31,22 @@ async fn timed_wf(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
     Ok(0)
 }
 
-#[test]
-#[should_panic(expected = "execution_timeout")]
-fn registering_a_workflow_with_execution_timeout_panics_naming_the_feature() {
-    let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    // Would silently never enforce the declared hard deadline — reject at setup.
-    rt.register_workflow(&timed_wf_info());
-}
-
-// ── Rejected: workflow-level retry_policy (Codex #1069 P2, runtime.rs:686) ──────
-
 #[workflow(retry = RetryPolicy::fixed(3, std::time::Duration::from_secs(1)))]
 async fn retried_wf(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
     let _ = ctx;
     Ok(0)
 }
 
-#[test]
-#[should_panic(expected = "retry_policy")]
-fn registering_a_workflow_with_workflow_level_retry_panics_naming_the_feature() {
+#[tokio::test]
+async fn execution_timeout_and_workflow_retry_register_and_run() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    // Would silently ignore the declared workflow-level auto-retry — reject at setup.
+    rt.register_workflow(&timed_wf_info());
     rt.register_workflow(&retried_wf_info());
+    for name in ["timed_wf", "retried_wf"] {
+        let exec = rt.start_workflow(name, json!(0)).unwrap();
+        let state = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(state, RunState::Completed(_)), "{name}: {state:?}");
+    }
 }
 
 // ── Rejected: quota (issue #1239) ────────────────────────────────────────────

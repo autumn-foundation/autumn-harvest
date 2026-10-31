@@ -164,3 +164,82 @@ Those columns stay directly queryable by design — indexing and search
 attribute matching read them straight via SQL — and a codec envelope
 would break that, so encoding them is a separate, larger design decision
 out of scope for this fix.
+
+## Addendum (issue #1979): the codec covers columns outside the event log
+
+**Decision.** The codec now also encodes the codec columns:
+`harvest_workflow_executions.input`, `.output` and `.memo`,
+`harvest_signals.payload`, `harvest_dead_letters.input`, and the workflow
+task's `harvest_task_queue.input` and `.output`. This supersedes the "third
+residual" above, which kept these columns out of scope.
+
+**Opt-in, readers first.** Column encoding is off by default. This release
+always decodes the codec columns at every engine read. An older release reads
+an envelope as literal data. So an operator upgrades every process first, then
+turns the switch on with `HarvestBuilder::encode_payload_columns()`. The switch
+lives on `PayloadCodecs` behind a shared cell, like the active key, so every
+clone sees it at once.
+
+**One rule per copy.** A value that enters a start, a handler, a signal event
+or a webhook is decoded first. The write that follows encodes it once. A
+row-to-row copy keeps the stored bytes. So no value nests one envelope inside
+another.
+
+**Search attributes stay in clear.** Visibility queries filter on them. Error
+text keeps its issue #1920 decision. Every other `JSONB` column has a row in
+the coverage table in `docs/security-posture.md`, with a reason when it stays
+clear. A unit test parses `schema.rs`, so a new `JSONB` column cannot skip the
+table.
+
+**Rotation.** `codec_rotation::CODEC_COLUMNS` lists the swept columns, with
+`harvest_execution_summaries.result`, which copies the output verbatim. The
+census counts each envelope cell. The retirement gate therefore stays closed
+while any column still holds the key. The sweep converts columns with a
+compare-and-swap on the old value, so it loses to an erasure. The column pass
+runs only when the event pass reaches its end, so a converged shard scans
+nothing extra between revalidations. A column pass keeps to the batch
+budget and resumes from an in-process cursor, so it never rescans a drained
+column within a pass. These tables are not append-only, so the
+column pass is not a sanctioned exception. Only the ciphertext changes. The
+replay-fidelity test now also proves the columns decode byte-identical after a
+sweep.
+
+**Escape guard.** A new write escapes a value shaped like an envelope, with
+the switch on or off, as the event codec does (issue #1253). Without it, a
+caller could store an envelope-shaped value that an engine read unwraps.
+
+**Residual.** A row written before this release had no escape. If it holds
+an envelope-shaped value, an engine read now decodes it. This is the issue
+#1253 residual, now on the engine path. Issue #2043 covers the short-lived
+copies. See the addendum below.
+
+## Addendum (issue #2043): the codec covers the short-lived copies
+
+**Decision.** The codec also encodes these copies:
+
+- the activity task row (`input`, `output` and `heartbeat_details`);
+- the completion-callback delivery and its dead letter;
+- the debounce, throttle and outbox buffers;
+- the batch job signal payload.
+
+**Why now.** A finished activity task row stays until task retention removes
+it, and a callback dead letter stays for good. So these copies are not
+short-lived. Each held the same data as the column it copies.
+
+**One rule per reader.** A reader decodes the stored value before it uses it.
+A dead-letter writer takes the input as its source row stores it, and keeps one
+envelope layer. A value that does not decode never reaches a handler, a webhook
+or a start. An activity attempt fails with a retryable error. A buffer scanner
+moves the row back. The callback scanner counts a failed attempt.
+
+**The last payload copies.** The batch buffer, the cross-shard child spec,
+the schedule input and the context headers are encoded too. The buffer keeps
+one envelope for each element, so SQL still appends to and counts the array.
+The spec is one cell, and erasure replaces it with a tombstone without a key.
+The reconciler compares the decoded schedule input, so a new nonce is not
+drift. A header map that does not decode fails the run, and it never means
+no headers. An export decodes headers only for a caller who may decode. The
+archive leaves an encoded header map out.
+
+**What stays clear.** Configuration and identifiers only. The coverage table
+gives the reason for each clear column.

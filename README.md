@@ -21,7 +21,10 @@ the same shape with one fewer service to operate.
 
 Weighing harvest against Temporal, DBOS, Inngest, Hatchet, or Restate? See the
 honest, evidence-linked [comparison page](docs/comparison.md) — it names
-harvest's own gaps, not just its strengths.
+harvest's own gaps, not just its strengths. The
+[safety report](docs/safety-report.md) states what the engine guarantees for
+leases, fencing, exactly-once completion and signal ordering. It gives the tests,
+the results, a command for each result and the known limits.
 
 Moving an existing Temporal deployment? See the
 [Temporal migration guide](docs/migrating-from-temporal.md) — a concept
@@ -57,8 +60,8 @@ child workflows, idempotency, and operating the service — read
 [`docs/getting-started/`](docs/getting-started/).
 
 Upgrading an existing deployment? See the
-[0.6.0 → 0.7.0 upgrade guide](docs/upgrading/0.7.0.md) — the previous
-[0.5.0 → 0.6.0 upgrade guide](docs/upgrading/0.6.0.md) covers the hop before that.
+[0.7.0 → 0.8.0 upgrade guide](docs/upgrading/0.8.0.md) — the previous
+[0.6.0 → 0.7.0 upgrade guide](docs/upgrading/0.7.0.md) covers the hop before that.
 
 Working on the engine itself? [`docs/architecture.md`](docs/architecture.md) is
 the workspace, design-decision, module and macro reference, and
@@ -78,6 +81,11 @@ Need a real reference instead of the tiny hello-world path? See:
   Docker. Each model call and tool call is an activity, a workspace write parks on an
   approval signal with a deadline, and killing the daemon mid-session resumes by replay instead
   of paying for completed turns twice. It runs with no API key (a scripted offline model).
+- [`examples/autoresearch/`](examples/autoresearch/) for Karpathy's autoresearch loop as durable
+  workflows: an agent edits `train.py`, a trainer runs it, and a keep rule decides, all night. It is
+  the capstone of the agent primitives and of most of the engine surface. It uses child workflows, a
+  saga, mutexes, signals, a query, an update, schedules, continue-as-new and seeded simulation
+  sweeps. It runs offline with a simulated trainer and a scripted researcher.
 
 ```rust
 use autumn_harvest::prelude::*;
@@ -248,9 +256,11 @@ async fn polling_loop(ctx: &WorkflowContext, mut state: serde_json::Value)
 ```
 
 `ctx.history_event_count()` reports the number of loaded durable history events.
+That count grows from task to task, so do not branch on it.
 `ctx.should_continue_as_new()` turns true once that count exceeds the
 `HarvestBuilder::history_continue_as_new_threshold(...)` soft threshold. The
-default threshold is `10_000` events.
+default threshold is `10_000` events. The engine records each answer, so a
+replay gives the same answer at the same code position.
 
 ```rust
 let harvest = HarvestBuilder::new()
@@ -271,8 +281,11 @@ guardrails against a runaway loop:
 A run that reaches a cap fails unless it calls `continue_as_new`. The worker
 moves it to the DLQ with the typed reason. The guardrail adds no workflow
 event variant. The byte measure is `pg_column_size(event_data)`, the
-same measure as the tenant `max_history_bytes` quota. The Postgres worker
-enforces both caps. The SQLite backend does not.
+same measure as the tenant `max_history_bytes` quota. The SQLite backend
+enforces both caps too, with the same defaults (issue #2023). It has no DLQ, so
+the `WorkflowFailed` event carries the reason. Its byte cap measures the
+stored event JSON length, not `pg_column_size`. Set its caps with `set_history_event_hard_cap` and
+`set_history_byte_hard_cap`.
 
 `harvest.workflow.history_bloat` fires once per run at 20.48% of the event
 cap, so at `10_240` events by default. The worker also logs a warning. Set
@@ -339,6 +352,10 @@ for a compile-checked polling loop that works with and without the `db` feature.
 | [`autumn-harvest-cli`](autumn-harvest-cli/) | `harvest` CLI: thin operator client for the management API |
 | [`autumn-harvest-redis`](autumn-harvest-redis/) | Optional Redis Streams dispatch channel — carries references to claimable rows; Postgres stays the source of truth |
 | [`autumn-harvest-sqlite`](autumn-harvest-sqlite/) | Optional SQLite storage backend for single-process and embedded deployments |
+| [`autumn-harvest-agent`](autumn-harvest-agent/) | Optional durable agent loop: model and tool calls as activities, approvals as durable waits ([guide](docs/agent-adapter.md)) |
+| [`autumn-harvest-verify`](autumn-harvest-verify/) | `cargo-harvest-verify`: opt-in semantic (MIR-level) determinism verifier for `#[workflow]` functions. R&D prototype, not published ([guide](docs/harvest-verify.md)) |
+| [`autumn-harvest-sandbox-guest`](autumn-harvest-sandbox-guest/) | `harvest-guest-agent`: process 1 of each Firecracker microVM for sandboxed code activities ([guide](docs/sandbox-activities.md)) |
+| [`autumn-harvest-conformance`](autumn-harvest-conformance/) | Test only: runs one workflow corpus on Postgres and on SQLite and compares the results. Not published |
 
 Use `autumn-harvest-plugin` if you're building an Autumn app. For a non-web
 context — a worker or CLI process with no HTTP surface at all — use the bare
@@ -416,7 +433,7 @@ this section documents.
 
 Match each route's own declared content type instead: `harvest events
 tail` sends `Accept: text/event-stream`, and so must any direct client
-of the `.../events/stream` or `.../stream` routes. `GET /admin/metrics`
+of the `.../events/stream`, `.../stream` or `.../stream/durable` routes. `GET /admin/metrics`
 and `GET /admin/queues/scaling?format=prometheus` return Prometheus
 plain text; do not send `Accept: application/json` to either.
 
@@ -1094,7 +1111,7 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 ## Requirements
 
 - Rust 1.88.0 or newer (MSRV). A checkout of this repository builds with the
-  release pinned in `rust-toolchain.toml` (currently 1.99.0); `rustup`
+  release pinned in `rust-toolchain.toml` (currently 1.99.1); `rustup`
   installs it on the first `cargo` call. CI uses the same pin, so a new
   stable release changes CI only when that file changes.
 - Postgres 12+ — except for `cargo dev`, whose `dev-runtime-managed` tier
@@ -1109,7 +1126,7 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 
 ## Status
 
-Version 0.7.0 builds on the Phase 4 surface (see
+Version 0.8.0 builds on the Phase 4 surface (see
 [`CHANGELOG.md`](CHANGELOG.md) for this release's full entry list). The core
 surface is broad: DAG scheduling, `#[dag]`, trigger rules, signal delivery,
 `ctx.wait_for_signal`, query registration/dispatch, the management API,
@@ -1196,13 +1213,15 @@ The equivalent environment override is
 
 ## Redis dispatch (optional)
 
-Postgres is the only required infrastructure dependency. On a deep backlog
-the Postgres claim scans and sorts the queue on every claim. An optional
-Redis Streams **dispatch channel** removes that scan: the engine publishes a
-small reference (task id, queue, due time) for each claimable row, and a
-worker claims the named row in Postgres with the full claim predicate before
-it acks the reference. Postgres keeps every row, every claim gate and the
-whole history write path.
+Postgres is the only required infrastructure dependency. Since issue #1971,
+the default Postgres claim reads a bounded window from the head of each
+queue. It scans and sorts the backlog only as a fallback. A claim with
+fairness keys or priority ageing always runs that scan. An optional Redis
+Streams **dispatch channel** removes the search for a row from each claim.
+The engine publishes a small reference (task id, queue, due time) for each
+claimable row. A worker claims the named row in Postgres with the full claim
+predicate before it acks the reference. Postgres keeps every row, every
+claim gate and the whole history write path.
 
 Build `autumn-harvest-plugin` with the `redis` feature, then set the URL:
 
@@ -1241,7 +1260,7 @@ replay-safe against recorded production histories using `WorkflowReplayer`
 
 ```toml
 # Cargo.toml — in your app's dev-dependencies
-autumn-harvest = { version = "0.7", features = ["testing"] }
+autumn-harvest = { version = "0.8", features = ["testing"] }
 ```
 
 ```rust
@@ -1489,4 +1508,8 @@ With no `telemetry(...)` call (the default), all `info_span!` sites compile to b
 
 ## License
 
-Dual-licensed under MIT or Apache 2.0 at your option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Each published crate ships both license files.
+
+To contribute, read [`CONTRIBUTING.md`](CONTRIBUTING.md).
+To report a vulnerability, follow [`SECURITY.md`](SECURITY.md).

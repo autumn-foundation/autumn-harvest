@@ -135,6 +135,8 @@ async fn start_test_workflow(conn: &mut AsyncPgConnection) -> autumn_harvest::Ex
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -261,6 +263,8 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
             circuit_breaker: None,
             requires: None,
             handler: heartbeat_activity,
+            input_schema: None,
+            output_schema: None,
         }],
         Arc::new(state),
     ))
@@ -484,6 +488,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -510,6 +515,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             registry,
         )
@@ -571,6 +577,8 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -700,6 +708,8 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
             circuit_breaker: None,
             requires: None,
             handler: uncooperative_activity,
+            input_schema: None,
+            output_schema: None,
         }],
         Arc::new(state),
     ))
@@ -726,6 +736,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(2),
                 // Short grace period so the test completes quickly.
@@ -753,6 +764,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             registry,
         )
@@ -814,6 +826,8 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -903,6 +917,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(2),
@@ -929,6 +944,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             registry,
         )
@@ -988,6 +1004,8 @@ async fn activity_exits_early_on_workflow_cancellation() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -1074,6 +1092,7 @@ async fn activity_without_cancellation_check_completes_normally() {
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_millis(300),
@@ -1100,6 +1119,7 @@ async fn activity_without_cancellation_check_completes_normally() {
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             registry,
         )
@@ -1159,6 +1179,8 @@ async fn activity_without_cancellation_check_completes_normally() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
+            tenant: None,
         },
         None,
     )

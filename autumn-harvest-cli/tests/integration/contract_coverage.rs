@@ -367,6 +367,29 @@ fn legal_hold_release_is_covered() {
     ]);
 }
 
+// ── harvest agents (issue #2267) ───────────────────────────────────────────
+
+#[test]
+fn agents_list_is_covered() {
+    assert_covered(&["agents", "list", "--status", "idle", "--wakes-before", "1"]);
+}
+
+#[test]
+fn agents_describe_is_covered() {
+    assert_covered(&["agents", "describe", "support/ada"]);
+}
+
+#[test]
+fn agents_pause_and_resume_are_covered() {
+    for args in [
+        &["agents", "pause", "support/ada", "--reason", "audit"][..],
+        &["agents", "resume", "support/ada"][..],
+    ] {
+        assert_covered(args);
+        assert_body_fields_documented(args);
+    }
+}
+
 #[test]
 fn workflow_start_is_covered() {
     assert_covered(&["workflow", "start", "my_workflow"]);
@@ -581,6 +604,43 @@ fn dag_retry_is_covered() {
         "--reason",
         "incident",
     ]);
+}
+
+const DAG_SET_SCHEDULE: &[&str] = &[
+    "dags",
+    "set-schedule",
+    "my_dag",
+    "--cron",
+    "0 3 * * *",
+    "--timezone",
+    "Europe/Berlin",
+    "--catchup",
+    "false",
+    "--max-active-runs",
+    "2",
+    "--jitter-secs",
+    "30",
+    "--overlap-policy",
+    "buffer_all",
+    "--buffer-all-max",
+    "5",
+    "--reason",
+    "incident",
+];
+
+#[test]
+fn dag_set_schedule_is_covered() {
+    assert_covered(DAG_SET_SCHEDULE);
+}
+
+#[test]
+fn dag_clear_override_is_covered() {
+    assert_covered(&["dags", "clear-override", "my_dag", "--reason", "done"]);
+}
+
+#[test]
+fn overrides_list_is_covered() {
+    assert_covered(&["overrides", "list"]);
 }
 
 // ── schedules ─────────────────────────────────────────────────────────────────
@@ -891,6 +951,16 @@ fn dag_pause_body_fields_are_documented() {
 #[test]
 fn dag_unpause_body_fields_are_documented() {
     assert_body_fields_documented(&["dag", "unpause", "my_dag"]);
+}
+
+#[test]
+fn dag_set_schedule_body_fields_are_documented() {
+    assert_body_fields_documented(DAG_SET_SCHEDULE);
+}
+
+#[test]
+fn dag_clear_override_body_fields_are_documented() {
+    assert_body_fields_documented(&["dags", "clear-override", "my_dag", "--reason", "done"]);
 }
 
 #[test]
@@ -1261,6 +1331,33 @@ fn queue_resume_is_covered() {
 #[test]
 fn queue_list_paused_is_covered() {
     assert_covered(&["queue", "list-paused"]);
+}
+
+// ── Fairness key weights (issue #1976) ────────────────────────────────────────
+
+#[test]
+fn queue_fairness_show_is_covered() {
+    assert_covered(&["queue", "fairness", "show", "email-workers"]);
+}
+
+#[test]
+fn queue_fairness_set_is_covered() {
+    let args = [
+        "queue",
+        "fairness",
+        "set",
+        "email-workers",
+        "tenant-a",
+        "--weight",
+        "2",
+    ];
+    assert_covered(&args);
+    assert_body_fields_documented(&args);
+}
+
+#[test]
+fn queue_fairness_clear_is_covered() {
+    assert_covered(&["queue", "fairness", "clear", "email-workers", "tenant-a"]);
 }
 
 // ── Per-activity-type pause/resume (issue #807) ───────────────────────────────

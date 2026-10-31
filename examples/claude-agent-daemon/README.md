@@ -137,7 +137,7 @@ for around two hours, and no command is answered in that time. Raising
 `--max-turns` raises that bound with it.
 
 The cause is the loop and not the engine. A `status`, `list` or `history` reads
-through a second, read-only connection and needs nothing the drive holds, so
+through read-only handles and needs nothing the drive holds, so
 those three could be answered during a drive by a daemon that served them on
 another task. `submit` and `approve` write, and they would still wait: this
 backend has one writer by design.
@@ -279,6 +279,12 @@ approval by hand from a trimmed view is still yours to do.
 └────────────────────────────────────────────┘
 ```
 
+- **[`autumn-harvest-agent`](../../autumn-harvest-agent)** — the agent
+  adapter (issue #1973). The daemon takes its approval signal names
+  (`approval_signal`, `approval_call_id`) and its payload-cap checks from it.
+  The daemon keeps its own Anthropic-native turn, because it replays thinking
+  blocks verbatim. For a provider-neutral loop over any `AgentModel`,
+  start from [`docs/agent-adapter.md`](../../docs/agent-adapter.md).
 - **[`src/session.rs`](src/session.rs)** — the agent loop, as a `#[workflow]`.
   Ordinary Rust: a `for` loop over turns, a model call, a tool call per
   `tool_use` block. Durability comes from the awaits. The transcript is rebuilt
@@ -312,10 +318,12 @@ approval by hand from a trimmed view is still yours to do.
   approval.
 - **[`src/daemon.rs`](src/daemon.rs)** — the socket, the drive tick, and the
   single-writer main loop.
-- **[`src/inspect.rs`](src/inspect.rs)** — a second, **read-only** connection
-  for the reads the runtime does not expose. Each one asks for what it needs: a
-  `status` reads one row, the startup check and the drive tick read the running
-  rows, and only `list` reads them all.
+- **[`src/inspect.rs`](src/inspect.rs)** — read-only handles beside the
+  writer. The backend's `SqliteReader` lists and describes executions (issue
+  #2027). A read-only connection reads the event, timer, signal and task
+  tables. Each read asks for what it needs: a `status` reads one row, the
+  startup check reads the running rows, and only `list` reads a page of them
+  all.
 - **[`src/guard.rs`](src/guard.rs)** — the exclusive lock on the database file
   that keeps "one writer" true across processes.
 
@@ -402,10 +410,10 @@ Honest limits, so nothing here reads as a promise:
   from the `--tick-ms` poll. The poll reads no database at all: the daemon is
   the only writer, so it holds the live sessions in memory, seeded once at
   startup from the rows a previous process left `RUNNING`. A query on every
-  tick would visit every session that ever ran, because `harvest_executions`
-  is indexed on `(workflow_name, workflow_id)` and not on `state`. The engine
-  owns that schema, and an example does not add an index to it. A production
-  daemon would sleep until the next timer deadline.
+  tick would only read back what the daemon already holds. The backend indexes
+  `harvest_executions` on `state` (issue #2027), so that query does not visit
+  every session that ever ran. A production daemon would sleep until the next
+  timer deadline.
 - **No streaming.** One turn is one non-streaming request, because an activity
   result is a value, not a stream. Token-by-token output needs a side channel.
 - **One turn can be paid for twice.** Activity execution is at-least-once, and

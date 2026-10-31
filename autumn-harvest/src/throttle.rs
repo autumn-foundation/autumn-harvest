@@ -621,11 +621,17 @@ async fn insert_pending_throttle_row(
     params: &AdmitThrottleParams<'_>,
     bucket_key: &str,
     deferred_at: DateTime<Utc>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
     let expires_at = compute_expiry(deferred_at, params.schedule_to_start);
+    // The row stores the input in the column form (issue #2043).
+    let stored_input = codecs.encode_column(&params.input)?;
     let start_options_json = serde_json::to_value(&params.start_options)
         .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+    // The headers take the column form too (issue #2043).
+    let start_options_json =
+        crate::debounce::encode_stored_start_options(codecs, start_options_json)?;
     diesel::sql_query(
         "INSERT INTO harvest_start_throttle \
             (id, workflow_name, throttle_key, bucket_key, workflow_id, queue_name, \
@@ -637,7 +643,7 @@ async fn insert_pending_throttle_row(
     .bind::<diesel::sql_types::Text, _>(bucket_key)
     .bind::<diesel::sql_types::Text, _>(params.workflow_id)
     .bind::<diesel::sql_types::Text, _>(params.queue_name)
-    .bind::<diesel::sql_types::Jsonb, _>(&params.input)
+    .bind::<diesel::sql_types::Jsonb, _>(&stored_input)
     .bind::<diesel::sql_types::Jsonb, _>(start_options_json)
     .bind::<diesel::sql_types::Timestamptz, _>(deferred_at)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(expires_at)
@@ -785,7 +791,24 @@ pub async fn reserve_or_defer(
     conn: &mut diesel_async::AsyncPgConnection,
     params: AdmitThrottleParams<'_>,
 ) -> crate::error::HarvestResult<ThrottleAdmission> {
-    admit(conn, params, false).await
+    reserve_or_defer_with_codecs(conn, params, &crate::store::DEFAULT_PAYLOAD_CODECS).await
+}
+
+/// [`reserve_or_defer`], storing a deferred input through `codecs`
+/// (issue #2043).
+///
+/// The row stores the input in the column form. The fire path decodes it
+/// before the start.
+///
+/// # Errors
+/// As [`reserve_or_defer`].
+#[cfg(feature = "db")]
+pub async fn reserve_or_defer_with_codecs(
+    conn: &mut diesel_async::AsyncPgConnection,
+    params: AdmitThrottleParams<'_>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> crate::error::HarvestResult<ThrottleAdmission> {
+    admit(conn, params, false, codecs).await
 }
 
 /// [`reserve_or_defer`] for an HTTP start, which load shedding governs
@@ -801,8 +824,8 @@ pub async fn reserve_or_defer(
 /// here. A bypass and a reserved token continue to the start primitive, which
 /// sheds a fresh create itself.
 ///
-/// Scheduler and backfill fires keep [`reserve_or_defer`]. They cannot act on
-/// `Retry-After`, so load shedding exempts them.
+/// Scheduler and backfill fires keep [`reserve_or_defer_with_codecs`]. They
+/// cannot act on `Retry-After`, so load shedding exempts them.
 ///
 /// # Errors
 /// As [`reserve_or_defer`], plus [`crate::error::HarvestError::LoadShed`]
@@ -812,7 +835,21 @@ pub async fn reserve_or_defer_or_shed(
     conn: &mut diesel_async::AsyncPgConnection,
     params: AdmitThrottleParams<'_>,
 ) -> crate::error::HarvestResult<ThrottleAdmission> {
-    admit(conn, params, true).await
+    reserve_or_defer_or_shed_with_codecs(conn, params, &crate::store::DEFAULT_PAYLOAD_CODECS).await
+}
+
+/// [`reserve_or_defer_or_shed`], storing a deferred input through `codecs`
+/// (issue #2043).
+///
+/// # Errors
+/// As [`reserve_or_defer_or_shed`].
+#[cfg(feature = "db")]
+pub async fn reserve_or_defer_or_shed_with_codecs(
+    conn: &mut diesel_async::AsyncPgConnection,
+    params: AdmitThrottleParams<'_>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> crate::error::HarvestResult<ThrottleAdmission> {
+    admit(conn, params, true, codecs).await
 }
 
 /// The shared body of [`reserve_or_defer`] and [`reserve_or_defer_or_shed`].
@@ -821,6 +858,7 @@ async fn admit(
     conn: &mut diesel_async::AsyncPgConnection,
     params: AdmitThrottleParams<'_>,
     shed_fresh_deferral: bool,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<ThrottleAdmission> {
     // Reject an empty id before any lookup, reservation, or persisted row
     // (issue #1353). A reserved token or deferred row with no id could only
@@ -925,7 +963,7 @@ async fn admit(
     }
 
     // Defer: durably persist the start before any WorkflowStarted event exists.
-    insert_pending_throttle_row(conn, &params, &key, now).await?;
+    insert_pending_throttle_row(conn, &params, &key, now, codecs).await?;
     Ok(ThrottleAdmission::Deferred(ThrottleDeferOutcome {
         workflow_id: params.workflow_id.to_string(),
         throttle_key: params.throttle_key.to_string(),
@@ -958,6 +996,80 @@ struct FireDueRow {
     expires_at: Option<DateTime<Utc>>,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     shard_id: i32,
+    /// When the row was deferred. A backoff moves it into the future (issue
+    /// #2043).
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    deferred_at: DateTime<Utc>,
+}
+
+/// How far a row that does not decode moves its `deferred_at` (issue #2043).
+///
+/// The claim has no `deferred_at` floor, so the move reorders the row behind
+/// its neighbours and does not hide it. The row is a candidate on every tick.
+/// The window limits the work instead: a row inside it is not written and not
+/// warned about again. The row keeps its `schedule_to_start` deadline.
+#[cfg(feature = "db")]
+const UNDECODABLE_REDEFER_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Decode the stored input of each claimed row (issue #2043).
+///
+/// The row stores `input` in the column form. The quota ordering and the
+/// start both need the plain input. A row that does not decode logs a warning
+/// with no payload text, once per backoff window. A row past its
+/// `schedule_to_start` deadline is dropped, as `fire_claimed_throttle_row`
+/// drops it, because that needs no payload. Any other row moves back and fires
+/// after an operator restores the key. A row still inside its window is left as
+/// it is. The row thus cannot sit at the head of its key, and it cannot abort
+/// the claim of its neighbours.
+///
+/// # Errors
+///
+/// Database failures while the row moves back or is dropped.
+#[cfg(feature = "db")]
+async fn decode_due_rows(
+    conn: &mut diesel_async::AsyncPgConnection,
+    rows: Vec<FireDueRow>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+    now: DateTime<Utc>,
+) -> crate::error::HarvestResult<Vec<FireDueRow>> {
+    let mut decodable = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        match codecs.decode_column(&row.input).and_then(|plain| {
+            let options =
+                crate::debounce::decode_stored_start_options(codecs, row.start_options.clone())?;
+            Ok((plain, options))
+        }) {
+            Ok((plain, options)) => {
+                row.input = plain;
+                row.start_options = options;
+                decodable.push(row);
+            }
+            Err(error) => {
+                let expired = row.expires_at.is_some_and(|at| at < now);
+                if !expired && row.deferred_at > now {
+                    // Inside the window of an earlier move. The row is already
+                    // behind its neighbours, so a write would add no order.
+                    tracing::debug!(
+                        throttle_id = %row.id,
+                        "throttle input still cannot be decoded; the row stays in its backoff window"
+                    );
+                    continue;
+                }
+                tracing::warn!(
+                    throttle_id = %row.id,
+                    expired,
+                    error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                    "throttle input or headers could not be decoded"
+                );
+                if expired {
+                    delete_throttle_row(conn, row.id).await?;
+                } else {
+                    redefer_throttle_row(conn, row.id, now + UNDECODABLE_REDEFER_BACKOFF).await?;
+                }
+            }
+        }
+    }
+    Ok(decodable)
 }
 
 #[cfg(feature = "db")]
@@ -1563,7 +1675,8 @@ async fn fire_due_on_conn(
                     ORDER BY rn ASC, deferred_at ASC LIMIT $2
                 )
                 SELECT t.id, t.workflow_name, t.throttle_key, t.bucket_key, t.workflow_id,
-                       t.queue_name, t.input, t.start_options, t.expires_at, t.shard_id
+                       t.queue_name, t.input, t.start_options, t.expires_at, t.shard_id,
+                       t.deferred_at
                 FROM harvest_start_throttle t
                 JOIN selected s ON s.id = t.id
                 ORDER BY t.deferred_at ASC
@@ -1577,6 +1690,7 @@ async fn fire_due_on_conn(
                             .await
                             .map_err(crate::error::database_error)?;
 
+                        let due_rows = decode_due_rows(conn, due_rows, codecs, now).await?;
                         pre_lock_rate_limit_buckets_for_claimed_batch(conn, &due_rows).await?;
                         // The sort uses the quota key, not `bucket_key`. A bucket that
                         // mixes quota keys can fire a newer row before an older one in
@@ -2038,6 +2152,7 @@ mod tests {
             start_options: serde_json::json!({ "tenant_id": "wrong" }),
             expires_at: None,
             shard_id: 0,
+            deferred_at: Utc::now(),
         };
         assert_eq!(row.workflow_name(), "wf_a");
         assert_eq!(row.quota_input()["tenant_id"], "t1");
@@ -2365,6 +2480,7 @@ mod tests {
                 start_options: serde_json::json!({}),
                 expires_at: None,
                 shard_id: 0,
+                deferred_at: Utc::now(),
             }
         }
 

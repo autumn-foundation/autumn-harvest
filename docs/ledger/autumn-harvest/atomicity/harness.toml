@@ -1,0 +1,71 @@
+# Ledger profiles for `autumn-harvest/src/atomicity/harness.rs`. See `docs/ledger/README.md`.
+
+["Workload::create"]
+driver = "test_support"
+backend = ["postgres"]
+kind = ["ddl", "read", "write"]
+tables = []
+measured = "unmeasured"
+
+["Workload::credit"]
+driver = "test_support"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["Workload::debit"]
+driver = "test_support"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["Workload::drop_tables"]
+driver = "test_support"
+backend = ["postgres"]
+kind = ["ddl"]
+tables = []
+measured = "unmeasured"
+
+["Workload::place"]
+driver = "test_support"
+backend = ["postgres"]
+kind = ["write"]
+tables = []
+measured = "unmeasured"
+
+["Workload::record"]
+driver = "test_support"
+backend = ["postgres"]
+kind = ["write"]
+tables = []
+measured = "unmeasured"
+
+["Workload::reserve"]
+driver = "test_support"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["Workload::restock"]
+driver = "test_support"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
+["Workload::totals"]
+driver = "test_support"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["commit_latency"]
+driver = "test_support"
+backend = ["postgres"]
+kind = ["ddl", "write"]
+tables = []
+measured = "unmeasured"

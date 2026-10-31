@@ -125,6 +125,31 @@ STALE_CLAIMS = [
         r"TODO\(#606 step 9\)",
         "#606 step 9 is wired: build_activity_enqueue_plan pins session tasks",
     ),
+    (
+        "docs/comparison.md",
+        r"No\s+cell\s+on\s+this\s+page\s+claims\s+a\s+throughput\s+or\s+latency\s+comparison",
+        "assay #14 reran the comparison on 0.7.0 (issue #1972)",
+    ),
+    (
+        "README.md",
+        r"The\s+SQLite\s+backend\s+does\s+not\.",
+        "the SQLite backend enforces both history caps (issue #2023)",
+    ),
+    (
+        "autumn-harvest-sqlite/README.md",
+        r"search\s+attributes,\s+and\s+`continue_as_new`",
+        "the SQLite backend supports continue_as_new (issue #2023)",
+    ),
+    (
+        "docs/rnd/sqlite-feasibility.md",
+        r"local\s+and\s+external\s+activities,\s+cancellable\s+timers",
+        "the SQLite backend runs local activities and cancellable timers (issue #2029)",
+    ),
+    (
+        "autumn-harvest-sqlite/README.md",
+        r"external\s+signals/cancels,\s+local\s+activities",
+        "the SQLite backend runs local activities (issue #2029)",
+    ),
 ]
 
 
@@ -472,6 +497,7 @@ def self_test():
             "cross-shard workflows are explicitly out of scope per the contract.\n"
             "and cross-shard workflows are out of\n  scope by design.\n"
             "- **No cross-shard workflows.** A single workflow's state.\n"
+            "No cell on this page\n  claims a throughput or latency comparison.\n"
         ),
         "docs/architecture.md": (
             "Cross-shard rebalancing of existing workflows is out of scope.\n"
@@ -484,7 +510,7 @@ def self_test():
     }
     claims = [c for c in STALE_CLAIMS if c[0] in old_claims]
     found = stale_claim_findings(old_claims.get, claims)
-    assert len(found) == 11, found
+    assert len(found) == 12, found
 
     # True statements that a pin must not match.
     current = {

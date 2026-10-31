@@ -96,6 +96,8 @@ $ cargo harvest-verify --list-boundaries
 | `--format text\|json` | Output format. `text` (default) is human-readable; `json` emits the full report. |
 | `--report` | **Also** print the `analyzed/proven/unknown/found/allowed` counts on **stderr**. The `text` renderer already ends with that same line plus the boundary set on stdout, so this flag exists to get the counts onto a separate stream (a CI step summary, say) — it does not add information. |
 | `--list-boundaries` | Print every boundary name, one per line, and exit `0`. |
+| `--emit-structure <FILE>` | Also write the structure manifest of each workflow to `FILE`. The report on stdout does not change. See [Structure manifest](#structure-manifest). |
+| `--check-structure <FILE>` | Read a structure manifest and run the saga compensation coverage check over it. It builds nothing, and only `--format` and `--strict` combine with it. Exit `1` on a gap, `2` on a bad manifest. With `--strict`, an `unknown` verdict or a manifest with no workflow also exits `1`. See [Saga compensation coverage](#saga-compensation-coverage). |
 
 **There is no `--release` flag, and optimized builds are refused.** MIR inlining
 is on at `opt-level ≥ 1`, and an inlined helper leaves no `Call` terminator — the
@@ -117,6 +119,10 @@ runs always ends in `-- --emit=mir -C opt-level=0`.
 
 Findings are always printed to stdout *before* the non-zero exit, so CI logs are
 self-explanatory. This mirrors `harvest det-check`'s contract.
+
+`--check-structure` keeps the same codes. `0` means no gap. `1` means a
+`gap`, or under `--strict` an `unknown` verdict or a manifest with no
+workflow. `2` means a bad manifest, or a build flag given with it.
 
 ---
 
@@ -140,7 +146,7 @@ counts and the boundary set. Verbatim, from a real run over this repo's examples
 $ cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- harvest-verify \
     -p autumn-harvest --all-examples --no-default-features --features testing \
     --allowlist harvest-verify.allow.toml --report
-harvest-verify: model 2026.09.0, rustc 1.98.0 (88d9e12ae 2026-08-18)
+harvest-verify: model 2026.10.2, rustc 1.98.0 (88d9e12ae 2026-08-18)
 
 proven-deterministic  workflow_logs::import_batch
 ... one line per workflow ...
@@ -148,7 +154,7 @@ proven-deterministic  workflow_logs::import_batch
 warning: skipping example wasm_activity: required feature(s) not enabled: wasm-activities
 
 analyzed 57: proven 56, unknown 0, found 0, allowed 1
-verdicts hold under model 2026.09.0; boundaries not analyzed: dyn-dispatch, indirect-call, ffi, unsafe-raw-pointer, inline-asm, external-crate-body, unmodeled-ctx-method, unresolved-generic, recursion, mir-parse, missing-body, drop-glue
+verdicts hold under model 2026.10.2; boundaries not analyzed: dyn-dispatch, indirect-call, ffi, unsafe-raw-pointer, inline-asm, external-crate-body, unmodeled-ctx-method, unresolved-generic, recursion, mir-parse, missing-body, drop-glue
 ```
 
 Three things about that footer are worth knowing before you quote it:
@@ -234,6 +240,128 @@ annotated with a source location. Where it cannot match one uniquely it names th
 function's own header rather than guessing a line.
 
 ---
+
+## Structure manifest
+
+`--emit-structure FILE` writes the call graph that the analysis resolved, one
+graph per workflow (issue #1995). The
+[upgrade check](upgrade-check.md) diffs two manifests, one per build, to find
+the workflow code that changed. The run builds the manifest only when you
+pass the flag.
+
+Each workflow lists every body it can reach:
+
+| Field | Meaning |
+|---|---|
+| `id` | The body path. The id drops spans, so a line shift keeps it. |
+| `digest` | SHA-256 of the raw MIR text of the body, of each item nested under it, of each `const` item it reads and of each `allocN` footer they name. It drops spans and `allocN` numbers. |
+| `calls` | Each call site. `in_loop` marks a call in a cycle of the caller's control flow, or a closure that the caller passes to another call. `resume` marks a call that handles an existing future, such as `poll`. |
+| `steps` | Each command the body emits. `kind` comes from the `step` field of the model's `[[sink]]` row, or of a `[[non_sink]]` row that can park the workflow, such as `await_condition`. `key` is the step name, such as the activity name, when the MIR shows it. |
+
+The workflow also lists its `unknown` boundaries. Two bodies whose ids
+normalize to the same text add an `ambiguous-body-id` boundary, because
+their `#2` suffix follows the digest, not the body.
+
+MIR prints a `const` read from another crate by path, such as
+`const limits::ATTEMPTS`, and not by value. When that crate is in the
+analyzed set, the digest includes the item from its MIR. A std, core or
+trusted crate is skipped. Any other crate adds an `external-const` boundary,
+because a change to its value does not change the reader's MIR. An activity
+body is not in
+the graph: a workflow names an activity through its `X_info()` function and
+never calls the body.
+
+### Flow graphs and handlers
+
+Each body also has a `flow` graph (issue #2010). The manifest names its
+format in `flow`, as `harvest-flow/1`. A node is an event. An edge joins two
+events when a path joins them with no other event on it.
+
+| Node `kind` | Meaning |
+|---|---|
+| `entry` | The first block. For a coroutine, the target of state `0`. |
+| `step` | A step site. `step` is its index in `steps`. |
+| `call` | A call that starts other bodies of the graph, in `callees`. |
+| `handler` | A handler registration. `handler` is its index in the workflow `handlers`. |
+| `saga-new` | `Saga::new`, or another call that returns a saga value. |
+| `saga-step` | `Saga::step`. `forward` and `compensate` name its closure bodies. `tracked` is true when its out-edges carry the label `ok` or `err`. |
+| `saga-compensate` | `Saga::compensate_all`. `tracked` is true when the body awaits it. |
+| `saga-escape` | A `Saga` value reaches a call or a capture that is not a `Saga` method. |
+| `exit` | A write of the returned value. `outcome` is `ok` for a literal `Ok(..)`, `err` for a literal `Err(..)` or the error arm of `?`, and `unknown` for any other value. Only a body that returns a `Result` has exit nodes. |
+
+`at` names the MIR block of a node. It is for diagnostics only. A tracked
+`saga-step` has at least one `ok` and one `err` edge, each of its edges
+has a label, and no other node has a labeled edge. `--check-structure` refuses a graph that breaks this, names
+a missing node, has other than one `entry`, or has a node that the `entry`
+cannot reach, an `exit` with an out-edge, or a `step` past the body
+`steps` list. It refuses a body with no flow graph. It also refuses a `call`, a
+`saga-step`, a handler or a body `calls` entry that names a body or handler
+the workflow does not hold, and a handler entry that no `handler` node
+names. It refuses a body that no reference reaches from the root, and two
+bodies that share an id.
+
+The workflow `handlers` list each handler registration: its `kind`
+(`signal`, `update`, `query` or `other`), its model `method`, its `name`
+when the MIR shows it, and its closure `bodies`. `returns` lists the
+coroutine bodies those closures return, such as the body of the `async fn`
+in `|v| handle(v)`.
+
+A closure that returns an `async` block hands that future to its caller.
+When the caller has no body in the analysis, as `Saga::step` has none, the
+analysis follows the `async` block itself. It follows the body of an
+`async` closure the same way. So the steps inside a saga closure are in the
+graph. The analysis follows only a block that the
+closure itself builds. A block that captures a `&mut` reference adds an
+`unresolved-callback` boundary, because its writes cannot reach the
+caller.
+
+## Saga compensation coverage
+
+`--check-structure FILE` reads a manifest and runs one property over the
+flow graphs. It reads no MIR. The question is: can a completed forward step
+of a `Saga` reach an error exit with no unwind on the way?
+
+```console
+$ cargo harvest-verify -p my-workflows --lib --emit-structure wf.json
+$ cargo harvest-verify --check-structure wf.json
+gap  my_workflows::order::place_order
+  gap: my_workflows::order::place_order::{closure#0} at bb24 returns err
+covered  my_workflows::order::refund
+
+checked 2: covered 1, gap 1, unknown 0, no-saga 0
+```
+
+`--format json` prints one report per workflow instead.
+
+| Verdict | Meaning |
+|---|---|
+| `no-saga` | No body uses a `Saga`, and no boundary can hide one. |
+| `covered` | Each error exit after a completed forward step unwinds first. |
+| `gap` | An error exit can follow a completed forward step with no unwind. The usual cause is a `?` on a call outside the saga. A boundary beside the gap does not change it, as the saga cannot reach the boundary. The report still lists the boundary. |
+| `unknown` | The graph cannot show the answer. A `saga-` reason can unwind or hide a step, so with one the report lists each gap as `possible gap`. |
+
+| `unknown` reason | Cause |
+|---|---|
+| `saga-escapes` | A saga value reaches a call, a capture or a body that does not own it. |
+| `saga-result-untracked` | The result of a step does not reach `?` through `.await` alone, as with `map_err` or `match`. |
+| `multiple-sagas` | One body builds two sagas. |
+| `saga-recreated` | A new saga starts while a step of the old one is pending. |
+| `saga-dropped-pending` | A body that starts no execution exits with a step pending. Its caller cannot unwind that step. The workflow root, each handler body and each coroutine in a handler `returns` start an execution: their error exit with a step pending is a gap. A body that is an entry and also the callee of an ordinary call is checked both ways. |
+| `no-flow-graph` | A body in the manifest has no flow graph. |
+| `boundary` | The workflow has a boundary that runs code. It can hide a saga and a gap, with or without a saga in sight. An `external-const` runs no code, so it does not count. A `handler-unresolved` boundary marks a handler registration whose handler argument, always the last, has no body in sight. A declarative record or a function pointer does that. |
+
+A `noop-compensation` note marks a compensation that emits no command. It
+does not change the verdict.
+
+The check follows `saga.step(..).await?` exactly. It follows the value,
+not only the control flow. The check counts `compensate_all` only when the
+body awaits it. A future passed to another call, as `Box::pin`, moved
+into an aggregate, as `Some(..)`, or held across a branch is a
+`saga-escape`. The check trusts the `Saga` contract: a failed step unwinds
+every earlier step. A panic is not an error exit. DAG compensation runs in
+the engine, so the graph cannot see it. See
+[`docs/rnd/workflow-graph-spike.md`](rnd/workflow-graph-spike.md) for the
+measured `unknown` rate.
 
 ## The allowlist
 
@@ -337,7 +465,7 @@ Run with it:
 $ cargo harvest-verify -p my-workflows --lib --model my-model.toml
 ```
 
-Two things to know about how rows match:
+Three things to know about how rows match:
 
 - **`path` is a `::`-segment *suffix* of the callee path**, with generic
   arguments stripped — never a prefix. Stable MIR prints callee paths using
@@ -350,6 +478,11 @@ Two things to know about how rows match:
   fully qualified). `dest_type` is how a bare `var` is pinned to
   `std::env::var` — no user function can accidentally return
   `Result<String, VarError>`.
+- **A bare row yields to a body.** A row with one segment and no `receiver`
+  (`count`, `sort`, `var`) describes std. A first-party function of that name
+  has a body in the analyzed set, and that body is analyzed instead. This holds
+  for every table, so a helper named `count` that reads the clock is still a
+  finding (`corpus/seeded/src/wf_helper_named_count.rs`).
 
 Rows are matched most-specific-first (`receiver` + `dest_type` > `receiver` >
 `path` alone), and a `[[source]]` row always beats a `[[trusted]]` crate: a
@@ -472,11 +605,18 @@ The ones you are most likely to meet:
   when it is a **method** whose receiver argument's declared
   type is rooted entirely in trusted crates (or, for an associated function,
   whose receiver type is spelled with a trusted root in some declared type at the
-  site), when the receiver is a primitive, or when a `[[std_free_fn]]` row names
-  it; otherwise it is an `external-crate-body` boundary and you get `unknown`.
+  site), when the receiver is a primitive, a slice, an array or a tuple, or when
+  a `[[std_free_fn]]` row names it; otherwise it is an `external-crate-body`
+  boundary and you get `unknown`. A receiver that every declaration at the site
+  prints trimmed — a helper's signature prints its parameters that way
+  (`fn remember(_1: &mut Vec<Row>)`) — counts when every rooted spelling of its
+  name elsewhere in the dumps is trusted. rustc trims a path only when the name
+  is unique in the crate graph, so `Vec` is the one item that `std::vec::Vec`
+  names. The same rule covers the future of a trusted crate's `async fn`
+  (`{async fn body of Saga<'_>::step()}`).
   `[[std_free_fn]]` therefore holds the **free** functions of std and of trusted
-  crates that rustc trims to one segment — seven rows here (`format`,
-  `must_use`, `to_value`, `from_value`, `display`, `debug`, `task_duration`). The
+  crates that rustc trims to one segment (`format`, `must_use`, `to_value`,
+  `to_vec`, `from_value`, `display`, `debug`, `task_duration`). The
   residual cost: a dependency's *extension trait* on a std type
   (`impl DepExt for String`) is trusted, because rustc trims both the trait and
   the self type, leaving a genuinely std receiver as the only qualified text.
@@ -496,12 +636,16 @@ The ones you are most likely to meet:
   that run before the sort, and including on branches where the sort never runs.
   A value sorted on one path counts as sorted on all of them. This under-reports;
   it never over-reports.
-- **Recursion is cut, not solved.** A callee already on the call stack, a call
-  chain deeper than 96 bodies, or an exhausted 6000-body budget is not entered:
-  the analyzer records a `recursion` boundary and returns a pass-through summary
-  that reports **no sinks**. The verdict degrades to
-  `unknown`, so you are told — but a command emitted only from inside a recursive
-  cycle produces no finding and no trace.
+- **Recursion is solved as a bounded fixpoint.** A call into a body already on
+  the call stack is not entered again. It returns the cycle's current summary,
+  joined with a pass-through of its argument taint, and records that argument
+  taint. The outer call then runs the body again with the joined argument
+  taint, until a round adds no fact. So a command emitted inside the cycle with
+  a value that only the recursive call carries is found
+  (`corpus/seeded/src/wf_recursive_relay.rs`). Three cases are still cut, with
+  a `recursion` boundary and an `unknown` verdict: a cycle that has not
+  converged after 8 rounds, a call chain deeper than 96 bodies, and an
+  exhausted 6000-body budget.
 - **Single-impl devirtualization assumes a closed world.** Correct for the
   analyzed crate set; wrong the moment a downstream crate adds a second impl.
 - **A sink inside a closure handed to a higher-order function is not recorded at

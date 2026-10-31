@@ -38,6 +38,14 @@ use crate::policy::RetryPolicy;
 /// in-flight attempt.
 pub const ERROR_TYPE_CIRCUIT_OPEN: &str = "CircuitOpen";
 
+/// Stable error-type name for an activity attempt whose stored input or
+/// checkpoint did not decode (issue #2043).
+///
+/// The worker raises it when a codec key is missing or a stored payload is
+/// bad. The failure is retryable, so the retry policy applies and an operator
+/// can restore the key. Its message never holds codec text.
+pub const ERROR_TYPE_PAYLOAD_DECODE_FAILED: &str = "PayloadDecodeFailed";
+
 /// Stable error-type name for worker-session breakage (issue #606).
 ///
 /// Synthesised by the broken-session scanner for every PENDING/RUNNING
@@ -112,8 +120,32 @@ pub const ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT: &str = "WorkflowTaskTimedOut";
 /// import naming them is unsatisfied). Instantiation fails deterministically,
 /// so the outcome is **non-retryable**: a denied capability cannot succeed on a
 /// later attempt without a policy change.
-#[cfg(feature = "wasm-activities")]
+///
+/// A sandboxed code activity uses the same type for a request that breaks its
+/// policy, and for a worker configuration that is not valid. See the
+/// `sandbox` module.
+#[cfg(any(feature = "wasm-activities", feature = "sandbox-activities"))]
 pub const ERROR_TYPE_SANDBOX_DENIED: &str = "SandboxDenied";
+
+/// Stable error-type name for a sandbox backend that could not run the code.
+///
+/// The backend could not start, boot or reach the sandbox. **Retryable**:
+/// another attempt, or another worker, can succeed.
+#[cfg(feature = "sandbox-activities")]
+pub const ERROR_TYPE_SANDBOX_UNAVAILABLE: &str = "SandboxUnavailable";
+
+/// Stable error-type name for a sandbox guest that broke the wire protocol.
+///
+/// **Non-retryable**: the guest runs untrusted code, so a retry could repeat
+/// an attack on the host parser.
+#[cfg(feature = "sandbox-activities")]
+pub const ERROR_TYPE_SANDBOX_PROTOCOL_VIOLATION: &str = "SandboxProtocolViolation";
+
+/// Stable error-type name for a sandbox run that its activity cancelled.
+///
+/// **Retryable**: the worker cancellation path decides what happens next.
+#[cfg(feature = "sandbox-activities")]
+pub const ERROR_TYPE_SANDBOX_CANCELLED: &str = "SandboxCancelled";
 
 /// Stable error-type name for a WASM activity that exhausted a resource budget
 /// (issue #965).
@@ -174,6 +206,25 @@ pub const ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED: &str = "WasmModuleLookupFailed";
 /// retrying in place is pointless.
 #[cfg(feature = "wasm-activities")]
 pub const ERROR_TYPE_WASM_OUTPUT_TOO_LARGE: &str = "WasmOutputTooLarge";
+
+/// Stable error-type name for a journal that does not match its re-run
+/// (issue #2014).
+///
+/// A journaled WASM activity replays its host-call journal on a retry. The
+/// re-run made a different call, or finished with recorded calls left over.
+/// A malformed journal fails the same way before the guest runs.
+/// **Non-retryable**: the same journal diverges in the same way on each
+/// attempt.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_WASM_JOURNAL_DIVERGENCE: &str = "WasmJournalDivergence";
+
+/// Stable error-type name for a transient host-call failure (issue #2014).
+///
+/// A granted host-call handler reported a transient failure. The host does
+/// not journal it. **Retryable**: the next attempt replays the journal and
+/// calls the handler again.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_HOST_CALL_FAILED: &str = "HostCallFailed";
 
 /// Typed failure carrier for activity handlers.
 ///
@@ -362,7 +413,7 @@ impl ActivityFailure {
     /// is non-retryable: a denied capability cannot be granted by a retry, so
     /// the in-flight attempt terminates immediately and the workflow's own
     /// failure/compensation path takes over.
-    #[cfg(feature = "wasm-activities")]
+    #[cfg(any(feature = "wasm-activities", feature = "sandbox-activities"))]
     #[must_use]
     pub fn sandbox_denied(detail: impl Into<String>) -> Self {
         Self::non_retryable(ERROR_TYPE_SANDBOX_DENIED, detail)
@@ -443,6 +494,26 @@ impl ActivityFailure {
     #[must_use]
     pub fn wasm_module_lookup_failed(detail: impl Into<String>) -> Self {
         Self::retryable(ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED, detail)
+    }
+
+    /// Construct the non-retryable failure for a journal that does not match
+    /// its re-run (issue #2014).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_WASM_JOURNAL_DIVERGENCE`].
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_journal_divergence(detail: impl Into<String>) -> Self {
+        Self::non_retryable(ERROR_TYPE_WASM_JOURNAL_DIVERGENCE, detail)
+    }
+
+    /// Construct the retryable failure for a transient host-call failure
+    /// (issue #2014).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_HOST_CALL_FAILED`].
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn host_call_failed(detail: impl Into<String>) -> Self {
+        Self::retryable(ERROR_TYPE_HOST_CALL_FAILED, detail)
     }
 }
 
@@ -1450,6 +1521,16 @@ mod tests {
                 ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED,
                 false,
             ),
+            (
+                ActivityFailure::wasm_journal_divergence("diverged"),
+                ERROR_TYPE_WASM_JOURNAL_DIVERGENCE,
+                true,
+            ),
+            (
+                ActivityFailure::host_call_failed("down"),
+                ERROR_TYPE_HOST_CALL_FAILED,
+                false,
+            ),
         ];
         for (failure, want_type, want_non_retryable) in cases {
             let payload = failure.into_error_payload();
@@ -1461,6 +1542,15 @@ mod tests {
             assert_eq!(error_type, want_type);
             assert_eq!(non_retryable, want_non_retryable, "{want_type}");
         }
+    }
+
+    /// History stores these names, so a rename breaks old `ActivityFailed`
+    /// events (issue #2014).
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn host_call_error_type_names_are_stable() {
+        assert_eq!(ERROR_TYPE_WASM_JOURNAL_DIVERGENCE, "WasmJournalDivergence");
+        assert_eq!(ERROR_TYPE_HOST_CALL_FAILED, "HostCallFailed");
     }
 
     /// A WASM failure's `non_retryable` flag is intrinsic to the constructor and

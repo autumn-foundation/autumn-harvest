@@ -3,9 +3,11 @@
 This page positions autumn-harvest against the five durable-execution engines an
 architect is most likely to shortlist alongside it — **Temporal, DBOS, Inngest,
 Hatchet, and Restate** — across the eleven dimensions that usually decide the
-choice. It is written for an engineer evaluating durable-execution engines who
-wants to reach a defensible include-or-exclude decision on harvest in one
-sitting, without cross-referencing five vendors' marketing pages.
+choice. A twelfth dimension, [durable agents](#12-durable-agents), compares
+the systems that ship a named, long-lived agent. It is written for an engineer
+evaluating durable-execution engines who wants to reach a defensible
+include-or-exclude decision on harvest in one sitting, without
+cross-referencing five vendors' marketing pages.
 
 It is deliberately not a sales page. Every harvest capability claimed as
 _shipped_ links to the phase entry or GitHub issue that landed it, so any cell is
@@ -58,7 +60,8 @@ sources.
 Each table below covers one AC1 dimension across all six engines. In every
 harvest cell, a **shipped** capability links to its phase entry or issue; a
 **planned** capability says so and links an open issue. Competitor cells link the
-sourcing doc and flag anything unverified.
+sourcing doc and flag anything unverified. Section 12 compares another set of
+peers: the systems that ship a durable agent.
 
 ### 1. Required infrastructure
 
@@ -97,18 +100,41 @@ sourcing doc and flag anything unverified.
 
 | Engine | Model |
 |---|---|
-| **autumn-harvest** | Code-first async Rust with event-sourced deterministic replay. Also a first-class DAG surface (`#[dag]`, [unified DAG execution #256](https://github.com/autumn-foundation/autumn-harvest/issues/256)); [signals/queries/updates](https://github.com/autumn-foundation/autumn-harvest/issues/234) ([#140](https://github.com/autumn-foundation/autumn-harvest/issues/140), [#346](https://github.com/autumn-foundation/autumn-harvest/issues/346)); [Saga compensation](saga.md) ([#238](https://github.com/autumn-foundation/autumn-harvest/issues/238)); inbound [webhook triggers (#344)](https://github.com/autumn-foundation/autumn-harvest/issues/344). |
+| **autumn-harvest** | Code-first async Rust with event-sourced deterministic replay. Also a first-class DAG surface (`#[dag]`, [unified DAG execution #256](https://github.com/autumn-foundation/autumn-harvest/issues/256)); [signals/queries/updates](https://github.com/autumn-foundation/autumn-harvest/issues/234) ([#140](https://github.com/autumn-foundation/autumn-harvest/issues/140), [#346](https://github.com/autumn-foundation/autumn-harvest/issues/346)); [Saga compensation](saga.md) ([#238](https://github.com/autumn-foundation/autumn-harvest/issues/238)); inbound [webhook triggers (#344)](https://github.com/autumn-foundation/autumn-harvest/issues/344); [keyed entities](adr/0006-keyed-entity.md) ([#1975](https://github.com/autumn-foundation/autumn-harvest/issues/1975)) with one handler at a time for each key; a payload-matching signal wait and [durable promises](durable-promises.md) ([#1985](https://github.com/autumn-foundation/autumn-harvest/issues/1985)). |
 | Temporal | Code-first imperative durable Workflows + Activities (side effects isolated in Activities). ([docs](https://docs.temporal.io/)) |
 | DBOS | Code-first — ordinary functions annotated as durable **workflows** and **steps** via decorators/annotations. ([docs](https://docs.dbos.dev/)) |
 | Inngest | Event-driven step functions — functions triggered by events / cron / webhooks, logic split into memoized `step` calls. ([docs](https://www.inngest.com/docs/learn/how-functions-are-executed)) |
 | Hatchet | Multi-paradigm — general-purpose task queue, DAG orchestrator, and durable-execution engine (DAGs can be built at runtime). ([docs](https://docs.hatchet.run/v1)) |
 | Restate | Durable handlers across Services, **Virtual Objects** (per-key consistent state), and Workflows, with durable RPC/queuing built in. ([docs](https://docs.restate.dev/foundations/key-concepts)) |
 
+#### Small primitives (issue #1985)
+
+Issue [#1985](https://github.com/autumn-foundation/autumn-harvest/issues/1985)
+lists four small primitives that peer engines ship. Each has a decision.
+
+| Primitive | Peer | Decision | Reason |
+|---|---|---|---|
+| Payload-matching event wait | Cloudflare `step.waitForEvent` | **Shipped.** `ctx.wait_for_signal_matching` and `ctx.receive_signal_matching` ([signals chapter](getting-started/04-signals.md)). | A signal that fails the predicate stays buffered. There is no timeout form yet. |
+| Durable promise | Restate awakeables | **Shipped.** `ctx.new_promise`, `ctx.promise` and `durable_promise::resolve` / `reject` ([durable promises](durable-promises.md)). | Built on signals, not external task tokens, so a promise can race a timer and settles once. |
+| Counting semaphore | No built-in peer primitive | **Declined.** | See below. |
+| `AllowAll` overlap | Temporal Schedules | **Shipped.** `OverlapPolicy::AllowAll`. | It ignores `max_active_runs`, as Temporal does. Each tick phase starts at most 100 catch-up runs. |
+
+**Why the counting semaphore is declined.** Two shipped features cover the
+common needs. The per-key concurrency limit
+([#247](https://github.com/autumn-foundation/autumn-harvest/issues/247)) caps
+how many runs of one key are active across the fleet. The durable mutex
+([#691](https://github.com/autumn-foundation/autumn-harvest/issues/691)) gives
+one holder for a region of a workflow. An N-permit region lock needs its own
+permit tables, a new event, lease renewal and reclaim, a terminal sweep, and
+reset and rebalance hooks. That work is the size of the mutex itself. The
+issue asks for small changes. Open a new issue with a use case that the two
+features above cannot serve.
+
 ### 5. Determinism guarantees & tooling
 
 | Engine | Approach |
 |---|---|
-| **autumn-harvest** | Event-sourced deterministic replay, layered with the deepest safety tooling in this set: **compile-time guardrails HVG001–HVG011** plus a `det_check` static analyzer (DET010/DET011) that flag non-deterministic patterns before they ship; the [`WorkflowReplayer` harness (Phase 3.5)](replay-verify.md) that replays current code against recorded histories in CI; **non-terminal [ND-blocking (#603)](https://github.com/autumn-foundation/autumn-harvest/issues/603)** that _parks and alerts_ a divergent run rather than silently wedging or failing it; and [deterministic side-effect primitives (#384)](https://github.com/autumn-foundation/autumn-harvest/issues/384) for time/UUID/random. See the [workflow determinism guide](workflow-determinism-guide.md). |
+| **autumn-harvest** | Event-sourced deterministic replay, layered with the deepest safety tooling in this set: **compile-time guardrails HVG001–HVG011** plus a `det_check` static analyzer (DET010/DET011) that flag non-deterministic patterns before they ship; the [`ReplayVerifier` CI gate (#251)](replay-verify.md), built on the `WorkflowReplayer` harness, that replays current code against recorded histories; **non-terminal [ND-blocking (#603)](https://github.com/autumn-foundation/autumn-harvest/issues/603)** that _parks and alerts_ a divergent run rather than silently wedging or failing it; and [deterministic side-effect primitives (#384)](https://github.com/autumn-foundation/autumn-harvest/issues/384) for time/UUID/random. See the [workflow determinism guide](workflow-determinism-guide.md), and [why Harvest keeps deterministic replay](why-deterministic-replay.md) for the trade-off against checkpoint-only steps. |
 | Temporal | Deterministic replay is core (Event History replayed against code); ships **Replay testing** to detect non-determinism before deploy. ([docs](https://docs.temporal.io/develop/safe-deployments)) |
 | DBOS | Checkpoint/resume from the last completed step (not command-comparison replay); docs state workflow functions must be deterministic and keep I/O in steps. ([docs](https://docs.dbos.dev/architecture)) |
 | Inngest | Step-based memoization; docs state **no determinism requirement** on the orchestration layer (each step runs once, result persisted, completed steps skipped on retry). ([docs](https://www.inngest.com/docs/learn/how-functions-are-executed)) |
@@ -130,7 +156,7 @@ sourcing doc and flag anything unverified.
 
 | Engine | Capabilities |
 |---|---|
-| **autumn-harvest** | Cron + interval, with [jitter (#240)](https://github.com/autumn-foundation/autumn-harvest/issues/240), [overlap policy (#241)](https://github.com/autumn-foundation/autumn-harvest/issues/241), [calendars + backfill (#337)](https://github.com/autumn-foundation/autumn-harvest/issues/337), [bounded catchup window (#484)](https://github.com/autumn-foundation/autumn-harvest/issues/484), bounded/finite runs ([#478](https://github.com/autumn-foundation/autumn-harvest/issues/478) / [#543](https://github.com/autumn-foundation/autumn-harvest/issues/543)), [HA-safe multi-replica ticks (#350)](https://github.com/autumn-foundation/autumn-harvest/issues/350), [schedule run history (#534)](https://github.com/autumn-foundation/autumn-harvest/issues/534), [in-place schedule update (#771)](https://github.com/autumn-foundation/autumn-harvest/issues/771), [last-completion carryover (#488)](https://github.com/autumn-foundation/autumn-harvest/issues/488), plus start-shaping via [debounce (#499)](https://github.com/autumn-foundation/autumn-harvest/issues/499) and [throttle (#607)](https://github.com/autumn-foundation/autumn-harvest/issues/607). |
+| **autumn-harvest** | Cron + interval, with [jitter (#240)](https://github.com/autumn-foundation/autumn-harvest/issues/240), [overlap policy (#241)](https://github.com/autumn-foundation/autumn-harvest/issues/241) with every Temporal mode, `AllowAll` included ([#1985](https://github.com/autumn-foundation/autumn-harvest/issues/1985)), [calendars + backfill (#337)](https://github.com/autumn-foundation/autumn-harvest/issues/337), [bounded catchup window (#484)](https://github.com/autumn-foundation/autumn-harvest/issues/484), bounded/finite runs ([#478](https://github.com/autumn-foundation/autumn-harvest/issues/478) / [#543](https://github.com/autumn-foundation/autumn-harvest/issues/543)), [HA-safe multi-replica ticks (#350)](https://github.com/autumn-foundation/autumn-harvest/issues/350), [schedule run history (#534)](https://github.com/autumn-foundation/autumn-harvest/issues/534), [in-place schedule update (#771)](https://github.com/autumn-foundation/autumn-harvest/issues/771), [last-completion carryover (#488)](https://github.com/autumn-foundation/autumn-harvest/issues/488), plus start-shaping via [debounce (#499)](https://github.com/autumn-foundation/autumn-harvest/issues/499) and [throttle (#607)](https://github.com/autumn-foundation/autumn-harvest/issues/607). |
 | Temporal | Schedules with interval and calendar/cron spec; Catchup Window (default 1 year, min 10s); overlap policies (Skip, BufferOne, BufferAll, AllowAll, CancelOther, TerminateOther); Backfill. ([docs](https://docs.temporal.io/schedule)) |
 | DBOS | Cron-scheduled workflows (stored in DB, runtime create/pause/resume/delete), time zones, and automatic backfill of missed runs after downtime. Calendar-holiday / overlap-policy depth **(unverified)**. ([docs](https://docs.dbos.dev/python/tutorials/scheduled-workflows)) |
 | Inngest | Cron/scheduled functions with per-step retries. Calendar, catchup/backfill, and overlap-policy depth **(unverified)** from official docs in this pass. ([docs](https://www.inngest.com/uses/scheduled-jobs)) |
@@ -181,6 +207,79 @@ sourcing doc and flag anything unverified.
 | Hatchet | **MIT** ("100% MIT licensed") for the OSS core; Hatchet Cloud is the paid managed tier (some features gated to paid). ([repo](https://github.com/hatchet-dev/hatchet)) |
 | Restate | **Split:** server/runtime is **Business Source License 1.1** (source-available, not OSI-approved; converts to an open-source Change License after a set term — the exact change license/date is **(unverified)** against the LICENSE file in this pass); **SDKs are MIT**. ([repo](https://github.com/restatedev/restate)) |
 
+### 12. Durable agents
+
+This section uses one definition of a durable agent. It is a named,
+long-lived actor. It owns its state, handles one message at a time, wakes
+itself on timers and survives crashes. Issue
+[#2276](https://github.com/autumn-foundation/autumn-harvest/issues/2276)
+asks how Harvest compares on that definition, and on the mesh layer above it.
+
+The peers meet that definition only in part:
+
+- A Restate Virtual Object runs one exclusive handler for each key
+  ([services](https://docs.restate.dev/concepts/services)).
+- A Cloudflare Durable Object lets other requests interleave during a
+  `fetch()`
+  ([rules](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/)).
+- One invocation at a time on a Golem agent is **(unverified)**.
+
+This section compares a different set of peers from the tables above.
+Temporal stays, because it is in every table. DBOS, Inngest and Hatchet are out: the sources
+for this section cover only their agent-framework integrations. The
+competitor cells were checked on 2026-10-19. The Harvest cells ship in this
+release, unless a cell names an earlier issue.
+
+| Engine | Agent and inbox | Wakes | Crash recovery | Listing | Agent to agent | Authority across agents | Live tokens |
+|---|---|---|---|---|---|---|---|
+| **autumn-harvest** | An `Agent` is a keyed entity. Its id is `<kind>/<name>`, and it runs one op at a time ([#2263](https://github.com/autumn-foundation/autumn-harvest/issues/2263)). A paused agent holds its work in the inbox, in order. | Heartbeats with a precheck, and booked follow-ups ([#2266](https://github.com/autumn-foundation/autumn-harvest/issues/2266)). A wake races the op signal against a durable deadline, so a tick never overlaps a message. An unattended tick is read-only unless its heartbeat allows actions ([#1973](https://github.com/autumn-foundation/autumn-harvest/issues/1973)). | Replay of the recorded model turns and tool calls ([#1973](https://github.com/autumn-foundation/autumn-harvest/issues/1973)). A crash costs at most the step in flight. An idle agent holds no worker memory ([#2267](https://github.com/autumn-foundation/autumn-harvest/issues/2267)). | An indexed Postgres query over search attributes, such as `agent_status` and `agent_next_wake_at`. The CLI has `harvest agents list`, `describe`, `pause`, `resume` and `erase` ([#2267](https://github.com/autumn-foundation/autumn-harvest/issues/2267)). | A durable send by workflow id, with the key `<from>:<seq>`. A durable sender sets `from` to `<agent id>@<incarnation>`, and an `agent_loop` sender to its run id. The engine dedupes the key across continue-as-new. The receiver also skips a sender seq that it applied ([#2269](https://github.com/autumn-foundation/autumn-harvest/issues/2269)). [`AgentMesh.tla`](../formal/tla/AgentMesh.tla) checks exactly-once delivery across a crash and an owner change. A send into a waiting cycle fails at once as a deadlock. | A [mandate](agent-mesh.md) only narrows, in a tree and across processes ([PR #2148](https://github.com/autumn-foundation/autumn-harvest/pull/2148), [#2269](https://github.com/autumn-foundation/autumn-harvest/issues/2269)). Flow rules gate a forbidden label set across the tree. Siblings split one token budget ([#2270](https://github.com/autumn-foundation/autumn-harvest/issues/2270)). `MeshBudget` caps a mesh for each period ([#2272](https://github.com/autumn-foundation/autumn-harvest/issues/2272)). | The model-call activity sends each token delta with `ActivityContext::publish_progress`, over Postgres `pg_notify`. Nothing is stored. A durable route with `.live()` streams the deltas and the stored text of each turn on one route ([#2268](https://github.com/autumn-foundation/autumn-harvest/issues/2268)). On SQLite, an in-process `LiveSink` gets them. |
+| Golem | A durable agent is "a stateful sandbox per identity" ([blog](https://golem.cloud/blog/the-rise-of-the-agent-runtime/)). Its id is the agent type and its constructor parameters ([1.5](https://golem.cloud/blog/golem-1-5-the-agent-runtime/)). One invocation at a time is **(unverified)**. | Scheduled agent calls are durable and can be cancelled ([post](https://golem.cloud/blog/whats-this-golem-cloud-thing-about/)). A heartbeat with a precheck is **(unverified)**. | Oplog replay from the latest snapshot ([docs](https://learn.golem.cloud/v1.5/how-to-guides/ts/golem-configure-durability-ts)). Since 1.6, an epoch fence stops a stale executor from writing the oplog ([PR #3845](https://github.com/golemcloud/golem/pull/3845)). | `golem agent list` pages through agents with filters ([docs](https://learn.golem.cloud/how-to-guides/common/golem-list-and-filter-agents)). The docs say that enumeration is slow and not for application logic ([API](https://learn.golem.cloud/v1.5/develop/additional)). | Agent-to-agent calls run exactly once, with one key across retries and replays. `get` creates the target if it is absent ([post](https://golem.cloud/blog/whats-this-golem-cloud-thing-about/)). | Capability cards with upper bounds, and host-enforced tool mediation, for each agent ([blog](https://golem.cloud/blog/the-rise-of-the-agent-runtime/)). Quotas cap rate, capacity and concurrency ([1.5](https://golem.cloud/blog/golem-1-5-the-agent-runtime/)). Narrowing across an agent call, flow rules and a token budget across agents are **(unverified)**. | 1.6 adds Durable Streams and streaming methods ([1.6](https://golem.cloud/blog/golem-1-6-agents-tools-and-artifacts/)). Their use for model tokens is **(unverified)**. |
+| Cloudflare Agents SDK (Durable Objects) | An agent is a Durable Object ([Agent class](https://developers.cloudflare.com/agents/concepts/agent-class/)), addressed by name ([API](https://developers.cloudflare.com/durable-objects/api/namespace/)). An input gate holds events only during a storage call. A `fetch()` lets other requests interleave ([rules](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/)). | One alarm for each object, run at least once ([alarms](https://developers.cloudflare.com/durable-objects/api/alarms/)). The SDK keeps many schedules in SQL behind that alarm. `keepAlive()` uses alarm heartbeats ([Agent class](https://developers.cloudflare.com/agents/concepts/agent-class/)). | Each write to the SQLite storage of the object is replicated before it is confirmed ([blog](https://blog.cloudflare.com/sqlite-in-durable-objects/)). An object can restart at any time, and no shutdown hook runs ([lifecycle](https://developers.cloudflare.com/durable-objects/concepts/durable-object-lifecycle/)). Long multi-step work goes to Workflows ([changelog](https://developers.cloudflare.com/changelog/post/2026-02-03-agents-workflows-integration)). | No in-Worker API lists objects. Keep an index, for example in a parent object or in D1 ([rules](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/)). | RPC between objects. The cited docs give no delivery guarantee. They advise a retry only for an idempotent call ([errors](https://developers.cloudflare.com/durable-objects/best-practices/error-handling/)). | Not in the cited docs **(unverified)**. | An agent broadcasts its state to clients over WebSockets ([Agent class](https://developers.cloudflare.com/agents/concepts/agent-class/)). Streaming of model tokens is **(unverified)**. |
+| Restate (Virtual Objects) | A Virtual Object has a key. One exclusive handler runs for each key. Later calls wait in a per-key inbox, in arrival order ([services](https://docs.restate.dev/concepts/services), [calls](https://docs.restate.dev/develop/ts/service-communication)). | Durable timers and delayed messages ([docs](https://docs.restate.dev/concepts/durable_building_blocks)). A heartbeat with a precheck is **(unverified)**. | Journal replay. State updates commit with the journal steps ([concepts](https://docs.restate.dev/foundations/key-concepts)). Leader epochs fence stale attempts ([architecture](https://docs.restate.dev/references/architecture)). | SQL over the `state`, `sys_inbox` and `sys_locks` tables ([introspection](https://docs.restate.dev/references/sql-introspection)). A query scans the live partition stores, and a heavy query can slow invocations ([#5170](https://github.com/restatedev/restate/issues/5170)). | Calls, one-way messages and delayed messages are exactly once ([docs](https://docs.restate.dev/concepts/durable_building_blocks)). Calls between exclusive handlers can deadlock. Restate does not detect it, and an operator cancels by hand ([calls](https://docs.restate.dev/develop/ts/service-communication)). | Concurrency limits for each scope, experimental in 1.7 ([notes](https://github.com/restatedev/restate/blob/main/release-notes/v1.7.0.md)). Restate frames them around inference calls ([blog](https://restate.dev/blog/announcing-restate-1-7)). Mandates and flow rules across objects are **(unverified)**. | Not in the cited docs **(unverified)**. The AI SDK middleware journals model calls ([AI docs](https://docs.restate.dev/ai/index)). |
+| Temporal | A workflow, addressed by its Workflow Id ([server](https://docs.temporal.io/temporal-service/temporal-server)). Agent SDK integrations run each model call as an activity ([OpenAI Agents](https://docs.temporal.io/develop/python/integrations/openai-agents)). One message at a time is **(unverified)**. | Durable timers and Schedules ([docs](https://docs.temporal.io/schedule)). A heartbeat with a precheck is **(unverified)**. | Replay of the event history ([docs](https://docs.temporal.io/develop/safe-deployments)). | Visibility, a search index that Temporal updates asynchronously. It is eventually consistent ([docs](https://docs.temporal.io/visibility)). | A Signal is fire-and-forget. An Update returns a result. Signal-with-Start starts a missing target ([messages](https://docs.temporal.io/encyclopedia/workflow-message-passing), [Go](https://docs.temporal.io/develop/go/message-passing)). Nexus calls cross namespaces ([Replay 2026](https://temporal.io/blog/replay-2026-product-announcements)). | Principal Attribution (pre-release) records the caller in history for audit ([Replay 2026](https://temporal.io/blog/replay-2026-product-announcements)). Mandates, flow rules and budgets across agents are **(unverified)**. | Workflow Streams (Public Preview) streams token batches over Signals and Updates ([Replay 2026](https://temporal.io/blog/replay-2026-product-announcements)). |
+
+**What differs.** Golem, Cloudflare and Restate each ship a named actor
+that owns its state and survives a crash
+([Golem](https://learn.golem.cloud/v1.5/how-to-guides/ts/golem-configure-durability-ts),
+[Cloudflare](https://blog.cloudflare.com/sqlite-in-durable-objects/),
+[Restate](https://docs.restate.dev/foundations/key-concepts)). No
+cited peer doc shows a mandate that narrows across agents. None shows flow
+rules over a tree of agents, or a budget across a mesh. Golem comes
+closest, with a capability card for each agent
+([blog](https://golem.cloud/blog/the-rise-of-the-agent-runtime/)). Harvest ships these layers
+with the agent, and replay keeps them across a crash. The same holds for
+heartbeats with prechecks and for read-only unattended runs.
+
+**Workspaces.** Golem snapshots the filesystem of an agent to blob
+storage. An oplog entry confirms each snapshot, and a start uses only a
+confirmed one ([PR #4061](https://github.com/golemcloud/golem/pull/4061)).
+Those snapshots need XFS with reflink
+([PR #4061](https://github.com/golemcloud/golem/pull/4061)). A Harvest workspace is a set of files
+that the codec encrypts and that its digest names. History records the
+reference that a tool call made, so only a recorded result moves the head
+([#2274](https://github.com/autumn-foundation/autumn-harvest/issues/2274)).
+It needs no file system feature.
+
+**Harvest limits for agents.**
+
+- A peer send needs a running target. Start each agent of a mesh first.
+  A Golem `get`
+  ([post](https://golem.cloud/blog/whats-this-golem-cloud-thing-about/))
+  and a Temporal Signal-with-Start
+  ([messages](https://docs.temporal.io/encyclopedia/workflow-message-passing))
+  create a missing target.
+- Across shards, a send goes through the outbox. It lands up to one scanner
+  poll interval later.
+- On SQLite, live tokens reach only an in-process `LiveSink`. No HTTP
+  route serves them.
+- On SQLite, a running activity never sees a cancel. An interrupt ends the
+  wait, but the model call runs to its end.
+- Live tokens are best effort, and nothing stores them. A client that
+  reconnects reads the final text once.
+- A mandate carries no signature. Authenticate a remote caller as for any
+  request ([agent mesh](agent-mesh.md)).
+- The agent layer is Rust only, like the rest of Harvest.
+
 ---
 
 ## What sets harvest apart
@@ -219,7 +318,7 @@ replay tests alone:
 2. **[Deterministic side-effect primitives (#384)](https://github.com/autumn-foundation/autumn-harvest/issues/384)**
    give authors safe replacements (`ctx.system_now`, `ctx.new_uuid`,
    `ctx.random_*`) that record their value once and replay it verbatim.
-3. **The [`WorkflowReplayer` harness (Phase 3.5)](replay-verify.md)** replays a
+3. **The [`ReplayVerifier` gate (#251)](replay-verify.md)** replays a
    code change against recorded production histories in CI, so a non-determinism
    regression is a failed test, not a 2 a.m. page.
 4. **Non-terminal [ND-blocking (#603)](https://github.com/autumn-foundation/autumn-harvest/issues/603)**
@@ -229,6 +328,11 @@ replay tests alone:
    exactly where it was. Most engines in this set treat replay determinism as an
    author responsibility validated by replay tests; harvest additionally makes a
    divergent run a recoverable, observable state.
+
+Some engines skip replay and resume from step checkpoints instead.
+[Why Harvest keeps deterministic replay](why-deterministic-replay.md) states
+what replay buys, what it costs, and when a checkpoint-only engine is the
+better choice.
 
 ### 3. Embedded in your web app — no separate orchestrator cluster
 
@@ -280,7 +384,10 @@ where one exists.
   [#385](https://github.com/autumn-foundation/autumn-harvest/issues/385)), a
   [schedules management page (#333)](https://github.com/autumn-foundation/autumn-harvest/issues/333),
   [DAG list + detail pages (#426)](https://github.com/autumn-foundation/autumn-harvest/issues/426)
-  and a rendered DAG run graph. Temporal, Inngest, Hatchet, DBOS (Conductor), and Restate all
+  and a rendered DAG run graph. The workflow list takes `AND`/`OR` filter
+  expressions, and the list and detail pages update live
+  ([#1982](https://github.com/autumn-foundation/autumn-harvest/issues/1982)).
+  Temporal, Inngest, Hatchet, DBOS (Conductor), and Restate all
   ship more mature UIs today.
 - **Younger project, smaller ecosystem.** harvest is pre-1.0 (0.x, breaking
   changes in minor versions) with a smaller community, fewer third-party
@@ -298,26 +405,45 @@ where one exists.
   ([shard rebalancing](sharding.md#shard-rebalancing--migrating-quiescent-workflows-issue-964),
   [#964](https://github.com/autumn-foundation/autumn-harvest/issues/964)), but not
   running ones.
-- **No cross-engine benchmark on equal hardware.** harvest now publishes its
-  own reproducible end-to-end numbers and the harness that produces them
+- **Keyed entities are a library, not a native primitive.** `autumn_harvest::entity`
+  gives each key one handler at a time and durable state
+  ([ADR 0006](adr/0006-keyed-entity.md),
+  [#1975](https://github.com/autumn-foundation/autumn-harvest/issues/1975)). An
+  operation has no reply, so a caller reads state with a query. A Restate
+  virtual object call returns a result. An Azure durable entity call made from
+  an orchestration also returns one.
+- **Durable agents have backend limits.** A peer send needs a running target.
+  A Golem agent call and a Temporal Signal-with-Start create a missing one.
+  On SQLite, live tokens reach only an in-process `LiveSink`, and a running
+  model call never sees an interrupt. See [durable agents](#12-durable-agents).
+- **Behind Temporal on throughput, on one measured box.** harvest publishes
+  its own reproducible end-to-end numbers and the harness that produces them
   ([`benchmarks.md`](benchmarks.md),
-  [#941](https://github.com/autumn-foundation/autumn-harvest/issues/941)), so
-  this page no longer has to omit performance entirely. What is still missing
-  is the thing a comparison page actually needs: **every engine measured on
-  one machine, each tuned by someone who operates it.** No cell on this page
-  claims a throughput or latency comparison against another engine, and none
-  will until that exists. A competitor's own published figure is not a
-  substitute — it carries hardware, configuration and staleness this project
-  cannot vouch for, and its unit is usually per-action or per-state-transition
-  rather than per-workflow.
+  [#941](https://github.com/autumn-foundation/autumn-harvest/issues/941)).
+  [Assay #14](assays/0014-harvest-vs-temporal-0.7.0-depth-sweep.md)
+  ([#1972](https://github.com/autumn-foundation/autumn-harvest/issues/1972))
+  measures harvest 0.7.0 against Temporal 1.25.2 on one 4-core box. Both
+  engines use one Postgres server and run a 3-activity workflow. Temporal
+  completed more workflows/sec at every backlog depth from 250 to 2,000:
 
-  One same-box measurement now exists, and it goes against harvest.
-  [Assay #11](assays/0011-harvest-vs-temporal-single-box.md) ran harvest's
-  Postgres mode and Temporal's Go SDK on one 4-core box, against one Postgres
-  server, at one 3-activity shape. Harvest sustained 5.47 workflows/sec.
-  Temporal sustained 43.29. That is one shape on one box, so the tables above
-  still carry no performance cell. Read the assay for what the result may and
-  may not be read to mean.
+  | harvest mode | Temporal ahead by |
+  |:--|--:|
+  | default (Postgres claim path), 0.7.0 | 1.78x to 7.17x |
+  | Redis dispatch, 0.7.0 | 1.74x to 2.10x |
+  | default, with the #1971 claim fix (PR #2052, merged to `trunk-dev`, not yet released) | 1.16x to 1.36x |
+
+  Without the claim fix, the default-mode gap grows sharply with backlog
+  depth. With it, harvest's own rate stays flat, and the gap grows only from
+  1.16x to 1.36x.
+
+  The bounds matter more than the ratios. It is one workflow shape on one
+  small box, with Temporal at its defaults and its four services sharing four
+  cores. That venue favours harvest, so a better-tuned Temporal could widen
+  the gap. A competitor's own published figure is not a substitute: its
+  hardware, configuration and unit (often per action) differ. The assay
+  states what the result may and may not be read to mean. Its predecessor,
+  [assay #11](assays/0011-harvest-vs-temporal-single-box.md), measured the
+  same shape on 0.6.x on another host.
 
 ---
 
@@ -374,3 +500,13 @@ Temporal-style Schedule object.
   concept map, a workflow-porting checklist, and a dual-run cutover playbook.
   This page answers _why / whether_ harvest; the migration guide answers
   _how_ to move.
+- **[Why Harvest keeps deterministic replay](why-deterministic-replay.md)**
+  ([#1993](https://github.com/autumn-foundation/autumn-harvest/issues/1993)):
+  what replay buys over checkpoint-only steps, and how Harvest lowers its cost.
+- **[Durable agents](agent-adapter.md)** and the **[agent mesh](agent-mesh.md)**
+  ([#2262](https://github.com/autumn-foundation/autumn-harvest/issues/2262)):
+  the agent, its wakes, peers, mandates, flow rules and budgets.
+- **[Safety report](safety-report.md)**
+  ([#2004](https://github.com/autumn-foundation/autumn-harvest/issues/2004)):
+  the claim, tests, results and known limits for leases, fencing,
+  exactly-once completion and signal ordering.

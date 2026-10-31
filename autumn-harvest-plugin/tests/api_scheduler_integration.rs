@@ -383,6 +383,8 @@ fn recording_activity_info(name: &'static str) -> ActivityInfo {
         circuit_breaker: None,
         requires: None,
         handler: record_activity,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -408,6 +410,8 @@ fn blocking_activity_info(name: &'static str, start_to_close: Duration) -> Activ
         circuit_breaker: None,
         requires: None,
         handler: wait_on_barrier_activity,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -496,6 +500,8 @@ async fn insert_workflow_on_url(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -593,6 +599,8 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
+            tenant: None,
         },
         None,
     )
@@ -773,6 +781,7 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         })
         .execute(&mut conn)
         .await
@@ -1118,6 +1127,7 @@ async fn seed_scheduled_activity_task_from_url(
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         })
         .execute(&mut conn)
         .await
@@ -3543,6 +3553,11 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
         diesel::update(harvest_task_queue::table.find(task_id))
             .set((
                 harvest_task_queue::state.eq("RUNNING"),
+                harvest_task_queue::worker_id.eq(Some("race-worker")),
+                harvest_task_queue::attempt.eq(1),
+                // One attempt keeps the terminal timeout, which appends an
+                // event, as the path under test.
+                harvest_task_queue::max_attempts.eq(1),
                 harvest_task_queue::started_at
                     .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(60))),
                 harvest_task_queue::start_to_close.eq(Some(chrono::Duration::seconds(1))),
@@ -3599,7 +3614,8 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
     )
     .await
     .expect("failed to append competing completion event");
-    autumn_harvest::queue::complete_task(&mut lock_conn, task_id, json!({ "completed": true }))
+    let claim = autumn_harvest::queue::TaskClaim::new(task_id, "race-worker", 1);
+    autumn_harvest::queue::complete_task(&mut lock_conn, &claim, json!({ "completed": true }))
         .await
         .expect("failed to complete competing activity task");
     lock_conn
@@ -5070,6 +5086,8 @@ async fn setup_workflow_backfill_app(
     let api_state = HarvestApiState::new();
     // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
+    // The embedder owns the admin boundary, so trigger-now (an admin route) runs.
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         registry,
@@ -5579,6 +5597,107 @@ async fn backfill_max_runs_zero_is_treated_as_unlimited() {
     );
 }
 
+// ── Budget guards touch only their own schedule (issue #2423) ───────────────
+
+/// Copy `source` into a second schedule row, the bystander.
+///
+/// The bystander has a budget of ten runs, three started runs and an `end_at`
+/// exhaustion. A budget statement for `source` must leave all three intact.
+async fn insert_exhausted_bystander_schedule(database_url: &str, source: uuid::Uuid) -> uuid::Uuid {
+    let bystander = uuid::Uuid::new_v4();
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect to insert the bystander schedule");
+    conn.batch_execute(&format!(
+        "CREATE TEMP TABLE bystander AS SELECT * FROM harvest_schedules WHERE id = '{source}'; \
+         UPDATE bystander SET id = '{bystander}', workflow_name = 'budget_bystander_wf', \
+             max_runs = 10, runs_started = 3, exhausted_at = NOW(), \
+             exhausted_reason = 'end_at_reached'; \
+         INSERT INTO harvest_schedules SELECT * FROM bystander;"
+    ))
+    .await
+    .expect("insert the bystander schedule");
+    bystander
+}
+
+/// Assert that the bystander kept its run count and its exhaustion.
+async fn assert_bystander_untouched(database_url: &str, bystander: uuid::Uuid) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect to load the bystander schedule");
+    let row: HarvestSchedule = harvest_schedules::table
+        .find(bystander)
+        .select(HarvestSchedule::as_select())
+        .first(&mut conn)
+        .await
+        .expect("bystander schedule row");
+    assert_eq!(
+        row.runs_started, 3,
+        "a budget statement for another schedule changed the bystander run count"
+    );
+    assert!(
+        row.exhausted_at.is_some(),
+        "a budget statement for another schedule cleared the bystander exhaustion"
+    );
+    assert_eq!(row.exhausted_reason.as_deref(), Some("end_at_reached"));
+}
+
+/// Trigger-now reserves a run slot on its own schedule only.
+#[tokio::test]
+async fn trigger_now_budget_reservation_touches_only_its_schedule() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "trigger_budget_scope_wf";
+    let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, Some(5)).await;
+    let bystander = insert_exhausted_bystander_schedule(&database_url, schedule.id).await;
+
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/trigger", schedule.id),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let reloaded = load_workflow_only_schedule_from_url_optional(&database_url, name)
+        .await
+        .expect("schedule row should still exist");
+    assert_eq!(reloaded.runs_started, 1, "the trigger reserves one slot");
+    assert_bystander_untouched(&database_url, bystander).await;
+}
+
+/// Backfill reserves and releases run slots on its own schedule only.
+///
+/// Every slot overflows the input cap, so each slot reserves, then releases.
+/// The release also runs the clear statement for a stale exhaustion.
+#[tokio::test]
+async fn backfill_budget_reserve_and_release_touch_only_their_schedule() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "backfill_budget_scope_wf";
+    let input = json!({ "blob": "x".repeat(2 * 1024 * 1024 + 1024) });
+    let (app, schedule) =
+        setup_throttled_workflow_backfill_app(&database_url, pool, name, Some(5), input).await;
+    let bystander = insert_exhausted_bystander_schedule(&database_url, schedule.id).await;
+
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T11:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["skipped_reasons"]["oversized_input"], json!(2));
+
+    assert_bystander_untouched(&database_url, bystander).await;
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn backfill_dag_over_window_dispatches_only_remaining_budget() {
@@ -6026,6 +6145,8 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             circuit_breaker: None,
             requires: None,
             handler: record_activity,
+            input_schema: None,
+            output_schema: None,
         }],
         Arc::new(state),
     ));
@@ -8172,6 +8293,7 @@ async fn insert_running_execution_for(database_url: &str, wf_name: &str) {
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            tenant: None,
         })
         .execute(&mut conn)
         .await
@@ -8564,4 +8686,96 @@ async fn schedule_api_surfaces_effective_execution_timeout_and_sla() {
         single["sla_secs"], 10_800,
         "GET /admin/schedules/{{id}} must resolve sla_secs identically to the list route: {single}"
     );
+}
+
+/// Issue #2385: `PATCH /dags/{dag_name}` sets and clears a schedule override.
+///
+/// The override wins over the code value, a pause keeps it, and a bad value
+/// writes nothing.
+#[tokio::test]
+async fn harvest_api_patch_dag_sets_and_clears_a_schedule_override() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_name = "override_pipeline";
+    let dag_catalog = Arc::new(
+        compile_dag_catalog(vec![DagInfo {
+            schedule: Some(Schedule::Interval(std::time::Duration::from_secs(3600))),
+            ..unified_manual_dag_info_named(dag_name, "dag-workers")
+        }])
+        .expect("scheduled unified DAG should compile"),
+    );
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info_named(dag_name)],
+        vec![],
+    ));
+    let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
+    api_state.set_allow_unauthenticated_mutations(true);
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::clone(&dag_catalog),
+        Arc::new(Vec::new()),
+        Some("scheduler-only".to_string()),
+        vec!["dag-workers".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state);
+    let route = format!("/dags/{dag_name}");
+
+    let (status, body) = patch_json(
+        &app,
+        route.clone(),
+        json!({ "schedule_expr": "interval:60", "reason": "incident" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["schedule_expr"], "interval:60");
+    assert!(body["next_run_at"].is_string(), "{body}");
+
+    for bad in [
+        json!({ "schedule_expr": "interval:0" }),
+        json!({ "schedle_expr": "interval:30" }),
+        json!({}),
+        json!({ "timezone": "UTC" }),
+        json!({ "overlap_policy": "sometimes" }),
+        json!({ "clear_override": true, "catchup": true }),
+    ] {
+        let (status, body) = patch_json(&app, route.clone(), bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} -> {body}");
+    }
+    assert_eq!(
+        load_schedule_from_url(&database_url, dag_name)
+            .await
+            .schedule_expr
+            .as_deref(),
+        Some("interval:60"),
+        "a rejected patch must leave the override in force"
+    );
+
+    let (status, body) = patch_json(&app, route.clone(), json!({ "paused": true })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["is_paused"], true);
+    assert_eq!(
+        body["schedule_expr"], "interval:60",
+        "a pause keeps the override"
+    );
+
+    let (status, body) = patch_json(&app, route.clone(), json!({ "clear_override": true })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["schedule_expr"], "interval:3600");
+    assert_eq!(
+        body["is_paused"], true,
+        "clearing the override keeps the pause"
+    );
+
+    let (status, body) = patch_json(
+        &app,
+        "/dags/not_registered".to_string(),
+        json!({ "schedule_expr": "interval:60" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }

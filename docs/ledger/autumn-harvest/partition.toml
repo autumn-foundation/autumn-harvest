@@ -1,0 +1,200 @@
+# Ledger profiles for `autumn-harvest/src/partition.rs`. See `docs/ledger/README.md`.
+
+["bounded_rename_name"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["capture_index_defs"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["cohort_has_rows_for"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["cohort_occupancy"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["constraint_backed_unique_indexes_on_partitioned_parent"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["ddl", "read"]
+tables = ["entity", "harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["delete_orphan_rows"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["dependent_views"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["deployed_cohort_width"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["detect_layout"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["disable_partitioning"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["ddl", "read", "write"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["drain_default_bounded_inner"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["ddl", "read", "write"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["enable_partitioning"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["ddl", "read"]
+tables = ["entity", "harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+
+["exec"]
+driver = "setup"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["explicitly_published_by"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["inbound_foreign_keys"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["incompatible_publications"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["list_partitions"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["maintenance_owner_gap"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["operator_triggers"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["restore_session_limits"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["row_security_config"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["scalar_bool"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["switch_off_session_limits"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["unique_indexes_missing_cohort"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"
+
+["unreplayable_constraints"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_workflow_executions"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/partition.md"

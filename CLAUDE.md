@@ -141,6 +141,15 @@ mutation of the **task queue** row, not of the event log. The `#2` / `#3`
 numbering above is kept because the issues and their PRs use it, but there are
 two `event_data` writers, not three.
 
+The rotation sweep also rewrites `codec_rotation::CODEC_COLUMNS` (issue
+#1979). Those tables are not append-only, so that pass is not an exception.
+`the_column_sweep_loses_to_an_erasure` proves that it loses to an erasure.
+
+`harvest_entity_state` (issue #2259) is not an exception either. It is a
+projection of entity snapshot events. The trigger
+`harvest_entity_state_projection_trg` writes it on `INSERT` into
+`harvest_events`, so it never rewrites an event.
+
 If you add another exception, it belongs in this list, with its own scope
 guarantee and its own proof.
 
@@ -166,8 +175,8 @@ That order is load-bearing.
 
 The partition layout changes rebuild `harvest_events` with `LIKE`, which copies
 no triggers. `enable_sql`, `migration_plan_steps` and `disable_partitioning`
-reinstall the guard, and `operator_triggers` exempts it by its exact shape. A
-new layout path must do the same.
+reinstall the guard and the entity projection trigger. `operator_triggers`
+exempts both by their exact shape. A new layout path must do the same.
 
 A test fixture that must rewrite a row calls `append_only::with_guard_off`. It
 turns off every trigger for one transaction and needs a superuser. Production
@@ -177,6 +186,74 @@ need them.
 
 A new sanctioned writer needs a new `EventRewrite` variant, a migration that
 adds its value to the trigger, and an entry in the list above.
+
+**The SQLite backend (issue #2031).** Its `harvest_events` has its own guard
+in `autumn-harvest-sqlite/src/schema.rs`. It has no sanctioned writer, so it
+refuses every `UPDATE`, and an `INSERT OR REPLACE` over a stored event. A
+test fixture calls `autumn_harvest_sqlite::append_only::with_guard_off`.
+
+### Decision owner fence (issue #2249)
+
+[ADR 0009](docs/adr/0009-decision-owner.md) defines owner mode. Issue #2251
+builds it. Code for owner mode follows these rules:
+
+- A decision commit takes the generation row, then its owner row
+  `FOR KEY SHARE`. It takes the owner row before any execution row, task
+  row or advisory lock.
+- An owned claim takes its owner row `FOR KEY SHARE SKIP LOCKED` in the
+  claim guard, after its task row. It never waits for that row (issue
+  #2252).
+- The commit compares holder and epoch. A mismatch aborts the whole
+  transaction. The commit never checks the lease end.
+- An acquisition takes the owner row `FOR UPDATE`, then increments the
+  epoch. Never change the epoch with a plain `UPDATE` or an upsert. Neither
+  one drains in-flight commits.
+- A batch acquisition takes its rows `FOR UPDATE SKIP LOCKED`, in
+  ascending partition order. It increments the epoch only on the rows
+  that it locked (issue #2296).
+- A renewal changes the lease end only. Renewal, release and revoke match
+  holder and epoch. A release keeps the epoch.
+- A statement on many owner rows locks them in ascending partition order.
+- A fenced owner unloads the partition and never retries at the stale
+  epoch.
+- A commit or an owned claim takes one owner row only. A foreign writer
+  takes none.
+- A decision transaction fences once. `decision_owner::fenced_scope` marks
+  the rest of that transaction as fenced. Wrap only the body after a passed
+  fence. A nested fence of the same connection then sends no query (issue
+  #2252).
+- An acknowledgement never comes from owner memory. It follows a durable
+  write.
+- The owner decider (issue #2255) takes a workflow task with the owned
+  by-execution claim, so no claim gate is skipped. It keeps execution ids as
+  hints only. A lost hint costs latency. Its scan finds the row.
+- With a DR pin, one statement fences the generation row, then the owner
+  row. An append in the fenced scope checks neither row again only when the
+  start fence took the same generation row.
+- List, search and describe read Postgres, never an owner cache.
+
+`decision_owner_lock_modes_db_tests.rs` proves the lock modes.
+
+## Ledger Profiles
+
+Every function that sends SQL needs a Ledger profile in `docs/ledger/`
+(issue #2364). CI's `lint` job runs `docs/audits/ledger-profiles.py`. It
+fails on a query with no profile, and on a profile that no longer matches
+its query. When you add, rename or change a query, run the gate. Print a stub
+with `--scaffold`, then choose its `driver`. When Ledger measures a query,
+set `measured` to the page. Read `docs/ledger/README.md` for the fields.
+
+## Performance Agents
+
+Do not profile the strict replay path again (`WorkflowReplayer::replay_from_events`,
+`benches/replay_profile.rs`). Repeated runs found nothing addressable. About 88%
+of the instructions are the harness building its own history and payloads, and
+the freeing of owned events. The strict matching code is spread over many
+functions, each under 6%. `docs/performance-replay.md` records the one fix that
+was available. That harness never runs the non-strict `match_activity` path that
+ordinary workers use. `docs/performance-match-activity-fanout.md` measures that
+path (issue #2330). Pick a different path, and check `docs/performance-*.md`
+first so you do not repeat one that is already measured.
 
 ## Project Documentation
 
@@ -192,3 +269,29 @@ have homes:
   record. Two guard suites read it as data, so treat it as load-bearing.
 - [`docs/changelog.d/README.md`](docs/changelog.d/README.md) — where a feature
   PR's changelog entry goes (a fragment file, never the shared phase list).
+- [`docs/design/README.md`](docs/design/README.md) — where a design record
+  (`DESIGN-<issue>.md`), a plan, an ADR or an R&D note goes.
+
+### Never write a document at the repository root
+
+A design record goes in `docs/design/`, not the root. So does any other
+planning or scratch document. `docs/audits/root-files.py` fails the `lint`
+job on a root file that is not in its allow list. Do not add an entry to
+make a document pass. Move the document.
+
+### Keep docs guards from becoming conflict magnets
+
+A docs guard that makes every feature PR edit the same lines makes open PRs
+conflict with each other. Two shapes caused this, and both are now banned:
+
+- **A live count in prose.** "68 of the 137 core modules" or "132 migrations"
+  changes with almost every PR. State a ratio or a bound, and guard that the
+  ratio holds. `sqlite_feasibility_docs` shows the pattern.
+- **A hand-written copy of another page.** When the source page changes on
+  `trunk-dev`, every open branch ports its own wording, and the ports
+  conflict. Mirror the source verbatim and regenerate the mirror with a
+  command. Identical ports merge cleanly. `safety_report_docs` shows the
+  pattern: run its guards with `UPDATE_DOC_MIRRORS=1`.
+
+When a docs guard goes red on `trunk-dev`, fix it once in a small dedicated
+PR. Do not port a hand-written fix into each feature branch.

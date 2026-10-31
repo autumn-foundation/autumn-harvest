@@ -1,0 +1,32 @@
+# Ledger profiles for `autumn-harvest/src/admission_gate.rs`. See `docs/ledger/README.md`.
+
+["db::create_gate"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_admission_gates"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/admission_gate.md"
+
+["db::lift_gate"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_admission_gates"]
+measured = "unmeasured"
+
+["db::list_gates"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_admission_gates"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/admission_gate.md"
+
+["db::load_active_gates"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_admission_gates"]
+measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest/admission_gate.md"
