@@ -355,6 +355,11 @@ ignore = true
 # candidate for a dedicated dedup PR, not bundled into this harness.
 multiple-versions = "warn"
 wildcards = "deny"
+# A path-only dev-dependency has no version, so cargo-deny reads it as a
+# wildcard. `autumn-harvest` needs one to `autumn-harvest-agent`: a versioned
+# edge makes a cycle that blocks a workspace `cargo publish`. Cargo strips
+# path-only dev-dependencies on publish, so this never reaches crates.io.
+allow-wildcard-paths = true
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
