@@ -926,6 +926,10 @@ jobs:
       - name: Compile db-backed tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         shell: bash
+        env:
+          # The same limit as the manifest compile step above. Without it, the
+          # Windows runner fails with os error 1455 here too.
+          CARGO_BUILD_JOBS: ${{ runner.os == 'Windows' && '2' || 'default' }}
         run: |
           cargo test -p autumn-harvest --all-features --lib --no-run
           cargo test -p autumn-harvest --all-features --tests --no-run
