@@ -127,14 +127,13 @@ type BoxFut<'a> =
 
 /// Counts the run and the attempt, then answers.
 fn counted_call(ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> BoxFut<'_> {
-    {
-        let mut all = RUNS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = all.entry(ctx.activity_type().to_owned()).or_default();
-        entry.0 += 1;
-        entry.1 = entry.1.max(ctx.attempt());
-    }
+    let mut all = RUNS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = all.entry(ctx.activity_type().to_owned()).or_default();
+    entry.0 += 1;
+    entry.1 = entry.1.max(ctx.attempt());
+    drop(all);
     Box::pin(async move { Ok(input) })
 }
 
@@ -230,8 +229,8 @@ fn build_worker(queue: &str, high: Arc<AtomicBool>, gauge: Arc<HoldGauge>) -> Ar
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
-                worker_id: worker_id.clone(),
-                queues: vec![queue.clone()],
+                worker_id,
+                queues: vec![queue],
                 notification_database_url: None,
                 max_concurrent_workflows: 8,
                 max_concurrent_activities: 32,

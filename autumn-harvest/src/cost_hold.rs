@@ -369,11 +369,12 @@ mod tests {
     fn the_skip_list_follows_the_signal() {
         let (high, read) = switch();
         let hold = CostHold::new(read, ["train_model"]);
-        assert!(hold.exclusions().is_empty());
+        let none: &[String] = &[];
+        assert_eq!(hold.exclusions(), none);
         high.store(true, Ordering::Relaxed);
         assert_eq!(hold.exclusions(), ["\u{1}train_model".to_owned()]);
         high.store(false, Ordering::Relaxed);
-        assert!(hold.exclusions().is_empty());
+        assert_eq!(hold.exclusions(), none);
     }
 
     #[cfg(feature = "db")]
@@ -388,7 +389,12 @@ mod tests {
         hold.holds();
         high.store(true, Ordering::Relaxed);
         hold.holds();
-        hold.clone().holds();
+        // A clone on another claim loop shares the state, so it reports no
+        // second change.
+        let twin = hold.clone();
+        std::thread::spawn(move || twin.holds())
+            .join()
+            .expect("the twin reads the signal");
         high.store(false, Ordering::Relaxed);
         hold.holds();
         assert_eq!(*gauge.0.lock().expect("gauge lock"), [false, true, false]);

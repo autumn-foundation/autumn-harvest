@@ -905,7 +905,7 @@ mod tests {
             &WorkerConfig::default(),
             Duration::from_millis(500),
         );
-        assert!(off.cost_hold_activities.is_empty());
+        assert_eq!(off.cost_hold_activities, Vec::<String>::new());
         let worker = WorkerConfig::default().with_cost_hold(crate::cost_hold::CostHold::new(
             || true,
             ["train_model", "rebuild_index"],
