@@ -107,7 +107,8 @@ How can an overlay candidate give a wrong or unsafe report?
   Each part must reach the task, or fail.
 - **Black.** The guidance part overlaps #2373. The PR says so, and #2373
   keeps skills. `Candidate::model` now refuses an unknown model before any
-  call, not at the first turn. Guidance replaces operator text, as
+  call, not at the first turn. It also refuses a model that the source
+  mandate forbids, which used to run unchecked. Guidance replaces operator text, as
   `system` does, and no ceiling bounds which tools it names. The policy
   and the tool rules still decide each call. `UnknownTool` tells a
   proposer which tools the harness holds, as `UnknownModel` does for

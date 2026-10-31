@@ -26,9 +26,11 @@ tool. `AgentHarness::has_tool`, `BUILTIN_TOOLS` and
 holds no tool. A delegated child takes no guidance. `compare` checks both
 overlays before the first model call.
 
-Behaviour change: `Candidate::model` with a model that the harness or the
-source mandate does not hold now fails with `EvalError::Overlay` before any
-call. Before, the candidate run failed at its first turn.
+Behaviour change: `Candidate::model` now sets the task model and checks
+it before any call. A model that the harness does not hold used to fail at
+the first turn. A model that the source mandate forbids used to run
+unchecked. Both now fail with `EvalError::Overlay`. A delegated child
+with no peer model now inherits the model.
 
 No event, migration or SQL changes. Serde skips an empty map, so a
 recorded task and a recorded turn input replay as they ran. A struct
