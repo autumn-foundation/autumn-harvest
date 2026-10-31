@@ -156,6 +156,27 @@ pub fn mix64(mut x: u64) -> (r: u64) ensures r == spec_mix64(x),
 pub fn dlq_mix64(seed: u64) -> (r: u64) ensures r == spec_mix64(seed),
 pub fn splitmix64(seed: u64) -> (r: u64) ensures r == spec_splitmix64(seed),
 
+## formal/verus/src/overlay_log.rs
+pub open spec fn spec_next_overlay_version(latest: Option < u64 >) -> Option < u64 > { match latest { None => Some(1u64), Some(last) => if last < u64::MAX { Some((last + 1) as u64) } else { None }, } }
+pub fn next_overlay_version(latest: Option < u64 >) -> (r: Option < u64 >) ensures r == spec_next_overlay_version(latest), latest.is_none() ==> r == Some(1u64), latest.is_some() && r.is_some() ==> r.unwrap() == latest.unwrap() + 1, r.is_none() ==> latest == Some(u64::MAX),
+pub enum ActivateDecision { Activate, UnknownVersion, Conflict, }
+pub open spec fn spec_decide_activate(known: bool, expected: Option < u64 >, actual: Option < u64 >) -> ActivateDecision { if ! known { ActivateDecision::UnknownVersion } else if expected == actual { ActivateDecision::Activate } else { ActivateDecision::Conflict } }
+pub fn decide_activate(known: bool, expected: Option < u64 >, actual: Option < u64 >) -> (r: ActivateDecision) ensures r == spec_decide_activate(known, expected, actual), ! known <==> r == ActivateDecision::UnknownVersion, r == ActivateDecision::Activate <==> known && expected == actual,
+pub struct Log { pub bodies: Seq < int >, pub active: Option < u64 >, }
+pub open spec fn latest(log: Log) -> Option < u64 > { if log.bodies.len() == 0 { None } else { Some(log.bodies.len() as u64) } }
+pub open spec fn holds(log: Log, v: u64) -> bool { 1 <= v && v <= log.bodies.len() }
+pub open spec fn inv(log: Log) -> bool { log.bodies.len() <= u64::MAX && match log.active { None => true, Some(v) => holds(log, v), } }
+pub open spec fn put(log: Log, body: int) -> Log { if spec_next_overlay_version(latest(log)).is_some() { Log { bodies: log.bodies.push(body), active: log.active } } else { log } }
+pub open spec fn activate(log: Log, v: u64, expected: Option < u64 >) -> Log { if spec_decide_activate(holds(log, v), expected, log.active) == ActivateDecision::Activate { Log { bodies: log.bodies, active: Some(v) } } else { log } }
+pub enum Op { Put(int), Activate(u64, Option < u64 >), }
+pub open spec fn step(log: Log, op: Op) -> Log { match op { Op::Put(body) => put(log, body), Op::Activate(v, expected) => activate(log, v, expected), } }
+pub open spec fn run(log: Log, ops: Seq < Op >) -> Log decreases ops.len(), { if ops.len() == 0 { log } else { run(step(log, ops [0]), ops.drop_first()) } }
+pub proof fn theorem_a_put_appends_a_new_top_version(log: Log, body: int) requires inv(log), log.bodies.len() < u64::MAX, ensures spec_next_overlay_version(latest(log)) == Some((log.bodies.len() + 1) as u64), forall | v: u64 | holds(log, v) ==> v < log.bodies.len() + 1, put(log, body).bodies.len() == log.bodies.len() + 1, put(log, body).bodies.subrange(0, log.bodies.len() as int) == log.bodies, put(log, body).bodies [log.bodies.len() as int] == body, put(log, body).active == log.active, inv(put(log, body)),
+pub proof fn theorem_a_refused_activate_changes_nothing(log: Log, v: u64, expected: Option < u64 >) ensures ! holds(log, v) ==> activate(log, v, expected) == log, expected != log.active ==> activate(log, v, expected) == log, activate(log, v, expected).bodies == log.bodies,
+pub proof fn theorem_a_step_keeps_the_invariant(log: Log, op: Op) requires inv(log), ensures inv(step(log, op)),
+pub proof fn theorem_no_call_rewrites_a_version(log: Log, ops: Seq < Op >) requires inv(log), ensures inv(run(log, ops)), log.bodies.len() <= run(log, ops).bodies.len(), run(log, ops).bodies.subrange(0, log.bodies.len() as int) == log.bodies, decreases ops.len(),
+pub proof fn theorem_exactly_one_of_two_activates_wins(log: Log, first: u64, second: u64) requires inv(log), holds(log, first), holds(log, second), log.active != Some(first), ensures spec_decide_activate(holds(log, first), log.active, log.active) == ActivateDecision::Activate, activate(log, first, log.active).active == Some(first), spec_decide_activate(holds(activate(log, first, log.active), second), log.active, activate(log, first, log.active).active,) == ActivateDecision::Conflict, activate(activate(log, first, log.active), second, log.active) == activate(log, first, log.active,),
+
 ## formal/verus/src/owner_fence.rs
 pub fn next_epoch(epoch: i64) -> (r: Option < i64 >) ensures epoch < i64::MAX ==> r == Some((epoch + 1) as i64), epoch == i64::MAX ==> r == None::< i64 >,
 pub fn fence_passes(pinned: i64, row: i64, holder_matches: bool) -> (r: bool) ensures r == (holder_matches && pinned == row), pinned < row ==>! r, pinned > row ==>! r,

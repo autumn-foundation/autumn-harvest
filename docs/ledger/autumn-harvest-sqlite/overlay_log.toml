@@ -1,0 +1,43 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/overlay_log.rs`. See `docs/ledger/README.md`.
+
+["activate_in"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_agent_overlay_heads", "harvest_agent_overlays"]
+measured = "unmeasured"
+
+["SqliteOverlayLog::active"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_agent_overlay_heads", "harvest_agent_overlays"]
+measured = "unmeasured"
+
+["append_in"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_agent_overlay_heads", "harvest_agent_overlays"]
+measured = "unmeasured"
+
+["SqliteOverlayLog::get"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_agent_overlays"]
+measured = "unmeasured"
+
+["SqliteOverlayLog::list"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_agent_overlays"]
+measured = "unmeasured"
+
+["SqliteOverlayLog::prepare"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["ddl", "read"]
+tables = ["harvest_agent_overlay_heads", "harvest_agent_overlays"]
+measured = "unmeasured"

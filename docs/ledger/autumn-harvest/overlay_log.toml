@@ -1,0 +1,43 @@
+# Ledger profiles for `autumn-harvest/src/overlay_log.rs`. See `docs/ledger/README.md`.
+
+["pg::active_overlay"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_agent_overlay_heads", "harvest_agent_overlays"]
+measured = "unmeasured"
+
+["pg::append_overlay"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_agent_overlay_heads", "harvest_agent_overlays"]
+measured = "unmeasured"
+
+["pg::get_overlay"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_agent_overlays"]
+measured = "unmeasured"
+
+["pg::list_overlays"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_agent_overlays"]
+measured = "unmeasured"
+
+["pg::lock_overlay_head"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_agent_overlay_heads", "harvest_agent_overlays"]
+measured = "unmeasured"
+
+["pg::set_overlay_pointer"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_agent_overlay_heads"]
+measured = "unmeasured"

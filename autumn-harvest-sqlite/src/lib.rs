@@ -787,6 +787,7 @@ mod history_cap;
 mod llm_ledger;
 mod lock;
 mod mutex;
+mod overlay_log;
 mod query;
 mod queue;
 mod retention;
@@ -804,6 +805,7 @@ pub use autumn_harvest::{ExecutionId, WorkflowEvent};
 pub use crate::error::{SqliteError, SqliteResult};
 pub use crate::history_cap::HistoryCapReason;
 pub use crate::llm_ledger::LlmLedgerRow;
+pub use crate::overlay_log::{OVERLAY_SCHEMA, SqliteOverlayLog};
 pub use crate::query::DEFAULT_QUERY_TIMEOUT;
 pub use crate::runtime::{
     ActivityBody, ActivitySpec, ExecutionOutcome, LedgerActivityBody, RunState, SignalDelivery,

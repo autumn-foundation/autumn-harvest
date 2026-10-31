@@ -35,6 +35,7 @@
 pub mod dedupe;
 pub mod inbox;
 pub mod overlay;
+pub mod overlay_store;
 pub mod wake;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

@@ -243,7 +243,8 @@ fn allowlisted(key: &str) -> bool {
 struct SuiteRow {
     /// `linux` | `linuxpart` | `allos` | `compileonly`.
     osclass: String,
-    /// `autumn-harvest` | `autumn-harvest-conformance` | `autumn-harvest-plugin`
+    /// `autumn-harvest` | `autumn-harvest-agent` | `autumn-harvest-conformance`
+    /// | `autumn-harvest-plugin`
     /// | `autumn-harvest-redis` | `agent-mesh` | `history-load-gate`
     /// | `standalone-runner`.
     krate: String,
@@ -300,6 +301,8 @@ fn parse_manifest() -> Vec<SuiteRow> {
     const VALID_OSCLASS: &[&str] = &["linux", "linuxpart", "allos", "compileonly"];
     const VALID_CRATE: &[&str] = &[
         "autumn-harvest",
+        // Issue #2371: the Postgres overlay store suite.
+        "autumn-harvest-agent",
         // Issue #2030: the cross-backend conformance suite.
         "autumn-harvest-conformance",
         "autumn-harvest-plugin",
