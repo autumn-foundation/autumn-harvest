@@ -376,23 +376,7 @@ fn design_note_keeps_its_planning_sections() {
 // AC-48
 #[test]
 fn changelog_fragment_describes_the_feature() {
-    let dir = workspace_root().join("docs/changelog.d");
-    let fragments: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .expect("changelog.d")
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with("-durable-routes.md"))
-        })
-        .collect();
-    assert_eq!(fragments.len(), 1, "exactly one durable-routes fragment");
-    let text = std::fs::read_to_string(&fragments[0]).expect("fragment");
-    assert!(
-        text.starts_with("## "),
-        "the fragment starts with a heading"
-    );
+    let text = shipped_work_entry("Durable routes: an Autumn route");
     assert!(text.contains("Durable routes"));
     assert!(text.contains("No migration"));
     assert!(text.contains("No new `WorkflowEvent`"));
@@ -401,24 +385,28 @@ fn changelog_fragment_describes_the_feature() {
 // SAC-38
 #[test]
 fn stream_changelog_fragment_describes_the_feature() {
-    let dir = workspace_root().join("docs/changelog.d");
-    let fragments: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .expect("changelog.d")
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with("-durable-streaming.md"))
-        })
-        .collect();
-    assert_eq!(fragments.len(), 1, "exactly one durable-streaming fragment");
-    let text = std::fs::read_to_string(&fragments[0]).expect("fragment");
-    assert!(
-        text.starts_with("## "),
-        "the fragment starts with a heading"
-    );
+    let text = shipped_work_entry("Durable streaming: a durable route");
     assert!(text.contains("Durable streaming"));
     assert!(text.contains("No migration"));
     assert!(text.contains("No new `WorkflowEvent`"));
+}
+
+/// The shipped-work entry whose first line names `title`.
+///
+/// The 0.8.0 collation sweep folded each changelog fragment into
+/// `docs/shipped-work.md`. An entry runs to the next `- **` line in the first
+/// column.
+fn shipped_work_entry(title: &str) -> String {
+    let text = std::fs::read_to_string(workspace_root().join("docs/shipped-work.md"))
+        .expect("docs/shipped-work.md");
+    let mut lines = text
+        .lines()
+        .skip_while(|l| !(l.starts_with("- **") && l.contains(title)));
+    let first = lines
+        .next()
+        .unwrap_or_else(|| panic!("docs/shipped-work.md has no entry for {title:?}"));
+    std::iter::once(first)
+        .chain(lines.take_while(|l| !l.starts_with("- **")))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
