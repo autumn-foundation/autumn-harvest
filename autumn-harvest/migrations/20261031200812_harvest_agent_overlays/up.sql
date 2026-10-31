@@ -15,10 +15,13 @@
 -- key keeps it on a stored version, so the active version cannot be
 -- deleted.
 --
--- The trigger refuses each UPDATE of a version row, as the `harvest_events`
--- guard of issue #1817 does. It stops mistakes. It is not a security
--- boundary: a superuser can disable triggers. DELETE is not guarded, so a
--- later erasure can remove a version that is not active.
+-- One trigger refuses each UPDATE of a version row, as the `harvest_events`
+-- guard of issue #1817 does. A second trigger refuses the DELETE of a head
+-- row. So `latest` never goes back, and no version number comes back with
+-- other bytes. The triggers stop mistakes. They are not a security
+-- boundary: the table owner or a superuser can disable them, and TRUNCATE
+-- is not guarded. DELETE of a version row that is not active stays open,
+-- so a later erasure can remove it.
 --
 -- The tables are new and not hot. No other session holds a lock on them.
 -- The timeout bounds the trigger and the foreign key all the same.
@@ -60,6 +63,25 @@ COMMENT ON FUNCTION harvest_agent_overlays_guard_immutable() IS
 CREATE TRIGGER harvest_agent_overlays_immutable_trg
     BEFORE UPDATE ON harvest_agent_overlays
     FOR EACH ROW EXECUTE FUNCTION harvest_agent_overlays_guard_immutable();
+
+CREATE OR REPLACE FUNCTION harvest_agent_overlay_heads_guard_delete()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $harvest_agent_overlay_heads_2371$
+BEGIN
+    RAISE EXCEPTION 'harvest_agent_overlay_heads keeps its rows: the counter of kind % never resets', OLD.kind
+        USING ERRCODE = 'restrict_violation',
+              HINT = 'A version number never comes back. See CLAUDE.md, Engine Invariants.';
+END
+$harvest_agent_overlay_heads_2371$;
+
+COMMENT ON FUNCTION harvest_agent_overlay_heads_guard_delete() IS
+    'Issue #2371: refuses each DELETE of an agent overlay head row.';
+
+CREATE TRIGGER harvest_agent_overlay_heads_keep_trg
+    BEFORE DELETE ON harvest_agent_overlay_heads
+    FOR EACH ROW EXECUTE FUNCTION harvest_agent_overlay_heads_guard_delete();
 
 COMMENT ON TABLE harvest_agent_overlays IS
     'Issue #2371: immutable agent profile overlay versions, keyed by (kind, version).';

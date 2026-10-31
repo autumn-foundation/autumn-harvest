@@ -8,7 +8,9 @@
 //! The rules:
 //!
 //! - The first version of a kind is 1. Each later version is the last one
-//!   plus 1. See [`next_overlay_version`].
+//!   plus 1. See [`next_overlay_version`]. The head row keeps the last
+//!   version, and a trigger refuses its delete, so no version number comes
+//!   back.
 //! - A version row never changes. The trigger
 //!   `harvest_agent_overlays_immutable_trg` refuses each `UPDATE`.
 //! - An activation is a compare-and-swap on the pointer. See
@@ -112,9 +114,11 @@ pub struct OverlayRow {
 }
 
 #[cfg(feature = "db")]
+#[doc(hidden)]
 pub use pg::{activate_overlay, active_overlay, append_overlay, get_overlay, list_overlays};
 
-/// The Postgres queries.
+/// The Postgres queries. They do not validate an overlay. Call them through
+/// `ProfileOverlayStore`, which does.
 #[cfg(feature = "db")]
 mod pg {
     use chrono::{DateTime, Utc};
@@ -155,9 +159,13 @@ mod pg {
     }
 
     #[derive(QueryableByName)]
-    struct Head {
+    struct Pointer {
         #[diesel(sql_type = Nullable<BigInt>)]
         active: Option<i64>,
+    }
+
+    #[derive(QueryableByName)]
+    struct Exists {
         #[diesel(sql_type = Bool)]
         known: bool,
     }
@@ -168,17 +176,11 @@ mod pg {
             .map_err(|_| HarvestError::Database(format!("overlay version {stored} is negative")))
     }
 
-    /// A version as `BIGINT`.
-    fn to_stored(version: u64) -> HarvestResult<i64> {
-        i64::try_from(version).map_err(|_| {
-            HarvestError::Database(format!("overlay version {version} does not fit a BIGINT"))
-        })
-    }
-
     /// The statement of [`append_overlay`].
     ///
     /// The upsert takes the lock of the head row, so two appends of one kind
-    /// get two versions. The insert reads `latest` from the upsert.
+    /// get two versions. A full counter matches no row, so the statement
+    /// inserts nothing.
     fn append_overlay_sql() -> String {
         format!(
             "WITH head AS (
@@ -187,15 +189,18 @@ mod pg {
                  ON CONFLICT (kind) DO UPDATE
                      SET latest = harvest_agent_overlay_heads.latest + 1,
                          updated_at = NOW()
+                     WHERE harvest_agent_overlay_heads.latest < {max}
                  RETURNING latest
              )
              INSERT INTO harvest_agent_overlays (kind, version, body, author_kind, author)
              SELECT $1, head.latest, $2, $3, $4 FROM head
-             RETURNING {ROW_COLUMNS}"
+             RETURNING {ROW_COLUMNS}",
+            max = i64::MAX,
         )
     }
 
-    /// Append `body` as the next version of `kind`. Returns the stored row.
+    /// Append `body` as the next version of `kind`. Returns the stored row,
+    /// or `None` when the counter of the kind is full.
     ///
     /// The database sets the version and the time. The caller validates
     /// `body` first.
@@ -209,23 +214,25 @@ mod pg {
         body: &[u8],
         author_kind: &str,
         author: &str,
-    ) -> HarvestResult<OverlayRow> {
-        let row: Row = diesel::sql_query(append_overlay_sql())
+    ) -> HarvestResult<Option<OverlayRow>> {
+        let rows: Vec<Row> = diesel::sql_query(append_overlay_sql())
             .bind::<Text, _>(kind)
             .bind::<Binary, _>(body)
             .bind::<Text, _>(author_kind)
             .bind::<Text, _>(author)
-            .get_result(conn)
+            .load(conn)
             .await
             .map_err(database_error)?;
-        row.decode()
+        rows.into_iter().next().map(Row::decode).transpose()
     }
 
     /// Move the pointer of `kind` to `version` when it is `expected`.
     ///
-    /// One transaction locks the head row, reads the pointer and checks the
-    /// version. [`decide_activate`] then decides. So of two activations with
-    /// the same `expected`, only one moves the pointer.
+    /// One transaction locks the head row, then checks the version. The
+    /// check is a new statement, so its snapshot sees each put that
+    /// committed while the lock waited. [`decide_activate`] then decides. So
+    /// of two activations with the same `expected`, only one moves the
+    /// pointer. A version or an `expected` above `i64::MAX` never matches.
     ///
     /// # Errors
     ///
@@ -238,19 +245,20 @@ mod pg {
     ) -> HarvestResult<ActivateOutcome> {
         use diesel_async::AsyncConnection;
 
-        let stored = to_stored(version)?;
-        let expected_stored = expected.map(to_stored).transpose()?;
+        let Ok(stored) = i64::try_from(version) else {
+            return Ok(ActivateOutcome::UnknownVersion);
+        };
         Box::pin(conn.transaction(async |conn| {
-            let head = lock_overlay_head(conn, kind, stored).await?;
-            let Some(head) = head else {
+            let Some(head) = lock_overlay_head(conn, kind).await? else {
                 return Ok(ActivateOutcome::UnknownVersion);
             };
+            let known = overlay_exists(conn, kind, stored).await?;
             let actual = head.active.map(to_version).transpose()?;
-            match decide_activate(head.known, expected, actual) {
+            match decide_activate(known, expected, actual) {
                 ActivateDecision::UnknownVersion => Ok(ActivateOutcome::UnknownVersion),
                 ActivateDecision::Conflict => Ok(ActivateOutcome::Conflict { actual }),
                 ActivateDecision::Activate => {
-                    set_overlay_pointer(conn, kind, stored, expected_stored).await?;
+                    set_overlay_pointer(conn, kind, stored, head.active).await?;
                     Ok(ActivateOutcome::Activated)
                 }
             }
@@ -258,30 +266,38 @@ mod pg {
         .await
     }
 
-    /// Lock the head row of `kind`. Returns its pointer, and whether
-    /// `version` exists. `None` means that the kind has no version.
+    /// Lock the head row of `kind`, and read its pointer. `None` means that
+    /// the kind has no version.
     async fn lock_overlay_head(
         conn: &mut AsyncPgConnection,
         kind: &str,
+    ) -> HarvestResult<Option<Pointer>> {
+        let rows: Vec<Pointer> = diesel::sql_query(
+            "SELECT active FROM harvest_agent_overlay_heads WHERE kind = $1 FOR UPDATE",
+        )
+        .bind::<Text, _>(kind)
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// Whether `kind` holds `version`.
+    async fn overlay_exists(
+        conn: &mut AsyncPgConnection,
+        kind: &str,
         version: i64,
-    ) -> HarvestResult<Option<Head>> {
+    ) -> HarvestResult<bool> {
         diesel::sql_query(
-            "SELECT h.active,
-                    EXISTS (SELECT 1 FROM harvest_agent_overlays o
-                            WHERE o.kind = h.kind AND o.version = $2) AS known
-             FROM harvest_agent_overlay_heads h
-             WHERE h.kind = $1
-             FOR UPDATE OF h",
+            "SELECT EXISTS (SELECT 1 FROM harvest_agent_overlays
+                            WHERE kind = $1 AND version = $2) AS known",
         )
         .bind::<Text, _>(kind)
         .bind::<BigInt, _>(version)
-        .get_result::<Head>(conn)
+        .get_result::<Exists>(conn)
         .await
-        .map(Some)
-        .or_else(|e| match e {
-            diesel::result::Error::NotFound => Ok(None),
-            e => Err(database_error(e)),
-        })
+        .map(|row| row.known)
+        .map_err(database_error)
     }
 
     /// Set the pointer of `kind` under the lock of [`lock_overlay_head`].

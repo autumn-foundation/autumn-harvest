@@ -68,10 +68,19 @@ harvest_agent_overlay_heads kind PK, latest, active -> harvest_agent_overlays (k
   lock, and inserts the version with the new `latest`. Two puts of one
   kind serialize on the head row.
 - `activate` is one transaction. It locks the head row `FOR UPDATE`,
-  checks that the version exists, compares the pointer and sets it.
+  then checks that the version exists in a new statement. Under READ
+  COMMITTED, that statement sees each put that committed while the lock
+  waited. Then it compares the pointer and sets it.
+- A full counter matches no row in the upsert, so `put` returns `Full`.
 - The trigger `harvest_agent_overlays_immutable_trg` refuses each
-  `UPDATE` of a version row. The foreign key stops the delete of an
-  active version.
+  `UPDATE` of a version row. The trigger
+  `harvest_agent_overlay_heads_keep_trg` refuses the delete of a head row,
+  so no version number comes back. The foreign key stops the delete of an
+  active version. On SQLite, a trigger does the same, also on a connection
+  with no `foreign_keys` pragma.
+- `put` refuses an overlay whose JSON is above `MAX_OVERLAY_BYTES`
+  (64 KiB), and an operator id with padded or invisible text.
+- The raw log functions do not validate, so they are `doc(hidden)`.
 
 ## Brainstorm
 
@@ -101,7 +110,10 @@ How can the store break its promise? Each attack has a guard.
 | Activate an old version after a deploy narrows the profile. | `activate` validates again. |
 | Store bytes that a later decode reads differently. | `get` returns the stored bytes, and decodes them with `deny_unknown_fields`. |
 | Write with no author. | `Provenance` refuses an empty or long id. The table checks too. |
-| A version counter overflows. | `next_overlay_version` returns `None`, and `put` fails. |
+| Write an author that looks like another one. | `Provenance` refuses padded text and invisible characters. |
+| Fill the table with one huge overlay per refine round. | `put` refuses JSON above `MAX_OVERLAY_BYTES`. |
+| Delete a head row, so a version number comes back with other bytes. | A trigger refuses the delete on both backends. |
+| A version counter overflows. | `next_overlay_version` returns `None`, and `put` returns `Full`. |
 
 ## Six hats
 
@@ -121,11 +133,36 @@ How can the store break its promise? Each attack has a guard.
   Then the stores. Then the gates: `cargo fmt`, `cargo clippy`,
   `comment-hygiene.py`, `ledger-profiles.py` and `migration_lock_safety`.
 
+## Limits for later issues
+
+The review of this change found these limits. Each belongs to a later
+issue.
+
+- **#2372, the recorded read.** `active` does not validate again. The
+  reader applies the overlay with `overlay::apply`, which checks it under
+  the current profile. #2372 records the applied profile in the activity
+  result, so a replay never reads the store. A deleted version that is
+  not active therefore cannot change a replay.
+- **#2374, rollback and audit.** The heads table keeps only the current
+  pointer. `rollback` needs the pointer before it, and the audit needs the
+  actor. #2374 adds an activation log and an `activate` variant with an
+  actor, as a default trait method.
+- **#2394, the refine policy.** A validator gets the kind and the overlay.
+  A policy validator holds its own ceilings for each kind. An auto-adopted
+  version can be a new `Provenance` variant. The enum is
+  `#[non_exhaustive]`. The Postgres `CHECK` on `author_kind` then needs a
+  migration. SQLite has no `CHECK` on it, because SQLite cannot widen one
+  in place.
+- **Provenance.** The caller states it. A store checks its form, not its
+  truth. The management route of #2374 sets it from the authenticated
+  operator.
+
 ## Proof
 
 `formal/verus/src/overlay_log.rs` mirrors `next_overlay_version` and
 `decide_activate`. It models the log as a sequence and a pointer. It
-proves these properties:
+assumes dense versions and one call at a time for each kind, which the
+head row lock gives. It proves these properties:
 
 - A put returns a version above every earlier version.
 - A put keeps every earlier version.
@@ -138,4 +175,6 @@ proves these properties:
 `autumn-harvest-agent/tests/overlay_store_suite/mod.rs` holds one suite.
 `tests/overlay_store.rs` runs it on the in-memory and SQLite stores.
 `tests/overlay_store_postgres.rs` runs it on Postgres, and shows that
-Postgres refuses an `UPDATE` of a version row.
+Postgres refuses an `UPDATE` of a version row and the delete of a head
+row. The suite overlaps calls only on Postgres. The SQLite integration
+tests race two connections on one file in threads.

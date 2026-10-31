@@ -21,15 +21,22 @@ use crate::error::{SqliteError, SqliteResult};
 
 /// The tables and the guard, applied on each open.
 ///
-/// The `UPDATE` trigger refuses each change of a version row. The `INSERT`
-/// trigger refuses `INSERT OR REPLACE` over a stored version. The foreign
-/// key keeps the pointer on a stored version.
-pub const OVERLAY_SCHEMA: &str = r"
+/// - The `UPDATE` trigger refuses each change of a version row.
+/// - The `INSERT` trigger refuses `INSERT OR REPLACE` over a stored version.
+/// - The `DELETE` trigger on the versions refuses the delete of the active
+///   version, also on a connection with no `foreign_keys` pragma.
+/// - The `DELETE` trigger on the heads keeps each counter, so no version
+///   number comes back.
+///
+/// `author_kind` has no `CHECK`. `SQLite` cannot widen a `CHECK` in place,
+/// and a later author kind would need one. The typed store checks it on
+/// each read.
+const OVERLAY_SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS harvest_agent_overlays (
     kind          TEXT    NOT NULL CHECK (kind <> ''),
     version       INTEGER NOT NULL CHECK (version >= 1),
     body          BLOB    NOT NULL,
-    author_kind   TEXT    NOT NULL CHECK (author_kind IN ('operator', 'refine')),
+    author_kind   TEXT    NOT NULL,
     author        TEXT    NOT NULL CHECK (author <> ''),
     created_at_ms INTEGER NOT NULL,
     PRIMARY KEY (kind, version)
@@ -52,12 +59,28 @@ CREATE TRIGGER IF NOT EXISTS harvest_agent_overlays_immutable_ins
 BEGIN
     SELECT RAISE(ABORT, 'harvest_agent_overlays is append-only (issue #2371)');
 END;
+CREATE TRIGGER IF NOT EXISTS harvest_agent_overlays_active_del
+    BEFORE DELETE ON harvest_agent_overlays
+    WHEN EXISTS (SELECT 1 FROM harvest_agent_overlay_heads
+                 WHERE kind = OLD.kind AND active = OLD.version)
+BEGIN
+    SELECT RAISE(ABORT, 'harvest_agent_overlays keeps its active version (issue #2371)');
+END;
+CREATE TRIGGER IF NOT EXISTS harvest_agent_overlay_heads_keep_del
+    BEFORE DELETE ON harvest_agent_overlay_heads
+BEGIN
+    SELECT RAISE(ABORT, 'harvest_agent_overlay_heads keeps its rows (issue #2371)');
+END;
 ";
 
 /// The columns of one version row.
 const ROW_COLUMNS: &str = "version, body, author_kind, author, created_at_ms";
 
 /// The log of agent profile overlays in one `SQLite` file.
+///
+/// It does not validate an overlay. Call it through `SqliteOverlayStore` in
+/// `autumn-harvest-agent`, which does.
+#[doc(hidden)]
 pub struct SqliteOverlayLog {
     conn: Mutex<Connection>,
 }
@@ -109,22 +132,22 @@ impl SqliteOverlayLog {
         f(&mut conn)
     }
 
-    /// Append `body` as the next version of `kind`. Returns the stored row.
+    /// Append `body` as the next version of `kind`. Returns the stored row,
+    /// or `None` when the counter of the kind is full.
     ///
     /// One `IMMEDIATE` transaction reads and bumps the counter, so two
     /// appends get two versions.
     ///
     /// # Errors
     ///
-    /// Returns [`SqliteError::Unsupported`] when the counter is full, and
-    /// [`SqliteError::Sqlite`] when a statement fails.
+    /// Returns [`SqliteError::Sqlite`] when a statement fails.
     pub fn append(
         &self,
         kind: &str,
         body: &[u8],
         author_kind: &str,
         author: &str,
-    ) -> SqliteResult<OverlayRow> {
+    ) -> SqliteResult<Option<OverlayRow>> {
         self.with_conn(|conn| append_in(conn, kind, body, author_kind, author))
     }
 
@@ -148,6 +171,7 @@ impl SqliteOverlayLog {
         };
         self.with_conn(|conn| activate_in(conn, kind, stored, expected))
     }
+
     /// The active version of `kind`, or `None`.
     ///
     /// # Errors
@@ -219,7 +243,7 @@ fn append_in(
     body: &[u8],
     author_kind: &str,
     author: &str,
-) -> SqliteResult<OverlayRow> {
+) -> SqliteResult<Option<OverlayRow>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let latest: Option<i64> = tx
         .query_row(
@@ -229,10 +253,12 @@ fn append_in(
         )
         .optional()?;
     let latest = latest.map(to_version).transpose()?;
-    let version = next_overlay_version(latest)
-        .filter(|next| i64::try_from(*next).is_ok())
-        .ok_or_else(|| SqliteError::Unsupported("the overlay counter is full".into()))?;
-    let stored = to_stored(version)?;
+    let Some(version) = next_overlay_version(latest) else {
+        return Ok(None);
+    };
+    let Ok(stored) = i64::try_from(version) else {
+        return Ok(None);
+    };
     let created_at = from_millis(Utc::now().timestamp_millis())?;
     tx.execute(
         "INSERT INTO harvest_agent_overlay_heads (kind, latest) VALUES (?1, ?2)
@@ -253,13 +279,13 @@ fn append_in(
         ],
     )?;
     tx.commit()?;
-    Ok(OverlayRow {
+    Ok(Some(OverlayRow {
         version,
         body: body.to_vec(),
         author_kind: author_kind.to_owned(),
         author: author.to_owned(),
         created_at,
-    })
+    }))
 }
 
 /// The body of [`SqliteOverlayLog::activate`].
@@ -303,30 +329,23 @@ fn activate_in(
 /// stored value that does not decode.
 fn read_row(row: &Row<'_>) -> rusqlite::Result<SqliteResult<OverlayRow>> {
     let version: i64 = row.get(0)?;
-    let body: Vec<u8> = row.get(1)?;
-    let author_kind: String = row.get(2)?;
-    let author: String = row.get(3)?;
     let created_at_ms: i64 = row.get(4)?;
-    Ok((|| {
-        Ok(OverlayRow {
-            version: to_version(version)?,
-            body,
-            author_kind,
-            author,
-            created_at: from_millis(created_at_ms)?,
-        })
-    })())
+    let (version, created_at) = match (to_version(version), from_millis(created_at_ms)) {
+        (Ok(version), Ok(created_at)) => (version, created_at),
+        (Err(err), _) | (_, Err(err)) => return Ok(Err(err)),
+    };
+    Ok(Ok(OverlayRow {
+        version,
+        body: row.get(1)?,
+        author_kind: row.get(2)?,
+        author: row.get(3)?,
+        created_at,
+    }))
 }
 
 fn to_version(stored: i64) -> SqliteResult<u64> {
     u64::try_from(stored)
         .map_err(|_| SqliteError::Unsupported(format!("overlay version {stored} is negative")))
-}
-
-fn to_stored(version: u64) -> SqliteResult<i64> {
-    i64::try_from(version).map_err(|_| {
-        SqliteError::Unsupported(format!("overlay version {version} does not fit an INTEGER"))
-    })
 }
 
 fn from_millis(ms: i64) -> SqliteResult<DateTime<Utc>> {

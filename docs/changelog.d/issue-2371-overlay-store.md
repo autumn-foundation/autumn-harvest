@@ -14,6 +14,8 @@ builds on the overlay kernel of #2370.
   A rollback activates an earlier version.
 - `active`, `get` and `list` read the log. `StoredOverlay::bytes` returns
   the exact bytes that the put wrote.
+- `put` refuses JSON above `MAX_OVERLAY_BYTES` (64 KiB), and an operator
+  id with padded or invisible text.
 - `AgentHarness` implements `OverlayValidator` under
   `Ceilings::from_profile`. #2394 adds operator ceilings.
 
@@ -25,7 +27,8 @@ so the agent crate adds no Diesel code.
 **Migration.** `20261031200812_harvest_agent_overlays` adds
 `harvest_agent_overlays` and `harvest_agent_overlay_heads`. The trigger
 `harvest_agent_overlays_immutable_trg` refuses each `UPDATE` of a version
-row. The tables are new and not hot. No `WorkflowEvent` variant and no
+row. The trigger `harvest_agent_overlay_heads_keep_trg` refuses each
+`DELETE` of a head row, so no version number comes back. The tables are new and not hot. No `WorkflowEvent` variant and no
 replay impact.
 
 **Proof.** `formal/verus/src/overlay_log.rs` mirrors `next_overlay_version`

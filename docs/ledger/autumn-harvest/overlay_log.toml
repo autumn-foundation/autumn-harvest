@@ -32,7 +32,14 @@ measured = "unmeasured"
 driver = "per_request"
 backend = ["postgres"]
 kind = ["read"]
-tables = ["harvest_agent_overlay_heads", "harvest_agent_overlays"]
+tables = ["harvest_agent_overlay_heads"]
+measured = "unmeasured"
+
+["pg::overlay_exists"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_agent_overlays"]
 measured = "unmeasured"
 
 ["pg::set_overlay_pointer"]

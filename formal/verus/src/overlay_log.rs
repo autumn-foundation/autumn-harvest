@@ -2,10 +2,22 @@
 //! (issue #2371).
 //!
 //! The copies of `next_overlay_version` and `decide_activate` below are the
-//! kernel of each overlay store. The spec `Log` models one kind: a sequence
-//! of version bodies and an active pointer. Version `v` is the entry at
-//! index `v - 1`. A body is an integer, because Verus cannot check bytes.
-//! The integration suite of each store checks that its SQL does the same.
+//! kernel of the overlay stores. The in-memory and `SQLite` stores call both.
+//! The Postgres store calls `decide_activate`, and its SQL computes
+//! `latest + 1` as `next_overlay_version` does.
+//!
+//! The spec `Log` models one kind: a sequence of version bodies and an
+//! active pointer. Version `v` is the entry at index `v - 1`. A body is an
+//! integer, because Verus cannot check bytes. The model makes two
+//! assumptions:
+//!
+//! - The versions are dense. The model has no delete. A raw delete of a
+//!   version that is not active leaves a gap. A trigger keeps the head row,
+//!   so the number of that version never comes back.
+//! - The calls of one kind run one after another. The lock of the head row
+//!   gives that order in each store.
+//!
+//! The shared suite of the stores checks that the SQL does the same.
 
 use vstd::prelude::*;
 
@@ -217,8 +229,9 @@ pub proof fn theorem_no_call_rewrites_a_version(log: Log, ops: Seq<Op>)
 }
 
 /// Two activations read the same pointer. Each names a stored version, and
-/// the first names a new one. The first moves the pointer, and the second
-/// is a conflict. So exactly one wins, in either order.
+/// the first names a new one. The lock of the head row runs them in turn.
+/// The first moves the pointer, and the second is a conflict. So exactly
+/// one wins, in either order.
 pub proof fn theorem_exactly_one_of_two_activates_wins(log: Log, first: u64, second: u64)
     requires
         inv(log),

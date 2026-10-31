@@ -197,7 +197,8 @@ test fixture calls `autumn_harvest_sqlite::append_only::with_guard_off`.
 A run can read an overlay version, so a version row never changes. Do not
 add code that updates `harvest_agent_overlays`. Put a new version, then
 activate it. The trigger `harvest_agent_overlays_immutable_trg` refuses
-each `UPDATE`. The SQLite store has the same guard. Only the pointer in
+each `UPDATE`. A second trigger keeps each head row, so no version number
+comes back. The SQLite store has the same guards. Only the pointer in
 `harvest_agent_overlay_heads` moves, by a compare-and-swap. Each store
 validates an overlay with `overlay::apply` before a put and before an
 activation.

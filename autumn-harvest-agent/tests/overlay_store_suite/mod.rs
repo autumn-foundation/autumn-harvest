@@ -94,6 +94,9 @@ pub async fn run_all(make: MakeStore<'_>) {
     a_rollback_restores_an_exact_earlier_version(make).await;
     provenance_is_checked_and_kept(make).await;
     an_unknown_kind_reads_empty(make).await;
+    concurrent_puts_get_distinct_versions(make).await;
+    kinds_do_not_share_versions(make).await;
+    the_pointer_compares_exactly(make).await;
 }
 
 /// After `put` v2, `get(kind, v1)` returns the bytes written for v1.
@@ -116,7 +119,6 @@ pub async fn get_returns_the_bytes_written_for_each_version(make: MakeStore<'_>)
     assert_eq!(got.bytes(), serde_json::to_vec(&first).expect("encode"));
     assert_eq!(got.overlay(), &first);
     assert_eq!(got.version(), v1);
-    assert_eq!(got.kind(), kind);
     let got = store
         .get(&kind, v2)
         .await
@@ -170,6 +172,11 @@ pub async fn activate_of_an_unknown_version_changes_nothing(make: MakeStore<'_>)
 
 /// Two activates with the same `expected_active`: exactly one succeeds.
 /// The other returns `Conflict { actual }`.
+///
+/// The two calls overlap only on Postgres, where each takes its own pool
+/// connection. The in-memory and `SQLite` futures finish in one poll, so
+/// `join!` runs them in turn. `autumn-harvest-sqlite` races two connections
+/// on one file in its own tests.
 pub async fn two_activates_with_one_expected_pointer_have_one_winner(make: MakeStore<'_>) {
     let store = make(Arc::new(Gate::default()));
     for round in 0..8 {
@@ -302,4 +309,81 @@ pub async fn an_unknown_kind_reads_empty(make: MakeStore<'_>) {
     assert_eq!(store.active(&kind).await.expect("active"), None);
     assert_eq!(store.get(&kind, version(1)).await.expect("get"), None);
     assert_eq!(store.list(&kind).await.expect("list"), []);
+}
+
+/// Puts of one kind in flight together get the versions 1 to N, each once.
+pub async fn concurrent_puts_get_distinct_versions(make: MakeStore<'_>) {
+    const PUTS: u64 = 8;
+    let store = make(Arc::new(Gate::default()));
+    let kind = kind("puts");
+    let overlays: Vec<_> = (0..PUTS)
+        .map(|n| narrow(9, &format!("prompt {n}")))
+        .collect();
+    let results = futures::future::join_all(
+        overlays
+            .iter()
+            .map(|overlay| store.put(&kind, overlay, ops())),
+    )
+    .await;
+    let mut versions: Vec<u64> = results
+        .into_iter()
+        .map(|version| version.expect("put").get())
+        .collect();
+    versions.sort_unstable();
+    assert_eq!(versions, (1..=PUTS).collect::<Vec<_>>());
+    let listed = store.list(&kind).await.expect("list");
+    assert_eq!(listed.len(), overlays.len());
+    for stored in listed {
+        let written = serde_json::from_slice::<ProfileOverlay>(stored.bytes()).expect("decode");
+        assert_eq!(&written, stored.overlay());
+    }
+}
+
+/// A version of one kind is not a version of another kind.
+pub async fn kinds_do_not_share_versions(make: MakeStore<'_>) {
+    let store = make(Arc::new(Gate::default()));
+    let (left, right) = (kind("left"), kind("right"));
+    let v1 = store
+        .put(&left, &narrow(9, "left"), ops())
+        .await
+        .expect("v1");
+    assert_eq!(store.get(&right, v1).await.expect("get"), None);
+    assert_eq!(
+        store.activate(&right, v1, None).await,
+        Err(OverlayStoreError::UnknownVersion { version: v1 })
+    );
+    let r1 = store
+        .put(&right, &narrow(8, "right"), ops())
+        .await
+        .expect("r1");
+    assert_eq!(r1, version(1), "each kind counts from 1");
+    let got = store.get(&right, r1).await.expect("get").expect("r1");
+    assert_eq!(got.overlay(), &narrow(8, "right"));
+    assert_eq!(got.kind(), right);
+}
+
+/// An expected pointer must equal the pointer. An unset pointer is not a
+/// set one. Activating the active version again over itself succeeds.
+pub async fn the_pointer_compares_exactly(make: MakeStore<'_>) {
+    let store = make(Arc::new(Gate::default()));
+    let kind = kind("pointer");
+    let v1 = store.put(&kind, &narrow(9, "a"), ops()).await.expect("v1");
+    assert_eq!(
+        store.activate(&kind, v1, Some(v1)).await,
+        Err(OverlayStoreError::Conflict { actual: None })
+    );
+    store.activate(&kind, v1, None).await.expect("activate v1");
+    assert_eq!(
+        store.activate(&kind, v1, None).await,
+        Err(OverlayStoreError::Conflict { actual: Some(v1) })
+    );
+    store
+        .activate(&kind, v1, Some(v1))
+        .await
+        .expect("the same version again");
+    let far = OverlayVersion::new(u64::MAX).expect("max");
+    assert_eq!(
+        store.activate(&kind, v1, Some(far)).await,
+        Err(OverlayStoreError::Conflict { actual: Some(v1) })
+    );
 }

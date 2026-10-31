@@ -5,9 +5,15 @@
 //! changes after the put. [`ProfileOverlayStore::activate`] moves the
 //! pointer with a compare-and-swap. A rollback activates an earlier version.
 //!
-//! Each store validates an overlay with [`overlay::apply`] before it stores
-//! it, and again before it activates it. So no stored version widens its
-//! profile. The design is in `docs/design/DESIGN-2371.md`.
+//! Each store validates an overlay with its [`OverlayValidator`] before it
+//! stores it, and again before it activates it. A deploy can narrow a
+//! profile after an activation. So a reader of [`ProfileOverlayStore::active`]
+//! applies the overlay with [`overlay::apply`], which checks it again.
+//!
+//! A store does its work when the future is polled. The `SQLite` store runs
+//! its statements on the calling thread, as `MemoryStore` stores do.
+//!
+//! The design is in `docs/design/DESIGN-2371.md`.
 //!
 //! [`overlay::apply`]: super::overlay::apply
 
@@ -30,6 +36,9 @@ use crate::model::BoxFuture;
 
 /// The most characters in an operator id.
 pub const MAX_AUTHOR_LEN: usize = 256;
+
+/// The most bytes in the JSON of one stored overlay.
+pub const MAX_OVERLAY_BYTES: usize = 64 * 1024;
 
 /// The number of one overlay version of a kind. The first version is 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -61,8 +70,12 @@ impl std::fmt::Display for OverlayVersion {
 }
 
 /// Who or what wrote an overlay version.
+///
+/// The caller states it. A store checks its form, not its truth. A later
+/// issue can add a kind of author, so match it with a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "author", content = "id", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Provenance {
     /// An operator, by operator id.
     Operator(String),
@@ -101,7 +114,9 @@ impl Provenance {
         }
     }
 
-    /// Refuse an empty, long or multi-line operator id.
+    /// Refuse an operator id that is empty or long, that starts or ends
+    /// with white space, or that holds a control or invisible character. So
+    /// two ids that look the same in an audit are the same id.
     fn check(&self) -> Result<(), OverlayStoreError> {
         let Self::Operator(id) = self else {
             return Ok(());
@@ -110,8 +125,10 @@ impl Provenance {
             "the operator id is empty"
         } else if id.chars().count() > MAX_AUTHOR_LEN {
             "the operator id is too long"
-        } else if id.chars().any(char::is_control) {
-            "the operator id holds a control character"
+        } else if id.trim() != id {
+            "the operator id starts or ends with white space"
+        } else if id.chars().any(|c| c.is_control() || is_invisible(c)) {
+            "the operator id holds a control or invisible character"
         } else {
             return Ok(());
         };
@@ -179,14 +196,10 @@ impl StoredOverlay {
         self.created_at
     }
 
-    /// Decode a stored row of `kind`. A store on another backend can call
-    /// it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`OverlayStoreError::Corrupt`] for a version 0, a body that
-    /// does not decode, or an unknown author.
-    pub fn from_row(kind: &str, row: OverlayRow) -> Result<Self, OverlayStoreError> {
+    /// Decode a stored row of `kind`. An error is
+    /// [`OverlayStoreError::Corrupt`]: a version 0, a body that does not
+    /// decode, or an unknown author.
+    pub(crate) fn from_row(kind: &str, row: OverlayRow) -> Result<Self, OverlayStoreError> {
         let version =
             OverlayVersion::new(row.version).ok_or_else(|| corrupt("a stored version is 0"))?;
         let overlay = serde_json::from_slice(&row.body)
@@ -213,7 +226,7 @@ pub enum OverlayStoreError {
         version: OverlayVersion,
     },
     /// The active pointer is not the expected one. It did not move.
-    #[error("the active overlay is {actual:?}, not the expected version")]
+    #[error("the active overlay is {}, not the expected version", show_active(*.actual))]
     Conflict {
         /// The active version at the time of the refusal.
         actual: Option<OverlayVersion>,
@@ -233,6 +246,14 @@ pub enum OverlayStoreError {
         /// Why.
         reason: &'static str,
     },
+    /// The JSON of the overlay is above [`MAX_OVERLAY_BYTES`].
+    #[error("the overlay has {bytes} bytes, above the limit of {limit}")]
+    TooLarge {
+        /// The size of the JSON.
+        bytes: usize,
+        /// The limit.
+        limit: usize,
+    },
     /// The version counter of the kind is full.
     #[error("the overlay version counter is full")]
     Full,
@@ -248,6 +269,28 @@ pub enum OverlayStoreError {
         /// The backend error.
         message: String,
     },
+}
+
+/// A pointer for an error message: `v3`, or `unset`.
+fn show_active(active: Option<OverlayVersion>) -> String {
+    active.map_or_else(|| "unset".to_owned(), |version| version.to_string())
+}
+
+/// Whether `c` is a format character that shows no glyph. These are the
+/// zero-width spaces and joiners, the bidirectional controls, the soft
+/// hyphen and the byte order mark.
+const fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
 }
 
 const fn corrupt(reason: &'static str) -> OverlayStoreError {
@@ -289,14 +332,19 @@ impl OverlayValidator for AgentHarness {
 }
 
 /// Storage for versioned profile overlays.
+///
+/// An implementation validates each overlay with an [`OverlayValidator`]
+/// before a put and before an activation. It never changes a stored
+/// version, and it never gives a version number twice.
 pub trait ProfileOverlayStore: Send + Sync + std::fmt::Debug {
     /// Validate `overlay` and append it as the next version of `kind`.
     ///
     /// # Errors
     ///
     /// The errors of [`OverlayValidator::validate`],
-    /// [`OverlayStoreError::InvalidProvenance`], [`OverlayStoreError::Full`]
-    /// and [`OverlayStoreError::Backend`].
+    /// [`OverlayStoreError::InvalidProvenance`],
+    /// [`OverlayStoreError::TooLarge`], [`OverlayStoreError::Full`] and
+    /// [`OverlayStoreError::Backend`].
     fn put<'a>(
         &'a self,
         kind: &'a str,
@@ -321,6 +369,9 @@ pub trait ProfileOverlayStore: Send + Sync + std::fmt::Debug {
     ) -> BoxFuture<'a, Result<(), OverlayStoreError>>;
 
     /// The active version of `kind`, or `None`.
+    ///
+    /// It does not validate the version again. Apply it with
+    /// [`overlay::apply`](super::overlay::apply) before use.
     ///
     /// # Errors
     ///
@@ -362,7 +413,22 @@ fn encode_checked(
 ) -> Result<Vec<u8>, OverlayStoreError> {
     provenance.check()?;
     validator.validate(kind, overlay)?;
-    serde_json::to_vec(overlay).map_err(backend)
+    let bytes = serde_json::to_vec(overlay).map_err(backend)?;
+    if bytes.len() > MAX_OVERLAY_BYTES {
+        return Err(OverlayStoreError::TooLarge {
+            bytes: bytes.len(),
+            limit: MAX_OVERLAY_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
+/// The version of a stored row, or [`OverlayStoreError::Full`] when the
+/// counter of the kind is full.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn appended(row: Option<OverlayRow>) -> Result<OverlayVersion, OverlayStoreError> {
+    let row = row.ok_or(OverlayStoreError::Full)?;
+    OverlayVersion::new(row.version).ok_or_else(|| corrupt("a stored version is 0"))
 }
 
 /// The result of an activation outcome of `version`.
@@ -370,8 +436,15 @@ fn activated(version: OverlayVersion, outcome: ActivateOutcome) -> Result<(), Ov
     match outcome {
         ActivateOutcome::Activated => Ok(()),
         ActivateOutcome::UnknownVersion => Err(OverlayStoreError::UnknownVersion { version }),
-        ActivateOutcome::Conflict { actual } => Err(OverlayStoreError::Conflict {
-            actual: actual.and_then(OverlayVersion::new),
+        ActivateOutcome::Conflict { actual: None } => {
+            Err(OverlayStoreError::Conflict { actual: None })
+        }
+        ActivateOutcome::Conflict {
+            actual: Some(actual),
+        } => Err(OverlayStoreError::Conflict {
+            actual: Some(
+                OverlayVersion::new(actual).ok_or_else(|| corrupt("a stored pointer is 0"))?,
+            ),
         }),
     }
 }
@@ -443,7 +516,7 @@ impl ProfileOverlayStore for InMemoryOverlayStore {
         overlay: &'a ProfileOverlay,
         provenance: Provenance,
     ) -> BoxFuture<'a, Result<OverlayVersion, OverlayStoreError>> {
-        Box::pin(std::future::ready(self.put_now(kind, overlay, provenance)))
+        Box::pin(async move { self.put_now(kind, overlay, &provenance) })
     }
 
     fn activate<'a>(
@@ -457,7 +530,7 @@ impl ProfileOverlayStore for InMemoryOverlayStore {
             &*self.validator,
             kind,
             version,
-            move || std::future::ready(Ok(self.swap_now(kind, version, expected_active))),
+            move || async move { Ok(self.swap_now(kind, version, expected_active)) },
         ))
     }
 
@@ -465,16 +538,18 @@ impl ProfileOverlayStore for InMemoryOverlayStore {
         &'a self,
         kind: &'a str,
     ) -> BoxFuture<'a, Result<Option<StoredOverlay>, OverlayStoreError>> {
-        let kinds = self.lock();
-        let active = kinds.get(kind).and_then(|log| {
-            let version = log.active?;
-            log.versions
-                .iter()
-                .find(|stored| stored.version == version)
-                .cloned()
-        });
-        drop(kinds);
-        Box::pin(std::future::ready(Ok(active)))
+        Box::pin(async move {
+            let kinds = self.lock();
+            let active = kinds.get(kind).and_then(|log| {
+                let version = log.active?;
+                log.versions
+                    .iter()
+                    .find(|stored| stored.version == version)
+                    .cloned()
+            });
+            drop(kinds);
+            Ok(active)
+        })
     }
 
     fn get<'a>(
@@ -482,54 +557,60 @@ impl ProfileOverlayStore for InMemoryOverlayStore {
         kind: &'a str,
         version: OverlayVersion,
     ) -> BoxFuture<'a, Result<Option<StoredOverlay>, OverlayStoreError>> {
-        let kinds = self.lock();
-        let stored = kinds.get(kind).and_then(|log| {
-            log.versions
-                .iter()
-                .find(|stored| stored.version == version)
-                .cloned()
-        });
-        drop(kinds);
-        Box::pin(std::future::ready(Ok(stored)))
+        Box::pin(async move {
+            let kinds = self.lock();
+            let stored = kinds.get(kind).and_then(|log| {
+                log.versions
+                    .iter()
+                    .find(|stored| stored.version == version)
+                    .cloned()
+            });
+            drop(kinds);
+            Ok(stored)
+        })
     }
 
     fn list<'a>(
         &'a self,
         kind: &'a str,
     ) -> BoxFuture<'a, Result<Vec<StoredOverlay>, OverlayStoreError>> {
-        let kinds = self.lock();
-        let versions = kinds
-            .get(kind)
-            .map(|log| log.versions.clone())
-            .unwrap_or_default();
-        drop(kinds);
-        Box::pin(std::future::ready(Ok(versions)))
+        Box::pin(async move {
+            let kinds = self.lock();
+            let versions = kinds
+                .get(kind)
+                .map(|log| log.versions.clone())
+                .unwrap_or_default();
+            drop(kinds);
+            Ok(versions)
+        })
     }
 }
 
 impl InMemoryOverlayStore {
     /// Validate and append one version under the lock.
+    ///
+    /// It decodes the stored bytes, as the database stores do on a read.
     fn put_now(
         &self,
         kind: &str,
         overlay: &ProfileOverlay,
-        provenance: Provenance,
+        provenance: &Provenance,
     ) -> Result<OverlayVersion, OverlayStoreError> {
-        let bytes = encode_checked(&*self.validator, kind, overlay, &provenance)?;
+        let bytes = encode_checked(&*self.validator, kind, overlay, provenance)?;
         let mut kinds = self.lock();
         let log = kinds.entry(kind.to_owned()).or_default();
         let latest = log.versions.last().map(|stored| stored.version.get());
-        let version = next_overlay_version(latest)
-            .and_then(OverlayVersion::new)
-            .ok_or(OverlayStoreError::Full)?;
-        log.versions.push(StoredOverlay {
-            kind: kind.to_owned(),
+        let version = next_overlay_version(latest).ok_or(OverlayStoreError::Full)?;
+        let row = OverlayRow {
             version,
-            bytes,
-            overlay: overlay.clone(),
-            provenance,
+            body: bytes,
+            author_kind: provenance.author_kind().to_owned(),
+            author: provenance.author(),
             created_at: Utc::now(),
-        });
+        };
+        let stored = StoredOverlay::from_row(kind, row)?;
+        let version = stored.version;
+        log.versions.push(stored);
         drop(kinds);
         Ok(version)
     }
@@ -564,7 +645,8 @@ impl InMemoryOverlayStore {
 /// A [`ProfileOverlayStore`] in a `SQLite` file.
 ///
 /// It opens its own connection. It can share the file of a
-/// `SqliteRuntime`.
+/// `SqliteRuntime`. A call runs its statements on the polling thread, and a
+/// busy file can hold that thread for up to 5 seconds.
 #[cfg(feature = "sqlite")]
 pub struct SqliteOverlayStore {
     log: autumn_harvest_sqlite::SqliteOverlayLog,
@@ -613,15 +695,14 @@ impl ProfileOverlayStore for SqliteOverlayStore {
         overlay: &'a ProfileOverlay,
         provenance: Provenance,
     ) -> BoxFuture<'a, Result<OverlayVersion, OverlayStoreError>> {
-        let put = || {
+        Box::pin(async move {
             let bytes = encode_checked(&*self.validator, kind, overlay, &provenance)?;
             let row = self
                 .log
                 .append(kind, &bytes, provenance.author_kind(), &provenance.author())
                 .map_err(backend)?;
-            OverlayVersion::new(row.version).ok_or_else(|| corrupt("a stored version is 0"))
-        };
-        Box::pin(std::future::ready(put()))
+            appended(row)
+        })
     }
 
     fn activate<'a>(
@@ -635,16 +716,14 @@ impl ProfileOverlayStore for SqliteOverlayStore {
             &*self.validator,
             kind,
             version,
-            move || {
-                std::future::ready(
-                    self.log
-                        .activate(
-                            kind,
-                            version.get(),
-                            expected_active.map(OverlayVersion::get),
-                        )
-                        .map_err(backend),
-                )
+            move || async move {
+                self.log
+                    .activate(
+                        kind,
+                        version.get(),
+                        expected_active.map(OverlayVersion::get),
+                    )
+                    .map_err(backend)
             },
         ))
     }
@@ -653,8 +732,7 @@ impl ProfileOverlayStore for SqliteOverlayStore {
         &'a self,
         kind: &'a str,
     ) -> BoxFuture<'a, Result<Option<StoredOverlay>, OverlayStoreError>> {
-        let row = self.log.active(kind).map_err(backend);
-        Box::pin(std::future::ready(decode_one(kind, row)))
+        Box::pin(async move { decode_one(kind, self.log.active(kind).map_err(backend)?) })
     }
 
     fn get<'a>(
@@ -662,16 +740,16 @@ impl ProfileOverlayStore for SqliteOverlayStore {
         kind: &'a str,
         version: OverlayVersion,
     ) -> BoxFuture<'a, Result<Option<StoredOverlay>, OverlayStoreError>> {
-        let row = self.log.get(kind, version.get()).map_err(backend);
-        Box::pin(std::future::ready(decode_one(kind, row)))
+        Box::pin(
+            async move { decode_one(kind, self.log.get(kind, version.get()).map_err(backend)?) },
+        )
     }
 
     fn list<'a>(
         &'a self,
         kind: &'a str,
     ) -> BoxFuture<'a, Result<Vec<StoredOverlay>, OverlayStoreError>> {
-        let rows = self.log.list(kind).map_err(backend);
-        Box::pin(std::future::ready(decode_all(kind, rows)))
+        Box::pin(async move { decode_all(kind, self.log.list(kind).map_err(backend)?) })
     }
 }
 
@@ -731,7 +809,7 @@ impl ProfileOverlayStore for PostgresOverlayStore {
             )
             .await
             .map_err(backend)?;
-            OverlayVersion::new(row.version).ok_or_else(|| corrupt("a stored version is 0"))
+            appended(row)
         })
     }
 
@@ -768,7 +846,7 @@ impl ProfileOverlayStore for PostgresOverlayStore {
             let mut conn = self.conn().await?;
             let row = autumn_harvest::overlay_log::active_overlay(&mut conn, kind)
                 .await
-                .map_err(backend);
+                .map_err(backend)?;
             decode_one(kind, row)
         })
     }
@@ -782,7 +860,7 @@ impl ProfileOverlayStore for PostgresOverlayStore {
             let mut conn = self.conn().await?;
             let row = autumn_harvest::overlay_log::get_overlay(&mut conn, kind, version.get())
                 .await
-                .map_err(backend);
+                .map_err(backend)?;
             decode_one(kind, row)
         })
     }
@@ -795,7 +873,7 @@ impl ProfileOverlayStore for PostgresOverlayStore {
             let mut conn = self.conn().await?;
             let rows = autumn_harvest::overlay_log::list_overlays(&mut conn, kind)
                 .await
-                .map_err(backend);
+                .map_err(backend)?;
             decode_all(kind, rows)
         })
     }
@@ -805,20 +883,16 @@ impl ProfileOverlayStore for PostgresOverlayStore {
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn decode_one(
     kind: &str,
-    row: Result<Option<OverlayRow>, OverlayStoreError>,
+    row: Option<OverlayRow>,
 ) -> Result<Option<StoredOverlay>, OverlayStoreError> {
-    row?.map(|row| StoredOverlay::from_row(kind, row))
+    row.map(|row| StoredOverlay::from_row(kind, row))
         .transpose()
 }
 
 /// Decode the stored rows of `kind`.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
-fn decode_all(
-    kind: &str,
-    rows: Result<Vec<OverlayRow>, OverlayStoreError>,
-) -> Result<Vec<StoredOverlay>, OverlayStoreError> {
-    rows?
-        .into_iter()
+fn decode_all(kind: &str, rows: Vec<OverlayRow>) -> Result<Vec<StoredOverlay>, OverlayStoreError> {
+    rows.into_iter()
         .map(|row| StoredOverlay::from_row(kind, row))
         .collect()
 }
@@ -954,6 +1028,73 @@ mod tests {
                 .expect("decode");
         assert_eq!(good.provenance(), &Provenance::refine(run));
         assert_eq!(good.version().get(), 2);
+    }
+
+    #[test]
+    fn an_operator_id_has_no_hidden_or_padded_text() {
+        for bad in [
+            " ops",
+            "ops ",
+            "o\u{200B}ps",
+            "ops\u{202E}",
+            "\u{FEFF}ops",
+            "o\tps",
+        ] {
+            assert!(
+                Provenance::operator(bad).check().is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        assert_eq!(Provenance::operator("ops team").check(), Ok(()));
+        assert_eq!(Provenance::operator("ops@exämple").check(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_large_overlay_is_refused() {
+        let store = InMemoryOverlayStore::new(Arc::new(harness()));
+        let big = ProfileOverlay {
+            system: Some("x".repeat(MAX_OVERLAY_BYTES)),
+            ..ProfileOverlay::default()
+        };
+        let err = store
+            .put("support", &big, Provenance::operator("ops"))
+            .await;
+        assert!(
+            matches!(
+                err,
+                Err(OverlayStoreError::TooLarge {
+                    limit: MAX_OVERLAY_BYTES,
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(store.list("support").await.expect("list"), []);
+    }
+
+    #[test]
+    fn a_conflict_names_the_active_version() {
+        let three = OverlayStoreError::Conflict {
+            actual: OverlayVersion::new(3),
+        };
+        assert_eq!(
+            three.to_string(),
+            "the active overlay is v3, not the expected version"
+        );
+        let unset = OverlayStoreError::Conflict { actual: None };
+        assert_eq!(
+            unset.to_string(),
+            "the active overlay is unset, not the expected version"
+        );
+    }
+
+    #[test]
+    fn a_stored_pointer_of_zero_is_corrupt() {
+        let version = OverlayVersion::new(1).expect("v1");
+        assert!(matches!(
+            activated(version, ActivateOutcome::Conflict { actual: Some(0) }),
+            Err(OverlayStoreError::Corrupt { .. })
+        ));
     }
 
     #[test]

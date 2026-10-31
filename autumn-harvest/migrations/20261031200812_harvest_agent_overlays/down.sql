@@ -5,3 +5,4 @@
 DROP TABLE IF EXISTS harvest_agent_overlay_heads;
 DROP TABLE IF EXISTS harvest_agent_overlays;
 DROP FUNCTION IF EXISTS harvest_agent_overlays_guard_immutable();
+DROP FUNCTION IF EXISTS harvest_agent_overlay_heads_guard_delete();
