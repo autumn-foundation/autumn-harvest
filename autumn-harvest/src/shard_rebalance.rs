@@ -702,10 +702,13 @@ pub use db::{
 #[cfg(feature = "db")]
 pub(crate) use db::forwarding_hop_conflict;
 
-/// Statement texts that a plan gate reads (issue #2424). They are not an API.
+/// Statement texts that a plan gate reads (issues #2424, #2367). They are not
+/// an API.
 #[cfg(feature = "db")]
 #[doc(hidden)]
-pub use db::{OBSERVE_SQL, QUIESCENCE_SQL, STAGED_CHILD_DELETES, STAGED_TIMERS_SQL};
+pub use db::{
+    OBSERVE_SQL, QUIESCENCE_SQL, STAGED_CHILD_DELETES, STAGED_SIGNALS_SQL, STAGED_TIMERS_SQL,
+};
 
 #[cfg(feature = "db")]
 mod db {
@@ -1496,13 +1499,7 @@ mod db {
 
         let timers = read_json(source, STAGED_TIMERS_SQL, exec_id).await?;
 
-        let signals = read_json(
-            source,
-            "SELECT COALESCE(jsonb_agg(to_jsonb(s)), '[]'::jsonb) AS payload \
-             FROM harvest_signals s WHERE s.workflow_exec_id = $1",
-            exec_id,
-        )
-        .await?;
+        let signals = read_json(source, STAGED_SIGNALS_SQL, exec_id).await?;
 
         let payload_refs = read_json(
             source,
@@ -1884,6 +1881,10 @@ mod db {
     /// Every timer of one execution, fired or not, as one JSON array.
     pub const STAGED_TIMERS_SQL: &str = "SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) \
          AS payload FROM harvest_timers t WHERE t.workflow_exec_id = $1";
+
+    /// Every signal of one execution, consumed or not, as one JSON array.
+    pub const STAGED_SIGNALS_SQL: &str = "SELECT COALESCE(jsonb_agg(to_jsonb(s)), '[]'::jsonb) \
+         AS payload FROM harvest_signals s WHERE s.workflow_exec_id = $1";
 
     /// Everything a staged copy writes apart from the execution row itself.
     pub const STAGED_CHILD_DELETES: &[&str] = &[

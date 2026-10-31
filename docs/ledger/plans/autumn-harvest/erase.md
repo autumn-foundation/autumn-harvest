@@ -80,10 +80,10 @@ Statements: 2. Tables with no usable index: none.
 
 ## `db::scrub_execution_node`
 
-Statements: 2. Tables with no usable index: `harvest_signals`.
+Statements: 2. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `UPDATE "harvest_signals" SET "payload" = $1 WHERE ("harvest_signals"."workflow_exec_id" = $2)` | `harvest_signals`: ModifyTable<br>`harvest_signals`: no usable index |
+| 1 | `UPDATE "harvest_signals" SET "payload" = $1 WHERE ("harvest_signals"."workflow_exec_id" = $2)` | `harvest_signals`: Bitmap Heap Scan on `idx_harvest_signals_exec`<br>`harvest_signals`: ModifyTable |
 | 2 | `UPDATE "harvest_workflow_executions" SET "input" = $1, "output" = $2, "memo" = $3, "search_attrs"...` | `harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey`<br>`harvest_workflow_executions`: ModifyTable |
 

@@ -4560,7 +4560,7 @@ async fn should_skip_candidate(
 
     let pending_signal_count = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(candidate.id))
-        .filter(harvest_signals::consumed.eq(false))
+        .filter(diesel::dsl::not(harvest_signals::consumed))
         .count()
         .get_result::<i64>(conn)
         .await

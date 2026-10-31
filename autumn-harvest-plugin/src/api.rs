@@ -16997,7 +16997,7 @@ async fn get_workflow_stack(
         .collect::<Vec<_>>();
     let buffered_signals = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(exec_uuid))
-        .filter(harvest_signals::consumed.eq(false))
+        .filter(diesel::dsl::not(harvest_signals::consumed))
         .select((harvest_signals::signal_name, harvest_signals::received_at))
         .load::<(String, chrono::DateTime<chrono::Utc>)>(&mut conn)
         .await
@@ -44301,7 +44301,7 @@ pub(crate) async fn load_stalled_workflows(
     // ── Step 5: unconsumed (buffered) signals ───────────────────────────────
     let has_signal: HashSet<uuid::Uuid> = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq_any(&exec_ids))
-        .filter(harvest_signals::consumed.eq(false))
+        .filter(diesel::dsl::not(harvest_signals::consumed))
         .select(harvest_signals::workflow_exec_id)
         .distinct()
         .load::<uuid::Uuid>(conn)
