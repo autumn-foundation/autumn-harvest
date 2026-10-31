@@ -24,6 +24,7 @@ use crate::mesh_control::{MESH_BUDGET_EXCEEDED, MeshBudget, MeshBudgetExceeded, 
 use crate::message::{ChatMessage, ContentPart, RunId, TokenUsage, ToolDefinition};
 use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MODEL_ID};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
+use crate::refine::{DEFAULT_PROPOSER_TIMEOUT, OverlayProposer};
 use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
 use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
@@ -122,6 +123,8 @@ pub struct AgentHarness {
     mesh_spend: Option<Arc<dyn MeshSpend>>,
     live: Option<Arc<dyn LiveSink>>,
     workspace: Option<WorkspaceStore>,
+    proposer: Option<Arc<dyn OverlayProposer>>,
+    proposer_timeout: Duration,
 }
 
 impl AgentHarness {
@@ -136,6 +139,8 @@ impl AgentHarness {
             mesh_spend: None,
             live: None,
             workspace: None,
+            proposer: None,
+            proposer_timeout: DEFAULT_PROPOSER_TIMEOUT,
             tools: Vec::new(),
             policy: Arc::new(AllowAll),
             temperature: None,
@@ -210,9 +215,36 @@ impl AgentHarness {
     }
 
     /// The activity-result cap of the workers, in bytes.
-    #[cfg(feature = "eval")]
     pub(crate) const fn result_cap(&self) -> u64 {
         self.max_result_bytes
+    }
+
+    /// Set the overlay proposer of the refine stages (issue #2379).
+    #[must_use]
+    pub fn proposer(mut self, proposer: Arc<dyn OverlayProposer>) -> Self {
+        self.proposer = Some(proposer);
+        self
+    }
+
+    /// Set the time budget of one proposer call.
+    ///
+    /// The budget is at most [`DEFAULT_PROPOSER_TIMEOUT`], so every stage
+    /// fits in the `start_to_close` of `agent_refine_propose`. A higher
+    /// value sets the default.
+    #[must_use]
+    pub fn proposer_timeout(mut self, timeout: Duration) -> Self {
+        self.proposer_timeout = timeout.min(DEFAULT_PROPOSER_TIMEOUT);
+        self
+    }
+
+    /// The overlay proposer, if one is installed.
+    pub(crate) fn overlay_proposer(&self) -> Option<&Arc<dyn OverlayProposer>> {
+        self.proposer.as_ref()
+    }
+
+    /// The time budget of one proposer call.
+    pub(crate) const fn proposer_budget(&self) -> Duration {
+        self.proposer_timeout
     }
 
     /// Set the time budget of one model call.
@@ -1610,7 +1642,7 @@ fn workspace_timeout() -> String {
     .into_error_payload()
 }
 
-fn model_failure(err: &AgentError) -> String {
+pub(crate) fn model_failure(err: &AgentError) -> String {
     let kind = format!("{:?}", err.kind());
     let message = err.to_string();
     let failure = if err.kind().is_retryable() {

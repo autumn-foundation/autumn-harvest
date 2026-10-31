@@ -51,7 +51,9 @@ pub struct ProfileOverlay {
 /// The limits of the profile that [`apply`] returns.
 ///
 /// A `None` ceiling sets no limit. A `None` bound is above every set ceiling.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A refine stage records its ceilings, so they encode as JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Ceilings {
     /// The highest `max_steps`.
     pub max_steps: Option<u32>,

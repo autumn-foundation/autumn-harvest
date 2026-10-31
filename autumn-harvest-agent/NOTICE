@@ -1,0 +1,15 @@
+autumn-harvest-agent
+Copyright the autumn-harvest contributors.
+Licensed under MIT OR Apache-2.0.
+
+This crate contains text adapted from Harness²:
+
+  Harness² (https://github.com/google-research/harness2)
+  Copyright 2026 Google LLC
+  Licensed under the Apache License, Version 2.0.
+  Source: harness2/core/prompts.py at commit
+  1cfe254e8d25b15f37048c3730134686abe60335.
+
+The adapted text is in src/refine/prompts.rs. That file is licensed under
+Apache-2.0 only. third_party/harness2/README.md lists the changes, and
+third_party/harness2/LICENSE holds the license text.

@@ -102,8 +102,8 @@ let built = HarvestBuilder::new()
 `agent` (section 15). `activities()` returns `agent_model_turn`,
 `agent_tool_call`, `agent_memory_snapshot`, `agent_deliver`,
 `agent_precheck`, `agent_discover_peers`, `agent_profile`,
-`agent_memory_reset`, `agent_workspace_retain`, `agent_workspace_reset` and
-`agent_workspace_floor`.
+`agent_memory_reset`, `agent_workspace_retain`, `agent_workspace_reset`,
+`agent_workspace_floor` and `agent_refine_propose` (section 16).
 The test `the_engine_registration_builds` builds this
 exact registration.
 
@@ -1198,3 +1198,53 @@ the answer of each model turn in two layers:
   See [durable routes](durable-routes.md#live-chunks).
 - The live text is a preview. The `TurnText` and the run result are the
   answer.
+
+## 16. Propose an overlay (issue #2379)
+
+The refine loop (epic #2369) needs candidate overlays. A proposer writes
+one from the evidence of recorded runs. There are two dimensions:
+
+- **INV** edits how the agent works, independent of the subject.
+- **DOM** edits what a practitioner in the domain knows.
+
+An app implements `OverlayProposer` for its provider, as it does
+`AgentModel`. `ModelProposer` implements it over any `AgentModel`, with
+the default INV and DOM templates. `ModelProposer::template` replaces one.
+Install the proposer with `AgentHarness::proposer`.
+
+```rust
+use std::sync::Arc;
+use autumn_harvest_agent::{AgentHarness, ModelProposer};
+
+let harness = AgentHarness::new(Arc::clone(&client))
+    .proposer(Arc::new(ModelProposer::new(client)));
+```
+
+The activity `agent_refine_propose` runs one stage. Its input is a
+`ProposeRequest`: the dimension, the evidence, the base profile, the
+current overlay, the ceilings of the run and the attempt count. It asks
+the proposer once per attempt. It checks each reply with
+`overlay::apply` under the ceilings. It returns one `Stage`:
+
+| Outcome | Meaning |
+|---|---|
+| `Proposed(overlay)` | A valid overlay that differs from `current`. |
+| `KeptBase` | A valid overlay that gives the profile of `current`. It is not a candidate. |
+| `FellBack { error }` | No attempt was valid. The stage inherits `current`. `error` is the last rejection. |
+
+- `ProposalAttempts` is from 1 to 8. The default is 2.
+  `RefinePolicy::proposal_attempts` (#2394) sets it.
+- The next attempt gets the last rejection, so the model can fix it.
+- A reply that does not decode, passes the ceilings or passes the result
+  cap is invalid. So is an attempt over `AgentHarness::proposer_timeout`
+  (at most 13 minutes).
+- A retryable proposer error (`RateLimited`, `Transport`, `Unavailable`)
+  fails the activity. The engine retries the whole stage. Any other error
+  spends one attempt.
+- The retries run inside the activity. So one stage is one recorded
+  result. A crash before the result runs the stage again from attempt 1.
+  Replay reads the result and asks no proposer.
+
+The default templates adapt Harness² text under Apache-2.0. See
+`autumn-harvest-agent/NOTICE`. The design is in
+[`DESIGN-2379.md`](design/DESIGN-2379.md).

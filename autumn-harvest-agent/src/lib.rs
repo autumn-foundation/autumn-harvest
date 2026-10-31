@@ -91,6 +91,7 @@ pub mod mesh_control;
 pub mod message;
 pub mod model;
 pub mod policy;
+pub mod refine;
 pub mod response_cache;
 #[cfg(feature = "sandbox")]
 pub mod sandbox;
@@ -134,6 +135,11 @@ pub use message::{
 };
 pub use model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
 pub use policy::{AllowAll, Rule, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
+pub use refine::{
+    Dimension, Evidence, ModelProposer, OverlayProposer, ProposalAttempts, ProposeContext,
+    ProposeRequest, ProposerReply, Stage, StageOutcome, agent_refine_propose,
+    agent_refine_propose_info,
+};
 pub use response_cache::{
     CacheIndex, CacheKey, CacheScope, InMemoryCacheIndex, KeyTenant, ResponseCache,
 };
