@@ -70,6 +70,7 @@ fn turn_request() -> ModelTurnRequest {
         prefix: None,
         remember: false,
         stream: false,
+        tool_guidance: std::collections::BTreeMap::new(),
     }
 }
 

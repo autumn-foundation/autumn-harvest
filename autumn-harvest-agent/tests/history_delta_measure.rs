@@ -101,6 +101,7 @@ fn agent_loop_history(filler: Filler) -> Vec<WorkflowEvent> {
             mesh: None,
             prefix: None,
             remember: false,
+            tool_guidance: std::collections::BTreeMap::new(),
         };
         let call = ToolCall {
             id: format!("call-{turn}"),

@@ -399,6 +399,7 @@ fn next_request(
         prefix: None,
         remember: false,
         model: task.model.clone(),
+        tool_guidance: task.tool_guidance.clone(),
     }
 }
 
@@ -2236,6 +2237,8 @@ fn child_task(
         waiting: Vec::new(),
         // Only a fan-out sets it, after its gate.
         report_failure: false,
+        // The child takes the prompt of its peer, so it takes no guidance.
+        tool_guidance: BTreeMap::new(),
     }
 }
 
@@ -2541,6 +2544,22 @@ pub fn activities() -> Vec<ActivityInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_delegated_child_takes_no_tool_guidance() {
+        let mut task = AgentTask::new("go");
+        task.tool_guidance
+            .insert("lookup".to_owned(), "Look up one key.".to_owned());
+        let peer = Peer::new("planner", "Plans.");
+        let child = child_task(
+            &task,
+            &peer,
+            "plan".to_owned(),
+            Mandate::new("triage"),
+            None,
+        );
+        assert_eq!(child.tool_guidance, BTreeMap::new());
+    }
 
     #[test]
     fn the_flow_state_after_a_turn_skips_denied_calls() {

@@ -755,11 +755,11 @@ because a custom codec can quote the answer.
   binary rebuilds that input without it, so set `tenant` only after the
   whole fleet runs this release.
 
-## 12. Evaluate a candidate model or prompt
+## 12. Evaluate a candidate overlay
 
 `eval::evaluate` re-drives a recorded `agent_loop` run with a candidate model
-or prompt (issue #2001). It reports where the decisions of the two runs
-diverge. Turn on the `eval` feature.
+and a profile overlay (issues #2001 and #2375). It reports where the
+decisions of the two runs diverge. Turn on the `eval` feature.
 
 ```rust,ignore
 use autumn_harvest_agent::eval::{Candidate, evaluate};
@@ -780,7 +780,7 @@ change.
 
 | Activity | In an evaluation |
 |---|---|
-| `agent_model_turn` | The candidate model answers, then the candidate policy decides. These are the only live calls. The response cache is skipped, so every turn asks the candidate. |
+| `agent_model_turn` | The candidate model answers under the overlay profile, then the candidate policy decides. These are the only live calls. The response cache is skipped, so every turn asks the candidate. |
 | `agent_tool_call` | The recorded outcome of the same call, or an error stub. No tool runs. |
 | `agent_memory_snapshot` | The recorded snapshot, or an empty one. |
 | `agent_deliver` | A stub. No report leaves the harness. |
@@ -813,11 +813,49 @@ That is not a divergence. `end_diverged` compares how the two runs end, for
 example `Completed` and `TokensExhausted`. `diverged()` reads both.
 `stubbed_tool_calls` counts the calls with no recorded outcome.
 
-### Compare two models
+### Run a whole overlay
 
-`eval::compare` runs two candidates on one source (issue #2271). It returns
-both evaluations and one `TurnDiff` per turn of the two candidates. In that
-diff, `recorded` holds the first candidate.
+`Candidate::overlay` runs the source under a `ProfileOverlay` (issue
+#2375). The harness reads the source profile from the recorded task. That
+profile holds the prompt, the bounds, `read_only`, the model, the mandate
+and the tool guidance. `agent::overlay::apply` merges the overlay before
+the engine starts.
+
+```rust,ignore
+use autumn_harvest_agent::eval::{Candidate, evaluate};
+use autumn_harvest_agent::ProfileOverlay;
+
+let overlay = ProfileOverlay {
+    guardrails: Some("Never refund twice.".into()),
+    max_steps: Some(4),
+    tool_guidance: [("lookup".into(), "Look up one order at a time.".into())].into(),
+    ..ProfileOverlay::default()
+};
+let evaluation = evaluate(&history, &Candidate::new(harness).overlay(overlay)).await?;
+println!("{}", evaluation.overlay_digest);
+```
+
+| Part | In an evaluation |
+|---|---|
+| The ceilings | `Ceilings::from_profile` of the source profile, so an overlay can only narrow the source bounds and model. `Candidate::ceilings` sets operator ceilings. |
+| A refused overlay | `EvalError::Overlay` with the `OverlayError`. It costs no model call. `compare` checks both overlays first. |
+| `system` and `guardrails` | The system prompt of every turn of the root agent. |
+| `tool_guidance` | The description of each named app tool in the `ToolDefinition` that the model sees. A key must name a harness app tool, not a built-in tool such as `memory`. A text holds at most `MAX_TOOL_GUIDANCE_BYTES`. A recorded outcome still answers a call with the same step, name and arguments. A delegated child takes no guidance. |
+| `Candidate::system_prompt` | A one-part overlay that sets `system`. |
+| `Candidate::model` | A one-part overlay that sets `model`. The ceilings admit the model, because the operator names it. The harness and the source mandate must still hold it, or the evaluation fails before any call. Every turn asks it. |
+| `Candidate::agent_model` | A route for one agent. It is not an overlay part. |
+| `Candidate::overlay` | Replaces the parts and the route that a shorthand set before it. It keeps the ceilings and the agent routes. |
+| `Evaluation::overlay_digest` | `ProfileOverlay::digest`: the SHA-256 of the JSON of the overlay. Equal overlays have equal digests. The digest leaves out the ceilings and the agent routes. |
+
+The candidate report shows the recorded run id, as the policy does. So two
+evaluations of one candidate with the same replies are equal.
+
+### Compare two candidates
+
+`eval::compare` runs two candidates on one source (issue #2271). Each can
+hold a model, an overlay or both (issue #2375). It returns both evaluations,
+each with its overlay digest, and one `TurnDiff` per turn of the two
+candidates. In that diff, `recorded` holds the first candidate.
 
 ```rust,ignore
 use autumn_harvest_agent::eval::{Candidate, compare};
@@ -829,7 +867,15 @@ let comparison = compare(&history, &first, &second).await?;
 ```
 
 `Candidate::model` sets the model of every turn. `Candidate::agent_model`
-sets the model of one agent of a delegation tree and wins over it.
+sets the model of one agent of a delegation tree and wins over it. Two
+overlays compare the same way:
+
+```rust,ignore
+let first = Candidate::new(harness_a).overlay(terse);
+let second = Candidate::new(harness_b).overlay(guided);
+let comparison = compare(&history, &first, &second).await?;
+assert_ne!(comparison.first.overlay_digest, comparison.second.overlay_digest);
+```
 
 Each candidate turn is a live model call. `Candidate::max_turns` caps them.
 The default cap is the recorded turn count plus `DEFAULT_EXTRA_TURNS`. The
@@ -838,7 +884,8 @@ cycle replays the history so far, so the time of an evaluation grows with the
 square of the run length.
 
 The harness refuses an erased source, a source that has not ended, a source
-that was cancelled or timed out, and a history that is not an agent run. A history with payload-store references or
+that was cancelled or timed out, and a history that is not an agent run. It
+also refuses an overlay that `agent::overlay::apply` refuses. A history with payload-store references or
 encrypted payloads needs decoding first. The model call blocks in place, so
 run the evaluation on a multi-thread Tokio runtime.
 

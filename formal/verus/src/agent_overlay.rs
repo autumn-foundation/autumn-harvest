@@ -9,6 +9,11 @@
 //! The proptests in `overlay.rs` check that the engine does the same.
 //! The model leaves out the system prompt. The proptests check its
 //! idempotency.
+//!
+//! Issue #2375 adds tool guidance. A tool name is an integer too. The model
+//! keeps the set of guided tools and leaves out the text. `long_guidance`
+//! tells whether a text is longer than `MAX_TOOL_GUIDANCE_BYTES`. The
+//! registry holds a set of models and a set of tools.
 
 use vstd::prelude::*;
 
@@ -120,6 +125,7 @@ pub struct Profile {
     pub read_only: bool,
     pub model: Option<int>,
     pub allowed: Option<Set<int>>,
+    pub guidance: Set<int>,
     pub rest: int,
 }
 
@@ -130,6 +136,14 @@ pub struct Overlay {
     pub max_output_tokens: Option<u32>,
     pub read_only: Option<bool>,
     pub model: Option<int>,
+    pub guidance: Set<int>,
+    pub long_guidance: bool,
+}
+
+/// The models and the tools that a harness holds.
+pub struct Registry {
+    pub models: Set<int>,
+    pub tools: Set<int>,
 }
 
 /// The ceilings of a result.
@@ -159,7 +173,7 @@ pub open spec fn allows(allowed: Option<Set<int>>, model: int) -> bool {
 }
 
 /// `apply` as a spec. `None` is a refusal.
-pub open spec fn apply(p: Profile, o: Overlay, c: Ceilings, registry: Set<int>) -> Option<Profile> {
+pub open spec fn apply(p: Profile, o: Overlay, c: Ceilings, registry: Registry) -> Option<Profile> {
     let steps = spec_merged_bound(Some(p.max_steps), o.max_steps, c.max_steps);
     let total = spec_merged_bound(p.max_total_tokens, o.max_total_tokens, c.max_total_tokens);
     let output = spec_merged_bound(p.max_output_tokens, o.max_output_tokens, c.max_output_tokens);
@@ -175,7 +189,9 @@ pub open spec fn apply(p: Profile, o: Overlay, c: Ceilings, registry: Set<int>) 
         None
     } else if forbidden || !c.models.contains(name(model)) {
         None
-    } else if o.model.is_some() && !registry.contains(o.model.unwrap()) {
+    } else if o.model.is_some() && !registry.models.contains(o.model.unwrap()) {
+        None
+    } else if !o.guidance.subset_of(registry.tools) || o.long_guidance {
         None
     } else {
         Some(
@@ -186,6 +202,7 @@ pub open spec fn apply(p: Profile, o: Overlay, c: Ceilings, registry: Set<int>) 
                 read_only: read_only.unwrap(),
                 model,
                 allowed: p.allowed,
+                guidance: p.guidance.union(o.guidance),
                 rest: p.rest,
             },
         )
@@ -194,7 +211,7 @@ pub open spec fn apply(p: Profile, o: Overlay, c: Ceilings, registry: Set<int>) 
 
 /// `apply` refuses exactly when a rule fails. Otherwise it returns the
 /// overlay value of each field, or else the profile value.
-pub proof fn theorem_apply_refuses_exactly(p: Profile, o: Overlay, c: Ceilings, registry: Set<int>)
+pub proof fn theorem_apply_refuses_exactly(p: Profile, o: Overlay, c: Ceilings, registry: Registry)
     ensures
         ({
             let steps = if o.max_steps.is_some() {
@@ -227,7 +244,8 @@ pub proof fn theorem_apply_refuses_exactly(p: Profile, o: Overlay, c: Ceilings, 
                 && !c.allow_clear_read_only) && (o.model.is_some() ==> allows(
                 p.allowed,
                 o.model.unwrap(),
-            ) && registry.contains(o.model.unwrap())) && c.models.contains(name(model));
+            ) && registry.models.contains(o.model.unwrap())) && c.models.contains(name(model))
+                && o.guidance.subset_of(registry.tools) && !o.long_guidance;
             &&& apply(p, o, c, registry).is_some() == ok
             &&& ok ==> apply(p, o, c, registry) == Some(
                 Profile {
@@ -237,6 +255,7 @@ pub proof fn theorem_apply_refuses_exactly(p: Profile, o: Overlay, c: Ceilings, 
                     read_only,
                     model,
                     allowed: p.allowed,
+                    guidance: p.guidance.union(o.guidance),
                     rest: p.rest,
                 },
             )
@@ -246,13 +265,14 @@ pub proof fn theorem_apply_refuses_exactly(p: Profile, o: Overlay, c: Ceilings, 
 
 /// No result bound is above its ceiling. A result clears `read_only` only
 /// when the ceilings allow it. Its model is in the ceilings. The registry
-/// and the mandate hold an overlay model. Each field that an overlay cannot
-/// name keeps its value.
+/// and the mandate hold an overlay model. The registry holds each guided
+/// tool of the overlay, and the result keeps it. Each field that an overlay
+/// cannot name keeps its value.
 pub proof fn theorem_a_result_stays_under_the_ceilings(
     p: Profile,
     o: Overlay,
     c: Ceilings,
-    registry: Set<int>,
+    registry: Registry,
 )
     ensures
         apply(p, o, c, registry).is_some() ==> {
@@ -262,8 +282,12 @@ pub proof fn theorem_a_result_stays_under_the_ceilings(
             &&& within(q.max_output_tokens, c.max_output_tokens)
             &&& (p.read_only && !q.read_only ==> c.allow_clear_read_only)
             &&& c.models.contains(name(q.model))
-            &&& (o.model.is_some() ==> registry.contains(o.model.unwrap()))
+            &&& (o.model.is_some() ==> registry.models.contains(o.model.unwrap()))
             &&& (o.model.is_some() ==> allows(p.allowed, o.model.unwrap()))
+            &&& o.guidance.subset_of(registry.tools)
+            &&& !o.long_guidance
+            &&& o.guidance.subset_of(q.guidance)
+            &&& p.guidance.subset_of(q.guidance)
             &&& q.allowed == p.allowed
             &&& q.rest == p.rest
         },
@@ -272,7 +296,7 @@ pub proof fn theorem_a_result_stays_under_the_ceilings(
 
 /// Under the ceilings of the profile, no bound rises. An overlay never
 /// clears `read_only`, and the model does not change.
-pub proof fn theorem_default_ceilings_only_narrow(p: Profile, o: Overlay, registry: Set<int>)
+pub proof fn theorem_default_ceilings_only_narrow(p: Profile, o: Overlay, registry: Registry)
     ensures
         apply(p, o, from_profile(p), registry).is_some() ==> {
             let q = apply(p, o, from_profile(p), registry).unwrap();
@@ -289,15 +313,19 @@ pub proof fn theorem_default_ceilings_only_narrow(p: Profile, o: Overlay, regist
 }
 
 /// A second apply of the same overlay changes nothing.
-pub proof fn theorem_apply_is_idempotent(p: Profile, o: Overlay, c: Ceilings, registry: Set<int>)
+pub proof fn theorem_apply_is_idempotent(p: Profile, o: Overlay, c: Ceilings, registry: Registry)
     ensures
         apply(p, o, c, registry).is_some() ==> apply(apply(p, o, c, registry).unwrap(), o, c, registry)
             == apply(p, o, c, registry),
 {
+    if apply(p, o, c, registry).is_some() {
+        let q = apply(p, o, c, registry).unwrap();
+        assert(q.guidance.union(o.guidance) =~= q.guidance);
+    }
 }
 
 /// An empty overlay under the ceilings of the profile returns the profile.
-pub proof fn theorem_an_empty_overlay_keeps_the_profile(p: Profile, registry: Set<int>)
+pub proof fn theorem_an_empty_overlay_keeps_the_profile(p: Profile, registry: Registry)
     ensures
         apply(
             p,
@@ -307,11 +335,14 @@ pub proof fn theorem_an_empty_overlay_keeps_the_profile(p: Profile, registry: Se
                 max_output_tokens: None,
                 read_only: None,
                 model: None,
+                guidance: Set::empty(),
+                long_guidance: false,
             },
             from_profile(p),
             registry,
         ) == Some(p),
 {
+    assert(p.guidance.union(Set::empty()) =~= p.guidance);
 }
 
 } // verus!

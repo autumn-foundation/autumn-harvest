@@ -662,6 +662,11 @@ pub struct AgentProfile {
     /// Install a store with `AgentHarness::workspace`.
     #[serde(default, skip_serializing_if = "crate::types::is_false")]
     pub workspace: bool,
+    /// New text for the description of each named app tool (issue #2373).
+    /// See [`AgentTask::tool_guidance`]. Only an overlay key must name a
+    /// harness tool. A profile key for no such tool changes nothing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_guidance: BTreeMap<String, String>,
 }
 
 const fn default_max_steps() -> u32 {
@@ -703,6 +708,7 @@ impl AgentProfile {
             mesh: None,
             stream: false,
             workspace: false,
+            tool_guidance: BTreeMap::new(),
         }
     }
 
@@ -880,6 +886,7 @@ impl AgentProfile {
         task.mesh.clone_from(&self.mesh);
         task.memory_in_state = self.memory == AgentMemory::State;
         task.stream = self.stream;
+        task.tool_guidance.clone_from(&self.tool_guidance);
         if self.workspace {
             task.workspace = Some(WorkspaceMount {
                 scope: WorkspaceMount::agent_scope(id.as_str()),
