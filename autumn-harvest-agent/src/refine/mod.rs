@@ -9,9 +9,12 @@ pub mod model_proposer;
 pub mod prompts;
 pub mod propose;
 
-pub use model_proposer::{KEEP_BASE, ModelProposer, OUTPUT_CONTRACT};
+pub use model_proposer::{
+    DEFAULT_PROPOSER_OUTPUT_TOKENS, KEEP_BASE, ModelProposer, OUTPUT_CONTRACT,
+};
 pub use propose::{
-    DEFAULT_PROPOSER_TIMEOUT, Dimension, Evidence, MAX_PROPOSAL_ATTEMPTS, MAX_REJECTION_CHARS,
-    OverlayProposer, ProposalAttempts, ProposalAttemptsError, ProposeContext, ProposeRequest,
-    ProposerReply, Stage, StageOutcome, agent_refine_propose, agent_refine_propose_info,
+    DEFAULT_PROPOSAL_ATTEMPTS, DEFAULT_PROPOSER_TIMEOUT, Dimension, Evidence,
+    MAX_PROPOSAL_ATTEMPTS, MAX_REJECTION_CHARS, OverlayProposer, ProposalAttempts,
+    ProposalAttemptsError, ProposeContext, ProposeRequest, ProposerReply, Stage, StageOutcome,
+    agent_refine_propose, agent_refine_propose_info,
 };

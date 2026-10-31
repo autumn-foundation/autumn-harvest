@@ -231,7 +231,9 @@ async fn a_crash_mid_retry_records_one_result_and_never_asks_a_completed_stage()
     let events = rt.load_history(exec).unwrap();
     assert_eq!(completed_stages(&events), stages);
 
-    // Replay reads the recorded stages and asks no proposer.
+    // Replay rebuilds the run from the recorded stages alone. The replayer
+    // holds no proposer, so no stage can be asked again. The log shows that
+    // no process called a proposer after the run ended.
     let report = WorkflowReplayer::new()
         .register(vec![two_stages_info()])
         .replay_from_events(events)
@@ -240,8 +242,10 @@ async fn a_crash_mid_retry_records_one_result_and_never_asks_a_completed_stage()
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "{report}"
     );
-    assert_eq!(parent.calls.load(Ordering::SeqCst), 2);
-    assert_eq!(lines(&log_path, "parent").len(), 2);
+    assert_eq!(
+        std::fs::read_to_string(&log_path).unwrap().lines().count(),
+        6
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

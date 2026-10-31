@@ -17,7 +17,8 @@ activity `agent_refine_propose` runs one stage.
 - `OverlayProposer` is a trait that an app implements, as it does
   `AgentModel`. `propose` takes a `ProposeContext` and returns a
   `ProposerReply`. The context holds the dimension, the evidence, the
-  current overlay, the attempt number and the rejection of the last try.
+  base profile, the ceilings, the current overlay, the attempt number and
+  the rejection of the last try.
 - `ProposerReply` is overlay JSON text or a decoded `ProfileOverlay`.
 - `Evidence` is plain text. #2377 adds a bundle variant. The enum is
   `#[non_exhaustive]`, so that change does not break an app.
@@ -34,19 +35,27 @@ activity `agent_refine_propose` runs one stage.
 
 ### The rules of a stage
 
-1. The activity asks the proposer once per attempt.
+1. `current` must apply under the ceilings. Otherwise the activity fails
+   for good as `CurrentOverlayRefused`, because a fallback hands
+   `current` on. The activity then asks the proposer once per attempt.
 2. A reply is valid when it decodes, `overlay::apply` accepts it under
    the ceilings of the run, and the stage fits the activity result cap.
 3. A valid reply whose applied profile equals the applied profile of
-   `current` gives `KeptBase`. Any other valid reply gives
+   `current` gives `KeptBase`. The check names the model of each side, so
+   `None` and `default` compare equal. Any other valid reply gives
    `Proposed(overlay)`.
 4. An invalid reply gives a rejection. The next attempt gets it as
    feedback. After the last attempt, the stage is `FellBack { error }`,
    with the last rejection. `Stage::overlay` then returns `current`.
-5. A proposer error that a retry can fix (`RateLimited`, `Transport`,
+5. A rejection keeps at most 1,000 characters. Under a result cap, it
+   keeps at most a sixth of the cap less the stage envelope. JSON writes
+   one character in at most six bytes, so a fallback always fits.
+6. A proposer error that a retry can fix (`RateLimited`, `Transport`,
    `Unavailable`) fails the activity as retryable. The engine retries the
-   whole stage. Any other proposer error is a rejection.
-6. An attempt that passes the proposer time budget is a rejection.
+   whole stage. `Config`, `Authentication` and `Budget` fail it for good.
+   Any other proposer error is a rejection.
+7. An attempt over the proposer time budget is a rejection. A zero budget
+   sets the default.
 
 `next_step` is the pure kernel of rules 3 and 4. The loop calls it after
 each reply.
@@ -57,15 +66,32 @@ The retries run inside one activity. The engine records one result per
 stage. A crash before the result re-runs the stage from attempt 1. A
 crash after the result replays it, and the proposer is not called.
 
+The activity sends no heartbeat. On Postgres, a lost worker holds the
+stage until the 2-hour `start_to_close` ends. A retryable failure on
+every engine attempt fails the activity. The refine workflow (#2380)
+then inherits `current`.
+
+### The model request
+
+`ModelProposer` puts each block of data in a tag with one boundary. The
+blocks are the evidence, the base profile, the ceilings, the current
+overlay and the last rejection. The boundary is 16 hex digits of a
+SHA-256 digest over every block. So no block can hold its own closing
+tag. A reply that stops at the output cap is a `Decode` error, so it
+spends one attempt. The default output cap is 8,192 tokens.
+
 ## Brainstorm
 
 | Question | Options | Choice |
 |---|---|---|
+| Trait shape | The issue form `propose(dim, evidence, current) -> ProposerReply`. An async call with a context. | An async call with a context that returns `Result`. A provider is async. The error kind decides a retry. The context adds the base profile, the ceilings, the attempt and the rejection, and it is `#[non_exhaustive]`. `Evidence` is plain text until #2377 adds `BundleManifest`. |
 | Reply type | Text only. Overlay only. Both. | Both. A model writes text. An app with a typed client returns an overlay. |
 | Equal to `current` | The same overlay. The same applied profile. | The same applied profile. A reply that restates a profile value changes nothing, so it is not a candidate. |
 | Where the profile comes from | Read by kind in the activity. In the request. | In the request. The workflow reads it once, so all stages use one profile. |
 | Retry feedback | None. The last rejection. | The last rejection, as Harness² does. The model can fix its own error. |
 | Transport faults | A rejection. An activity retry. | An activity retry. A rejection would spend an attempt on an outage. |
+| A bad key or config | A rejection. A failure for good. | A failure for good. A rejection hides the fault as a model with bad overlays. |
+| What the model sees | The evidence and the overlay. Also the base profile and the ceilings. | Also the base profile and the ceilings. An overlay `system` replaces the base prompt, so the model must read it. |
 | Where the templates live | Constants only. A model-backed proposer. | A model-backed proposer. A template with no user is dead text. |
 | Module | `agent::propose`. A new `refine` module. | `refine`. #2380, #2381 and #2382 add to it. |
 
@@ -80,10 +106,15 @@ How can a stage go wrong? Each failure has a guard.
 | An operator sets 1,000,000 attempts. | `ProposalAttempts` refuses a value above 8 when it decodes. |
 | Zero attempts give a stage with no answer. | `ProposalAttempts` refuses 0. |
 | A huge prompt makes the result too large to record. | The stage checks the result cap. An oversized reply is a rejection. |
+| A long or escaped rejection makes a fallback too large. | The rejection limit follows the result cap. |
+| A ceilings JSON leaves out a key, which would mean no limit. | Each ceiling key is required. Only an explicit `null` sets no limit. |
+| `current` is past the ceilings, and a fallback hands it on. | The stage refuses it before the first attempt. |
+| The evidence forges a heading or a closing tag. | Each block has a boundary that the data cannot know. |
+| A revoked key spends every attempt and reports a fallback. | A configuration error fails the stage for good. |
 | A slow proposer holds the activity forever. | Each attempt has a time budget of at most 13 minutes. Eight attempts fit in the 2-hour `start_to_close`. |
 | A crash mid-retry records two results. | One activity is one recorded result. |
 | Replay asks the proposer again. | Replay reads the recorded `Stage`. |
-| A long error floods history. | The stage cuts the rejection to 1,000 characters. |
+| A long error floods history. | The stage cuts the rejection to 1,000 characters or less. |
 | The evidence holds an instruction. | The templates say that evidence is data, not instructions. |
 | A reply restates the current overlay. | It gives `KeptBase`, so no probe is spent. |
 
@@ -105,9 +136,12 @@ How can a stage go wrong? Each failure has a guard.
 
 ## Limits
 
-- A `FellBack` stage inherits `current`. The stage does not check that
-  `current` applies under the ceilings. The adoption gate (#2381) applies
-  the overlay again before it goes live.
+- The proposed `system` and `guardrails` text is model output. The
+  ceilings do not bound text. Treat it as untrusted until the adoption
+  gate (#2381) accepts it.
+- The crate license is `MIT OR Apache-2.0`, as
+  `scripts/check-license-files.sh` requires. `src/refine/prompts.rs` is
+  Apache-2.0 only, and `NOTICE` says so.
 - `ModelProposer` calls its model directly. The cost ledger does not see
   the call. The fixed budget of #2380 bounds the spend.
 - A large `Evidence::Text` can pass the activity input cap. #2377 moves

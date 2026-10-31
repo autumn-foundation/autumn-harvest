@@ -136,9 +136,10 @@ pub use message::{
 pub use model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
 pub use policy::{AllowAll, Rule, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
 pub use refine::{
-    Dimension, Evidence, ModelProposer, OverlayProposer, ProposalAttempts, ProposeContext,
-    ProposeRequest, ProposerReply, Stage, StageOutcome, agent_refine_propose,
-    agent_refine_propose_info,
+    DEFAULT_PROPOSAL_ATTEMPTS, DEFAULT_PROPOSER_OUTPUT_TOKENS, DEFAULT_PROPOSER_TIMEOUT, Dimension,
+    Evidence, KEEP_BASE, MAX_PROPOSAL_ATTEMPTS, ModelProposer, OUTPUT_CONTRACT, OverlayProposer,
+    ProposalAttempts, ProposalAttemptsError, ProposeContext, ProposeRequest, ProposerReply, Stage,
+    StageOutcome, agent_refine_propose, agent_refine_propose_info,
 };
 pub use response_cache::{
     CacheIndex, CacheKey, CacheScope, InMemoryCacheIndex, KeyTenant, ResponseCache,

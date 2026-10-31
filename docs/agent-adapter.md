@@ -1222,8 +1222,10 @@ let harness = AgentHarness::new(Arc::clone(&client))
 
 The activity `agent_refine_propose` runs one stage. Its input is a
 `ProposeRequest`: the dimension, the evidence, the base profile, the
-current overlay, the ceilings of the run and the attempt count. It asks
-the proposer once per attempt. It checks each reply with
+current overlay, the ceilings of the run and the attempt count. The
+current overlay must apply under the ceilings. The activity asks the
+proposer once per attempt. The proposer reads the base profile and the
+ceilings too. It checks each reply with
 `overlay::apply` under the ceilings. It returns one `Stage`:
 
 | Outcome | Meaning |
@@ -1235,15 +1237,21 @@ the proposer once per attempt. It checks each reply with
 - `ProposalAttempts` is from 1 to 8. The default is 2.
   `RefinePolicy::proposal_attempts` (#2394) sets it.
 - The next attempt gets the last rejection, so the model can fix it.
-- A reply that does not decode, passes the ceilings or passes the result
-  cap is invalid. So is an attempt over `AgentHarness::proposer_timeout`
-  (at most 13 minutes).
+- A reply that does not decode, is above the ceilings or is above the
+  result cap is invalid. So is an attempt over
+  `AgentHarness::proposer_timeout` (at most 13 minutes).
 - A retryable proposer error (`RateLimited`, `Transport`, `Unavailable`)
-  fails the activity. The engine retries the whole stage. Any other error
-  spends one attempt.
+  fails the activity. The engine retries the whole stage. `Config`,
+  `Authentication` and `Budget` fail it for good. Any other error spends
+  one attempt.
+- Each ceiling key is required in JSON. Only an explicit `null` sets no
+  limit.
+- The proposed text is model output. Treat it as untrusted until the
+  adoption gate (#2381) accepts it.
 - The retries run inside the activity. So one stage is one recorded
   result. A crash before the result runs the stage again from attempt 1.
-  Replay reads the result and asks no proposer.
+  Replay reads the result and asks no proposer. On Postgres, a lost
+  worker holds the stage until its 2-hour `start_to_close` ends.
 
 The default templates adapt Harness² text under Apache-2.0. See
 `autumn-harvest-agent/NOTICE`. The design is in

@@ -51,15 +51,22 @@ pub struct ProfileOverlay {
 /// The limits of the profile that [`apply`] returns.
 ///
 /// A `None` ceiling sets no limit. A `None` bound is above every set ceiling.
-/// A refine stage records its ceilings, so they encode as JSON.
+///
+/// A refine stage records its ceilings, so they encode as JSON. The decode
+/// fails closed. Each key is required, because a missing key would decode
+/// as no limit. Only an explicit `null` sets no limit. An unknown key also
+/// fails, so an old worker never drops a ceiling that a new worker sets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ceilings {
     /// The highest `max_steps`.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub max_steps: Option<u32>,
     /// The highest `max_total_tokens`.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub max_total_tokens: Option<u32>,
     /// The highest `max_output_tokens`.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub max_output_tokens: Option<u32>,
     /// The models that the profile may name.
     pub models: BTreeSet<String>,

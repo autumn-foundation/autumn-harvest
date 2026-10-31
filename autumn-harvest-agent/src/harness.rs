@@ -230,10 +230,14 @@ impl AgentHarness {
     ///
     /// The budget is at most [`DEFAULT_PROPOSER_TIMEOUT`], so every stage
     /// fits in the `start_to_close` of `agent_refine_propose`. A higher
-    /// value sets the default.
+    /// value or zero sets the default.
     #[must_use]
     pub fn proposer_timeout(mut self, timeout: Duration) -> Self {
-        self.proposer_timeout = timeout.min(DEFAULT_PROPOSER_TIMEOUT);
+        self.proposer_timeout = if timeout.is_zero() {
+            DEFAULT_PROPOSER_TIMEOUT
+        } else {
+            timeout.min(DEFAULT_PROPOSER_TIMEOUT)
+        };
         self
     }
 

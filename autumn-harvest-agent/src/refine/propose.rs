@@ -8,6 +8,7 @@
 //! [`Stage`]. The retries run inside the activity, so the engine records
 //! one result per stage.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::num::NonZeroU32;
 use std::time::Duration;
@@ -21,8 +22,8 @@ use thiserror::Error;
 use crate::agent::AgentProfile;
 use crate::agent::overlay::{self, Ceilings, ProfileOverlay};
 use crate::bounds::json_len;
-use crate::error::AgentError;
-use crate::harness::{AgentHarness, model_failure, truncate};
+use crate::error::{AgentError, ErrorKind};
+use crate::harness::{AgentHarness, DEFAULT_MODEL, model_failure, truncate};
 use crate::model::BoxFuture;
 
 /// The most attempts of one stage.
@@ -35,7 +36,11 @@ pub const MAX_PROPOSAL_ATTEMPTS: u32 = 8;
 /// The default and highest time budget of one proposer call: 13 minutes.
 pub const DEFAULT_PROPOSER_TIMEOUT: Duration = Duration::from_secs(13 * 60);
 
-/// The most characters of a rejection that a stage keeps.
+/// The default number of attempts of one stage, as in Harness².
+pub const DEFAULT_PROPOSAL_ATTEMPTS: u32 = 2;
+
+/// The most characters of a rejection that a stage keeps, before the
+/// truncation mark. A small result cap keeps fewer.
 pub const MAX_REJECTION_CHARS: usize = 1_000;
 
 /// The bytes that a [`Stage`] adds around its overlay JSON.
@@ -43,6 +48,9 @@ const STAGE_ENVELOPE_BYTES: u64 = 128;
 
 /// The error type of a stage with no proposer installed.
 const PROPOSER_MISSING: &str = "OverlayProposerMissing";
+
+/// The error type of a stage whose current overlay does not apply.
+const CURRENT_REFUSED: &str = "CurrentOverlayRefused";
 
 /// The part of the setup that a proposer edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -84,9 +92,9 @@ impl Evidence {
 
     /// The evidence as the text that a prompt holds.
     #[must_use]
-    pub fn render(&self) -> &str {
+    pub fn render(&self) -> Cow<'_, str> {
         match self {
-            Self::Text(text) => text,
+            Self::Text(text) => Cow::Borrowed(text),
         }
     }
 }
@@ -98,8 +106,8 @@ pub struct ProposalAttemptsError(pub u32);
 
 /// The number of attempts of one stage: 1 to [`MAX_PROPOSAL_ATTEMPTS`].
 ///
-/// The default is 2, as in Harness². `RefinePolicy::proposal_attempts`
-/// (issue #2394) sets it.
+/// The default is [`DEFAULT_PROPOSAL_ATTEMPTS`].
+/// `RefinePolicy::proposal_attempts` (issue #2394) sets it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "u32", into = "u32")]
 pub struct ProposalAttempts(NonZeroU32);
@@ -127,7 +135,7 @@ impl ProposalAttempts {
 
 impl Default for ProposalAttempts {
     fn default() -> Self {
-        Self(NonZeroU32::MIN.saturating_add(1))
+        Self(NonZeroU32::new(DEFAULT_PROPOSAL_ATTEMPTS).unwrap_or(NonZeroU32::MIN))
     }
 }
 
@@ -146,18 +154,49 @@ impl From<ProposalAttempts> for u32 {
 }
 
 /// What a proposer reads for one attempt.
+///
+/// It is `#[non_exhaustive]`, so a new field does not break a proposer.
+/// Build one with [`ProposeContext::new`].
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct ProposeContext<'a> {
     /// The part of the setup to edit.
     pub dimension: Dimension,
     /// The evidence of the source runs.
     pub evidence: &'a Evidence,
+    /// The base profile of the operator. Each overlay applies to it, so a
+    /// proposal that sets `system` replaces its system prompt.
+    pub profile: &'a AgentProfile,
+    /// The ceilings of the run. A reply above them is invalid.
+    pub ceilings: &'a Ceilings,
     /// The overlay that the stage edits.
     pub current: &'a ProfileOverlay,
     /// The attempt number. The first attempt is 1.
     pub attempt: u32,
     /// Why the stage refused the reply of the last attempt.
     pub rejection: Option<&'a str>,
+}
+
+impl<'a> ProposeContext<'a> {
+    /// The context of attempt 1, with no rejection.
+    #[must_use]
+    pub const fn new(
+        dimension: Dimension,
+        evidence: &'a Evidence,
+        profile: &'a AgentProfile,
+        ceilings: &'a Ceilings,
+        current: &'a ProfileOverlay,
+    ) -> Self {
+        Self {
+            dimension,
+            evidence,
+            profile,
+            ceilings,
+            current,
+            attempt: 1,
+            rejection: None,
+        }
+    }
 }
 
 /// The answer of a proposer.
@@ -175,9 +214,16 @@ pub enum ProposerReply {
 /// [`AgentModel`](crate::AgentModel). [`ModelProposer`](super::ModelProposer)
 /// implements it over a model.
 ///
-/// Return an [`AgentError`] whose kind says whether a retry can succeed.
-/// A retryable kind fails the activity, and the engine retries the stage.
-/// Any other kind spends one attempt.
+/// Return an [`AgentError`] whose kind says what the stage does:
+///
+/// - `RateLimited`, `Transport` and `Unavailable` fail the activity as
+///   retryable. The engine retries the whole stage.
+/// - `Config`, `Authentication` and `Budget` fail the activity for good. A
+///   new attempt cannot fix them.
+/// - Any other kind spends one attempt.
+///
+/// The proposed `system` and `guardrails` text is model output. Treat it
+/// as untrusted until the adoption gate (issue #2381) accepts it.
 pub trait OverlayProposer: Send + Sync + fmt::Debug {
     /// Propose an overlay for one attempt.
     fn propose<'a>(
@@ -188,7 +234,9 @@ pub trait OverlayProposer: Send + Sync + fmt::Debug {
 
 /// The input of [`agent_refine_propose`].
 ///
-/// The refine workflow (issue #2380) builds it from recorded reads.
+/// The refine workflow (issue #2380) builds it from recorded reads. The
+/// `ceilings` and `attempts` come from the operator policy (issue #2394),
+/// never from the input of the refine run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposeRequest {
     /// The part of the setup to edit.
@@ -212,7 +260,8 @@ pub struct ProposeRequest {
 pub enum StageOutcome {
     /// A valid overlay that differs from `current`.
     Proposed(ProfileOverlay),
-    /// A valid overlay equal to `current`. It is not a candidate.
+    /// A valid overlay that gives the profile of `current`. It is not a
+    /// candidate.
     KeptBase,
     /// No attempt gave a valid overlay. The stage inherits `current`.
     FellBack {
@@ -294,8 +343,10 @@ pub(crate) const fn next_step(attempt: u32, max: u32, verdict: Verdict) -> Step 
 ///
 /// # Errors
 ///
-/// Returns a non-retryable payload when no proposer is installed. Returns
-/// a retryable payload when the proposer fails with a retryable kind.
+/// Returns a non-retryable payload when no proposer is installed, when
+/// `current` does not apply under the ceilings, or when the proposer fails
+/// with a configuration kind. Returns a retryable payload when the proposer
+/// fails with a retryable kind.
 pub(crate) async fn run_stage(
     harness: &AgentHarness,
     request: ProposeRequest,
@@ -315,24 +366,32 @@ pub(crate) async fn run_stage(
         ceilings,
         attempts,
     } = request;
+    // A fallback hands `current` on, so `current` must apply.
+    let base = overlay::apply(&profile, &current, &ceilings, harness).map_err(|err| {
+        ActivityFailure::non_retryable(
+            CURRENT_REFUSED,
+            format!("the current overlay does not apply under the ceilings of the run: {err}"),
+        )
+        .into_error_payload()
+    })?;
+    let cap = harness.result_cap();
     let check = Check {
         profile: &profile,
         ceilings: &ceilings,
         registry: harness,
-        base: overlay::apply(&profile, &current, &ceilings, harness).ok(),
-        cap: harness.result_cap(),
+        base: with_named_model(base),
+        cap,
     };
+    let limit = rejection_chars(cap);
     let budget = harness.proposer_budget();
     let max = attempts.get();
     let mut rejection: Option<String> = None;
     let mut attempt = 1;
     loop {
         let context = ProposeContext {
-            dimension,
-            evidence: &evidence,
-            current: &current,
             attempt,
             rejection: rejection.as_deref(),
+            ..ProposeContext::new(dimension, &evidence, &profile, &ceilings, &current)
         };
         let reply = tokio::time::timeout(budget, proposer.propose(&context)).await;
         let checked = match reply {
@@ -340,11 +399,11 @@ pub(crate) async fn run_stage(
                 "the proposer did not answer within {} ms",
                 budget.as_millis()
             )),
-            Ok(Err(err)) if err.kind().is_retryable() => return Err(model_failure(&err)),
+            Ok(Err(err)) if fails_the_stage(err.kind()) => return Err(model_failure(&err)),
             Ok(Err(err)) => Err(format!("the proposer failed: {err}")),
             Ok(Ok(reply)) => check.reply(reply),
         }
-        .map_err(|error| truncate(&error, MAX_REJECTION_CHARS));
+        .map_err(|error| truncate(&error, limit));
         let verdict = match &checked {
             Err(_) => Verdict::Invalid,
             Ok(None) => Verdict::Same,
@@ -370,13 +429,48 @@ pub(crate) async fn run_stage(
     }
 }
 
+/// Whether a proposer error of `kind` fails the activity.
+///
+/// A retryable kind fails it as retryable. A configuration kind fails it
+/// for good, because a new attempt sends the same request with the same
+/// setup.
+const fn fails_the_stage(kind: ErrorKind) -> bool {
+    kind.is_retryable()
+        || matches!(
+            kind,
+            ErrorKind::Config | ErrorKind::Authentication | ErrorKind::Budget
+        )
+}
+
+/// The most characters of a rejection under the result cap `cap`.
+///
+/// JSON writes one character in at most six bytes (`\u0000`). So a sixth
+/// of the cap, less the stage envelope, always fits. A cap of zero is no
+/// cap.
+fn rejection_chars(cap: u64) -> usize {
+    if cap == 0 {
+        return MAX_REJECTION_CHARS;
+    }
+    let room = cap.saturating_sub(STAGE_ENVELOPE_BYTES) / 6;
+    usize::try_from(room).map_or(MAX_REJECTION_CHARS, |room| room.min(MAX_REJECTION_CHARS))
+}
+
+/// `profile` with its model named. `None` and [`DEFAULT_MODEL`] name the
+/// same model, so the two must compare equal.
+fn with_named_model(mut profile: AgentProfile) -> AgentProfile {
+    if profile.model.is_none() {
+        profile.model = Some(DEFAULT_MODEL.to_owned());
+    }
+    profile
+}
+
 /// The inputs that check one reply.
 struct Check<'a> {
     profile: &'a AgentProfile,
     ceilings: &'a Ceilings,
     registry: &'a AgentHarness,
-    /// The profile under `current`, or `None` when `current` does not apply.
-    base: Option<AgentProfile>,
+    /// The profile under `current`, with its model named.
+    base: AgentProfile,
     /// The activity result cap, in bytes. Zero is no cap.
     cap: u64,
 }
@@ -392,7 +486,7 @@ impl Check<'_> {
         };
         let applied = overlay::apply(self.profile, &overlay, self.ceilings, self.registry)
             .map_err(|err| format!("the overlay is refused: {err}"))?;
-        if self.base.as_ref() == Some(&applied) {
+        if with_named_model(applied) == self.base {
             return Ok(None);
         }
         let bytes = json_len(&overlay).saturating_add(STAGE_ENVELOPE_BYTES);
@@ -412,10 +506,17 @@ impl Check<'_> {
 /// times. A retryable proposer failure retries the whole stage with
 /// backoff.
 ///
+/// The activity sends no heartbeat. On Postgres, a lost worker therefore
+/// holds the stage until its 2-hour `start_to_close` ends. Then the engine
+/// runs the stage again from attempt 1.
+///
 /// # Errors
 ///
-/// Returns an error when no harness or no proposer is installed, or when
-/// the proposer fails with a retryable kind on every engine attempt.
+/// Returns an error when no harness or no proposer is installed, when
+/// `current` does not apply, or when the proposer fails with a
+/// configuration kind. A retryable failure on every engine attempt also
+/// fails the activity. The refine workflow (issue #2380) then inherits
+/// `current`.
 #[activity(
     start_to_close = "2h",
     retry = RetryPolicy::exponential(4, Duration::from_secs(2))
@@ -442,7 +543,6 @@ mod tests {
 
     use super::*;
     use crate::agent::overlay::OverlayError;
-    use crate::error::ErrorKind;
     use crate::model::{AgentModel, ChatRequest, ChatResponse};
     use proptest::prelude::*;
     use serde_json::json;
@@ -590,7 +690,11 @@ mod tests {
     async fn invalid_twice_falls_back_to_current() {
         let proposer = ScriptedProposer::new(vec![undecodable(), past_ceiling(), valid()]);
         let current = current();
-        let stage = stage(&proposer, request(2, current.clone())).await;
+        let request = ProposeRequest {
+            attempts: ProposalAttempts::default(),
+            ..request(1, current.clone())
+        };
+        let stage = stage(&proposer, request).await;
         assert!(
             matches!(stage.outcome, StageOutcome::FellBack { .. }),
             "{stage:?}"
@@ -793,6 +897,116 @@ mod tests {
         let recorded: Stage = serde_json::from_value(raw).unwrap();
         assert_eq!(recorded.outcome, StageOutcome::Proposed(valid_overlay()));
         assert_eq!(agent_refine_propose_info().name, "agent_refine_propose");
+    }
+
+    #[tokio::test]
+    async fn the_proposer_reads_the_base_profile_and_the_ceilings() {
+        #[derive(Debug, Default)]
+        struct Peek(Mutex<Option<(Option<String>, Option<u32>)>>);
+        impl OverlayProposer for Peek {
+            fn propose<'a>(
+                &'a self,
+                context: &'a ProposeContext<'a>,
+            ) -> BoxFuture<'a, Result<ProposerReply, AgentError>> {
+                *self.0.lock().unwrap() =
+                    Some((context.profile.system.clone(), context.ceilings.max_steps));
+                Box::pin(async { Ok(ProposerReply::Json("{}".to_owned())) })
+            }
+        }
+        let peek = Arc::new(Peek::default());
+        let harness = AgentHarness::new(Arc::new(NoModel)).proposer(Arc::clone(&peek) as _);
+        let _ = run_stage(&harness, request(1, current())).await.unwrap();
+        let seen = peek.0.lock().unwrap().clone();
+        assert_eq!(seen, Some((Some("Help the user.".to_owned()), Some(20))));
+    }
+
+    #[tokio::test]
+    async fn a_fallback_fits_a_small_result_cap() {
+        let key = "\u{1}".repeat(1_000);
+        let reply = serde_json::to_string(&serde_json::json!({ key: 1 })).unwrap();
+        let proposer = ScriptedProposer::new(vec![Ok(ProposerReply::Json(reply))]);
+        let harness = harness(Arc::clone(&proposer)).max_result_bytes(2_048);
+        let stage = run_stage(&harness, request(1, current())).await.unwrap();
+        assert!(
+            matches!(stage.outcome, StageOutcome::FellBack { .. }),
+            "{stage:?}"
+        );
+        assert!(json_len(&stage) <= 2_048, "{} bytes", json_len(&stage));
+    }
+
+    #[tokio::test]
+    async fn a_configuration_error_fails_the_stage_for_good() {
+        for kind in [
+            ErrorKind::Config,
+            ErrorKind::Authentication,
+            ErrorKind::Budget,
+        ] {
+            let proposer =
+                ScriptedProposer::new(vec![Err(AgentError::new(kind, "bad key")), valid()]);
+            let err = run_stage(&harness(Arc::clone(&proposer)), request(2, current()))
+                .await
+                .expect_err("a configuration error fails the stage");
+            let failure = autumn_harvest::failure::parse_typed_payload(&err).expect("typed");
+            assert!(failure.non_retryable, "{kind:?}: {err}");
+            assert_eq!(proposer.calls(), 1, "{kind:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_current_overlay_past_the_ceilings_is_refused() {
+        let proposer = ScriptedProposer::new(vec![valid()]);
+        let current = ProfileOverlay {
+            max_steps: Some(50),
+            ..ProfileOverlay::default()
+        };
+        let err = run_stage(&harness(Arc::clone(&proposer)), request(2, current))
+            .await
+            .expect_err("the current overlay is past the ceilings");
+        let failure = autumn_harvest::failure::parse_typed_payload(&err).expect("typed");
+        assert!(failure.non_retryable, "{err}");
+        assert_eq!(failure.error_type, CURRENT_REFUSED);
+        assert_eq!(proposer.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn naming_the_default_model_keeps_the_base() {
+        let reply = ProfileOverlay {
+            model: Some(crate::harness::DEFAULT_MODEL.to_owned()),
+            ..current()
+        };
+        let proposer = ScriptedProposer::new(vec![Ok(ProposerReply::Overlay(reply))]);
+        let stage = stage(&proposer, request(2, current())).await;
+        assert_eq!(stage.outcome, StageOutcome::KeptBase);
+    }
+
+    #[test]
+    fn a_zero_proposer_timeout_keeps_the_default() {
+        let harness = harness(ScriptedProposer::new(Vec::new())).proposer_timeout(Duration::ZERO);
+        assert_eq!(harness.proposer_budget(), DEFAULT_PROPOSER_TIMEOUT);
+    }
+
+    #[test]
+    fn ceilings_with_a_missing_key_do_not_decode() {
+        let ceilings = Ceilings::from_profile(&profile());
+        let full = serde_json::to_value(&ceilings).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Ceilings>(full.clone()).unwrap(),
+            ceilings
+        );
+        for key in [
+            "max_steps",
+            "max_total_tokens",
+            "max_output_tokens",
+            "models",
+        ] {
+            let mut part = full.clone();
+            part.as_object_mut().unwrap().remove(key);
+            assert!(serde_json::from_value::<Ceilings>(part).is_err(), "{key}");
+        }
+        let mut open = full;
+        open["max_steps"] = serde_json::Value::Null;
+        let open: Ceilings = serde_json::from_value(open).unwrap();
+        assert_eq!(open.max_steps, None, "an explicit null is no limit");
     }
 
     #[test]
