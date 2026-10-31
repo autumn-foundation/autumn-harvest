@@ -14,7 +14,7 @@
 //!
 //! The hold reuses the claim's skip list. The adaptive limit (issue #1836)
 //! adds each saturated type to that list with
-//! [`SATURATED_ACTIVITY_MARKER`](crate::queue::SATURATED_ACTIVITY_MARKER) in
+//! `queue::SATURATED_ACTIVITY_MARKER` in
 //! front. A held type goes into the same list with the same marker. So the
 //! hold adds no SQL, no claim gate and no migration.
 //!
@@ -44,6 +44,12 @@ pub const DEFAULT_COST_HOLD_RECHECK: Duration = Duration::from_secs(5);
 
 /// The shortest recheck time. A shorter value would spin the channel.
 pub const MIN_COST_HOLD_RECHECK: Duration = Duration::from_secs(1);
+
+/// The claim skip-list marker. It equals
+/// `queue::SATURATED_ACTIVITY_MARKER`, which needs the `db` feature. The
+/// builder checks a hold without that feature, so this module keeps its own
+/// copy. A `db` test pins the two equal.
+const CLAIM_MARKER: char = '\u{1}';
 
 /// A live cost signal that a [`CostHold`] reads before each claim.
 ///
@@ -98,7 +104,9 @@ pub struct CostHold {
     signal: Arc<dyn CostSignalSource>,
     /// Sorted and without duplicates.
     activities: Arc<[String]>,
-    /// The same names with the claim marker in front.
+    /// The same names with the claim marker in front. Only the `db` claim
+    /// path reads them.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
     marked: Arc<[String]>,
     recheck: Duration,
     state: Arc<AtomicU8>,
@@ -141,7 +149,7 @@ impl CostHold {
         names.dedup();
         let marked: Vec<String> = names
             .iter()
-            .map(|name| format!("{}{name}", crate::queue::SATURATED_ACTIVITY_MARKER))
+            .map(|name| format!("{CLAIM_MARKER}{name}"))
             .collect();
         Self {
             signal,
@@ -163,6 +171,7 @@ impl CostHold {
 
     /// Report each change of the hold to `metrics`. The handler registry
     /// sets it.
+    #[cfg(feature = "db")]
     #[must_use]
     pub(crate) fn with_metrics(
         mut self,
@@ -233,6 +242,7 @@ impl CostHold {
 
     /// The claim skip-list entries of the held types, or an empty slice
     /// when the signal is low.
+    #[cfg(feature = "db")]
     pub(crate) fn exclusions(&self) -> &[String] {
         if self.holds() { &self.marked } else { &[] }
     }
@@ -251,7 +261,7 @@ impl CostHold {
             if name.is_empty() {
                 return Err("cost hold names an empty activity".to_owned());
             }
-            if name.starts_with(crate::queue::SATURATED_ACTIVITY_MARKER) {
+            if name.starts_with(CLAIM_MARKER) {
                 return Err(format!(
                     "cost hold activity {name:?} starts with a reserved control character"
                 ));
@@ -285,20 +295,61 @@ impl CostHold {
 #[cfg(test)]
 mod tests {
     use super::{CostHold, DEFAULT_COST_HOLD_RECHECK, MIN_COST_HOLD_RECHECK};
-    use crate::telemetry::MetricsRecorder;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use crate::info::ActivityInfo;
     use std::time::Duration;
+    #[cfg(feature = "db")]
+    use {
+        crate::telemetry::MetricsRecorder,
+        std::sync::atomic::{AtomicBool, Ordering},
+        std::sync::{Arc, Mutex},
+    };
 
+    fn activity(name: &'static str, is_local: bool) -> ActivityInfo {
+        ActivityInfo {
+            name,
+            module: "cost_hold_tests",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            default_schedule_to_close: None,
+            is_local,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            rate_limit_key_expr: None,
+            circuit_breaker: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
+        }
+    }
+
+    /// The local copy of the claim marker matches the claim's own.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_claim_marker_matches_the_queue() {
+        assert_eq!(super::CLAIM_MARKER, crate::queue::SATURATED_ACTIVITY_MARKER);
+    }
+
+    #[cfg(feature = "db")]
     fn switch() -> (Arc<AtomicBool>, impl Fn() -> bool + Send + Sync + 'static) {
         let high = Arc::new(AtomicBool::new(false));
         let read = Arc::clone(&high);
         (high, move || read.load(Ordering::Relaxed))
     }
 
+    #[cfg(feature = "db")]
     #[derive(Debug, Default)]
     struct Gauge(Mutex<Vec<bool>>);
 
+    #[cfg(feature = "db")]
     impl MetricsRecorder for Gauge {
         fn record_cost_hold(&self, held: bool) {
             self.0.lock().expect("gauge lock").push(held);
@@ -313,6 +364,7 @@ mod tests {
         assert!(!hold.is_deferrable("c"));
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn the_skip_list_follows_the_signal() {
         let (high, read) = switch();
@@ -324,6 +376,7 @@ mod tests {
         assert!(hold.exclusions().is_empty());
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn each_change_sets_the_gauge_once() {
         let (high, read) = switch();
@@ -352,10 +405,10 @@ mod tests {
 
     #[test]
     fn validation_rejects_a_local_activity_and_the_marker() {
-        let mut local = crate::worker::session_internal_activity_info("inline_step");
-        local.is_local = true;
-        let remote = crate::worker::session_internal_activity_info("train_model");
-        let infos = [local, remote];
+        let infos = [
+            activity("inline_step", true),
+            activity("train_model", false),
+        ];
         assert!(
             CostHold::new(|| false, ["train_model", "not_registered"])
                 .validate(&infos)

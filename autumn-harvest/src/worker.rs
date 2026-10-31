@@ -560,7 +560,7 @@ fn session_internal_stub_handler(
 
 /// Build the `ActivityInfo` registered for a reserved worker-session
 /// activity name (issue #606) -- see [`session_internal_stub_handler`].
-pub(crate) fn session_internal_activity_info(name: &'static str) -> ActivityInfo {
+fn session_internal_activity_info(name: &'static str) -> ActivityInfo {
     ActivityInfo {
         name,
         module: "autumn_harvest::sessions",
@@ -817,6 +817,9 @@ impl HandlerRegistry {
     /// instrumentation inherits whatever the application configured. Callers
     /// that do not care about telemetry should prefer [`Self::with_state`],
     /// which installs safe no-op defaults.
+    // too_many_lines: the struct literal sets every registry field, one per
+    // line. Splitting it would hide a missed field from the compiler.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn with_state_and_telemetry(
         workflows: Vec<WorkflowInfo>,
