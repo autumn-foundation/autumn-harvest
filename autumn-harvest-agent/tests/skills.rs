@@ -8,21 +8,25 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
+use autumn_harvest_agent::agent::overlay::apply;
 use autumn_harvest_agent::bounds::json_len;
 use autumn_harvest_agent::eval::{Candidate, evaluate};
+use autumn_harvest_agent::mesh::DELEGATE_TOOL;
 use autumn_harvest_agent::skill::SKILLS_HEADING;
 use autumn_harvest_agent::{
-    AgentHarness, AgentId, AgentOp, AgentProfile, AgentStop, AgentTask, ChatRequest, ContentPart,
-    LOAD_SKILL_TOOL, ModelTurnRequest, SkillText, ToolCallRequest, ToolEffect, agent_loop_info,
+    AgentHarness, AgentId, AgentOp, AgentProfile, AgentStop, AgentTask, Approval, Ceilings,
+    ChatRequest, ContentPart, LOAD_SKILL_TOOL, Mandate, ModelTurnRequest, OverlayError, Peer,
+    ProfileOverlay, Rule, SkillText, ToolCallRequest, ToolEffect, ToolRules, agent_loop_info,
     agent_tool_call_info, sqlite,
 };
-use autumn_harvest_sqlite::SqliteRuntime;
+use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{Recorder, Reply, ScriptedModel, answer, calls, recorded_tool, report, runtime};
 use serde_json::{Value, json};
 
@@ -191,8 +195,11 @@ async fn guidance_does_not_touch_a_built_in_tool() {
 
     run(&mut rt, &task).await;
 
-    let shown = description(&model.requests()[0], LOAD_SKILL_TOOL).unwrap();
-    assert_ne!(shown, "Never load a skill.");
+    let shown = description(&model.requests()[0], LOAD_SKILL_TOOL);
+    assert_eq!(
+        shown.as_deref(),
+        Some("Load the text of one skill. The system prompt lists the skills.")
+    );
 }
 
 // AC: two skills whose bodies exceed `max_request_bytes` still fit, because
@@ -418,53 +425,184 @@ async fn a_read_only_run_may_load_a_skill() {
     );
 }
 
-// AC: after `load_skill("triage")`, replay of that history makes no call to
-// the skill source, which a counter shows.
-#[tokio::test(flavor = "multi_thread")]
-async fn replay_reads_a_loaded_skill_from_history() {
-    let (_dir, db) = fresh_db();
-    let recorder = Arc::new(Recorder::default());
-    let model = ScriptedModel::new(vec![load("triage"), answer("sorted", 1)]);
-    let harness = Arc::new(harness(model.clone(), &recorder));
-    let mut rt = SqliteRuntime::open(&db).unwrap();
+/// A runtime on `db` whose `agent_tool_call` counts each `load_skill` call
+/// that it serves. The counter is the skill source of the issue.
+fn counted_runtime(
+    db: &std::path::Path,
+    harness: AgentHarness,
+) -> (SqliteRuntime, Arc<AtomicUsize>) {
+    let harness = Arc::new(harness);
+    let mut rt = SqliteRuntime::open(db).unwrap();
     sqlite::register(&mut rt, Arc::clone(&harness));
-    // The skill source: the tool-call activity that serves `load_skill`.
     let loads = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&loads);
-    let served = Arc::clone(&harness);
     rt.register_activity_with_body(&agent_tool_call_info(), move |input| {
         let request: ToolCallRequest = serde_json::from_value(input).unwrap();
         if request.call.name == LOAD_SKILL_TOOL {
             counted.fetch_add(1, Ordering::SeqCst);
         }
         let handle = tokio::runtime::Handle::current();
-        let outcome = tokio::task::block_in_place(|| handle.block_on(served.tool_call(request)))?;
+        let outcome = tokio::task::block_in_place(|| handle.block_on(harness.tool_call(request)))?;
         Ok(serde_json::to_value(outcome).unwrap())
     });
+    (rt, loads)
+}
 
-    let (report, exec) = run(&mut rt, &skilled("a new ticket")).await;
-    assert_eq!(report.stop, AgentStop::Completed);
+/// A harness whose policy asks a person about each write.
+fn gated(model: Arc<ScriptedModel>, recorder: &Arc<Recorder>) -> AgentHarness {
+    harness(model, recorder).policy(Arc::new(
+        ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+    ))
+}
+
+// AC: after `load_skill("triage")`, replay of that history makes no call to
+// the skill source, which a counter shows.
+#[tokio::test(flavor = "multi_thread")]
+async fn replay_reads_a_loaded_skill_from_history() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    // The run loads a skill, then waits for an approval of `pay`.
+    let first = ScriptedModel::new(vec![
+        load("triage"),
+        calls(&[("c2", "pay", json!({"amount": 5}))], 1),
+    ]);
+    let (mut rt, loads) = counted_runtime(&db, gated(first, &recorder));
+    let exec = sqlite::start(&mut rt, &skilled("a new ticket")).unwrap();
+    let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the run waits for an approval");
+    };
     assert_eq!(loads.load(Ordering::SeqCst), 1, "the live run loads once");
+    drop(rt);
 
+    // A new process replays the run from history up to the wait.
+    let second = ScriptedModel::new(vec![answer("paid", 1)]);
+    let (mut rt, reloads) = counted_runtime(&db, gated(second.clone(), &recorder));
+    sqlite::decide(&mut rt, exec, &signal, &Approval::Approve).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert_eq!(reloads.load(Ordering::SeqCst), 0, "replay makes no load");
+    assert_eq!(second.calls(), 1, "replay asks no recorded model turn");
+    assert_eq!(recorder.runs().len(), 1, "the approved call runs once");
     let history = rt.load_history(exec).unwrap();
+    assert_eq!(
+        outcomes(&history)[0],
+        ("Step one.\nStep two.".to_owned(), false),
+        "history holds the body"
+    );
     let replay = WorkflowReplayer::new()
         .register(vec![agent_loop_info()])
         .with_execution_id(exec)
-        .replay_from_events(history.clone())
+        .replay_from_events(history)
         .await;
     assert!(
         matches!(replay.status, ReplayStatus::ReplaySucceeded),
         "{replay:?}"
     );
-    // A second drive of the finished run replays it. Neither replay loads.
-    let again = rt.run_until_blocked(exec).await.unwrap();
-    assert_eq!(report, common::report(again));
-    assert_eq!(loads.load(Ordering::SeqCst), 1, "replay makes no load");
-    assert_eq!(model.calls(), 2, "replay asks no model");
+}
+
+// AC1 and AC2 through the overlay: `apply` with a real harness, then a
+// durable agent that runs the result.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_applied_overlay_reaches_the_model() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![load("triage"), answer("sorted", 1)]);
+    let base = AgentProfile::new("support").system("Help the user.");
+    let harness = harness(model.clone(), &recorder);
+    let ceilings = Ceilings::from_profile(&base);
+    let ghost = ProfileOverlay {
+        tool_guidance: BTreeMap::from([("ghost".to_owned(), "x".to_owned())]),
+        ..ProfileOverlay::default()
+    };
+    assert_eq!(
+        apply(&base, &ghost, &ceilings, &harness),
+        Err(OverlayError::UnknownTool {
+            tool: "ghost".to_owned()
+        })
+    );
+    let overlay = ProfileOverlay {
+        tool_guidance: BTreeMap::from([("lookup".to_owned(), "Find an order.".to_owned())]),
+        skills: BTreeMap::from([(
+            "triage".to_owned(),
+            SkillText::new("Sort a ticket.", "Read it first."),
+        )]),
+        ..ProfileOverlay::default()
+    };
+    let refined = apply(&base, &overlay, &ceilings, &harness).expect("the overlay applies");
+    let mut rt = runtime(&db, harness.agent(refined));
+    let agent = AgentId::new("support", "acct-3").unwrap();
+
+    sqlite::send(&mut rt, &agent, &AgentOp::message("a ticket"), None).unwrap();
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+
+    let first = &model.requests()[0];
+    assert_eq!(
+        description(first, "lookup").as_deref(),
+        Some("Find an order.")
+    );
+    assert_eq!(description(first, "pay").as_deref(), Some("A test tool."));
+    assert!(system_text(first).contains("- `triage`: Sort a ticket."));
+    assert_eq!(model.calls(), 2);
+}
+
+// A mandate allowlist does not need to name `load_skill`. It still bounds
+// the app tools.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mandate_allowlist_keeps_load_skill() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![load("triage"), answer("ok", 1)]);
+    let mut rt = runtime(&db, harness(model.clone(), &recorder));
+    let task = skilled("go").mandate(Mandate::new("planner").tools(["lookup"]));
+
+    let (_, exec) = run(&mut rt, &task).await;
+
+    let request = &model.requests()[0];
+    assert!(description(request, LOAD_SKILL_TOOL).is_some());
+    assert!(description(request, "pay").is_none(), "the allowlist holds");
+    let history = rt.load_history(exec).unwrap();
     assert_eq!(
         outcomes(&history),
-        vec![("Step one.\nStep two.".to_owned(), false)],
-        "history holds the body"
+        vec![("Step one.\nStep two.".to_owned(), false)]
+    );
+}
+
+// A delegated child gets neither the guidance nor the skills of its parent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delegated_child_gets_neither_part() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(
+            &[(
+                "d1",
+                DELEGATE_TOOL,
+                json!({"agent": "researcher", "task": "find it"}),
+            )],
+            1,
+        ),
+        answer("found", 1),
+        answer("done", 1),
+    ]);
+    let harness = harness(model.clone(), &recorder)
+        .peer(Peer::new("researcher", "Finds facts.").system("You research."));
+    let mut rt = runtime(&db, harness);
+    let task = skilled("plan")
+        .tool_guidance("lookup", "Parent text.")
+        .mandate(Mandate::new("planner").peers(["researcher"]));
+
+    let (report, _) = run(&mut rt, &task).await;
+
+    assert_eq!(report.stop, AgentStop::Completed);
+    let parent = &model.requests()[0];
+    assert!(description(parent, LOAD_SKILL_TOOL).is_some());
+    let child = &model.requests()[1];
+    assert!(description(child, LOAD_SKILL_TOOL).is_none());
+    assert!(!system_text(child).contains(SKILLS_HEADING));
+    assert_eq!(
+        description(child, "lookup").as_deref(),
+        Some("A test tool.")
     );
 }
 

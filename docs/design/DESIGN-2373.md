@@ -35,11 +35,12 @@ Both parts are text, so an overlay can carry them.
 - `ProfileOverlay`, `AgentProfile` and `AgentTask` get
   `skills: BTreeMap<String, SkillText>`. `apply` merges them as it merges
   the guidance.
-- `apply` refuses a skill with `OverlayError::InvalidSkill` when its name is
-  not a valid name, or its summary is empty, has a line break, has a control
-  or format character, or is too long. A body has at most
-  `MAX_SKILL_BODY_BYTES`, and a map has at most `MAX_SKILLS` skills. So the
-  bodies of a recorded profile or task stay under 1 MiB.
+- `apply` refuses a skill with `OverlayError::InvalidSkill` when a rule
+  fails. The name must be a valid name. The summary must be one line, not
+  empty and not too long. It must hold no control or format character.
+- A body has at most `MAX_SKILL_BODY_BYTES`. A map has at most
+  `MAX_SKILLS` skills. So the bodies of a recorded profile or task stay
+  under 1 MiB.
 - Each segment checks the skills of its task before it builds the system
   prompt. A durable agent runs its segments outside `drive`, so the check
   sits in the shared prompt builder. A bad skill fails the run or the op
@@ -141,8 +142,13 @@ guard.
 `formal/verus/src/agent_overlay.rs` models the guidance keys as a set of
 integers. `apply` refuses exactly when a key of the merged set is not a
 registered tool. The theorems keep their form: the ceiling, idempotency
-and empty-overlay properties hold with the guidance. A spec of the tool
-definition proves that guidance keeps the name and the effect.
+and empty-overlay properties hold with the guidance. The empty-overlay
+theorem needs a profile whose guidance keys are registered tools.
+
+A spec of the tool definition proves that guidance keeps the name and the
+effect, and that a built-in keeps its whole definition. No mirror ties
+this spec to `guided` in `harness.rs`. The tests in `tests/skills.rs`
+check the engine.
 
 ## Tests
 

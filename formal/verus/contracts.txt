@@ -69,9 +69,9 @@ pub proof fn theorem_default_ceilings_only_narrow(p: Profile, o: Overlay, regist
 , { theorem_a_result_stays_under_the_ceilings(p, o, from_profile(p), registry, tools); }
 pub proof fn theorem_apply_is_idempotent(p: Profile, o: Overlay, c: Ceilings, registry: Set < int >, tools: Set < int >,) ensures apply(p, o, c, registry, tools).is_some() ==> apply(apply(p, o, c, registry, tools).unwrap(), o, c, registry, tools,) == apply(p, o, c, registry, tools),
 pub proof fn theorem_an_empty_overlay_keeps_the_profile(p: Profile, registry: Set < int >, tools: Set < int, >) requires p.guidance.subset_of(tools), ensures apply(p, Overlay { max_steps: None, max_total_tokens: None, max_output_tokens: None, read_only: None, model: None, guidance: Set::empty(), }, from_profile(p), registry, tools,) == Some(p),
-pub struct ToolDef { pub name: int, pub description: int, pub effect: int, }
-pub open spec fn guided(t: ToolDef, guidance: Map < int, int >) -> ToolDef { if guidance.contains_key(t.name) { ToolDef { name: t.name, description: guidance [t.name], effect: t.effect } } else { t } }
-pub proof fn theorem_guidance_changes_only_the_description(t: ToolDef, guidance: Map < int, int >) ensures guided(t, guidance).name == t.name, guided(t, guidance).effect == t.effect, guidance.contains_key(t.name) ==> guided(t, guidance).description == guidance [t.name], ! guidance.contains_key(t.name) ==> guided(t, guidance) == t,
+pub struct ToolDef { pub name: int, pub description: int, pub effect: int, pub builtin: bool, }
+pub open spec fn guided(t: ToolDef, guidance: Map < int, int >) -> ToolDef { if ! t.builtin && guidance.contains_key(t.name) { ToolDef { name: t.name, description: guidance [t.name], effect: t.effect, builtin: false } } else { t } }
+pub proof fn theorem_guidance_changes_only_the_description(t: ToolDef, guidance: Map < int, int >) ensures guided(t, guidance).name == t.name, guided(t, guidance).effect == t.effect, guided(t, guidance).builtin == t.builtin, ! t.builtin && guidance.contains_key(t.name) ==> guided(t, guidance).description == guidance [t.name], t.builtin ||! guidance.contains_key(t.name) ==> guided(t, guidance) == t,
 
 ## formal/verus/src/agent_siblings.rs
 pub open spec fn share(remaining: int, siblings: int, index: int) -> int { if index < remaining % siblings { remaining / siblings + 1 } else { remaining / siblings } }

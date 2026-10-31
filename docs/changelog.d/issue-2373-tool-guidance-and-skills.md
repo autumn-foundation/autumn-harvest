@@ -31,6 +31,8 @@ design is in `docs/design/DESIGN-2373.md`.
 
 Tests: `formal/verus/src/agent_overlay.rs` models the guidance keys. It
 proves that `apply` refuses exactly when a key names no registered tool,
-and that guidance changes only the description. `tests/skills.rs` covers
-each criterion of the issue on SQLite and in `eval::evaluate`. The overlay
-proptests check the new rules against the oracle.
+and that guidance changes only the description of an app tool.
+`tests/skills.rs` covers the run criteria on SQLite and in
+`eval::evaluate`. The unit tests in `src/agent/overlay.rs` cover the
+refusals of `apply`. The overlay proptests check the new rules against the
+oracle.

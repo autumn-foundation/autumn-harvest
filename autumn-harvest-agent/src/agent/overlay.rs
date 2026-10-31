@@ -1012,17 +1012,23 @@ mod tests {
     /// Skill names. `Bad Name` is not a valid name.
     const SKILLS: [&str; 3] = ["triage", "refund", "Bad Name"];
 
+    /// One of `names`. The last name is a bad case, so it comes rarely.
+    /// Then most cases reach the checks of an applied result.
+    fn mostly_good(names: [&'static str; 3]) -> impl Strategy<Value = String> {
+        prop_oneof![
+            4 => Just(names[0].to_owned()),
+            4 => Just(names[1].to_owned()),
+            1 => Just(names[2].to_owned()),
+        ]
+    }
+
     fn any_guidance() -> impl Strategy<Value = BTreeMap<String, String>> {
-        proptest::collection::btree_map(
-            proptest::sample::select(TOOLS.to_vec()).prop_map(str::to_owned),
-            "[a-z ]{0,8}",
-            0..=2,
-        )
+        proptest::collection::btree_map(mostly_good(TOOLS), "[a-z ]{0,8}", 0..=2)
     }
 
     fn any_skill_text() -> impl Strategy<Value = SkillText> {
         let summary = prop_oneof![
-            4 => "[a-z ]{1,12}",
+            16 => "[a-z ]{0,11}[a-z]",
             1 => Just(String::new()),
             1 => Just("two\nlines".to_owned()),
             1 => Just("a\u{2028}b\tc".to_owned()),
@@ -1032,11 +1038,7 @@ mod tests {
     }
 
     fn any_skills() -> impl Strategy<Value = BTreeMap<String, SkillText>> {
-        proptest::collection::btree_map(
-            proptest::sample::select(SKILLS.to_vec()).prop_map(str::to_owned),
-            any_skill_text(),
-            0..=2,
-        )
+        proptest::collection::btree_map(mostly_good(SKILLS), any_skill_text(), 0..=2)
     }
 
     fn any_model() -> impl Strategy<Value = Option<String>> {
@@ -1363,6 +1365,14 @@ mod tests {
                     prop_assert!(names.contains(model));
                     let mandate = profile.mandate.as_ref();
                     prop_assert!(mandate.is_none_or(|m| m.allows_model(Some(model))));
+                }
+                prop_assert!(out.tool_guidance.keys().all(|tool| names.contains(tool)));
+                prop_assert!(out.skills.iter().all(|(name, text)| crate::skill::check(name, text).is_ok()));
+                for (tool, text) in &overlay.tool_guidance {
+                    prop_assert_eq!(out.tool_guidance.get(tool), Some(text));
+                }
+                for (name, text) in &overlay.skills {
+                    prop_assert_eq!(out.skills.get(name), Some(text));
                 }
                 prop_assert_eq!(unnamed(&out, &profile), profile);
             }

@@ -408,8 +408,8 @@ and the run ends under `budget_exceeded`. Three limits apply:
 The adapter owns the payloads it records: `AgentTask`, `ModelTurnRequest`,
 `ModelTurn`, `ToolCallRequest`, `ToolOutcome`, `AgentReport`,
 `HeartbeatTask`, `HeartbeatReport`, `Report`, `ReportSource`,
-`MemoryScope`, `Followups`, `LoopGuard`, `Mandate`, `Peer` and
-`DelegationRecord`. They hold only types this crate
+`MemoryScope`, `Followups`, `LoopGuard`, `Mandate`, `Peer`,
+`DelegationRecord`, `SkillText` and `SkillLookup`. They hold only types this crate
 defines, so the crate owns their serde shape. Replay reads these payloads
 back, so add a field only with `#[serde(default)]`. A new field of an
 activity input also needs `skip_serializing_if` at its default, because a
@@ -1227,6 +1227,9 @@ let profile = AgentProfile::new("support")
   `MAX_SKILLS`. Each segment checks the skills first, so a bad skill fails
   the run or the op before any model call.
 - The mandate tool allowlist does not need to name `load_skill`.
+- `eval::evaluate` treats a `load_skill` call as any tool call. A recorded
+  call takes its recorded body. A new call gets the stub and counts in
+  `stubbed_tool_calls`.
 - Upgrade every worker before a profile or a task carries skills. An old
   worker does not know the reserved name.
 - A delegated child gets neither part. Its peer has its own prompt.

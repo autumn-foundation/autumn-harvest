@@ -364,31 +364,38 @@ pub proof fn theorem_an_empty_overlay_keeps_the_profile(p: Profile, registry: Se
     assert(p.guidance.union(Set::empty()) =~= p.guidance);
 }
 
-/// The fields of a tool definition that guidance can touch.
+/// The fields of a tool definition that guidance can touch. `builtin` marks
+/// a tool of the crate, such as `load_skill`.
 pub struct ToolDef {
     pub name: int,
     pub description: int,
     pub effect: int,
+    pub builtin: bool,
 }
 
 /// The definition that the harness sends for `t` under `guidance`. The
-/// guidance text of the tool name replaces the description.
+/// guidance text of an app tool replaces its description. A built-in keeps
+/// its own text. This spec models `guided` in `harness.rs`. No mirror ties
+/// them, so the tests in `tests/skills.rs` check the engine.
 pub open spec fn guided(t: ToolDef, guidance: Map<int, int>) -> ToolDef {
-    if guidance.contains_key(t.name) {
-        ToolDef { name: t.name, description: guidance[t.name], effect: t.effect }
+    if !t.builtin && guidance.contains_key(t.name) {
+        ToolDef { name: t.name, description: guidance[t.name], effect: t.effect, builtin: false }
     } else {
         t
     }
 }
 
-/// Guidance changes only the description. The name and the effect stay, so
-/// the policy decides as it did. A tool with no guidance keeps its text.
+/// Guidance changes only the description of an app tool. The name and the
+/// effect stay, so the policy decides as it did. A built-in, or a tool with
+/// no guidance, keeps its whole definition.
 pub proof fn theorem_guidance_changes_only_the_description(t: ToolDef, guidance: Map<int, int>)
     ensures
         guided(t, guidance).name == t.name,
         guided(t, guidance).effect == t.effect,
-        guidance.contains_key(t.name) ==> guided(t, guidance).description == guidance[t.name],
-        !guidance.contains_key(t.name) ==> guided(t, guidance) == t,
+        guided(t, guidance).builtin == t.builtin,
+        !t.builtin && guidance.contains_key(t.name) ==> guided(t, guidance).description
+            == guidance[t.name],
+        t.builtin || !guidance.contains_key(t.name) ==> guided(t, guidance) == t,
 {
 }
 
