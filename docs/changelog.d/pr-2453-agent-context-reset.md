@@ -43,4 +43,5 @@ criterion, a crash right after a reset included. Unit tests and proptests
 are in `bounds.rs` and `context_reset.rs`.
 
 Known limit: a tool round that passes the cap in one step still ends as
-`transcript_full`. The reset runs only before a request.
+`transcript_full`. The reset runs only before a request. Issue #2461 tracks
+it.

@@ -214,18 +214,20 @@ fn report_is_linked_from_the_corpus() {
     }
 }
 
+/// The collation sweep for 0.8.0 folded the fragment into the release record.
 #[test]
-fn a_changelog_fragment_exists() {
-    let dir = repo_root().join("docs/changelog.d");
-    let found = std::fs::read_dir(&dir)
-        .expect("docs/changelog.d exists")
-        .filter_map(Result::ok)
-        .any(|entry| {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            name.starts_with("issue-2011-") && path.extension().is_some_and(|ext| ext == "md")
-        });
-    assert!(found, "issue #2011 needs docs/changelog.d/issue-2011-*.md");
+fn the_release_record_carries_the_spike() {
+    let shipped = read("docs/shipped-work.md");
+    assert!(
+        shipped
+            .lines()
+            .any(|l| l.starts_with("- **") && l.contains("see issue #2011")),
+        "docs/shipped-work.md needs an entry for issue #2011"
+    );
+    assert!(
+        read("CHANGELOG.md").contains("(issue #2011)"),
+        "CHANGELOG.md needs an entry for issue #2011"
+    );
 }
 
 #[test]

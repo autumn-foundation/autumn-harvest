@@ -506,20 +506,16 @@ fn user_guide_and_cross_links_exist() {
     );
 }
 
+/// The collation sweep for 0.8.0 folded the `pr-962` fragment into the
+/// release record.
 #[test]
-fn changelog_fragment_exists() {
-    let dir = repo_root().join("docs/changelog.d");
-    let entries = std::fs::read_dir(&dir)
-        .unwrap_or_else(|err| panic!("cannot read {}: {err}", dir.display()));
-    let found = entries.flatten().any(|entry| {
-        entry.file_name().to_str().is_some_and(|name| {
-            name.starts_with("pr-962-") && Path::new(name).extension().is_some_and(|e| e == "md")
-        })
-    });
+fn release_record_carries_the_entry() {
+    let shipped = read_normalized(&repo_root().join("docs/shipped-work.md"));
     assert!(
-        found,
-        "exactly one changelog fragment `docs/changelog.d/pr-962-<slug>.md` must \
-         exist. `CHANGELOG.md` itself is generated and must not be edited by hand."
+        shipped
+            .lines()
+            .any(|l| l.starts_with("- **") && l.contains("see issue #962")),
+        "docs/shipped-work.md needs an entry for issue #962"
     );
 }
 

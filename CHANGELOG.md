@@ -17,7 +17,397 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking and behavior changes.** Decision boundaries are recorded opt-in (issue #1833); the default claim reads a bounded window and sets its own planner settings (issue #1971, migration `20261008042107_harvest_task_queue_claim_seek_index`); `queue::complete_task` takes a `&TaskClaim` (issue #1992); no reset forks a PII-erased run (issue #1999); a worker runs up to two claims at once by default (`max_concurrent_claims = 2`); the schema contract covers activities and side effects, `contract_version` 2 (issue #1994); the usage report carries the agent cost ledger (issue #1996); fairness keys are opt-in (issue #1976); column encoding covers activity rows and short-lived copies (issues #1979 and #2043); a keyed entity drops the input of a caller start (issue #2082); a dropped `Session` releases its slot (issue #2193); activity results and workflow-side values nested past 100 levels fail (issues #2225 and #2224); and a calendar tests the schedule's local date (issue #2332). Each has its own section and check in [`docs/upgrading/0.8.0.md`](docs/upgrading/0.8.0.md) §1.
 
-The per-PR entries for this release are the fragments in [`docs/changelog.d/`](docs/changelog.d/README.md). The collation sweep folds them into this section and into `docs/shipped-work.md`.
+### Added
+
+- **Keyed entity: serialized handlers over durable state for each key (issue #1975).** `autumn_harvest::entity` adds a keyed entity, like a Restate virtual object or an Azure durable entity. [ADR 0006](docs/adr/0006-keyed-entity.md) records the design and the priority call: P1 for this library layer, rank 13 for a native primitive.
+
+- **A durable agent loop: `autumn-harvest-agent` (issue #1973).** A new optional crate, `autumn-harvest-agent`. The agent loop is the workflow `agent_loop`. Each model call is the activity `agent_model_turn`, and each tool call is the activity `agent_tool_call`.
+
+- **The AEAD codec covers execution, signal and DLQ columns (issue #1979).** The codec used to encrypt the `harvest_events` payload fields only. Execution input, output and memo, signal payloads and DLQ inputs stayed in clear.
+
+- **Worker container image and Helm chart (issue #1989).** ADR 0006 (`docs/adr/0006-worker-container-image.md`) states what the image holds: the `harvest` CLI, `harvest-replay`, the reference `standalone-runner` and the plugin migrations. It holds no user workflow. A user worker builds on the image.
+
+- **Mid-run signals, updates and queries in `WorkflowTestEnv` (issue #1991).** `WorkflowTestEnv` could queue signals only before the run started. A test could not send a signal after the workflow reached a given point. It could not run an update or a query against the running workflow.
+
+- **Always-on agents: heartbeats, follow-ups, delivery, memory, loop guard (issue #1973).** `autumn-harvest-agent` gains the always-on primitives, modelled on `autumn-plugin-agent` with no dependency on it. `docs/agent-adapter.md` section 10 shows them end to end.
+
+- **Assay #11 rerun on 0.7.0 at every depth, and 0.7.0 benchmarks (issue #1972).** Assay ledger #14 reruns assay #11 against 0.7.0. The pre-registration (`docs/rnd/2026-10-08-harvest-vs-temporal-0.7.0-depth-sweep-preregistration.md`) was committed and pushed before any run.
+
+- **`queue::complete_task` requires a claim (issue #1992).** **Breaking API change.** `queue::complete_task` now takes a `&queue::TaskClaim` in place of a task id:
+
+- **HashiCorp Vault Transit KMS binding (issue #1981).** AWS KMS was the only KMS binding for the AEAD codec. This adds HashiCorp Vault Transit, which runs on any cloud and on premises.
+
+- **Fan-out failure tolerance and result writer (issue #1986).** Issue #1986 adds two options to the activity fan-out helpers. The new `fan_out` module holds them.
+
+- **Every reset fork refuses a PII-erased source (issue #1999).** Batch reset could fork a PII-erased `FAILED`, `CANCELLED` or `TIMED_OUT` run. The fork resumed on `{"_harvest_erased": true}` tombstones. The refusal was an opt-in flag, and only DAG retry set it.
+
+- **Replay-as-evaluation for agent runs (issue #2001).** `autumn_harvest_agent::eval::evaluate` re-drives a recorded `agent_loop` run with a candidate model or prompt. It reports where the decisions of the two runs diverge. It is behind the new `eval` feature of `autumn-harvest-agent`.
+
+- **MCP Tasks for `#[workflow(mcp)]` workflows (issue #2005).** `HarvestPlugin::mcp_tasks()` serves each `#[workflow(mcp)]` workflow as a task of the `io.modelcontextprotocol/tasks` extension (MCP 2026-07-28). A client gets a task at once and polls `tasks/get` for the result.
+
+- **Pre-deploy upgrade verdict for each in-flight run (issue #1995).** The new upgrade check gives each in-flight run one verdict against a candidate build: `migrate`, `review` or `pin`. It runs inside the candidate build, because only that build holds its workflow types and codec keys.
+
+- **A worker runs more than one claim at once (PR #2106, assay #14 re-charter item 1).** A worker now runs up to `max_concurrent_claims` claims at once. The default is 2. Before, one serial loop ran one claim at a time. Set `WorkerConfig::with_max_concurrent_claims(1)` to keep the old loop.
+
+- **Resident state for parallel activity awaits (issue #2008).** **Measurement first (issue #2007, counter part).** A new counter, `harvest.workflow.resident{workflow, queue, outcome}`, counts each decision attempt on a worker with resident state on. `outcome` is `hit` when the decision resumed a resident workflow.
+
+- **OR filters and live Vantage views (issue #1982).**
+
+- **Durable, resumable workflow output streams (issue #1974).** `ctx.publish_progress` is best-effort. A chunk is not stored. A slow client loses chunks. A client that disconnects cannot resume. LLM token streaming needs a stream that a client can resume at any offset.
+
+- **SQLite: `continue_as_new` and the default history caps (issue #2023).** **`continue_as_new` works on SQLite.** Before, it failed the run with `UnsupportedFeature`. Now one transaction appends `WorkflowContinuedAsNew`, seals the run `CONTINUED_AS_NEW`, and starts a successor with the same `workflow_name` and `workflow_id`.
+
+- **Schemas for activity payloads and side-effect values (issue #1994).** Activities publish input and output schemas. Side effects publish a value schema. `harvest schema check` gates them with the issue #794 ruleset.
+
+- **Export aged partitions before the drop (issue #2009).** On the partitioned layout, the sweep dropped an aged `harvest_events` partition, and its history was gone. A `PartitionArchiver` now keeps that history in object storage.
+
+- **Durable outbound MCP/A2A task calls (issue #2006).** `WorkflowContext::call_remote_task` lets a workflow call a long-running task on a remote MCP or A2A server. The workflow suspends until the task ends. The wait holds no worker slot and no open connection, and a worker restart loses nothing.
+
+- **A cross-run, content-addressed LLM response cache (issue #1998).** `autumn-harvest-agent` gets an opt-in `ResponseCache`. Install it with `AgentHarness::response_cache`. A model call that matches an earlier call is served from the cache, in any later run.
+
+- **Verify idle pool connections only (Ledger, pool recycle pings).** `pool::engine_manager(dsn)` builds the connection manager with `RecyclingMethod::Fast`. `pool::with_engine_timeouts` adds a `pre_recycle` hook that pings a connection only when its last checkout is `pool::VERIFY_IDLE_AFTER` (1 second) or longer ago.
+
+- **SQLite ingests every staged signal (issue #2020).** The SQLite backend no longer drops signals read with `drain_signals`, `try_receive_signal` or a push handler. Each decision cycle now appends every staged signal to history before replay, in arrival order.
+
+- **More formal verification: Verus proofs, more Kani proofs, a fourth Shuttle model.** **Verus.** A new `verus` CI job runs `scripts/check-verus-proofs.sh`. The script pins the weekly Verus release `0.2026.10.04.426d8b0` by SHA-256 and checks `formal/verus/src/lib.rs`. The proofs take about 2 seconds.
+
+- **Agent cost ledger (issue #1996).** An activity can now record each LLM call:
+
+- **SQLite backend: workflow updates (issue #2025).** `SqliteRuntime::update(exec, name, args)` runs a workflow update and returns its result. Before this change, a `RecordUpdateResult` command sealed the run `FAILED` as `UnsupportedFeature`.
+
+- **SQLite: cancel and terminate a run, with cooperative cancellation (issue #2021).** `SqliteRuntime` had no way to stop a live run. The only path was a `TerminateIfRunning` restart of the same workflow id. Embedded apps, such as the agent daemon, could not stop a stuck run.
+
+- **S3 and GCS adapters, archived-history read-back (issue #1983).**
+
+- **SQLite runs the `#[activity]` body with an `ActivityContext` (issue #2024).** **Breaking for `autumn-harvest-sqlite`.** `SqliteRuntime::register_activity` now takes only `&ActivityInfo`. It awaits the `#[activity]` body on the drive's async runtime, with a real `ActivityContext`. One activity fn now runs unchanged on SQLite and on Postgres.
+
+- **LLM token and cost budgets per run and per tenant (issue #1997).** A declared budget now stops the LLM spend of an agent loop. `QuotaPolicy` takes four new caps and one window: `max_run_llm_tokens`, `max_run_llm_cost_usd_micros`, `max_tenant_llm_tokens`, `max_tenant_llm_cost_usd_micros` and `tenant_llm_window_secs`.
+
+- **SQLite: workflow queries (issue #2022).** A workflow on SQLite registered queries with `ctx.register_query(..)`, but nothing could call them. `SqliteRuntime::query(exec, name, args)` now does.
+
+- **Small primitives: matching wait, durable promise, `AllowAll` (issue #1985).** Issue #1985 asked for a decision on four primitives that peer engines ship. Three shipped. This change declines the counting semaphore and gives the reason in `docs/comparison.md`.
+
+- **Weighted fairness keys within a queue (issue #1976).** A task can carry a fairness key. A worker with `WorkerConfig::with_fairness_keys(true)` serves the keys of each queue in weighted round robin. One tenant's flood can no longer hold another tenant's tasks in a shared queue.
+
+- **Agent mesh primitives: delegation, mandates, budgets and flow rules (PR #2148).** `autumn-harvest-agent` gains agent mesh primitives. A run can delegate a task to a peer agent. The peer runs as a sub-agent inside the same workflow, on Postgres and on SQLite.
+
+- **SQLite: keyed signals, signal by workflow id, signal-with-start (issue #2028).** Before this change, `send_signal` on SQLite takes only an `ExecutionId`. A retried delivery stages the signal twice. No call starts a run or signals it in one step.
+
+- **Codec column follow-ups (issue #2054).** Three follow-ups from the review of issue #1979.
+
+- **Agent payload-budget follow-ups (issue #2040).** `autumn-harvest-agent` now keeps a run inside the engine payload caps in four more cases. Items 4 and 6 of the issue shipped earlier, in the always-on PR.
+
+- **Sandboxed code activities on Firecracker microVMs.** The new `sandbox-activities` feature lets an activity run code that an agent writes at run time. The code can be Python, Node, shell or any program in the guest image.
+
+- **SQLite: cancellable timers, workflow mutex, local activities, execution timeout and workflow retry (issue #2029).** Five primitives sealed a SQLite run `FAILED` with `UnsupportedFeature`, or panicked at registration. Code that used any of them could not move from Postgres. Each one now works on SQLite and records the Postgres events, so its history replays on the core `WorkflowReplayer`.
+
+- **SQLite: list and describe executions, search attributes and memo (issue #2027).** The SQLite runtime read one execution at a time by id. It had no list, no filter and no describe. `upsert_search_attrs` sealed the run `FAILED`.
+
+- **The AEAD codec covers the short-lived payload copies (issue #2043).** Issue #1979 left the short-lived payload copies in clear. A finished activity task row stays until task retention removes it, and a callback dead letter stays until a redrive removes it.
+
+- **Audit chain verification reuses the keyed HMAC state.** `ChainVerifier` sets each key up once and streams the canonical row into the MAC. Verify-only cost over 5,000 rows drops from 176.8M to 139.2M instructions (-21.3%) and from 44,999 to 10,000 allocations (-77.8%).
+
+- **Shared optional-duration conversion for typed-stub macros (🪞 Echo clone-class merge).** `workflow.rs`'s `start_with_options` (four fields: `execution_timeout`, `max_execution_timeout_ceiling`, `chain_execution_timeout`, `max_workflow_chain_timeout_ceiling`), its `signal_with_start` (the first two of those four), and `update.rs`'s `update_with_start` (the same first two) each hard-coded an identical match converting an `Option<std::time::Duration>` field into an `Option<chrono::Duration>`, rejecting overflow with a `HarvestError::Config` naming the field — eight hand-copied occurrences across two files.
+
+- **Republish tasks shifted by the late resume pass (issue #2066).** `resume_queue` shifts held tasks in two passes. The late pass shifts tasks that the first pass cannot see, such as a task created during the pause.
+
+- **SQLite: schedules, retention and the append-only guard (issue #2031).** The SQLite backend had no schedules and no retention. Its `harvest_events` table had no append-only guard.
+
+- **SQLite: child workflows, and signal, cancel and await between runs (issue #2026).** Before this change, the SQLite backend rejected composition. A workflow that started a child, awaited another run, or signalled or cancelled another run ended `FAILED` as an unsupported feature.
+
+- **Replay-stable `should_continue_as_new()` (issue #2080).** `should_continue_as_new()` compared the loaded history size with the threshold. The loaded size grows from task to task, so a cold replay of a loop could answer `true` where the live run answered `false`.
+
+- **Autoresearch capstone example (PR #2190).** `examples/autoresearch` runs Karpathy's autoresearch loop as durable Harvest workflows on the SQLite backend. An agent edits `train.py`, a trainer runs it, and a pure keep rule keeps the commit or resets it.
+
+- **Late stream chunks survive a terminated staged copy (issue #2128).** Activation now copies the source's durable stream chunks whenever the target is not erased. Before, an operator terminate of the staged copy skipped the copy, and the forwarded durable read ended without the late chunks.
+
+- **Monotonic durable stream inserts (issue #2083).** `append_stream_chunks` admits only offsets above the highest stored real offset. Before, a re-run could store an offset below a reader's cursor, and no reader received it.
+
+- **Continue-as-new provenance in `ctx.info()` (issue #2082).** `ctx.info()` now reports `start_source` and `continued_from`. They come from the execution row columns `start_source` and `continued_from_exec_id`. The row never changes after the insert, so the values are replay-stable.
+
+- **Fairness state bound, preview locks and key spelling (issue #2097).** Four follow-ups to the fairness keys of issue #1976.
+
+- **Orphaned payload blob sweep (issue #2123).** None by default. The sweep is opt-in.
+
+- **Cross-backend conformance suite (issue #2030).** A new test-only crate, `autumn-harvest-conformance`, runs one corpus of workflows on Postgres 16 and on SQLite. Each scenario must give the same executions, the same histories after the named comparison rules, the same outcome and the same update results.
+
+- **The AEAD codec covers the last payload copies (issue #2043).** The first change for issue #2043 left four groups in clear. This change encodes them. No payload column stays clear now.
+
+- **Non-destructive fork of any run (issue #2000).** **New route.** `POST /workflows/{id}/fork` (admin-only). It copies a history prefix of a source run to a new execution with a new workflow id. The source is never written, so a run in any state can be forked, `COMPLETED` and `TERMINATED` included.
+
+- **Timeouts on the orphan sweep's store calls (issue #2123).** None unless the orphan sweep is on and its store hangs.
+
+- **Stage a NOTIFY note without a probe round trip (issue #2125).** A staged NOTIFY note needs the transaction id and the database of its write. The stage used to read them in its own `SELECT txid_current(), current_database(), pg_postmaster_start_time()`.
+
+- **Retention keeps the source of a recorded fork (issue #2122).** A recorded fork reads its source history while it runs. Retention did not know about forks. It could delete a terminal source under a running recorded fork.
+
+- **Timeout lanes share one refill page (issue #2126).** Before this change, the four task-timeout lanes read the same page of live rows with four statements. Lanes at one sweep clock and one cursor now share one statement, and each lane tests its predicate once.
+
+- **Release a Session when its owner drops it (issue #2193).** A `Session` now releases its host slot when its owner drops it. This covers a cancelled `Future`, a race loser and a `select!` branch. Before, the slot stayed `ACTIVE` until the 24-hour lease ended.
+
+- **Cancellation scopes (issue #1984).**
+
+- **A drop release waits for live members of its session (issue #2193).** A dropped `Session` releases its host slot at the next suspension. Its owner can be dropped while a member activity of the session is still queued or running.
+
+- **Harvest-verify proves the autoresearch capstone, and three soundness fixes.** `harvest-verify` now proves all four workflows of the autoresearch capstone: `experiment`, `research_session`, and the agent crate's `agent_loop` and `agent_heartbeat`. CI runs that gate with `--strict`, so an `unknown` fails the build as well as a finding.
+
+- **Assay #15: the Postgres 12 floor at the schema layer.** Assay ledger #15 applies all 139 migrations to fresh PG 12.22, PG 14.24 and PG 16.15 databases, three runs each. All 834 PG 12 and PG 14 applications succeed (417 per version), and the schema signature matches PG 16.
+
+- **Durable routes: an Autumn route that runs as a keyed workflow (PR #2223).** The new `durable_route` module of `autumn-harvest-plugin` adds the `DurableRoute` extractor. A route hands its work to a registered workflow, keyed by the request's `Idempotency-Key`. A retry with the same key attaches to the same run and gets its stored result, so side effects do not run again.
+
+- **Share the DR-fence prelude of `harvest partition` (issue #2221).** `harvest partition enable`, `maintain` and `disable` repeated one prelude: connect, check write authority, take the DR fence (issue #1823). The new `prepare_partition_shard` holds it once.
+
+- **Durable streaming: a durable route that answers with a resumable SSE stream (PR #2246).** `DurableCall::stream()` in `autumn-harvest-plugin` joins durable routes (PR #2223) and durable streams (issue #1974). A route starts or attaches to its keyed run, then streams each chunk that the run stores with `publish_durable_progress`.
+
+- **ADR 0009: decision partitions and the fenced owner lease (issue #2249).** [ADR 0009](docs/adr/0009-decision-owner.md) records the stage 1 owner model of epic #2247. The ADR changes no engine code. Issues #2250 to #2254 build it.
+
+- **Shared result-to-observation mapping for cross-shard fan-out reads (🪞 Echo clone-class merge).** `usage.rs`, `workflow_count.rs`, `version_usage.rs`, `version_gate_retirement.rs` and `workflow_reachability.rs` each hand-copied the identical tail of their `observe_shard` function: run the shard's own query, then `match result { Ok(rows) => ShardObservation { shard_id, rows, error: None }, Err(e) => ShardObservation { shard_id, rows: Vec::new(), error: Some(e.to_string()) } }`.
+
+- **LargePayloadRule counts payload bytes without allocating (Bolt).** `LargePayloadRule` now measures a payload with a counting writer instead of `Value::to_string()`. The byte count and every warning stay identical. On a 6,000-event history, instructions in `HistoryAnalyzer::analyze` fall 77.5% and allocated bytes fall 97.6%.
+
+- **The decision owner lease and the commit fence (issue #2251).** Stage 1a of epic #2247. [ADR 0009](docs/adr/0009-decision-owner.md) fixes the protocol. Owner mode stays off until issue #2252 adds its switch and its claim, so no production path holds a tenure yet.
+
+- **Foreign writers wake the partition owner and evict its cache (issue #2253).** Stage 1a of epic #2247. Decision 12 of [ADR 0009](docs/adr/0009-decision-owner.md) records the design and the inventory of foreign writers. No migration. No `WorkflowEvent` variant. No new append path, so the append-only invariant keeps its two exceptions.
+
+- **Owned workflow-task claims and the owner-mode switch (issue #2252).** Stage 1a of epic #2247. [ADR 0009](docs/adr/0009-decision-owner.md) fixes the protocol. Owner mode replaces the sticky lease for workflow tasks. Activity claims do not change. Owner mode is off until an operator turns it on.
+
+- **PAUSED-run index for the claim gate (issue #2212).** Migration `20261018053859` adds `idx_harvest_we_paused ON harvest_workflow_executions (id) WHERE state = 'PAUSED'`. The claim's PAUSED-run gate read one primary-key page chain per candidate. With more than 32 paused-run tasks at a queue head it read every PAUSED row.
+
+- **SLA-breach scan uses its partial index (Ledger).** `timeout::enforce_workflow_sla_breaches` repeats the tail of the predicate of `idx_harvest_executions_sla_deadline`, `(completed_at IS NULL OR completed_at > sla_deadline_at)`, in its `WHERE`. The new clause adds no condition.
+
+- **`is_redacted_export` probes one key without a `Value` tree (perf).** `debugger::is_redacted_export` reads `payload_policy` with a streaming map visitor instead of parsing the whole history into a `serde_json::Value`. `harvest debug diff` and `ReplayDebugger::trace_json` call it before they parse the same text again.
+
+- **Owner failover tests: frozen owner, kill -9 and scale-out (issue #2254).** Stage 1a of epic #2247. No migration. No `WorkflowEvent` variant. No new append path, so the append-only invariant keeps its two exceptions.
+
+- **Baseline of the claim split, the persist phases and the fence cost (issue #2248).** Stage 1 of epic #2247. The case for a decision owner extrapolated from the formula `1 / (claims × claim latency)`. This change measures the three inputs that the formula did not have.
+
+- **Owner-local disk cache, encrypted and disposable (issue #2258).** Stage 2 of epic #2247. A decision owner can keep the history of each live run in a local SQLite file. A memory miss then reads the file and the Postgres delta, not the full Postgres history.
+
+- **Keyed-entity state as history events with a Postgres projection (issue #2259).** Stage 3a of epic #2247. [ADR 0006](docs/adr/0006-keyed-entity.md) records the amendment. The design record is [`docs/design/DESIGN-2259.md`](docs/design/DESIGN-2259.md).
+
+- **Stage 1b: workflow tasks leave the contended claim path (issue #2255).** Stage 1b of epic #2247. [ADR 0009](docs/adr/0009-decision-owner.md) decision 13 records the design. Owner mode stays off until an operator turns it on. Legacy mode does not change.
+
+- **Durable agents and agent meshes (epic #2262).** The agent loop (#1973), the keyed entity (#1975) and the agent mesh join into one durable `Agent`. `docs/design/DESIGN-2262.md` is the spec. Each sub-issue below has its own red tests.
+
+- **Durable stream append skips the stored-row count (issue #2083).** `store::append_stream_chunks` counted every stored chunk of a run on each append. It now reads the lowest and highest real offset in one statement and skips the count while that span plus the new chunks fits the cap.
+
+- **Failed agent children keep their reports (issue #2320).** A failed child of a fan-out no longer drops the reports of its later siblings. `fan_out` merges every successful report, then fails the batch with the first error in input order.
+
+- **Owner-local SQLite projection for SQL over entity state (issue #2260).** Stage 3b of epic #2247. A decision owner can keep the last state snapshot of each live entity in its disk cache file. User code then runs read-only SQL over the state of one entity with `Worker::query_entity_sql`.
+
+- **Owner decider takes workflow tasks in claim order (issue #2308).** The owner decider of issue #2255 took workflow tasks in wake order and by `scheduled_at`. Under saturation, an older low-priority backlog could take every workflow permit before a newer high-priority task.
+
+- **A failed fan-out child reports its usage (issue #2328).** A failed `agent_loop` run returned only an error string. A parent lost the usage and the flow labels of that run, and of its whole subtree.
+
+- **Group commit across executions in one decision partition (issue #2256).** `group_commit::GroupCommit` lets an owner commit the decisions of several executions of one decision partition in one Postgres transaction. [`DESIGN-2256.md`](docs/design/DESIGN-2256.md) section 1 is the design note.
+
+- **Queue age gauge seeks the oldest rows (Ledger, issue #2339).** `queue::oldest_pending_ages` no longer reads every eligible pending row. For each queue it reads the oldest 32 rows through `idx_harvest_tq_coverage_sample`, runs the claim gates over them, and keeps the result when it is provably exact.
+
+- **Assay #16: the Postgres 12 floor at the engine layer.** Assay ledger #16 tried to run the engine's database suites on PG 12.22, PG 14.24 and PG 16.15. The verdict is undetermined: the PG 16 control passed 79.0% of in-scope tests against a registered 90% validity line, so no arm was graded.
+
+- **Deterministic profiles for the 0.8.0 fork, owner and agent paths.** No `*_profile.rs` harness measured the new 0.8.0 paths of the fenced decision owner, the non-destructive fork or the durable agent. Nine harnesses now do. Each runs under `valgrind --tool=callgrind`, needs no database, asserts its outcome and has a page with its baseline numbers and reproduce steps.
+
+- **Queue depth gauge counts up to a cap (Ledger, issue #2356).** The `harvest.queue.depth` sampler no longer counts every eligible pending row. `queue::bounded_queue_depths` counts each queue up to `telemetry::QUEUE_DEPTH_CAP` (10,000). Statistics in `pg_class` pick one of two ways to count.
+
+- **Runtime DAG schedule overrides (issue #2385, epic #2384).** A DAG schedule came only from code. The scheduler converged each `harvest_schedules` row to the code value on every tick, so an operator could change a schedule only by a restart or a deploy.
+
+- **Runtime overrides for code-declared workflow schedules (issue #2386, epic #2384).** `PATCH /admin/schedules/{id}` edited a schedule row in place (issue #771). For a schedule declared with `WorkerBuilder::workflow_schedule`, the next scheduler tick converged the row back to its code value.
+
+- **Runtime SLA and execution-timeout overrides per workflow type (issue #2387, epic #2384).** `WorkflowInfo::sla`, `WorkflowInfo::execution_timeout` and their `DagInfo` counterparts were static, so a change needed a restart.
+
+- **See and change runtime overrides from the CLI and Vantage (issue #2388, epic #2384).** The overrides of #2385, #2386 and #2387 were visible only one route at a time. An operator could not tell which parameters were overridden.
+
+- **Schedule overrides follow their DAG to a new shard (issue #2389, epic #2384).** A DAG schedule override lives on the shard that owns the DAG. A shard routing change moved the schedule row to its new owner, but the override stayed behind.
+
+- **SQLite: runtime overrides of schedules (issue #2390, epic #2384).** `SqliteRuntime` gains `set_schedule_override`, `clear_schedule_override` and `schedule_override`. An override wins over the code value of `upsert_schedule` and survives a reopen with new code, as on Postgres (#2386). Fields SQLite cannot override return `SqliteError::Unsupported` and write nothing.
+
+### Fixed
+
+- **Durable agent workspace snapshots (PR #2431).** `DirWorkspaceBlobs::put` now syncs the scratch file before the rename, then the folder and its parent. Until one put has synced every ancestor of the folder, each put syncs them all, so a retry after a failed first put still makes a new root durable. Before, a crash after a committed tool call could lose the snapshot that the history names.
+
+- **Schedule budget updates touched every schedule (issue #2423).** The `max_runs` guard of trigger-now and backfill was a raw SQL fragment with a bare `OR`, so the `id` guard covered one branch only. Reservation incremented `runs_started` on every capped schedule under its cap on the shard, and backfill release cleared `exhausted_at` on them. Check `runs_started` and `exhausted_at` on capped schedules in a shard that ran a trigger-now or a backfill.
+
+- **A resolved race and each timer arm no longer scan whole SQLite tables (issue #2429).** On SQLite, the cancel of a losing `ctx.race()` activity matched the task by `activity_id` alone, and each timer arm read `MAX(arm_seq)` over every timer. The cancel now names the run, and `idx_harvest_timers_arm_seq` serves the arm. An existing file gets the index on its next open.
+
+- **Run the MCP tools and durable webhook suites in CI (issue #1959).** `mcp_tools_integration` and `webhook_durable_integration` now run in CI from `linux` manifest rows. Before this change, every test in them was `#[ignore]`d, so CI never ran them.
+
+- **A permit freed during a gated poll wakes the idle wait (issue #1787).** A poll that finds a pool full claims only the other kind. When it then goes idle, the wait also wakes on a released permit.
+
+- **A redundant wake keeps resident activities parked (issue #2008).** A workflow task can run right after a decision that already read every result. Its delta then holds the events of the last suspension and no result.
+
+- **The dispatch reader waits for a permit, and a task keeps its own-row hint (issue #1429).** **Behaviour change 1: the reader waits for a full pool.** A worker gives a reference straight back when the pool it needs has no free permit, so a peer with a permit can read it.
+
+- **Wasmtime 48.0.6 and rustls 0.23.46 for new RustSec advisories.** New RustSec advisories failed the `Dependency ledger (cargo-deny)` job on every pull request against `trunk-dev`.
+
+- **A refusal after the idle-wait snapshot still arms the capacity wake (issue #1787).** Before an idle wait, the leader claim loop reads `capacity_bound()`. When it is false, the wait does not wake on a released permit, because a release cannot unblock a claim.
+
+- **Agent adapter: failed-edit keys, tick input cap, final-turn delivery, follow-up size (issue #2050).** This fix closes four open items of #2046.
+
+- **The worker runs admitted declarative updates (issue #2035).** The worker now runs each pending update and records its result. Before this change the HTTP edge appended `UpdateAdmitted` and woke the workflow task, but no engine code ran the handler.
+
+- **Cap the interval schedule period (issue #2048).** `validate_schedule` accepted any non-zero whole-second `Schedule::Interval`. The scheduler adds the period to a timestamp to find the next run. chrono panics when the sum passes year 262143.
+
+- **Codec failures and carried columns (issue #2065).** Follow-up to issue #1979. Three defects, one fix each.
+
+- **Tenant binding on a raw router mount (issue #2076).** `harvest_api_router` now installs the tenant binding layer. Before, a raw mount whose middleware set `VerifiedTenant` did not confine the caller. Tenant A could read, signal or cancel the run of tenant B by id.
+
+- **Exact number literals in `filter` (issue #2141).** A number in `attrs.<key> =`, `!=` or `IN` kept only `i64`, `u64` or `f64` precision. So `12345678901234567890123` and `...124` bound the same value.
+
+- **SQLite payload depth cap (issue #2157).** The SQLite backend refuses a start input, memo, signal payload or update input that nests deeper than `MAX_PAYLOAD_DEPTH` (100). Ingress returns the new `SqliteError::PayloadTooDeep` before it persists anything.
+
+- **A signal staged during the final decision is no longer lost (issue #2079).** A task ingests the pending signals at its start. A signal that arrived later stayed unconsumed. If the run then completed or failed, the run sealed over the signal.
+
+- **`upgrade_check` hides a mistyped URL (issue #2119).** The `upgrade_check` command printed a mistyped database URL, password included, to stderr. A URL without `--database-url` reached the unknown-flag error. A URL given to `--database-url-env`, `--limit` or `--format` reached the matching error too.
+
+- **A cross-shard child gets the cancel reason of its parent (issue #2194).** A same-shard child that a parent cancels gets the reason of the parent. A cross-shard child always got `parent requested cancellation`.
+
+- **Autoresearch compiles again, and `harvest-verify` gates it in CI.** PR #2187 added `start_provenance` to `testing::HistorySnapshot`. PR #2190 merged the autoresearch capstone in parallel, and its replay helper builds a `HistorySnapshot` without the new field.
+
+- **Autoresearch compiles again after three parallel fixes.** PR #2187 added `start_provenance` to `testing::HistorySnapshot`, and the autoresearch replay helper did not set it. PRs #2201, #2204 and #2207 each added the missing field on their own.
+
+- **SQLite deep activity result (issue #2216).** An activity result nested past `MAX_PAYLOAD_DEPTH` (100) is no longer stored. The SQLite worker turns it into a non-retryable `ActivityFailed` with `error_type = "PayloadTooDeep"`, the new `PAYLOAD_TOO_DEEP_ERROR_TYPE`.
+
+- **`WorkflowCancelRequested` in the payload slot matches.** `trunk-dev` did not compile. Issue #1984 added `WorkflowCancelRequested`, and the exhaustive payload slot matches in `event.rs` did not name it. The event has no payload field, so both matches now return `None` for it.
+
+- **Workflow-side payload depth (issue #2224).** A value that workflow code hands to the engine can no longer nest past `MAX_PAYLOAD_DEPTH` (100). Before this fix, such a value was stored. Then every later drive of the run failed with "recursion limit exceeded".
+
+- **Postgres deep activity result (issue #2225).** Breaking: an activity result nested 101 to 125 levels used to complete on Postgres. It now fails with `PayloadTooDeep`, as on SQLite. A heartbeat checkpoint nested past 100 levels is now dropped.
+
+- **DST nightly: rare sweep targets and an interrupted image pull (issue #2280).** Run 15 of the DST nightly failed in two jobs.
+
+- **Broken-session scan seeks `harvest_task_queue` without an index (issue #2069).** `enforce_broken_sessions` runs on every timeout tick. For each candidate session it seeks member tasks by `session_id` twice: a probe for a RUNNING member, and a load of the PENDING and RUNNING members.
+
+- **Ctutils 0.4.5 and tokio 1.53.3 for RUSTSEC-2026-0385 and -0386 (issue #2307).** The daily advisory scan failed on two new advisories.
+
+- **Det-check rejects a blank suppression reason (issue #2314).** `harvest det-check` accepted `// harvest-suppress: DET003 " "`. The parser tested `reason.is_empty()`. It now tests `reason.trim().is_empty()`. A blank reason no longer suppresses a finding or appears in `--list-suppressions`.
+
+- **Calendar tests the schedule's local date (issue #2332).** A calendar skip policy tested the UTC date of a fire time. A `CronInTimezone` schedule outside about UTC±5h then met the wrong day. A Mon–Fri 08:00 `Asia/Tokyo` schedule with `weekends-off` lost its Monday fire.
+
+### Security
+
+- **wasmtime 48.0.8 for RUSTSEC-2026-0422 to -0424 (issue #2434).** Three new advisories affect `wasmtime` 48.0.7, used by the optional `wasm-activities` feature: a type-check panic, a cross-engine type confusion, and unchecked memory use when components transfer borrowed resources. `Cargo.lock` moves to 48.0.8, and the manifest floor in `autumn-harvest` moves to 48.0.8, so a downstream consumer stays off the vulnerable release.
+
+- **OIDC login and custom roles for Vantage and the API (issue #1978).** Issue #1978 asks where SSO lives. [ADR 0006](docs/adr/0006-oidc-sso-and-custom-roles.md) records the decision: SSO lives in Harvest as a thin opt-in layer, custom roles are built in, and mTLS stays in autumn-web.
+
+- **Bind the tenant to the principal, per-tenant retention (issue #1977).** ADR 0004 (`docs/adr/0004-tenant-isolation-cells.md`) records the decision in a new amendment. Hostile multi-tenancy is now in scope at the management API. It stays out of scope inside the engine.
+
+- **Authorizer hook sees the body `workflow_id` (issue #2081).** `AuthzRequest` has two new fields: `workflow_id` and `start_input_present`. Harvest reads them from the body of `start`, `signal-with-start` and `update-with-start` before the hook runs. They are `None` and `false` on every other route.
+
+### Performance
+
+- **Held claims no longer send the claim to the full scan (issue #2420).** With 32 or more claims in flight on one queue head, every row of the #1971 seek window could be locked, and the claim ran the full backlog scan. At 100K pending rows that read 106,467 buffers. A deep window of up to 256 rows per held head now runs first, and reads about 1,750 buffers. Claim order does not change. No migration.
+
+- **Scaling signals, canary status and shard rebalance read an index (issue #2424).** `queue::queue_task_counts` now reads live rows only, and `GET /admin/canary`, the rebalance quiescence check and the timer copy use new indexes. Migration `20261030015439_harvest_census_scan_indexes` builds three indexes with a plain `CREATE INDEX`. On a large deployment, build them `CONCURRENTLY` first, as the header of its `up.sql` shows.
+
+- **Standalone durable activity: measured, decided (issue #1987).** [ADR 0007](docs/adr/0007-standalone-activity.md) records it: document the one-step-workflow pattern, and do not build a standalone-activity start path now. The activities guide shows the pattern and its local-activity fast path.
+
+- **`decode_event` moves payload trees instead of rebuilding them.** `decode_event` reads a stored event out of a `serde_json::Value`. Serde rebuilds a `Value` field node by node, even from a `Value`. So every payload tree was torn down and rebuilt on every history read and replay load.
+
+- **`decode_event` moves payload trees instead of rebuilding them (issue #2136).** `PayloadCodecs::decode_event` runs on every history read and replay load. Serde decoded each payload `Value` by building a copy of it, one `BTreeMap` node and one `Vec` at a time, then freed the original.
+
+- **Intern metrics-rs label values and seed circuit-breaker state (PR #2202).** **Metrics labels.** `MetricsRsRecorder` copied every per-task label value into a new `String` on every sample. Those values are the activity, workflow, queue, build id and error type.
+
+- **Count activity occurrences without hashing (issue #2000).** `fork::scheduled_occurrence` found the occurrence number of a scheduled activity with a `HashMap` that hashed every `ActivityScheduled` name before the match. It now finds the activity by id first, then counts earlier events with the same name.
+
+- **Batched owner acquisition (issue #2296).** `OwnerLoop` now takes the partitions of a scan in one transaction, `decision_owner::acquire_many`. Before, each partition was its own transaction of 6 statements. A join of 512 partitions sent 3,072 statements.
+
+- **Fan-out replay of `match_activity` is no longer quadratic (issue #2330).** `HistoryMatcher::scan_activity_terminal` walked from each schedule to its terminal. In a fan-out of N activities, each walk stepped over the later schedules and the consumed completions, so a replay cost O(N²).
+
+- **The external, timer and child matcher scans are no longer quadratic (issue #2338).** Three `HistoryMatcher` scans walked history one event at a time on each call, so a fan-out replay cost O(N²):
+
+- **The external stash no longer costs O(N²) (issue #2346).** The external stash of `HistoryMatcher` had three quadratic paths:
+
+- **Return Chrome trace events without a serde round trip (PR #2279).** `trace_export::export_chrome_trace` returned `json!(events)`. On a `Vec<Value>`, that macro serializes the finished tree into a second, deep copy. It now returns `Value::Array(events)`, which moves the vector.
+
+- **Hash replay event positions without SipHash (PR #2303).** `HistoryMatcher::is_consumed` runs once per scanned event, and it probed three sets of event positions with the default `SipHash`. Those sets now use `EventIndexHasher`, a multiplicative hasher in `replay.rs`.
+
+- **The signal wait is no longer quadratic (issue #2349).** `HistoryMatcher::match_signal` had two quadratic paths:
+
+- **Perf(replay): the recorded-update lookup is no longer quadratic.** `HistoryMatcher::match_update` scanned the whole history for each update. It now builds an index of update results once the scans have walked as many events as the history holds.
+
+- **The retention candidate scan uses its index again (issue #2395).** The retention janitor selects terminal executions in six states, `TERMINATED` included. Its partial index, `idx_harvest_we_retention_scan`, listed only five. Postgres uses a partial index only when the query predicate implies the index predicate, so each retention tick read the whole of `harvest_workflow_executions`, on every shard.
+
+### Documentation
+
+- **0.8.0 end-to-end benchmarks.** [`docs/benchmarks/results-v0.8.0.md`](docs/benchmarks/results-v0.8.0.md) publishes the 0.8.0 sweep, with a replay spread of 5.6%. It was measured on a new host. A same-box control runs the 0.7.0 suite there. On that host, 0.8.0 completes 57% more workflows at one shard, and its 1-shard dispatch p50 is 6.89 ms against 12.60. The control was noisier than the 10% bar, so that comparison is rough. `PUBLISHED_BASELINES` holds the new numbers.
+
+- **License texts, security policy and contribution guide (issue #1990).** The repository root holds `LICENSE-MIT`, `LICENSE-APACHE`, `SECURITY.md` and `CONTRIBUTING.md`. `LICENSE-APACHE` is the canonical Apache-2.0 text. `SECURITY.md` sends reports to GitHub private vulnerability reporting. It names the fail-closed gate and the scoped token checks as in scope.
+
+- **Why Harvest keeps deterministic replay (issue #1993).** Docs-only. New page `docs/why-deterministic-replay.md` answers engines that advertise "no deterministic replay" as a feature. It compares replay with checkpoint-only steps and process snapshots by what each engine checks on resume.
+
+- **Jepsen-style safety report (issue #2004).** `docs/safety-report.md` states four guarantees: leases, fencing, exactly-once completion and signal ordering. For each one, it gives the claim, the tests, the results and the known limits.
+
+- **Stop the safety and SQLite reports from conflicting every PR.** Two docs guards made feature PRs edit the same lines. `sqlite_feasibility_docs` pinned live counts in the prose of `docs/rnd/sqlite-feasibility.md`: the core module total, the coupled total, the (a)/(b)/(c) totals, the per-mechanism counts and the migration count.
+
+- **Clean-room harness for the getting-started path.** `scripts/clean-room-getting-started.sh` starts from an empty directory and pastes the Chapter 1 `Cargo.toml` and `src/main.rs` plus the Chapter 2 workflow, activity and registration blocks. It runs `cargo check` and logs each step's exit code and seconds to a TSV.
+
+- **OpenTelemetry workflow conventions draft (issue #2015).** `docs/otel-workflow-semconv/README.md` is a draft proposal of workflow semantic conventions for OpenTelemetry. It generalizes the ADR 0001 span contract into a `workflow.*` namespace. It has one span for each core operation and a replay rule.
+
+- **Upstream Weaver check for the OTel workflow draft (issue #2015).** `scripts/check-otel-workflow-semconv.sh` runs the upstream OpenTelemetry policy checks on the draft workflow model. It mirrors the upstream `semantic-conventions` `make check-policies` recipe at a pinned upstream commit.
+
+- **Ready the OTel workflow draft for the upstream process (issue #2015).** The draft now follows the upstream process for new conventions. That process has two gates. An issue finds co-owners. Then a community project proposal gets a TC review and a GC vote.
+
+- **Chapter 3 snippets guarded in CI.** Docs tooling only. `scripts/check-durable-timers-examples.sh` extracts the three flagship timer workflows of chapter 3 and compiles them with `cargo check` in CI's lint job. Baseline: 3 snippets, 0 compile errors, 8 min cold.
+
+- **Chapter 9 snippets guarded in CI.** Docs tooling only. `scripts/check-worker-routing-examples.sh` extracts the four Rust snippets of chapter 9 (activity `requires`, label map, `with_label`, `with_queue_weights`) and compiles them in CI's lint job.
+
+- **Depth walk profile, negative result (issue #2312).** `payload_depth::nests_past_cap` runs on every successful activity result. A callgrind profile shows it at 10.6% of a harness that only clones and checks values. The one idea that the profile suggests saves at most 18.5% of the walk.
+
+### Testing
+
+- **Seeded deep-backlog fixture and stats snapshot before drop (issue #1956, PR #2045).** Issue #1956 found that no committed fixture was production-shaped. The e2e bench also dropped its databases at exit, so `pg_stat_user_tables` was lost. This change adds the fixture and the harness, and re-runs Ledger against them.
+
+- **Check chaos traces against the TLA+ specs (issue #2003).** **Trace validation.** The chaos suite now records the history of each task row. Two test-only triggers copy each committed write to `harvest_task_queue`, and each activity or terminal event, into `harvest_tla_trace`.
+
+- **The real worker loop under deterministic simulation (issue #2002).** Issue #1830 simulated the activity claim protocol on an in-memory oracle. It did not run `worker.rs`. The new world simulation runs the real worker loop on Postgres, and a seed picks every step.
+
+- **Resident-state hit rate (issue #2007).** #2114 added the counter `harvest.workflow.resident{workflow, queue, outcome}`. This change measures it on two workloads and records the results in `docs/rnd/2026-10-11-resident-hit-rate.md`.
+
+- **Nightly coverage and a ratchet on the critical modules (issue #1818).** CI now measures line and branch coverage every night. A ratchet stops the coverage of seven critical modules from dropping. There is no new `WorkflowEvent` variant, no migration and no change to engine behavior.
+
+- **Seeded interleaving simulation of workflow code (issue #2033).** `WorkflowTestEnv::simulation()` tests user workflow code against the delivery orders that production can produce. The default env lands every result of a suspension in one task, in command order.
+
+- **A fair drain phase for the world simulation (issue #2217).** The DST nightly failed world seed 52000000302 on `Converges`. The engine was not at fault. Worker `w1.1` abandoned the first decision task of `s2`, and only the reclaimer requeues the claim of a dead worker.
+
+- **The fenced owner lease, modelled before code (issue #2250).** Epic #2247 adds a fenced decision owner per partition. This change writes the spec first. It adds no engine code, no migration and no new `WorkflowEvent` variant.
+
+- **Stateright model checks of the DST oracles (PR #2283).** A new test target, `stateright` (`autumn-harvest/tests/stateright/`), with the [Stateright](https://www.stateright.rs) crate as a dev-dependency. Two models visit every reachable state of the DST oracles within a bound:
+
+- **A fair drain phase for the owner-lease simulation (issue #2294).** The DST nightly failed the owner-lease sweep in all four shards. Each shard stopped at its first failing seed, with "the run did not consume every signal within 400 steps".
+
+- **Stage 2 gate: cold decisions and history load (issue #2257).** Stage 2 of epic #2247 is an owner-local disk cache (#2258). It ships only if cold decisions pass 20% of decisions for a week, or the cold p99 passes 50 ms.
+
+### Internal
+
+- **Speculative durable execution, a DST spike (issue #2011).** Issue #2011 asks whether a worker can run the next decision while the previous commit flushes. The answer is a no-go. The engine does not change.
+
+- **Workflows as analyzable artifacts: the flow graph and saga coverage (issue #2010).** `harvest-verify` now emits each workflow's step, signal, update and compensation graph as data. A model check runs over that data alone. Write-up and verdict: `docs/rnd/workflow-graph-spike.md`.
+
+- **Journaled, capability-gated host calls for agent code (issue #2014).** `docs/rnd/agent-code-host-call-journal.md` answers issue #2014 with a working prototype and a verdict. The prototype is the new `autumn_harvest::wasm_journal` module, behind the `wasm-activities` feature. A guest imports one function, `harvest::host_call(name, request)`.
+
+- **Physical backout, saga or hybrid per workflow (issue #2012).** An R&D spike asks whether Harvest can pick physical backout or a saga per workflow from contention. The write-up is `docs/rnd/contention-adaptive-atomicity.md`. **Verdict: go with changes.**
+
+- **Typed state snapshot spike and resident hit-rate measurements (issue #2013).** **The gate.** Issue #2013 is gated on the resident hit rate of #2007. The counter `harvest.workflow.resident{workflow, queue, outcome}` came with #2114. This change measures it on two workloads:
+
+- **Split the CI `lint` job so clippy runs in parallel.** **CI-only change** (implemented). The `lint` job ran about 35 cargo invocations one after another: clippy on each crate and plugin feature set, plus eight docs-snippet compile checks.
+
+- **Land the Dependabot bumps that needed code: Rust 1.99.1, syn 3, aes 0.9 with aes-gcm 0.11.** Four Dependabot PRs could not pass CI alone. This change lands them together with the code each one needs.
+
+- **Ledger profile for every SQL query (issue #2364).** Every function that sends SQL to Postgres or SQLite now has a Ledger profile. The catalog lives in `docs/ledger/`, with one TOML file for each source file, so two PRs conflict on it only when they change queries in the same source file.
+
+- **Ledger census: the access path of every per-task query (issue #2366).** A new census plans each SQL statement that the DB suites send, and maps it to its Ledger profile. A Diesel instrumentation hook in the integration test binary records each statement and its call stack when `HARVEST_LEDGER_CENSUS` names a file.
+
+- **Ledger census batch 2: the per-tick profiles (issue #2396).** The Ledger census now plans the `per_tick` Postgres profiles, the background loops, scanners and sweepers. 172 of them link a plan page under `docs/ledger/plans/`. The suites did not reach 23.
+
+- **Ledger census batch 3: the per-request profiles (issue #2402).** The Ledger census now plans the `per_request` Postgres profiles, the queries behind API calls and operator reads. 153 of them link a plan page under `docs/ledger/plans/`.
+
+- **Ledger census batch 4: the setup profiles (issue #2414).** The Ledger census now plans the `setup` Postgres profiles, the queries that run at startup, in migrations and in partition layout changes. 63 of them link a plan page under `docs/ledger/plans/`.
+
+- **Ledger census batch 5: the plugin test suites (issue #2425).** The census hook moved into a `ledger-census` cargo feature, so the plugin's test binaries can link it. 729 Postgres profiles now link a plan page, up from 552. The census found the #2423 bug.
+
+- **Ledger census batch 6: the SQLite profiles (issue #2429).** The `ledger-census` feature registers a SQLite auto-extension, and `ledger-census.py plan-sqlite` plans the recorded statements with `EXPLAIN QUERY PLAN`. 103 of the 109 SQLite profiles now link a plan page.
+
+The full entry for each change is in [`docs/shipped-work.md`](docs/shipped-work.md).
 
 ## [0.7.0] - 2026-10-05
 
@@ -29,7 +419,777 @@ The per-PR entries for this release are the fragments in [`docs/changelog.d/`](d
 
 - **Breaking defaults and behavior changes.** Mutating management routes fail closed with `401` outside the `dev` profile when no auth layer is declared (issue #1802); activities with no timeout of their own stop after a 10-minute `default_activity_start_to_close` (issue #1808); a worker with an empty `build_id` no longer claims a run pinned to a build (issue #1805); the retention janitor deletes finished `harvest_task_queue` rows after 7 days (issue #1811, migration `20261003201739_harvest_task_queue_hygiene`); continuations are claimed before new starts while a claim skips a task whose run is past its deadline (issue #1824, migration `20261004162927_harvest_task_queue_new_start`); each run's history is capped by default at 50,000 events and 50 MiB (issue #1804); a `start_to_close` or `heartbeat_timeout` timeout now retries per the activity's retry policy, and an open circuit breaker defers work instead of failing it (issue #1809); and `WorkerConfig::default()` drains for 25 s, down from 30 s (issue #1813). Each has its own section, opt-out and check in [`docs/upgrading/0.7.0.md`](docs/upgrading/0.7.0.md) §1.
 
-The per-PR entries for this release are the fragments in [`docs/changelog.d/`](docs/changelog.d/README.md). The collation sweep folds them into this section and into `docs/shipped-work.md`.
+- **Corrected the assay #10 and #11 numbers after three further review
+  findings (follow-up to #1617).** #1617 merged with its apparatus already
+  fixed and its reports still carrying numbers the pre-fix apparatus had
+  produced. This re-measures and replaces them.
+
+  **Assay #11 had never run its own registered workload.** Its Shape table
+  registers a ~40-byte payload for both arms; both had been moved to the
+  canonical empty object so assay #10's L1 could compare against a published
+  figure taken that way, and #11 then reused #10's harvest arm unchanged. The
+  deviation had been disclosed, which is not the same as grading registered
+  lines on the registered shape. The apparatus now takes `ASSAY10_INPUT_JSON`,
+  so #10 keeps the empty object its L1 needs and #11 runs both arms at its own
+  payload. The same round found the Temporal arm persisting **no** activity
+  input payload where harvest persists an explicit JSON null, which is 6,000
+  smaller history records per repetition in Temporal's favour, and the embedded
+  SQLite arm still returning JSON null where the other two return
+  `{"ok": true}` — the embedded backend runs a caller-supplied callback rather
+  than `ActivityInfo::handler`, so the earlier fix never reached it.
+
+  Corrected figures: assay #11 is **43.29 against 5.47 workflows/sec**, a
+  **7.91x** kill against harvest (computed from the unrounded means; a first
+  revision printed 7.92x by dividing rounded display values, caught in review),
+  replacing 44.31 against 5.58. Assay #10's
+  embedded arm is **3.19**, replacing 3.20. The corrections moved neither
+  headline measurably. Both facts are recorded: the withdrawn numbers came
+  from an apparatus with known defects, *and* they happened to be right.
+
+  **A harvest run was discarded for box contamination, and the report says so
+  in detail.** Its repetitions read 5.39, 5.37 and **15.02** workflows/sec, an
+  outlier roughly 2.8x its own siblings against an arm whose clean repetitions
+  sit inside 5%. The cause was `git merge` and `git push` running on the box
+  mid-measurement, against the idleness precondition `docs/benchmarks.md`
+  insists on. What made it dangerous is that the contamination is invisible in
+  the arm's mean, 8.60, and visible only per repetition, so a harness
+  reporting means alone would have published it.
+
+  An earlier revision additionally claimed that 8.60 *passed* assay #10's L1
+  validity band the same arm otherwise kills, and called it a verdict flipped
+  by interference. That is withdrawn: #10's band was registered for the
+  canonical `{}` input and this run used #11's payload, so the band never
+  applied and the flip could not have occurred. The claim rested on the same
+  defect the apparatus fix above removes.
+
+  Also newly reported rather than smoothed away: Temporal's spread across three
+  repetitions (39.28-48.95, about 25%) is far wider than harvest's (about 5%),
+  which three repetitions cannot characterise and this assay does not try to.
+
+  **Every depth-diagnostic cell was re-measured** after the payload
+  corrections. A first revision kept the pre-correction cells and argued from
+  the single re-run cell that the curve was unaffected; review caught that as
+  an overreach, since the corrections are asymmetric (one adds persisted
+  payloads to Temporal only) and the shallowest cell had the narrowest margin.
+  The re-measured 250-row cell reads 36.17 against 28.85 before, so the
+  shallowest margin reads 1.53x where it read 1.22x. That difference is **not
+  attributed to the correction**: both are single repetitions and the gap is
+  about the size of this arm's own ~25% spread, so run-to-run variation alone
+  explains it. The cells support a range (~1.5x-2x against harvest's best
+  mode) rather than a trend, and Temporal's own cells span about 33%, which is
+  too noisy to call flat. What holds is that Temporal wins at every depth
+  tested and shows no counterpart to harvest's 4.2x collapse.
+
+  **Zero engine impact.** No `WorkflowEvent` variant, no migration, no
+  behaviour or public-API change. `registered-sweep.md` is kept unedited with
+  the withdrawn embedded figure still in it, and the report points at the
+  re-run instead, so the record shows what was measured rather than what was
+  preferred.
+
+- **Assay ledger #12: re-charter of assay #10's "position of the depth
+  curve's knee" pit, killed on its own pre-registered stop rule.** #10's
+  post-hoc, single-repetition depth diagnostic found the `postgres` arm
+  ahead of `redis_pg` at backlog depths 250 and 500, and behind it at 1000
+  and 2000, suggesting a throughput crossover somewhere in `(500, 1000]`.
+  `docs/operations/redis-dispatch.md`'s "When to use it" section has no
+  number backing "deep"/"shallow", so this re-runs the same two bracketing
+  depths at n=3 (not n=1) before spending any time narrowing a band.
+
+  Depth 500 replicates cleanly: `postgres` mean 23.76 (range
+  [23.55, 23.86]) stays above `redis_pg`'s mean 21.48 (range
+  [20.06, 22.29]), no overlap. Depth 1000 does not replicate: `postgres`'s
+  three repetitions (14.94, 24.04, 23.80 — mean 20.93) span a 61% swing,
+  and its range fully contains `redis_pg`'s tight [21.24, 22.03]. The
+  pre-registration's own committed stop rule treats a rep-range overlap at
+  either bracketing depth as unsettling the crossover claim; depth 750 was
+  not run.
+
+  This does not disturb #10's own separate, tightly-clustered finding
+  (`redis_pg` flat within 1.4% from 250 to 2,000 rows in that sweep) — it
+  shows that `postgres`'s own repetition-to-repetition variance at depth
+  1000, under this apparatus's single-worker shape, is large enough that a
+  lone repetition (exactly what #10's diagnostic was) cannot reliably say
+  which arm leads at that depth. The operator guide gets no depth figure
+  from this; the honest outcome is that "deep" stays undefined rather than
+  acquiring a false-precision number that failed to replicate.
+
+  One environment correction made before any reported run: the apparatus's
+  own printed durability line showed the freshly started Postgres server
+  defaulting to `fsync = on` / `synchronous_commit = on`, not #10's
+  registered `off`/`off`. Caught before treating the first attempt as
+  comparable; `postgresql.conf` was corrected and the server restarted, and
+  the mismatched run was discarded rather than reported.
+
+  Named, un-chartered pits: what causes the ~60% spread in `postgres`'s
+  own repeated measurements at depth 1000 (cold cache after the
+  apparatus's per-repetition database recreation is one untested
+  candidate); a higher-repetition (n≥6) characterization of that spread;
+  the knee question itself, which needs a variance-characterized apparatus
+  before any depth number is decision-grade.
+
+  **Zero engine impact.** No `WorkflowEvent` variant, no migration, no
+  behaviour or public-API change. Apparatus reused unmodified from #10;
+  raw per-rep output archived under
+  `docs/assays/apparatus/0010-cross-mode-throughput/results/depth-knee-0012/`.
+
+### Added
+
+- **Cross-region DR via logical replication with fenced failover (issue #954).** Harvest's availability ceiling was one Postgres region per shard, and the obvious answer — a cloud cross-region replica — is dangerously incomplete for an event-sourced engine: after a failover, old-region workers that come back (or were partitioned, not dead) can still claim tasks and append events against their local, now-stale database, forking a workflow's history.
+
+- **Mixed-kind concurrent waits in one suspension batch (issue #950).** `futures::join!`/`try_join!` and `ctx.race()` now accept **any combination** of ctx-managed awaitables — activities (fresh dispatch or re-park), durable timers, signal waits and child workflows — in a single call.
+
+- **Payload codec key rotation with lazy re-encryption sweep (issue #948).** Adds a key-rotation story to the `PayloadCodec` boundary (ADR-0003). Before this, encryption at the codec boundary was permanent: `harvest_events` is append-only, so after a key compromise every byte of stored history stayed encrypted under the compromised key forever, and the only escape was a bespoke export/transform/reimport nobody runs under incident pressure.
+
+- **Failing decision cycles are replay-clean and lossless (issue #952).** Two documented engine limitations made a workflow's *failing* decision cycle second-class. Both are closed here, composing only existing events — **zero new `WorkflowEvent` variants, no migration, no contract change.**
+
+- **Stream audit records to an external SIEM sink (issue #953).** Every mutating management-API operation already writes an audit record, but those rows lived per-shard inside the same Postgres databases they describe — readable only through Harvest's own API, by whoever holds Harvest credentials.
+
+- **Cross-shard child workflow placement (issue #956).** Child workflows were always pinned to the parent's shard, and `spawn_child_workflow_fan_out` had made a 10k-child fan-out three lines of code — so a single orchestrator concentrated its entire fan-out's event-append, task-claim and vacuum load on one Postgres instance no matter how many shards the operator provisioned.
+
+- **Opt-in partitioned `harvest_events` for high-throughput retention (#958).**
+  Native Postgres declarative partitioning, so a retention pass reclaims event
+  storage by **dropping partitions** — an O(1) metadata operation — instead of
+  row-level `DELETE`s that leave dead tuples, index bloat and vacuum debt.
+  Measured at 200k rows: the row-`DELETE` path issued 99,740 deletes and left a
+  15.41% dead-tuple ratio; the partitioned path issued **zero** and left
+  **0.00%**, reclaiming the same 100,000 events in 99 ms, with concurrent append
+  and task-claim p99 inside the ±5% budget.
+
+  **Existing deployments are untouched.** The migration
+  (`20260901115500_harvest_event_partitioning`) is inert: it ships the machinery
+  but converts nothing. Opt in per shard with `harvest partition enable`, or
+  `harvest partition plan` for a large live table (the plan keeps the index
+  builds and constraint validation outside the `ACCESS EXCLUSIVE` window, so the
+  swap itself is metadata-only). `harvest partition disable` reverts.
+
+  Partition creation and reclamation are automated by the retention janitor — no
+  operator cron pre-creates partitions. `harvest partition status` reports every
+  cohort the sweeper left alone and why, which is the answer to "why has space
+  not come back?".
+
+  Zero new `WorkflowEvent` variants, no change to the event JSON at rest, and no
+  change to any Diesel-generated statement: the partition key is a `cohort`
+  column that `schema.rs` deliberately does not declare, so every read and write
+  is byte-for-byte identical in both layouts. Per-execution event ids,
+  `load_history`/`load_history_since` ordering and delta loads are unchanged —
+  asserted by re-running the existing store, replay, retention, legal-hold and
+  end-to-end suites against the partitioned layout in CI.
+
+  Legal holds (#747) and per-type retention overrides (#737) block reclamation
+  with no special-casing: a held or over-retained execution keeps its row, which
+  keeps its events owned, which blocks the drop.
+
+  Honest limits, all documented in `docs/partitioned-events.md`: history reads
+  do not partition-prune (size the cohort width so the live partition count
+  stays around 8–16); the partitioned layout drops the `harvest_events` foreign
+  key — its `ON DELETE CASCADE` is the delete storm being eliminated — replacing
+  the insert-time half with a trigger that also enforces `(workflow_exec_id,
+  event_id)` uniqueness across partitions, with a documented residual window for
+  two appends in flight at once across a cohort boundary; a legal hold now pins
+  every cohort its execution wrote into, retaining other executions' expired
+  rows with it unless `straggler_grace_secs` is set; the partitioned layout
+  needs Postgres 14+; and the whole retention pass is not made faster by this
+  change — the per-execution candidate loop the `HistoryArchiver` contract
+  requires dominates it on both layouts.
+
+- **Reproducible end-to-end benchmark suite with published results (#941).**
+  Harvest had two performance artifacts — the replay CPU budget (#135) and the
+  task-claim microbenchmark with its CI gate (#786) — and neither answered the
+  first question an evaluating architect asks: *how many workflows per second,
+  end to end, and at what latency?* This ships the answer, the harness that
+  produces it, and a committed topology so a reader can check it themselves in
+  one command.
+
+  Four scenarios at 1, 2 and 4 shards: sustained **workflows completed/sec** for
+  a canonical 3-activity workflow; **activity dispatch latency** p50/p99
+  (`harvest_task_queue.created_at` → the handler's first line); **signal
+  round-trip** p50/p99 (an HTTP signal request leaving the client → the workflow
+  resuming past `wait_for_signal`); and **replay throughput** over the same
+  10 001-event history #135 budgets. Results are published in
+  `docs/benchmarks.md`, with each release's numbers kept in
+  `docs/benchmarks/results-v<version>.md` rather than overwritten.
+
+  `./benchmarks/run.sh` is the one documented command: it brings up
+  `benchmarks/docker-compose.yml` (four **independent** Postgres servers, one per
+  shard — a Harvest shard is a database with its own pool, so four databases on
+  one server would make a shard sweep a measurement of one server contending
+  with itself), runs all twelve cells, and tears it down.
+  `HARVEST_BENCH_CHECK=1` additionally compares the run against the published
+  baselines at ±15% and prints a per-number verdict; `HARVEST_BENCH_SCENARIOS`
+  and `HARVEST_BENCH_SHARDS` narrow the matrix so reproducing one headline does
+  not cost forty minutes.
+
+  **Measurement discipline is the actual engineering here**, and every rule is
+  enforced by the harness rather than promised in prose. Throughput is a
+  **bounded closed loop**, not a pre-loaded drain: a first implementation that
+  pre-loaded a backlog reported 473 workflows/s on the middle half of the drain
+  and 55/s over the whole of it, because claim cost grows superlinearly with
+  backlog depth — the drain accelerates as it empties, so the "rate" was an
+  artifact of where you looked, and publishing it would have re-published #786's
+  claim-depth curve under an end-to-end label. The closed loop keeps depth
+  shallow and constant; `inflight_soundness` refuses to publish a run in which
+  the harness, not the engine, was the limiter (it fires at 384 in flight on the
+  reference box). The published default is **four times** the worker's workflow
+  slots: a deeper population buys a higher number by measuring further into the
+  claim-depth curve, which is #786's finding rather than this suite's. The two latency scenarios are paced at ~30% of the measured saturated
+  rate, because a p99 taken under saturation measures the backlog rather than
+  the dispatch path, and `pacing_verdict` marks a run that could not hold its
+  pace. The signal round-trip is read from **one monotonic clock in one
+  process**, so it carries no skew term; activity dispatch necessarily spans a
+  database and a host clock, so the harness measures the offset and publishes it
+  beside the number, and a negative sample — which only skew can produce — is
+  counted and reported rather than clamped to zero. Any cell that is thin,
+  truncated, left a shard idle, or failed a request reports `n/a` with a named
+  reason.
+
+  Replay is run at all three shard counts as the **noise control**: it is
+  in-memory and cannot legitimately move with shard count, so drift across those
+  three runs bounds how loaded the box was while the other nine cells were
+  measured. Its history builder now lives in the shared harness and
+  `benches/replay_bench.rs` calls it, so the throughput published here and the
+  #135 budget can never drift into describing different workloads.
+
+  **No duplication of #786 and no new CI gate.** The suite contains no claim or
+  enqueue scenario, `docs/benchmarks.md` cross-references `docs/performance.md`
+  as the component-level complement, and `benchmarks_docs.rs` fails the build if
+  a CI manifest row ever runs an end-to-end scenario (issue #941 puts CI-gated
+  end-to-end budgets out of scope until baselines stabilise). The same guard
+  pins the doc to the harness: the published baselines are constants, the index
+  page and the versioned results file must both carry them (the results file on
+  a matching scenario/shard row, not merely somewhere in the text), every
+  documented environment variable must be one the harness actually reads, the
+  documented command must be the committed runner, the published worker and
+  concurrency configuration must be the constants the run used, and the compose
+  file must define a service per shard.
+
+  **Zero engine impact.** No new `WorkflowEvent` variant, no migration, no
+  behaviour or public-API change; nothing under `autumn-harvest/src/` is touched.
+  Every number is taken from columns and events that already existed.
+
+  Honest limits, all stated with the numbers: durability is off
+  (`fsync=off`/`synchronous_commit=off`) so these are an upper bound for a
+  durably configured Postgres; the signal endpoint is a minimal HTTP/1.1 handler
+  calling the same `signal::send_signal` entry point the plugin route calls, not
+  autumn-web's middleware stack; the workflow is deliberately trivial; the shard
+  sweep holds hardware fixed, so it bounds *software* scale-out on one machine
+  and says nothing about a four-machine deployment; and the published numbers
+  come from native Postgres clusters rather than containers, which makes the
+  compose path the more pessimistic of the two.
+
+- **Vantage schedules management page (issue #951).** Every schedule capability an operator needs already existed as an API — list, fire-time preview (#348), backfill (#337), per-schedule run history (#534/#762), catchup policy state (#484), bounded runs (#478/#543), jitter (#240), overlap policy (#241), pause/resume — but at 3 a.m. the question "did the nightly billing schedule fire, and if not, is it paused, exhausted, or wedged?" still meant a curl session against five endpoints and a mental join.
+
+- **`harvest migrate` for split/external Harvest databases (issue #1240).** Since 0.6.0 Autumn owns Harvest's migrations — but only the ones that live in the **application** database. Under `harvest.mode = "split"` / `"external"` Harvest storage is a separate database `plugin_migrations` cannot reach, and outside the `dev` profile the plugin only *warns* about pending migrations there.
+
+- **Zero-setup local dev runtime (issue #525).** autumn-harvest is, by primitive surface, essentially Temporal-complete — and the first thing a new developer had to do was unrelated to workflows: install Docker, author a `compose.yaml`, `docker compose up -d`, poll for Postgres health, set `DATABASE_URL`.
+
+- **Semantic (MIR-level) determinism analysis for workflows, R&D (issue #962).** The determinism defences shipped so far are **syntactic**: the `#[workflow]` compile-time guardrails (HVG001–HVG011) pattern-match tokens inside the annotated body, and `harvest det-check` (#778) plus the HashMap-iteration rule (#785) extend the same tables across exactly one hop, resolved in the caller's own module.
+
+- **The boot-time orphaned-workflow gate now covers the standalone runner (issue #1128).** PR #1109 (issue #700 AC4) added a boot-time orphaned-workflow-type reachability fail-fast to the **plugin** boot path and explicitly logged the gap it left: "the standalone `HarvestRunner::start` embedder path has no orphan gate at all … A separate issue should add an equivalent pre-worker check inside the runner." This closes that gap — and closes it by making the two paths run *the same code*, not an equivalent copy.
+
+- **Dependency ledger harness + wasmtime/h2/crossbeam-epoch security fixes (PR #1303).** No lockfile-verified dependency audit previously existed in this repo — no `cargo-audit`/`cargo-deny`, no advisory scan, no license gate in CI. This PR adds one (`deny.toml` + a new `dependency-audit` CI job running `cargo deny check` via `EmbarkStudios/cargo-deny-action@v2`) and, using it, fixes the reachable findings it turned up:
+
+- **Idle rate-limit bucket GC (issue #1127).** `harvest_rate_limit_buckets` rows are auto-registered `ON CONFLICT (key) DO NOTHING` and, until now, were **never deleted** — no production `DELETE` existed anywhere in the tree. Two of the key conventions that share that table embed caller/tenant input: `dyn-rate:{expr}:{resolved}` (per-key activity rate limits, #699/PR #1101) and `start-throttle:{workflow}:{key}` (workflow-start throttles, #607).
+
+- **Shared connection guard for cross-shard fan-out reads (🪞 Echo clone-class merge).** Eight management-API read models (`canary`, `status_summary`, `usage`, `workflow_count`, `workflow_reachability`, `queue_coverage`, `version_gate_retirement`, `version_usage`) each hand-copied the same per-shard connection guard every time a new cross-shard fan-out endpoint was added between issues #164 and #796: resolve `Option<DbPool>` or record `"shard {id} has no configured storage pool"`; acquire a connection or record `"database connection for shard {id} could not be acquired"`.
+
+- **Shard-placement-aware resolution for `workflow_id`-addressed signal/cancel (issue #1146).** `ctx.signal_external_workflow_by_id` / `ctx.request_cancel_external_workflow_by_id` (issue #751) address a target by its stable `(workflow_name, workflow_id)` business key. To deliver, the engine has to know which shard owns the target, and it answered that by re-deriving `ShardRouter::pick_for_new_workflow` — the rendezvous hash a **fresh start** of that key would use.
+
+- **Dev runtime: the `sslmode` scan reads syntax, not substrings (issue #1286).** `classify_database_url` runs a textual `sslmode` scan *before* handing the DSN to `tokio_postgres::Config::from_str`, because the client models only `disable`/`prefer`/`require` — so `verify-ca` and `verify-full`, the two strongest signals that a DSN points at a remote managed database, would otherwise arrive as an opaque parse error rather than as the specific thing they are.
+
+- **Reject an unrepresentable workflow duration at `try_build()` (issue #1163).** Closes a silent-data-loss gap in `#[workflow(execution_timeout = "…")]` (and the sibling `chain_execution_timeout` (#617) and `sla` (#487) fields): every start path resolved a declared `std::time::Duration` via `chrono::Duration::from_std(d).ok()`.
+
+- **Shard rebalancing: migrating quiescent workflows across shards (issue #964).** The sharding contract used to end at "cross-shard rebalancing of existing workflows is out of scope", and the consequences compounded: adding a shard only helped **new** starts, so a hot shard stayed hot for as long as its residents lived — forever, for a continue-as-new entity workflow — and a shard could never be decommissioned.
+
+- **Strict percent-decoding swept to every raw-pairs route (issue #1151).** Issue #774 fixed one route, `GET /admin/queue-coverage`: axum's built-in `Query<Vec<(String, String)>>` extractor is backed by `serde_urlencoded`/`form_urlencoded`, which *always* succeed by silently substituting `U+FFFD` for a malformed percent-encoded byte sequence instead of rejecting the request — so `?queue_name=%FF` silently decoded to a *different*, legitimate-looking `queue_name` instead of the documented `400`, letting a corrupted request produce a false-clean result on a CI/CD deploy gate.
+
+- **The dev profile serves the management API unauthenticated, as documented (issue #1284).** The quickstart's documented Step 3 —
+
+- **Canary replay's completing path now agrees with its suspended path at the frontier (issue #1175).** `executor.rs::run_workflow_canary` had two terminal arms that reach the frontier — recorded history fully consumed — and disagreed about whether a new command emitted there is drift.
+
+- **Hot code swap for workflow definitions via runtime modules, R&D (issue #967).** Harvest's *routing* side of deploys has been finished for a while — build-ID routing (#171), compatibility sets, percent ramps (#604), reachability (#520/#535) — but the *delivery* side is still "ship a new binary and bounce the fleet".
+
+- **Ownership guard on ordinary workflow terminal writes (issue #1184).** Issue #1182 (and #804 before it) closed the worker-ownership race for one narrow branch: `handle_suspended_workflow`'s empty-command-set catch-all, via `commit_terminal_failure_if_still_claimed` / `fail_suspended_workflow_if_still_claimed`, reusing `queue::claim_still_held_for_update` (a `FOR UPDATE SKIP LOCKED` recheck of `worker_id` + `crash_strikes` under a fresh row lock).
+
+- **Build-scope the diagnose rate-limit bypass per eligible worker (issue #1190).** Follow-up from issue #809 (PR #1188). `GET /workflows/{id}/diagnose` (`build_diagnosis_report` in `autumn-harvest-plugin/src/api.rs`) decides whether a pending activity's rate-limit bucket is even a claim-time impediment by checking whether the activity is circuit-breaker-tracked in **this API replica's own in-process** `CircuitBreakerRegistry` — a compile-time `#[activity(circuit_breaker = ...)]` fact, because a breaker-tracked activity is gated at dispatch, not at claim (#369).
+
+- **Distinguish a timed circuit-open from a forced one in stall diagnosis (issue #1193).** Follow-up from a Codex P2 on PR #1188 (issue #809, `GET /workflows/{id}/diagnose`). `BlockedOn::health()` reported **every** non-half-open circuit-breaker verdict as `ExecutionHealth::Stalled` ("needs a human: nothing will move this run forward on its own").
+
+- **Post-commit completion-trigger supersede metrics and an observable nested-admission residual (issue #1197).** Follow-up to #811 (PR #1196), closing the two residuals that were deliberately deferred out of that slice rather than rushed in.
+
+- **`TerminateIfRunning` cleans up an orphaned undelivered signal (sqlite backend, issue #1374).** 🪝 Snag exploratory QA finding: `autumn-harvest-sqlite`'s `cancel_and_seal_prior` (the `TerminateIfRunning` reuse-policy cleanup path) already deleted a sealed prior's PENDING task rows and unfired timers — see `terminate_if_running_cleans_up_orphan_timer` — so nothing orphaned by the replace could be claimed or fire against a run that will never be driven again.
+
+- **Quota-blocked retries get a bounded backoff (issue #1227).** A sixth automated Codex review round on PR #1221 (issue #946, per-tenant resource quotas) surfaced four `HarvestError::QuotaExceeded` catch sites that correctly avoid terminally failing an execution over an unrelated tenant's transient quota condition, but don't defer the retry with a backoff — so a target durably at quota cap (e.g. a `max_dead_letters` cap, which only clears via manual operator action) causes either a zero-delay retry loop or starvation of unrelated …
+
+- **Source-aware shard coverage for `GET /workers` fan-out (issue #1213).** Filed from Codex round 7 on #1207 (itself part of #961): `GET /workers?shard_id=B` could return a worker registered with the empty (auto/legacy) `shard_assignments` shape in shard A's database, even though that shape means "covers whatever shard the row was read from" (#1150), not "covers every shard".
+
+- **Attribute-macro signature checks route through attr_util (🪞 Echo clone-class merge).** `query.rs`, `update.rs`, and `signal.rs` each hard-coded a private copy of `first_param_is_ctx` (checks the handler's first argument is `&WorkflowContext`), and `query.rs`/`update.rs` each hard-coded a private copy of `returns_result` (checks the handler returns `Result<T, E>`).
+
+- **SSRF guard rejects IPv4-compatible IPv6 loopback/private embeds (issue #1390).** 🪝 Snag exploratory QA finding: `completion_callback::is_ipv6_non_routable` unwrapped an embedded IPv4 address via `Ipv6Addr::to_ipv4_mapped()`, which recognizes only the modern IPv4-*mapped* form (`::ffff:a.b.c.d`, RFC 4291 `::ffff:0:0/96`). The deprecated IPv4-*compatible* form (`::a.b.c.d`, the bare `::/96` prefix) encodes the identical address but `to_ipv4_mapped()` returns `None` for it, so `validate_target_url` classified `https://[::127.0.0.1]/hook`, `https://[::10.0.0.5]/hook`, `https://[::192.168.1.1]/hook`, and `https://[::169.254.1.1]/hook` as **routable** — bypassing the exact guarantee the function's own doc comment states ("even then is rejected if it …
+
+- **Replay-drift gate propagates nested fixture-walk errors (issue #1174).** Filed from a Codex review on #1171 (issue #798): `testing.rs::collect_json_files` propagated a failure to read the **top-level** bundle directory, but swallowed every error found while walking **nested** directories.
+
+- **Fleet health `by_shard` counts empty-assignment workers (issue #1208).** Split out of PR #1207 (issue #961). `GET /workers/health`'s `by_shard` tally dropped a worker advertising the empty (auto/legacy) `shard_assignments` shape: an empty array names no bucket, so a healthy worker polling shard 7 could leave `by_shard[7] == 0`.
+
+- **Cross-type continue-as-new: target-resolved input cap and an exhaustive carry/re-resolve partition (issue #1161).** Follow-up from #803 (cross-type continue-as-new). #803 left four `WorkflowInfo` fields out of the successor-default resolution: `throttle` (#607), `debounce` (#499), `batch` (#518), and `max_input_bytes` (#252), documented only as "not consulted".
+
+- **Backup-verify post-budget correctness fixes (issue #1205).** Four correctness findings from the Codex review of #1204's `e3b089f`, filed after that PR's review-round budget was exhausted. All four were verified against source before filing; none is a regression from #1204 — each is a gap in the verifier #1204 shipped.
+
+- **OpenAPI 3.1 spec for the management API (issue #694).** The management API now publishes an OpenAPI 3.1 document, so an integrator generates a typed client in any language instead of hand-writing HTTP calls against routes reverse-engineered from prose.
+
+- **Bump `lru` 0.16 -> 0.18.4, closing our own RUSTSEC-2026-0253 exposure (PR #1417).** `deny.toml` (PR #1393) deferred RUSTSEC-2026-0253 — a use-after-free in `LruCache::pop()` when a stored key's `Drop` panics mid-pop — as unreachable for `autumn-harvest/src/cache.rs`'s `WorkflowCache` (its key and value types have no custom `Drop`), and flagged the fix (`lru` >= 0.18.2) as a candidate for "the next scheduled batch" once a changelog read confirmed no breaking API surface.
+
+- **Shared stub-use path derivation for query/update/signal (🪞 Echo clone-class merge).** `query.rs`, `update.rs`, and `signal.rs` each hard-coded an identical 32-line derivation of `leading_colon`/`nested_path_tokens` from a parsed `WorkflowPath`, differing only in the `mod_name` prefix declared one line above the block.
+
+- **Bound multi-shard worker shutdown against an exhausted shard pool (issue #1209).** Filed from the Codex review on PR #1207 (itself part of #961): that review's budget was exhausted, so this correctness finding shipped as its own issue.
+
+- **Reject an empty `workflow_id` across the by-id route family (issue #1353).** `workflow_id: ""` was accepted by `POST /workflows/{name}/start` with no validation, as a value distinct from omitting the field (omitting it auto-generates a UUID; an explicit empty string was taken literally as the business id).
+
+- **`redact_dsn` withholds a hostless DSN (issue #1416).** `redact_dsn`'s doc comment promises that a malformed-but-secret-bearing DSN never reaches a report or a log line — it falls back to `"<unparseable dsn>"` on anything `url::Url::parse` rejects outright.
+
+- **Redis dispatch worker integration (issue #1312).** **Opt-in. Additive. No new `WorkflowEvent` variant and no migration.** The `autumn-harvest-redis` crate has existed and been tested since Phase 4, but it was never wired into the worker: its own module doc named the required transactional-boundary refactor as unbuilt, so an operator could not turn it on at any throughput.
+
+- **`cancel` on a terminal execution now answers 409, not 400 (issue #1444).** `docs/openapi.json` documents `409 Conflict` — "Execution is already in a terminal state" — for both `POST /workflows/{id}/cancel` and `POST /workflows/by-id/{workflow_name}/{workflow_id}/cancel`. The sibling mutating routes, `pause_workflow` and `rerun_workflow`, honor that: both route their `HarvestError::Config("… already terminal …")` through the shared `conflict_from()` helper (issue #383's own state-conflict convention) and answer 409.
+
+- **Vantage degraded-banner focus-on-load (issue #1446).** The Vantage operator dashboard's `div.degraded-banner` render sites (schedule fire-time preview, schedule run history's cross-shard degradation banners, and the backfill launcher's error/warning banners) — the dashboard is the product's stated no-separate-service alternative to querying Postgres by hand for debugging failed workflows (`docs/plans/vantage-spec-dashboard-ui.md`), so a message an operator cannot perceive defeats the page's own purpose.
+
+- **Exact filter-argument equality in the chaos docs/CI parity guard (issue #1224).** `chaos_docs::doc_example_filter_matches_chaos_workflow_filter` tied `docs/testing/chaos.md`'s local-iteration example to `.github/workflows/chaos.yml`'s filter using two independent `contains("chaos_tests::")` checks. Both are prefix checks, so if either side narrowed its filter (e.g.
+
+- **Backfill quota_key for pre-upgrade executions (issue #1226).** Follow-up from a Codex automated-review finding on PR #1221 (issue #946, per-tenant resource quotas): the migration that added `harvest_workflow_executions.quota_key` shipped with no backfill, by design — the key-resolution expression is Rust application code, not something a pure-SQL migration can evaluate.
+
+- **Vantage jump-to-event label association (issue #1485).** The Vantage operator dashboard's workflow detail page (`autumn-harvest-plugin/src/ui.rs`), specifically the "Jump to event" control in the event timeline pagination. It only renders once a workflow's history exceeds `DETAIL_EVENT_PAGE_SIZE` (100 events) — a long-running or heavily-retried workflow is exactly the kind an operator is investigating via the runbook's five stuck-workflow scenarios (`docs/vantage-ui.md`), so this is exactly when the control appears.
+
+- **Codec key rotation: structural fleet-wide preconditions (issue #1244).** Follow-up to #948 / #1242. Two correctness preconditions for codec key rotation were real but enforced only by operator discipline. This closes both structurally.
+
+- **Cross-shard child placement: five P1 follow-ups from #1260 (issue #1263).** **Scope.** Issue #1263 tracks 17 follow-ups deliberately deferred from PR #1260 (opt-in cross-shard child workflow placement) so that PR could land without widening. This PR closes the six the issue's own author flagged P1, all introduced by #1260: items 7, 10, 11, 13, 15, and 17.
+
+- **Terminate's idempotent no-op stops claiming a false cancellation (issue #1456).** `terminate_workflow_execution_collect` and `cancel_workflow_execution_collect` share `CancelledWorkflowExecution::idempotent()` for their already-terminal no-op path. Its fallback reason — used only when the row's `error` column is `NULL` — was a single fixed string, `"workflow already cancelled"`, written for cancel's narrow reuse (reachable there only on an already-`CANCELLED` row, where `error` is always populated by the original cancellation, so the fallback was dead code).
+
+- **Cross-region DR follow-up correctness fixes (issue #1249).** Thirteen correctness findings from rounds 6–9 of the automated review of #1246's cross-region DR work (issue #954), filed after that PR's review-round budget was exhausted.
+
+- **Quota-vs-supersede ordering and a detached-child lock-ordering gap (issue #1228).** A seventh automated Codex review round on PR #1221 (issue #946, per-tenant resource quotas) surfaced two more findings against commit `3bda6fc`, after all 5 permitted review rounds for that PR were used and round 6's findings were already tracked in #1227.
+
+- **Close the sweep-batch-vs-retirement race in codec rotation (issue #1251).** Fixes a narrow but serious race in the codec-rotation re-encryption sweep (issue #948): a re-encryption batch could commit a row under a key that `retire_codec_key` had already retired, making that row undecodable — permanently, if the operator destroyed the key material on a green gate.
+
+- **A coherent audit-export cursor lifecycle: close a revival race, audit retire/reactivate (issue #1273).** Two deferred findings from #1261's review (issue #953's audit-export cursor), filed together because they are two symptoms of the same under-designed mechanism: `decommission_cursor` retired a shard's export cursor by setting `retired_at`, but the states a cursor can be in, who may transition it, and what gets recorded were never written down.
+
+- **Audit-export redrive reports what it can actually deliver (issue #1267).** `POST /admin/audit-export/redrive` rewinds a shard's export cursor under `SELECT … FOR UPDATE` on the cursor row. `audit::purge_old_audit_records` does not take that lock — it reads the cursor through a plain, uncorrelated subquery.
+
+- **Claude agent-daemon example on the SQLite backend (PR #1493).** A new top-level example, `examples/claude-agent-daemon/`: a local daemon (`agentd`) that runs Claude agent sessions as **durable workflows** on the embedded `autumn-harvest-sqlite` backend. No Postgres, no Docker, one binary and one file.
+
+- **Directory-privacy enforcement no longer skips Windows (issue #1287).** Both directory-privacy checks in the dev runtime lived inside a `#[cfg(unix)]` block: `harden_root` (`reaper.rs`, guards the session root a planted record could point `stop_orphan`'s `pg_ctl` at) and `directory_is_private` (`acquire.rs`, guards the managed-tier binary cache).
+
+- **Dependency ledger: `unsound` advisory scope gap + anyhow RUSTSEC-2026-0190 fix (PR #1556).** Routine Ballast ledger sweep. `cargo deny check` came back fully green (no errors), but with one warning: the `RUSTSEC-2026-0253` (lru) ignore entry in `deny.toml`, previously verified reachable-and-deferred in PR #1417, now reported "advisory was not encountered" — cargo-deny no longer evaluates it at all.
+
+- **Audit-export retention bootstrap-window guard (issue #1266).** `purge_old_audit_records` already refused to delete an unexported audit row when a live cursor existed for the shard, or when the sweeping process had a sink configured.
+
+- **Give the codec-rotation revalidation deadline its own column (issue #1258).** Fixes a liveness bug in the codec-rotation re-encryption sweep (issue #948): on a busy, already-converged shard, the periodic re-census that finds a row committed below the cursor could be starved indefinitely.
+
+- **Print the actual history shape on a flaky assertion mismatch (issue #1558).** `worker_fails_workflow_when_activity_start_to_close_timeout_elapses` (`autumn-harvest/tests/integration/integration_e2e.rs`) failed once after a prior hardening fix. The issue ruled out all four candidate root-cause mechanisms by reading source and found no supported hypothesis.
+
+- **Codec envelope nests, closing the business-data collision (issue #1253).** Found by automated review on autumn-foundation/autumn-harvest#1242 and filed separately: the flat codec envelope (`_harvest_codec_envelope` as a sibling key next to `codec_id`/`data`/`kid`) was structurally indistinguishable from business data that happened to carry the same keys. #948 moved the version discriminator from 1 to 2 to avoid reinterpreting old four-key plaintext, but a *new* value shaped exactly like the version-2 envelope collided with it too — bumping the version relocates this hazard …
+
+- **Redact completion-callback target URLs in startup and runtime logs (issue #1274).** `HarvestBuilderError::CallbackTargetRejected`'s `Display` interpolated the full completion-callback target URL. A builder error surfaces through `try_build()` straight into startup logs. A completion-callback target often carries a bearer token or signing key in its path or query.
+
+- **Harvest-verify correctness follow-ups from Codex round 6-8 (issue #1296).** Nine correctness findings from three Codex review rounds on #1294 (rounds 6-8, after that PR's review budget was exhausted), all in `autumn-harvest-verify` — no engine footprint.
+
+- **Close the fourth `expected_shards` copy issue #1146 missed (issue #1146).** `autumn-harvest-plugin/src/version_gate_retirement.rs`'s `expected_shards` was a byte-for-byte hand-rolled duplicate of "pool keys ∪ readable shards ∪ default shard, or `{0}` if empty" — the same fan-out rule issue #1146 consolidated onto [`shard_fanout::expected_shards`] (itself `external_target_location::fanout_shards`) for `version_usage.rs`, `workflow_reachability.rs`, and `workflow_count.rs`.
+
+- **Rate-limit bucket GC failure reports keep `dry_run` (issue #1316).** `RateLimitBucketGcOutcome::failed` filled every field but `error` from `Default`. `dry_run` came back `false` on every failure, even a failed `dry_run: true` preview. `GET /admin/retention` then showed a failed preview as a failed REAL pass — the exact conflation `RateLimitBucketGcOutcome` (issue #1127) exists to prevent.
+
+- **`harvest migrate`'s target label reads DSN separators as libpq does (issue #1321).** `autumn-harvest-cli::scan_keyword_dsn` split a libpq keyword/value DSN's options with `u8::is_ascii_whitespace`. `tokio_postgres` — the client that actually connects with these DSNs — splits on `char::is_whitespace`, the Unicode `White_Space` property (`tokio-postgres`'s `config::Parser::skip_ws`).
+
+- **Two pre-registered assays: cross-mode throughput, and the first
+  cross-engine comparison (ledger #10, #11).** Harvest had four measurements
+  of its own modes, taken at four shapes on at least three hosts against at
+  least three trees, with the embedded SQLite backend appearing in none of
+  them; and `docs/benchmarks.md` stated plainly that no competitor had ever
+  been run on the same hardware. Both gaps are now closed by measurement, and
+  both assays report a **kill**.
+
+  **#10 (cross-mode)** drains one backlog of the canonical 3-activity workflow
+  on three arms — embedded SQLite, the Postgres claim path, and Postgres with
+  `RedisDispatch` — on one box, from one tree, in one sitting. Its validity
+  line **failed**: the Postgres arm read 5.58 workflows/sec against a
+  registered `[7.91, 71.19]` band around the published 23.73, so L2 and L3 are
+  ungraded and the apparatus refuses to print them. The cause was this repo's
+  own documented warning: `docs/benchmarks.md` records why #941 chose a bounded
+  closed loop over a pre-loaded drain, because a drain re-publishes #786's
+  claim-depth curve under an end-to-end label — and #10 registered a 2,000-deep
+  drain anyway. The durable finding is its post-hoc depth diagnostic:
+  `redis_pg` is **flat within 1.4%** from 250 to 2,000 rows of backlog
+  (22.21–22.53 workflows/sec) while `postgres` falls **4.2x** (23.90 → 5.63).
+  The channel's margin is therefore 0.93x at 500 rows and 3.94x at 2,000: it is
+  **insurance against backlog depth, not a general throughput upgrade**, and a
+  deployment that never builds a deep queue pays for a second stateful
+  dependency and gets nothing. The embedded arm's 3.20 workflows/sec is
+  deliberately *not* presented as like-for-like — `autumn-harvest-sqlite`
+  hard-codes `PRAGMA synchronous = FULL` and exposes no knob, while the
+  Postgres arms ran `fsync=off` per the published bench conditions, so part of
+  any gap is durability rather than engine, and L3 was registered without
+  noticing that.
+
+  **#11 (harvest vs Temporal)** puts both engines on one 4-core box against the
+  same PostgreSQL server at the same shape. **Harvest lost, by 7.9x** (5.58
+  against 44.31 workflows/sec), and lost in the venue that disadvantages its
+  competitor, with all four Temporal services co-resident. Its depth diagnostic
+  is what makes the result usable rather than merely bad news: Temporal is
+  faster at *every* depth tested, so the kill is not an artifact of depth;
+  against harvest's *best* mode the margin is a stable ~1.7x rather than 7.9x;
+  and the widening part is the known, fixable `#786`/`#1177` claim-path defect.
+  That bounds the highest-value performance fix available: repairing #1177
+  would move the default mode from 5.63 toward the Redis arm's flat 22 at depth
+  2,000, taking the margin from 6.9x to roughly 1.8x.
+
+  **Measurement discipline is most of the work here, and it is adversarial by
+  construction.** Both pre-registrations were committed before either apparatus
+  existed, and #11's fixed *in advance* what its result may not be read to mean,
+  so a harvest win could not later be spun as "faster than Temporal." Six
+  rounds of review found 19 defects; **three sweeps were discarded rather than
+  reported**, including one whose Redis arm published no dispatch hints at all
+  and was therefore timing the reconcile sweep's recovery path. Five separate
+  places where #10's workload was not the port-by-value it claimed were fixed
+  and then the whole workload was diffed against `e2e_bench_support.rs` field by
+  field. Four parity defects in the Temporal arm, **all of which disadvantaged
+  Temporal**, were fixed before the reported run. Caveats that cut against
+  harvest are recorded rather than omitted: the measured window charges worker
+  startup, which is far costlier for Temporal, so the shallow-depth cells
+  understate it.
+
+  **Zero engine impact.** No `WorkflowEvent` variant, no migration, no
+  behaviour or public-API change; nothing under `autumn-harvest/src/` is
+  touched. Both apparatus are non-production throwaways, detached from the root
+  workspace. `docs/comparison.md`'s stale "no first-party benchmarks yet" bullet
+  is corrected, and `docs/benchmarks.md` now carries the Temporal result
+  including the part where harvest loses.
+
+- **Dev runtime: withhold a DSN a keyword scanner cannot vouch for (issue #1322).** `banner::redact_keyword_value` accepted any `key=value` token as a libpq keyword. A mistyped URL that lost its `://` — `postgres=//alice:hunter2@db` — scans as the "keyword" `postgres`. It has no `password=` option, so the scanner found nothing to blank out and printed the whole string, credential included.
+
+- **Hot code swap review-round 6/7 fixes (issue #1345).** Seven correctness findings against the `hot-code-swap` R&D spike (#967), found past that PR's review budget and recorded on this issue instead. All behind the `hot-code-swap` Cargo feature, so none affects a default build.
+
+- **Cross-shard business-key race: decision recorded, not re-fought (issue #1313).** Issue #1313 followed up on PR #1306 (issue #1146, Codex round 4): a by-id fan-out reads every expected shard sequentially, on separate connections, with no shared snapshot.
+
+- **Ownership guard on the pause fast-path park (issue #1347).** Issue #1184 added a worker-ownership recheck (`queue::claim_still_held_for_update`) to every ordinary terminal-write path: completion, failure, and `check_paused_and_park`'s own operator-pause re-park. One site kept the old, unguarded shape: `process_workflow_task`'s early, non-locking pause fast path, which called `queue::park_workflow_task` directly.
+
+- **Both Harvest routers return `Router<()>` (issues #1606, #1607).** First of epic #1605's two roots. `harvest_api_router` and `harvest_ui_router` returned `Router<autumn_web::AppState>`, and that type parameter is what forced every non-autumn-web embedder to construct an `AppState` it had no other use for.
+
+- **A standalone mount can reach a working admin credential (issue #1608).** The second of epic #1605's two roots, and the one that made the standalone integration path unusable rather than merely awkward.
+
+- **A by-id cancel reports from a later fan-out than the one that cancelled (issue #1313).** `external_target_location`'s by-id fan-out reads every expected shard sequentially, on separate connections to separate databases, with no shared snapshot — Postgres has no cross-shard transaction and Harvest adds no coordinator.
+
+- **Batched seek-and-refine claim: `queue::claim_task_batched` (issue #1340).** Issue #1340 tracks the architectural fix `docs/performance.md`'s "Any residual predicate defeats sort-elision" section (issue #1177) names but declines to attempt: a seek-and-refine restructuring of the claim candidate scan.
+
+- **Retry deadlines computed on Postgres's own clock (issue #1389).** A Codex review round on PR #1386 (issue #1227) found that `queue::requeue_for_retry` computes its retry deadline on the **host** clock (`Utc::now() + delay`), but `claim_task` checks eligibility (`scheduled_at <= NOW()`) on **Postgres's** clock.
+
+- **Quota-retry backoff survives a stale sentinel (issue #1391).** A Codex review round on PR #1386 (issue #1227's quota-retry backoff), filed as a follow-up because that PR's own 5-round review budget was already spent, found a way to defeat the bounded backoff PR #1386 added.
+
+- **Outbox relay backoff deadlines computed on Postgres's own clock (issue #1392).** A Codex review round on PR #1386 (issue #1227), past that PR's 5-round review budget, found that the completion-trigger outbox's backoff deadlines (`next_attempt_at`) are computed and checked on each scanner replica's own **host** clock, not Postgres's.
+
+- **`HarvestMetricsRecorder` gains framework-neutral Prometheus rendering (issue #1611).** Part of epic #1605's Tier 2 (make the non-autumn-web integration path first-class). `HarvestMetricsRecorder` aggregates the ADR-0001 §7 catalogue metrics entirely in-process, but the only way to read them back out was `impl MetricsSource`, whose rendering happens inside autumn-web's shared `/actuator/prometheus` endpoint.
+
+- **Select every per-shard monitor's acquisition against cancellation (issue #1426).** Split out of the review on PR #1424 (itself part of #1209): that PR's fix was scoped to three specific mechanisms (`transition_fleet_status`, the heartbeat loop, and the schedule-overdue sampler's eager first pass).
+
+- **TLS for LISTEN/NOTIFY listeners (issue #1717).** `QueueListener`, `WorkflowEventListener` and `WorkflowProgressListener` always used `NoTls`. Every listener failed on Postgres with `sslmode=require`. Workers fell back to polling, so the failure stayed hidden. `result_raw` had no fallback, so each synchronous result wait failed.
+
+- **Shared release-claim-via helper for queue/activity/workflow pause (🪞 Echo clone-class merge).** `queue_pause::release_claim_if_queue_paused`, `queue_pause::release_claim`, `activity_pause::release_claim_if_activity_paused`, and `execution::release_claim_if_workflow_paused` each bound `task_id`/`worker_id` into their own pre-built statement, executed it, and mapped the row count to a bool, in a byte-identical body.
+
+- **Redis dispatch follow-ups: latency, coverage, and operability (issue #1429).** Issue #1312 shipped Redis Streams as an opt-in dispatch channel in front of the Postgres task queue. It shipped with ten known gaps, each named in its own doc comment or tracking note.
+
+- **Stall diagnosis: timer provenance survives a scheduled_at drift (issue #1402).** Follow-up to issue #1191 (PR #1403): `stall_diagnosis::is_the_missed_timer_wake` trusted an exact or near-exact match between a workflow task's `scheduled_at` and a durable timer's `fires_at` as proof the row is that timer's own missed wake.
+
+- **Redis dispatch: a worker keeps its channel, and a late install is revalidated (issue #1431).** Follow-up to issue #1312 and PR #1698. Both findings share one root cause: the process-global dispatch slot can change after a worker starts.
+
+- **Lifecycle invariant gaps: guarded transitions, one transition table, CI that runs the DAG suites.** An audit set every workflow execution, task queue and DAG lifecycle transition against the checks that enforce it. This change fixes the defects it found and closes the coverage gaps it can close without a schema change.
+
+- **Redis dispatch reads reach every queue under slow round trips (issue #1754).** `RedisDispatch::read_across_queues` divided its blocking budget between the queues and did not count the Redis round trip. On a slow link, the deadline passed before the rotation reached the queues at its tail.
+
+- **Dependency ledger: restore unsound-advisory transitive scope (PR #1760).** `deny.toml`'s `[advisories]` section had documented `unsound` advisory scoping as a solved problem: cargo-deny 0.18 removed the `[advisories.unsound]` field and unconditionally denied `unsound` advisories for every reachable instance, workspace or transitive.
+
+- **Vantage action forms preserve entered data on error (issue #1687).** The Vantage workflow detail page's three operator recovery actions — Send signal, Reset to event N, Trigger update (`autumn-harvest-plugin/src/ui.rs`). `docs/vantage-ui.md`'s "Diagnosing a stuck workflow" runbook routes an operator through these for 3 of its 5 documented scenarios (waiting-on-signal, blocked-on-child, replay non-determinism), so this is an incident-response path, not a peripheral one.
+
+- **Inbound webhooks work off the plugin path (issue #1612).** Part of epic #1605 (making the non-`HarvestPlugin` integration path first-class). `build_webhook_routes` returns `Vec<autumn_web::Route>`, which only composes with an `autumn_web::AppBuilder` — so a `#[webhook]` binding was reachable only through `HarvestPlugin`, even though Chapter 12's own example is a plain 50-line Stripe integration with nothing plugin-specific about the mapping logic itself.
+
+- **Offload look-alike escape (issue #1758).** Business data that carried `_harvest_offload_envelope: 1` was read back as a dangling reference. Replay of that event failed with `PayloadOffload`.
+
+- **Audit export disable marks shards unobserved (issue #1506).** A live process could clear its audit-export config. Both audit-export gauges then kept their last value, and no alert fired. `set_global_audit_export_config` now records the `Some` to `None` change.
+
+- **A `before` redrive reports a prefix retention already purged (issue #1508).** `POST /admin/audit-export/redrive` with `before` derives its window from the records that still exist. Retention could purge the earliest records at or after the instant. The redrive then resolved to the lowest survivor and reported `already_purged_records: 0`.
+
+- **`HarvestEmbedding`: one entry point for a standalone embedding (issue #1613).** `HarvestEmbedding::new(built, config, resources).start()` runs the standalone startup sequence and returns the runner and a mounted `Router<()>`. The embedder used to do each step by hand, and the reference example skipped most of them.
+
+- **Skip-policy shift target is a weekday (issue #1772).** `run_next_business_day` and `run_prev_business_day` could land on Saturday or Sunday for calendars such as `us-federal-holidays` and `nyse`. The scheduler passes `exclude_weekends = false` for every calendar except `weekends-off`.
+
+- **Shared with-start admission step (issue #1440).** Signal-with-start and update-with-start no longer duplicate their start path.
+
+- **Postgres poll path claims only against a free local permit (issue #1787).** The default Postgres poll path claimed a task before the worker had a free permit for it. The claim stamps `started_at`, and start-to-close and heartbeat deadlines run from `started_at`.
+
+- **The chaos suite runs nightly, with a watchdog (issue #1790).** `chaos.yml` did not parse from its first commit. Two `run:` values held `chaos:: ` unquoted, and YAML reads `: ` as a mapping value. GitHub ran the file as a zero-job failure and never fired its cron.
+
+- **Claim-epoch fence on activity ownership writes (issue #1789).** A worker whose liveness row went stale could still write the result of an activity. The orphan reclaimer requeued the row, and a second worker claimed it.
+
+- **Completion-trigger fire retention (issue #1676).** `backup verify` proves a delivered completion-trigger fire from the target's `harvest_execution_summaries` row. That row expires at `--summary-age`. The fire row never expired, so an old fire fell back to a timestamp guess.
+
+- **`#[workflow]` names the fix for a `_` input parameter.** `#[workflow]` now rejects a `_` or destructuring input parameter with a compile error that names the cause and the fix (`_input: ()`). Before, the macro dropped the pattern and rustc reported `E0061` "takes 5 arguments but 4 arguments were supplied" on the attribute line.
+
+- **README cron-schedule and retry snippets compile.** The README's "Scheduling workflows on a cron" snippet called `.workflows(..)` and `.workflow_schedule(..)` on `autumn_web::app()`. That builder has neither method, so the snippet failed with `E0599`.
+
+- **Process-, database- and network-level crash-recovery tests (issue #1801).** The chaos KILL is a panic in one tokio task. The new tests in `chaos_tests::infra_faults` inject faults below the engine. They run real workers against a Postgres 16 container and a toxiproxy container:
+
+- **Deterministic suspension readiness (issue #1797).** The executor no longer uses the 100 ms `SUSPENSION_TIMEOUT` to decide that a workflow is suspended. A cycle now suspends when the handler is `Pending`, no wake fired during the poll, and a Harvest future is parked.
+
+- **Batch the mixed-suspension per-timer lookup, clock read and insert.** `persist_mixed_suspension_batch` and the history-cap preflight resolved each `StartTimer` with its own lookup, `SELECT NOW()` and `INSERT`. A park that arms `n` timers now issues one lookup per site, one clock read and one multi-row insert.
+
+- **Sticky routing on by default, with shutdown release (issue #1798, step 1).** `WorkerConfig::default()` now turns sticky routing on. `sticky_timeout` is `DEFAULT_STICKY_TIMEOUT` (5 s), the fallback window that Temporal uses for its sticky queue. Until the pin expires, only the worker that holds the warm cache can claim the next decision of a suspended execution.
+
+- **Lazy audit claim-scan index (issue #1667).** An unconfigured deployment no longer pays for the audit export index.
+
+- **Retry, re-dispatch and cron fire jitter on by default (issue #1792).** Activities that failed together used to retry together, at 1 s, 2 s, 4 s. Cron schedules all fired on the same instant. Jitter now spreads both.
+
+- **Retry budget per activity type (issue #1793).** Without a budget, nothing limits retries in aggregate. Each task retries up to its own policy. During a dependency brownout, the retries multiply the load on the dependency when it can least absorb it.
+
+- **Post-commit NOTIFY for appends and enqueues (issue #1796).** History appends and enqueues called `pg_notify` inside the write transaction. Postgres takes a database-wide lock at commit for such a transaction, so these commits ran one at a time.
+
+- **`standalone-runner` has no `autumn-web` in its manifest (issue #1615).** Part of epic #1605, Tier 3. This is the acceptance test for the epic's definition of done. `examples/standalone-runner` replaces its old form, so the tree keeps one standalone reference, not two.
+
+- **Admin token scope and authorizer hook (issue #1803).** API tokens had two scopes, `read` and `mutate`. A `mutate` token could mint and revoke tokens, so one leaked token could create others. Authorization had no tenant or shard input, and `shard_id` was not a capability.
+
+- **Automatic load shedding by backlog age (issue #1794).** A queue can now shed new workflow starts while its backlog is old. A shed caller gets `429 Too Many Requests` with a `Retry-After` header.
+
+- **Default activity start-to-close timeout (issue #1808).** `WorkerConfig::default()` now sets `default_activity_start_to_close` to `DEFAULT_ACTIVITY_START_TO_CLOSE` (10 minutes). Before, the field was `None`. With that value, a regular activity with no timeout of its own could hang on a live worker forever and hold a slot.
+
+- **Workflow-task ownership guard checks `attempt` (issue #1806).** `queue::claim_still_held_for_update` now matches `attempt` as well as `crash_strikes`.
+
+- **Resident workflow state on warm decisions (issue #1798, step 2).** A warm cache entry now keeps the suspended workflow itself, not only its events. The next decision on the same worker sends the new result to the parked handler future and polls it again.
+
+- **Build pinning fails closed (issue #1805).** A worker with an empty `build_id` can no longer claim a run pinned to a build. The `OR $n = ''` bypass is gone from all claim queries and from `BuildCompatibilitySet::is_eligible`.
+
+- **Liveness and readiness probes with a draining state (issue #1812).** Harvest now has `GET /health/live` and `GET /health/ready`. Both are `PublicSafe`.
+
+- **Workflow-claim releases check `attempt` (issue #1806).** `queue::release_suspended_workflow_claim` and `queue::release_terminal_workflow_claim` now match `attempt` as well as `crash_strikes`. The first #1806 fix covered only the persist guard.
+
+- **A published TypeScript client, and a harvest-server evaluation (issue #1616).** Part of epic #1605. Part 1 ships code. Part 2 is a design note.
+
+- **Task-queue table hygiene (issue #1811).** The retention janitor now deletes finished `harvest_task_queue` rows. Before, they went only when their execution was deleted, and history retention is off by default. So `COMPLETED`, `FAILED` and `CANCELLED` rows stayed forever, and the table and its indexes grew without limit.
+
+- **Bounded pool acquire and Postgres session timeouts (issue #1788).** A full pool or a stuck connection no longer stops claims and heartbeats.
+
+- **SLO definitions and burn-rate alerts (issue #1816).** **New optional pack.** `docs/alerts/slo-pack-v0.1.0.rules.yml` defines three reference SLOs and pages on error-budget burn. It uses the multi-window, multi-burn-rate method from the Google SRE Workbook.
+
+- **Production AES-256-GCM payload codec with a KMS key provider (issue #1825).** Harvest had a payload codec hook and key rotation, but only `IdentityCodec`. Payloads were plaintext by default, and rotation had no production codec to rotate.
+
+- **Continuations before new starts; no work past a run deadline (issue #1824).** Two claim rules now apply by default. See [`operations/claim-order.md`](docs/operations/claim-order.md).
+
+- **Database guard on append-only `harvest_events` (issue #1817).** A `BEFORE UPDATE` trigger on `harvest_events` now rejects history rewrites with `restrict_violation` (SQLSTATE `23001`). Before this change, only a source grep test enforced the invariant.
+
+- **Worker drain releases its claims (issue #1813).** `WorkerConfig::default()` now sets `shutdown_timeout` to `DEFAULT_SHUTDOWN_TIMEOUT` (25 s). Before, it was 30 s, the same as the Kubernetes default `terminationGracePeriodSeconds`. The platform could then kill the pod at the moment the drain gave up.
+
+- **Document that `AeadCodec` leaves failure text in clear (issue #1920).** `AeadCodec` encrypts the six payload fields only. Failure strings, such as `WorkflowFailed.error` and `WorkflowStarted.last_error`, stay in clear. The docs did not name this boundary.
+
+- **One timeout scanner per shard, jittered and bounded (issue #1795).** Every replica ran the timeout checker on every shard every 500 ms, with no jitter, and its task-timeout scans had no `LIMIT`. Scan load grew with fleet size, so adding workers to clear a backlog added database load in proportion.
+
+- **Shared deferred-admission decode for debounce/throttle/batch fire (🪞 Echo clone-class merge).** `debounce::fire_claimed_debounce_row`, `throttle::fire_claimed_throttle_row`, and `event_batch.rs`'s two flush/fire sites each decoded the same seven `DebounceStartOptions` fields — `reuse_policy`, `execution_timeout`, `sla`, `max_execution_timeout_ceiling`, `chain_execution_timeout`, `max_workflow_chain_timeout_ceiling`, `priority` — into locals, in a byte-identical block.
+
+- **Optional per-client API rate limiting (issue #1827).** The management API can now rate-limit each client. A client over its limit gets `429 Too Many Requests` with a `Retry-After` header in whole seconds.
+
+- **The N/N-1 rolling-deploy contract and its smoke job (issue #1828).** `docs/upgrading/README.md` states the contract. N-1 and N run together on the schema of N. A release adds expand migrations only. A contract step ships at least one minor release after the last user of the object.
+
+- **SQLite single-writer lock, typed unsupported failures, Redis TLS (issue #1834).** **SQLite: the single-writer contract is enforced.** `SqliteRuntime::open` takes an exclusive OS lock on `<database>.lock` (`flock` / `LockFileEx`, via `fs4`). A second runtime on the same file fails fast with the new `SqliteError::DatabaseLocked`.
+
+- **Default history event cap and byte cap (issue #1804).** Before this change, a runaway loop grew `harvest_events` and replay CPU without bound. The only default was the advisory `should_continue_as_new` at 10,000 events. The worker now caps each run's history by default.
+
+- **Adaptive concurrency limit per activity type (issue #1836).** The slot tuner grows the worker slots when local permit waits rise. When a dependency is the bottleneck, that is the wrong direction. More calls only add latency and errors.
+
+- **Orphan reclaim skips a locked row (issue #1876).** `poison_pill::reclaim_orphaned_tasks` no longer stalls behind a task-row lock that another session holds. A partitioned worker can keep its transaction, and its row locks, open on the server.
+
+- **Tenant isolation with cells (issue #1837).** [ADR 0004](docs/adr/0004-tenant-isolation-cells.md) records it. Harvest supports cooperative multi-tenant deployment. The isolation unit is a cell: one reserved shard plus the worker pool assigned to it.
+
+- **Automatic resume after a stalled cutover; duplicate-append detection (issue #1839).** A worker now settles a shard migration that stalled after its cutover. Before, only a manual `harvest shard rebalance-resume` did this. Set `ScannerConfig::rebalance_resume_enabled = false` to keep the old behavior.
+
+- **Adaptive concurrency limit: operator guide and example (issue #1836).** The adaptive concurrency limit shipped with design notes and metrics, but without an operator guide or an example. This follow-up adds both. It changes no code in the library.
+
+- **Retry deadlock and serialization aborts; lock-order table (issue #1822).** At the wired sites, a deadlock victim no longer fails its workflow.
+
+- **Activity timeout retries and a deferring circuit breaker (issue #1809).** Activity timeouts were terminal, but the design doc said that start-to-close and heartbeat timeouts retry per policy. Every timeout of a `RUNNING` task also fed the circuit breaker, even when the handler never started.
+
+- **Decision-boundary event records build and worker per decision (issue #1833).** A history now shows which build and which worker made each decision.
+
+- **Metric-gated build-ramp abort and a `build_id` metric label (issue #1814).** A build ramp can now abort itself. The opt-in ramp guard compares the target build of a ramp with its base build at each ramp step.
+
+- **DB-pool, query-latency and poller metrics, and a gray-failure signal (issue #1815).** Harvest reported no saturation of its database, and worker health was a heartbeat check only. A worker that was alive but sick passed that check.
+
+- **DR fencing on by default, admin writes fenced, batched claim fenced (issue #1823).** The cross-region DR generation fence (issue #954) was opt-in per process. A process started without it could write to a demoted primary after a failover.
+
+- **Claim cost no longer grows with backlog depth (issue #1971).** **Claim order does not change.** The claim picks the same row as before. Its cost changes. One fix changes behavior: a capped concurrency key can no longer run tasks over its cap.
+
+### Fixed
+
+- The PII-erasure tombstone `UPDATE` on `harvest_events` now keys on
+  `workflow_exec_id` as well as the row id, so the planner prunes to a single
+  partition instead of probing every partition's index. No behaviour change on
+  the unpartitioned layout.
+
+- **`enforce_external_cancels_outbox` self-deadlocked on aliased shards, hanging `Test DB (linux, shard 6)` for 6h on every CI run (issues #1350, #1357).** `Test DB (linux, shard 6)` never completed — it burned a full 6-hour GitHub Actions job on every run, on `trunk-dev` and on every PR, deterministically hanging at the same test every time: `shard_placement_by_id_tests::outbox_by_id_resolves_when_the_caller_holds_the_higher_aliased_shard`.
+
+- **Pin `tinyvec` in the `harvest new` scaffold to avoid a build-breaking upstream regression (issue #1359).** `harvest new` scaffolds a project with a fresh `Cargo.toml` and no committed `Cargo.lock`, so the first `cargo build` a new user runs resolves whatever's newest on crates.io.
+
+- **Fix sqs feature's legacy TLS/HTTP stack pull (PR #1393).** `deny.toml` (from the dependency-ledger harness, PR #1303) deferred four RUSTSEC advisories — RUSTSEC-2026-0098/0099/0104 (rustls-webpki 0.101.7 certificate-parsing bugs) and the h2@0.3.27 half of RUSTSEC-2026-0258 (unbounded empty DATA frames) — as reachable via the optional `sqs` feature but stuck pending an `aws-config`/`aws-sdk-sqs` manifest bump.
+
+- **`timer_overdue` false positive under saturated workflow dispatch slots (issue #1191).** `stall_diagnosis::workflow_wake_was_missed` gated the `timer_overdue` verdict on the run's own workflow-task row being `PENDING` with `scheduled_at` aged past a 60-second grace window (`TIMER_OVERDUE_GRACE_SECONDS`), on the assumption that only `persist_started_timer` (via `queue::reschedule_task`) re-pends a row to that exact shape.
+
+- **Shard-rebalance seal integrity, legal-hold cutover race, and successor minting (issue #1317, PR #1406).** Follow-up to #964 and PR #1305, addressing the highest-severity findings from that PR's round 6-12 review: several ways the shard-rebalance feature could strand or destroy the one forwarding seal an execution's id resolves through, plus several call sites that derived a shard from an `ExecutionId`'s origin bits instead of the row's current residence.
+
+- **Local-activity batch silently dropped co-batched bookkeeping commands (issue #1247).** `extract_run_local_activity` (`autumn-harvest/src/worker.rs`) walked a drained `RunLocalActivity` command batch with a `match` that handled only four kinds (`RecordMarker`, `RecordSideEffect`, `SpawnDetachedChildWorkflow`, `RunLocalActivity`) and ended in a `_ => {}` catch-all.
+
+- **A redriven run re-dispatches past its failing cycle's trailing records (issue #1262).** , composing only existing events — **zero new `WorkflowEvent` variants, no migration, no contract change.**
+
+- **Audit-export unobservable-shard gauge (issue #1268).** Follow-up from the review of #1261 (issue #953). `harvest.audit.export_lag` is written only on a successful observation, so a shard the exporter cannot observe — a connection it cannot acquire, a failing cursor read, a failing lag query — kept serving its last value, commonly `0`.
+
+- **`harvest.audit.export_lag` no longer under-reports on commit-order skew (issue #1271).** **Bug fix. No new `WorkflowEvent` variant, no replay impact.** One migration: widens an existing partial index; no new table, no new column.
+
+- **Audit export runs on its own task (issue #1269).** Follow-up from the review of #1261 (issue #953). `fire_due_audit_exports` ran inline inside `timeout::enforce_timeouts_once`, sharing that loop's connection and cadence with timeout enforcement, SLA checks, session cleanup, and codec rotation.
+
+- **One unsupported-command execution head-of-line-blocked unrelated executions in `poll_once`/`run_until_idle` (issue #1530).** `SqliteRuntime::poll_once`/`poll_once_as_of` drove `store::running_executions` — every `RUNNING` execution, in ascending `ExecutionId` order — with `self.drive_one_cycle(exec, now, &failure_now).await?`. The bare `?` propagated the first per-execution error and aborted the rest of that pass, so any execution ordered after a permanently-erroring one (an unsupported command such as `SignalExternalWorkflow`, but any `drive_one_cycle` error applies) never got a decision cycle — not once, forever, even after a restart, since the broken execution never reaches a …
+
+- **`run_until_idle` capped fleet convergence at one decision cycle per call in the presence of a persistently-broken execution (issue #1555).** `run_until_idle`'s outer loop called `self.poll_once().await?`. The bare `?` propagated ANY per-pass error immediately, so a single call returned after exactly one internal `poll_once` pass whenever the fleet contained an execution that errors every cycle (e.g. an unsupported command through ordinary dynamic control flow, same shape as #1530).
+
+- **A tokenless dev-session record no longer reaps a live pid (issue #1295).** `postmaster_is_the_recorded_one` fell back to plain liveness when a session record carried no postmaster start token: any live process at the recorded pid counted as a match.
+
+- **Three narrow dev-runtime robustness gaps closed (issue #1299).** Follow-up to #525 / #1281, filed after that PR's review budget was spent. Three small, independent hardening gaps in the same module.
+
+- **A keyed by-id signal could double-deliver across a shard-crossing continue-as-new or restart (issue #1318).** `signal_external_workflow_by_id_with_idempotency`'s exactly-once promise held per execution, not per business key. `resolve_and_signal_by_workflow_id`'s idempotency pre-check (`execution::lookup_idempotent_signal_dedupe`) already recognised a key reused against a same-shard predecessor — issue #751's PR #1145 closed that route.
+
+- **The by-id fan-out could mislabel a rebalanced caller's own shard (issue #1324).** `timeout::resolve_delivery_route` already read the caller's real shard off the held connection (`caller_shard`, the issue #964 fix): a query against `harvest_workflow_executions.shard_id` on `conn` itself, not a decode of the caller's `ExecutionId` bits.
+
+- **Workflow-pause post-claim re-check (issue #1640).** `apply_post_claim_rechecks` (`queue.rs`) is the shared, post-claim authoritative re-check both `claim_task_on_shard` and `claim_task_batched` call after a claim's own `UPDATE` commits its snapshot. It already re-checks queue pause (`queue_pause`, issue #619) and activity pause (`activity_pause`, issue #807), but not workflow-execution pause.
+
+- **Durable workflow terminal metrics survive post-commit cancellation (issue #1348).** `process_workflow_task`'s `Persisted` arm computes this cycle's terminal metrics (`harvest.workflow.duration`, `.history_size`, `.continue_as_new`, `harvest.workflow.terminal`, canary metrics) before the persist transaction, then emits them only after that transaction commits (issue #1184) — so a rolled-back attempt cannot double-count.
+
+- **`audit::list_audit`'s `before` cursor keeps tied rows (issue #1408).** `list_audit` (`autumn-harvest/src/audit.rs`) ordered strictly by `occurred_at DESC` and filtered `before` with `occurred_at.lt(before)` — a single-column, exclusive cursor with no tiebreaker. A caller paging `GET /admin/audit` by setting each request's `before` to the last row's `occurred_at` permanently dropped any other row sharing that exact timestamp.
+
+- **`backup verify` text output names both causes when unreadable and skipped-no-handler samples mix (issue #1410).** **Text-output wording fix only** (implemented). `format_backup_verify_text` in `autumn-harvest-cli/src/lib.rs` had one branch for "every sampled history was unreadable" that fired whenever `unreadable > 0` and nothing replayed, regardless of `skipped_no_handler`.
+
+- **Backup verify adjudicates cross-shard completion-trigger fires (issue #1401).** `backup_verify.rs` had zero references to `harvest_completion_trigger_fires` or `harvest_completion_trigger_outbox`. `completion_trigger.rs`'s cross-shard relay (`relay_gate_checked_start`) commits the source shard's outbox delete and the target shard's start in two independent transactions; a restore that skews the two shards can leave the source confirming a delivery the target never received, with no scanner and, until now, no drill check to catch it.
+
+- **Child placement and SSE resume cursor use residence, not origin (issue #1405).** Follow-up to #964/#1317/#1596. That prior work fixed the residence-routing bug class (deriving a shard from `ExecutionId`'s origin-encoded bits instead of a row's live residence after a shard-rebalance migration) at `handle.rs` (`WorkflowHandle`'s cancel/terminate/result paths), `completion_trigger.rs`, and ten sites across `api.rs`/`mcp_tools.rs` (SSE listeners and audit attribution).
+
+- **SQLite: `ExecutionNotFound` for an unknown id on every accessor (issue #1735).** `SqliteError::ExecutionNotFound` means an unknown id. Before this change, only `outcome` and `send_signal` returned it. For an unknown `ExecutionId`:
+
+- **Shard health names unhealthy assigned pollers (issue #1463).** The `no_live_worker` blocking reason said "no live worker assigned to this shard polls queue(s)" when an assigned worker did poll the queue but was stale, unhealthy, or draining.
+
+- **Worker heartbeat aborts on external cancellation (issue #1552).** `Worker::run_with_listener` and the multi-shard runner held each heartbeat `JoinHandle` as a bare local. Cancelling the `Worker::run()` future from outside, for example with `JoinHandle::abort()`, dropped the handle.
+
+- **Reaper checks the process table before its startup grace period (issue #1585).** The dev reaper skipped a session with no known postmaster pid for 15 seconds after `created_at`. That deadline is wall-clock time. A system suspend freezes a starting postmaster but not the clock.
+
+- **Shared test database uses the full migration bundle (issue #1693).** `quota_enforcement_tests::completion_trigger_defers_to_outbox_when_target_quota_exceeded` timed out on CI. The source workflow stayed `RUNNING` and its task row stayed queued. The task looked unclaimed, but the claim path was correct.
+
+- **Directory-privacy checks and filesystem ACLs (issue #1548).** The dev runtime checks POSIX mode bits to decide that no other user can write to the cache root, its ancestors, and the session root.
+
+- **Schedule health end_at check skips jitter when slot is unknown (issue #1568).** The Vantage schedule health check judged `end_at` against the jitter-adjusted `next_run_at`. The scheduler hashes jitter against a different slot in two cases. A calendar can rebase the slot first.
+
+- **The worker path ND-blocks a cycle that skips recorded commands (issue #1791).** Only the replay paths (strict, canary, query and debugger) checked for unconsumed recorded history at the end of a cycle. `drive_workflow`, the production worker path, did not.
+
+- **Raw SQL derives terminal-state lists from the constants (issue #1546).** Sixteen raw-SQL state lists were copied by hand. Twelve of them listed six terminal states. `erase::TERMINAL_STATES` now holds a seventh state, `MIGRATED` (issue #964), so those copies are not the same rule as the constant.
+
+- **Re-drive a workflow task on a local activity event-id conflict (issue #1787).** **Local activity append conflict.** A local activity append that loses its `event_id` to a concurrent append now re-drives the workflow task. Before, it failed the run.
+
+- **Wire five resilience DB suites into CI and lock the allowlist (issue #1799).** Five DB suites from issue #1799 now have `linux` manifest rows: `scheduler_ha_tests`, `poison_pill_tests`, `signal_tests`, `replayer_integration_tests` (with `testing`), and the plugin suite `erase_payloads_integration`. Before this change, CI compiled them but never ran them.
+
+- **Quota reconcile scan reads rows per registered name (issue #1631).** The `quota_key` reconcile sweep fetches up to `batch_size` candidate rows per tick. The old query filtered `workflow_name = ANY($1)` after an `(id)` index scan. Postgres read every unrelated `quota_key IS NULL` row to find the matches.
+
+- **One shared quota-lock ordering for debounce and throttle (issue #1752).** The `debounce` and `throttle` scanners each held a copy of the same five functions. They order a claimed batch by advisory-lock id, so two scanner transactions cannot form an ABBA deadlock (issue #1230 Finding 2).
+
+- **Heartbeat stamps use the database clock (issue #1807).** `record_heartbeat` wrote `last_heartbeat_at` from the worker host clock. The heartbeat-timeout scan compares that column with the database `NOW()`. A host 60 seconds behind the database stamped a heartbeat that was already too old.
+
+- **Buffered-schedule drain takes the fire claim (issue #1820).** `drain_buffered_schedule_runs` serves the `BufferOne` and `BufferAll` overlap policies. It took no claim. Every replica runs the scheduler, so two replicas could drain one buffered slot.
+
+- **No panics on scanner, `Drop` and request paths (issue #1821).** A panic on a path that every replica runs can disable that path across the fleet. One bad row stops the same scanner loop on every replica.
+
+- **The capability-miss release checks attempt (issue #1917).** `release_task_for_capability_miss` guarded on `worker_id` and `crash_strikes`. A workflow cycle reaches this release after its handler starts. The stuck-running requeue keeps `crash_strikes`, and the same worker can win the row again.
+
+- **Tracked artifacts and doc drift (issue #1831).** **Artifacts removed.** `test_debug`, `test_keys`, their sources and `autumn-harvest/src/analyzer.rs.orig` are gone. `.gitignore` now ignores `*.orig` and `*.rej`.
+
+- **A late heartbeat no longer quarantines live work (issue #1879).** **Bug.** The worker heartbeat slept one interval, then ran its tick. The period was therefore the interval plus the tick latency. The stale window is two intervals, rounded up to whole seconds.
+
+- **Wire the remaining DB suites into CI and track the rest (issue #1799).** 49 more DB suites now have `linux` manifest rows: 27 core suites and 22 plugin suites. Before this change, CI compiled them but never ran them.
+
+- **Callback 4xx and Retry-After, spread DLQ redrive, CLI timeouts (issue #1832).** Three fixes from the September 2026 resilience gap analysis (epic #1786).
+
+- **No timeout retry after the run ends (issue #1870).** #1809 made a `StartToClose` or `Heartbeat` timeout retry per the retry policy. That fixes the bug of issue #1870. This change closes one gap in it.
+
+- **Business-day scan bound and skip-scan date limits (issue #1968).** Three defects in `calendar.rs`.
+
+- **Reject a sub-second interval schedule (issue #1967).** `validate_schedule` accepted any non-zero `Schedule::Interval`. The stored form is `interval:<whole seconds>`, so the scheduler dropped the fraction. Each tick reads the stored form back. A 500 ms schedule became `interval:0`, fired once, and then stopped.
+
+- **Rate-limit claimed API tokens before the token lookup (issue #1827).** The API rate limiter ran inside the token layer. The token layer looks up every `hvst_` bearer in the database first. A made-up token got `401` from that lookup and never reached the limiter.
+
+### Security
+
+- **Mutating routes fail closed outside `dev` (issue #1802).** Outside the `dev` profile, a management API with no declared auth boundary now refuses every mutating route with `401`. Before, only admin-gated routes did. Workflow start, signal and update (with the with-start variants), reset, DAG trigger, patch and retry, schedule changes, external-activity callbacks, worker drain, Vantage form posts and MCP tool mutations were open to any caller.
+
+- **Audit hash chain, signed WASM modules, OTel Collector recipe (issue #1838).** ADR 0004 (`docs/adr/0004-security-extras.md`) records each decision. All three features are opt-in. A deployment that sets nothing sees no change in runtime behavior or wire bytes.
+
+### Performance
+
+- **Index both sides of the external signal/cancel/await outbox scans, and pin their plan (issue #1486).** `timeout::enforce_timeouts_once` runs three sibling outbox scanners on every worker's periodic tick: `enforce_external_signals_outbox`, `enforce_external_cancels_outbox` and `enforce_external_awaits_outbox`. Each drains its own outbox of pending cross-workflow `ctx.signal()` / `ctx.cancel()` / `ctx.await_external()` requests with the same query — claim one candidate row under `LIMIT 1 ...
+
+- **`decode_event` skips serde `Content` buffering (issue #1721).** `WorkflowEvent` is adjacently tagged. `serde_json::Map` sorts keys, so `data` comes before `type`. Serde then buffers each event in `Content` before it chooses a variant. That runs on every history read and replay load.
+
+- **Workflow input shared across the start path (issue #1733).** The start path holds the workflow `input` in four owned structs. These are `StartWorkflowParams`, `NewWorkflowExecution`, `EnqueueParams` and `NewTaskQueueItem`. Each struct deep-copies the JSON. The start transaction also clones the whole request and the enqueue params on entry.
+
+- **Timeline AccKey hashing (PR #1894).** `derive_timeline` hashes its `AccKey` lookup keys with a manual `Hash` impl that writes one 128-bit value, instead of three `SipHash` writes. Equality and the keyed `RandomState` hasher are unchanged.
+
+- **Perf:** `info::validate_node` looks up `required`, `properties`, `items` and `additionalProperties` only when the value has the matching kind. Instructions on `schema_validate_profile` drop 18.8% (312.5M to 253.8M, callgrind). Behavior is unchanged; the 50 `info::` unit tests pass. See `docs/performance-schema-validate-kind-gated-lookups.md`.**
+
+### Documentation
+
+- **Restore the engine reference as `docs/architecture.md` (PR #1285).** **Docs-only** (implemented). `562c781` ("fix: claude.md") reduced `CLAUDE.md` to workflow instructions — correctly, since `CLAUDE.md` is agent instructions and not a place for project documentation to accumulate.
+
+- **Correct `docs/performance.md`'s claim-plan attribution: any residual predicate defeats sort-elision, not just the sticky CASE (issue #1177).** `docs/performance.md` (issue #786) measured `claim_task`'s superlinear backlog scaling and attributed it to one specific mechanism: the claim query's `ORDER BY` leading with a non-indexable sticky-routing `CASE` expression, which `idx_harvest_tq_poll` cannot serve.
+
+- **Pause-array-size claim cost (issue #1215).** `docs/performance.md`'s "Known limitations" section listed five claim-path predicates the attribution table does not measure (capability labels, queue pauses, `schedule_to_close`, worker sessions, sticky routing). A sixth — the per-activity-type pause (#807) — was not on that list at all, and the queue-pause fix's own "resolved" entry (#619) had been measured against exactly one active pause, never a realistically wide pause table.
+
+- **Chapter 5 and 6 flagship snippets compile.** Docs-only. Chapter 5's `spawn_child_workflow_raw` call passed a workflow id the method does not take (E0061). Chapter 6's `charge_card` used `.map_err(|e| e.to_string())?` in a `HarvestResult` function, and `HarvestError` has no `From<String>` (E0277).
+
+- **Calendars.md snippets compile under CI (issue #1783).** The "Programmatic Helpers" example in `docs/calendars.md` called `apply_skip_policy` with three arguments. The function takes four. Issue #1772 fixed the call. Nothing guarded it, so the example could drift again.
+
+- **`docs/embedding.md` and a getting-started fork for plain Axum (issue #1614).** `docs/embedding.md` is the reference for the standalone path. It covers what the runtime needs, what the router gives you, and what you own instead of `HarvestPlugin`.
+
+### Testing
+
+- **Loom and Shuttle model checking on every PR (issue #1800).** **CI.** The loom models used to run only on manual dispatch (`.github/workflows/loom.yml`), and had never run. `ci.yml` now has two jobs, `loom` ("Loom models") and `shuttle` ("Shuttle models").
+
+- **TLA+ models of the core protocols and Kani proofs (issue #1819).** **TLA+ models.** `formal/tla/` holds three models. The new `formal-models` CI job checks each one through `scripts/check-formal-models.sh`. The runner reads `formal/tla/models.txt` and pins `tla2tools.jar` 1.7.4 by SHA-256.
+
+- **Stateful lifecycle model and crash-history checks (issue #1829).** Two new test layers check client-visible guarantees. Neither changes engine code. There is no new `WorkflowEvent` variant and no migration.
+
+- **Pin the nightly lifecycle counterexamples (issue #1923).** The first deep nightly run failed `lifecycle_matches_the_reference_model` in all 8 shards. That run tested `e22a53bb` (PR #1909, issue #1824). #1824 made a new start sort 30 seconds later at claim.
+
+- **The chaos append test expects the #1871 fix (issue #1925).** No scheduled `chaos.yml` run passed for 48 h, so the watchdog opened #1925. Two runs failed:
+
+- **Deterministic simulation of the activity claim protocol (issue #1830).** [ADR 0004](docs/adr/0004-deterministic-simulation-testing.md) chooses option (b): an in-memory oracle store, a seeded single-thread simulation, and a differential test against Postgres. A failing seed replays on a laptop with one command.
+
+- **Nightly fuzzing and a structure-aware replay target (issue #1835).** Fuzzing now runs every night with a persisted corpus. A new target fuzzes the replayer with structured histories. There is no new `WorkflowEvent` variant, no migration and no change to engine behavior.
+
+### Internal
+
+- **Comment-hygiene CI harness and a corpus audit.** **Tooling + comment-only source changes** (implemented). Adds `docs/audits/comment-hygiene.py`, wired into CI's ungated `lint` job alongside the other Folio corpus harnesses, and fixes every Tier A defect it found across the 785 `*.rs` files (822k lines, 175k comment lines).
+
+- **Contract audit reads raw-byte bodies and typed queries (issue #1411).** This change closes the two audit blind spots left open in #1411. The contract fixes shipped in #1690 and #1699. Now those defect classes fail CI.
+
+- **`StartWorkflowParams::new` replaces 40-field literals (issue #1448).** `StartWorkflowParams` has 40 fields. Each production start site wrote all of them, so every new field touched up to 12 files.
+
+- **Pin the workspace toolchain to Rust 1.99.0.** `rust-toolchain.toml` pins every build, format and lint run to Rust 1.99.0 with the `rustfmt` and `clippy` components. CI's `dtolnay/rust-toolchain@stable` steps run `rustup default`, and rustup gives the file precedence over that default, so all stable jobs now compile with the pinned release.
+
+- **One shared workflow-task backoff requeue (issue #1751).** Three functions in `autumn-harvest/src/queue.rs` re-pend a claimed workflow task with a Postgres-clock backoff: `requeue_workflow_task_nd_blocked`, `requeue_workflow_task_after_panic`, and `requeue_workflow_task_for_quota_retry`. Each held a hand-copied `UPDATE`. Four earlier fixes patched one copy and missed another (issues #1389, #1391, #1589, #1402).
+
+- **Repair chaos.yml and guard workflow YAML (Semaphore).** `chaos.yml` was invalid YAML: two `run:` scalars held `chaos::` followed by a space, which YAML reads as a mapping value. GitHub ran the file as a zero-job failed run on every push and never fired the nightly cron.
+
+- **One shared handler-dispatch builder (issue #1632).** The `#[query]`, `#[update]`, `#[workflow]`, and `#[activity]` macros each copied the same block. The block decodes the handler arguments by arity (0, 1, or many), calls the handler, and encodes the result as JSON.
+
+- **Online-migration lock-safety lint (issue #1810).** Safe online migrations were a convention, not a check. Only three migrations set `lock_timeout`. `20260915231809` drops and rebuilds a unique index on `harvest_workflow_executions` inside its transaction, and no test noticed.
+
+- **Supply chain: advisory scan, SHA pins, Dependabot, signed releases (issue #1826).** **Daily advisory scan.** `.github/workflows/advisory-scan.yml` runs `cargo deny check advisories` every day. `.github/ci/advisory-scan.sh` opens an alert issue for a finding, comments on the open one, and closes it after a clean scan.
+
+The full entry for each change is in [`docs/shipped-work.md`](docs/shipped-work.md).
 
 ## [0.6.0] - 2026-08-26
 

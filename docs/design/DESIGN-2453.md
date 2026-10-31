@@ -115,7 +115,8 @@ A zero cap is no cap, so it never resets. A `reset_at_percent` of 0 counts as
 1, and a value over 100 counts as 100.
 
 **Known limit.** A tool round that passes the cap in one step still ends as
-`transcript_full`. The reset runs only before a request.
+`transcript_full`. The reset runs only before a request. Issue #2461 tracks
+this limit.
 
 ## 6. Acceptance criteria and their tests
 

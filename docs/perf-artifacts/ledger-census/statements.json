@@ -649,15 +649,12 @@
      "2": "text[]"
     }
    },
-   "SELECT \"harvest_signals\".\"signal_name\", \"harvest_signals\".\"received_at\" FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $1) AND (\"harvest_signals\".\"consumed\" = $2))": {
+   "SELECT \"harvest_signals\".\"signal_name\", \"harvest_signals\".\"received_at\" FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $1) AND  NOT (\"harvest_signals\".\"consumed\"))": {
     "literals": [
-     {
-      "2": "false"
-     }
+     {}
     ],
     "types": {
-     "1": "uuid",
-     "2": "boolean"
+     "1": "uuid"
     }
    },
    "SELECT \"harvest_task_queue\".\"id\", \"harvest_task_queue\".\"queue_name\", \"harvest_task_queue\".\"task_type\", \"harvest_task_queue\".\"workflow_exec_id\", \"harvest_task_queue\".\"activity_name\", \"harvest_task_queue\".\"activity_id\", \"harvest_task_queue\".\"input\", \"harvest_task_queue\".\"state\", \"harvest_task_queue\".\"priority\", \"harvest_task_queue\".\"worker_id\", \"harvest_task_queue\".\"attempt\", \"harvest_task_queue\".\"max_attempts\", \"harvest_task_queue\".\"scheduled_at\", \"harvest_task_queue\".\"started_at\", \"harvest_task_queue\".\"completed_at\", \"harvest_task_queue\".\"last_heartbeat_at\", \"harvest_task_queue\".\"heartbeat_details\", \"harvest_task_queue\".\"heartbeat_timeout\", \"harvest_task_queue\".\"start_to_close\", \"harvest_task_queue\".\"schedule_to_start\", \"harvest_task_queue\".\"retry_policy\", \"harvest_task_queue\".\"output\", \"harvest_task_queue\".\"error\", \"harvest_task_queue\".\"sticky_worker_id\", \"harvest_task_queue\".\"sticky_until\", \"harvest_task_queue\".\"sticky_timeout\", \"harvest_task_queue\".\"trace_context\", \"harvest_task_queue\".\"concurrency_key\", \"harvest_task_queue\".\"concurrency_cap\", \"harvest_task_queue\".\"required_build_id\", \"harvest_task_queue\".\"rate_limit_key\", \"harvest_task_queue\".\"crash_strikes\", \"harvest_task_queue\".\"schedule_to_close_at\", \"harvest_task_queue\".\"required_capabilities\", \"harvest_task_queue\".\"context_headers\", \"harvest_task_queue\".\"created_at\", \"harvest_task_queue\".\"wake_requested\", \"harvest_task_queue\".\"session_id\", \"harvest_task_queue\".\"capability_misses\", \"harvest_task_queue\".\"capability_miss_workers\", \"harvest_task_queue\".\"capability_miss_handler\", \"harvest_task_queue\".\"timer_fires_at\", \"harvest_task_queue\".\"handler_started_attempt\", \"harvest_task_queue\".\"timed_out_claims\", \"harvest_task_queue\".\"handler_started_at\", \"harvest_task_queue\".\"new_start\", \"harvest_task_queue\".\"fairness_key\" FROM \"harvest_task_queue\" WHERE (((\"harvest_task_queue\".\"workflow_exec_id\" = $1) AND (\"harvest_task_queue\".\"task_type\" = $2)) AND (\"harvest_task_queue\".\"state\" = ANY($3))) ORDER BY \"harvest_task_queue\".\"scheduled_at\" ASC, \"harvest_task_queue\".\"id\" ASC": {
@@ -1076,15 +1073,12 @@
      "3": "text"
     }
    },
-   "SELECT DISTINCT \"harvest_signals\".\"workflow_exec_id\" FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = ANY($1)) AND (\"harvest_signals\".\"consumed\" = $2))": {
+   "SELECT DISTINCT \"harvest_signals\".\"workflow_exec_id\" FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = ANY($1)) AND  NOT (\"harvest_signals\".\"consumed\"))": {
     "literals": [
-     {
-      "2": "false"
-     }
+     {}
     ],
     "types": {
-     "1": "uuid[]",
-     "2": "boolean"
+     "1": "uuid[]"
     }
    },
    "SELECT DISTINCT \"harvest_task_queue\".\"workflow_exec_id\" FROM \"harvest_task_queue\" WHERE ((\"harvest_task_queue\".\"workflow_exec_id\" = ANY($1)) AND (\"harvest_task_queue\".\"state\" = ANY($2)))": {
@@ -2797,33 +2791,26 @@
    }
   },
   "open_signal_waits": {
-   "SELECT \"harvest_signals\".\"signal_name\", \"harvest_signals\".\"received_at\" FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $1) AND (\"harvest_signals\".\"consumed\" = $2))": {
+   "SELECT \"harvest_signals\".\"signal_name\", \"harvest_signals\".\"received_at\" FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $1) AND  NOT (\"harvest_signals\".\"consumed\"))": {
     "literals": [
-     {
-      "2": "false"
-     }
+     {}
     ],
     "types": {
-     "1": "uuid",
-     "2": "boolean"
+     "1": "uuid"
     }
    }
   },
   "wait_still_open": {
-   "SELECT COUNT(*) FROM \"harvest_signals\" WHERE (((\"harvest_signals\".\"workflow_exec_id\" = $1) AND (\"harvest_signals\".\"signal_name\" = $2)) AND (\"harvest_signals\".\"consumed\" = $3))": {
+   "SELECT COUNT(*) FROM \"harvest_signals\" WHERE (((\"harvest_signals\".\"workflow_exec_id\" = $1) AND (\"harvest_signals\".\"signal_name\" = $2)) AND  NOT (\"harvest_signals\".\"consumed\"))": {
     "literals": [
      {
-      "2": "'approval'",
-      "3": "false"
+      "2": "'approval'"
      },
-     {
-      "3": "false"
-     }
+     {}
     ],
     "types": {
      "1": "uuid",
-     "2": "text",
-     "3": "boolean"
+     "2": "text"
     }
    }
   }
@@ -3161,16 +3148,13 @@
      "3": "bigint"
     }
    },
-   "SELECT \"harvest_signals\".\"id\", \"harvest_signals\".\"workflow_exec_id\", \"harvest_signals\".\"signal_name\", \"harvest_signals\".\"payload\", \"harvest_signals\".\"received_at\", \"harvest_signals\".\"consumed\", \"harvest_signals\".\"idempotency_key\" FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $1) AND (\"harvest_signals\".\"consumed\" = $2)) ORDER BY \"harvest_signals\".\"received_at\" ASC LIMIT $3": {
+   "SELECT \"harvest_signals\".\"id\", \"harvest_signals\".\"workflow_exec_id\", \"harvest_signals\".\"signal_name\", \"harvest_signals\".\"payload\", \"harvest_signals\".\"received_at\", \"harvest_signals\".\"consumed\", \"harvest_signals\".\"idempotency_key\" FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $1) AND  NOT (\"harvest_signals\".\"consumed\")) ORDER BY \"harvest_signals\".\"received_at\" ASC LIMIT $2": {
     "literals": [
-     {
-      "2": "false"
-     }
+     {}
     ],
     "types": {
      "1": "uuid",
-     "2": "boolean",
-     "3": "bigint"
+     "2": "bigint"
     }
    },
    "SELECT \"harvest_task_queue\".\"id\", \"harvest_task_queue\".\"queue_name\", \"harvest_task_queue\".\"task_type\", \"harvest_task_queue\".\"workflow_exec_id\", \"harvest_task_queue\".\"activity_name\", \"harvest_task_queue\".\"activity_id\", \"harvest_task_queue\".\"input\", \"harvest_task_queue\".\"state\", \"harvest_task_queue\".\"priority\", \"harvest_task_queue\".\"worker_id\", \"harvest_task_queue\".\"attempt\", \"harvest_task_queue\".\"max_attempts\", \"harvest_task_queue\".\"scheduled_at\", \"harvest_task_queue\".\"started_at\", \"harvest_task_queue\".\"completed_at\", \"harvest_task_queue\".\"last_heartbeat_at\", \"harvest_task_queue\".\"heartbeat_details\", \"harvest_task_queue\".\"heartbeat_timeout\", \"harvest_task_queue\".\"start_to_close\", \"harvest_task_queue\".\"schedule_to_start\", \"harvest_task_queue\".\"retry_policy\", \"harvest_task_queue\".\"output\", \"harvest_task_queue\".\"error\", \"harvest_task_queue\".\"sticky_worker_id\", \"harvest_task_queue\".\"sticky_until\", \"harvest_task_queue\".\"sticky_timeout\", \"harvest_task_queue\".\"trace_context\", \"harvest_task_queue\".\"concurrency_key\", \"harvest_task_queue\".\"concurrency_cap\", \"harvest_task_queue\".\"required_build_id\", \"harvest_task_queue\".\"rate_limit_key\", \"harvest_task_queue\".\"crash_strikes\", \"harvest_task_queue\".\"schedule_to_close_at\", \"harvest_task_queue\".\"required_capabilities\", \"harvest_task_queue\".\"context_headers\", \"harvest_task_queue\".\"created_at\", \"harvest_task_queue\".\"wake_requested\", \"harvest_task_queue\".\"session_id\", \"harvest_task_queue\".\"capability_misses\", \"harvest_task_queue\".\"capability_miss_workers\", \"harvest_task_queue\".\"capability_miss_handler\", \"harvest_task_queue\".\"timer_fires_at\", \"harvest_task_queue\".\"handler_started_attempt\", \"harvest_task_queue\".\"timed_out_claims\", \"harvest_task_queue\".\"handler_started_at\", \"harvest_task_queue\".\"new_start\", \"harvest_task_queue\".\"fairness_key\" FROM \"harvest_task_queue\" WHERE (((\"harvest_task_queue\".\"workflow_exec_id\" = $1) AND ((((\"harvest_task_queue\".\"state\" = $2) OR (\"harvest_task_queue\".\"state\" = $3)) OR (\"harvest_task_queue\".\"state\" = $4)) OR (\"harvest_task_queue\".\"state\" = $5))) AND (\"harvest_task_queue\".\"task_type\" = $6)) ORDER BY \"harvest_task_queue\".\"scheduled_at\" ASC, \"harvest_task_queue\".\"id\" ASC LIMIT $7": {
@@ -60621,15 +60605,12 @@
    }
   },
   "count_unconsumed_signals": {
-   "SELECT COUNT(*) FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $1) AND (\"harvest_signals\".\"consumed\" = $2))": {
+   "SELECT COUNT(*) FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $1) AND  NOT (\"harvest_signals\".\"consumed\"))": {
     "literals": [
-     {
-      "2": "false"
-     }
+     {}
     ],
     "types": {
-     "1": "uuid",
-     "2": "boolean"
+     "1": "uuid"
     }
    }
   },
@@ -60950,16 +60931,12 @@
      "9": "uuid"
     }
    },
-   "SELECT \"harvest_signals\".\"id\", \"harvest_signals\".\"signal_name\", \"harvest_signals\".\"payload\", \"harvest_signals\".\"idempotency_key\", \"harvest_signals\".\"received_at\" FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $1) AND (\"harvest_signals\".\"consumed\" = $2)) ORDER BY \"harvest_signals\".\"received_at\" ASC, \"harvest_signals\".\"id\" ASC": {
+   "SELECT \"harvest_signals\".\"id\", \"harvest_signals\".\"signal_name\", \"harvest_signals\".\"payload\", \"harvest_signals\".\"idempotency_key\", \"harvest_signals\".\"received_at\" FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $1) AND  NOT (\"harvest_signals\".\"consumed\")) ORDER BY \"harvest_signals\".\"received_at\" ASC, \"harvest_signals\".\"id\" ASC": {
     "literals": [
-     {
-      "2": "false"
-     },
      {}
     ],
     "types": {
-     "1": "uuid",
-     "2": "boolean"
+     "1": "uuid"
     }
    },
    "UPDATE \"harvest_signals\" SET \"consumed\" = $1 WHERE (\"harvest_signals\".\"id\" = ANY($2))": {
@@ -61630,16 +61607,12 @@
      "4": "timestamptz"
     }
    },
-   "SELECT COUNT(*) FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $1) AND (\"harvest_signals\".\"consumed\" = $2))": {
+   "SELECT COUNT(*) FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $1) AND  NOT (\"harvest_signals\".\"consumed\"))": {
     "literals": [
-     {
-      "2": "false"
-     },
      {}
     ],
     "types": {
-     "1": "uuid",
-     "2": "boolean"
+     "1": "uuid"
     }
    },
    "SELECT COUNT(*) FROM \"harvest_task_queue\" WHERE ((\"harvest_task_queue\".\"workflow_exec_id\" = $1) AND (\"harvest_task_queue\".\"state\" = ANY($2)))": {
@@ -63484,30 +63457,22 @@
    }
   },
   "has_pending_signals": {
-   "SELECT EXISTS (SELECT \"harvest_signals\".\"id\", \"harvest_signals\".\"workflow_exec_id\", \"harvest_signals\".\"signal_name\", \"harvest_signals\".\"payload\", \"harvest_signals\".\"received_at\", \"harvest_signals\".\"consumed\", \"harvest_signals\".\"idempotency_key\" FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $1) AND (\"harvest_signals\".\"consumed\" = $2)))": {
+   "SELECT EXISTS (SELECT \"harvest_signals\".\"id\", \"harvest_signals\".\"workflow_exec_id\", \"harvest_signals\".\"signal_name\", \"harvest_signals\".\"payload\", \"harvest_signals\".\"received_at\", \"harvest_signals\".\"consumed\", \"harvest_signals\".\"idempotency_key\" FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $1) AND  NOT (\"harvest_signals\".\"consumed\")))": {
     "literals": [
-     {
-      "2": "false"
-     },
      {}
     ],
     "types": {
-     "1": "uuid",
-     "2": "boolean"
+     "1": "uuid"
     }
    }
   },
   "load_pending_signals": {
-   "SELECT \"harvest_signals\".\"id\", \"harvest_signals\".\"workflow_exec_id\", \"harvest_signals\".\"signal_name\", \"harvest_signals\".\"payload\", \"harvest_signals\".\"received_at\", \"harvest_signals\".\"consumed\", \"harvest_signals\".\"idempotency_key\" FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $1) AND (\"harvest_signals\".\"consumed\" = $2)) ORDER BY \"harvest_signals\".\"received_at\" ASC, \"harvest_signals\".\"id\" ASC": {
+   "SELECT \"harvest_signals\".\"id\", \"harvest_signals\".\"workflow_exec_id\", \"harvest_signals\".\"signal_name\", \"harvest_signals\".\"payload\", \"harvest_signals\".\"received_at\", \"harvest_signals\".\"consumed\", \"harvest_signals\".\"idempotency_key\" FROM \"harvest_signals\" WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $1) AND  NOT (\"harvest_signals\".\"consumed\")) ORDER BY \"harvest_signals\".\"received_at\" ASC, \"harvest_signals\".\"id\" ASC": {
     "literals": [
-     {
-      "2": "false"
-     },
      {}
     ],
     "types": {
-     "1": "uuid",
-     "2": "boolean"
+     "1": "uuid"
     }
    }
   },
@@ -89090,17 +89055,13 @@
     ],
     "types": {}
    },
-   "UPDATE \"harvest_signals\" SET \"workflow_exec_id\" = $1 WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $2) AND (\"harvest_signals\".\"consumed\" = $3))": {
+   "UPDATE \"harvest_signals\" SET \"workflow_exec_id\" = $1 WHERE ((\"harvest_signals\".\"workflow_exec_id\" = $2) AND  NOT (\"harvest_signals\".\"consumed\"))": {
     "literals": [
-     {
-      "3": "false"
-     },
      {}
     ],
     "types": {
      "1": "uuid",
-     "2": "uuid",
-     "3": "boolean"
+     "2": "uuid"
     }
    },
    "UPDATE \"harvest_workflow_executions\" SET \"state\" = $1, \"output\" = $2, \"error\" = $3, \"sticky_worker_id\" = $4, \"completed_at\" = $5 WHERE ((\"harvest_workflow_executions\".\"id\" = $6) AND (\"harvest_workflow_executions\".\"state\" = $7))": {

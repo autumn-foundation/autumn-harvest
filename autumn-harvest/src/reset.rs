@@ -1399,7 +1399,7 @@ async fn count_unconsumed_signals(
 ) -> Result<usize, WorkflowResetError> {
     let count = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(exec_id.as_uuid()))
-        .filter(harvest_signals::consumed.eq(false))
+        .filter(diesel::dsl::not(harvest_signals::consumed))
         .count()
         .get_result::<i64>(conn)
         .await
@@ -1905,7 +1905,7 @@ async fn reapply_or_drop_signals(
 ) -> Result<usize, WorkflowResetError> {
     let signals: Vec<SignalForReset> = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(source_exec_id.as_uuid()))
-        .filter(harvest_signals::consumed.eq(false))
+        .filter(diesel::dsl::not(harvest_signals::consumed))
         .order((
             harvest_signals::received_at.asc(),
             harvest_signals::id.asc(),

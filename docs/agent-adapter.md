@@ -708,7 +708,7 @@ let task = AgentTask::new("audit the ledger")
   next turn after a reset goes in full, not as a delta.
 
 A tool round that passes the cap in one step still ends as `transcript_full`.
-The reset runs only before a request. A task with no `context_reset` field
+The reset runs only before a request. Issue #2461 tracks this limit. A task with no `context_reset` field
 takes no new path, so a recorded run replays as it ran.
 `formal/verus/src/agent_reset.rs` proves that a request over the cap always
 reaches the threshold, and that no run passes `max_resets`.

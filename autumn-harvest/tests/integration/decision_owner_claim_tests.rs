@@ -1438,13 +1438,19 @@ async fn run_timer_workflows(url: &str, pool: &DbPool, queue_name: &str, runs: u
     }
 }
 
-/// Wait until owners hold every partition, `n` each at least.
+/// Wait until `workers` owners hold every partition, and the balance moves
+/// none of them.
+///
+/// `plan_balance` releases only above `target + 1`. A split above that bound
+/// moves partitions during the run, and each moved run replays cold.
 async fn wait_for_owners(conn: &mut AsyncPgConnection, workers: usize) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let target = i64::try_from(512_usize.div_ceil(workers)).expect("fits");
     loop {
         let held = held_by_worker(conn).await;
         let total: i64 = held.values().sum();
-        if held.len() == workers && total == 512 {
+        let settled = held.values().all(|n| *n <= target + 1);
+        if held.len() == workers && total == 512 && settled {
             return;
         }
         assert!(

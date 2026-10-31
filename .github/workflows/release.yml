@@ -73,19 +73,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # git-cliff reads the full history.
-          fetch-depth: 0
           persist-credentials: false
-      - name: Install git-cliff
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
-        with:
-          tool: git-cliff
-      - name: Verify CHANGELOG.md is current
+      # CHANGELOG.md is written by hand from the changelog fragments, so it
+      # never matches git-cliff output. The gate checks that the tag has a
+      # section, in the form `## [X.Y.Z] - YYYY-MM-DD`.
+      - name: Check CHANGELOG.md has a section for the tag
         run: |
-          git-cliff --config cliff.toml --output /tmp/CHANGELOG.md
-          perl -0pi -e 's/\n+\z/\n/' /tmp/CHANGELOG.md
-          if ! diff -u CHANGELOG.md /tmp/CHANGELOG.md; then
-            echo "::error::CHANGELOG.md is out of date for ${GITHUB_REF_NAME}. Run git-cliff --config cliff.toml --output CHANGELOG.md and commit it before tagging the release."
+          heading="## [${GITHUB_REF_NAME#v}] - "
+          if ! grep -qF -- "$heading" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '${heading}YYYY-MM-DD' section for ${GITHUB_REF_NAME}. Collate the fragments in docs/changelog.d/ into it before you tag."
             exit 1
           fi
       # Issue #1616. The client package version must equal the tag.
@@ -586,7 +582,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      # `validate` has checked CHANGELOG.md already.
+      # `validate` has checked that CHANGELOG.md has a section for the tag.
       - name: Install git-cliff
         uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:

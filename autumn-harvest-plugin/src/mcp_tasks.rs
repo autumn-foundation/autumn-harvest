@@ -1458,7 +1458,7 @@ async fn wait_still_open(
     let queued: i64 = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(run))
         .filter(harvest_signals::signal_name.eq(&wait.signal_name))
-        .filter(harvest_signals::consumed.eq(false))
+        .filter(diesel::dsl::not(harvest_signals::consumed))
         .count()
         .get_result(&mut conn)
         .await
@@ -1812,7 +1812,7 @@ async fn open_signal_waits(
         .map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))?;
     let queued: Vec<(String, DateTime<Utc>)> = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(live.id))
-        .filter(harvest_signals::consumed.eq(false))
+        .filter(diesel::dsl::not(harvest_signals::consumed))
         .select((harvest_signals::signal_name, harvest_signals::received_at))
         .load(&mut conn)
         .await

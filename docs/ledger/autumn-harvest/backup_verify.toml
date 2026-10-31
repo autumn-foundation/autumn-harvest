@@ -19,7 +19,7 @@ driver = "setup"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events", "harvest_signals", "harvest_workflow_executions"]
-measured = "unmeasured"
+measured = "docs/performance-signals-exec-index.md"
 
 ["probes::fetch_trigger_fire_page"]
 driver = "setup"

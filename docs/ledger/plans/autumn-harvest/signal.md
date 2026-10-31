@@ -20,11 +20,11 @@ The full statement text is in `docs/perf-artifacts/ledger-census/statements.json
 
 ## `forward_signals_to_retry_attempt`
 
-Statements: 1. Tables with no usable index: `harvest_signals`.
+Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `UPDATE "harvest_signals" SET "workflow_exec_id" = $1, "consumed" = $2 WHERE ("harvest_signals"."w...` | `harvest_signals`: ModifyTable<br>`harvest_signals`: no usable index |
+| 1 | `UPDATE "harvest_signals" SET "workflow_exec_id" = $1, "consumed" = $2 WHERE ("harvest_signals"."w...` | `harvest_signals`: Bitmap Heap Scan on `idx_harvest_signals_exec`<br>`harvest_signals`: ModifyTable |
 
 ## `has_pending_signals`
 

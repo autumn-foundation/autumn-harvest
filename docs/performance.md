@@ -1817,6 +1817,19 @@ per worker: it is the mean claims in flight. Each claim kind has its own
 series since issue #2248, so the sum over `kind` is needed. Divide it by `max_concurrent_claims` for the
 occupancy of each loop.
 
+### Dispatch latency with two loops (issue #2418)
+
+This measurement counted throughput only. At a paced start rate, the first
+cut of two loops raised the activity dispatch p50 of the e2e bench from
+13.6 ms to 66.3 ms. Both loops drained the workflow backlog, then the leader
+slept the NOTIFY settle while the activities committed. A workflow task of
+the worker that ends now wakes the leader with no settle. On the same box,
+two loops then give a p50 of 8.1 ms and a p99 of 14.1 ms.
+
+Issue #2422 then made a NOTIFY poll before it settles. The settle runs only
+after an empty poll. A signal to an idle worker then no longer waits the
+whole 50 to 75 ms settle.
+
 ### What the measurement does not establish
 
 - **Another box.** This host is not assay #14's host. Temporal reads 31.9 to
@@ -2800,3 +2813,10 @@ standalone note rather than part of the claim-path attribution table above:
   — `debugger::is_redacted_export`, the first step of `harvest debug diff`.
   It reads one top-level key without building a `Value` tree. The probe
   cost 29% of the pipeline before the change.
+* [`docs/performance-signals-exec-index.md`](performance-signals-exec-index.md)
+  — the statements that read every signal of one execution, consumed rows
+  included (issue #2367). Before the index, a retry, a PII erasure, a shard
+  rebalance and each execution delete read the whole signals table. A plain
+  index on `workflow_exec_id` drops the execution delete from 4,150 to 149
+  buffers. The pending reads send `NOT consumed` as a literal, so a generic
+  plan keeps the partial index.

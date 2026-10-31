@@ -34,43 +34,47 @@ Four scenarios, each run at **1 shard**, **2 shards** and **4 shards**.
 | `signal_roundtrip` | signal round-trip p50/p99 | an HTTP signal request leaving the client → the workflow's own code resuming past `wait_for_signal` |
 | `replay_throughput` | replay events/sec | the issue #135 history (10 001 events), in memory |
 
-### Headline numbers, v0.7.0
+### Headline numbers, v0.8.0
 
 Four logical CPUs, Postgres 16.15, durability off, one worker per shard. The
 full environment, the per-cell notes and the verbatim run output are in
-[`benchmarks/results-v0.7.0.md`](benchmarks/results-v0.7.0.md).
+[`benchmarks/results-v0.8.0.md`](benchmarks/results-v0.8.0.md).
 
 | scenario | metric | 1 shard | 2 shards | 4 shards |
 |:--|:--|--:|--:|--:|
-| `throughput` | workflows/sec | 15.46 | 18.84 | 19.50 |
-| `dispatch_latency` | p50 ms | 16.12 | 26.17 | 69.98 |
-| `dispatch_latency` | p99 ms | 90.86 | 107.79 | 183.13 |
-| `signal_roundtrip` | p50 ms | 47.53 | 51.10 | 62.27 |
-| `signal_roundtrip` | p99 ms | 92.99 | 95.52 | 118.00 |
-| `replay_throughput` | events/sec | 9 750 423.86 | 9 063 901.37 | 8 981 387.93 |
+| `throughput` | workflows/sec | 52.91 | 48.14 | 50.90 |
+| `dispatch_latency` | p50 ms | 6.89 | 10.68 | 25.35 |
+| `dispatch_latency` | p99 ms | 12.11 | 22.93 | 49.73 |
+| `signal_roundtrip` | p50 ms | 11.36 | 15.55 | 25.69 |
+| `signal_roundtrip` | p99 ms | 80.38 | 81.96 | 85.03 |
+| `replay_throughput` | events/sec | 9 571 608.09 | 9 591 638.46 | 9 058 597.83 |
 
 Read these four points with the table:
 
-* **This is a different host from 0.6.0, and most of the drop is the host.**
-  A same-box control, linked from the results file, runs the 0.6.0 suite on
-  this host. There,
-  0.6.0 reads 17.91 workflows/sec at one shard, against 23.73 on its own
-  host. On the same host, 0.7.0 is 14% below 0.6.0 at one shard, 11% below at
-  two and level at four. It dispatches faster: a 1-shard p50 of 16.12 ms
-  against 45.31.
-* **The box was quiet, but less quiet than for 0.6.0.** The replay control
-  spread **7.9%** against 0.8% for 0.6.0. That is inside the 10% bar. On four
-  cores, a concurrent build once moved a published latency by more than 10x.
-  Check your own run's noise-control section before you compare anything.
-* **Sharding bought 1.22x at two shards and 1.26x at four.** Four shards
-  share four cores with four Postgres clusters and the harness. See
+* **This is a different host from 0.7.0, and this host is faster.** A
+  same-box control, linked from the results file, runs the 0.7.0 suite on
+  this host. There, 0.7.0 reads 33.61 workflows/sec at one shard, against
+  15.46 on its own host. On the same host, 0.8.0 is 57% above 0.7.0 at one
+  shard, 20% above at two and 23% above at four. No control run was within
+  the 10% bar, so treat that comparison as rough.
+* **Dispatch and the signal p50 fell; the signal p99 did not.** The 1-shard
+  dispatch p50 is 6.89 ms against 12.60 for 0.7.0 on this host. The signal
+  p50 is 11.36 ms against 43.04. The signal p99 stays at 80 to 85 ms. Two
+  claim loops (#2106), the leader wake (#2418) and poll before settle (#2422)
+  all change these paths. The results file says what this suite can and
+  cannot attribute.
+* **The box was quiet.** The replay control spread **5.6%**, inside the 10%
+  bar. On four cores, a concurrent build once moved a published latency by
+  more than 10x. Check your own run's noise-control section before you
+  compare anything.
+* **Sharding bought nothing on this box.** One shard with two claim loops
+  already keeps the four cores busy. Four shards share them with four
+  Postgres clusters and the harness. See
   [what the shard sweep can and cannot show](#what-the-shard-sweep-can-and-cannot-show).
-* **The dispatch tail is wide.** At one shard the dispatch p99 is 5.6x its
-  p50. The p50 rises fastest with shard count: 16.12 to 69.98 ms.
 
 ### Reading this next to another engine
 
-Before putting `15.46 workflows/sec` next to a number from another
+Before putting `52.91 workflows/sec` next to a number from another
 durable-execution engine's own page, two things make that comparison
 misleading on their own — independent of which engine comes out ahead.
 
@@ -97,18 +101,19 @@ and four logical CPUs shared with Postgres and the load generator — see
 [the configuration these numbers were taken at](#the-configuration-these-numbers-were-taken-at).
 `replay_throughput` is exempt: it runs entirely in memory as this page's
 noise control, so none of that configuration bounds it. Little's law on the
-`throughput` scenario's 1-shard cell — 32 workflows in flight ÷ 15.46/sec ≈
-2.07 s
+`throughput` scenario's 1-shard cell — 32 workflows in flight ÷ 52.91/sec ≈
+0.60 s
 end to end per workflow — bounds how long a workflow spends in the system.
 It says nothing about how that time splits between dispatch waiting,
 database work, and worker execution; this suite does not instrument that
 split for the throughput scenario itself. Adding workers, or giving Postgres
 its own cores, moves the number, and neither is an architectural change. The
 poll interval is not as direct a lever as it looks: with LISTEN/NOTIFY wired,
-as it is here, a successful notification wakes a worker in 50 to 75 ms
-regardless of the configured interval (a fixed 50 ms before issue #1796 added
-the jitter; 0.7.0 has it), and a worker claiming tasks back to
-back under load never waits at all. The interval mainly bounds a *missed*
+as it is here, a successful notification wakes a worker at once, regardless
+of the configured interval. Since issue #2422 the worker polls first. It
+sleeps the 50 to 75 ms settle only after an empty poll. Before 0.8.0 every
+notification slept the settle first. A worker claiming tasks back to back
+under load never waits at all. The interval mainly bounds a *missed*
 notification, per
 [the configuration these numbers were taken at](#the-configuration-these-numbers-were-taken-at).
 
@@ -140,6 +145,8 @@ Two things from entry 14 bear on this page's own numbers:
   14, the worker spent 91% to 99% of its wall time inside a claim. That fits
   one claim in flight at a time, with throughput set by the claim latency.
   This reading is post hoc, not a registered line.
+  Issue #2106 acted on it: since 0.8.0 a worker runs two claim loops by
+  default. The 0.8.0 headline above includes that change.
 
 ### Results by release
 
@@ -147,6 +154,7 @@ Each release's numbers are kept, not overwritten:
 
 * **0.6.0** — [`benchmarks/results-v0.6.0.md`](benchmarks/results-v0.6.0.md)
 * **0.7.0** — [`benchmarks/results-v0.7.0.md`](benchmarks/results-v0.7.0.md)
+* **0.8.0** — [`benchmarks/results-v0.8.0.md`](benchmarks/results-v0.8.0.md)
 
 ## The configuration these numbers were taken at
 
@@ -161,7 +169,7 @@ here rather than only in the output of a run you have not done yet.
 | concurrent activity tasks per worker | 16 | two per workflow slot |
 | connections per shard pool | 32 | at or above total worker concurrency, so no measurement includes pool-checkout queueing |
 | workflows in flight per shard | 32 | four times the workflow slots — see [bounded load](#methodology) |
-| paced start rate per shard | 8/sec | roughly 30% of the saturated rate, so the latency scenarios measure the path and not the queue |
+| paced start rate per shard | 8/sec | well below the saturated rate (about 15% on 0.8.0), so the latency scenarios measure the path and not the queue |
 | poll interval | 25 ms | with LISTEN/NOTIFY wired per shard, so this bounds a *missed* notification rather than every wake |
 | durability | `fsync=off`, `synchronous_commit=off` | see [known limitations](#known-limitations) |
 
@@ -243,8 +251,8 @@ Two honest caveats about that band:
   measurement working, not failing.
 * The published numbers were taken on **native Postgres clusters**, provisioned
   with the same settings as the compose services but not through Docker. The
-  0.6.0 box had no Docker daemon; the 0.7.0 sweep used native clusters too, so
-  the two releases share one method. The compose path adds
+  0.6.0 box had no Docker daemon; the 0.7.0 and 0.8.0 sweeps used native
+  clusters too, so the three releases share one method. The compose path adds
   container networking and a container filesystem; **that delta has not been
   measured**, and this page does not claim to know its sign. Treat the ±15% band
   as applying to the native path, and treat a compose run's difference from it
