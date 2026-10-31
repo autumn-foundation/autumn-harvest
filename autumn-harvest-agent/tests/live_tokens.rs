@@ -238,6 +238,7 @@ fn request(stream: bool) -> ModelTurnRequest {
         prefix: None,
         remember: false,
         model: None,
+        tool_guidance: std::collections::BTreeMap::new(),
     }
 }
 

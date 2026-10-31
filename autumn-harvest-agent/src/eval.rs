@@ -1,7 +1,19 @@
 //! Replay-as-evaluation (issue #2001).
 //!
-//! [`evaluate`] re-drives a recorded `agent_loop` run with a candidate model or
-//! prompt. It reports where the decisions of the two runs diverge.
+//! [`evaluate`] re-drives a recorded `agent_loop` run with a candidate model
+//! and a [`ProfileOverlay`] (issue #2375). It reports where the decisions of
+//! the two runs diverge.
+//!
+//! # The overlay
+//!
+//! The harness reads the source profile from the recorded task. It applies
+//! the overlay of the candidate with [`overlay::apply`] before the engine
+//! starts. A refused overlay gives [`EvalError::Overlay`] and costs no model
+//! call. The ceilings are [`Ceilings::from_profile`] of the source profile,
+//! unless [`Candidate::ceilings`] sets others. By default an overlay can thus
+//! only narrow the bounds and the model of the source.
+//! [`Evaluation::overlay_digest`] names the overlay. [`compare`] checks both
+//! overlays before the first model call.
 //!
 //! # How it runs
 //!
@@ -88,7 +100,7 @@
 //! async, so the harness blocks in place. Blocking in place needs a
 //! multi-thread Tokio runtime.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -102,6 +114,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::agent::AgentProfile;
+use crate::agent::overlay::{self, Ceilings, OverlayError, ProfileOverlay};
 use crate::harness::{AgentHarness, fit_turn};
 use crate::memory::MemorySnapshot;
 use crate::mesh::Peer;
@@ -141,17 +155,21 @@ const EVAL_ID_PREFIX: &str = "eval_";
 /// fails when the name changes.
 const SIGNAL_TIMEOUT_PREFIX: &str = "__signal_timeout:";
 
-/// The candidate: a harness with a live model, and an optional new prompt.
+/// The candidate: a harness with a live model, and a profile overlay.
 ///
-/// The harness supplies the model, the temperature, the tool definitions and
-/// the policy. The model and the policy run live, so use a policy with no
-/// side effects. The tools, the memory store and the delivery never run.
+/// The harness supplies the models, the temperature, the tools and the
+/// policy. The model and the policy run live, so use a policy with no side
+/// effects. The tools, the memory store and the delivery never run.
 #[derive(Debug, Clone)]
 pub struct Candidate {
     harness: Arc<AgentHarness>,
-    system: Option<String>,
+    overlay: ProfileOverlay,
+    ceilings: Option<Ceilings>,
+    /// The models that [`model`](Self::model) admits past the ceilings.
+    admitted: BTreeSet<String>,
     max_turns: Option<usize>,
-    model: Option<String>,
+    /// The model of every turn, from [`model`](Self::model).
+    route: Option<String>,
     agent_models: BTreeMap<String, String>,
 }
 
@@ -167,24 +185,69 @@ impl Candidate {
     pub const fn shared(harness: Arc<AgentHarness>) -> Self {
         Self {
             harness,
-            system: None,
+            // The empty overlay, in a form that a `const fn` can build.
+            overlay: ProfileOverlay {
+                system: None,
+                guardrails: None,
+                model: None,
+                max_steps: None,
+                max_total_tokens: None,
+                max_output_tokens: None,
+                read_only: None,
+                tool_guidance: BTreeMap::new(),
+            },
+            ceilings: None,
+            admitted: BTreeSet::new(),
             max_turns: None,
-            model: None,
+            route: None,
             agent_models: BTreeMap::new(),
         }
     }
 
+    /// Run the source under `overlay` (issue #2375).
+    ///
+    /// It replaces the overlay and the route that a shorthand set before it.
+    /// Call [`system_prompt`](Self::system_prompt) or
+    /// [`model`](Self::model) after it to change one part.
+    #[must_use]
+    pub fn overlay(mut self, overlay: ProfileOverlay) -> Self {
+        self.overlay = overlay;
+        self.admitted.clear();
+        self.route = None;
+        self
+    }
+
+    /// Bound the overlay with the operator `ceilings`.
+    ///
+    /// Without it, the ceilings are [`Ceilings::from_profile`] of the source
+    /// profile. The models that [`model`](Self::model) admits are added to
+    /// either set.
+    #[must_use]
+    pub fn ceilings(mut self, ceilings: Ceilings) -> Self {
+        self.ceilings = Some(ceilings);
+        self
+    }
+
     /// Ask the harness model `name` for every model turn (issue #2271).
+    ///
+    /// It sets the overlay model to `name`. The operator chooses it, so the
+    /// ceilings admit it. The registry and the source mandate must still
+    /// hold it. It also asks `name` for each turn of a delegated peer that
+    /// names its own model.
     ///
     /// Without it, each turn asks the model that its recorded input names.
     #[must_use]
     pub fn model(mut self, name: impl Into<String>) -> Self {
-        self.model = Some(name.into());
+        let name = name.into();
+        self.overlay.model = Some(name.clone());
+        self.admitted.insert(name.clone());
+        self.route = Some(name);
         self
     }
 
     /// Ask the harness model `name` for each turn of the agent `agent` of a
     /// delegation tree. It wins over [`model`](Self::model) for that agent.
+    /// It is a route, not an overlay part.
     #[must_use]
     pub fn agent_model(mut self, agent: impl Into<String>, name: impl Into<String>) -> Self {
         self.agent_models.insert(agent.into(), name.into());
@@ -195,13 +258,14 @@ impl Candidate {
     fn model_for(&self, agent: Option<&str>) -> Option<&String> {
         agent
             .and_then(|agent| self.agent_models.get(agent))
-            .or(self.model.as_ref())
+            .or(self.route.as_ref())
     }
 
-    /// Replace the system prompt of the recorded task.
+    /// Replace the system prompt of the recorded task. It sets the overlay
+    /// prompt, so it is a one-part overlay.
     #[must_use]
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
-        self.system = Some(prompt.into());
+        self.overlay.system = Some(prompt.into());
         self
     }
 
@@ -214,6 +278,47 @@ impl Candidate {
         self.max_turns = Some(max_turns);
         self
     }
+
+    /// The recorded `task` under the overlay of this candidate.
+    ///
+    /// The source profile holds the fields of `task` that an overlay can
+    /// set, and the mandate. The result writes each such field back.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal of [`overlay::apply`].
+    fn task_under_overlay(&self, task: &AgentTask) -> Result<AgentTask, OverlayError> {
+        let source = source_profile(task);
+        let mut ceilings = self
+            .ceilings
+            .clone()
+            .unwrap_or_else(|| Ceilings::from_profile(&source));
+        ceilings.models.extend(self.admitted.iter().cloned());
+        let profile = overlay::apply(&source, &self.overlay, &ceilings, self.harness.as_ref())?;
+        let mut task = task.clone();
+        task.system = profile.system;
+        task.max_steps = profile.max_steps;
+        task.max_total_tokens = profile.max_total_tokens;
+        task.max_output_tokens = profile.max_output_tokens;
+        task.read_only = profile.read_only;
+        task.model = profile.model;
+        task.tool_guidance = profile.tool_guidance;
+        Ok(task)
+    }
+}
+
+/// The source profile of a recorded `task`: each field that an overlay can
+/// set, and the mandate, which bounds an overlay model.
+fn source_profile(task: &AgentTask) -> AgentProfile {
+    let mut profile = AgentProfile::new("eval").max_steps(task.max_steps);
+    profile.system.clone_from(&task.system);
+    profile.max_total_tokens = task.max_total_tokens;
+    profile.max_output_tokens = task.max_output_tokens;
+    profile.read_only = task.read_only;
+    profile.model.clone_from(&task.model);
+    profile.mandate.clone_from(&task.mandate);
+    profile.tool_guidance.clone_from(&task.tool_guidance);
+    profile
 }
 
 /// Why an evaluation cannot start or finish.
@@ -241,6 +346,10 @@ pub enum EvalError {
     /// The current runtime cannot block in place.
     #[error("evaluation needs a multi-thread Tokio runtime")]
     MultiThreadRuntimeRequired,
+    /// The overlay of the candidate goes past its ceilings, or names a model
+    /// or a tool that the harness does not hold (issue #2375).
+    #[error("the candidate overlay is refused: {0}")]
+    Overlay(#[from] OverlayError),
 }
 
 /// One side of a comparison.
@@ -388,6 +497,12 @@ pub struct Evaluation {
     pub stubbed_tool_calls: u32,
     /// `true` when the turn cap stopped the candidate run.
     pub turn_cap_reached: bool,
+    /// The [`ProfileOverlay::digest`] of the candidate overlay (issue
+    /// #2375). It leaves out the ceilings and the routes of
+    /// [`Candidate::agent_model`]. A report that decodes with no field has
+    /// the empty string.
+    #[serde(default)]
+    pub overlay_digest: String,
 }
 
 impl Evaluation {
@@ -419,12 +534,23 @@ pub async fn evaluate(
     candidate: &Candidate,
 ) -> Result<Evaluation, EvalError> {
     let recording = Recording::read(history)?;
+    let task = candidate.task_under_overlay(&recording.task)?;
+    run(&recording, task, candidate).await
+}
+
+/// Run `candidate` on `task`, the recorded task under its overlay, and
+/// compare the run with `recording`.
+///
+/// # Errors
+///
+/// The errors of [`evaluate`] after the overlay check.
+async fn run(
+    recording: &Recording,
+    task: AgentTask,
+    candidate: &Candidate,
+) -> Result<Evaluation, EvalError> {
     let handle = multi_thread_handle()?;
 
-    let mut task = recording.task.clone();
-    if let Some(system) = &candidate.system {
-        task.system = Some(system.clone());
-    }
     let input = serde_json::to_value(&task).map_err(|e| EvalError::Undecodable(e.to_string()))?;
     let max_turns = candidate
         .max_turns
@@ -445,7 +571,7 @@ pub async fn evaluate(
         stubbed: 0,
     }));
 
-    let model = model_mock(&session, candidate, &recording, handle);
+    let model = model_mock(&session, candidate, recording, handle);
     let tool = {
         let session = Arc::clone(&session);
         move |input: Value| -> Result<Value, String> {
@@ -496,13 +622,20 @@ pub async fn evaluate(
     let outcome = env.run(agent_loop_info().handler, input).await;
 
     let candidate_turns = model_turns(outcome.events())?;
-    let candidate_end = match outcome.result {
-        Ok(output) => RunEnd::Completed(decode(output).map_err(EvalError::Undecodable)?),
-        Err(error) => RunEnd::Failed(error),
-    };
-    let (replayed, stubbed, cap_reached) = {
+    let (replayed, stubbed, cap_reached, root) = {
         let session = lock(&session);
-        (session.replayed, session.stubbed, session.cap_reached)
+        let root = session.root.clone();
+        (session.replayed, session.stubbed, session.cap_reached, root)
+    };
+    let candidate_end = match outcome.result {
+        Ok(output) => {
+            let mut report: AgentReport = decode(output).map_err(EvalError::Undecodable)?;
+            if let (Some(from), Some(to)) = (&root, &recording.run_id) {
+                rebase_run_ids(&mut report, from, to);
+            }
+            RunEnd::Completed(report)
+        }
+        Err(error) => RunEnd::Failed(error),
     };
 
     let turns = diff_turns(&recording.turns, &candidate_turns);
@@ -513,12 +646,13 @@ pub async fn evaluate(
     Ok(Evaluation {
         turns,
         first_divergence,
-        recorded: recording.end,
+        recorded: recording.end.clone(),
         candidate: candidate_end,
         end_diverged,
         replayed_tool_calls: replayed,
         stubbed_tool_calls: stubbed,
         turn_cap_reached: cap_reached,
+        overlay_digest: candidate.overlay.digest(),
     })
 }
 
@@ -558,16 +692,23 @@ impl Comparison {
 /// [`Candidate::model`] or [`Candidate::agent_model`] on each. The two
 /// evaluations run one after the other, each with its own live model calls.
 ///
+/// Both overlays pass [`overlay::apply`] before the first model call
+/// (issue #2375).
+///
 /// # Errors
 ///
-/// The errors of [`evaluate`]. A refused history costs no model call.
+/// The errors of [`evaluate`]. A refused history or overlay costs no model
+/// call.
 pub async fn compare(
     history: &[WorkflowEvent],
     first: &Candidate,
     second: &Candidate,
 ) -> Result<Comparison, EvalError> {
-    let first = evaluate(history, first).await?;
-    let second = evaluate(history, second).await?;
+    let recording = Recording::read(history)?;
+    let first_task = first.task_under_overlay(&recording.task)?;
+    let second_task = second.task_under_overlay(&recording.task)?;
+    let first = run(&recording, first_task, first).await?;
+    let second = run(&recording, second_task, second).await?;
     let decision = |evaluation: &Evaluation, turn: usize| {
         evaluation
             .turns
@@ -597,6 +738,30 @@ pub async fn compare(
         first_divergence,
         end_diverged,
     })
+}
+
+/// Give the run ids of a candidate `report` the recorded root `to` in place
+/// of the engine root `from`, as the policy sees them.
+///
+/// The test engine gives each evaluation a new execution id. So without it
+/// two evaluations of one candidate never report equal.
+///
+/// Only the root id itself, or the id of a lane under it, changes. A lane
+/// starts with `:`, so another id that starts with `from` keeps its value.
+fn rebase_run_ids(report: &mut AgentReport, from: &str, to: &str) {
+    let rebase = |run_id: &mut Option<String>| {
+        let lane = run_id
+            .as_deref()
+            .and_then(|id| id.strip_prefix(from))
+            .filter(|lane| lane.is_empty() || lane.starts_with(':'));
+        if let Some(lane) = lane {
+            *run_id = Some(format!("{to}{lane}"));
+        }
+    };
+    rebase(&mut report.run_id);
+    for delegation in &mut report.delegations {
+        rebase(&mut delegation.run_id);
+    }
 }
 
 /// What the source run recorded.
@@ -1506,6 +1671,102 @@ mod tests {
             oversized: false,
             interruptible: Vec::new(),
         }
+    }
+
+    #[derive(Debug)]
+    struct NoModel;
+
+    impl crate::AgentModel for NoModel {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a crate::ChatRequest,
+        ) -> crate::model::BoxFuture<'a, Result<crate::model::ChatResponse, crate::AgentError>>
+        {
+            Box::pin(async { Err(crate::AgentError::new(crate::ErrorKind::Provider, "unused")) })
+        }
+    }
+
+    fn lookup_harness() -> AgentHarness {
+        let lookup = crate::FnTool::new("lookup", "Looks up.", json!({}), |_| async {
+            Ok(json!(null))
+        });
+        AgentHarness::new(Arc::new(NoModel)).tool(lookup.shared())
+    }
+
+    #[test]
+    fn every_overlay_part_reaches_the_task() {
+        let mut source = AgentTask::new("go")
+            .system("Be brief.")
+            .max_steps(8)
+            .max_total_tokens(9_000)
+            .max_output_tokens(800);
+        source.read_only = false;
+        let overlay = ProfileOverlay {
+            system: Some("Be kind.".to_owned()),
+            guardrails: Some("Never refund twice.".to_owned()),
+            model: None,
+            max_steps: Some(3),
+            max_total_tokens: Some(1_000),
+            max_output_tokens: Some(100),
+            read_only: Some(true),
+            tool_guidance: BTreeMap::from([("lookup".to_owned(), "One key.".to_owned())]),
+        };
+        let task = Candidate::new(lookup_harness())
+            .overlay(overlay)
+            .task_under_overlay(&source)
+            .expect("a narrowing overlay applies");
+        assert_eq!(
+            task.system.as_deref(),
+            Some("Be kind.\n\n## Guardrails\n\nNever refund twice.")
+        );
+        assert_eq!(task.max_steps, 3);
+        assert_eq!(task.max_total_tokens, Some(1_000));
+        assert_eq!(task.max_output_tokens, Some(100));
+        assert!(task.read_only);
+        assert_eq!(
+            task.tool_guidance.get("lookup").map(String::as_str),
+            Some("One key.")
+        );
+        let named = Candidate::new(lookup_harness().model_named("m", Arc::new(NoModel)))
+            .model("m")
+            .task_under_overlay(&source)
+            .expect("the operator admits m");
+        assert_eq!(named.model.as_deref(), Some("m"));
+        // The parts that an overlay cannot set keep the recorded values.
+        assert_eq!(task.input, source.input);
+        assert_eq!(task.run_id_source, source.run_id_source);
+    }
+
+    #[test]
+    fn only_the_root_and_its_lanes_take_the_recorded_run_id() {
+        let mut report: AgentReport = serde_json::from_value(json!({
+            "stop": "completed",
+            "text": "",
+            "steps_used": 0,
+            "tool_calls": 0,
+            "usage": crate::message::TokenUsage::default(),
+            "messages": [],
+            "run_id": "e1",
+        }))
+        .expect("a report");
+        let child = |run_id: &str| crate::mesh::DelegationRecord {
+            chain: vec!["a".to_owned()],
+            run_id: Some(run_id.to_owned()),
+            stop: None,
+            refusal: None,
+            usage: crate::message::TokenUsage::default(),
+            steps_used: 0,
+            tool_calls: 0,
+        };
+        report.delegations = vec![child("e1:d1"), child("e10"), child("x")];
+        rebase_run_ids(&mut report, "e1", "r1");
+        assert_eq!(report.run_id.as_deref(), Some("r1"));
+        let ids: Vec<_> = report
+            .delegations
+            .iter()
+            .map(|record| record.run_id.as_deref())
+            .collect();
+        assert_eq!(ids, [Some("r1:d1"), Some("e10"), Some("x")]);
     }
 
     #[test]

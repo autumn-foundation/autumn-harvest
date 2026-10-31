@@ -103,7 +103,8 @@ pub mod workflow;
 pub mod workspace;
 
 pub use agent::overlay::{
-    Ceilings, GUARDRAILS_HEADING, ModelRegistry, OverlayError, ProfileOverlay,
+    Ceilings, GUARDRAILS_HEADING, MAX_TOOL_GUIDANCE_BYTES, ModelRegistry, OverlayError,
+    ProfileOverlay,
 };
 pub use agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentHeartbeat, AgentId, AgentIdError, AgentMemory, AgentOp,
@@ -118,7 +119,7 @@ pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
 pub use error::{AgentError, ErrorKind};
 pub use flow::{FlowRule, FlowRules, Recheck, Released};
 pub use followup::Followups;
-pub use harness::{AgentHarness, DEFAULT_MODEL};
+pub use harness::{AgentHarness, BUILTIN_TOOLS, DEFAULT_MODEL};
 pub use heartbeat::{
     HEARTBEAT_WORKFLOW_NAME, HeartbeatReport, HeartbeatTask, Precheck, agent_heartbeat,
     agent_heartbeat_info,

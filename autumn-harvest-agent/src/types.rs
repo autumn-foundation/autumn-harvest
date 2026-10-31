@@ -6,7 +6,7 @@
 //! Replay reads these payloads back. Add a field only with `#[serde(default)]`,
 //! so that a history written before the field still decodes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crate::flow::Released;
@@ -174,6 +174,12 @@ pub struct AgentTask {
     /// parent keeps the usage and the labels of the failed run.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub report_failure: bool,
+    /// New text for the description of each named app tool (issue #2373).
+    /// The model sees it in place of the tool description. The tool effect
+    /// and the policy do not change. A delegated child has none. Serde skips
+    /// an empty map, so a recorded task replays as it ran.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_guidance: BTreeMap<String, String>,
 }
 
 /// Where the run id of a task comes from.
@@ -223,6 +229,7 @@ impl AgentTask {
             workspace: None,
             waiting: Vec::new(),
             report_failure: false,
+            tool_guidance: BTreeMap::new(),
         }
     }
 
@@ -507,6 +514,10 @@ pub struct ModelTurnRequest {
     /// replay asks the same model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The tool guidance of the task (issue #2373). See
+    /// [`AgentTask::tool_guidance`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_guidance: BTreeMap<String, String>,
 }
 
 /// The recorded result of one model-turn activity.

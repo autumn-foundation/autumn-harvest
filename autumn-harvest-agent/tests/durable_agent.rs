@@ -750,3 +750,38 @@ async fn a_crash_inside_a_model_call_reruns_only_that_call() {
         "only the call in flight at the crash runs again"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn profile_tool_guidance_reaches_the_model_and_the_history() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![answer("ok", 1)]);
+    let recorder = Arc::new(Recorder::default());
+    let mut profile = AgentProfile::new("support");
+    profile
+        .tool_guidance
+        .insert("lookup".to_owned(), "Look up one order.".to_owned());
+    let harness = AgentHarness::new(model.clone())
+        .tool(recorded_tool("lookup", ToolEffect::ReadOnly, &recorder))
+        .tool(recorded_tool("other", ToolEffect::ReadOnly, &recorder))
+        .agent(profile);
+    let mut rt = runtime(&db, harness);
+    let agent = id("guided");
+
+    say(&mut rt, &agent, "where is it?");
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+
+    let tools = &model.requests()[0].tools;
+    let text = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .map(|tool| tool.description.clone())
+    };
+    assert_eq!(text("lookup").as_deref(), Some("Look up one order."));
+    assert_eq!(text("other").as_deref(), Some("A test tool."));
+    let requests = turn_requests(&rt, &agent);
+    assert_eq!(
+        requests[0].tool_guidance.get("lookup").map(String::as_str),
+        Some("Look up one order.")
+    );
+}

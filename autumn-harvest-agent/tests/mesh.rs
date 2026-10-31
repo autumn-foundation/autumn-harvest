@@ -1103,6 +1103,7 @@ async fn a_turn_records_labels_only_with_flow_rules() {
         mesh: None,
         prefix: None,
         remember: false,
+        tool_guidance: std::collections::BTreeMap::new(),
     };
     let plain = AgentHarness::new(model.clone()).tool(inbox());
     let turn = plain.model_turn(request.clone()).await.unwrap();
@@ -1405,6 +1406,7 @@ fn turn_request() -> ModelTurnRequest {
         mesh: None,
         prefix: None,
         remember: false,
+        tool_guidance: std::collections::BTreeMap::new(),
     }
 }
 

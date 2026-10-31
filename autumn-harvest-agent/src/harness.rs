@@ -16,6 +16,7 @@ use crate::bounds::{exceeds_bytes, json_len};
 use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::{AgentError, ErrorKind};
 use crate::flow::{FlowRules, Released, call_labels};
+use crate::followup::FOLLOWUP_TOOL;
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::live::{Coalescer, LiveEvent, LiveSink};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemorySnapshot, MemoryStore, MemoryTool};
@@ -90,6 +91,10 @@ const OUTCOME_ENVELOPE_BYTES: u64 = 64;
 
 /// The mark at the end of a cut result.
 const TRUNCATED: &str = "…[truncated]";
+
+/// The names of the tools that the crate provides. A built-in tool wins a
+/// name clash with an app tool, so tool guidance cannot name one.
+pub const BUILTIN_TOOLS: [&str; 3] = [MEMORY_TOOL, DELEGATE_TOOL, FOLLOWUP_TOOL];
 
 /// The model, the tools, and the policy behind the two agent activities.
 ///
@@ -300,6 +305,16 @@ impl AgentHarness {
     #[must_use]
     pub fn has_model(&self, name: &str) -> bool {
         name == DEFAULT_MODEL || self.models.contains_key(name)
+    }
+
+    /// Whether the harness holds an app tool named `name` that the model
+    /// can see (issue #2373).
+    ///
+    /// A built-in tool such as `memory` hides an app tool of the same name.
+    /// So the result is `false` for each name in [`BUILTIN_TOOLS`].
+    #[must_use]
+    pub fn has_tool(&self, name: &str) -> bool {
+        !BUILTIN_TOOLS.contains(&name) && self.tools.iter().any(|tool| tool.name() == name)
     }
 
     /// The model `name`. `None` is the [`DEFAULT_MODEL`].
@@ -679,10 +694,21 @@ impl AgentHarness {
         if hidden_delegate {
             builtins.push(Arc::new(WorkflowTool(delegate_definition(&[]))));
         }
+        let builtin = |name: &str| builtins.iter().any(|tool| tool.name() == name);
         let tools = self
             .permitted(&builtins, request.allowed_tools.as_ref())
             .filter(|tool| !(hidden_delegate && tool.name() == DELEGATE_TOOL))
-            .map(Tool::definition)
+            .map(|tool| {
+                let mut definition = tool.definition();
+                // Tool guidance replaces the description of an app tool only
+                // (issue #2373). The effect and the policy do not change.
+                if let Some(text) = request.tool_guidance.get(&definition.name)
+                    && !builtin(&definition.name)
+                {
+                    definition.description.clone_from(text);
+                }
+                definition
+            })
             .collect();
         (builtins, tools)
     }
@@ -1994,6 +2020,47 @@ mod tests {
         ) -> crate::model::BoxFuture<'a, Result<crate::model::ChatResponse, AgentError>> {
             Box::pin(async { Err(AgentError::new(ErrorKind::Provider, "unused")) })
         }
+    }
+
+    #[test]
+    fn guidance_replaces_the_text_of_an_app_tool_only() {
+        let tool = |name: &str| {
+            crate::FnTool::new(name, "Original.", serde_json::json!({}), |_| async {
+                Ok(serde_json::json!(null))
+            })
+            .shared()
+        };
+        let harness = AgentHarness::new(Arc::new(NoModel))
+            .memory(Arc::new(crate::InMemoryMemoryStore::default()))
+            .tool(tool("lookup"))
+            .tool(tool("other"))
+            .tool(tool(MEMORY_TOOL));
+        assert!(harness.has_tool("lookup"));
+        assert!(!harness.has_tool(MEMORY_TOOL), "a built-in hides it");
+        let request: ModelTurnRequest = serde_json::from_value(serde_json::json!({
+            "run_id": "r",
+            "steps_used": 0,
+            "max_steps": 4,
+            "usage": TokenUsage::default(),
+            "messages": [],
+            "memory_scope": "agent:a",
+            "tool_guidance": {"lookup": "New.", "memory": "Hijack."},
+        }))
+        .expect("a request");
+        let (_, unguided) = harness.turn_tools(&ModelTurnRequest {
+            tool_guidance: BTreeMap::new(),
+            ..request.clone()
+        });
+        let (_, guided) = harness.turn_tools(&request);
+        assert_eq!(guided.len(), unguided.len());
+        for (guided, plain) in guided.iter().zip(&unguided) {
+            if guided.name == "lookup" {
+                assert_eq!(guided.description, "New.");
+            } else {
+                assert_eq!(guided, plain, "{} keeps its text", plain.name);
+            }
+        }
+        assert!(guided.iter().any(|tool| tool.name == MEMORY_TOOL));
     }
 
     #[test]

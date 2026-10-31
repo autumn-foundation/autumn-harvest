@@ -5,17 +5,23 @@
 //! past what the operator allows. The design is in
 //! `docs/design/DESIGN-2370.md`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use super::AgentProfile;
 use crate::harness::{AgentHarness, DEFAULT_MODEL, truncate};
 use crate::mesh::MAX_NAME_LEN;
+use crate::transcript::hex;
 
 /// The heading of the guardrails in the system prompt.
 pub const GUARDRAILS_HEADING: &str = "## Guardrails";
+
+/// The most bytes of one tool guidance text (issue #2375). Each turn input
+/// records the guidance, so a long text grows the history on every turn.
+pub const MAX_TOOL_GUIDANCE_BYTES: usize = 4_096;
 
 /// A change to an [`AgentProfile`] that a model may write.
 ///
@@ -46,6 +52,25 @@ pub struct ProfileOverlay {
     /// outside the app.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+    /// New text for the description of each named tool (issue #2373). Each
+    /// key must name a harness tool. A key replaces the profile text of that
+    /// tool. Other keys keep it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_guidance: BTreeMap<String, String>,
+}
+
+impl ProfileOverlay {
+    /// The SHA-256 digest of the overlay, as `sha256:<hex>`.
+    ///
+    /// The digest reads the JSON of the overlay. The JSON holds the fields in
+    /// declaration order, leaves out each unset field and sorts the map keys.
+    /// Thus equal overlays have equal digests.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        // An overlay holds strings, numbers and maps only, so it encodes.
+        let bytes = serde_json::to_vec(self).unwrap_or_default();
+        format!("sha256:{}", hex(&Sha256::digest(&bytes)))
+    }
 }
 
 /// The limits of the profile that [`apply`] returns.
@@ -83,22 +108,37 @@ impl Ceilings {
     }
 }
 
-/// The models that a harness holds.
+/// The models and the tools that a harness holds.
 pub trait ModelRegistry {
     /// Whether the registry holds the model `name`.
     fn has_model(&self, name: &str) -> bool;
+
+    /// Whether the registry holds the tool `name` (issue #2373). The
+    /// default holds no tool, so it refuses all tool guidance.
+    fn has_tool(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
 }
 
 impl ModelRegistry for AgentHarness {
     fn has_model(&self, name: &str) -> bool {
         Self::has_model(self, name)
     }
+
+    fn has_tool(&self, name: &str) -> bool {
+        Self::has_tool(self, name)
+    }
 }
 
 /// A plain set holds only its own names, so it can leave out
-/// [`DEFAULT_MODEL`].
+/// [`DEFAULT_MODEL`]. One set holds the model names and the tool names.
 impl ModelRegistry for BTreeSet<String> {
     fn has_model(&self, name: &str) -> bool {
+        self.contains(name)
+    }
+
+    fn has_tool(&self, name: &str) -> bool {
         self.contains(name)
     }
 }
@@ -106,7 +146,7 @@ impl ModelRegistry for BTreeSet<String> {
 /// Why [`apply`] refuses an overlay.
 ///
 /// [`apply`] checks in variant order and returns the first refusal. It cuts
-/// a model name in an error to [`MAX_NAME_LEN`] characters.
+/// a model or tool name in an error to [`MAX_NAME_LEN`] characters.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum OverlayError {
@@ -130,6 +170,21 @@ pub enum OverlayError {
     UnknownModel {
         /// The model name.
         model: String,
+    },
+    /// The registry holds no tool with a tool guidance key (issue #2373).
+    /// The error names the first such key in key order.
+    #[error("the harness has no tool named {tool:?}")]
+    UnknownTool {
+        /// The tool name.
+        tool: String,
+    },
+    /// The guidance text of `tool` is longer than
+    /// [`MAX_TOOL_GUIDANCE_BYTES`]. The error names the first such key in
+    /// key order.
+    #[error("the guidance of the tool {tool:?} is too long")]
+    GuidanceTooLong {
+        /// The tool name.
+        tool: String,
     },
 }
 
@@ -196,8 +251,9 @@ fn with_guardrails(system: Option<&str>, guardrails: &str) -> String {
 /// bound may be above its ceiling. So a profile bound above an operator
 /// ceiling fails, even when the overlay does not set that bound. The model
 /// is the overlay model, or else the profile model. The guardrails go after
-/// the system prompt. Each other field keeps its profile value. The Verus
-/// proof `agent_overlay.rs` models this function.
+/// the system prompt. Each tool guidance key replaces the profile text of
+/// that tool. Each other field keeps its profile value. The Verus proof
+/// `agent_overlay.rs` models this function.
 ///
 /// # Errors
 ///
@@ -208,6 +264,10 @@ fn with_guardrails(system: Option<&str>, guardrails: &str) -> String {
 ///   model, or the profile mandate forbids the overlay model.
 /// - [`OverlayError::UnknownModel`]: `registry` does not hold the overlay
 ///   model.
+/// - [`OverlayError::UnknownTool`]: `registry` does not hold a tool that
+///   the tool guidance names.
+/// - [`OverlayError::GuidanceTooLong`]: a guidance text is longer than
+///   [`MAX_TOOL_GUIDANCE_BYTES`].
 pub fn apply<R: ModelRegistry + ?Sized>(
     profile: &AgentProfile,
     overlay: &ProfileOverlay,
@@ -223,6 +283,7 @@ pub fn apply<R: ModelRegistry + ?Sized>(
         max_total_tokens,
         max_output_tokens,
         read_only,
+        tool_guidance,
     } = overlay;
     let above = |field| OverlayError::AboveCeiling { field };
     let Ok(Some(max_steps)) = merged_bound(Some(profile.max_steps), *max_steps, ceilings.max_steps)
@@ -267,6 +328,21 @@ pub fn apply<R: ModelRegistry + ?Sized>(
             model: truncate(named, MAX_NAME_LEN),
         });
     }
+    if let Some(tool) = tool_guidance.keys().find(|tool| !registry.has_tool(tool)) {
+        return Err(OverlayError::UnknownTool {
+            tool: truncate(tool, MAX_NAME_LEN),
+        });
+    }
+    if let Some(tool) = tool_guidance
+        .iter()
+        .find_map(|(tool, text)| (text.len() > MAX_TOOL_GUIDANCE_BYTES).then_some(tool))
+    {
+        return Err(OverlayError::GuidanceTooLong {
+            tool: truncate(tool, MAX_NAME_LEN),
+        });
+    }
+    let mut guidance = profile.tool_guidance.clone();
+    guidance.extend(tool_guidance.clone());
     let system = system.as_ref().or(profile.system.as_ref());
     let system = guardrails.as_deref().map_or_else(
         || system.cloned(),
@@ -279,6 +355,7 @@ pub fn apply<R: ModelRegistry + ?Sized>(
         max_output_tokens,
         read_only,
         model: model.cloned(),
+        tool_guidance: guidance,
         ..profile.clone()
     })
 }
@@ -290,6 +367,7 @@ mod tests {
     use crate::mesh::Mandate;
     use proptest::prelude::*;
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn registry(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|name| (*name).to_owned()).collect()
@@ -766,6 +844,140 @@ mod tests {
         );
     }
 
+    fn guidance(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(tool, text)| ((*tool).to_owned(), (*text).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn guidance_for_an_unregistered_tool_is_unknown() {
+        let profile = rich_profile();
+        let overlay = ProfileOverlay {
+            tool_guidance: guidance(&[("lookup", "Use it."), ("wipe", "Never.")]),
+            ..ProfileOverlay::default()
+        };
+        let err = apply(
+            &profile,
+            &overlay,
+            &Ceilings::from_profile(&profile),
+            &registry(&["lookup"]),
+        );
+        assert_eq!(
+            err,
+            Err(OverlayError::UnknownTool {
+                tool: "wipe".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn guidance_merges_over_the_profile_guidance_by_tool() {
+        let mut profile = rich_profile();
+        profile.tool_guidance = guidance(&[("lookup", "Old."), ("search", "Keep.")]);
+        let overlay = ProfileOverlay {
+            tool_guidance: guidance(&[("lookup", "New."), ("pay", "Ask first.")]),
+            ..ProfileOverlay::default()
+        };
+        let out = apply(
+            &profile,
+            &overlay,
+            &Ceilings::from_profile(&profile),
+            &registry(&["lookup", "pay"]),
+        )
+        .expect("registered tools");
+        assert_eq!(
+            out.tool_guidance,
+            guidance(&[
+                ("lookup", "New."),
+                ("pay", "Ask first."),
+                ("search", "Keep.")
+            ])
+        );
+    }
+
+    #[test]
+    fn the_digest_names_one_overlay() {
+        assert_eq!(
+            ProfileOverlay::default().digest(),
+            "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "the digest of an empty JSON object"
+        );
+        let a = ProfileOverlay {
+            system: Some("s".to_owned()),
+            tool_guidance: guidance(&[("b", "2"), ("a", "1")]),
+            ..ProfileOverlay::default()
+        };
+        let b: ProfileOverlay = serde_json::from_value(json!({
+            "tool_guidance": {"a": "1", "b": "2"},
+            "system": "s",
+            "model": null,
+        }))
+        .expect("decode");
+        assert_eq!(a.digest(), b.digest(), "one overlay has one digest");
+        let c = ProfileOverlay {
+            system: Some("t".to_owned()),
+            ..a.clone()
+        };
+        assert_ne!(a.digest(), c.digest());
+    }
+
+    #[test]
+    fn an_error_names_a_long_tool_in_short() {
+        let profile = AgentProfile::new("support");
+        let long = "t".repeat(10_000);
+        let overlay = ProfileOverlay {
+            tool_guidance: BTreeMap::from([(long, "x".to_owned())]),
+            ..ProfileOverlay::default()
+        };
+        let err = apply(
+            &profile,
+            &overlay,
+            &Ceilings::from_profile(&profile),
+            &registry(&[]),
+        )
+        .expect_err("refused");
+        let OverlayError::UnknownTool { tool } = &err else {
+            panic!("unexpected {err:?}");
+        };
+        assert_eq!(*tool, truncate(&"t".repeat(10_000), MAX_NAME_LEN));
+        assert!(tool.starts_with(&"t".repeat(MAX_NAME_LEN)), "{tool}");
+        assert!(!tool.starts_with(&"t".repeat(MAX_NAME_LEN + 1)), "{tool}");
+    }
+
+    #[test]
+    fn a_long_guidance_text_is_refused() {
+        let profile = AgentProfile::new("support");
+        let fits = ProfileOverlay {
+            tool_guidance: guidance(&[("lookup", &"a".repeat(MAX_TOOL_GUIDANCE_BYTES))]),
+            ..ProfileOverlay::default()
+        };
+        let ceilings = Ceilings::from_profile(&profile);
+        assert!(apply(&profile, &fits, &ceilings, &registry(&["lookup"])).is_ok());
+        let long = ProfileOverlay {
+            tool_guidance: guidance(&[("lookup", &"a".repeat(MAX_TOOL_GUIDANCE_BYTES + 1))]),
+            ..ProfileOverlay::default()
+        };
+        assert_eq!(
+            apply(&profile, &long, &ceilings, &registry(&["lookup"])),
+            Err(OverlayError::GuidanceTooLong {
+                tool: "lookup".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn the_default_registry_holds_no_tool() {
+        struct Models;
+        impl ModelRegistry for Models {
+            fn has_model(&self, _name: &str) -> bool {
+                true
+            }
+        }
+        assert!(!Models.has_tool("lookup"));
+    }
+
     const MODELS: [&str; 4] = [DEFAULT_MODEL, "m1", "m2", "m3"];
 
     fn any_model() -> impl Strategy<Value = Option<String>> {
@@ -785,10 +997,28 @@ mod tests {
             .prop_map(|names| names.into_iter().map(str::to_owned).collect())
     }
 
-    /// A registry. Half of the time it holds every model, so more overlays
-    /// apply.
+    const TOOLS: [&str; 2] = ["lookup", "pay"];
+
+    /// A registry of models and tools. Half of the time it holds every
+    /// name, so more overlays apply.
     fn any_registry() -> impl Strategy<Value = BTreeSet<String>> {
-        prop_oneof![any_models(), Just(registry(&MODELS))]
+        let names: Vec<&str> = MODELS.iter().chain(&TOOLS).copied().collect();
+        prop_oneof![
+            proptest::sample::subsequence(names.clone(), 0..=names.len())
+                .prop_map(|names| names.into_iter().map(str::to_owned).collect()),
+            Just(names.iter().map(|name| (*name).to_owned()).collect()),
+        ]
+    }
+
+    fn any_guidance() -> impl Strategy<Value = BTreeMap<String, String>> {
+        proptest::collection::btree_map(
+            proptest::sample::select(TOOLS.to_vec()).prop_map(str::to_owned),
+            prop_oneof![
+                9 => "[a-z ]{0,6}",
+                1 => Just("a".repeat(MAX_TOOL_GUIDANCE_BYTES + 1)),
+            ],
+            0..=TOOLS.len(),
+        )
     }
 
     prop_compose! {
@@ -803,6 +1033,7 @@ mod tests {
             window in 0_u32..300,
             mandate in proptest::option::of(proptest::option::of(any_models())),
             beat in proptest::option::of((any_bound(), any_model())),
+            tool_guidance in any_guidance(),
         ) -> AgentProfile {
             let mut profile = AgentProfile::new("kind").max_steps(max_steps);
             profile.system = system;
@@ -812,6 +1043,7 @@ mod tests {
             profile.read_only = read_only;
             profile.tenant = tenant;
             profile.window = window;
+            profile.tool_guidance = tool_guidance;
             profile.mandate = mandate.map(|models| {
                 let mandate = Mandate::new("kind/a");
                 match models {
@@ -837,6 +1069,7 @@ mod tests {
             max_total_tokens in any_bound(),
             max_output_tokens in any_bound(),
             read_only in proptest::option::of(any::<bool>()),
+            tool_guidance in any_guidance(),
         ) -> ProfileOverlay {
             ProfileOverlay {
                 system,
@@ -846,6 +1079,7 @@ mod tests {
                 max_total_tokens,
                 max_output_tokens,
                 read_only,
+                tool_guidance,
             }
         }
     }
@@ -933,6 +1167,22 @@ mod tests {
         if overlay.model.is_some() && !names.contains(&name) {
             return Err(OverlayError::UnknownModel { model: name });
         }
+        if let Some(tool) = overlay
+            .tool_guidance
+            .keys()
+            .find(|tool| !names.contains(*tool))
+        {
+            return Err(OverlayError::UnknownTool { tool: tool.clone() });
+        }
+        if let Some((tool, _)) = overlay
+            .tool_guidance
+            .iter()
+            .find(|(_, text)| text.len() > MAX_TOOL_GUIDANCE_BYTES)
+        {
+            return Err(OverlayError::GuidanceTooLong { tool: tool.clone() });
+        }
+        let mut tool_guidance = profile.tool_guidance.clone();
+        tool_guidance.extend(overlay.tool_guidance.clone());
         let mut system = overlay.system.clone().or_else(|| profile.system.clone());
         if let Some(guardrails) = &overlay.guardrails {
             let section = format!("## Guardrails\n\n{guardrails}");
@@ -950,6 +1200,7 @@ mod tests {
         out.max_total_tokens = max_total_tokens;
         out.max_output_tokens = max_output_tokens;
         out.read_only = read_only;
+        out.tool_guidance = tool_guidance;
         Ok(out)
     }
 
@@ -972,6 +1223,7 @@ mod tests {
             max_total_tokens: base.max_total_tokens,
             max_output_tokens: base.max_output_tokens,
             read_only: base.read_only,
+            tool_guidance: base.tool_guidance.clone(),
             ..profile.clone()
         }
     }
@@ -1014,6 +1266,10 @@ mod tests {
                     prop_assert!(names.contains(model));
                     let mandate = profile.mandate.as_ref();
                     prop_assert!(mandate.is_none_or(|m| m.allows_model(Some(model))));
+                }
+                for (tool, text) in &overlay.tool_guidance {
+                    prop_assert!(names.contains(tool));
+                    prop_assert_eq!(out.tool_guidance.get(tool), Some(text));
                 }
                 prop_assert_eq!(unnamed(&out, &profile), profile);
             }
