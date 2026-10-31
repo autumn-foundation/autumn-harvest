@@ -1198,3 +1198,30 @@ the answer of each model turn in two layers:
   See [durable routes](durable-routes.md#live-chunks).
 - The live text is a preview. The `TurnText` and the run result are the
   answer.
+
+### Tool guidance and skills (issue #2373)
+
+A profile and a task can carry two text parts. A profile overlay can set
+both. See `docs/design/DESIGN-2373.md`.
+
+```rust,ignore
+let profile = AgentProfile::new("support")
+    .tool_guidance("lookup", "Look up an order by its id. Never guess an id.")
+    .skill("refund", SkillText::new("Pay a refund.", "Check the order first. ..."));
+```
+
+- **Tool guidance.** The text replaces the description of an app tool in
+  the definition that the model sees. The name, the schema, the effect and
+  the policy stay. A built-in tool keeps its own text. `overlay::apply`
+  refuses a key that names no app tool with `OverlayError::UnknownTool`.
+- **Skills.** The system prompt lists each name and one-line summary under
+  `## Skills`. It never holds a body. The model gets the `load_skill` tool,
+  with `ToolEffect::ReadOnly`. A call is an ordinary `agent_tool_call`, so
+  history records the body and replay reads it from there. The body is cut
+  like any tool result.
+- A run with no skills offers no `load_skill` tool. A call to it is an
+  unknown tool. The harness never shows an app tool with that name.
+- A skill name follows the agent name rules. A summary is one line of at
+  most `MAX_SKILL_SUMMARY_CHARS` characters. A task with a skill that breaks
+  a rule fails at its start.
+- A delegated child gets neither part. Its peer has its own prompt.

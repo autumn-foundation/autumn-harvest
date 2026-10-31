@@ -25,12 +25,13 @@ use crate::message::{ChatMessage, ContentPart, RunId, TokenUsage, ToolDefinition
 use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MODEL_ID};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
 use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
+use crate::skill::{LOAD_SKILL_TOOL, SkillTool};
 use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 
 use crate::transcript::{InMemoryTranscriptStore, PREFIX_MISSING, TranscriptStore, chain};
-use crate::types::{ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome};
+use crate::types::{ModelTurn, ModelTurnRequest, SkillLookup, ToolCallRequest, ToolOutcome};
 use crate::workspace::{WorkspaceHandle, WorkspaceMount, WorkspaceRef, WorkspaceStore};
 
 /// The default cap on one tool result, in characters.
@@ -300,6 +301,14 @@ impl AgentHarness {
     #[must_use]
     pub fn has_model(&self, name: &str) -> bool {
         name == DEFAULT_MODEL || self.models.contains_key(name)
+    }
+
+    /// Whether the harness holds the app tool `name` (issue #2373). A
+    /// built-in tool is not an app tool. Neither is an app tool named
+    /// [`LOAD_SKILL_TOOL`], which the harness never shows.
+    #[must_use]
+    pub fn has_tool(&self, name: &str) -> bool {
+        name != LOAD_SKILL_TOOL && self.tools.iter().any(|tool| tool.name() == name)
     }
 
     /// The model `name`. `None` is the [`DEFAULT_MODEL`].
@@ -670,6 +679,9 @@ impl AgentHarness {
             request.memory_scope.as_ref(),
             request.extra_tools.iter().cloned(),
         );
+        if request.skills {
+            builtins.push(Arc::new(SkillTool));
+        }
         // Only a run with a mandate names its acting agent.
         let mandate = request.agent.is_some();
         // Under a mandate with no peer to offer, a `delegate` call is still a
@@ -682,7 +694,7 @@ impl AgentHarness {
         let tools = self
             .permitted(&builtins, request.allowed_tools.as_ref())
             .filter(|tool| !(hidden_delegate && tool.name() == DELEGATE_TOOL))
-            .map(Tool::definition)
+            .map(|tool| guided(tool, &builtins, &request.tool_guidance))
             .collect();
         (builtins, tools)
     }
@@ -1109,11 +1121,14 @@ impl AgentHarness {
     /// the activity signature.
     pub async fn tool_call(&self, request: ToolCallRequest) -> Result<ToolOutcome, String> {
         let call = request.call;
-        let builtins = self.builtins_labelled(
+        let mut builtins = self.builtins_labelled(
             request.memory_scope.as_ref(),
             std::iter::empty(),
             &request.flow_labels,
         );
+        if request.skill.is_some() {
+            builtins.push(Arc::new(SkillTool));
+        }
         // A second check of the mandate. The decision and the call can run on
         // workers with different tool lists.
         if !permits(&builtins, request.allowed_tools.as_ref(), &call.name) {
@@ -1140,6 +1155,10 @@ impl AgentHarness {
         {
             return Ok(self
                 .error_outcome("the tool labels changed after the decision; call the tool again"));
+        }
+        // A built-in wins a name clash, so this is the skill tool.
+        if let Some(lookup) = request.skill.filter(|_| tool.name() == LOAD_SKILL_TOOL) {
+            return Ok(self.skill_outcome(lookup, &call.arguments));
         }
         // A read-only run can read the files but never moves the head.
         let keep_files = !request.read_only;
@@ -1281,6 +1300,24 @@ impl AgentHarness {
             .reset(&mount.scope, mount.generation)
             .await
             .map_err(|err| model_failure(&err))
+    }
+
+    /// The result of a `load_skill` call (issue #2373). The body is cut like
+    /// any tool result. A missing skill is an error that the model reads.
+    fn skill_outcome(&self, lookup: SkillLookup, arguments: &serde_json::Value) -> ToolOutcome {
+        match (lookup, crate::skill::requested(arguments)) {
+            (SkillLookup::Found(body), _) => ToolOutcome::ok(fit_result(
+                truncate(&body, self.tool_output_limit),
+                self.max_result_bytes,
+            )),
+            (SkillLookup::Missing, Some(name)) => self.error_outcome(&format!(
+                "no skill named {:?}; the system prompt lists the skills",
+                truncate(name, crate::mesh::MAX_NAME_LEN)
+            )),
+            (SkillLookup::Missing, None) => {
+                self.error_outcome("load_skill needs a string argument \"name\"")
+            }
+        }
     }
 
     /// An error result whose recorded outcome fits the result cap.
@@ -1435,8 +1472,12 @@ impl AgentHarness {
         // gets no memory tool. An app tool of that name could otherwise slip
         // past the memory-write opt-in.
         let reserved = self.memory.is_some();
+        // `load_skill` is always reserved. An app tool of that name could
+        // otherwise answer a call that the model makes for a skill.
         let taken = move |name: &str| {
-            (reserved && name == MEMORY_TOOL) || builtins.iter().any(|tool| tool.name() == name)
+            (reserved && name == MEMORY_TOOL)
+                || name == LOAD_SKILL_TOOL
+                || builtins.iter().any(|tool| tool.name() == name)
         };
         builtins.iter().map(AsRef::as_ref).chain(
             self.tools
@@ -1459,6 +1500,22 @@ struct Scope<'a> {
     exercised: &'a BTreeSet<String>,
     /// The flow rules that a person released before the turn.
     released: &'a Released,
+}
+
+/// The definition of `tool` that the model sees. Guidance replaces the
+/// description of an app tool (issue #2373). A built-in keeps its own text.
+/// The name, the schema and the effect never change.
+fn guided(
+    tool: &dyn Tool,
+    builtins: &[Arc<dyn Tool>],
+    guidance: &BTreeMap<String, String>,
+) -> ToolDefinition {
+    let mut definition = tool.definition();
+    let builtin = builtins.iter().any(|other| other.name() == tool.name());
+    if let Some(text) = guidance.get(tool.name()).filter(|_| !builtin) {
+        definition.description.clone_from(text);
+    }
+    definition
 }
 
 /// Whether the mandate permits the tool `name`.
@@ -1653,7 +1710,7 @@ fn fit_result(text: String, cap: u64) -> String {
 }
 
 /// Cut `text` to at most `max` bytes on a char boundary, and mark the cut.
-fn cut_bytes(text: String, max: usize) -> String {
+pub(crate) fn cut_bytes(text: String, max: usize) -> String {
     if text.len() <= max {
         return text;
     }
@@ -2018,6 +2075,45 @@ mod tests {
             let out = crate::agent::overlay::apply(&profile, &overlay, &ceilings, &harness);
             assert_eq!(out.is_ok(), registered, "{name}");
         }
+    }
+
+    #[test]
+    fn a_harness_registers_only_its_app_tools() {
+        use crate::tool::FnTool;
+        let harness = AgentHarness::new(Arc::new(NoModel))
+            .tool(
+                FnTool::new("lookup", "Find.", serde_json::json!({}), |_| async {
+                    Ok(serde_json::json!(1))
+                })
+                .shared(),
+            )
+            .tool(
+                FnTool::new(
+                    crate::skill::LOAD_SKILL_TOOL,
+                    "Mine.",
+                    serde_json::json!({}),
+                    |_| async { Ok(serde_json::json!(1)) },
+                )
+                .shared(),
+            );
+        assert!(crate::agent::overlay::ToolRegistry::has_tool(
+            &harness, "lookup"
+        ));
+        assert!(!crate::agent::overlay::ToolRegistry::has_tool(
+            &harness, "pay"
+        ));
+        assert!(!crate::agent::overlay::ToolRegistry::has_tool(
+            &harness,
+            crate::skill::LOAD_SKILL_TOOL
+        ));
+        assert!(!crate::agent::overlay::ToolRegistry::has_tool(
+            &harness,
+            crate::memory::MEMORY_TOOL
+        ));
+        assert!(!crate::agent::overlay::ToolRegistry::has_tool(
+            &harness,
+            crate::mesh::DELEGATE_TOOL
+        ));
     }
 
     #[test]
