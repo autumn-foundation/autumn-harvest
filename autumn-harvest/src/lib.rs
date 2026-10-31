@@ -429,6 +429,8 @@ pub mod metrics_rs_adapter;
 pub mod migrate;
 /// Durable mutual-exclusion locks for workflow code (`ctx.mutex`, issue #691).
 pub mod mutex;
+/// The log of agent profile overlays (issue #2371).
+pub mod overlay_log;
 /// The owner-local disk cache of decided histories (issue #2258).
 #[cfg(feature = "owner-disk-cache")]
 pub mod owner_disk_cache;

@@ -15,6 +15,9 @@ categories = ["asynchronous"]
 default = []
 # Register the agent loop on the embedded SQLite backend.
 sqlite = ["dep:autumn-harvest-sqlite"]
+# The Postgres overlay store (issue #2371). It turns on the `db` feature of
+# the core crate, which holds the queries. This crate adds no Diesel code.
+postgres = ["autumn-harvest/db"]
 # Replay-as-evaluation (issue #2001). Drives a recorded run in the in-memory
 # test engine, so it needs the engine's `testing` surface.
 eval = ["autumn-harvest/testing"]
@@ -52,6 +55,13 @@ tokio-util = "0.7"
 # Measures gzip against delta encoding (issue #2009). Already in the lockfile.
 flate2 = "1"
 tokio = { workspace = true }
+# The Postgres overlay store suite (issue #2371) builds its own pool and
+# checks the guard with raw SQL.
+deadpool = { workspace = true }
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
 
 [[test]]
 name = "sqlite_loop"
@@ -128,6 +138,10 @@ required-features = ["sqlite"]
 [[test]]
 name = "agent_workspace"
 required-features = ["sqlite"]
+
+[[test]]
+name = "overlay_store_postgres"
+required-features = ["postgres"]
 
 [lints]
 workspace = true

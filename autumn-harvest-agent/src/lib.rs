@@ -105,6 +105,14 @@ pub mod workspace;
 pub use agent::overlay::{
     Ceilings, GUARDRAILS_HEADING, ModelRegistry, OverlayError, ProfileOverlay,
 };
+#[cfg(feature = "postgres")]
+pub use agent::overlay_store::PostgresOverlayStore;
+#[cfg(feature = "sqlite")]
+pub use agent::overlay_store::SqliteOverlayStore;
+pub use agent::overlay_store::{
+    InMemoryOverlayStore, MAX_AUTHOR_LEN, OverlayStoreError, OverlayValidator, OverlayVersion,
+    ProfileOverlayStore, Provenance, StoredOverlay,
+};
 pub use agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentHeartbeat, AgentId, AgentIdError, AgentMemory, AgentOp,
     AgentProfile, AgentState, AgentStatus, Control, HeartbeatSetting, INTERRUPT_SIGNAL, Interrupt,

@@ -243,7 +243,8 @@ fn allowlisted(key: &str) -> bool {
 struct SuiteRow {
     /// `linux` | `linuxpart` | `allos` | `compileonly`.
     osclass: String,
-    /// `autumn-harvest` | `autumn-harvest-conformance` | `autumn-harvest-plugin`
+    /// `autumn-harvest` | `autumn-harvest-agent` | `autumn-harvest-conformance`
+    /// | `autumn-harvest-plugin`
     /// | `autumn-harvest-redis` | `agent-mesh` | `history-load-gate`
     /// | `standalone-runner`.
     krate: String,
@@ -300,6 +301,8 @@ fn parse_manifest() -> Vec<SuiteRow> {
     const VALID_OSCLASS: &[&str] = &["linux", "linuxpart", "allos", "compileonly"];
     const VALID_CRATE: &[&str] = &[
         "autumn-harvest",
+        // Issue #2371: the Postgres overlay store suite.
+        "autumn-harvest-agent",
         // Issue #2030: the cross-backend conformance suite.
         "autumn-harvest-conformance",
         "autumn-harvest-plugin",
@@ -983,6 +986,62 @@ fn history_load_gate_postgres_suite_has_a_running_row() {
             "examples/history-load-gate/tests/{target}.rs needs a `linux history-load-gate {target}` row"
         );
     }
+}
+
+/// Issue #2371. Each agent test target that needs the `postgres` feature
+/// runs from a `linux` manifest row. The agent test step in `ci.yml` does
+/// not turn the feature on, so without a row the target never runs.
+#[test]
+fn agent_postgres_suites_have_a_running_row() {
+    let rows = parse_manifest();
+    let manifest = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../autumn-harvest-agent/Cargo.toml"),
+    )
+    .expect("read the agent Cargo.toml");
+    let targets = postgres_test_targets(&manifest);
+    assert!(
+        targets.contains(&"overlay_store_postgres".to_owned()),
+        "the agent crate has a Postgres suite: {targets:?}"
+    );
+    for target in targets {
+        assert!(
+            rows.iter().any(|r| r.krate == "autumn-harvest-agent"
+                && r.target == target
+                && r.osclass == "linux"
+                && r.feature_set().contains("postgres")
+                && r.filter == "-"),
+            "autumn-harvest-agent/tests/{target}.rs needs a \
+             `linux autumn-harvest-agent {target} postgres -` row"
+        );
+    }
+}
+
+/// The `[[test]]` names in `manifest` whose `required-features` hold
+/// `postgres`.
+fn postgres_test_targets(manifest: &str) -> Vec<String> {
+    manifest
+        .split("[[test]]")
+        .skip(1)
+        .filter_map(|block| {
+            let block = block.split("\n[").next().unwrap_or(block);
+            let name = block
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("name = "))?
+                .trim_matches('"');
+            let needs = block
+                .lines()
+                .any(|line| line.contains("required-features") && line.contains("\"postgres\""));
+            needs.then(|| name.to_owned())
+        })
+        .collect()
+}
+
+#[test]
+fn postgres_test_targets_reads_required_features() {
+    let manifest = "[[test]]\nname = \"a\"\nrequired-features = [\"sqlite\"]\n\n\
+                    [[test]]\nname = \"b\"\nrequired-features = [\"postgres\"]\n\n\
+                    [lints]\nworkspace = true\n";
+    assert_eq!(postgres_test_targets(manifest), ["b"]);
 }
 
 /// The name of the `ci.yml` step that runs the offline suites of the
