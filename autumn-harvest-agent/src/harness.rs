@@ -295,6 +295,13 @@ impl AgentHarness {
         self
     }
 
+    /// Whether the registry holds the model `name`. It always holds
+    /// [`DEFAULT_MODEL`].
+    #[must_use]
+    pub fn has_model(&self, name: &str) -> bool {
+        name == DEFAULT_MODEL || self.models.contains_key(name)
+    }
+
     /// The model `name`. `None` is the [`DEFAULT_MODEL`].
     ///
     /// # Errors
@@ -1986,6 +1993,30 @@ mod tests {
             _request: &'a ChatRequest,
         ) -> crate::model::BoxFuture<'a, Result<crate::model::ChatResponse, AgentError>> {
             Box::pin(async { Err(AgentError::new(ErrorKind::Provider, "unused")) })
+        }
+    }
+
+    #[test]
+    fn the_registry_holds_the_default_and_each_named_model() {
+        use crate::agent::overlay::ModelRegistry;
+        let harness = AgentHarness::new(Arc::new(NoModel)).model_named("cheap", Arc::new(NoModel));
+        assert!(harness.has_model(DEFAULT_MODEL));
+        assert!(harness.has_model("cheap"));
+        assert!(!harness.has_model("other"));
+        assert!(ModelRegistry::has_model(&harness, "cheap"));
+        assert!(!ModelRegistry::has_model(&harness, "other"));
+        let profile = crate::AgentProfile::new("support");
+        let ceilings = crate::Ceilings {
+            models: ["cheap", "other"].map(str::to_owned).into(),
+            ..crate::Ceilings::from_profile(&profile)
+        };
+        for (name, registered) in [("cheap", true), ("other", false)] {
+            let overlay = crate::ProfileOverlay {
+                model: Some(name.to_owned()),
+                ..crate::ProfileOverlay::default()
+            };
+            let out = crate::agent::overlay::apply(&profile, &overlay, &ceilings, &harness);
+            assert_eq!(out.is_ok(), registered, "{name}");
         }
     }
 
