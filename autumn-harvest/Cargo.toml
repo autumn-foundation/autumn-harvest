@@ -416,8 +416,11 @@ testcontainers-modules = { workspace = true }
 
 # Runs the real `agent_loop` on a Postgres worker to measure the resident hit
 # rate (issue #2013). The loom and shuttle models never use it.
+# Keep this dependency path-only, with no `version`. The agent crate depends on
+# this crate, so a versioned edge makes a cycle. Cargo then cannot order a
+# workspace `cargo publish`. A path-only dev-dependency is stripped on publish.
 [target.'cfg(not(any(loom, shuttle)))'.dev-dependencies]
-autumn-harvest-agent = { version = "0.8.0", path = "../autumn-harvest-agent" }
+autumn-harvest-agent = { path = "../autumn-harvest-agent" }
 # Explores every interleaving of the DST oracles within a bound (the
 # `stateright` test target). Dev-only, so it never ships. The loom and Shuttle
 # builds skip it, so `--cfg loom` cannot reach its dependencies.
