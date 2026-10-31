@@ -5,7 +5,7 @@
 //! past what the operator allows. The design is in
 //! `docs/design/DESIGN-2370.md`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -13,6 +13,9 @@ use thiserror::Error;
 use super::AgentProfile;
 use crate::harness::{AgentHarness, DEFAULT_MODEL, truncate};
 use crate::mesh::MAX_NAME_LEN;
+#[cfg(test)]
+use crate::skill::MAX_SKILL_SUMMARY_CHARS;
+use crate::skill::{SkillText, first_invalid};
 
 /// The heading of the guardrails in the system prompt.
 pub const GUARDRAILS_HEADING: &str = "## Guardrails";
@@ -46,6 +49,13 @@ pub struct ProfileOverlay {
     /// outside the app.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+    /// The text that replaces the description of each named tool (issue
+    /// #2373). Each key must name a registered tool.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_guidance: BTreeMap<String, String>,
+    /// The skills that the agent loads on demand (issue #2373).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skills: BTreeMap<String, SkillText>,
 }
 
 /// The limits of the profile that [`apply`] returns.
@@ -103,6 +113,26 @@ impl ModelRegistry for BTreeSet<String> {
     }
 }
 
+/// The tools that a harness holds (issue #2373).
+pub trait ToolRegistry {
+    /// Whether the registry holds the app tool `name`.
+    fn has_tool(&self, name: &str) -> bool;
+}
+
+impl ToolRegistry for AgentHarness {
+    fn has_tool(&self, name: &str) -> bool {
+        Self::has_tool(self, name)
+    }
+}
+
+/// A plain set holds the names of models and tools in one set. A set of
+/// model names alone refuses every guidance key, so it fails closed.
+impl ToolRegistry for BTreeSet<String> {
+    fn has_tool(&self, name: &str) -> bool {
+        self.contains(name)
+    }
+}
+
 /// Why [`apply`] refuses an overlay.
 ///
 /// [`apply`] checks in variant order and returns the first refusal. It cuts
@@ -130,6 +160,20 @@ pub enum OverlayError {
     UnknownModel {
         /// The model name.
         model: String,
+    },
+    /// A guidance key of the result names no registered tool (issue #2373).
+    #[error("the harness has no tool named {tool:?}")]
+    UnknownTool {
+        /// The tool name.
+        tool: String,
+    },
+    /// A skill of the result is not valid (issue #2373).
+    #[error("the skill {skill:?} is not valid: {reason}")]
+    InvalidSkill {
+        /// The skill name.
+        skill: String,
+        /// Why the skill is not valid.
+        reason: &'static str,
     },
 }
 
@@ -196,8 +240,9 @@ fn with_guardrails(system: Option<&str>, guardrails: &str) -> String {
 /// bound may be above its ceiling. So a profile bound above an operator
 /// ceiling fails, even when the overlay does not set that bound. The model
 /// is the overlay model, or else the profile model. The guardrails go after
-/// the system prompt. Each other field keeps its profile value. The Verus
-/// proof `agent_overlay.rs` models this function.
+/// the system prompt. The tool guidance and the skills merge over the
+/// profile maps, and an overlay entry wins. Each other field keeps its
+/// profile value. The Verus proof `agent_overlay.rs` models this function.
 ///
 /// # Errors
 ///
@@ -208,7 +253,11 @@ fn with_guardrails(system: Option<&str>, guardrails: &str) -> String {
 ///   model, or the profile mandate forbids the overlay model.
 /// - [`OverlayError::UnknownModel`]: `registry` does not hold the overlay
 ///   model.
-pub fn apply<R: ModelRegistry + ?Sized>(
+/// - [`OverlayError::UnknownTool`]: a guidance key of the result names no
+///   tool of `registry`.
+/// - [`OverlayError::InvalidSkill`]: a skill of the result fails
+///   [`skill::check`](crate::skill::check).
+pub fn apply<R: ModelRegistry + ToolRegistry + ?Sized>(
     profile: &AgentProfile,
     overlay: &ProfileOverlay,
     ceilings: &Ceilings,
@@ -223,6 +272,8 @@ pub fn apply<R: ModelRegistry + ?Sized>(
         max_total_tokens,
         max_output_tokens,
         read_only,
+        tool_guidance,
+        skills,
     } = overlay;
     let above = |field| OverlayError::AboveCeiling { field };
     let Ok(Some(max_steps)) = merged_bound(Some(profile.max_steps), *max_steps, ceilings.max_steps)
@@ -267,6 +318,19 @@ pub fn apply<R: ModelRegistry + ?Sized>(
             model: truncate(named, MAX_NAME_LEN),
         });
     }
+    let tool_guidance = merged(&profile.tool_guidance, tool_guidance);
+    if let Some(tool) = tool_guidance.keys().find(|tool| !registry.has_tool(tool)) {
+        return Err(OverlayError::UnknownTool {
+            tool: truncate(tool, MAX_NAME_LEN),
+        });
+    }
+    let skills = merged(&profile.skills, skills);
+    if let Some((skill, reason)) = first_invalid(&skills) {
+        return Err(OverlayError::InvalidSkill {
+            skill: truncate(skill, MAX_NAME_LEN),
+            reason,
+        });
+    }
     let system = system.as_ref().or(profile.system.as_ref());
     let system = guardrails.as_deref().map_or_else(
         || system.cloned(),
@@ -279,8 +343,17 @@ pub fn apply<R: ModelRegistry + ?Sized>(
         max_output_tokens,
         read_only,
         model: model.cloned(),
+        tool_guidance,
+        skills,
         ..profile.clone()
     })
+}
+
+/// `base` with each entry of `over` on top. An entry of `over` wins.
+fn merged<V: Clone>(base: &BTreeMap<String, V>, over: &BTreeMap<String, V>) -> BTreeMap<String, V> {
+    let mut out = base.clone();
+    out.extend(over.iter().map(|(key, value)| (key.clone(), value.clone())));
+    out
 }
 
 #[cfg(test)]
@@ -766,7 +839,207 @@ mod tests {
         );
     }
 
+    fn guided(tool: &str, text: &str) -> ProfileOverlay {
+        ProfileOverlay {
+            tool_guidance: BTreeMap::from([(tool.to_owned(), text.to_owned())]),
+            ..ProfileOverlay::default()
+        }
+    }
+
+    fn with_skill(name: &str, summary: &str) -> ProfileOverlay {
+        ProfileOverlay {
+            skills: BTreeMap::from([(name.to_owned(), SkillText::new(summary, "body"))]),
+            ..ProfileOverlay::default()
+        }
+    }
+
+    #[test]
+    fn guidance_for_an_unregistered_tool_is_refused() {
+        let profile = rich_profile();
+        let ceilings = Ceilings::from_profile(&profile);
+        let err = apply(
+            &profile,
+            &guided("ghost", "Use it well."),
+            &ceilings,
+            &registry(&["lookup"]),
+        );
+        assert_eq!(
+            err,
+            Err(OverlayError::UnknownTool {
+                tool: "ghost".to_owned()
+            })
+        );
+        let out = apply(
+            &profile,
+            &guided("lookup", "Use it well."),
+            &ceilings,
+            &registry(&["lookup"]),
+        )
+        .expect("a registered tool takes guidance");
+        assert_eq!(out.tool_guidance["lookup"], "Use it well.");
+    }
+
+    #[test]
+    fn a_profile_key_for_an_unregistered_tool_fails_too() {
+        let profile = rich_profile().tool_guidance("ghost", "Old text.");
+        let err = apply(
+            &profile,
+            &ProfileOverlay::default(),
+            &Ceilings::from_profile(&profile),
+            &registry(&["lookup"]),
+        );
+        assert_eq!(
+            err,
+            Err(OverlayError::UnknownTool {
+                tool: "ghost".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn guidance_and_skills_merge_over_the_profile() {
+        let profile = rich_profile()
+            .tool_guidance("lookup", "Old.")
+            .tool_guidance("pay", "Keep.")
+            .skill("triage", SkillText::new("Old triage.", "old"))
+            .skill("refund", SkillText::new("Refunds.", "steps"));
+        let overlay = ProfileOverlay {
+            tool_guidance: BTreeMap::from([("lookup".to_owned(), "New.".to_owned())]),
+            skills: BTreeMap::from([("triage".to_owned(), SkillText::new("New triage.", "new"))]),
+            ..ProfileOverlay::default()
+        };
+        let ceilings = Ceilings::from_profile(&profile);
+        let names = registry(&["lookup", "pay"]);
+        let out = apply(&profile, &overlay, &ceilings, &names).expect("valid parts apply");
+        assert_eq!(out.tool_guidance["lookup"], "New.");
+        assert_eq!(out.tool_guidance["pay"], "Keep.");
+        assert_eq!(out.skills["triage"], SkillText::new("New triage.", "new"));
+        assert_eq!(out.skills["refund"], SkillText::new("Refunds.", "steps"));
+        assert_eq!(apply(&out, &overlay, &ceilings, &names), Ok(out));
+    }
+
+    #[test]
+    fn an_invalid_skill_is_refused() {
+        let profile = rich_profile();
+        let ceilings = Ceilings::from_profile(&profile);
+        let long = "x".repeat(MAX_SKILL_SUMMARY_CHARS + 1);
+        for (name, summary, reason) in [
+            (
+                "Bad Name",
+                "Fine.",
+                "the name must hold 1 to 64 of a-z, 0-9, _ and -",
+            ),
+            (
+                "",
+                "Fine.",
+                "the name must hold 1 to 64 of a-z, 0-9, _ and -",
+            ),
+            ("triage", "", "the summary is empty"),
+            ("triage", "  ", "the summary is empty"),
+            ("triage", "two\nlines", "the summary has a line break"),
+            ("triage", long.as_str(), "the summary is too long"),
+        ] {
+            let err = apply(
+                &profile,
+                &with_skill(name, summary),
+                &ceilings,
+                &registry(&[]),
+            );
+            assert_eq!(
+                err,
+                Err(OverlayError::InvalidSkill {
+                    skill: name.to_owned(),
+                    reason
+                }),
+                "{name:?} {summary:?}"
+            );
+        }
+        let at_cap = "x".repeat(MAX_SKILL_SUMMARY_CHARS);
+        let out = apply(
+            &profile,
+            &with_skill("triage", &at_cap),
+            &ceilings,
+            &registry(&[]),
+        )
+        .expect("a summary at the cap applies");
+        assert_eq!(out.skills["triage"].summary, at_cap);
+    }
+
+    #[test]
+    fn an_error_names_a_long_tool_or_skill_in_short() {
+        let profile = rich_profile();
+        let ceilings = Ceilings::from_profile(&profile);
+        let long = "t".repeat(10 * MAX_NAME_LEN);
+        let Err(OverlayError::UnknownTool { tool }) =
+            apply(&profile, &guided(&long, "x"), &ceilings, &registry(&[]))
+        else {
+            panic!("a long tool name is unknown");
+        };
+        assert!(tool.chars().count() < 2 * MAX_NAME_LEN, "{tool}");
+        let Err(OverlayError::InvalidSkill { skill, .. }) =
+            apply(&profile, &with_skill(&long, "x"), &ceilings, &registry(&[]))
+        else {
+            panic!("a long skill name is not valid");
+        };
+        assert!(skill.chars().count() < 2 * MAX_NAME_LEN, "{skill}");
+    }
+
+    #[test]
+    fn an_overlay_with_guidance_and_skills_round_trips_through_json() {
+        let overlay = ProfileOverlay {
+            tool_guidance: BTreeMap::from([("lookup".to_owned(), "Use it well.".to_owned())]),
+            skills: BTreeMap::from([("triage".to_owned(), SkillText::new("Sort.", "Steps."))]),
+            ..ProfileOverlay::default()
+        };
+        let text = serde_json::to_string(&overlay).expect("encode");
+        assert_eq!(
+            serde_json::from_str::<ProfileOverlay>(&text).expect("decode"),
+            overlay
+        );
+        let extra = json!({"skills": {"triage": {"summary": "s", "body": "b", "effect": "write"}}});
+        assert!(serde_json::from_value::<ProfileOverlay>(extra).is_err());
+        assert_eq!(
+            serde_json::to_string(&ProfileOverlay::default()).expect("encode"),
+            "{}"
+        );
+    }
+
     const MODELS: [&str; 4] = [DEFAULT_MODEL, "m1", "m2", "m3"];
+
+    /// Tool names. A registry never holds `ghost`.
+    const TOOLS: [&str; 3] = ["lookup", "pay", "ghost"];
+
+    /// Skill names. `Bad Name` is not a valid name.
+    const SKILLS: [&str; 3] = ["triage", "refund", "Bad Name"];
+
+    /// One of `names`. The last name is a bad case, so it comes rarely.
+    /// Then most cases reach the checks of an applied result.
+    fn mostly_good(names: [&'static str; 3]) -> impl Strategy<Value = String> {
+        prop_oneof![
+            4 => Just(names[0].to_owned()),
+            4 => Just(names[1].to_owned()),
+            1 => Just(names[2].to_owned()),
+        ]
+    }
+
+    fn any_guidance() -> impl Strategy<Value = BTreeMap<String, String>> {
+        proptest::collection::btree_map(mostly_good(TOOLS), "[a-z ]{0,8}", 0..=2)
+    }
+
+    fn any_skill_text() -> impl Strategy<Value = SkillText> {
+        let summary = prop_oneof![
+            16 => "[a-z ]{0,11}[a-z]",
+            1 => Just(String::new()),
+            1 => Just("two\nlines".to_owned()),
+            1 => Just("a\u{2028}b\tc".to_owned()),
+            1 => Just("x".repeat(MAX_SKILL_SUMMARY_CHARS + 1)),
+        ];
+        (summary, "[a-z\n ]{0,24}").prop_map(|(summary, body)| SkillText::new(summary, body))
+    }
+
+    fn any_skills() -> impl Strategy<Value = BTreeMap<String, SkillText>> {
+        proptest::collection::btree_map(mostly_good(SKILLS), any_skill_text(), 0..=2)
+    }
 
     fn any_model() -> impl Strategy<Value = Option<String>> {
         proptest::option::of(proptest::sample::select(MODELS.to_vec()).prop_map(str::to_owned))
@@ -785,10 +1058,25 @@ mod tests {
             .prop_map(|names| names.into_iter().map(str::to_owned).collect())
     }
 
-    /// A registry. Half of the time it holds every model, so more overlays
-    /// apply.
+    /// A registry of models and tools. Half of the time it holds every
+    /// model and every real tool, so more overlays apply.
     fn any_registry() -> impl Strategy<Value = BTreeSet<String>> {
-        prop_oneof![any_models(), Just(registry(&MODELS))]
+        let tools = proptest::sample::subsequence(vec!["lookup", "pay"], 0..=2);
+        let some = (any_models(), tools).prop_map(|(mut names, tools)| {
+            names.extend(tools.into_iter().map(str::to_owned));
+            names
+        });
+        prop_oneof![
+            some,
+            Just(registry(&[
+                DEFAULT_MODEL,
+                "m1",
+                "m2",
+                "m3",
+                "lookup",
+                "pay"
+            ]))
+        ]
     }
 
     prop_compose! {
@@ -803,6 +1091,8 @@ mod tests {
             window in 0_u32..300,
             mandate in proptest::option::of(proptest::option::of(any_models())),
             beat in proptest::option::of((any_bound(), any_model())),
+            tool_guidance in any_guidance(),
+            skills in any_skills(),
         ) -> AgentProfile {
             let mut profile = AgentProfile::new("kind").max_steps(max_steps);
             profile.system = system;
@@ -824,6 +1114,8 @@ mod tests {
                 model,
                 ..AgentHeartbeat::every(std::time::Duration::from_secs(60))
             });
+            profile.tool_guidance = tool_guidance;
+            profile.skills = skills;
             profile
         }
     }
@@ -837,6 +1129,8 @@ mod tests {
             max_total_tokens in any_bound(),
             max_output_tokens in any_bound(),
             read_only in proptest::option::of(any::<bool>()),
+            tool_guidance in any_guidance(),
+            skills in any_skills(),
         ) -> ProfileOverlay {
             ProfileOverlay {
                 system,
@@ -846,6 +1140,8 @@ mod tests {
                 max_total_tokens,
                 max_output_tokens,
                 read_only,
+                tool_guidance,
+                skills,
             }
         }
     }
@@ -888,7 +1184,8 @@ mod tests {
         prop_oneof![random_ceilings(), wide_ceilings()]
     }
 
-    /// `apply`, written from the rules in `docs/design/DESIGN-2370.md`.
+    /// `apply`, written from the rules in `docs/design/DESIGN-2370.md` and
+    /// `docs/design/DESIGN-2373.md`.
     fn oracle(
         profile: &AgentProfile,
         overlay: &ProfileOverlay,
@@ -933,6 +1230,22 @@ mod tests {
         if overlay.model.is_some() && !names.contains(&name) {
             return Err(OverlayError::UnknownModel { model: name });
         }
+        let mut tool_guidance = profile.tool_guidance.clone();
+        tool_guidance.extend(overlay.tool_guidance.clone());
+        if let Some(tool) = tool_guidance.keys().find(|tool| !names.contains(*tool)) {
+            return Err(OverlayError::UnknownTool { tool: tool.clone() });
+        }
+        let mut skills = profile.skills.clone();
+        skills.extend(overlay.skills.clone());
+        for (index, (skill, text)) in skills.iter().enumerate() {
+            let reason = skill_reason(index, skill, text);
+            if let Some(reason) = reason {
+                return Err(OverlayError::InvalidSkill {
+                    skill: skill.clone(),
+                    reason,
+                });
+            }
+        }
         let mut system = overlay.system.clone().or_else(|| profile.system.clone());
         if let Some(guardrails) = &overlay.guardrails {
             let section = format!("## Guardrails\n\n{guardrails}");
@@ -950,7 +1263,43 @@ mod tests {
         out.max_total_tokens = max_total_tokens;
         out.max_output_tokens = max_output_tokens;
         out.read_only = read_only;
+        out.tool_guidance = tool_guidance;
+        out.skills = skills;
         Ok(out)
+    }
+
+    /// Why the skill at `index` breaks a rule of `docs/design/DESIGN-2373.md`.
+    fn skill_reason(index: usize, skill: &str, text: &SkillText) -> Option<&'static str> {
+        let name_ok = !skill.is_empty()
+            && skill.len() <= 64
+            && skill
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+        let odd = |c: char| {
+            c.is_control()
+                || ('\u{2028}'..='\u{2029}').contains(&c)
+                || ('\u{202a}'..='\u{202e}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c)
+                || c == '\u{200e}'
+                || c == '\u{200f}'
+        };
+        if index >= 32 {
+            Some("there are more than 32 skills")
+        } else if !name_ok {
+            Some("the name must hold 1 to 64 of a-z, 0-9, _ and -")
+        } else if text.summary.trim().is_empty() {
+            Some("the summary is empty")
+        } else if text.summary.contains(['\n', '\r']) {
+            Some("the summary has a line break")
+        } else if text.summary.chars().any(odd) {
+            Some("the summary has a control or format character")
+        } else if text.summary.chars().count() > MAX_SKILL_SUMMARY_CHARS {
+            Some("the summary is too long")
+        } else if text.body.len() > 32 * 1024 {
+            Some("the body is too long")
+        } else {
+            None
+        }
     }
 
     /// Whether `value` is at most `ceiling`. A `None` ceiling sets no limit.
@@ -972,6 +1321,8 @@ mod tests {
             max_total_tokens: base.max_total_tokens,
             max_output_tokens: base.max_output_tokens,
             read_only: base.read_only,
+            tool_guidance: base.tool_guidance.clone(),
+            skills: base.skills.clone(),
             ..profile.clone()
         }
     }
@@ -1015,6 +1366,14 @@ mod tests {
                     let mandate = profile.mandate.as_ref();
                     prop_assert!(mandate.is_none_or(|m| m.allows_model(Some(model))));
                 }
+                prop_assert!(out.tool_guidance.keys().all(|tool| names.contains(tool)));
+                prop_assert!(out.skills.iter().all(|(name, text)| crate::skill::check(name, text).is_ok()));
+                for (tool, text) in &overlay.tool_guidance {
+                    prop_assert_eq!(out.tool_guidance.get(tool), Some(text));
+                }
+                for (name, text) in &overlay.skills {
+                    prop_assert_eq!(out.skills.get(name), Some(text));
+                }
                 prop_assert_eq!(unnamed(&out, &profile), profile);
             }
         }
@@ -1037,6 +1396,12 @@ mod tests {
             profile in any_profile(),
             names in any_registry(),
         ) {
+            // The Verus theorem needs each part of the profile to be valid.
+            let mut profile = profile;
+            profile.tool_guidance.retain(|tool, _| names.contains(tool));
+            profile
+                .skills
+                .retain(|name, text| crate::skill::check(name, text).is_ok());
             let out = apply(
                 &profile,
                 &ProfileOverlay::default(),

@@ -53,6 +53,7 @@ use crate::message::{
     ChatMessage, ChatRole, ContentPart, RunId, StopReason, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::policy::ToolDecision;
+use crate::skill::{self, LOAD_SKILL_TOOL};
 use crate::transcript::{PREFIX_MISSING, PrefixRef, Sent, TRANSCRIPT_DELTA_PATCH};
 use crate::types::{
     AgentReport, AgentStop, AgentTask, MAX_PARALLEL_CHILDREN, ModelTurn, ModelTurnRequest,
@@ -399,6 +400,8 @@ fn next_request(
         prefix: None,
         remember: false,
         model: task.model.clone(),
+        tool_guidance: task.tool_guidance.clone(),
+        skills: !task.skills.is_empty(),
     }
 }
 
@@ -464,15 +467,7 @@ pub(crate) async fn drive(
         tracing::warn!(error = %err, "the mesh search attribute was not set");
     }
     let mut tree = root_tree(ctx, task, &progress.run_id);
-    let agent = match &task.mandate {
-        Some(mandate) => {
-            mandate
-                .validate()
-                .map_err(|err| format!("the task mandate is not valid: {err}"))?;
-            Some(discover(ctx, mandate).await?)
-        }
-        None => None,
-    };
+    let agent = root_member(ctx, task).await?;
     let mut input = task.input.as_str();
     let mut delivered = 0_u32;
     loop {
@@ -943,8 +938,25 @@ fn take_steers(
     Ok(())
 }
 
-/// The system prompt of one segment: the task prompt and the memory
-/// snapshot.
+/// Check the mandate of `task`. Then find the peers that the mandate names,
+/// if it has one.
+///
+/// # Errors
+///
+/// Returns an error when the mandate is not valid, or when the peer lookup
+/// fails.
+async fn root_member(ctx: &WorkflowContext, task: &AgentTask) -> Result<Option<Member>, String> {
+    let Some(mandate) = &task.mandate else {
+        return Ok(None);
+    };
+    mandate
+        .validate()
+        .map_err(|err| format!("the task mandate is not valid: {err}"))?;
+    Ok(Some(discover(ctx, mandate).await?))
+}
+
+/// The system prompt of one segment: the task prompt, the skill list and
+/// the memory snapshot.
 ///
 /// The snapshot is read once per segment, by an activity, so the prompt does
 /// not change inside the segment and replay reads the recorded snapshot.
@@ -955,14 +967,28 @@ async fn system_prompt(
     ctx: &WorkflowContext,
     task: &AgentTask,
 ) -> Result<(Option<String>, BTreeSet<String>), String> {
+    // A skill name and summary join the prompt, so each segment checks them
+    // first. A durable agent runs its segments outside `drive` (issue #2373).
+    if let Some((name, reason)) = skill::first_invalid(&task.skills) {
+        return Err(format!(
+            "the skill {:?} is not valid: {reason}",
+            truncate(name, crate::mesh::MAX_NAME_LEN)
+        ));
+    }
+    // The list holds names and summaries, never a body (issue #2373).
+    let system = match (task.system.as_deref(), skill::listing(&task.skills)) {
+        (Some(system), Some(list)) if !system.is_empty() => Some(format!("{system}\n\n{list}")),
+        (_, Some(list)) => Some(list),
+        (system, None) => system.map(str::to_owned),
+    };
     let Some(scope) = &task.memory_scope else {
-        return Ok((task.system.clone(), BTreeSet::new()));
+        return Ok((system, BTreeSet::new()));
     };
     let snapshot: MemorySnapshot = ctx
         .execute_activity(&agent_memory_snapshot_info(), scope.clone())
         .await
         .map_err(|e| e.to_string())?;
-    let prompt = task.system.as_ref().map_or_else(
+    let prompt = system.as_ref().map_or_else(
         || snapshot.text().to_owned(),
         |system| format!("{system}\n\n{}", snapshot.text()),
     );
@@ -1547,13 +1573,16 @@ async fn run_tool(
     if let Some(agent) = run.agent.filter(|_| call.name == DELEGATE_TOOL) {
         return delegate(ctx, run, agent, progress, tree, &call).await;
     }
+    // The body comes from the recorded task, so the activity needs no
+    // lookup (issue #2373). A run with no skills offers no such tool.
+    let wants_skill = call.name == LOAD_SKILL_TOOL && !task.skills.is_empty();
     // A memory note keeps the labels of the tree (issue #2272).
     let flow_labels = if call.name == MEMORY_TOOL {
         tree.exercised.clone()
     } else {
         BTreeSet::new()
     };
-    let request = ToolCallRequest {
+    let mut request = ToolCallRequest {
         run_id: progress.run_id.clone(),
         session_id: task.session_id.clone(),
         step: progress.step_base.saturating_add(slot.step),
@@ -1564,7 +1593,15 @@ async fn run_tool(
         labels: slot.labels.cloned(),
         flow_labels,
         workspace: progress.workspace.clone(),
+        skill: None,
     };
+    if wants_skill {
+        request.skill = Some(skill::lookup(
+            &task.skills,
+            &request.call.arguments,
+            skill_room(task.request_cap(), &request),
+        ));
+    }
     // Only a tool that opts in races an interrupt. Any other call runs to
     // its end, because its side effect may be half done.
     if run.live && slot.interruptible {
@@ -1584,6 +1621,21 @@ async fn run_tool(
     }
     let outcome = call_tool(ctx, request).await?;
     Ok(adopt_workspace(progress, outcome))
+}
+
+/// The bytes that the request cap `cap` leaves for a skill body in
+/// `request` (issue #2373). The envelope of the lookup takes a few more
+/// bytes. A cap of zero is no cap, so the room is zero too.
+fn skill_room(cap: u64, request: &ToolCallRequest) -> u64 {
+    /// The JSON around the body: the field name, the tag and the cut mark.
+    const LOOKUP_ENVELOPE_BYTES: u64 = 64;
+    if cap == 0 {
+        return 0;
+    }
+    // A full request leaves room 1, not 0, so the body never goes uncut.
+    cap.saturating_sub(json_len(request))
+        .saturating_sub(LOOKUP_ENVELOPE_BYTES)
+        .max(1)
 }
 
 /// The most runs of one tool call whose workspace store fails (issue
@@ -2236,6 +2288,10 @@ fn child_task(
         waiting: Vec::new(),
         // Only a fan-out sets it, after its gate.
         report_failure: false,
+        // The peer has its own prompt, so the guidance and the skills of the
+        // parent do not apply to it (issue #2373).
+        tool_guidance: std::collections::BTreeMap::new(),
+        skills: std::collections::BTreeMap::new(),
     }
 }
 

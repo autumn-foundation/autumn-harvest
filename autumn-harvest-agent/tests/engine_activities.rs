@@ -49,6 +49,8 @@ fn with_harness(harness: AgentHarness) -> ActivityContext {
 
 fn turn_request() -> ModelTurnRequest {
     ModelTurnRequest {
+        skills: false,
+        tool_guidance: std::collections::BTreeMap::new(),
         run_id: "run-1".into(),
         session_id: None,
         steps_used: 0,
@@ -151,6 +153,7 @@ async fn the_tool_handler_runs_the_named_tool_with_its_context() {
     ));
     let ctx = with_harness(harness);
     let request = ToolCallRequest {
+        skill: None,
         run_id: "run-1".into(),
         session_id: None,
         step: 0,
@@ -370,6 +373,7 @@ async fn a_huge_tool_error_still_fits_the_result_cap() {
         .tool_output_limit(usize::MAX);
     let outcome = harness
         .tool_call(ToolCallRequest {
+            skill: None,
             run_id: "run-1".into(),
             session_id: None,
             step: 0,
@@ -599,6 +603,7 @@ async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
     ));
     let outcome = harness
         .tool_call(ToolCallRequest {
+            skill: None,
             run_id: "run-1".into(),
             session_id: None,
             step: 0,
@@ -731,6 +736,7 @@ async fn a_zero_result_cap_leaves_a_big_reply_and_a_big_tool_result_alone() {
 
     let outcome = harness
         .tool_call(ToolCallRequest {
+            skill: None,
             run_id: "run-1".into(),
             session_id: None,
             step: 0,

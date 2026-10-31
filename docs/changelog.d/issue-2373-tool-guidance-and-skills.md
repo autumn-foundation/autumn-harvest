@@ -1,0 +1,38 @@
+## Agents — Tool guidance and skills as overlay parts (issue #2373, epic #2369)
+
+`ProfileOverlay`, `AgentProfile` and `AgentTask` get `tool_guidance` and
+`skills`. `skill` adds `SkillText`, `LOAD_SKILL_TOOL`, `SKILLS_HEADING`,
+`MAX_SKILL_SUMMARY_CHARS`, `MAX_SKILLS`, `MAX_SKILL_BODY_BYTES` and
+`check`. `overlay` adds `ToolRegistry`, and
+`OverlayError` adds `UnknownTool` and `InvalidSkill`.
+`AgentHarness::has_tool` is new.
+
+- **Tool guidance.** The text replaces the description of an app tool in
+  the definition that the model sees. The name, the schema, the effect and
+  the policy stay. `apply` refuses a key that names no app tool.
+- **Skills.** The system prompt lists each name and summary, never a body.
+  The model gets `load_skill`, with `ToolEffect::ReadOnly`. A call is an
+  ordinary `agent_tool_call`. The workflow reads the body from the task, so
+  history records it and replay reads it from there. The body is cut like
+  any tool result. Without skills, the tool is not offered. The name
+  `load_skill` is reserved, so an existing app tool with that name is no
+  longer shown, and `AgentHarness::tool` logs a warning. Upgrade every
+  worker before a run carries skills.
+- A skill has a valid name, a one-line summary with no control character,
+  and a body of at most 32 KiB. A map holds at most 32 skills. Each
+  segment checks them, durable agents included.
+- `apply` merges each map over the profile map, and an overlay entry wins.
+  It checks the result, so a stale profile key fails too.
+
+`ModelTurnRequest` gets `tool_guidance` and `skills`. `ToolCallRequest`
+gets `skill`, a `SkillLookup`. Each new field is skipped when empty, so a
+recorded history keeps its bytes. No event, migration or SQL changes. The
+design is in `docs/design/DESIGN-2373.md`.
+
+Tests: `formal/verus/src/agent_overlay.rs` models the guidance keys. It
+proves that `apply` refuses exactly when a key names no registered tool,
+and that guidance changes only the description of an app tool.
+`tests/skills.rs` covers the run criteria on SQLite and in
+`eval::evaluate`. The unit tests in `src/agent/overlay.rs` cover the
+refusals of `apply`. The overlay proptests check the new rules against the
+oracle.
