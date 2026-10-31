@@ -82,6 +82,10 @@ name = "mesh"
 required-features = ["sqlite"]
 
 [[test]]
+name = "model_turn_span"
+required-features = ["sqlite"]
+
+[[test]]
 name = "durable_agent"
 required-features = ["sqlite"]
 
