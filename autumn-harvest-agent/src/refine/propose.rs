@@ -343,10 +343,10 @@ pub(crate) const fn next_step(attempt: u32, max: u32, verdict: Verdict) -> Step 
 ///
 /// # Errors
 ///
-/// Returns a non-retryable payload when no proposer is installed, when
-/// `current` does not apply under the ceilings, or when the proposer fails
-/// with a configuration kind. Returns a retryable payload when the proposer
-/// fails with a retryable kind.
+/// Returns a non-retryable payload in three cases. No proposer is
+/// installed, `current` does not apply under the ceilings, or the proposer
+/// fails with a configuration kind. Returns a retryable payload when the
+/// proposer fails with a retryable kind.
 pub(crate) async fn run_stage(
     harness: &AgentHarness,
     request: ProposeRequest,
