@@ -9,6 +9,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use crate::context_reset::ContextReset;
 use crate::flow::Released;
 use crate::followup::Followups;
 use crate::loop_guard::LoopGuard;
@@ -174,6 +175,11 @@ pub struct AgentTask {
     /// parent keeps the usage and the labels of the failed run.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub report_failure: bool,
+    /// The context reset setting (issue #2453). With a setting, the run gets
+    /// the `save_progress` tool and resets near the request cap. See
+    /// [`context_reset`](crate::context_reset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_reset: Option<ContextReset>,
 }
 
 /// Where the run id of a task comes from.
@@ -223,7 +229,16 @@ impl AgentTask {
             workspace: None,
             waiting: Vec::new(),
             report_failure: false,
+            context_reset: None,
         }
+    }
+
+    /// Let the run save notes and reset near the request cap. See
+    /// [`context_reset`](Self::context_reset).
+    #[must_use]
+    pub const fn context_reset(mut self, setting: ContextReset) -> Self {
+        self.context_reset = Some(setting);
+        self
     }
 
     /// Give the run the workspace `scope`, from its head `head` (issue
@@ -763,6 +778,10 @@ pub struct AgentReport {
     /// The error of a run that ended under [`AgentStop::Failed`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The context resets of the run, follow-ups included (issue #2453). A
+    /// delegated child counts its own.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub resets: u32,
 }
 
 /// The transcript without system messages.

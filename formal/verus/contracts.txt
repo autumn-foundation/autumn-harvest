@@ -70,6 +70,21 @@ pub proof fn theorem_default_ceilings_only_narrow(p: Profile, o: Overlay, regist
 pub proof fn theorem_apply_is_idempotent(p: Profile, o: Overlay, c: Ceilings, registry: Set < int >) ensures apply(p, o, c, registry).is_some() ==> apply(apply(p, o, c, registry).unwrap(), o, c, registry) == apply(p, o, c, registry),
 pub proof fn theorem_an_empty_overlay_keeps_the_profile(p: Profile, registry: Set < int >) ensures apply(p, Overlay { max_steps: None, max_total_tokens: None, max_output_tokens: None, read_only: None, model: None, }, from_profile(p), registry,) == Some(p),
 
+## formal/verus/src/agent_reset.rs
+pub open spec fn clamped(percent: int) -> int { if percent == 0 { 1 } else if percent > 100 { 100 } else { percent } }
+pub open spec fn reaches(len: int, cap: int, percent: int) -> bool { cap > 0 && len * 100 >= cap * clamped(percent) }
+pub fn reaches_percent(len: u64, cap: u64, percent: u8) -> (r: bool) ensures r == reaches(len as int, cap as int, percent as int),
+pub open spec fn due(resets: int, max_resets: int, len: int, cap: int, percent: int) -> bool { resets < max_resets && reaches(len, cap, percent) }
+pub fn reset_due(resets: u32, max_resets: u32, len: u64, cap: u64, percent: u8) -> (r: bool) ensures r == due(resets as int, max_resets as int, len as int, cap as int, percent as int),
+pub proof fn theorem_a_request_over_the_cap_reaches_the_threshold(len: int, cap: int, percent: int) requires 0 < cap < len, 0 <= percent, ensures reaches(len, cap, percent),
+pub proof fn theorem_a_reset_comes_before_the_cap(resets: int, max_resets: int, len: int, cap: int, percent: int,) requires resets < max_resets, 0 < cap < len, 0 <= percent, ensures due(resets, max_resets, len, cap, percent),
+pub proof fn theorem_the_threshold_is_monotone(small: int, large: int, cap: int, percent: int) requires 0 <= small <= large, reaches(small, cap, percent), ensures reaches(large, cap, percent),
+pub proof fn theorem_a_request_under_the_threshold_fits(len: int, cap: int, percent: int) requires 0 <= len, 0 < cap, 0 <= percent, ! reaches(len, cap, percent), ensures len < cap,
+pub proof fn theorem_a_zero_cap_never_resets(resets: int, max_resets: int, len: int, percent: int) ensures ! due(resets, max_resets, len, 0, percent),
+pub open spec fn after(resets: int, max_resets: int, len: int, cap: int, percent: int) -> int { if due(resets, max_resets, len, cap, percent) { resets + 1 } else { resets } }
+pub open spec fn count(resets: int, max_resets: int, lens: Seq < int >, cap: int, percent: int) -> int decreases lens.len(), { if lens.len() == 0 { resets } else { count(after(resets, max_resets, lens [0], cap, percent), max_resets, lens.subrange(1, lens.len() as int), cap, percent,) } }
+pub proof fn theorem_resets_never_pass_the_cap(resets: int, max_resets: int, lens: Seq < int >, cap: int, percent: int,) requires 0 <= resets <= max_resets, ensures resets <= count(resets, max_resets, lens, cap, percent) <= max_resets, decreases lens.len(),
+
 ## formal/verus/src/agent_siblings.rs
 pub open spec fn share(remaining: int, siblings: int, index: int) -> int { if index < remaining % siblings { remaining / siblings + 1 } else { remaining / siblings } }
 pub open spec fn total(remaining: int, siblings: int, n: int) -> int decreases n, { if n <= 0 { 0 } else { total(remaining, siblings, n - 1) + share(remaining, siblings, n - 1) } }

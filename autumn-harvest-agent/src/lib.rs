@@ -9,7 +9,8 @@
 //! The crate owns its agent primitives: [`AgentModel`], [`Tool`],
 //! [`ToolPolicy`], [`Approval`] and the message types. It also has the
 //! always-on primitives: [`heartbeat`], [`followup`], [`delivery`],
-//! [`memory`] and [`loop_guard`]. [`ResponseCache`] serves an identical
+//! [`memory`] and [`loop_guard`]. [`context_reset`] lets a long run save
+//! notes and restart from them. [`ResponseCache`] serves an identical
 //! model call across runs. The `eval` feature adds the `eval` module.
 //! That module re-drives a recorded run with a candidate model or prompt.
 //! The `sandbox` feature adds the `sandbox` module. Its `SandboxTool` runs
@@ -75,6 +76,7 @@
 pub mod agent;
 pub mod approval;
 pub mod bounds;
+pub mod context_reset;
 pub mod delivery;
 pub mod error;
 #[cfg(feature = "eval")]
@@ -114,6 +116,7 @@ pub use agent::{
     agent_workspace_reset_info, agent_workspace_retain, agent_workspace_retain_info,
 };
 pub use approval::Approval;
+pub use context_reset::{ContextReset, ProgressNotes};
 pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
 pub use error::{AgentError, ErrorKind};
 pub use flow::{FlowRule, FlowRules, Recheck, Released};
