@@ -16,6 +16,7 @@ use crate::bounds::{exceeds_bytes, json_len};
 use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::{AgentError, ErrorKind};
 use crate::flow::{FlowRules, Released, call_labels};
+use crate::followup::FOLLOWUP_TOOL;
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::live::{Coalescer, LiveEvent, LiveSink};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemorySnapshot, MemoryStore, MemoryTool};
@@ -159,8 +160,12 @@ impl AgentHarness {
     }
 
     /// Add one tool.
+    ///
+    /// The harness never shows a tool named [`LOAD_SKILL_TOOL`], and logs a
+    /// warning for it.
     #[must_use]
     pub fn tool(mut self, tool: Arc<dyn Tool>) -> Self {
+        warn_reserved(tool.as_ref());
         self.tools.push(tool);
         self
     }
@@ -168,7 +173,9 @@ impl AgentHarness {
     /// Add several tools.
     #[must_use]
     pub fn tools(mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) -> Self {
-        self.tools.extend(tools);
+        for tool in tools {
+            self = self.tool(tool);
+        }
         self
     }
 
@@ -303,12 +310,13 @@ impl AgentHarness {
         name == DEFAULT_MODEL || self.models.contains_key(name)
     }
 
-    /// Whether the harness holds the app tool `name` (issue #2373). A
-    /// built-in tool is not an app tool. Neither is an app tool named
-    /// [`LOAD_SKILL_TOOL`], which the harness never shows.
+    /// Whether the harness holds the app tool `name` (issue #2373).
+    ///
+    /// A built-in tool is not an app tool. Neither is an app tool with the
+    /// name of a built-in, because a built-in can take its place in a run.
     #[must_use]
     pub fn has_tool(&self, name: &str) -> bool {
-        name != LOAD_SKILL_TOOL && self.tools.iter().any(|tool| tool.name() == name)
+        !is_builtin_name(name) && self.tools.iter().any(|tool| tool.name() == name)
     }
 
     /// The model `name`. `None` is the [`DEFAULT_MODEL`].
@@ -1518,11 +1526,28 @@ fn guided(
     definition
 }
 
+/// Whether `name` is the name of a built-in tool of the crate.
+fn is_builtin_name(name: &str) -> bool {
+    matches!(name, LOAD_SKILL_TOOL | MEMORY_TOOL | DELEGATE_TOOL) || name == FOLLOWUP_TOOL
+}
+
+/// Warn when an app tool takes the reserved name [`LOAD_SKILL_TOOL`]. The
+/// harness never shows such a tool (issue #2373).
+fn warn_reserved(tool: &dyn Tool) {
+    if tool.name() == LOAD_SKILL_TOOL {
+        tracing::warn!(
+            tool = LOAD_SKILL_TOOL,
+            "the name is reserved for skills; the harness never shows this app tool"
+        );
+    }
+}
+
 /// Whether the mandate permits the tool `name`.
 ///
 /// The mandate never bounds a workflow tool, such as `delegate`. Its own
 /// switch governs it. The `memory` tool writes state that later runs read,
-/// so an allowlist must name it.
+/// so an allowlist must name it. The `load_skill` tool needs no entry
+/// either. It reads only the skills of the run and changes nothing.
 fn permits(builtins: &[Arc<dyn Tool>], allowed: Option<&BTreeSet<String>>, name: &str) -> bool {
     allowed.is_none_or(|allowed| allowed.contains(name))
         || (name != MEMORY_TOOL && builtins.iter().any(|tool| tool.name() == name))
@@ -2079,41 +2104,28 @@ mod tests {
 
     #[test]
     fn a_harness_registers_only_its_app_tools() {
+        use crate::agent::overlay::ToolRegistry;
         use crate::tool::FnTool;
+        let app = |name: &str| {
+            FnTool::new(name, "Mine.", serde_json::json!({}), |_| async {
+                Ok(serde_json::json!(1))
+            })
+            .shared()
+        };
+        let builtins = [
+            crate::skill::LOAD_SKILL_TOOL,
+            crate::memory::MEMORY_TOOL,
+            crate::mesh::DELEGATE_TOOL,
+            crate::followup::FOLLOWUP_TOOL,
+        ];
         let harness = AgentHarness::new(Arc::new(NoModel))
-            .tool(
-                FnTool::new("lookup", "Find.", serde_json::json!({}), |_| async {
-                    Ok(serde_json::json!(1))
-                })
-                .shared(),
-            )
-            .tool(
-                FnTool::new(
-                    crate::skill::LOAD_SKILL_TOOL,
-                    "Mine.",
-                    serde_json::json!({}),
-                    |_| async { Ok(serde_json::json!(1)) },
-                )
-                .shared(),
-            );
-        assert!(crate::agent::overlay::ToolRegistry::has_tool(
-            &harness, "lookup"
-        ));
-        assert!(!crate::agent::overlay::ToolRegistry::has_tool(
-            &harness, "pay"
-        ));
-        assert!(!crate::agent::overlay::ToolRegistry::has_tool(
-            &harness,
-            crate::skill::LOAD_SKILL_TOOL
-        ));
-        assert!(!crate::agent::overlay::ToolRegistry::has_tool(
-            &harness,
-            crate::memory::MEMORY_TOOL
-        ));
-        assert!(!crate::agent::overlay::ToolRegistry::has_tool(
-            &harness,
-            crate::mesh::DELEGATE_TOOL
-        ));
+            .tool(app("lookup"))
+            .tools(builtins.map(app));
+        assert!(ToolRegistry::has_tool(&harness, "lookup"));
+        assert!(!ToolRegistry::has_tool(&harness, "pay"));
+        for name in builtins {
+            assert!(!ToolRegistry::has_tool(&harness, name), "{name}");
+        }
     }
 
     #[test]

@@ -125,7 +125,8 @@ impl ToolRegistry for AgentHarness {
     }
 }
 
-/// A plain set holds the names of models and tools in one set.
+/// A plain set holds the names of models and tools in one set. A set of
+/// model names alone refuses every guidance key, so it fails closed.
 impl ToolRegistry for BTreeSet<String> {
     fn has_tool(&self, name: &str) -> bool {
         self.contains(name)
@@ -1024,6 +1025,7 @@ mod tests {
             4 => "[a-z ]{1,12}",
             1 => Just(String::new()),
             1 => Just("two\nlines".to_owned()),
+            1 => Just("a\u{2028}b\tc".to_owned()),
             1 => Just("x".repeat(MAX_SKILL_SUMMARY_CHARS + 1)),
         ];
         (summary, "[a-z\n ]{0,24}").prop_map(|(summary, body)| SkillText::new(summary, body))
@@ -1233,23 +1235,8 @@ mod tests {
         }
         let mut skills = profile.skills.clone();
         skills.extend(overlay.skills.clone());
-        for (skill, text) in &skills {
-            let name_ok = !skill.is_empty()
-                && skill.len() <= 64
-                && skill
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
-            let reason = if !name_ok {
-                Some("the name must hold 1 to 64 of a-z, 0-9, _ and -")
-            } else if text.summary.trim().is_empty() {
-                Some("the summary is empty")
-            } else if text.summary.contains(['\n', '\r']) {
-                Some("the summary has a line break")
-            } else if text.summary.chars().count() > MAX_SKILL_SUMMARY_CHARS {
-                Some("the summary is too long")
-            } else {
-                None
-            };
+        for (index, (skill, text)) in skills.iter().enumerate() {
+            let reason = skill_reason(index, skill, text);
             if let Some(reason) = reason {
                 return Err(OverlayError::InvalidSkill {
                     skill: skill.clone(),
@@ -1277,6 +1264,40 @@ mod tests {
         out.tool_guidance = tool_guidance;
         out.skills = skills;
         Ok(out)
+    }
+
+    /// Why the skill at `index` breaks a rule of `docs/design/DESIGN-2373.md`.
+    fn skill_reason(index: usize, skill: &str, text: &SkillText) -> Option<&'static str> {
+        let name_ok = !skill.is_empty()
+            && skill.len() <= 64
+            && skill
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+        let odd = |c: char| {
+            c.is_control()
+                || ('\u{2028}'..='\u{2029}').contains(&c)
+                || ('\u{202a}'..='\u{202e}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c)
+                || c == '\u{200e}'
+                || c == '\u{200f}'
+        };
+        if index >= 32 {
+            Some("there are more than 32 skills")
+        } else if !name_ok {
+            Some("the name must hold 1 to 64 of a-z, 0-9, _ and -")
+        } else if text.summary.trim().is_empty() {
+            Some("the summary is empty")
+        } else if text.summary.contains(['\n', '\r']) {
+            Some("the summary has a line break")
+        } else if text.summary.chars().any(odd) {
+            Some("the summary has a control or format character")
+        } else if text.summary.chars().count() > MAX_SKILL_SUMMARY_CHARS {
+            Some("the summary is too long")
+        } else if text.body.len() > 32 * 1024 {
+            Some("the body is too long")
+        } else {
+            None
+        }
     }
 
     /// Whether `value` is at most `ceiling`. A `None` ceiling sets no limit.

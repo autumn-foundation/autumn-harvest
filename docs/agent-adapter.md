@@ -1222,6 +1222,11 @@ let profile = AgentProfile::new("support")
 - A run with no skills offers no `load_skill` tool. A call to it is an
   unknown tool. The harness never shows an app tool with that name.
 - A skill name follows the agent name rules. A summary is one line of at
-  most `MAX_SKILL_SUMMARY_CHARS` characters. A task with a skill that breaks
-  a rule fails at its start.
+  most `MAX_SKILL_SUMMARY_CHARS` characters, with no control character. A
+  body has at most `MAX_SKILL_BODY_BYTES`, and a map holds at most
+  `MAX_SKILLS`. Each segment checks the skills first, so a bad skill fails
+  the run or the op before any model call.
+- The mandate tool allowlist does not need to name `load_skill`.
+- Upgrade every worker before a profile or a task carries skills. An old
+  worker does not know the reserved name.
 - A delegated child gets neither part. Its peer has its own prompt.

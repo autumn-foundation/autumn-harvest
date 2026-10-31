@@ -938,21 +938,14 @@ fn take_steers(
     Ok(())
 }
 
-/// Check the skills and the mandate of `task`. Then find the peers that the
-/// mandate names, if it has one.
+/// Check the mandate of `task`. Then find the peers that the mandate names,
+/// if it has one.
 ///
 /// # Errors
 ///
-/// Returns an error when a skill or the mandate is not valid, or when the
-/// peer lookup fails.
+/// Returns an error when the mandate is not valid, or when the peer lookup
+/// fails.
 async fn root_member(ctx: &WorkflowContext, task: &AgentTask) -> Result<Option<Member>, String> {
-    // A skill name and summary join the system prompt (issue #2373).
-    if let Some((name, reason)) = skill::first_invalid(&task.skills) {
-        return Err(format!(
-            "the task skill {:?} is not valid: {reason}",
-            truncate(name, crate::mesh::MAX_NAME_LEN)
-        ));
-    }
     let Some(mandate) = &task.mandate else {
         return Ok(None);
     };
@@ -974,6 +967,14 @@ async fn system_prompt(
     ctx: &WorkflowContext,
     task: &AgentTask,
 ) -> Result<(Option<String>, BTreeSet<String>), String> {
+    // A skill name and summary join the prompt, so each segment checks them
+    // first. A durable agent runs its segments outside `drive` (issue #2373).
+    if let Some((name, reason)) = skill::first_invalid(&task.skills) {
+        return Err(format!(
+            "the skill {:?} is not valid: {reason}",
+            truncate(name, crate::mesh::MAX_NAME_LEN)
+        ));
+    }
     // The list holds names and summaries, never a body (issue #2373).
     let system = match (task.system.as_deref(), skill::listing(&task.skills)) {
         (Some(system), Some(list)) if !system.is_empty() => Some(format!("{system}\n\n{list}")),
@@ -1574,15 +1575,14 @@ async fn run_tool(
     }
     // The body comes from the recorded task, so the activity needs no
     // lookup (issue #2373). A run with no skills offers no such tool.
-    let skill = (call.name == LOAD_SKILL_TOOL && !task.skills.is_empty())
-        .then(|| skill::lookup(&task.skills, &call.arguments, task.request_cap()));
+    let wants_skill = call.name == LOAD_SKILL_TOOL && !task.skills.is_empty();
     // A memory note keeps the labels of the tree (issue #2272).
     let flow_labels = if call.name == MEMORY_TOOL {
         tree.exercised.clone()
     } else {
         BTreeSet::new()
     };
-    let request = ToolCallRequest {
+    let mut request = ToolCallRequest {
         run_id: progress.run_id.clone(),
         session_id: task.session_id.clone(),
         step: progress.step_base.saturating_add(slot.step),
@@ -1593,8 +1593,15 @@ async fn run_tool(
         labels: slot.labels.cloned(),
         flow_labels,
         workspace: progress.workspace.clone(),
-        skill,
+        skill: None,
     };
+    if wants_skill {
+        request.skill = Some(skill::lookup(
+            &task.skills,
+            &request.call.arguments,
+            skill_room(task.request_cap(), &request),
+        ));
+    }
     // Only a tool that opts in races an interrupt. Any other call runs to
     // its end, because its side effect may be half done.
     if run.live && slot.interruptible {
@@ -1614,6 +1621,21 @@ async fn run_tool(
     }
     let outcome = call_tool(ctx, request).await?;
     Ok(adopt_workspace(progress, outcome))
+}
+
+/// The bytes that the request cap `cap` leaves for a skill body in
+/// `request` (issue #2373). The envelope of the lookup takes a few more
+/// bytes. A cap of zero is no cap, so the room is zero too.
+fn skill_room(cap: u64, request: &ToolCallRequest) -> u64 {
+    /// The JSON around the body: the field name, the tag and the cut mark.
+    const LOOKUP_ENVELOPE_BYTES: u64 = 64;
+    if cap == 0 {
+        return 0;
+    }
+    // A full request leaves room 1, not 0, so the body never goes uncut.
+    cap.saturating_sub(json_len(request))
+        .saturating_sub(LOOKUP_ENVELOPE_BYTES)
+        .max(1)
 }
 
 /// The most runs of one tool call whose workspace store fails (issue

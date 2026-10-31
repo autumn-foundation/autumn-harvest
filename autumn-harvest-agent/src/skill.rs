@@ -29,6 +29,14 @@ pub const SKILLS_HEADING: &str = "## Skills";
 /// The most characters in the summary of one skill.
 pub const MAX_SKILL_SUMMARY_CHARS: usize = 200;
 
+/// The most skills of one profile or task. With
+/// [`MAX_SKILL_SUMMARY_CHARS`], it bounds the skill list in the prompt.
+pub const MAX_SKILLS: usize = 32;
+
+/// The most bytes in the body of one skill. With [`MAX_SKILLS`], it keeps
+/// the bodies of a recorded profile or task to 1 MiB.
+pub const MAX_SKILL_BODY_BYTES: usize = 32 * 1024;
+
 /// The text of one skill.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,8 +63,9 @@ impl SkillText {
 ///
 /// A name follows [`valid_name`]. It joins the system prompt, so it carries
 /// no other text. A summary is one line of 1 to
-/// [`MAX_SKILL_SUMMARY_CHARS`] characters. So the listing stays small, and
-/// a body cannot hide in it.
+/// [`MAX_SKILL_SUMMARY_CHARS`] characters, with no control or format
+/// character. So the listing stays small, and a body cannot hide in it. A
+/// body has at most [`MAX_SKILL_BODY_BYTES`] bytes.
 ///
 /// # Errors
 ///
@@ -68,20 +77,38 @@ pub fn check(name: &str, text: &SkillText) -> Result<(), &'static str> {
         Err("the summary is empty")
     } else if text.summary.contains(['\n', '\r']) {
         Err("the summary has a line break")
+    } else if text.summary.chars().any(hidden) {
+        Err("the summary has a control or format character")
     } else if text.summary.chars().count() > MAX_SKILL_SUMMARY_CHARS {
         Err("the summary is too long")
+    } else if text.body.len() > MAX_SKILL_BODY_BYTES {
+        Err("the body is too long")
     } else {
         Ok(())
     }
 }
 
-/// The first skill of `skills` that is not valid, with the reason.
+/// Whether `c` can break a line or hide text when a person reads it: a
+/// control character, a line or paragraph separator, or a direction mark.
+fn hidden(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// The first skill of `skills` that is not valid, with the reason. A skill
+/// past [`MAX_SKILLS`] is not valid.
 pub(crate) fn first_invalid(
     skills: &BTreeMap<String, SkillText>,
 ) -> Option<(&String, &'static str)> {
-    skills
-        .iter()
-        .find_map(|(name, text)| check(name, text).err().map(|reason| (name, reason)))
+    skills.iter().enumerate().find_map(|(index, (name, text))| {
+        if index >= MAX_SKILLS {
+            return Some((name, "there are more than 32 skills"));
+        }
+        check(name, text).err().map(|reason| (name, reason))
+    })
 }
 
 /// The skill list of the system prompt, or `None` with no skills. It holds
@@ -106,17 +133,18 @@ pub(crate) fn requested(arguments: &serde_json::Value) -> Option<&str> {
 
 /// What `skills` hold for a `load_skill` call with `arguments`.
 ///
-/// The body is cut to fit half of the request cap `cap`. The other half
-/// holds the rest of the tool-call input. A cap of zero is no cap.
+/// `room` is the space that the request cap leaves for the body, in bytes.
+/// JSON can escape one byte into six, so the body keeps a sixth of it. A
+/// room of zero means no cap.
 pub(crate) fn lookup(
     skills: &BTreeMap<String, SkillText>,
     arguments: &serde_json::Value,
-    cap: u64,
+    room: u64,
 ) -> SkillLookup {
     requested(arguments)
         .and_then(|name| skills.get(name))
         .map_or(SkillLookup::Missing, |skill| {
-            let max = max_tool_result_bytes(cap / 2);
+            let max = max_tool_result_bytes(room);
             SkillLookup::Found(cut_bytes(skill.body.clone(), max))
         })
 }
@@ -227,12 +255,51 @@ mod tests {
     }
 
     #[test]
-    fn a_lookup_cuts_the_body_to_half_the_cap() {
-        let SkillLookup::Found(body) = lookup(&skills(), &json!({"name": "refund"}), 4_096) else {
+    fn a_lookup_cuts_the_body_to_its_room() {
+        let SkillLookup::Found(body) = lookup(&skills(), &json!({"name": "refund"}), 2_048) else {
             panic!("refund is found");
         };
         assert!(body.len() <= max_tool_result_bytes(2_048), "{}", body.len());
         assert!(body.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn a_summary_with_a_hidden_character_is_not_valid() {
+        for summary in [
+            "a\u{2028}b",
+            "a\u{202e}b",
+            "a\u{1b}[31mb",
+            "a\tb",
+            "a\u{85}b",
+        ] {
+            assert_eq!(
+                check("triage", &SkillText::new(summary, "b")),
+                Err("the summary has a control or format character"),
+                "{summary:?}"
+            );
+        }
+        assert_eq!(
+            check("triage", &SkillText::new("Sort — fast.", "b")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_body_and_a_count_have_bounds() {
+        let at_cap = SkillText::new("Sort.", "x".repeat(MAX_SKILL_BODY_BYTES));
+        assert_eq!(check("triage", &at_cap), Ok(()));
+        let over = SkillText::new("Sort.", "x".repeat(MAX_SKILL_BODY_BYTES + 1));
+        assert_eq!(check("triage", &over), Err("the body is too long"));
+        let mut many: BTreeMap<String, SkillText> = (0..MAX_SKILLS)
+            .map(|i| (format!("s{i:02}"), SkillText::new("Sort.", "b")))
+            .collect();
+        assert_eq!(first_invalid(&many), None);
+        many.insert("zz".to_owned(), SkillText::new("Sort.", "b"));
+        let (name, reason) = first_invalid(&many).expect("one skill too many");
+        assert_eq!(
+            (name.as_str(), reason),
+            ("zz", "there are more than 32 skills")
+        );
     }
 
     #[test]
