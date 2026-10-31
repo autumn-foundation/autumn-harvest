@@ -88,8 +88,8 @@ pub fn check(name: &str, text: &SkillText) -> Result<(), &'static str> {
     }
 }
 
-/// Whether `c` can break a line or hide text when a person reads it: a
-/// control character, a line or paragraph separator, or a direction mark.
+/// Whether `c` can break a line or hide text from a reader. Such a
+/// character is a control character, a line separator or a direction mark.
 fn hidden(c: char) -> bool {
     c.is_control()
         || matches!(
