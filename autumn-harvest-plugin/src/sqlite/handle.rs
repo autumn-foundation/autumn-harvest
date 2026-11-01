@@ -1,9 +1,11 @@
 //! [`HarvestSqlite`], the app-facing client of the SQLite backend (issue
 //! #2467).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use autumn_harvest::info::{SchemaViolation, WorkflowInfo};
 use autumn_harvest::{ExecutionId, WorkflowEvent};
 use autumn_harvest_sqlite::{
     ExecutionDescription, ExecutionFilter, ExecutionPage, SignalDelivery, SignalWithStartOutcome,
@@ -15,7 +17,7 @@ use autumn_web::reexports::axum;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use super::driver::{Command, SignalWithStartRequest};
+use super::driver::{Command, SignalWithStartParams};
 
 /// Why a [`HarvestSqlite`] call failed.
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +32,23 @@ pub enum HarvestSqliteError {
     /// A read task failed before it returned a result.
     #[error("the Harvest SQLite read failed: {0}")]
     Read(String),
+    /// The input breaks the workflow's registered `input_schema`. The
+    /// Postgres start path refuses it the same way (issue #373).
+    #[error("input validation failed: {}", describe_violations(.0))]
+    InvalidInput(Vec<SchemaViolation>),
+}
+
+fn describe_violations(violations: &[SchemaViolation]) -> String {
+    violations
+        .iter()
+        .map(|violation| {
+            violation.field_path.as_ref().map_or_else(
+                || violation.message.clone(),
+                |path| format!("{path}: {}", violation.message),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// The client of the plugin's SQLite backend.
@@ -66,6 +85,8 @@ struct Inner {
     reader: Arc<Mutex<SqliteReader>>,
     path: PathBuf,
     workflows: Vec<String>,
+    /// The registered definitions, for their input schemas.
+    infos: HashMap<String, WorkflowInfo>,
 }
 
 impl std::fmt::Debug for HarvestSqlite {
@@ -81,16 +102,22 @@ impl HarvestSqlite {
         sender: mpsc::Sender<Command>,
         reader: SqliteReader,
         path: PathBuf,
-        mut workflows: Vec<String>,
+        infos: Vec<WorkflowInfo>,
     ) -> Self {
+        let mut workflows: Vec<String> = infos.iter().map(|info| info.name.to_owned()).collect();
         workflows.sort();
         workflows.dedup();
+        let infos = infos
+            .into_iter()
+            .map(|info| (info.name.to_owned(), info))
+            .collect();
         Self {
             inner: Arc::new(Inner {
                 sender,
                 reader: Arc::new(Mutex::new(reader)),
                 path,
                 workflows,
+                infos,
             }),
         }
     }
@@ -99,6 +126,25 @@ impl HarvestSqlite {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.inner.path
+    }
+
+    /// Check `input` against the `input_schema` of `workflow_name`.
+    ///
+    /// A workflow with no schema, or an unknown name, passes. `start` and
+    /// `signal_with_start` call this first.
+    ///
+    /// # Errors
+    ///
+    /// Returns every violation of the schema.
+    pub fn validate_input(
+        &self,
+        workflow_name: &str,
+        input: &Value,
+    ) -> Result<(), Vec<SchemaViolation>> {
+        self.inner
+            .infos
+            .get(workflow_name)
+            .map_or(Ok(()), |info| info.validate_input(input))
     }
 
     /// The registered workflow names, sorted.
@@ -162,6 +208,8 @@ impl HarvestSqlite {
         input: Value,
         options: StartOptions,
     ) -> Result<StartOutcome, HarvestSqliteError> {
+        self.validate_input(workflow_name, &input)
+            .map_err(HarvestSqliteError::InvalidInput)?;
         let workflow_name = workflow_name.to_owned();
         Ok(self
             .call(|reply| Command::Start {
@@ -181,8 +229,10 @@ impl HarvestSqlite {
     /// Returns the backend's refusal or [`HarvestSqliteError::Stopped`].
     pub async fn signal_with_start(
         &self,
-        request: SignalWithStartRequest,
+        request: SignalWithStartParams,
     ) -> Result<SignalWithStartOutcome, HarvestSqliteError> {
+        self.validate_input(&request.workflow_name, &request.input)
+            .map_err(HarvestSqliteError::InvalidInput)?;
         Ok(self
             .call(|reply| Command::SignalWithStart { request, reply })
             .await??)

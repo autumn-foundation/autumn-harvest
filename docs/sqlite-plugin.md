@@ -91,7 +91,9 @@ flowchart LR
   activity runs on the app's runtime, so a task that it spawns, such as a
   fleet open, lives there too. A long activity delays the next write.
 - **A tick instead of `LISTEN`/`NOTIFY`.** The driver drives every run after
-  each command, then waits for the next command or the tick. The tick bounds
+  each batch of at most 32 commands, then waits for the next command or the
+  tick. The batch bound keeps a steady stream of requests from starving the
+  runs. The tick bounds
   how late a due timer, a retry backoff or a schedule slot fires.
 - **Reads do not wait.** List, describe and history use a read-only
   `SqliteReader`, so a long activity never blocks them.
@@ -144,7 +146,10 @@ async fn offboard(harvest: HarvestSqlite, Path(name): Path<String>) -> AutumnRes
 
 The handle has `start`, `signal_with_start`, `signal`,
 `signal_by_workflow_id`, `cancel`, `terminate`, `query`, `update`, `describe`,
-`list`, `history` and `shutdown`.
+`list`, `history` and `shutdown`. `start` and `signal_with_start` check the
+input against the workflow's `input_schema` first, as the Postgres start path
+does (issue #373). A violation is `HarvestSqliteError::InvalidInput`, and over
+HTTP it is the Postgres `400` with `violations`.
 
 ## The management API
 

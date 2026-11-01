@@ -35,6 +35,13 @@ use autumn_harvest_sqlite::{
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
+/// The most commands the driver runs before each drive pass.
+///
+/// Without a bound, a steady stream of starts or signals keeps the queue
+/// non-empty, and the loop never reaches `poll_once`. Runs, due timers and
+/// retries would then stop moving while every request still succeeds.
+const COMMANDS_PER_PASS: usize = 32;
+
 /// How many commands may wait while the driver is busy.
 ///
 /// A sender waits when the queue is full. The bound keeps a burst of HTTP
@@ -58,7 +65,7 @@ pub struct Registry {
 
 /// An owned signal-with-start request. See [`SignalWithStart`].
 #[derive(Debug, Clone)]
-pub struct SignalWithStartRequest {
+pub struct SignalWithStartParams {
     /// The registered workflow type.
     pub workflow_name: String,
     /// The business id. It must not be blank.
@@ -84,7 +91,7 @@ pub enum Command {
         reply: oneshot::Sender<SqliteResult<StartOutcome>>,
     },
     SignalWithStart {
-        request: SignalWithStartRequest,
+        request: SignalWithStartParams,
         reply: oneshot::Sender<SqliteResult<SignalWithStartOutcome>>,
     },
     Signal {
@@ -216,7 +223,7 @@ async fn drive(
 ) -> Option<oneshot::Sender<()>> {
     let mut last_error: Option<String> = None;
     loop {
-        loop {
+        for _ in 0..COMMANDS_PER_PASS {
             match receiver.try_recv() {
                 Ok(Command::Shutdown { reply }) => return reply,
                 Err(mpsc::error::TryRecvError::Disconnected) => return None,

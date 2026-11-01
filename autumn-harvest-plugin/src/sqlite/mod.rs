@@ -31,7 +31,7 @@ use autumn_web::AppState;
 use autumn_web::app::AppBuilder;
 use autumn_web::error::AutumnError;
 
-pub use driver::SignalWithStartRequest;
+pub use driver::SignalWithStartParams;
 pub use handle::{HarvestSqlite, HarvestSqliteError};
 
 /// The `autumn-harvest-sqlite` types that [`HarvestSqlite`] takes and returns.
@@ -327,11 +327,7 @@ async fn start(
         app_config.database.effective_primary_url(),
     )
     .map_err(AutumnError::service_unavailable_msg)?;
-    let workflow_names = parts
-        .workflows
-        .iter()
-        .map(|info| info.name.to_owned())
-        .collect();
+    let infos = parts.workflows.clone();
     let registry = Registry {
         workflows: parts.workflows,
         activities: parts.activities,
@@ -355,7 +351,7 @@ async fn start(
             )));
         }
     };
-    let handle = HarvestSqlite::new(driver.sender.clone(), reader, path.clone(), workflow_names);
+    let handle = HarvestSqlite::new(driver.sender.clone(), reader, path.clone(), infos);
     slot.lock().unwrap_or_else(PoisonError::into_inner).driver = Some(driver);
     state.insert_extension(handle.clone());
     let _ = handle_slot.set(handle);

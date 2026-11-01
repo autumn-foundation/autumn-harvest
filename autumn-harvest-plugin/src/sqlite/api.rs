@@ -34,7 +34,7 @@ use axum::routing::{any, get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{EPIC_ISSUE, HarvestSqlite, HarvestSqliteError, SignalWithStartRequest};
+use super::{EPIC_ISSUE, HarvestSqlite, HarvestSqliteError, SignalWithStartParams};
 use crate::api::HarvestApiState;
 
 /// What every handler reads.
@@ -101,8 +101,12 @@ pub fn router(state: ApiState) -> Router<()> {
 
 /// The HTTP form of a backend error.
 fn map_error(error: HarvestSqliteError) -> AutumnError {
-    let HarvestSqliteError::Sqlite(error) = error else {
-        return AutumnError::service_unavailable_msg(error.to_string());
+    let error = match error {
+        HarvestSqliteError::Sqlite(error) => error,
+        HarvestSqliteError::InvalidInput(_) => {
+            return AutumnError::bad_request_msg(error.to_string());
+        }
+        other => return AutumnError::service_unavailable_msg(other.to_string()),
     };
     let message = error.to_string();
     match error {
@@ -419,7 +423,7 @@ async fn get_history(
 /// `POST /workflows/{workflow_name}/start`. The names follow the Postgres
 /// request. Each option that this backend cannot honour is refused.
 #[derive(Debug, Default, Deserialize)]
-struct StartRequest {
+struct SqliteStartBody {
     workflow_id: Option<String>,
     input: Option<Value>,
     memo: Option<Value>,
@@ -443,7 +447,7 @@ struct StartRequest {
     residency_key: Option<String>,
 }
 
-impl StartRequest {
+impl SqliteStartBody {
     fn refuse_unsupported(&self) -> Result<(), AutumnError> {
         refuse_unsupported(&[
             ("queue", self.queue.is_some()),
@@ -467,6 +471,22 @@ impl StartRequest {
             ("residency_key", self.residency_key.is_some()),
         ])
     }
+}
+
+/// The Postgres `400` for an input that breaks the workflow's
+/// `input_schema` (issue #373), or `None` when the input passes.
+fn schema_refusal(handle: &HarvestSqlite, workflow_name: &str, input: &Value) -> Option<Response> {
+    let violations = handle.validate_input(workflow_name, input).err()?;
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "input validation failed",
+                "violations": violations,
+            })),
+        )
+            .into_response(),
+    )
 }
 
 /// `terminate_if_running` ends another caller's run, so it needs an admin,
@@ -493,7 +513,7 @@ async fn start(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response, AutumnError> {
-    let request: StartRequest = optional_body(&body)?;
+    let request: SqliteStartBody = optional_body(&body)?;
     request.refuse_unsupported()?;
     // Postgres dedupes a start on this header (issue #808). This backend
     // does not, so a retried start would run twice. Refuse it instead.
@@ -509,13 +529,13 @@ async fn start(
     options.workflow_id = request.workflow_id;
     options.memo = request.memo;
     options.search_attributes = request.search_attrs.unwrap_or_default();
+    let input = request.input.unwrap_or(Value::Null);
+    if let Some(refusal) = schema_refusal(state.handle()?, &workflow_name, &input) {
+        return Ok(refusal);
+    }
     let started = state
         .handle()?
-        .start(
-            &workflow_name,
-            request.input.unwrap_or(Value::Null),
-            options,
-        )
+        .start(&workflow_name, input, options)
         .await
         .map_err(map_error)?;
     let description = state
@@ -569,7 +589,7 @@ async fn signal_with_start(
     Path(workflow_name): Path<String>,
     session: Option<axum::Extension<Session>>,
     Json(body): Json<SignalWithStartBody>,
-) -> Result<Json<Value>, AutumnError> {
+) -> Result<Response, AutumnError> {
     refuse_unsupported(&[
         ("queue", body.queue.is_some()),
         ("memo", body.memo.is_some()),
@@ -583,11 +603,16 @@ async fn signal_with_start(
     require_admin_for_policy(&state, body.id_reuse_policy.as_deref(), session).await?;
     let reuse_policy = crate::api::parse_reuse_policy(body.id_reuse_policy.as_deref())?;
     let handle = state.handle()?;
+    // Postgres checks the start input even when the call attaches.
+    let input = body.start_input.unwrap_or(Value::Null);
+    if let Some(refusal) = schema_refusal(handle, &workflow_name, &input) {
+        return Ok(refusal);
+    }
     let outcome = handle
-        .signal_with_start(SignalWithStartRequest {
+        .signal_with_start(SignalWithStartParams {
             workflow_name: workflow_name.clone(),
             workflow_id: body.workflow_id.clone(),
-            input: body.start_input.unwrap_or(Value::Null),
+            input,
             reuse_policy,
             signal_name: body.signal_name,
             signal_payload: body.signal_payload.unwrap_or(Value::Null),
@@ -603,7 +628,8 @@ async fn signal_with_start(
         "state": stored_json(&description.summary.state),
         "started_fresh": outcome.started_fresh,
         "signal_delivered": outcome.signal_delivered,
-    })))
+    }))
+    .into_response())
 }
 
 /// The exactly-once key: the `Idempotency-Key` header, then the
@@ -824,10 +850,10 @@ mod tests {
 
     #[test]
     fn an_unsupported_start_option_is_refused_by_name() {
-        let request = StartRequest {
+        let request = SqliteStartBody {
             queue: Some("q".into()),
             priority: Some(json!("high")),
-            ..StartRequest::default()
+            ..SqliteStartBody::default()
         };
         let error = request.refuse_unsupported().unwrap_err();
         assert_eq!(error.status(), StatusCode::BAD_REQUEST);
@@ -836,7 +862,7 @@ mod tests {
             message.contains("queue") && message.contains("priority"),
             "{message}"
         );
-        assert!(StartRequest::default().refuse_unsupported().is_ok());
+        assert!(SqliteStartBody::default().refuse_unsupported().is_ok());
     }
 
     #[test]

@@ -364,3 +364,57 @@ async fn sqlite_path_places_the_file_for_an_in_memory_app_database() {
     assert_eq!(health["path"], harvest_file.display().to_string());
     assert!(harvest_file.exists());
 }
+
+/// A string schema for `greet`, as `#[workflow(input_schema = ..)]` gives.
+fn string_schema() -> Value {
+    json!({ "type": "string" })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_input_that_breaks_the_schema_is_refused_before_it_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut info = greet_info();
+    info.input_schema = Some(string_schema);
+    let client = TestApp::new()
+        .config(config(dir.path()))
+        .profile("dev")
+        .plugin(
+            HarvestPlugin::new()
+                .workflows(vec![info])
+                .activities(activities![shout])
+                .api("/harvest"),
+        )
+        .build();
+
+    let response = client
+        .post("/harvest/workflows/greet/start")
+        .json(&json!({ "input": 42 }))
+        .send()
+        .await;
+    response.assert_status(400);
+    let body: Value = response.json();
+    assert_eq!(body["error"], "input validation failed");
+    assert!(body["violations"].as_array().is_some_and(|v| !v.is_empty()));
+
+    let response = client
+        .post("/harvest/workflows/greet/signal-with-start")
+        .json(&json!({
+            "workflow_id": "w-schema",
+            "start_input": 42,
+            "signal_name": "go",
+        }))
+        .send()
+        .await;
+    response.assert_status(400);
+
+    // App code gets the same refusal from the handle.
+    let handle = client.state().extension::<HarvestSqlite>().unwrap();
+    assert!(matches!(
+        handle.start("greet", json!(42), StartOptions::new()).await,
+        Err(autumn_harvest_plugin::sqlite::HarvestSqliteError::InvalidInput(_))
+    ));
+
+    let runs: Value = client.get("/harvest/workflows").send().await.json();
+    assert_eq!(runs, json!([]), "a refused start writes nothing");
+    start(&client, &json!({ "input": "bee" })).await;
+}
