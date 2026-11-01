@@ -133,6 +133,10 @@ required-features = ["sqlite"]
 name = "skills"
 required-features = ["sqlite", "eval"]
 
+[[test]]
+name = "refine_propose"
+required-features = ["sqlite"]
+
 [lints]
 workspace = true
 
