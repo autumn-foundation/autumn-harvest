@@ -241,7 +241,6 @@ pub mod harvest_workflow_executions_unmapped {
     /// intermediate residences. This array keeps them. The array plus the
     /// shard of the live row is the complete set of shards that still hold
     /// a copy of the run. A cross-residence payload erasure traverses that set.
-    #[must_use]
     pub fn migrated_from_shards() -> types::MigratedFromShards {
         diesel::dsl::sql(r#""harvest_workflow_executions"."migrated_from_shards""#)
     }
@@ -251,7 +250,6 @@ pub mod harvest_workflow_executions_unmapped {
     /// The reconciler writes it with `migrated_run_terminal_at`. The `state`
     /// of the seal stays `MIGRATED` forever. A reuse-policy decision reads
     /// this column to tell a failed live copy from a successful one.
-    #[must_use]
     pub fn migrated_run_terminal_state() -> types::MigratedRunTerminalState {
         diesel::dsl::sql(r#""harvest_workflow_executions"."migrated_run_terminal_state""#)
     }
@@ -261,7 +259,6 @@ pub mod harvest_workflow_executions_unmapped {
     /// It is not NULL only while the migration that vacated this row is in
     /// flight. An abort restores `state` to this value and clears it. A
     /// successful cutover clears it.
-    #[must_use]
     pub fn staging_vacated_state() -> types::StagingVacatedState {
         diesel::dsl::sql(r#""harvest_workflow_executions"."staging_vacated_state""#)
     }
@@ -271,7 +268,6 @@ pub mod harvest_workflow_executions_unmapped {
     /// It is not NULL exactly when `staging_vacated_state` is not NULL.
     /// `activate_target` finalizes the marker with a direct match on this id.
     /// That needs no cross-database write and has no retry race.
-    #[must_use]
     pub fn staging_vacated_by() -> types::StagingVacatedBy {
         diesel::dsl::sql(r#""harvest_workflow_executions"."staging_vacated_by""#)
     }
