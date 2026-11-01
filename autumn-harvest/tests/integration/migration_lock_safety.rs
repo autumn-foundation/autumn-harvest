@@ -5049,8 +5049,9 @@ fn metadata_toml_is_read_like_diesel_reads_it() {
 const OLD_EXEC_INDEX: &str =
     "CREATE INDEX idx_old ON harvest_workflow_executions (completed_at, id);";
 
-/// The shape of `20261029034500` as it shipped in 0.8.0: a guarded plain build,
-/// then a plain drop of the index it replaces, in one file (issue #2395).
+/// The shape of `20261029034500` as it shipped in 0.8.0 (issue #2395). A
+/// guarded plain build comes first. A plain drop of the old index follows it
+/// in the same file.
 const SHIPPED_BUILD_THEN_DROP: &str = "SET LOCAL lock_timeout = '5s';
 
 DO $$
