@@ -44,16 +44,20 @@ async fn connect() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
 }
 
 /// Insert one `MIGRATED` seal with every marker set, and return its id.
+///
+/// `harvest_we_migrated_forward_check` requires a seal to carry its forwarding
+/// pointer, so the fixture sets `migrated_to_shard` and `migrated_at` too.
 async fn seed_seal(conn: &mut AsyncPgConnection, vacated_by: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     conn.batch_execute(&format!(
         "INSERT INTO harvest_workflow_executions \
            (id, workflow_name, workflow_id, run_id, shard_id, state, input, \
-            started_at, created_at, migrated_from_shards, \
-            migrated_run_terminal_state, staging_vacated_state, staging_vacated_by) \
+            started_at, created_at, migrated_to_shard, migrated_at, \
+            migrated_from_shards, migrated_run_terminal_state, \
+            staging_vacated_state, staging_vacated_by) \
          VALUES \
            ('{id}', 'markers_flow', 'markers-{id}', gen_random_uuid(), 0, \
-            'MIGRATED', '{{}}', now(), now(), '[3, 5]'::jsonb, \
+            'MIGRATED', '{{}}', now(), now(), 5, now(), '[3, 5]'::jsonb, \
             'FAILED', 'COMPLETED', '{vacated_by}')"
     ))
     .await
