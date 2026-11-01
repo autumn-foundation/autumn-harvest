@@ -203,6 +203,7 @@ impl HarvestRuntimeConfig {
             reject_sqlite_section_without_feature(&root.harvest.sqlite)?;
             config.apply_partial(root.harvest);
         }
+        reject_sqlite_env_without_feature(env)?;
         config.apply_env_overrides(env)?;
         config.validate()?;
         Ok(config)
@@ -846,6 +847,33 @@ fn reject_sqlite_section_without_feature(
          or remove the section"
             .to_owned(),
     ))
+}
+
+/// The environment variables of `[harvest.sqlite]`.
+const SQLITE_ENV_VARS: [&str; 2] = [
+    "AUTUMN_HARVEST_SQLITE__PATH",
+    "AUTUMN_HARVEST_SQLITE__TICK_MS",
+];
+
+/// Refuse a `[harvest.sqlite]` environment variable in a build without the
+/// `sqlite` feature, as [`reject_sqlite_section_without_feature`] refuses
+/// the file section. An environment-only deployment would otherwise write
+/// to Postgres with no error.
+fn reject_sqlite_env_without_feature(env: &dyn Env) -> Result<(), ConfigError> {
+    if cfg!(feature = "sqlite") {
+        return Ok(());
+    }
+    let Some(name) = SQLITE_ENV_VARS
+        .iter()
+        .find(|name| env.var(name).is_ok_and(|value| !value.is_empty()))
+    else {
+        return Ok(());
+    };
+    Err(ConfigError::Validation(format!(
+        "{name} is set, but this build of autumn-harvest-plugin has no `sqlite` feature. \
+         Enable `autumn-harvest-plugin/sqlite` in an app built on `autumn-web/sqlite`, or \
+         unset it"
+    )))
 }
 
 fn load_operator_roots(env: &dyn Env) -> Result<Vec<PartialRoot>, ConfigError> {
@@ -1540,6 +1568,27 @@ key_prefix = "from_toml"
             message.contains("redis") && message.contains("feature"),
             "expected the error to name the `redis` cargo feature, got {error}"
         );
+    }
+
+    /// A build without the `sqlite` feature refuses the `[harvest.sqlite]`
+    /// variables, so an environment-only deployment never writes to Postgres
+    /// by mistake (issue #2467).
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn harvest_config_sqlite_env_without_the_feature_is_rejected() {
+        for name in SQLITE_ENV_VARS {
+            let env = MockEnv::new().with(name, "harvest.db");
+            let error = HarvestRuntimeConfig::load_with_env(&env)
+                .expect_err("a sqlite variable must fail without the sqlite feature");
+            let message = error.to_string();
+            assert!(
+                message.contains(name) && message.contains("`sqlite` feature"),
+                "{message}"
+            );
+        }
+        // An empty value is unset, as for the other variables.
+        let env = MockEnv::new().with("AUTUMN_HARVEST_SQLITE__PATH", "");
+        HarvestRuntimeConfig::load_with_env(&env).expect("an empty value is unset");
     }
 
     /// A build with the `redis` feature accepts a configured URL.
