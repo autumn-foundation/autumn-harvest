@@ -146,12 +146,17 @@ async fn offboard(harvest: HarvestSqlite, Path(name): Path<String>) -> AutumnRes
 
 The handle has `start`, `signal_with_start`, `signal`,
 `signal_by_workflow_id`, `cancel`, `terminate`, `query`, `update`, `describe`,
-`list`, `history` and `shutdown`. `start` and `signal_with_start` check the
-input against the workflow's `input_schema` first, as the Postgres start path
-does (issue #373). The signal calls check the payload against the `arg_schema`
-of a declarative `#[signal]` handler (issue #610). A violation is
-`HarvestSqliteError::InvalidInput` or `InvalidSignal`, and over HTTP it is the
-Postgres `400` with `violations`.
+`list`, `history` and `shutdown`. The schema checks follow Postgres:
+
+- `start` checks the workflow's `input_schema` first (issue #373).
+- `signal_with_start` checks it only when it creates a run. An attach
+  discards the input, so it needs none.
+- A signal checks the `arg_schema` of a declarative `#[signal]` handler
+  (issue #610), after the committed key probe. A retry of a delivered keyed
+  signal stays a duplicate, even when the schema changed since.
+
+A violation is `HarvestSqliteError::InvalidInput` or `InvalidSignal`. Over
+HTTP it is the Postgres `400` with `violations`.
 
 ## The management API
 

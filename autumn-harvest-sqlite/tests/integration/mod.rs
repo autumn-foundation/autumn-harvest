@@ -41,6 +41,7 @@ mod runtime_robustness;
 mod schedule_override_fixture;
 mod schedule_overrides;
 mod schedules;
+mod schema_checks;
 mod shared_state;
 mod signal_ingest;
 mod signal_timeout;

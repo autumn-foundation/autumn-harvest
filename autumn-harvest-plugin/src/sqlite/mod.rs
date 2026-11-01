@@ -335,6 +335,7 @@ async fn start(
         workflows: parts.workflows,
         activities: parts.activities,
         updates: parts.updates,
+        signals: parts.signals,
         state: Arc::new(with_app_state(parts.state, state)),
     };
     let tick = Duration::from_millis(sqlite_config.tick_ms);
@@ -354,13 +355,7 @@ async fn start(
             )));
         }
     };
-    let handle = HarvestSqlite::new(
-        driver.sender.clone(),
-        reader,
-        path.clone(),
-        infos,
-        parts.signals,
-    );
+    let handle = HarvestSqlite::new(driver.sender.clone(), reader, path.clone(), infos);
     slot.lock().unwrap_or_else(PoisonError::into_inner).driver = Some(driver);
     state.insert_extension(handle.clone());
     let _ = handle_slot.set(handle);

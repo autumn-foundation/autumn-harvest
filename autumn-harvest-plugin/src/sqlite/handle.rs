@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use autumn_harvest::info::{SchemaViolation, SignalHandlerInfo, WorkflowInfo};
+use autumn_harvest::info::{SchemaViolation, WorkflowInfo};
 use autumn_harvest::{ExecutionId, WorkflowEvent};
 use autumn_harvest_sqlite::{
     ExecutionDescription, ExecutionFilter, ExecutionPage, SignalDelivery, SignalWithStartOutcome,
@@ -92,8 +92,6 @@ struct Inner {
     workflows: Vec<String>,
     /// The registered definitions, for their input schemas.
     infos: HashMap<String, WorkflowInfo>,
-    /// The declarative `#[signal]` handlers, for their payload schemas.
-    signals: Vec<SignalHandlerInfo>,
 }
 
 impl std::fmt::Debug for HarvestSqlite {
@@ -110,7 +108,6 @@ impl HarvestSqlite {
         reader: SqliteReader,
         path: PathBuf,
         infos: Vec<WorkflowInfo>,
-        signals: Vec<SignalHandlerInfo>,
     ) -> Self {
         let mut workflows: Vec<String> = infos.iter().map(|info| info.name.to_owned()).collect();
         workflows.sort();
@@ -126,7 +123,6 @@ impl HarvestSqlite {
                 path,
                 workflows,
                 infos,
-                signals,
             }),
         }
     }
@@ -156,36 +152,6 @@ impl HarvestSqlite {
             .map_or(Ok(()), |info| info.validate_input(input))
     }
 
-    /// Check a signal `payload` against the `arg_schema` of the declarative
-    /// `#[signal]` handler for `(workflow_name, signal_name)`.
-    ///
-    /// A signal with no handler, or a handler with no schema, passes.
-    ///
-    /// # Errors
-    ///
-    /// Returns every violation of the schema.
-    pub fn validate_signal(
-        &self,
-        workflow_name: &str,
-        signal_name: &str,
-        payload: &Value,
-    ) -> Result<(), Vec<SchemaViolation>> {
-        self.inner
-            .signals
-            .iter()
-            .find(|handler| handler.workflow == workflow_name && handler.name == signal_name)
-            .map_or(Ok(()), |handler| handler.validate_arg(payload))
-    }
-
-    /// Whether any declarative signal handler of `signal_name` has a schema.
-    /// Only then does a signal by run id read the run's workflow name.
-    fn signal_has_schema(&self, signal_name: &str) -> bool {
-        self.inner
-            .signals
-            .iter()
-            .any(|handler| handler.name == signal_name && handler.arg_schema.is_some())
-    }
-
     /// The registered workflow names, sorted.
     #[must_use]
     pub fn workflow_names(&self) -> &[String] {
@@ -203,6 +169,19 @@ impl HarvestSqlite {
             .await
             .map_err(|_| HarvestSqliteError::Stopped)?;
         response.await.map_err(|_| HarvestSqliteError::Stopped)
+    }
+
+    /// A runtime reply, with a schema refusal lifted to its own variant.
+    fn lift<T>(reply: Result<T, SqliteError>) -> Result<T, HarvestSqliteError> {
+        reply.map_err(|error| match error {
+            SqliteError::SignalPayloadInvalid { violations, .. } => {
+                HarvestSqliteError::InvalidSignal(violations)
+            }
+            SqliteError::WorkflowInputInvalid { violations, .. } => {
+                HarvestSqliteError::InvalidInput(violations)
+            }
+            other => HarvestSqliteError::Sqlite(other),
+        })
     }
 
     async fn read<T: Send + 'static>(
@@ -270,17 +249,14 @@ impl HarvestSqlite {
         &self,
         request: SignalWithStartParams,
     ) -> Result<SignalWithStartOutcome, HarvestSqliteError> {
-        self.validate_input(&request.workflow_name, &request.input)
-            .map_err(HarvestSqliteError::InvalidInput)?;
-        self.validate_signal(
-            &request.workflow_name,
-            &request.signal_name,
-            &request.signal_payload,
+        // The runtime checks the start input only when it creates a run, and
+        // the signal only after the key probe, as Postgres does (issue
+        // #2467). So an attach needs no input, and a delivered keyed retry
+        // stays a duplicate.
+        Self::lift(
+            self.call(|reply| Command::SignalWithStart { request, reply })
+                .await?,
         )
-        .map_err(HarvestSqliteError::InvalidSignal)?;
-        Ok(self
-            .call(|reply| Command::SignalWithStart { request, reply })
-            .await??)
     }
 
     /// Signal one run. Returns `false` when the idempotency key was already
@@ -297,23 +273,17 @@ impl HarvestSqlite {
         payload: Value,
         idempotency_key: Option<String>,
     ) -> Result<bool, HarvestSqliteError> {
-        if self.signal_has_schema(name) {
-            let description = self.describe(exec).await?;
-            if let Some(workflow_name) = description.summary.workflow_name.value() {
-                self.validate_signal(workflow_name, name, &payload)
-                    .map_err(HarvestSqliteError::InvalidSignal)?;
-            }
-        }
         let name = name.to_owned();
-        Ok(self
-            .call(|reply| Command::Signal {
+        Self::lift(
+            self.call(|reply| Command::Signal {
                 exec,
                 name,
                 payload,
                 idempotency_key,
                 reply,
             })
-            .await??)
+            .await?,
+        )
     }
 
     /// Signal the running run of a `(workflow_name, workflow_id)` key.
@@ -329,15 +299,13 @@ impl HarvestSqlite {
         payload: Value,
         idempotency_key: Option<String>,
     ) -> Result<SignalDelivery, HarvestSqliteError> {
-        self.validate_signal(workflow_name, name, &payload)
-            .map_err(HarvestSqliteError::InvalidSignal)?;
         let (workflow_name, workflow_id, name) = (
             workflow_name.to_owned(),
             workflow_id.to_owned(),
             name.to_owned(),
         );
-        Ok(self
-            .call(|reply| Command::SignalByWorkflowId {
+        Self::lift(
+            self.call(|reply| Command::SignalByWorkflowId {
                 workflow_name,
                 workflow_id,
                 name,
@@ -345,7 +313,8 @@ impl HarvestSqlite {
                 idempotency_key,
                 reply,
             })
-            .await??)
+            .await?,
+        )
     }
 
     /// Ask a run to cancel. The next drive replays it with the reason set.

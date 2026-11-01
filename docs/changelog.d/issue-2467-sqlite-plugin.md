@@ -30,8 +30,11 @@ default build does not change.
 - **Loud refusals.** Each builder option or mode with no SQLite port fails
   the build or the boot and names its issue (#2468 to #2472).
 
-Supporting changes: `HarvestBuilder::take_state` and `take_activities`, and
-`SqliteReader::load_history`. The `[harvest.sqlite]` section is refused in a
+Supporting changes: `HarvestBuilder::take_state` and `take_activities`,
+`SqliteReader::load_history`, and `SqliteRuntime::register_signal_handler`.
+`SqliteError` gains `SignalPayloadInvalid` and `WorkflowInputInvalid`: the
+runtime checks a signal's `arg_schema` after its key probe, and a
+signal-with-start's `input_schema` only when it creates a run. The `[harvest.sqlite]` section is refused in a
 build without the feature. No `WorkflowEvent` variant, no migration.
 
 Tests: `autumn-harvest-plugin/tests/sqlite_plugin.rs` boots real apps on a

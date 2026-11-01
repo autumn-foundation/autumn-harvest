@@ -59,6 +59,8 @@ pub struct Registry {
     pub activities: Vec<ActivityInfo>,
     /// The declarative `#[update]` handlers.
     pub updates: Vec<UpdateHandlerInfo>,
+    /// The declarative `#[signal]` handlers, for their payload schemas.
+    pub signals: Vec<autumn_harvest::SignalHandlerInfo>,
     /// The `HarvestPlugin::state` values.
     pub state: SharedState,
 }
@@ -210,6 +212,9 @@ fn register(runtime: &mut SqliteRuntime, registry: Registry) {
     }
     for update in &registry.updates {
         runtime.register_update(update);
+    }
+    for signal in &registry.signals {
+        runtime.register_signal_handler(signal);
     }
     runtime.set_shared_state(registry.state);
 }
@@ -393,6 +398,7 @@ mod tests {
                     workflows: vec![forever_info()],
                     activities: Vec::new(),
                     updates: Vec::new(),
+                    signals: Vec::new(),
                     state: autumn_harvest::context::empty_shared_state(),
                 };
                 let runtime = Driver::open(&path, registry).expect("open");

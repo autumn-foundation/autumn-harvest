@@ -147,6 +147,8 @@ fn map_error(error: HarvestSqliteError) -> AutumnError {
         | SqliteError::InvalidSearchAttribute(_)
         | SqliteError::InvalidFilter(_)
         | SqliteError::UpdateInputInvalid { .. }
+        | SqliteError::SignalPayloadInvalid { .. }
+        | SqliteError::WorkflowInputInvalid { .. }
         | SqliteError::PayloadTooDeep { .. } => AutumnError::bad_request_msg(message),
         SqliteError::PayloadTooLarge { .. } => {
             AutumnError::bad_request_msg(message).with_status(StatusCode::PAYLOAD_TOO_LARGE)

@@ -22,8 +22,8 @@ use autumn_harvest::payload_depth::{
 };
 use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::{
-    ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, NoOpMetrics, TimerId,
-    UpdateHandlerInfo, UpdateId, WorkflowCommand, WorkflowEvent, WorkflowHandlerFn,
+    ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, NoOpMetrics, SignalHandlerInfo,
+    TimerId, UpdateHandlerInfo, UpdateId, WorkflowCommand, WorkflowEvent, WorkflowHandlerFn,
     WorkflowHistoryPolicy, WorkflowIdReusePolicy, WorkflowInfo, WorkflowOutcome,
 };
 use chrono::{DateTime, Utc};
@@ -427,6 +427,12 @@ pub struct SqliteRuntime {
     /// The app state that `ctx.state::<T>()` reads, in workflows, activities
     /// and query replays (issue #2467). It is empty by default.
     shared_state: SharedState,
+    /// The registered workflow definitions, for their `input_schema`
+    /// (issue #2467).
+    workflow_infos: HashMap<String, WorkflowInfo>,
+    /// The declarative `#[signal]` handlers that carry an `arg_schema`, by
+    /// `(workflow, signal)` (issue #2467).
+    signal_handlers: HashMap<(String, String), SignalHandlerInfo>,
 }
 
 impl Drop for SqliteRuntime {
@@ -539,6 +545,8 @@ impl SqliteRuntime {
             drive_blocked: HashSet::new(),
             query_timeout: DEFAULT_QUERY_TIMEOUT,
             shared_state: empty_shared_state(),
+            workflow_infos: HashMap::new(),
+            signal_handlers: HashMap::new(),
         })
     }
 
@@ -655,6 +663,8 @@ impl SqliteRuntime {
             );
         }
         self.workflows.insert(info.name.to_string(), info.handler);
+        self.workflow_infos
+            .insert(info.name.to_string(), info.clone());
         self.workflow_policies.insert(
             info.name.to_string(),
             WorkflowPolicy {
@@ -862,6 +872,28 @@ impl SqliteRuntime {
     }
 
     /// Register a declarative `#[update]` handler from its
+    /// The `#[signal]` handlers that a signal's payload is checked against.
+    ///
+    /// A handler with an `arg_schema` makes every signal of that
+    /// `(workflow, name)` meet the schema before it is staged, as on Postgres
+    /// (issue #610). A retry of a keyed signal that was already delivered is
+    /// still a duplicate, even when the schema changed since (issue #2467).
+    /// A handler with no schema changes nothing.
+    pub fn register_signal_handler(&mut self, info: &SignalHandlerInfo) {
+        if info.arg_schema.is_some() {
+            self.signal_handlers.insert(
+                (info.workflow.to_string(), info.name.to_string()),
+                info.clone(),
+            );
+        }
+    }
+
+    /// The handler whose schema a signal `name` of `workflow` must meet.
+    fn signal_check(&self, workflow: &str, name: &str) -> Option<&SignalHandlerInfo> {
+        self.signal_handlers
+            .get(&(workflow.to_string(), name.to_string()))
+    }
+
     /// [`UpdateHandlerInfo`] (issue #2025).
     ///
     /// The handler serves only runs of `info.workflow`. The runtime keeps the
@@ -1150,6 +1182,7 @@ impl SqliteRuntime {
                 config: &config,
                 started_at: now,
                 fields,
+                input_check: None,
             },
         )?;
         tx.commit()?;
@@ -1309,6 +1342,7 @@ impl SqliteRuntime {
         }
         let key = signal_key(name, &payload, idempotency_key)?;
         self.seal_key_if_overdue(workflow_name, workflow_id)?;
+        let check = self.signal_check(workflow_name, name).cloned();
         let tx = self.conn.transaction()?;
         if let Some(holder) = key_in_chain(&tx, workflow_name, workflow_id, name, key)? {
             return Ok(SignalDelivery {
@@ -1321,7 +1355,7 @@ impl SqliteRuntime {
                 workflow_name: workflow_name.to_string(),
                 workflow_id: workflow_id.to_string(),
             })?;
-        let delivered = stage_keyed(&tx, exec, name, &payload, key, Utc::now())?;
+        let delivered = stage_keyed(&tx, exec, name, &payload, key, Utc::now(), check.as_ref())?;
         tx.commit()?;
         Ok(SignalDelivery {
             exec_id: exec,
@@ -1392,6 +1426,10 @@ impl SqliteRuntime {
         self.seal_key_if_overdue(workflow_name, workflow_id)?;
         let now = (self.now_fn)().timestamp_millis();
         let config = self.start_config(workflow_name, now)?;
+        // Checked only where they apply: the input when a run is created, the
+        // signal after the key probe (issue #2467).
+        let input_check = self.workflow_infos.get(workflow_name).cloned();
+        let signal_check = self.signal_check(workflow_name, signal_name).cloned();
         let tx = self.conn.transaction()?;
         if let Some(holder) = key_in_chain(&tx, workflow_name, workflow_id, signal_name, key)? {
             return Ok(SignalWithStartOutcome {
@@ -1411,6 +1449,7 @@ impl SqliteRuntime {
                 config: &config,
                 started_at: now,
                 fields: RunFields::default(),
+                input_check: input_check.as_ref(),
             },
         )?;
         let signal_delivered = stage_keyed(
@@ -1420,6 +1459,7 @@ impl SqliteRuntime {
             &signal_payload,
             key,
             Utc::now(),
+            signal_check.as_ref(),
         )?;
         tx.commit()?;
         Ok(SignalWithStartOutcome {
@@ -1443,7 +1483,27 @@ impl SqliteRuntime {
         // check runs at `deadline_clock` (issue #2029).
         self.seal_if_overdue_at(exec, deadline_clock)?;
         let key = signal_key(name, payload, idempotency_key)?;
-        stage_keyed(&self.conn, exec, name, payload, key, received_at)
+        // The workflow name is read only when some handler of this signal
+        // name carries a schema.
+        let check = if self
+            .signal_handlers
+            .keys()
+            .any(|(_, signal)| signal == name)
+        {
+            let workflow = store::workflow_name_of(&self.conn, exec)?;
+            self.signal_check(&workflow, name).cloned()
+        } else {
+            None
+        };
+        stage_keyed(
+            &self.conn,
+            exec,
+            name,
+            payload,
+            key,
+            received_at,
+            check.as_ref(),
+        )
     }
 
     /// Request a cooperative cancel of `exec` (issue #2021).
@@ -3095,6 +3155,7 @@ impl SqliteRuntime {
                 config: &config,
                 started_at: now,
                 fields: RunFields::default(),
+                input_check: None,
             },
         )?;
         store::copy_inherited_fields(&tx, exec, successor)?;
@@ -4425,6 +4486,14 @@ impl StartMatrix {
         if self == Self::SignalWithStart {
             check_input_cap(&input)?;
         }
+        if let Some(info) = fresh.input_check
+            && let Err(violations) = info.validate_input(&input)
+        {
+            return Err(SqliteError::WorkflowInputInvalid {
+                workflow: workflow_name.to_string(),
+                violations,
+            });
+        }
         insert_fresh_execution(conn, workflow_name, workflow_id, input, fresh)
     }
 }
@@ -4449,6 +4518,10 @@ struct FreshRun<'a> {
     started_at: i64,
     /// The memo and the search attributes (issue #2027).
     fields: RunFields<'a>,
+    /// The definition whose `input_schema` the input of a created run must
+    /// meet (issue #2467). Only a signal-with-start sets it: the start route
+    /// checks before its own attach decision, as on Postgres.
+    input_check: Option<&'a WorkflowInfo>,
 }
 
 /// Start the run of the slot of `due` inside the caller's fire transaction
@@ -4465,6 +4538,7 @@ fn start_slot(
         config,
         started_at: now,
         fields: RunFields::default(),
+        input_check: None,
     };
     match start_in_tx(
         conn,
@@ -4667,6 +4741,7 @@ fn stage_keyed(
     payload: &Value,
     key: Option<&str>,
     received_at: DateTime<Utc>,
+    check: Option<&SignalHandlerInfo>,
 ) -> SqliteResult<bool> {
     if let Some(key) = key
         && store::has_signal_key(conn, exec, key)?
@@ -4680,6 +4755,16 @@ fn stage_keyed(
     // write handle, so no transition can happen between this check and the
     // insert.
     refuse_unless_running(conn, exec)?;
+    // The schema check comes after the key probe above, as on Postgres. A
+    // retry of a delivered keyed signal stays a duplicate (issue #2467).
+    if let Some(handler) = check
+        && let Err(violations) = handler.validate_arg(payload)
+    {
+        return Err(SqliteError::SignalPayloadInvalid {
+            signal: name.to_string(),
+            violations,
+        });
+    }
     // Enforce the signal-payload cap at INGRESS (issues #252 and #1069),
     // before the `harvest_signals` row is staged.
     // Otherwise the next drive records an oversized `SignalReceived` event.
@@ -5023,6 +5108,7 @@ fn start_retry(
             config: &config,
             started_at: plan.start_at,
             fields: RunFields::default(),
+            input_check: None,
         },
     )?;
     // A retry is the same logical run. It keeps the memo, the search

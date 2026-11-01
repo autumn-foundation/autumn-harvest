@@ -430,7 +430,18 @@ async fn an_input_that_breaks_the_schema_is_refused_before_it_starts() {
 
     let runs: Value = client.get("/harvest/workflows").send().await.json();
     assert_eq!(runs, json!([]), "a refused start writes nothing");
-    start(&client, &json!({ "input": "bee" })).await;
+    start(&client, &json!({ "input": "bee", "workflow_id": "w-ok" })).await;
+
+    // An attach discards the start input, so it needs none, as on Postgres.
+    let attached = client
+        .post("/harvest/workflows/greet/signal-with-start")
+        .json(&json!({ "workflow_id": "w-ok", "signal_name": "go" }))
+        .send()
+        .await;
+    attached.assert_ok();
+    let attached: Value = attached.json();
+    assert_eq!(attached["started_fresh"], false);
+    assert_eq!(attached["signal_delivered"], true);
 }
 
 /// An object schema for the `go` signal of `greet`.
