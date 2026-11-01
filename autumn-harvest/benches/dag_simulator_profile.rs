@@ -31,7 +31,7 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn noop() {}
+const fn noop() {}
 
 fn builder(layers: usize, width: usize) -> DagBuilder {
     let mut b = DagBuilder::new();

@@ -92,12 +92,12 @@ fn env_usize(key: &str, default: usize) -> usize {
 // types across many parallel shards) rather than either one universal name
 // or an unrealistic one-name-per-node cardinality that would never
 // legitimately collide in `activity_durations`.
-fn extract_shard() {}
-fn transform_shard() {}
-fn validate_shard() {}
-fn enrich_shard() {}
-fn load_shard() {}
-fn checkpoint_shard() {}
+const fn extract_shard() {}
+const fn transform_shard() {}
+const fn validate_shard() {}
+const fn enrich_shard() {}
+const fn load_shard() {}
+const fn checkpoint_shard() {}
 
 fn push_activity(builder: &mut DagBuilder, column: usize) -> DagTaskRef {
     match column % 6 {
