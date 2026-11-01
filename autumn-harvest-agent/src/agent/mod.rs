@@ -54,6 +54,7 @@ use crate::loop_guard::LoopGuard;
 use crate::memory::MemoryScope;
 use crate::mesh::{Mandate, Refusal};
 use crate::message::{ChatMessage, ChatRole, RunId, SessionId};
+use crate::skill::SkillText;
 use crate::types::{AgentStop, AgentTask, DEFAULT_APPROVAL_TIMEOUT_SECS, DEFAULT_MAX_STEPS};
 use crate::workflow::{
     Member, Outbox, Progress, Run, SteerBook, Tree, deliver, discover, harness, run_segment,
@@ -668,6 +669,14 @@ pub struct AgentProfile {
     /// [`context_reset`](crate::context_reset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_reset: Option<ContextReset>,
+    /// The text that replaces the description of each named tool (issue
+    /// #2373). See [`AgentTask::tool_guidance`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_guidance: BTreeMap<String, String>,
+    /// The skills of the agents of the kind (issue #2373). See
+    /// [`AgentTask::skills`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skills: BTreeMap<String, SkillText>,
 }
 
 const fn default_max_steps() -> u32 {
@@ -710,6 +719,8 @@ impl AgentProfile {
             stream: false,
             workspace: false,
             context_reset: None,
+            tool_guidance: BTreeMap::new(),
+            skills: BTreeMap::new(),
         }
     }
 
@@ -718,6 +729,20 @@ impl AgentProfile {
     #[must_use]
     pub const fn context_reset(mut self, setting: ContextReset) -> Self {
         self.context_reset = Some(setting);
+        self
+    }
+
+    /// Show `text` to the model in place of the description of `tool`.
+    #[must_use]
+    pub fn tool_guidance(mut self, tool: impl Into<String>, text: impl Into<String>) -> Self {
+        self.tool_guidance.insert(tool.into(), text.into());
+        self
+    }
+
+    /// Add the skill `name` to the agents of the kind.
+    #[must_use]
+    pub fn skill(mut self, name: impl Into<String>, text: SkillText) -> Self {
+        self.skills.insert(name.into(), text);
         self
     }
 
@@ -896,6 +921,8 @@ impl AgentProfile {
         task.memory_in_state = self.memory == AgentMemory::State;
         task.stream = self.stream;
         task.context_reset = self.context_reset;
+        task.tool_guidance.clone_from(&self.tool_guidance);
+        task.skills.clone_from(&self.skills);
         if self.workspace {
             task.workspace = Some(WorkspaceMount {
                 scope: WorkspaceMount::agent_scope(id.as_str()),
