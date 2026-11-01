@@ -20,7 +20,8 @@ default build does not change.
   extension and an axum extractor: start, signal-with-start, signal (by run
   or workflow id), cancel, terminate, query, update, describe, list,
   history, and `shutdown`, which releases the writer lock. A start checks
-  the workflow's `input_schema`, as on Postgres.
+  the workflow's `input_schema`, and a signal checks its `#[signal]`
+  `arg_schema`, as on Postgres.
 - **Management API.** The core routes keep their Postgres paths and field
   names. Every other route answers `501` and links the epic. An unsupported
   start option is a `400` that names it. The #1802 mutation gate and

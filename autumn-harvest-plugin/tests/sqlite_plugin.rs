@@ -130,7 +130,7 @@ async fn a_workflow_runs_end_to_end_over_http() {
         .await;
     signal.assert_ok();
     let signal: Value = signal.json();
-    assert_eq!(signal["delivered"], true);
+    assert_eq!(signal["signal_delivered"], true);
     // The same key again is not delivered twice.
     let again = client
         .post(&format!("/harvest/workflows/{exec}/signal/go"))
@@ -139,7 +139,7 @@ async fn a_workflow_runs_end_to_end_over_http() {
         .send()
         .await;
     let again: Value = again.json();
-    assert_eq!(again["delivered"], false);
+    assert_eq!(again["signal_delivered"], false);
 
     let result = wait_for(
         &client,
@@ -417,4 +417,78 @@ async fn an_input_that_breaks_the_schema_is_refused_before_it_starts() {
     let runs: Value = client.get("/harvest/workflows").send().await.json();
     assert_eq!(runs, json!([]), "a refused start writes nothing");
     start(&client, &json!({ "input": "bee" })).await;
+}
+
+/// An object schema for the `go` signal of `greet`.
+fn object_schema() -> Value {
+    json!({ "type": "object" })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signal_that_breaks_its_schema_is_refused_before_it_is_staged() {
+    let dir = tempfile::tempdir().unwrap();
+    let go = autumn_harvest::SignalHandlerInfo {
+        name: "go",
+        workflow: "greet",
+        module: module_path!(),
+        arg_type_hint: "serde_json::Value",
+        description: None,
+        arg_schema: Some(object_schema),
+    };
+    let client = TestApp::new()
+        .config(config(dir.path()))
+        .profile("dev")
+        .plugin(plugin().signals(vec![go]))
+        .build();
+    let exec = start(&client, &json!({ "input": "bee", "workflow_id": "w-sig" })).await;
+
+    let refused = [
+        client
+            .post(&format!("/harvest/workflows/{exec}/signal/go"))
+            .json(&json!(42))
+            .send()
+            .await,
+        client
+            .post("/harvest/workflows/by-id/greet/w-sig/signal/go")
+            .json(&json!(42))
+            .send()
+            .await,
+        client
+            .post("/harvest/workflows/greet/signal-with-start")
+            .json(&json!({
+                "workflow_id": "w-sig",
+                "start_input": "bee",
+                "signal_name": "go",
+                "signal_payload": 42,
+            }))
+            .send()
+            .await,
+    ];
+    for response in refused {
+        response.assert_status(400);
+        let body: Value = response.json();
+        assert_eq!(body["error"], "signal payload validation failed");
+    }
+    let handle = client.state().extension::<HarvestSqlite>().unwrap();
+    assert!(matches!(
+        handle
+            .signal(exec.parse().unwrap(), "go", json!(42), None)
+            .await,
+        Err(autumn_harvest_plugin::sqlite::HarvestSqliteError::InvalidSignal(_))
+    ));
+
+    // A payload that passes reaches the run, which then completes.
+    client
+        .post(&format!("/harvest/workflows/{exec}/signal/go"))
+        .json(&json!({ "ok": true }))
+        .send()
+        .await
+        .assert_ok();
+    let result = wait_for(
+        &client,
+        &format!("/harvest/workflows/{exec}/result"),
+        |body| body["state"] == "COMPLETED",
+    )
+    .await;
+    assert_eq!(result["output"]["go"], json!({ "ok": true }));
 }

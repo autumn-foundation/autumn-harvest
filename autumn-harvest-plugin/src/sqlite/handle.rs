@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use autumn_harvest::info::{SchemaViolation, WorkflowInfo};
+use autumn_harvest::info::{SchemaViolation, SignalHandlerInfo, WorkflowInfo};
 use autumn_harvest::{ExecutionId, WorkflowEvent};
 use autumn_harvest_sqlite::{
     ExecutionDescription, ExecutionFilter, ExecutionPage, SignalDelivery, SignalWithStartOutcome,
@@ -36,6 +36,11 @@ pub enum HarvestSqliteError {
     /// Postgres start path refuses it the same way (issue #373).
     #[error("input validation failed: {}", describe_violations(.0))]
     InvalidInput(Vec<SchemaViolation>),
+    /// The payload breaks the `arg_schema` of the signal's declarative
+    /// `#[signal]` handler. The Postgres signal paths refuse it the same way
+    /// (issue #610).
+    #[error("signal payload validation failed: {}", describe_violations(.0))]
+    InvalidSignal(Vec<SchemaViolation>),
 }
 
 fn describe_violations(violations: &[SchemaViolation]) -> String {
@@ -87,6 +92,8 @@ struct Inner {
     workflows: Vec<String>,
     /// The registered definitions, for their input schemas.
     infos: HashMap<String, WorkflowInfo>,
+    /// The declarative `#[signal]` handlers, for their payload schemas.
+    signals: Vec<SignalHandlerInfo>,
 }
 
 impl std::fmt::Debug for HarvestSqlite {
@@ -103,6 +110,7 @@ impl HarvestSqlite {
         reader: SqliteReader,
         path: PathBuf,
         infos: Vec<WorkflowInfo>,
+        signals: Vec<SignalHandlerInfo>,
     ) -> Self {
         let mut workflows: Vec<String> = infos.iter().map(|info| info.name.to_owned()).collect();
         workflows.sort();
@@ -118,6 +126,7 @@ impl HarvestSqlite {
                 path,
                 workflows,
                 infos,
+                signals,
             }),
         }
     }
@@ -145,6 +154,36 @@ impl HarvestSqlite {
             .infos
             .get(workflow_name)
             .map_or(Ok(()), |info| info.validate_input(input))
+    }
+
+    /// Check a signal `payload` against the `arg_schema` of the declarative
+    /// `#[signal]` handler for `(workflow_name, signal_name)`.
+    ///
+    /// A signal with no handler, or a handler with no schema, passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns every violation of the schema.
+    pub fn validate_signal(
+        &self,
+        workflow_name: &str,
+        signal_name: &str,
+        payload: &Value,
+    ) -> Result<(), Vec<SchemaViolation>> {
+        self.inner
+            .signals
+            .iter()
+            .find(|handler| handler.workflow == workflow_name && handler.name == signal_name)
+            .map_or(Ok(()), |handler| handler.validate_arg(payload))
+    }
+
+    /// Whether any declarative signal handler of `signal_name` has a schema.
+    /// Only then does a signal by run id read the run's workflow name.
+    fn signal_has_schema(&self, signal_name: &str) -> bool {
+        self.inner
+            .signals
+            .iter()
+            .any(|handler| handler.name == signal_name && handler.arg_schema.is_some())
     }
 
     /// The registered workflow names, sorted.
@@ -233,6 +272,12 @@ impl HarvestSqlite {
     ) -> Result<SignalWithStartOutcome, HarvestSqliteError> {
         self.validate_input(&request.workflow_name, &request.input)
             .map_err(HarvestSqliteError::InvalidInput)?;
+        self.validate_signal(
+            &request.workflow_name,
+            &request.signal_name,
+            &request.signal_payload,
+        )
+        .map_err(HarvestSqliteError::InvalidSignal)?;
         Ok(self
             .call(|reply| Command::SignalWithStart { request, reply })
             .await??)
@@ -252,6 +297,13 @@ impl HarvestSqlite {
         payload: Value,
         idempotency_key: Option<String>,
     ) -> Result<bool, HarvestSqliteError> {
+        if self.signal_has_schema(name) {
+            let description = self.describe(exec).await?;
+            if let Some(workflow_name) = description.summary.workflow_name.value() {
+                self.validate_signal(workflow_name, name, &payload)
+                    .map_err(HarvestSqliteError::InvalidSignal)?;
+            }
+        }
         let name = name.to_owned();
         Ok(self
             .call(|reply| Command::Signal {
@@ -277,6 +329,8 @@ impl HarvestSqlite {
         payload: Value,
         idempotency_key: Option<String>,
     ) -> Result<SignalDelivery, HarvestSqliteError> {
+        self.validate_signal(workflow_name, name, &payload)
+            .map_err(HarvestSqliteError::InvalidSignal)?;
         let (workflow_name, workflow_id, name) = (
             workflow_name.to_owned(),
             workflow_id.to_owned(),

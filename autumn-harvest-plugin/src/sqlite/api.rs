@@ -103,7 +103,7 @@ pub fn router(state: ApiState) -> Router<()> {
 fn map_error(error: HarvestSqliteError) -> AutumnError {
     let error = match error {
         HarvestSqliteError::Sqlite(error) => error,
-        HarvestSqliteError::InvalidInput(_) => {
+        HarvestSqliteError::InvalidInput(_) | HarvestSqliteError::InvalidSignal(_) => {
             return AutumnError::bad_request_msg(error.to_string());
         }
         other => return AutumnError::service_unavailable_msg(other.to_string()),
@@ -473,20 +473,24 @@ impl SqliteStartBody {
     }
 }
 
-/// The Postgres `400` for an input that breaks the workflow's
-/// `input_schema` (issue #373), or `None` when the input passes.
-fn schema_refusal(handle: &HarvestSqlite, workflow_name: &str, input: &Value) -> Option<Response> {
-    let violations = handle.validate_input(workflow_name, input).err()?;
-    Some(
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "input validation failed",
-                "violations": violations,
-            })),
-        )
-            .into_response(),
+/// A refused write as its Postgres response.
+///
+/// A schema violation is the Postgres `400` with `violations`: the
+/// workflow's `input_schema` (issue #373) or a signal's `arg_schema` (issue
+/// #610). Every other error goes through [`map_error`].
+fn write_error(error: HarvestSqliteError) -> Response {
+    let (message, violations) = match error {
+        HarvestSqliteError::InvalidInput(violations) => ("input validation failed", violations),
+        HarvestSqliteError::InvalidSignal(violations) => {
+            ("signal payload validation failed", violations)
+        }
+        other => return map_error(other).into_response(),
+    };
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": message, "violations": violations })),
     )
+        .into_response()
 }
 
 /// `terminate_if_running` ends another caller's run, so it needs an admin,
@@ -530,14 +534,10 @@ async fn start(
     options.memo = request.memo;
     options.search_attributes = request.search_attrs.unwrap_or_default();
     let input = request.input.unwrap_or(Value::Null);
-    if let Some(refusal) = schema_refusal(state.handle()?, &workflow_name, &input) {
-        return Ok(refusal);
-    }
-    let started = state
-        .handle()?
-        .start(&workflow_name, input, options)
-        .await
-        .map_err(map_error)?;
+    let started = match state.handle()?.start(&workflow_name, input, options).await {
+        Ok(started) => started,
+        Err(error) => return Ok(write_error(error)),
+    };
     let description = state
         .handle()?
         .describe(started.exec_id)
@@ -603,23 +603,23 @@ async fn signal_with_start(
     require_admin_for_policy(&state, body.id_reuse_policy.as_deref(), session).await?;
     let reuse_policy = crate::api::parse_reuse_policy(body.id_reuse_policy.as_deref())?;
     let handle = state.handle()?;
-    // Postgres checks the start input even when the call attaches.
-    let input = body.start_input.unwrap_or(Value::Null);
-    if let Some(refusal) = schema_refusal(handle, &workflow_name, &input) {
-        return Ok(refusal);
-    }
-    let outcome = handle
+    // The handle checks the start input even when the call attaches, and
+    // the signal payload, as Postgres does.
+    let outcome = match handle
         .signal_with_start(SignalWithStartParams {
             workflow_name: workflow_name.clone(),
             workflow_id: body.workflow_id.clone(),
-            input,
+            input: body.start_input.unwrap_or(Value::Null),
             reuse_policy,
             signal_name: body.signal_name,
             signal_payload: body.signal_payload.unwrap_or(Value::Null),
             idempotency_key: body.idempotency_key,
         })
         .await
-        .map_err(map_error)?;
+    {
+        Ok(outcome) => outcome,
+        Err(error) => return Ok(write_error(error)),
+    };
     let description = handle.describe(outcome.exec_id).await.map_err(map_error)?;
     Ok(Json(json!({
         "execution_id": outcome.exec_id.to_string(),
@@ -671,20 +671,25 @@ async fn signal(
     RawQuery(raw): RawQuery,
     headers: axum::http::HeaderMap,
     body: Bytes,
-) -> Result<Json<Value>, AutumnError> {
+) -> Result<Response, AutumnError> {
     let exec = parse_exec(&id)?;
     let key = idempotency_key(&headers, raw.as_deref())?;
     let payload: Value = optional_body::<Option<Value>>(&body)?.unwrap_or(Value::Null);
-    let delivered = state
+    let delivered = match state
         .handle()?
         .signal(exec, &signal_name, payload, key)
         .await
-        .map_err(map_error)?;
+    {
+        Ok(delivered) => delivered,
+        Err(error) => return Ok(write_error(error)),
+    };
+    // `signal_delivered` is the Postgres `SignalAck` field.
     Ok(Json(json!({
         "ok": true,
         "execution_id": exec.to_string(),
-        "delivered": delivered,
-    })))
+        "signal_delivered": delivered,
+    }))
+    .into_response())
 }
 
 async fn signal_by_id(
@@ -693,19 +698,23 @@ async fn signal_by_id(
     RawQuery(raw): RawQuery,
     headers: axum::http::HeaderMap,
     body: Bytes,
-) -> Result<Json<Value>, AutumnError> {
+) -> Result<Response, AutumnError> {
     let key = idempotency_key(&headers, raw.as_deref())?;
     let payload: Value = optional_body::<Option<Value>>(&body)?.unwrap_or(Value::Null);
-    let delivery = state
+    let delivery = match state
         .handle()?
         .signal_by_workflow_id(&workflow_name, &workflow_id, &signal_name, payload, key)
         .await
-        .map_err(map_error)?;
+    {
+        Ok(delivery) => delivery,
+        Err(error) => return Ok(write_error(error)),
+    };
     Ok(Json(json!({
         "ok": true,
         "execution_id": delivery.exec_id.to_string(),
-        "delivered": delivery.delivered,
-    })))
+        "signal_delivered": delivery.delivered,
+    }))
+    .into_response())
 }
 
 /// The body of cancel and terminate. Both take an optional reason.

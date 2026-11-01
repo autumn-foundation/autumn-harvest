@@ -72,6 +72,8 @@ struct StartParts {
     workflows: Vec<autumn_harvest::info::WorkflowInfo>,
     activities: Vec<autumn_harvest::info::ActivityInfo>,
     updates: Vec<autumn_harvest::UpdateHandlerInfo>,
+    /// The declarative `#[signal]` handlers, for their payload schemas.
+    signals: Vec<autumn_harvest::SignalHandlerInfo>,
     /// The `HarvestPlugin::state` values. The startup hook adds `AppState`.
     state: autumn_harvest::context::SharedStateMap,
 }
@@ -113,6 +115,7 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         workflows: builder.workflow_infos().to_vec(),
         activities: builder.take_activities(),
         updates: builder.update_handlers().to_vec(),
+        signals: builder.signal_handlers().to_vec(),
         state: builder.take_state(),
     };
 
@@ -351,7 +354,13 @@ async fn start(
             )));
         }
     };
-    let handle = HarvestSqlite::new(driver.sender.clone(), reader, path.clone(), infos);
+    let handle = HarvestSqlite::new(
+        driver.sender.clone(),
+        reader,
+        path.clone(),
+        infos,
+        parts.signals,
+    );
     slot.lock().unwrap_or_else(PoisonError::into_inner).driver = Some(driver);
     state.insert_extension(handle.clone());
     let _ = handle_slot.set(handle);
