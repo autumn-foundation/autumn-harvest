@@ -37,6 +37,8 @@ use crate::harness::{AgentHarness, CacheTenant};
 use crate::heartbeat::{HEARTBEAT_WORKFLOW_NAME, HeartbeatTask, agent_heartbeat_info};
 use crate::mesh_control::{MESH_ATTR, MeshPause, MeshSpend, Spend};
 use crate::model::BoxFuture;
+use crate::refine::agent_refine_propose_info;
+use crate::refine::propose::run_stage;
 use crate::types::{AgentTask, ModelTurnRequest};
 use crate::workflow::{
     WORKFLOW_NAME, agent_deliver_info, agent_discover_peers_info, agent_loop_info,
@@ -114,6 +116,13 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     rt.register_activity_with_body(&agent_discover_peers_info(), move |input| {
         call(input, |names: Vec<String>| {
             std::future::ready(Ok::<_, String>(h.discover_peers(&names)))
+        })
+    });
+    let h = Arc::clone(&harness);
+    rt.register_activity_with_body(&agent_refine_propose_info(), move |input| {
+        call(input, |request| {
+            let h = Arc::clone(&h);
+            async move { run_stage(&h, request).await }
         })
     });
     rt.register_activity_with_body(&agent_precheck_info(), move |input| {

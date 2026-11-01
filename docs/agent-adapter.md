@@ -102,8 +102,8 @@ let built = HarvestBuilder::new()
 `agent` (section 15). `activities()` returns `agent_model_turn`,
 `agent_tool_call`, `agent_memory_snapshot`, `agent_deliver`,
 `agent_precheck`, `agent_discover_peers`, `agent_profile`,
-`agent_memory_reset`, `agent_workspace_retain`, `agent_workspace_reset` and
-`agent_workspace_floor`.
+`agent_memory_reset`, `agent_workspace_retain`, `agent_workspace_reset`,
+`agent_workspace_floor` and `agent_refine_propose` (section 16).
 The test `the_engine_registration_builds` builds this
 exact registration.
 
@@ -408,8 +408,8 @@ and the run ends under `budget_exceeded`. Three limits apply:
 The adapter owns the payloads it records: `AgentTask`, `ModelTurnRequest`,
 `ModelTurn`, `ToolCallRequest`, `ToolOutcome`, `AgentReport`,
 `HeartbeatTask`, `HeartbeatReport`, `Report`, `ReportSource`,
-`MemoryScope`, `Followups`, `LoopGuard`, `Mandate`, `Peer` and
-`DelegationRecord`. They hold only types this crate
+`MemoryScope`, `Followups`, `LoopGuard`, `Mandate`, `Peer`,
+`DelegationRecord`, `SkillText` and `SkillLookup`. They hold only types this crate
 defines, so the crate owns their serde shape. Replay reads these payloads
 back, so add a field only with `#[serde(default)]`. A new field of an
 activity input also needs `skip_serializing_if` at its default, because a
@@ -1198,3 +1198,96 @@ the answer of each model turn in two layers:
   See [durable routes](durable-routes.md#live-chunks).
 - The live text is a preview. The `TurnText` and the run result are the
   answer.
+
+### Tool guidance and skills (issue #2373)
+
+A profile and a task can carry two text parts. A profile overlay can set
+both. See `docs/design/DESIGN-2373.md`.
+
+```rust,ignore
+let profile = AgentProfile::new("support")
+    .tool_guidance("lookup", "Look up an order by its id. Never guess an id.")
+    .skill("refund", SkillText::new("Pay a refund.", "Check the order first. ..."));
+```
+
+- **Tool guidance.** The text replaces the description of an app tool in
+  the definition that the model sees. The name, the schema, the effect and
+  the policy stay. A built-in tool keeps its own text. `overlay::apply`
+  refuses a key that names no app tool with `OverlayError::UnknownTool`.
+- **Skills.** The system prompt lists each name and one-line summary under
+  `## Skills`. It never holds a body. The model gets the `load_skill` tool,
+  with `ToolEffect::ReadOnly`. A call is an ordinary `agent_tool_call`, so
+  history records the body and replay reads it from there. The body is cut
+  like any tool result.
+- A run with no skills offers no `load_skill` tool. A call to it is an
+  unknown tool. The harness never shows an app tool with that name.
+- A skill name follows the agent name rules. A summary is one line of at
+  most `MAX_SKILL_SUMMARY_CHARS` characters, with no control character. A
+  body has at most `MAX_SKILL_BODY_BYTES`, and a map holds at most
+  `MAX_SKILLS`. Each segment checks the skills first, so a bad skill fails
+  the run or the op before any model call.
+- The mandate tool allowlist does not need to name `load_skill`.
+- `eval::evaluate` treats a `load_skill` call as any tool call. A recorded
+  call takes its recorded body. A new call gets the stub and counts in
+  `stubbed_tool_calls`.
+- Upgrade every worker before a profile or a task carries skills. An old
+  worker does not know the reserved name.
+- A delegated child gets neither part. Its peer has its own prompt.
+
+## 16. Propose an overlay (issue #2379)
+
+The refine loop (epic #2369) needs candidate overlays. A proposer writes
+one from the evidence of recorded runs. There are two dimensions:
+
+- **INV** edits how the agent works, independent of the subject.
+- **DOM** edits what a practitioner in the domain knows.
+
+An app implements `OverlayProposer` for its provider, as it does
+`AgentModel`. `ModelProposer` implements it over any `AgentModel`, with
+the default INV and DOM templates. `ModelProposer::template` replaces one.
+Install the proposer with `AgentHarness::proposer`.
+
+```rust
+use std::sync::Arc;
+use autumn_harvest_agent::{AgentHarness, ModelProposer};
+
+let harness = AgentHarness::new(Arc::clone(&client))
+    .proposer(Arc::new(ModelProposer::new(client)));
+```
+
+The activity `agent_refine_propose` runs one stage. Its input is a
+`ProposeRequest`: the dimension, the evidence, the base profile, the
+current overlay, the ceilings of the run and the attempt count. The
+current overlay must apply under the ceilings. The activity asks the
+proposer once per attempt. The proposer reads the base profile and the
+ceilings too. It checks each reply with
+`overlay::apply` under the ceilings. It returns one `Stage`:
+
+| Outcome | Meaning |
+|---|---|
+| `Proposed(overlay)` | A valid overlay that differs from `current`. |
+| `KeptBase` | A valid overlay that gives the profile of `current`. It is not a candidate. |
+| `FellBack { error }` | No attempt was valid. The stage inherits `current`. `error` is the last rejection. |
+
+- `ProposalAttempts` is from 1 to 8. The default is 2.
+  `RefinePolicy::proposal_attempts` (#2394) sets it.
+- The next attempt gets the last rejection, so the model can fix it.
+- A reply that does not decode, is above the ceilings or is above the
+  result cap is invalid. So is an attempt over
+  `AgentHarness::proposer_timeout` (at most 13 minutes).
+- A retryable proposer error (`RateLimited`, `Transport`, `Unavailable`)
+  fails the activity. The engine retries the whole stage. `Config`,
+  `Authentication` and `Budget` fail it for good. Any other error spends
+  one attempt.
+- Each ceiling key is required in JSON. Only an explicit `null` sets no
+  limit.
+- The proposed text is model output. Treat it as untrusted until the
+  adoption gate (#2381) accepts it.
+- The retries run inside the activity. So one stage is one recorded
+  result. A crash before the result runs the stage again from attempt 1.
+  Replay reads the result and asks no proposer. On Postgres, a lost
+  worker holds the stage until its 2-hour `start_to_close` ends.
+
+The default templates adapt Harness² text under Apache-2.0. See
+`autumn-harvest-agent/NOTICE`. The design is in
+[`DESIGN-2379.md`](design/DESIGN-2379.md).

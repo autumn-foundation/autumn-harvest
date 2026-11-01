@@ -283,6 +283,8 @@ impl Conversation {
             ),
         };
         ModelTurnRequest {
+            tool_guidance: std::collections::BTreeMap::new(),
+            skills: false,
             run_id: "run-agent-model-turn-profile".into(),
             session_id: None,
             steps_used: u32::try_from(page).expect("a turn number fits in u32"),

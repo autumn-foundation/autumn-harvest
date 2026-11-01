@@ -143,6 +143,14 @@ required-features = ["sqlite"]
 name = "overlay_store_postgres"
 required-features = ["postgres"]
 
+[[test]]
+name = "skills"
+required-features = ["sqlite", "eval"]
+
+[[test]]
+name = "refine_propose"
+required-features = ["sqlite"]
+
 [lints]
 workspace = true
 

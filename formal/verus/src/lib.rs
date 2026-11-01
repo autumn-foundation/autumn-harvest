@@ -11,3 +11,4 @@ mod scan_skip;
 mod depth_cap;
 mod agent_overlay;
 mod overlay_log;
+mod agent_propose;
