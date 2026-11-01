@@ -10,6 +10,9 @@
 //!   2. `blocking-index`: `CREATE INDEX`, `DROP INDEX` and `REINDEX` on a hot
 //!      table must use `CONCURRENTLY`. A plain build blocks writes until it
 //!      ends. A plain drop needs `ACCESS EXCLUSIVE`, which queues all access.
+//!   3. `lock-upgrade`: after a plain build on a hot table, the same file must
+//!      not drop an index of that table or alter it. The build holds `SHARE`
+//!      until the commit, so the stronger lock deadlocks with waiting writers.
 //!
 //! An in-file annotation is the reviewed escape hatch. Shipped migrations
 //! cannot change, so `GRANDFATHERED` names each one by tree and name.
@@ -212,6 +215,8 @@ enum Rule {
     BlockingIndex,
     /// `CONCURRENTLY` in a migration that runs inside a transaction.
     ConcurrentlyInTransaction,
+    /// An `ACCESS EXCLUSIVE` lock on a hot table after a plain build of it.
+    LockUpgrade,
     /// A `lock-safety:` comment that does not parse.
     BadAnnotation,
     /// A valid annotation that suppresses no finding.
@@ -219,10 +224,11 @@ enum Rule {
 }
 
 impl Rule {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::LockTimeout,
         Self::BlockingIndex,
         Self::ConcurrentlyInTransaction,
+        Self::LockUpgrade,
         Self::BadAnnotation,
         Self::UnusedAnnotation,
     ];
@@ -232,6 +238,7 @@ impl Rule {
             Self::LockTimeout => "lock-timeout",
             Self::BlockingIndex => "blocking-index",
             Self::ConcurrentlyInTransaction => "concurrently-in-transaction",
+            Self::LockUpgrade => "lock-upgrade",
             Self::BadAnnotation => "bad-annotation",
             Self::UnusedAnnotation => "unused-annotation",
         }
@@ -246,6 +253,8 @@ impl Rule {
     /// The annotation rules guard the escape hatch itself, so nothing
     /// suppresses them. Postgres rejects each `concurrently-in-transaction`
     /// statement, so an annotation would only hide a migration that fails.
+    /// A `lock-upgrade` always has a safe form: drop first, or move the drop
+    /// to its own migration. So nothing suppresses it either.
     const fn allowable(self) -> bool {
         matches!(self, Self::LockTimeout | Self::BlockingIndex)
     }
@@ -497,6 +506,8 @@ fn lint(sql: &str, run_in_transaction: bool, history: &History) -> Vec<Finding> 
         }
     }
 
+    findings.extend(lock_upgrades(&analysis));
+
     // Every hot lock needs a bound in force. Report each statement without
     // one, so an annotation on one lock never covers another.
     let mut reported = BTreeSet::new();
@@ -519,6 +530,65 @@ fn lint(sql: &str, run_in_transaction: bool, history: &History) -> Vec<Finding> 
     }
 
     apply_annotations(sql, &analysis.comments, findings)
+}
+
+/// Each statement that asks for `ACCESS EXCLUSIVE` on a hot table after a
+/// plain build of that table in the same file (issue #2395).
+///
+/// A plain build holds `SHARE` until the commit. A writer that read or locked
+/// a row of the table already holds a lock that `SHARE` allows. Its write
+/// then waits behind the build. A later `DROP INDEX` or `ALTER TABLE` of the
+/// table waits behind that writer. That is a deadlock, and Postgres may abort
+/// the migration after the full build. A plain reader also blocks the later
+/// lock, until `lock_timeout` fails the migration.
+///
+/// The file counts as one transaction. Diesel and `harvest migrate` send it
+/// as one batch, which Postgres runs as one implicit transaction. The lint
+/// does not track an explicit `COMMIT` here, so this rule fails closed.
+/// A drop of an index on an unknown table counts, because that table may be
+/// the one that the build holds. Code that does not run now does not count.
+fn lock_upgrades(analysis: &Analysis) -> Vec<Finding> {
+    let holds_share = |hit: &&Hit| {
+        hit.verb == "CREATE INDEX"
+            && hit.kind == (Kind::Index { concurrent: false })
+            && hit.hot
+            && hit.body_start.is_none()
+    };
+    let needs_exclusive = |hit: &Hit| {
+        hit.body_start.is_none()
+            && matches!(
+                (hit.verb, hit.kind),
+                ("DROP INDEX", Kind::Index { concurrent: false }) | ("ALTER TABLE", Kind::Lock)
+            )
+    };
+    let same_table = |build: &Hit, later: &Hit| match (&build.table, &later.table) {
+        (Some(built), Some(locked)) => base(built) == base(locked),
+        _ => true,
+    };
+    let mut reported = BTreeSet::new();
+    let mut findings = Vec::new();
+    for build in analysis.hits.iter().filter(holds_share) {
+        let upgrades = analysis.hits.iter().filter(|later| {
+            later.at > build.at && needs_exclusive(later) && same_table(build, later)
+        });
+        for later in upgrades.filter(|later| reported.insert(later.at)) {
+            findings.push(Finding {
+                rule: Rule::LockUpgrade,
+                line: later.line,
+                stmt: later.at,
+                detail: format!(
+                    "{} asks for ACCESS EXCLUSIVE on {} while the plain {} on line {} \
+                     still holds SHARE. It deadlocks with each writer that waits behind the \
+                     build. Drop first, or move this statement to its own migration",
+                    later.label(),
+                    later.table_name(),
+                    build.label(),
+                    build.line
+                ),
+            });
+        }
+    }
+    findings
 }
 
 /// Why a statement that must run outside a transaction block cannot run where
@@ -4971,6 +5041,144 @@ fn metadata_toml_is_read_like_diesel_reads_it() {
     assert!(!run_in_transaction(
         "run_in_transaction=false # CONCURRENTLY\n"
     ));
+}
+
+// ── lock-upgrade ─────────────────────────────────────────────────────────────
+
+/// The old index that the `lock-upgrade` tests drop.
+const OLD_EXEC_INDEX: &str =
+    "CREATE INDEX idx_old ON harvest_workflow_executions (completed_at, id);";
+
+/// The shape of `20261029034500` as it shipped in 0.8.0: a guarded plain build,
+/// then a plain drop of the index it replaces, in one file (issue #2395).
+const SHIPPED_BUILD_THEN_DROP: &str = "SET LOCAL lock_timeout = '5s';
+
+DO $$
+BEGIN
+    IF to_regclass('idx_new') IS NULL THEN
+        -- lock-safety: allow blocking-index #2395 operators prebuild it CONCURRENTLY
+        CREATE INDEX idx_new ON harvest_workflow_executions (completed_at, id);
+    END IF;
+END $$;
+
+-- lock-safety: allow blocking-index #2395 operators drop it CONCURRENTLY first
+DROP INDEX IF EXISTS idx_old;
+";
+
+#[test]
+fn a_drop_after_a_plain_build_of_the_same_table_is_a_lock_upgrade() {
+    for run_in_transaction in [true, false] {
+        let findings = lint_with_history(
+            &[OLD_EXEC_INDEX],
+            SHIPPED_BUILD_THEN_DROP,
+            run_in_transaction,
+        );
+        assert_eq!(rules(&findings), [Rule::LockUpgrade], "{findings:?}");
+        assert_eq!(findings[0].line, 12, "the finding names the drop");
+        assert!(
+            findings[0]
+                .detail
+                .contains("CREATE INDEX idx_new on line 7"),
+            "the finding names the build: {}",
+            findings[0].detail
+        );
+    }
+}
+
+#[test]
+fn an_alter_table_after_a_plain_build_of_the_same_table_is_a_lock_upgrade() {
+    let sql = "SET LOCAL lock_timeout = '5s';
+-- lock-safety: allow blocking-index #2395 test fixture
+CREATE INDEX idx_new ON harvest_workflow_executions (id);
+ALTER TABLE harvest_workflow_executions ADD COLUMN x INT;
+";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockUpgrade], "{findings:?}");
+    assert_eq!(findings[0].line, 4);
+}
+
+#[test]
+fn a_drop_of_an_unknown_index_after_a_plain_build_fails_closed() {
+    let sql = SHIPPED_BUILD_THEN_DROP.replace(
+        "-- lock-safety: allow blocking-index #2395 operators drop it CONCURRENTLY first\n",
+        "-- lock-safety: allow blocking-index #2395 the lint cannot place this index\n",
+    );
+    let findings = lint_with_history(&[], &sql, true);
+    assert_eq!(rules(&findings), [Rule::LockUpgrade], "{findings:?}");
+}
+
+#[test]
+fn drop_first_or_another_table_or_a_split_is_not_a_lock_upgrade() {
+    // `ACCESS EXCLUSIVE` first: the build then runs under the stronger lock.
+    let drop_first = "SET LOCAL lock_timeout = '5s';
+-- lock-safety: allow blocking-index #2395 test fixture
+DROP INDEX IF EXISTS idx_old;
+-- lock-safety: allow blocking-index #2395 test fixture
+CREATE INDEX idx_new ON harvest_workflow_executions (completed_at, id);
+";
+    assert_eq!(lint_with_history(&[OLD_EXEC_INDEX], drop_first, true), []);
+
+    // The build holds `SHARE` on another table only.
+    let other_table = "SET LOCAL lock_timeout = '5s';
+-- lock-safety: allow blocking-index #2395 test fixture
+CREATE INDEX idx_new ON harvest_timers (fires_at);
+-- lock-safety: allow blocking-index #2395 test fixture
+DROP INDEX IF EXISTS idx_old;
+";
+    assert_eq!(lint_with_history(&[OLD_EXEC_INDEX], other_table, true), []);
+
+    // The fix for issue #2395: the build and the drop in two migrations.
+    let (build, drop) = SHIPPED_BUILD_THEN_DROP
+        .split_once("\n-- lock-safety: allow blocking-index #2395 operators drop")
+        .expect("the fixture has a drop");
+    let drop = format!(
+        "SET LOCAL lock_timeout = '5s';\n-- lock-safety: allow blocking-index #2395 operators drop{drop}"
+    );
+    assert_eq!(lint_with_history(&[OLD_EXEC_INDEX], build, true), []);
+    assert_eq!(lint_with_history(&[OLD_EXEC_INDEX, build], &drop, true), []);
+}
+
+#[test]
+fn a_concurrent_build_or_a_cold_table_is_not_a_lock_upgrade() {
+    let cold = "SET LOCAL lock_timeout = '5s';
+CREATE INDEX idx_new ON harvest_schedules (id);
+ALTER TABLE harvest_schedules ADD COLUMN x INT;
+";
+    assert_eq!(lint_with_history(&[], cold, true), []);
+
+    // A build in a function body runs later, in another transaction.
+    let body = "SET LOCAL lock_timeout = '5s';
+CREATE FUNCTION harvest_build_later() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_catalog.set_config('lock_timeout', '5s', true);
+    -- lock-safety: allow blocking-index #2395 test fixture
+    CREATE INDEX idx_new ON harvest_workflow_executions (id);
+END $$;
+-- lock-safety: allow blocking-index #2395 test fixture
+DROP INDEX IF EXISTS idx_old;
+";
+    let findings = lint_with_history(&[OLD_EXEC_INDEX], body, true);
+    assert!(
+        !rules(&findings).contains(&Rule::LockUpgrade),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn no_annotation_allows_a_lock_upgrade() {
+    let sql = SHIPPED_BUILD_THEN_DROP.replace(
+        "DROP INDEX IF EXISTS idx_old;",
+        "-- lock-safety: allow lock-upgrade #2395 try to hide it\nDROP INDEX IF EXISTS idx_old;",
+    );
+    let findings = lint_with_history(&[OLD_EXEC_INDEX], &sql, true);
+    assert!(
+        rules(&findings).contains(&Rule::BadAnnotation),
+        "{findings:?}"
+    );
+    assert!(
+        rules(&findings).contains(&Rule::LockUpgrade),
+        "{findings:?}"
+    );
 }
 
 // ── The escape hatch ─────────────────────────────────────────────────────────
