@@ -2178,7 +2178,7 @@ jobs:
       - name: Clippy autumn-harvest-plugin (sqlite feature)
         run: cargo clippy -p autumn-harvest-plugin --features sqlite --lib --test sqlite_plugin -- -D warnings
       - name: SQLite plugin unit tests
-        run: cargo test -p autumn-harvest-plugin --features sqlite --lib sqlite::
+        run: "cargo test -p autumn-harvest-plugin --features sqlite --lib sqlite::"
       - name: SQLite plugin end-to-end suite
         run: cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin
 
