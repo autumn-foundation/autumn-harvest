@@ -55868,7 +55868,6 @@ mod tests {
         WorkflowExecution {
             migrated_to_shard: None,
             migrated_at: None,
-            migrated_from_shards: None,
             id: uuid::Uuid::new_v4(),
             workflow_name: "trial_subscription".to_string(),
             workflow_id: "sub-42".to_string(),
@@ -55927,9 +55926,7 @@ mod tests {
             quota_key: None,
             created_at: chrono::Utc::now(),
             migrated_run_terminal_at: None,
-            migrated_run_terminal_state: None,
-            staging_vacated_state: None,
-            staging_vacated_by: None,
+            rebalance: crate::models::RebalanceMarkers::default(),
             tenant: None,
         }
     }

@@ -303,6 +303,8 @@ mod quota_supersede_ordering_tests;
 mod ramp_guard_tests;
 mod rate_limit_bucket_gc_tests;
 mod rate_limit_key_tests;
+#[cfg(feature = "db")]
+mod rebalance_markers_db_tests;
 mod redrive_tests;
 #[cfg(all(feature = "testing", feature = "db"))]
 mod remote_task_db_tests;

@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use uuid::Uuid;
 
+use crate::schema::harvest_workflow_executions_unmapped as unmapped;
 use crate::schema::{
     harvest_admission_gates, harvest_api_tokens, harvest_audit_export_cursor, harvest_audit_log,
     harvest_backfill_log, harvest_batch_jobs, harvest_build_compat, harvest_build_policies,
@@ -232,41 +233,19 @@ pub struct WorkflowExecution {
     /// Non-NULL exactly when `state = 'MIGRATED'`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migrated_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Every shard that previously hosted this execution (issue #964), oldest
-    /// first, as a JSON array of shard ids. `None` for a run that never moved.
-    /// Together with the shard this row is on, it is the complete set of shards
-    /// still holding a copy of the run's bytes — which is what a cross-residence
-    /// payload erasure traverses, and why it is kept separately from the
-    /// deliberately-collapsed `migrated_to_shard` pointer.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub migrated_from_shards: Option<serde_json::Value>,
     /// Wall-clock a reconciler observed this seal's live copy as terminal
     /// (issue #1317). `None` until observed; non-`None` releases the row
     /// from active-conflict classification without changing `state`, so
     /// retention and erasure keep treating it as a `MIGRATED` seal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migrated_run_terminal_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// The live copy's own terminal state, recorded alongside
-    /// `migrated_run_terminal_at` by the same reconciler pass (fresh
-    /// review, P2 follow-up). `state` on this row stays `MIGRATED`
-    /// forever; a reuse-policy decision that needs to know whether the
-    /// live copy actually finished FAILED/CANCELLED reads this instead.
-    /// See [`Self::effective_terminal_state`].
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub migrated_run_terminal_state: Option<String>,
-    /// The state a shard-rebalance staging vacate sealed over (issue #1317
-    /// review). Non-`None` only while the migration that vacated this row
-    /// is still in flight. An abort restores `state` to this value and
-    /// clears it. A successful cutover just clears it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub staging_vacated_state: Option<String>,
-    /// The execution id of the migration whose staging vacated this row
-    /// (issue #1596 review). Non-`None` exactly when `staging_vacated_state`
-    /// is. Lets `activate_target` finalize this row's marker with a direct
-    /// match on the vacating migration's own execution id, with no
-    /// cross-database write and no retry race.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub staging_vacated_by: Option<Uuid>,
+    /// The shard-rebalance markers (issue #2492).
+    ///
+    /// They sit outside the `table!`, which keeps it at 64 columns or fewer.
+    /// `flatten` keeps their JSON keys at the top level, as before.
+    #[diesel(embed)]
+    #[serde(flatten)]
+    pub rebalance: RebalanceMarkers,
     /// Verified tenant of the run (issue #1977). `None` means no tenant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
@@ -311,13 +290,61 @@ impl WorkflowExecution {
     #[must_use]
     pub fn effective_terminal_state(&self) -> &str {
         if self.state == "MIGRATED" {
-            self.migrated_run_terminal_state
+            self.rebalance
+                .migrated_run_terminal_state
                 .as_deref()
                 .unwrap_or(&self.state)
         } else {
             &self.state
         }
     }
+}
+
+/// The shard-rebalance columns of `harvest_workflow_executions` (issue #2492).
+///
+/// The `table!` leaves these columns out, so it stays at 64 columns or fewer.
+/// Each field selects through a typed fragment in
+/// [`crate::schema::harvest_workflow_executions_unmapped`].
+#[derive(
+    Debug, Clone, Default, PartialEq, Queryable, Selectable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_workflow_executions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct RebalanceMarkers {
+    /// Every shard that previously hosted this execution (issue #964), oldest
+    /// first, as a JSON array of shard ids. `None` for a run that never moved.
+    ///
+    /// The array plus the shard of this row is the complete set of shards
+    /// that still hold a copy of the run. A cross-residence payload erasure
+    /// traverses that set. `migrated_to_shard` collapses hops, so it cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[diesel(select_expression = unmapped::migrated_from_shards())]
+    #[diesel(select_expression_type = unmapped::types::MigratedFromShards)]
+    pub migrated_from_shards: Option<serde_json::Value>,
+    /// The terminal state of the live copy (issue #1317).
+    ///
+    /// The reconciler writes it with `migrated_run_terminal_at`. The `state`
+    /// of a seal stays `MIGRATED` forever. A reuse-policy decision reads this
+    /// field instead. See [`WorkflowExecution::effective_terminal_state`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[diesel(select_expression = unmapped::migrated_run_terminal_state())]
+    #[diesel(select_expression_type = unmapped::types::MigratedRunTerminalState)]
+    pub migrated_run_terminal_state: Option<String>,
+    /// The state a shard-rebalance staging vacate sealed over (issue #1317).
+    ///
+    /// It is `Some` only while the migration that vacated this row is in
+    /// flight. An abort restores `state` to this value and clears it. A
+    /// successful cutover clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[diesel(select_expression = unmapped::staging_vacated_state())]
+    #[diesel(select_expression_type = unmapped::types::StagingVacatedState)]
+    pub staging_vacated_state: Option<String>,
+    /// The execution id of the migration whose staging vacated this row
+    /// (issue #1596). It is `Some` exactly when `staging_vacated_state` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[diesel(select_expression = unmapped::staging_vacated_by())]
+    #[diesel(select_expression_type = unmapped::types::StagingVacatedBy)]
+    pub staging_vacated_by: Option<Uuid>,
 }
 
 /// Serialize a nullable `start_source` column, reporting a `None` (pre-upgrade /
@@ -2042,11 +2069,8 @@ mod effective_terminal_state_tests {
             quota_key: None,
             migrated_to_shard: None,
             migrated_at: None,
-            migrated_from_shards: None,
             migrated_run_terminal_at: None,
-            migrated_run_terminal_state: None,
-            staging_vacated_state: None,
-            staging_vacated_by: None,
+            rebalance: super::RebalanceMarkers::default(),
             tenant: None,
         }
     }
@@ -2069,7 +2093,7 @@ mod effective_terminal_state_tests {
     fn a_reconciled_seal_reads_the_live_copy_s_recorded_outcome() {
         let mut row = stub("MIGRATED");
         row.migrated_run_terminal_at = Some(chrono::Utc::now());
-        row.migrated_run_terminal_state = Some("FAILED".to_string());
+        row.rebalance.migrated_run_terminal_state = Some("FAILED".to_string());
         assert_eq!(
             row.effective_terminal_state(),
             "FAILED",
@@ -2081,8 +2105,36 @@ mod effective_terminal_state_tests {
     fn a_reconciled_seal_with_a_successful_outcome_still_reads_as_that_outcome() {
         let mut row = stub("MIGRATED");
         row.migrated_run_terminal_at = Some(chrono::Utc::now());
-        row.migrated_run_terminal_state = Some("COMPLETED".to_string());
+        row.rebalance.migrated_run_terminal_state = Some("COMPLETED".to_string());
         assert_eq!(row.effective_terminal_state(), "COMPLETED");
+    }
+
+    /// The embedded markers keep their JSON keys at the top level (issue #2492).
+    #[test]
+    fn the_rebalance_markers_serialize_flat_and_round_trip() {
+        let mut row = stub("MIGRATED");
+        let vacated_by = uuid::Uuid::new_v4();
+        row.rebalance = super::RebalanceMarkers {
+            migrated_from_shards: Some(serde_json::json!([2, 7])),
+            migrated_run_terminal_state: Some("FAILED".to_string()),
+            staging_vacated_state: Some("COMPLETED".to_string()),
+            staging_vacated_by: Some(vacated_by),
+        };
+        let json = serde_json::to_value(&row).expect("serialize the row");
+        assert!(json.get("rebalance").is_none(), "the group must not nest");
+        assert_eq!(json["migrated_from_shards"], serde_json::json!([2, 7]));
+        assert_eq!(json["migrated_run_terminal_state"], "FAILED");
+        assert_eq!(json["staging_vacated_state"], "COMPLETED");
+        assert_eq!(json["staging_vacated_by"], vacated_by.to_string());
+
+        let back: super::WorkflowExecution =
+            serde_json::from_value(json).expect("deserialize the row");
+        assert_eq!(back.rebalance, row.rebalance);
+
+        let empty = serde_json::to_value(stub("RUNNING")).expect("serialize");
+        for key in crate::schema::harvest_workflow_executions_unmapped::COLUMNS {
+            assert!(empty.get(key).is_none(), "`{key}` is skipped when None");
+        }
     }
 
     #[test]

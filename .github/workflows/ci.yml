@@ -550,6 +550,14 @@ jobs:
           python3 docs/audits/required-migration-versions-sync.py --self-test
           python3 docs/audits/required-migration-versions-sync.py
 
+      # Issue #2492: every diesel table! keeps 64 columns or fewer, and the
+      # workspace never enables 128-column-tables. A table over 32 columns
+      # needs a ceiling in the script. A ceiling only goes down.
+      - name: Diesel table width (docs/audits/diesel-table-width.py)
+        run: |
+          python3 docs/audits/diesel-table-width.py --self-test
+          python3 docs/audits/diesel-table-width.py
+
       # Only listed files sit at the repository root. A design record goes in
       # docs/design/. The script lists each root file with a reason.
       - name: Root files (docs/audits/root-files.py)

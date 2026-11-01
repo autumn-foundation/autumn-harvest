@@ -60677,7 +60677,6 @@ mod tests {
         WorkflowExecution {
             migrated_to_shard: None,
             migrated_at: None,
-            migrated_from_shards: None,
             quota_key: None,
             id: uuid::Uuid::new_v4(),
             workflow_name: "decode-wf".to_string(),
@@ -60736,9 +60735,7 @@ mod tests {
             history_bloat_warned_at: None,
             triage_note: None,
             migrated_run_terminal_at: None,
-            migrated_run_terminal_state: None,
-            staging_vacated_state: None,
-            staging_vacated_by: None,
+            rebalance: autumn_harvest::models::RebalanceMarkers::default(),
             tenant: None,
         }
     }

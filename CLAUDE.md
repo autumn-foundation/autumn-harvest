@@ -234,6 +234,18 @@ builds it. Code for owner mode follows these rules:
 
 `decision_owner_lock_modes_db_tests.rs` proves the lock modes.
 
+## Diesel Table Width
+
+Keep every `diesel::table!` at 32 columns or fewer (issue #2492). Diesel
+implements its traits per tuple size, and a cargo feature sets the largest
+size. One column over a tier forces the next tier on every crate that builds
+diesel, embedders included. The 128 tier does not compile in 8 GB.
+
+`docs/audits/diesel-table-width.py` runs in CI's `lint` job. It fails on a
+`table!` over 64 columns, a new `table!` over 32, and a ceiling that grows.
+Do not raise a ceiling to add a column. Move a rarely used column out of the
+`table!`, as `schema::harvest_workflow_executions_unmapped` does.
+
 ## Ledger Profiles
 
 Every function that sends SQL needs a Ledger profile in `docs/ledger/`

@@ -101,6 +101,10 @@ insert path. That spreads the copy rule over eight paths, and the next column
 meets the same limit. The cost of the chosen way is a slower cold build of
 diesel. CI caches dependencies, so it pays that cost once per lock file.
 
+Issue #2492 reverses that choice. Cargo unifies features, so every embedder
+also paid for `128-column-tables`. Four rebalance columns now sit outside the
+`table!`, and the workspace is back on `64-column-tables`.
+
 ### 1.2 Verified tenant
 
 - `TokenPrincipal` gets `tenant: Option<String>`. The token layer reads it

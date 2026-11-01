@@ -3894,8 +3894,8 @@ async fn delete_candidate_execution(
                 harvest_workflow_executions::error,
                 harvest_workflow_executions::search_attrs,
                 harvest_workflow_executions::parent_id,
-                harvest_workflow_executions::migrated_from_shards,
-                harvest_workflow_executions::staging_vacated_state,
+                crate::schema::harvest_workflow_executions_unmapped::migrated_from_shards(),
+                crate::schema::harvest_workflow_executions_unmapped::staging_vacated_state(),
             ))
             .for_update()
             .first::<SummarySourceRow>(conn)
