@@ -200,6 +200,7 @@ impl HarvestRuntimeConfig {
     pub fn load_with_env(env: &dyn Env) -> Result<Self, ConfigError> {
         let mut config = Self::default();
         for root in load_operator_roots(env)? {
+            reject_sqlite_section_without_feature(&root.harvest.sqlite)?;
             config.apply_partial(root.harvest);
         }
         config.apply_env_overrides(env)?;
@@ -660,6 +661,14 @@ struct PartialHarvestRuntimeConfig {
     startup: PartialHarvestStartupConfig,
     #[serde(default)]
     redis: PartialHarvestRedisConfig,
+    #[serde(default)]
+    sqlite: PartialHarvestSqliteConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialHarvestSqliteConfig {
+    path: Option<String>,
+    tick_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -728,6 +737,117 @@ fn load_partial_root(path: &Path) -> Result<Option<PartialRoot>, ConfigError> {
 
 /// The operator config files, in precedence order: `autumn.toml`, then
 /// `autumn-{profile}.toml`. A file that does not exist is skipped.
+/// The default drive tick of the SQLite backend, in milliseconds.
+pub const DEFAULT_SQLITE_TICK_MS: u64 = 250;
+
+/// The longest accepted `harvest.sqlite.tick_ms`.
+///
+/// The tick is the longest wait before a due timer fires. A longer tick also
+/// delays a retry backoff and a schedule slot.
+const SQLITE_TICK_CEILING_MS: u64 = 60_000;
+
+/// The `[harvest.sqlite]` section (issue #2467).
+///
+/// Only a build with the `sqlite` feature reads it. A build without the
+/// feature refuses a file that sets it, so the setting is never ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarvestSqliteConfig {
+    /// The Harvest database file. `None` derives it from the app database:
+    /// `app.db` gives `app.harvest.db` in the same directory.
+    pub path: Option<String>,
+    /// How often the driver polls for due timers and retries, in
+    /// milliseconds. A command drives at once, without waiting for a tick.
+    pub tick_ms: u64,
+}
+
+impl Default for HarvestSqliteConfig {
+    fn default() -> Self {
+        Self {
+            path: None,
+            tick_ms: DEFAULT_SQLITE_TICK_MS,
+        }
+    }
+}
+
+impl HarvestSqliteConfig {
+    /// Load `[harvest.sqlite]` from the Autumn config files and the process
+    /// environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when a config file cannot be read or parsed,
+    /// or when a value is invalid.
+    pub fn load() -> Result<Self, ConfigError> {
+        Self::load_with_env(&OsEnv)
+    }
+
+    /// Load `[harvest.sqlite]` with an explicit environment provider.
+    ///
+    /// The sources are `autumn.toml`, then `autumn-{profile}.toml`, then
+    /// `AUTUMN_HARVEST_SQLITE__PATH` and `AUTUMN_HARVEST_SQLITE__TICK_MS`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when a config file cannot be read or parsed,
+    /// or when a value is invalid.
+    pub fn load_with_env(env: &dyn Env) -> Result<Self, ConfigError> {
+        let mut config = Self::default();
+        for root in load_operator_roots(env)? {
+            let partial = root.harvest.sqlite;
+            if let Some(path) = partial.path {
+                config.path = Some(path);
+            }
+            if let Some(tick_ms) = partial.tick_ms {
+                config.tick_ms = tick_ms;
+            }
+        }
+        if let Ok(path) = env.var("AUTUMN_HARVEST_SQLITE__PATH") {
+            config.path = (!path.is_empty()).then_some(path);
+        }
+        if let Ok(tick_ms) = env.var("AUTUMN_HARVEST_SQLITE__TICK_MS") {
+            config.tick_ms = parse_u64("AUTUMN_HARVEST_SQLITE__TICK_MS", &tick_ms)?;
+        }
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.tick_ms < 1 || self.tick_ms > SQLITE_TICK_CEILING_MS {
+            return Err(ConfigError::Validation(format!(
+                "harvest.sqlite.tick_ms must be between 1 and {SQLITE_TICK_CEILING_MS}"
+            )));
+        }
+        if self
+            .path
+            .as_deref()
+            .is_some_and(|path| path.trim().is_empty())
+        {
+            return Err(ConfigError::Validation(
+                "harvest.sqlite.path must not be blank".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Refuse `[harvest.sqlite]` in a build without the `sqlite` feature.
+///
+/// That build has no SQLite backend. A set path there would be ignored, and
+/// Harvest would write to Postgres instead.
+fn reject_sqlite_section_without_feature(
+    section: &PartialHarvestSqliteConfig,
+) -> Result<(), ConfigError> {
+    if cfg!(feature = "sqlite") || (section.path.is_none() && section.tick_ms.is_none()) {
+        return Ok(());
+    }
+    Err(ConfigError::Validation(
+        "[harvest.sqlite] is set, but this build of autumn-harvest-plugin has no `sqlite` \
+         feature. Enable `autumn-harvest-plugin/sqlite` in an app built on `autumn-web/sqlite`, \
+         or remove the section"
+            .to_owned(),
+    ))
+}
+
 fn load_operator_roots(env: &dyn Env) -> Result<Vec<PartialRoot>, ConfigError> {
     let mut roots = Vec::new();
     for path in operator_config_paths(env) {

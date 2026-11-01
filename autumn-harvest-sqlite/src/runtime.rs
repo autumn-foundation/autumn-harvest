@@ -10,7 +10,7 @@ use autumn_harvest::builder::{
 };
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::context::{
-    DEFAULT_CURRENT_DETAILS_CAP_BYTES, LoserCancelReason, empty_shared_state,
+    DEFAULT_CURRENT_DETAILS_CAP_BYTES, LoserCancelReason, SharedState, empty_shared_state,
 };
 use autumn_harvest::executor::{
     QueryReplayOutcome, WorkflowExecuteSpanMeta, drive_query_replay_async,
@@ -424,6 +424,9 @@ pub struct SqliteRuntime {
     drive_blocked: HashSet<ExecutionId>,
     /// The time limit of one query replay (issue #2022).
     query_timeout: std::time::Duration,
+    /// The app state that `ctx.state::<T>()` reads, in workflows, activities
+    /// and query replays (issue #2467). It is empty by default.
+    shared_state: SharedState,
 }
 
 impl Drop for SqliteRuntime {
@@ -535,6 +538,7 @@ impl SqliteRuntime {
             history_policy: WorkflowHistoryPolicy::default(),
             drive_blocked: HashSet::new(),
             query_timeout: DEFAULT_QUERY_TIMEOUT,
+            shared_state: empty_shared_state(),
         })
     }
 
@@ -549,6 +553,16 @@ impl SqliteRuntime {
     #[doc(hidden)]
     pub fn set_clock(&mut self, now_fn: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) {
         self.now_fn = std::sync::Arc::new(now_fn);
+    }
+
+    /// Set the app state that `ctx.state::<T>()` returns (issue #2467).
+    ///
+    /// Workflows, activities, local activities, update replays and query
+    /// replays all read this one map. The Postgres worker gives them the
+    /// `HarvestBuilder::state` values in the same way. The default map is
+    /// empty, so `ctx.state::<T>()` returns `None`.
+    pub fn set_shared_state(&mut self, state: SharedState) {
+        self.shared_state = state;
     }
 
     /// The event cap per run (issue #2023). `None` is unlimited.
@@ -1819,7 +1833,7 @@ impl SqliteRuntime {
         let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
             exec,
             history,
-            empty_shared_state(),
+            self.shared_state.clone(),
             self.history_policy,
         )
         .with_workflow_name(workflow_name)
@@ -2256,7 +2270,13 @@ impl SqliteRuntime {
         name: &str,
         args: Value,
     ) -> impl std::future::Future<Output = SqliteResult<Value>> + Send + 'static {
-        let loaded = QueryReplay::load(&self.conn, &self.workflows, self.history_policy, exec);
+        let loaded = QueryReplay::load(
+            &self.conn,
+            &self.workflows,
+            self.history_policy,
+            self.shared_state.clone(),
+            exec,
+        );
         let name = name.to_string();
         let timeout = self.query_timeout;
         async move { loaded?.run(name, args, timeout).await }
@@ -3244,7 +3264,7 @@ impl SqliteRuntime {
                 history.clone(),
                 handler,
                 input,
-                empty_shared_state(),
+                self.shared_state.clone(),
                 // Issue #2023: the soft threshold for `should_continue_as_new`.
                 self.history_policy,
                 Some(&span_meta), // FIX: the sole seam carrying business workflow_id → ctx.info()
@@ -3522,9 +3542,12 @@ impl SqliteRuntime {
                 details: error,
             }),
             WorkflowOutcome::Suspended { commands } => {
+                // A clone of the `Arc`, so the drive can borrow `self` mutably.
+                let shared_state = self.shared_state.clone();
                 let owner = worker::RunOwner {
                     workflow_id: &workflow_id,
                     workflow_type: &workflow_name,
+                    state: &shared_state,
                 };
                 self.drive_suspension(
                     exec,

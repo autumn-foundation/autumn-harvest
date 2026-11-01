@@ -45847,7 +45847,7 @@ async fn replay_dead_letter_from_shards(
     )))
 }
 
-fn parse_reuse_policy(raw: Option<&str>) -> Result<WorkflowIdReusePolicy, AutumnError> {
+pub(crate) fn parse_reuse_policy(raw: Option<&str>) -> Result<WorkflowIdReusePolicy, AutumnError> {
     match raw {
         None | Some("" | "allow_duplicate") => Ok(WorkflowIdReusePolicy::AllowDuplicate),
         Some("reject_duplicate") => Ok(WorkflowIdReusePolicy::RejectDuplicate),
