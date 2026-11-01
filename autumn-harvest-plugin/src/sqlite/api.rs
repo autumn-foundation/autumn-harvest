@@ -490,10 +490,17 @@ async fn start(
     State(state): State<ApiState>,
     Path(workflow_name): Path<String>,
     session: Option<axum::Extension<Session>>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response, AutumnError> {
     let request: StartRequest = optional_body(&body)?;
     request.refuse_unsupported()?;
+    // Postgres dedupes a start on this header (issue #808). This backend
+    // does not, so a retried start would run twice. Refuse it instead.
+    refuse_unsupported(&[(
+        "the Idempotency-Key header",
+        headers.contains_key("idempotency-key"),
+    )])?;
     let session = session.map(|axum::Extension(session)| session);
     require_admin_for_policy(&state, request.reuse_policy.as_deref(), session).await?;
     let mut options = StartOptions::new().reuse_policy(crate::api::parse_reuse_policy(

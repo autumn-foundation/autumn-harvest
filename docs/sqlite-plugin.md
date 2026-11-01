@@ -170,8 +170,8 @@ of the Postgres body.
 | `POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}` | |
 
 Every other management route answers `501` and links the epic. A start
-option this backend cannot honour, such as `queue`, `priority` or `start_at`,
-is a `400` that names it. Neither is ever an empty `200`.
+option this backend cannot honour, such as `queue`, `priority`, `start_at` or
+the `Idempotency-Key` header, is a `400` that names it. Neither is ever an empty `200`.
 
 Auth works as on Postgres. `api_with_auth(path, mw)` wraps the router. The
 issue #1802 mutation gate refuses an anonymous mutating call outside `dev`.
@@ -186,7 +186,7 @@ no-op would let an app believe a protection or a feature is on.
 | Option or mode | Issue |
 | --- | --- |
 | `enable_api_tokens`, `api_with_role_auth`, `with_roles`, `with_authorizer`, `with_api_rate_limit`, `api_with_oidc` | [#2469](https://github.com/autumn-foundation/autumn-harvest/issues/2469) |
-| Vantage, `decode_payloads_on_read`, the other read routes | [#2468](https://github.com/autumn-foundation/autumn-harvest/issues/2468) |
+| Vantage, `decode_payloads_on_read`, the other read routes, declarative `queries![..]` (a query that the workflow registers with `ctx.register_query` works) | [#2468](https://github.com/autumn-foundation/autumn-harvest/issues/2468) |
 | The transactional outbox | [#2470](https://github.com/autumn-foundation/autumn-harvest/issues/2470) |
 | Workflow schedules, `retention`, `mcp_tools`, `mcp_tasks`, `webhooks`, `connector`, `synthetic_canary` | [#2471](https://github.com/autumn-foundation/autumn-harvest/issues/2471) |
 | `harvest.mode = "split"` / `"external"`, per-tenant Harvest in a fleet | [#2472](https://github.com/autumn-foundation/autumn-harvest/issues/2472) |

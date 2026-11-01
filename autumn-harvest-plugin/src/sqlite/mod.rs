@@ -171,6 +171,12 @@ fn builder_refusals(builder: &HarvestBuilder) -> Vec<(&'static str, u32)> {
         // DAGs are an engine non-goal of the SQLite backend (#2019).
         refused.push(("HarvestPlugin::dags", 2019));
     }
+    // The SQLite replay passes no declarative query handler, so a call to one
+    // would answer `QueryNotFound`. A query that the workflow body registers
+    // with `ctx.register_query` works.
+    if !builder.query_handlers().is_empty() {
+        refused.push(("HarvestPlugin::queries", 2468));
+    }
     if !builder.workflow_schedules().is_empty() {
         refused.push(("workflow schedules", 2471));
     }
@@ -459,6 +465,32 @@ mod tests {
     #[test]
     fn a_plain_builder_has_no_refusal() {
         assert!(builder_refusals(&HarvestBuilder::default()).is_empty());
+    }
+
+    #[test]
+    fn a_declarative_query_is_refused_with_its_issue() {
+        fn answer(
+            _ctx: &autumn_harvest::context::WorkflowContext,
+            _args: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(serde_json::Value::Null)
+        }
+        let query = autumn_harvest::QueryHandlerInfo {
+            name: "stage",
+            workflow: "greet",
+            module: module_path!(),
+            input_type_hint: "()",
+            output_type_hint: "()",
+            handler: answer,
+            description: None,
+            arg_schema: None,
+            response_schema: None,
+        };
+        let builder = HarvestBuilder::default().queries(vec![query]);
+        assert_eq!(
+            builder_refusals(&builder),
+            vec![("HarvestPlugin::queries", 2468)]
+        );
     }
 
     #[test]

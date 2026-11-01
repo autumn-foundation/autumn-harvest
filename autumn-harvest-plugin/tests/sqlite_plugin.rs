@@ -215,6 +215,19 @@ async fn an_unsupported_start_option_is_a_400_not_a_silent_drop() {
     response.assert_status(400);
     response.assert_body_contains("queue");
     response.assert_body_contains("start_at");
+
+    // Postgres dedupes a start on this header. This backend does not, so a
+    // retry must not silently start a second run.
+    let response = client
+        .post("/harvest/workflows/greet/start")
+        .header("Idempotency-Key", "k-1")
+        .json(&json!({ "input": "bee" }))
+        .send()
+        .await;
+    response.assert_status(400);
+    response.assert_body_contains("Idempotency-Key");
+    let runs: Value = client.get("/harvest/workflows").send().await.json();
+    assert_eq!(runs, json!([]), "a refused start writes nothing");
 }
 
 #[tokio::test(flavor = "multi_thread")]
