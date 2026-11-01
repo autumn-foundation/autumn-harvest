@@ -823,3 +823,10 @@ harness = false
 name = "update_lookup_profile"
 required-features = ["testing"]
 harness = false
+
+# Deterministic (non-criterion) instruction/allocation profiling harness for
+# `schema_contract::diff_schema_contracts`.
+# See `benches/schema_contract_diff_profile.rs`.
+[[bench]]
+name = "schema_contract_diff_profile"
+harness = false
