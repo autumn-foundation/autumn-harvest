@@ -133,6 +133,10 @@ required-features = ["sqlite"]
 name = "context_reset"
 required-features = ["sqlite"]
 
+[[test]]
+name = "refine_propose"
+required-features = ["sqlite"]
+
 [lints]
 workspace = true
 
