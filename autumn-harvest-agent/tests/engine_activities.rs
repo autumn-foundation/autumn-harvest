@@ -266,6 +266,7 @@ fn the_engine_registration_builds() {
             "agent_workspace_retain",
             "agent_workspace_reset",
             "agent_workspace_floor",
+            "agent_refine_propose",
         ]
     );
     let flows: Vec<&str> = workflows().iter().map(|w| w.name).collect();

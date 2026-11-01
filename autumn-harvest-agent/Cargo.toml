@@ -129,6 +129,10 @@ required-features = ["sqlite"]
 name = "agent_workspace"
 required-features = ["sqlite"]
 
+[[test]]
+name = "refine_propose"
+required-features = ["sqlite"]
+
 [lints]
 workspace = true
 
