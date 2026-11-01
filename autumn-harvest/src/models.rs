@@ -306,7 +306,15 @@ impl WorkflowExecution {
 /// Each field selects through a typed fragment in
 /// [`crate::schema::harvest_workflow_executions_unmapped`].
 #[derive(
-    Debug, Clone, Default, PartialEq, Queryable, Selectable, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    Queryable,
+    Selectable,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 #[diesel(table_name = harvest_workflow_executions)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
