@@ -19,11 +19,3 @@ embedder built diesel at that tier too. The workspace now enables
   have ceilings that only go down.
 
 No new `WorkflowEvent` variant. No migration. `harvest_events` is untouched.
-
-### Also: durable route chain walk race (issue #2491)
-
-The chain walk answered a final `500 result-unavailable` at its step cap on a
-chain that was still advancing, so a client lost a result that existed. The
-successor lookup now reports whether it read a live run, and the walk counts
-it. The cap then answers pending. This adds no query.
-`chain_walk_answers_pending_when_the_chain_moves_during_the_walk` pins the race.

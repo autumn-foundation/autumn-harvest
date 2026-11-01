@@ -55,8 +55,10 @@ would write, so it replays unchanged on the core `WorkflowReplayer`.
 
 **Reach for the Postgres core ([`autumn-harvest`](../autumn-harvest)) instead
 when** you need distributed / multi-worker execution, multi-server crash
-recovery, high throughput, `LISTEN`/`NOTIFY` push wake-ups, DAGs, the
-management API, worker sessions, or sharding.
+recovery, high throughput, `LISTEN`/`NOTIFY` push wake-ups, DAGs, the full
+management API, worker sessions, or sharding. `HarvestPlugin` serves the core
+management routes on this backend: see [`sqlite-plugin.md`](sqlite-plugin.md)
+(epic #2466).
 
 | | SQLite backend | Postgres core |
 | --- | --- | --- |
@@ -1254,8 +1256,10 @@ the first execution error to the caller. A sealed execution is terminal, so
 later passes skip it.
 
 Backend-level non-goals: distributed / multi-writer workers, `LISTEN`/`NOTIFY`
-push wake-ups, multi-server crash recovery, the management API, worker
-sessions, sharding, and DAGs. Schedules and retention shipped under issue
+push wake-ups, multi-server crash recovery, the full management API, worker
+sessions, sharding, and DAGs. `HarvestPlugin` serves the core management
+routes on this backend since issue #2467. See
+[`sqlite-plugin.md`](sqlite-plugin.md). Schedules and retention shipped under issue
 #2031. Rejection is deliberate, so a
 partial, silently-wrong implementation never ships.
 

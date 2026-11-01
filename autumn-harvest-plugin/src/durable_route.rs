@@ -1178,11 +1178,9 @@ trait RunReads: Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Successor {
     exec_id: ExecutionId,
-    /// The lookup read this run in a state that is not terminal (issue #2491).
-    ///
-    /// The lookup reads the id and the state from one row. A later snapshot
-    /// can find the run ended, because the chain moved on. The walk then
-    /// knows that the chain was live during the walk, so it answers pending.
+    /// The run had not ended when the lookup read it. It can continue as
+    /// new before the walk reads its snapshot, so the walk must still count
+    /// the chain as live.
     live: bool,
 }
 
@@ -1220,9 +1218,7 @@ async fn wait_at_most(
 ///
 /// The walk takes at most `max_steps` steps. Each step is one successor
 /// lookup. Past the cap, a walk that met a live run answers pending, and a
-/// walk that read only ended runs answers result-unavailable. A successor
-/// lookup that read a live run counts as a live run, even when the next
-/// snapshot finds that run ended (issue #2491). A waiting read
+/// walk that read only ended runs answers result-unavailable. A waiting read
 /// takes a permit from `waiters`. A run that is already terminal needs no
 /// permit.
 async fn wait_for_result(
@@ -1296,8 +1292,9 @@ async fn wait_for_result(
         steps += 1;
         match reads.successor(current).await {
             Ok(Some(next)) => {
-                // The chain moved on between the lookup and the snapshot. A
-                // retry can then succeed, so the answer at the cap is pending.
+                // The lookup saw a live run, which can continue as new before
+                // the next snapshot. Without this, that race reads as a walk
+                // over ended runs and answers a final 500, not pending.
                 saw_live |= next.live;
                 current = next.exec_id;
             }
@@ -1363,12 +1360,11 @@ async fn chain_successor(
         Some((run, state)) if run != live_id && state != "CONTINUED_AS_NEW" => {
             Ok(Some(Successor {
                 exec_id: run,
-                live: !autumn_harvest::erase::is_terminal_state(&state),
+                live: !crate::api::is_terminal_state(&state),
             }))
         }
         // A sealed newest run leads on through its continue-as-new event. A
         // run that a rerun sealed has no such event, so it reports itself.
-        // The snapshot reads the state of a run found through an event.
         Some((run, _)) if run != live_id => {
             Ok(Some(ended(continued_as(conn, run).await?.unwrap_or(run))))
         }
@@ -2970,8 +2966,9 @@ mod tests {
         snapshot_error: Option<fn() -> HarvestError>,
         wait_error: Option<fn() -> HarvestError>,
         successor_error: Option<fn() -> HarvestError>,
-        /// The successor lookup reads `next` as live.
-        next_live: bool,
+        /// Whether the lookup reports `next` as live. `None` derives it from
+        /// the state of `next`, as Postgres does at the time of the lookup.
+        next_live: Option<bool>,
     }
 
     /// Runs in memory. The chain counts its waits and its successor reads.
@@ -2994,7 +2991,7 @@ mod tests {
                     snapshot_error: None,
                     wait_error: None,
                     successor_error: None,
-                    next_live: false,
+                    next_live: None,
                 },
             );
             exec_id
@@ -3056,9 +3053,11 @@ mod tests {
             self.successors
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let run = &self.runs[&exec_id];
-            let next = run.next.map(|exec_id| Successor {
-                exec_id,
-                live: run.next_live,
+            let next = run.next.map(|next| Successor {
+                exec_id: next,
+                live: run
+                    .next_live
+                    .unwrap_or_else(|| !self.runs[&next].state.is_terminal()),
             });
             std::future::ready(
                 run.successor_error
@@ -3105,6 +3104,27 @@ mod tests {
             if *exec_id == x && result.state == WorkflowResultState::ContinuedAsNew));
     }
 
+    /// A successor that was live at its lookup can continue as new before
+    /// the walk reads its snapshot. The walk then reads only ended runs, but
+    /// the chain is still moving, so the cap answers pending, not a final
+    /// 500. This was the `same_type_chain_takes_one_step` flake.
+    #[tokio::test]
+    async fn chain_walk_counts_a_successor_that_was_live_at_its_lookup() {
+        let mut chain = FakeChain::default();
+        let end = chain.run(WorkflowResultState::Completed, None);
+        // `newest` was the chain head and still running at the lookup. It
+        // continued as new before its snapshot.
+        let newest = chain.run(WorkflowResultState::ContinuedAsNew, Some(end));
+        let first = chain.run(WorkflowResultState::ContinuedAsNew, Some(newest));
+        chain.run_mut(first).next_live = Some(true);
+        let capped = wait_for_result(&chain, &waiters(1), 1, first, ONE_SECOND).await;
+        assert!(matches!(capped, Waited::NoResult(ReadFailure::Pending)));
+        // The same walk over runs that had all ended stays final.
+        chain.run_mut(first).next_live = Some(false);
+        let ended = wait_for_result(&chain, &waiters(1), 1, first, ONE_SECOND).await;
+        assert!(matches!(ended, Waited::NoResult(ReadFailure::Unreadable)));
+    }
+
     // AC-59
     #[tokio::test]
     async fn chain_walk_answers_pending_past_the_step_cap() {
@@ -3132,31 +3152,6 @@ mod tests {
         let waited = wait_for_result(&single, &waiters(1), 1, done, ONE_SECOND).await;
         assert!(matches!(waited, Waited::Terminal { .. }));
         assert_eq!(single.successors(), 0);
-    }
-
-    /// Issue #2491: the chain moves on between the lookup and the snapshot.
-    ///
-    /// The lookup reads the newest run as live. By the snapshot, that run
-    /// has continued as new too. Every snapshot then reads an ended run, but
-    /// the chain was live, so a retry can succeed. The cap answers pending.
-    #[tokio::test]
-    async fn chain_walk_answers_pending_when_the_chain_moves_during_the_walk() {
-        let mut chain = FakeChain::default();
-        let tail = chain.run(WorkflowResultState::Running, None);
-        let newest = chain.run(WorkflowResultState::ContinuedAsNew, Some(tail));
-        let start = chain.run(WorkflowResultState::ContinuedAsNew, Some(newest));
-        chain.run_mut(start).next_live = true;
-        let waited = wait_for_result(&chain, &waiters(1), 1, start, ONE_SECOND).await;
-        assert!(
-            matches!(waited, Waited::NoResult(ReadFailure::Pending)),
-            "a chain that was live during the walk must not answer a final 500"
-        );
-        assert_eq!(chain.successors(), 1);
-
-        // The same shape with an ended lookup stays final.
-        chain.run_mut(start).next_live = false;
-        let waited = wait_for_result(&chain, &waiters(1), 1, start, ONE_SECOND).await;
-        assert!(matches!(waited, Waited::NoResult(ReadFailure::Unreadable)));
     }
 
     // AC-60

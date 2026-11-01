@@ -73,6 +73,7 @@ run time, so the lint treats those names as hot.
 | `lock-timeout` | A statement takes a blocking lock on a hot table, and no non-zero `lock_timeout` is in force. | Put `SET LOCAL lock_timeout = '5s';` first. |
 | `blocking-index` | A plain `CREATE INDEX`, `DROP INDEX` or `REINDEX` touches a hot table. So does `ALTER TABLE ... ADD` of a `UNIQUE`, `PRIMARY KEY` or `EXCLUDE` constraint without `USING INDEX` and an index name. `USING INDEX TABLESPACE` still builds an index. | Use `CONCURRENTLY` (section 4), or the guarded build (section 5). On `harvest_events`, `CONCURRENTLY` also counts, because the partitioned layout cannot run it. |
 | `concurrently-in-transaction` | `CONCURRENTLY` or `VACUUM` runs in a transaction, shares its file with another statement, or sits in a `DO` block. Postgres rejects both there. | Put it alone in a file with `run_in_transaction = false` (section 4). |
+| `lock-upgrade` | After a plain `CREATE INDEX` on a hot table, the same file runs a plain `DROP INDEX` of an index on that table, or an `ALTER TABLE` of it. A drop of an index on an unknown table counts too. | Drop first, or move the later statement to its own migration (section 5). |
 | `bad-annotation` | A `-- lock-safety:` comment does not parse. | Fix the annotation (section 6). |
 | `unused-annotation` | An annotation allows a rule that the statement below it does not break. | Remove the annotation. |
 
@@ -310,6 +311,22 @@ check.
 Put the out-of-band recipe in the migration header and in the upgrade guide
 row for the migration.
 
+**Never drop or alter after the build.** A plain build holds `SHARE` on its
+table until the commit. A step transaction that read or locked a row holds a
+lock that `SHARE` allows, and its next write waits behind the build. A later
+`DROP INDEX` or `ALTER TABLE` of that table needs `ACCESS EXCLUSIVE`, so it
+waits behind the step transaction. That is a deadlock. Postgres can abort the
+migration after the full build, and the build rolls back. An open reader
+blocks the later lock too, until `lock_timeout` fails the migration. The
+`lock-upgrade` rule flags this order.
+
+To replace an index, build the new one in one migration. Drop the old one in
+the next migration, in its own transaction.
+`20261029034500_harvest_retention_candidates_index` and
+`20261101012649_harvest_retention_scan_index_drop` show the pair (issue
+#2395). A drop first is safe too, but it holds `ACCESS EXCLUSIVE` for the
+full build, so it blocks reads as well.
+
 ## 6. The escape hatch
 
 An annotation allows one rule at one statement:
@@ -324,7 +341,8 @@ An annotation allows one rule at one statement:
   annotations.
 - `<rule>` is `lock-timeout` or `blocking-index`. Nothing allows
   `concurrently-in-transaction`, because Postgres rejects each statement that
-  breaks it. Nothing allows `bad-annotation` or `unused-annotation` either.
+  breaks it. Nothing allows `lock-upgrade`, because a safe order always
+  exists. Nothing allows `bad-annotation` or `unused-annotation` either.
 - Cite the issue that approves the exception, and give the reason.
 
 A reviewer approves each annotation. It is the record that the lock is a
