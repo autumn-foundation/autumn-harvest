@@ -67,7 +67,6 @@ pub fn router(state: ApiState) -> Router<()> {
         .route("/workflows", get(list_workflows))
         .route("/workflows/registered", get(list_registered))
         .route("/workflows/{id}", get(get_workflow))
-        .route("/workflows/{id}/result", get(get_result))
         .route("/workflows/{id}/history", get(get_history))
         .route("/workflows/{id}/cancel", post(cancel))
         .route("/workflows/{id}/terminate", post(terminate))
@@ -371,25 +370,6 @@ async fn get_by_id(
             ))
         })?;
     Ok(Json(describe_json(handle, exec).await?))
-}
-
-async fn get_result(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, AutumnError> {
-    let exec = parse_exec(&id)?;
-    let description = state.handle()?.describe(exec).await.map_err(map_error)?;
-    let state_name = stored_json(&description.summary.state);
-    let terminal = state_name
-        .as_str()
-        .is_some_and(crate::api::is_terminal_state);
-    Ok(Json(json!({
-        "execution_id": exec.to_string(),
-        "state": state_name,
-        "is_terminal": terminal,
-        "output": parse_stored_json(&description.output_json),
-        "error": stored_json(&description.error),
-    })))
 }
 
 async fn get_history(

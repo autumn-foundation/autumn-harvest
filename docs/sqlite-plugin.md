@@ -165,7 +165,6 @@ of the Postgres body.
 | `GET /workflows` | `workflow_name`, `workflow_id`, `workflow_id_prefix`, `state`, `limit`, `page_size`, `cursor` |
 | `GET /workflows/registered` | |
 | `GET /workflows/{id}` | the run and its whole history |
-| `GET /workflows/{id}/result` | |
 | `GET /workflows/{id}/history` | |
 | `POST /workflows/{workflow_name}/start` | `workflow_id`, `input`, `memo`, `search_attrs`, `reuse_policy` |
 | `POST /workflows/{workflow_name}/signal-with-start` | |
@@ -176,7 +175,11 @@ of the Postgres body.
 | `GET /workflows/by-id/{workflow_name}/{workflow_id}` | |
 | `POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}` | |
 
-Every other management route answers `501` and links the epic. A start
+Every other management route answers `501` and links the epic. That
+includes `GET /workflows/{id}/result`: its Postgres polling contract (`204`
+with `Retry-After` while running, the compact state, the successor chain) is
+not ported yet ([#2489](https://github.com/autumn-foundation/autumn-harvest/issues/2489)).
+Poll `GET /workflows/{id}` and read `execution.state` and `execution.output`. A start
 option this backend cannot honour, such as `queue`, `priority`, `start_at` or
 the `Idempotency-Key` header, is a `400` that names it. Neither is ever an empty `200`.
 

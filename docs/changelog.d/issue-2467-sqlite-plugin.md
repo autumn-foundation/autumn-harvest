@@ -23,7 +23,8 @@ default build does not change.
   the workflow's `input_schema`, and a signal checks its `#[signal]`
   `arg_schema`, as on Postgres.
 - **Management API.** The core routes keep their Postgres paths and field
-  names. Every other route answers `501` and links the epic. An unsupported
+  names. Every other route answers `501` and links the epic, including
+  `GET /workflows/{id}/result` (#2489). An unsupported
   start option is a `400` that names it. The #1802 mutation gate and
   `api_with_auth` work as on Postgres.
 - **Loud refusals.** Each builder option or mode with no SQLite port fails

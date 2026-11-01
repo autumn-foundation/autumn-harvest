@@ -70,6 +70,15 @@ fn app(dir: &Path, profile: &str) -> TestClient {
         .build()
 }
 
+/// Poll the run until it is `COMPLETED`, and return its `execution`.
+async fn wait_completed(client: &TestClient, exec: &str) -> Value {
+    let body = wait_for(client, &format!("/harvest/workflows/{exec}"), |body| {
+        body["execution"]["state"] == "COMPLETED"
+    })
+    .await;
+    body["execution"].clone()
+}
+
 /// Poll `path` until `done` accepts the body, or fail after 10 s.
 async fn wait_for(client: &TestClient, path: &str, done: impl Fn(&Value) -> bool) -> Value {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -141,12 +150,7 @@ async fn a_workflow_runs_end_to_end_over_http() {
     let again: Value = again.json();
     assert_eq!(again["signal_delivered"], false);
 
-    let result = wait_for(
-        &client,
-        &format!("/harvest/workflows/{exec}/result"),
-        |body| body["state"] == "COMPLETED",
-    )
-    .await;
+    let result = wait_completed(&client, &exec).await;
     assert_eq!(result["output"]["shouted"], "hi BEE app=true");
     assert_eq!(result["output"]["go"], json!({ "ok": true }));
 
@@ -201,6 +205,14 @@ async fn an_unported_route_answers_501_and_names_the_epic() {
     let response = client.get("/harvest/admin/status").send().await;
     response.assert_status(501);
     response.assert_body_contains("issues/2466");
+    // The Postgres result contract (204 while running, the compact state,
+    // the successor chain) is not ported yet (#2489), so it is not faked.
+    let id = autumn_harvest::ExecutionId::new();
+    let response = client
+        .get(&format!("/harvest/workflows/{id}/result"))
+        .send()
+        .await;
+    response.assert_status(501);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -267,12 +279,7 @@ async fn app_code_gets_the_handle_from_the_app_state() {
         .signal_by_workflow_id("greet", "w-app", "go", json!(1), None)
         .await
         .unwrap();
-    let result = wait_for(
-        &client,
-        &format!("/harvest/workflows/{}/result", started.exec_id),
-        |body| body["state"] == "COMPLETED",
-    )
-    .await;
+    let result = wait_completed(&client, &started.exec_id.to_string()).await;
     assert_eq!(result["output"]["shouted"], "hi ANT app=true");
 }
 
@@ -339,12 +346,7 @@ async fn a_restart_resumes_the_run_from_the_harvest_file() {
         .send()
         .await
         .assert_ok();
-    let result = wait_for(
-        &client,
-        &format!("/harvest/workflows/{exec}/result"),
-        |body| body["state"] == "COMPLETED",
-    )
-    .await;
+    let result = wait_completed(&client, &exec).await;
     assert_eq!(result["output"]["shouted"], "hi WASP app=true");
     assert_eq!(result["output"]["go"], "after restart");
 }
@@ -484,11 +486,6 @@ async fn a_signal_that_breaks_its_schema_is_refused_before_it_is_staged() {
         .send()
         .await
         .assert_ok();
-    let result = wait_for(
-        &client,
-        &format!("/harvest/workflows/{exec}/result"),
-        |body| body["state"] == "COMPLETED",
-    )
-    .await;
+    let result = wait_completed(&client, &exec).await;
     assert_eq!(result["output"]["go"], json!({ "ok": true }));
 }
