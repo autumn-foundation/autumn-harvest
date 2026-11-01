@@ -179,7 +179,12 @@ Every other management route answers `501` and links the epic. That
 includes `GET /workflows/{id}/result`: its Postgres polling contract (`204`
 with `Retry-After` while running, the compact state, the successor chain) is
 not ported yet ([#2489](https://github.com/autumn-foundation/autumn-harvest/issues/2489)).
-Poll `GET /workflows/{id}` and read `execution.state` and `execution.output`. A start
+Poll `GET /workflows/{id}` and read `execution.state` and `execution.output`.
+
+A route that reads no query parameter refuses one with a `400`. For example,
+`GET /workflows/{id}/history` does not page yet, so `?after=`, `?event_type=`
+and `?limit=` are refused. They are not ignored, so the full history never
+passes for a filtered page (#2489). A start
 option this backend cannot honour, such as `queue`, `priority`, `start_at` or
 the `Idempotency-Key` header, is a `400` that names it. Neither is ever an empty `200`.
 

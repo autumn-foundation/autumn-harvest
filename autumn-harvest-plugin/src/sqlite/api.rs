@@ -60,30 +60,54 @@ pub fn router(state: ApiState) -> Router<()> {
         state.api_state.clone(),
         crate::api::require_mutation_auth_by_method,
     );
+    // A route that reads no query parameter refuses one. A Postgres client
+    // may send `?after=` or `?event_type=` here. Answering it with the full,
+    // unfiltered body would look like success (#2489).
+    let no_query = middleware::from_fn(refuse_query_parameters);
     Router::new()
         .route("/health", get(health))
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health))
         .route("/workflows", get(list_workflows))
-        .route("/workflows/registered", get(list_registered))
-        .route("/workflows/{id}", get(get_workflow))
-        .route("/workflows/{id}/history", get(get_history))
-        .route("/workflows/{id}/cancel", post(cancel))
-        .route("/workflows/{id}/terminate", post(terminate))
+        .route(
+            "/workflows/registered",
+            get(list_registered).route_layer(no_query.clone()),
+        )
+        .route(
+            "/workflows/{id}",
+            get(get_workflow).route_layer(no_query.clone()),
+        )
+        .route(
+            "/workflows/{id}/history",
+            get(get_history).route_layer(no_query.clone()),
+        )
+        .route(
+            "/workflows/{id}/cancel",
+            post(cancel).route_layer(no_query.clone()),
+        )
+        .route(
+            "/workflows/{id}/terminate",
+            post(terminate).route_layer(no_query.clone()),
+        )
         .route("/workflows/{id}/signal/{signal_name}", post(signal))
         .route(
             "/workflows/{id}/query/{query_name}",
-            get(query_get).post(query_post),
+            get(query_get)
+                .post(query_post)
+                .route_layer(no_query.clone()),
         )
         .route("/workflows/{id}/update/{update_name}", post(update))
-        .route("/workflows/{workflow_name}/start", post(start))
+        .route(
+            "/workflows/{workflow_name}/start",
+            post(start).route_layer(no_query.clone()),
+        )
         .route(
             "/workflows/{workflow_name}/signal-with-start",
-            post(signal_with_start),
+            post(signal_with_start).route_layer(no_query.clone()),
         )
         .route(
             "/workflows/by-id/{workflow_name}/{workflow_id}",
-            get(get_by_id),
+            get(get_by_id).route_layer(no_query),
         )
         .route(
             "/workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
@@ -165,6 +189,26 @@ fn refuse_unsupported(fields: &[(&str, bool)]) -> Result<(), AutumnError> {
         "not supported on the SQLite backend: {} (autumn-harvest#{EPIC_ISSUE})",
         set.join(", ")
     )))
+}
+
+/// Refuse a request that carries any query parameter.
+async fn refuse_query_parameters(
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let Some(query) = request.uri().query().filter(|query| !query.is_empty()) else {
+        return next.run(request).await;
+    };
+    let keys: Vec<&str> = query
+        .split('&')
+        .filter_map(|pair| pair.split('=').next())
+        .filter(|key| !key.is_empty())
+        .collect();
+    AutumnError::bad_request_msg(format!(
+        "not supported on the SQLite backend: query parameter {} (autumn-harvest#2489)",
+        keys.join(", ")
+    ))
+    .into_response()
 }
 
 async fn not_ported() -> Response {

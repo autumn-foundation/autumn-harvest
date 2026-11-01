@@ -238,6 +238,18 @@ async fn an_unsupported_start_option_is_a_400_not_a_silent_drop() {
         .await;
     response.assert_status(400);
     response.assert_body_contains("Idempotency-Key");
+
+    // A history read with Postgres paging options must not answer the whole
+    // history as if it had honoured them.
+    let id = autumn_harvest::ExecutionId::new();
+    for query in ["after=10", "event_type=WorkflowFailed", "limit=1"] {
+        let response = client
+            .get(&format!("/harvest/workflows/{id}/history?{query}"))
+            .send()
+            .await;
+        response.assert_status(400);
+        response.assert_body_contains("#2489");
+    }
     let runs: Value = client.get("/harvest/workflows").send().await.json();
     assert_eq!(runs, json!([]), "a refused start writes nothing");
 }
