@@ -248,6 +248,12 @@ async fn drive(
             }
         };
         if progressed {
+            // A pass can finish without awaiting anything: the store is
+            // synchronous SQLite. A chain of such passes, such as a workflow
+            // that keeps continuing as new, would then hold the executor. On
+            // a current-thread runtime that starves HTTP handlers, timers and
+            // the shutdown. Yield before the next pass.
+            tokio::task::yield_now().await;
             continue;
         }
         tokio::select! {
@@ -348,5 +354,70 @@ async fn handle(runtime: &mut SqliteRuntime, command: Command) {
         }
         // `drive` takes a shutdown before it calls `handle`.
         Command::Shutdown { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // The `#[workflow]` macro needs an `async fn`.
+    #![allow(clippy::unused_async)]
+
+    use super::*;
+    use autumn_harvest::prelude::*;
+
+    /// Continues as new forever. Each pass makes progress, and no pass
+    /// awaits anything outside the store.
+    #[workflow]
+    async fn forever(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+        ctx.continue_as_new(serde_json::json!(n + 1))
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(n)
+    }
+
+    /// On a current-thread runtime, a chain of passes that never awaits
+    /// must not hold the executor. Without a yield between passes, the test
+    /// task is never polled again, and the watchdog below fires.
+    #[test]
+    fn a_progress_chain_does_not_starve_a_current_thread_runtime() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("h.db");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let tokio = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            tokio.block_on(async move {
+                let registry = Registry {
+                    workflows: vec![forever_info()],
+                    activities: Vec::new(),
+                    updates: Vec::new(),
+                    state: autumn_harvest::context::empty_shared_state(),
+                };
+                let runtime = Driver::open(&path, registry).expect("open");
+                let driver = Driver::start(runtime, Duration::from_millis(250));
+                let (reply, started) = oneshot::channel();
+                driver
+                    .sender
+                    .send(Command::Start {
+                        workflow_name: "forever".to_owned(),
+                        input: serde_json::json!(0),
+                        options: StartOptions::new(),
+                        reply,
+                    })
+                    .await
+                    .expect("send");
+                started.await.expect("reply").expect("start");
+                // Another task on the same runtime must still run.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                driver.shutdown().await;
+                let _ = done_tx.send(());
+            });
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(30)).is_ok(),
+            "the drive loop starved the current-thread runtime"
+        );
     }
 }
