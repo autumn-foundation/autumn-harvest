@@ -25,9 +25,14 @@
 --
 -- `harvest_dead_letters` is not a hot table. But `CREATE INDEX` (not
 -- `CONCURRENTLY`) takes `SHARE` on it. That blocks each dead-letter insert
--- until the build ends. An insert runs in the transaction that fails a task,
--- so a long build stalls each terminal task failure. The DLQ is largest
--- during an incident. Size the build window from its row count.
+-- until the build ends. The three builds run in one transaction, so `SHARE`
+-- holds until the last one ends.
+--
+-- An insert runs in the transaction that fails a task. That transaction
+-- already holds the task row lock. On the workflow path, it also holds the
+-- execution row lock. A blocked insert keeps these locks. So each signal,
+-- cancel or decision on that execution can also wait for the build. The DLQ is largest during an incident. Size the
+-- build window from its row count.
 --
 -- On a live, large deployment, build the indexes out of band first:
 --

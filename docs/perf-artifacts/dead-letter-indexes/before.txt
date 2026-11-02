@@ -12,15 +12,54 @@
              relname             | relpages 
 ---------------------------------+----------
  harvest_dead_letters            |     5883
- harvest_dead_letters_pkey       |      535
+ harvest_dead_letters_pkey       |      522
  idx_harvest_dl_owner            |        1
  idx_harvest_dl_quota            |        1
- idx_harvest_dl_workflow_exec_id |      534
+ idx_harvest_dl_workflow_exec_id |      554
 (5 rows)
 
--- psql -d dl_before -f write.sql
+-- psql -d dl_before -f write.sql (run 1)
  buffers | rows | wal_records | wal_fpi | wal_bytes |                            query                             
 ---------+------+-------------+---------+-----------+--------------------------------------------------------------
-    7141 | 1000 |        3004 |     903 |   5545869 | INSERT INTO harvest_dead_letters (original_task_id, queue_na
+    7151 | 1000 |        3009 |     914 |   5581664 | INSERT INTO harvest_dead_letters (original_task_id, queue_na
 (1 row)
+
+-- psql -d dl_before -f write.sql (run 2)
+ buffers | rows | wal_records | wal_fpi | wal_bytes |                            query                             
+---------+------+-------------+---------+-----------+--------------------------------------------------------------
+    7130 | 1000 |        3003 |     905 |   5514325 | INSERT INTO harvest_dead_letters (original_task_id, queue_na
+(1 row)
+
+-- psql -d dl_before -f tradeoff.sql
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Limit (actual rows=100 loops=1)
+   Buffers: shared hit=2343 read=3658
+   ->  Sort (actual rows=100 loops=1)
+         Sort Key: failed_at
+         Sort Method: top-N heapsort  Memory: 39kB
+         Buffers: shared hit=2343 read=3658
+         ->  Seq Scan on harvest_dead_letters (actual rows=5000 loops=1)
+               Filter: (activity_name = 'refund'::text)
+               Rows Removed by Filter: 95000
+               Buffers: shared hit=2343 read=3658
+ Planning:
+   Buffers: shared hit=2
+(12 rows)
+
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Limit (actual rows=100 loops=1)
+   Buffers: shared hit=5883
+   ->  Sort (actual rows=100 loops=1)
+         Sort Key: failed_at
+         Sort Method: top-N heapsort  Memory: 36kB
+         Buffers: shared hit=5883
+         ->  Seq Scan on harvest_dead_letters (actual rows=5000 loops=1)
+               Filter: (activity_name = 'refund'::text)
+               Rows Removed by Filter: 95000
+               Buffers: shared hit=5883
+ Planning:
+   Buffers: shared hit=2
+(12 rows)
 

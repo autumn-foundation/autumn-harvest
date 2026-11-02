@@ -24,8 +24,7 @@ therefore reads the table N times.
   run when it purges the run. So the table is small in steady state, and
   largest during an incident.
 - Operators list, filter and redrive during that incident.
-- `failed_at` and `queue_name` are `NOT NULL`. `original_task_id` is
-  `NOT NULL`.
+- `failed_at`, `queue_name` and `original_task_id` are `NOT NULL`.
 - Only `completion_callback::redrive_delivery_at` filters on
   `original_task_id`. Diesel binds `task_type` as a parameter.
 - Each read orders by `failed_at` alone. No read orders by `id`.
@@ -49,29 +48,30 @@ therefore reads the table N times.
 7. A cached newest `failed_at` for the status summary.
 8. One migration per index, each `CONCURRENTLY`.
 
-Decision: 2, the second index of 1, and the third index of 1. Each is a
-guarded build in one migration.
+Decision: option 2 for `failed_at`, plus the `original_task_id` and
+`(queue_name, failed_at)` indexes of option 1. A guard wraps each build, and
+one migration holds all three.
 
 - 2 beats `(failed_at DESC, id)`. No statement orders by `id`, so the
   suffix only widens each entry.
-- 3 is rejected. The delete binds `task_type`, so a generic plan cannot
+- The design rejects 3. The delete binds `task_type`, so a generic plan cannot
   match the predicate. Issue #2367 found that defect. A full index needs no
   query change.
-- 4 is rejected. `(queue_name, failed_at)` also serves the order and the
+- The design rejects 4. `(queue_name, failed_at)` also serves the order and the
   `failed_at` range of each queue filter.
-- 5 is rejected. It needs an extension, and the filter is rare.
+- The design rejects 5. It needs an extension, and the filter is rare.
 - 6 and 7 change behaviour. The indexes make both unnecessary for now.
-- 8 is rejected. The test bundle cannot run it. The guarded build gives the
+- The design rejects 8. The test bundle cannot run it. The guarded build gives the
   same result to an operator who prebuilds the index.
 
 ## Reverse brainstorm: how to break it
 
 | Way to break it | Guard |
 |---|---|
-| A plain build on a large DLQ during an incident blocks each task failure. | The migration header and the upgrade guide give the `CONCURRENTLY` recipe. `lock_timeout` is 5 s. |
+| A plain build on a large DLQ during an incident blocks each task failure. The failure keeps its row locks, so signals on that run wait too. | The migration header and the upgrade guide give the `CONCURRENTLY` recipe. `lock_timeout` is 5 s. |
 | An operator prebuilds a same-named index with another definition. | The guard compares the definition and fails. |
 | A failed prebuild leaves an `INVALID` index. | The guard fails and names the fix. |
-| A `blocking-index` annotation on a table that is not hot. | The lint reports `unused-annotation`. No annotation is written. |
+| A `blocking-index` annotation on a table that is not hot. | The lint reports `unused-annotation`. The migration has no annotation. |
 | A partial index that a generic plan cannot use. | Each index is full. The gates force a generic plan. |
 | A gate plans a copy of the SQL, so it passes after the engine changes. | Each engine gate captures the SQL that the engine function sends. |
 | A gate skips when it has no database, so it passes over the defect. | `plan_gate_db` panics with no database. |
@@ -79,7 +79,9 @@ guarded build in one migration.
 | The redrive delete removes another row. | A test seeds three rows and checks that one goes. |
 | A change to the list order. | No query changes. A test checks newest first and the limit. |
 | A migration version that collides with another branch. | A second-precision UTC prefix. |
-| Each failure in a storm writes three more index entries. | The perf page measures the insert cost. |
+| Each failure in a storm writes three more index entries. | The perf page measures the insert cost, with random task ids. |
+| A filter that no index serves walks the `failed_at` index from the wrong end. | The perf page measures it on a shuffled heap. The upgrade guide names the bound: a time window or a queue. |
+| A gate accepts a full index walk for the list or the probe. | Those gates also require a backward scan under a `Limit`. |
 
 ## Six hats
 
@@ -88,7 +90,9 @@ guarded build in one migration.
 - **Red.** The status summary runs on each request. That probe must not
   grow with the DLQ.
 - **Black.** Three more entries for each insert. A plain build blocks task
-  failures. The `error ILIKE` count still reads the table.
+  failures. The `error ILIKE` count still reads the table. A filter that no
+  index serves can walk the `failed_at` index. On a shuffled heap, with the
+  matches at the far end, that walk costs 16 times the old scan.
 - **Yellow.** A list page reads `limit` rows. The newest-age probe reads one
   row. A redrive of N rows does N index lookups.
 - **Green.** One `(failed_at)` index serves both orders and `MAX`. One
@@ -104,9 +108,19 @@ Migration `20261102143438_harvest_dead_letter_indexes` builds:
 - `idx_harvest_dl_original_task` on `harvest_dead_letters (original_task_id)`;
 - `idx_harvest_dl_queue_failed` on `harvest_dead_letters (queue_name, failed_at)`.
 
-Each build is guarded, as in `20261030182800`. No query changes. The
+A guard wraps each build, as in `20261030182800`. No query changes. The
 `error ILIKE` filter and an unfiltered count still read the table. That
 cost is inherent.
+
+The design accepts the walk of the trade-off above. Before, those reads were
+full scans too. The wins run on each list page, each status request and
+each callback redrive row. Two follow-ups can remove the walk: an
+`(activity_name, failed_at)` index, and a time window on an unbounded
+redrive.
+
+The plugin reads, `ui::query_dead_letters_for_ui` and the API bulk reads,
+have no gate. They send the same filters and orders as the engine reads. The
+Ledger plan pages record their access paths.
 
 ## Acceptance criteria
 

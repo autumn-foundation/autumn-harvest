@@ -12,18 +12,49 @@
              relname             | relpages 
 ---------------------------------+----------
  harvest_dead_letters            |     5883
- harvest_dead_letters_pkey       |      535
+ harvest_dead_letters_pkey       |      522
  idx_harvest_dl_failed_at        |      276
  idx_harvest_dl_original_task    |      388
  idx_harvest_dl_owner            |        1
  idx_harvest_dl_queue_failed     |      443
  idx_harvest_dl_quota            |        1
- idx_harvest_dl_workflow_exec_id |      534
+ idx_harvest_dl_workflow_exec_id |      554
 (8 rows)
 
--- psql -d dl_after -f write.sql
+-- psql -d dl_after -f write.sql (run 1)
  buffers | rows | wal_records | wal_fpi | wal_bytes |                            query                             
 ---------+------+-------------+---------+-----------+--------------------------------------------------------------
-   14754 | 1000 |        6046 |     916 |   5872650 | INSERT INTO harvest_dead_letters (original_task_id, queue_na
+   15198 | 1000 |        6043 |    1285 |   8532671 | INSERT INTO harvest_dead_letters (original_task_id, queue_na
 (1 row)
+
+-- psql -d dl_after -f write.sql (run 2)
+ buffers | rows | wal_records | wal_fpi | wal_bytes |                            query                             
+---------+------+-------------+---------+-----------+--------------------------------------------------------------
+   15190 | 1000 |        6138 |    1274 |   8547898 | INSERT INTO harvest_dead_letters (original_task_id, queue_na
+(1 row)
+
+-- psql -d dl_after -f tradeoff.sql
+                                            QUERY PLAN                                             
+---------------------------------------------------------------------------------------------------
+ Limit (actual rows=100 loops=1)
+   Buffers: shared hit=5856
+   ->  Index Scan using idx_harvest_dl_failed_at on harvest_dead_letters (actual rows=100 loops=1)
+         Filter: (activity_name = 'refund'::text)
+         Rows Removed by Filter: 95000
+         Buffers: shared hit=5856
+ Planning:
+   Buffers: shared hit=2
+(8 rows)
+
+                                            QUERY PLAN                                             
+---------------------------------------------------------------------------------------------------
+ Limit (actual rows=100 loops=1)
+   Buffers: shared hit=95393
+   ->  Index Scan using idx_harvest_dl_failed_at on harvest_dead_letters (actual rows=100 loops=1)
+         Filter: (activity_name = 'refund'::text)
+         Rows Removed by Filter: 95000
+         Buffers: shared hit=95393
+ Planning:
+   Buffers: shared hit=2
+(8 rows)
 

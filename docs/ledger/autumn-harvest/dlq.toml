@@ -69,7 +69,7 @@ driver = "per_request"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_dead_letters", "harvest_workflow_executions"]
-measured = "unmeasured"
+measured = "docs/performance-dead-letter-indexes.md"
 plan = "docs/ledger/plans/autumn-harvest/dlq.md"
 
 ["query_dead_letters_for_redrive"]

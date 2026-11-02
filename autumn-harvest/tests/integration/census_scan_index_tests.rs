@@ -664,6 +664,36 @@ fn seed_dead_letter(
     .expect("write to a String");
 }
 
+/// Append to `sql` an `INSERT` of the dead letter of one callback delivery.
+///
+/// The row has the queue name and the execution id that an exhausted
+/// delivery writes.
+fn seed_callback_dead_letter(
+    sql: &mut String,
+    delivery_id: uuid::Uuid,
+    exec_id: ExecutionId,
+    error: &str,
+) {
+    write!(
+        sql,
+        "INSERT INTO harvest_dead_letters \
+             (original_task_id, queue_name, task_type, workflow_exec_id, input, error, attempts) \
+         VALUES ('{delivery_id}', 'completion-callback', 'CALLBACK', '{exec_id}', '{{}}'::jsonb, \
+                 '{error}', 1);"
+    )
+    .expect("write to a String");
+}
+
+/// Assert that `plan` stops early: a backward index scan under a `Limit`.
+///
+/// `assert_served` alone also accepts a walk of the whole index.
+fn assert_newest_first_and_bounded(plan: &str, what: &str) {
+    assert!(
+        plan.contains("Limit") && plan.contains("Backward"),
+        "{what} must read a backward scan under a Limit:\n{plan}"
+    );
+}
+
 /// The DLQ list reads the newest rows by index, newest first, up to its limit.
 #[tokio::test(flavor = "multi_thread")]
 async fn dead_letter_list_reads_the_newest_rows_by_index() {
@@ -688,12 +718,13 @@ async fn dead_letter_list_reads_the_newest_rows_by_index() {
     let rows = autumn_harvest::dlq::list_dead_letters(&mut conn, 2, None)
         .await
         .expect("list dead letters");
-    let list = take_statement(&log, "SELECT");
+    let list = take_statement(&log, "SELECT \"harvest_dead_letters\"");
     let errors: Vec<&str> = rows.iter().map(|r| r.error.as_str()).collect();
     assert_eq!(errors, ["newest", "middle"]);
 
     let plan = generic_plan(&mut conn, &list).await;
     assert_served(&plan, DLQ, DLQ_FAILED_AT_INDEX, "list_dead_letters");
+    assert_newest_first_and_bounded(&plan, "list_dead_letters");
 }
 
 #[derive(QueryableByName, Debug)]
@@ -745,6 +776,7 @@ async fn dead_letter_newest_age_reads_one_row_by_index() {
 
     let plan = generic_plan(&mut conn, DLQ_NEWEST_AGE_SQL).await;
     assert_served(&plan, DLQ, DLQ_FAILED_AT_INDEX, "the newest-age probe");
+    assert_newest_first_and_bounded(&plan, "the newest-age probe");
 }
 
 #[derive(QueryableByName, Debug)]
@@ -780,14 +812,7 @@ async fn callback_redrive_deletes_its_dead_letter_by_index() {
                  'https://example.test/hook', '{{}}'::jsonb, 'failed', '{{}}'::jsonb, \
                  'FAILED', 1, 1, '{{}}'::jsonb, NOW());"
     );
-    seed_dead_letter(
-        &mut sql,
-        delivery_id,
-        "callbacks",
-        "CALLBACK",
-        "this delivery",
-        "NOW()",
-    );
+    seed_callback_dead_letter(&mut sql, delivery_id, exec_id, "this delivery");
     seed_dead_letter(
         &mut sql,
         delivery_id,
@@ -796,14 +821,7 @@ async fn callback_redrive_deletes_its_dead_letter_by_index() {
         "same id, activity",
         "NOW()",
     );
-    seed_dead_letter(
-        &mut sql,
-        uuid::Uuid::new_v4(),
-        "callbacks",
-        "CALLBACK",
-        "another delivery",
-        "NOW()",
-    );
+    seed_callback_dead_letter(&mut sql, uuid::Uuid::new_v4(), exec_id, "another delivery");
     conn.batch_execute(&sql)
         .await
         .expect("seed a failed delivery and three dead letters");
@@ -856,6 +874,22 @@ async fn seed_two_queues(conn: &mut AsyncPgConnection) {
     conn.batch_execute(&sql).await.expect("seed dead letters");
 }
 
+/// Return the `error` of each dead letter in `ids`, in the order of `ids`.
+async fn errors_of(conn: &mut AsyncPgConnection, ids: &[String]) -> Vec<String> {
+    let mut errors = Vec::with_capacity(ids.len());
+    for id in ids {
+        let id: uuid::Uuid = id.parse().expect("a dead-letter id");
+        let row: DeadLetterError =
+            diesel::sql_query("SELECT error FROM harvest_dead_letters WHERE id = $1")
+                .bind::<diesel::sql_types::Uuid, _>(id)
+                .get_result(conn)
+                .await
+                .expect("load a dead letter");
+        errors.push(row.error);
+    }
+    errors
+}
+
 /// Assert that the queue filter of each statement reads the queue index.
 async fn assert_queue_served(conn: &mut AsyncPgConnection, statements: [(String, &str); 2]) {
     for (sql, what) in statements {
@@ -893,21 +927,7 @@ async fn queue_redrive_reads_the_queue_by_index() {
         take_statements(&log, ["SELECT COUNT(*)", "SELECT \"harvest_dead_letters\""]);
     assert_eq!(result.matched, 3, "the count ignores the cap");
 
-    let ids: Vec<uuid::Uuid> = result
-        .ids
-        .iter()
-        .map(|id| id.parse().expect("a dead-letter id"))
-        .collect();
-    let mut errors = Vec::new();
-    for id in ids {
-        let row: DeadLetterError =
-            diesel::sql_query("SELECT error FROM harvest_dead_letters WHERE id = $1")
-                .bind::<diesel::sql_types::Uuid, _>(id)
-                .get_result(&mut conn)
-                .await
-                .expect("load a dead letter");
-        errors.push(row.error);
-    }
+    let errors = errors_of(&mut conn, &result.ids).await;
     assert_eq!(errors, ["alpha oldest", "alpha middle"]);
 
     assert_queue_served(
@@ -920,7 +940,7 @@ async fn queue_redrive_reads_the_queue_by_index() {
     .await;
 }
 
-/// A bulk replay by queue counts and reads that queue by index.
+/// A bulk replay by queue counts and reads that queue by index, oldest first.
 #[tokio::test(flavor = "multi_thread")]
 async fn queue_bulk_replay_reads_the_queue_by_index() {
     use autumn_harvest::dlq::{BulkDlqFilter, bulk_replay_dead_letters};
@@ -942,6 +962,8 @@ async fn queue_bulk_replay_reads_the_queue_by_index() {
     let [count, read] =
         take_statements(&log, ["SELECT COUNT(*)", "SELECT \"harvest_dead_letters\""]);
     assert_eq!(result.matched, 3, "the count ignores the limit");
+    let errors = errors_of(&mut conn, &result.ids).await;
+    assert_eq!(errors, ["alpha oldest", "alpha middle"]);
 
     assert_queue_served(
         &mut conn,

@@ -2825,4 +2825,6 @@ standalone note rather than part of the claim-path attribution table above:
   newest-age probe of the status summary (issue #2401). Before the indexes,
   each one read the whole of `harvest_dead_letters`. On 100,000 rows, a list
   page drops from 5,959 to 5 buffers, and each callback redrive delete from
-  5,884 to 5. Each dead-letter insert costs about 8 more buffers.
+  5,884 to 5. Each dead-letter insert costs about 8 more buffers. A filter
+  that no index serves can now walk the `failed_at` index, which costs more
+  on a shuffled heap.
