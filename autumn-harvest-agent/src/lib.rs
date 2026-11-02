@@ -117,13 +117,15 @@ pub use agent::overlay_store::{
     InMemoryOverlayStore, MAX_AUTHOR_LEN, OverlayStoreError, OverlayValidator, OverlayVersion,
     ProfileOverlayStore, Provenance, StoredOverlay,
 };
+pub use agent::profile_read::ProfileRead;
 pub use agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentHeartbeat, AgentId, AgentIdError, AgentMemory, AgentOp,
     AgentProfile, AgentState, AgentStatus, Control, HeartbeatSetting, INTERRUPT_SIGNAL, Interrupt,
-    PeerEnvelope, PeerReply, STEER_SIGNAL, Steer, Urgency, UserMessage, agent, agent_info,
-    agent_memory_reset, agent_memory_reset_info, agent_profile, agent_profile_info,
-    agent_workspace_floor, agent_workspace_floor_info, agent_workspace_reset,
-    agent_workspace_reset_info, agent_workspace_retain, agent_workspace_retain_info,
+    PROFILE_VERSION_ATTR, PeerEnvelope, PeerReply, STEER_SIGNAL, Steer, Urgency, UserMessage,
+    agent, agent_info, agent_memory_reset, agent_memory_reset_info, agent_profile,
+    agent_profile_info, agent_profile_overlay, agent_profile_overlay_info, agent_workspace_floor,
+    agent_workspace_floor_info, agent_workspace_reset, agent_workspace_reset_info,
+    agent_workspace_retain, agent_workspace_retain_info,
 };
 pub use approval::Approval;
 pub use context_reset::{ContextReset, ProgressNotes};

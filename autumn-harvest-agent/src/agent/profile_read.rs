@@ -119,9 +119,10 @@ impl AgentHarness {
     ///
     /// # Errors
     ///
-    /// Returns a non-retryable activity error that names the version when
-    /// the overlay does not apply, and for a kind with no profile or a
-    /// corrupt row. Returns a retryable error when the store fails.
+    /// Returns a non-retryable activity error when the overlay does not
+    /// apply. That error names the version. A kind with no profile and a
+    /// corrupt row also give a non-retryable error. A store failure gives a
+    /// retryable error.
     pub async fn overlaid_profile(&self, kind: &str) -> Result<ProfileRead, String> {
         let kind_name = truncate(kind, MAX_NAME_LEN);
         let base = self.agent_profile(kind).ok_or_else(|| {

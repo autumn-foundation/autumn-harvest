@@ -148,6 +148,9 @@ pub trait Backend {
     /// Approve the call that `signal` names.
     async fn approve(&mut self, id: &AgentId, signal: &str);
 
+    /// Delete the agent `id`, and run it until its run ends.
+    async fn delete(&mut self, id: &AgentId);
+
     /// A strict replay of each recorded run of the agent `id`.
     async fn replay(&mut self, id: &AgentId) -> Vec<ReplayReport>;
 
@@ -215,7 +218,7 @@ fn agent(kind: &str, name: &str) -> AgentId {
 
 /// The approval signal of the first gated call of a new agent.
 pub fn first_approval() -> String {
-    approval_signal(1, 0, CALL_ID)
+    approval_signal(0, 0, CALL_ID)
 }
 
 fn segments(n: u64) -> impl Fn(&AgentState) -> bool + Sync {
@@ -233,9 +236,9 @@ fn assert_all(prompts: &[String], text: &str) {
     }
 }
 
-/// AC 1: run op 1 under v1, activate v2, then replay op 1. The replay
-/// raises no non-determinism error, and the rebuilt transcript is the
-/// original one.
+/// AC 1: run op 1 under v1, activate v2, then replay op 1. The rebuilt
+/// transcript is the original one, and the replay raises no
+/// non-determinism error.
 pub async fn replay_is_exact<B: Backend>(backend: &mut B) {
     let kind = backend.kind();
     let model = PromptModel::new();
@@ -249,12 +252,6 @@ pub async fn replay_is_exact<B: Backend>(backend: &mut B) {
     assert_all(&model.prompts(), PROMPT_V1);
 
     adopt(store.as_ref(), &kind, &prompt(PROMPT_V2), Some(v1)).await;
-    for report in backend.replay(&id).await {
-        assert!(
-            matches!(report.status, ReplayStatus::ReplaySucceeded),
-            "{report}"
-        );
-    }
 
     // A new process with v2 active, and a model that must not be asked.
     let fresh = PromptModel::new();
@@ -263,6 +260,16 @@ pub async fn replay_is_exact<B: Backend>(backend: &mut B) {
     assert_eq!(rebuilt.transcript, original.transcript);
     assert_eq!(rebuilt.profile_version, Some(v1));
     assert_eq!(fresh.calls(), 0, "the replay asks no model");
+
+    // A strict replay needs a whole history, so the run ends first. The
+    // delete op runs no segment, so it reads no profile.
+    backend.delete(&id).await;
+    for report in backend.replay(&id).await {
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
 }
 
 /// AC 2: op 1 sees v1's text, and op 2 sees v2's text.

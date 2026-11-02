@@ -105,6 +105,15 @@ impl Backend for Sqlite {
         sqlite::decide(self.rt(), exec, signal, &Approval::Approve).unwrap();
     }
 
+    async fn delete(&mut self, id: &AgentId) {
+        sqlite::delete(self.rt(), id, None).unwrap();
+        let ended = sqlite::drive(self.rt(), id).await.unwrap();
+        assert!(
+            matches!(ended, Some(RunState::Completed(_))),
+            "the run ended: {ended:?}"
+        );
+    }
+
     async fn replay(&mut self, id: &AgentId) -> Vec<ReplayReport> {
         let mut reports = Vec::new();
         for exec in self.runs(id) {
@@ -166,4 +175,54 @@ async fn the_search_attribute_follows_the_op() {
 #[tokio::test(flavor = "multi_thread")]
 async fn bad_stored_data_fails_safe() {
     overlay_read_suite::bad_stored_data_fails_safe(&mut Sqlite::new()).await;
+}
+
+/// Every search attribute that an agent publishes is named in the
+/// "Search attributes" paragraph of `docs/agent-adapter.md` section 15.
+/// The agent sets each one: a tenant, a mesh, a heartbeat and a version.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_published_attribute_is_documented() {
+    use std::time::Duration;
+
+    use autumn_harvest_agent::{AgentHeartbeat, AgentProfile, PROFILE_VERSION_ATTR};
+
+    let mut backend = Sqlite::new();
+    let model = overlay_read_suite::PromptModel::new();
+    let profile = AgentProfile::new("support")
+        .tenant("acme")
+        .mesh("ops")
+        .heartbeat(AgentHeartbeat::every(Duration::from_secs(300)));
+    let base = AgentHarness::new(model).agent(profile);
+    let (harness, store) = overlay_read_suite::with_store(&backend, base);
+    let prompt = overlay_read_suite::prompt(overlay_read_suite::PROMPT_V1);
+    overlay_read_suite::adopt(store.as_ref(), "support", &prompt, None).await;
+    backend.serve(harness).await;
+    let id = AgentId::new("support", "documented").unwrap();
+    backend.send(&id, &AgentOp::message("hello")).await;
+    backend
+        .settle(&id, &|state: &AgentState| state.segments == 1)
+        .await;
+
+    let page = backend
+        .rt()
+        .list_executions(&ExecutionFilter::new().workflow_id(id.as_str()))
+        .unwrap();
+    let attrs = page.executions[0]
+        .search_attributes
+        .value()
+        .unwrap()
+        .clone();
+    assert!(attrs.contains_key(PROFILE_VERSION_ATTR), "{attrs:?}");
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/agent-adapter.md"),
+    )
+    .unwrap();
+    let start = doc.find("**Search attributes.**").expect("the paragraph");
+    let paragraph = &doc[start..start + doc[start..].find("\n\n").unwrap()];
+    for key in attrs.keys() {
+        assert!(
+            paragraph.contains(&format!("`{key}`")),
+            "docs/agent-adapter.md does not name {key}"
+        );
+    }
 }

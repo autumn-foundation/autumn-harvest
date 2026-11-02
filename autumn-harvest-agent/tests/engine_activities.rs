@@ -265,6 +265,7 @@ fn the_engine_registration_builds() {
             "agent_precheck",
             "agent_discover_peers",
             "agent_profile",
+            "agent_profile_overlay",
             "agent_memory_reset",
             "agent_workspace_retain",
             "agent_workspace_reset",

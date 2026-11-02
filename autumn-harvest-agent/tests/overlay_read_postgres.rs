@@ -132,8 +132,11 @@ impl Pg {
         .load(&mut self.conn().await)
         .await
         .expect("load runs");
-        rows.first()
-            .map(|row| row.text.parse().expect("an execution id"))
+        // A slice pattern: `first()` would resolve to `RunQueryDsl::first`.
+        match rows.as_slice() {
+            [row, ..] => Some(row.text.parse().expect("an execution id")),
+            [] => None,
+        }
     }
 
     /// The last committed state of the agent `id`.
@@ -286,6 +289,23 @@ impl Backend for Pg {
         )
         .await
         .expect("approve");
+    }
+
+    async fn delete(&mut self, id: &AgentId) {
+        let exec = self.current(id).await.expect("a run");
+        autumn_harvest::signal::send_signal(
+            &mut self.conn().await,
+            exec,
+            ENTITY_OP_SIGNAL,
+            Agent::delete_payload(),
+        )
+        .await
+        .expect("delete");
+        let deadline = Instant::now() + LIMIT;
+        while self.current(id).await.is_some() {
+            assert!(Instant::now() < deadline, "the run of {id} did not end");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     async fn replay(&mut self, id: &AgentId) -> Vec<ReplayReport> {

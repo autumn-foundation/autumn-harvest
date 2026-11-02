@@ -64,6 +64,7 @@ use crate::workflow::{
 use crate::workspace::{WorkspaceMount, WorkspaceRef};
 use dedupe::Inbound;
 use inbox::{Admit, InboxStatus, OpClass, admit};
+use profile_read::{ProfileRead, overlaid};
 
 /// The registered workflow name of a durable agent.
 pub const AGENT_WORKFLOW_NAME: &str = "agent";
@@ -80,6 +81,10 @@ pub const DEFAULT_WINDOW: u32 = 200;
 
 /// The longest agent name, in bytes.
 pub const MAX_AGENT_NAME_BYTES: usize = 200;
+
+/// The search attribute that holds the overlay version of the last op that
+/// read a profile, for example `"v2"` (issue #2372).
+pub const PROFILE_VERSION_ATTR: &str = "agent_profile_version";
 
 /// The signal that interrupts the op that an agent runs (issue #2265).
 ///
@@ -587,7 +592,8 @@ pub enum AgentMemory {
 ///
 /// The harness holds one profile for each kind. The agent reads its profile
 /// once per run, through a recorded activity, so a deploy changes the next
-/// run only.
+/// run only. With an overlay store, each op also reads the active overlay
+/// through a recorded activity, so an activation changes the next op only.
 // The flags are independent switches on a recorded payload.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1242,6 +1248,9 @@ struct AgentRun<'a> {
     id: Result<AgentId, String>,
     /// The profile of the kind, or why there is none.
     profile: Result<AgentProfile, String>,
+    /// Whether the run read reports an overlay store. Each op then reads its
+    /// overlay (issue #2372).
+    overlays: bool,
     /// The mandate and the peers of the agent, when the profile has a mandate.
     member: Option<Member>,
 }
@@ -1264,10 +1273,12 @@ pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<Ag
     let id = AgentId::parse(ctx.workflow_id()).map_err(|err| format!("{err}"));
     // A failed lookup fails each work op of this run with a named error. The
     // run and its carried state stay, so the next run looks again.
-    let mut profile = match &id {
+    let read = match &id {
         Ok(id) => lookup_profile(ctx, id).await.unwrap_or_else(Err),
         Err(err) => Err(err.clone()),
     };
+    let overlays = read.as_ref().is_ok_and(|read| read.overlay_store);
+    let mut profile = read.map(|read| read.profile);
     let member = match &profile {
         Ok(AgentProfile {
             mandate: Some(mandate),
@@ -1285,6 +1296,7 @@ pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<Ag
         ctx,
         id,
         profile,
+        overlays,
         member,
     };
     let max_ops = run
@@ -1317,8 +1329,8 @@ pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<Ag
 async fn lookup_profile(
     ctx: &WorkflowContext,
     id: &AgentId,
-) -> Result<Result<AgentProfile, String>, String> {
-    let found: Option<AgentProfile> = ctx
+) -> Result<Result<ProfileRead, String>, String> {
+    let found: Option<ProfileRead> = ctx
         .execute_activity(&agent_profile_info(), id.kind().to_owned())
         .await
         .map_err(|err| err.to_string())?;
@@ -1370,6 +1382,32 @@ impl AgentRun<'_> {
         Ok(state)
     }
 
+    /// The profile of one op (issue #2372).
+    ///
+    /// With no overlay store, it is the run profile. Else the op reads the
+    /// active overlay through the recorded activity `agent_profile_overlay`,
+    /// and takes the overlay fields of the read. The read sets
+    /// [`AgentState::profile_version`]. A failed read keeps it.
+    async fn op_profile(&self, state: &mut AgentState) -> Result<AgentProfile, String> {
+        let (id, profile) = match (&self.id, &self.profile) {
+            (Ok(id), Ok(profile)) => (id, profile),
+            (Err(err), _) | (_, Err(err)) => return Err(err.clone()),
+        };
+        if !self.overlays {
+            return Ok(profile.clone());
+        }
+        let read: ProfileRead = self
+            .ctx
+            .execute_activity(&agent_profile_overlay_info(), id.kind().to_owned())
+            .await
+            .map_err(|err| err.to_string())?;
+        state.profile_version = read.overlay_version;
+        Ok(match read.overlay_version {
+            Some(_) => overlaid(profile, &read.profile),
+            None => profile.clone(),
+        })
+    }
+
     /// Book the next heartbeat. See [`wake::next_heartbeat`].
     fn schedule(&self, state: &mut AgentState, now: i64, ticked: bool) {
         let every = state
@@ -1416,6 +1454,12 @@ impl AgentRun<'_> {
                 profile
                     .and_then(|profile| profile.mesh.as_ref())
                     .map(|mesh| serde_json::json!(mesh)),
+            ),
+            (
+                PROFILE_VERSION_ATTR,
+                state
+                    .profile_version
+                    .map(|version| serde_json::json!(format!("{version}"))),
             ),
         ];
         if let Err(err) = self
@@ -1672,22 +1716,32 @@ impl AgentRun<'_> {
             Err(_) => Err(Refusal::InvalidMandate),
         };
         // The sender cannot see the model of this agent, so the receiver
-        // checks it against the mandate that it accepts (issue #2271).
-        let model = self.profile.as_ref().ok().and_then(|p| p.model.as_deref());
-        let accepted = accepted.and_then(|mandate| {
-            if mandate.allows_model(model) {
-                Ok(mandate)
-            } else {
-                Err(Refusal::ModelForbidden)
-            }
-        });
+        // checks it against the mandate that it accepts (issue #2271). The
+        // op profile names the model, so the op reads it first.
+        let accepted = match accepted {
+            Ok(mandate) => match self.op_profile(&mut state).await {
+                Ok(profile) if mandate.allows_model(profile.model.as_deref()) => {
+                    Ok((mandate, profile))
+                }
+                Ok(_) => Err(Some(Refusal::ModelForbidden)),
+                Err(err) => {
+                    fail(&mut state, &err);
+                    Err(None)
+                }
+            },
+            Err(refusal) => Err(Some(refusal)),
+        };
         let reply = match accepted {
             Err(refusal) => PeerReply {
-                refusal: Some(refusal),
+                error: refusal
+                    .is_none()
+                    .then(|| state.last_error.clone())
+                    .flatten(),
+                refusal,
                 flow_labels: state.flow_labels.clone(),
                 ..PeerReply::default()
             },
-            Ok(mandate) => {
+            Ok((mandate, profile)) => {
                 let member = self.member.as_ref().map_or_else(
                     || Member::bare(mandate.clone()),
                     |member| member.narrowed(mandate.clone()),
@@ -1703,7 +1757,7 @@ impl AgentRun<'_> {
                     waiting: &envelope.waiting,
                 };
                 let (next, outcome) = self
-                    .run_segment_as(state, &input, Mode::Peer, Some(peer))
+                    .run_segment_as(state, &input, Mode::Peer, Some(peer), &profile)
                     .await;
                 state = next;
                 // Only this segment answers. A failed segment sends no text,
@@ -1788,13 +1842,24 @@ impl AgentRun<'_> {
             .map_err(|err| err.to_string())
     }
 
-    /// Run one segment with `input` and fold it into `state`.
-    async fn segment(&self, state: AgentState, input: &str, mode: Mode<'_>) -> AgentState {
-        self.run_segment_as(state, input, mode, None).await.0
+    /// Read the op profile, then run one segment with `input` and fold it
+    /// into `state`. A failed read fails the op before any model call.
+    async fn segment(&self, mut state: AgentState, input: &str, mode: Mode<'_>) -> AgentState {
+        match self.op_profile(&mut state).await {
+            Ok(profile) => {
+                self.run_segment_as(state, input, mode, None, &profile)
+                    .await
+                    .0
+            }
+            Err(err) => {
+                fail(&mut state, &err);
+                state
+            }
+        }
     }
 
-    /// Run one segment, as [`Self::segment`] does. A peer message passes
-    /// its narrowed member and its waiting chain.
+    /// Run one segment on the op `profile`, as [`Self::segment`] does. A
+    /// peer message passes its narrowed member and its waiting chain.
     ///
     /// It also returns the stop and the answer of a segment that completed.
     async fn run_segment_as(
@@ -1803,10 +1868,11 @@ impl AgentRun<'_> {
         input: &str,
         mode: Mode<'_>,
         peer: Option<PeerSegment<'_>>,
+        profile: &AgentProfile,
     ) -> (AgentState, Option<(AgentStop, String)>) {
-        let (id, profile) = match (&self.id, &self.profile) {
-            (Ok(id), Ok(profile)) => (id, profile),
-            (Err(err), _) | (_, Err(err)) => {
+        let id = match &self.id {
+            Ok(id) => id,
+            Err(err) => {
                 fail(&mut state, err);
                 return (state, None);
             }
@@ -2160,7 +2226,8 @@ fn trim_window(messages: Vec<ChatMessage>, window: u32) -> Vec<ChatMessage> {
     messages.into_iter().skip(cut).collect()
 }
 
-/// The profile of one kind, as an activity.
+/// The run read of one kind, as an activity: the bare profile, and
+/// whether an overlay store is installed. See [`ProfileRead`].
 ///
 /// # Errors
 ///
@@ -2172,8 +2239,27 @@ fn trim_window(messages: Vec<ChatMessage>, window: u32) -> Vec<ChatMessage> {
 pub async fn agent_profile(
     ctx: &ActivityContext,
     kind: String,
-) -> Result<Option<AgentProfile>, String> {
-    Ok(harness(ctx)?.agent_profile(&kind))
+) -> Result<Option<ProfileRead>, String> {
+    Ok(harness(ctx)?.profile_read(&kind))
+}
+
+/// The op read of one kind, as an activity (issue #2372): the profile with
+/// the active overlay applied, and its version. See
+/// [`AgentHarness::overlaid_profile`](crate::AgentHarness::overlaid_profile).
+///
+/// # Errors
+///
+/// Returns a non-retryable error that names the version when the overlay
+/// does not apply. Returns a retryable error when the store fails.
+#[activity(
+    start_to_close = "1m",
+    retry = RetryPolicy::exponential(3, Duration::from_secs(1))
+)]
+pub async fn agent_profile_overlay(
+    ctx: &ActivityContext,
+    kind: String,
+) -> Result<ProfileRead, String> {
+    harness(ctx)?.overlaid_profile(&kind).await
 }
 
 /// Clear one memory scope, as an activity.
