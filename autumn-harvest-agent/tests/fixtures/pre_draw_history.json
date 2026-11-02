@@ -1,0 +1,280 @@
+{
+  "events": [
+    {
+      "data": {
+        "input": {
+          "approval_timeout_secs": 3600,
+          "deliver": false,
+          "followups": null,
+          "history": [],
+          "input": "pick a colour",
+          "loop_guard": {
+            "stop_after": 5,
+            "warn_after": 3,
+            "window": 30
+          },
+          "max_output_tokens": null,
+          "max_request_bytes": null,
+          "max_steps": 8,
+          "max_total_tokens": null,
+          "memory_scope": null,
+          "read_only": false,
+          "run_id_source": "execution_id",
+          "session_id": null,
+          "system": null,
+          "transcript_delta": true,
+          "unattended": false,
+          "unattended_memory_writes": false,
+          "whole_request_budget": true
+        },
+        "timestamp": "2026-11-02T03:13:29.216Z"
+      },
+      "type": "WorkflowStarted"
+    },
+    {
+      "data": {
+        "details": 1,
+        "name": "patch:agent_final_turn_rules"
+      },
+      "type": "MarkerRecorded"
+    },
+    {
+      "data": {
+        "details": 1,
+        "name": "patch:agent.transcript-delta"
+      },
+      "type": "MarkerRecorded"
+    },
+    {
+      "data": {
+        "activity_id": "c659fc2b-cd6b-48b9-bfed-e064a0bb09f0",
+        "input": {
+          "max_output_tokens": null,
+          "max_steps": 8,
+          "messages": [
+            {
+              "content": [
+                {
+                  "text": "pick a colour"
+                }
+              ],
+              "role": "user"
+            }
+          ],
+          "remember": true,
+          "run_id": "fffff860-e849-4c2e-b683-ebef3794f1f9",
+          "session_id": null,
+          "steps_used": 0,
+          "usage": {
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0
+          }
+        },
+        "name": "agent_model_turn",
+        "queue": "default"
+      },
+      "type": "ActivityScheduled"
+    },
+    {
+      "data": {
+        "activity_id": "c659fc2b-cd6b-48b9-bfed-e064a0bb09f0",
+        "output": {
+          "content": [
+            {
+              "tool_call": {
+                "arguments": {
+                  "q": "colour"
+                },
+                "id": "c1",
+                "name": "lookup"
+              }
+            }
+          ],
+          "decisions": [
+            {
+              "decision": "allow"
+            }
+          ],
+          "stop": "tool_use",
+          "usage": {
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "input_tokens": 3,
+            "output_tokens": 0
+          }
+        }
+      },
+      "type": "ActivityCompleted"
+    },
+    {
+      "data": {
+        "activity_id": "34cbfdd2-c8d7-4046-a5d9-49b4af7e62f4",
+        "input": {
+          "call": {
+            "arguments": {
+              "q": "colour"
+            },
+            "id": "c1",
+            "name": "lookup"
+          },
+          "run_id": "fffff860-e849-4c2e-b683-ebef3794f1f9",
+          "session_id": null,
+          "step": 0
+        },
+        "name": "agent_tool_call",
+        "queue": "default"
+      },
+      "type": "ActivityScheduled"
+    },
+    {
+      "data": {
+        "activity_id": "34cbfdd2-c8d7-4046-a5d9-49b4af7e62f4",
+        "output": {
+          "content": "{\"echo\":{\"q\":\"colour\"}}",
+          "is_error": false
+        }
+      },
+      "type": "ActivityCompleted"
+    },
+    {
+      "data": {
+        "activity_id": "98a9592e-5bef-4ffe-a533-17167032251a",
+        "input": {
+          "max_output_tokens": null,
+          "max_steps": 8,
+          "messages": [
+            {
+              "content": [
+                {
+                  "tool_call": {
+                    "arguments": {
+                      "q": "colour"
+                    },
+                    "id": "c1",
+                    "name": "lookup"
+                  }
+                }
+              ],
+              "role": "assistant"
+            },
+            {
+              "content": [
+                {
+                  "tool_result": {
+                    "content": "{\"echo\":{\"q\":\"colour\"}}",
+                    "tool_call_id": "c1"
+                  }
+                }
+              ],
+              "role": "tool"
+            }
+          ],
+          "prefix": {
+            "digest": "6baeb7d90a9d3446829b040fd5081e0a69816e659dc5e6dee5fbb97f7013e760",
+            "len": 1
+          },
+          "remember": true,
+          "run_id": "fffff860-e849-4c2e-b683-ebef3794f1f9",
+          "session_id": null,
+          "steps_used": 1,
+          "usage": {
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "input_tokens": 3,
+            "output_tokens": 0
+          }
+        },
+        "name": "agent_model_turn",
+        "queue": "default"
+      },
+      "type": "ActivityScheduled"
+    },
+    {
+      "data": {
+        "activity_id": "98a9592e-5bef-4ffe-a533-17167032251a",
+        "output": {
+          "content": [
+            {
+              "text": "blue"
+            }
+          ],
+          "decisions": [],
+          "stop": "end_turn",
+          "usage": {
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "input_tokens": 2,
+            "output_tokens": 0
+          }
+        }
+      },
+      "type": "ActivityCompleted"
+    },
+    {
+      "data": {
+        "output": {
+          "followup_dropped": false,
+          "followups": 0,
+          "messages": [
+            {
+              "content": [
+                {
+                  "text": "pick a colour"
+                }
+              ],
+              "role": "user"
+            },
+            {
+              "content": [
+                {
+                  "tool_call": {
+                    "arguments": {
+                      "q": "colour"
+                    },
+                    "id": "c1",
+                    "name": "lookup"
+                  }
+                }
+              ],
+              "role": "assistant"
+            },
+            {
+              "content": [
+                {
+                  "tool_result": {
+                    "content": "{\"echo\":{\"q\":\"colour\"}}",
+                    "tool_call_id": "c1"
+                  }
+                }
+              ],
+              "role": "tool"
+            },
+            {
+              "content": [
+                {
+                  "text": "blue"
+                }
+              ],
+              "role": "assistant"
+            }
+          ],
+          "run_id": "fffff860-e849-4c2e-b683-ebef3794f1f9",
+          "steps_used": 1,
+          "stop": "completed",
+          "text": "blue",
+          "tool_calls": 1,
+          "usage": {
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "input_tokens": 5,
+            "output_tokens": 0
+          }
+        }
+      },
+      "type": "WorkflowCompleted"
+    }
+  ],
+  "execution_id": "fffff860-e849-4c2e-b683-ebef3794f1f9"
+}

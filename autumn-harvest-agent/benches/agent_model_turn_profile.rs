@@ -307,6 +307,7 @@ impl Conversation {
             // `send_turn` sets `remember` on every turn of the delta form.
             remember: shape != Shape::Full,
             model: None,
+            draw: None,
         }
     }
 

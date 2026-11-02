@@ -769,6 +769,7 @@ impl AgentHarness {
             tools,
             max_tokens: request.max_output_tokens,
             temperature: self.temperature,
+            draw: request.draw,
         };
         // The key holds the model id, so one model never reads the answer
         // of another.

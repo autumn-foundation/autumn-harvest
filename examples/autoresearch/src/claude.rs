@@ -824,6 +824,7 @@ mod tests {
             }],
             max_tokens: None,
             temperature: Some(0.2),
+            draw: None,
         }
     }
 

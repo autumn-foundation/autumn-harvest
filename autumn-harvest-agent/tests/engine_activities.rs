@@ -72,6 +72,7 @@ fn turn_request() -> ModelTurnRequest {
         prefix: None,
         remember: false,
         stream: false,
+        draw: None,
     }
 }
 

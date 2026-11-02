@@ -7,6 +7,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::draw::DrawId;
 use crate::error::AgentError;
 use crate::message::{ChatMessage, ContentPart, StopReason, TokenUsage, ToolDefinition};
 
@@ -24,6 +25,11 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     /// The sampling temperature.
     pub temperature: Option<f32>,
+    /// The draw of this call (issue #2440). `None` is a run of one draw.
+    ///
+    /// The response cache puts a draw in the key, so each draw has its own
+    /// entry. A model may pass it to its provider as a seed.
+    pub draw: Option<DrawId>,
 }
 
 /// One chat response.
@@ -48,6 +54,12 @@ pub struct ChatResponse {
 /// The LLM budgets (issue #1997) count `input_tokens` plus `output_tokens` of
 /// [`ChatResponse::usage`]. Count the whole prompt in `input_tokens`, cached
 /// tokens included, even when the provider reports them apart.
+///
+/// A model may read [`ChatRequest::draw`] and pass it to its provider as a
+/// seed (issue #2440). Then each draw of one request is its own sample. The
+/// default ignores it. Draw 0 of each run then has the same seed, and the
+/// cache shares that answer across runs. Name the change in
+/// [`model_id`](Self::model_id), as for any client setting.
 pub trait AgentModel: Send + Sync + std::fmt::Debug {
     /// Send one request and decode the answer.
     fn chat<'a>(
