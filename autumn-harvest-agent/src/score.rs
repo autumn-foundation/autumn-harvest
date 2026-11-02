@@ -13,6 +13,7 @@
 //! reject never beats a score. See `docs/design/DESIGN-2441.md`.
 
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -371,6 +372,29 @@ pub struct ScoreContext<'a> {
     check: BudgetCheck<'a>,
     calls: Mutex<Vec<LlmCall>>,
     refusal: Mutex<Option<String>>,
+    /// The judge calls that hold a ledger slot: done, or still in flight.
+    slots: AtomicUsize,
+}
+
+/// One reserved ledger slot. A drop before [`Slot::keep`] frees it, so a
+/// failed or cancelled call gives its slot back.
+struct Slot<'s> {
+    slots: &'s AtomicUsize,
+    kept: bool,
+}
+
+impl Slot<'_> {
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        if !self.kept {
+            self.slots.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 impl fmt::Debug for ScoreContext<'_> {
@@ -396,6 +420,7 @@ impl<'a> ScoreContext<'a> {
             check,
             calls: Mutex::new(Vec::new()),
             refusal: Mutex::new(None),
+            slots: AtomicUsize::new(0),
         }
     }
 
@@ -432,12 +457,14 @@ impl<'a> ScoreContext<'a> {
                 "the harness has no such judge model; add it with AgentHarness::model_named",
             )
         })?;
-        if self.lock_calls().len() >= MAX_LLM_CALLS_PER_ATTEMPT {
-            return Err(AgentError::new(
+        // Reserve the slot before the call, so concurrent calls never pass
+        // the ledger cap together.
+        let slot = self.reserve().ok_or_else(|| {
+            AgentError::new(
                 ErrorKind::Budget,
                 format!("one score makes at most {MAX_LLM_CALLS_PER_ATTEMPT} judge calls"),
-            ));
-        }
+            )
+        })?;
         if let Err(refusal) = self.harness.check_budget(|| (self.check)()).await {
             *self.refusal.lock().unwrap_or_else(PoisonError::into_inner) = Some(refusal);
             return Err(AgentError::new(
@@ -459,7 +486,32 @@ impl<'a> ScoreContext<'a> {
             .harness
             .ledger_call(model, &response.usage, started.elapsed());
         self.lock_calls().push(call);
+        slot.keep();
         Ok(response)
+    }
+
+    /// Reserve one ledger slot, or `None` when every slot is taken.
+    fn reserve(&self) -> Option<Slot<'_>> {
+        let mut taken = self.slots.load(Ordering::SeqCst);
+        loop {
+            if taken >= MAX_LLM_CALLS_PER_ATTEMPT {
+                return None;
+            }
+            match self.slots.compare_exchange_weak(
+                taken,
+                taken + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(Slot {
+                        slots: &self.slots,
+                        kept: false,
+                    });
+                }
+                Err(now) => taken = now,
+            }
+        }
     }
 
     /// The refusal payload of a judge call, if the budget refused one.
@@ -535,7 +587,10 @@ pub(crate) async fn run_score<'a>(
     let calls = cx.ledger_calls();
     // A refusal wins, also when the scorer handled the error.
     if let Some(refusal) = cx.refused() {
-        return (Err(refusal), calls);
+        return (
+            Err(never_retried_after_pay(refusal, !calls.is_empty())),
+            calls,
+        );
     }
     let verdict = match outcome {
         Ok(Verdict::Reject(reason)) => Ok(Verdict::reject(reason)),
@@ -543,6 +598,20 @@ pub(crate) async fn run_score<'a>(
         Err(err) => Err(score_failure(&err, !calls.is_empty())),
     };
     (verdict, calls)
+}
+
+/// `payload`, made non-retryable when a judge call was paid.
+///
+/// A failed budget read is retryable. After a paid call, a retry would pay
+/// again unseen, so the payload keeps its type and stops the retries.
+fn never_retried_after_pay(payload: String, paid: bool) -> String {
+    match autumn_harvest::failure::parse_typed_payload(&payload) {
+        Some(mut failure) if paid && !failure.non_retryable => {
+            failure.non_retryable = true;
+            failure.into_error_payload()
+        }
+        _ => payload,
+    }
 }
 
 /// The activity error payload of a scorer error.
@@ -1493,5 +1562,164 @@ mod tests {
             model.calls.load(Ordering::SeqCst),
             MAX_LLM_CALLS_PER_ATTEMPT
         );
+    }
+
+    /// A model that waits at a barrier, so two calls are in flight at once.
+    #[derive(Debug)]
+    struct Gate {
+        barrier: tokio::sync::Barrier,
+        calls: AtomicUsize,
+    }
+
+    impl AgentModel for Gate {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if self.calls.load(Ordering::SeqCst) >= MAX_LLM_CALLS_PER_ATTEMPT {
+                    // Wait at most a moment for a second call to join.
+                    let _ =
+                        tokio::time::timeout(Duration::from_millis(200), self.barrier.wait()).await;
+                }
+                Ok(ChatResponse {
+                    content: vec![ContentPart::Text("1".into())],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::new(1, 1),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_judge_calls_never_pass_the_ledger_cap() {
+        let model = Arc::new(Gate {
+            barrier: tokio::sync::Barrier::new(2),
+            calls: AtomicUsize::new(0),
+        });
+        let harness = AgentHarness::new(model.clone());
+        let cx = ScoreContext::unmetered(&harness);
+        for _ in 0..MAX_LLM_CALLS_PER_ATTEMPT - 1 {
+            cx.chat(None, &empty_request()).await.unwrap();
+        }
+        let request = empty_request();
+        let (a, b) = tokio::join!(cx.chat(None, &request), cx.chat(None, &request));
+        assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+        assert_eq!(cx.ledger_calls().len(), MAX_LLM_CALLS_PER_ATTEMPT);
+        assert_eq!(
+            model.calls.load(Ordering::SeqCst),
+            MAX_LLM_CALLS_PER_ATTEMPT
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_judge_call_frees_its_slot() {
+        let harness = AgentHarness::new(Arc::new(PricedOnce {
+            calls: AtomicUsize::new(0),
+        }));
+        let cx = ScoreContext::unmetered(&harness);
+        assert!(cx.chat(None, &empty_request()).await.is_err());
+        assert_eq!(cx.slots.load(Ordering::SeqCst), 0);
+        cx.chat(None, &empty_request()).await.unwrap();
+        assert_eq!(cx.slots.load(Ordering::SeqCst), 1);
+    }
+
+    /// A model that fails its first call, then answers.
+    #[derive(Debug)]
+    struct PricedOnce {
+        calls: AtomicUsize,
+    }
+
+    impl AgentModel for PricedOnce {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if first {
+                    return Err(AgentError::new(ErrorKind::Provider, "down"));
+                }
+                Ok(ChatResponse {
+                    content: Vec::new(),
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::new(1, 1),
+                })
+            })
+        }
+    }
+
+    /// A scorer that makes two judge calls and hides any error.
+    #[derive(Debug)]
+    struct TwoCalls;
+
+    impl Scorer for TwoCalls {
+        fn id(&self) -> &str {
+            "two"
+        }
+
+        fn score<'a>(
+            &'a self,
+            _input: &'a ScoreInput,
+            cx: &'a ScoreContext<'_>,
+        ) -> BoxFuture<'a, Result<Verdict, AgentError>> {
+            Box::pin(async move {
+                for _ in 0..2 {
+                    if let Err(err) = cx.chat(None, &empty_request()).await {
+                        return Ok(Verdict::reject(err.to_string()));
+                    }
+                }
+                Verdict::score(1.0)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_budget_read_after_a_paid_call_is_never_retried() {
+        let model = judge();
+        let harness = AgentHarness::new(model.clone()).scorer(Arc::new(TwoCalls));
+        let reads = AtomicUsize::new(0);
+        // The first read passes. The second read fails as the engine does.
+        let check: BudgetCheck<'_> = Box::new(|| {
+            let first = reads.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if first {
+                    Ok(())
+                } else {
+                    Err(
+                        autumn_harvest::llm_budget::check_failed(&"the pool is down")
+                            .into_error_payload(),
+                    )
+                }
+            })
+        });
+        let (verdict, calls) = run_score(&harness, ScoreRequest::new("two", input()), check).await;
+        let failure = failure(&verdict.unwrap_err());
+        assert_eq!(
+            failure.error_type,
+            autumn_harvest::llm_budget::ERROR_TYPE_LLM_BUDGET_CHECK_FAILED
+        );
+        assert!(failure.non_retryable, "a retry would pay again unseen");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_budget_read_before_any_call_stays_retryable() {
+        let model = judge();
+        let harness = AgentHarness::new(model.clone()).scorer(Arc::new(TwoCalls));
+        let check: BudgetCheck<'_> = Box::new(|| {
+            Box::pin(async {
+                Err(
+                    autumn_harvest::llm_budget::check_failed(&"the pool is down")
+                        .into_error_payload(),
+                )
+            })
+        });
+        let (verdict, calls) = run_score(&harness, ScoreRequest::new("two", input()), check).await;
+        assert!(!failure(&verdict.unwrap_err()).non_retryable);
+        assert_eq!(calls.len(), 0);
+        assert_eq!(model.calls.load(Ordering::SeqCst), 0);
     }
 }

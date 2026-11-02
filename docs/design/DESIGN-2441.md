@@ -47,6 +47,8 @@ a rule.
 | The winner depends on the order in which draws end. | A tie goes to the lowest draw id. The proof shows that the result depends only on the set of entries. |
 | A judge call spends tokens that no ledger sees. | `ScoreContext::chat` keeps a ledger call for each judge call. The activity records each one under the run that calls it. |
 | A scorer fails after a paid judge call. A failed attempt writes no row, so each retry pays again unseen. | An error after a paid judge call is never retried. At most one attempt goes unrecorded. |
+| A failed budget read after a paid judge call keeps its retryable payload. | The refusal payload keeps its type, but turns non-retryable after a paid call. |
+| Concurrent judge calls pass the ledger cap together. | `ScoreContext::chat` reserves a ledger slot before each call. A failed or cancelled call frees its slot. |
 | A judge call runs past a spent budget. | `ScoreContext::chat` checks the LLM budget before each call. A refusal fails the activity with `LlmBudgetExceeded`, even when the scorer hides the error. The check sees committed spend only (section 5). |
 | A scorer logs a huge reject reason or error, and history grows. | `run_score` cuts a reason and an error message to `MAX_REJECT_REASON_BYTES`. |
 | A recorded verdict does not decode after an upgrade. | `Verdict` encodes as `{"score": x}` or `{"reject": "..."}`. A unit test pins the shape. |
