@@ -1232,7 +1232,7 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
     let workflow_id = format!("continue-metrics-{}", Uuid::new_v4());
 
     diesel::insert_into(harvest_workflow_executions::table)
-        .values(NewWorkflowExecution {
+        .values(&NewWorkflowExecution {
             quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
@@ -1384,7 +1384,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
     let workflow_id = format!("hard-cap-{}", Uuid::new_v4());
 
     diesel::insert_into(harvest_workflow_executions::table)
-        .values(NewWorkflowExecution {
+        .values(&NewWorkflowExecution {
             quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
@@ -1552,7 +1552,7 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
     let workflow_id = format!("hard-cap-attempt-{}", Uuid::new_v4());
 
     diesel::insert_into(harvest_workflow_executions::table)
-        .values(NewWorkflowExecution {
+        .values(&NewWorkflowExecution {
             quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
@@ -1719,7 +1719,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
         let workflow_id = format!("suspended-cap-{kind}-{}", Uuid::new_v4());
 
         diesel::insert_into(harvest_workflow_executions::table)
-            .values(NewWorkflowExecution {
+            .values(&NewWorkflowExecution {
                 quota_key: None,
                 continued_from_exec_id: None,
                 first_exec_id: None,
@@ -1983,7 +1983,7 @@ async fn history_bloat_counter_fires_once_when_a_still_suspended_execution_cross
     let workflow_id = format!("history-bloat-soft-warn-{}", Uuid::new_v4());
 
     diesel::insert_into(harvest_workflow_executions::table)
-        .values(NewWorkflowExecution {
+        .values(&NewWorkflowExecution {
             quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
@@ -2225,7 +2225,7 @@ async fn history_bloat_soft_threshold_not_crossed_by_a_contended_mutex_acquires_
     let workflow_id = format!("history-bloat-mutex-waiter-{}", Uuid::new_v4());
 
     diesel::insert_into(harvest_workflow_executions::table)
-        .values(NewWorkflowExecution {
+        .values(&NewWorkflowExecution {
             quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
@@ -2466,7 +2466,7 @@ async fn history_bloat_counter_fires_even_when_the_same_decision_reaches_the_har
     let workflow_id = format!("history-bloat-hard-cap-warn-{}", Uuid::new_v4());
 
     diesel::insert_into(harvest_workflow_executions::table)
-        .values(NewWorkflowExecution {
+        .values(&NewWorkflowExecution {
             quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
@@ -2724,7 +2724,7 @@ async fn history_bloat_counter_does_not_fire_off_a_prospective_pending_command_c
     let workflow_id = format!("history-bloat-prospective-overcount-{}", Uuid::new_v4());
 
     diesel::insert_into(harvest_workflow_executions::table)
-        .values(NewWorkflowExecution {
+        .values(&NewWorkflowExecution {
             quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
@@ -2934,7 +2934,7 @@ async fn history_bloat_counter_fires_exactly_once_across_two_real_live_suspensio
     let workflow_id = format!("history-bloat-double-suspension-{}", Uuid::new_v4());
 
     diesel::insert_into(harvest_workflow_executions::table)
-        .values(NewWorkflowExecution {
+        .values(&NewWorkflowExecution {
             quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
@@ -3152,7 +3152,7 @@ async fn history_bloat_counter_never_fires_when_the_soft_threshold_is_disabled()
     let workflow_id = format!("history-bloat-disabled-{}", Uuid::new_v4());
 
     diesel::insert_into(harvest_workflow_executions::table)
-        .values(NewWorkflowExecution {
+        .values(&NewWorkflowExecution {
             quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
@@ -3343,7 +3343,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
     let workflow_id = format!("local-retry-cap-{}", Uuid::new_v4());
 
     diesel::insert_into(harvest_workflow_executions::table)
-        .values(NewWorkflowExecution {
+        .values(&NewWorkflowExecution {
             quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
@@ -3545,7 +3545,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
     let workflow_id = format!("detached-cascade-cap-{}", Uuid::new_v4());
 
     diesel::insert_into(harvest_workflow_executions::table)
-        .values(NewWorkflowExecution {
+        .values(&NewWorkflowExecution {
             quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
@@ -3758,7 +3758,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
     let workflow_id = format!("parent-hard-cap-{}", Uuid::new_v4());
 
     diesel::insert_into(harvest_workflow_executions::table)
-        .values(NewWorkflowExecution {
+        .values(&NewWorkflowExecution {
             quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,

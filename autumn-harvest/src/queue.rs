@@ -4,6 +4,8 @@
 //! moves a `PENDING` row to `RUNNING` using `FOR UPDATE SKIP LOCKED` --
 //! no two workers will ever claim the same task.
 
+use crate::schema::harvest_task_queue_ext;
+use crate::table_split::SetExt;
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
@@ -5080,9 +5082,13 @@ pub(crate) async fn mark_claim_handler_started(
     let update = diesel::update(dsl::harvest_task_queue.find(claim.task_id))
         .set((
             dsl::handler_started_attempt.eq(claim.attempt),
-            dsl::handler_started_at.eq(diesel::dsl::sql::<
-                diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
-            >("clock_timestamp()")),
+            SetExt(
+                harvest_task_queue_ext::handler_started_at.eq(diesel::dsl::sql::<
+                    diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+                >(
+                    "clock_timestamp()"
+                )),
+            ),
         ))
         .into_boxed();
     let updated = fence(update, Some(claim))
@@ -6570,7 +6576,7 @@ fn workflow_backoff_set(
                 .bind::<Double, _>(delay_secs(delay))
                 .sql(")"),
         ),
-        dsl::wake_requested.eq(false),
+        SetExt(harvest_task_queue_ext::wake_requested.eq(false)),
         dsl::activity_name.eq(None::<String>),
         dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
         sticky,
@@ -6847,13 +6853,17 @@ async fn requeue_claimed_workflow_task_with_backoff(
         .sql(" IS NOT NULL THEN 0 ELSE ")
         .bind::<Double, _>(delay_secs(delay))
         .sql(" END)")),
-        dsl::decision_partition.eq(sql::<Nullable<SmallInt>>("COALESCE(decision_partition, ")
+        SetExt(
+            harvest_task_queue_ext::decision_partition.eq(sql::<Nullable<SmallInt>>(
+                "COALESCE(decision_partition, ",
+            )
             .bind::<Nullable<SmallInt>, _>(stamp)
             .sql(")")),
+        ),
         dsl::sticky_worker_id.eq(None::<String>),
         dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
         dsl::sticky_timeout.eq(None::<chrono::Duration>),
-        dsl::wake_requested.eq(false),
+        SetExt(harvest_task_queue_ext::wake_requested.eq(false)),
         dsl::activity_name.eq(None::<String>),
         dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
     ))
@@ -12922,6 +12932,10 @@ mod tests {
     ///
     /// The list is fixed so that a cached claim statement keeps its result
     /// type. A field added to the model must be added to the list too.
+    ///
+    /// The claim loads its result by name. The model selects its core
+    /// columns, then its extension columns (issue #2492). So the check
+    /// compares the two lists as sets.
     #[test]
     fn claim_result_columns_match_the_task_queue_item_fields() {
         use diesel::SelectableHelper;
@@ -12929,7 +12943,7 @@ mod tests {
             &crate::schema::harvest_task_queue::table.select(TaskQueueItem::as_select()),
         )
         .to_string();
-        let model: Vec<String> = select
+        let mut model: Vec<String> = select
             .trim_start_matches("SELECT ")
             .split(" FROM ")
             .next()
@@ -12937,10 +12951,12 @@ mod tests {
             .split(", ")
             .map(|c| c.replace("\"harvest_task_queue\".", "").replace('"', ""))
             .collect();
-        let listed: Vec<String> = claim_result_columns_sql!()
+        let mut listed: Vec<String> = claim_result_columns_sql!()
             .split(", ")
             .map(|c| c.trim().trim_start_matches("claimed.").to_owned())
             .collect();
+        model.sort();
+        listed.sort();
         assert_eq!(listed, model);
         assert!(
             claim_task_query().ends_with(concat!(

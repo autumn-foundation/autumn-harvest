@@ -3,6 +3,8 @@
 //! Tests the full two-build rolling deploy scenario via the UI API surface:
 //! shift active policy → declare compat → observe reachability → retire.
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::table_split::SetExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -526,7 +528,9 @@ async fn api_retire_build_returns_conflict_when_not_safe() {
 
     // Manually assign build_id to the execution.
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set(harvest_workflow_executions::assigned_build_id.eq(Some("sha-v1")))
+        .set(SetExt(
+            harvest_workflow_executions_ext::assigned_build_id.eq(Some("sha-v1")),
+        ))
         .execute(&mut conn)
         .await
         .unwrap();
@@ -943,7 +947,9 @@ async fn two_build_rolling_deploy_full_lifecycle() {
         .unwrap();
         // Assign sha-v1 to these executions.
         diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-            .set(harvest_workflow_executions::assigned_build_id.eq(Some("sha-v1")))
+            .set(SetExt(
+                harvest_workflow_executions_ext::assigned_build_id.eq(Some("sha-v1")),
+            ))
             .execute(&mut conn)
             .await
             .unwrap();
@@ -989,7 +995,7 @@ async fn two_build_rolling_deploy_full_lifecycle() {
 
     // Step 5: Simulate completing all sha-v1 executions.
     diesel::update(harvest_workflow_executions::table)
-        .filter(harvest_workflow_executions::assigned_build_id.eq(Some("sha-v1")))
+        .filter(harvest_workflow_executions_ext::assigned_build_id.eq(Some("sha-v1")))
         .set(harvest_workflow_executions::state.eq("COMPLETED"))
         .execute(&mut conn)
         .await

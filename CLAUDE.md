@@ -242,9 +242,12 @@ size. One column over a tier forces the next tier on every crate that builds
 diesel, embedders included. The 128 tier does not compile in 8 GB.
 
 `docs/audits/diesel-table-width.py` runs in CI's `lint` job. It fails on a
-`table!` over 64 columns, a new `table!` over 32, and a ceiling that grows.
-Do not raise a ceiling to add a column. Move a rarely used column out of the
-`table!`, as `schema::harvest_workflow_executions_unmapped` does.
+`table!` over 32 columns, and on a manifest that enables a wider tier. A
+table that needs more columns splits over a core and an extension
+declaration. Read `autumn-harvest/src/table_split.rs` before you add a column
+to `harvest_workflow_executions`, `harvest_task_queue` or `harvest_schedules`.
+A new column goes in the extension declaration. Assign it inside an update
+of the core table with `SetExt`.
 
 ## Ledger Profiles
 

@@ -8,6 +8,8 @@
     clippy::too_many_lines
 )]
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::table_split::Ext;
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -2451,7 +2453,7 @@ async fn test_exact_pool_routing_cross_shard() {
             execs_dsl::id.eq(source_exec_id.as_uuid()),
             execs_dsl::workflow_name.eq("source_wf"),
             execs_dsl::workflow_id.eq("source-exec-1"),
-            execs_dsl::run_id.eq(uuid::Uuid::new_v4()),
+            Ext(harvest_workflow_executions_ext::run_id.eq(uuid::Uuid::new_v4())),
             execs_dsl::shard_id.eq(0),
             execs_dsl::state.eq("COMPLETED"),
             execs_dsl::input.eq(json!({})),

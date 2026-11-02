@@ -2,7 +2,7 @@
 //! The rebalance markers that sit outside the executions `table!` (issue #2492).
 //!
 //! `schema::harvest_workflow_executions_unmapped` reads four columns through
-//! SQL fragments, so the `table!` keeps 64 columns or fewer. A fragment is not
+//! SQL fragments, outside both `table!` declarations. A fragment is not
 //! checked against the database at compile time. These tests write each
 //! column with raw SQL and read it back through the typed paths.
 

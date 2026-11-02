@@ -6,6 +6,8 @@
 //! auto-pause, and non-retryable/cancelled/timed-out outcomes are never
 //! retried.
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::table_split::SetExt;
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -491,8 +493,8 @@ async fn get_provenance(
         .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
         .select((
             harvest_workflow_executions::start_source,
-            harvest_workflow_executions::start_source_ref,
-            harvest_workflow_executions::started_by,
+            harvest_workflow_executions_ext::start_source_ref,
+            harvest_workflow_executions_ext::started_by,
         ))
         .first(conn)
         .await
@@ -511,7 +513,7 @@ async fn get_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String
 async fn get_attempt(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i32 {
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
-        .select(harvest_workflow_executions::workflow_attempt)
+        .select(harvest_workflow_executions_ext::workflow_attempt)
         .first::<i32>(conn)
         .await
         .expect("execution must exist")
@@ -1578,9 +1580,13 @@ async fn workflow_retry_carries_chain_deadline_verbatim() {
     let origin_chain_deadline = chrono::Utc::now() + chrono::Duration::hours(6);
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
-            harvest_workflow_executions::chain_execution_timeout
-                .eq(Some(chrono::Duration::days(7))),
-            harvest_workflow_executions::chain_deadline_at.eq(Some(origin_chain_deadline)),
+            SetExt(
+                harvest_workflow_executions_ext::chain_execution_timeout
+                    .eq(Some(chrono::Duration::days(7))),
+            ),
+            SetExt(
+                harvest_workflow_executions_ext::chain_deadline_at.eq(Some(origin_chain_deadline)),
+            ),
         ))
         .execute(&mut conn)
         .await
@@ -1616,8 +1622,8 @@ async fn workflow_retry_carries_chain_deadline_verbatim() {
     ) = harvest_workflow_executions::table
         .find(retry_exec.as_uuid())
         .select((
-            harvest_workflow_executions::chain_execution_timeout,
-            harvest_workflow_executions::chain_deadline_at,
+            harvest_workflow_executions_ext::chain_execution_timeout,
+            harvest_workflow_executions_ext::chain_deadline_at,
         ))
         .first(&mut check)
         .await

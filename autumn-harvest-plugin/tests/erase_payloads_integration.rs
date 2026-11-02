@@ -15,6 +15,7 @@
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -290,7 +291,7 @@ async fn pii_survives_in_execution_row(
         .select((
             harvest_workflow_executions::input,
             harvest_workflow_executions::output,
-            harvest_workflow_executions::memo,
+            harvest_workflow_executions_ext::memo,
             harvest_workflow_executions::search_attrs,
         ))
         .first(conn)

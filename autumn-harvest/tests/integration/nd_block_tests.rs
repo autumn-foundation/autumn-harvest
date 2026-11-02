@@ -13,6 +13,7 @@
 //! durable timer; the divergent v2 schedules an activity instead, so replay
 //! of the recorded `TimerStarted` diverges deterministically.
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -440,7 +441,7 @@ async fn get_nd_block_row(
         .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
         .select((
             harvest_workflow_executions::nd_blocked_at,
-            harvest_workflow_executions::nd_block_reason,
+            harvest_workflow_executions_ext::nd_block_reason,
             harvest_workflow_executions::nd_block_count,
             harvest_workflow_executions::search_attrs,
         ))

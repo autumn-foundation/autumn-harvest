@@ -30,6 +30,7 @@
 //! See `docs/durable-routes.md` for the guide. `docs/design/DESIGN-durable-routes.md`
 //! and `docs/design/DESIGN-durable-streaming.md` are the design records.
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fmt::Display;
@@ -1393,7 +1394,7 @@ async fn newest_chain_run(
             executions::id
                 .eq(chain)
                 .nullable()
-                .or(executions::first_exec_id.eq(chain)),
+                .or(harvest_workflow_executions_ext::first_exec_id.eq(chain)),
         )
         // A reconciled migration seal is a stub, not a run.
         .filter(executions::migrated_run_terminal_at.is_null())

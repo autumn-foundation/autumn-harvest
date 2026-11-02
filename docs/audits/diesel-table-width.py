@@ -17,8 +17,8 @@ The script fails in five cases:
 - A manifest enables `128-column-tables`. When `WIDE_TABLES` is empty, a
   manifest that enables `64-column-tables` fails too.
 
-Do not raise a ceiling to add a column. Move a column out of the `table!`
-instead. `schema::harvest_workflow_executions_unmapped` shows the pattern.
+Do not add a ceiling. Split a wide table over a core and an extension
+declaration instead. `autumn-harvest/src/table_split.rs` shows how.
 
 Usage:
     python3 docs/audits/diesel-table-width.py
@@ -34,12 +34,14 @@ TARGET = 32
 SKIP_DIRS = {"target", ".git", "node_modules"}
 
 # Tables over TARGET columns, keyed by name, with their column count. The
-# goal is an empty map, so that the workspace can drop `64-column-tables`.
-WIDE_TABLES = {
-    "harvest_workflow_executions": 61,
-    "harvest_task_queue": 48,
-    "harvest_schedules": 38,
-}
+# map is empty: every table fits the default tier (issue #2492). A table
+# wider than TARGET splits over two declarations instead, through
+# `autumn-harvest/src/table_split.rs`. Do not add an entry.
+WIDE_TABLES = {}
+
+# Manifests that the workspace never builds. The assay apparatus crates pin
+# the dependency set of a recorded run, so they keep their own features.
+MANIFEST_SKIP_DIRS = {"docs"}
 
 TABLE_OPEN = re.compile(r"\btable!\s*\{")
 # The table name and its primary key, then the opening brace of the body.
@@ -136,6 +138,8 @@ def run(root):
             found.append((name, count, f"{path.relative_to(root)}:{line}"))
     failures = check_tables(found, WIDE_TABLES)
     for path in walk(root, "Cargo.toml"):
+        if MANIFEST_SKIP_DIRS.intersection(path.relative_to(root).parts[:1]):
+            continue
         text = path.read_text(encoding="utf-8")
         failures.extend(check_manifest(text, path.relative_to(root), WIDE_TABLES))
     return failures

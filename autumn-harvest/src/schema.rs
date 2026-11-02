@@ -14,7 +14,6 @@ diesel::table! {
         id -> Uuid,
         workflow_name -> Text,
         workflow_id -> Text,
-        run_id -> Uuid,
         shard_id -> Int4,
         state -> Text,
         input -> Jsonb,
@@ -29,6 +28,71 @@ diesel::table! {
         /// Absolute UTC deadline for execution-level timeout (issue #243).
         /// Computed at start as `started_at + execution_timeout`. NULL = no deadline.
         deadline_at -> Nullable<Timestamptz>,
+        search_attrs -> Nullable<Jsonb>,
+        created_at -> Timestamptz,
+        /// Parent-close policy for detached children (issue #347). NULL for awaited children.
+        parent_close_policy -> Nullable<Text>,
+        owner -> Nullable<Text>,
+        severity -> Nullable<Text>,
+        /// Wall-clock instant the active pause was applied (issue #383). NULL = not paused.
+        paused_at -> Nullable<Timestamptz>,
+        /// Optional operator-supplied pause reason (issue #383).
+        pause_reason -> Nullable<Text>,
+        /// Identity that requested the active pause, from the audit trail (issue #383).
+        pause_actor -> Nullable<Text>,
+        /// Optional declared SLA budget for soft breach signal (issue #487).
+        /// Stored so continue-as-new / reset can re-anchor per run. NULL = no SLA.
+        sla -> Nullable<Interval>,
+        /// Schedule that fired this execution (issue #488). NULL for manual starts.
+        /// Used to resolve the last-completion-result carryover at workflow start time.
+        schedule_id -> Nullable<Uuid>,
+        /// ID of the previous failed execution in this retry chain (issue #523). NULL for first attempt.
+        retry_of_exec_id -> Nullable<Uuid>,
+        /// Wall-clock of the most recent replay-non-determinism block observation
+        /// (issue #603). NULL = not blocked. State stays RUNNING while blocked.
+        nd_blocked_at -> Nullable<Timestamptz>,
+        /// Consecutive block entries for the current divergence incident (issue
+        /// #603). Drives the re-dispatch backoff; reset to 0 on a clean cycle.
+        nd_block_count -> Int4,
+        /// Optional auto-expiry for the legal hold (issue #747). NULL =
+        /// indefinite; a past value means the hold is inactive again.
+        legal_hold_until -> Nullable<Timestamptz>,
+        /// Workflow-start provenance classifier (issue #740): a bounded
+        /// `snake_case` source string (`api` / `schedule` / `child` / ...). NULL
+        /// for pre-upgrade rows, reported as "unknown". Distinct from `origin`
+        /// (issue #534); never read on replay.
+        start_source -> Nullable<Text>,
+        /// Wall-clock a reconciler observed this seal's live copy as terminal
+        /// (issue #1317). NULL until observed.
+        ///
+        /// `is_active_conflict_state` treats `MIGRATED` as active forever, on
+        /// purpose -- the run is still live, just elsewhere. Nothing else
+        /// propagates the live copy's terminal completion back here. So a
+        /// start of the same business key attached to this seal forever,
+        /// long past the point the real run finished. Non-NULL releases the
+        /// row from that classification.
+        ///
+        /// Deliberately NOT a `state` change. Retention and erasure key off
+        /// `state = 'MIGRATED'` to protect the forwarding pointer from
+        /// deletion; this column carries the fact separately so that
+        /// protection stays intact.
+        migrated_run_terminal_at -> Nullable<Timestamptz>,
+        /// Verified tenant of the run (issue #1977). A start by a tenant-bound
+        /// caller sets it. Children, retries, continue-as-new, reset and re-run
+        /// copy it from the source run. NULL means the run has no tenant.
+        tenant -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// The columns of `harvest_workflow_executions` that its core declaration leaves out
+    /// (issue #2492). See [`crate::table_split`].
+    #[sql_name = "harvest_workflow_executions"]
+    harvest_workflow_executions_ext (id) {
+        id -> Uuid,
+        run_id -> Uuid,
         /// Chain-scoped lifetime cap DURATION (issue #617). Distinct from the
         /// per-run `execution_timeout`: mirrors it in shape but is anchored at the
         /// first run's start and carried verbatim across every continue-as-new.
@@ -41,29 +105,14 @@ diesel::table! {
         /// NULL = no chain cap. Not shifted by pause/resume (absolute wall-clock).
         chain_deadline_at -> Nullable<Timestamptz>,
         memo -> Nullable<Jsonb>,
-        search_attrs -> Nullable<Jsonb>,
-        created_at -> Timestamptz,
         /// Build ID assigned to this execution at start time (issue #171).
         assigned_build_id -> Nullable<Text>,
-        /// Parent-close policy for detached children (issue #347). NULL for awaited children.
-        parent_close_policy -> Nullable<Text>,
-        owner -> Nullable<Text>,
         runbook_url -> Nullable<Text>,
-        severity -> Nullable<Text>,
-        /// Wall-clock instant the active pause was applied (issue #383). NULL = not paused.
-        paused_at -> Nullable<Timestamptz>,
-        /// Optional operator-supplied pause reason (issue #383).
-        pause_reason -> Nullable<Text>,
-        /// Identity that requested the active pause, from the audit trail (issue #383).
-        pause_actor -> Nullable<Text>,
         /// Last-write-wins human-readable status string set by the workflow author
         /// via `ctx.set_current_details(...)` (issue #473). NULL = never set.
         current_details -> Nullable<Text>,
         /// Per-execution ambient context headers (issue #481). NULL = empty map.
         context_headers -> Nullable<Jsonb>,
-        /// Optional declared SLA budget for soft breach signal (issue #487).
-        /// Stored so continue-as-new / reset can re-anchor per run. NULL = no SLA.
-        sla -> Nullable<Interval>,
         /// Absolute UTC deadline for soft SLA enforcement (issue #487).
         /// Computed at start as `started_at + sla`. NULL = no SLA declared.
         sla_deadline_at -> Nullable<Timestamptz>,
@@ -74,9 +123,6 @@ diesel::table! {
         /// Wall-clock instant the SLA was first detected as breached (issue #487).
         /// `NULL` when `sla_breached = false`.
         sla_breached_at -> Nullable<Timestamptz>,
-        /// Schedule that fired this execution (issue #488). NULL for manual starts.
-        /// Used to resolve the last-completion-result carryover at workflow start time.
-        schedule_id -> Nullable<Uuid>,
         /// The logical schedule slot this run fires for (issue #488). Carryover is
         /// ordered by this rather than `completed_at` so out-of-order completions can't
         /// roll an incremental cursor backward. NULL for non-scheduled executions.
@@ -86,21 +132,13 @@ diesel::table! {
         workflow_attempt -> Int4,
         /// Frozen effective retry policy for this execution (issue #523). NULL = no auto-retry.
         workflow_retry_policy -> Nullable<Jsonb>,
-        /// ID of the previous failed execution in this retry chain (issue #523). NULL for first attempt.
-        retry_of_exec_id -> Nullable<Uuid>,
         /// Dispatch origin of this execution (issue #534): `scheduled` / `backfill` /
         /// `manual_trigger` for schedule-attributed runs, NULL for all non-scheduled runs
         /// (manual start, signal-with-start, child workflows, etc.). Metadata only —
         /// never affects replay or carryover.
         origin -> Nullable<Text>,
-        /// Wall-clock of the most recent replay-non-determinism block observation
-        /// (issue #603). NULL = not blocked. State stays RUNNING while blocked.
-        nd_blocked_at -> Nullable<Timestamptz>,
         /// Divergence error string from the most recent blocked cycle (issue #603).
         nd_block_reason -> Nullable<Text>,
-        /// Consecutive block entries for the current divergence incident (issue
-        /// #603). Drives the re-dispatch backoff; reset to 0 on a clean cycle.
-        nd_block_count -> Int4,
         /// Per-execution completion-callback targets (issue #605): a JSON array
         /// of `{url, filter}` objects. NULL = no per-execution targets; the
         /// effective set is still the union with any builder-wide defaults,
@@ -119,18 +157,10 @@ diesel::table! {
         /// `legal_hold_until` is NULL or in the future; an active hold exempts
         /// this execution's history from retention deletion and PII erasure.
         legal_hold_set_at -> Nullable<Timestamptz>,
-        /// Optional auto-expiry for the legal hold (issue #747). NULL =
-        /// indefinite; a past value means the hold is inactive again.
-        legal_hold_until -> Nullable<Timestamptz>,
         /// Operator-supplied justification for the legal hold (issue #747).
         legal_hold_reason -> Nullable<Text>,
         /// Principal that placed the legal hold (issue #747, audit trail).
         legal_hold_actor -> Nullable<Text>,
-        /// Workflow-start provenance classifier (issue #740): a bounded
-        /// `snake_case` source string (`api` / `schedule` / `child` / ...). NULL
-        /// for pre-upgrade rows, reported as "unknown". Distinct from `origin`
-        /// (issue #534); never read on replay.
-        start_source -> Nullable<Text>,
         /// Optional correlation reference for the start source (issue #740),
         /// e.g. the triggering execution id or schedule id. NULL when absent.
         start_source_ref -> Nullable<Text>,
@@ -168,36 +198,17 @@ diesel::table! {
         /// Wall-clock of the cutover commit that sealed this row (issue #964).
         /// Non-NULL exactly when `state = 'MIGRATED'`.
         migrated_at -> Nullable<Timestamptz>,
-        /// Wall-clock a reconciler observed this seal's live copy as terminal
-        /// (issue #1317). NULL until observed.
-        ///
-        /// `is_active_conflict_state` treats `MIGRATED` as active forever, on
-        /// purpose -- the run is still live, just elsewhere. Nothing else
-        /// propagates the live copy's terminal completion back here. So a
-        /// start of the same business key attached to this seal forever,
-        /// long past the point the real run finished. Non-NULL releases the
-        /// row from that classification.
-        ///
-        /// Deliberately NOT a `state` change. Retention and erasure key off
-        /// `state = 'MIGRATED'` to protect the forwarding pointer from
-        /// deletion; this column carries the fact separately so that
-        /// protection stays intact.
-        migrated_run_terminal_at -> Nullable<Timestamptz>,
-        /// Verified tenant of the run (issue #1977). A start by a tenant-bound
-        /// caller sets it. Children, retries, continue-as-new, reset and re-run
-        /// copy it from the source run. NULL means the run has no tenant.
-        tenant -> Nullable<Text>,
     }
 }
 
 /// Columns of `harvest_workflow_executions` that its `table!` leaves out
 /// (issue #2492).
 ///
-/// Diesel implements its traits for tuples up to a fixed size. The
-/// `64-column-tables` feature stops at 64. The `128-column-tables` feature
-/// costs much more compile time and memory. Cargo turns it on for every crate
-/// that depends on this one. So each `table!` stays at 64 columns or fewer,
-/// and `diesel_table_width_guard` enforces it.
+/// Each `table!` stays within the default diesel tier of 32 columns. The
+/// table splits over a core and an extension declaration, as
+/// [`crate::table_split`] explains. Together they hold 61 columns. These four
+/// columns stay out of both, so the extension keeps room for a new column.
+/// `docs/audits/diesel-table-width.py` enforces the width.
 ///
 /// The physical columns stay in Postgres. Only the shard rebalance writes them,
 /// and it writes them with raw SQL. Reads go through the typed SQL fragments
@@ -307,21 +318,12 @@ diesel::table! {
         completed_at -> Nullable<Timestamptz>,
         last_heartbeat_at -> Nullable<Timestamptz>,
         heartbeat_details -> Nullable<Jsonb>,
-        heartbeat_timeout -> Nullable<Interval>,
-        start_to_close -> Nullable<Interval>,
-        schedule_to_start -> Nullable<Interval>,
-        retry_policy -> Nullable<Jsonb>,
         output -> Nullable<Jsonb>,
         error -> Nullable<Text>,
         sticky_worker_id -> Nullable<Text>,
         sticky_until -> Nullable<Timestamptz>,
         sticky_timeout -> Nullable<Interval>,
-        trace_context -> Nullable<Jsonb>,
         concurrency_key -> Nullable<Text>,
-        concurrency_cap -> Nullable<Int4>,
-        /// Build ID required to claim this task (issue #171). NULL = any worker.
-        required_build_id -> Nullable<Text>,
-        rate_limit_key -> Nullable<Text>,
         /// Number of times this task was reclaimed from a dead worker without
         /// completing (issue #367). Quarantined to the DLQ once it reaches the
         /// operator-configured poison-pill threshold. Distinct from `attempt`.
@@ -330,20 +332,11 @@ diesel::table! {
         /// attempts (issue #378). Computed once at initial enqueue as
         /// `NOW() + schedule_to_close`. NULL = no total deadline enforced.
         schedule_to_close_at -> Nullable<Timestamptz>,
-        /// Structured capability requirements JSONB payload (issue #382).
-        required_capabilities -> Nullable<Jsonb>,
         /// Per-execution ambient context headers propagated from the parent workflow (issue #481).
         context_headers -> Nullable<Jsonb>,
         /// Row insert time (issue #501 review). Nullable: pre-upgrade rows are NULL
         /// and the schedule-to-start SLI falls back to `scheduled_at` via COALESCE.
         created_at -> Nullable<Timestamptz>,
-        /// Durable "please wake this task" flag (dropped-wake fix, issue #601 CI
-        /// hardening). Set by `wake_workflow_task` when its primary re-pend UPDATE
-        /// matches zero rows because the row is currently claimed and mid-processing
-        /// (`state = 'RUNNING'`, `worker_id IS NOT NULL`) -- the wake would otherwise
-        /// be silently dropped. Read-and-cleared by `park_workflow_task` so a park
-        /// racing a same-cycle wake immediately re-pends instead of parking.
-        wake_requested -> Bool,
         /// Worker session this activity belongs to (issue #606). NULL for an
         /// ordinary activity. When set, the claim query hard-pins this row to
         /// `sticky_worker_id` -- unlike ordinary sticky routing, it never
@@ -365,12 +358,6 @@ diesel::table! {
         /// redelivery budget is consumed per entry, so one incapable worker
         /// repeatedly winning the claim race cannot exhaust it.
         capability_miss_workers -> Array<Text>,
-        /// Issue #804 (round 46): WHICH handler the two counters above are
-        /// about, as `{kind}:{name}`. The counters describe one frontier, and
-        /// a frontier is identified by the single handler that would move it;
-        /// a mismatch means the evidence belongs to a frontier now behind us.
-        /// `NULL` = none recorded yet, which reads as a mismatch.
-        capability_miss_handler -> Nullable<Text>,
         /// The `fires_at` of the durable timer this row is armed for (issue
         /// #1402). Set only by `queue::reschedule_task`. Survives a later
         /// `scheduled_at` drift with the same wake reason (a queue-pause
@@ -383,6 +370,41 @@ diesel::table! {
         /// the current claim started its handler. `NULL` when no attempt
         /// started.
         handler_started_attempt -> Nullable<Int4>,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// The columns of `harvest_task_queue` that its core declaration leaves out
+    /// (issue #2492). See [`crate::table_split`].
+    #[sql_name = "harvest_task_queue"]
+    harvest_task_queue_ext (id) {
+        id -> Uuid,
+        heartbeat_timeout -> Nullable<Interval>,
+        start_to_close -> Nullable<Interval>,
+        schedule_to_start -> Nullable<Interval>,
+        retry_policy -> Nullable<Jsonb>,
+        trace_context -> Nullable<Jsonb>,
+        concurrency_cap -> Nullable<Int4>,
+        /// Build ID required to claim this task (issue #171). NULL = any worker.
+        required_build_id -> Nullable<Text>,
+        rate_limit_key -> Nullable<Text>,
+        /// Structured capability requirements JSONB payload (issue #382).
+        required_capabilities -> Nullable<Jsonb>,
+        /// Durable "please wake this task" flag (dropped-wake fix, issue #601 CI
+        /// hardening). Set by `wake_workflow_task` when its primary re-pend UPDATE
+        /// matches zero rows because the row is currently claimed and mid-processing
+        /// (`state = 'RUNNING'`, `worker_id IS NOT NULL`) -- the wake would otherwise
+        /// be silently dropped. Read-and-cleared by `park_workflow_task` so a park
+        /// racing a same-cycle wake immediately re-pends instead of parking.
+        wake_requested -> Bool,
+        /// Issue #804 (round 46): WHICH handler the two counters above are
+        /// about, as `{kind}:{name}`. The counters describe one frontier, and
+        /// a frontier is identified by the single handler that would move it;
+        /// a mismatch means the evidence belongs to a frontier now behind us.
+        /// `NULL` = none recorded yet, which reads as a mismatch.
+        capability_miss_handler -> Nullable<Text>,
         timed_out_claims -> Nullable<Array<Nullable<Text>>>,
         /// When the handler of `handler_started_attempt` started (issue
         /// #1809).
@@ -475,12 +497,10 @@ diesel::table! {
         catchup -> Bool,
         max_active_runs -> Int4,
         is_paused -> Bool,
-        last_run_at -> Nullable<Timestamptz>,
         next_run_at -> Nullable<Timestamptz>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
         workflow_name -> Nullable<Text>,
-        workflow_input -> Nullable<Jsonb>,
         queue_name -> Nullable<Text>,
         paused_at -> Nullable<Timestamptz>,
         paused_by -> Nullable<Text>,
@@ -530,6 +550,22 @@ diesel::table! {
         /// Machine-readable reason for exhaustion (issue #478).
         /// One of: `"end_at_reached"`, `"max_runs_exhausted"`. NULL when not exhausted.
         exhausted_reason -> Nullable<Text>,
+        /// Count of missed slots dropped on the most recent recovery tick (issue #484).
+        /// 0 when no recovery has occurred or the policy is SkipAll/Unbounded.
+        last_catchup_dropped -> Int4,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// The columns of `harvest_schedules` that its core declaration leaves out
+    /// (issue #2492). See [`crate::table_split`].
+    #[sql_name = "harvest_schedules"]
+    harvest_schedules_ext (id) {
+        id -> Uuid,
+        last_run_at -> Nullable<Timestamptz>,
+        workflow_input -> Nullable<Jsonb>,
         /// Catchup policy discriminator for missed fire slots (issue #484).
         /// One of: `"skip_all"`, `"most_recent"`, `"window"`, `"unbounded"`.
         /// NULL means the legacy `catchup` bool drives behaviour (zero backfill).
@@ -537,9 +573,6 @@ diesel::table! {
         /// Window duration in seconds for the `"window"` catchup policy (issue #484).
         /// NULL for all other policies.
         catchup_window_secs -> Nullable<Int8>,
-        /// Count of missed slots dropped on the most recent recovery tick (issue #484).
-        /// 0 when no recovery has occurred or the policy is SkipAll/Unbounded.
-        last_catchup_dropped -> Int4,
         /// Timestamp of the most recent recovery tick that produced drops (issue #484).
         /// NULL when `last_catchup_dropped` = 0.
         last_catchup_at -> Nullable<Timestamptz>,
@@ -1508,3 +1541,213 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_codec_key_state,
     harvest_entity_state,
 );
+
+// The bridges between each split table and its extension (issue #2492).
+// See `crate::table_split`.
+crate::split_table! {
+    core: harvest_workflow_executions,
+    ext: harvest_workflow_executions_ext,
+    columns: [
+        run_id,
+        chain_execution_timeout,
+        chain_deadline_at,
+        memo,
+        assigned_build_id,
+        runbook_url,
+        current_details,
+        context_headers,
+        sla_deadline_at,
+        sla_breached,
+        sla_breached_at,
+        scheduled_for,
+        workflow_attempt,
+        workflow_retry_policy,
+        origin,
+        nd_block_reason,
+        completion_callbacks,
+        continued_from_exec_id,
+        first_exec_id,
+        legal_hold_set_at,
+        legal_hold_reason,
+        legal_hold_actor,
+        start_source_ref,
+        started_by,
+        history_bloat_warned_at,
+        triage_note,
+        quota_key,
+        migrated_to_shard,
+        migrated_at,
+    ],
+    joins: [
+        harvest_events,
+        harvest_task_queue,
+        harvest_schedules,
+        harvest_signals,
+        harvest_timers,
+        harvest_dead_letters,
+        harvest_external_tasks,
+        harvest_workers,
+        harvest_batch_jobs,
+        harvest_audit_log,
+        harvest_audit_export_cursor,
+        harvest_audit_purge_watermark,
+        harvest_api_tokens,
+        harvest_build_policies,
+        harvest_build_compat,
+        harvest_backfill_log,
+        harvest_calendars,
+        harvest_calendar_exclusions,
+        harvest_schedule_decisions,
+        harvest_run_default_overrides,
+        harvest_schedule_overrides,
+        harvest_rate_limit_buckets,
+        harvest_completion_triggers,
+        harvest_completion_trigger_fires,
+        harvest_completion_trigger_outbox,
+        harvest_cross_shard_children,
+        harvest_shard_migrations,
+        harvest_debounce,
+        harvest_start_throttle,
+        harvest_start_idempotency,
+        harvest_event_batches,
+        harvest_payload_refs,
+        harvest_completion_deliveries,
+        harvest_sessions,
+        harvest_execution_summaries,
+        harvest_wasm_modules,
+        harvest_mutex_locks,
+        harvest_mutex_waiters,
+        harvest_stream_chunks,
+        harvest_workflow_logs,
+        harvest_llm_ledger,
+        harvest_codec_rotation_cursor,
+        harvest_codec_key_state,
+        harvest_entity_state,
+    ],
+}
+crate::split_table! {
+    core: harvest_task_queue,
+    ext: harvest_task_queue_ext,
+    columns: [
+        heartbeat_timeout,
+        start_to_close,
+        schedule_to_start,
+        retry_policy,
+        trace_context,
+        concurrency_cap,
+        required_build_id,
+        rate_limit_key,
+        required_capabilities,
+        wake_requested,
+        capability_miss_handler,
+        timed_out_claims,
+        handler_started_at,
+        new_start,
+        fairness_key,
+        decision_partition,
+    ],
+    joins: [
+        harvest_workflow_executions,
+        harvest_events,
+        harvest_schedules,
+        harvest_signals,
+        harvest_timers,
+        harvest_dead_letters,
+        harvest_external_tasks,
+        harvest_workers,
+        harvest_batch_jobs,
+        harvest_audit_log,
+        harvest_audit_export_cursor,
+        harvest_audit_purge_watermark,
+        harvest_api_tokens,
+        harvest_build_policies,
+        harvest_build_compat,
+        harvest_backfill_log,
+        harvest_calendars,
+        harvest_calendar_exclusions,
+        harvest_schedule_decisions,
+        harvest_run_default_overrides,
+        harvest_schedule_overrides,
+        harvest_rate_limit_buckets,
+        harvest_completion_triggers,
+        harvest_completion_trigger_fires,
+        harvest_completion_trigger_outbox,
+        harvest_cross_shard_children,
+        harvest_shard_migrations,
+        harvest_debounce,
+        harvest_start_throttle,
+        harvest_start_idempotency,
+        harvest_event_batches,
+        harvest_payload_refs,
+        harvest_completion_deliveries,
+        harvest_sessions,
+        harvest_execution_summaries,
+        harvest_wasm_modules,
+        harvest_mutex_locks,
+        harvest_mutex_waiters,
+        harvest_stream_chunks,
+        harvest_workflow_logs,
+        harvest_llm_ledger,
+        harvest_codec_rotation_cursor,
+        harvest_codec_key_state,
+        harvest_entity_state,
+    ],
+}
+crate::split_table! {
+    core: harvest_schedules,
+    ext: harvest_schedules_ext,
+    columns: [
+        last_run_at,
+        workflow_input,
+        catchup_policy,
+        catchup_window_secs,
+        last_catchup_at,
+        retry_policy,
+    ],
+    joins: [
+        harvest_workflow_executions,
+        harvest_events,
+        harvest_task_queue,
+        harvest_signals,
+        harvest_timers,
+        harvest_dead_letters,
+        harvest_external_tasks,
+        harvest_workers,
+        harvest_batch_jobs,
+        harvest_audit_log,
+        harvest_audit_export_cursor,
+        harvest_audit_purge_watermark,
+        harvest_api_tokens,
+        harvest_build_policies,
+        harvest_build_compat,
+        harvest_backfill_log,
+        harvest_calendars,
+        harvest_calendar_exclusions,
+        harvest_schedule_decisions,
+        harvest_run_default_overrides,
+        harvest_schedule_overrides,
+        harvest_rate_limit_buckets,
+        harvest_completion_triggers,
+        harvest_completion_trigger_fires,
+        harvest_completion_trigger_outbox,
+        harvest_cross_shard_children,
+        harvest_shard_migrations,
+        harvest_debounce,
+        harvest_start_throttle,
+        harvest_start_idempotency,
+        harvest_event_batches,
+        harvest_payload_refs,
+        harvest_completion_deliveries,
+        harvest_sessions,
+        harvest_execution_summaries,
+        harvest_wasm_modules,
+        harvest_mutex_locks,
+        harvest_mutex_waiters,
+        harvest_stream_chunks,
+        harvest_workflow_logs,
+        harvest_llm_ledger,
+        harvest_codec_rotation_cursor,
+        harvest_codec_key_state,
+        harvest_entity_state,
+    ],
+}

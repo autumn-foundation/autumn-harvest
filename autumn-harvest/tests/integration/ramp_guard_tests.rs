@@ -8,6 +8,7 @@
 //! A test uses `HARVEST_TEST_DATABASE_URL` when it is set and makes its own
 //! database from it. Otherwise it starts a Postgres container.
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -396,7 +397,7 @@ async fn ramp_and_start(conn: &mut AsyncPgConnection) {
 async fn assigned_builds(conn: &mut AsyncPgConnection) -> (i64, i64) {
     let rows: Vec<Option<String>> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(WF))
-        .select(harvest_workflow_executions::assigned_build_id)
+        .select(harvest_workflow_executions_ext::assigned_build_id)
         .load(conn)
         .await
         .expect("load assigned builds");

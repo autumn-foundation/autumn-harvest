@@ -409,6 +409,8 @@ mod sticky_routing_tests;
 #[cfg(feature = "db")]
 mod stream_append_count_perf;
 mod supply_chain_ci;
+#[cfg(feature = "db")]
+mod table_split_db_tests;
 mod telemetry_span_tests;
 #[cfg(feature = "db")]
 mod tenant_cell_isolation_tests;

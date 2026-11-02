@@ -62,6 +62,8 @@
     clippy::items_after_statements
 )]
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::table_split::SetExt;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -1155,7 +1157,9 @@ async fn continue_as_new_same_type_propagates_quota_key() {
     // whatever is ALREADY on the row verbatim, regardless of any live
     // policy.
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
-        .set(harvest_workflow_executions::quota_key.eq(Some("acme")))
+        .set(SetExt(
+            harvest_workflow_executions_ext::quota_key.eq(Some("acme")),
+        ))
         .execute(&mut conn)
         .await
         .expect("stamp predecessor quota_key");
@@ -1202,7 +1206,9 @@ async fn continue_as_new_cross_type_re_resolves_quota_key() {
     // Predecessor's row carries an unrelated key from a different policy --
     // this must NOT survive the cross-type transition.
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
-        .set(harvest_workflow_executions::quota_key.eq(Some("stale-key")))
+        .set(SetExt(
+            harvest_workflow_executions_ext::quota_key.eq(Some("stale-key")),
+        ))
         .execute(&mut conn)
         .await
         .expect("stamp predecessor quota_key");
@@ -1247,7 +1253,9 @@ async fn continue_as_new_cross_type_to_no_quota_workflow_clears_quota_key() {
     )
     .await;
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
-        .set(harvest_workflow_executions::quota_key.eq(Some("acme")))
+        .set(SetExt(
+            harvest_workflow_executions_ext::quota_key.eq(Some("acme")),
+        ))
         .execute(&mut conn)
         .await
         .expect("stamp predecessor quota_key");

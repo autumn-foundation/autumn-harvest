@@ -103,7 +103,8 @@ diesel. CI caches dependencies, so it pays that cost once per lock file.
 
 Issue #2492 reverses that choice. Cargo unifies features, so every embedder
 also paid for `128-column-tables`. Four rebalance columns now sit outside the
-`table!`, and the workspace is back on `64-column-tables`.
+`table!`. The table then splits over a core and an extension declaration,
+and the workspace is on the default 32-column tier.
 
 ### 1.2 Verified tenant
 
