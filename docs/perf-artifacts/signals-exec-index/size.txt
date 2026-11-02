@@ -1,0 +1,9 @@
+-- createdb -T <migrated empty db> sz; psql -d sz -f size.sql
+      shape       | pages 
+------------------+-------
+ 25 per execution |   138
+(1 row)
+      shape      | pages 
+-----------------+-------
+ 1 per execution |   534
+(1 row)

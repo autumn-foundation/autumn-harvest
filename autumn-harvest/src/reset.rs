@@ -1399,7 +1399,7 @@ async fn count_unconsumed_signals(
 ) -> Result<usize, WorkflowResetError> {
     let count = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(exec_id.as_uuid()))
-        .filter(harvest_signals::consumed.eq(false))
+        .filter(diesel::dsl::not(harvest_signals::consumed))
         .count()
         .get_result::<i64>(conn)
         .await
@@ -1905,7 +1905,7 @@ async fn reapply_or_drop_signals(
 ) -> Result<usize, WorkflowResetError> {
     let signals: Vec<SignalForReset> = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(source_exec_id.as_uuid()))
-        .filter(harvest_signals::consumed.eq(false))
+        .filter(diesel::dsl::not(harvest_signals::consumed))
         .order((
             harvest_signals::received_at.asc(),
             harvest_signals::id.asc(),
@@ -2050,7 +2050,6 @@ pub(crate) mod tests {
         crate::models::WorkflowExecution {
             migrated_to_shard: None,
             migrated_at: None,
-            migrated_from_shards: None,
             id: ExecutionId::new().as_uuid(),
             workflow_name: "wf".into(),
             workflow_id: "id".into(),
@@ -2109,9 +2108,7 @@ pub(crate) mod tests {
             triage_note: None,
             quota_key: None,
             migrated_run_terminal_at: None,
-            migrated_run_terminal_state: None,
-            staging_vacated_state: None,
-            staging_vacated_by: None,
+            rebalance: crate::models::RebalanceMarkers::default(),
             tenant: None,
         }
     }

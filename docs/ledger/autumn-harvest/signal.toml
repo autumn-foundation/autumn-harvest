@@ -5,7 +5,7 @@ driver = "per_task"
 backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_signals"]
-measured = "unmeasured"
+measured = "docs/performance-signals-exec-index.md"
 plan = "docs/ledger/plans/autumn-harvest/signal.md"
 
 ["has_pending_signals"]

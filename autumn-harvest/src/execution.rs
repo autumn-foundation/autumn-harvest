@@ -3,6 +3,8 @@
 //! The public start helper in this module gives callers idempotent workflow
 //! start semantics scoped to `(workflow_name, workflow_id)`.
 
+use crate::schema::harvest_workflow_executions_ext;
+use crate::table_split::SetExt;
 use chrono::Utc;
 use diesel::ExpressionMethods;
 use diesel::NullableExpressionMethods;
@@ -4271,7 +4273,10 @@ async fn cancel_workflow_execution_collect_mode(
                         harvest_workflow_executions::output.eq(None::<serde_json::Value>),
                         harvest_workflow_executions::error.eq(Some(reason.clone())),
                         harvest_workflow_executions::completed_at.eq(Some(completed_at)),
-                        harvest_workflow_executions::sla_deadline_at.eq(new_sla_deadline_at),
+                        SetExt(
+                            harvest_workflow_executions_ext::sla_deadline_at
+                                .eq(new_sla_deadline_at),
+                        ),
                         // Cancellation wins: clear the pending pause record.
                         harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
                         harvest_workflow_executions::pause_reason.eq(None::<String>),
@@ -5855,7 +5860,10 @@ pub async fn resume_workflow_execution(
                         harvest_workflow_executions::pause_reason.eq(None::<String>),
                         harvest_workflow_executions::pause_actor.eq(None::<String>),
                         harvest_workflow_executions::deadline_at.eq(new_deadline_at),
-                        harvest_workflow_executions::sla_deadline_at.eq(new_sla_deadline_at),
+                        SetExt(
+                            harvest_workflow_executions_ext::sla_deadline_at
+                                .eq(new_sla_deadline_at),
+                        ),
                     ))
                     .execute(conn)
                     .await
@@ -6018,7 +6026,7 @@ async fn load_triage_for_update(
         .select((
             harvest_workflow_executions::owner,
             harvest_workflow_executions::severity,
-            harvest_workflow_executions::triage_note,
+            harvest_workflow_executions_ext::triage_note,
         ))
         .for_update()
         .first::<TriageColumns>(conn)
@@ -6085,7 +6093,7 @@ pub async fn annotate_workflow_execution(
                     .set((
                         harvest_workflow_executions::owner.eq(new_owner.clone()),
                         harvest_workflow_executions::severity.eq(new_severity.clone()),
-                        harvest_workflow_executions::triage_note.eq(new_note.clone()),
+                        SetExt(harvest_workflow_executions_ext::triage_note.eq(new_note.clone())),
                     ))
                     .execute(conn)
                     .await
@@ -6239,9 +6247,11 @@ pub async fn reactivate_failed_execution_at(
             harvest_workflow_executions::pause_reason.eq(None::<String>),
             harvest_workflow_executions::pause_actor.eq(None::<String>),
             harvest_workflow_executions::deadline_at.eq(new_deadline_at),
-            harvest_workflow_executions::sla_deadline_at.eq(new_sla_deadline_at),
-            harvest_workflow_executions::sla_breached.eq(false),
-            harvest_workflow_executions::sla_breached_at.eq(None::<chrono::DateTime<Utc>>),
+            SetExt(harvest_workflow_executions_ext::sla_deadline_at.eq(new_sla_deadline_at)),
+            SetExt(harvest_workflow_executions_ext::sla_breached.eq(false)),
+            SetExt(
+                harvest_workflow_executions_ext::sla_breached_at.eq(None::<chrono::DateTime<Utc>>),
+            ),
         ))
         .execute(conn)
         .await
@@ -6708,7 +6718,9 @@ pub async fn terminate_workflow_execution_collect(
                     harvest_workflow_executions::output.eq(None::<serde_json::Value>),
                     harvest_workflow_executions::error.eq(Some(reason.clone())),
                     harvest_workflow_executions::completed_at.eq(Some(completed_at)),
-                    harvest_workflow_executions::sla_deadline_at.eq(new_sla_deadline_at),
+                    SetExt(
+                        harvest_workflow_executions_ext::sla_deadline_at.eq(new_sla_deadline_at),
+                    ),
                     // Clear active-pause metadata when terminating a paused
                     // run so it doesn't appear terminal-and-paused (#383).
                     harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
@@ -9432,10 +9444,10 @@ async fn resolve_carryover(
         .filter(dsl::schedule_id.eq(schedule_id))
         .filter(dsl::state.eq("COMPLETED"))
         .filter(dsl::completed_at.is_not_null())
-        .filter(dsl::scheduled_for.lt(current_slot))
+        .filter(harvest_workflow_executions_ext::scheduled_for.lt(current_slot))
         .filter(dsl::id.ne(current_exec_id))
         .order((
-            dsl::scheduled_for.desc(),
+            harvest_workflow_executions_ext::scheduled_for.desc(),
             dsl::completed_at.desc(),
             dsl::id.desc(),
         ))
@@ -9464,10 +9476,10 @@ async fn resolve_carryover(
             "TERMINATED",
         ]))
         .filter(dsl::completed_at.is_not_null())
-        .filter(dsl::scheduled_for.lt(current_slot))
+        .filter(harvest_workflow_executions_ext::scheduled_for.lt(current_slot))
         .filter(dsl::id.ne(current_exec_id))
         .order((
-            dsl::scheduled_for.desc(),
+            harvest_workflow_executions_ext::scheduled_for.desc(),
             dsl::completed_at.desc(),
             dsl::id.desc(),
         ))

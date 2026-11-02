@@ -11,6 +11,7 @@
 //!
 //! See `docs/durable-routes.md` and `docs/design/DESIGN-durable-streaming.md`.
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -919,7 +920,7 @@ impl StreamReads for PgReads {
             .filter(
                 executions::retry_of_exec_id
                     .eq(id)
-                    .or(executions::continued_from_exec_id.eq(id)),
+                    .or(harvest_workflow_executions_ext::continued_from_exec_id.eq(id)),
             )
             // A reconciled migration seal is a stub, not a run.
             .filter(executions::migrated_run_terminal_at.is_null())

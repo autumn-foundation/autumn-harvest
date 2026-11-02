@@ -287,6 +287,28 @@ pub enum SqliteError {
     #[error("invalid signal: {0}")]
     InvalidSignal(String),
 
+    /// A signal payload breaks the `arg_schema` of the workflow's declarative
+    /// `#[signal]` handler (issue #2467). The check runs after the committed
+    /// key probe, so a retry of a delivered keyed signal is still a duplicate.
+    #[error("signal payload validation failed for signal `{signal}`")]
+    SignalPayloadInvalid {
+        /// The signal name.
+        signal: String,
+        /// Every violation of the schema.
+        violations: Vec<autumn_harvest::info::SchemaViolation>,
+    },
+
+    /// The input of a run that this call would create breaks the workflow's
+    /// `input_schema` (issue #2467). A signal-with-start that attaches to a
+    /// run discards its input, so it is not checked.
+    #[error("input validation failed for workflow `{workflow}`")]
+    WorkflowInputInvalid {
+        /// The workflow type.
+        workflow: String,
+        /// Every violation of the schema.
+        violations: Vec<autumn_harvest::info::SchemaViolation>,
+    },
+
     /// A search attribute at start, or in a list filter, is not a JSON
     /// primitive (issue #2027).
     #[error("invalid search attribute: {0}")]

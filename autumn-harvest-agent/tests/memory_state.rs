@@ -73,7 +73,7 @@ fn harness(model: Arc<dyn AgentModel>) -> AgentHarness {
 }
 
 fn state_of(rt: &SqliteRuntime, id: &AgentId) -> impl Future<Output = AgentState> + Send + 'static {
-    let query = sqlite::state(rt, id);
+    let query = Box::pin(sqlite::state(rt, id));
     async move { query.await.unwrap().unwrap() }
 }
 

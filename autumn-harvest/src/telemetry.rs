@@ -560,6 +560,14 @@ pub const METRIC_NOTIFY_QUEUE_USAGE: &str = "harvest.notify.queue_usage";
 /// alerts on a pause that was left on too long.
 pub const METRIC_QUEUE_PAUSED: &str = "harvest.queue.paused";
 
+/// Gauge: `1` while a cost signal holds the deferrable activity types of a
+/// worker, `0` while it does not (autumn#1720).
+///
+/// A [`crate::cost_hold::CostHold`] sets it at the first claim and at each
+/// change. It has no label. Only a worker with a cost hold sets it. Use
+/// `max(harvest_cost_hold)` to see whether any replica holds work.
+pub const METRIC_COST_HOLD: &str = "harvest.cost.hold";
+
 /// Gauge: `1` per queue where this worker has an empty `build_id` and the
 /// queue has a build policy (issue #1805). Such a worker cannot claim pinned
 /// runs. Label: `queue`.
@@ -3783,6 +3791,15 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge `harvest_queue_paused{queue}`.
     fn record_queue_paused(&self, queue: &str, paused: bool) {
         let _ = (queue, paused);
+    }
+
+    /// Whether a cost signal holds the deferrable activity types of this
+    /// worker (autumn#1720). `held = true` while the signal is high.
+    ///
+    /// A [`crate::cost_hold::CostHold`] calls it at the first claim and at
+    /// each change. Maps to the gauge `harvest_cost_hold`.
+    fn record_cost_hold(&self, held: bool) {
+        let _ = held;
     }
 
     /// A worker with an empty `build_id` serves a queue that has a build

@@ -25,7 +25,7 @@
 #     <(grep    -E '^[[:space:]]*#' .github/ci/integration-suites.txt) \
 #     <(grep -vE '^[[:space:]]*(#|$)' .github/ci/integration-suites.txt | LC_ALL=C sort -u)
 #   LC_ALL=C sort -o .github/ci/integration-suites.txt \
-#   crate    = agent-mesh | autumn-harvest | autumn-harvest-conformance | autumn-harvest-plugin | autumn-harvest-redis | history-load-gate | standalone-runner
+#   crate    = agent-mesh | autumn-harvest | autumn-harvest-agent | autumn-harvest-conformance | autumn-harvest-plugin | autumn-harvest-redis | history-load-gate | standalone-runner
 #   features = comma-list passed as `--features <v>`, or `-`.
 #   filter   = positional filter after `--`, or `-` for the whole target. A
 #   osclass   crate                    target       features            filter
@@ -126,6 +126,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          completion_callback_tests
 linux        autumn-harvest         integration                      -                          completion_trigger_outbox_queue_perf
 linux        autumn-harvest         integration                      -                          concurrency_supersede_tests
+linux        autumn-harvest         integration                      -                          cost_hold_tests
 linux        autumn-harvest         integration                      -                          cross_shard_children_tests
 linux        autumn-harvest         integration                      -                          cross_type_continue_as_new_tests
 linux        autumn-harvest         integration                      -                          cross_workflow_await_tests
@@ -203,6 +204,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          ramp_guard_tests
 linux        autumn-harvest         integration                      -                          rate_limit_bucket_gc_tests
 linux        autumn-harvest         integration                      -                          rate_limit_key
+linux        autumn-harvest         integration                      -                          rebalance_markers_db_tests
 linux        autumn-harvest         integration                      -                          redrive_tests
 linux        autumn-harvest         integration                      -                          resident_hit_rate_db_tests
 linux        autumn-harvest         integration                      -                          resident_outcome_tests
@@ -246,6 +248,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          sticky_default_tests
 linux        autumn-harvest         integration                      -                          sticky_routing_tests
 linux        autumn-harvest         integration                      -                          stream_append_count_perf
+linux        autumn-harvest         integration                      -                          table_split_db_tests
 linux        autumn-harvest         integration                      -                          telemetry_span_tests
 linux        autumn-harvest         integration                      -                          tenant_cell_isolation_tests
 linux        autumn-harvest         integration                      -                          tenant_propagation_tests
@@ -305,6 +308,9 @@ linux        autumn-harvest         integration                      testing    
 linux        autumn-harvest         integration                      testing                    worker_session_tests
 linux        autumn-harvest         integration                      testing                    workflow_sim_ingest_tests
 linux        autumn-harvest         integration                      wasm-activities            wasm_activities_tests
+linux        autumn-harvest-agent   overlay_read_postgres            postgres                   -
+linux        autumn-harvest-agent   overlay_store_postgres           postgres                   -
+linux        autumn-harvest-agent   score_postgres                   postgres                   -
 linux        autumn-harvest-conformance  conformance                  -                          -
 linux        autumn-harvest-plugin  activity_info_api_integration    -                          -
 linux        autumn-harvest-plugin  admission_gate_authoritative_localpg  -                          -

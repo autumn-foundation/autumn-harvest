@@ -864,6 +864,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let companion_name = format_ident!("__autumn_workflow_info_{fn_name}");
     let public_info_name = format_ident!("{fn_name}_info");
+    // `quote!` does not interpolate inside `///`, so build the doc line here.
+    let info_doc_example =
+        format!(" let result = ctx.spawn_child_workflow(&{public_info_name}(), input).await?;");
 
     // Collect parameter names after the first (ctx is first, rest are inputs).
     let params: Vec<_> = input_fn.sig.inputs.iter().skip(1).collect();
@@ -1194,8 +1197,8 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         ///
         /// Pass to typed dispatch helpers on [`::autumn_harvest::WorkflowContext`]:
         ///
-        /// ```rust,ignore
-        /// let result = ctx.spawn_child_workflow(&#public_info_name(), input).await?;
+        /// ```text
+        #[doc = #info_doc_example]
         /// ```
         pub fn #public_info_name() -> ::autumn_harvest::WorkflowInfo {
             #companion_name()
@@ -1611,5 +1614,48 @@ mod dispatch_characterization_tests {
             }
         });
         assert_eq!(extract_dispatch_body(&out), WORKFLOW_DISPATCH_N_TYPED);
+    }
+}
+
+#[cfg(test)]
+mod info_doc_tests {
+    use super::workflow_macro;
+    use quote::quote;
+
+    fn generate() -> String {
+        workflow_macro(
+            quote! {},
+            quote! {
+                async fn onboarding(ctx: &WorkflowContext, user_id: i64) -> HarvestResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn info_doc_names_the_generated_info_fn() {
+        let out = generate();
+        assert!(
+            out.contains(
+                "let result = ctx.spawn_child_workflow(&onboarding_info(), input).await?;"
+            ),
+            "the doc example must name the real info fn:\n{out}"
+        );
+    }
+
+    #[test]
+    fn info_doc_has_no_uninterpolated_variable() {
+        assert!(!generate().contains("#public_info_name"));
+    }
+
+    #[test]
+    fn info_doc_example_is_never_compiled() {
+        // A fragment uses `ctx` and `input`, which a doctest does not define.
+        // `cargo test -- --include-ignored` compiles `ignore` fences.
+        let out = generate();
+        assert!(out.contains("```text"), "{out}");
+        assert!(!out.contains("```rust,ignore"), "{out}");
     }
 }

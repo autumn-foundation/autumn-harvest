@@ -74,7 +74,7 @@ fn completed(i: usize, id: ActivityExecId) -> WorkflowEvent {
 }
 
 /// The target of the external signal in the `fanout_extsig` shape.
-fn signal_target() -> ExternalTarget {
+const fn signal_target() -> ExternalTarget {
     ExternalTarget::ExecutionId(ExecutionId::from_uuid(uuid::Uuid::from_u128(2338)))
 }
 
@@ -101,15 +101,15 @@ fn history(shape: &str, n: usize) -> Vec<WorkflowEvent> {
         }
         "fanout" | "fanout_rev" | "fanout_extsig" => {
             events.extend(ids.iter().enumerate().map(|(i, id)| scheduled(i, *id)));
-            if shape != "fanout_rev" {
-                events.extend(ids.iter().enumerate().map(|(i, id)| completed(i, *id)));
-            } else {
+            if shape == "fanout_rev" {
                 events.extend(
                     ids.iter()
                         .enumerate()
                         .rev()
                         .map(|(i, id)| completed(i, *id)),
                 );
+            } else {
+                events.extend(ids.iter().enumerate().map(|(i, id)| completed(i, *id)));
             }
         }
         other => panic!("unknown MATCH_ACTIVITY_PROFILE_SHAPE {other:?}"),

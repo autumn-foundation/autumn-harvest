@@ -1,5 +1,7 @@
 //! DAG scheduler and runtime execution.
 
+use crate::schema::{harvest_schedules_ext, harvest_workflow_executions_ext};
+use crate::table_split::SetExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -2114,8 +2116,8 @@ async fn upsert_schedule(
                 // policy-takes-precedence resolver (`CatchupPolicy::from_db`) would
                 // keep driving ticks off the old bounded policy and ignore the
                 // DAG's `catchup` setting (issue #484 / Codex #1552).
-                dsl::catchup_policy.eq(Option::<String>::None),
-                dsl::catchup_window_secs.eq(Option::<i64>::None),
+                SetExt(harvest_schedules_ext::catchup_policy.eq(Option::<String>::None)),
+                SetExt(harvest_schedules_ext::catchup_window_secs.eq(Option::<i64>::None)),
                 dsl::max_active_runs.eq(i32::try_from(dag.max_active_runs).unwrap_or(i32::MAX)),
                 dsl::dag_name.eq(Some(dag.name.as_str())),
                 dsl::updated_at.eq(now),
@@ -3026,7 +3028,7 @@ async fn apply_workflow_schedule_update(
         dsl::max_active_runs.eq(i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)),
         dsl::dag_name.eq(dag_name),
         dsl::workflow_name.eq(Some(ws.workflow_name.as_str())),
-        dsl::workflow_input.eq(Some(ws.input.clone())),
+        SetExt(harvest_schedules_ext::workflow_input.eq(Some(ws.input.clone()))),
         dsl::queue_name.eq(Some(ws.queue_name.as_str())),
         dsl::updated_at.eq(now),
         dsl::next_run_at.eq(next_run_at),
@@ -3042,12 +3044,20 @@ async fn apply_workflow_schedule_update(
         dsl::end_at.eq(ws.end_at),
         dsl::max_runs.eq(ws.max_runs.map(|n| i32::try_from(n).unwrap_or(i32::MAX))),
         // Catchup policy columns (issue #484).
-        dsl::catchup_policy.eq(ws.catchup_policy.and_then(|p| p.to_db_columns().0)),
-        dsl::catchup_window_secs.eq(ws.catchup_policy.and_then(|p| p.to_db_columns().1)),
-        dsl::retry_policy.eq(ws
-            .retry_policy
-            .as_ref()
-            .and_then(|p| serde_json::to_value(p).ok())),
+        SetExt(
+            harvest_schedules_ext::catchup_policy
+                .eq(ws.catchup_policy.and_then(|p| p.to_db_columns().0)),
+        ),
+        SetExt(
+            harvest_schedules_ext::catchup_window_secs
+                .eq(ws.catchup_policy.and_then(|p| p.to_db_columns().1)),
+        ),
+        SetExt(
+            harvest_schedules_ext::retry_policy.eq(ws
+                .retry_policy
+                .as_ref()
+                .and_then(|p| serde_json::to_value(p).ok())),
+        ),
     );
     if guard_live_fire_claim {
         // Anti-race with the scheduler tick (issue #350 / #771 AC7): refuse to
@@ -4146,8 +4156,8 @@ async fn load_overlap_cleanup_targets(
         // must not make them targets for automatic overlap-cleanup. Scheduled and
         // backfill runs remain eligible; NULL origin (pre-migration) is included for
         // backward compatibility.
-        .filter(harvest_workflow_executions::origin.is_null().or(
-            harvest_workflow_executions::origin.ne(crate::execution::ORIGIN_MANUAL_TRIGGER),
+        .filter(harvest_workflow_executions_ext::origin.is_null().or(
+            harvest_workflow_executions_ext::origin.ne(crate::execution::ORIGIN_MANUAL_TRIGGER),
         ))
         .order(harvest_workflow_executions::started_at.asc())
         .limit(i64::from(limit))
@@ -4286,7 +4296,7 @@ async fn record_catchup_drops(
     )
     .set((
         dsl::last_catchup_dropped.eq(i32::try_from(dropped).unwrap_or(i32::MAX)),
-        dsl::last_catchup_at.eq(Some(now)),
+        SetExt(harvest_schedules_ext::last_catchup_at.eq(Some(now))),
     ))
     .execute(conn)
     .await;
@@ -5621,7 +5631,7 @@ async fn tick_one_workflow_schedule(
             .filter(dsl::fire_claim_token.eq(Some(claim_token))),
     )
     .set((
-        dsl::last_run_at.eq(effective_last_run_at),
+        SetExt(harvest_schedules_ext::last_run_at.eq(effective_last_run_at)),
         dsl::next_run_at.eq(final_next_run_at),
         dsl::runs_started.eq(dsl::runs_started + dispatched_i32),
         dsl::exhausted_at.eq(budget_exhausted_at),

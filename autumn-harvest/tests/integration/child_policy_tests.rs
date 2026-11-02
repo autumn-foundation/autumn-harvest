@@ -3,6 +3,8 @@
 #![cfg(feature = "db")]
 #![allow(clippy::items_after_statements)]
 
+use autumn_harvest::schema::harvest_task_queue_ext;
+use autumn_harvest::table_split::SetExt;
 use std::any::Any;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -498,7 +500,7 @@ async fn wait_for_child_task_trace_context(
     for _ in 0..100 {
         if let Some(trace_context) = harvest_task_queue::table
             .filter(harvest_task_queue::workflow_exec_id.eq(Some(child_exec_id.as_uuid())))
-            .select(harvest_task_queue::trace_context)
+            .select(harvest_task_queue_ext::trace_context)
             .first::<Option<Value>>(conn)
             .await
             .optional()
@@ -527,7 +529,7 @@ async fn wait_for_child_task_concurrency(
             .filter(harvest_task_queue::workflow_exec_id.eq(Some(child_exec_id.as_uuid())))
             .select((
                 harvest_task_queue::concurrency_key,
-                harvest_task_queue::concurrency_cap,
+                harvest_task_queue_ext::concurrency_cap,
             ))
             .first::<(Option<String>, Option<i32>)>(conn)
             .await
@@ -1279,7 +1281,10 @@ async fn workflow_task_timeout_cascades_detached_children() {
         )
         .set((
             harvest_task_queue::scheduled_at.eq(Utc::now() - chrono::Duration::seconds(5)),
-            harvest_task_queue::schedule_to_start.eq(Some(chrono::Duration::milliseconds(1))),
+            SetExt(
+                harvest_task_queue_ext::schedule_to_start
+                    .eq(Some(chrono::Duration::milliseconds(1))),
+            ),
         ))
         .execute(&mut conn)
         .await

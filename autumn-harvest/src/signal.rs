@@ -865,7 +865,7 @@ pub async fn has_pending_signals(
     diesel::select(diesel::dsl::exists(
         dsl::harvest_signals
             .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
-            .filter(dsl::consumed.eq(false)),
+            .filter(diesel::dsl::not(dsl::consumed)),
     ))
     .get_result(conn)
     .await
@@ -887,7 +887,7 @@ pub async fn load_pending_signals(
 
     dsl::harvest_signals
         .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
-        .filter(dsl::consumed.eq(false))
+        .filter(diesel::dsl::not(dsl::consumed))
         .order((dsl::received_at.asc(), dsl::id.asc()))
         .select(HarvestSignal::as_select())
         .load(conn)

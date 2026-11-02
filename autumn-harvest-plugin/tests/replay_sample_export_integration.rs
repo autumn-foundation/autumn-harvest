@@ -17,6 +17,8 @@
 //! available in every sandbox, so these tests are compile-checked there and run
 //! Docker-backed in CI (matching the #543/#544/#601 precedent).
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::table_split::SetExt;
 use std::collections::BTreeMap;
 
 use autumn_harvest::event::WorkflowEvent;
@@ -1400,10 +1402,10 @@ async fn exported_fixture_carries_context_headers_for_replay() {
         autumn_harvest::schema::harvest_workflow_executions::table
             .filter(autumn_harvest::schema::harvest_workflow_executions::id.eq(exec_id.as_uuid())),
     )
-    .set(
-        autumn_harvest::schema::harvest_workflow_executions::context_headers
+    .set(SetExt(
+        harvest_workflow_executions_ext::context_headers
             .eq(Some(json!({ "tenant-tier": "premium" }))),
-    )
+    ))
     .execute(&mut conn)
     .await
     .expect("attach headers");

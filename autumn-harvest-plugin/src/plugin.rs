@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use autumn_web::AppState;
 use autumn_web::app::AppBuilder;
 use autumn_web::config::{AutumnConfig, DatabaseConfig};
-use autumn_web::db;
 use autumn_web::error::AutumnError;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::plugin::Plugin;
@@ -149,6 +148,9 @@ struct HarvestRuntime {
 #[derive(Default)]
 struct HarvestRuntimeSlot {
     builder: Option<HarvestBuilder>,
+    /// Applied to `builder` at startup, when the app state holds the autumn
+    /// cost signal (autumn#1720).
+    cost_deferral: crate::cost::CostDeferral,
     runtime: Option<HarvestRuntime>,
     /// Broker connector registrations (issue #944), stashed alongside the
     /// builder so `start_harvest_runtime` can spawn one consumer loop each
@@ -162,7 +164,7 @@ struct HarvestRuntimeSlot {
 /// Operates on `Router<()>` because both exported routers are state-free
 /// (issue #1606). The router is converted to `Router<AppState>` once, at the
 /// `AppBuilder::nest` boundary below.
-type ApiMiddlewareFn = Box<
+pub(crate) type ApiMiddlewareFn = Box<
     dyn FnOnce(autumn_web::reexports::axum::Router<()>) -> autumn_web::reexports::axum::Router<()>
         + Send
         + Sync,
@@ -293,6 +295,13 @@ pub struct HarvestPlugin {
     /// The cap on live durable streams. Set via
     /// [`Self::durable_route_max_streams`].
     durable_route_max_streams: usize,
+    /// The activity types that the autumn cost signal holds (autumn#1720).
+    /// Set via [`Self::cost_deferrable_activities`].
+    cost_deferral: crate::cost::CostDeferral,
+    /// The Harvest file on the SQLite backend (issue #2467). Set via
+    /// [`Self::sqlite_path`]. Operator config wins over it.
+    #[cfg(feature = "sqlite")]
+    sqlite_path: Option<std::path::PathBuf>,
 }
 
 /// One registered broker connector: a binding plus the source that feeds it.
@@ -383,6 +392,9 @@ impl HarvestPlugin {
             durable_route_max_waiters: crate::durable_route::DEFAULT_MAX_WAITERS,
             durable_route_max_chain_steps: crate::durable_route::DEFAULT_MAX_CHAIN_STEPS,
             durable_route_max_streams: crate::durable_route::DEFAULT_MAX_STREAMS,
+            cost_deferral: crate::cost::CostDeferral::default(),
+            #[cfg(feature = "sqlite")]
+            sqlite_path: None,
         }
     }
 
@@ -536,6 +548,37 @@ impl HarvestPlugin {
         self
     }
 
+    /// Defer these activity types while the autumn cost signal is high
+    /// (autumn#1720).
+    ///
+    /// The signal is the app's `autumn_web::cost::CostSignal`. It is high
+    /// while its value is above `[cost] defer_threshold`. The workers then
+    /// claim no task of these types. Each task stays `PENDING`, uses no
+    /// attempt and holds no slot. When the signal falls, the next poll
+    /// claims it. Other activities and every workflow task run as usual.
+    ///
+    /// A later call replaces the list. An empty list turns the hold off.
+    /// `try_build` rejects a local activity in the list. See
+    /// `docs/cost-deferral.md`.
+    #[must_use]
+    pub fn cost_deferrable_activities<I, S>(mut self, activities: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.cost_deferral.activities = activities.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set the time before a held dispatch reference returns to the channel
+    /// (autumn#1720). Only a worker with a dispatch channel uses it. The
+    /// default is 5 seconds. The minimum is 1 second.
+    #[must_use]
+    pub const fn cost_hold_recheck(mut self, recheck: std::time::Duration) -> Self {
+        self.cost_deferral.recheck = Some(recheck);
+        self
+    }
+
     /// Enable the **opt-in durable per-execution workflow log sink** (issue
     /// #790).
     ///
@@ -565,6 +608,20 @@ impl HarvestPlugin {
         policy: autumn_harvest::context::WorkflowLogPolicy,
     ) -> Self {
         self.builder = self.builder.workflow_log_persistence(policy);
+        self
+    }
+
+    /// Put the Harvest file of the SQLite backend at `path` (issue #2467).
+    ///
+    /// `[harvest.sqlite] path` and `AUTUMN_HARVEST_SQLITE__PATH` still win,
+    /// so an operator can move the file without a rebuild. With none of the
+    /// three, the file sits next to the app database. Each app in one
+    /// process, as in a test binary, needs its own file: the runtime holds
+    /// an exclusive writer lock on it.
+    #[cfg(feature = "sqlite")]
+    #[must_use]
+    pub fn sqlite_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.sqlite_path = Some(path.into());
         self
     }
 
@@ -1333,8 +1390,113 @@ impl Plugin for HarvestPlugin {
         Some(harvest_plugin_contract())
     }
 
-    #[allow(clippy::too_many_lines)]
     fn build(self, app: AppBuilder) -> AppBuilder {
+        #[cfg(feature = "sqlite")]
+        {
+            self.build_sqlite(app)
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            self.build_postgres(app)
+        }
+    }
+}
+
+impl HarvestPlugin {
+    /// Build on the SQLite backend (issue #2467).
+    ///
+    /// Each option that this backend cannot honour yet is collected with
+    /// its issue. `crate::sqlite::build` then refuses them all in one panic.
+    #[cfg(feature = "sqlite")]
+    fn build_sqlite(self, app: AppBuilder) -> AppBuilder {
+        let mut refused: Vec<(&'static str, u32)> = Vec::new();
+        let mut refuse = |set: bool, option: &'static str, issue: u32| {
+            if set {
+                refused.push((option, issue));
+            }
+        };
+        refuse(
+            self.api_tokens_enabled,
+            "HarvestPlugin::enable_api_tokens",
+            2469,
+        );
+        refuse(
+            self.role_auth_enabled,
+            "HarvestPlugin::api_with_role_auth",
+            2469,
+        );
+        refuse(
+            self.authorizer.is_some(),
+            "HarvestPlugin::with_authorizer",
+            2469,
+        );
+        refuse(self.roles.is_some(), "HarvestPlugin::with_roles", 2469);
+        refuse(
+            self.api_rate_limit.is_some(),
+            "HarvestPlugin::with_api_rate_limit",
+            2469,
+        );
+        #[cfg(feature = "oidc")]
+        refuse(self.oidc.is_some(), "HarvestPlugin::api_with_oidc", 2469);
+        refuse(
+            self.mcp_tools_enabled || self.mcp_tasks_enabled,
+            "HarvestPlugin::mcp_tools / mcp_tasks",
+            2471,
+        );
+        #[cfg(feature = "webhooks")]
+        refuse(
+            !self.webhook_triggers.is_empty(),
+            "HarvestPlugin::webhooks",
+            2471,
+        );
+        #[cfg(feature = "connectors")]
+        refuse(
+            !self.connectors.is_empty(),
+            "HarvestPlugin::connector",
+            2471,
+        );
+        #[cfg(feature = "metrics")]
+        refuse(
+            self.metrics_scrape_enabled,
+            "HarvestPlugin::with_metrics_scrape",
+            crate::sqlite::EPIC_ISSUE,
+        );
+        refuse(
+            self.canary_config.is_some(),
+            "HarvestPlugin::synthetic_canary",
+            2471,
+        );
+        refuse(
+            self.decode_payloads_on_read,
+            "HarvestPlugin::decode_payloads_on_read",
+            2468,
+        );
+        // The SQLite worker reads no cost hold, so a held type would run
+        // (autumn#1720).
+        refuse(
+            !self.cost_deferral.activities.is_empty(),
+            "HarvestPlugin::cost_deferrable_activities",
+            crate::sqlite::EPIC_ISSUE,
+        );
+        crate::sqlite::build(
+            app,
+            crate::sqlite::SqliteParts {
+                builder: self.builder,
+                api_path: self.api_path,
+                api_middleware: self.api_middleware,
+                allow_unauthenticated_mutations: self.allow_unauthenticated_mutations,
+                path: self.sqlite_path,
+                refused,
+            },
+        )
+    }
+
+    /// Build on the Postgres backend, the default.
+    // Under `sqlite` nothing calls it. The allow keeps the Postgres code that
+    // it reaches live, so that build does not drown in dead-code warnings.
+    #[cfg_attr(feature = "sqlite", allow(dead_code))]
+    #[allow(clippy::too_many_lines)]
+    fn build_postgres(self, app: AppBuilder) -> AppBuilder {
         let Self {
             builder,
             api_path,
@@ -1365,6 +1527,9 @@ impl Plugin for HarvestPlugin {
             durable_route_max_waiters,
             durable_route_max_chain_steps,
             durable_route_max_streams,
+            cost_deferral,
+            #[cfg(feature = "sqlite")]
+                sqlite_path: _,
         } = self;
         #[cfg(not(feature = "mcp"))]
         let _ = (
@@ -1741,6 +1906,7 @@ impl Plugin for HarvestPlugin {
 
         let slot = Arc::new(Mutex::new(HarvestRuntimeSlot {
             builder: Some(builder),
+            cost_deferral,
             runtime: None,
             #[cfg(feature = "connectors")]
             connectors,
@@ -2022,13 +2188,17 @@ async fn start_harvest_runtime(
     ensure_runtime_migrations(state.profile(), &app_config, &harvest_config).await?;
 
     let runtime_state = state.clone();
-    let app_pool = state.pool().cloned();
+    let app_pool = crate::state::app_postgres_pool(state);
     let harvest_pool = resolve_harvest_pool(state, &harvest_config)?;
     let router = ShardRouter::single();
 
-    let (builder, runtime_already_started) = {
+    let (builder, cost_deferral, runtime_already_started) = {
         let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
-        (guard.builder.take(), guard.runtime.is_some())
+        (
+            guard.builder.take(),
+            guard.cost_deferral.clone(),
+            guard.runtime.is_some(),
+        )
     };
     #[cfg(feature = "connectors")]
     let connector_registrations = {
@@ -2079,6 +2249,10 @@ async fn start_harvest_runtime(
     if let Some(cfg) = api_state.canary_config() {
         builder = crate::canary::register_canary(builder, &cfg);
     }
+
+    // The autumn cost signal holds the deferrable activity types
+    // (autumn#1720). `try_build` validates the names.
+    cost_deferral.apply(&mut builder, state);
 
     let mut built = builder
         .try_build()
@@ -2580,7 +2754,7 @@ fn resolve_harvest_pool(
     config: &HarvestRuntimeConfig,
 ) -> autumn_web::AutumnResult<DbPool> {
     match config.mode {
-        HarvestMode::Embedded => state.pool().cloned().ok_or_else(|| {
+        HarvestMode::Embedded => crate::state::app_postgres_pool(state).ok_or_else(|| {
             AutumnError::service_unavailable_msg("autumn-harvest requires a configured database")
         }),
         HarvestMode::Split | HarvestMode::External => {
@@ -2588,8 +2762,8 @@ fn resolve_harvest_pool(
                 url: config.database.url.clone(),
                 ..DatabaseConfig::default()
             };
-            db::create_pool(&database)
-                .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?
+            crate::state::create_postgres_pool(&database)
+                .map_err(AutumnError::service_unavailable_msg)?
                 .ok_or_else(|| {
                     AutumnError::service_unavailable_msg(
                         "harvest.database.url must resolve to a dedicated database pool",
@@ -3129,11 +3303,13 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "sqlite"))]
+    use crate::AppDbPool;
+    use crate::HarvestDbPool;
     use crate::config::{
         HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig, HarvestRuntimeConfig,
     };
     use crate::runner::injected_runtime_state;
-    use crate::{AppDbPool, HarvestDbPool};
     use autumn_harvest::dag::DagBuilder;
     use autumn_harvest::policy::Schedule;
     use autumn_web::config::DatabaseConfig;
@@ -3452,7 +3628,7 @@ mod tests {
     }
 
     fn test_pool(database_url: &str, pool_size: usize) -> DbPool {
-        autumn_web::db::create_pool(&DatabaseConfig {
+        crate::state::create_postgres_pool(&DatabaseConfig {
             url: Some(database_url.to_owned()),
             pool_size,
             ..DatabaseConfig::default()
@@ -3805,6 +3981,9 @@ mod tests {
         assert_eq!(stored.profile(), state.profile());
     }
 
+    // An `AppState` around a Postgres app pool. Under `sqlite` the app pool
+    // is a SQLite pool (issue #2467).
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn harvest_plugin_embedded_mode_reuses_app_pool() {
         let app_pool = test_pool("postgres://app:app@localhost:5432/app", 3);
@@ -3817,6 +3996,9 @@ mod tests {
         assert_eq!(harvest_pool.status().max_size, 3);
     }
 
+    // An `AppState` around a Postgres app pool. Under `sqlite` the app pool
+    // is a SQLite pool (issue #2467).
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn harvest_plugin_split_mode_builds_dedicated_harvest_pool() {
         let app_pool = test_pool("postgres://app:app@localhost:5432/app", 3);
@@ -3836,6 +4018,9 @@ mod tests {
         assert_eq!(harvest_pool.status().max_size, 10);
     }
 
+    // An `AppState` around a Postgres app pool. Under `sqlite` the app pool
+    // is a SQLite pool (issue #2467).
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn injected_runtime_state_contains_explicit_app_and_harvest_pool_roles() {
         let app_pool = test_pool("postgres://app:app@localhost:5432/app", 3);
@@ -3866,6 +4051,9 @@ mod tests {
         assert_eq!(legacy_harvest_db.status().max_size, 7);
     }
 
+    // An `AppState` around a Postgres app pool. Under `sqlite` the app pool
+    // is a SQLite pool (issue #2467).
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn harvest_plugin_external_mode_builds_dedicated_harvest_pool() {
         let app_pool = test_pool("postgres://app:app@localhost:5432/app", 3);

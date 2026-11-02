@@ -1,5 +1,7 @@
 //! Time-based retention janitor for completed workflow history.
 
+#[cfg(feature = "db")]
+use crate::schema::harvest_workflow_executions_ext;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -3794,7 +3796,7 @@ async fn read_candidate_hold(
     harvest_workflow_executions::table
         .find(candidate_id)
         .select((
-            harvest_workflow_executions::legal_hold_set_at,
+            harvest_workflow_executions_ext::legal_hold_set_at,
             harvest_workflow_executions::legal_hold_until,
         ))
         .first::<HoldTimestamps>(conn)
@@ -3882,7 +3884,7 @@ async fn delete_candidate_execution(
         let row: Option<SummarySourceRow> = harvest_workflow_executions::table
             .find(candidate_id)
             .select((
-                harvest_workflow_executions::legal_hold_set_at,
+                harvest_workflow_executions_ext::legal_hold_set_at,
                 harvest_workflow_executions::legal_hold_until,
                 harvest_workflow_executions::workflow_name,
                 harvest_workflow_executions::workflow_id,
@@ -3894,8 +3896,8 @@ async fn delete_candidate_execution(
                 harvest_workflow_executions::error,
                 harvest_workflow_executions::search_attrs,
                 harvest_workflow_executions::parent_id,
-                harvest_workflow_executions::migrated_from_shards,
-                harvest_workflow_executions::staging_vacated_state,
+                crate::schema::harvest_workflow_executions_unmapped::migrated_from_shards(),
+                crate::schema::harvest_workflow_executions_unmapped::staging_vacated_state(),
             ))
             .for_update()
             .first::<SummarySourceRow>(conn)
@@ -4560,7 +4562,7 @@ async fn should_skip_candidate(
 
     let pending_signal_count = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(candidate.id))
-        .filter(harvest_signals::consumed.eq(false))
+        .filter(diesel::dsl::not(harvest_signals::consumed))
         .count()
         .get_result::<i64>(conn)
         .await
@@ -4657,6 +4659,8 @@ pub struct LegalHoldOutcome {
 
 #[cfg(feature = "db")]
 mod legal_hold_db {
+    use crate::schema::harvest_workflow_executions_ext;
+    use crate::table_split::SetExt;
     use chrono::{DateTime, Utc};
     use diesel::prelude::*;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -4684,11 +4688,11 @@ mod legal_hold_db {
         harvest_workflow_executions::table
             .find(exec_id.as_uuid())
             .select((
-                harvest_workflow_executions::legal_hold_set_at,
+                harvest_workflow_executions_ext::legal_hold_set_at,
                 harvest_workflow_executions::legal_hold_until,
-                harvest_workflow_executions::legal_hold_reason,
-                harvest_workflow_executions::legal_hold_actor,
-                harvest_workflow_executions::migrated_to_shard,
+                harvest_workflow_executions_ext::legal_hold_reason,
+                harvest_workflow_executions_ext::legal_hold_actor,
+                harvest_workflow_executions_ext::migrated_to_shard,
             ))
             .for_update()
             .first::<HoldColumns>(conn)
@@ -4790,10 +4794,12 @@ mod legal_hold_db {
 
                 diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
                     .set((
-                        harvest_workflow_executions::legal_hold_set_at.eq(Some(now)),
+                        SetExt(harvest_workflow_executions_ext::legal_hold_set_at.eq(Some(now))),
                         harvest_workflow_executions::legal_hold_until.eq(hold_until),
-                        harvest_workflow_executions::legal_hold_reason.eq(stored_reason),
-                        harvest_workflow_executions::legal_hold_actor.eq(Some(actor)),
+                        SetExt(
+                            harvest_workflow_executions_ext::legal_hold_reason.eq(stored_reason),
+                        ),
+                        SetExt(harvest_workflow_executions_ext::legal_hold_actor.eq(Some(actor))),
                     ))
                     .execute(conn)
                     .await
@@ -4854,14 +4860,23 @@ mod legal_hold_db {
                 if was_set {
                     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
                         .set((
-                            harvest_workflow_executions::legal_hold_set_at
-                                .eq::<Option<DateTime<Utc>>>(None),
+                            SetExt(
+                                harvest_workflow_executions_ext::legal_hold_set_at.eq::<Option<
+                                    DateTime<Utc>,
+                                >>(
+                                    None
+                                ),
+                            ),
                             harvest_workflow_executions::legal_hold_until
                                 .eq::<Option<DateTime<Utc>>>(None),
-                            harvest_workflow_executions::legal_hold_reason
-                                .eq::<Option<String>>(None),
-                            harvest_workflow_executions::legal_hold_actor
-                                .eq::<Option<String>>(None),
+                            SetExt(
+                                harvest_workflow_executions_ext::legal_hold_reason
+                                    .eq::<Option<String>>(None),
+                            ),
+                            SetExt(
+                                harvest_workflow_executions_ext::legal_hold_actor
+                                    .eq::<Option<String>>(None),
+                            ),
                         ))
                         .execute(conn)
                         .await

@@ -2482,7 +2482,7 @@ async fn load_blocked_on_data(
 
     let signals: Vec<HarvestSignal> = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(exec_uuid))
-        .filter(harvest_signals::consumed.eq(false))
+        .filter(diesel::dsl::not(harvest_signals::consumed))
         .order(harvest_signals::received_at.asc())
         .limit(20)
         .select(HarvestSignal::as_select())
@@ -15821,7 +15821,6 @@ mod tests {
         autumn_harvest::models::WorkflowExecution {
             migrated_to_shard: None,
             migrated_at: None,
-            migrated_from_shards: None,
             quota_key: None,
             id: Uuid::new_v4(),
             workflow_name: "test_workflow".to_string(),
@@ -15880,9 +15879,7 @@ mod tests {
             history_bloat_warned_at: None,
             triage_note: None,
             migrated_run_terminal_at: None,
-            migrated_run_terminal_state: None,
-            staging_vacated_state: None,
-            staging_vacated_by: None,
+            rebalance: autumn_harvest::models::RebalanceMarkers::default(),
             tenant: None,
         }
     }

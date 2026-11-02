@@ -80,6 +80,8 @@ fn agent_loop_history(filler: Filler) -> Vec<WorkflowEvent> {
     let mut events = Vec::new();
     for turn in 0..TURNS {
         let request = ModelTurnRequest {
+            skills: false,
+            tool_guidance: std::collections::BTreeMap::new(),
             run_id: "run-2009".into(),
             session_id: None,
             steps_used: u32::try_from(turn).unwrap(),
@@ -101,6 +103,7 @@ fn agent_loop_history(filler: Filler) -> Vec<WorkflowEvent> {
             mesh: None,
             prefix: None,
             remember: false,
+            draw: None,
         };
         let call = ToolCall {
             id: format!("call-{turn}"),

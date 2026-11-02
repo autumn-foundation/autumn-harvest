@@ -11,6 +11,8 @@
 //! Set `HARVEST_TEST_DATABASE_URL` to use a migrated Postgres. Otherwise the
 //! suite starts a testcontainers Postgres 16.
 
+use autumn_harvest::schema::{harvest_task_queue_ext, harvest_workflow_executions_ext};
+use autumn_harvest::table_split::SetExt;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -305,7 +307,7 @@ async fn first_task_fairness_key(
     harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(exec.as_uuid()))
         .filter(harvest_task_queue::task_type.eq("workflow"))
-        .select(harvest_task_queue::fairness_key)
+        .select(harvest_task_queue_ext::fairness_key)
         .first(conn)
         .await
         .expect("read the first workflow task")
@@ -725,7 +727,7 @@ async fn a_malformed_fork_reference_is_refused() {
         diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
             .set((
                 harvest_workflow_executions::start_source.eq(Some("fork")),
-                harvest_workflow_executions::start_source_ref.eq(reference),
+                SetExt(harvest_workflow_executions_ext::start_source_ref.eq(reference)),
             ))
             .execute(&mut conn)
             .await
@@ -755,7 +757,9 @@ async fn a_fork_lineage_past_the_scan_bound_is_refused() {
         diesel::update(harvest_workflow_executions::table.find(child.as_uuid()))
             .set((
                 harvest_workflow_executions::start_source.eq(Some("fork")),
-                harvest_workflow_executions::start_source_ref.eq(Some(parent.to_string())),
+                SetExt(
+                    harvest_workflow_executions_ext::start_source_ref.eq(Some(parent.to_string())),
+                ),
             ))
             .execute(&mut conn)
             .await
@@ -792,7 +796,9 @@ async fn a_malformed_ancestor_at_the_scan_bound_is_refused() {
         diesel::update(harvest_workflow_executions::table.find(child.as_uuid()))
             .set((
                 harvest_workflow_executions::start_source.eq(Some("fork")),
-                harvest_workflow_executions::start_source_ref.eq(Some(parent.to_string())),
+                SetExt(
+                    harvest_workflow_executions_ext::start_source_ref.eq(Some(parent.to_string())),
+                ),
             ))
             .execute(&mut conn)
             .await
@@ -1391,7 +1397,7 @@ async fn a_fork_task_is_a_new_start() {
                 autumn_harvest::schema::harvest_task_queue::workflow_exec_id
                     .eq(Some(exec_id.as_uuid())),
             )
-            .select(autumn_harvest::schema::harvest_task_queue::new_start)
+            .select(harvest_task_queue_ext::new_start)
     };
     let fork_flags: Vec<bool> = new_start(forked).load(&mut conn).await.expect("fork task");
     assert_eq!(fork_flags, vec![true], "the fork task is a new start");
@@ -1542,7 +1548,9 @@ async fn only_a_fork_with_a_prefix_keeps_the_source_build() {
     let source = completed_source(&url, &pool, &queue, &queue).await;
     let mut conn = connect(&url).await;
     diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
-        .set(harvest_workflow_executions::assigned_build_id.eq(Some("build-old")))
+        .set(SetExt(
+            harvest_workflow_executions_ext::assigned_build_id.eq(Some("build-old")),
+        ))
         .execute(&mut conn)
         .await
         .expect("pin the source build");
@@ -1573,7 +1581,7 @@ async fn build_of(url: &str, exec_id: ExecutionId) -> (Option<String>, Option<St
     let mut conn = connect(url).await;
     let row: Option<String> = harvest_workflow_executions::table
         .find(exec_id.as_uuid())
-        .select(harvest_workflow_executions::assigned_build_id)
+        .select(harvest_workflow_executions_ext::assigned_build_id)
         .first(&mut conn)
         .await
         .expect("fork row");
@@ -1582,7 +1590,7 @@ async fn build_of(url: &str, exec_id: ExecutionId) -> (Option<String>, Option<St
             autumn_harvest::schema::harvest_task_queue::workflow_exec_id
                 .eq(Some(exec_id.as_uuid())),
         )
-        .select(autumn_harvest::schema::harvest_task_queue::required_build_id)
+        .select(harvest_task_queue_ext::required_build_id)
         .first(&mut conn)
         .await
         .expect("fork task");
@@ -1676,7 +1684,7 @@ async fn a_fork_commits_with_its_audit_row() {
 async fn forks_of(conn: &mut AsyncPgConnection, source: ExecutionId) -> i64 {
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::start_source.eq(Some("fork")))
-        .filter(harvest_workflow_executions::start_source_ref.eq(Some(source.to_string())))
+        .filter(harvest_workflow_executions_ext::start_source_ref.eq(Some(source.to_string())))
         .count()
         .get_result(conn)
         .await
@@ -1781,7 +1789,9 @@ async fn a_fork_is_admitted_under_the_tenant_quota() {
     let source = seed_run(&mut conn, &queue, &input).await;
     // The start of the source admitted it under its tenant key.
     diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
-        .set(harvest_workflow_executions::quota_key.eq(Some(queue.as_str())))
+        .set(SetExt(
+            harvest_workflow_executions_ext::quota_key.eq(Some(queue.as_str())),
+        ))
         .execute(&mut conn)
         .await
         .expect("stamp the source key");
@@ -1877,7 +1887,9 @@ async fn a_fork_resolves_its_quota_key_under_the_current_policy() {
     let input = json!({ "tag": queue, "amount": 1, "tenant": queue });
     let source = seed_run(&mut conn, &queue, &input).await;
     diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
-        .set(harvest_workflow_executions::quota_key.eq(Some("stale-tenant")))
+        .set(SetExt(
+            harvest_workflow_executions_ext::quota_key.eq(Some("stale-tenant")),
+        ))
         .execute(&mut conn)
         .await
         .expect("stamp a stale key");
@@ -2363,7 +2375,9 @@ async fn only_a_recorded_fork_suppresses_completion_notifications() {
     let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
     let targets = json!([{ "url": "https://callbacks.invalid/done" }]);
     diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
-        .set(harvest_workflow_executions::completion_callbacks.eq(Some(targets.clone())))
+        .set(SetExt(
+            harvest_workflow_executions_ext::completion_callbacks.eq(Some(targets.clone())),
+        ))
         .execute(&mut conn)
         .await
         .expect("set the callback targets");
@@ -2455,7 +2469,9 @@ async fn a_reset_keeps_the_quota_key_of_its_source() {
     let mut conn = connect(&url).await;
     let source = seed_run_with(&mut conn, &queue, &json!({ "n": 1 }), None, None).await;
     diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
-        .set(harvest_workflow_executions::quota_key.eq("tenant-a"))
+        .set(SetExt(
+            harvest_workflow_executions_ext::quota_key.eq("tenant-a"),
+        ))
         .execute(&mut conn)
         .await
         .expect("set the source key");
@@ -2465,7 +2481,7 @@ async fn a_reset_keeps_the_quota_key_of_its_source() {
         .expect("reset");
     let key: Option<String> = harvest_workflow_executions::table
         .find(reset.new_exec_id.as_uuid())
-        .select(harvest_workflow_executions::quota_key)
+        .select(harvest_workflow_executions_ext::quota_key)
         .first(&mut conn)
         .await
         .expect("read the reset row");
@@ -2801,7 +2817,9 @@ async fn retention_keeps_the_root_of_the_deepest_lineage() {
             .set((
                 harvest_workflow_executions::state.eq(state),
                 harvest_workflow_executions::start_source.eq(Some("fork")),
-                harvest_workflow_executions::start_source_ref.eq(Some(parent.to_string())),
+                SetExt(
+                    harvest_workflow_executions_ext::start_source_ref.eq(Some(parent.to_string())),
+                ),
             ))
             .execute(&mut conn)
             .await

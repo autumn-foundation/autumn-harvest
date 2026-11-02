@@ -8,6 +8,8 @@
 //! Set `HARVEST_TEST_DATABASE_URL` to use a migrated Postgres. Otherwise the
 //! suite starts a testcontainers Postgres 16.
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::table_split::SetExt;
 use std::sync::Arc;
 
 use autumn_harvest::event::WorkflowEvent;
@@ -382,7 +384,9 @@ async fn a_live_fork_refuses_a_callback_target_the_policy_rejects() {
         autumn_harvest::completion_callback::EventFilter::AnyTerminal,
     )];
     diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
-        .set(harvest_workflow_executions::completion_callbacks.eq(Some(json!(stale))))
+        .set(SetExt(
+            harvest_workflow_executions_ext::completion_callbacks.eq(Some(json!(stale))),
+        ))
         .execute(&mut conn)
         .await
         .expect("set the callback targets");

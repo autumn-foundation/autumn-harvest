@@ -61,5 +61,5 @@ driver = "per_request"
 backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_signals", "harvest_workflow_executions"]
-measured = "unmeasured"
+measured = "docs/performance-signals-exec-index.md"
 plan = "docs/ledger/plans/autumn-harvest/erase.md"

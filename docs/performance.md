@@ -2813,3 +2813,18 @@ standalone note rather than part of the claim-path attribution table above:
   — `debugger::is_redacted_export`, the first step of `harvest debug diff`.
   It reads one top-level key without building a `Value` tree. The probe
   cost 29% of the pipeline before the change.
+* [`docs/performance-signals-exec-index.md`](performance-signals-exec-index.md)
+  — the statements that read every signal of one execution, consumed rows
+  included (issue #2367). Before the index, a retry, a PII erasure, a shard
+  rebalance and each execution delete read the whole signals table. A plain
+  index on `workflow_exec_id` drops the execution delete from 4,150 to 149
+  buffers. The pending reads send `NOT consumed` as a literal, so a generic
+  plan keeps the partial index.
+* [`docs/performance-dead-letter-indexes.md`](performance-dead-letter-indexes.md)
+  — the DLQ list, the callback redrive delete, each queue filter and the
+  newest-age probe of the status summary (issue #2401). Before the indexes,
+  each one read the whole of `harvest_dead_letters`. On 100,000 rows, a list
+  page drops from 5,959 to 5 buffers, and each callback redrive delete from
+  5,884 to 5. Each dead-letter insert costs about 8 more buffers. A filter
+  that no index serves can now walk the `failed_at` index, which costs more
+  on a shuffled heap.

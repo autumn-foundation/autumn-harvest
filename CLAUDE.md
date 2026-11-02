@@ -192,6 +192,17 @@ in `autumn-harvest-sqlite/src/schema.rs`. It has no sanctioned writer, so it
 refuses every `UPDATE`, and an `INSERT OR REPLACE` over a stored event. A
 test fixture calls `autumn_harvest_sqlite::append_only::with_guard_off`.
 
+### Agent overlay versions are immutable (issue #2371)
+
+A run can read an overlay version, so a version row never changes. Do not
+add code that updates `harvest_agent_overlays`. Put a new version, then
+activate it. The trigger `harvest_agent_overlays_immutable_trg` refuses
+each `UPDATE`. A second trigger keeps each head row, so no version number
+comes back. The SQLite store has the same guards. Only the pointer in
+`harvest_agent_overlay_heads` moves, by a compare-and-swap. Each store
+validates an overlay with `overlay::apply` before a put and before an
+activation.
+
 ### Decision owner fence (issue #2249)
 
 [ADR 0009](docs/adr/0009-decision-owner.md) defines owner mode. Issue #2251
@@ -233,6 +244,21 @@ builds it. Code for owner mode follows these rules:
 - List, search and describe read Postgres, never an owner cache.
 
 `decision_owner_lock_modes_db_tests.rs` proves the lock modes.
+
+## Diesel Table Width
+
+Keep every `diesel::table!` at 32 columns or fewer (issue #2492). Diesel
+implements its traits per tuple size, and a cargo feature sets the largest
+size. One column over a tier forces the next tier on every crate that builds
+diesel, embedders included. The 128 tier does not compile in 8 GB.
+
+`docs/audits/diesel-table-width.py` runs in CI's `lint` job. It fails on a
+`table!` over 32 columns, and on a manifest that enables a wider tier. A
+table that needs more columns splits over a core and an extension
+declaration. Read `autumn-harvest/src/table_split.rs` before you add a column
+to `harvest_workflow_executions`, `harvest_task_queue` or `harvest_schedules`.
+A new column goes in the extension declaration. Assign it inside an update
+of the core table with `SetExt`.
 
 ## Ledger Profiles
 

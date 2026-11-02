@@ -39,6 +39,8 @@ pub mod config;
 /// broker client lives behind this plugin's `kafka` / `sqs` features.
 #[cfg(feature = "connectors")]
 pub mod connector;
+/// Feed the autumn cost signal into the Harvest workers (autumn#1720).
+pub mod cost;
 pub mod dag_graph;
 pub mod dag_retry;
 /// Zero-setup local dev runtime (issue #525).
@@ -79,6 +81,8 @@ pub mod same_origin;
 pub mod schedule_runs;
 pub mod shard_fanout;
 pub mod shard_health;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 pub mod state;
 pub mod status_summary;
 /// Strict percent-decoding for raw HTTP query strings.

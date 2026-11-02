@@ -100,7 +100,7 @@ Statements: 1. Tables with no usable index: none.
 
 ## `db::read_json`
 
-Statements: 7. Tables with no usable index: `harvest_signals`.
+Statements: 7. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
@@ -109,7 +109,7 @@ Statements: 7. Tables with no usable index: `harvest_signals`.
 | 3 | `SELECT COALESCE(jsonb_agg(to_jsonb(l)), '[]'::jsonb) AS payload FROM harvest_llm_ledger l WHERE l...` | `harvest_llm_ledger`: Bitmap Heap Scan on `harvest_llm_ledger_pkey` |
 | 4 | `SELECT COALESCE(jsonb_agg(to_jsonb(l)), '[]'::jsonb) AS payload FROM harvest_workflow_logs l WHER...` | `harvest_workflow_logs`: Bitmap Heap Scan on `harvest_workflow_logs_exec_seq` |
 | 5 | `SELECT COALESCE(jsonb_agg(to_jsonb(p)), '[]'::jsonb) AS payload FROM harvest_payload_refs p WHERE...` | `harvest_payload_refs`: Bitmap Heap Scan on `idx_harvest_payload_refs_exec` |
-| 6 | `SELECT COALESCE(jsonb_agg(to_jsonb(s)), '[]'::jsonb) AS payload FROM harvest_signals s WHERE s.wo...` | `harvest_signals`: no usable index |
+| 6 | `SELECT COALESCE(jsonb_agg(to_jsonb(s)), '[]'::jsonb) AS payload FROM harvest_signals s WHERE s.wo...` | `harvest_signals`: Bitmap Heap Scan on `idx_harvest_signals_exec` |
 | 7 | `SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) AS payload FROM harvest_timers t WHERE t.wor...` | `harvest_timers`: Bitmap Heap Scan on `idx_harvest_timers_exec` |
 
 ## `db::read_legal_hold_set_at`

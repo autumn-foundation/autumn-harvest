@@ -29,12 +29,14 @@ use crate::agent::{
     Steer,
 };
 use crate::agent::{
-    agent_info, agent_memory_reset_info, agent_profile_info, agent_workspace_floor_info,
-    agent_workspace_reset_info, agent_workspace_retain_info,
+    agent_info, agent_memory_reset_info, agent_profile_info, agent_profile_overlay_info,
+    agent_workspace_floor_info, agent_workspace_reset_info, agent_workspace_retain_info,
 };
 use crate::approval::{Approval, Decision, approval_signal, await_decision, decode_decision};
-use crate::bounds::{RoundBudget, exceeds_bytes, json_len, sibling_cap};
+use crate::bounds::{RoundBudget, json_len, reaches_percent, reset_due, sibling_cap};
+use crate::context_reset::{self, ProgressNotes, SAVE_PROGRESS_TOOL};
 use crate::delivery::{Report, ReportSource, report_text};
+use crate::draw::Draw;
 use crate::flow::Released;
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
 use crate::harness::{AgentHarness, CacheTenant, DEFAULT_TOOL_OUTPUT_LIMIT, truncate};
@@ -53,6 +55,7 @@ use crate::message::{
     ChatMessage, ChatRole, ContentPart, RunId, StopReason, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::policy::ToolDecision;
+use crate::skill::{self, LOAD_SKILL_TOOL};
 use crate::transcript::{PREFIX_MISSING, PrefixRef, Sent, TRANSCRIPT_DELTA_PATCH};
 use crate::types::{
     AgentReport, AgentStop, AgentTask, MAX_PARALLEL_CHILDREN, ModelTurn, ModelTurnRequest,
@@ -122,6 +125,29 @@ pub(crate) struct Progress {
     /// The workspace of the run and its head (issue #2274). A tool call that
     /// changes the workspace moves the head.
     pub(crate) workspace: Option<WorkspaceMount>,
+    /// The notes and the context resets of the run (issue #2453).
+    pub(crate) reset: ResetState,
+    /// The steer messages of this segment. A reset keeps them, so a reset
+    /// never drops a message from a person.
+    pub(crate) steers: Vec<ChatMessage>,
+}
+
+/// The notes and the context resets of one run (issue #2453).
+#[derive(Debug, Default)]
+pub(crate) struct ResetState {
+    /// The context resets of the run, follow-ups included.
+    pub(crate) count: u32,
+    /// The notes of the last `save_progress` call that passed its checks.
+    pub(crate) notes: Option<ProgressNotes>,
+    /// Show the notes after the input of each segment. Only a durable agent
+    /// sets it, because its transcript holds no copy of the notes.
+    pub(crate) restore: bool,
+    /// The last turn was the save turn of a reset. The reset runs before
+    /// the next request.
+    pub(crate) pending: bool,
+    /// The booking that woke this segment, with its result. Each reset of
+    /// the segment keeps it, because the wake message points at it.
+    pub(crate) woken_by: Option<[ChatMessage; 2]>,
 }
 
 /// The steer messages of a durable agent (issue #2265).
@@ -184,6 +210,8 @@ impl Progress {
             memory: None,
             parked_until: None,
             workspace: None,
+            reset: ResetState::default(),
+            steers: Vec::new(),
         }
     }
 
@@ -227,6 +255,7 @@ impl Progress {
             run_id: Some(self.run_id.clone()),
             workspace: self.workspace.as_ref().and_then(|mount| mount.head.clone()),
             error: None,
+            resets: self.reset.count,
         }
     }
 
@@ -361,6 +390,12 @@ impl Run<'_> {
                 (self.task.memory_in_state && self.task.memory_writable())
                     .then(MemoryTool::definition),
             )
+            .chain(
+                self.task
+                    .context_reset
+                    .as_ref()
+                    .map(context_reset::definition),
+            )
             .collect()
     }
 }
@@ -399,6 +434,9 @@ fn next_request(
         prefix: None,
         remember: false,
         model: task.model.clone(),
+        tool_guidance: task.tool_guidance.clone(),
+        skills: !task.skills.is_empty(),
+        draw: task.draw.as_ref().map(|draw| draw.id),
     }
 }
 
@@ -442,10 +480,16 @@ pub(crate) async fn drive(
     task: &AgentTask,
     source: ReportSource,
 ) -> Result<(AgentReport, u32), String> {
-    let run_id = match task.run_id_source {
-        RunIdSource::ExecutionId => ctx.execution_id().to_string(),
+    // A draw with a root has the run id `{root}:s{n}` (issue #2440).
+    let draw_run_id = match &task.draw {
+        Some(draw) => draw.run_id()?,
+        None => None,
+    };
+    let run_id = match (draw_run_id, task.run_id_source) {
+        (Some(draw), _) => draw,
+        (None, RunIdSource::ExecutionId) => ctx.execution_id().to_string(),
         // A run recorded before the change keeps its recorded run id.
-        RunIdSource::WorkflowId => ctx.workflow_id().to_owned(),
+        (None, RunIdSource::WorkflowId) => ctx.workflow_id().to_owned(),
     };
     // A system message inside the history is dropped. Only `task.system`
     // reaches the model as the system prompt.
@@ -464,15 +508,7 @@ pub(crate) async fn drive(
         tracing::warn!(error = %err, "the mesh search attribute was not set");
     }
     let mut tree = root_tree(ctx, task, &progress.run_id);
-    let agent = match &task.mandate {
-        Some(mandate) => {
-            mandate
-                .validate()
-                .map_err(|err| format!("the task mandate is not valid: {err}"))?;
-            Some(discover(ctx, mandate).await?)
-        }
-        None => None,
-    };
+    let agent = root_member(ctx, task).await?;
     let mut input = task.input.as_str();
     let mut delivered = 0_u32;
     loop {
@@ -632,8 +668,19 @@ async fn open_segment(
         messages.push(ChatMessage::text(ChatRole::System, system));
     }
     messages.append(&mut progress.messages);
+    if task.context_reset.is_some() && input == followup::WAKE_MESSAGE {
+        progress.reset.woken_by = booking(&messages);
+    }
     messages.push(ChatMessage::text(ChatRole::User, input));
+    if progress.reset.restore
+        && let Some(notes) = &progress.reset.notes
+    {
+        messages.extend(context_reset::restored(&notes.text));
+    }
     progress.messages = messages;
+    progress.steers.clear();
+    // A save turn that ended its segment has no reset to run.
+    progress.reset.pending = false;
     if progress
         .sent
         .as_ref()
@@ -684,7 +731,9 @@ pub(crate) async fn run_segment(
                 return Ok(AgentStop::Interrupted);
             }
             if let Some(book) = progress.steer.as_mut() {
-                take_steers(ctx, book, &mut progress.messages)?;
+                let steers = take_steers(ctx, book)?;
+                progress.messages.extend(steers.iter().cloned());
+                progress.steers.extend(steers);
             }
         }
         // A delegation adds the child usage after a turn. A tree over its cap
@@ -696,15 +745,15 @@ pub(crate) async fn run_segment(
         {
             return Ok(AgentStop::TokensExhausted);
         }
-        let request = next_request(run, progress, tree, &extra_tools, progress.messages.clone());
+        let cap = task.request_cap();
+        let (request, len) = sized_request(run, progress, tree, &extra_tools, input);
         // A request the engine would refuse is not sent. The refusal is not
         // retryable, so it would fail the run after earlier work was paid for.
         //
         // A task recorded before the whole-request budget read a zero cap as a
         // limit of zero bytes. Its run ended here, so a replay must end here.
-        let cap = task.request_cap();
         let legacy_zero_cap = cap == 0 && !task.whole_request_budget;
-        if legacy_zero_cap || exceeds_bytes(&request, cap) {
+        if legacy_zero_cap || (cap > 0 && len > cap) {
             return Ok(AgentStop::TranscriptFull);
         }
         let turn: ModelTurn = match send_turn(ctx, run.live, progress, request).await {
@@ -739,15 +788,12 @@ pub(crate) async fn run_segment(
         let calls = turn.calls();
 
         if calls.is_empty() {
+            if save_reply(progress, &turn, over_budget) {
+                continue;
+            }
             progress.push_assistant(&turn);
             progress.answer = Some(turn.text());
-            return Ok(if over_budget {
-                AgentStop::TokensExhausted
-            } else if turn.stop == StopReason::MaxTokens {
-                AgentStop::OutputCapped
-            } else {
-                AgentStop::Completed
-            });
+            return Ok(answer_stop(&turn, over_budget));
         }
         // A turn with calls that ends here is NOT added to the transcript. A
         // tool call with no result would make the transcript invalid for the
@@ -779,6 +825,8 @@ pub(crate) async fn run_segment(
 
         match Box::pin(run_round(ctx, run, progress, tree, slot, &turn, calls)).await? {
             RoundEnd::Continue => {}
+            // The reset of a save round runs next, with the notes it has.
+            RoundEnd::Full if progress.reset.pending => {}
             RoundEnd::Full => {
                 // Not every call ran, so the text of the turn is no answer.
                 // It can claim work that never ran.
@@ -793,6 +841,211 @@ pub(crate) async fn run_segment(
             }
         }
     }
+}
+
+/// How a segment ends on `turn`, a turn with no calls.
+fn answer_stop(turn: &ModelTurn, over_budget: bool) -> AgentStop {
+    if over_budget {
+        AgentStop::TokensExhausted
+    } else if turn.stop == StopReason::MaxTokens {
+        AgentStop::OutputCapped
+    } else {
+        AgentStop::Completed
+    }
+}
+
+/// Whether a turn with no calls is the text reply to a save turn (issue
+/// #2453). Such a reply has not ended the task. The reset drops it and runs
+/// before the next request. A bound that ends the run still ends it.
+fn save_reply(progress: &Progress, turn: &ModelTurn, over_budget: bool) -> bool {
+    progress.reset.pending && !over_budget && turn.stop != StopReason::MaxTokens
+}
+
+/// The next request and its size, after a context reset when one is due
+/// (issue #2453).
+///
+/// A reset reads only the recorded window, the cap and the reset count, so
+/// replay takes the same reset.
+fn sized_request(
+    run: Run<'_>,
+    progress: &mut Progress,
+    tree: &Tree,
+    extra_tools: &[ToolDefinition],
+    input: &str,
+) -> (ModelTurnRequest, u64) {
+    let request = next_request(run, progress, tree, extra_tools, progress.messages.clone());
+    let len = json_len(&request);
+    if run.task.context_reset.is_none() {
+        return (request, len);
+    }
+    match plan_reset(run, progress, tree, extra_tools, input, len) {
+        Some(window) => {
+            progress.messages = window;
+            let request = next_request(run, progress, tree, extra_tools, progress.messages.clone());
+            let len = json_len(&request);
+            (request, len)
+        }
+        None => (request, len),
+    }
+}
+
+/// Plan the context reset before one request of `len` bytes (issue
+/// #2453). Returns the new window, or `None` to send the window as it is.
+///
+/// A due reset first asks for a save turn. The loop sends the window with a
+/// fixed notice, and only `save_progress` runs in that round. The model so
+/// reads each result before the reset drops it. The reset runs before the
+/// next request.
+///
+/// The save turn needs room under the cap for the notice and the notes.
+/// Without room, the reset runs at once. A reset whose window, with the
+/// notes of that time, still reaches the threshold frees no room. So it does
+/// not run, because it would only spend the next reset.
+fn plan_reset(
+    run: Run<'_>,
+    progress: &mut Progress,
+    tree: &Tree,
+    extra_tools: &[ToolDefinition],
+    input: &str,
+    len: u64,
+) -> Option<Vec<ChatMessage>> {
+    let setting = run.task.context_reset?;
+    let cap = run.task.request_cap();
+    if std::mem::take(&mut progress.reset.pending) {
+        return Some(reset_now(run.task, progress, input));
+    }
+    if !reset_due(
+        progress.reset.count,
+        setting.max_resets,
+        len,
+        cap,
+        setting.reset_at_percent,
+    ) {
+        return None;
+    }
+    let after = reset_window(run.task, progress, input);
+    let after_len = json_len(&next_request(run, progress, tree, extra_tools, after));
+    if reaches_percent(after_len, cap, setting.reset_at_percent) {
+        return None;
+    }
+    let mut noticed = progress.messages.clone();
+    noticed.push(ChatMessage::text(
+        ChatRole::User,
+        context_reset::RESET_NOTICE,
+    ));
+    let noticed_len = json_len(&next_request(
+        run,
+        progress,
+        tree,
+        extra_tools,
+        noticed.clone(),
+    ));
+    if noticed_len.saturating_add(u64::from(setting.max_notes_bytes)) > cap {
+        return Some(reset_now(run.task, progress, input));
+    }
+    progress.reset.pending = true;
+    Some(noticed)
+}
+
+/// Count one reset and return its window. The window does not start with
+/// the last sent window, so the next turn goes in full.
+fn reset_now(task: &AgentTask, progress: &mut Progress, input: &str) -> Vec<ChatMessage> {
+    progress.reset.count = progress.reset.count.saturating_add(1);
+    progress.sent = None;
+    reset_window(task, progress, input)
+}
+
+/// The window after a reset (issue #2453).
+///
+/// It holds the system prompt and the task. In a segment that a follow-up
+/// woke, the booking that woke it follows. The wake message points at that
+/// booking, so the wake message comes next. The booking that this segment
+/// made follows that. Then the notes follow, and last the steers.
+fn reset_window(task: &AgentTask, progress: &Progress, input: &str) -> Vec<ChatMessage> {
+    let messages = &progress.messages;
+    let mut window = Vec::with_capacity(10 + progress.steers.len());
+    window.extend(
+        messages
+            .first()
+            .filter(|message| message.role == ChatRole::System)
+            .cloned(),
+    );
+    window.push(ChatMessage::text(ChatRole::User, task.input.clone()));
+    // The segment starts at its last input message.
+    let start = messages
+        .iter()
+        .rposition(|message| {
+            message.role == ChatRole::User
+                && message.content == [ContentPart::Text(input.to_owned())]
+        })
+        .unwrap_or(0);
+    if input == followup::WAKE_MESSAGE {
+        window.extend(progress.reset.woken_by.iter().flatten().cloned());
+    }
+    if input != task.input {
+        window.push(ChatMessage::text(ChatRole::User, input));
+    }
+    if progress.followup.is_some() {
+        window.extend(booking(&messages[start..]).into_iter().flatten());
+    }
+    if let Some(notes) = &progress.reset.notes {
+        window.extend(context_reset::restored(&notes.text));
+    }
+    window.extend(progress.steers.iter().cloned());
+    window
+}
+
+/// The last `schedule_followup` call of `messages` that booked a follow-up,
+/// alone in its message, and its result. A refused call books nothing, so
+/// it does not count.
+fn booking(messages: &[ChatMessage]) -> Option<[ChatMessage; 2]> {
+    let calls = messages.iter().rev().flat_map(|message| {
+        message
+            .content
+            .iter()
+            .rev()
+            .filter(move |_| message.role == ChatRole::Assistant)
+    });
+    let (call, result) = calls
+        .filter_map(|part| match part {
+            ContentPart::ToolCall { id, name, .. } if name == FOLLOWUP_TOOL => {
+                result_of(messages, id).map(|result| (part, result))
+            }
+            _ => None,
+        })
+        .find(|(_, result)| booked(result))?;
+    Some([
+        ChatMessage {
+            role: ChatRole::Assistant,
+            content: vec![call.clone()],
+        },
+        ChatMessage {
+            role: ChatRole::Tool,
+            content: vec![result.clone()],
+        },
+    ])
+}
+
+/// The result part of the call `id` in `messages`.
+fn result_of<'a>(messages: &'a [ChatMessage], id: &str) -> Option<&'a ContentPart> {
+    messages.iter().find_map(|message| {
+        message.content.iter().find(
+            |part| matches!(part, ContentPart::ToolResult { tool_call_id, .. } if tool_call_id == id),
+        )
+    })
+}
+
+/// Whether a `schedule_followup` result booked a follow-up. The loop guard
+/// can add a note after the JSON, so only the first value counts.
+fn booked(result: &ContentPart) -> bool {
+    let ContentPart::ToolResult { content, .. } = result else {
+        return false;
+    };
+    serde_json::Deserializer::from_str(content)
+        .into_iter::<serde_json::Value>()
+        .next()
+        .and_then(Result::ok)
+        .is_some_and(|value| value["scheduled"] == true)
 }
 
 /// One model turn. A durable agent races it against an interrupt.
@@ -918,15 +1171,12 @@ fn take_interrupt(ctx: &WorkflowContext) -> Result<bool, String> {
         .is_some())
 }
 
-/// Add each waiting steer to the transcript as a user message.
+/// Take each waiting steer as a user message for the transcript.
 ///
 /// A steer whose op already ran is a no-op. A payload that does not decode
 /// is dropped: it carries no message id to keep.
-fn take_steers(
-    ctx: &WorkflowContext,
-    book: &mut SteerBook,
-    messages: &mut Vec<ChatMessage>,
-) -> Result<(), String> {
+fn take_steers(ctx: &WorkflowContext, book: &mut SteerBook) -> Result<Vec<ChatMessage>, String> {
+    let mut messages = Vec::new();
     for raw in ctx
         .drain_signals_raw(STEER_SIGNAL)
         .map_err(|err| err.to_string())?
@@ -940,11 +1190,28 @@ fn take_steers(
         messages.push(ChatMessage::text(ChatRole::User, steer.text));
         SteerBook::note(&mut book.steered, steer.message_id);
     }
-    Ok(())
+    Ok(messages)
 }
 
-/// The system prompt of one segment: the task prompt and the memory
-/// snapshot.
+/// Check the mandate of `task`. Then find the peers that the mandate names,
+/// if it has one.
+///
+/// # Errors
+///
+/// Returns an error when the mandate is not valid, or when the peer lookup
+/// fails.
+async fn root_member(ctx: &WorkflowContext, task: &AgentTask) -> Result<Option<Member>, String> {
+    let Some(mandate) = &task.mandate else {
+        return Ok(None);
+    };
+    mandate
+        .validate()
+        .map_err(|err| format!("the task mandate is not valid: {err}"))?;
+    Ok(Some(discover(ctx, mandate).await?))
+}
+
+/// The system prompt of one segment: the task prompt, the skill list and
+/// the memory snapshot.
 ///
 /// The snapshot is read once per segment, by an activity, so the prompt does
 /// not change inside the segment and replay reads the recorded snapshot.
@@ -955,14 +1222,28 @@ async fn system_prompt(
     ctx: &WorkflowContext,
     task: &AgentTask,
 ) -> Result<(Option<String>, BTreeSet<String>), String> {
+    // A skill name and summary join the prompt, so each segment checks them
+    // first. A durable agent runs its segments outside `drive` (issue #2373).
+    if let Some((name, reason)) = skill::first_invalid(&task.skills) {
+        return Err(format!(
+            "the skill {:?} is not valid: {reason}",
+            truncate(name, crate::mesh::MAX_NAME_LEN)
+        ));
+    }
+    // The list holds names and summaries, never a body (issue #2373).
+    let system = match (task.system.as_deref(), skill::listing(&task.skills)) {
+        (Some(system), Some(list)) if !system.is_empty() => Some(format!("{system}\n\n{list}")),
+        (_, Some(list)) => Some(list),
+        (system, None) => system.map(str::to_owned),
+    };
     let Some(scope) = &task.memory_scope else {
-        return Ok((task.system.clone(), BTreeSet::new()));
+        return Ok((system, BTreeSet::new()));
     };
     let snapshot: MemorySnapshot = ctx
         .execute_activity(&agent_memory_snapshot_info(), scope.clone())
         .await
         .map_err(|e| e.to_string())?;
-    let prompt = task.system.as_ref().map_or_else(
+    let prompt = system.as_ref().map_or_else(
         || snapshot.text().to_owned(),
         |system| format!("{system}\n\n{}", snapshot.text()),
     );
@@ -1136,6 +1417,10 @@ async fn run_round(
             ToolOutcome::error(NOT_RUN_INTERRUPTED).content
         } else if stale {
             ToolOutcome::error(NOT_RUN_STALE).content
+        } else if progress.reset.pending && call.name != SAVE_PROGRESS_TOOL {
+            // The reset drops each result of this round unread, so only the
+            // notes tool runs.
+            ToolOutcome::error(NOT_RUN_RESET).content
         } else if !guard.budget.can_run() {
             // A placeholder for each call exceeds the cap. No result could
             // reach the model, so no call runs.
@@ -1344,6 +1629,7 @@ fn placeholder() -> String {
         NOT_RUN_LOOP,
         NOT_RUN_STALE,
         NOT_RUN_INTERRUPTED,
+        NOT_RUN_RESET,
         INTERRUPTED_CALL,
         INTERRUPTED_APPROVAL,
     ]
@@ -1375,6 +1661,11 @@ const INTERRUPTED_CALL: &str = "the call was cancelled: a person interrupted thi
 /// The answer to a gated call whose approval wait an interrupt ended.
 const INTERRUPTED_APPROVAL: &str =
     "denied: a person interrupted this op while the call waited for an approval";
+
+/// The answer to a call of a save turn other than `save_progress` (issue
+/// #2453). The reset after the turn drops each result unread.
+const NOT_RUN_RESET: &str =
+    "the call did not run: your context resets now, so only save_progress runs in this turn";
 
 /// The answer to a call that did not run because a delegation earlier in the
 /// round added flow labels after the decision.
@@ -1493,8 +1784,8 @@ async fn live_decision(
 
 /// Run one tool call.
 ///
-/// The follow-up tool and the delegate tool run in the workflow. Every other
-/// call is a durable activity.
+/// The follow-up tool, the notes tool and the delegate tool run in the
+/// workflow. Every other call is a durable activity.
 async fn run_tool(
     ctx: &WorkflowContext,
     run: Run<'_>,
@@ -1527,6 +1818,12 @@ async fn run_tool(
             Err(reason) => ToolOutcome::error(&reason),
         });
     }
+    if let Some(settings) = task
+        .context_reset
+        .filter(|_| call.name == SAVE_PROGRESS_TOOL)
+    {
+        return Ok(save_notes(&settings, progress, tree, &call));
+    }
     // State memory is edited in the workflow, so the edit commits with the
     // op (issue #2273).
     if call.name == MEMORY_TOOL
@@ -1547,13 +1844,16 @@ async fn run_tool(
     if let Some(agent) = run.agent.filter(|_| call.name == DELEGATE_TOOL) {
         return delegate(ctx, run, agent, progress, tree, &call).await;
     }
+    // The body comes from the recorded task, so the activity needs no
+    // lookup (issue #2373). A run with no skills offers no such tool.
+    let wants_skill = call.name == LOAD_SKILL_TOOL && !task.skills.is_empty();
     // A memory note keeps the labels of the tree (issue #2272).
     let flow_labels = if call.name == MEMORY_TOOL {
         tree.exercised.clone()
     } else {
         BTreeSet::new()
     };
-    let request = ToolCallRequest {
+    let mut request = ToolCallRequest {
         run_id: progress.run_id.clone(),
         session_id: task.session_id.clone(),
         step: progress.step_base.saturating_add(slot.step),
@@ -1564,7 +1864,15 @@ async fn run_tool(
         labels: slot.labels.cloned(),
         flow_labels,
         workspace: progress.workspace.clone(),
+        skill: None,
     };
+    if wants_skill {
+        request.skill = Some(skill::lookup(
+            &task.skills,
+            &request.call.arguments,
+            skill_room(task.request_cap(), &request),
+        ));
+    }
     // Only a tool that opts in races an interrupt. Any other call runs to
     // its end, because its side effect may be half done.
     if run.live && slot.interruptible {
@@ -1584,6 +1892,45 @@ async fn run_tool(
     }
     let outcome = call_tool(ctx, request).await?;
     Ok(adopt_workspace(progress, outcome))
+}
+
+/// The bytes that the request cap `cap` leaves for a skill body in
+/// `request` (issue #2373). The envelope of the lookup takes a few more
+/// bytes. A cap of zero is no cap, so the room is zero too.
+fn skill_room(cap: u64, request: &ToolCallRequest) -> u64 {
+    /// The JSON around the body: the field name, the tag and the cut mark.
+    const LOOKUP_ENVELOPE_BYTES: u64 = 64;
+    if cap == 0 {
+        return 0;
+    }
+    // A full request leaves room 1, not 0, so the body never goes uncut.
+    cap.saturating_sub(json_len(request))
+        .saturating_sub(LOOKUP_ENVELOPE_BYTES)
+        .max(1)
+}
+
+/// Run one `save_progress` call (issue #2453). The notes live in the
+/// workflow, so replay rebuilds them from the recorded call. They keep the
+/// flow labels of the tree at the time of the save.
+fn save_notes(
+    settings: &crate::ContextReset,
+    progress: &mut Progress,
+    tree: &Tree,
+    call: &ToolCall,
+) -> ToolOutcome {
+    match context_reset::notes_of(&call.arguments, settings) {
+        Ok(text) => {
+            let outcome = ToolOutcome::ok(
+                serde_json::json!({"saved": true, "bytes": text.len()}).to_string(),
+            );
+            progress.reset.notes = Some(ProgressNotes {
+                text,
+                labels: tree.exercised.clone(),
+            });
+            outcome
+        }
+        Err(reason) => ToolOutcome::error(&reason),
+    }
 }
 
 /// The most runs of one tool call whose workspace store fails (issue
@@ -1746,6 +2093,7 @@ async fn delegate(
         usage: child.usage,
         steps_used: steps,
         tool_calls,
+        resets: child.reset.count,
     });
     let outcome = serde_json::json!({
         "agent": peer.name,
@@ -1779,6 +2127,7 @@ fn refuse_delegation(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &s
         usage: TokenUsage::default(),
         steps_used: 0,
         tool_calls: 0,
+        resets: 0,
     });
     refused(refusal, name)
 }
@@ -1984,6 +2333,7 @@ fn merge_child(
         usage: report.usage,
         steps_used: report.steps_used,
         tool_calls: report.tool_calls,
+        resets: report.resets,
     });
     let outcome = serde_json::json!({
         "agent": peer.name,
@@ -2095,6 +2445,7 @@ fn peer_outcome(
                 usage: TokenUsage::new(u32::try_from(reply.tokens).unwrap_or(u32::MAX), 0),
                 steps_used: 0,
                 tool_calls: 0,
+                resets: 0,
             });
             if let Some(refusal) = reply.refusal {
                 refused(refusal, &peer.name)
@@ -2122,6 +2473,7 @@ fn peer_outcome(
                 usage: TokenUsage::default(),
                 steps_used: 0,
                 tool_calls: 0,
+                resets: 0,
             });
             ToolOutcome::error(&format!(
                 "the durable agent {:?} gave no answer: {error}",
@@ -2185,6 +2537,7 @@ fn refuse(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &str) -> Tool
         usage: TokenUsage::default(),
         steps_used: 0,
         tool_calls: 0,
+        resets: 0,
     });
     refused(refusal, name)
 }
@@ -2236,6 +2589,16 @@ fn child_task(
         waiting: Vec::new(),
         // Only a fan-out sets it, after its gate.
         report_failure: false,
+        // A child keeps the setting. Its new run holds no notes of the
+        // parent (issue #2453).
+        context_reset: task.context_reset,
+        // The peer has its own prompt, so the guidance and the skills of the
+        // parent do not apply to it (issue #2373).
+        tool_guidance: std::collections::BTreeMap::new(),
+        skills: std::collections::BTreeMap::new(),
+        // A child is part of the draw of its parent, so its requests keep
+        // the draw id. It has its own run id, so it drops the root.
+        draw: task.draw.as_ref().map(Draw::inherited),
     }
 }
 
@@ -2401,17 +2764,22 @@ async fn cache_tenant(
 /// id, a hit could give a tool a key that an earlier run used, so the turn
 /// skips the cache.
 ///
-/// A delegated child has the run id `{root}:d{n}`. A later run of the same
-/// workflow id gives its child the same id, so the rule covers the root part.
+/// A delegated child has the run id `{root}:d{n}`, and a draw has
+/// `{root}:s{n}` (issue #2440). A draw can delegate, so the suffixes can
+/// chain. A later run of the same workflow id gives its children the same
+/// ids, so the rule covers each root part of the chain.
 fn shares_run_id(run_id: &str, workflow_id: &str, execution_id: &str) -> bool {
-    let root = child_root(run_id).unwrap_or(run_id);
-    (run_id == workflow_id || root == workflow_id) && run_id != execution_id && root != execution_id
+    let chain: Vec<&str> = std::iter::successors(Some(run_id), |id| child_root(id)).collect();
+    chain.contains(&workflow_id) && !chain.contains(&execution_id)
 }
 
-/// The root run id of a delegated child run id `{root}:d{n}`, or `None` for
-/// any other run id.
+/// The parent run id of a child run id `{root}:d{n}` or `{root}:s{n}`, or
+/// `None` for any other run id.
 fn child_root(run_id: &str) -> Option<&str> {
-    let (root, ordinal) = run_id.rsplit_once(":d")?;
+    let (root, suffix) = run_id.rsplit_once(':')?;
+    let ordinal = suffix
+        .strip_prefix('d')
+        .or_else(|| suffix.strip_prefix('s'))?;
     (!ordinal.is_empty() && ordinal.bytes().all(|byte| byte.is_ascii_digit())).then_some(root)
 }
 
@@ -2531,10 +2899,13 @@ pub fn activities() -> Vec<ActivityInfo> {
         agent_precheck_info(),
         agent_discover_peers_info(),
         agent_profile_info(),
+        agent_profile_overlay_info(),
         agent_memory_reset_info(),
         agent_workspace_retain_info(),
         agent_workspace_reset_info(),
         agent_workspace_floor_info(),
+        crate::refine::agent_refine_propose_info(),
+        crate::score::agent_score_info(),
     ]
 }
 
@@ -2595,12 +2966,250 @@ mod tests {
             NOT_RUN_LOOP,
             NOT_RUN_STALE,
             NOT_RUN_INTERRUPTED,
+            NOT_RUN_RESET,
             INTERRUPTED_CALL,
             INTERRUPTED_APPROVAL,
         ] {
             let answer = ToolOutcome::error(message).content;
             assert!(json_len(&answer) <= reserved, "{message}");
         }
+        // The round budget of a recorded run holds this length. A longer
+        // fixed answer would change how that run replays.
+        assert_eq!(
+            reserved,
+            json_len(&ToolOutcome::error(NOT_RUN_STALE).content)
+        );
+    }
+
+    /// A tree with no labels, for a reset test.
+    fn bare_tree() -> Tree {
+        Tree {
+            root: "r".into(),
+            rounds: 0,
+            delegations: 0,
+            exercised: BTreeSet::new(),
+            released: Released::new(),
+            records: Vec::new(),
+            outbox: Outbox::default(),
+        }
+    }
+
+    /// A run of a task, a window and the request size of that window.
+    fn reset_fixture() -> (AgentTask, Progress, u64) {
+        let setting = crate::ContextReset::new(1, 50).max_notes_bytes(100);
+        let task = AgentTask::new("audit").context_reset(setting);
+        let progress = Progress::new(
+            "r".into(),
+            vec![
+                ChatMessage::text(ChatRole::User, "audit"),
+                ChatMessage::text(ChatRole::Assistant, "x".repeat(2_000)),
+            ],
+        );
+        let run = Run {
+            task: &task,
+            agent: None,
+            live: false,
+        };
+        let request = next_request(
+            run,
+            &progress,
+            &bare_tree(),
+            &run.extra_tools(),
+            progress.messages.clone(),
+        );
+        let len = json_len(&request);
+        (task, progress, len)
+    }
+
+    fn plan(task: &AgentTask, progress: &mut Progress, len: u64) -> Option<Vec<ChatMessage>> {
+        let run = Run {
+            task,
+            agent: None,
+            live: false,
+        };
+        plan_reset(
+            run,
+            progress,
+            &bare_tree(),
+            &run.extra_tools(),
+            "audit",
+            len,
+        )
+    }
+
+    #[test]
+    fn a_save_turn_comes_first_and_the_reset_after_it() {
+        let (mut task, mut progress, len) = reset_fixture();
+        task.max_request_bytes = Some(len + 1_000);
+        let noticed = plan(&task, &mut progress, len).expect("a save turn");
+        assert!(progress.reset.pending);
+        assert_eq!(progress.reset.count, 0, "the save turn spends no reset");
+        let last = noticed.last().unwrap();
+        assert_eq!(
+            last.content,
+            vec![ContentPart::Text(context_reset::RESET_NOTICE.to_owned())]
+        );
+        assert_eq!(noticed.len(), progress.messages.len() + 1);
+
+        progress.sent = Some(crate::transcript::Sent::of(&progress.messages));
+        let window = plan(&task, &mut progress, len).expect("the reset");
+        assert!(!progress.reset.pending);
+        assert_eq!(progress.reset.count, 1);
+        assert!(progress.sent.is_none(), "the next turn goes in full");
+        assert_eq!(window, vec![ChatMessage::text(ChatRole::User, "audit")]);
+    }
+
+    #[test]
+    fn with_no_room_for_a_save_turn_the_reset_runs_at_once() {
+        let (mut task, mut progress, len) = reset_fixture();
+        task.max_request_bytes = Some(len);
+        task.context_reset = Some(crate::ContextReset::new(1, 100).max_notes_bytes(100));
+        let window = plan(&task, &mut progress, len).expect("the reset");
+        assert!(!progress.reset.pending);
+        assert_eq!(progress.reset.count, 1);
+        assert_eq!(window, vec![ChatMessage::text(ChatRole::User, "audit")]);
+    }
+
+    #[test]
+    fn the_save_turn_needs_room_for_the_notes() {
+        let (mut task, mut progress, len) = reset_fixture();
+        // The notice fits, but the notes of a save turn would not.
+        task.max_request_bytes = Some(len + 1_000);
+        task.context_reset = Some(crate::ContextReset::new(1, 50).max_notes_bytes(5_000));
+        let window = plan(&task, &mut progress, len).expect("the reset");
+        assert!(!progress.reset.pending, "no save turn");
+        assert_eq!(progress.reset.count, 1);
+        assert_eq!(window, vec![ChatMessage::text(ChatRole::User, "audit")]);
+    }
+
+    #[test]
+    fn under_the_threshold_or_with_no_reset_left_nothing_changes() {
+        let (mut task, mut progress, len) = reset_fixture();
+        task.max_request_bytes = Some(len * 3);
+        assert!(plan(&task, &mut progress, len).is_none(), "under 50 %");
+        task.max_request_bytes = Some(len + 1_000);
+        progress.reset.count = 1;
+        assert!(plan(&task, &mut progress, len).is_none(), "no reset left");
+        assert!(!progress.reset.pending);
+    }
+
+    fn followup_call(id: &str) -> ContentPart {
+        ContentPart::ToolCall {
+            id: id.into(),
+            name: FOLLOWUP_TOOL.into(),
+            arguments: serde_json::json!({"prompt": id, "delay_minutes": 1}),
+        }
+    }
+
+    fn result(id: &str, content: &str) -> ContentPart {
+        ContentPart::ToolResult {
+            tool_call_id: id.into(),
+            content: content.into(),
+        }
+    }
+
+    fn assistant(content: Vec<ContentPart>) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Assistant,
+            content,
+        }
+    }
+
+    fn tool(content: Vec<ContentPart>) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Tool,
+            content,
+        }
+    }
+
+    #[test]
+    fn a_booking_is_the_last_call_that_booked() {
+        let booked = r#"{"in_minutes":1,"scheduled":true}"#;
+        let refused = ToolOutcome::error("a follow-up is already scheduled").content;
+        let messages = vec![
+            ChatMessage::text(ChatRole::User, "task"),
+            assistant(vec![
+                ContentPart::Text("booking".into()),
+                ContentPart::ToolCall {
+                    id: "a".into(),
+                    name: "lookup".into(),
+                    arguments: serde_json::json!({}),
+                },
+                followup_call("f1"),
+            ]),
+            // The loop guard can add a note after the JSON.
+            tool(vec![
+                result("a", "ok"),
+                result("f1", &format!("{booked}\n[note]")),
+            ]),
+            assistant(vec![followup_call("f2")]),
+            tool(vec![result("f2", &refused)]),
+            assistant(vec![followup_call("f3")]),
+            tool(vec![result(
+                "f3",
+                &ToolOutcome::error(NOT_RUN_RESET).content,
+            )]),
+        ];
+        let [call, answer] = booking(&messages).expect("the booking");
+        assert_eq!(call.content, vec![followup_call("f1")]);
+        assert_eq!(answer.content.len(), 1);
+        assert!(booked_part(&answer.content[0]));
+        assert!(booking(&messages[..2]).is_none(), "a call with no result");
+        assert!(
+            booking(&messages[3..]).is_none(),
+            "refused calls book nothing"
+        );
+    }
+
+    fn booked_part(part: &ContentPart) -> bool {
+        booked(part)
+    }
+
+    #[test]
+    fn a_woken_window_keeps_the_booking_that_woke_it() {
+        let booked = r#"{"in_minutes":1,"scheduled":true}"#;
+        let task = AgentTask::new("audit").system("s");
+        let mut progress = Progress::new(
+            "r".into(),
+            vec![
+                ChatMessage::text(ChatRole::System, "s"),
+                ChatMessage::text(ChatRole::User, "audit"),
+                assistant(vec![followup_call("f1")]),
+                tool(vec![result("f1", booked)]),
+                ChatMessage::text(ChatRole::User, followup::WAKE_MESSAGE),
+                // This segment books again.
+                assistant(vec![followup_call("f2")]),
+                tool(vec![result("f2", booked)]),
+            ],
+        );
+        progress.followup = Some(Planned { delay_secs: 60 });
+        progress.reset.woken_by = booking(&progress.messages[..4]);
+        let window = reset_window(&task, &progress, followup::WAKE_MESSAGE);
+        let ids: Vec<String> = window
+            .iter()
+            .map(|message| match &message.content[0] {
+                ContentPart::Text(text) => text.chars().take(5).collect(),
+                ContentPart::ToolCall { id, .. }
+                | ContentPart::ToolResult {
+                    tool_call_id: id, ..
+                } => id.clone(),
+            })
+            .collect();
+        assert_eq!(ids, ["s", "audit", "f1", "f1", "[Sche", "f2", "f2"]);
+        // A durable follow-up op has the wake message as its task.
+        let durable = AgentTask::new(followup::WAKE_MESSAGE);
+        progress.followup = None;
+        let window = reset_window(&durable, &progress, followup::WAKE_MESSAGE);
+        assert_eq!(
+            window.len(),
+            4,
+            "the system prompt, the task and the booking"
+        );
+        assert_eq!(window[2].content, vec![followup_call("f1")]);
+        // A second reset of the op still keeps the booking.
+        progress.messages = window;
+        let again = reset_window(&durable, &progress, followup::WAKE_MESSAGE);
+        assert_eq!(again, progress.messages);
     }
 
     #[test]
@@ -2631,6 +3240,23 @@ mod tests {
         assert!(!shares_run_id("0e3c", "daily", "0e3c"));
         // A test context has neither id.
         assert!(!shares_run_id("run-1", "", "00000000"));
+    }
+
+    #[test]
+    fn a_draw_of_a_workflow_id_run_skips_the_cache() {
+        assert!(shares_run_id("daily:s0", "daily", "0e3c"));
+        assert!(shares_run_id("daily:s1:d2", "daily", "0e3c"));
+        assert!(!shares_run_id("0e3c:s1", "daily", "0e3c"));
+        assert!(!shares_run_id("0e3c:s1:d2", "daily", "0e3c"));
+        // A draw that `run_draws` starts has a recorded UUID as its root, so
+        // the child sees no shared id.
+        assert!(!shares_run_id(
+            "01890a5d-ac96-774b-bcce-b302099a8057:s0",
+            "child-wf",
+            "child-exec"
+        ));
+        // Only a numeric suffix marks a child.
+        assert!(!shares_run_id("daily:sx", "daily", "0e3c"));
     }
 
     #[test]

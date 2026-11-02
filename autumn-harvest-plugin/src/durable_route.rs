@@ -30,6 +30,7 @@
 //! See `docs/durable-routes.md` for the guide. `docs/design/DESIGN-durable-routes.md`
 //! and `docs/design/DESIGN-durable-streaming.md` are the design records.
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fmt::Display;
@@ -1171,7 +1172,17 @@ trait RunReads: Sync {
     fn successor(
         &self,
         exec_id: ExecutionId,
-    ) -> impl Future<Output = HarvestResult<Option<ExecutionId>>> + Send;
+    ) -> impl Future<Output = HarvestResult<Option<Successor>>> + Send;
+}
+
+/// The next run of a chain, as one successor lookup found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Successor {
+    exec_id: ExecutionId,
+    /// The run had not ended when the lookup read it. It can continue as
+    /// new before the walk reads its snapshot, so the walk must still count
+    /// the chain as live.
+    live: bool,
 }
 
 impl RunReads for DurableRouteRuntime {
@@ -1188,7 +1199,7 @@ impl RunReads for DurableRouteRuntime {
         wait_at_most(budget, handle.result_snapshot_with_wait(budget)).await
     }
 
-    async fn successor(&self, exec_id: ExecutionId) -> HarvestResult<Option<ExecutionId>> {
+    async fn successor(&self, exec_id: ExecutionId) -> HarvestResult<Option<Successor>> {
         chain_successor(self, exec_id).await
     }
 }
@@ -1281,7 +1292,13 @@ async fn wait_for_result(
         }
         steps += 1;
         match reads.successor(current).await {
-            Ok(Some(next)) => current = next,
+            Ok(Some(next)) => {
+                // The lookup saw a live run, which can continue as new before
+                // the next snapshot. Without this, that race reads as a walk
+                // over ended runs and answers a final 500, not pending.
+                saw_live |= next.live;
+                current = next.exec_id;
+            }
             Ok(None) => {
                 return Waited::Terminal {
                     exec_id: current,
@@ -1316,7 +1333,7 @@ fn read_error(error: &HarvestError) -> ReadFailure {
 async fn chain_successor(
     runtime: &DurableRouteRuntime,
     exec_id: ExecutionId,
-) -> HarvestResult<Option<ExecutionId>> {
+) -> HarvestResult<Option<Successor>> {
     let sharded = runtime.pool.sharded_pool();
     let shard = sharded.routed_shard_for_execution(exec_id);
     let mut held = autumn_harvest::pool::acquire_within_pool_bound(sharded.pool_for(shard)).await?;
@@ -1335,13 +1352,24 @@ async fn chain_successor(
     // the lookup keeps to this chain.
     let live_chain = live.first_exec_id.unwrap_or(live.id);
     let newest = newest_chain_run(conn, &live.workflow_name, &live.workflow_id, live_chain).await?;
+    let ended = |exec_id| Successor {
+        exec_id,
+        live: false,
+    };
     match newest {
         // The newest run of the chain stands in for the whole same-type chain.
-        Some((run, state)) if run != live_id && state != "CONTINUED_AS_NEW" => Ok(Some(run)),
+        Some((run, state)) if run != live_id && state != "CONTINUED_AS_NEW" => {
+            Ok(Some(Successor {
+                exec_id: run,
+                live: !crate::api::is_terminal_state(&state),
+            }))
+        }
         // A sealed newest run leads on through its continue-as-new event. A
         // run that a rerun sealed has no such event, so it reports itself.
-        Some((run, _)) if run != live_id => Ok(Some(continued_as(conn, run).await?.unwrap_or(run))),
-        _ => continued_as(conn, live_id).await,
+        Some((run, _)) if run != live_id => {
+            Ok(Some(ended(continued_as(conn, run).await?.unwrap_or(run))))
+        }
+        _ => Ok(continued_as(conn, live_id).await?.map(ended)),
     }
 }
 
@@ -1366,7 +1394,7 @@ async fn newest_chain_run(
             executions::id
                 .eq(chain)
                 .nullable()
-                .or(executions::first_exec_id.eq(chain)),
+                .or(harvest_workflow_executions_ext::first_exec_id.eq(chain)),
         )
         // A reconciled migration seal is a stub, not a run.
         .filter(executions::migrated_run_terminal_at.is_null())
@@ -2939,6 +2967,9 @@ mod tests {
         snapshot_error: Option<fn() -> HarvestError>,
         wait_error: Option<fn() -> HarvestError>,
         successor_error: Option<fn() -> HarvestError>,
+        /// Whether the lookup reports `next` as live. `None` derives it from
+        /// the state of `next`, as Postgres does at the time of the lookup.
+        next_live: Option<bool>,
     }
 
     /// Runs in memory. The chain counts its waits and its successor reads.
@@ -2961,6 +2992,7 @@ mod tests {
                     snapshot_error: None,
                     wait_error: None,
                     successor_error: None,
+                    next_live: None,
                 },
             );
             exec_id
@@ -3018,13 +3050,19 @@ mod tests {
         fn successor(
             &self,
             exec_id: ExecutionId,
-        ) -> impl Future<Output = HarvestResult<Option<ExecutionId>>> + Send {
+        ) -> impl Future<Output = HarvestResult<Option<Successor>>> + Send {
             self.successors
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let run = &self.runs[&exec_id];
+            let next = run.next.map(|next| Successor {
+                exec_id: next,
+                live: run
+                    .next_live
+                    .unwrap_or_else(|| !self.runs[&next].state.is_terminal()),
+            });
             std::future::ready(
                 run.successor_error
-                    .map_or_else(|| Ok(run.next), |error| Err(error())),
+                    .map_or_else(|| Ok(next), |error| Err(error())),
             )
         }
     }
@@ -3065,6 +3103,27 @@ mod tests {
             wait_for_result(&lone, &waiters(1), DEFAULT_MAX_CHAIN_STEPS, x, ONE_SECOND).await;
         assert!(matches!(&waited, Waited::Terminal { exec_id, result }
             if *exec_id == x && result.state == WorkflowResultState::ContinuedAsNew));
+    }
+
+    /// A successor that was live at its lookup can continue as new before
+    /// the walk reads its snapshot. The walk then reads only ended runs, but
+    /// the chain is still moving, so the cap answers pending, not a final
+    /// 500. This was the `same_type_chain_takes_one_step` flake.
+    #[tokio::test]
+    async fn chain_walk_counts_a_successor_that_was_live_at_its_lookup() {
+        let mut chain = FakeChain::default();
+        let end = chain.run(WorkflowResultState::Completed, None);
+        // `newest` was the chain head and still running at the lookup. It
+        // continued as new before its snapshot.
+        let newest = chain.run(WorkflowResultState::ContinuedAsNew, Some(end));
+        let first = chain.run(WorkflowResultState::ContinuedAsNew, Some(newest));
+        chain.run_mut(first).next_live = Some(true);
+        let capped = wait_for_result(&chain, &waiters(1), 1, first, ONE_SECOND).await;
+        assert!(matches!(capped, Waited::NoResult(ReadFailure::Pending)));
+        // The same walk over runs that had all ended stays final.
+        chain.run_mut(first).next_live = Some(false);
+        let ended = wait_for_result(&chain, &waiters(1), 1, first, ONE_SECOND).await;
+        assert!(matches!(ended, Waited::NoResult(ReadFailure::Unreadable)));
     }
 
     // AC-59

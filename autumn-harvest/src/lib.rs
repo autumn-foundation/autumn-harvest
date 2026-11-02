@@ -273,6 +273,8 @@ pub mod completion_callback;
 pub mod completion_trigger;
 /// Per-key concurrency limits for tenant fair-share scheduling (issue #247).
 pub mod concurrency;
+/// Cost-aware deferral of activities while a cost signal is high (autumn#1720).
+pub mod cost_hold;
 // Issue #1821 exempts this module. Each workflow poll runs under
 // `catch_unwind`, so a panic here fails one workflow task, and replay builds a
 // new context. Recovery from a poisoned lock can keep partial replay state.
@@ -429,6 +431,8 @@ pub mod metrics_rs_adapter;
 pub mod migrate;
 /// Durable mutual-exclusion locks for workflow code (`ctx.mutex`, issue #691).
 pub mod mutex;
+/// The log of agent profile overlays (issue #2371).
+pub mod overlay_log;
 /// The owner-local disk cache of decided histories (issue #2258).
 #[cfg(feature = "owner-disk-cache")]
 pub mod owner_disk_cache;
@@ -553,6 +557,9 @@ pub mod slot_tuner;
 pub mod stall_diagnosis;
 /// Request-scoped idempotency keys for plain workflow starts (issue #808).
 pub mod start_idempotency;
+/// One physical table over two diesel `table!` declarations (issue #2492).
+#[cfg(feature = "db")]
+pub mod table_split;
 /// OpenTelemetry integration: trace-context propagation and metrics.
 pub mod telemetry;
 /// Tenant keys: validation shared by tokens, starts and retention (issue #1977).

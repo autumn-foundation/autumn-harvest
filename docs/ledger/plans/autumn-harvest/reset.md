@@ -62,7 +62,7 @@ Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT COUNT(*) FROM "harvest_signals" WHERE (("harvest_signals"."workflow_exec_id" = $1) AND ("h...` | `harvest_signals`: Index Only Scan on `idx_harvest_signals_pending` |
+| 1 | `SELECT COUNT(*) FROM "harvest_signals" WHERE (("harvest_signals"."workflow_exec_id" = $1) AND NOT...` | `harvest_signals`: Index Only Scan on `idx_harvest_signals_pending` |
 
 ## `insert_fork_row`
 

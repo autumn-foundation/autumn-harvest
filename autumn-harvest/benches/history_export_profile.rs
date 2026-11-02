@@ -37,6 +37,7 @@
 //! valgrind --tool=dhat --dhat-out-file=dhat.json "$BIN"
 //! ```
 
+#[allow(dead_code)]
 #[path = "replay_profile_support.rs"]
 mod support;
 

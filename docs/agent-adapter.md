@@ -102,8 +102,9 @@ let built = HarvestBuilder::new()
 `agent` (section 15). `activities()` returns `agent_model_turn`,
 `agent_tool_call`, `agent_memory_snapshot`, `agent_deliver`,
 `agent_precheck`, `agent_discover_peers`, `agent_profile`,
-`agent_memory_reset`, `agent_workspace_retain`, `agent_workspace_reset` and
-`agent_workspace_floor`.
+`agent_profile_overlay` (section 15), `agent_memory_reset`,
+`agent_workspace_retain`, `agent_workspace_reset`, `agent_workspace_floor`,
+`agent_refine_propose` (section 16) and `agent_score` (section 17).
 The test `the_engine_registration_builds` builds this
 exact registration.
 
@@ -288,6 +289,8 @@ shows what ran. The text of that turn is not the answer either.
 
 A `transcript_full` transcript is too large for one request. Do not pass it
 whole as the `history` of a new run. Summarise it, or keep its last turns.
+A run with `AgentTask::context_reset` can reset before it reaches the cap. See
+[Context reset](#context-reset-issue-2453).
 
 Retries follow `ErrorKind::is_retryable`. `RateLimited`, `Transport` and
 `Unavailable` retry with backoff, up to four attempts. So does a model call
@@ -408,8 +411,8 @@ and the run ends under `budget_exceeded`. Three limits apply:
 The adapter owns the payloads it records: `AgentTask`, `ModelTurnRequest`,
 `ModelTurn`, `ToolCallRequest`, `ToolOutcome`, `AgentReport`,
 `HeartbeatTask`, `HeartbeatReport`, `Report`, `ReportSource`,
-`MemoryScope`, `Followups`, `LoopGuard`, `Mandate`, `Peer` and
-`DelegationRecord`. They hold only types this crate
+`MemoryScope`, `Followups`, `LoopGuard`, `Mandate`, `Peer`,
+`DelegationRecord`, `SkillText` and `SkillLookup`. They hold only types this crate
 defines, so the crate owns their serde shape. Replay reads these payloads
 back, so add a field only with `#[serde(default)]`. A new field of an
 activity input also needs `skip_serializing_if` at its default, because a
@@ -655,6 +658,63 @@ The guard is not a cost control. A model that changes its arguments, or a
 tool whose result changes, does not trip it. Use `max_steps`,
 `max_total_tokens` and the chain cap for cost.
 
+### Context reset (issue #2453)
+
+A long run can save its progress and restart from it, after CORAL. The
+setting is off by default.
+
+```rust
+use autumn_harvest_agent::{AgentTask, ContextReset};
+
+// Up to 2 resets, each before a request that reaches 80 % of the cap.
+let task = AgentTask::new("audit the ledger")
+    .context_reset(ContextReset::new(2, 80).max_notes_bytes(4_096));
+```
+
+- The model gets the `save_progress` tool. Its `notes` argument replaces
+  the notes of the run. The workflow handles the call, so no activity runs.
+  Replay reads the call from the recorded model turn.
+- Notes over `max_notes_bytes` get an error result. The earlier notes stay.
+  The default bound is 8 192 bytes.
+- Before each request, the loop measures it against the request cap of
+  [Payload caps](#payload-caps-issue-2040). When the request reaches
+  `reset_at_percent` of the cap and a reset is left, a reset is due. 0 counts
+  as 1, and a value over 100 counts as 100. A zero cap is no cap, so it never
+  resets. The loop measures the reset window with the notes of that time. A
+  reset whose window still reaches the threshold frees no room, so it does
+  not run.
+- A due reset first asks for a save turn. The loop sends the window with the
+  fixed notice `RESET_NOTICE`. The model reads the last round, and only
+  `save_progress` runs in that turn. Each other call gets an error result.
+- The reset runs before the next request. It also runs when the save turn
+  answers in text, or when its round does not fit the cap. The reply to the
+  notice is no answer. A failed save keeps the earlier notes.
+- The save turn needs room under the cap for the notice and
+  `max_notes_bytes`. Without that room, the reset runs at once.
+- The new window is the system prompt and `AgentTask::input`. In a segment
+  that a follow-up woke, the booking that woke it and the wake message
+  follow. A booking of the segment itself follows them. Then the notes and
+  the steers of a durable agent op follow.
+- The notes are the model's own `save_progress` call, with a fixed result.
+  The model wrote them, maybe under the influence of a tool result, so they
+  never go into a user message.
+- `max_resets` counts per run, follow-ups included. With no reset left, the
+  run ends as `transcript_full`, as before. `AgentReport::resets` counts the
+  resets. A report with no reset does not write the field.
+- A reset changes only the transcript. The flow labels belong to the run, so
+  a reset clears no taint.
+- A delegated child takes the setting and starts with no notes. Its resets
+  are its own. `DelegationRecord::resets` counts them.
+- The reset reads only recorded data, so replay takes the same reset. The
+  next turn after a reset goes in full, not as a delta.
+
+A tool round that passes the cap in one step still ends as `transcript_full`.
+The reset runs only before a request. Issue #2461 tracks this limit. A task with no `context_reset` field
+takes no new path, so a recorded run replays as it ran.
+`formal/verus/src/agent_reset.rs` proves that a request over the cap always
+reaches the threshold, and that no run passes `max_resets`.
+`docs/design/DESIGN-2453.md` records the design.
+
 ## 11. Response cache
 
 Replay reads an answer from the history of one run. A second run that sends
@@ -674,8 +734,24 @@ let harness = AgentHarness::new(model).response_cache(cache);
 ```
 
 **The key.** The key is a SHA-256 hash of the model id, the output cap, the
-temperature, the tools, the messages, the tenant and its source, and the
-namespace.
+temperature, the tools, the messages, the tenant and its source, the
+namespace and the draw.
+
+**The draw (issue #2440).** `ChatRequest::draw` names one sample of a run.
+Two draws of one request get two keys, so each draw has its own entry. A
+request with no draw keeps the key that it had before draws, so stored
+entries still hit.
+
+`run_draws` runs each draw as a child `agent_loop` run with the run id
+`{root}:s{n}`. Each call records a new UUID as its root, so two batches never
+share a run id. Tools then get one idempotency key per draw. A draw does not
+deliver, and it has no memory, no workspace and no follow-ups. Each draw gets
+the whole token cap of the task, so the caller bounds the total.
+
+A delegated child keeps the draw id and gets its own run id. A durable agent
+segment also ends in `:s{n}`, but its root is an incarnation id. A model may
+pass the draw to its provider as a seed. Then draw 0 of each run has the
+same seed, and the cache shares that answer across runs.
 
 **The model id.** A model names itself through `AgentModel::model_id`. A
 model with no id is never cached. The crate ships no model with an id. The
@@ -707,7 +783,8 @@ history and never reads the cache.
 **Tool idempotency.** A hit repeats the tool-call ids of the stored answer.
 Tools take the run id, the step and the call id as an idempotency key. With
 `RunIdSource::WorkflowId`, two runs can share a run id. On Postgres, such a
-turn skips the cache. On SQLite, start each run from `AgentTask::new`, which
+turn skips the cache. A child run id `{root}:d{n}` or `{root}:s{n}` of such
+a run skips it too. On SQLite, start each run from `AgentTask::new`, which
 uses the execution id.
 
 **Storage.** The answer goes to your `PayloadStore`, inside a codec
@@ -741,7 +818,7 @@ because a custom codec can quote the answer.
 **Limits.**
 
 - A hit repeats one sample. At a high temperature, a second run gets the
-  same answer.
+  same answer. Give each sample its own draw to keep the samples apart.
 - `max_age` limits what the cache serves, not what the store keeps. Change
   `namespace` to make every old entry a miss. The old blobs stay in the store
   until the index drops them.
@@ -754,12 +831,15 @@ because a custom codec can quote the answer.
 - A run that sets `tenant` records it in each model-turn input. An older
   binary rebuilds that input without it, so set `tenant` only after the
   whole fleet runs this release.
+- A draw records `draw` in its task and in each model-turn input. An older
+  binary drops the field. Its draws then share one key, and its run ids
+  change. Call `run_draws` only after the whole fleet runs this release.
 
-## 12. Evaluate a candidate model or prompt
+## 12. Evaluate a candidate overlay
 
 `eval::evaluate` re-drives a recorded `agent_loop` run with a candidate model
-or prompt (issue #2001). It reports where the decisions of the two runs
-diverge. Turn on the `eval` feature.
+and a profile overlay (issues #2001 and #2375). It reports where the
+decisions of the two runs diverge. Turn on the `eval` feature.
 
 ```rust,ignore
 use autumn_harvest_agent::eval::{Candidate, evaluate};
@@ -780,7 +860,7 @@ change.
 
 | Activity | In an evaluation |
 |---|---|
-| `agent_model_turn` | The candidate model answers, then the candidate policy decides. These are the only live calls. The response cache is skipped, so every turn asks the candidate. |
+| `agent_model_turn` | The candidate model answers under the overlay profile, then the candidate policy decides. These are the only live calls. The response cache is skipped, so every turn asks the candidate. |
 | `agent_tool_call` | The recorded outcome of the same call, or an error stub. No tool runs. |
 | `agent_memory_snapshot` | The recorded snapshot, or an empty one. |
 | `agent_deliver` | A stub. No report leaves the harness. |
@@ -813,11 +893,50 @@ That is not a divergence. `end_diverged` compares how the two runs end, for
 example `Completed` and `TokensExhausted`. `diverged()` reads both.
 `stubbed_tool_calls` counts the calls with no recorded outcome.
 
-### Compare two models
+### Run a whole overlay
 
-`eval::compare` runs two candidates on one source (issue #2271). It returns
-both evaluations and one `TurnDiff` per turn of the two candidates. In that
-diff, `recorded` holds the first candidate.
+`Candidate::overlay` runs the source under a `ProfileOverlay` (issue
+#2375). The harness reads the source profile from the recorded task. That
+profile holds the prompt, the bounds, `read_only`, the model, the mandate,
+the tool guidance and the skills. `agent::overlay::apply` merges the overlay
+before the engine starts.
+
+```rust,ignore
+use autumn_harvest_agent::eval::{Candidate, evaluate};
+use autumn_harvest_agent::ProfileOverlay;
+
+let overlay = ProfileOverlay {
+    guardrails: Some("Never refund twice.".into()),
+    max_steps: Some(4),
+    tool_guidance: [("lookup".into(), "Look up one order at a time.".into())].into(),
+    ..ProfileOverlay::default()
+};
+let evaluation = evaluate(&history, &Candidate::new(harness).overlay(overlay)).await?;
+println!("{}", evaluation.overlay_digest);
+```
+
+| Part | In an evaluation |
+|---|---|
+| The ceilings | `Ceilings::from_profile` of the source profile, so an overlay can only narrow the source bounds and model. `Candidate::ceilings` sets operator ceilings. |
+| A refused overlay | `EvalError::Overlay` with the `OverlayError`. It costs no model call. `compare` checks both overlays first. |
+| `system` and `guardrails` | The system prompt of every turn of the root agent. |
+| `tool_guidance` | The description of each named app tool in the `ToolDefinition` that the model sees (issue #2373). A recorded outcome still answers a call with the same step, name and arguments. |
+| `skills` | The skill list in the system prompt and the `load_skill` tool. A `load_skill` call is a tool call like any other: a recorded outcome answers it, or it gets the stub. |
+| `Candidate::system_prompt` | A one-part overlay that sets `system`. |
+| `Candidate::model` | A one-part overlay that sets `model`. The ceilings admit the model, because the operator names it. The harness and the source mandate must still hold it, or the evaluation fails before any call. Every turn asks it. |
+| `Candidate::agent_model` | A route for one agent. It is not an overlay part. |
+| `Candidate::overlay` | Replaces the parts and the route that a shorthand set before it. It keeps the ceilings and the agent routes. |
+| `Evaluation::overlay_digest` | `ProfileOverlay::digest`: the SHA-256 of the JSON of the overlay. Equal overlays have equal digests. The digest leaves out the ceilings and the agent routes. |
+
+The candidate report shows the recorded run id, as the policy does. So two
+evaluations of one candidate with the same replies are equal.
+
+### Compare two candidates
+
+`eval::compare` runs two candidates on one source (issue #2271). Each can
+hold a model, an overlay or both (issue #2375). It returns both evaluations,
+each with its overlay digest, and one `TurnDiff` per turn of the two
+candidates. In that diff, `recorded` holds the first candidate.
 
 ```rust,ignore
 use autumn_harvest_agent::eval::{Candidate, compare};
@@ -829,7 +948,15 @@ let comparison = compare(&history, &first, &second).await?;
 ```
 
 `Candidate::model` sets the model of every turn. `Candidate::agent_model`
-sets the model of one agent of a delegation tree and wins over it.
+sets the model of one agent of a delegation tree and wins over it. Two
+overlays compare the same way:
+
+```rust,ignore
+let first = Candidate::new(harness_a).overlay(terse);
+let second = Candidate::new(harness_b).overlay(guided);
+let comparison = compare(&history, &first, &second).await?;
+assert_ne!(comparison.first.overlay_digest, comparison.second.overlay_digest);
+```
 
 Each candidate turn is a live model call. `Candidate::max_turns` caps them.
 The default cap is the recorded turn count plus `DEFAULT_EXTRA_TURNS`. The
@@ -838,7 +965,8 @@ cycle replays the history so far, so the time of an evaluation grows with the
 square of the run length.
 
 The harness refuses an erased source, a source that has not ended, a source
-that was cancelled or timed out, and a history that is not an agent run. A history with payload-store references or
+that was cancelled or timed out, and a history that is not an agent run. It
+also refuses an overlay that `agent::overlay::apply` refuses. A history with payload-store references or
 encrypted payloads needs decoding first. The model call blocks in place, so
 run the evaluation on a multi-thread Tokio runtime.
 
@@ -980,8 +1108,8 @@ the [module guide](architecture.md).
 **Search attributes.** Each op upserts `agent_kind`, `agent_status`
 (`running`, `waiting_approval`, `idle`, `paused` or `parked`),
 `agent_last_active_at`, `agent_next_wake_at`, `agent_wake_reason`,
-`agent_tenant`, `agent_mesh` and `agent_tokens_used`. Times are epoch
-milliseconds. The `filter` grammar of `GET /workflows` lists by them. The
+`agent_tenant`, `agent_mesh`, `agent_tokens_used` and
+`agent_profile_version`. Times are epoch milliseconds. The `filter` grammar of `GET /workflows` lists by them. The
 index `idx_harvest_we_agent_wake` serves a range on `agent_next_wake_at`,
 so a list of the agents due to wake reads only those agents.
 
@@ -1068,6 +1196,27 @@ and the edit lands once. No store and no edit key are involved.
 
 `autumn-harvest-agent/examples/agent_session_entity.rs` runs a chat session
 as an agent.
+
+### Progress notes (issue #2453)
+
+`AgentProfile::context_reset` gives each op the
+[context reset](#context-reset-issue-2453). The agent keeps its notes in
+`AgentState::notes`, with the flow labels of the op that saved them.
+
+- Each op shows the notes after its input, as a `save_progress` call and its
+  result. `trim_window` drops old turns, but the notes stay.
+- The transcript in the state holds no copy of the notes. The first turn of
+  an op with notes therefore goes in full, not as a delta.
+- An op that reads the notes takes their labels, so the taint follows the
+  text.
+- Only a segment that may write memory gets the reset and the
+  `save_progress` tool. A read-only op, a heartbeat tick, a follow-up and a
+  peer message get neither, unless the segment has
+  `unattended_memory_writes`. Such a segment can read untrusted data, and a
+  later op with write tools reads the notes. It still reads the notes.
+- A silent tick or a failed op keeps no transcript, so it changes no notes
+  either.
+- `Control::ClearTranscript` clears the notes too.
 
 ### Workspaces (issue #2274)
 
@@ -1198,3 +1347,216 @@ the answer of each model turn in two layers:
   See [durable routes](durable-routes.md#live-chunks).
 - The live text is a preview. The `TurnText` and the run result are the
   answer.
+
+### Profile overlays (issue #2372)
+
+An activated overlay changes the next op only, because each op reads it
+through a recorded activity and keeps that read to its end.
+
+```rust,ignore
+let store = Arc::new(SqliteOverlayStore::open(&db, Arc::new(base.clone()))?);
+let harness = base.overlay_store(store);
+```
+
+- The run reads its profile through `agent_profile`. With a store, the
+  result sets `overlay_store`, and each op that runs a segment also calls
+  `agent_profile_overlay` with the run profile. That result holds the
+  run profile with the overlay applied, and its `overlay_version`. Replay
+  reads both results from history.
+- The version must still validate under the current harness profile.
+  Then it applies to the run profile under the run ceilings. The op takes
+  only the fields that an overlay can set. The mandate, the peers and the heartbeat stay those of the
+  run, so a deploy still changes the next run only.
+- With no store, the op schedules no read. With no active version, the
+  read records `overlay_version: None`, and the op runs on the run
+  profile.
+- A version that `overlay::apply` refuses fails the op. `last_error` names
+  the version, and no model call runs. The agent never runs bare in its
+  place. A deploy that removes a model or lowers a bound refuses an old
+  version in this way.
+- A heartbeat sets its own bounds and model for a tick. They take
+  precedence over the overlay, as they do over the profile.
+- `AgentState::profile_version` keeps the version of the last op that read
+  one. Each op upserts it as `agent_profile_version`, for example `"v2"`.
+  `filter=attrs.agent_profile_version = 'v2'` lists the agents whose last op
+  ran on version 2.
+- Install the store on every worker, and only after every worker runs
+  this version. An older worker cannot replay a history that holds an op
+  read. On a worker with no store, the op read fails and retries. See
+  `docs/design/DESIGN-2372.md`.
+
+### Tool guidance and skills (issue #2373)
+
+A profile and a task can carry two text parts. A profile overlay can set
+both. See `docs/design/DESIGN-2373.md`.
+
+```rust,ignore
+let profile = AgentProfile::new("support")
+    .tool_guidance("lookup", "Look up an order by its id. Never guess an id.")
+    .skill("refund", SkillText::new("Pay a refund.", "Check the order first. ..."));
+```
+
+- **Tool guidance.** The text replaces the description of an app tool in
+  the definition that the model sees. The name, the schema, the effect and
+  the policy stay. A built-in tool keeps its own text. `overlay::apply`
+  refuses a key that names no app tool with `OverlayError::UnknownTool`.
+- **Skills.** The system prompt lists each name and one-line summary under
+  `## Skills`. It never holds a body. The model gets the `load_skill` tool,
+  with `ToolEffect::ReadOnly`. A call is an ordinary `agent_tool_call`, so
+  history records the body and replay reads it from there. The body is cut
+  like any tool result.
+- A run with no skills offers no `load_skill` tool. A call to it is an
+  unknown tool. The harness never shows an app tool with that name.
+- A skill name follows the agent name rules. A summary is one line of at
+  most `MAX_SKILL_SUMMARY_CHARS` characters, with no control character. A
+  body has at most `MAX_SKILL_BODY_BYTES`, and a map holds at most
+  `MAX_SKILLS`. Each segment checks the skills first, so a bad skill fails
+  the run or the op before any model call.
+- The mandate tool allowlist does not need to name `load_skill`.
+- `eval::evaluate` treats a `load_skill` call as any tool call. A recorded
+  call takes its recorded body. A new call gets the stub and counts in
+  `stubbed_tool_calls`.
+- Upgrade every worker before a profile or a task carries skills. An old
+  worker does not know the reserved name.
+- A delegated child gets neither part. Its peer has its own prompt.
+
+## 16. Propose an overlay (issue #2379)
+
+The refine loop (epic #2369) needs candidate overlays. A proposer writes
+one from the evidence of recorded runs. There are two dimensions:
+
+- **INV** edits how the agent works, independent of the subject.
+- **DOM** edits what a practitioner in the domain knows.
+
+An app implements `OverlayProposer` for its provider, as it does
+`AgentModel`. `ModelProposer` implements it over any `AgentModel`, with
+the default INV and DOM templates. `ModelProposer::template` replaces one.
+Install the proposer with `AgentHarness::proposer`.
+
+```rust
+use std::sync::Arc;
+use autumn_harvest_agent::{AgentHarness, ModelProposer};
+
+let harness = AgentHarness::new(Arc::clone(&client))
+    .proposer(Arc::new(ModelProposer::new(client)));
+```
+
+The activity `agent_refine_propose` runs one stage. Its input is a
+`ProposeRequest`: the dimension, the evidence, the base profile, the
+current overlay, the ceilings of the run and the attempt count. The
+current overlay must apply under the ceilings. The activity asks the
+proposer once per attempt. The proposer reads the base profile and the
+ceilings too. It checks each reply with
+`overlay::apply` under the ceilings. It returns one `Stage`:
+
+| Outcome | Meaning |
+|---|---|
+| `Proposed(overlay)` | A valid overlay that differs from `current`. |
+| `KeptBase` | A valid overlay that gives the profile of `current`. It is not a candidate. |
+| `FellBack { error }` | No attempt was valid. The stage inherits `current`. `error` is the last rejection. |
+
+- `ProposalAttempts` is from 1 to 8. The default is 2.
+  `RefinePolicy::proposal_attempts` (#2394) sets it.
+- The next attempt gets the last rejection, so the model can fix it.
+- A reply that does not decode, is above the ceilings or is above the
+  result cap is invalid. So is an attempt over
+  `AgentHarness::proposer_timeout` (at most 13 minutes).
+- A retryable proposer error (`RateLimited`, `Transport`, `Unavailable`)
+  fails the activity. The engine retries the whole stage. `Config`,
+  `Authentication` and `Budget` fail it for good. Any other error spends
+  one attempt.
+- Each ceiling key is required in JSON. Only an explicit `null` sets no
+  limit.
+- The proposed text is model output. Treat it as untrusted until the
+  adoption gate (#2381) accepts it.
+- The retries run inside the activity. So one stage is one recorded
+  result. A crash before the result runs the stage again from attempt 1.
+  Replay reads the result and asks no proposer. On Postgres, a lost
+  worker holds the stage until its 2-hour `start_to_close` ends.
+
+The default templates adapt Harness² text under Apache-2.0. See
+`autumn-harvest-agent/NOTICE`. The design is in
+[`DESIGN-2379.md`](design/DESIGN-2379.md).
+
+## 17. Score a run (issue #2441)
+
+A `Scorer` checks one run and returns a `Verdict`. A verdict is
+`Score(FiniteF64)` or `Reject(reason)`. A higher score is better. A score
+comes from a verifier: a pure check, a test run or a judge model.
+`ChatResponse` has no log-probabilities, so the crate does not use them.
+
+Install each scorer under its id. A later scorer with the same id replaces
+the earlier one.
+
+```rust
+use std::sync::Arc;
+use autumn_harvest_agent::{AgentHarness, ExactMatch, JsonSchema};
+
+let harness = AgentHarness::new(client)
+    .scorer(Arc::new(ExactMatch::new("Paris")))
+    .scorer(Arc::new(JsonSchema::new(schema)));
+```
+
+The activity `agent_score` takes a `ScoreRequest`: a scorer id and a
+`ScoreInput`. The input holds the task input, the final answer, the stop
+reason and the tool results of the run. `ScoreInput::from_run` builds it
+from an `AgentTask` and its `AgentReport`. The activity returns the
+verdict. History records it, so replay never calls the scorer again.
+
+- `FiniteF64` refuses NaN and both infinities. It stores `-0.0` as `0.0`.
+  `Verdict::score` refuses a non-finite value with `ErrorKind::Decode`, and
+  that fails the activity for good.
+- `Verdict::reject` cuts a reason to `MAX_REJECT_REASON_BYTES`. The
+  activity cuts a longer reason and a long error message too.
+- An unknown scorer id fails the activity as `ScorerMissing`. A retryable
+  scorer error retries the activity with backoff.
+- `AgentHarness::score_timeout` bounds one score, judge calls included. The
+  default and the highest value is 13 minutes, below the 15-minute
+  `start_to_close`. A score past it fails as a retryable `Unavailable`.
+- A verdict encodes as `{"score": 0.5}` or `{"reject": "reason"}`.
+
+**Built-in scorers.** `ExactMatch` compares the trimmed answer with the
+trimmed expected text. Each built-in scorer checks one fixed target. For
+a target per task, write an app scorer. `JsonSchema` reads the answer as JSON, with or
+without a Markdown code fence, and checks it with the engine schema check.
+That check covers a subset of JSON Schema: see
+`autumn_harvest::info::validate_against_schema`. Each gives `Score(1.0)` on
+a match. Each rejects a miss, and a run that did not stop as `completed`.
+`with_id` renames one, so a harness can keep two.
+
+**A judge scorer.** A judge is an app scorer that asks a model. It calls
+`ScoreContext::chat` with a harness model name, not the model itself.
+That call:
+
+1. checks the LLM budget of the run (issue #1997), before the model call;
+2. calls the model under `AgentHarness::model_timeout`;
+3. keeps one cost ledger call (issue #1996).
+
+The activity records each ledger call under the run that scores, so a
+strategy run owns the tokens of its judge. A budget refusal fails the
+activity with `LlmBudgetExceeded`, also when the scorer hides the error.
+SQLite has no run budget, so there the check passes.
+
+A failed attempt writes no ledger row on either backend. So an error after
+a paid judge call fails the activity for good, and no retry pays again
+unseen. Return a reject for a judge reply that does not parse. The budget
+sums committed rows only, so the judge calls of one attempt see the spend
+from before that attempt.
+
+A judge reads untrusted text: the answer of the run. Treat its reply as
+data. Clamp a judge score to a fixed range, so one reply such as `1e308`
+cannot rule `select`. Do not put a reject reason back into a prompt as an
+instruction. `ScoreContext::unmetered` builds a context with no budget
+check and no ledger record, for a test of a scorer.
+
+**Select a draw.** `select(&[(DrawId, Verdict)])` picks the draw with the
+highest score. A tie goes to the lowest draw id. A reject never beats a
+score. The result is `None` only when every verdict is a reject, or when
+the list is empty. The order of the list does not change the result.
+
+`select` maps each score to an `i64` order key, the key of
+`f64::total_cmp`. The kernel `best_draw` then works on integers.
+`formal/verus/src/agent_select.rs` proves its three properties. It also
+proves that the key keeps the order of the bits. A proptest checks that the
+key keeps the order of the scores. The design is in
+[`DESIGN-2441.md`](design/DESIGN-2441.md).

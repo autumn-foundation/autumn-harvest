@@ -12,10 +12,12 @@ use std::time::Duration;
 use tracing::Instrument;
 
 use crate::agent::AgentProfile;
+use crate::agent::overlay_store::ProfileOverlayStore;
 use crate::bounds::{exceeds_bytes, json_len};
 use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::{AgentError, ErrorKind};
 use crate::flow::{FlowRules, Released, call_labels};
+use crate::followup::FOLLOWUP_TOOL;
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::live::{Coalescer, LiveEvent, LiveSink};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemorySnapshot, MemoryStore, MemoryTool};
@@ -24,13 +26,16 @@ use crate::mesh_control::{MESH_BUDGET_EXCEEDED, MeshBudget, MeshBudgetExceeded, 
 use crate::message::{ChatMessage, ContentPart, RunId, TokenUsage, ToolDefinition};
 use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MODEL_ID};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
+use crate::refine::{DEFAULT_PROPOSER_TIMEOUT, OverlayProposer};
 use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
+use crate::score::Scorer;
+use crate::skill::{LOAD_SKILL_TOOL, SkillTool};
 use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 
 use crate::transcript::{InMemoryTranscriptStore, PREFIX_MISSING, TranscriptStore, chain};
-use crate::types::{ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome};
+use crate::types::{ModelTurn, ModelTurnRequest, SkillLookup, ToolCallRequest, ToolOutcome};
 use crate::workspace::{WorkspaceHandle, WorkspaceMount, WorkspaceRef, WorkspaceStore};
 
 /// The default cap on one tool result, in characters.
@@ -41,6 +46,14 @@ pub const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 8_000;
 /// A task, a peer or a profile with no model name uses it. A mandate
 /// allowlist names it as any other model.
 pub const DEFAULT_MODEL: &str = "default";
+
+/// The default and highest time budget of one score: 13 minutes (issue
+/// #2441).
+///
+/// It stays below the 15-minute `start_to_close` of `agent_score`. A slow
+/// scorer therefore ends as a failure that the harness reports. SQLite
+/// reports an engine timeout only after the body returns.
+pub const DEFAULT_SCORE_TIMEOUT: Duration = Duration::from_secs(13 * 60);
 
 /// The default time budget of one model call: 13 minutes.
 ///
@@ -122,6 +135,11 @@ pub struct AgentHarness {
     mesh_spend: Option<Arc<dyn MeshSpend>>,
     live: Option<Arc<dyn LiveSink>>,
     workspace: Option<WorkspaceStore>,
+    proposer: Option<Arc<dyn OverlayProposer>>,
+    proposer_timeout: Duration,
+    scorers: BTreeMap<String, Arc<dyn Scorer>>,
+    score_timeout: Duration,
+    overlays: Option<Arc<dyn ProfileOverlayStore>>,
 }
 
 impl AgentHarness {
@@ -136,6 +154,11 @@ impl AgentHarness {
             mesh_spend: None,
             live: None,
             workspace: None,
+            proposer: None,
+            proposer_timeout: DEFAULT_PROPOSER_TIMEOUT,
+            scorers: BTreeMap::new(),
+            score_timeout: DEFAULT_SCORE_TIMEOUT,
+            overlays: None,
             tools: Vec::new(),
             policy: Arc::new(AllowAll),
             temperature: None,
@@ -158,8 +181,12 @@ impl AgentHarness {
     }
 
     /// Add one tool.
+    ///
+    /// The harness never shows a tool named [`LOAD_SKILL_TOOL`], and logs a
+    /// warning for it.
     #[must_use]
     pub fn tool(mut self, tool: Arc<dyn Tool>) -> Self {
+        warn_reserved(tool.as_ref());
         self.tools.push(tool);
         self
     }
@@ -167,7 +194,9 @@ impl AgentHarness {
     /// Add several tools.
     #[must_use]
     pub fn tools(mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) -> Self {
-        self.tools.extend(tools);
+        for tool in tools {
+            self = self.tool(tool);
+        }
         self
     }
 
@@ -210,9 +239,98 @@ impl AgentHarness {
     }
 
     /// The activity-result cap of the workers, in bytes.
-    #[cfg(feature = "eval")]
     pub(crate) const fn result_cap(&self) -> u64 {
         self.max_result_bytes
+    }
+
+    /// Set the overlay proposer of the refine stages (issue #2379).
+    #[must_use]
+    pub fn proposer(mut self, proposer: Arc<dyn OverlayProposer>) -> Self {
+        self.proposer = Some(proposer);
+        self
+    }
+
+    /// Set the time budget of one proposer call.
+    ///
+    /// The budget is at most [`DEFAULT_PROPOSER_TIMEOUT`], so every stage
+    /// fits in the `start_to_close` of `agent_refine_propose`. A higher
+    /// value or zero sets the default.
+    #[must_use]
+    pub fn proposer_timeout(mut self, timeout: Duration) -> Self {
+        self.proposer_timeout = if timeout.is_zero() {
+            DEFAULT_PROPOSER_TIMEOUT
+        } else {
+            timeout.min(DEFAULT_PROPOSER_TIMEOUT)
+        };
+        self
+    }
+
+    /// Read the active overlay of each kind from `store` (issue #2372).
+    #[must_use]
+    pub fn overlay_store(mut self, store: Arc<dyn ProfileOverlayStore>) -> Self {
+        self.overlays = Some(store);
+        self
+    }
+
+    /// The overlay store, if one is installed.
+    pub(crate) fn overlays(&self) -> Option<&Arc<dyn ProfileOverlayStore>> {
+        self.overlays.as_ref()
+    }
+
+    /// The overlay proposer, if one is installed.
+    pub(crate) fn overlay_proposer(&self) -> Option<&Arc<dyn OverlayProposer>> {
+        self.proposer.as_ref()
+    }
+
+    /// The time budget of one proposer call.
+    pub(crate) const fn proposer_budget(&self) -> Duration {
+        self.proposer_timeout
+    }
+
+    /// Add a scorer under its id (issue #2441). The `agent_score` activity
+    /// calls it.
+    ///
+    /// A later scorer with the same id replaces the earlier one.
+    #[must_use]
+    pub fn scorer(mut self, scorer: Arc<dyn Scorer>) -> Self {
+        self.scorers.insert(scorer.id().to_owned(), scorer);
+        self
+    }
+
+    /// Whether the harness has a scorer with this id.
+    #[must_use]
+    pub fn has_scorer(&self, id: &str) -> bool {
+        self.scorers.contains_key(id)
+    }
+
+    /// The scorer with this id.
+    pub(crate) fn scorer_of(&self, id: &str) -> Option<&Arc<dyn Scorer>> {
+        self.scorers.get(id)
+    }
+
+    /// Set the time budget of one score, judge calls included.
+    ///
+    /// The budget is at most [`DEFAULT_SCORE_TIMEOUT`], so a score fits in
+    /// the `start_to_close` of `agent_score`. A higher value or zero sets
+    /// the default.
+    #[must_use]
+    pub fn score_timeout(mut self, timeout: Duration) -> Self {
+        self.score_timeout = if timeout.is_zero() {
+            DEFAULT_SCORE_TIMEOUT
+        } else {
+            timeout.min(DEFAULT_SCORE_TIMEOUT)
+        };
+        self
+    }
+
+    /// The time budget of one score.
+    pub(crate) const fn score_budget(&self) -> Duration {
+        self.score_timeout
+    }
+
+    /// The time budget of one model call.
+    pub(crate) const fn model_budget(&self) -> Duration {
+        self.model_timeout
     }
 
     /// Set the time budget of one model call.
@@ -293,6 +411,22 @@ impl AgentHarness {
             self.models.insert(name, model);
         }
         self
+    }
+
+    /// Whether the registry holds the model `name`. It always holds
+    /// [`DEFAULT_MODEL`].
+    #[must_use]
+    pub fn has_model(&self, name: &str) -> bool {
+        name == DEFAULT_MODEL || self.models.contains_key(name)
+    }
+
+    /// Whether the harness holds the app tool `name` (issue #2373).
+    ///
+    /// A built-in tool is not an app tool. Neither is an app tool with the
+    /// name of a built-in, because a built-in can take its place in a run.
+    #[must_use]
+    pub fn has_tool(&self, name: &str) -> bool {
+        !is_builtin_name(name) && self.tools.iter().any(|tool| tool.name() == name)
     }
 
     /// The model `name`. `None` is the [`DEFAULT_MODEL`].
@@ -663,6 +797,9 @@ impl AgentHarness {
             request.memory_scope.as_ref(),
             request.extra_tools.iter().cloned(),
         );
+        if request.skills {
+            builtins.push(Arc::new(SkillTool));
+        }
         // Only a run with a mandate names its acting agent.
         let mandate = request.agent.is_some();
         // Under a mandate with no peer to offer, a `delegate` call is still a
@@ -675,7 +812,7 @@ impl AgentHarness {
         let tools = self
             .permitted(&builtins, request.allowed_tools.as_ref())
             .filter(|tool| !(hidden_delegate && tool.name() == DELEGATE_TOOL))
-            .map(Tool::definition)
+            .map(|tool| guided(tool, &builtins, &request.tool_guidance))
             .collect();
         (builtins, tools)
     }
@@ -706,6 +843,7 @@ impl AgentHarness {
             tools,
             max_tokens: request.max_output_tokens,
             temperature: self.temperature,
+            draw: request.draw,
         };
         // The key holds the model id, so one model never reads the answer
         // of another.
@@ -1102,11 +1240,14 @@ impl AgentHarness {
     /// the activity signature.
     pub async fn tool_call(&self, request: ToolCallRequest) -> Result<ToolOutcome, String> {
         let call = request.call;
-        let builtins = self.builtins_labelled(
+        let mut builtins = self.builtins_labelled(
             request.memory_scope.as_ref(),
             std::iter::empty(),
             &request.flow_labels,
         );
+        if request.skill.is_some() {
+            builtins.push(Arc::new(SkillTool));
+        }
         // A second check of the mandate. The decision and the call can run on
         // workers with different tool lists.
         if !permits(&builtins, request.allowed_tools.as_ref(), &call.name) {
@@ -1133,6 +1274,10 @@ impl AgentHarness {
         {
             return Ok(self
                 .error_outcome("the tool labels changed after the decision; call the tool again"));
+        }
+        // A built-in wins a name clash, so this is the skill tool.
+        if let Some(lookup) = request.skill.filter(|_| tool.name() == LOAD_SKILL_TOOL) {
+            return Ok(self.skill_outcome(lookup, &call.arguments));
         }
         // A read-only run can read the files but never moves the head.
         let keep_files = !request.read_only;
@@ -1274,6 +1419,24 @@ impl AgentHarness {
             .reset(&mount.scope, mount.generation)
             .await
             .map_err(|err| model_failure(&err))
+    }
+
+    /// The result of a `load_skill` call (issue #2373). The body is cut like
+    /// any tool result. A missing skill is an error that the model reads.
+    fn skill_outcome(&self, lookup: SkillLookup, arguments: &serde_json::Value) -> ToolOutcome {
+        match (lookup, crate::skill::requested(arguments)) {
+            (SkillLookup::Found(body), _) => ToolOutcome::ok(fit_result(
+                truncate(&body, self.tool_output_limit),
+                self.max_result_bytes,
+            )),
+            (SkillLookup::Missing, Some(name)) => self.error_outcome(&format!(
+                "no skill named {:?}; the system prompt lists the skills",
+                truncate(name, crate::mesh::MAX_NAME_LEN)
+            )),
+            (SkillLookup::Missing, None) => {
+                self.error_outcome("load_skill needs a string argument \"name\"")
+            }
+        }
     }
 
     /// An error result whose recorded outcome fits the result cap.
@@ -1428,8 +1591,12 @@ impl AgentHarness {
         // gets no memory tool. An app tool of that name could otherwise slip
         // past the memory-write opt-in.
         let reserved = self.memory.is_some();
+        // `load_skill` is always reserved. An app tool of that name could
+        // otherwise answer a call that the model makes for a skill.
         let taken = move |name: &str| {
-            (reserved && name == MEMORY_TOOL) || builtins.iter().any(|tool| tool.name() == name)
+            (reserved && name == MEMORY_TOOL)
+                || name == LOAD_SKILL_TOOL
+                || builtins.iter().any(|tool| tool.name() == name)
         };
         builtins.iter().map(AsRef::as_ref).chain(
             self.tools
@@ -1454,11 +1621,44 @@ struct Scope<'a> {
     released: &'a Released,
 }
 
+/// The definition of `tool` that the model sees. Guidance replaces the
+/// description of an app tool (issue #2373). A built-in keeps its own text.
+/// The name, the schema and the effect never change.
+fn guided(
+    tool: &dyn Tool,
+    builtins: &[Arc<dyn Tool>],
+    guidance: &BTreeMap<String, String>,
+) -> ToolDefinition {
+    let mut definition = tool.definition();
+    let builtin = builtins.iter().any(|other| other.name() == tool.name());
+    if let Some(text) = guidance.get(tool.name()).filter(|_| !builtin) {
+        definition.description.clone_from(text);
+    }
+    definition
+}
+
+/// Whether `name` is the name of a built-in tool of the crate.
+fn is_builtin_name(name: &str) -> bool {
+    matches!(name, LOAD_SKILL_TOOL | MEMORY_TOOL | DELEGATE_TOOL) || name == FOLLOWUP_TOOL
+}
+
+/// Warn when an app tool takes the reserved name [`LOAD_SKILL_TOOL`]. The
+/// harness never shows such a tool (issue #2373).
+fn warn_reserved(tool: &dyn Tool) {
+    if tool.name() == LOAD_SKILL_TOOL {
+        tracing::warn!(
+            tool = LOAD_SKILL_TOOL,
+            "the name is reserved for skills; the harness never shows this app tool"
+        );
+    }
+}
+
 /// Whether the mandate permits the tool `name`.
 ///
 /// The mandate never bounds a workflow tool, such as `delegate`. Its own
 /// switch governs it. The `memory` tool writes state that later runs read,
-/// so an allowlist must name it.
+/// so an allowlist must name it. The `load_skill` tool needs no entry
+/// either. It reads only the skills of the run and changes nothing.
 fn permits(builtins: &[Arc<dyn Tool>], allowed: Option<&BTreeSet<String>>, name: &str) -> bool {
     allowed.is_none_or(|allowed| allowed.contains(name))
         || (name != MEMORY_TOOL && builtins.iter().any(|tool| tool.name() == name))
@@ -1603,7 +1803,7 @@ fn workspace_timeout() -> String {
     .into_error_payload()
 }
 
-fn model_failure(err: &AgentError) -> String {
+pub(crate) fn model_failure(err: &AgentError) -> String {
     let kind = format!("{:?}", err.kind());
     let message = err.to_string();
     let failure = if err.kind().is_retryable() {
@@ -1646,7 +1846,7 @@ fn fit_result(text: String, cap: u64) -> String {
 }
 
 /// Cut `text` to at most `max` bytes on a char boundary, and mark the cut.
-fn cut_bytes(text: String, max: usize) -> String {
+pub(crate) fn cut_bytes(text: String, max: usize) -> String {
     if text.len() <= max {
         return text;
     }
@@ -1986,6 +2186,56 @@ mod tests {
             _request: &'a ChatRequest,
         ) -> crate::model::BoxFuture<'a, Result<crate::model::ChatResponse, AgentError>> {
             Box::pin(async { Err(AgentError::new(ErrorKind::Provider, "unused")) })
+        }
+    }
+
+    #[test]
+    fn the_registry_holds_the_default_and_each_named_model() {
+        use crate::agent::overlay::ModelRegistry;
+        let harness = AgentHarness::new(Arc::new(NoModel)).model_named("cheap", Arc::new(NoModel));
+        assert!(harness.has_model(DEFAULT_MODEL));
+        assert!(harness.has_model("cheap"));
+        assert!(!harness.has_model("other"));
+        assert!(ModelRegistry::has_model(&harness, "cheap"));
+        assert!(!ModelRegistry::has_model(&harness, "other"));
+        let profile = crate::AgentProfile::new("support");
+        let ceilings = crate::Ceilings {
+            models: ["cheap", "other"].map(str::to_owned).into(),
+            ..crate::Ceilings::from_profile(&profile)
+        };
+        for (name, registered) in [("cheap", true), ("other", false)] {
+            let overlay = crate::ProfileOverlay {
+                model: Some(name.to_owned()),
+                ..crate::ProfileOverlay::default()
+            };
+            let out = crate::agent::overlay::apply(&profile, &overlay, &ceilings, &harness);
+            assert_eq!(out.is_ok(), registered, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_harness_registers_only_its_app_tools() {
+        use crate::agent::overlay::ToolRegistry;
+        use crate::tool::FnTool;
+        let app = |name: &str| {
+            FnTool::new(name, "Mine.", serde_json::json!({}), |_| async {
+                Ok(serde_json::json!(1))
+            })
+            .shared()
+        };
+        let builtins = [
+            crate::skill::LOAD_SKILL_TOOL,
+            crate::memory::MEMORY_TOOL,
+            crate::mesh::DELEGATE_TOOL,
+            crate::followup::FOLLOWUP_TOOL,
+        ];
+        let harness = AgentHarness::new(Arc::new(NoModel))
+            .tool(app("lookup"))
+            .tools(builtins.map(app));
+        assert!(ToolRegistry::has_tool(&harness, "lookup"));
+        assert!(!ToolRegistry::has_tool(&harness, "pay"));
+        for name in builtins {
+            assert!(!ToolRegistry::has_tool(&harness, name), "{name}");
         }
     }
 

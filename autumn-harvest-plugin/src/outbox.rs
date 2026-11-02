@@ -268,7 +268,7 @@ async fn drain_workflow_start_outbox_batch(
         return Ok(OutboxDrainStats::default());
     }
 
-    let Some(app_pool) = state.pool().cloned() else {
+    let Some(app_pool) = crate::state::app_postgres_pool(state) else {
         return Err(AutumnError::service_unavailable_msg(
             "Database not configured for Harvest outbox",
         ));

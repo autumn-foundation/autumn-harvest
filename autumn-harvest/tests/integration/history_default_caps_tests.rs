@@ -327,7 +327,7 @@ async fn seed_execution(conn: &mut AsyncPgConnection, workflow_name: &str) -> Ex
     let workflow_id = format!("history-default-caps-{}", Uuid::new_v4());
 
     diesel::insert_into(harvest_workflow_executions::table)
-        .values(NewWorkflowExecution {
+        .values(&NewWorkflowExecution {
             quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,

@@ -1773,7 +1773,7 @@ async fn load_pending_signals(
 
     let rows: Vec<(String, serde_json::Value)> = dsl::harvest_signals
         .filter(dsl::workflow_exec_id.eq(execution_id.as_uuid()))
-        .filter(dsl::consumed.eq(false))
+        .filter(diesel::dsl::not(dsl::consumed))
         .order((dsl::received_at, dsl::id))
         .select((dsl::signal_name, dsl::payload))
         .load(conn)

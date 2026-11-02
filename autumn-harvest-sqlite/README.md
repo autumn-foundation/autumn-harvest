@@ -33,8 +33,12 @@ you need:
 - **Distributed / multi-worker** execution or **multi-server** crash recovery.
 - **High throughput** — a single writer with `BEGIN IMMEDIATE` is not built for
   a fleet claiming thousands of tasks per second.
-- **`LISTEN`/`NOTIFY` push wake-ups**, DAGs, the management API, worker
+- **`LISTEN`/`NOTIFY` push wake-ups**, DAGs, the full management API, worker
   sessions, or sharding — all v0.1 non-goals here (see below).
+
+To run this backend inside an Autumn app, use `HarvestPlugin` with its
+`sqlite` feature. It drives this runtime and serves the core management
+routes. See [`docs/sqlite-plugin.md`](../docs/sqlite-plugin.md) (issue #2467).
 
 ## Quickstart
 
@@ -158,7 +162,8 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 
 - Distributed / multi-writer workers; multi-server crash recovery.
 - `LISTEN`/`NOTIFY` push wake-ups.
-- The management API, DAGs, worker sessions, sharding.
+- The full management API (`HarvestPlugin` serves the core routes, issue
+  #2467), DAGs, worker sessions, sharding.
 - External activities and a continue-as-new to a different workflow type
   (`continue_as_new_as_type`) — a workflow reaching one of these is rejected
   **loudly, by name**, never silently dropped. The run then ends

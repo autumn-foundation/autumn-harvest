@@ -5,6 +5,8 @@
 //! fired after downtime, and that dropped counts are persisted to the
 //! `last_catchup_dropped` / `last_catchup_at` columns.
 
+use autumn_harvest::schema::harvest_schedules_ext;
+use autumn_harvest::table_split::Ext;
 use std::sync::Arc;
 
 use autumn_harvest::info::WorkflowInfo;
@@ -175,8 +177,8 @@ async fn insert_catchup_schedule(
             dsl::buffered_runs.eq(serde_json::json!([])),
             dsl::buffer_all_max.eq(0),
             dsl::skip_policy.eq("skip"),
-            dsl::catchup_policy.eq(catchup_policy),
-            dsl::catchup_window_secs.eq(catchup_window_secs),
+            Ext(harvest_schedules_ext::catchup_policy.eq(catchup_policy)),
+            Ext(harvest_schedules_ext::catchup_window_secs.eq(catchup_window_secs)),
         ))
         .execute(conn)
         .await
@@ -239,7 +241,7 @@ async fn most_recent_policy_fires_one_and_records_drops() {
         .find(sched_id)
         .select((
             harvest_schedules::dsl::last_catchup_dropped,
-            harvest_schedules::dsl::last_catchup_at,
+            harvest_schedules_ext::last_catchup_at,
         ))
         .first(&mut check)
         .await
@@ -271,7 +273,7 @@ async fn most_recent_policy_fires_one_and_records_drops() {
             .find(sched_id)
             .select((
                 harvest_schedules::dsl::last_catchup_dropped,
-                harvest_schedules::dsl::last_catchup_at,
+                harvest_schedules_ext::last_catchup_at,
             ))
             .first(&mut check)
             .await
@@ -452,7 +454,7 @@ async fn window_policy_fires_only_in_window_slots() {
         .find(sched_id)
         .select((
             harvest_schedules::dsl::last_catchup_dropped,
-            harvest_schedules::dsl::last_catchup_at,
+            harvest_schedules_ext::last_catchup_at,
         ))
         .first(&mut check)
         .await

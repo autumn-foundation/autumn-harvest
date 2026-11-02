@@ -7,6 +7,8 @@
 //! #478 exhaustion reconciliation in both directions, the #350 fire-claim
 //! anti-race gate, and validate-before-commit atomicity.
 
+use autumn_harvest::schema::harvest_schedules_ext;
+use autumn_harvest::table_split::SetExt;
 use std::sync::Arc;
 
 use autumn_harvest::models::HarvestSchedule;
@@ -201,7 +203,7 @@ async fn paused_schedule_stays_paused_and_bookkeeping_preserved() {
             dsl::paused_by.eq(Some("ops")),
             dsl::pause_reason.eq(Some("incident")),
             dsl::runs_started.eq(5),
-            dsl::last_run_at.eq(Some(last_run)),
+            SetExt(harvest_schedules_ext::last_run_at.eq(Some(last_run))),
             dsl::consecutive_failure_count.eq(2),
         ))
         .execute(&mut conn)
