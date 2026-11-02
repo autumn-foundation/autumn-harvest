@@ -273,6 +273,8 @@ pub mod completion_callback;
 pub mod completion_trigger;
 /// Per-key concurrency limits for tenant fair-share scheduling (issue #247).
 pub mod concurrency;
+/// Cost-aware deferral of activities while a cost signal is high (autumn#1720).
+pub mod cost_hold;
 // Issue #1821 exempts this module. Each workflow poll runs under
 // `catch_unwind`, so a panic here fails one workflow task, and replay builds a
 // new context. Recovery from a poisoned lock can keep partial replay state.

@@ -148,6 +148,9 @@ struct HarvestRuntime {
 #[derive(Default)]
 struct HarvestRuntimeSlot {
     builder: Option<HarvestBuilder>,
+    /// Applied to `builder` at startup, when the app state holds the autumn
+    /// cost signal (autumn#1720).
+    cost_deferral: crate::cost::CostDeferral,
     runtime: Option<HarvestRuntime>,
     /// Broker connector registrations (issue #944), stashed alongside the
     /// builder so `start_harvest_runtime` can spawn one consumer loop each
@@ -292,6 +295,9 @@ pub struct HarvestPlugin {
     /// The cap on live durable streams. Set via
     /// [`Self::durable_route_max_streams`].
     durable_route_max_streams: usize,
+    /// The activity types that the autumn cost signal holds (autumn#1720).
+    /// Set via [`Self::cost_deferrable_activities`].
+    cost_deferral: crate::cost::CostDeferral,
     /// The Harvest file on the SQLite backend (issue #2467). Set via
     /// [`Self::sqlite_path`]. Operator config wins over it.
     #[cfg(feature = "sqlite")]
@@ -386,6 +392,7 @@ impl HarvestPlugin {
             durable_route_max_waiters: crate::durable_route::DEFAULT_MAX_WAITERS,
             durable_route_max_chain_steps: crate::durable_route::DEFAULT_MAX_CHAIN_STEPS,
             durable_route_max_streams: crate::durable_route::DEFAULT_MAX_STREAMS,
+            cost_deferral: crate::cost::CostDeferral::default(),
             #[cfg(feature = "sqlite")]
             sqlite_path: None,
         }
@@ -538,6 +545,37 @@ impl HarvestPlugin {
     #[must_use]
     pub const fn durable_route_max_streams(mut self, max_streams: usize) -> Self {
         self.durable_route_max_streams = max_streams;
+        self
+    }
+
+    /// Defer these activity types while the autumn cost signal is high
+    /// (autumn#1720).
+    ///
+    /// The signal is the app's `autumn_web::cost::CostSignal`. It is high
+    /// while its value is above `[cost] defer_threshold`. The workers then
+    /// claim no task of these types. Each task stays `PENDING`, uses no
+    /// attempt and holds no slot. When the signal falls, the next poll
+    /// claims it. Other activities and every workflow task run as usual.
+    ///
+    /// A later call replaces the list. An empty list turns the hold off.
+    /// `try_build` rejects a local activity in the list. See
+    /// `docs/cost-deferral.md`.
+    #[must_use]
+    pub fn cost_deferrable_activities<I, S>(mut self, activities: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.cost_deferral.activities = activities.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set the time before a held dispatch reference returns to the channel
+    /// (autumn#1720). Only a worker with a dispatch channel uses it. The
+    /// default is 5 seconds. The minimum is 1 second.
+    #[must_use]
+    pub const fn cost_hold_recheck(mut self, recheck: std::time::Duration) -> Self {
+        self.cost_deferral.recheck = Some(recheck);
         self
     }
 
@@ -1433,6 +1471,13 @@ impl HarvestPlugin {
             "HarvestPlugin::decode_payloads_on_read",
             2468,
         );
+        // The SQLite worker reads no cost hold, so a held type would run
+        // (autumn#1720).
+        refuse(
+            !self.cost_deferral.activities.is_empty(),
+            "HarvestPlugin::cost_deferrable_activities",
+            crate::sqlite::EPIC_ISSUE,
+        );
         crate::sqlite::build(
             app,
             crate::sqlite::SqliteParts {
@@ -1482,6 +1527,7 @@ impl HarvestPlugin {
             durable_route_max_waiters,
             durable_route_max_chain_steps,
             durable_route_max_streams,
+            cost_deferral,
             #[cfg(feature = "sqlite")]
                 sqlite_path: _,
         } = self;
@@ -1860,6 +1906,7 @@ impl HarvestPlugin {
 
         let slot = Arc::new(Mutex::new(HarvestRuntimeSlot {
             builder: Some(builder),
+            cost_deferral,
             runtime: None,
             #[cfg(feature = "connectors")]
             connectors,
@@ -2145,9 +2192,13 @@ async fn start_harvest_runtime(
     let harvest_pool = resolve_harvest_pool(state, &harvest_config)?;
     let router = ShardRouter::single();
 
-    let (builder, runtime_already_started) = {
+    let (builder, cost_deferral, runtime_already_started) = {
         let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
-        (guard.builder.take(), guard.runtime.is_some())
+        (
+            guard.builder.take(),
+            guard.cost_deferral.clone(),
+            guard.runtime.is_some(),
+        )
     };
     #[cfg(feature = "connectors")]
     let connector_registrations = {
@@ -2198,6 +2249,10 @@ async fn start_harvest_runtime(
     if let Some(cfg) = api_state.canary_config() {
         builder = crate::canary::register_canary(builder, &cfg);
     }
+
+    // The autumn cost signal holds the deferrable activity types
+    // (autumn#1720). `try_build` validates the names.
+    cost_deferral.apply(&mut builder, state);
 
     let mut built = builder
         .try_build()

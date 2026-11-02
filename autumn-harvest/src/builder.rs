@@ -1448,6 +1448,7 @@ impl BuiltHarvest {
         .with_retry_after_ceiling(self.worker_config.retry_after_ceiling)
         .with_retry_budget(self.worker_config.retry_budget.clone())
         .with_adaptive_limit(self.worker_config.adaptive_limit.clone())
+        .with_cost_hold(self.worker_config.cost_hold.clone())
         .with_owner_disk_cache(
             self.worker_config.owner_disk_cache.clone(),
             self.worker_config.owner_disk_cache_min_events,
@@ -1555,6 +1556,7 @@ impl BuiltHarvest {
         .with_retry_after_ceiling(self.worker_config.retry_after_ceiling)
         .with_retry_budget(self.worker_config.retry_budget.clone())
         .with_adaptive_limit(self.worker_config.adaptive_limit.clone())
+        .with_cost_hold(self.worker_config.cost_hold.clone())
         .with_owner_disk_cache(
             self.worker_config.owner_disk_cache.clone(),
             self.worker_config.owner_disk_cache_min_events,
@@ -2851,6 +2853,10 @@ impl HarvestBuilder {
         validate_classic_dags_have_no_compensators(&self.dags)?;
         validate_dag_schedules(&self.dags)?;
         validate_activity_rate_limits(&self.activities)?;
+        if let Some(hold) = &self.worker_config.cost_hold {
+            hold.validate(&self.activities)
+                .map_err(HarvestBuilderError::InvalidWorkerConfig)?;
+        }
         #[cfg(feature = "wasm-activities")]
         validate_wasm_activity_name_collisions(&self.wasm_bindings, &self.activities)?;
         #[cfg(feature = "wasm-activities")]
@@ -4425,6 +4431,16 @@ pub struct WorkerConfig {
     /// The Postgres worker enforces the limit. Local activities and the
     /// `autumn-harvest-sqlite` backend do not use it.
     pub adaptive_limit: crate::adaptive_limit::AdaptiveLimitConfig,
+    /// Holds deferrable activity types while a cost signal is high
+    /// (autumn#1720).
+    ///
+    /// **Off by default.** While the signal is high, the worker claims no
+    /// task of a held type. The task stays `PENDING` and uses no attempt.
+    /// Set via `with_cost_hold`. See [`crate::cost_hold`].
+    ///
+    /// The Postgres worker enforces the hold. Local activities and the
+    /// `autumn-harvest-sqlite` backend do not use it.
+    pub cost_hold: Option<crate::cost_hold::CostHold>,
 }
 
 /// Drop duplicate shard ids, preserving first-occurrence order (issue #797).
@@ -4581,6 +4597,7 @@ impl Default for WorkerConfig {
             scanner: crate::scanner_lease::ScannerConfig::default(),
             retry_budget: crate::retry_budget::RetryBudgetConfig::default(),
             adaptive_limit: crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
+            cost_hold: None,
         }
     }
 }
@@ -5360,6 +5377,14 @@ impl WorkerConfig {
         config: crate::adaptive_limit::AdaptiveLimitConfig,
     ) -> Self {
         self.adaptive_limit = config;
+        self
+    }
+
+    /// Hold deferrable activity types while a cost signal is high
+    /// (autumn#1720). See [`WorkerConfig::cost_hold`].
+    #[must_use]
+    pub fn with_cost_hold(mut self, hold: crate::cost_hold::CostHold) -> Self {
+        self.cost_hold = Some(hold);
         self
     }
 }
@@ -6450,6 +6475,56 @@ mod tests {
         let (registry, _dags, _schedules, _worker_config) =
             built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
         assert_eq!(registry.adaptive_limits().config(), &config);
+    }
+
+    /// The worker registry holds the configured cost hold (autumn#1720).
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_wires_cost_hold_into_worker_registry() {
+        use crate::cost_hold::CostHold;
+
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let built = HarvestBuilder::new()
+            .activities(vec![make_activity("train_model", None, None)])
+            .worker(WorkerConfig::default().with_cost_hold(CostHold::new(|| true, ["train_model"])))
+            .try_build()
+            .expect("a remote activity can be held");
+        let (registry, _dags, _schedules, _worker_config) = built.into_worker_parts();
+        let hold = registry.cost_hold().expect("the registry keeps the hold");
+        assert_eq!(hold.activities(), ["train_model".to_owned()]);
+        assert!(hold.holds());
+
+        let built = HarvestBuilder::new().build();
+        let (registry, _dags, _schedules, _worker_config) = built.into_worker_parts();
+        assert!(registry.cost_hold().is_none(), "no hold by default");
+    }
+
+    /// A local activity runs inline, so a cost hold cannot defer it
+    /// (autumn#1720).
+    #[test]
+    fn try_build_rejects_a_cost_hold_on_a_local_activity() {
+        use crate::cost_hold::CostHold;
+
+        let result = HarvestBuilder::new()
+            .activities(vec![make_local_activity("inline_step", None)])
+            .worker(WorkerConfig::default().with_cost_hold(CostHold::new(|| true, ["inline_step"])))
+            .try_build();
+        let Err(HarvestBuilderError::InvalidWorkerConfig(message)) = result else {
+            panic!("a local activity in a cost hold must fail the build");
+        };
+        assert!(
+            message.contains("local activity 'inline_step'"),
+            "{message}"
+        );
+    }
+
+    /// The cost hold is off by default (autumn#1720).
+    #[test]
+    fn worker_config_cost_hold_is_off_by_default() {
+        assert!(WorkerConfig::default().cost_hold.is_none());
     }
 
     /// The adaptive limit is off by default (issue #1836).

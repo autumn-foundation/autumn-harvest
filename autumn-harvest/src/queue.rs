@@ -1038,7 +1038,8 @@ macro_rules! expired_runs_cte_sql {
 /// (issue #1836).
 ///
 /// `$6` holds the names with unmet requirements. The worker also adds each
-/// activity type at its adaptive limit, with this marker in front.
+/// activity type at its adaptive limit, with this marker in front. A cost
+/// hold adds each type that it holds the same way (autumn#1720).
 /// `Worker::new` rejects a registered name that starts with the marker.
 pub const SATURATED_ACTIVITY_MARKER: char = '\u{1}';
 
