@@ -4,10 +4,9 @@ Issue #2489. Parent epic #2466. Follows #2467 (PR #2474).
 
 ## Problem
 
-Slice 1 ports the core management routes to SQLite. Each of five review
-rounds on PR #2474 found one more place where a SQLite route differs from
-the Postgres wire contract. A review should not be the gate. A shared test
-should fail first.
+Slice 1 ports the core management routes to SQLite. Reviews of PR #2474
+found, one at a time, SQLite routes that differ from the Postgres wire
+contract. A review should not be the gate. A shared test should fail first.
 
 Slice 1 also answers `GET /workflows/{id}/result` with `501`, and it refuses
 the paging keys of `GET /workflows/{id}/history` with `400`.
@@ -26,10 +25,11 @@ the paging keys of `GET /workflows/{id}/history` with `400`.
   `WorkflowRetryScheduled`.
 - A Postgres history event has a global `id` (the cursor) and a 0-based
   `event_id`. A SQLite event has a key `(exec_id, seq)`. `seq` is 0-based.
-- A SQLite event row has no append time. A Postgres row has one.
+- Before this change, a SQLite event row has no append time. A Postgres
+  row has one.
 - Postgres routes a signal, cancel, terminate, query or update that targets
-  a `FAILED` run with a live retry to that retry (issue #843). SQLite answers
-  `409`.
+  a `FAILED` run with a live retry to that retry (issue #843). Before this
+  change, SQLite answers `409`.
 
 Two audit passes compared every ported route. The table lists each real
 break and its decision.
@@ -62,6 +62,8 @@ These stay a documented subset:
 - A cancel is cooperative. It answers `state: "RUNNING"` and
   `deferred: true`.
 - A route refuses a query key that it does not read. Postgres ignores it.
+  `/history` ignores it, as on Postgres. `/result` refuses it on both.
+- An event written before this change has `timestamp: null`.
 - A body that is empty is the default. Postgres needs a content type.
 - A signal key dedupes across the whole run chain. Postgres dedupes per run.
 - A start refuses an idempotency key. Postgres dedupes on it (issue #808).
@@ -103,7 +105,7 @@ Decision: 2, 6 (`SqliteReader::successor`), 7 and a new column for 8.
 | Count filtered events in `total_events`. | `history_filter_holds_only` checks the total. |
 | Bind one parameter per `event_type`. A long filter then hits the SQLite limit. | One JSON array parameter through `json_each`. |
 | Read `recorded_at` on an old file. The reader cannot add the column. | The query asks the file, and a missing column reads `NULL`. |
-| Change a stored event. | `recorded_at` is written by the `INSERT` only. The append-only guard still refuses an `UPDATE`. Replay reads `event_json` only. |
+| Change a stored event. | Only the `INSERT` writes `recorded_at`. The append-only guard still refuses an `UPDATE`. Replay reads `event_json` only. |
 | Route a signal to a sealed `CONTINUED_AS_NEW` run's successor. Postgres does not. | Only a `FAILED` run routes. |
 | Report `newly_cancelled: true` on a repeat cancel. | The driver reads the pending request first. |
 | Fix one backend and leave the other. | Both suites call `wire_contract.rs`. |

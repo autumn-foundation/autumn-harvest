@@ -227,6 +227,19 @@ async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId, outp
         .unwrap();
 }
 
+/// Seal `exec_id` in a terminal failure `state` with `error`.
+async fn mark_ended(conn: &mut AsyncPgConnection, exec_id: ExecutionId, state: &str, error: &str) {
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq(state),
+            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::error.eq(Some(error)),
+        ))
+        .execute(conn)
+        .await
+        .unwrap();
+}
+
 async fn mark_continued_as_new(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -518,4 +531,42 @@ async fn test_get_update_result_orphaned_timed_out() {
     assert_eq!(body["update_id"], update_id.to_string());
     assert_eq!(body["error_type"], "update_orphaned");
     assert_eq!(body["workflow_state"], "TIMED_OUT");
+}
+
+/// The failure states keep the compact form that the SQLite suite checks
+/// too (issue #2489).
+#[tokio::test]
+async fn result_of_a_failed_or_cancelled_run_carries_the_error() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    for (state, compact) in [("FAILED", "failed"), ("CANCELLED", "cancelled")] {
+        let exec_id = seed_running(&mut conn, &format!("ended-{compact}")).await;
+        mark_ended(&mut conn, exec_id, state, "it broke").await;
+        let reply = get_reply(&app, &format!("/workflows/{exec_id}/result")).await;
+        let body = wire_contract::result_is_terminal(&reply, compact);
+        assert_eq!(body["error"], "it broke");
+    }
+}
+
+/// The list, registered and health checks of the shared contract (issue
+/// #2489). The SQLite suite runs the same checks.
+#[tokio::test]
+async fn list_registered_and_health_keep_the_shared_contract() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    wire_contract::list_refuses_an_unknown_state(&get_reply(&app, "/workflows?state=BOGUS").await);
+    wire_contract::list_refuses_an_unknown_state(
+        &get_reply(&app, "/workflows?state=running").await,
+    );
+    let page = get_reply(&app, "/workflows?page_size=1").await;
+    assert_eq!(page.status, 200, "{page:?}");
+    wire_contract::list_envelope_shape(&page.body);
+    let registered = get_reply(&app, "/workflows/registered").await;
+    assert_eq!(registered.status, 200, "{registered:?}");
+    wire_contract::registered_shape(&registered.body);
+    wire_contract::live_shape(&get_reply(&app, "/health/live").await);
+    wire_contract::ready_shape(&get_reply(&app, "/health/ready").await);
 }

@@ -499,7 +499,8 @@ fn already_stopped(runtime: &SqliteRuntime, exec: ExecutionId) -> SqliteResult<S
 /// A cooperative cancel of the live attempt of `exec`.
 ///
 /// A cancelled run and a repeat request answer as no-ops, with the reason
-/// that the run keeps. Any other terminal run is refused, as on Postgres.
+/// that the run keeps. A completed, failed or terminated run is refused, as
+/// on Postgres.
 fn cancel(runtime: &mut SqliteRuntime, exec: ExecutionId, reason: &str) -> SqliteResult<StopAck> {
     let exec = live_attempt(runtime, exec)?;
     if state_of(runtime, exec)? == "CANCELLED" {

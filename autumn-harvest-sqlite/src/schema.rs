@@ -856,8 +856,6 @@ mod tests {
         assert!(conn.execute(insert, ["e1", "k"]).is_err());
     }
 
-    // A fresh database already has the freeze columns from `SCHEMA`, so `migrate` is
-    // a pure no-op (idempotent).
     #[test]
     fn migrate_adds_the_event_append_time() {
         let conn = Connection::open_in_memory().unwrap();
@@ -880,6 +878,8 @@ mod tests {
         assert_eq!(old_row, None, "an old event has no append time");
     }
 
+    // A fresh database already has the freeze columns from `SCHEMA`, so `migrate` is
+    // a pure no-op (idempotent).
     #[test]
     fn migrate_is_a_noop_on_a_fresh_database() {
         let conn = Connection::open_in_memory().unwrap();

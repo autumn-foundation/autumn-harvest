@@ -12,9 +12,7 @@ use std::time::Duration;
 
 use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
 use autumn_harvest::prelude::*;
-use autumn_harvest_sqlite::{
-    HistoryFilter, MAX_HISTORY_PAGE, RunState, SqliteError, SqliteReader, SqliteRuntime,
-};
+use autumn_harvest_sqlite::{HistoryFilter, RunState, SqliteError, SqliteReader, SqliteRuntime};
 use serde_json::{Value, json};
 
 /// Waits for `go` twice, then completes with the last payload.
@@ -156,20 +154,17 @@ async fn an_event_type_filter_keeps_the_unfiltered_totals() {
 }
 
 #[tokio::test]
-async fn a_page_size_is_cut_to_the_bounds() {
+async fn a_zero_page_size_reads_one_event() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("h.db");
     let mut rt = runtime(&db);
     let exec = completed_run(&mut rt).await;
     let reader = SqliteReader::open(&db).unwrap();
-    let all = reader
-        .history_page(exec, &HistoryFilter::new().limit(MAX_HISTORY_PAGE + 1))
-        .unwrap();
-    assert_eq!(all.next, None);
     let one = reader
         .history_page(exec, &HistoryFilter::new().limit(0))
         .unwrap();
-    assert_eq!(one.events.len(), 1, "a zero limit reads one event");
+    assert_eq!(one.events.len(), 1);
+    assert_eq!(one.next, Some(1));
 }
 
 #[test]
@@ -224,4 +219,25 @@ async fn a_top_level_run_has_no_parent() {
         reader.parent(ExecutionId::new()),
         Err(SqliteError::ExecutionNotFound(_))
     ));
+}
+
+/// A file from before issue #2489 has no `recorded_at`. A reader cannot add
+/// the column, so it reads each event with no append time.
+#[tokio::test]
+async fn a_reader_pages_a_file_without_the_append_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("h.db");
+    let exec = {
+        let mut rt = runtime(&db);
+        completed_run(&mut rt).await
+    };
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("ALTER TABLE harvest_events DROP COLUMN recorded_at")
+        .unwrap();
+    drop(conn);
+
+    let reader = SqliteReader::open(&db).unwrap();
+    let page = reader.history_page(exec, &HistoryFilter::new()).unwrap();
+    assert_eq!(page.events.len(), 4);
+    assert!(page.events.iter().all(|event| event.recorded_at.is_none()));
 }

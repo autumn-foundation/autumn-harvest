@@ -24,6 +24,20 @@ async fn parked(ctx: &WorkflowContext, _n: Value) -> Result<Value, String> {
     Ok(json!({ "go": go }))
 }
 
+/// Takes `go` signals until one carries `"stop"`. Each signal adds an
+/// event, so a test can grow a history past one page.
+#[workflow]
+async fn collects(ctx: &WorkflowContext, _n: Value) -> Result<Value, String> {
+    let mut count = 0_u32;
+    loop {
+        let go = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+        if go == json!("stop") {
+            return Ok(json!(count));
+        }
+        count += 1;
+    }
+}
+
 /// Continues as new once. The successor waits for `go`.
 #[workflow]
 async fn hop(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
@@ -81,7 +95,7 @@ fn app(dir: &std::path::Path) -> TestClient {
         .profile("dev")
         .plugin(
             HarvestPlugin::new()
-                .workflows(workflows![parked, hop, brittle, broken, tunable])
+                .workflows(workflows![parked, collects, hop, brittle, broken, tunable])
                 .api("/harvest"),
         )
         .build()
@@ -193,7 +207,8 @@ async fn result_answers_204_while_running_and_the_compact_form_at_the_end() {
         );
     }
 
-    post(&client, &format!("/workflows/{exec}/signal/go"), &json!(7)).await;
+    let signal = post(&client, &format!("/workflows/{exec}/signal/go"), &json!(7)).await;
+    assert_eq!(signal.status, 202, "{signal:?}");
     // A long poll answers once the run ends.
     let done = get(&client, &format!("/workflows/{exec}/result?wait=10s")).await;
     let body = contract::result_is_terminal(&done, "completed");
@@ -270,6 +285,16 @@ async fn a_failed_run_routes_to_its_live_retry() {
     })
     .await;
     contract::result_is_terminal(&answer, "cancelled");
+
+    // A terminate of a failed run ends its retry.
+    let second = start(&client, "brittle", "b-2", json!(null)).await;
+    wait_state(&client, &second, "FAILED").await;
+    let second_retry = retry_of(&client, &second).await;
+    let stop = post_empty(&client, &format!("/workflows/{second}/terminate")).await;
+    assert_eq!(stop.status, 202, "{stop:?}");
+    assert_eq!(stop.body["execution_id"], second_retry, "{stop:?}");
+    assert_eq!(stop.body["newly_terminated"], true);
+    assert_eq!(stop.body["state"], "TERMINATED");
 }
 
 // ── GET /workflows/{id}/history ──────────────────────────────────────────────
@@ -324,6 +349,10 @@ async fn history_pages_with_the_postgres_cursor() {
     .await;
     contract::history_filter_holds_only(&none.body, &[], 0, total);
 
+    // Like Postgres, the route ignores a key that it does not read.
+    let ignored = get(&client, &format!("/workflows/{exec}/history?bogus=1")).await;
+    assert_eq!(ignored.status, 200, "{ignored:?}");
+
     let from_zero = get(&client, &format!("/workflows/{exec}/history?after=0")).await;
     assert_eq!(
         from_zero.body["events"].as_array().map(Vec::len),
@@ -347,6 +376,34 @@ async fn history_pages_with_the_postgres_cursor() {
 }
 
 // ── Describe, by id, list, registered, health ────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn describe_caps_its_history_at_one_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = app(dir.path());
+    let exec = start(&client, "collects", "c-1", json!(null)).await;
+    for n in 0..105 {
+        let signal = post(&client, &format!("/workflows/{exec}/signal/go"), &json!(n)).await;
+        assert_eq!(signal.status, 202, "{signal:?}");
+    }
+    post(
+        &client,
+        &format!("/workflows/{exec}/signal/go"),
+        &json!("stop"),
+    )
+    .await;
+    wait_state(&client, &exec, "COMPLETED").await;
+
+    let describe = get(&client, &format!("/workflows/{exec}")).await;
+    contract::describe_shape(&describe.body);
+    assert_eq!(describe.body["history"].as_array().map(Vec::len), Some(100));
+    assert_eq!(describe.body["history_truncated"], true);
+    let full = get(&client, &format!("/workflows/{exec}/history?limit=1000")).await;
+    assert!(
+        full.body["total_events"].as_u64().unwrap() > 100,
+        "{full:?}"
+    );
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_read_routes_keep_the_postgres_shape() {
@@ -380,7 +437,7 @@ async fn the_read_routes_keep_the_postgres_shape() {
 
     let registered = get(&client, "/workflows/registered").await;
     contract::registered_shape(&registered.body);
-    assert_eq!(registered.body.as_array().map(Vec::len), Some(5));
+    assert_eq!(registered.body.as_array().map(Vec::len), Some(6));
 
     contract::live_shape(&get(&client, "/health/live").await);
     contract::ready_shape(&get(&client, "/health/ready").await);
@@ -419,6 +476,19 @@ async fn the_write_routes_answer_the_postgres_codes() {
     assert_eq!(again.status, 409, "{again:?}");
     assert_eq!(again.body["existing_execution_id"], exec);
     assert_eq!(again.body["existing_state"], "COMPLETED");
+
+    let duplicate = post(
+        &client,
+        "/workflows/parked/signal-with-start",
+        &json!({
+            "workflow_id": "w-1",
+            "signal_name": "go",
+            "id_reuse_policy": "reject_duplicate",
+        }),
+    )
+    .await;
+    assert_eq!(duplicate.status, 409, "{duplicate:?}");
+    assert_eq!(duplicate.body["existing_execution_id"], exec);
 
     // A signal to a terminal run is a 400, as on Postgres.
     let late = post(&client, &format!("/workflows/{exec}/signal/go"), &json!(2)).await;

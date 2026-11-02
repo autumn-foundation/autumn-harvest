@@ -207,7 +207,8 @@ Every other management route answers `501` and links the epic.
   `deferred: true`. The next drive ends the run. A repeat cancel answers
   `newly_cancelled: false` and the first reason.
 - A route refuses a query parameter that it does not read with a `400`.
-  Postgres ignores it. A start option this backend cannot honour, such as
+  Postgres ignores it. `/history` ignores it, as on Postgres. `/result`
+  refuses it on both backends. A start option this backend cannot honour, such as
   `queue`, `priority`, `start_at` or the `Idempotency-Key` header, is a `400`
   that names it. Neither is ever an empty `200`.
 - An empty request body is the default body. Postgres needs a JSON body.
@@ -217,6 +218,8 @@ Every other management route answers `501` and links the epic.
   only.
 - An update completes in the request. `?wait=admitted` and `timeout_secs`
   are refused.
+- An event written before #2489 has `timestamp: null`. A Postgres event
+  always has a time.
 - A cancel or a terminate body has no `failed_task_count`. This backend
   deletes the pending tasks of the run. It does not mark them failed.
 

@@ -247,6 +247,21 @@ async fn history_malformed_cursor_returns_400() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // The same refusals run on SQLite (issue #2489).
+    for query in ["limit=0", "limit=abc", "after=-1", "after=x"] {
+        let (status, body) = get_json(&app, &format!("/workflows/{exec_id}/history?{query}")).await;
+        let reply = wire_contract::Reply {
+            status: status.as_u16(),
+            retry_after: None,
+            execution_id: None,
+            body,
+        };
+        wire_contract::history_refuses(&reply, 400);
+    }
+    // A key that the route does not read is ignored on both backends.
+    let (status, _body) = get_json(&app, &format!("/workflows/{exec_id}/history?bogus=1")).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 /// (e) Non-integer `limit` → 400.
