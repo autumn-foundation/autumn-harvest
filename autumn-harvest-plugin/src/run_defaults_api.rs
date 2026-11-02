@@ -39,6 +39,10 @@ use crate::shard_fanout::UnavailableShard;
 const ROUTE: &str = "PATCH /admin/workflow-types/{workflow_name}/run-defaults";
 
 /// The run-default fields, in whole seconds. `None` sets no value.
+#[expect(
+    clippy::struct_field_names,
+    reason = "the field names are the JSON keys of the route, and each one is in seconds"
+)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct RunDefaultSecs {
     /// The soft SLA.
