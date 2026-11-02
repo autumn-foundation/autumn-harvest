@@ -305,3 +305,15 @@ required-features = ["sqs"]
 [[test]]
 name = "sqlite_plugin"
 required-features = ["sqlite"]
+
+# A SQLite app with a Postgres Harvest database (issue #2472). It starts a
+# Postgres container, so it needs Docker. CI runs it in the
+# `sqlite-plugin-split` job.
+[[test]]
+name = "sqlite_plugin_split"
+required-features = ["sqlite"]
+
+# Per-tenant Harvest in a SQLite fleet app (issue #2472). It needs no Docker.
+[[test]]
+name = "sqlite_plugin_fleet"
+required-features = ["sqlite"]

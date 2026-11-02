@@ -20,6 +20,7 @@
 
 mod api;
 mod driver;
+mod fleet;
 mod handle;
 
 use std::path::{Path, PathBuf};
@@ -32,6 +33,7 @@ use autumn_web::app::AppBuilder;
 use autumn_web::error::AutumnError;
 
 pub use driver::SignalWithStartParams;
+pub use fleet::{HarvestFleet, HarvestTenant, tenant_harvest_file};
 pub use handle::{HarvestSqlite, HarvestSqliteError};
 
 /// The `autumn-harvest-sqlite` types that [`HarvestSqlite`] takes and returns.
@@ -55,6 +57,8 @@ pub(crate) struct SqliteParts {
     pub allow_unauthenticated_mutations: bool,
     /// The Harvest file that the app chose with `HarvestPlugin::sqlite_path`.
     pub path: Option<PathBuf>,
+    /// One Harvest per open fleet tenant (issue #2472).
+    pub per_tenant: bool,
     /// Each option that was set but has no SQLite port: its name and issue.
     pub refused: Vec<(&'static str, u32)>,
 }
@@ -66,6 +70,8 @@ struct Slot {
     driver: Option<Driver>,
     /// The path from `HarvestPlugin::sqlite_path`, if any.
     code_path: Option<PathBuf>,
+    /// Whether to run one Harvest per open fleet tenant.
+    per_tenant: bool,
 }
 
 struct StartParts {
@@ -92,17 +98,12 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         api_middleware,
         allow_unauthenticated_mutations,
         path: code_path,
+        per_tenant,
         mut refused,
     } = parts;
 
     refused.extend(builder_refusals(&builder));
     if let Some(message) = refusal_message(&refused) {
-        panic!("{message}");
-    }
-    let mode = HarvestRuntimeConfig::load()
-        .unwrap_or_else(|error| panic!("cannot load the Harvest configuration: {error}"))
-        .mode;
-    if let Some(message) = mode_refusal(mode) {
         panic!("{message}");
     }
     // Fail now on a bad `[harvest.sqlite]`, not at the first request.
@@ -122,22 +123,23 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
     let api_state = HarvestApiState::new();
     api_state.set_allow_unauthenticated_mutations(allow_unauthenticated_mutations);
     api_state.set_admin_auth_boundary(api_middleware.is_some());
-    let handle_slot: Arc<OnceLock<HarvestSqlite>> = Arc::new(OnceLock::new());
+    let handles = Handles::default();
 
     let slot = Arc::new(Mutex::new(Slot {
         parts: Some(start_parts),
         driver: None,
         code_path,
+        per_tenant,
     }));
     let startup_slot = Arc::clone(&slot);
-    let startup_handle = Arc::clone(&handle_slot);
+    let startup_handles = handles.clone();
     let startup_api_state = api_state.clone();
     let app = app
         .on_startup(move |state| {
             let slot = Arc::clone(&startup_slot);
-            let handle_slot = Arc::clone(&startup_handle);
+            let handles = startup_handles.clone();
             let api_state = startup_api_state.clone();
-            async move { start(&state, &slot, &handle_slot, &api_state).await }
+            async move { start(&state, &slot, &handles, &api_state).await }
         })
         .on_shutdown(move || {
             let slot = Arc::clone(&slot);
@@ -157,8 +159,9 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         return app;
     };
     let mut router = api::router(api::ApiState {
-        handle: handle_slot,
-        api_state,
+        handle: handles.control,
+        fleet: handles.fleet,
+        flags: api_state,
     });
     if let Some(middleware) = api_middleware {
         router = middleware(router);
@@ -220,16 +223,49 @@ fn refusal_message(refused: &[(&'static str, u32)]) -> Option<String> {
     ))
 }
 
-/// The refusal of a mode other than `embedded`, or `None`.
-fn mode_refusal(mode: HarvestMode) -> Option<String> {
+/// The plugin path that serves a mode on a SQLite app (issue #2472).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Backend {
+    /// Harvest in its own SQLite file. See [`build`].
+    Sqlite,
+    /// Harvest in a Postgres database: the Postgres path, with its own pool.
+    Postgres,
+}
+
+/// Embedded mode keeps Harvest next to the app, so it runs on SQLite. Split
+/// and external mode keep Harvest in a Postgres database.
+pub(crate) const fn backend_for(mode: HarvestMode) -> Backend {
     match mode {
-        HarvestMode::Embedded => None,
-        HarvestMode::Split | HarvestMode::External => Some(format!(
-            "harvest.mode = {mode:?} needs a Postgres Harvest database, which a SQLite app \
-             cannot reach yet (autumn-harvest#2472). Use harvest.mode = \"embedded\" with \
-             harvest.sqlite.path"
-        )),
+        HarvestMode::Embedded => Backend::Sqlite,
+        HarvestMode::Split | HarvestMode::External => Backend::Postgres,
     }
+}
+
+/// The refusal of a SQLite-only setting in split or external mode, or
+/// `None`.
+///
+/// Neither setting has an effect on a Postgres Harvest database. A refusal
+/// keeps an operator from believing that the setting works.
+pub(crate) fn split_refusal(
+    mode: HarvestMode,
+    per_tenant: bool,
+    configured_path: Option<&str>,
+) -> Option<String> {
+    let mut set = Vec::new();
+    if configured_path.is_some() {
+        set.push("harvest.sqlite.path");
+    }
+    if per_tenant {
+        set.push("HarvestPlugin::sqlite_per_tenant");
+    }
+    if set.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "harvest.mode = {mode:?} keeps Harvest in Postgres, so these SQLite settings have no \
+         effect: {}. Remove them, or use harvest.mode = \"embedded\" (autumn-harvest#2472)",
+        set.join(", ")
+    ))
 }
 
 /// Where the Harvest file goes (issue #2467).
@@ -298,10 +334,19 @@ fn sibling_harvest_file(app_file: &Path) -> PathBuf {
     app_file.with_file_name(format!("{stem}.harvest.db"))
 }
 
+/// The handles that the startup hook fills and the API reads.
+#[derive(Clone, Default)]
+struct Handles {
+    /// The control Harvest.
+    control: Arc<OnceLock<HarvestSqlite>>,
+    /// The per-tenant Harvests, when `sqlite_per_tenant` is on.
+    fleet: Arc<OnceLock<HarvestFleet>>,
+}
+
 async fn start(
     state: &AppState,
     slot: &Arc<Mutex<Slot>>,
-    handle_slot: &Arc<OnceLock<HarvestSqlite>>,
+    handles: &Handles,
     api_state: &HarvestApiState,
 ) -> autumn_web::AutumnResult<()> {
     api_state.set_deployment_profile(state.profile().to_string());
@@ -310,6 +355,14 @@ async fn start(
 
     let runtime_config = HarvestRuntimeConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    if backend_for(runtime_config.mode) != Backend::Sqlite {
+        // The build read `embedded`. A mode that changed since then would
+        // need the Postgres path, which this build did not mount.
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "harvest.mode changed to {:?} after the build. Restart the app",
+            runtime_config.mode
+        )));
+    }
     if !runtime_config.worker_enabled {
         // One process holds the writer lock. A process with no driver could
         // not write at all, so an API-only replica is not a SQLite topology.
@@ -321,13 +374,18 @@ async fn start(
     let sqlite_config = HarvestSqliteConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     let app_config = state.config();
-    let (parts, code_path) = {
+    let (parts, code_path, per_tenant) = {
         let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
-        (slot.parts.take(), slot.code_path.clone())
+        (slot.parts.take(), slot.code_path.clone(), slot.per_tenant)
     };
     let Some(parts) = parts else {
         // A second startup in one process keeps the running driver.
         return Ok(());
+    };
+    let fleet = if per_tenant {
+        Some(app_fleet(state).map_err(AutumnError::service_unavailable_msg)?)
+    } else {
+        None
     };
     let path = resolve_path(
         sqlite_config.path.as_deref(),
@@ -336,16 +394,17 @@ async fn start(
     )
     .map_err(AutumnError::service_unavailable_msg)?;
     let infos = parts.workflows.clone();
-    let registry = Registry {
+    let registry = Arc::new(Registry {
         workflows: parts.workflows,
         activities: parts.activities,
         updates: parts.updates,
         signals: parts.signals,
         state: Arc::new(with_app_state(parts.state, state)),
-    };
+    });
     let tick = Duration::from_millis(sqlite_config.tick_ms);
     let open_path = path.clone();
-    let runtime = tokio::task::spawn_blocking(move || Driver::open(&open_path, registry))
+    let open_registry = Arc::clone(&registry);
+    let runtime = tokio::task::spawn_blocking(move || Driver::open(&open_path, &open_registry))
         .await
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?
         .map_err(AutumnError::service_unavailable_msg)?;
@@ -360,12 +419,37 @@ async fn start(
             )));
         }
     };
-    let handle = HarvestSqlite::new(driver.sender.clone(), reader, path.clone(), infos);
+    let handle = HarvestSqlite::new(driver.sender.clone(), reader, path.clone(), infos.clone());
     slot.lock().unwrap_or_else(PoisonError::into_inner).driver = Some(driver);
     state.insert_extension(handle.clone());
-    let _ = handle_slot.set(handle);
+    let _ = handles.control.set(handle);
     tracing::info!(path = %path.display(), "harvest is running on SQLite");
+
+    if let Some(fleet) = fleet {
+        let tenants = HarvestFleet::new(fleet, registry, infos, tick);
+        tenants.install().await;
+        state.insert_extension(tenants.clone());
+        let _ = handles.fleet.set(tenants);
+        tracing::info!("harvest runs one SQLite file per open fleet tenant");
+    }
     Ok(())
+}
+
+/// The app's SQLite fleet, for `sqlite_per_tenant` (issue #2472).
+///
+/// # Errors
+///
+/// Returns a message when the app has no fleet.
+fn app_fleet(state: &AppState) -> Result<autumn_web::db::fleet::DatabaseFleet, String> {
+    state
+        .shards()
+        .and_then(autumn_web::sharding::ShardSet::fleet)
+        .cloned()
+        .ok_or_else(|| {
+            "HarvestPlugin::sqlite_per_tenant needs a SQLite fleet: configure \
+             [database.fleet], or remove the option (autumn-harvest#2472)"
+                .to_owned()
+        })
 }
 
 /// Add `AppState` to the activity state, as the Postgres worker does.
@@ -448,12 +532,31 @@ mod tests {
         assert!(error.contains("harvest.sqlite.path"), "{error}");
     }
 
+    /// Split and external mode keep Harvest in Postgres, so they take the
+    /// Postgres path (issue #2472). Only embedded mode runs on SQLite.
     #[test]
-    fn split_and_external_modes_are_refused_with_their_issue() {
-        assert!(mode_refusal(HarvestMode::Embedded).is_none());
+    fn embedded_takes_the_sqlite_path_and_split_takes_postgres() {
+        assert_eq!(backend_for(HarvestMode::Embedded), Backend::Sqlite);
+        assert_eq!(backend_for(HarvestMode::Split), Backend::Postgres);
+        assert_eq!(backend_for(HarvestMode::External), Backend::Postgres);
+    }
+
+    /// A SQLite-only setting has no effect on a Postgres Harvest database.
+    /// The build refuses it, so it is never ignored (issue #2472).
+    #[test]
+    fn split_mode_refuses_the_sqlite_only_settings() {
         for mode in [HarvestMode::Split, HarvestMode::External] {
-            let message = mode_refusal(mode).unwrap();
-            assert!(message.contains("#2472"), "{message}");
+            assert!(split_refusal(mode, false, None).is_none());
+            let path = split_refusal(mode, false, Some("/srv/h.db")).unwrap();
+            assert!(path.contains("harvest.sqlite.path"), "{path}");
+            assert!(path.contains("#2472"), "{path}");
+            let tenant = split_refusal(mode, true, None).unwrap();
+            assert!(tenant.contains("sqlite_per_tenant"), "{tenant}");
+            let both = split_refusal(mode, true, Some("/srv/h.db")).unwrap();
+            assert!(
+                both.contains("harvest.sqlite.path") && both.contains("sqlite_per_tenant"),
+                "{both}"
+            );
         }
     }
 
