@@ -1,8 +1,10 @@
-//! HTTP integration tests for the run-default overrides (issue #2387).
+//! HTTP integration tests for the run-default overrides (issues #2387 and
+//! #2406).
 //!
 //! `GET` and `PATCH /admin/workflow-types/{workflow_name}/run-defaults` set
-//! the operator override of the `sla` and `execution_timeout` of one type.
-//! Each test maps to one acceptance criterion of #2387. No worker runs, so a
+//! the operator override of the `sla`, the `execution_timeout` and the
+//! `chain_execution_timeout` of one type. Each test maps to one acceptance
+//! criterion of #2387 or #2406. No worker runs, so a
 //! started run stays `RUNNING` and its deadlines stay as the start wrote them.
 //!
 //! `GET /admin/overrides` and the `overrides` count on `GET /admin/config`
@@ -678,12 +680,13 @@ async fn the_fleet_chain_ceiling_caps_the_override() {
     assert_eq!(chain_cap(&url, capped).await, (secs(7200), secs(7200)));
 
     // An override below the ceiling is kept.
-    patch(
+    let (status, body) = patch(
         &app,
         CHAIN_WF,
         json!({ "chain_execution_timeout_secs": 1800 }),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let below = start(&app, CHAIN_WF).await;
     assert_eq!(chain_cap(&url, below).await, (secs(1800), secs(1800)));
 }

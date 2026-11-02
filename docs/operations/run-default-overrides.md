@@ -1,7 +1,8 @@
 # Runtime SLA, execution-timeout and chain-cap overrides
 
-A workflow type declares its soft `sla`, its hard `execution_timeout` and its
-chain cap `chain_execution_timeout` in code, through
+A workflow type declares three durations in code: its soft `sla`, its hard
+`execution_timeout` and its chain cap `chain_execution_timeout`. It declares
+them through
 `#[workflow(sla = ..., execution_timeout = ..., chain_execution_timeout = ...)]`.
 A DAG declares `sla` and `execution_timeout` through `#[dag(...)]` or
 `DagInfo`, and its runs take them through its shadow workflow type of the
@@ -78,7 +79,7 @@ The start clamps still apply after the override:
 - The fleet chain ceiling `max_workflow_chain_timeout` still caps the chain
   cap. A root run of a type with no chain cap takes the ceiling as its
   default, as before. A child run of such a type stays uncapped.
-- A completion-trigger start sets no chain cap. A follow-up issue tracks it.
+- A completion-trigger start sets no chain cap. Issue #2511 tracks it.
 - A per-start `sla_secs` or `execution_timeout_secs` in the start request
   still wins over both.
 
@@ -112,9 +113,9 @@ chain in flight keeps its chain deadline, and no option moves it. A shorter
 deadline could end a chain at once. To end a chain early, cancel or terminate
 its current run.
 
-`recompute_in_flight: true` moves the SLA deadline only. It moves the SLA
-deadline of every RUNNING, SUSPENDED or PAUSED run of the type that has not
-breached yet, on every shard:
+`recompute_in_flight: true` moves the SLA deadline only. It moves it on every
+shard, for each RUNNING, SUSPENDED or PAUSED run of the type that has not
+breached yet:
 
 - The run keeps its anchor. The new deadline is the old deadline minus the
   old SLA, plus the new one. A run with no SLA so far anchors at its start.

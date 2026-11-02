@@ -25,7 +25,7 @@ now take the chain cap of the type, the override and the fleet chain ceiling.
 A child spawn now caps its chain cap with the fleet ceiling. The typed `start`
 and `signal_with_start` stubs of `#[workflow]` now apply the run-default
 overrides of a client that shares the cache (#2387). A completion-trigger
-start still sets no chain cap. A follow-up issue tracks it.
+start still sets no chain cap. Issue #2511 tracks it.
 
 **Migration.** `20261102141324_harvest_run_default_chain_timeout` adds the
 nullable column `chain_execution_timeout_secs` to

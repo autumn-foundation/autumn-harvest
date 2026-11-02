@@ -136,6 +136,26 @@ async fn load(conn: &mut AsyncPgConnection, id: ExecutionId) -> WorkflowExecutio
         .expect("load execution")
 }
 
+/// Load the stored overrides into the cache of `registry`, and check that it
+/// holds `expected` for `name`.
+///
+/// A worker refreshes the cache in the background. A successor could seal
+/// before that refresh lands. So the test loads the cache first. A successor
+/// that read the override would then take it.
+async fn load_cache(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    name: &str,
+    expected: Duration,
+) {
+    registry
+        .run_defaults()
+        .refresh(conn)
+        .await
+        .expect("load the overrides");
+    assert_eq!(registry.chain_execution_timeout(name), Some(expected));
+}
+
 /// Run a worker until `root` continues, then return its successor.
 async fn successor_of(url: &str, root: ExecutionId, registry: Arc<HandlerRegistry>) -> ExecutionId {
     let worker = build_runtime_worker("w-2406", 2, 1, registry);
@@ -183,6 +203,8 @@ async fn assert_keeps_the_chain(
 /// that a later start takes does not reach it.
 #[tokio::test]
 async fn a_same_type_successor_keeps_the_stored_chain_deadline() {
+    // The DB tests of the same table clear it on a shared database.
+    let _shared = crate::run_defaults_db_tests::SHARED_DB.lock().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let name = leaked("chain_same");
@@ -190,15 +212,11 @@ async fn a_same_type_successor_keeps_the_stored_chain_deadline() {
 
     let root = start_root(&mut conn, &registry, name, serde_json::json!({})).await;
     override_chain(&mut conn, name, 3 * HOUR).await;
+    load_cache(&mut conn, &registry, name, 3 * HOUR).await;
     let successor = successor_of(&url, root, Arc::clone(&registry)).await;
     assert_keeps_the_chain(&mut conn, root, successor).await;
 
     // The next chain that starts takes the override.
-    registry
-        .run_defaults()
-        .refresh(&mut conn)
-        .await
-        .expect("load the overrides");
     let next = start_root(&mut conn, &registry, name, serde_json::json!({})).await;
     assert_eq!(
         load(&mut conn, next).await.chain_execution_timeout,
@@ -210,6 +228,8 @@ async fn a_same_type_successor_keeps_the_stored_chain_deadline() {
 /// target type has an override.
 #[tokio::test]
 async fn a_cross_type_successor_keeps_the_stored_chain_deadline() {
+    // The DB tests of the same table clear it on a shared database.
+    let _shared = crate::run_defaults_db_tests::SHARED_DB.lock().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let from = leaked("chain_from");
@@ -227,6 +247,7 @@ async fn a_cross_type_successor_keeps_the_stored_chain_deadline() {
     )
     .await;
     override_chain(&mut conn, to, 3 * HOUR).await;
+    load_cache(&mut conn, &registry, to, 3 * HOUR).await;
     let successor = successor_of(&url, root, registry).await;
     assert_eq!(load(&mut conn, successor).await.workflow_name, to);
     assert_keeps_the_chain(&mut conn, root, successor).await;

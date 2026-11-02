@@ -6082,7 +6082,10 @@ async fn ui_trigger_now_threads_dag_execution_timeout_sla_and_fleet_ceiling() {
 async fn ui_trigger_now_takes_the_chain_cap_override_and_the_ceiling() {
     let (database_url, _container) = overdue_read_database_url().await;
     let pool = build_test_pool(&database_url);
-    let workflow_name = "ui_trigger_chain_wf";
+    // A unique name, so a run left over on a shared database is no overlap.
+    let workflow_name: &'static str = Box::leak(
+        format!("ui_trigger_chain_wf_{}", uuid::Uuid::new_v4().simple()).into_boxed_str(),
+    );
     let registry = Arc::new(
         HandlerRegistry::new(vec![bare_workflow_info(workflow_name)], vec![])
             .with_max_workflow_chain_timeout(Some(std::time::Duration::from_secs(2 * 3600))),

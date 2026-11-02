@@ -21,10 +21,12 @@ cap needs a deploy.
   successor too. A workflow retry (#523) also inherits the deadline.
 - A child is a new chain origin. It resolves the chain timeout of its own
   type.
-- The start paths that read the code value are: the HTTP start, signal-with-
-  start, update-with-start, debounce, batch, bulk start, the trigger-now
-  routes, the DAG trigger, the scheduler tick and its buffered drain, the
-  typed `WorkflowHandle` start and the child spawn.
+- These start paths read the code value:
+  - the HTTP start, signal-with-start and update-with-start routes;
+  - debounce, batch and bulk start;
+  - the trigger-now routes and the DAG trigger;
+  - the scheduler tick and its buffered drain;
+  - the typed `WorkflowHandle` start and the child spawn.
 - The outbox start, the Vantage trigger-now and the typed signal-with-start
   stub do not set a chain timeout. So they ignore both the code value and the
   fleet ceiling. This is a gap of #617.
@@ -32,7 +34,7 @@ cap needs a deploy.
   the ceiling would reach a child uncapped.
 - A completion-trigger start sets no chain timeout and no execution timeout.
   Its outbox row has no column for them. This change leaves that path as it
-  is, and a follow-up issue tracks it.
+  is. Issue #2511 tracks it.
 - The cache of #2387 holds one `RunDefaultFields` per type. A start reads it
   from memory.
 
@@ -78,10 +80,12 @@ and a shorter deadline can end a chain at once.
   table. No new route, no new event and no replay impact.
 - **Green (ideas).** One resolver for the chain timeout. It closes the outbox
   and Vantage gaps of #617 at the same time.
-- **Blue (process).** Write the failing tests first: unit tests on the
-  fields, the cache and the resolver, a DB test on the store, HTTP tests for
-  each AC and a worker test for continue-as-new. Then add the code, then the
-  docs.
+- **Blue (process).** Write the failing tests first. Then add the code, then
+  the docs. The tests are:
+  - unit tests on the fields, the cache and the resolver;
+  - a DB test on the store;
+  - HTTP tests for each AC;
+  - a worker test for continue-as-new.
 
 ## Design
 
@@ -96,10 +100,14 @@ and a shorter deadline can end a chain at once.
   `CHECK` to three columns.
 - The route takes and returns `chain_execution_timeout_secs` in `code`,
   `override` and `effective`. The bound is 1 second to 100 years.
-- The outbox start, the Vantage trigger-now of a workflow schedule and the
-  typed signal-with-start stub pass the chain timeout and the fleet ceiling,
-  as the other start paths do. A Vantage trigger-now of a DAG passes neither,
-  as the scheduler DAG path does.
+- Three more paths pass the chain timeout and the fleet ceiling, as the
+  other start paths do:
+  - the outbox start;
+  - the Vantage trigger-now of a workflow schedule;
+  - the typed signal-with-start stub.
+
+  A Vantage trigger-now of a DAG passes neither, as the scheduler DAG path
+  does.
 - A child spawn caps its chain timeout with the fleet ceiling. A child type
   with no chain timeout stays uncapped, as before.
 

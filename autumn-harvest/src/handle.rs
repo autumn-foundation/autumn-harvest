@@ -2850,6 +2850,44 @@ mod tests {
         )
     }
 
+    /// Issues #2387 and #2406: a client that shares the cache applies each
+    /// override. The typed `start` and `signal_with_start` stubs call these.
+    /// A client with no cache returns the declared values.
+    #[test]
+    fn the_client_applies_the_run_default_overrides() {
+        let hour = Duration::from_secs(3600);
+        let bare = residency_client();
+        assert_eq!(bare.apply_chain_run_default("wf", Some(hour)), Some(hour));
+        assert_eq!(
+            bare.apply_run_defaults("wf", Some(hour), None),
+            (Some(hour), None)
+        );
+
+        let cache = Arc::new(crate::run_defaults::RunDefaultsCache::new());
+        cache.write_through(
+            "wf",
+            crate::run_defaults::RunDefaultFields {
+                execution_timeout: Some(2 * hour),
+                sla: Some(hour / 2),
+                chain_execution_timeout: Some(3 * hour),
+            },
+        );
+        let client = residency_client().with_run_defaults(cache);
+        assert_eq!(
+            client.apply_chain_run_default("wf", Some(hour)),
+            Some(3 * hour)
+        );
+        assert_eq!(
+            client.apply_run_defaults("wf", Some(hour), None),
+            (Some(2 * hour), Some(hour / 2))
+        );
+        assert_eq!(
+            client.apply_chain_run_default("other", Some(hour)),
+            Some(hour),
+            "another type keeps its declared value"
+        );
+    }
+
     /// AC1b/AC5 on the **handle** surface: the SDK's placement resolver reads
     /// the client's declared residency map, not a hash. Shard 1 is deliberately
     /// NOT the default shard, so a "always resolves to default" regression is
