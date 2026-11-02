@@ -1113,7 +1113,7 @@ the [module guide](architecture.md).
 index `idx_harvest_we_agent_wake` serves a range on `agent_next_wake_at`,
 so a list of the agents due to wake reads only those agents.
 
-**Operate.** `harvest agents` composes the generic management routes:
+**Operate.** `harvest agents` composes management routes:
 
 | Command | Route |
 |---|---|
@@ -1130,7 +1130,8 @@ so a list of the agents due to wake reads only those agents.
 
 **Profile overlays (issue #2374).** The `profile` commands use the routes
 of the overlay store. Install the store with
-`HarvestPlugin::agent_overlay_store`. Without it, each route is `404`.
+`HarvestPlugin::agent_overlay_store`. Without it, each route is `404`. The
+SQLite plugin does not serve these routes yet (#2471).
 
 - `list` shows each version with its provenance and created time. The
   active version has `active: true`.
@@ -1141,13 +1142,16 @@ of the overlay store. Install the store with
   the version that is active.
 - `rollback` activates the version that was active before the current
   one. A second rollback undoes the first one. With no earlier
-  activation, it exits non-zero and changes nothing.
+  activation, it exits non-zero and changes nothing. A move after its
+  read, also a move away and back, makes it a `409`.
 - `activate` and `rollback` need the `mutate` scope, as the
-  `harvest-operator` role has (`docs/operator-role.md`). A `read` role gets
-  `403`.
-- Each activation writes an audit row, `agent_profile.activate` or
-  `agent_profile.rollback`. The row holds the kind, the operator id, and
-  `from vN to vM`. The audit export ships it.
+  `harvest-operator` role has. See
+  [Custom roles](security-posture.md#custom-roles). A `read` role, or a
+  read-only principal (`docs/operator-role.md`), gets `403`.
+- Each activate and rollback request writes an audit row,
+  `agent_profile.activate` or `agent_profile.rollback`. The row holds the
+  kind, the operator id, and `from vN to vM`. A refused request writes a
+  failed row. The audit export ships each row.
 - The store logs each move with its actor, also a move from code. See
   [`docs/design/DESIGN-2374.md`](design/DESIGN-2374.md).
 

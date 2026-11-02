@@ -17,7 +17,7 @@ Three layers. Each one adds what the layer below it cannot do.
 | Store | `agent/overlay_store.rs`, `overlay_log.rs` (core and SQLite) | An activation log, an actor on each activation, and `rollback`. |
 | Diff | `agent/overlay_diff.rs` | `overlay_diff::diff`: each leaf of two overlays that differs. |
 | Routes | `autumn-harvest-plugin/src/agent_profile_api.rs` | Six routes on the store, the audit rows, and the role gate. |
-| CLI | `autumn-harvest-cli/src/agents.rs` | `harvest agents profile list, show, diff, activate, rollback`. |
+| CLI | `autumn-harvest-cli/src/agent_profile.rs` | `harvest agents profile list, show, diff, activate, rollback`. |
 
 ### The activation log
 
@@ -39,8 +39,12 @@ harvest_agent_overlay_activations
 
 ### Rollback
 
-`rollback(kind, actor)` reads the last move, `from → to`. It activates
-`from` over the expected pointer `to`.
+`rollback(kind, actor)` reads the last move, `from → to`, with its `seq`.
+It validates `from`. Then it activates `from` over the expected pointer
+`to`. Under the head lock, the swap also needs the last `seq` to be the
+one that it read (`decide_rollback`). So a pointer that moved away and
+back after the read fails with `Conflict`. A compare on the pointer alone
+would pass, and restore the wrong version.
 
 | Last move | Result |
 |---|---|
@@ -49,9 +53,9 @@ harvest_agent_overlay_activations
 | `v1 → v2` | `v1` is active. The log gets `v2 → v1`. |
 
 A second rollback undoes the first one, as `kubectl rollout undo` does. A
-pointer that moved after the read fails the swap with `Conflict`. A
 deployment that activated a version before this change has no log row,
-so its first rollback is `NoEarlierActivation`.
+so its first rollback is `NoEarlierActivation`. A rollback to a deleted
+version is `UnknownVersion`, and the pointer stays.
 
 ### Routes
 
@@ -64,15 +68,16 @@ so its first rollback is `NoEarlierActivation`.
 | `POST /agents/{kind}/profile/activate` | mutate | `{version, expected_active}`. A CAS. |
 | `POST /agents/{kind}/profile/rollback` | mutate | `{}`. |
 
-- The routes are not under `/admin`, so the mutate scope reaches the two
-  writes. The `harvest-operator` role has that scope. `harvest-viewer` and
-  a read-only principal get `403` from the role layers.
+- The routes are not in `ADMIN_SCOPE_ROUTES`, so the mutate scope reaches
+  the two writes. The `harvest-operator` role has that scope.
+  `harvest-viewer` and a read-only principal get `403` from the role
+  layers.
 - `expected_active` is required. `null` means an unset pointer. So a
   client always states the pointer that it read.
 - A `409` names the actual active version. A rollback with no earlier
   activation is also a `409`.
 - With no store, every route is `404` with a message that names the
-  builder method.
+  builder method. A database outage on a write is `503`.
 - The actor is the audit actor of the request. The store records it as
   `Provenance::Operator`.
 
@@ -82,8 +87,19 @@ Each activate and rollback request writes one audit row:
 `agent_profile.activate` or `agent_profile.rollback`, target type
 `agent_profile`, target id the kind, actor the operator id. A succeeded
 row keeps `from v1 to v2` in `error_summary`, as the ramp guard row of
-issue #1814 keeps its rates. A failed row keeps the error. The audit
-export ships each row.
+issue #1814 keeps its rates. An activation of the active version keeps
+`unchanged at v2`. A failed row keeps the error, cut to 512 bytes. The
+audit export ships each row.
+
+The move and its audit run in a task of their own. A client that drops
+the connection then cannot stop the audit after the move commits. The
+audit takes its connection after the move, so a store on the same pool
+never waits for it.
+
+The store and the audit table do not share a transaction, because a store
+is any backend. When the audit insert fails after a move, the route
+answers `500`, and the message says that the move committed. The
+activation log keeps the move with its actor in all cases.
 
 ### Diff
 
@@ -126,7 +142,9 @@ How can this break its promise? Each attack has a guard.
 |---|---|
 | Two operators activate at once, and both win. | The request carries `expected_active`. The store CAS lets one win. The other gets `409` with the actual version. |
 | A client omits `expected_active` to skip the CAS. | The key is required. Its absence is `400`. |
-| A rollback runs while another activation lands. | The rollback swaps over the `to` of the last move. A moved pointer fails it with `Conflict`. |
+| A rollback runs while another activation lands. | The swap needs the `seq` that the rollback read. Any move after the read fails it with `Conflict`. |
+| The pointer moves away and back while a rollback waits. | The `seq` check catches it. A check on the pointer alone would not. |
+| A client drops the connection after the move. | The move and its audit run in a task of their own. |
 | A viewer activates a version. | The routes are `Mutating`. The role layers refuse a `read` scope with `403`, before the handler runs. |
 | An activation leaves no trace. | The route writes an audit row. A succeeded change whose audit insert fails returns an error. The store also logs the move. |
 | A log row is rewritten to change a rollback target. | A trigger refuses each `UPDATE` on both backends. |
@@ -170,6 +188,14 @@ moves. It proves these properties:
 - After `v1`, then `v2` over `v1`, a rollback makes `v1` active.
 - Of two rollbacks that read the same move, only the first moves the
   pointer.
+- A rollback swap over a stale read changes nothing, also when the
+  pointer moved back to the value that it read.
+
+The model starts from an unset pointer with no move. A pointer from
+before this change has no log row. The code then refuses the first
+rollback, so the theorems need not cover it. The model treats each
+version up to `stored` as present. A deleted target fails the swap in the
+code with `UnknownVersion`.
 
 ## Tests
 

@@ -42,7 +42,7 @@ kind = ["ddl", "read"]
 tables = ["harvest_agent_overlay_activations", "harvest_agent_overlay_heads", "harvest_agent_overlays"]
 measured = "unmeasured"
 
-["SqliteOverlayLog::last_activation"]
+["last_move"]
 driver = "per_request"
 backend = ["sqlite"]
 kind = ["read"]

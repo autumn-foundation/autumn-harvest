@@ -3,7 +3,8 @@
 //! [`diff`] walks the JSON of both overlays. It goes down into each object
 //! that both sides hold. So a change to one tool guidance entry shows only
 //! that entry. An unset field is absent from the JSON, so it shows as
-//! `null`.
+//! `null`. An empty map is unset too, so a map that only one side holds
+//! shows as one change.
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -32,8 +33,8 @@ pub fn diff(a: &ProfileOverlay, b: &ProfileOverlay) -> Vec<OverlayChange> {
     changes
 }
 
-/// The JSON object of an overlay. An overlay holds strings, numbers and
-/// maps only, so it always encodes.
+/// The JSON object of an overlay. An overlay holds strings, numbers,
+/// booleans and maps only, so it always encodes.
 fn json(overlay: &ProfileOverlay) -> Map<String, Value> {
     match serde_json::to_value(overlay) {
         Ok(Value::Object(map)) => map,
@@ -181,19 +182,31 @@ mod tests {
     }
 
     fn overlay() -> impl Strategy<Value = ProfileOverlay> {
+        let text = || proptest::option::of("[a-c]{0,2}");
+        let bound = || proptest::option::of(0_u32..3);
+        let skill = ("[a-c]{0,1}", "[a-c]{0,1}").prop_map(|(s, b)| SkillText::new(s, b));
         (
-            proptest::option::of("[a-c]{0,2}"),
-            proptest::option::of(0_u32..3),
-            proptest::option::of(any::<bool>()),
+            (text(), text(), text(), proptest::option::of(any::<bool>())),
+            (bound(), bound(), bound()),
             proptest::collection::btree_map("[a-c]", "[a-c]{0,2}", 0..3),
+            proptest::collection::btree_map("[a-c]", skill, 0..3),
         )
             .prop_map(
-                |(system, max_steps, read_only, tool_guidance)| ProfileOverlay {
+                |(
+                    (system, guardrails, model, read_only),
+                    (max_steps, max_total_tokens, max_output_tokens),
+                    tool_guidance,
+                    skills,
+                )| ProfileOverlay {
                     system,
+                    guardrails,
+                    model,
                     max_steps,
+                    max_total_tokens,
+                    max_output_tokens,
                     read_only,
                     tool_guidance,
-                    ..ProfileOverlay::default()
+                    skills,
                 },
             )
     }
@@ -209,7 +222,7 @@ mod tests {
                 .into_iter()
                 .map(|change| OverlayChange { path: change.path, a: change.b, b: change.a })
                 .collect();
-            prop_assert_eq!(forward.clone(), back);
+            prop_assert_eq!(&forward, &back);
             for change in &forward {
                 prop_assert_ne!(&change.a, &change.b);
             }

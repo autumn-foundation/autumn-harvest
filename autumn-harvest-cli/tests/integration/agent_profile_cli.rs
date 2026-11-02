@@ -139,3 +139,33 @@ async fn a_refused_rollback_fails_with_the_message() {
     );
     assert!(matches!(error, CliError::Http { status, .. } if status.as_u16() == 409));
 }
+
+/// A stale `--expected` exits non-zero, and the error names the version
+/// that is active.
+#[tokio::test]
+async fn a_stale_activate_fails_with_the_active_version() {
+    let message = r#"{"error":"the active overlay is v3, not the expected version"}"#;
+    let (base_url, task) = scripted_server(vec![("409 Conflict", message.to_owned())]).await;
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "--base-url",
+        &base_url,
+        "agents",
+        "profile",
+        "activate",
+        "support",
+        "2",
+        "--expected",
+        "1",
+    ])
+    .expect("parse");
+    let error = run_cli(cli).await.expect_err("a 409 fails");
+    let requests = task.await.expect("server");
+    assert_eq!(requests.len(), 1, "--expected skips the read");
+    assert_eq!(
+        body(&requests[0]),
+        serde_json::json!({"version": 2, "expected_active": 1})
+    );
+    assert_ne!(error.exit_code(), 0);
+    assert!(error.to_string().contains("v3"), "{error}");
+}

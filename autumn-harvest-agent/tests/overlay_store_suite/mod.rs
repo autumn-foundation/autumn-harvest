@@ -213,6 +213,13 @@ pub async fn two_activates_with_one_expected_pointer_have_one_winner(make: MakeS
         );
         let active = store.active(&kind).await.expect("active").expect("set");
         assert_eq!(active.version(), winner);
+        // The race logs one move only: from v1 to the winner (issue #2374).
+        let last = store
+            .last_activation(&kind)
+            .await
+            .expect("last")
+            .expect("move");
+        assert_eq!((last.seq(), last.from(), last.to()), (2, Some(v1), winner));
     }
 }
 

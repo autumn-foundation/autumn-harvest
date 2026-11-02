@@ -5327,8 +5327,8 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
                 .patch(crate::run_defaults_api::patch_run_defaults)
                 .route_layer(require_admin.clone()),
         )
-        // Agent profile overlays (issue #2374). Not under `/admin`, so the
-        // `mutate` scope reaches the two writes.
+        // Agent profile overlays (issue #2374). Not in `ADMIN_SCOPE_ROUTES`,
+        // so the `mutate` scope reaches the two writes.
         .route(
             "/agents/{kind}/profile",
             get(crate::agent_profile_api::get_active).route_layer(require_admin.clone()),

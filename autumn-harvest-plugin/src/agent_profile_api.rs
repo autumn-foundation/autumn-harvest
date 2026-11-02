@@ -1,12 +1,13 @@
 //! The agent profile overlay routes (issue #2374).
 //!
 //! The routes read and move the overlay versions of one agent kind, through
-//! the [`ProfileOverlayStore`] that the embedder installs. They are not
-//! under `/admin`, so the `mutate` scope of the `harvest-operator` role
-//! reaches the two writes. A `read` scope reaches only the reads.
+//! the [`ProfileOverlayStore`] that the embedder installs. They are not in
+//! `ADMIN_SCOPE_ROUTES`, so the `mutate` scope of the `harvest-operator`
+//! role reaches the two writes. A `read` scope reaches only the reads.
 //!
 //! Each activate and rollback request writes one audit row. A succeeded row
-//! keeps `from v1 to v2` in `error_summary`. The design is in
+//! keeps `from v1 to v2` in `error_summary`. The move and its audit run in a
+//! task of their own, so a dropped client cannot stop the audit. The design is in
 //! `docs/design/DESIGN-2374.md`.
 
 use std::sync::Arc;
@@ -26,10 +27,10 @@ use autumn_web::reexports::axum;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query};
 use axum::http::{HeaderMap, StatusCode};
-use diesel_async::AsyncPgConnection;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{HarvestApiState, acquire_conn, audit_context, deserialize_tristate, map_error};
+use crate::authz::{MAX_AUDITED_SUMMARY_LEN, truncate};
 
 const ACTIVATE_ROUTE: &str = "POST /agents/{kind}/profile/activate";
 const ROLLBACK_ROUTE: &str = "POST /agents/{kind}/profile/rollback";
@@ -285,86 +286,134 @@ pub async fn diff_versions(
     }))
 }
 
-/// The audit context of one write request.
-struct AuditCtx<'a> {
-    actor: &'a str,
-    source: &'a str,
-    request_id: Option<&'a str>,
+/// One write request: its audit context and its route.
+struct Write {
+    api_state: HarvestApiState,
+    kind: String,
+    actor: String,
+    source: String,
+    request_id: Option<String>,
     operation: &'static str,
     route: &'static str,
-    kind: &'a str,
 }
 
-/// `from v1 to v2`, or `from unset to v1`.
+/// `from v1 to v2`, `from unset to v1`, or `unchanged at v2` for an
+/// activation of the active version.
 fn move_summary(from: Option<OverlayVersion>, to: OverlayVersion) -> String {
-    let from = from.map_or_else(|| "unset".to_owned(), |from| from.to_string());
-    format!("from {from} to {to}")
-}
-
-/// Insert one audit row for a write request. `outcome` is the summary of a
-/// succeeded move, or the error of a failed request.
-///
-/// A failed request logs its audit error and keeps its own error. A
-/// succeeded request returns the audit error, so an unaudited move never
-/// reports success.
-async fn audit_write(
-    conn: &mut AsyncPgConnection,
-    ctx: &AuditCtx<'_>,
-    outcome: Result<&str, &str>,
-) -> Result<(), AutumnError> {
-    let (status, summary) = match outcome {
-        Ok(summary) => (STATUS_SUCCEEDED, summary),
-        Err(error) => (STATUS_FAILED, error),
-    };
-    let record = NewAuditRecord {
-        actor: ctx.actor,
-        operation: ctx.operation,
-        target_type: TARGET_AGENT_PROFILE,
-        target_id: Some(ctx.kind),
-        route_or_command: ctx.route,
-        request_id: ctx.request_id,
-        idempotency_key: None,
-        status,
-        error_summary: Some(summary),
-        shard_id: None,
-        source: ctx.source,
-    };
-    match audit::insert_audit(conn, &record).await {
-        Ok(_) => Ok(()),
-        Err(error) if outcome.is_err() => {
-            tracing::warn!(error = %error, kind = ctx.kind, "audit insert failed for an overlay move");
-            Ok(())
-        }
-        Err(error) => Err(map_error(error)),
+    match from {
+        Some(from) if from == to => format!("unchanged at {to}"),
+        Some(from) => format!("from {from} to {to}"),
+        None => format!("from unset to {to}"),
     }
 }
 
-/// Audit the outcome of one write request, then answer it.
-async fn answer(
-    conn: &mut AsyncPgConnection,
-    ctx: &AuditCtx<'_>,
-    outcome: Result<(Option<OverlayVersion>, OverlayVersion), AutumnError>,
-) -> Result<Json<OverlayMove>, AutumnError> {
-    match outcome {
-        Ok((from, to)) => {
-            audit_write(conn, ctx, Ok(&move_summary(from, to))).await?;
-            Ok(Json(OverlayMove {
-                kind: ctx.kind.to_owned(),
-                from,
-                to,
-                actor: ctx.actor.to_owned(),
-            }))
-        }
-        Err(error) => {
-            audit_write(conn, ctx, Err(&error.to_string())).await?;
-            Err(error)
+impl Write {
+    fn new(
+        api_state: HarvestApiState,
+        headers: &HeaderMap,
+        kind: String,
+        operation: &'static str,
+        route: &'static str,
+    ) -> Self {
+        let (actor, source, request_id) = audit_context(headers, &api_state);
+        Self {
+            api_state,
+            kind,
+            actor,
+            source,
+            request_id,
+            operation,
+            route,
         }
     }
+
+    /// Insert one audit row. `outcome` is the summary of a succeeded move,
+    /// or the error of a failed request. Both texts are cut to
+    /// [`MAX_AUDITED_SUMMARY_LEN`] bytes.
+    ///
+    /// It takes its connection after the move, so a store on the same pool
+    /// never waits for it.
+    async fn audit(&self, outcome: Result<&str, &str>) -> Result<(), AutumnError> {
+        let (status, summary) = match outcome {
+            Ok(summary) => (STATUS_SUCCEEDED, summary),
+            Err(error) => (STATUS_FAILED, error),
+        };
+        let pool = self.api_state.storage_pool().map_err(map_error)?;
+        let mut conn = acquire_conn(pool.default_pool()).await?;
+        let record = NewAuditRecord {
+            actor: &self.actor,
+            operation: self.operation,
+            target_type: TARGET_AGENT_PROFILE,
+            target_id: Some(truncate(&self.kind, MAX_AUDITED_SUMMARY_LEN)),
+            route_or_command: self.route,
+            request_id: self.request_id.as_deref(),
+            idempotency_key: None,
+            status,
+            error_summary: Some(truncate(summary, MAX_AUDITED_SUMMARY_LEN)),
+            shard_id: None,
+            source: &self.source,
+        };
+        audit::insert_audit(&mut conn, &record)
+            .await
+            .map(|_| ())
+            .map_err(map_error)
+    }
+
+    /// Audit the outcome of the request, then answer it.
+    ///
+    /// A failed request logs its audit error and keeps its own error. A
+    /// committed move whose audit row fails answers `500`, and the message
+    /// says that the move committed. So an operator does not send it again.
+    async fn finish(
+        self,
+        outcome: Result<(Option<OverlayVersion>, OverlayVersion), AutumnError>,
+    ) -> Result<Json<OverlayMove>, AutumnError> {
+        match outcome {
+            Ok((from, to)) => {
+                let summary = move_summary(from, to);
+                if let Err(error) = self.audit(Ok(&summary)).await {
+                    return Err(AutumnError::internal_server_error_msg(format!(
+                        "the move {summary} committed, but its audit row failed: {error}"
+                    )));
+                }
+                Ok(Json(OverlayMove {
+                    kind: self.kind,
+                    from,
+                    to,
+                    actor: self.actor,
+                }))
+            }
+            Err(error) => {
+                if let Err(audit_error) = self.audit(Err(&error.to_string())).await {
+                    tracing::warn!(
+                        error = %audit_error,
+                        kind = %truncate(&self.kind, MAX_AUDITED_SUMMARY_LEN),
+                        "audit insert failed for a refused overlay move"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Run `body` and its audit in a task of its own. A client that drops the
+/// connection then cannot stop the audit after the move commits.
+async fn detached<F>(body: F) -> Result<Json<OverlayMove>, AutumnError>
+where
+    F: Future<Output = Result<Json<OverlayMove>, AutumnError>> + Send + 'static,
+{
+    tokio::spawn(body).await.map_err(|error| {
+        AutumnError::internal_server_error_msg(format!("the overlay move task failed: {error}"))
+    })?
 }
 
 /// The error of a bad request body.
 fn bad_body(rejection: &JsonRejection) -> AutumnError {
-    AutumnError::bad_request_msg(format!("invalid request body: {}", rejection.body_text()))
+    AutumnError::bad_request_msg(format!(
+        "invalid request body: {}",
+        truncate(&rejection.body_text(), MAX_AUDITED_SUMMARY_LEN)
+    ))
 }
 
 /// The move of an activate request.
@@ -421,19 +470,18 @@ pub async fn activate(
     headers: HeaderMap,
     request: Result<Json<ActivateRequest>, JsonRejection>,
 ) -> Result<Json<OverlayMove>, AutumnError> {
-    let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut conn = acquire_conn(pool.default_pool()).await?;
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let outcome = activate_move(&api_state, &kind, request, &actor).await;
-    let ctx = AuditCtx {
-        actor: &actor,
-        source: &source,
-        request_id: request_id.as_deref(),
-        operation: OP_AGENT_PROFILE_ACTIVATE,
-        route: ACTIVATE_ROUTE,
-        kind: &kind,
-    };
-    answer(&mut conn, &ctx, outcome).await
+    let write = Write::new(
+        api_state,
+        &headers,
+        kind,
+        OP_AGENT_PROFILE_ACTIVATE,
+        ACTIVATE_ROUTE,
+    );
+    detached(async move {
+        let outcome = activate_move(&write.api_state, &write.kind, request, &write.actor).await;
+        write.finish(outcome).await
+    })
+    .await
 }
 
 /// `POST /agents/{kind}/profile/rollback`.
@@ -443,19 +491,18 @@ pub async fn rollback(
     headers: HeaderMap,
     request: Result<Json<RollbackRequest>, JsonRejection>,
 ) -> Result<Json<OverlayMove>, AutumnError> {
-    let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut conn = acquire_conn(pool.default_pool()).await?;
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let outcome = rollback_move(&api_state, &kind, request, &actor).await;
-    let ctx = AuditCtx {
-        actor: &actor,
-        source: &source,
-        request_id: request_id.as_deref(),
-        operation: OP_AGENT_PROFILE_ROLLBACK,
-        route: ROLLBACK_ROUTE,
-        kind: &kind,
-    };
-    answer(&mut conn, &ctx, outcome).await
+    let write = Write::new(
+        api_state,
+        &headers,
+        kind,
+        OP_AGENT_PROFILE_ROLLBACK,
+        ROLLBACK_ROUTE,
+    );
+    detached(async move {
+        let outcome = rollback_move(&write.api_state, &write.kind, request, &write.actor).await;
+        write.finish(outcome).await
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -477,6 +524,7 @@ mod tests {
         let v2 = v2.expect("v2");
         assert_eq!(move_summary(v1, v2), "from v1 to v2");
         assert_eq!(move_summary(None, v2), "from unset to v2");
+        assert_eq!(move_summary(Some(v2), v2), "unchanged at v2");
     }
 
     #[test]

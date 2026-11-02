@@ -5861,7 +5861,7 @@
     },
     "/agents/{kind}/profile/activate": {
       "post": {
-        "description": "Make a profile overlay version active, with a compare-and-swap on the active version (issue #2374). The store validates the version again under the current profile, then moves the pointer and logs the move with the operator id. The next op of each agent of the kind reads the new version. The mutate scope (the harvest-operator role) is enough. Audited under agent_profile.activate: the row has the kind as target_id, the operator id as actor, and from vN to vM in error_summary.",
+        "description": "Make a profile overlay version active, with a compare-and-swap on the active version (issue #2374). The store validates the version again under the current profile, then moves the pointer and logs the move with the operator id. The next op of each agent of the kind reads the new version. The routes are not in ADMIN_SCOPE_ROUTES, so the mutate scope (the harvest-operator role) is enough. Audited under agent_profile.activate: the row has the kind as target_id, the operator id as actor, and from vN to vM in error_summary.",
         "operationId": "post_agents_by_kind_profile_activate",
         "parameters": [
           {
@@ -5926,21 +5926,24 @@
             "description": "The version no longer validates under the current profile."
           },
           "500": {
-            "description": "Store or database error."
+            "description": "Store or database error. When the move committed but its audit row failed, the message says so. Do not send the request again."
+          },
+          "503": {
+            "description": "The database is unavailable."
           }
         },
         "summary": "Make a profile overlay version active, with a compare-and-swap on the active version (issue #2374).",
         "tags": [
           "agent"
         ],
-        "x-harvest-idempotency": "Idempotent: activating the active version over itself is a 200 that moves nothing and logs no move. A stale expected_active is a 409.",
+        "x-harvest-idempotency": "Idempotent: activating the active version over itself is a 200 that moves nothing and logs no move. Its audit row says unchanged at vN. A stale expected_active is a 409.",
         "x-harvest-read-only": false,
         "x-harvest-route-class": "mutating"
       }
     },
     "/agents/{kind}/profile/diff": {
       "get": {
-        "description": "Show only the parts that differ between two profile overlay versions of an agent kind (issue #2374). Each entry of changes has a path (the keys from the root of the overlay JSON), the a value and the b value. An unset side is null. A map field shows only the entries that differ. Two equal versions give no change.",
+        "description": "Show only the parts that differ between two profile overlay versions of an agent kind (issue #2374). Each entry of changes has a path (the keys from the root of the overlay JSON), the a value and the b value. An unset side is null. When both versions hold a map field, only the entries that differ show. Two equal versions give no change.",
         "operationId": "get_agents_by_kind_profile_diff",
         "parameters": [
           {
@@ -6008,7 +6011,7 @@
     },
     "/agents/{kind}/profile/rollback": {
       "post": {
-        "description": "Activate the version that was active before the current one (issue #2374). The store reads the last move from vN to vM, and activates vN over vM. A second rollback undoes the first one. The mutate scope (the harvest-operator role) is enough. Audited under agent_profile.rollback, with the same row form as activate.",
+        "description": "Activate the version that was active before the current one (issue #2374). The store reads the last move from vN to vM, and activates vN over vM. The swap also needs that move to be the last one, so a pointer that moved after the read is a 409, also when it moved back. A second rollback undoes the first one. The routes are not in ADMIN_SCOPE_ROUTES, so the mutate scope (the harvest-operator role) is enough. Audited under agent_profile.rollback, with the same row form as activate.",
         "operationId": "post_agents_by_kind_profile_rollback",
         "parameters": [
           {
@@ -6042,7 +6045,7 @@
             "description": "The body is not an empty JSON object, or the operator id is invalid."
           },
           "404": {
-            "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store), or the earlier version no longer exists."
+            "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store), the kind has no profile, or the earlier version no longer exists."
           },
           "409": {
             "description": "No earlier activation exists, or another call moved the pointer after the read. Nothing changed."
@@ -6051,7 +6054,10 @@
             "description": "The earlier version no longer validates under the current profile."
           },
           "500": {
-            "description": "Store or database error."
+            "description": "Store or database error. When the move committed but its audit row failed, the message says so. Do not send the request again."
+          },
+          "503": {
+            "description": "The database is unavailable."
           }
         },
         "summary": "Activate the version that was active before the current one (issue #2374).",

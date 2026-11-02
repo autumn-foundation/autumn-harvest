@@ -49,6 +49,20 @@ async fn database() -> (String, Option<ContainerAsync<Postgres>>) {
 }
 
 /// A kind that no earlier test or run used, so a reused database works.
+/// A plain activation by `ops`.
+const fn mv(
+    version: u64,
+    expected: Option<u64>,
+) -> autumn_harvest::overlay_log::MoveRequest<'static> {
+    autumn_harvest::overlay_log::MoveRequest {
+        version,
+        expected,
+        actor_kind: "operator",
+        actor: "ops",
+        after_seq: None,
+    }
+}
+
 fn unique(prefix: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -192,6 +206,126 @@ async fn postgres_refuses_an_update_of_an_activation_row() {
     assert_eq!(last.actor(), &ops());
 }
 
+/// A rollback swap needs the move that it read to be the last one (issue
+/// #2374). The pointer moved v2 -> v3 -> v2 after the read, so it matches
+/// again, but the swap is a conflict and the pointer stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_refuses_a_rollback_over_a_stale_move() {
+    use autumn_harvest::overlay_log::{ActivateOutcome, MoveRequest, activate_overlay};
+
+    let (url, _container) = database().await;
+    let store =
+        PostgresOverlayStore::new(pool(&url), Arc::new(overlay_store_suite::Gate::default()));
+    let kind = unique("aba");
+    let ops = || Provenance::operator("ops");
+    for _ in 0..3 {
+        store
+            .put(&kind, &ProfileOverlay::default(), ops())
+            .await
+            .expect("put");
+    }
+    let v = |n| autumn_harvest_agent::OverlayVersion::new(n).expect("version");
+    store.activate(&kind, v(1), None, ops()).await.expect("v1");
+    store
+        .activate(&kind, v(2), Some(v(1)), ops())
+        .await
+        .expect("v2");
+    let read = store
+        .last_activation(&kind)
+        .await
+        .expect("last")
+        .expect("move");
+    store
+        .activate(&kind, v(3), Some(v(2)), ops())
+        .await
+        .expect("v3");
+    store
+        .activate(&kind, v(2), Some(v(3)), ops())
+        .await
+        .expect("v2");
+
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let stale = MoveRequest {
+        after_seq: Some(read.seq()),
+        ..mv(1, Some(2))
+    };
+    assert_eq!(
+        activate_overlay(&mut conn, &kind, &stale)
+            .await
+            .expect("swap"),
+        ActivateOutcome::Conflict { actual: Some(2) }
+    );
+    let active = store.active(&kind).await.expect("active").expect("set");
+    assert_eq!(active.version(), v(2));
+    let back = store
+        .rollback(&kind, ops())
+        .await
+        .expect("a fresh rollback");
+    assert_eq!(
+        (back.from, back.to),
+        (v(2), v(3)),
+        "it reverses the last move"
+    );
+}
+
+/// A rollback to a deleted version refuses, and the pointer stays. A
+/// pointer that moved before the log existed has no earlier activation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rollback_refuses_a_deleted_target_and_a_legacy_pointer() {
+    use autumn_harvest_agent::{OverlayStoreError, OverlayVersion};
+
+    let (url, _container) = database().await;
+    let store =
+        PostgresOverlayStore::new(pool(&url), Arc::new(overlay_store_suite::Gate::default()));
+    let ops = || Provenance::operator("ops");
+    let v = |n| OverlayVersion::new(n).expect("version");
+    let kind = unique("deleted");
+    for _ in 0..2 {
+        store
+            .put(&kind, &ProfileOverlay::default(), ops())
+            .await
+            .expect("put");
+    }
+    store.activate(&kind, v(1), None, ops()).await.expect("v1");
+    store
+        .activate(&kind, v(2), Some(v(1)), ops())
+        .await
+        .expect("v2");
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    diesel::sql_query("DELETE FROM harvest_agent_overlays WHERE kind = $1 AND version = 1")
+        .bind::<Text, _>(&kind)
+        .execute(&mut conn)
+        .await
+        .expect("an old version can be deleted");
+    let before = store.last_activation(&kind).await.expect("last");
+    assert_eq!(
+        store.rollback(&kind, ops()).await,
+        Err(OverlayStoreError::UnknownVersion { version: v(1) })
+    );
+    let active = store.active(&kind).await.expect("active").expect("set");
+    assert_eq!(active.version(), v(2));
+    assert_eq!(store.last_activation(&kind).await.expect("last"), before);
+
+    // A legacy pointer: set with no log row, as before migration
+    // 20261102142302.
+    let legacy = unique("legacy");
+    store
+        .put(&legacy, &ProfileOverlay::default(), ops())
+        .await
+        .expect("put");
+    diesel::sql_query("UPDATE harvest_agent_overlay_heads SET active = 1 WHERE kind = $1")
+        .bind::<Text, _>(&legacy)
+        .execute(&mut conn)
+        .await
+        .expect("seed a legacy pointer");
+    assert_eq!(
+        store.rollback(&legacy, ops()).await,
+        Err(OverlayStoreError::NoEarlierActivation)
+    );
+    let active = store.active(&legacy).await.expect("active").expect("set");
+    assert_eq!(active.version(), v(1));
+}
+
 /// The log refuses the delete of a head row, so a deleted version never
 /// comes back with other bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -243,7 +377,7 @@ async fn the_postgres_log_decides_under_the_lock() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     let kind = unique("log");
     assert_eq!(
-        activate_overlay(&mut conn, &kind, 1, None, "operator", "ops")
+        activate_overlay(&mut conn, &kind, &mv(1, None))
             .await
             .expect("no head"),
         ActivateOutcome::UnknownVersion
@@ -254,25 +388,25 @@ async fn the_postgres_log_decides_under_the_lock() {
         .expect("a version");
     assert_eq!(row.version, 1);
     assert_eq!(
-        activate_overlay(&mut conn, &kind, 2, None, "operator", "ops")
+        activate_overlay(&mut conn, &kind, &mv(2, None))
             .await
             .expect("unknown"),
         ActivateOutcome::UnknownVersion
     );
     assert_eq!(
-        activate_overlay(&mut conn, &kind, u64::MAX, None, "operator", "ops")
+        activate_overlay(&mut conn, &kind, &mv(u64::MAX, None))
             .await
             .expect("too large"),
         ActivateOutcome::UnknownVersion
     );
     assert_eq!(
-        activate_overlay(&mut conn, &kind, 1, Some(u64::MAX), "operator", "ops")
+        activate_overlay(&mut conn, &kind, &mv(1, Some(u64::MAX)))
             .await
             .expect("far expected"),
         ActivateOutcome::Conflict { actual: None }
     );
     assert_eq!(
-        activate_overlay(&mut conn, &kind, 1, None, "operator", "ops")
+        activate_overlay(&mut conn, &kind, &mv(1, None))
             .await
             .expect("activate"),
         ActivateOutcome::Activated

@@ -294,8 +294,47 @@ pub fn rollback_target(from: Option<u64>, to: u64) -> (r: Option<RollbackPlan>)
         r.is_some() ==> r.unwrap().target == from.unwrap() && r.unwrap().expected == to,
 {
     match from {
-        Some(target) => Some(RollbackPlan { target, expected: to }),
+        Some(target) => Some(RollbackPlan { target, expected: to, }),
         None => None,
+    }
+}
+
+/// `decide_rollback` as a spec.
+pub open spec fn spec_decide_rollback(
+    known: bool,
+    expected: u64,
+    actual: Option<u64>,
+    read_seq: u64,
+    last_seq: Option<u64>,
+) -> ActivateDecision {
+    if spec_decide_activate(known, Some(expected), actual) != ActivateDecision::Activate {
+        spec_decide_activate(known, Some(expected), actual)
+    } else if last_seq == Some(read_seq) {
+        ActivateDecision::Activate
+    } else {
+        ActivateDecision::Conflict
+    }
+}
+
+// mirror: autumn-harvest/src/overlay_log.rs decide_rollback
+pub fn decide_rollback(
+    known: bool,
+    expected: u64,
+    actual: Option<u64>,
+    read_seq: u64,
+    last_seq: Option<u64>,
+) -> (r: ActivateDecision)
+    ensures
+        r == spec_decide_rollback(known, expected, actual, read_seq, last_seq),
+        r == ActivateDecision::Activate ==> last_seq == Some(read_seq),
+        r == ActivateDecision::Activate ==> known && actual == Some(expected),
+{
+    match decide_activate(known, Some(expected), actual) {
+        ActivateDecision::Activate => match last_seq {
+            Some(seq) if seq == read_seq => ActivateDecision::Activate,
+            _ => ActivateDecision::Conflict,
+        },
+        other => other,
     }
 }
 
@@ -468,6 +507,88 @@ pub proof fn theorem_exactly_one_of_two_rollbacks_wins(h: Heads)
         activate_logged(rollback(h), h.moves.last().from.unwrap(), Some(h.moves.last().to))
             == rollback(h),
 {
+}
+
+/// The `seq` of the last move, or `None` with no move. The `seq` of a move
+/// is its index plus 1.
+pub open spec fn last_seq(h: Heads) -> Option<u64> {
+    if h.moves.len() == 0 {
+        None
+    } else {
+        Some(h.moves.len() as u64)
+    }
+}
+
+/// The swap of a rollback that read `plan` at the move `read_seq`. It runs
+/// later, on `h`, under the lock.
+pub open spec fn rollback_swap(h: Heads, plan: RollbackPlan, read_seq: u64) -> Heads {
+    let known = 1 <= plan.target && plan.target <= h.stored;
+    if spec_decide_rollback(known, plan.expected, h.active, read_seq, last_seq(h))
+        != ActivateDecision::Activate {
+        h
+    } else if h.active == Some(plan.target) {
+        h
+    } else {
+        Heads {
+            stored: h.stored,
+            active: Some(plan.target),
+            moves: h.moves.push(Move { from: h.active, to: plan.target }),
+        }
+    }
+}
+
+/// A swap over a stale read changes nothing: a move after the read changed
+/// the last `seq`. That holds also when the pointer moved back to the value
+/// that the rollback read.
+pub proof fn theorem_a_stale_rollback_changes_nothing(h: Heads, plan: RollbackPlan, read_seq: u64)
+    requires
+        h.moves.len() <= u64::MAX,
+        last_seq(h) != Some(read_seq),
+    ensures
+        rollback_swap(h, plan, read_seq) == h,
+{
+}
+
+/// A swap over a fresh read is the rollback.
+pub proof fn theorem_a_fresh_rollback_swap_is_the_rollback(h: Heads)
+    requires
+        chained(h),
+        h.moves.len() > 0,
+        h.moves.len() <= u64::MAX,
+        h.moves.last().from.is_some(),
+    ensures
+        rollback_swap(
+            h,
+            spec_rollback_target(h.moves.last().from, h.moves.last().to).unwrap(),
+            h.moves.len() as u64,
+        ) == rollback(h),
+{
+}
+
+/// The ABA case: a rollback reads v1 -> v2. The pointer then moves to v3
+/// and back to v2. The pointer matches the read, but the swap changes
+/// nothing.
+pub proof fn theorem_a_move_away_and_back_fails_a_stale_rollback(h: Heads)
+    requires
+        chained(h),
+        h.stored >= 3,
+        h.moves.len() > 0,
+        h.moves.len() < 1000,
+        h.active == Some(2u64),
+        h.moves.last().from == Some(1u64),
+    ensures
+        rollback_swap(
+            activate_logged(activate_logged(h, 3, Some(2u64)), 2, Some(3u64)),
+            RollbackPlan { target: 1, expected: 2 },
+            h.moves.len() as u64,
+        ) == activate_logged(activate_logged(h, 3, Some(2u64)), 2, Some(3u64)),
+        activate_logged(activate_logged(h, 3, Some(2u64)), 2, Some(3u64)).active == Some(2u64),
+{
+    let away = activate_logged(h, 3, Some(2u64));
+    let back = activate_logged(away, 2, Some(3u64));
+    assert(away.moves.len() == h.moves.len() + 1);
+    assert(back.moves.len() == h.moves.len() + 2);
+    theorem_a_stale_rollback_changes_nothing(back, RollbackPlan { target: 1, expected: 2 }, h.moves.len() as u64);
 }
 
 } // verus!

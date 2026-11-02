@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
 use autumn_harvest::overlay_log::{
-    ActivateDecision, ActivateOutcome, ActivationRow, OverlayRow, decide_activate, logs_activation,
+    ActivateDecision, ActivateOutcome, ActivationRow, MoveRequest, OverlayRow, logs_activation,
     next_overlay_version,
 };
 use chrono::{DateTime, Utc};
@@ -177,40 +177,23 @@ impl SqliteOverlayLog {
         self.with_conn(|conn| append_in(conn, kind, body, author_kind, author))
     }
 
-    /// Move the pointer of `kind` to `version` when it is `expected`, and
-    /// log the move with its actor.
+    /// Move the pointer of `kind` as `request` asks, and log the move with
+    /// its actor.
     ///
     /// One `IMMEDIATE` transaction reads the pointer, checks the version,
     /// sets the pointer and logs the move. So of two activations with the
-    /// same `expected`, only one moves the pointer. An activation of the
+    /// same `expected`, only one moves the pointer. A rollback also needs
+    /// the move that it read to be the last one. An activation of the
     /// active version logs nothing.
     ///
     /// # Errors
     ///
     /// Returns [`SqliteError::Sqlite`] when a statement fails.
-    pub fn activate(
-        &self,
-        kind: &str,
-        version: u64,
-        expected: Option<u64>,
-        actor_kind: &str,
-        actor: &str,
-    ) -> SqliteResult<ActivateOutcome> {
-        let Ok(stored) = i64::try_from(version) else {
+    pub fn activate(&self, kind: &str, request: &MoveRequest<'_>) -> SqliteResult<ActivateOutcome> {
+        let Ok(stored) = i64::try_from(request.version) else {
             return Ok(ActivateOutcome::UnknownVersion);
         };
-        self.with_conn(|conn| {
-            activate_in(
-                conn,
-                &Activation {
-                    kind,
-                    stored,
-                    expected,
-                    actor_kind,
-                    actor,
-                },
-            )
-        })
+        self.with_conn(|conn| activate_in(conn, kind, stored, request))
     }
 
     /// The last move of the pointer of `kind`, or `None`.
@@ -219,17 +202,7 @@ impl SqliteOverlayLog {
     ///
     /// Returns [`SqliteError::Sqlite`] when the query fails.
     pub fn last_activation(&self, kind: &str) -> SqliteResult<Option<ActivationRow>> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                "SELECT seq, from_version, to_version, actor_kind, actor, activated_at_ms
-                 FROM harvest_agent_overlay_activations
-                 WHERE kind = ?1 ORDER BY seq DESC LIMIT 1",
-                params![kind],
-                read_move,
-            )
-            .optional()?
-            .transpose()
-        })
+        self.with_conn(|conn| last_move(conn, kind))
     }
 
     /// The active version of `kind`, or `None`.
@@ -348,23 +321,26 @@ fn append_in(
     }))
 }
 
-/// The input of [`activate_in`].
-struct Activation<'a> {
-    kind: &'a str,
-    stored: i64,
-    expected: Option<u64>,
-    actor_kind: &'a str,
-    actor: &'a str,
+/// The last move of `kind` on `conn`, or `None`.
+fn last_move(conn: &Connection, kind: &str) -> SqliteResult<Option<ActivationRow>> {
+    conn.query_row(
+        "SELECT seq, from_version, to_version, actor_kind, actor, activated_at_ms
+         FROM harvest_agent_overlay_activations
+         WHERE kind = ?1 ORDER BY seq DESC LIMIT 1",
+        params![kind],
+        read_move,
+    )
+    .optional()?
+    .transpose()
 }
 
 /// The body of [`SqliteOverlayLog::activate`].
-fn activate_in(conn: &mut Connection, call: &Activation<'_>) -> SqliteResult<ActivateOutcome> {
-    let Activation {
-        kind,
-        stored,
-        expected,
-        ..
-    } = *call;
+fn activate_in(
+    conn: &mut Connection,
+    kind: &str,
+    stored: i64,
+    request: &MoveRequest<'_>,
+) -> SqliteResult<ActivateOutcome> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let head: Option<(Option<i64>, bool)> = tx
         .query_row(
@@ -380,11 +356,15 @@ fn activate_in(conn: &mut Connection, call: &Activation<'_>) -> SqliteResult<Act
         return Ok(ActivateOutcome::UnknownVersion);
     };
     let actual = active.map(to_version).transpose()?;
-    let outcome = match decide_activate(known, expected, actual) {
+    let last_seq = match request.after_seq {
+        Some(_) => last_move(&tx, kind)?.map(|row| row.seq),
+        None => None,
+    };
+    let outcome = match request.decide(known, actual, last_seq) {
         ActivateDecision::UnknownVersion => ActivateOutcome::UnknownVersion,
         ActivateDecision::Conflict => ActivateOutcome::Conflict { actual },
         ActivateDecision::Activate => {
-            if logs_activation(actual, to_version(stored)?) {
+            if logs_activation(actual, request.version) {
                 tx.execute(
                     "UPDATE harvest_agent_overlay_heads SET active = ?2 WHERE kind = ?1",
                     params![kind, stored],
@@ -399,8 +379,8 @@ fn activate_in(conn: &mut Connection, call: &Activation<'_>) -> SqliteResult<Act
                         kind,
                         active,
                         stored,
-                        call.actor_kind,
-                        call.actor,
+                        request.actor_kind,
+                        request.actor,
                         Utc::now().timestamp_millis()
                     ],
                 )?;

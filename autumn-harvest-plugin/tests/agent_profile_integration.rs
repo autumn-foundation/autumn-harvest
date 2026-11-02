@@ -151,11 +151,22 @@ async fn call(
     uri: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
+    call_as(app, "alice@example.com", role, method, uri, body).await
+}
+
+async fn call_as(
+    app: &axum::Router,
+    actor: &str,
+    role: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
     let mut builder = axum::http::Request::builder()
         .method(method)
         .uri(uri)
         .header(ROLE_HEADER, role)
-        .header("x-harvest-actor", "alice@example.com");
+        .header("x-harvest-actor", actor);
     if body.is_some() {
         builder = builder.header("content-type", "application/json");
     }
@@ -383,15 +394,18 @@ async fn two_concurrent_activates_have_one_winner() {
 }
 
 /// AC 6: each activation and rollback is in the audit export, with the
-/// kind, both ends and the operator id. A refused one is a failed row.
+/// kind, both ends and the operator id. A refused one is a failed row, and
+/// an activation of the active version records that nothing moved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_activation_is_in_the_audit_export() {
     let fx = fixture(true).await;
     two_versions(&fx.store).await;
+    assert_eq!(rollback(&fx.app).await.0, StatusCode::CONFLICT);
     assert_eq!(activate(&fx.app, 1, None).await.0, StatusCode::OK);
     assert_eq!(activate(&fx.app, 2, Some(1)).await.0, StatusCode::OK);
     assert_eq!(rollback(&fx.app).await.0, StatusCode::OK);
     assert_eq!(activate(&fx.app, 2, None).await.0, StatusCode::CONFLICT);
+    assert_eq!(activate(&fx.app, 1, Some(1)).await.0, StatusCode::OK);
 
     let mut conn = AsyncPgConnection::establish(&fx.url)
         .await
@@ -431,8 +445,14 @@ async fn each_activation_is_in_the_audit_export() {
         })
         .collect();
     let alice = "alice@example.com";
+    let (operation, status, target, actor, error) = seen[0];
     assert_eq!(
-        seen[..3],
+        (operation, status, target, actor),
+        ("agent_profile.rollback", "failed", KIND, alice)
+    );
+    assert!(error.contains("no earlier activation"), "{error}");
+    assert_eq!(
+        seen[1..4],
         [
             (
                 "agent_profile.activate",
@@ -457,8 +477,18 @@ async fn each_activation_is_in_the_audit_export() {
             ),
         ]
     );
-    assert_eq!(seen.len(), 4, "{seen:?}");
-    let (operation, status, target, actor, error) = seen[3];
+    assert_eq!(seen.len(), 6, "{seen:?}");
+    assert_eq!(
+        seen[5],
+        (
+            "agent_profile.activate",
+            "succeeded",
+            KIND,
+            alice,
+            "unchanged at v1"
+        )
+    );
+    let (operation, status, target, actor, error) = seen[4];
     assert_eq!(
         (operation, status, target, actor),
         ("agent_profile.activate", "failed", KIND, alice)
@@ -592,4 +622,46 @@ async fn each_route_is_404_without_a_store() {
             "{uri}: {reply}"
         );
     }
+}
+
+/// A padded operator id is a `400` with a failed audit row, and the
+/// pointer does not move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bad_operator_id_is_refused_and_audited() {
+    let fx = fixture(true).await;
+    two_versions(&fx.store).await;
+    let (status, body) = call_as(
+        &fx.app,
+        " alice",
+        ROLE_OPERATOR,
+        "POST",
+        "/agents/support/profile/activate",
+        Some(activate_body(1, None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(error_text(&body).contains("operator id"), "{body}");
+    assert_eq!(active(&fx.store).await, None);
+
+    let mut conn = AsyncPgConnection::establish(&fx.url)
+        .await
+        .expect("connect");
+    let rows = autumn_harvest::audit::list_audit(
+        &mut conn,
+        &autumn_harvest::audit::AuditFilters {
+            actor: None,
+            operation: Some("agent_profile.activate".to_owned()),
+            target_type: None,
+            target_id: None,
+            status: None,
+            since: None,
+            before: None,
+            before_id: None,
+            limit: 50,
+        },
+    )
+    .await
+    .expect("audit rows");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].status, "failed");
 }

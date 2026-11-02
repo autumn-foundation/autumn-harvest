@@ -208,7 +208,7 @@ no-op would let an app believe a protection or a feature is on.
 | `enable_api_tokens`, `api_with_role_auth`, `with_roles`, `with_authorizer`, `with_api_rate_limit`, `api_with_oidc` | [#2469](https://github.com/autumn-foundation/autumn-harvest/issues/2469) |
 | Vantage, `decode_payloads_on_read`, the other read routes, declarative `queries![..]` (a query that the workflow registers with `ctx.register_query` works) | [#2468](https://github.com/autumn-foundation/autumn-harvest/issues/2468) |
 | The transactional outbox | [#2470](https://github.com/autumn-foundation/autumn-harvest/issues/2470) |
-| Workflow schedules, `retention`, `mcp_tools`, `mcp_tasks`, `webhooks`, `connector`, `synthetic_canary` | [#2471](https://github.com/autumn-foundation/autumn-harvest/issues/2471) |
+| Workflow schedules, `retention`, `mcp_tools`, `mcp_tasks`, `webhooks`, `connector`, `synthetic_canary`, `agent_overlay_store` | [#2471](https://github.com/autumn-foundation/autumn-harvest/issues/2471) |
 | `harvest.mode = "split"` / `"external"`, per-tenant Harvest in a fleet | [#2472](https://github.com/autumn-foundation/autumn-harvest/issues/2472) |
 | `harvest.worker_enabled = false` | not planned: the app process is the only writer |
 | DAGs | an engine non-goal of the SQLite backend (#2019) |
