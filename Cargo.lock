@@ -530,7 +530,7 @@ dependencies = [
  "polyval 0.7.3",
  "proc-macro2",
  "proptest",
- "rand 0.8.6",
+ "rand 0.10.1",
  "rusqlite",
  "rustls",
  "rustls-native-certs",
@@ -3644,7 +3644,7 @@ name = "harvest-verify-corpus-helpers"
 version = "0.8.0"
 dependencies = [
  "harvest-verify-corpus-helpers-deep",
- "rand 0.8.6",
+ "rand 0.10.1",
  "tokio",
  "uuid",
 ]
@@ -3660,7 +3660,7 @@ dependencies = [
  "autumn-harvest",
  "harvest-verify-corpus-helpers",
  "harvest-verify-corpus-helpers-deep",
- "rand 0.8.6",
+ "rand 0.10.1",
  "serde",
  "serde_json",
  "tokio",
@@ -4306,7 +4306,7 @@ dependencies = [
  "js-sys",
  "p256",
  "p384",
- "rand 0.8.6",
+ "rand 0.8.8",
  "rsa",
  "serde",
  "serde_json",
@@ -4791,7 +4791,7 @@ dependencies = [
  "num-integer",
  "num-iter",
  "num-traits",
- "rand 0.8.6",
+ "rand 0.8.8",
  "smallvec",
  "zeroize",
 ]
@@ -5264,7 +5264,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
 dependencies = [
  "phf_shared 0.11.3",
- "rand 0.8.6",
+ "rand 0.8.8",
 ]
 
 [[package]]
@@ -5821,9 +5821,9 @@ checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 
 [[package]]
 name = "rand"
-version = "0.8.6"
+version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
+checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
 dependencies = [
  "libc",
  "rand_chacha 0.3.1",
@@ -6336,7 +6336,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5875471e6cab2871bc150ecb8c727db5113c9338cc3354dc5ee3425b6aa40a1c"
 dependencies = [
- "rand 0.8.6",
+ "rand 0.8.8",
 ]
 
 [[package]]
@@ -6447,7 +6447,7 @@ dependencies = [
  "borsh",
  "bytes",
  "num-traits",
- "rand 0.8.6",
+ "rand 0.8.8",
  "rkyv",
  "serde",
  "serde_json",
@@ -6983,7 +6983,7 @@ dependencies = [
  "corosensei",
  "hex",
  "owo-colors",
- "rand 0.8.6",
+ "rand 0.8.8",
  "rand_core 0.6.4",
  "rand_pcg 0.3.1",
  "scoped-tls",
@@ -7006,7 +7006,7 @@ dependencies = [
  "corosensei",
  "hex",
  "owo-colors",
- "rand 0.8.6",
+ "rand 0.8.8",
  "rand_core 0.6.4",
  "rand_pcg 0.3.1",
  "scoped-tls",
@@ -7020,7 +7020,7 @@ version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7673a579e1660404067f5aa1344d6530f15b59f53b0fe98767d7ab117d14067"
 dependencies = [
- "rand 0.8.6",
+ "rand 0.8.8",
  "rand_pcg 0.3.1",
  "shuttle-engine",
  "smallvec",
