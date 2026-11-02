@@ -14,7 +14,9 @@ but it does not depend on that crate. On the engine:
 
 It also has the always-on primitives: heartbeats, follow-ups on a durable
 timer, delivery, a frozen memory snapshot, and a loop guard. An opt-in
-response cache serves an identical model call across runs, per tenant.
+response cache serves an identical model call across runs, per tenant. An
+opt-in context reset (issue #2453) lets a long run save progress notes and
+restart from them near the request cap.
 
 A durable `Agent` (issue #2263) is a named, long-lived actor. It is the agent
 loop inside a keyed entity: the workflow `agent`, with the `AgentId`
