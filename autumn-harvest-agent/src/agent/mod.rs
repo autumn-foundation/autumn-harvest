@@ -64,6 +64,7 @@ use crate::workflow::{
 use crate::workspace::{WorkspaceMount, WorkspaceRef};
 use dedupe::Inbound;
 use inbox::{Admit, InboxStatus, OpClass, admit};
+use overlay_store::OverlayVersion;
 use profile_read::{OverlayRead, ProfileRead, overlaid};
 
 /// The registered workflow name of a durable agent.
@@ -1382,21 +1383,19 @@ impl AgentRun<'_> {
         Ok(state)
     }
 
-    /// The profile of one op (issue #2372).
+    /// The profile of one op and its overlay version (issue #2372).
     ///
     /// With no overlay store, it is the run profile, with no version. Else
     /// the op reads the active overlay through the recorded activity
     /// `agent_profile_overlay`. The activity applies it to the run profile.
-    /// The op then takes the overlay fields of the read. The read sets
-    /// [`AgentState::profile_version`]. A failed read keeps it.
-    async fn op_profile(&self, state: &mut AgentState) -> Result<AgentProfile, String> {
+    /// The op then takes the overlay fields of the read.
+    async fn op_profile(&self) -> Result<(AgentProfile, Option<OverlayVersion>), String> {
         let (id, profile) = match (&self.id, &self.profile) {
             (Ok(id), Ok(profile)) => (id, profile),
             (Err(err), _) | (_, Err(err)) => return Err(err.clone()),
         };
         if !self.overlays {
-            state.profile_version = None;
-            return Ok(profile.clone());
+            return Ok((profile.clone(), None));
         }
         let request = OverlayRead {
             kind: id.kind().to_owned(),
@@ -1407,11 +1406,11 @@ impl AgentRun<'_> {
             .execute_activity(&agent_profile_overlay_info(), request)
             .await
             .map_err(|err| err.to_string())?;
-        state.profile_version = read.overlay_version;
-        Ok(match read.overlay_version {
+        let op = match read.overlay_version {
             Some(_) => overlaid(profile, &read.profile),
             None => profile.clone(),
-        })
+        };
+        Ok((op, read.overlay_version))
     }
 
     /// Book the next heartbeat. See [`wake::next_heartbeat`].
@@ -1850,7 +1849,8 @@ impl AgentRun<'_> {
     /// drops on return, so the op future holds no profile across the
     /// segment.
     ///
-    /// `Err(Some)` is a refusal of a peer message, which changes no state.
+    /// `Err(Some)` is a refusal of a peer message. It changes no state,
+    /// though with a store the drain and the op read are in history.
     /// `Err(None)` is a failed op, which `state` records.
     async fn open_op(
         &self,
@@ -1888,13 +1888,15 @@ impl AgentRun<'_> {
         if let Err(err) = self.ctx.drain_signals_raw(INTERRUPT_SIGNAL) {
             return Err(failed(state, &err.to_string()));
         }
-        let op = match self.op_profile(state).await {
-            Ok(op) => op,
+        let (op, version) = match self.op_profile().await {
+            Ok(read) => read,
             Err(err) => return Err(failed(state, &err)),
         };
         if self.overlays && forbids(op.model.as_deref()) {
             return Err(Some(Refusal::ModelForbidden));
         }
+        // Only an op that runs moves the version. A failed read keeps it.
+        state.profile_version = version;
         Ok(op.segment_task(id, input, mode))
     }
 

@@ -13,8 +13,9 @@ Parent: #2369. It builds on the overlay kernel of #2370 and the store of
   profile. It returns the run profile with the overlay applied, and its
   `overlay_version`. History records both, so a replay never reads the
   store. An old history has no flag and schedules no new activity.
-- The overlay applies under the meet of the run ceilings and the current
-  harness ceilings. The op takes only the fields that an overlay can set.
+- The version must still validate under the current harness profile.
+  Then it applies to the run profile under the run ceilings. The op takes
+  only the fields that an overlay can set.
   The mandate, the peers and the heartbeat stay those of the run.
 - A worker with no store fails the op read with a retryable error.
 - Each op drains its stale interrupts before the read, so an interrupt

@@ -1294,9 +1294,9 @@ let harness = base.overlay_store(store);
   `agent_profile_overlay` with the run profile. That result holds the
   run profile with the overlay applied, and its `overlay_version`. Replay
   reads both results from history.
-- The overlay applies under the ceilings of the run profile and of the
-  current harness profile. The op takes only the fields that an overlay
-  can set. The mandate, the peers and the heartbeat stay those of the
+- The version must still validate under the current harness profile.
+  Then it applies to the run profile under the run ceilings. The op takes
+  only the fields that an overlay can set. The mandate, the peers and the heartbeat stay those of the
   run, so a deploy still changes the next run only.
 - With no store, the op schedules no read. With no active version, the
   read records `overlay_version: None`, and the op runs on the run

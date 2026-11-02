@@ -42,9 +42,12 @@ op that reads it, and the next op reads the store again.
 When the run read reports `overlay_store: true`, each op that runs a
 segment calls `agent_profile_overlay` first, with an `OverlayRead`: the
 kind and the run profile. The activity reads the active version of the
-kind and applies it to the run profile. The ceilings are the meet of
-`Ceilings::from_profile` of the run profile and of the current harness
-profile. The harness is the registry.
+kind. The version must still validate under the current harness profile,
+as a put and an activation check it. Then it applies to the run profile
+under the run ceilings. Both checks use `Ceilings::from_profile`, and the
+harness is the registry. So each bound that the version sets is at most
+the run bound and the deploy bound. A deploy that changes the profile
+model refuses only a version that names a model.
 
 | Store state | Result |
 |---|---|
@@ -121,7 +124,9 @@ guard.
 | The op read fails, and the agent runs bare. | The kernel `op_profile` returns an error for an active version that does not apply. Verus proves that an active version never yields the bare profile. |
 | A retry hides a bad version. | A refused overlay is a non-retryable failure. |
 | An op read changes the mandate or the peers mid-run. | The op takes only the overlay fields from the read. |
-| A deploy widens a field that the overlay does not set. | The read applies to the run profile, under the meet of both ceilings. |
+| A deploy widens a field that the overlay does not set. | The read applies to the run profile, under the run ceilings. |
+| A deploy narrows a bound under a stored version. | The version must still validate under the current harness profile. |
+| A refused peer moves the version. | The op sets the version only after the model check. |
 | A worker with no store runs the op bare. | That worker fails the read with a retryable error. |
 | An interrupt during the read is dropped as stale. | The drain comes before the read. |
 | The attribute names a version after the store goes. | A work op with no store clears the version. |

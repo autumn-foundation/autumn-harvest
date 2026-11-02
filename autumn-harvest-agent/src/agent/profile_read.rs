@@ -59,26 +59,6 @@ pub struct OverlayRead {
     pub profile: AgentProfile,
 }
 
-/// The tighter of two bounds. A `None` bound sets no limit.
-const fn tighter(a: Option<u32>, b: Option<u32>) -> Option<u32> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(if a < b { a } else { b }),
-        (Some(bound), None) | (None, Some(bound)) => Some(bound),
-        (None, None) => None,
-    }
-}
-
-/// The ceilings that both `a` and `b` allow.
-fn meet(a: &Ceilings, b: &Ceilings) -> Ceilings {
-    Ceilings {
-        max_steps: tighter(a.max_steps, b.max_steps),
-        max_total_tokens: tighter(a.max_total_tokens, b.max_total_tokens),
-        max_output_tokens: tighter(a.max_output_tokens, b.max_output_tokens),
-        models: a.models.intersection(&b.models).cloned().collect(),
-        allow_clear_read_only: a.allow_clear_read_only && b.allow_clear_read_only,
-    }
-}
-
 /// The profile of one op: `base` with no version, or the applied profile
 /// of the active version.
 ///
@@ -146,10 +126,13 @@ impl AgentHarness {
     /// applied, and its version (issue #2372).
     ///
     /// With no active version, it returns the run profile and no version.
-    /// The overlay applies under the ceilings of the run profile and of the
-    /// harness profile of the kind, both from [`Ceilings::from_profile`].
-    /// The harness is the registry. So a deploy that narrows the profile or
-    /// removes a model refuses an old version.
+    /// The version must validate under the harness profile of the kind, as
+    /// [`OverlayValidator`](super::overlay_store::OverlayValidator) checks
+    /// it. Then it applies to the run profile under the run ceilings. Both
+    /// use [`Ceilings::from_profile`], with this harness as the registry. So
+    /// a deploy that narrows a bound or removes a model refuses an old
+    /// version. A deploy that changes the profile model refuses only a
+    /// version that names a model.
     ///
     /// # Errors
     ///
@@ -180,12 +163,14 @@ impl AgentHarness {
             Err(err) => return Err(refused("OverlayReadFailed", err.to_string())),
         };
         let run = &request.profile;
-        let ceilings = meet(
-            &Ceilings::from_profile(run),
-            &Ceilings::from_profile(&current),
-        );
         let active = active.map(|stored| {
-            let applied = apply(run, stored.overlay(), &ceilings, self);
+            // The version must still validate under this deploy, as a put
+            // and an activation check it. Then it applies to the run
+            // profile under the run ceilings. So each bound that it sets is
+            // at most the run bound and the deploy bound.
+            let overlay = stored.overlay();
+            let applied = apply(&current, overlay, &Ceilings::from_profile(&current), self)
+                .and_then(|_| apply(run, overlay, &Ceilings::from_profile(run), self));
             (stored.version(), applied)
         });
         match op_profile(run.clone(), active) {
@@ -207,8 +192,6 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use std::collections::BTreeSet;
-
     use crate::mesh::Mandate;
     use crate::skill::SkillText;
     use proptest::prelude::*;
@@ -288,25 +271,6 @@ mod tests {
         assert_eq!(out.tenant, run.tenant);
         assert_eq!(out.max_ops_per_run, run.max_ops_per_run);
         assert_eq!(out.window, run.window);
-    }
-
-    #[test]
-    fn the_meet_takes_the_tighter_ceiling() {
-        let wide = Ceilings::from_profile(
-            &AgentProfile::new("support")
-                .max_steps(50)
-                .max_total_tokens(900)
-                .model("m1"),
-        );
-        let mut narrow = Ceilings::from_profile(&AgentProfile::new("support").max_steps(20));
-        narrow.models.insert("m1".to_owned());
-        let out = meet(&wide, &narrow);
-        assert_eq!(out.max_steps, Some(20));
-        assert_eq!(out.max_total_tokens, Some(900));
-        assert_eq!(out.max_output_tokens, None);
-        assert_eq!(out.models, BTreeSet::from(["m1".to_owned()]));
-        assert!(!out.allow_clear_read_only);
-        assert_eq!(meet(&narrow, &wide), out, "the meet is symmetric");
     }
 
     /// A model that no read calls.
@@ -405,6 +369,32 @@ mod tests {
         let harness = deployed(current, &steps).await;
         let err = harness.overlaid_profile(&request(run)).await.unwrap_err();
         assert!(err.contains("v1") && err.contains("max_steps"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_model_deploy_keeps_a_version_that_names_no_model() {
+        let run = AgentProfile::new("support").model("m1");
+        let current = AgentProfile::new("support").model("m2");
+        let guardrails = ProfileOverlay {
+            guardrails: Some("Be brief.".to_owned()),
+            ..ProfileOverlay::default()
+        };
+        let harness = deployed(current, &guardrails).await;
+        let read = harness.overlaid_profile(&request(run)).await.unwrap();
+        assert_eq!(read.overlay_version, OverlayVersion::new(1));
+        assert_eq!(read.profile.model.as_deref(), Some("m1"), "the run model");
+    }
+
+    #[tokio::test]
+    async fn a_version_that_clears_read_only_never_widens_the_run() {
+        let run = AgentProfile::new("support").read_only();
+        let writable = ProfileOverlay {
+            read_only: Some(false),
+            ..ProfileOverlay::default()
+        };
+        let harness = deployed(AgentProfile::new("support"), &writable).await;
+        let err = harness.overlaid_profile(&request(run)).await.unwrap_err();
+        assert!(err.contains("v1") && err.contains("read_only"), "{err}");
     }
 
     #[tokio::test]
