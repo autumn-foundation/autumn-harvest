@@ -5688,6 +5688,11 @@ pub fn migrate_target_label(dsn: &str, ordinal: usize) -> String {
 /// `<unparseable dsn>` and cost an operator the identity of the failing shard.
 /// What it must not admit is a token that is keyword-shaped but not a keyword,
 /// which is how a mistyped URL smuggles a password past redaction.
+///
+/// `autumn-harvest-plugin`'s dev runtime solves the same problem for DSN
+/// redaction. See `is_connection_keyword` in
+/// `autumn-harvest-plugin/src/dev/dsn.rs` (issue #2521). Keep this list in
+/// step with that one.
 fn is_connection_keyword(key: &str) -> bool {
     const KEYWORDS: &[&str] = &[
         "application_name",

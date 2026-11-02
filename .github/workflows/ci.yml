@@ -550,6 +550,18 @@ jobs:
           python3 docs/audits/required-migration-versions-sync.py --self-test
           python3 docs/audits/required-migration-versions-sync.py
 
+      # Issue #2521: autumn-harvest-cli/src/lib.rs and
+      # autumn-harvest-plugin/src/dev/dsn.rs each define
+      # is_connection_keyword with the same libpq KEYWORDS list. Two copies
+      # are below the rule-of-three merge bar, and hoisting the list into
+      # autumn-harvest core would be a public-API change needing a human
+      # call, so the code links them and does not merge them. This step
+      # fails when one copy's keyword list changes and the other does not.
+      - name: Libpq-keyword sync (docs/audits/libpq-keyword-sync.py)
+        run: |
+          python3 docs/audits/libpq-keyword-sync.py --self-test
+          python3 docs/audits/libpq-keyword-sync.py
+
       # Issue #2492: every diesel table! keeps 32 columns or fewer, so the
       # workspace and every embedder build diesel at its default tier. A wider
       # table splits over two declarations (autumn-harvest/src/table_split.rs).
