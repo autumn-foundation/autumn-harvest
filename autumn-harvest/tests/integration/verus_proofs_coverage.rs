@@ -74,13 +74,14 @@ fn matching_brace(tokens: &[String], open: usize) -> usize {
 }
 
 /// The body tokens of the first `fn <name>(` in `tokens`, with its braces.
+/// A generic fn, `fn <name><T>(`, also matches (issue #2372).
 ///
 /// The body opens at the first `{` outside parentheses. A Verus `ensures`
 /// clause can hold a block, but only inside parentheses.
 fn fn_body(tokens: &[String], name: &str) -> Option<Vec<String>> {
     let start = tokens
         .windows(3)
-        .position(|w| w[0] == "fn" && w[1] == name && w[2] == "(")?;
+        .position(|w| w[0] == "fn" && w[1] == name && (w[2] == "(" || w[2] == "<"))?;
     let mut parens = 0_i32;
     for (i, t) in tokens.iter().enumerate().skip(start) {
         match t.as_str() {

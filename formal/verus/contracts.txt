@@ -73,6 +73,12 @@ pub struct ToolDef { pub name: int, pub description: int, pub effect: int, pub b
 pub open spec fn guided(t: ToolDef, guidance: Map < int, int >) -> ToolDef { if ! t.builtin && guidance.contains_key(t.name) { ToolDef { name: t.name, description: guidance [t.name], effect: t.effect, builtin: false } } else { t } }
 pub proof fn theorem_guidance_changes_only_the_description(t: ToolDef, guidance: Map < int, int >) ensures guided(t, guidance).name == t.name, guided(t, guidance).effect == t.effect, guided(t, guidance).builtin == t.builtin, ! t.builtin && guidance.contains_key(t.name) ==> guided(t, guidance).description == guidance [t.name], t.builtin ||! guidance.contains_key(t.name) ==> guided(t, guidance) == t,
 
+## formal/verus/src/agent_profile_read.rs
+pub open spec fn spec_op_profile < P, V, E > (base: P, active: Option < (V, Result < P, E >) >) -> Result < (P, Option < V >), (V, E), > { match active { None => Ok((base, None)), Some((version, Ok(applied))) => Ok((applied, Some(version))), Some((version, Err(err))) => Err((version, err)), } }
+pub fn op_profile < P, V, E > (base: P, active: Option < (V, Result < P, E >) >) -> (r: Result < (P, Option < V >), (V, E), >) ensures r == spec_op_profile(base, active), active is None ==> r == Ok::< (P, Option < V >), (V, E) > ((base, None)), active is Some ==> (r is Ok <==> (active -> 0).1 is Ok), active is Some && r is Ok ==> (r -> Ok_0).1 == Some((active -> 0).0), active is Some && r is Ok ==> (r -> Ok_0).0 == (active -> 0).1 -> Ok_0, active is Some && r is Err ==> (r -> Err_0).0 == (active -> 0).0,
+pub proof fn theorem_an_active_version_never_runs_bare < P, V, E > (base: P, version: V, applied: Result < P, E >,) ensures spec_op_profile(base, Some((version, applied))) is Ok ==> spec_op_profile(base, Some((version, applied)),) -> Ok_0.1 is Some, applied is Err ==> spec_op_profile(base, Some((version, applied))) is Err,
+pub proof fn theorem_the_recorded_version_is_the_applied_one < P, V, E > (base: P, version: V, applied: P,) ensures spec_op_profile(base, Some((version, Ok::< P, E > (applied)))) == Ok::< (P, Option < V >), (V, E), > ((applied, Some(version))),
+
 ## formal/verus/src/agent_propose.rs
 pub enum Verdict { Invalid, Same, Differs, }
 pub enum Step { Retry, Propose, Keep, FallBack, }

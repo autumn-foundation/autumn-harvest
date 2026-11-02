@@ -29,8 +29,8 @@ use crate::agent::{
     Steer,
 };
 use crate::agent::{
-    agent_info, agent_memory_reset_info, agent_profile_info, agent_workspace_floor_info,
-    agent_workspace_reset_info, agent_workspace_retain_info,
+    agent_info, agent_memory_reset_info, agent_profile_info, agent_profile_overlay_info,
+    agent_workspace_floor_info, agent_workspace_reset_info, agent_workspace_retain_info,
 };
 use crate::approval::{Approval, Decision, approval_signal, await_decision, decode_decision};
 use crate::bounds::{RoundBudget, json_len, reaches_percent, reset_due, sibling_cap};
@@ -2899,6 +2899,7 @@ pub fn activities() -> Vec<ActivityInfo> {
         agent_precheck_info(),
         agent_discover_peers_info(),
         agent_profile_info(),
+        agent_profile_overlay_info(),
         agent_memory_reset_info(),
         agent_workspace_retain_info(),
         agent_workspace_reset_info(),

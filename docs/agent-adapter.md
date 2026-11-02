@@ -102,7 +102,7 @@ let built = HarvestBuilder::new()
 `agent` (section 15). `activities()` returns `agent_model_turn`,
 `agent_tool_call`, `agent_memory_snapshot`, `agent_deliver`,
 `agent_precheck`, `agent_discover_peers`, `agent_profile`,
-`agent_memory_reset`, `agent_workspace_retain`, `agent_workspace_reset`,
+`agent_profile_overlay` (section 15), `agent_memory_reset`, `agent_workspace_retain`, `agent_workspace_reset`,
 `agent_workspace_floor` and `agent_refine_propose` (section 16).
 The test `the_engine_registration_builds` builds this
 exact registration.
@@ -1059,8 +1059,8 @@ the [module guide](architecture.md).
 **Search attributes.** Each op upserts `agent_kind`, `agent_status`
 (`running`, `waiting_approval`, `idle`, `paused` or `parked`),
 `agent_last_active_at`, `agent_next_wake_at`, `agent_wake_reason`,
-`agent_tenant`, `agent_mesh` and `agent_tokens_used`. Times are epoch
-milliseconds. The `filter` grammar of `GET /workflows` lists by them. The
+`agent_tenant`, `agent_mesh`, `agent_tokens_used` and
+`agent_profile_version`. Times are epoch milliseconds. The `filter` grammar of `GET /workflows` lists by them. The
 index `idx_harvest_we_agent_wake` serves a range on `agent_next_wake_at`,
 so a list of the agents due to wake reads only those agents.
 
@@ -1298,6 +1298,43 @@ the answer of each model turn in two layers:
   See [durable routes](durable-routes.md#live-chunks).
 - The live text is a preview. The `TurnText` and the run result are the
   answer.
+
+### Profile overlays (issue #2372)
+
+An activated overlay changes the next op only, because each op reads it
+through a recorded activity and keeps that read to its end.
+
+```rust,ignore
+let store = Arc::new(SqliteOverlayStore::open(&db, Arc::new(base.clone()))?);
+let harness = base.overlay_store(store);
+```
+
+- The run reads its profile through `agent_profile`. With a store, the
+  result sets `overlay_store`, and each op that runs a segment also calls
+  `agent_profile_overlay` with the run profile. That result holds the
+  run profile with the overlay applied, and its `overlay_version`. Replay
+  reads both results from history.
+- The version must still validate under the current harness profile.
+  Then it applies to the run profile under the run ceilings. The op takes
+  only the fields that an overlay can set. The mandate, the peers and the heartbeat stay those of the
+  run, so a deploy still changes the next run only.
+- With no store, the op schedules no read. With no active version, the
+  read records `overlay_version: None`, and the op runs on the run
+  profile.
+- A version that `overlay::apply` refuses fails the op. `last_error` names
+  the version, and no model call runs. The agent never runs bare in its
+  place. A deploy that removes a model or lowers a bound refuses an old
+  version in this way.
+- A heartbeat sets its own bounds and model for a tick. They take
+  precedence over the overlay, as they do over the profile.
+- `AgentState::profile_version` keeps the version of the last op that read
+  one. Each op upserts it as `agent_profile_version`, for example `"v2"`.
+  `filter=attrs.agent_profile_version = 'v2'` lists the agents whose last op
+  ran on version 2.
+- Install the store on every worker, and only after every worker runs
+  this version. An older worker cannot replay a history that holds an op
+  read. On a worker with no store, the op read fails and retries. See
+  `docs/design/DESIGN-2372.md`.
 
 ### Tool guidance and skills (issue #2373)
 
