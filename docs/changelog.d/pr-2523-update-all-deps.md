@@ -1,4 +1,4 @@
-## Dependency update, MSRV 1.97
+## Dependency update, MSRV 1.97 (PR #2523)
 
 Updates every workspace dependency that can move. `testcontainers` stays at
 0.27, because `testcontainers-modules` 0.15 needs it. `rusqlite` stays at 0.40,
