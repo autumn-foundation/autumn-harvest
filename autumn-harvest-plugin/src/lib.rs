@@ -19,6 +19,7 @@ pub mod authz;
 /// auto-wired by [`crate::plugin::HarvestPlugin`].
 pub mod callback_deliverer;
 
+mod agent_profile_api;
 /// Default `reqwest`-based signed-webhook sink for audit-record export.
 ///
 /// Implements [`autumn_harvest::audit_export::AuditSink`], auto-wired by

@@ -18,6 +18,12 @@
 //!   gives that order in each store.
 //!
 //! The shared suite of the stores checks that the SQL does the same.
+//!
+//! Issue #2374 adds the activation log and the rollback. The copies of
+//! `logs_activation` and `rollback_target` are its kernel. The spec `Heads`
+//! models the pointer of one kind and its log of moves. Each move records
+//! the pointer before it and the version after it. A rollback activates the
+//! pointer before the last move, over the pointer after it.
 
 use vstd::prelude::*;
 
@@ -252,6 +258,215 @@ pub proof fn theorem_exactly_one_of_two_activates_wins(log: Log, first: u64, sec
             first,
             log.active,
         ),
+{
+}
+
+// mirror: autumn-harvest/src/overlay_log.rs logs_activation
+pub fn logs_activation(actual: Option<u64>, version: u64) -> (r: bool)
+    ensures
+        r <==> actual != Some(version),
+{
+    match actual {
+        Some(have) => have != version,
+        None => true,
+    }
+}
+
+/// The plan of a rollback: activate `target` over the pointer `expected`.
+pub struct RollbackPlan {
+    pub target: u64,
+    pub expected: u64,
+}
+
+/// `rollback_target` as a spec.
+pub open spec fn spec_rollback_target(from: Option<u64>, to: u64) -> Option<RollbackPlan> {
+    match from {
+        Some(target) => Some(RollbackPlan { target, expected: to }),
+        None => None,
+    }
+}
+
+// mirror: autumn-harvest/src/overlay_log.rs rollback_target
+pub fn rollback_target(from: Option<u64>, to: u64) -> (r: Option<RollbackPlan>)
+    ensures
+        r == spec_rollback_target(from, to),
+        r.is_none() <==> from.is_none(),
+        r.is_some() ==> r.unwrap().target == from.unwrap() && r.unwrap().expected == to,
+{
+    match from {
+        Some(target) => Some(RollbackPlan { target, expected: to }),
+        None => None,
+    }
+}
+
+/// One move of the pointer: the pointer before it and the version after it.
+pub struct Move {
+    pub from: Option<u64>,
+    pub to: u64,
+}
+
+/// The pointer of one kind and its log of moves. The kind holds the
+/// versions 1 to `stored`.
+pub struct Heads {
+    pub stored: u64,
+    pub active: Option<u64>,
+    pub moves: Seq<Move>,
+}
+
+/// The pointer is the version after the last move, or unset with no move.
+/// Each move starts where the move before it ended, and ends on a stored
+/// version. No move stays in place.
+pub open spec fn chained(h: Heads) -> bool {
+    &&& (h.moves.len() == 0 ==> h.active.is_none())
+    &&& (h.moves.len() > 0 ==> h.active == Some(h.moves.last().to))
+    &&& (h.moves.len() > 0 ==> h.moves[0].from.is_none())
+    &&& forall|i: int| 0 < i < h.moves.len() ==> #[trigger] h.moves[i].from == Some(h.moves[i - 1].to)
+    &&& forall|i: int| 0 <= i < h.moves.len() ==> #[trigger] h.moves[i].from != Some(h.moves[i].to)
+    &&& forall|i: int| 0 <= i < h.moves.len() ==> 1 <= #[trigger] h.moves[i].to <= h.stored
+}
+
+/// An activation of `v` over `expected`. A move to a new version logs it.
+/// An activation of the active version succeeds and logs nothing.
+pub open spec fn activate_logged(h: Heads, v: u64, expected: Option<u64>) -> Heads {
+    let known = 1 <= v && v <= h.stored;
+    if spec_decide_activate(known, expected, h.active) != ActivateDecision::Activate {
+        h
+    } else if h.active == Some(v) {
+        h
+    } else {
+        Heads { stored: h.stored, active: Some(v), moves: h.moves.push(Move { from: h.active, to: v }) }
+    }
+}
+
+/// A rollback: read the last move, then activate its start over its end.
+/// With no move, or a last move from an unset pointer, it changes nothing.
+pub open spec fn rollback(h: Heads) -> Heads {
+    if h.moves.len() == 0 {
+        h
+    } else {
+        match spec_rollback_target(h.moves.last().from, h.moves.last().to) {
+            None => h,
+            Some(plan) => activate_logged(h, plan.target, Some(plan.expected)),
+        }
+    }
+}
+
+/// An activation keeps the chain.
+pub proof fn theorem_an_activation_keeps_the_chain(h: Heads, v: u64, expected: Option<u64>)
+    requires
+        chained(h),
+    ensures
+        chained(activate_logged(h, v, expected)),
+        activate_logged(h, v, expected).stored == h.stored,
+{
+    let next = activate_logged(h, v, expected);
+    if next.moves.len() > h.moves.len() {
+        assert forall|i: int| 0 < i < next.moves.len() implies #[trigger] next.moves[i].from
+            == Some(next.moves[i - 1].to) by {
+            if i == h.moves.len() {
+                assert(next.moves[i].from == h.active);
+            } else {
+                assert(next.moves[i] == h.moves[i]);
+                assert(next.moves[i - 1] == h.moves[i - 1]);
+            }
+        }
+        assert forall|i: int| 0 <= i < next.moves.len() implies #[trigger] next.moves[i].from
+            != Some(next.moves[i].to) by {
+            if i < h.moves.len() {
+                assert(next.moves[i] == h.moves[i]);
+            }
+        }
+        assert forall|i: int| 0 <= i < next.moves.len() implies 1 <= #[trigger] next.moves[i].to
+            <= next.stored by {
+            if i < h.moves.len() {
+                assert(next.moves[i] == h.moves[i]);
+            }
+        }
+    }
+}
+
+/// A rollback keeps the chain.
+pub proof fn theorem_a_rollback_keeps_the_chain(h: Heads)
+    requires
+        chained(h),
+    ensures
+        chained(rollback(h)),
+{
+    if h.moves.len() > 0 {
+        match spec_rollback_target(h.moves.last().from, h.moves.last().to) {
+            None => {},
+            Some(plan) => theorem_an_activation_keeps_the_chain(h, plan.target, Some(plan.expected)),
+        }
+    }
+}
+
+/// A rollback with no earlier activation changes nothing: no move, or a
+/// last move from an unset pointer.
+pub proof fn theorem_a_rollback_with_no_earlier_activation_changes_nothing(h: Heads)
+    requires
+        chained(h),
+        h.moves.len() == 0 || h.moves.last().from.is_none(),
+    ensures
+        rollback(h) == h,
+{
+}
+
+/// A rollback activates the version that was active before the current
+/// one. It logs that move, so a second rollback undoes it.
+pub proof fn theorem_a_rollback_restores_the_version_before(h: Heads)
+    requires
+        chained(h),
+        h.moves.len() > 0,
+        h.moves.last().from.is_some(),
+        1 <= h.moves.last().from.unwrap() <= h.stored,
+    ensures
+        rollback(h).active == h.moves.last().from,
+        rollback(h).moves.len() == h.moves.len() + 1,
+        rollback(h).moves.last() == (Move { from: h.active, to: h.moves.last().from.unwrap() }),
+        rollback(rollback(h)).active == h.active,
+{
+    let back = rollback(h);
+    theorem_a_rollback_keeps_the_chain(h);
+    assert(back.moves.last() == Move { from: h.active, to: h.moves.last().from.unwrap() });
+    assert(h.active.is_some());
+    assert(1 <= h.active.unwrap() <= h.stored);
+}
+
+/// The issue case: activate v1, then v2 over v1, then roll back. v1 is
+/// active again.
+pub proof fn theorem_a_rollback_after_v1_then_v2_makes_v1_active(stored: u64)
+    requires
+        stored >= 2,
+    ensures
+        rollback(
+            activate_logged(
+                activate_logged(Heads { stored, active: None, moves: Seq::empty() }, 1, None),
+                2,
+                Some(1u64),
+            ),
+        ).active == Some(1u64),
+{
+    let empty = Heads { stored, active: None, moves: Seq::empty() };
+    let one = activate_logged(empty, 1, None);
+    let two = activate_logged(one, 2, Some(1u64));
+    assert(one.moves.len() == 1);
+    assert(two.moves.len() == 2);
+    assert(two.moves.last() == Move { from: Some(1u64), to: 2 });
+}
+
+/// Two rollbacks read the same last move. The lock of the head row runs
+/// them in turn. The first moves the pointer, and the second is a
+/// conflict, so it changes nothing.
+pub proof fn theorem_exactly_one_of_two_rollbacks_wins(h: Heads)
+    requires
+        chained(h),
+        h.moves.len() > 0,
+        h.moves.last().from.is_some(),
+        1 <= h.moves.last().from.unwrap() <= h.stored,
+    ensures
+        rollback(h).active != h.active,
+        activate_logged(rollback(h), h.moves.last().from.unwrap(), Some(h.moves.last().to))
+            == rollback(h),
 {
 }
 

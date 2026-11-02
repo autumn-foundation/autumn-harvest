@@ -645,6 +645,7 @@ version = "0.8.0"
 dependencies = [
  "async-trait",
  "autumn-harvest",
+ "autumn-harvest-agent",
  "autumn-harvest-redis",
  "autumn-harvest-sqlite",
  "autumn-web",

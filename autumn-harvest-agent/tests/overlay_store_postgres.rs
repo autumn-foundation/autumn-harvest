@@ -128,7 +128,10 @@ async fn postgres_refuses_a_delete_of_the_active_version() {
         )
         .await
         .expect("put");
-    store.activate(&kind, v1, None).await.expect("activate");
+    store
+        .activate(&kind, v1, None, Provenance::operator("ops"))
+        .await
+        .expect("activate");
 
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     let err = diesel::sql_query("DELETE FROM harvest_agent_overlays WHERE kind = $1")
@@ -139,6 +142,54 @@ async fn postgres_refuses_a_delete_of_the_active_version() {
     assert!(err.to_string().contains("foreign key"), "{err}");
     let active = store.active(&kind).await.expect("active").expect("set");
     assert_eq!(active.version(), v1);
+}
+
+/// The trigger refuses each `UPDATE` of an activation row, so no one can
+/// change the target of a rollback (issue #2374).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_refuses_an_update_of_an_activation_row() {
+    let (url, _container) = database().await;
+    let store =
+        PostgresOverlayStore::new(pool(&url), Arc::new(overlay_store_suite::Gate::default()));
+    let kind = unique("moves");
+    let ops = || Provenance::operator("ops");
+    let v1 = store
+        .put(&kind, &ProfileOverlay::default(), ops())
+        .await
+        .expect("v1");
+    let v2 = store
+        .put(&kind, &ProfileOverlay::default(), ops())
+        .await
+        .expect("v2");
+    store.activate(&kind, v1, None, ops()).await.expect("v1");
+    store
+        .activate(&kind, v2, Some(v1), ops())
+        .await
+        .expect("v2");
+
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    for statement in [
+        "UPDATE harvest_agent_overlay_activations SET from_version = 2 WHERE kind = $1",
+        "UPDATE harvest_agent_overlay_activations SET actor = 'mallory' WHERE kind = $1",
+    ] {
+        let err = diesel::sql_query(statement)
+            .bind::<Text, _>(&kind)
+            .execute(&mut conn)
+            .await
+            .expect_err("the guard refuses it");
+        assert!(
+            err.to_string()
+                .contains("harvest_agent_overlay_activations is append-only"),
+            "{statement}: {err}"
+        );
+    }
+    let last = store
+        .last_activation(&kind)
+        .await
+        .expect("last")
+        .expect("v2");
+    assert_eq!((last.from(), last.to()), (Some(v1), v2));
+    assert_eq!(last.actor(), &ops());
 }
 
 /// The log refuses the delete of a head row, so a deleted version never
@@ -156,7 +207,10 @@ async fn postgres_never_gives_a_version_number_twice() {
     let ops = || Provenance::operator("ops");
     let v1 = store.put(&kind, &first, ops()).await.expect("v1");
     let v2 = store.put(&kind, &first, ops()).await.expect("v2");
-    store.activate(&kind, v1, None).await.expect("activate");
+    store
+        .activate(&kind, v1, None, Provenance::operator("ops"))
+        .await
+        .expect("activate");
 
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     diesel::sql_query("DELETE FROM harvest_agent_overlays WHERE kind = $1 AND version = 2")
@@ -189,7 +243,7 @@ async fn the_postgres_log_decides_under_the_lock() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     let kind = unique("log");
     assert_eq!(
-        activate_overlay(&mut conn, &kind, 1, None)
+        activate_overlay(&mut conn, &kind, 1, None, "operator", "ops")
             .await
             .expect("no head"),
         ActivateOutcome::UnknownVersion
@@ -200,25 +254,25 @@ async fn the_postgres_log_decides_under_the_lock() {
         .expect("a version");
     assert_eq!(row.version, 1);
     assert_eq!(
-        activate_overlay(&mut conn, &kind, 2, None)
+        activate_overlay(&mut conn, &kind, 2, None, "operator", "ops")
             .await
             .expect("unknown"),
         ActivateOutcome::UnknownVersion
     );
     assert_eq!(
-        activate_overlay(&mut conn, &kind, u64::MAX, None)
+        activate_overlay(&mut conn, &kind, u64::MAX, None, "operator", "ops")
             .await
             .expect("too large"),
         ActivateOutcome::UnknownVersion
     );
     assert_eq!(
-        activate_overlay(&mut conn, &kind, 1, Some(u64::MAX))
+        activate_overlay(&mut conn, &kind, 1, Some(u64::MAX), "operator", "ops")
             .await
             .expect("far expected"),
         ActivateOutcome::Conflict { actual: None }
     );
     assert_eq!(
-        activate_overlay(&mut conn, &kind, 1, None)
+        activate_overlay(&mut conn, &kind, 1, None, "operator", "ops")
             .await
             .expect("activate"),
         ActivateOutcome::Activated

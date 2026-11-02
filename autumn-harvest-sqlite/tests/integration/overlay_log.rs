@@ -49,7 +49,8 @@ fn sqlite_refuses_a_delete_of_the_active_version() {
     let path = dir.path().join("harvest.db");
     let log = log_with_one_version(&path);
     assert_eq!(
-        log.activate("support", 1, None).expect("activate"),
+        log.activate("support", 1, None, "operator", "ops")
+            .expect("activate"),
         ActivateOutcome::Activated
     );
     // A raw connection has no `foreign_keys` pragma. The trigger refuses the
@@ -76,23 +77,28 @@ fn an_activation_is_a_compare_and_swap() {
         .expect("v2")
         .expect("a version");
     assert_eq!(
-        log.activate("support", 3, None).expect("activate"),
+        log.activate("support", 3, None, "operator", "ops")
+            .expect("activate"),
         ActivateOutcome::UnknownVersion
     );
     assert_eq!(
-        log.activate("other", 1, None).expect("activate"),
+        log.activate("other", 1, None, "operator", "ops")
+            .expect("activate"),
         ActivateOutcome::UnknownVersion
     );
     assert_eq!(
-        log.activate("support", 1, None).expect("activate"),
+        log.activate("support", 1, None, "operator", "ops")
+            .expect("activate"),
         ActivateOutcome::Activated
     );
     assert_eq!(
-        log.activate("support", 2, None).expect("activate"),
+        log.activate("support", 2, None, "operator", "ops")
+            .expect("activate"),
         ActivateOutcome::Conflict { actual: Some(1) }
     );
     assert_eq!(
-        log.activate("support", 2, Some(1)).expect("activate"),
+        log.activate("support", 2, Some(1), "operator", "ops")
+            .expect("activate"),
         ActivateOutcome::Activated
     );
     let versions: Vec<u64> = log
@@ -190,7 +196,8 @@ fn activates_on_two_connections_have_one_winner() {
         let target = u64::try_from(n).expect("small") + 2;
         (
             target,
-            log.activate("support", target, None).expect("activate"),
+            log.activate("support", target, None, "operator", "ops")
+                .expect("activate"),
         )
     });
     let winners: Vec<u64> = outcomes
@@ -214,5 +221,49 @@ fn activates_on_two_connections_have_one_winner() {
             .expect("active")
             .map(|row| row.version),
         Some(winners[0])
+    );
+}
+
+/// Each move logs one row, and the guard refuses a change of a row (issue
+/// #2374). An activation of the active version logs nothing.
+#[test]
+fn sqlite_logs_each_move_and_refuses_a_rewrite() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("harvest.db");
+    let log = log_with_one_version(&path);
+    log.append("support", b"{}", "operator", "ops")
+        .expect("append")
+        .expect("v2");
+    assert_eq!(log.last_activation("support").expect("last"), None);
+    log.activate("support", 1, None, "operator", "ops")
+        .expect("v1");
+    log.activate("support", 2, Some(1), "operator", "oncall")
+        .expect("v2");
+    log.activate("support", 2, Some(2), "operator", "ops")
+        .expect("stay");
+    let last = log.last_activation("support").expect("last").expect("move");
+    assert_eq!((last.seq, last.from, last.to), (2, Some(1), 2));
+    assert_eq!(last.actor, "oncall");
+
+    let raw = rusqlite::Connection::open(&path).expect("raw");
+    for statement in [
+        "UPDATE harvest_agent_overlay_activations SET from_version = 2",
+        "INSERT OR REPLACE INTO harvest_agent_overlay_activations \
+         (kind, seq, from_version, to_version, actor_kind, actor, activated_at_ms) \
+         VALUES ('support', 2, 2, 1, 'operator', 'mallory', 0)",
+    ] {
+        let err = raw
+            .execute(statement, [])
+            .expect_err("the guard refuses it");
+        assert!(
+            err.to_string()
+                .contains("harvest_agent_overlay_activations is append-only"),
+            "{statement}: {err}"
+        );
+    }
+    let last = log.last_activation("support").expect("last").expect("move");
+    assert_eq!(
+        (last.from, last.to, last.actor.as_str()),
+        (Some(1), 2, "oncall")
     );
 }

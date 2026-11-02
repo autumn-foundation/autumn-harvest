@@ -265,6 +265,9 @@ pub struct HarvestPlugin {
     /// [`Self::synthetic_canary`]; `None` (default) leaves the canary entirely
     /// off and the runtime byte-for-byte unchanged (AC1).
     canary_config: Option<crate::canary::CanaryConfig>,
+    /// The agent profile overlay store of the `/agents/{kind}/profile`
+    /// routes (issue #2374). Set via [`Self::agent_overlay_store`].
+    agent_overlay_store: Option<Arc<dyn autumn_harvest_agent::ProfileOverlayStore>>,
     /// Inbound webhook trigger bindings produced by `autumn_harvest::webhooks!`
     /// (issue #344). Set via [`Self::webhooks`] (feature `webhooks`).
     #[cfg(feature = "webhooks")]
@@ -382,6 +385,7 @@ impl HarvestPlugin {
             allow_unauthenticated_mutations: false,
             status_thresholds: crate::status_summary::StatusThresholds::default(),
             canary_config: None,
+            agent_overlay_store: None,
             #[cfg(feature = "webhooks")]
             webhook_triggers: Vec::new(),
             #[cfg(feature = "connectors")]
@@ -967,6 +971,21 @@ impl HarvestPlugin {
         self
     }
 
+    /// Serve the agent profile overlay routes from `store` (issue #2374).
+    ///
+    /// The routes list, show and diff the overlay versions of an agent kind,
+    /// and activate or roll back a version. Give the store the harness as
+    /// its validator, so each activation checks the overlay again. Without
+    /// this call, each of those routes answers `404`.
+    #[must_use]
+    pub fn agent_overlay_store(
+        mut self,
+        store: Arc<dyn autumn_harvest_agent::ProfileOverlayStore>,
+    ) -> Self {
+        self.agent_overlay_store = Some(store);
+        self
+    }
+
     /// Register inbound webhook triggers produced by `autumn_harvest::webhooks!`
     /// (issue #344).
     ///
@@ -1467,6 +1486,11 @@ impl HarvestPlugin {
             2471,
         );
         refuse(
+            self.agent_overlay_store.is_some(),
+            "HarvestPlugin::agent_overlay_store",
+            2471,
+        );
+        refuse(
             self.decode_payloads_on_read,
             "HarvestPlugin::decode_payloads_on_read",
             2468,
@@ -1517,6 +1541,7 @@ impl HarvestPlugin {
             allow_unauthenticated_mutations,
             status_thresholds,
             canary_config,
+            agent_overlay_store,
             #[cfg(feature = "webhooks")]
             webhook_triggers,
             #[cfg(feature = "connectors")]
@@ -1903,6 +1928,8 @@ impl HarvestPlugin {
         // schedule, and the (follow-up) `GET /admin/canary` read model can
         // resolve the interval/staleness window. `None` leaves the canary off.
         api_state.set_canary_config(canary_config);
+        // Issue #2374: the store of the agent profile overlay routes.
+        api_state.set_agent_overlay_store(agent_overlay_store);
 
         let slot = Arc::new(Mutex::new(HarvestRuntimeSlot {
             builder: Some(builder),

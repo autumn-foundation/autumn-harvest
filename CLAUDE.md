@@ -201,7 +201,10 @@ each `UPDATE`. A second trigger keeps each head row, so no version number
 comes back. The SQLite store has the same guards. Only the pointer in
 `harvest_agent_overlay_heads` moves, by a compare-and-swap. Each store
 validates an overlay with `overlay::apply` before a put and before an
-activation.
+activation. Each move of the pointer adds one row to
+`harvest_agent_overlay_activations` in the same transaction (issue #2374).
+A rollback reads that row, so never rewrite it. The trigger
+`harvest_agent_overlay_activations_immutable_trg` refuses each `UPDATE`.
 
 ### Decision owner fence (issue #2249)
 

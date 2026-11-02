@@ -102,6 +102,9 @@ sqlite = ["autumn-web/sqlite", "dep:autumn-harvest-sqlite"]
 
 [dependencies]
 autumn-harvest = { version = "0.8.0", path = "../autumn-harvest", features = ["db", "testing"] }
+# The agent profile overlay routes (issue #2374) use the store trait and the
+# overlay diff. The crate builds on the core crate only, so no cycle forms.
+autumn-harvest-agent = { version = "0.8.0", path = "../autumn-harvest-agent" }
 autumn-web = "0.9"
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }

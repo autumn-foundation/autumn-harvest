@@ -4,7 +4,7 @@
 driver = "per_request"
 backend = ["sqlite"]
 kind = ["read", "write"]
-tables = ["harvest_agent_overlay_heads", "harvest_agent_overlays"]
+tables = ["harvest_agent_overlay_activations", "harvest_agent_overlay_heads", "harvest_agent_overlays"]
 measured = "unmeasured"
 
 ["SqliteOverlayLog::active"]
@@ -39,5 +39,12 @@ measured = "unmeasured"
 driver = "setup"
 backend = ["sqlite"]
 kind = ["ddl", "read"]
-tables = ["harvest_agent_overlay_heads", "harvest_agent_overlays"]
+tables = ["harvest_agent_overlay_activations", "harvest_agent_overlay_heads", "harvest_agent_overlays"]
+measured = "unmeasured"
+
+["SqliteOverlayLog::last_activation"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_agent_overlay_activations"]
 measured = "unmeasured"
