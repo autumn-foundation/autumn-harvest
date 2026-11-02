@@ -25,9 +25,14 @@ cap needs a deploy.
   start, update-with-start, debounce, batch, bulk start, the trigger-now
   routes, the DAG trigger, the scheduler tick and its buffered drain, the
   typed `WorkflowHandle` start and the child spawn.
-- The outbox start and the Vantage trigger-now do not set a chain timeout. So
-  they ignore both the code value and the fleet ceiling. This is a gap of
-  #617.
+- The outbox start, the Vantage trigger-now and the typed signal-with-start
+  stub do not set a chain timeout. So they ignore both the code value and the
+  fleet ceiling. This is a gap of #617.
+- A child spawn does not apply the fleet chain ceiling. So an override above
+  the ceiling would reach a child uncapped.
+- A completion-trigger start sets no chain timeout and no execution timeout.
+  Its outbox row has no column for them. This change leaves that path as it
+  is, and a follow-up issue tracks it.
 - The cache of #2387 holds one `RunDefaultFields` per type. A start reads it
   from memory.
 
@@ -51,10 +56,10 @@ and a shorter deadline can end a chain at once.
 
 | Way to break it | Guard |
 |---|---|
-| A start path reads the code value and skips the override. | `HandlerRegistry::chain_execution_timeout` is the one resolver. Each start path calls it. A source guard fails on a direct read of the field outside the allow list. |
+| A start path reads the code value and skips the override. | `HandlerRegistry::chain_execution_timeout` is the one resolver. Each start path calls it. A source guard scans every source file and fails on a read that no `apply_chain*` call wraps. |
 | A continue-as-new successor re-resolves the chain timeout from the override. A chain then escapes its cap. | The successor copies both columns, as before. A worker test sets an override and checks that the successor keeps the stored deadline. |
 | The override skips the fleet ceiling. | The override replaces only the type value. `effective_chain_timeout` caps the result. An HTTP test sets an override above the ceiling. |
-| A value of zero or above 100 years. `chrono` overflows and drops the cap. | The write refuses it, as for the other fields. A `CHECK` refuses it in the table too. |
+| A value of zero or above 100 years. `chrono` overflows and drops the cap. | The write refuses both, as for the other fields. The table `CHECK` also refuses zero. |
 | The row `CHECK` still demands `sla_secs` or `execution_timeout_secs`. An override of the chain cap alone then fails. | The migration replaces the `CHECK`. A DB test stores a chain-only override. |
 | An old process reads a row with a chain value only. | An old process decodes the row with no chain field. It treats the row as an override that sets nothing, so it uses the code values. |
 | A `recompute_in_flight` reads the chain field. | The recompute moves the SLA only. The route documents that the chain cap never moves in flight. |
@@ -91,8 +96,12 @@ and a shorter deadline can end a chain at once.
   `CHECK` to three columns.
 - The route takes and returns `chain_execution_timeout_secs` in `code`,
   `override` and `effective`. The bound is 1 second to 100 years.
-- The outbox start and the Vantage trigger-now pass the chain timeout and the
-  fleet ceiling, as the other start paths do.
+- The outbox start, the Vantage trigger-now of a workflow schedule and the
+  typed signal-with-start stub pass the chain timeout and the fleet ceiling,
+  as the other start paths do. A Vantage trigger-now of a DAG passes neither,
+  as the scheduler DAG path does.
+- A child spawn caps its chain timeout with the fleet ceiling. A child type
+  with no chain timeout stays uncapped, as before.
 
 ## Acceptance criteria
 

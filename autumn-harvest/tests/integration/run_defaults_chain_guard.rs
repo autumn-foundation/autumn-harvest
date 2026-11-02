@@ -3,30 +3,43 @@
 //! An operator can override `chain_execution_timeout` at runtime.
 //! `HandlerRegistry::chain_execution_timeout` applies that override. A start
 //! path that reads the declared field itself skips the override. This guard
-//! fails on such a read in the files that hold the start paths.
+//! scans every source file of the crates that start runs. It fails on a read
+//! of the declared field that no `apply_chain*` call wraps.
 
-/// The files that start a chain, from the repository root.
-const START_PATHS: [&str; 7] = [
-    "autumn-harvest-plugin/src/api.rs",
-    "autumn-harvest-plugin/src/ui.rs",
-    "autumn-harvest-plugin/src/outbox.rs",
-    "autumn-harvest/src/scheduler.rs",
-    "autumn-harvest/src/handle.rs",
-    "autumn-harvest/src/worker.rs",
-    "autumn-harvest-macros/src/workflow.rs",
+use std::path::{Path, PathBuf};
+
+/// The source trees to scan, from the repository root.
+const SOURCE_DIRS: [&str; 4] = [
+    "autumn-harvest/src",
+    "autumn-harvest-plugin/src",
+    "autumn-harvest-macros/src",
+    "autumn-harvest-agent/src",
 ];
 
-fn read(relative: &str) -> String {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crate directory must have a parent");
-    std::fs::read_to_string(root.join(relative))
-        .unwrap_or_else(|error| panic!("read {relative}: {error}"))
-        .replace("\r\n", "\n")
-}
+/// The files that may read the declared value. None of them starts a run.
+const ALLOWED_FILES: [&str; 4] = [
+    // The declaration, its builder method and its `Debug` output.
+    "autumn-harvest/src/info.rs",
+    // The startup check of the declared durations.
+    "autumn-harvest/src/builder.rs",
+    // The `code` view of the run-defaults route.
+    "autumn-harvest-plugin/src/run_defaults_api.rs",
+    // A unit test of the macro token helper.
+    "autumn-harvest-macros/src/attr_util.rs",
+];
 
-/// The receivers that name a `WorkflowInfo` in these files.
-const INFO_NAMES: [&str; 6] = ["info", "w", "wf", "wf_info", "target_info", "child_wf_info"];
+/// The receivers that name a `WorkflowInfo` in the scanned files.
+const INFO_NAMES: [&str; 9] = [
+    "info",
+    "i",
+    "w",
+    "wf",
+    "wf_info",
+    "target_info",
+    "child_wf_info",
+    "workflow_info",
+    "meta",
+];
 
 /// A read is sanctioned when an `apply_chain*` call wraps it.
 const APPLY: &str = "apply_chain";
@@ -34,28 +47,68 @@ const APPLY: &str = "apply_chain";
 /// How many lines before or after a read the wrapping call can sit.
 ///
 /// `rustfmt` splits a long call over several lines.
-const WINDOW: usize = 5;
+const WINDOW: usize = 3;
 
-/// Whether `code` reads `{name}.chain_execution_timeout` as a whole token.
-fn reads_field(code: &str, name: &str) -> bool {
-    let needle = format!("{name}.chain_execution_timeout");
-    code.match_indices(&needle).any(|(at, _)| {
-        let before = code[..at].chars().next_back();
-        let after = code[at + needle.len()..].chars().next();
-        !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
-            && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+const FIELD: &str = ".chain_execution_timeout";
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crate directory must have a parent")
+        .to_path_buf()
+}
+
+/// Every `.rs` file under `dir`, as a path from the repository root.
+fn rust_files(root: &Path, dir: &str, out: &mut Vec<String>) {
+    let entries =
+        std::fs::read_dir(root.join(dir)).unwrap_or_else(|error| panic!("read {dir}: {error}"));
+    for entry in entries {
+        let path = entry.expect("dir entry").path();
+        let relative = path
+            .strip_prefix(root)
+            .expect("under the root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if path.is_dir() {
+            rust_files(root, &relative, out);
+        } else if relative.ends_with(".rs") {
+            out.push(relative);
+        }
+    }
+}
+
+/// Whether `code` reads the field of a receiver in [`INFO_NAMES`].
+///
+/// A receiver may follow a `.`, as in `self.info`. An assignment is not a
+/// read.
+fn reads_field(code: &str) -> bool {
+    code.match_indices(FIELD).any(|(at, _)| {
+        let receiver: String = code[..at]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let rest = &code[at + FIELD.len()..];
+        let whole_token = !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_');
+        let trimmed = rest.trim_start();
+        let assignment = trimmed.starts_with('=') && !trimmed.starts_with("==");
+        whole_token && !assignment && INFO_NAMES.contains(&receiver.as_str())
     })
+}
+
+/// The code part of a line, without a trailing `//` comment.
+fn code(line: &str) -> &str {
+    line.split("//").next().unwrap_or_default()
 }
 
 /// The reads of the declared chain cap that no override wraps.
 fn unwrapped_reads(source: &str) -> Vec<(usize, String)> {
     let lines: Vec<&str> = source.lines().collect();
-    let code = |line: &str| line.split("//").next().unwrap_or_default().to_string();
     (0..lines.len())
-        .filter(|&index| {
-            let text = code(lines[index]);
-            INFO_NAMES.iter().any(|name| reads_field(&text, name))
-        })
+        .filter(|&index| reads_field(code(lines[index])))
         .filter(|&index| {
             let low = index.saturating_sub(WINDOW);
             let high = (index + WINDOW).min(lines.len() - 1);
@@ -69,14 +122,22 @@ fn unwrapped_reads(source: &str) -> Vec<(usize, String)> {
 
 #[test]
 fn no_start_path_reads_the_declared_chain_cap() {
-    let offenders: Vec<String> = START_PATHS
+    let root = repo_root();
+    let mut files = Vec::new();
+    for dir in SOURCE_DIRS {
+        rust_files(&root, dir, &mut files);
+    }
+    assert!(files.len() > 50, "the scan must cover the source trees");
+    let mut offenders = Vec::new();
+    for file in files
         .iter()
-        .flat_map(|path| {
-            unwrapped_reads(&read(path))
-                .into_iter()
-                .map(move |(line, text)| format!("{path}:{line}: {text}"))
-        })
-        .collect();
+        .filter(|f| !ALLOWED_FILES.contains(&f.as_str()))
+    {
+        let source = std::fs::read_to_string(root.join(file)).expect("read source");
+        for (line, text) in unwrapped_reads(&source) {
+            offenders.push(format!("{file}:{line}: {text}"));
+        }
+    }
     assert!(
         offenders.is_empty(),
         "read the chain cap through HandlerRegistry::chain_execution_timeout \
@@ -84,24 +145,27 @@ fn no_start_path_reads_the_declared_chain_cap() {
     );
 }
 
-/// The guard is live: it flags a bare read, and it skips a wrapped read, a
-/// comment and a stored row.
+/// The guard is live: it flags a bare read, and it skips a wrapped read, an
+/// assignment, a comment and a stored row.
 #[test]
 fn the_guard_flags_a_bare_read_only() {
     let sample = "let x = info.chain_execution_timeout;\n\
                   let y = execution.chain_execution_timeout;\n\
                   // info.chain_execution_timeout in a comment\n\
-                  .and_then(|info| info.chain_execution_timeout)\n";
+                  .and_then(|i| i.chain_execution_timeout)\n\
+                  info.chain_execution_timeout = Some(d);\n\
+                  let z = self.info.chain_execution_timeout;\n";
     let lines: Vec<usize> = unwrapped_reads(sample)
         .into_iter()
         .map(|(n, _)| n)
         .collect();
-    assert_eq!(lines, [1, 4]);
+    assert_eq!(lines, [1, 4, 6]);
     let wrapped = "cache.apply_chain(name, wf.chain_execution_timeout)\n";
     assert!(unwrapped_reads(wrapped).is_empty());
+    let resolver = std::fs::read_to_string(repo_root().join("autumn-harvest/src/worker.rs"))
+        .expect("read worker.rs");
     assert!(
-        read("autumn-harvest/src/worker.rs")
-            .contains("pub fn chain_execution_timeout(&self, workflow_name: &str)"),
+        resolver.contains("pub fn chain_execution_timeout(&self, workflow_name: &str)"),
         "the resolver must exist"
     );
 }

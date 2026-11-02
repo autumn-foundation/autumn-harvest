@@ -76,7 +76,9 @@ The start clamps still apply after the override:
   `sla = 3h` gives new runs a 10-minute SLA.
 - The fleet ceiling `max_workflow_execution_timeout` still caps the timeout.
 - The fleet chain ceiling `max_workflow_chain_timeout` still caps the chain
-  cap. A type with no chain cap takes the ceiling as its default, as before.
+  cap. A root run of a type with no chain cap takes the ceiling as its
+  default, as before. A child run of such a type stays uncapped.
+- A completion-trigger start sets no chain cap. A follow-up issue tracks it.
 - A per-start `sla_secs` or `execution_timeout_secs` in the start request
   still wins over both.
 

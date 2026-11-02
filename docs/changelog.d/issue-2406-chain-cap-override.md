@@ -19,11 +19,13 @@ override. Every start path of a new chain calls it, or
 `apply_chain_run_default`. The guard `run_defaults_chain_guard` fails on a
 start path that reads the declared field itself.
 
-**Gaps closed.** The outbox start and the Vantage trigger-now set no chain
-cap before. They now take the chain cap of the type, the override and the
-fleet chain ceiling. The typed `start` and `signal_with_start` stubs of
-`#[workflow]` now apply the run-default overrides of a client that shares the
-cache (#2387).
+**Gaps closed.** The outbox start, the Vantage trigger-now of a workflow
+schedule and the typed `signal_with_start` stub set no chain cap before. They
+now take the chain cap of the type, the override and the fleet chain ceiling.
+A child spawn now caps its chain cap with the fleet ceiling. The typed `start`
+and `signal_with_start` stubs of `#[workflow]` now apply the run-default
+overrides of a client that shares the cache (#2387). A completion-trigger
+start still sets no chain cap. A follow-up issue tracks it.
 
 **Migration.** `20261102141324_harvest_run_default_chain_timeout` adds the
 nullable column `chain_execution_timeout_secs` to

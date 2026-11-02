@@ -1148,9 +1148,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             "max_execution_timeout_ceiling",
             &quote! { client.max_workflow_execution_timeout() },
         );
-    // `start_with_options`-only (issue #617): `signal_with_start` and
-    // `update.rs`'s `update_with_start` pass `None` for both instead. The
-    // operator override of the chain cap wins (issue #2406).
+    // Shared by `start_with_options` and `signal_with_start` (issue #2406).
+    // `update.rs`'s `update_with_start` passes `None` for both. The operator
+    // override of the chain cap wins.
     let stub_chain_execution_timeout_tokens = crate::attr_util::optional_chrono_duration_tokens(
         "chain_execution_timeout",
         &quote! { client.apply_chain_run_default(info.name, info.chain_execution_timeout) },
@@ -1390,14 +1390,10 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     let max_execution_timeout_ceiling = #stub_max_execution_timeout_ceiling_tokens;
 
-                    // Note (issue #617): this typed-stub signal-with-start passes
-                    // `None` for the two chain-cap fields below, so it does NOT
-                    // apply the chain-scoped lifetime cap. The chain cap (both the
-                    // workflow-type default and the fleet-wide ceiling-as-default)
-                    // IS resolved on the HTTP signal-with-start route and on this
-                    // stub's own `start`/`start_with_options` path (via
-                    // `StartWorkflowParams`), plus the scheduler/backfill start
-                    // paths — never here.
+                    // Chain-scoped lifetime cap (issues #617 and #2406): the type
+                    // value, the operator override and the fleet chain ceiling.
+                    let chain_execution_timeout = #stub_chain_execution_timeout_tokens;
+                    let max_workflow_chain_timeout_ceiling = #stub_max_workflow_chain_timeout_ceiling_tokens;
 
                     let payload = ::autumn_harvest::serde_json::to_value(&signal_payload)
                         .map_err(::autumn_harvest::error::HarvestError::Serialization)?;
@@ -1415,12 +1411,10 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         reuse_policy: opts.reuse_policy.unwrap_or(::autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate),
                         trace_context: opts.trace_context,
                         max_execution_timeout_ceiling,
-                        // Chain-scoped lifetime cap (issue #617): the typed-stub
-                        // signal-with-start does NOT thread the chain cap. It is
-                        // resolved on the HTTP signal-with-start route and on the
-                        // typed stub's own `start`/`start_with_options` path.
-                        chain_execution_timeout: ::std::option::Option::None,
-                        max_workflow_chain_timeout_ceiling: ::std::option::Option::None,
+                        // Chain-scoped lifetime cap (issues #617 and #2406), as in
+                        // `start_with_options` and the HTTP signal-with-start route.
+                        chain_execution_timeout,
+                        max_workflow_chain_timeout_ceiling,
                         concurrency_key,
                         concurrency_limit,
                         concurrency_on_conflict,

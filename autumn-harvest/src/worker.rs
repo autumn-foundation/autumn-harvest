@@ -1942,6 +1942,37 @@ mod resolve_dispatch_deadline_tests {
         assert_eq!(registry.chain_execution_timeout("wf"), Some(hour));
     }
 
+    /// Issue #2406 AC2: the fleet chain ceiling caps the chain cap of a child,
+    /// override included. A child type with no cap stays uncapped.
+    #[test]
+    fn the_fleet_chain_ceiling_caps_a_child_override() {
+        let hour = std::time::Duration::from_secs(3600);
+        let registry = HandlerRegistry::new(
+            vec![
+                deadline_info_fixture("wf", None, None),
+                deadline_info_fixture("uncapped", None, None),
+            ],
+            vec![],
+        )
+        .with_max_workflow_chain_timeout(Some(2 * hour));
+        registry.run_defaults().write_through(
+            "wf",
+            crate::run_defaults::RunDefaultFields {
+                chain_execution_timeout: Some(10 * hour),
+                ..crate::run_defaults::RunDefaultFields::default()
+            },
+        );
+        let child = resolve_child_workflow_defaults(&registry, "wf");
+        assert_eq!(
+            child.chain_execution_timeout,
+            Some(chrono::Duration::hours(2))
+        );
+        let deadline = child.chain_deadline_at.expect("a chain deadline");
+        assert!(deadline <= chrono::Utc::now() + chrono::Duration::hours(2));
+        let uncapped = resolve_child_workflow_defaults(&registry, "uncapped");
+        assert_eq!(uncapped.chain_execution_timeout, None);
+    }
+
     /// A DAG's shadow `WorkflowInfo` resolves through the exact same code
     /// path as a plain `#[workflow]` (issue #1412). `DagInfo::as_workflow_info`
     /// propagates `execution_timeout`/`sla` verbatim onto that shadow entry,
@@ -13675,8 +13706,14 @@ fn resolve_child_workflow_defaults(
     let deadline_at = execution_timeout.map(|d| chrono::Utc::now() + d);
     let sla_deadline_at = sla.map(|d| chrono::Utc::now() + d);
     // A child is its own logical workflow → fresh chain origin (issue #617).
-    let chain_execution_timeout =
-        chain_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
+    // Issue #2406: the fleet chain ceiling caps the chain cap of a child, so
+    // an override cannot exceed it. A child type with no cap stays uncapped.
+    let chain_ceiling = registry
+        .max_workflow_chain_timeout
+        .and_then(|d| chrono::Duration::from_std(d).ok());
+    let chain_execution_timeout = chain_execution_timeout
+        .and_then(|d| chrono::Duration::from_std(d).ok())
+        .map(|d| chain_ceiling.map_or(d, |ceiling| d.min(ceiling)));
     // `checked_add_signed` guards against `Duration::MAX` overflow (issue
     // #617): `DateTime + Duration` panics; yield `None` instead.
     let chain_deadline_at =

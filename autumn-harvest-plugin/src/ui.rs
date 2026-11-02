@@ -10600,16 +10600,20 @@ async fn execute_schedule_trigger_ui(
 
     // Provenance ref for a manual UI schedule trigger is the schedule id (#740).
     let ui_schedule_id_str = row.id.to_string();
-    // Issue #2406: a trigger-now begins a new chain. It takes the chain cap of
-    // the type, the operator override and the fleet chain ceiling, as a
-    // scheduler fire does.
+    // Issue #2406: a trigger-now of a workflow schedule begins a new chain. It
+    // takes the chain cap of the type, the operator override and the fleet
+    // chain ceiling, as a scheduler fire does. A DAG has no chain cap, as on
+    // the scheduler DAG path.
+    let is_dag = row.dag_name.is_some();
     let chain_execution_timeout = runtime
         .registry()
         .chain_execution_timeout(workflow_name)
+        .filter(|_| !is_dag)
         .and_then(|d| chrono::Duration::from_std(d).ok());
     let max_workflow_chain_timeout_ceiling = runtime
         .registry()
         .max_workflow_chain_timeout
+        .filter(|_| !is_dag)
         .and_then(|d| chrono::Duration::from_std(d).ok());
     let result = start_or_load_workflow_execution_with_metrics_and_codecs(
         conn,
