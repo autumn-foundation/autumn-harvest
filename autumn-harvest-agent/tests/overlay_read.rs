@@ -230,12 +230,15 @@ async fn every_published_attribute_is_documented() {
         .unwrap()
         .clone();
     assert!(attrs.contains_key(PROFILE_VERSION_ATTR), "{attrs:?}");
+    // A Windows checkout can hold CRLF line ends, so the read makes them LF.
     let doc = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/agent-adapter.md"),
     )
-    .unwrap();
+    .unwrap()
+    .replace("\r\n", "\n");
     let start = doc.find("**Search attributes.**").expect("the paragraph");
-    let paragraph = &doc[start..start + doc[start..].find("\n\n").unwrap()];
+    let end = doc[start..].find("\n\n").expect("the paragraph end");
+    let paragraph = &doc[start..start + end];
     for key in attrs.keys() {
         assert!(
             paragraph.contains(&format!("`{key}`")),
