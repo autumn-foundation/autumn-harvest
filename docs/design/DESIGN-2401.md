@@ -98,7 +98,7 @@ guarded build in one migration.
 
 ## Decision
 
-Migration `<version>_harvest_dead_letter_indexes` builds:
+Migration `20261102143438_harvest_dead_letter_indexes` builds:
 
 - `idx_harvest_dl_failed_at` on `harvest_dead_letters (failed_at)`;
 - `idx_harvest_dl_original_task` on `harvest_dead_letters (original_task_id)`;
