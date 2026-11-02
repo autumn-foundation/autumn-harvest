@@ -18,6 +18,7 @@ use autumn_harvest::audit::{
 };
 use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::models::NewAuditRecord;
+use autumn_harvest_agent::agent::MAX_AGENT_NAME_BYTES;
 use autumn_harvest_agent::{
     OverlayChange, OverlayStoreError, OverlayVersion, ProfileOverlay, ProfileOverlayStore,
     Provenance, StoredOverlay, overlay_diff,
@@ -27,6 +28,7 @@ use autumn_web::reexports::axum;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{HarvestApiState, acquire_conn, audit_context, deserialize_tristate, map_error};
@@ -362,26 +364,43 @@ impl Write {
     /// Audit the outcome of the request, then answer it.
     ///
     /// A failed request logs its audit error and keeps its own error. A
-    /// committed move whose audit row fails answers `500`, and the message
-    /// says that the move committed. So an operator does not send it again.
+    /// committed move whose audit row fails answers `500` with
+    /// `committed: true` and both ends. The body is built here, so no
+    /// redaction of a `5xx` message hides it. An operator then does not
+    /// send the request again.
     async fn finish(
         self,
         outcome: Result<(Option<OverlayVersion>, OverlayVersion), AutumnError>,
-    ) -> Result<Json<OverlayMove>, AutumnError> {
+    ) -> Response {
         match outcome {
             Ok((from, to)) => {
                 let summary = move_summary(from, to);
                 if let Err(error) = self.audit(Ok(&summary)).await {
-                    return Err(AutumnError::internal_server_error_msg(format!(
-                        "the move {summary} committed, but its audit row failed: {error}"
-                    )));
+                    tracing::error!(
+                        error = %error,
+                        kind = %truncate(&self.kind, MAX_AUDITED_SUMMARY_LEN),
+                        summary,
+                        "an overlay move committed, but its audit row failed"
+                    );
+                    let body = serde_json::json!({
+                        "error": format!(
+                            "the move {summary} committed, but its audit row failed. \
+                             Do not send the request again."
+                        ),
+                        "committed": true,
+                        "kind": self.kind,
+                        "from": from,
+                        "to": to,
+                    });
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
                 }
-                Ok(Json(OverlayMove {
+                Json(OverlayMove {
                     kind: self.kind,
                     from,
                     to,
                     actor: self.actor,
-                }))
+                })
+                .into_response()
             }
             Err(error) => {
                 if let Err(audit_error) = self.audit(Err(&error.to_string())).await {
@@ -391,21 +410,41 @@ impl Write {
                         "audit insert failed for a refused overlay move"
                     );
                 }
-                Err(error)
+                error.into_response()
             }
         }
     }
 }
 
 /// Run `body` and its audit in a task of its own. A client that drops the
-/// connection then cannot stop the audit after the move commits.
-async fn detached<F>(body: F) -> Result<Json<OverlayMove>, AutumnError>
+/// connection then cannot stop the audit after the move commits. The task
+/// keeps the log context and the shard fence of the request.
+async fn detached<F>(body: F) -> Response
 where
-    F: Future<Output = Result<Json<OverlayMove>, AutumnError>> + Send + 'static,
+    F: Future<Output = Response> + Send + 'static,
 {
-    tokio::spawn(body).await.map_err(|error| {
-        AutumnError::internal_server_error_msg(format!("the overlay move task failed: {error}"))
-    })?
+    let task = autumn_web::log::context::in_current_context(autumn_harvest::shard_fence::scoped(
+        autumn_harvest::shard_fence::current(),
+        body,
+    ));
+    match tokio::spawn(task).await {
+        Ok(response) => response,
+        Err(error) => {
+            AutumnError::internal_server_error_msg(format!("the overlay move task failed: {error}"))
+                .into_response()
+        }
+    }
+}
+
+/// Refuse a kind longer than an agent name can be, before any move. So
+/// each audit row names the whole kind.
+fn check_kind(kind: &str) -> Result<(), AutumnError> {
+    if kind.len() > MAX_AGENT_NAME_BYTES {
+        return Err(AutumnError::bad_request_msg(format!(
+            "the kind is longer than {MAX_AGENT_NAME_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// The error of a bad request body.
@@ -423,6 +462,7 @@ async fn activate_move(
     request: Result<Json<ActivateRequest>, JsonRejection>,
     actor: &str,
 ) -> Result<(Option<OverlayVersion>, OverlayVersion), AutumnError> {
+    check_kind(kind)?;
     let Json(request) = request.map_err(|rejection| bad_body(&rejection))?;
     let Some(expected) = request.expected_active else {
         return Err(AutumnError::bad_request_msg(
@@ -445,6 +485,7 @@ async fn rollback_move(
     request: Result<Json<RollbackRequest>, JsonRejection>,
     actor: &str,
 ) -> Result<(Option<OverlayVersion>, OverlayVersion), AutumnError> {
+    check_kind(kind)?;
     match request {
         Ok(Json(RollbackRequest {})) | Err(JsonRejection::MissingJsonContentType(_)) => {}
         Err(rejection) => return Err(bad_body(&rejection)),
@@ -469,7 +510,7 @@ pub async fn activate(
     Path(kind): Path<String>,
     headers: HeaderMap,
     request: Result<Json<ActivateRequest>, JsonRejection>,
-) -> Result<Json<OverlayMove>, AutumnError> {
+) -> Response {
     let write = Write::new(
         api_state,
         &headers,
@@ -490,7 +531,7 @@ pub async fn rollback(
     Path(kind): Path<String>,
     headers: HeaderMap,
     request: Result<Json<RollbackRequest>, JsonRejection>,
-) -> Result<Json<OverlayMove>, AutumnError> {
+) -> Response {
     let write = Write::new(
         api_state,
         &headers,

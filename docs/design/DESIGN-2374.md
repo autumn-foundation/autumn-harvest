@@ -98,7 +98,10 @@ never waits for it.
 
 The store and the audit table do not share a transaction, because a store
 is any backend. When the audit insert fails after a move, the route
-answers `500`, and the message says that the move committed. The
+answers `500` with `committed: true`, the kind and both ends. The route
+builds that body itself, because autumn-web hides the message of a `5xx`
+outside dev. The task keeps the log context and the shard fence of the
+request. A kind over 200 bytes is a `400` before any move. The
 activation log keeps the move with its actor in all cases.
 
 ### Diff

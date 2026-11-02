@@ -5914,7 +5914,7 @@
             "description": "Success."
           },
           "400": {
-            "description": "Bad body: no expected_active, version 0, an unknown field, or an invalid operator id."
+            "description": "Bad body: no expected_active, version 0, an unknown field, an invalid operator id, or a kind over 200 bytes."
           },
           "404": {
             "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store), the kind has no profile, or the kind has no such version."
@@ -5926,7 +5926,7 @@
             "description": "The version no longer validates under the current profile."
           },
           "500": {
-            "description": "Store or database error. When the move committed but its audit row failed, the message says so. Do not send the request again."
+            "description": "Store or database error. When the move committed but its audit row failed, the body holds committed true, kind, from and to. Do not send the request again."
           },
           "503": {
             "description": "The database is unavailable."
@@ -6042,7 +6042,7 @@
             "description": "Success."
           },
           "400": {
-            "description": "The body is not an empty JSON object, or the operator id is invalid."
+            "description": "The body is not an empty JSON object, the operator id is invalid, or the kind is over 200 bytes."
           },
           "404": {
             "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store), the kind has no profile, or the earlier version no longer exists."
@@ -6054,7 +6054,7 @@
             "description": "The earlier version no longer validates under the current profile."
           },
           "500": {
-            "description": "Store or database error. When the move committed but its audit row failed, the message says so. Do not send the request again."
+            "description": "Store or database error. When the move committed but its audit row failed, the body holds committed true, kind, from and to. Do not send the request again."
           },
           "503": {
             "description": "The database is unavailable."

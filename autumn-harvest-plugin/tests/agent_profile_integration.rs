@@ -665,3 +665,48 @@ async fn a_bad_operator_id_is_refused_and_audited() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].status, "failed");
 }
+
+/// A move that commits while its audit row fails answers `500` with
+/// `committed: true`, also in the `prod` profile. A kind longer than an
+/// agent name is a `400` before any move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_committed_move_with_no_audit_row_says_so() {
+    use diesel_async::RunQueryDsl;
+
+    let fx = fixture(true).await;
+    two_versions(&fx.store).await;
+    let mut conn = AsyncPgConnection::establish(&fx.url)
+        .await
+        .expect("connect");
+    diesel::sql_query("ALTER TABLE harvest_audit_log RENAME TO harvest_audit_log_away")
+        .execute(&mut conn)
+        .await
+        .expect("hide the audit table");
+    let (status, body) = activate(&fx.app, 1, None).await;
+    diesel::sql_query("ALTER TABLE harvest_audit_log_away RENAME TO harvest_audit_log")
+        .execute(&mut conn)
+        .await
+        .expect("restore the audit table");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["committed"], true, "{body}");
+    assert_eq!(
+        (body["from"].clone(), body["to"].clone()),
+        (Value::Null, json!(1))
+    );
+    assert!(
+        error_text(&body).contains("Do not send the request again"),
+        "{body}"
+    );
+    assert_eq!(active(&fx.store).await, Some(1), "the move committed");
+
+    let long = "k".repeat(201);
+    let (status, body) = call(
+        &fx.app,
+        ROLE_OPERATOR,
+        "POST",
+        &format!("/agents/{long}/profile/rollback"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}

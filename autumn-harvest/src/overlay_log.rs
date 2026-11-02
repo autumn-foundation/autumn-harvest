@@ -196,7 +196,13 @@ impl MoveRequest<'_> {
             (Some(read_seq), Some(expected)) => {
                 decide_rollback(known, expected, actual, read_seq, last_seq)
             }
-            _ => decide_activate(known, self.expected, actual),
+            // A rollback always expects a pointer. A guard with none never
+            // passes, so no caller can drop the guard by mistake.
+            (Some(_), None) => match decide_activate(known, None, actual) {
+                ActivateDecision::UnknownVersion => ActivateDecision::UnknownVersion,
+                _ => ActivateDecision::Conflict,
+            },
+            (None, _) => decide_activate(known, self.expected, actual),
         }
     }
 }
@@ -666,6 +672,12 @@ mod tests {
             ..rollback
         };
         assert_eq!(plain.decide(true, Some(2), Some(6)), Activate);
+        let unguarded = MoveRequest {
+            expected: None,
+            ..rollback
+        };
+        assert_eq!(unguarded.decide(true, None, Some(5)), Conflict);
+        assert_eq!(unguarded.decide(false, None, Some(5)), UnknownVersion);
     }
 
     #[test]
