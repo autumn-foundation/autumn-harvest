@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::task::Poll;
 
 use autumn_harvest::builder::{DEFAULT_MAX_ACTIVITY_RESULT_BYTES, DEFAULT_RETRY_AFTER_CEILING};
-use autumn_harvest::context::{ActivityIdentity, empty_shared_state};
+use autumn_harvest::context::{ActivityIdentity, SharedState};
 use autumn_harvest::llm_ledger::LlmCall;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::{
@@ -391,6 +391,8 @@ pub struct RunOwner<'a> {
     pub workflow_id: &'a str,
     /// The run's workflow type, the `#[workflow]` fn name.
     pub workflow_type: &'a str,
+    /// The app state that `ctx.state::<T>()` reads (issue #2467).
+    pub state: &'a SharedState,
 }
 
 /// The heartbeat channel capacity. The drain empties it on every poll, so a
@@ -421,7 +423,7 @@ fn activity_context(
     let task_id = task.task_id.parse().ok();
     debug_assert!(task_id.is_some(), "a task row id is a UUID");
     let ctx = ActivityContext::new_embedded(
-        empty_shared_state(),
+        owner.state.clone(),
         identity,
         tx,
         task.heartbeat_details.clone(),
@@ -1397,7 +1399,7 @@ pub async fn run_local_attempt(
             let deadline = chrono::Duration::from_std(budget)
                 .ok()
                 .and_then(|span| Utc::now().checked_add_signed(span));
-            let ctx = ActivityContext::new_embedded_local(empty_shared_state(), identity)
+            let ctx = ActivityContext::new_embedded_local(owner.state.clone(), identity)
                 .with_attempt(attempt)
                 .with_max_attempts(run.max_attempts())
                 .with_deadline(deadline)
@@ -1748,11 +1750,18 @@ mod tests {
         conn
     }
 
+    /// The state the drain tests pass. It is empty.
+    static TEST_STATE: std::sync::LazyLock<autumn_harvest::context::SharedState> =
+        std::sync::LazyLock::new(autumn_harvest::context::empty_shared_state);
+
     /// The owner the drain tests pass. Their closure bodies never read it.
-    const TEST_OWNER: super::RunOwner<'static> = super::RunOwner {
-        workflow_id: "wf-test",
-        workflow_type: "test_workflow",
-    };
+    fn test_owner() -> super::RunOwner<'static> {
+        super::RunOwner {
+            workflow_id: "wf-test",
+            workflow_type: "test_workflow",
+            state: &TEST_STATE,
+        }
+    }
 
     fn seed_running_task(conn: &Connection, exec: ExecutionId, name: &str) -> ClaimedTask {
         let act = ActivityExecId::new();
@@ -2824,7 +2833,7 @@ mod tests {
         let produced = drain_ready(
             &mut conn,
             exec,
-            &TEST_OWNER,
+            &test_owner(),
             0,
             &failure_now,
             &activities,
@@ -2886,7 +2895,7 @@ mod tests {
         let produced = drain_ready(
             &mut conn,
             exec,
-            &TEST_OWNER,
+            &test_owner(),
             0,
             &failure_now,
             &activities,
@@ -2950,7 +2959,7 @@ mod tests {
         let produced = drain_ready(
             &mut conn,
             exec,
-            &TEST_OWNER,
+            &test_owner(),
             0,
             &failure_now,
             &activities,
@@ -3043,7 +3052,7 @@ mod tests {
         let produced = drain_ready(
             &mut conn,
             exec,
-            &TEST_OWNER,
+            &test_owner(),
             0,
             &failure_now,
             &activities,

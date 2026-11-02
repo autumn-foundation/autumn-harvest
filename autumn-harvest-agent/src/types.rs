@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use crate::context_reset::ContextReset;
 use crate::flow::Released;
 use crate::followup::Followups;
 use crate::loop_guard::LoopGuard;
@@ -19,6 +20,7 @@ use crate::message::{
     ChatMessage, ChatRole, ContentPart, SessionId, StopReason, TokenUsage, ToolCall,
 };
 use crate::policy::ToolDecision;
+use crate::skill::SkillText;
 use crate::workspace::{WorkspaceMount, WorkspaceRef};
 use serde::{Deserialize, Serialize};
 
@@ -174,12 +176,19 @@ pub struct AgentTask {
     /// parent keeps the usage and the labels of the failed run.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub report_failure: bool,
-    /// New text for the description of each named app tool (issue #2373).
-    /// The model sees it in place of the tool description. The tool effect
-    /// and the policy do not change. A delegated child has none. Serde skips
-    /// an empty map, so a recorded task replays as it ran.
+    /// The context reset setting (issue #2453). With a setting, the run gets
+    /// the `save_progress` tool and resets near the request cap. See
+    /// [`context_reset`](crate::context_reset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_reset: Option<ContextReset>,
+    /// The text that replaces the description of each named tool (issue
+    /// #2373). The key is a tool name. The tool keeps its effect.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_guidance: BTreeMap<String, String>,
+    /// The skills of the run (issue #2373). With skills, the run gets the
+    /// `load_skill` tool. See [`skill`](crate::skill).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skills: BTreeMap<String, SkillText>,
 }
 
 /// Where the run id of a task comes from.
@@ -229,8 +238,33 @@ impl AgentTask {
             workspace: None,
             waiting: Vec::new(),
             report_failure: false,
+            context_reset: None,
             tool_guidance: BTreeMap::new(),
+            skills: BTreeMap::new(),
         }
+    }
+
+    /// Let the run save notes and reset near the request cap. See
+    /// [`context_reset`](Self::context_reset).
+    #[must_use]
+    pub const fn context_reset(mut self, setting: ContextReset) -> Self {
+        self.context_reset = Some(setting);
+        self
+    }
+
+    /// Show `text` to the model in place of the description of `tool`. See
+    /// [`tool_guidance`](Self::tool_guidance).
+    #[must_use]
+    pub fn tool_guidance(mut self, tool: impl Into<String>, text: impl Into<String>) -> Self {
+        self.tool_guidance.insert(tool.into(), text.into());
+        self
+    }
+
+    /// Add the skill `name`. See [`skills`](Self::skills).
+    #[must_use]
+    pub fn skill(mut self, name: impl Into<String>, text: SkillText) -> Self {
+        self.skills.insert(name.into(), text);
+        self
     }
 
     /// Give the run the workspace `scope`, from its head `head` (issue
@@ -514,10 +548,13 @@ pub struct ModelTurnRequest {
     /// replay asks the same model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// The tool guidance of the task (issue #2373). See
-    /// [`AgentTask::tool_guidance`].
+    /// The text that replaces the description of each named app tool
+    /// (issue #2373).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_guidance: BTreeMap<String, String>,
+    /// Offer the `load_skill` tool (issue #2373).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skills: bool,
 }
 
 /// The recorded result of one model-turn activity.
@@ -649,6 +686,20 @@ pub struct ToolCallRequest {
     /// The workspace of the run, for a tool that opts in (issue #2274).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceMount>,
+    /// What the run holds for a `load_skill` call (issue #2373). `None`
+    /// when the run has no skills, so the tool is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<SkillLookup>,
+}
+
+/// What a run holds for one `load_skill` call (issue #2373).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "body")]
+pub enum SkillLookup {
+    /// The body of the named skill, cut to fit the request cap.
+    Found(String),
+    /// The run has no skill of that name, or the call names none.
+    Missing,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -774,6 +825,10 @@ pub struct AgentReport {
     /// The error of a run that ended under [`AgentStop::Failed`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The context resets of the run, follow-ups included (issue #2453). A
+    /// delegated child counts its own.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub resets: u32,
 }
 
 /// The transcript without system messages.

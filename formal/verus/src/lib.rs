@@ -9,5 +9,7 @@ mod agent_wake;
 mod agent_siblings;
 mod scan_skip;
 mod depth_cap;
+mod agent_reset;
 mod agent_overlay;
+mod overlay_log;
 mod agent_propose;

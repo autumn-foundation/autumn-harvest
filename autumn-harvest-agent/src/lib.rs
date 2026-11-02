@@ -9,7 +9,8 @@
 //! The crate owns its agent primitives: [`AgentModel`], [`Tool`],
 //! [`ToolPolicy`], [`Approval`] and the message types. It also has the
 //! always-on primitives: [`heartbeat`], [`followup`], [`delivery`],
-//! [`memory`] and [`loop_guard`]. [`ResponseCache`] serves an identical
+//! [`memory`] and [`loop_guard`]. [`context_reset`] lets a long run save
+//! notes and restart from them. [`ResponseCache`] serves an identical
 //! model call across runs. The `eval` feature adds the `eval` module.
 //! That module re-drives a recorded run with a candidate model or prompt.
 //! The `sandbox` feature adds the `sandbox` module. Its `SandboxTool` runs
@@ -75,6 +76,7 @@
 pub mod agent;
 pub mod approval;
 pub mod bounds;
+pub mod context_reset;
 pub mod delivery;
 pub mod error;
 #[cfg(feature = "eval")]
@@ -95,6 +97,7 @@ pub mod refine;
 pub mod response_cache;
 #[cfg(feature = "sandbox")]
 pub mod sandbox;
+pub mod skill;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod tool;
@@ -104,8 +107,15 @@ pub mod workflow;
 pub mod workspace;
 
 pub use agent::overlay::{
-    Ceilings, GUARDRAILS_HEADING, MAX_TOOL_GUIDANCE_BYTES, ModelRegistry, OverlayError,
-    ProfileOverlay,
+    Ceilings, GUARDRAILS_HEADING, ModelRegistry, OverlayError, ProfileOverlay, ToolRegistry,
+};
+#[cfg(feature = "postgres")]
+pub use agent::overlay_store::PostgresOverlayStore;
+#[cfg(feature = "sqlite")]
+pub use agent::overlay_store::SqliteOverlayStore;
+pub use agent::overlay_store::{
+    InMemoryOverlayStore, MAX_AUTHOR_LEN, OverlayStoreError, OverlayValidator, OverlayVersion,
+    ProfileOverlayStore, Provenance, StoredOverlay,
 };
 pub use agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentHeartbeat, AgentId, AgentIdError, AgentMemory, AgentOp,
@@ -116,11 +126,12 @@ pub use agent::{
     agent_workspace_reset_info, agent_workspace_retain, agent_workspace_retain_info,
 };
 pub use approval::Approval;
+pub use context_reset::{ContextReset, ProgressNotes};
 pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
 pub use error::{AgentError, ErrorKind};
 pub use flow::{FlowRule, FlowRules, Recheck, Released};
 pub use followup::Followups;
-pub use harness::{AgentHarness, BUILTIN_TOOLS, DEFAULT_MODEL};
+pub use harness::{AgentHarness, DEFAULT_MODEL};
 pub use heartbeat::{
     HEARTBEAT_WORKFLOW_NAME, HeartbeatReport, HeartbeatTask, Precheck, agent_heartbeat,
     agent_heartbeat_info,
@@ -145,6 +156,7 @@ pub use refine::{
 pub use response_cache::{
     CacheIndex, CacheKey, CacheScope, InMemoryCacheIndex, KeyTenant, ResponseCache,
 };
+pub use skill::{LOAD_SKILL_TOOL, SkillText};
 pub use tool::{FnTool, Tool, ToolContext, ToolEffect};
 pub use transcript::{InMemoryTranscriptStore, PrefixRef, TranscriptStore};
 pub use types::{

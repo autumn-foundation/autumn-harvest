@@ -746,6 +746,9 @@ pub struct DelegationRecord {
     /// Tool calls of the child and of every agent under it.
     #[serde(default)]
     pub tool_calls: u32,
+    /// The context resets of the child itself (issue #2453).
+    #[serde(default, skip_serializing_if = "crate::types::is_zero")]
+    pub resets: u32,
 }
 
 #[cfg(test)]

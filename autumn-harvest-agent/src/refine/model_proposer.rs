@@ -30,9 +30,14 @@ the current overlay. A key that you leave out keeps the profile value, not the c
 value.
 
 The allowed keys are `system`, `guardrails`, `model`, `max_steps`, `max_total_tokens`, \
-`max_output_tokens`, `read_only` and `tool_guidance`. Any other key makes the reply invalid. \
-`tool_guidance` maps a tool name to new text for the description of that tool. The name must \
-be a tool of the agent. The operator ceilings bound each value. A reply past them is invalid.
+`max_output_tokens`, `read_only`, `tool_guidance` and `skills`. Any other key makes the reply \
+invalid. The operator ceilings bound each value. A reply past them is invalid.
+
+`tool_guidance` maps a tool name to the text that the model reads for that tool. Name only a \
+tool that the agent has. `skills` maps a skill name to an object with a one-line `summary` and \
+a `body`. The agent reads the summary in its prompt and loads the body on demand. A skill name \
+uses only a-z, 0-9, _ and -. Each entry is added to the profile entries, and an entry with the \
+same name replaces the profile entry.
 
 To keep the current overlay, reply with the word KEEP_BASE alone.";
 
@@ -105,6 +110,13 @@ impl ModelProposer {
             "max_total_tokens": profile.max_total_tokens,
             "max_output_tokens": profile.max_output_tokens,
             "read_only": profile.read_only,
+            "tool_guidance": profile.tool_guidance,
+            // A body can be long, so the block shows each summary only.
+            "skills": profile
+                .skills
+                .iter()
+                .map(|(name, skill)| (name, &skill.summary))
+                .collect::<std::collections::BTreeMap<_, _>>(),
         });
         let blocks = [
             ("evidence", context.evidence.render().into_owned()),
@@ -310,6 +322,10 @@ mod tests {
             max_output_tokens: Some(1),
             read_only: Some(true),
             tool_guidance: std::collections::BTreeMap::from([("lookup".to_owned(), String::new())]),
+            skills: std::collections::BTreeMap::from([(
+                "triage".to_owned(),
+                crate::skill::SkillText::new("s", "b"),
+            )]),
         };
         let serde_json::Value::Object(keys) = serde_json::to_value(&overlay).expect("encode")
         else {
@@ -376,6 +392,31 @@ mod tests {
         assert!(user.contains("Answer refunds."), "{user}");
         assert!(user.contains("THE OPERATOR CEILINGS"), "{user}");
         assert!(user.contains("\"max_steps\":7"), "{user}");
+    }
+
+    #[test]
+    fn a_request_offers_tool_guidance_and_skills() {
+        assert!(OUTPUT_CONTRACT.contains("`tool_guidance`"));
+        assert!(OUTPUT_CONTRACT.contains("`skills`"));
+        let proposer = ModelProposer::new(TextModel::new(Vec::new()));
+        let evidence = Evidence::text("e");
+        let current = ProfileOverlay::default();
+        let profile = AgentProfile::new("support")
+            .tool_guidance("lookup", "Find an order by its id.")
+            .skill(
+                "refund",
+                crate::skill::SkillText::new("Pay a refund.", "SECRET BODY"),
+            );
+        let ceilings = Ceilings::from_profile(&profile);
+        let ctx = ProposeContext {
+            profile: &profile,
+            ceilings: &ceilings,
+            ..context(&evidence, &current, None)
+        };
+        let user = text_of(&proposer.request(&ctx).messages[1]);
+        assert!(user.contains("Find an order by its id."), "{user}");
+        assert!(user.contains("Pay a refund."), "{user}");
+        assert!(!user.contains("SECRET BODY"), "a body stays out: {user}");
     }
 
     #[test]

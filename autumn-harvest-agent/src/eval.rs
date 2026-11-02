@@ -195,6 +195,7 @@ impl Candidate {
                 max_output_tokens: None,
                 read_only: None,
                 tool_guidance: BTreeMap::new(),
+                skills: BTreeMap::new(),
             },
             ceilings: None,
             admitted: BTreeSet::new(),
@@ -303,6 +304,7 @@ impl Candidate {
         task.read_only = profile.read_only;
         task.model = profile.model;
         task.tool_guidance = profile.tool_guidance;
+        task.skills = profile.skills;
         Ok(task)
     }
 }
@@ -318,6 +320,7 @@ fn source_profile(task: &AgentTask) -> AgentProfile {
     profile.model.clone_from(&task.model);
     profile.mandate.clone_from(&task.mandate);
     profile.tool_guidance.clone_from(&task.tool_guidance);
+    profile.skills.clone_from(&task.skills);
     profile
 }
 
@@ -463,6 +466,9 @@ pub struct TurnDiff {
 }
 
 /// How a run ended.
+// A box would change the public shape of `Completed`. The report is the
+// common case, so its size is no waste.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "end", content = "detail")]
 #[non_exhaustive]
@@ -1710,6 +1716,10 @@ mod tests {
             max_output_tokens: Some(100),
             read_only: Some(true),
             tool_guidance: BTreeMap::from([("lookup".to_owned(), "One key.".to_owned())]),
+            skills: BTreeMap::from([(
+                "triage".to_owned(),
+                crate::skill::SkillText::new("Sort the queue.", "Oldest first."),
+            )]),
         };
         let task = Candidate::new(lookup_harness())
             .overlay(overlay)
@@ -1726,6 +1736,10 @@ mod tests {
         assert_eq!(
             task.tool_guidance.get("lookup").map(String::as_str),
             Some("One key.")
+        );
+        assert_eq!(
+            task.skills.get("triage").map(|skill| skill.body.as_str()),
+            Some("Oldest first.")
         );
         let named = Candidate::new(lookup_harness().model_named("m", Arc::new(NoModel)))
             .model("m")
@@ -1757,6 +1771,7 @@ mod tests {
             usage: crate::message::TokenUsage::default(),
             steps_used: 0,
             tool_calls: 0,
+            resets: 0,
         };
         report.delegations = vec![child("e1:d1"), child("e10"), child("x")];
         rebase_run_ids(&mut report, "e1", "r1");
@@ -1989,6 +2004,7 @@ mod tests {
                 run_id: None,
                 workspace: None,
                 error: None,
+                resets: 0,
             })
         };
         let done = report(crate::AgentStop::Completed);

@@ -35,6 +35,7 @@
 pub mod dedupe;
 pub mod inbox;
 pub mod overlay;
+pub mod overlay_store;
 pub mod wake;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -45,6 +46,7 @@ use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::context_reset::{ContextReset, ProgressNotes};
 use crate::delivery::{Report, ReportSource, is_silent, report_text};
 use crate::flow::Released;
 use crate::followup::{Followups, WAKE_MESSAGE};
@@ -53,6 +55,7 @@ use crate::loop_guard::LoopGuard;
 use crate::memory::MemoryScope;
 use crate::mesh::{Mandate, Refusal};
 use crate::message::{ChatMessage, ChatRole, RunId, SessionId};
+use crate::skill::SkillText;
 use crate::types::{AgentStop, AgentTask, DEFAULT_APPROVAL_TIMEOUT_SECS, DEFAULT_MAX_STEPS};
 use crate::workflow::{
     Member, Outbox, Progress, Run, SteerBook, Tree, deliver, discover, harness, run_segment,
@@ -247,8 +250,8 @@ pub enum Control {
     Resume,
     /// Clear the memory of the agent.
     ResetMemory,
-    /// Clear the transcript and its flow labels. The labels of the memory
-    /// notes and of the workspace files stay.
+    /// Clear the transcript, its progress notes and its flow labels. The
+    /// labels of the memory notes and of the workspace files stay.
     ClearTranscript,
     /// Delete every workspace snapshot of the agent (issue #2274). The next
     /// op starts with an empty workspace.
@@ -662,11 +665,19 @@ pub struct AgentProfile {
     /// Install a store with `AgentHarness::workspace`.
     #[serde(default, skip_serializing_if = "crate::types::is_false")]
     pub workspace: bool,
-    /// New text for the description of each named app tool (issue #2373).
-    /// See [`AgentTask::tool_guidance`]. Only an overlay key must name a
-    /// harness tool. A profile key for no such tool changes nothing.
+    /// The context reset setting of each op (issue #2453). The agent keeps
+    /// its notes across ops and across the window. See
+    /// [`context_reset`](crate::context_reset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_reset: Option<ContextReset>,
+    /// The text that replaces the description of each named tool (issue
+    /// #2373). See [`AgentTask::tool_guidance`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_guidance: BTreeMap<String, String>,
+    /// The skills of the agents of the kind (issue #2373). See
+    /// [`AgentTask::skills`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skills: BTreeMap<String, SkillText>,
 }
 
 const fn default_max_steps() -> u32 {
@@ -708,8 +719,32 @@ impl AgentProfile {
             mesh: None,
             stream: false,
             workspace: false,
+            context_reset: None,
             tool_guidance: BTreeMap::new(),
+            skills: BTreeMap::new(),
         }
+    }
+
+    /// Let the agents of the kind save notes and reset near the request
+    /// cap.
+    #[must_use]
+    pub const fn context_reset(mut self, setting: ContextReset) -> Self {
+        self.context_reset = Some(setting);
+        self
+    }
+
+    /// Show `text` to the model in place of the description of `tool`.
+    #[must_use]
+    pub fn tool_guidance(mut self, tool: impl Into<String>, text: impl Into<String>) -> Self {
+        self.tool_guidance.insert(tool.into(), text.into());
+        self
+    }
+
+    /// Add the skill `name` to the agents of the kind.
+    #[must_use]
+    pub fn skill(mut self, name: impl Into<String>, text: SkillText) -> Self {
+        self.skills.insert(name.into(), text);
+        self
     }
 
     /// Give each agent of the kind a persistent workspace. See
@@ -886,7 +921,9 @@ impl AgentProfile {
         task.mesh.clone_from(&self.mesh);
         task.memory_in_state = self.memory == AgentMemory::State;
         task.stream = self.stream;
+        task.context_reset = self.context_reset;
         task.tool_guidance.clone_from(&self.tool_guidance);
+        task.skills.clone_from(&self.skills);
         if self.workspace {
             task.workspace = Some(WorkspaceMount {
                 scope: WorkspaceMount::agent_scope(id.as_str()),
@@ -1060,6 +1097,11 @@ pub struct AgentState {
     /// by the activity `agent_workspace_floor`.
     #[serde(skip_serializing_if = "is_zero")]
     pub workspace_generation: u64,
+    /// The progress notes of the agent, with their labels (issue #2453).
+    /// Each op shows them after its input, so `trim_window` never drops
+    /// them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<ProgressNotes>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -1412,6 +1454,8 @@ impl AgentRun<'_> {
             }
             Control::ClearTranscript => {
                 state.transcript.clear();
+                // The notes stand in for dropped turns, so they go too.
+                state.notes = None;
                 // The transcript took its taint with it. A memory note keeps
                 // its own labels, and the next op reads a store note again
                 // (issue #2272). The workspace files keep theirs too.
@@ -1806,6 +1850,7 @@ impl AgentRun<'_> {
         if task.memory_in_state {
             progress.memory = Some(open_memory(&mut state, &mut task, &mut tree));
         }
+        open_notes(&mut task, &state, &mut progress, &mut tree);
         let run = Run {
             task: &task,
             agent: peer
@@ -1830,8 +1875,7 @@ impl AgentRun<'_> {
                 let silent = matches!(mode, Mode::Heartbeat(_)) && is_silent(&answer);
                 kept = !silent && !refused;
                 if kept {
-                    let messages = crate::types::without_system(&progress.messages);
-                    state.transcript = trim_window(messages, profile.window);
+                    keep_segment(&task, &mut state, &mut progress, profile.window);
                 }
                 state.last_stop = Some(stop);
                 state.last_answer = Some(answer.clone());
@@ -1962,6 +2006,41 @@ fn fold_segment(state: &mut AgentState, progress: &mut Progress, tree: Tree) {
     state.tokens_used = state
         .tokens_used
         .saturating_add(u64::from(progress.usage.total()));
+}
+
+/// Keep the transcript and the notes of a segment of `task` that ended.
+///
+/// The transcript drops the system prompt and is cut to `window`. The state
+/// keeps the notes, so the transcript holds no copy of them (issue #2453).
+/// The notes last past the op, as a memory note does. So only a segment
+/// that may write memory keeps them. A silent tick or a failed op keeps no
+/// transcript, so it changes no notes either.
+fn keep_segment(task: &AgentTask, state: &mut AgentState, progress: &mut Progress, window: u32) {
+    let messages = crate::types::without_system(&progress.messages);
+    state.transcript = trim_window(crate::context_reset::without_restored(messages), window);
+    if progress.reset.restore && task.memory_writable() {
+        state.notes = progress.reset.notes.take();
+    }
+}
+
+/// Give a segment of `task` the notes of the agent (issue #2453). The
+/// segment reads them, so it takes their labels.
+///
+/// A segment that may not write memory keeps no notes. A reset would drop
+/// the history of the agent and keep no summary of it. So such a segment
+/// gets no reset and no `save_progress` tool. It still reads the notes.
+fn open_notes(task: &mut AgentTask, state: &AgentState, progress: &mut Progress, tree: &mut Tree) {
+    if task.context_reset.is_none() {
+        return;
+    }
+    if !task.memory_writable() {
+        task.context_reset = None;
+    }
+    if let Some(notes) = &state.notes {
+        tree.exercised.extend(notes.labels.iter().cloned());
+    }
+    progress.reset.notes.clone_from(&state.notes);
+    progress.reset.restore = true;
 }
 
 /// Put the state memory of the agent into the system prompt of a segment.

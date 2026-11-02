@@ -10,10 +10,10 @@
 //! The model leaves out the system prompt. The proptests check its
 //! idempotency.
 //!
-//! Issue #2375 adds tool guidance. A tool name is an integer too. The model
-//! keeps the set of guided tools and leaves out the text. `long_guidance`
-//! tells whether a text is longer than `MAX_TOOL_GUIDANCE_BYTES`. The
-//! registry holds a set of models and a set of tools.
+//! Issue #2373 adds tool guidance and skills. A guidance key is an integer,
+//! and `tools` is the set of registered tools. The model leaves out the
+//! guidance text and the skills. The unit tests in `overlay.rs` check them.
+//! `guided` models the tool definition that the harness sends.
 
 use vstd::prelude::*;
 
@@ -137,13 +137,6 @@ pub struct Overlay {
     pub read_only: Option<bool>,
     pub model: Option<int>,
     pub guidance: Set<int>,
-    pub long_guidance: bool,
-}
-
-/// The models and the tools that a harness holds.
-pub struct Registry {
-    pub models: Set<int>,
-    pub tools: Set<int>,
 }
 
 /// The ceilings of a result.
@@ -172,8 +165,11 @@ pub open spec fn allows(allowed: Option<Set<int>>, model: int) -> bool {
     allowed.is_none() || allowed.unwrap().contains(model)
 }
 
-/// `apply` as a spec. `None` is a refusal.
-pub open spec fn apply(p: Profile, o: Overlay, c: Ceilings, registry: Registry) -> Option<Profile> {
+/// `apply` as a spec. `None` is a refusal. `registry` holds the models of
+/// the harness, and `tools` holds its registered tools.
+pub open spec fn apply(p: Profile, o: Overlay, c: Ceilings, registry: Set<int>, tools: Set<int>) -> Option<
+    Profile,
+> {
     let steps = spec_merged_bound(Some(p.max_steps), o.max_steps, c.max_steps);
     let total = spec_merged_bound(p.max_total_tokens, o.max_total_tokens, c.max_total_tokens);
     let output = spec_merged_bound(p.max_output_tokens, o.max_output_tokens, c.max_output_tokens);
@@ -189,9 +185,9 @@ pub open spec fn apply(p: Profile, o: Overlay, c: Ceilings, registry: Registry) 
         None
     } else if forbidden || !c.models.contains(name(model)) {
         None
-    } else if o.model.is_some() && !registry.models.contains(o.model.unwrap()) {
+    } else if o.model.is_some() && !registry.contains(o.model.unwrap()) {
         None
-    } else if !o.guidance.subset_of(registry.tools) || o.long_guidance {
+    } else if !p.guidance.union(o.guidance).subset_of(tools) {
         None
     } else {
         Some(
@@ -211,7 +207,13 @@ pub open spec fn apply(p: Profile, o: Overlay, c: Ceilings, registry: Registry) 
 
 /// `apply` refuses exactly when a rule fails. Otherwise it returns the
 /// overlay value of each field, or else the profile value.
-pub proof fn theorem_apply_refuses_exactly(p: Profile, o: Overlay, c: Ceilings, registry: Registry)
+pub proof fn theorem_apply_refuses_exactly(
+    p: Profile,
+    o: Overlay,
+    c: Ceilings,
+    registry: Set<int>,
+    tools: Set<int>,
+)
     ensures
         ({
             let steps = if o.max_steps.is_some() {
@@ -244,10 +246,10 @@ pub proof fn theorem_apply_refuses_exactly(p: Profile, o: Overlay, c: Ceilings, 
                 && !c.allow_clear_read_only) && (o.model.is_some() ==> allows(
                 p.allowed,
                 o.model.unwrap(),
-            ) && registry.models.contains(o.model.unwrap())) && c.models.contains(name(model))
-                && o.guidance.subset_of(registry.tools) && !o.long_guidance;
-            &&& apply(p, o, c, registry).is_some() == ok
-            &&& ok ==> apply(p, o, c, registry) == Some(
+            ) && registry.contains(o.model.unwrap())) && c.models.contains(name(model))
+                && p.guidance.union(o.guidance).subset_of(tools);
+            &&& apply(p, o, c, registry, tools).is_some() == ok
+            &&& ok ==> apply(p, o, c, registry, tools) == Some(
                 Profile {
                     max_steps: steps,
                     max_total_tokens: total,
@@ -265,41 +267,44 @@ pub proof fn theorem_apply_refuses_exactly(p: Profile, o: Overlay, c: Ceilings, 
 
 /// No result bound is above its ceiling. A result clears `read_only` only
 /// when the ceilings allow it. Its model is in the ceilings. The registry
-/// and the mandate hold an overlay model. The registry holds each guided
-/// tool of the overlay, and the result keeps it. Each field that an overlay
-/// cannot name keeps its value.
+/// and the mandate hold an overlay model. Each field that an overlay cannot
+/// name keeps its value. Each guidance key names a registered tool.
 pub proof fn theorem_a_result_stays_under_the_ceilings(
     p: Profile,
     o: Overlay,
     c: Ceilings,
-    registry: Registry,
+    registry: Set<int>,
+    tools: Set<int>,
 )
     ensures
-        apply(p, o, c, registry).is_some() ==> {
-            let q = apply(p, o, c, registry).unwrap();
+        apply(p, o, c, registry, tools).is_some() ==> {
+            let q = apply(p, o, c, registry, tools).unwrap();
             &&& within(Some(q.max_steps), c.max_steps)
             &&& within(q.max_total_tokens, c.max_total_tokens)
             &&& within(q.max_output_tokens, c.max_output_tokens)
             &&& (p.read_only && !q.read_only ==> c.allow_clear_read_only)
             &&& c.models.contains(name(q.model))
-            &&& (o.model.is_some() ==> registry.models.contains(o.model.unwrap()))
+            &&& (o.model.is_some() ==> registry.contains(o.model.unwrap()))
             &&& (o.model.is_some() ==> allows(p.allowed, o.model.unwrap()))
-            &&& o.guidance.subset_of(registry.tools)
-            &&& !o.long_guidance
-            &&& o.guidance.subset_of(q.guidance)
-            &&& p.guidance.subset_of(q.guidance)
             &&& q.allowed == p.allowed
             &&& q.rest == p.rest
+            &&& q.guidance.subset_of(tools)
+            &&& o.guidance.subset_of(q.guidance)
         },
 {
 }
 
 /// Under the ceilings of the profile, no bound rises. An overlay never
 /// clears `read_only`, and the model does not change.
-pub proof fn theorem_default_ceilings_only_narrow(p: Profile, o: Overlay, registry: Registry)
+pub proof fn theorem_default_ceilings_only_narrow(
+    p: Profile,
+    o: Overlay,
+    registry: Set<int>,
+    tools: Set<int>,
+)
     ensures
-        apply(p, o, from_profile(p), registry).is_some() ==> {
-            let q = apply(p, o, from_profile(p), registry).unwrap();
+        apply(p, o, from_profile(p), registry, tools).is_some() ==> {
+            let q = apply(p, o, from_profile(p), registry, tools).unwrap();
             &&& q.max_steps <= p.max_steps
             &&& within(q.max_total_tokens, p.max_total_tokens)
             &&& within(q.max_output_tokens, p.max_output_tokens)
@@ -309,23 +314,37 @@ pub proof fn theorem_default_ceilings_only_narrow(p: Profile, o: Overlay, regist
             &&& q.rest == p.rest
         },
 {
-    theorem_a_result_stays_under_the_ceilings(p, o, from_profile(p), registry);
+    theorem_a_result_stays_under_the_ceilings(p, o, from_profile(p), registry, tools);
 }
 
 /// A second apply of the same overlay changes nothing.
-pub proof fn theorem_apply_is_idempotent(p: Profile, o: Overlay, c: Ceilings, registry: Registry)
+pub proof fn theorem_apply_is_idempotent(
+    p: Profile,
+    o: Overlay,
+    c: Ceilings,
+    registry: Set<int>,
+    tools: Set<int>,
+)
     ensures
-        apply(p, o, c, registry).is_some() ==> apply(apply(p, o, c, registry).unwrap(), o, c, registry)
-            == apply(p, o, c, registry),
+        apply(p, o, c, registry, tools).is_some() ==> apply(
+            apply(p, o, c, registry, tools).unwrap(),
+            o,
+            c,
+            registry,
+            tools,
+        ) == apply(p, o, c, registry, tools),
 {
-    if apply(p, o, c, registry).is_some() {
-        let q = apply(p, o, c, registry).unwrap();
-        assert(q.guidance.union(o.guidance) =~= q.guidance);
-    }
+    let merged = p.guidance.union(o.guidance);
+    assert(merged.union(o.guidance) =~= merged);
 }
 
-/// An empty overlay under the ceilings of the profile returns the profile.
-pub proof fn theorem_an_empty_overlay_keeps_the_profile(p: Profile, registry: Registry)
+/// An empty overlay under the ceilings of the profile returns the profile,
+/// when each guidance key of the profile names a registered tool.
+pub proof fn theorem_an_empty_overlay_keeps_the_profile(p: Profile, registry: Set<int>, tools: Set<
+    int,
+>)
+    requires
+        p.guidance.subset_of(tools),
     ensures
         apply(
             p,
@@ -336,13 +355,48 @@ pub proof fn theorem_an_empty_overlay_keeps_the_profile(p: Profile, registry: Re
                 read_only: None,
                 model: None,
                 guidance: Set::empty(),
-                long_guidance: false,
             },
             from_profile(p),
             registry,
+            tools,
         ) == Some(p),
 {
     assert(p.guidance.union(Set::empty()) =~= p.guidance);
+}
+
+/// The fields of a tool definition that guidance can touch. `builtin` marks
+/// a tool of the crate, such as `load_skill`.
+pub struct ToolDef {
+    pub name: int,
+    pub description: int,
+    pub effect: int,
+    pub builtin: bool,
+}
+
+/// The definition that the harness sends for `t` under `guidance`. The
+/// guidance text of an app tool replaces its description. A built-in keeps
+/// its own text. This spec models `guided` in `harness.rs`. No mirror ties
+/// them, so the tests in `tests/skills.rs` check the engine.
+pub open spec fn guided(t: ToolDef, guidance: Map<int, int>) -> ToolDef {
+    if !t.builtin && guidance.contains_key(t.name) {
+        ToolDef { name: t.name, description: guidance[t.name], effect: t.effect, builtin: false }
+    } else {
+        t
+    }
+}
+
+/// Guidance changes only the description of an app tool. The name and the
+/// effect stay, so the policy decides as it did. A built-in, or a tool with
+/// no guidance, keeps its whole definition.
+pub proof fn theorem_guidance_changes_only_the_description(t: ToolDef, guidance: Map<int, int>)
+    ensures
+        guided(t, guidance).name == t.name,
+        guided(t, guidance).effect == t.effect,
+        guided(t, guidance).builtin == t.builtin,
+        !t.builtin && guidance.contains_key(t.name) ==> guided(t, guidance).description
+            == guidance[t.name],
+        t.builtin || !guidance.contains_key(t.name) ==> guided(t, guidance) == t,
+{
 }
 
 } // verus!
