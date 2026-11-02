@@ -2209,7 +2209,7 @@ fn sqlite_split_suite_runs_in_its_own_job() {
     let body: Vec<&str> = job
         .lines()
         .skip(1)
-        .take_while(|line| !(line.starts_with("  ") && !line.starts_with("   ")))
+        .take_while(|line| line.starts_with("   ") || !line.starts_with("  "))
         .collect();
     assert!(
         body.join("\n")
