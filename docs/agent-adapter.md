@@ -733,8 +733,17 @@ let harness = AgentHarness::new(model).response_cache(cache);
 ```
 
 **The key.** The key is a SHA-256 hash of the model id, the output cap, the
-temperature, the tools, the messages, the tenant and its source, and the
-namespace.
+temperature, the tools, the messages, the tenant and its source, the
+namespace and the draw.
+
+**The draw (issue #2440).** `ChatRequest::draw` names one sample of a run.
+Two draws of one request get two keys, so each draw has its own entry. A
+request with no draw keeps the key that it had before draws, so stored
+entries still hit. `run_draws` runs each draw as a child `agent_loop` run
+with the run id `{root}:s{n}`. The root is the execution id of the caller.
+Tools then get one idempotency key per draw. A delegated child keeps the
+draw id. A model may pass the draw to its provider as a seed. Such a model
+must say so in its model id.
 
 **The model id.** A model names itself through `AgentModel::model_id`. A
 model with no id is never cached. The crate ships no model with an id. The
@@ -766,7 +775,8 @@ history and never reads the cache.
 **Tool idempotency.** A hit repeats the tool-call ids of the stored answer.
 Tools take the run id, the step and the call id as an idempotency key. With
 `RunIdSource::WorkflowId`, two runs can share a run id. On Postgres, such a
-turn skips the cache. On SQLite, start each run from `AgentTask::new`, which
+turn skips the cache. A child run id `{root}:d{n}` or `{root}:s{n}` of such
+a run skips it too. On SQLite, start each run from `AgentTask::new`, which
 uses the execution id.
 
 **Storage.** The answer goes to your `PayloadStore`, inside a codec
@@ -800,7 +810,7 @@ because a custom codec can quote the answer.
 **Limits.**
 
 - A hit repeats one sample. At a high temperature, a second run gets the
-  same answer.
+  same answer. Give each sample its own draw to keep the samples apart.
 - `max_age` limits what the cache serves, not what the store keeps. Change
   `namespace` to make every old entry a miss. The old blobs stay in the store
   until the index drops them.

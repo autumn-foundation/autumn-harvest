@@ -310,6 +310,7 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            draw: None,
         }
     }
 

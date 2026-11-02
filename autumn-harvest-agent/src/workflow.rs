@@ -36,6 +36,7 @@ use crate::approval::{Approval, Decision, approval_signal, await_decision, decod
 use crate::bounds::{RoundBudget, json_len, reaches_percent, reset_due, sibling_cap};
 use crate::context_reset::{self, ProgressNotes, SAVE_PROGRESS_TOOL};
 use crate::delivery::{Report, ReportSource, report_text};
+use crate::draw::Draw;
 use crate::flow::Released;
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
 use crate::harness::{AgentHarness, CacheTenant, DEFAULT_TOOL_OUTPUT_LIMIT, truncate};
@@ -435,6 +436,7 @@ fn next_request(
         model: task.model.clone(),
         tool_guidance: task.tool_guidance.clone(),
         skills: !task.skills.is_empty(),
+        draw: task.draw.as_ref().map(|draw| draw.id),
     }
 }
 
@@ -478,10 +480,15 @@ pub(crate) async fn drive(
     task: &AgentTask,
     source: ReportSource,
 ) -> Result<(AgentReport, u32), String> {
-    let run_id = match task.run_id_source {
-        RunIdSource::ExecutionId => ctx.execution_id().to_string(),
+    // A draw with a root has the run id `{root}:s{n}` (issue #2440).
+    let run_id = match (
+        task.draw.as_ref().and_then(Draw::run_id),
+        task.run_id_source,
+    ) {
+        (Some(draw), _) => draw,
+        (None, RunIdSource::ExecutionId) => ctx.execution_id().to_string(),
         // A run recorded before the change keeps its recorded run id.
-        RunIdSource::WorkflowId => ctx.workflow_id().to_owned(),
+        (None, RunIdSource::WorkflowId) => ctx.workflow_id().to_owned(),
     };
     // A system message inside the history is dropped. Only `task.system`
     // reaches the model as the system prompt.
@@ -2588,6 +2595,9 @@ fn child_task(
         // parent do not apply to it (issue #2373).
         tool_guidance: std::collections::BTreeMap::new(),
         skills: std::collections::BTreeMap::new(),
+        // A child is part of the draw of its parent, so its requests keep
+        // the draw id. It has its own run id, so it drops the root.
+        draw: task.draw.as_ref().map(Draw::inherited),
     }
 }
 
@@ -2753,17 +2763,22 @@ async fn cache_tenant(
 /// id, a hit could give a tool a key that an earlier run used, so the turn
 /// skips the cache.
 ///
-/// A delegated child has the run id `{root}:d{n}`. A later run of the same
-/// workflow id gives its child the same id, so the rule covers the root part.
+/// A delegated child has the run id `{root}:d{n}`, and a draw has
+/// `{root}:s{n}` (issue #2440). A draw can delegate, so the suffixes can
+/// chain. A later run of the same workflow id gives its children the same
+/// ids, so the rule covers each root part of the chain.
 fn shares_run_id(run_id: &str, workflow_id: &str, execution_id: &str) -> bool {
-    let root = child_root(run_id).unwrap_or(run_id);
-    (run_id == workflow_id || root == workflow_id) && run_id != execution_id && root != execution_id
+    let chain: Vec<&str> = std::iter::successors(Some(run_id), |id| child_root(id)).collect();
+    chain.contains(&workflow_id) && !chain.contains(&execution_id)
 }
 
-/// The root run id of a delegated child run id `{root}:d{n}`, or `None` for
-/// any other run id.
+/// The parent run id of a child run id `{root}:d{n}` or `{root}:s{n}`, or
+/// `None` for any other run id.
 fn child_root(run_id: &str) -> Option<&str> {
-    let (root, ordinal) = run_id.rsplit_once(":d")?;
+    let (root, suffix) = run_id.rsplit_once(':')?;
+    let ordinal = suffix
+        .strip_prefix('d')
+        .or_else(|| suffix.strip_prefix('s'))?;
     (!ordinal.is_empty() && ordinal.bytes().all(|byte| byte.is_ascii_digit())).then_some(root)
 }
 
@@ -3222,6 +3237,18 @@ mod tests {
         assert!(!shares_run_id("0e3c", "daily", "0e3c"));
         // A test context has neither id.
         assert!(!shares_run_id("run-1", "", "00000000"));
+    }
+
+    #[test]
+    fn a_draw_of_a_workflow_id_run_skips_the_cache() {
+        assert!(shares_run_id("daily:s0", "daily", "0e3c"));
+        assert!(shares_run_id("daily:s1:d2", "daily", "0e3c"));
+        assert!(!shares_run_id("0e3c:s1", "daily", "0e3c"));
+        assert!(!shares_run_id("0e3c:s1:d2", "daily", "0e3c"));
+        // A draw started by `run_draws` has the execution id of its parent
+        // as its root, so the child sees no shared id.
+        assert!(!shares_run_id("p-exec:s0", "child-wf", "child-exec"));
+        assert!(!shares_run_id("daily:sx", "daily:s", "0e3c"));
     }
 
     #[test]

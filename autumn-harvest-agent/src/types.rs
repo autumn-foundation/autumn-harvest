@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crate::context_reset::ContextReset;
+use crate::draw::{Draw, DrawId};
 use crate::flow::Released;
 use crate::followup::Followups;
 use crate::loop_guard::LoopGuard;
@@ -189,6 +190,11 @@ pub struct AgentTask {
     /// `load_skill` tool. See [`skill`](crate::skill).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub skills: BTreeMap<String, SkillText>,
+    /// The draw of the run (issue #2440). Each model request carries its id.
+    /// With a root, the run id is `{root}:s{n}`. A delegated child keeps the
+    /// id. Use [`run_draws`](crate::run_draws) to start draws.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draw: Option<Draw>,
 }
 
 /// Where the run id of a task comes from.
@@ -241,6 +247,7 @@ impl AgentTask {
             context_reset: None,
             tool_guidance: BTreeMap::new(),
             skills: BTreeMap::new(),
+            draw: None,
         }
     }
 
@@ -555,6 +562,10 @@ pub struct ModelTurnRequest {
     /// Offer the `load_skill` tool (issue #2373).
     #[serde(default, skip_serializing_if = "is_false")]
     pub skills: bool,
+    /// The draw of this turn (issue #2440). A recorded input with no field
+    /// decodes as `None`, so a run in flight replays as it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draw: Option<DrawId>,
 }
 
 /// The recorded result of one model-turn activity.

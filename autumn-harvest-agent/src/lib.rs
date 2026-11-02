@@ -78,6 +78,7 @@ pub mod approval;
 pub mod bounds;
 pub mod context_reset;
 pub mod delivery;
+pub mod draw;
 pub mod error;
 #[cfg(feature = "eval")]
 pub mod eval;
@@ -128,6 +129,7 @@ pub use agent::{
 pub use approval::Approval;
 pub use context_reset::{ContextReset, ProgressNotes};
 pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
+pub use draw::{Draw, DrawId, run_draws};
 pub use error::{AgentError, ErrorKind};
 pub use flow::{FlowRule, FlowRules, Recheck, Released};
 pub use followup::Followups;

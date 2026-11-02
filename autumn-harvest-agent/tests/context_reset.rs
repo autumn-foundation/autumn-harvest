@@ -770,6 +770,7 @@ fn logged_requests(log_path: &Path, who: &str) -> Vec<ChatRequest> {
             tools: serde_json::from_value(line["tools"].clone()).unwrap(),
             max_tokens: serde_json::from_value(line["max_tokens"].clone()).unwrap(),
             temperature: serde_json::from_value(line["temperature"].clone()).unwrap(),
+            draw: None,
         })
         .collect()
 }
