@@ -161,7 +161,7 @@ tokio-postgres-rustls = { version = "0.14", optional = true }
 metrics = { version = "0.24.6", optional = true }
 # Hashes the `metrics-rs` label interner. SipHash cost more than the copy it saves.
 foldhash = { version = "0.2", optional = true }
-schemars = { version = "0.8", optional = true }
+schemars = { version = "1.2", optional = true }
 # wasmtime 48's own minimum Rust is 1.95, so the `wasm-activities` feature that
 # enables these has an effective MSRV of 1.95 (the crate's core MSRV stays 1.88).
 # 48.0.3 is the first 48.x release with the RUSTSEC-2026-0316 fix (46.x has no
@@ -384,7 +384,7 @@ tempfile = "3"
 # here because a `[dependencies]` entry is not visible to integration test
 # binaries, and the round-49 regression test drives the real `do_heartbeat_tick`.
 tokio-util = { version = "0.7", features = ["rt"] }
-schemars = { version = "0.8" }
+schemars = { version = "1.2" }
 # Assemble `.wat` text into `.wasm` bytes in the `wasm-activities` integration
 # tests. Already a (feature-gated) dependency of the crate; a plain dev-dep here
 # so the integration test binaries can build guest modules regardless of feature
