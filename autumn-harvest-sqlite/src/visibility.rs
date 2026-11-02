@@ -326,6 +326,25 @@ impl SqliteReader {
         describe(&self.conn, exec)
     }
 
+    /// The event history of `exec`, oldest first (issue #2467). See
+    /// [`SqliteRuntime::load_history`](crate::SqliteRuntime::load_history).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
+    /// [`SqliteError::Sqlite`] if the query fails, and
+    /// [`SqliteError::Corrupt`] for a row that does not parse.
+    pub fn load_history(
+        &self,
+        exec: ExecutionId,
+    ) -> SqliteResult<Vec<autumn_harvest::WorkflowEvent>> {
+        let history = crate::store::load_history(&self.conn, exec)?;
+        if history.is_empty() && !crate::store::execution_exists(&self.conn, exec)? {
+            return Err(SqliteError::ExecutionNotFound(exec));
+        }
+        Ok(history)
+    }
+
     /// The cost ledger rows of `exec` (issue #2275). See
     /// [`SqliteRuntime::llm_ledger`](crate::SqliteRuntime::llm_ledger).
     ///

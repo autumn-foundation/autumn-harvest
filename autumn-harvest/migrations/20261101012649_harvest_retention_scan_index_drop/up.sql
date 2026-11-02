@@ -1,0 +1,41 @@
+-- Issue #2395, second step. Drop `idx_harvest_we_retention_scan`.
+--
+-- `20261029034500` builds `idx_harvest_we_retention_candidates`. Its six
+-- states imply each subset of them. So the new index serves each query that
+-- the old index served, and the old index now only costs writes.
+--
+-- ## Why the drop is its own migration
+--
+-- Each migration runs in its own transaction. `20261029034500` first built
+-- the new index and dropped the old one in one transaction. The build holds
+-- `SHARE` on `harvest_workflow_executions` until the commit. The drop then
+-- asks for `ACCESS EXCLUSIVE` on the same table.
+--
+-- A step transaction that read or locked an execution row holds a lock that
+-- `SHARE` allows. Its next write waits behind the build. The drop then waits
+-- behind that step transaction. That is a deadlock. Postgres aborts the
+-- migration, and the whole build rolls back. A plain open reader blocks the
+-- drop too, until `lock_timeout` fails it. So on a busy deployment the
+-- migration can fail each time, after it blocked every state change for the
+-- full build.
+--
+-- Here the drop holds no earlier lock in its transaction, so it cannot close
+-- such a cycle. A lost wait fails this drop only. The committed build stays.
+--
+-- ## Lock cost and the zero-downtime recipe
+--
+-- `DROP INDEX` (not `CONCURRENTLY`) takes `ACCESS EXCLUSIVE` for a short
+-- time. While it waits, each later read and write of the table queues behind
+-- it. `lock_timeout` bounds that wait (issue #1810). When it fires, run the
+-- migration again.
+--
+-- On a live, large deployment, drop the index out of band first:
+--
+--     DROP INDEX CONCURRENTLY IF EXISTS idx_harvest_we_retention_scan;
+--
+-- Then this migration finds no index, and its drop takes no lock. A database
+-- that applied the first form of `20261029034500` has no such index either.
+SET LOCAL lock_timeout = '5s';
+
+-- lock-safety: allow blocking-index #2395 operators drop it CONCURRENTLY first, see the header
+DROP INDEX IF EXISTS idx_harvest_we_retention_scan;

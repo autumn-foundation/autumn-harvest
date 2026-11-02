@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use autumn_harvest::context::{WorkflowContext, empty_shared_state};
+use autumn_harvest::context::{SharedState, WorkflowContext};
 use autumn_harvest::error::NonDeterministicDetails;
 use autumn_harvest::executor::{
     QueryReplayOutcome, TerminalQueryDecision, classify_terminal_query, drive_query_replay_async,
@@ -41,6 +41,9 @@ pub struct QueryReplay {
     history_policy: WorkflowHistoryPolicy,
     pending_cancel: Option<String>,
     parent: Option<ExecutionId>,
+    /// The runtime's app state, so `ctx.state::<T>()` matches the drive
+    /// (issue #2467).
+    shared_state: SharedState,
     /// The drive's timeout and deadline, so `ctx.deadline()` matches (issue
     /// #2029).
     deadline: (
@@ -61,6 +64,7 @@ impl QueryReplay {
         conn: &Connection,
         workflows: &HashMap<String, WorkflowHandlerFn>,
         history_policy: WorkflowHistoryPolicy,
+        shared_state: SharedState,
         exec: ExecutionId,
     ) -> SqliteResult<Self> {
         // The state read goes first. It is the read that rejects an unknown id.
@@ -90,6 +94,7 @@ impl QueryReplay {
             // A child sees its parent here, as on a drive (issue #2026).
             parent: store::parent_link(conn, exec)?.map(|(parent, _)| parent),
             deadline: store::run_config(conn, exec)?.context_deadline(),
+            shared_state,
         })
     }
 
@@ -109,7 +114,7 @@ impl QueryReplay {
         let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
             exec,
             self.history,
-            empty_shared_state(),
+            self.shared_state,
             self.history_policy,
         )
         .with_workflow_name(self.workflow_name)

@@ -130,6 +130,10 @@ name = "agent_workspace"
 required-features = ["sqlite"]
 
 [[test]]
+name = "skills"
+required-features = ["sqlite", "eval"]
+
+[[test]]
 name = "refine_propose"
 required-features = ["sqlite"]
 
