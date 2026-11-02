@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "agent-loop-hit-rate"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-agent",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "agent-mesh"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autoresearch",
  "autumn-harvest",
@@ -477,7 +477,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "autoresearch"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-agent",
@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "aes 0.9.2",
  "aes-gcm 0.11.1",
@@ -565,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-agent"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-cli"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "chrono",
@@ -615,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-conformance"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
@@ -632,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-macros"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-plugin"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "autumn-harvest",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-redis"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "autumn-harvest",
@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-sandbox-guest"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "libc",
@@ -724,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-sqlite"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "chrono",
@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-verify"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "chrono",
@@ -1458,7 +1458,7 @@ dependencies = [
 
 [[package]]
 name = "billing-autumn-web"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-plugin",
@@ -1956,7 +1956,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "claude-agent-daemon"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-agent",
@@ -3619,7 +3619,7 @@ dependencies = [
 
 [[package]]
 name = "harvest-verify-corpus-boundary"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "harvest-verify-corpus-helpers",
@@ -3630,7 +3630,7 @@ dependencies = [
 
 [[package]]
 name = "harvest-verify-corpus-clean"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "harvest-verify-corpus-helpers",
@@ -3641,7 +3641,7 @@ dependencies = [
 
 [[package]]
 name = "harvest-verify-corpus-helpers"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "harvest-verify-corpus-helpers-deep",
  "rand 0.8.6",
@@ -3651,11 +3651,11 @@ dependencies = [
 
 [[package]]
 name = "harvest-verify-corpus-helpers-deep"
-version = "0.8.0"
+version = "0.9.0"
 
 [[package]]
 name = "harvest-verify-corpus-seeded"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "harvest-verify-corpus-helpers",
@@ -3737,7 +3737,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "history-load-gate"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
@@ -5727,7 +5727,7 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quickstart"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-plugin",
@@ -6586,7 +6586,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "saga-choreography"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "chrono",
@@ -7262,7 +7262,7 @@ dependencies = [
 
 [[package]]
 name = "standalone-runner"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-cli",

@@ -89,7 +89,7 @@ autumn-harvest/          <- workspace root
 
 `autumn-harvest-redis` is an **optional** dependency of `autumn-harvest-plugin`, behind that crate's `redis` cargo feature (issue #1312). It implements the core `dispatch::TaskDispatch` seam over Redis Streams. The default build never compiles it, and the plugin rejects `[harvest.redis] url` on a build without the feature. `autumn-harvest-redis` depends on `autumn-harvest` with `default-features = false`, so the channel never pulls the `db` feature into a caller that does not want it. See [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md).
 
-`autumn-harvest-agent` is the durable agent loop (issue #1973). The agent loop is a workflow, and each model call and tool call is an activity. It owns its agent primitives (`AgentModel`, `Tool`, `ToolPolicy`, `Approval`), modelled on `autumn-plugin-agent` but with no dependency on it. It depends on `autumn-harvest` with `default-features = false` only, so it has no Postgres, no `autumn-web` and no Autumn plugin dependency. `scripts/check-agent-adapter-deps.sh` gates that in CI. Its `eval` feature (issue #2001) also turns on the engine's `testing` feature for replay-as-evaluation. Its `mesh` and `flow` modules add delegation to peer agents, mandates and flow rules. Its `agent` module (issue #2263) runs the loop as a durable `Agent`: a keyed entity with a typed inbox, one op at a time. See [`docs/agent-adapter.md`](agent-adapter.md), [`docs/agent-mesh.md`](agent-mesh.md) and [ADR 0006](adr/0006-agent-adapter-framework.md).
+`autumn-harvest-agent` is the durable agent loop (issue #1973). The agent loop is a workflow, and each model call and tool call is an activity. It owns its agent primitives (`AgentModel`, `Tool`, `ToolPolicy`, `Approval`), modelled on `autumn-plugin-agent` but with no dependency on it. It depends on `autumn-harvest` with `default-features = false` only, so it has no Postgres, no `autumn-web` and no Autumn plugin dependency. `scripts/check-agent-adapter-deps.sh` gates that in CI. Its `eval` feature (issue #2001) also turns on the engine's `testing` feature for replay-as-evaluation. Its `mesh` and `flow` modules add delegation to peer agents, mandates and flow rules. Its `agent` module (issue #2263) runs the loop as a durable `Agent`: a keyed entity with a typed inbox, one op at a time. Its `agent::overlay` and `agent::overlay_store` modules (epic #2369) add profile overlays under ceilings and a versioned store. Its `refine` module proposes an overlay, and its `score` module (issue #2441) records a verdict for a run. See [`docs/agent-adapter.md`](agent-adapter.md), [`docs/agent-mesh.md`](agent-mesh.md) and [ADR 0006](adr/0006-agent-adapter-framework.md).
 
 `autumn-harvest-sandbox-guest` builds `harvest-guest-agent`, a static binary that runs as process 1 in each microVM of the sandboxed code activities. Only the guest image uses it. It depends on `autumn-harvest` with `default-features = false` and the `sandbox-activities` feature, and it shares the wire protocol and the process executor with the host. See [`docs/sandbox-activities.md`](sandbox-activities.md).
 
@@ -1781,7 +1781,7 @@ Enable the `schema` Cargo feature and derive `JsonSchema` on your types:
 
 ```toml
 # In your Cargo.toml:
-autumn-harvest = { version = "0.8", features = ["schema"] }
+autumn-harvest = { version = "0.9", features = ["schema"] }
 schemars = "0.8"
 ```
 

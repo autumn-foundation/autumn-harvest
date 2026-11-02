@@ -14,8 +14,8 @@ tracks the work. This page describes slice 1,
 ```toml
 [dependencies]
 autumn-web = { version = "0.9", features = ["sqlite"] }
-autumn-harvest = { version = "0.8", default-features = false }
-autumn-harvest-plugin = { version = "0.8", features = ["sqlite"] }
+autumn-harvest = { version = "0.9", default-features = false }
+autumn-harvest-plugin = { version = "0.9", features = ["sqlite"] }
 ```
 
 The feature is a backend flip, like `autumn-web/sqlite`, which it turns on.
