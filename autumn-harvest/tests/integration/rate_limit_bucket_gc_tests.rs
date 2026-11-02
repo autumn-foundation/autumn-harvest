@@ -440,7 +440,7 @@ const fn collected(result: &autumn_harvest::retention::RetentionTickResult) -> u
     gc(result).collected
 }
 
-const WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+const WINDOW: Duration = Duration::from_hours(24);
 
 const fn day_old() -> chrono::Duration {
     chrono::Duration::hours(48)
@@ -729,7 +729,7 @@ async fn the_configured_window_is_honoured() {
     // A 1h window collects it.
     let result = run_one_tick(
         pool,
-        gc_only(Duration::from_secs(60 * 60)),
+        gc_only(Duration::from_hours(1)),
         Arc::new(CapturingMetrics::default()),
     )
     .await;

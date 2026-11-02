@@ -159,7 +159,7 @@ fn worker(queue: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 capability_miss_max_redeliveries: 5,
                 workflow_task_timeout: Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
-                max_workflow_pause_duration: Duration::from_secs(24 * 3600),
+                max_workflow_pause_duration: Duration::from_hours(24),
                 labels: HashMap::new(),
                 sharded_pool: None,
                 max_workflow_history_events: None,

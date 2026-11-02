@@ -57,7 +57,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 const PAGE_SIZE: usize = 2;
-const GRACE: Duration = Duration::from_secs(60 * 60);
+const GRACE: Duration = Duration::from_hours(1);
 
 type Blobs = HashMap<String, (Vec<u8>, DateTime<Utc>)>;
 

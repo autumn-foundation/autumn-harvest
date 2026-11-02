@@ -52,7 +52,7 @@ use std::pin::Pin;
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{AeadInOut, KeyInit, Nonce, Tag};
 use base64::Engine as _;
-use rand::RngCore as _;
+use rand::{Rng as _, TryRng as _};
 /// Re-exported so that a [`KmsDecrypt`] implementation needs no direct
 /// `zeroize` dependency.
 pub use zeroize::Zeroizing;
@@ -134,7 +134,7 @@ impl DataKey {
     #[must_use]
     pub fn generate() -> Self {
         let mut key = Box::new(Zeroizing::new([0u8; DATA_KEY_BYTES]));
-        rand::rngs::OsRng.fill_bytes(key.as_mut_slice());
+        rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(key.as_mut_slice());
         Self(key)
     }
 
@@ -297,7 +297,7 @@ impl PayloadCodec for AeadCodec {
 
     fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
         let mut nonce = [0u8; NONCE_BYTES];
-        rand::rngs::OsRng
+        rand::rngs::SysRng
             .try_fill_bytes(&mut nonce)
             .map_err(|_| CodecError("aes-256-gcm: the OS RNG is unavailable".to_string()))?;
         let body_start = self.header.len() + NONCE_BYTES;

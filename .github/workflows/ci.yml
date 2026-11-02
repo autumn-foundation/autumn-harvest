@@ -2509,7 +2509,7 @@ jobs:
           done
 
   msrv:
-    name: MSRV (1.88.0)
+    name: MSRV (1.97.0)
     needs: changes
     # Draft-skip (see lint) + docs-only skip via the `changes` guard.
     if: >-
@@ -2521,12 +2521,12 @@ jobs:
     # action sets. The environment variable outranks the file, so every
     # cargo call in this job really compiles with the MSRV.
     env:
-      RUSTUP_TOOLCHAIN: 1.88.0
+      RUSTUP_TOOLCHAIN: 1.97.0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.97.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Check MSRV compiles
         run: cargo check --workspace
@@ -2535,8 +2535,8 @@ jobs:
       # `runner.rs` never reach the MSRV compiler. Issue #1312.
       - name: Check MSRV compiles (autumn-harvest-plugin redis feature, issue #1312)
         run: cargo check -p autumn-harvest-plugin --features redis
-      # Issue #1983. The locked `aws-sdk-s3` declares Rust 1.88, the MSRV
-      # itself. This step makes a lockfile bump past it fail.
+      # Issue #1983. This step makes an `aws-sdk-s3` lockfile bump past the MSRV
+      # fail.
       - name: Check MSRV compiles (autumn-harvest-plugin s3 and gcs features, issue #1983)
         run: cargo check -p autumn-harvest-plugin --features s3,gcs
 

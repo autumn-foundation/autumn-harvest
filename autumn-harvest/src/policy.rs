@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use croner::Cron;
+use croner::parser::{CronParser, Seconds};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -1599,7 +1600,20 @@ impl WorkflowSchedule {
 /// the last date that `chrono` holds (issue #2048). The cap sits far below
 /// that limit and far above any real cadence. [`validate_schedule`] rejects a
 /// longer period.
-pub const MAX_INTERVAL_PERIOD: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+pub const MAX_INTERVAL_PERIOD: Duration = Duration::from_hours(876_000);
+
+/// Parse a cron expression, with an optional seconds field.
+///
+/// `sloppy_ranges` keeps forms such as `0/10 * * * *` valid. Croner 4 rejects
+/// them by default, but a stored schedule can hold one. Without this flag, such
+/// a schedule does not parse, so it stops firing and reports no error.
+pub(crate) fn parse_cron(expr: &str) -> Result<Cron, croner::errors::CronError> {
+    CronParser::builder()
+        .seconds(Seconds::Optional)
+        .sloppy_ranges(true)
+        .build()
+        .parse(expr)
+}
 
 /// Validate a [`Schedule`] value, returning an error string if it is invalid.
 ///
@@ -1615,9 +1629,7 @@ pub const MAX_INTERVAL_PERIOD: Duration = Duration::from_secs(100 * 365 * 24 * 6
 /// fractional second, or is longer than [`MAX_INTERVAL_PERIOD`].
 pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
     match schedule {
-        Schedule::Cron(expr) => Cron::new(expr)
-            .with_seconds_optional()
-            .parse()
+        Schedule::Cron(expr) => parse_cron(expr)
             .map(|_| ())
             .map_err(|e| format!("invalid cron expression '{expr}': {e}")),
         Schedule::CronInTimezone { expr, tz } => {
@@ -1627,9 +1639,7 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
                     "unknown timezone '{tz}'; use an IANA timezone name (e.g. \"America/Los_Angeles\", \"UTC\")"
                 ));
             }
-            Cron::new(expr)
-                .with_seconds_optional()
-                .parse()
+            parse_cron(expr)
                 .map(|_| ())
                 .map_err(|e| format!("invalid cron expression '{expr}': {e}"))
         }
@@ -1846,7 +1856,7 @@ mod tests {
     #[test]
     fn resolve_retry_after_hint_none_falls_through() {
         assert_eq!(
-            resolve_retry_after_hint(None, Duration::from_secs(900)),
+            resolve_retry_after_hint(None, Duration::from_mins(15)),
             None,
             "no hint present -> fall through to the policy's own delay"
         );
@@ -1856,7 +1866,7 @@ mod tests {
     fn resolve_retry_after_hint_zero_falls_through() {
         // Duration cannot be negative, so "<= 0" reduces to exactly ZERO.
         assert_eq!(
-            resolve_retry_after_hint(Some(Duration::ZERO), Duration::from_secs(900)),
+            resolve_retry_after_hint(Some(Duration::ZERO), Duration::from_mins(15)),
             None,
             "a zero-duration hint must fall through to the policy delay (AC3)"
         );
@@ -1880,7 +1890,7 @@ mod tests {
     #[test]
     fn resolve_retry_after_hint_under_ceiling_is_honored_verbatim() {
         assert_eq!(
-            resolve_retry_after_hint(Some(Duration::from_secs(30)), Duration::from_secs(900)),
+            resolve_retry_after_hint(Some(Duration::from_secs(30)), Duration::from_mins(15)),
             Some(Duration::from_secs(30)),
         );
     }
@@ -1888,8 +1898,8 @@ mod tests {
     #[test]
     fn resolve_retry_after_hint_at_ceiling_is_honored_verbatim() {
         assert_eq!(
-            resolve_retry_after_hint(Some(Duration::from_secs(900)), Duration::from_secs(900)),
-            Some(Duration::from_secs(900)),
+            resolve_retry_after_hint(Some(Duration::from_mins(15)), Duration::from_mins(15)),
+            Some(Duration::from_mins(15)),
             "a hint exactly at the ceiling must not be treated as over-ceiling"
         );
     }
@@ -1897,8 +1907,8 @@ mod tests {
     #[test]
     fn resolve_retry_after_hint_over_ceiling_is_clamped_not_rejected() {
         assert_eq!(
-            resolve_retry_after_hint(Some(Duration::from_secs(3600)), Duration::from_secs(900)),
-            Some(Duration::from_secs(900)),
+            resolve_retry_after_hint(Some(Duration::from_secs(3600)), Duration::from_mins(15)),
+            Some(Duration::from_mins(15)),
             "an over-ceiling hint must clamp down, never error/reject (AC3)"
         );
     }
@@ -1907,7 +1917,7 @@ mod tests {
     fn resolve_retry_after_hint_one_nanosecond_is_honored() {
         // The smallest possible positive Duration must not be treated as "zero".
         assert_eq!(
-            resolve_retry_after_hint(Some(Duration::from_nanos(1)), Duration::from_secs(900)),
+            resolve_retry_after_hint(Some(Duration::from_nanos(1)), Duration::from_mins(15)),
             Some(Duration::from_nanos(1)),
         );
     }
@@ -2788,7 +2798,7 @@ mod tests {
         assert_eq!(CatchupPolicy::SkipAll.as_str(), "skip_all");
         assert_eq!(CatchupPolicy::MostRecent.as_str(), "most_recent");
         assert_eq!(
-            CatchupPolicy::Window(Duration::from_secs(900)).as_str(),
+            CatchupPolicy::Window(Duration::from_mins(15)).as_str(),
             "window"
         );
         assert_eq!(CatchupPolicy::Unbounded.as_str(), "unbounded");
@@ -2806,7 +2816,7 @@ mod tests {
         );
         assert_eq!(
             CatchupPolicy::from_db(Some("window"), Some(900), false),
-            CatchupPolicy::Window(Duration::from_secs(900)),
+            CatchupPolicy::Window(Duration::from_mins(15)),
         );
         assert_eq!(
             CatchupPolicy::from_db(Some("unbounded"), None, false),
@@ -2853,7 +2863,7 @@ mod tests {
             (Some("most_recent"), None)
         );
         assert_eq!(
-            CatchupPolicy::Window(Duration::from_secs(900)).to_db_columns(),
+            CatchupPolicy::Window(Duration::from_mins(15)).to_db_columns(),
             (Some("window"), Some(900)),
         );
         assert_eq!(
@@ -2878,7 +2888,7 @@ mod tests {
         );
         assert_eq!(
             CatchupPolicy::from_user_input("window", Some(900)),
-            Ok(CatchupPolicy::Window(Duration::from_secs(900)))
+            Ok(CatchupPolicy::Window(Duration::from_mins(15)))
         );
         // Window with no/negative secs clamps to 0 rather than erroring.
         assert_eq!(

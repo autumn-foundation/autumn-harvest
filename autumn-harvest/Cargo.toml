@@ -53,9 +53,8 @@ schema = ["dep:schemars"]
 # Sandboxed WebAssembly activities (issue #965). Pulls wasmtime + wat only when
 # explicitly enabled; requires the `db` feature (activity events are persisted).
 #
-# EFFECTIVE MSRV: this feature requires Rust >= 1.95 (wasmtime 48's own minimum).
-# The crate's core/default MSRV is 1.88 and is UNAFFECTED: this optional R&D-spike
-# feature is out of the default build and the MSRV CI check (`cargo check
+# MSRV: wasmtime 50 needs Rust >= 1.97, which is the workspace MSRV. This optional
+# R&D-spike feature is out of the default build and the MSRV CI check (`cargo check
 # --workspace`, default features, never compiles wasmtime). See
 # docs/rnd/wasm-activities-spike.md.
 wasm-activities = ["dep:wasmtime", "dep:wat", "db", "dep:ed25519-dalek"]
@@ -82,8 +81,7 @@ atomicity-spike = ["db"]
 # capability model and resource limits rather than adding a second sandbox, so
 # this feature adds **no new dependency to the workspace**.
 #
-# EFFECTIVE MSRV: inherited from `wasm-activities` (Rust >= 1.95, wasmtime 48's
-# own minimum). The crate's core/default MSRV is 1.88 and is UNAFFECTED.
+# MSRV: inherited from `wasm-activities` (Rust >= 1.97, wasmtime 50's own minimum).
 # See docs/rnd/hot-code-swap.md.
 hot-code-swap = ["wasm-activities"]
 # Deterministic chaos / fault-injection test harness (issue #940). Off by
@@ -94,7 +92,7 @@ chaos = ["db"]
 # The owner-local disk cache (issue #2258). Off by default. It needs owner
 # mode and a directory. Both crates are already in the lockfile through
 # `autumn-harvest-sqlite`. See docs/adr/0012-owner-disk-cache.md.
-owner-disk-cache = ["db", "dep:rusqlite", "dep:fs4"]
+owner-disk-cache = ["db", "dep:rusqlite"]
 
 [dependencies]
 autumn-harvest-macros = { version = "0.8.0", path = "../autumn-harvest-macros" }
@@ -108,12 +106,12 @@ sha2 = "0.11"
 hmac = "0.13"
 # AES-256-GCM payload codec (issue #1825). `autumn-web` 0.9 keeps its own 0.10.3 in
 # the lockfile. No default features: the codec reads nonces from `rand`'s
-# `OsRng`, so `aead/getrandom` is not needed.
+# `SysRng`, so `aead/getrandom` is not needed.
 aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc", "zeroize"] }
 # `aes-gcm`'s own `zeroize` feature clears only a temporary key. These turn on
 # `ZeroizeOnDrop` for the AES round keys and the GHASH state. All three crates
 # are already in the lockfile through `aes-gcm`.
-aes = { version = "0.9.2", features = ["zeroize"] }
+aes = { version = "0.9.4", features = ["zeroize"] }
 ghash = { version = "0.6.0", default-features = false, features = ["zeroize"] }
 polyval = { version = "0.7.3", default-features = false, features = ["zeroize"] }
 # Clears data-key bytes on drop (issue #1825). Already in the lockfile.
@@ -122,7 +120,7 @@ url = "2"
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-arbitrary = { version = "1.4", features = ["derive"], optional = true }
+arbitrary = { version = "1.5", features = ["derive"], optional = true }
 chrono-tz = { workspace = true }
 # Reads a migration's `metadata.toml` in `crate::migrate` with the SAME parser
 # Diesel reads it with, so what this applies and what `diesel migration run`
@@ -134,7 +132,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 lru = "0.19.0"
-croner = "2.2"
+croner = "4.0"
 seahash = "4.1"
 rand = { workspace = true }
 deadpool = { workspace = true, optional = true }
@@ -162,14 +160,14 @@ metrics = { version = "0.24.6", optional = true }
 # Hashes the `metrics-rs` label interner. SipHash cost more than the copy it saves.
 foldhash = { version = "0.2", optional = true }
 schemars = { version = "1.2", optional = true }
-# wasmtime 48's own minimum Rust is 1.95, so the `wasm-activities` feature that
-# enables these has an effective MSRV of 1.95 (the crate's core MSRV stays 1.88).
+# wasmtime 50's own minimum Rust is 1.97, which sets the workspace MSRV.
 # 48.0.3 is the first 48.x release with the RUSTSEC-2026-0316 fix (46.x has no
 # patched release). 48.0.6 is the first with the RUSTSEC-2026-0363 and
 # RUSTSEC-2026-0364 fixes. 48.0.7 is the first with the RUSTSEC-2026-0378 and
 # RUSTSEC-2026-0379 fixes. 48.0.8 is the first with the RUSTSEC-2026-0422 to
-# RUSTSEC-2026-0424 fixes. Pin the floor so a downstream consumer enabling
-# `wasm-activities` can't silently resolve back to a vulnerable 48.0.x (same
+# RUSTSEC-2026-0424 fixes. The floor is now the 50.x line, above all of them. Pin
+# it so a downstream consumer enabling `wasm-activities` can't silently resolve
+# back to a vulnerable release (same
 # reasoning as tokio-postgres above -- a workspace's own Cargo.lock never
 # propagates to downstream consumers, only the manifest constraint does).
 # Default features minus `cache`. Harvest keeps compiled modules in memory
@@ -177,7 +175,7 @@ schemars = { version = "1.2", optional = true }
 # the only path to `zstd` 0.13, which carries RUSTSEC-2026-0391 and
 # RUSTSEC-2026-0395 to -0410. No wasmtime release depends on the patched
 # `zstd` 0.14, so dropping the feature removes the crate from the graph.
-wasmtime = { version = "48.0.8", optional = true, default-features = false, features = [
+wasmtime = { version = "50.0.1", optional = true, default-features = false, features = [
     "addr2line",
     "anyhow",
     "async",
@@ -214,7 +212,6 @@ ed25519-dalek = { version = "3.0", optional = true }
 # The owner-local disk cache (issue #2258): one SQLite file per partition and
 # an exclusive lock on a sidecar file.
 rusqlite = { workspace = true, optional = true, features = ["hooks", "limits"] }
-fs4 = { version = "1.1", default-features = false, features = ["sync"], optional = true }
 
 [[test]]
 name = "integration"
@@ -443,7 +440,7 @@ loom = "0.7.2"
 # APIs. Their `shuttle` feature swaps in the Shuttle-scheduled types. See
 # `docs/testing/shuttle.md`.
 [target.'cfg(shuttle)'.dependencies]
-shuttle = "0.9.5"
+shuttle = "0.9.9"
 shuttle-tokio = { version = "1.0.0", features = ["shuttle", "macros", "rt", "sync", "time"] }
 shuttle-tokio-util = { version = "0.7.0", features = ["shuttle"] }
 

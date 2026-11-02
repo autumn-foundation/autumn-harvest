@@ -19,11 +19,10 @@ autumn-harvest-agent = { version = "0.8.0", path = "../../autumn-harvest-agent",
 # autoresearch capstone. One copy serves both examples.
 autoresearch = { version = "0.8.0", path = "../autoresearch" }
 chrono = { workspace = true }
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]

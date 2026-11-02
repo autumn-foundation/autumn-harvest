@@ -150,7 +150,7 @@ impl HttpRemoteTasks {
         reason = "the static client configuration is valid"
     )]
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .timeout(REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()

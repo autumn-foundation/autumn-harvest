@@ -938,7 +938,7 @@ async fn scheduler_tick_applies_fleet_wide_chain_ceiling() {
             }],
             vec![],
         )
-        .with_max_workflow_chain_timeout(Some(std::time::Duration::from_secs(3 * 24 * 3600))),
+        .with_max_workflow_chain_timeout(Some(std::time::Duration::from_hours(72))),
     );
 
     // Register a due interval schedule for this workflow.

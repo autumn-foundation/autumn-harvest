@@ -4562,7 +4562,7 @@ mod tests {
             workflow: "cart",
             signal_name: "add_item",
         };
-        let week = Duration::from_secs(7 * 24 * 60 * 60);
+        let week = Duration::from_hours(168);
 
         // `Starts` reserves a `harvest_start_idempotency` row, so the window IS
         // the bound and an untuned one is the thing worth saying.
@@ -4606,10 +4606,10 @@ mod tests {
                 IdempotencyMode::BrokerCoordinates,
                 SIGNALS,
                 Some(week),
-                Some(Duration::from_secs(3 * 24 * 60 * 60)),
+                Some(Duration::from_hours(72)),
             ),
             Some(UntunedDedupeBound::ExecutionRetention {
-                max_age: Duration::from_secs(3 * 24 * 60 * 60),
+                max_age: Duration::from_hours(72),
             }),
             "a tuned window must not silence the retention bound it does not govern",
         );
@@ -4648,8 +4648,8 @@ mod tests {
         const STARTS: ConnectorTarget = ConnectorTarget::Starts {
             workflow: "order_flow",
         };
-        let three_days = Duration::from_secs(3 * 24 * 60 * 60);
-        let week = Duration::from_secs(7 * 24 * 60 * 60);
+        let three_days = Duration::from_hours(72);
+        let week = Duration::from_hours(168);
 
         assert_eq!(
             untuned_dedupe_bound(IdempotencyMode::WorkflowId, STARTS, None, Some(three_days)),

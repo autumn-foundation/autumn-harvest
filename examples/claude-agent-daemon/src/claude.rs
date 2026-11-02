@@ -150,10 +150,14 @@ impl ModelConfig {
                  offline."
             ));
         }
-        let http = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .map_err(|e| format!("cannot build the HTTP client: {e}"))?;
+        let http = {
+            // Reqwest panics without a provider. An `Err` means that one is installed.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            reqwest::Client::builder()
+        }
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .map_err(|e| format!("cannot build the HTTP client: {e}"))?;
         Ok(Self {
             api_key,
             model,

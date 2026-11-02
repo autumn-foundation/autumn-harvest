@@ -246,7 +246,7 @@ async fn dag_declared_execution_timeout_and_sla_set_deadline_columns() {
     let wf_name = unique_name("dag743_deadlines");
     let dag = deadline_dag(
         "nightly_deadline_etl",
-        Some(std::time::Duration::from_secs(4 * 3600)),
+        Some(std::time::Duration::from_hours(4)),
         Some(std::time::Duration::from_secs(3600)),
     );
     let info = dag
@@ -348,7 +348,7 @@ async fn dag_sla_breach_emits_metric_exactly_once_without_terminating() {
     let wf_name = unique_name("dag743_sla");
     let dag = deadline_dag(
         "nightly_deadline_etl",
-        Some(std::time::Duration::from_secs(24 * 3600)),
+        Some(std::time::Duration::from_hours(24)),
         Some(std::time::Duration::from_secs(3600)),
     );
     let info = dag.as_workflow_info().unwrap();
@@ -425,7 +425,7 @@ async fn dag_sla_is_clamped_to_execution_timeout_at_start() {
     let dag = deadline_dag(
         "nightly_deadline_etl",
         Some(std::time::Duration::from_secs(3600)),
-        Some(std::time::Duration::from_secs(10 * 3600)),
+        Some(std::time::Duration::from_hours(10)),
     );
     let info = dag.as_workflow_info().unwrap();
     let (execution_timeout, sla) = resolve_deadlines(&info);
@@ -462,7 +462,7 @@ async fn dag_and_workflow_execution_timeout_ceilings_apply_identically() {
     let dag_wf_name = unique_name("dag743_ceiling_dag");
     let dag = deadline_dag(
         "nightly_deadline_etl",
-        Some(std::time::Duration::from_secs(10 * 3600)),
+        Some(std::time::Duration::from_hours(10)),
         None,
     );
     let info = dag.as_workflow_info().unwrap();
@@ -674,7 +674,7 @@ async fn trigger_unified_dag_threads_dag_declared_execution_timeout_and_sla() {
     let dag_name = leaked_dag_name("dag743_trigger");
     let dag = deadline_dag(
         dag_name,
-        Some(std::time::Duration::from_secs(2 * 3600)),
+        Some(std::time::Duration::from_hours(2)),
         Some(std::time::Duration::from_secs(3600)),
     );
     let registry = dag_registry(&dag);
@@ -741,11 +741,7 @@ async fn scheduler_tick_buffered_drain_threads_dag_declared_execution_timeout() 
     let dag = DagInfo {
         schedule: Some(Schedule::Interval(std::time::Duration::from_secs(3600))),
         overlap_policy: OverlapPolicy::BufferOne,
-        ..deadline_dag(
-            dag_name,
-            Some(std::time::Duration::from_secs(2 * 3600)),
-            None,
-        )
+        ..deadline_dag(dag_name, Some(std::time::Duration::from_hours(2)), None)
     };
     let registry = dag_registry(&dag);
     let catalog = compile_dag_catalog(vec![dag]).expect("compile dag catalog");
@@ -800,11 +796,7 @@ async fn scheduler_tick_applies_fleet_wide_execution_timeout_ceiling_to_dag() {
     // `tick_workflow_schedules` ever sees it as due.
     let dag = DagInfo {
         schedule: Some(Schedule::Interval(std::time::Duration::from_secs(3600))),
-        ..deadline_dag(
-            dag_name,
-            Some(std::time::Duration::from_secs(10 * 3600)),
-            None,
-        )
+        ..deadline_dag(dag_name, Some(std::time::Duration::from_hours(10)), None)
     };
     let registry = Arc::new(
         HandlerRegistry::new(

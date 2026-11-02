@@ -43,7 +43,7 @@ use uuid::Uuid;
 
 const WF: &str = "nightly_etl";
 const OTHER_WF: &str = "hourly_report";
-const THREE_HOURS: Duration = Duration::from_secs(3 * 3600);
+const THREE_HOURS: Duration = Duration::from_hours(3);
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()

@@ -188,10 +188,12 @@ const RULES: &[Rule] = &[
         patterns: &[
             "rand::random",
             "rand::thread_rng(",
+            "rand::rng(",
             "thread_rng(",
             "SmallRng::from_entropy",
             "StdRng::from_entropy",
             "rand::rngs::OsRng",
+            "rand::rngs::SysRng",
         ],
         message: "Random number generation inside a workflow function is non-deterministic. \
                   The RNG state differs on each replay, producing different values.",

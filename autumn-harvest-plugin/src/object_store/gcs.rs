@@ -117,7 +117,7 @@ impl GceMetadataToken {
     pub fn new() -> Self {
         // The metadata server is plain HTTP on the local link. Do not send
         // the token request through a proxy, and do not follow redirects.
-        let http = reqwest::Client::builder()
+        let http = crate::http::client_builder()
             .timeout(HTTP_TIMEOUT)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -196,7 +196,7 @@ impl GcsTokenSource for GceMetadataToken {
 }
 
 fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::http::client_builder()
         .timeout(HTTP_TIMEOUT)
         .build()
         .unwrap_or_default()

@@ -100,7 +100,7 @@ fn make_worker_with_redeliveries(registry: Arc<HandlerRegistry>, redeliveries: u
             capability_miss_max_redeliveries: redeliveries,
             workflow_task_timeout: std::time::Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
-            max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+            max_workflow_pause_duration: std::time::Duration::from_hours(24),
             #[cfg(feature = "db")]
             labels: std::collections::HashMap::new(),
             queue_weights: std::collections::HashMap::new(),
