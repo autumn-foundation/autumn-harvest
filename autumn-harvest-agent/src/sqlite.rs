@@ -39,6 +39,7 @@ use crate::mesh_control::{MESH_ATTR, MeshPause, MeshSpend, Spend};
 use crate::model::BoxFuture;
 use crate::refine::agent_refine_propose_info;
 use crate::refine::propose::run_stage;
+use crate::score::{agent_score_info, run_score};
 use crate::types::{AgentTask, ModelTurnRequest};
 use crate::workflow::{
     WORKFLOW_NAME, agent_deliver_info, agent_discover_peers_info, agent_loop_info,
@@ -123,6 +124,18 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
         call(input, |request| {
             let h = Arc::clone(&h);
             async move { run_stage(&h, request).await }
+        })
+    });
+    let h = Arc::clone(&harness);
+    rt.register_activity_with_ledger(&agent_score_info(), move |input, _at| {
+        call_with_ledger(input, |request| {
+            let h = Arc::clone(&h);
+            async move {
+                // SQLite has no run budget, so a judge call passes the check.
+                let pass = Box::new(|| Box::pin(async { Ok(()) }) as BoxFuture<'_, _>);
+                let (verdict, calls) = run_score(&h, request, pass).await;
+                verdict.map(|verdict| (verdict, calls))
+            }
         })
     });
     rt.register_activity_with_body(&agent_precheck_info(), move |input| {

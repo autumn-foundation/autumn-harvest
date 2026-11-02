@@ -100,6 +100,22 @@ pub open spec fn after(resets: int, max_resets: int, len: int, cap: int, percent
 pub open spec fn count(resets: int, max_resets: int, lens: Seq < int >, cap: int, percent: int) -> int decreases lens.len(), { if lens.len() == 0 { resets } else { count(after(resets, max_resets, lens [0], cap, percent), max_resets, lens.subrange(1, lens.len() as int), cap, percent,) } }
 pub proof fn theorem_resets_never_pass_the_cap(resets: int, max_resets: int, lens: Seq < int >, cap: int, percent: int,) requires 0 <= resets <= max_resets, ensures resets <= count(resets, max_resets, lens, cap, percent) <= max_resets, decreases lens.len(),
 
+## formal/verus/src/agent_select.rs
+pub open spec fn key(bits: i64) -> i64 { bits ^ ((((bits >> 63i64) as u64) >> 1u64) as i64) }
+pub open spec fn bits_below(a: i64, b: i64) -> bool { if a < 0 && b >= 0 { true } else if a >= 0 && b >= 0 { a < b } else if a < 0 && b < 0 { (a & 0x7fff_ffff_ffff_ffffi64) > (b & 0x7fff_ffff_ffff_ffffi64) } else { false } }
+pub fn key_of_bits(bits: i64) -> (r: i64) ensures r == key(bits),
+pub proof fn theorem_the_order_key_keeps_the_bit_order(a: i64, b: i64) by (bit_vector) requires a != i64::MIN, b != i64::MIN, ensures bits_below(a, b) <==> key(a) < key(b), a == b <==> key(a) == key(b),
+pub open spec fn spec_pick(best: Option < (u32, i64) >, next: (u32, Option < i64 >)) -> Option < (u32, i64) > { match next.1 { None => best, Some(key) => match best { None => Some((next.0, key)), Some(b) => if key > b.1 || (key == b.1 && next.0 < b.0) { Some((next.0, key)) } else { best }, }, } }
+pub open spec fn chosen(s: Seq < (u32, Option < i64 >) >) -> Option < (u32, i64) > decreases s.len(), { if s.len() == 0 { None } else { spec_pick(chosen(s.drop_last()), s.last()) } }
+pub open spec fn covers(w: (u32, i64), e: (u32, Option < i64 >)) -> bool { match e.1 { None => true, Some(k) => k < w.1 || (k == w.1 && w.0 <= e.0), } }
+pub fn pick(best: Option < (u32, i64) >, next: (u32, Option < i64 >)) -> (r: Option < (u32, i64) >) ensures r == spec_pick(best, next),
+pub fn best_draw(draws:& [(u32, Option < i64 >)]) -> (r: Option < (u32, i64) >) ensures r == chosen(draws @),
+proof fn lemma_chosen(s: Seq < (u32, Option < i64 >) >) ensures chosen(s) is None <==> forall | i: int | 0 <= i < s.len() ==> (#[trigger] s [i]).1 is None, chosen(s) is Some ==> s.contains((chosen(s).unwrap().0, Some(chosen(s).unwrap().1))), chosen(s) is Some ==> forall | i: int | 0 <= i < s.len() ==> covers(chosen(s).unwrap(), #[trigger] s [i]), decreases s.len(),
+pub proof fn theorem_the_winner_has_the_top_score(s: Seq < (u32, Option < i64 >) >) ensures chosen(s) is Some ==> s.contains((chosen(s).unwrap().0, Some(chosen(s).unwrap().1))), chosen(s) is Some ==> forall | i: int | 0 <= i < s.len() && (#[trigger] s [i]).1 is Some ==> s [i].1.unwrap() <= chosen(s,).unwrap().1, chosen(s) is Some ==> forall | i: int | 0 <= i < s.len() && (#[trigger] s [i]).1 == Some(chosen(s).unwrap().1) ==> chosen(s,).unwrap().0 <= s [i].0,
+pub proof fn theorem_a_reject_never_wins_while_a_score_exists(s: Seq < (u32, Option < i64 >) >) ensures chosen(s) is None <==> forall | i: int | 0 <= i < s.len() ==> (#[trigger] s [i]).1 is None, (exists | i: int | 0 <= i < s.len() && (#[trigger] s [i]).1 is Some) ==> chosen(s) is Some, chosen(s) is Some ==> s.contains((chosen(s).unwrap().0, Some(chosen(s).unwrap().1))), s.len() == 0 ==> chosen(s) is None,
+pub proof fn theorem_the_result_does_not_depend_on_the_order(s1: Seq < (u32, Option < i64 >) >, s2: Seq < (u32, Option < i64 >) >,) requires forall | e: (u32, Option < i64 >) | s1.contains(e) <==> s2.contains(e), ensures chosen(s1) == chosen(s2),
+pub proof fn theorem_a_permutation_gives_the_same_result(s1: Seq < (u32, Option < i64 >) >, s2: Seq < (u32, Option < i64 >) >,) requires s1.to_multiset() =~= s2.to_multiset(), ensures chosen(s1) == chosen(s2),
+
 ## formal/verus/src/agent_siblings.rs
 pub open spec fn share(remaining: int, siblings: int, index: int) -> int { if index < remaining % siblings { remaining / siblings + 1 } else { remaining / siblings } }
 pub open spec fn total(remaining: int, siblings: int, n: int) -> int decreases n, { if n <= 0 { 0 } else { total(remaining, siblings, n - 1) + share(remaining, siblings, n - 1) } }

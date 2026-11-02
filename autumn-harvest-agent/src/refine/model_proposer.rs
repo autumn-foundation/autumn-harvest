@@ -198,7 +198,7 @@ fn reply_of(response: &ChatResponse, current: &ProfileOverlay) -> ProposerReply 
 }
 
 /// `text` without a Markdown code fence around it.
-fn unfenced(text: &str) -> &str {
+pub(crate) fn unfenced(text: &str) -> &str {
     let Some(body) = text.strip_prefix("```") else {
         return text;
     };

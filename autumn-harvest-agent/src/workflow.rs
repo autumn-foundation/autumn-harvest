@@ -2888,6 +2888,7 @@ pub fn activities() -> Vec<ActivityInfo> {
         agent_workspace_reset_info(),
         agent_workspace_floor_info(),
         crate::refine::agent_refine_propose_info(),
+        crate::score::agent_score_info(),
     ]
 }
 

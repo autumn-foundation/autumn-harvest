@@ -27,6 +27,7 @@ use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MOD
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
 use crate::refine::{DEFAULT_PROPOSER_TIMEOUT, OverlayProposer};
 use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
+use crate::score::Scorer;
 use crate::skill::{LOAD_SKILL_TOOL, SkillTool};
 use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
@@ -44,6 +45,14 @@ pub const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 8_000;
 /// A task, a peer or a profile with no model name uses it. A mandate
 /// allowlist names it as any other model.
 pub const DEFAULT_MODEL: &str = "default";
+
+/// The default and highest time budget of one score: 13 minutes (issue
+/// #2441).
+///
+/// It stays below the 15-minute `start_to_close` of `agent_score`. A slow
+/// scorer therefore ends as a failure that the harness reports. SQLite
+/// reports an engine timeout only after the body returns.
+pub const DEFAULT_SCORE_TIMEOUT: Duration = Duration::from_secs(13 * 60);
 
 /// The default time budget of one model call: 13 minutes.
 ///
@@ -127,6 +136,8 @@ pub struct AgentHarness {
     workspace: Option<WorkspaceStore>,
     proposer: Option<Arc<dyn OverlayProposer>>,
     proposer_timeout: Duration,
+    scorers: BTreeMap<String, Arc<dyn Scorer>>,
+    score_timeout: Duration,
 }
 
 impl AgentHarness {
@@ -143,6 +154,8 @@ impl AgentHarness {
             workspace: None,
             proposer: None,
             proposer_timeout: DEFAULT_PROPOSER_TIMEOUT,
+            scorers: BTreeMap::new(),
+            score_timeout: DEFAULT_SCORE_TIMEOUT,
             tools: Vec::new(),
             policy: Arc::new(AllowAll),
             temperature: None,
@@ -257,6 +270,52 @@ impl AgentHarness {
     /// The time budget of one proposer call.
     pub(crate) const fn proposer_budget(&self) -> Duration {
         self.proposer_timeout
+    }
+
+    /// Add a scorer under its id (issue #2441). The `agent_score` activity
+    /// calls it.
+    ///
+    /// A later scorer with the same id replaces the earlier one.
+    #[must_use]
+    pub fn scorer(mut self, scorer: Arc<dyn Scorer>) -> Self {
+        self.scorers.insert(scorer.id().to_owned(), scorer);
+        self
+    }
+
+    /// Whether the harness has a scorer with this id.
+    #[must_use]
+    pub fn has_scorer(&self, id: &str) -> bool {
+        self.scorers.contains_key(id)
+    }
+
+    /// The scorer with this id.
+    pub(crate) fn scorer_of(&self, id: &str) -> Option<&Arc<dyn Scorer>> {
+        self.scorers.get(id)
+    }
+
+    /// Set the time budget of one score, judge calls included.
+    ///
+    /// The budget is at most [`DEFAULT_SCORE_TIMEOUT`], so a score fits in
+    /// the `start_to_close` of `agent_score`. A higher value or zero sets
+    /// the default.
+    #[must_use]
+    pub fn score_timeout(mut self, timeout: Duration) -> Self {
+        self.score_timeout = if timeout.is_zero() {
+            DEFAULT_SCORE_TIMEOUT
+        } else {
+            timeout.min(DEFAULT_SCORE_TIMEOUT)
+        };
+        self
+    }
+
+    /// The time budget of one score.
+    pub(crate) const fn score_budget(&self) -> Duration {
+        self.score_timeout
+    }
+
+    /// The time budget of one model call.
+    pub(crate) const fn model_budget(&self) -> Duration {
+        self.model_timeout
     }
 
     /// Set the time budget of one model call.
