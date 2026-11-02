@@ -1039,8 +1039,8 @@ the [module guide](architecture.md).
 **Search attributes.** Each op upserts `agent_kind`, `agent_status`
 (`running`, `waiting_approval`, `idle`, `paused` or `parked`),
 `agent_last_active_at`, `agent_next_wake_at`, `agent_wake_reason`,
-`agent_tenant`, `agent_mesh` and `agent_tokens_used`. Times are epoch
-milliseconds. The `filter` grammar of `GET /workflows` lists by them. The
+`agent_tenant`, `agent_mesh`, `agent_tokens_used` and
+`agent_profile_version`. Times are epoch milliseconds. The `filter` grammar of `GET /workflows` lists by them. The
 index `idx_harvest_we_agent_wake` serves a range on `agent_next_wake_at`,
 so a list of the agents due to wake reads only those agents.
 
@@ -1278,6 +1278,35 @@ the answer of each model turn in two layers:
   See [durable routes](durable-routes.md#live-chunks).
 - The live text is a preview. The `TurnText` and the run result are the
   answer.
+
+### Profile overlays (issue #2372)
+
+An activated overlay changes the next op only, because each op reads it
+through a recorded activity and keeps that read to its end.
+
+```rust,ignore
+let store = Arc::new(SqliteOverlayStore::open(&db, Arc::new(base.clone()))?);
+let harness = base.overlay_store(store);
+```
+
+- The run reads its profile through `agent_profile`. With a store, the
+  result sets `overlay_store`, and each op that runs a segment also calls
+  `agent_profile_overlay`. That result holds the applied profile and its
+  `overlay_version`. Replay reads both results from history.
+- The op takes only the fields that an overlay can set. The mandate, the
+  peers and the heartbeat stay those of the run, so a deploy still
+  changes the next run only.
+- With no store, or no active version, the op runs on the bare profile.
+  The read records `overlay_version: None`.
+- A version that `overlay::apply` refuses fails the op. `last_error` names
+  the version, and no model call runs. The agent never runs bare in its
+  place. A model that a deploy removed is such a case.
+- `AgentState::profile_version` keeps the version of the last op that read
+  one. Each op upserts it as `agent_profile_version`, for example `"v2"`.
+  `filter=attrs.agent_profile_version = 'v2'` lists the agents whose last op
+  ran on version 2.
+- Install the store on every worker. A worker with no store reads the bare
+  profile. See `docs/design/DESIGN-2372.md`.
 
 ### Tool guidance and skills (issue #2373)
 

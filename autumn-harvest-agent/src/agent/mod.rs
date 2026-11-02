@@ -36,6 +36,7 @@ pub mod dedupe;
 pub mod inbox;
 pub mod overlay;
 pub mod overlay_store;
+pub mod profile_read;
 pub mod wake;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1102,6 +1103,10 @@ pub struct AgentState {
     /// them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<ProgressNotes>,
+    /// The overlay version of the last op that read a profile (issue
+    /// #2372). `None` is the bare profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_version: Option<overlay_store::OverlayVersion>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
