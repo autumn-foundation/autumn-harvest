@@ -20,7 +20,8 @@ on that read to its end.
 | `AgentHarness::overlay_store` | `harness.rs` | Installs a store. |
 | `ProfileRead` | `agent/profile_read.rs` | A profile, its `overlay_version`, and the `overlay_store` flag. |
 | `agent_profile` | `agent/mod.rs` | The run read. It returns the bare profile and the flag. |
-| `agent_profile_overlay` | `agent/mod.rs` | The op read. It returns the applied profile and its version. |
+| `OverlayRead` | `agent/profile_read.rs` | The input of the op read: the kind and the run profile. |
+| `agent_profile_overlay` | `agent/mod.rs` | The op read. It returns the run profile with the overlay applied, and its version. |
 | `op_profile` | `agent/profile_read.rs` | The kernel that picks the profile of an op. Verus proves it. |
 | `AgentState::profile_version` | `agent/mod.rs` | The version of the last op that read a profile. |
 | `agent_profile_version` | search attribute | That version, as text, for example `"v2"`. |
@@ -39,14 +40,16 @@ op that reads it, and the next op reads the store again.
 ### The op read
 
 When the run read reports `overlay_store: true`, each op that runs a
-segment calls `agent_profile_overlay` first. The activity reads the
-active version of the kind and applies it to the harness profile under
-`Ceilings::from_profile`.
+segment calls `agent_profile_overlay` first, with an `OverlayRead`: the
+kind and the run profile. The activity reads the active version of the
+kind and applies it to the run profile. The ceilings are the meet of
+`Ceilings::from_profile` of the run profile and of the current harness
+profile. The harness is the registry.
 
 | Store state | Result |
 |---|---|
-| No store installed on this worker | The bare profile, version `None`. |
-| No active version | The bare profile, version `None`. |
+| No store installed on this worker | A retryable failure. The run read found a store, so another worker can take the retry. |
+| No active version | The run profile, version `None`. |
 | An active version that applies | The applied profile and its version. |
 | An active version that `overlay::apply` refuses | A non-retryable failure that names the version. |
 | A corrupt row | A non-retryable failure. |
@@ -57,12 +60,30 @@ call runs. The agent never falls back to the bare profile.
 
 ### The op profile
 
-The op runs on the run profile with the overlay fields of the read on top:
+The op takes the overlay fields of the read over the run profile:
 `system`, `model`, `max_steps`, `max_total_tokens`, `max_output_tokens`,
 `read_only`, `tool_guidance` and `skills`. With version `None`, the op runs
 on the run profile as it is. So the mandate, the peers, the heartbeat and
-the other run fields stay those of the run. A deploy still changes the next
-run only. An activation changes the next op only.
+the other run fields stay those of the run. A field that the overlay does
+not set also keeps its run value, because the read applies to the run
+profile. A deploy still changes the next run only. An activation changes
+the next op only.
+
+A heartbeat sets its own bounds and model for a tick. They take precedence
+over the overlay, as they already do over the profile. An overlay can only
+narrow the profile, so this widens nothing that an operator did not set.
+
+### The op start
+
+Each op checks the run and drains the stale interrupts before the op read.
+Without a store, this keeps the order of the old code exactly. With a
+store, an interrupt that arrives during the read stops the op.
+
+### Deploy order
+
+An older worker cannot replay a history that holds `agent_profile_overlay`.
+Install the store only after every worker runs this version. Do not roll
+the code back while runs with a store are in flight.
 
 ### The search attribute
 
@@ -80,6 +101,8 @@ op ran on version 2.
 | How to gate the read | Always. A `patched` marker. A flag in the run read. | The flag. An old history has no flag, and a harness with no store pays no activity. |
 | Which activity | Change `agent_profile`. A new activity. | Both. `agent_profile` reports the flag. A new `agent_profile_overlay` reads per op, so the run read keeps its input. |
 | What the op runs on | The whole read profile. The run profile with the overlay fields of the read. | The overlay fields only. The run fields keep the run guarantee. |
+| The base of the apply | The current harness profile. The run profile. | The run profile, passed as the input. A deploy then never widens an op. |
+| A worker with no store | The bare profile. A retryable failure. | A retryable failure. The run read found a store, so a bare op would skip an active version. |
 | A bad overlay | Run bare. Fail the op. Fail the run. | Fail the op. The next op can read a fixed pointer. |
 | The attribute value | A number. Text. | Text, `"v2"`. The filter of the issue quotes it, and errors print the same form. |
 
@@ -98,6 +121,10 @@ guard.
 | The op read fails, and the agent runs bare. | The kernel `op_profile` returns an error for an active version that does not apply. Verus proves that an active version never yields the bare profile. |
 | A retry hides a bad version. | A refused overlay is a non-retryable failure. |
 | An op read changes the mandate or the peers mid-run. | The op takes only the overlay fields from the read. |
+| A deploy widens a field that the overlay does not set. | The read applies to the run profile, under the meet of both ceilings. |
+| A worker with no store runs the op bare. | That worker fails the read with a retryable error. |
+| An interrupt during the read is dropped as stale. | The drain comes before the read. |
+| The attribute names a version after the store goes. | A work op with no store clears the version. |
 | A control op clears the attribute. | The attribute comes from the state, so an op that reads nothing keeps it. |
 
 ## Six hats
@@ -109,8 +136,8 @@ guard.
   bare.
 - **Black.** Each op with a store records one more activity, with the whole
   applied profile. A profile with many skills can be near 1 MiB, so the
-  history grows faster. A worker without a store returns the bare profile.
-  Install the store on every worker.
+  history grows faster. The input holds the run profile too. A worker
+  without a store fails the read, so install the store on every worker.
 - **Yellow.** Rollback is an activation of an older version, so it reaches
   the next op too. `harvest agents list` can filter by version (#2374).
 - **Green.** #2394 can pass operator ceilings to the op read. The kernel
@@ -131,7 +158,7 @@ guard.
 ## Tests
 
 `autumn-harvest-agent/tests/overlay_read_suite/mod.rs` holds one suite of
-five tests. `tests/overlay_read.rs` runs it on SQLite with the SQLite
+six tests. `tests/overlay_read.rs` runs it on SQLite with the SQLite
 store. `tests/overlay_read_postgres.rs` runs it on a Postgres worker with
 the Postgres store.
 
@@ -139,4 +166,6 @@ the Postgres store.
 2. The next op sees v2.
 3. A mid-op activation is ignored.
 4. The search attribute follows the op.
-5. Bad stored data fails safe.
+5. Bad stored data fails safe: a removed model.
+6. Bad stored data fails safe: a lowered bound, where the bare profile
+   could run.

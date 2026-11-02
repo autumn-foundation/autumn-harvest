@@ -15,6 +15,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{ReplayReport, ReplayStatus};
 use autumn_harvest_agent::approval::approval_signal;
 use autumn_harvest_agent::{
@@ -151,8 +152,12 @@ pub trait Backend {
     /// Delete the agent `id`, and run it until its run ends.
     async fn delete(&mut self, id: &AgentId);
 
-    /// A strict replay of each recorded run of the agent `id`.
-    async fn replay(&mut self, id: &AgentId) -> Vec<ReplayReport>;
+    /// A strict replay of each recorded run of the agent `id`. The replay
+    /// holds `harness` as state, so a read outside history would see it.
+    async fn replay(&mut self, id: &AgentId, harness: AgentHarness) -> Vec<ReplayReport>;
+
+    /// Every recorded event of the agent `id`, oldest run first.
+    async fn history(&mut self, id: &AgentId) -> Vec<WorkflowEvent>;
 
     /// The state that a new process rebuilds from history, with `harness`.
     async fn rebuilt(&mut self, id: &AgentId, harness: AgentHarness) -> AgentState;
@@ -221,6 +226,37 @@ pub fn first_approval() -> String {
     approval_signal(0, 0, CALL_ID)
 }
 
+/// The input and the result of each recorded activity named `name`.
+pub fn recorded(
+    events: &[WorkflowEvent],
+    name: &str,
+) -> Vec<(serde_json::Value, serde_json::Value)> {
+    let mut inputs = std::collections::HashMap::new();
+    let mut out = Vec::new();
+    for event in events {
+        match event {
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: scheduled,
+                input,
+                ..
+            } if scheduled == name => {
+                inputs.insert(activity_id.clone(), input.clone());
+            }
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output,
+            } => {
+                if let Some(input) = inputs.remove(activity_id) {
+                    out.push((input, output.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn segments(n: u64) -> impl Fn(&AgentState) -> bool + Sync {
     move |state: &AgentState| state.segments >= n
 }
@@ -261,10 +297,21 @@ pub async fn replay_is_exact<B: Backend>(backend: &mut B) {
     assert_eq!(rebuilt.profile_version, Some(v1));
     assert_eq!(fresh.calls(), 0, "the replay asks no model");
 
+    // History holds the op read and the turn that used it.
+    let events = backend.history(&id).await;
+    let reads = recorded(&events, "agent_profile_overlay");
+    assert_eq!(reads.len(), 1, "one op read");
+    assert_eq!(reads[0].1["overlay_version"], json!(v1.get()));
+    let turns = recorded(&events, "agent_model_turn");
+    assert_eq!(turns.len(), 1);
+    assert!(turns[0].0.to_string().contains(PROMPT_V1), "{}", turns[0].0);
+
     // A strict replay needs a whole history, so the run ends first. The
-    // delete op runs no segment, so it reads no profile.
+    // delete op runs no segment, so it reads no profile. The replay holds
+    // the v2 harness, so a read outside history would change the turn input.
     backend.delete(&id).await;
-    for report in backend.replay(&id).await {
+    let (harness, _store) = with_store(backend, base_harness(&kind, PromptModel::new()));
+    for report in backend.replay(&id, harness).await {
         assert!(
             matches!(report.status, ReplayStatus::ReplaySucceeded),
             "{report}"
@@ -323,7 +370,9 @@ pub async fn a_mid_op_activation_is_ignored<B: Backend>(backend: &mut B) {
     backend.send(&id, &AgentOp::message("again")).await;
     let state = backend.settle(&id, &segments(2)).await;
     assert_eq!(state.profile_version, Some(v2));
-    assert!(model.prompts()[2].contains(PROMPT_V2));
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 3);
+    assert!(prompts[2].contains(PROMPT_V2), "{prompts:?}");
 }
 
 /// AC 4: `agent_profile_version = 'v2'` lists the agent after op 2, and
@@ -381,10 +430,41 @@ pub async fn bad_stored_data_fails_safe<B: Backend>(backend: &mut B) {
     let state = backend.settle(&id, &failures(1)).await;
     let error = state.last_error.clone().unwrap_or_default();
     assert!(
-        error.contains(&v1.to_string()) && error.contains("m2"),
+        error.contains(&format!("the overlay {v1}")) && error.contains("m2"),
         "the error names the version and the model: {error}"
     );
     assert_eq!(state.profile_version, None);
     assert_eq!(state.transcript, Vec::new(), "the op kept nothing");
     assert_eq!(fallback.calls() + named.calls(), 0, "no model ran");
+}
+
+/// AC 5, second case: the bare profile could run here. A deploy lowers
+/// `max_steps` below the stored version, so the version no longer
+/// validates. The op still fails, and no model runs.
+pub async fn a_narrowed_deploy_fails_safe<B: Backend>(backend: &mut B) {
+    let kind = backend.kind();
+    let old = PromptModel::new();
+    let wide = base_harness(&kind, old.clone());
+    let profile = wide.agent_profile(&kind).unwrap().max_steps(20);
+    let (_harness, store) = with_store(backend, wide.agent(profile.clone()));
+    let overlay = ProfileOverlay {
+        max_steps: Some(15),
+        ..prompt(PROMPT_V1)
+    };
+    let v1 = adopt(store.as_ref(), &kind, &overlay, None).await;
+
+    let fallback = PromptModel::new();
+    let narrow = base_harness(&kind, fallback.clone());
+    let narrow = narrow.agent(profile.max_steps(10));
+    let (harness, _store) = with_store(backend, narrow);
+    backend.serve(harness).await;
+    let id = agent(&kind, "narrowed");
+    backend.send(&id, &AgentOp::message("hello")).await;
+    let state = backend.settle(&id, &failures(1)).await;
+    let error = state.last_error.clone().unwrap_or_default();
+    assert!(
+        error.contains(&format!("the overlay {v1}")) && error.contains("max_steps"),
+        "the error names the version and the bound: {error}"
+    );
+    assert_eq!(fallback.calls() + old.calls(), 0, "no model ran bare");
 }

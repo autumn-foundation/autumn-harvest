@@ -9,11 +9,16 @@ Parent: #2369. It builds on the overlay kernel of #2370 and the store of
   profile, so a result that an old worker recorded still decodes. With a
   store, it sets `overlay_store: true`.
 - With that flag, each op that runs a segment calls the new activity
-  `agent_profile_overlay`. It returns the applied profile and its
+  `agent_profile_overlay` with an `OverlayRead`: the kind and the run
+  profile. It returns the run profile with the overlay applied, and its
   `overlay_version`. History records both, so a replay never reads the
   store. An old history has no flag and schedules no new activity.
-- The op takes only the fields that an overlay can set. The mandate, the
-  peers and the heartbeat stay those of the run.
+- The overlay applies under the meet of the run ceilings and the current
+  harness ceilings. The op takes only the fields that an overlay can set.
+  The mandate, the peers and the heartbeat stay those of the run.
+- A worker with no store fails the op read with a retryable error.
+- Each op drains its stale interrupts before the read, so an interrupt
+  during the read stops the op.
 - A version that `overlay::apply` refuses fails the op with a
   non-retryable error that names the version. The agent never runs on the
   bare profile in its place.
@@ -25,8 +30,11 @@ Parent: #2369. It builds on the overlay kernel of #2370 and the store of
 `op_profile`. It proves that an active version never yields the bare
 profile, and that an op records the version that it applied.
 
-**Tests.** `tests/overlay_read_suite` holds five tests: an exact replay,
-the next op, a mid-op activation, the search attribute, and bad stored
-data. `overlay_read.rs` runs them on SQLite, and `overlay_read_postgres.rs`
+**Deploy order.** An older worker cannot replay a history that holds an
+op read. Install the store only after every worker runs this version.
+
+**Tests.** `tests/overlay_read_suite` holds six tests: an exact replay,
+the next op, a mid-op activation, the search attribute, and two cases of
+bad stored data. `overlay_read.rs` runs them on SQLite, and `overlay_read_postgres.rs`
 runs them on a Postgres worker. No `WorkflowEvent` variant and no
 migration. Design: `docs/design/DESIGN-2372.md`.

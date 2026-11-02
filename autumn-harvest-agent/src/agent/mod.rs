@@ -64,7 +64,7 @@ use crate::workflow::{
 use crate::workspace::{WorkspaceMount, WorkspaceRef};
 use dedupe::Inbound;
 use inbox::{Admit, InboxStatus, OpClass, admit};
-use profile_read::{ProfileRead, overlaid};
+use profile_read::{OverlayRead, ProfileRead, overlaid};
 
 /// The registered workflow name of a durable agent.
 pub const AGENT_WORKFLOW_NAME: &str = "agent";
@@ -1382,11 +1382,32 @@ impl AgentRun<'_> {
         Ok(state)
     }
 
+    /// Check the run, then drop each stale interrupt, before an op reads
+    /// its profile.
+    ///
+    /// An interrupt that arrived while no op ran is stale. The drain comes
+    /// before the op read, so an interrupt that arrives during the read
+    /// stops the op.
+    fn start_op(&self) -> Result<(), String> {
+        let profile = match (&self.id, &self.profile) {
+            (Ok(_), Ok(profile)) => profile,
+            (Err(err), _) | (_, Err(err)) => return Err(err.clone()),
+        };
+        if let Some(Err(err)) = profile.mandate.as_ref().map(Mandate::validate) {
+            return Err(format!("the profile mandate is not valid: {err}"));
+        }
+        self.ctx
+            .drain_signals_raw(INTERRUPT_SIGNAL)
+            .map(drop)
+            .map_err(|err| err.to_string())
+    }
+
     /// The profile of one op (issue #2372).
     ///
-    /// With no overlay store, it is the run profile. Else the op reads the
-    /// active overlay through the recorded activity `agent_profile_overlay`,
-    /// and takes the overlay fields of the read. The read sets
+    /// With no overlay store, it is the run profile, with no version. Else
+    /// the op reads the active overlay through the recorded activity
+    /// `agent_profile_overlay`. The activity applies it to the run profile.
+    /// The op then takes the overlay fields of the read. The read sets
     /// [`AgentState::profile_version`]. A failed read keeps it.
     async fn op_profile(&self, state: &mut AgentState) -> Result<AgentProfile, String> {
         let (id, profile) = match (&self.id, &self.profile) {
@@ -1394,11 +1415,16 @@ impl AgentRun<'_> {
             (Err(err), _) | (_, Err(err)) => return Err(err.clone()),
         };
         if !self.overlays {
+            state.profile_version = None;
             return Ok(profile.clone());
         }
+        let request = OverlayRead {
+            kind: id.kind().to_owned(),
+            profile: profile.clone(),
+        };
         let read: ProfileRead = self
             .ctx
-            .execute_activity(&agent_profile_overlay_info(), id.kind().to_owned())
+            .execute_activity(&agent_profile_overlay_info(), request)
             .await
             .map_err(|err| err.to_string())?;
         state.profile_version = read.overlay_version;
@@ -1719,16 +1745,27 @@ impl AgentRun<'_> {
         // checks it against the mandate that it accepts (issue #2271). The
         // op profile names the model, so the op reads it first.
         let accepted = match accepted {
-            Ok(mandate) => match self.op_profile(&mut state).await {
-                Ok(profile) if mandate.allows_model(profile.model.as_deref()) => {
-                    Ok((mandate, profile))
+            Ok(mandate) => {
+                let read = match self.start_op() {
+                    Ok(()) => self.op_profile(&mut state).await,
+                    Err(err) => Err(err),
+                };
+                match read {
+                    Ok(profile) if mandate.allows_model(profile.model.as_deref()) => {
+                        Ok((mandate, profile))
+                    }
+                    Ok(_) => Err(Some(Refusal::ModelForbidden)),
+                    // With no run profile, the model is the default one. Its
+                    // refusal comes first, as before the op read.
+                    Err(_) if self.profile.is_err() && !mandate.allows_model(None) => {
+                        Err(Some(Refusal::ModelForbidden))
+                    }
+                    Err(err) => {
+                        fail(&mut state, &err);
+                        Err(None)
+                    }
                 }
-                Ok(_) => Err(Some(Refusal::ModelForbidden)),
-                Err(err) => {
-                    fail(&mut state, &err);
-                    Err(None)
-                }
-            },
+            }
             Err(refusal) => Err(Some(refusal)),
         };
         let reply = match accepted {
@@ -1845,6 +1882,10 @@ impl AgentRun<'_> {
     /// Read the op profile, then run one segment with `input` and fold it
     /// into `state`. A failed read fails the op before any model call.
     async fn segment(&self, mut state: AgentState, input: &str, mode: Mode<'_>) -> AgentState {
+        if let Err(err) = self.start_op() {
+            fail(&mut state, &err);
+            return state;
+        }
         match self.op_profile(&mut state).await {
             Ok(profile) => {
                 self.run_segment_as(state, input, mode, None, &profile)
@@ -1877,16 +1918,7 @@ impl AgentRun<'_> {
                 return (state, None);
             }
         };
-        if let Some(Err(err)) = profile.mandate.as_ref().map(Mandate::validate) {
-            let reason = format!("the profile mandate is not valid: {err}");
-            fail(&mut state, &reason);
-            return (state, None);
-        }
-        // An interrupt that arrived while no op ran is stale.
-        if let Err(err) = self.ctx.drain_signals_raw(INTERRUPT_SIGNAL) {
-            fail(&mut state, &err.to_string());
-            return (state, None);
-        }
+        // `start_op` checked the mandate and drained the stale interrupts.
         let mut task = profile.segment_task(id, input, mode);
         if let Some(peer) = &peer {
             let mandate = peer.member.mandate();
@@ -2243,8 +2275,8 @@ pub async fn agent_profile(
     Ok(harness(ctx)?.profile_read(&kind))
 }
 
-/// The op read of one kind, as an activity (issue #2372): the profile with
-/// the active overlay applied, and its version. See
+/// The op read of one kind, as an activity (issue #2372): the run profile
+/// with the active overlay applied, and its version. See
 /// [`AgentHarness::overlaid_profile`](crate::AgentHarness::overlaid_profile).
 ///
 /// # Errors
@@ -2257,9 +2289,9 @@ pub async fn agent_profile(
 )]
 pub async fn agent_profile_overlay(
     ctx: &ActivityContext,
-    kind: String,
+    request: OverlayRead,
 ) -> Result<ProfileRead, String> {
-    harness(ctx)?.overlaid_profile(&kind).await
+    harness(ctx)?.overlaid_profile(&request).await
 }
 
 /// Clear one memory scope, as an activity.

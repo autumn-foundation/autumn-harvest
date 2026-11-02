@@ -117,7 +117,7 @@ pub use agent::overlay_store::{
     InMemoryOverlayStore, MAX_AUTHOR_LEN, OverlayStoreError, OverlayValidator, OverlayVersion,
     ProfileOverlayStore, Provenance, StoredOverlay,
 };
-pub use agent::profile_read::ProfileRead;
+pub use agent::profile_read::{OverlayRead, ProfileRead};
 pub use agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentHeartbeat, AgentId, AgentIdError, AgentMemory, AgentOp,
     AgentProfile, AgentState, AgentStatus, Control, HeartbeatSetting, INTERRUPT_SIGNAL, Interrupt,

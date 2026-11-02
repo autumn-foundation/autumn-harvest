@@ -62,9 +62,9 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     });
     let h = Arc::clone(&harness);
     rt.register_activity_with_body(&agent_profile_overlay_info(), move |input| {
-        call(input, |kind: String| {
+        call(input, |request: crate::agent::profile_read::OverlayRead| {
             let h = Arc::clone(&h);
-            async move { h.overlaid_profile(&kind).await }
+            async move { h.overlaid_profile(&request).await }
         })
     });
     let h = Arc::clone(&harness);

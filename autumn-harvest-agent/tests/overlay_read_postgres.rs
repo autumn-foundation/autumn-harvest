@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, ENTITY_STATE_QUERY};
+use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest::testing::{ReplayReport, WorkflowReplayer};
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
@@ -137,6 +138,21 @@ impl Pg {
             [row, ..] => Some(row.text.parse().expect("an execution id")),
             [] => None,
         }
+    }
+
+    /// Every run of the agent `id`, oldest first.
+    async fn runs(&self, id: &AgentId) -> Vec<ExecutionId> {
+        let rows: Vec<TextRow> = diesel::sql_query(
+            "SELECT id::text AS text FROM harvest_workflow_executions \
+              WHERE workflow_name = 'agent' AND workflow_id = $1 ORDER BY started_at",
+        )
+        .bind::<Text, _>(id.as_str())
+        .load(&mut self.conn().await)
+        .await
+        .expect("load runs");
+        rows.iter()
+            .map(|row| row.text.parse().expect("an execution id"))
+            .collect()
     }
 
     /// The last committed state of the agent `id`.
@@ -308,23 +324,24 @@ impl Backend for Pg {
         }
     }
 
-    async fn replay(&mut self, id: &AgentId) -> Vec<ReplayReport> {
-        let rows: Vec<TextRow> = diesel::sql_query(
-            "SELECT id::text AS text FROM harvest_workflow_executions \
-              WHERE workflow_name = 'agent' AND workflow_id = $1 ORDER BY started_at",
-        )
-        .bind::<Text, _>(id.as_str())
-        .load(&mut self.conn().await)
-        .await
-        .expect("load runs");
+    async fn history(&mut self, id: &AgentId) -> Vec<WorkflowEvent> {
+        let mut events = Vec::new();
+        for exec in self.runs(id).await {
+            let history = autumn_harvest::store::load_history(&mut self.conn().await, exec)
+                .await
+                .expect("load history");
+            events.extend(history.events);
+        }
+        events
+    }
+
+    async fn replay(&mut self, id: &AgentId, harness: AgentHarness) -> Vec<ReplayReport> {
         let mut reports = Vec::new();
-        for row in rows {
+        for exec in self.runs(id).await {
             let report = WorkflowReplayer::new()
                 .register(vec![agent_info()])
-                .replay_from_db(
-                    &mut self.conn().await,
-                    row.text.parse().expect("an execution id"),
-                )
+                .with_state(harness.clone())
+                .replay_from_db(&mut self.conn().await, exec)
                 .await
                 .expect("replay");
             reports.push(report);
@@ -345,8 +362,9 @@ impl Backend for Pg {
     }
 
     async fn listed(&mut self, version: &str) -> Vec<String> {
-        // The shape that the `filter` grammar compiles for
-        // `attrs.agent_profile_version = '<version>'`.
+        // A copy of the SQL that the `filter` grammar of the plugin crate
+        // compiles for `attrs.agent_profile_version = '<version>'`. This
+        // crate cannot depend on the plugin crate.
         let rows: Vec<TextRow> = diesel::sql_query(
             "SELECT workflow_id AS text FROM harvest_workflow_executions \
               WHERE workflow_name = 'agent' AND search_attrs @> $1",
@@ -382,4 +400,9 @@ async fn the_search_attribute_follows_the_op() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bad_stored_data_fails_safe() {
     overlay_read_suite::bad_stored_data_fails_safe(&mut Pg::new().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_narrowed_deploy_fails_safe() {
+    overlay_read_suite::a_narrowed_deploy_fails_safe(&mut Pg::new().await).await;
 }

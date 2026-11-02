@@ -9,6 +9,7 @@ mod overlay_read_suite;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{ReplayReport, WorkflowReplayer};
 use autumn_harvest_agent::{
     AgentHarness, AgentId, AgentOp, AgentState, Approval, ProfileOverlayStore, SqliteOverlayStore,
@@ -114,12 +115,20 @@ impl Backend for Sqlite {
         );
     }
 
-    async fn replay(&mut self, id: &AgentId) -> Vec<ReplayReport> {
+    async fn history(&mut self, id: &AgentId) -> Vec<WorkflowEvent> {
+        let runs = self.runs(id);
+        runs.into_iter()
+            .flat_map(|exec| self.rt().load_history(exec).unwrap())
+            .collect()
+    }
+
+    async fn replay(&mut self, id: &AgentId, harness: AgentHarness) -> Vec<ReplayReport> {
         let mut reports = Vec::new();
         for exec in self.runs(id) {
             let events = self.rt().load_history(exec).unwrap();
             let report = WorkflowReplayer::new()
                 .register(vec![agent_info()])
+                .with_state(harness.clone())
                 .with_workflow_id(id.as_str())
                 .replay_from_events(events)
                 .await;
@@ -175,6 +184,11 @@ async fn the_search_attribute_follows_the_op() {
 #[tokio::test(flavor = "multi_thread")]
 async fn bad_stored_data_fails_safe() {
     overlay_read_suite::bad_stored_data_fails_safe(&mut Sqlite::new()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_narrowed_deploy_fails_safe() {
+    overlay_read_suite::a_narrowed_deploy_fails_safe(&mut Sqlite::new()).await;
 }
 
 /// Every search attribute that an agent publishes is named in the
