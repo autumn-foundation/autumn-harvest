@@ -23,6 +23,7 @@ mod execution_timeout;
 mod fleet_fault_isolation;
 mod freeze_activity_defaults;
 mod history_caps;
+mod history_page;
 mod llm_ledger;
 mod local_activities;
 mod overlay_log;

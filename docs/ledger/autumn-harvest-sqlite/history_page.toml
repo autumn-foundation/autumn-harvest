@@ -1,0 +1,15 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/history_page.rs`. See `docs/ledger/README.md`.
+
+["has_recorded_at"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
+
+["history_page"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"

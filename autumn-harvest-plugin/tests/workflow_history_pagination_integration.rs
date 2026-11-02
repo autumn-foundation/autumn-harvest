@@ -37,6 +37,9 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
+#[path = "support/wire_contract.rs"]
+mod wire_contract;
+
 fn init_sql() -> Vec<u8> {
     autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
@@ -274,6 +277,7 @@ async fn history_page_boundaries_no_drops_or_duplicates() {
     append_mixed_events(&mut conn, exec_id, 7).await;
 
     let limit = 5;
+    let mut pages: Vec<Value> = Vec::new();
     let mut collected_ids: Vec<i64> = Vec::new();
     let mut cursor = String::new();
     let mut page_count = 0;
@@ -286,6 +290,7 @@ async fn history_page_boundaries_no_drops_or_duplicates() {
         };
         let (status, body) = get_json(&app, &uri).await;
         assert_eq!(status, StatusCode::OK, "page {page_count}: body={body}");
+        pages.push(body.clone());
 
         let events = body["events"].as_array().expect("events must be array");
         assert!(
@@ -322,6 +327,8 @@ async fn history_page_boundaries_no_drops_or_duplicates() {
     );
     // 15 total events (1 WorkflowStarted + 14 timer events).
     assert_eq!(collected_ids.len(), 15, "must have collected all 15 events");
+    // The same walk check runs on SQLite (issue #2489).
+    wire_contract::history_pages_cover(&pages, limit, 15);
 }
 
 /// (b) `event_type` filter: only matching types returned; `total_events` is the
@@ -367,6 +374,7 @@ async fn history_event_type_filter_returns_only_matching() {
         total, 11,
         "total_events must count all events including filtered-out ones"
     );
+    wire_contract::history_filter_holds_only(&body, &["TimerStarted"], 5, 11);
 }
 
 /// (b) Multiple `event_type` values (repeatable param).
@@ -540,6 +548,7 @@ async fn history_response_shape_has_required_fields() {
     );
     assert!(first["type"].is_string(), "each event must have 'type'");
     assert!(first["data"].is_object(), "each event must have 'data'");
+    wire_contract::history_page_shape(&body);
 }
 
 /// Unknown `event_type` names yield an empty events page (not a 400).

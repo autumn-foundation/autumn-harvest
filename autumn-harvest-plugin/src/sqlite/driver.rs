@@ -29,8 +29,8 @@ use autumn_harvest::context::SharedState;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::{ExecutionId, UpdateHandlerInfo};
 use autumn_harvest_sqlite::{
-    SignalDelivery, SignalWithStart, SignalWithStartOutcome, SqliteResult, SqliteRuntime,
-    StartOptions, StartOutcome,
+    AdmittedUpdate, SignalDelivery, SignalWithStart, SignalWithStartOutcome, SqliteError,
+    SqliteResult, SqliteRuntime, StartOptions, StartOutcome,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -84,6 +84,41 @@ pub struct SignalWithStartParams {
     pub idempotency_key: Option<String>,
 }
 
+/// The most runs that a chain walk visits, as on Postgres.
+pub const MAX_CHAIN_HOPS: usize = 128;
+
+/// A signal that reached a run (issue #2489).
+#[derive(Debug, Clone, Copy)]
+pub struct RoutedSignal {
+    /// The run that took the signal. It is a retry when the signal named a
+    /// failed run (issue #843).
+    pub exec: ExecutionId,
+    /// `false` when the idempotency key was already delivered.
+    pub delivered: bool,
+}
+
+/// The answer to a cancel or a terminate (issue #2489).
+#[derive(Debug, Clone)]
+pub struct StopAck {
+    /// The run that the request acted on.
+    pub exec: ExecutionId,
+    /// The state of that run after the request.
+    pub state: String,
+    /// The reason that the run keeps.
+    pub reason: String,
+    /// `false` when an earlier request already did the same.
+    pub newly: bool,
+}
+
+/// An update that the driver ran on a run (issue #2489).
+#[derive(Debug, Clone)]
+pub struct RoutedUpdate {
+    /// The run that took the update.
+    pub exec: ExecutionId,
+    /// The admitted update.
+    pub update: AdmittedUpdate,
+}
+
 /// One request to the driver task.
 pub enum Command {
     Start {
@@ -101,7 +136,7 @@ pub enum Command {
         name: String,
         payload: Value,
         idempotency_key: Option<String>,
-        reply: oneshot::Sender<SqliteResult<bool>>,
+        reply: oneshot::Sender<SqliteResult<RoutedSignal>>,
     },
     SignalByWorkflowId {
         workflow_name: String,
@@ -114,12 +149,12 @@ pub enum Command {
     Cancel {
         exec: ExecutionId,
         reason: String,
-        reply: oneshot::Sender<SqliteResult<()>>,
+        reply: oneshot::Sender<SqliteResult<StopAck>>,
     },
     Terminate {
         exec: ExecutionId,
         reason: String,
-        reply: oneshot::Sender<SqliteResult<()>>,
+        reply: oneshot::Sender<SqliteResult<StopAck>>,
     },
     Query {
         exec: ExecutionId,
@@ -131,7 +166,7 @@ pub enum Command {
         exec: ExecutionId,
         name: String,
         input: Value,
-        reply: oneshot::Sender<SqliteResult<Value>>,
+        reply: oneshot::Sender<SqliteResult<RoutedUpdate>>,
     },
     /// Stop the loop. `reply` fires once the runtime is dropped, so the
     /// writer lock is free.
@@ -302,12 +337,12 @@ async fn handle(runtime: &mut SqliteRuntime, command: Command) {
             idempotency_key,
             reply,
         } => {
-            let _ = reply.send(runtime.send_signal_idempotent(
-                exec,
-                &name,
-                payload,
-                idempotency_key.as_deref(),
-            ));
+            let routed = live_attempt(runtime, exec).and_then(|exec| {
+                runtime
+                    .send_signal_idempotent(exec, &name, payload, idempotency_key.as_deref())
+                    .map(|delivered| RoutedSignal { exec, delivered })
+            });
+            let _ = reply.send(routed);
         }
         Command::SignalByWorkflowId {
             workflow_name,
@@ -317,27 +352,29 @@ async fn handle(runtime: &mut SqliteRuntime, command: Command) {
             idempotency_key,
             reply,
         } => {
-            let _ = reply.send(runtime.send_signal_by_workflow_id(
+            let delivery = signal_by_workflow_id(
+                runtime,
                 &workflow_name,
                 &workflow_id,
                 &name,
                 payload,
                 idempotency_key.as_deref(),
-            ));
+            );
+            let _ = reply.send(delivery);
         }
         Command::Cancel {
             exec,
             reason,
             reply,
         } => {
-            let _ = reply.send(runtime.cancel(exec, &reason));
+            let _ = reply.send(cancel(runtime, exec, &reason));
         }
         Command::Terminate {
             exec,
             reason,
             reply,
         } => {
-            let _ = reply.send(runtime.terminate(exec, &reason));
+            let _ = reply.send(terminate(runtime, exec, &reason));
         }
         Command::Query {
             exec,
@@ -347,7 +384,11 @@ async fn handle(runtime: &mut SqliteRuntime, command: Command) {
         } => {
             // The replay runs on the caller's task. The driver only reads the
             // rows it needs, so a slow query never holds the writer.
-            let _ = reply.send(Box::pin(runtime.query(exec, &name, args)));
+            let replay: QueryFuture = match live_attempt(runtime, exec) {
+                Ok(exec) => Box::pin(runtime.query(exec, &name, args)),
+                Err(error) => Box::pin(std::future::ready(Err(error))),
+            };
+            let _ = reply.send(replay);
         }
         Command::Update {
             exec,
@@ -355,10 +396,145 @@ async fn handle(runtime: &mut SqliteRuntime, command: Command) {
             input,
             reply,
         } => {
-            let _ = reply.send(runtime.update(exec, &name, input).await);
+            let routed = match live_attempt(runtime, exec) {
+                Ok(exec) => runtime
+                    .update_admitted(exec, &name, input)
+                    .await
+                    .map(|update| RoutedUpdate { exec, update }),
+                Err(error) => Err(error),
+            };
+            let _ = reply.send(routed);
         }
         // `drive` takes a shutdown before it calls `handle`.
         Command::Shutdown { .. } => {}
+    }
+}
+
+/// The stored state of `exec`.
+fn state_of(runtime: &SqliteRuntime, exec: ExecutionId) -> SqliteResult<String> {
+    Ok(runtime
+        .describe(exec)?
+        .summary
+        .state
+        .into_value()
+        .unwrap_or_default())
+}
+
+/// The live attempt of `exec` (issue #843).
+///
+/// A `FAILED` run that started a workflow retry hands each write to that
+/// retry, as on Postgres. The walk follows the retry chain only. A
+/// `CONTINUED_AS_NEW` run is not routed, as on Postgres. A retry row that is
+/// gone ends the walk at the run before it.
+fn live_attempt(runtime: &SqliteRuntime, exec: ExecutionId) -> SqliteResult<ExecutionId> {
+    let mut current = exec;
+    for _ in 0..MAX_CHAIN_HOPS {
+        if state_of(runtime, current)? != "FAILED" {
+            return Ok(current);
+        }
+        match runtime.successor(current)? {
+            Some(next) if runtime.describe(next).is_ok() => current = next,
+            _ => return Ok(current),
+        }
+    }
+    Ok(current)
+}
+
+/// Signal the run of a `(workflow_name, workflow_id)` key.
+///
+/// A key that names a failed run hands the signal to its live retry, as on
+/// Postgres (issue #843). A retry has its own workflow id, so the key lookup
+/// cannot find it.
+fn signal_by_workflow_id(
+    runtime: &mut SqliteRuntime,
+    workflow_name: &str,
+    workflow_id: &str,
+    name: &str,
+    payload: Value,
+    idempotency_key: Option<&str>,
+) -> SqliteResult<SignalDelivery> {
+    let refused = match runtime.send_signal_by_workflow_id(
+        workflow_name,
+        workflow_id,
+        name,
+        payload.clone(),
+        idempotency_key,
+    ) {
+        Err(SqliteError::WorkflowNotRunning {
+            execution_id,
+            state,
+        }) => (execution_id, state),
+        other => return other,
+    };
+    let target = live_attempt(runtime, refused.0)?;
+    if target == refused.0 {
+        return Err(SqliteError::WorkflowNotRunning {
+            execution_id: refused.0,
+            state: refused.1,
+        });
+    }
+    let delivered = runtime.send_signal_idempotent(target, name, payload, idempotency_key)?;
+    Ok(SignalDelivery {
+        exec_id: target,
+        delivered,
+    })
+}
+
+/// The answer to a request that finds the run terminal: Postgres answers it
+/// as a no-op (issue #1456). The stored error wins over the state phrase.
+fn already_stopped(runtime: &SqliteRuntime, exec: ExecutionId) -> SqliteResult<StopAck> {
+    let row = runtime.describe(exec)?;
+    let state = row.summary.state.into_value().unwrap_or_default();
+    let reason = row.error.into_value().unwrap_or_else(|| {
+        autumn_harvest::CancelledWorkflowExecution::default_idempotent_reason(&state)
+    });
+    Ok(StopAck {
+        exec,
+        state,
+        reason,
+        newly: false,
+    })
+}
+
+/// A cooperative cancel of the live attempt of `exec`.
+///
+/// A cancelled run and a repeat request answer as no-ops, with the reason
+/// that the run keeps. Any other terminal run is refused, as on Postgres.
+fn cancel(runtime: &mut SqliteRuntime, exec: ExecutionId, reason: &str) -> SqliteResult<StopAck> {
+    let exec = live_attempt(runtime, exec)?;
+    if state_of(runtime, exec)? == "CANCELLED" {
+        return already_stopped(runtime, exec);
+    }
+    let newly = runtime.pending_cancel_reason(exec)?.is_none();
+    if newly {
+        runtime.cancel(exec, reason)?;
+    }
+    let reason = runtime.pending_cancel_reason(exec)?.unwrap_or_default();
+    Ok(StopAck {
+        exec,
+        state: "RUNNING".to_owned(),
+        reason,
+        newly,
+    })
+}
+
+/// A terminate of the live attempt of `exec`. A terminal run answers as a
+/// no-op, as on Postgres.
+fn terminate(
+    runtime: &mut SqliteRuntime,
+    exec: ExecutionId,
+    reason: &str,
+) -> SqliteResult<StopAck> {
+    let exec = live_attempt(runtime, exec)?;
+    match runtime.terminate(exec, reason) {
+        Ok(()) => {
+            let mut ack = already_stopped(runtime, exec)?;
+            ack.newly = true;
+            Ok(ack)
+        }
+        // A run past its deadline ends `TIMED_OUT` in the same call.
+        Err(SqliteError::WorkflowNotRunning { .. }) => already_stopped(runtime, exec),
+        Err(error) => Err(error),
     }
 }
 

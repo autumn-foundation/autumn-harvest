@@ -37,6 +37,11 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
+#[path = "support/wire_contract.rs"]
+mod wire_contract;
+
+use wire_contract::Reply;
+
 fn init_sql() -> Vec<u8> {
     autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
@@ -113,6 +118,46 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
         json["__retry_after"] = Value::String(ra);
     }
     (status, json)
+}
+
+fn header_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+/// One GET as the shared wire contract reads it (issue #2489).
+async fn get_reply(app: &HarvestApiApp, uri: &str) -> Reply {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("x-harvest-admin", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("GET request");
+    let retry_after = header_value(response.headers(), "retry-after");
+    let execution_id = header_value(response.headers(), wire_contract::EXECUTION_ID_HEADER);
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    Reply {
+        status,
+        retry_after,
+        execution_id,
+        body,
+    }
 }
 
 async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> ExecutionId {
@@ -229,6 +274,13 @@ async fn result_unknown_id_returns_404() {
     let unknown = ExecutionId::new_for_shard(ShardId::new(0));
     let (status, _body) = get_json(&app, &format!("/workflows/{unknown}/result")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    wire_contract::result_of_unknown_run(
+        &get_reply(&app, &format!("/workflows/{unknown}/result")).await,
+        &get_reply(&app, "/workflows/not-an-id/result").await,
+    );
+    wire_contract::result_refuses_a_bad_query(
+        &get_reply(&app, &format!("/workflows/{unknown}/result?bogus=1")).await,
+    );
 }
 
 /// (b) A COMPLETED execution → 200 OK with state=completed and its output.
@@ -246,6 +298,8 @@ async fn result_completed_returns_200_with_output() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["state"], "completed");
     assert_eq!(body["output"]["answer"], 42);
+    let reply = get_reply(&app, &format!("/workflows/{exec_id}/result")).await;
+    wire_contract::result_is_terminal(&reply, "completed");
 }
 
 /// (c) A RUNNING execution with no wait → 204 No Content + Retry-After.
@@ -264,6 +318,9 @@ async fn result_running_no_wait_returns_204() {
         body["__retry_after"].as_str(),
         Some("1"),
         "Retry-After header must be present"
+    );
+    wire_contract::result_is_pending(
+        &get_reply(&app, &format!("/workflows/{exec_id}/result")).await,
     );
 }
 
@@ -294,6 +351,8 @@ async fn result_follows_continue_as_new_to_final_output() {
         body["output"]["final"], "result",
         "must return the successor's output"
     );
+    let reply = get_reply(&app, &format!("/workflows/{predecessor_id}/result")).await;
+    wire_contract::result_is_terminal(&reply, "completed");
 }
 
 #[tokio::test]

@@ -528,7 +528,8 @@ impl CancelledWorkflowExecution {
     /// same reason (`execution.rs`'s own cancel arm, `signal.rs`). The
     /// generic fallback below states only what is true here: this row is
     /// sealed. It does not imply the run itself has ended.
-    fn default_idempotent_reason(state: &str) -> String {
+    #[must_use]
+    pub fn default_idempotent_reason(state: &str) -> String {
         let phrase = match state {
             "COMPLETED" => "completed",
             "FAILED" => "failed",

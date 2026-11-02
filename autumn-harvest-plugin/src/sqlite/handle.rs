@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use autumn_harvest::info::{SchemaViolation, WorkflowInfo};
-use autumn_harvest::{ExecutionId, WorkflowEvent};
+use autumn_harvest::{ExecutionId, WorkflowEvent, WorkflowResult, WorkflowResultState};
 use autumn_harvest_sqlite::{
-    ExecutionDescription, ExecutionFilter, ExecutionPage, SignalDelivery, SignalWithStartOutcome,
-    SqliteError, SqliteReader, StartOptions, StartOutcome,
+    ExecutionDescription, ExecutionFilter, ExecutionPage, ExecutionSummary, HistoryFilter,
+    HistoryPage, SignalDelivery, SignalWithStartOutcome, SqliteError, SqliteReader, StartOptions,
+    StartOutcome,
 };
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
@@ -17,7 +18,9 @@ use autumn_web::reexports::axum;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use super::driver::{Command, SignalWithStartParams};
+use super::driver::{
+    Command, MAX_CHAIN_HOPS, RoutedSignal, RoutedUpdate, SignalWithStartParams, StopAck,
+};
 
 /// Why a [`HarvestSqlite`] call failed.
 #[derive(Debug, thiserror::Error)]
@@ -158,6 +161,12 @@ impl HarvestSqlite {
         &self.inner.workflows
     }
 
+    /// The registered workflow definition of `name`, if any.
+    #[must_use]
+    pub fn workflow_info(&self, name: &str) -> Option<&WorkflowInfo> {
+        self.inner.infos.get(name)
+    }
+
     async fn call<T>(
         &self,
         command: impl FnOnce(oneshot::Sender<T>) -> Command,
@@ -262,6 +271,10 @@ impl HarvestSqlite {
     /// Signal one run. Returns `false` when the idempotency key was already
     /// delivered.
     ///
+    /// A signal to a `FAILED` run with a live retry reaches the retry, as on
+    /// Postgres (issue #843). [`signal_routed`](Self::signal_routed) names
+    /// the run that took it.
+    ///
     /// # Errors
     ///
     /// Returns the backend's refusal, such as a terminal run, or
@@ -273,6 +286,24 @@ impl HarvestSqlite {
         payload: Value,
         idempotency_key: Option<String>,
     ) -> Result<bool, HarvestSqliteError> {
+        Ok(self
+            .signal_routed(exec, name, payload, idempotency_key)
+            .await?
+            .delivered)
+    }
+
+    /// [`signal`](Self::signal), and name the run that took the signal.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`signal`](Self::signal).
+    pub async fn signal_routed(
+        &self,
+        exec: ExecutionId,
+        name: &str,
+        payload: Value,
+        idempotency_key: Option<String>,
+    ) -> Result<RoutedSignal, HarvestSqliteError> {
         let name = name.to_owned();
         Self::lift(
             self.call(|reply| Command::Signal {
@@ -319,10 +350,18 @@ impl HarvestSqlite {
 
     /// Ask a run to cancel. The next drive replays it with the reason set.
     ///
+    /// A cancelled run and a repeat request answer with `newly: false`. A
+    /// `FAILED` run with a live retry hands the request to the retry.
+    ///
     /// # Errors
     ///
-    /// Returns the backend's refusal or [`HarvestSqliteError::Stopped`].
-    pub async fn cancel(&self, exec: ExecutionId, reason: &str) -> Result<(), HarvestSqliteError> {
+    /// Returns the backend's refusal, such as a run that ended another way,
+    /// or [`HarvestSqliteError::Stopped`].
+    pub async fn cancel(
+        &self,
+        exec: ExecutionId,
+        reason: &str,
+    ) -> Result<StopAck, HarvestSqliteError> {
         let reason = reason.to_owned();
         Ok(self
             .call(|reply| Command::Cancel {
@@ -335,6 +374,9 @@ impl HarvestSqlite {
 
     /// End a run `TERMINATED` at once.
     ///
+    /// A terminal run answers with `newly: false`. A `FAILED` run with a live
+    /// retry hands the request to the retry.
+    ///
     /// # Errors
     ///
     /// Returns the backend's refusal or [`HarvestSqliteError::Stopped`].
@@ -342,7 +384,7 @@ impl HarvestSqlite {
         &self,
         exec: ExecutionId,
         reason: &str,
-    ) -> Result<(), HarvestSqliteError> {
+    ) -> Result<StopAck, HarvestSqliteError> {
         let reason = reason.to_owned();
         Ok(self
             .call(|reply| Command::Terminate {
@@ -380,13 +422,38 @@ impl HarvestSqlite {
     ///
     /// # Errors
     ///
-    /// Returns the backend's refusal or [`HarvestSqliteError::Stopped`].
+    /// Returns the backend's refusal or [`HarvestSqliteError::Stopped`]. A
+    /// handler error is [`SqliteError::UpdateFailed`].
     pub async fn update(
         &self,
         exec: ExecutionId,
         name: &str,
         input: Value,
     ) -> Result<Value, HarvestSqliteError> {
+        let routed = self.update_routed(exec, name, input).await?;
+        routed.update.result.map_err(|error| {
+            HarvestSqliteError::Sqlite(SqliteError::UpdateFailed {
+                execution_id: routed.exec,
+                name: name.to_owned(),
+                error,
+            })
+        })
+    }
+
+    /// [`update`](Self::update), and return the update id and the run that
+    /// took it. A handler error is in the result, because history holds the
+    /// admission.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`update`](Self::update), except
+    /// [`SqliteError::UpdateFailed`].
+    pub async fn update_routed(
+        &self,
+        exec: ExecutionId,
+        name: &str,
+        input: Value,
+    ) -> Result<RoutedUpdate, HarvestSqliteError> {
         let name = name.to_owned();
         Ok(self
             .call(|reply| Command::Update {
@@ -433,6 +500,158 @@ impl HarvestSqlite {
         exec: ExecutionId,
     ) -> Result<Vec<WorkflowEvent>, HarvestSqliteError> {
         self.read(move |reader| reader.load_history(exec)).await
+    }
+
+    /// One page of the event history of one run, oldest first (issue
+    /// #2489).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, or a
+    /// read error.
+    pub async fn history_page(
+        &self,
+        exec: ExecutionId,
+        filter: HistoryFilter,
+    ) -> Result<HistoryPage, HarvestSqliteError> {
+        self.read(move |reader| reader.history_page(exec, &filter))
+            .await
+    }
+
+    /// The parent run of `exec`, if it is a child run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, or a
+    /// read error.
+    pub async fn parent(
+        &self,
+        exec: ExecutionId,
+    ) -> Result<Option<ExecutionId>, HarvestSqliteError> {
+        self.read(move |reader| reader.parent(exec)).await
+    }
+
+    /// The result of the logical run that `exec` starts (issue #2489).
+    ///
+    /// The read follows the `continue_as_new` chain and the workflow retry
+    /// chain to the last run, as `GET /workflows/{id}/result` does on
+    /// Postgres. A run that is not terminal reads
+    /// [`WorkflowResultState::Running`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, or a
+    /// read error.
+    pub async fn result(&self, exec: ExecutionId) -> Result<WorkflowResult, HarvestSqliteError> {
+        self.read(move |reader| last_run_of_chain(reader, exec).map(|row| compact_result(&row)))
+            .await
+    }
+
+    /// The run that a by-id route acts on: the running run of the key, or
+    /// else the newest run, as on Postgres.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::WorkflowIdNotFound`] when the key has no run,
+    /// or a read error.
+    pub async fn resolve_by_id(
+        &self,
+        workflow_name: &str,
+        workflow_id: &str,
+    ) -> Result<ExecutionId, HarvestSqliteError> {
+        let (workflow_name, workflow_id) = (workflow_name.to_owned(), workflow_id.to_owned());
+        self.read(move |reader| {
+            let key = ExecutionFilter::new()
+                .workflow_name(workflow_name.clone())
+                .workflow_id(workflow_id.clone())
+                .limit(1);
+            for filter in [key.clone().state("RUNNING"), key] {
+                let page = reader.list_executions(&filter)?;
+                if let Some(exec) = page
+                    .executions
+                    .first()
+                    .and_then(ExecutionSummary::execution_id)
+                {
+                    return Ok(exec);
+                }
+            }
+            Err(SqliteError::WorkflowIdNotFound {
+                workflow_name,
+                workflow_id,
+            })
+        })
+        .await
+    }
+
+    /// Check that the Harvest file answers a read.
+    ///
+    /// # Errors
+    ///
+    /// Returns the read error.
+    pub async fn ping(&self) -> Result<(), HarvestSqliteError> {
+        self.read(|reader| reader.list_executions(&ExecutionFilter::new().limit(1)))
+            .await
+            .map(|_| ())
+    }
+}
+
+/// The last run of the chain that `exec` starts.
+///
+/// A `CONTINUED_AS_NEW` run hands over to its successor. A `FAILED` run hands
+/// over to its workflow retry. The walk stops after [`MAX_CHAIN_HOPS`] runs,
+/// as on Postgres. A successor row that is gone ends the walk at the run
+/// before it.
+fn last_run_of_chain(
+    reader: &SqliteReader,
+    exec: ExecutionId,
+) -> Result<ExecutionDescription, SqliteError> {
+    let mut row = reader.describe(exec)?;
+    let mut current = exec;
+    for _ in 0..MAX_CHAIN_HOPS {
+        let Some(next) = reader.successor(current)? else {
+            break;
+        };
+        match reader.describe(next) {
+            Ok(next_row) => {
+                row = next_row;
+                current = next;
+            }
+            Err(SqliteError::ExecutionNotFound(_)) => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(row)
+}
+
+/// The compact Postgres result form of one run. It mirrors
+/// `WorkflowResult::from_execution`.
+fn compact_result(row: &ExecutionDescription) -> WorkflowResult {
+    let state = WorkflowResultState::from_execution_state(
+        row.summary.state.value().map_or("", String::as_str),
+    );
+    let completed_at = row.summary.closed_at.value().copied();
+    let output = || {
+        row.output_json
+            .value()
+            .and_then(|text| serde_json::from_str(text).ok())
+    };
+    match state {
+        WorkflowResultState::Running => WorkflowResult::running(),
+        WorkflowResultState::Completed | WorkflowResultState::ContinuedAsNew => WorkflowResult {
+            state,
+            output: output(),
+            error: None,
+            completed_at,
+        },
+        WorkflowResultState::Failed
+        | WorkflowResultState::Cancelled
+        | WorkflowResultState::TimedOut
+        | WorkflowResultState::Terminated => WorkflowResult {
+            state,
+            output: None,
+            error: row.error.value().cloned(),
+            completed_at,
+        },
     }
 }
 
