@@ -1083,6 +1083,7 @@ async fn a_turn_records_labels_only_with_flow_rules() {
     let request = ModelTurnRequest {
         skills: false,
         allowed_effects: None,
+        no_response_cache: false,
         tool_guidance: std::collections::BTreeMap::new(),
         run_id: "r".into(),
         session_id: None,
@@ -1388,6 +1389,7 @@ fn turn_request() -> ModelTurnRequest {
     ModelTurnRequest {
         skills: false,
         allowed_effects: None,
+        no_response_cache: false,
         tool_guidance: std::collections::BTreeMap::new(),
         run_id: "r".into(),
         session_id: None,

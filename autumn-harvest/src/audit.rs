@@ -74,6 +74,11 @@ pub const OP_DAG_PATCH: &str = "dag.patch";
 /// Audit operation: Set, changed or cleared the run-default override of a
 /// workflow type (issue #2387).
 pub const OP_WORKFLOW_TYPE_RUN_DEFAULTS: &str = "workflow_type.run_defaults";
+/// Audit operation: Set the sampling policy of an agent kind (issue #2439).
+pub const OP_AGENT_SAMPLING_POLICY_SET: &str = "agent.sampling_policy.set";
+/// Audit operation: Reset the sampling policy of an agent kind to every
+/// default (issue #2439).
+pub const OP_AGENT_SAMPLING_POLICY_RESET: &str = "agent.sampling_policy.reset";
 /// Audit operation: Created a new workflow schedule.
 pub const OP_SCHEDULE_CREATE: &str = "schedule.create";
 /// Audit operation: Edited an existing workflow schedule in place (issue #771).
@@ -313,6 +318,8 @@ pub const TARGET_AUDIT_EXPORT: &str = "audit_export";
 pub const TARGET_ROUTE: &str = "route";
 /// Audit target type: a registered workflow type (issue #2387).
 pub const TARGET_WORKFLOW_TYPE: &str = "workflow_type";
+/// Audit target type: an agent kind (issue #2439).
+pub const TARGET_AGENT_KIND: &str = "agent_kind";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 
@@ -553,6 +560,20 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ),
     (
         "PATCH /admin/workflow-types/{workflow_name}/run-defaults",
+        RouteClass::Mutating,
+    ),
+    // The sampling policy of an agent kind (issue #2439). Only an operator
+    // sets or resets it.
+    (
+        "GET /admin/agents/{kind}/sampling-policy",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "PUT /admin/agents/{kind}/sampling-policy",
+        RouteClass::Mutating,
+    ),
+    (
+        "DELETE /admin/agents/{kind}/sampling-policy",
         RouteClass::Mutating,
     ),
     ("GET /admin/history/exports", RouteClass::ReadOnly),
@@ -938,6 +959,8 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_DAG_TRIGGER,
     OP_DAG_PATCH,
     OP_WORKFLOW_TYPE_RUN_DEFAULTS,
+    OP_AGENT_SAMPLING_POLICY_SET,
+    OP_AGENT_SAMPLING_POLICY_RESET,
     OP_SCHEDULE_CREATE,
     OP_SCHEDULE_UPDATE,
     OP_SCHEDULE_PAUSE,
@@ -1303,6 +1326,16 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     (
         "PATCH /admin/workflow-types/{workflow_name}/run-defaults",
         Some(OP_WORKFLOW_TYPE_RUN_DEFAULTS),
+    ),
+    // The sampling policy of an agent kind (issue #2439).
+    ("GET /admin/agents/{kind}/sampling-policy", None),
+    (
+        "PUT /admin/agents/{kind}/sampling-policy",
+        Some(OP_AGENT_SAMPLING_POLICY_SET),
+    ),
+    (
+        "DELETE /admin/agents/{kind}/sampling-policy",
+        Some(OP_AGENT_SAMPLING_POLICY_RESET),
     ),
     ("GET /admin/history/exports", None),
     ("GET /admin/history/export-sample", None),

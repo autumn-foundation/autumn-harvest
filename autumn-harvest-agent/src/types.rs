@@ -200,6 +200,11 @@ pub struct AgentTask {
     /// policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_effects: Option<BTreeSet<ToolEffect>>,
+    /// Neither read nor write the response cache (issue #2439). A strategy
+    /// draw sets it, so N draws are N samples, not one cached answer.
+    /// #2440 replaces it with a draw id in the cache key.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_response_cache: bool,
 }
 
 impl Serialize for AgentTask {
@@ -271,6 +276,7 @@ impl AgentTask {
             tool_guidance: BTreeMap::new(),
             skills: BTreeMap::new(),
             allowed_effects: None,
+            no_response_cache: false,
         }
     }
 
@@ -590,6 +596,9 @@ pub struct ModelTurnRequest {
     /// unknown tool. `None` allows each effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_effects: Option<BTreeSet<ToolEffect>>,
+    /// Skip the response cache for this turn (issue #2439).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_response_cache: bool,
 }
 
 /// The recorded result of one model-turn activity.

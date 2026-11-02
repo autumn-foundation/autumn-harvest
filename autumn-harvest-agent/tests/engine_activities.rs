@@ -51,6 +51,7 @@ fn turn_request() -> ModelTurnRequest {
     ModelTurnRequest {
         skills: false,
         allowed_effects: None,
+        no_response_cache: false,
         tool_guidance: std::collections::BTreeMap::new(),
         run_id: "run-1".into(),
         session_id: None,

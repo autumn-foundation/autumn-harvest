@@ -102,6 +102,10 @@ sqlite = ["autumn-web/sqlite", "dep:autumn-harvest-sqlite"]
 
 [dependencies]
 autumn-harvest = { version = "0.8.0", path = "../autumn-harvest", features = ["db", "testing"] }
+# The sampling policy routes (issue #2439) call the Postgres policy store of
+# the agent crate. The agent crate never depends on this crate.
+# `scripts/check-agent-adapter-deps.sh` checks that direction.
+autumn-harvest-agent = { version = "0.8.0", path = "../autumn-harvest-agent", features = ["postgres"] }
 autumn-web = "0.9"
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }

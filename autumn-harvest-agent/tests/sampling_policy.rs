@@ -2,7 +2,8 @@
 //!
 //! Each test drives `agent_draws` on SQLite. The `SQLite` runtime runs one
 //! activity at a time, so the wall-clock concurrency test is in
-//! `sampling_policy_postgres.rs`. This file checks the wave shape in history.
+//! `sampling_policy_postgres.rs`. This file checks the wave shape in the
+//! history.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -13,14 +14,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest_agent::mesh::DELEGATE_TOOL;
 use autumn_harvest_agent::sampling::{
     DrawsInput, DrawsReport, InMemorySamplingPolicyStore, MAX_DRAWS, PolicyAction, Refusal,
     SAMPLING_POLICY_FIELDS, SamplingPolicy, SamplingPolicyStore, ScorerId, ScorerRef, Scorers,
     SqliteSamplingPolicyStore, Strategy,
 };
 use autumn_harvest_agent::{
-    AgentHarness, AgentOp, AgentStop, AgentTask, ChatRequest, MAX_PARALLEL_CHILDREN, ToolEffect,
-    sqlite,
+    AgentHarness, AgentId, AgentModel, AgentOp, AgentProfile, AgentStop, AgentTask, ChatRequest,
+    MAX_PARALLEL_CHILDREN, Mandate, Peer, ToolCall, ToolCallRequest, ToolEffect, sqlite,
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{Recorder, TryFnModel, answer, calls, recorded_tool, runtime};
@@ -35,13 +37,19 @@ fn fresh_db() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
+/// A harness with a profile of [`KIND`], so a strategy run of the kind can
+/// build its task.
+fn with_profile(model: Arc<dyn AgentModel>) -> AgentHarness {
+    AgentHarness::new(model).agent(AgentProfile::new(KIND))
+}
+
 /// A model that answers every request with one text and counts its calls.
 fn plain_model() -> Arc<TryFnModel> {
     TryFnModel::new(|_| answer("an answer", 5))
 }
 
 fn best_of(n: u32) -> DrawsInput {
-    DrawsInput::new(KIND, AgentTask::new("Name a prime."), Strategy::BestOfN, n)
+    DrawsInput::new(KIND, "Name a prime.", Strategy::BestOfN, n)
 }
 
 fn policy(edit: impl FnOnce(&mut SamplingPolicy)) -> SamplingPolicy {
@@ -106,7 +114,7 @@ fn a_missing_policy_reads_every_default() {
 async fn with_no_policy_best_of_three_is_refused_before_any_model_call() {
     let (_dir, db) = fresh_db();
     let model = plain_model();
-    let harness = AgentHarness::new(model.clone()).sampling_policies(store_with(None));
+    let harness = with_profile(model.clone()).sampling_policies(store_with(None));
     let mut rt = runtime(&db, harness);
     let state = drive(&mut rt, &best_of(3)).await;
     refused(
@@ -123,10 +131,52 @@ async fn with_no_policy_best_of_three_is_refused_before_any_model_call() {
 async fn a_harness_with_no_store_reads_every_default() {
     let (_dir, db) = fresh_db();
     let model = plain_model();
-    let mut rt = runtime(&db, AgentHarness::new(model.clone()));
+    let mut rt = runtime(&db, with_profile(model.clone()));
     let state = drive(&mut rt, &best_of(3)).await;
     refused(&state, "strategy_not_allowed");
     assert_eq!(model.requests().len(), 0, "no model call");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kind_with_no_profile_is_refused_before_any_model_call() {
+    let (_dir, db) = fresh_db();
+    let model = plain_model();
+    // The policy of the kind allows the run, but no profile builds a task.
+    let harness =
+        AgentHarness::new(model.clone()).sampling_policies(store_with(Some(best_of_n_up_to(4))));
+    let mut rt = runtime(&db, harness);
+    refused(
+        &drive(&mut rt, &best_of(2)).await,
+        Refusal::UnknownKind.code(),
+    );
+    assert_eq!(model.requests().len(), 0, "no model call");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_draw_runs_the_task_of_the_profile() {
+    let (_dir, db) = fresh_db();
+    let model = plain_model();
+    let mut profile = AgentProfile::new(KIND);
+    profile.system = Some("You are the researcher.".to_owned());
+    let harness = AgentHarness::new(model.clone())
+        .agent(profile)
+        .sampling_policies(store_with(Some(best_of_n_up_to(2))));
+    let mut rt = runtime(&db, harness);
+    assert_eq!(
+        draws_report(drive(&mut rt, &best_of(2)).await).draws.len(),
+        2
+    );
+    for request in model.requests() {
+        let system = request
+            .messages
+            .first()
+            .filter(|message| message.role == autumn_harvest_agent::ChatRole::System)
+            .and_then(|message| match message.content.first() {
+                Some(autumn_harvest_agent::ContentPart::Text(text)) => Some(text.clone()),
+                _ => None,
+            });
+        assert_eq!(system.as_deref(), Some("You are the researcher."));
+    }
 }
 
 // ── 2. the draw cap ─────────────────────────────────────────────────────────
@@ -143,7 +193,7 @@ async fn max_draws_four_runs_four_and_refuses_five() {
     let (_dir, db) = fresh_db();
     let model = plain_model();
     let harness =
-        AgentHarness::new(model.clone()).sampling_policies(store_with(Some(best_of_n_up_to(4))));
+        with_profile(model.clone()).sampling_policies(store_with(Some(best_of_n_up_to(4))));
     let mut rt = runtime(&db, harness);
 
     let report = draws_report(drive(&mut rt, &best_of(4)).await);
@@ -175,7 +225,7 @@ async fn zero_draws_is_refused() {
     let (_dir, db) = fresh_db();
     let model = plain_model();
     let harness =
-        AgentHarness::new(model.clone()).sampling_policies(store_with(Some(best_of_n_up_to(4))));
+        with_profile(model.clone()).sampling_policies(store_with(Some(best_of_n_up_to(4))));
     let mut rt = runtime(&db, harness);
     refused(&drive(&mut rt, &best_of(0)).await, Refusal::NoDraws.code());
     assert_eq!(model.requests().len(), 0);
@@ -186,9 +236,9 @@ async fn a_strategy_outside_the_list_is_refused() {
     let (_dir, db) = fresh_db();
     let model = plain_model();
     let harness =
-        AgentHarness::new(model.clone()).sampling_policies(store_with(Some(best_of_n_up_to(4))));
+        with_profile(model.clone()).sampling_policies(store_with(Some(best_of_n_up_to(4))));
     let mut rt = runtime(&db, harness);
-    let vote = DrawsInput::new(KIND, AgentTask::new("Vote."), Strategy::Vote, 2);
+    let vote = DrawsInput::new(KIND, "Vote.", Strategy::Vote, 2);
     refused(&drive(&mut rt, &vote).await, "strategy_not_allowed");
     assert_eq!(model.requests().len(), 0);
 }
@@ -209,34 +259,24 @@ fn child_spans(events: &[WorkflowEvent]) -> Vec<bool> {
         .collect()
 }
 
+/// The `SQLite` runtime runs one activity at a time, so a call counter shows
+/// nothing here. The history shows the waves. The wall-clock proof is in
+/// `sampling_policy_postgres.rs`.
 #[tokio::test(flavor = "multi_thread")]
-async fn max_concurrent_draws_two_keeps_two_draws_open_at_most() {
+async fn max_concurrent_draws_two_starts_two_draws_at_most() {
     let (_dir, db) = fresh_db();
-    let open = Arc::new(AtomicUsize::new(0));
-    let peak = Arc::new(AtomicUsize::new(0));
-    let model = {
-        let (open, peak) = (Arc::clone(&open), Arc::clone(&peak));
-        TryFnModel::new(move |_| {
-            let now = open.fetch_add(1, Ordering::SeqCst) + 1;
-            peak.fetch_max(now, Ordering::SeqCst);
-            open.fetch_sub(1, Ordering::SeqCst);
-            answer("an answer", 5)
-        })
-    };
+    let model = plain_model();
     let policy = policy(|p| {
         p.strategies = BTreeSet::from([Strategy::BestOfN]);
         p.max_draws = 4;
         p.max_concurrent_draws = 2;
     });
-    let harness = AgentHarness::new(model.clone()).sampling_policies(store_with(Some(policy)));
+    let harness = with_profile(model.clone()).sampling_policies(store_with(Some(policy)));
     let mut rt = runtime(&db, harness);
     let exec = sqlite::start_draws(&mut rt, &best_of(4)).expect("the run starts");
     let report = draws_report(rt.run_until_blocked(exec).await.expect("the run drives"));
     assert_eq!(report.draws.len(), 4);
-    assert!(
-        peak.load(Ordering::SeqCst) <= 2,
-        "never more than two open calls"
-    );
+    assert_eq!(report.concurrency, 2);
 
     // The history shows the waves: at most two children run at one time.
     let spans = child_spans(&rt.load_history(exec).expect("the history loads"));
@@ -255,7 +295,7 @@ async fn a_run_that_asks_for_more_concurrency_is_refused() {
     let (_dir, db) = fresh_db();
     let model = plain_model();
     let harness =
-        AgentHarness::new(model.clone()).sampling_policies(store_with(Some(best_of_n_up_to(4))));
+        with_profile(model.clone()).sampling_policies(store_with(Some(best_of_n_up_to(4))));
     let mut rt = runtime(&db, harness);
     let input = best_of(4).concurrency(2);
     refused(
@@ -293,7 +333,7 @@ async fn publish_draw(effects: Option<BTreeSet<ToolEffect>>) -> (Arc<Recorder>, 
             p.draw_effects = effects;
         }
     });
-    let harness = AgentHarness::new(calls_publish())
+    let harness = with_profile(calls_publish())
         .tool(recorded_tool("publish", ToolEffect::Write, &recorder))
         .sampling_policies(store_with(Some(policy)));
     let mut rt = runtime(&db, harness);
@@ -312,8 +352,8 @@ async fn a_default_draw_never_runs_a_write_tool() {
     let results = results_of(&report);
     assert_eq!(results.len(), 1, "{results:?}");
     assert!(
-        results[0].contains("denied"),
-        "the draw reads the refusal: {results:?}"
+        results[0].contains("denied by policy: this run may not run a tool of effect write"),
+        "the draw reads the effect refusal: {results:?}"
     );
 }
 
@@ -326,26 +366,185 @@ async fn a_draw_with_write_in_draw_effects_runs_the_tool() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_draw_never_gets_wider_effects_than_its_task() {
+async fn a_read_only_profile_stays_read_only_in_a_draw_that_may_write() {
     let (_dir, db) = fresh_db();
     let recorder = Arc::new(Recorder::default());
     let policy = policy(|p| {
         p.strategies = BTreeSet::from([Strategy::BestOfN]);
         p.draw_effects = BTreeSet::from([ToolEffect::ReadOnly, ToolEffect::Write]);
     });
+    let mut profile = AgentProfile::new(KIND);
+    profile.read_only = true;
     let harness = AgentHarness::new(calls_publish())
+        .agent(profile)
         .tool(recorded_tool("publish", ToolEffect::Write, &recorder))
         .sampling_policies(store_with(Some(policy)));
     let mut rt = runtime(&db, harness);
-    let input = DrawsInput::new(
-        KIND,
-        AgentTask::new("Name a prime.").read_only(),
-        Strategy::BestOfN,
-        1,
-    );
+    let input = best_of(1);
     let report = draws_report(drive(&mut rt, &input).await);
     assert_eq!(recorder.runs().len(), 0, "a read-only task stays read-only");
     assert!(results_of(&report)[0].contains("denied"));
+}
+
+/// The text of the first user message of a request.
+fn first_user(request: &ChatRequest) -> String {
+    request
+        .messages
+        .iter()
+        .find(|message| message.role == autumn_harvest_agent::ChatRole::User)
+        .and_then(|message| match message.content.first() {
+            Some(autumn_harvest_agent::ContentPart::Text(text)) => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn has_results(request: &ChatRequest) -> bool {
+    request.messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|part| matches!(part, autumn_harvest_agent::ContentPart::ToolResult { .. }))
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inline_child_of_a_draw_keeps_the_effects_of_the_draw() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    // The draw may delegate (`internal`) and write, but not read. Only the
+    // effect set of the draw refuses the read of its child.
+    let policy = policy(|p| {
+        p.strategies = BTreeSet::from([Strategy::BestOfN]);
+        p.draw_effects = BTreeSet::from([ToolEffect::Internal, ToolEffect::Write]);
+    });
+    let model = TryFnModel::new(|request: &ChatRequest| {
+        let child = first_user(request) == "Look it up.";
+        match (child, has_results(request)) {
+            (_, true) => answer("done", 5),
+            (true, false) => calls(&[("l1", "lookup", json!({}))], 5),
+            (false, false) => calls(
+                &[(
+                    "d1",
+                    DELEGATE_TOOL,
+                    json!({"agent": "helper", "task": "Look it up."}),
+                )],
+                5,
+            ),
+        }
+    });
+    let mut profile = AgentProfile::new(KIND);
+    profile.mandate = Some(Mandate::new(KIND).peers(["helper"]));
+    let harness = AgentHarness::new(model.clone())
+        .agent(profile)
+        .peer(Peer::new("helper", "Looks things up."))
+        .tool(recorded_tool("lookup", ToolEffect::ReadOnly, &recorder))
+        .sampling_policies(store_with(Some(policy)));
+    let mut rt = runtime(&db, harness);
+    let report = draws_report(drive(&mut rt, &best_of(1)).await);
+    assert_eq!(recorder.runs().len(), 0, "the child never ran the read");
+    let child_results: Vec<String> = model
+        .requests()
+        .iter()
+        .filter(|request| first_user(request) == "Look it up.")
+        .flat_map(|request| request.messages.iter())
+        .flat_map(|message| message.content.iter())
+        .filter_map(|part| match part {
+            autumn_harvest_agent::ContentPart::ToolResult { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        child_results
+            .iter()
+            .any(|text| text.contains("may not run a tool of effect read_only")),
+        "the child reads the effect refusal: {child_results:?}"
+    );
+    assert_eq!(report.draws.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draw_never_delegates_to_a_durable_peer() {
+    let (_dir, db) = fresh_db();
+    let policy = policy(|p| {
+        p.strategies = BTreeSet::from([Strategy::BestOfN]);
+        p.draw_effects = BTreeSet::from([ToolEffect::ReadOnly, ToolEffect::Internal]);
+    });
+    let model = TryFnModel::new(|request: &ChatRequest| {
+        if has_results(request) {
+            answer("done", 5)
+        } else {
+            calls(
+                &[(
+                    "d1",
+                    DELEGATE_TOOL,
+                    json!({"agent": "desk", "task": "Ask the desk."}),
+                )],
+                5,
+            )
+        }
+    });
+    let desk = AgentId::new("desk", "one").unwrap();
+    let mut profile = AgentProfile::new(KIND);
+    profile.mandate = Some(Mandate::new(KIND).peers(["desk"]));
+    let harness = AgentHarness::new(model)
+        .agent(profile)
+        .peer(Peer::agent("desk", "The support desk.", &desk))
+        .sampling_policies(store_with(Some(policy)));
+    let mut rt = runtime(&db, harness);
+    let report = draws_report(drive(&mut rt, &best_of(1)).await);
+    let results = results_of(&report);
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(
+        results[0].contains("may not delegate"),
+        "the delegation is refused: {results:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tool_call_activity_checks_the_effect_set_again() {
+    let recorder = Arc::new(Recorder::default());
+    let harness = AgentHarness::new(plain_model()).tool(recorded_tool(
+        "publish",
+        ToolEffect::Write,
+        &recorder,
+    ));
+    let request = |effects: BTreeSet<ToolEffect>| ToolCallRequest {
+        run_id: "run-1".to_owned(),
+        session_id: None,
+        step: 0,
+        call: ToolCall {
+            id: "c1".to_owned(),
+            name: "publish".to_owned(),
+            arguments: json!({}),
+        },
+        memory_scope: None,
+        read_only: false,
+        allowed_tools: None,
+        labels: None,
+        flow_labels: BTreeSet::new(),
+        workspace: None,
+        skill: None,
+        allowed_effects: Some(effects),
+    };
+    // A decision recorded on a worker with other rules still cannot run it.
+    let refused = harness
+        .tool_call(request(BTreeSet::from([ToolEffect::ReadOnly])))
+        .await
+        .unwrap();
+    assert!(
+        refused
+            .content
+            .contains("may not run a tool of effect write"),
+        "{refused:?}"
+    );
+    assert_eq!(recorder.runs().len(), 0);
+    let allowed = harness
+        .tool_call(request(BTreeSet::from([ToolEffect::Write])))
+        .await
+        .unwrap();
+    assert!(!allowed.content.contains("may not run"), "{allowed:?}");
+    assert_eq!(recorder.runs().len(), 1);
 }
 
 // ── 5. judge models ─────────────────────────────────────────────────────────
@@ -360,7 +559,7 @@ async fn a_judge_outside_judge_models_is_refused_before_any_model_call() {
         p.scorers = Scorers::Only(BTreeSet::from([ScorerId::new("judge").unwrap()]));
         p.judge_models = BTreeSet::from(["small-judge".to_owned()]);
     });
-    let harness = AgentHarness::new(model.clone()).sampling_policies(store_with(Some(policy)));
+    let harness = with_profile(model.clone()).sampling_policies(store_with(Some(policy)));
     let mut rt = runtime(&db, harness);
 
     let wide = best_of(2).scorer(ScorerRef::judge("judge", "big-judge").unwrap());
@@ -382,7 +581,7 @@ async fn the_default_scorers_refuse_every_judge() {
     let (_dir, db) = fresh_db();
     let model = plain_model();
     let harness =
-        AgentHarness::new(model.clone()).sampling_policies(store_with(Some(best_of_n_up_to(2))));
+        with_profile(model.clone()).sampling_policies(store_with(Some(best_of_n_up_to(2))));
     let mut rt = runtime(&db, harness);
     let judged = best_of(2).scorer(ScorerRef::judge("judge", "any").unwrap());
     refused(&drive(&mut rt, &judged).await, "scorer_not_allowed");
@@ -403,7 +602,7 @@ async fn a_set_from_one_process_changes_the_next_run_of_a_second_process() {
     let model = plain_model();
     // The running process: a runtime and its own store connection.
     let running = Arc::new(SqliteSamplingPolicyStore::open(&db).expect("the store opens"));
-    let harness = AgentHarness::new(model.clone()).sampling_policies(running);
+    let harness = with_profile(model.clone()).sampling_policies(running);
     let mut rt = runtime(&db, harness);
     refused(&drive(&mut rt, &best_of(3)).await, "strategy_not_allowed");
 
@@ -450,7 +649,7 @@ async fn a_change_during_a_run_does_not_change_that_run() {
             answer("an answer", 5)
         })
     };
-    let harness = AgentHarness::new(model.clone()).sampling_policies(store);
+    let harness = with_profile(model.clone()).sampling_policies(store);
     let mut rt = runtime(&db, harness);
     let report = draws_report(drive(&mut rt, &best_of(3)).await);
     assert_eq!(report.draws.len(), 3, "the run kept the policy it read");
@@ -467,7 +666,7 @@ async fn the_policy_is_read_once_per_run() {
         inner: store_with(Some(best_of_n_up_to(4))),
         reads: Arc::clone(&reads),
     });
-    let harness = AgentHarness::new(plain_model()).sampling_policies(store);
+    let harness = with_profile(plain_model()).sampling_policies(store);
     let mut rt = runtime(&db, harness);
     let report = draws_report(drive(&mut rt, &best_of(4)).await);
     assert_eq!(report.draws.len(), 4);
@@ -591,10 +790,9 @@ fn an_agent_op_with_a_policy_field_fails_to_decode() {
             op
         );
         for field in SAMPLING_POLICY_FIELDS {
-            assert!(
-                serde_json::from_value::<AgentOp>(with_field(value.clone(), field)).is_err(),
-                "{field} fails the decode of {op:?}"
-            );
+            let err = serde_json::from_value::<AgentOp>(with_field(value.clone(), field))
+                .expect_err("a policy field fails the decode");
+            assert!(err.to_string().contains(field), "{field} in {op:?}: {err}");
         }
     }
 }
@@ -612,10 +810,6 @@ fn a_strategy_input_with_a_policy_field_fails_to_decode() {
             "{field} fails the decode"
         );
     }
-    // The nested task is guarded too.
-    let mut nested = input;
-    nested["task"]["max_draws"] = json!(9);
-    assert!(serde_json::from_value::<DrawsInput>(nested).is_err());
 }
 
 // ── validation ──────────────────────────────────────────────────────────────
@@ -668,7 +862,7 @@ fn audits_each_change(store: &dyn SamplingPolicyStore) {
         .now_or_never()
         .unwrap()
         .unwrap();
-    assert_eq!(change.old, Some(second.clone()));
+    assert_eq!(change.old_policy(), Some(second.clone()));
     assert_eq!(change.new, None);
     assert_eq!(change.revision, 3);
 
@@ -679,8 +873,8 @@ fn audits_each_change(store: &dyn SamplingPolicyStore) {
             (
                 row.revision,
                 row.action,
-                row.old.clone(),
-                row.new.clone(),
+                row.old_policy(),
+                row.new_policy(),
                 row.actor.as_str(),
             )
         })
@@ -752,4 +946,76 @@ fn audits_each_change(store: &dyn SamplingPolicyStore) {
 
 fn first_bad() -> SamplingPolicy {
     policy(|p| p.max_draws = 0)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_corrupt_stored_policy_fails_the_run_and_a_reset_recovers() {
+    let (_dir, db) = fresh_db();
+    // A newer binary stored a key that this binary does not know.
+    let raw = autumn_harvest_sqlite::SqlitePolicyLog::open(&db).expect("the log opens");
+    raw.write(
+        KIND,
+        "sampling",
+        Some(r#"{"max_drawz": 3}"#),
+        "ops@example.com",
+    )
+    .expect("the raw write succeeds")
+    .expect("the counter has room");
+    let store = Arc::new(SqliteSamplingPolicyStore::open(&db).expect("the store opens"));
+    assert!(matches!(
+        store.read(KIND).await,
+        Err(autumn_harvest_agent::sampling::PolicyStoreError::Corrupt { .. })
+    ));
+
+    // The run fails closed. It never falls back to the defaults.
+    let model = plain_model();
+    let harness = with_profile(model.clone()).sampling_policies(store.clone());
+    let mut rt = runtime(&db, harness);
+    match drive(&mut rt, &best_of(1)).await {
+        RunState::Failed(error) => assert!(error.contains("corrupt"), "{error}"),
+        other => panic!("expected a failed run, got {other:?}"),
+    }
+    assert_eq!(model.requests().len(), 0, "no model call");
+
+    // The audit stays readable, and a reset reports its success.
+    assert_eq!(store.audit(KIND, 10).await.unwrap().len(), 1);
+    let change = store
+        .reset(KIND, "ops@example.com")
+        .await
+        .expect("the reset commits");
+    assert_eq!(change.old, Some(json!({"max_drawz": 3})));
+    assert_eq!(change.old_policy(), None, "the old body does not decode");
+    assert_eq!(
+        store.read(KIND).await.unwrap().policy,
+        SamplingPolicy::default()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_draw_skips_the_response_cache() {
+    let (_dir, db) = fresh_db();
+    let replies = (0..5).map(|n| answer(&format!("answer {n}"), 5)).collect();
+    let model = common::ScriptedModel::named("m1", replies);
+    let cache_store = Arc::new(common::MemStore::default());
+    let mut profile = AgentProfile::new(KIND);
+    profile.tenant = Some("acme".to_owned());
+    let harness = AgentHarness::new(model.clone())
+        .agent(profile)
+        .response_cache(common::response_cache(&cache_store))
+        .sampling_policies(store_with(Some(best_of_n_up_to(3))));
+    let mut rt = runtime(&db, harness);
+
+    // The cache is live: a second plain run of one request is a hit.
+    let plain = AgentTask::new("Name a prime.").tenant("acme");
+    for _ in 0..2 {
+        let exec = sqlite::start(&mut rt, &plain).expect("the run starts");
+        common::report(rt.run_until_blocked(exec).await.expect("the run drives"));
+    }
+    assert_eq!(model.calls(), 1, "the second plain run reads the cache");
+
+    // Three draws of the same request make three model calls.
+    let report = draws_report(drive(&mut rt, &best_of(3)).await);
+    let texts: BTreeSet<String> = report.draws.iter().map(|draw| draw.text.clone()).collect();
+    assert_eq!(model.calls(), 4, "each draw calls the model");
+    assert_eq!(texts.len(), 3, "three distinct samples: {texts:?}");
 }

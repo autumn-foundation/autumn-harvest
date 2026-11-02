@@ -24,6 +24,7 @@ Options for each open question. The chosen option is in bold.
 | How a second process sees a change | a cache with a TTL · **one read per strategy run, with no cache** |
 | How a run reads the policy | each draw reads it · **one recorded activity, `agent_sampling_policy`, at the start** |
 | What the strategy run is | `agent_sample` of #2443 · **a gate and fan-out workflow, `agent_draws`, that #2443 builds on** |
+| What builds a draw task | the caller · **the `AgentProfile` of the kind** |
 | How the concurrency bound works | a sliding window · **waves of at most `max_concurrent_draws` child runs** |
 | How a draw gets its effects | a policy field on `AgentTask` · **`AgentTask::allowed_effects`, which only narrows** |
 | How a decode refuses a policy field | `deny_unknown_fields` on `AgentTask` · **a named list of policy keys, checked on decode** |
@@ -42,7 +43,10 @@ rule.
 | A newer worker records a field that an older worker drops. | `SamplingPolicy` denies unknown fields, so the older worker fails closed. |
 | A draw writes N times. | Each draw gets `draw_effects` meet the effects of its task. The decision and the tool call both check it. |
 | A draw delegates, and its child writes. | An inline child keeps the effects of its parent. A delegation to a durable peer from a narrowed run is refused. |
-| A judge calls an expensive model. | A judge scorer names its model. The kernel refuses a model outside `judge_models`. |
+| A judge calls an expensive model. | A judge scorer names its model. The kernel refuses a model outside `judge_models`. #2441 must classify each scorer id itself. |
+| A caller names a kind with a wide policy for its own task. | The profile of the kind builds each draw. A kind with no profile is refused. |
+| N draws hit one cached answer. | A draw skips the response cache. |
+| An older worker drops `allowed_effects`. | A draw with no write effect is also read-only. The upgrade guide says to upgrade every worker first. |
 | A policy asks for 1000 parallel draws. | The validation caps `max_concurrent_draws` at `MAX_PARALLEL_CHILDREN`, and the kernel caps it again. |
 | A viewer sets the policy. | The set and reset routes are `Mutating`. The middleware returns 403 before the handler. |
 | A store row is corrupt. | The read fails, so the run fails. It never falls back to a wider value. |
@@ -104,17 +108,21 @@ trait SamplingPolicyStore {
 }
 ```
 
-In-memory, SQLite and Postgres stores pass one shared suite. A write locks
-the row, writes the new body, increments the revision and inserts an audit
-row with the old and new bodies, in one transaction.
+There are in-memory, SQLite and Postgres stores. A write runs in one
+transaction. It takes an advisory lock on the row, writes the new body and
+increments the revision. Then it inserts an audit row with the old and new
+bodies. An audit row keeps the stored JSON, so it stays readable when a
+body no longer decodes.
 
 ### The run
 
-`agent_draws(DrawsInput)` reads the policy once, admits the request, and
-runs the draws as child `agent_loop` runs in waves. Each draw has
-`allowed_effects = draw_effects ∩ task effects` and reports a failure as a
-report. #2440 adds draw identity. #2441 and #2443 add the score and the
-selection.
+`agent_draws(DrawsInput)` reads the profile of the kind, then the policy,
+once each. It admits the request, and runs the draws as child `agent_loop`
+runs in waves. The profile builds each draw, and the caller gives only the
+input text. Each draw has `allowed_effects = draw_effects ∩ profile
+effects`. It is read-only with no write effect, skips the response cache
+and reports a failure as a report. #2440 adds draw identity. #2441 and
+#2443 add the score and the selection.
 
 ### Who sets it
 
@@ -130,7 +138,9 @@ unless named otherwise:
 1. No policy: every default, and `best_of_n` with `n = 3` is refused with
    no model call.
 2. `max_draws = 4`: `n = 4` runs, `n = 5` is refused with no model call.
-3. `max_concurrent_draws = 2`: no more than 2 open model calls.
+3. `max_concurrent_draws = 2`: no more than 2 open model calls. The wall
+   clock proof is in `sampling_policy_postgres.rs`. The SQLite test checks
+   the waves in the history.
 4. Default `draw_effects`: a `Write` tool body never runs.
    `[read_only, write]`: it runs.
 5. A judge model outside `judge_models` is refused with no model call.

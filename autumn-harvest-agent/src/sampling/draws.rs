@@ -1,14 +1,18 @@
 //! The gate and the fan-out of a strategy run (issue #2439).
 //!
-//! [`agent_draws`] reads the policy of its kind once, in the recorded
-//! activity [`agent_sampling_policy`]. It admits the request with
+//! [`agent_draws`] reads the profile of its kind and the policy of that
+//! kind once each, in recorded activities. It admits the request with
 //! [`admit`], then runs each draw as a child `agent_loop` run. Replay reads
-//! the recorded policy, so a change during the run never reaches it.
+//! the records, so a change during the run never reaches it.
+//!
+//! The kind must have a registered `AgentProfile`, and the profile builds
+//! the task of each draw. The caller gives only the input text. So a caller
+//! cannot borrow the policy of a kind and run a task of its own choice.
 //!
 //! The draws run in waves of at most the admitted concurrency. A wave
 //! starts when the wave before it ends. Each draw runs with
 //! `allowed_effects` set to the draw effects of the policy, met with the
-//! effects of its task. So a draw never gets more than a single run.
+//! effects of the profile. So a draw never gets more than a single run.
 //!
 //! #2440 adds draw identity. #2441 and #2443 score the draws and select
 //! one.
@@ -24,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use super::admit::{Admission, Ask, Refusal, admit, wave_end};
 use super::policy::{ScorerRef, Strategy};
 use super::store::PolicyRead;
+use crate::agent::{AgentProfile, agent_profile_info};
 use crate::mesh::valid_name;
 use crate::tool::ToolEffect;
 use crate::types::{AgentReport, AgentTask, RunIdSource};
@@ -34,14 +39,15 @@ pub const DRAWS_WORKFLOW_NAME: &str = "agent_draws";
 
 /// The input of one strategy run.
 ///
-/// It denies unknown keys, so it never carries a policy field.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// It denies unknown keys, so it never carries a policy field. It holds no
+/// task: the profile of the kind builds the task of each draw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DrawsInput {
-    /// The agent kind whose policy applies.
+    /// The agent kind. Its profile builds each draw, and its policy applies.
     pub kind: String,
-    /// The task of each draw.
-    pub task: AgentTask,
+    /// The user message of each draw.
+    pub input: String,
     /// The strategy.
     pub strategy: Strategy,
     /// The draws of the whole run, across all rounds.
@@ -56,12 +62,17 @@ pub struct DrawsInput {
 }
 
 impl DrawsInput {
-    /// `draws` draws of `task` under `strategy`, for the kind `kind`.
+    /// `draws` draws of `input` under `strategy`, for the kind `kind`.
     #[must_use]
-    pub fn new(kind: impl Into<String>, task: AgentTask, strategy: Strategy, draws: u32) -> Self {
+    pub fn new(
+        kind: impl Into<String>,
+        input: impl Into<String>,
+        strategy: Strategy,
+        draws: u32,
+    ) -> Self {
         Self {
             kind: kind.into(),
-            task,
+            input: input.into(),
             strategy,
             draws,
             concurrency: None,
@@ -113,6 +124,13 @@ pub async fn agent_draws(ctx: &WorkflowContext, input: DrawsInput) -> Result<Dra
     if !valid_name(&input.kind) {
         return Err(Refusal::InvalidKind.error_text());
     }
+    let profile: Option<AgentProfile> = ctx
+        .execute_activity(&agent_profile_info(), input.kind.clone())
+        .await
+        .map_err(|err| err.to_string())?;
+    let Some(profile) = profile else {
+        return Err(Refusal::UnknownKind.error_text());
+    };
     let read = read_policy(ctx, &input.kind).await?;
     let ask = Ask {
         strategy: input.strategy,
@@ -121,7 +139,8 @@ pub async fn agent_draws(ctx: &WorkflowContext, input: DrawsInput) -> Result<Dra
         scorer: input.scorer.as_ref(),
     };
     let admission = admit(&read.policy, &ask).map_err(|refusal| refusal.error_text())?;
-    let draws = run_draws(ctx, &input.task, &admission).await?;
+    let task = profile_task(&profile, &input.input);
+    let draws = run_draws(ctx, &task, &admission).await?;
     Ok(DrawsReport {
         kind: input.kind,
         strategy: input.strategy,
@@ -169,26 +188,71 @@ pub async fn run_draws(
     Ok(reports)
 }
 
+/// The task that `profile` gives for `input`, as a durable agent builds
+/// it. It has no memory, no workspace, no follow-ups and no delivery,
+/// because a draw is not the answer that reaches a person.
+fn profile_task(profile: &AgentProfile, input: &str) -> AgentTask {
+    let mandate_read_only = profile
+        .mandate
+        .as_ref()
+        .is_some_and(|mandate| mandate.read_only);
+    let mut task = AgentTask::new(input).max_steps(profile.max_steps);
+    task.system.clone_from(&profile.system);
+    task.max_total_tokens = profile.max_total_tokens;
+    task.max_output_tokens = profile.max_output_tokens;
+    task.approval_timeout_secs = profile.approval_timeout_secs;
+    task.max_request_bytes = profile.max_request_bytes;
+    task.loop_guard = profile.loop_guard;
+    task.read_only = profile.read_only || mandate_read_only;
+    task.tenant.clone_from(&profile.tenant);
+    task.mandate.clone_from(&profile.mandate);
+    task.model.clone_from(&profile.model);
+    task.mesh.clone_from(&profile.mesh);
+    task.stream = profile.stream;
+    task.context_reset = profile.context_reset;
+    task.tool_guidance.clone_from(&profile.tool_guidance);
+    task.skills.clone_from(&profile.skills);
+    task
+}
+
 /// The task of one draw.
 ///
 /// - Its effects are the draw effects met with the effects of `task`.
+/// - It is read-only unless its effects hold `write` or `external`. A
+///   worker that predates `allowed_effects` then still refuses a write.
+/// - It runs no delegation at the same time as another, so the open model
+///   calls stay within the concurrency of the run.
+/// - It saves no progress notes unless `internal` is allowed, so it has no
+///   context reset then.
 /// - It reports a failure, so the run keeps the usage of a failed draw.
 /// - It delivers nothing and books no follow-up. Only the selected answer
 ///   may reach a person.
-/// - It has no workspace, so the draws never race on one head (issue
-///   #2274).
+/// - It has no memory and no workspace, so N draws never make N writes to
+///   one store (issue #2274).
+/// - It skips the response cache, so N draws are N samples.
 fn draw_task(task: &AgentTask, draw_effects: &BTreeSet<ToolEffect>) -> AgentTask {
-    let allowed_effects = task.allowed_effects.as_ref().map_or_else(
+    let allowed_effects: BTreeSet<ToolEffect> = task.allowed_effects.as_ref().map_or_else(
         || draw_effects.clone(),
         |own| own.intersection(draw_effects).copied().collect(),
     );
+    let writes = allowed_effects.contains(&ToolEffect::Write)
+        || allowed_effects.contains(&ToolEffect::External);
+    let context_reset = task
+        .context_reset
+        .filter(|_| allowed_effects.contains(&ToolEffect::Internal));
     AgentTask {
+        read_only: task.read_only || !writes,
         allowed_effects: Some(allowed_effects),
         run_id_source: RunIdSource::ExecutionId,
         report_failure: true,
         deliver: false,
         followups: None,
         workspace: None,
+        memory_scope: None,
+        memory_in_state: false,
+        parallel_children: 0,
+        context_reset,
+        no_response_cache: true,
         ..task.clone()
     }
 }
@@ -230,7 +294,27 @@ mod tests {
         );
         assert!(draw.report_failure);
         assert!(!draw.deliver);
+        assert!(draw.read_only, "a draw with no write effect is read-only");
+        assert_eq!(draw.parallel_children, 0);
+        assert!(draw.no_response_cache);
         assert_eq!(draw.run_id_source, RunIdSource::ExecutionId);
+        assert!(!open.read_only, "a draw with a write effect may write");
+    }
+
+    #[test]
+    fn a_draw_builds_its_task_from_the_profile() {
+        let mut profile = AgentProfile::new("researcher");
+        profile.system = Some("Be brief.".to_owned());
+        profile.max_steps = 3;
+        profile.read_only = true;
+        profile.parallel_children = 8;
+        let task = profile_task(&profile, "Name a prime.");
+        assert_eq!(task.input, "Name a prime.");
+        assert_eq!(task.system.as_deref(), Some("Be brief."));
+        assert_eq!(task.max_steps, 3);
+        assert!(task.read_only);
+        assert_eq!(task.memory_scope, None);
+        assert!(!task.deliver);
     }
 
     #[test]
@@ -244,13 +328,12 @@ mod tests {
 
     #[test]
     fn concurrency_zero_takes_the_cap() {
-        let input = DrawsInput::new("k", AgentTask::new("x"), Strategy::Vote, 3).concurrency(0);
+        let input = DrawsInput::new("k", "x", Strategy::Vote, 3).concurrency(0);
         assert_eq!(input.concurrency, None);
         let value = serde_json::to_value(&input).unwrap();
         assert!(value.get("concurrency").is_none());
         let zero = serde_json::json!({
-            "kind": "k", "task": serde_json::to_value(AgentTask::new("x")).unwrap(),
-            "strategy": "vote", "draws": 3, "concurrency": 0,
+            "kind": "k", "input": "x", "strategy": "vote", "draws": 3, "concurrency": 0,
         });
         assert!(serde_json::from_value::<DrawsInput>(zero).is_err());
     }

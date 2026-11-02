@@ -820,7 +820,13 @@ impl AgentHarness {
         };
         // The key holds the model id, so one model never reads the answer
         // of another.
-        let key = self.cache_key(client.as_ref(), &tenant, &chat);
+        // A strategy draw skips the cache, so N draws are N samples, not one
+        // cached answer (issue #2439).
+        let key = if request.no_response_cache {
+            None
+        } else {
+            self.cache_key(client.as_ref(), &tenant, &chat)
+        };
         let mut cached = match &key {
             Some(key) => self.cache_lookup(key).await,
             None => None,

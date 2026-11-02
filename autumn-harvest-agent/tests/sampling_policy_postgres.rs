@@ -2,8 +2,8 @@
 //!
 //! - The store keeps one policy per kind and audits each change.
 //! - With `max_concurrent_draws = 2`, a model that counts its open calls
-//!   never sees more than 2. The worker runs 8 activities at once, so the
-//!   bound comes from the policy, not from the worker.
+//!   sees 2 and never 3. The worker runs 8 activities at once, so the bound
+//!   comes from the policy, not from the worker.
 //! - A set through one pool changes the next run of a worker on another
 //!   pool, with no restart.
 //!
@@ -30,7 +30,7 @@ use autumn_harvest_agent::sampling::{
 };
 use autumn_harvest_agent::workflow;
 use autumn_harvest_agent::{
-    AgentError, AgentHarness, AgentModel, AgentTask, BoxFuture, ChatRequest, ChatResponse,
+    AgentError, AgentHarness, AgentModel, AgentProfile, BoxFuture, ChatRequest, ChatResponse,
     ContentPart, StopReason, TokenUsage,
 };
 use diesel::sql_types::{Nullable, Text, Uuid as SqlUuid};
@@ -175,25 +175,56 @@ async fn outcome(url: &str, exec: ExecutionId) -> Result<DrawsReport, String> {
     }
 }
 
-/// A model that sleeps in each call and counts its open calls.
-#[derive(Debug, Default)]
+/// A model that counts its open calls. It answers only requests whose
+/// input holds `marker`, so a stray task from another suite never counts.
+///
+/// Each call waits until two calls are open, or until a timeout. A third
+/// call would then show as a peak of 3. So the test does not depend on the
+/// time that a worker takes to start the second draw.
+#[derive(Debug)]
 struct CountingModel {
+    marker: String,
     open: AtomicUsize,
     peak: AtomicUsize,
     calls: AtomicUsize,
 }
 
+impl CountingModel {
+    fn new(marker: &str) -> Arc<Self> {
+        Arc::new(Self {
+            marker: marker.to_owned(),
+            open: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+        })
+    }
+}
+
 impl AgentModel for CountingModel {
     fn chat<'a>(
         &'a self,
-        _request: &'a ChatRequest,
+        request: &'a ChatRequest,
     ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
         Box::pin(async move {
-            let now = self.open.fetch_add(1, Ordering::SeqCst) + 1;
-            self.peak.fetch_max(now, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            self.open.fetch_sub(1, Ordering::SeqCst);
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let ours = request.messages.iter().any(|message| {
+                message.content.iter().any(
+                    |part| matches!(part, ContentPart::Text(text) if text.contains(&self.marker)),
+                )
+            });
+            if ours {
+                let now = self.open.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while AtomicUsize::load(&self.open, Ordering::SeqCst) < 2
+                    && Instant::now() < deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                // Hold the call, so a third call would overlap it.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                self.open.fetch_sub(1, Ordering::SeqCst);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(ChatResponse {
                 content: vec![ContentPart::Text("an answer".to_owned())],
                 stop_reason: StopReason::EndTurn,
@@ -210,7 +241,9 @@ async fn run_on_worker(
     input: &DrawsInput,
 ) -> Result<DrawsReport, String> {
     let store = Arc::new(PostgresSamplingPolicyStore::new(pool(url)));
-    let harness = AgentHarness::new(model.clone()).sampling_policies(store);
+    let harness = AgentHarness::new(model.clone())
+        .agent(AgentProfile::new(&input.kind))
+        .sampling_policies(store);
     let queue = unique("draws-q");
     let exec = start(url, &queue, input).await;
     let worker = worker(&queue, harness);
@@ -238,7 +271,7 @@ async fn the_postgres_store_reads_sets_resets_and_audits() {
     let first = best_of_n(4, 2);
     let change = store.set(&kind, &first, "ops@example.com").await.unwrap();
     assert_eq!(
-        (change.old, change.new.clone(), change.revision),
+        (change.old_policy(), change.new_policy(), change.revision),
         (None, Some(first.clone()), 1)
     );
     let read = store.read(&kind).await.unwrap();
@@ -258,7 +291,7 @@ async fn the_postgres_store_reads_sets_resets_and_audits() {
 
     let change = store.reset(&kind, "lead@example.com").await.unwrap();
     assert_eq!(
-        (change.old, change.new, change.revision),
+        (change.old_policy(), change.new, change.revision),
         (Some(first.clone()), None, 2)
     );
     let read = store.read(&kind).await.unwrap();
@@ -272,8 +305,8 @@ async fn the_postgres_store_reads_sets_resets_and_audits() {
                 row.revision,
                 row.action,
                 row.actor.as_str(),
-                row.old.clone(),
-                row.new.clone(),
+                row.old_policy(),
+                row.new_policy(),
             )
         })
         .collect();
@@ -323,6 +356,7 @@ async fn concurrent_sets_each_audit_the_body_that_they_replaced() {
     assert_eq!(audit[0].old, None);
     for pair in audit.windows(2) {
         assert_eq!(pair[1].old, pair[0].new, "no lost update");
+        assert!(pair[1].at >= pair[0].at, "the time never goes back");
         assert_eq!(pair[1].revision, pair[0].revision + 1);
     }
 }
@@ -337,8 +371,13 @@ async fn max_concurrent_draws_two_keeps_two_model_calls_open_at_most() {
         .set(&kind, &best_of_n(4, 2), "ops@example.com")
         .await
         .unwrap();
-    let model = Arc::new(CountingModel::default());
-    let input = DrawsInput::new(&kind, AgentTask::new("Name a prime."), Strategy::BestOfN, 4);
+    let model = CountingModel::new(&kind);
+    let input = DrawsInput::new(
+        &kind,
+        format!("Name a prime ({kind})."),
+        Strategy::BestOfN,
+        4,
+    );
     let report = run_on_worker(&url, &model, &input)
         .await
         .expect("the run completes");
@@ -360,12 +399,19 @@ async fn a_set_from_one_process_changes_the_next_run_of_a_running_worker() {
     let _one_at_a_time = WORKERS.lock().await;
     let (url, _container) = database().await;
     let kind = unique("live");
-    let model = Arc::new(CountingModel::default());
-    let input = DrawsInput::new(&kind, AgentTask::new("Name a prime."), Strategy::BestOfN, 2);
+    let model = CountingModel::new(&kind);
+    let input = DrawsInput::new(
+        &kind,
+        format!("Name a prime ({kind})."),
+        Strategy::BestOfN,
+        2,
+    );
 
     // One worker keeps running across both runs.
     let store = Arc::new(PostgresSamplingPolicyStore::new(pool(&url)));
-    let harness = AgentHarness::new(model.clone()).sampling_policies(store);
+    let harness = AgentHarness::new(model.clone())
+        .agent(AgentProfile::new(&input.kind))
+        .sampling_policies(store);
     let queue = unique("live-q");
     let worker = worker(&queue, harness);
     let handle = tokio::spawn({

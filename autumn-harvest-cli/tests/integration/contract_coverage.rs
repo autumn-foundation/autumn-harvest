@@ -37,6 +37,7 @@ const fn method_str(m: ApiMethod) -> &'static str {
         ApiMethod::Get => "GET",
         ApiMethod::Post => "POST",
         ApiMethod::Patch => "PATCH",
+        ApiMethod::Put => "PUT",
         ApiMethod::Delete => "DELETE",
     }
 }
@@ -384,6 +385,27 @@ fn agents_pause_and_resume_are_covered() {
     for args in [
         &["agents", "pause", "support/ada", "--reason", "audit"][..],
         &["agents", "resume", "support/ada"][..],
+    ] {
+        assert_covered(args);
+        assert_body_fields_documented(args);
+    }
+}
+
+#[test]
+fn agents_sampling_policy_is_covered() {
+    // Issue #2439.
+    for args in [
+        &["agents", "sampling", "policy", "researcher", "show"][..],
+        &[
+            "agents",
+            "sampling",
+            "policy",
+            "researcher",
+            "set",
+            "--max-draws",
+            "4",
+        ][..],
+        &["agents", "sampling", "policy", "researcher", "reset"][..],
     ] {
         assert_covered(args);
         assert_body_fields_documented(args);

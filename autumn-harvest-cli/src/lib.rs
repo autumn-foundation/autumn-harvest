@@ -661,6 +661,8 @@ pub enum ApiMethod {
     Patch,
     /// HTTP POST.
     Post,
+    /// HTTP PUT.
+    Put,
     /// HTTP DELETE.
     Delete,
 }
@@ -1188,6 +1190,8 @@ enum Commands {
         command: ShardCommand,
     },
     /// List, describe, pause, resume and erase durable agents (issue #2267).
+    /// Show, set and reset the sampling policy of an agent kind (issue
+    /// #2439).
     #[command(alias = "agent")]
     Agents {
         #[command(subcommand)]
@@ -8436,6 +8440,7 @@ pub(crate) async fn execute_request(cli: &Cli, request: &ApiRequest) -> Result<V
         ApiMethod::Get => client.get(url),
         ApiMethod::Patch => client.patch(url),
         ApiMethod::Post => client.post(url),
+        ApiMethod::Put => client.put(url),
         ApiMethod::Delete => client.delete(url),
     };
     // Issue #1579: a bare `Accept: */*` (curl's own default) makes the

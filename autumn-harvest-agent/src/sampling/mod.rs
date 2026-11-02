@@ -1,9 +1,9 @@
 //! Operator sampling policy per agent kind (issue #2439, epic #2438).
 //!
 //! Every strategy of the epic runs more than one draw. The operator decides
-//! how many, how many at once, which tool effects a draw may run, and which
-//! scorers and judge models a kind may use. Each setting has a safe
-//! default, and a change needs no restart.
+//! the draw count and the concurrency. The operator also decides the tool
+//! effects of a draw, the scorers and the judge models. Each setting has a
+//! safe default, and a change needs no restart.
 //!
 //! - [`SamplingPolicy`] holds the settings of one kind.
 //! - [`SamplingPolicyStore`] keeps one policy per kind and audits each

@@ -153,7 +153,11 @@ impl ScorerRef {
 ///
 /// Only an operator sets it. A missing key decodes as its default, and
 /// each default is the safe value. An unknown key fails the decode, so an
-/// older worker never drops a setting that a newer worker records.
+/// older worker never drops a setting that a newer worker records. The run
+/// of that older worker fails closed.
+///
+/// A key added later must skip its default on encode. An older worker then
+/// fails only when the policy really holds the new setting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SamplingPolicy {

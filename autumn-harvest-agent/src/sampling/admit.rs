@@ -53,6 +53,8 @@ pub enum Refusal {
     },
     /// The kind is not a valid agent kind.
     InvalidKind,
+    /// No agent profile has the kind, so no task can be built.
+    UnknownKind,
 }
 
 /// The prefix of the error of a refused run.
@@ -70,6 +72,7 @@ impl Refusal {
             Self::ScorerNotAllowed { .. } => "scorer_not_allowed",
             Self::JudgeModelNotAllowed { .. } => "judge_model_not_allowed",
             Self::InvalidKind => "invalid_kind",
+            Self::UnknownKind => "unknown_kind",
         }
     }
 
@@ -107,6 +110,7 @@ impl std::fmt::Display for Refusal {
                 )
             }
             Self::InvalidKind => f.write_str("the kind is not a valid agent kind"),
+            Self::UnknownKind => f.write_str("no agent profile has the kind"),
         }
     }
 }
@@ -249,6 +253,10 @@ pub fn admit(policy: &SamplingPolicy, ask: &Ask<'_>) -> Result<Admission, Refusa
 
 /// Refuse a scorer that the policy does not allow, then a judge model
 /// outside `judge_models`.
+///
+/// The request says whether a scorer is a judge. No scorer runs yet. The
+/// scorer registry of #2441 must classify each id, and must refuse a judge
+/// id that names no model.
 fn check_scorer(policy: &SamplingPolicy, scorer: &ScorerRef) -> Result<(), Refusal> {
     let listed = match &policy.scorers {
         // Each scorer that calls no model. A judge never passes.

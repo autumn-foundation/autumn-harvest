@@ -1381,7 +1381,7 @@ is the safe value.
 
 | Setting | Meaning | Default |
 |---|---|---|
-| `strategies` | The strategies that the kind may use: `best_of_n`, `rejection`, `vote`, `cascade`, `beam` | none, so each run is a single draw |
+| `strategies` | The strategies that the kind may use: `best_of_n`, `rejection`, `vote`, `cascade`, `beam` | none, so each strategy run is refused and each run is a single draw |
 | `max_draws` | The most draws of one strategy run, across all rounds. 1 to 256. | 1 |
 | `max_concurrent_draws` | The most draws that run at the same time. 1 to `MAX_PARALLEL_CHILDREN` (16). | 1 |
 | `draw_effects` | The `ToolEffect`s that a draw may run | `[read_only]` |
@@ -1390,7 +1390,8 @@ is the safe value.
 | `max_answer_retries` | The cap of the in-loop answer check (#2442). 0 to 16. | 0 |
 
 An unknown key fails the decode. So an older worker never drops a setting
-that a newer worker recorded.
+that a newer worker recorded. The run of that older worker fails closed,
+with the non-retryable error `SamplingPolicyInvalid`.
 
 ### Who sets it
 
@@ -1418,28 +1419,50 @@ process, with no restart. A harness with no store reads every default.
 
 ### What a strategy run does
 
-`agent_draws` takes a `DrawsInput`: the kind, the task, the strategy, the
-draw count, an optional concurrency and an optional scorer.
+`agent_draws` takes a `DrawsInput`: the kind, the input text, the
+strategy, the draw count, an optional concurrency and an optional scorer.
+It holds no task.
 
-1. It reads the policy once, in the recorded activity
+1. It reads the `AgentProfile` of the kind, in the recorded activity
+   `agent_profile`. A kind with no profile is refused. The profile builds
+   the task of each draw, so a caller cannot borrow the policy of a kind
+   for a task of its own.
+2. It reads the policy once, in the recorded activity
    `agent_sampling_policy`. Replay reads the record, so a change during
    the run does not reach it.
-2. `sampling::admit` checks the strategy, the draw count, the
+3. `sampling::admit` checks the strategy, the draw count, the
    concurrency, the scorer and the judge model, in that order. A request
    over the policy fails with `sampling refused (<code>)` before any model
    call. The codes are the variants of `sampling::Refusal`.
-3. It runs the draws as child `agent_loop` runs, in waves of at most the
-   admitted concurrency.
+4. It runs the draws as child `agent_loop` runs, in waves of at most the
+   admitted concurrency. A wave starts when the wave before it ends.
 
 Each draw sets `AgentTask::allowed_effects` to `draw_effects` met with
-the effects of its task. The decision phase denies a tool of any other
+the effects of its profile. The decision phase denies a tool of any other
 effect, and the tool-call activity checks it again. So a draw never gets
-wider effects than a single run of its task. An inline child of a draw
-keeps the set. A delegation from a draw to a durable peer is refused. A
-draw delivers nothing, books no follow-up and has no workspace.
+wider effects than a single run of its kind.
 
-`agent_draws` returns each draw report. Draw identity (#2440), the
-scorers (#2441) and the selection (#2443) build on it.
+- A draw is read-only unless its effects hold `write` or `external`.
+- An inline child of a draw keeps the effect set. A delegation from a draw
+  to a durable peer is refused.
+- A draw runs its delegations one at a time, so the open model calls stay
+  within the concurrency of the run.
+- A draw has no memory, no workspace, no follow-ups and no delivery. It
+  has no context reset unless `internal` is allowed, because
+  `save_progress` is `internal`.
+- A draw skips the response cache, so N draws are N samples.
+
+`agent_draws` returns each draw report. An engine failure of a draw fails
+the run. Draw identity (#2440), the scorers (#2441) and the selection
+(#2443) build on it. The request says whether a scorer is a judge. The
+scorer registry of #2441 must classify each id itself.
+
+### Upgrade every worker first
+
+A worker that predates `allowed_effects` drops it. The read-only fallback
+stops a write on such a worker, but not an `internal` tool. Upgrade every
+worker before you give a kind a strategy. Do not roll back past this
+release while a strategy run is in flight.
 
 ### A run never carries a policy
 

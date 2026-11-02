@@ -39,14 +39,33 @@ pub struct PolicyRead {
 }
 
 /// The result of one set or reset.
+///
+/// `old` and `new` are the stored JSON, not a decoded policy. A committed
+/// change then never reports an error for a stored body that no longer
+/// decodes, for example after a downgrade.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyChange {
     /// The stored policy before the change. `None` for every default.
-    pub old: Option<SamplingPolicy>,
+    pub old: Option<serde_json::Value>,
     /// The stored policy after the change. `None` after a reset.
-    pub new: Option<SamplingPolicy>,
+    pub new: Option<serde_json::Value>,
     /// The revision after the change.
     pub revision: u64,
+}
+
+impl PolicyChange {
+    /// The policy before the change. `None` for every default, or for a
+    /// body that does not decode.
+    #[must_use]
+    pub fn old_policy(&self) -> Option<SamplingPolicy> {
+        lenient(self.old.as_ref())
+    }
+
+    /// The policy after the change. `None` after a reset.
+    #[must_use]
+    pub fn new_policy(&self) -> Option<SamplingPolicy> {
+        lenient(self.new.as_ref())
+    }
 }
 
 /// What an audit row records.
@@ -60,6 +79,9 @@ pub enum PolicyAction {
 }
 
 /// One audited change.
+///
+/// `old` and `new` are the stored JSON. So the audit stays readable when a
+/// stored body no longer decodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyAudit {
     /// The revision that the change wrote.
@@ -69,11 +91,32 @@ pub struct PolicyAudit {
     /// The operator id.
     pub actor: String,
     /// The stored policy before the change.
-    pub old: Option<SamplingPolicy>,
+    pub old: Option<serde_json::Value>,
     /// The stored policy after the change.
-    pub new: Option<SamplingPolicy>,
+    pub new: Option<serde_json::Value>,
     /// The time of the change.
     pub at: DateTime<Utc>,
+}
+
+impl PolicyAudit {
+    /// The policy before the change. `None` for every default, or for a
+    /// body that does not decode.
+    #[must_use]
+    pub fn old_policy(&self) -> Option<SamplingPolicy> {
+        lenient(self.old.as_ref())
+    }
+
+    /// The policy after the change. `None` after a reset, or for a body
+    /// that does not decode.
+    #[must_use]
+    pub fn new_policy(&self) -> Option<SamplingPolicy> {
+        lenient(self.new.as_ref())
+    }
+}
+
+/// Decode a stored body for display. It never fails.
+fn lenient(body: Option<&serde_json::Value>) -> Option<SamplingPolicy> {
+    body.and_then(|body| serde_json::from_value(body.clone()).ok())
 }
 
 /// Why a store refuses a call.
@@ -226,12 +269,18 @@ fn decode_read(row: Option<PolicyRow>) -> Result<PolicyRead, PolicyStoreError> {
     })
 }
 
-fn decode_change(row: &PolicyChangeRow) -> Result<PolicyChange, PolicyStoreError> {
-    Ok(PolicyChange {
-        old: decode_body(row.old.as_deref())?,
-        new: decode_body(row.new.as_deref())?,
+/// The stored JSON of a body. A text that is not JSON stays readable as a
+/// JSON string. Only a run decodes a body strictly, in [`decode_read`].
+fn raw_body(body: &str) -> serde_json::Value {
+    serde_json::from_str(body).unwrap_or_else(|_| serde_json::Value::String(body.to_owned()))
+}
+
+fn decode_change(row: &PolicyChangeRow) -> PolicyChange {
+    PolicyChange {
+        old: row.old.as_deref().map(raw_body),
+        new: row.new.as_deref().map(raw_body),
         revision: row.revision,
-    })
+    }
 }
 
 fn decode_audit(rows: Vec<PolicyAuditRow>) -> Result<Vec<PolicyAudit>, PolicyStoreError> {
@@ -250,8 +299,8 @@ fn decode_audit(rows: Vec<PolicyAuditRow>) -> Result<Vec<PolicyAudit>, PolicySto
                 revision: row.revision,
                 action,
                 actor: row.actor,
-                old: decode_body(row.old.as_deref())?,
-                new: decode_body(row.new.as_deref())?,
+                old: row.old.as_deref().map(raw_body),
+                new: row.new.as_deref().map(raw_body),
                 at: row.at,
             })
         })
@@ -339,7 +388,7 @@ impl SamplingPolicyStore for InMemorySamplingPolicyStore {
     ) -> BoxFuture<'a, Result<PolicyChange, PolicyStoreError>> {
         Box::pin(async move {
             let body = check_write(kind, Some(policy), actor)?;
-            decode_change(&self.write(kind, body, actor)?)
+            Ok(decode_change(&self.write(kind, body, actor)?))
         })
     }
 
@@ -350,7 +399,7 @@ impl SamplingPolicyStore for InMemorySamplingPolicyStore {
     ) -> BoxFuture<'a, Result<PolicyChange, PolicyStoreError>> {
         Box::pin(async move {
             check_write(kind, None, actor)?;
-            decode_change(&self.write(kind, None, actor)?)
+            Ok(decode_change(&self.write(kind, None, actor)?))
         })
     }
 
@@ -423,8 +472,9 @@ impl SqliteSamplingPolicyStore {
         let row = self
             .log
             .write(kind, POLICY_SAMPLING, body, actor)
-            .map_err(backend)?;
-        decode_change(&row)
+            .map_err(backend)?
+            .ok_or(PolicyStoreError::Full)?;
+        Ok(decode_change(&row))
     }
 }
 
@@ -518,8 +568,9 @@ impl PostgresSamplingPolicyStore {
             actor,
         )
         .await
-        .map_err(backend)?;
-        decode_change(&row)
+        .map_err(backend)?
+        .ok_or(PolicyStoreError::Full)?;
+        Ok(decode_change(&row))
     }
 }
 

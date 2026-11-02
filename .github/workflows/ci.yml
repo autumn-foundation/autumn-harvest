@@ -2726,9 +2726,9 @@ jobs:
       # target of `autumn-harvest`. The gate above does not see its two
       # workflows, so this step analyzes them. `-p autumn-harvest-agent` gives
       # the analyzer the agent crate's MIR, so a call into it is followed,
-      # and the agent's own two workflows are analyzed too.
+      # and the agent's own workflows are analyzed too.
       #
-      # STRICT, unlike the gates above: all four workflows prove, so an
+      # STRICT, unlike the gates above: every workflow proves, so an
       # `unknown` fails the job as well as a `nondeterminism-found`. The
       # capstone is the example that shows the analyzer at work, and a quiet
       # slide back to `unknown` would undo that. It needs no allowlist entry,

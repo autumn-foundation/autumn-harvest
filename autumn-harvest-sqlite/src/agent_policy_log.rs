@@ -116,17 +116,19 @@ impl SqlitePolicyLog {
     /// One `IMMEDIATE` transaction reads the row, writes it and writes the
     /// audit row. So each audit row names the body that its change replaced.
     ///
+    /// Returns `None` when the revision counter is full. Nothing changes
+    /// then.
+    ///
     /// # Errors
     ///
-    /// Returns [`SqliteError::Sqlite`] when a statement fails, and
-    /// [`SqliteError::Unsupported`] when the revision counter is full.
+    /// Returns [`SqliteError::Sqlite`] when a statement fails.
     pub fn write(
         &self,
         kind: &str,
         policy: &str,
         body: Option<&str>,
         actor: &str,
-    ) -> SqliteResult<PolicyChangeRow> {
+    ) -> SqliteResult<Option<PolicyChangeRow>> {
         self.with_conn(|conn| write_in(conn, kind, policy, body, actor))
     }
 
@@ -169,7 +171,7 @@ fn write_in(
     policy: &str,
     body: Option<&str>,
     actor: &str,
-) -> SqliteResult<PolicyChangeRow> {
+) -> SqliteResult<Option<PolicyChangeRow>> {
     let action = if body.is_some() {
         ACTION_SET
     } else {
@@ -178,11 +180,10 @@ fn write_in(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let stored = read_in(&tx, kind, policy)?;
     let current = stored.as_ref().map_or(0, |row| row.revision);
-    let revision = next_policy_revision(current)
-        .and_then(|next| i64::try_from(next).ok())
-        .ok_or_else(|| {
-            SqliteError::Unsupported(format!("the policy revision of {kind:?} is full"))
-        })?;
+    let Some(revision) = next_policy_revision(current).and_then(|next| i64::try_from(next).ok())
+    else {
+        return Ok(None);
+    };
     let old = stored.and_then(|row| row.body);
     let now = Utc::now().timestamp_millis();
     tx.execute(
@@ -203,11 +204,11 @@ fn write_in(
         params![kind, policy, revision, action, actor, old, body, now],
     )?;
     tx.commit()?;
-    Ok(PolicyChangeRow {
+    Ok(Some(PolicyChangeRow {
         old,
         new: body.map(str::to_owned),
         revision: to_revision(revision)?,
-    })
+    }))
 }
 
 /// The body of [`SqlitePolicyLog::audit`].

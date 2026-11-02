@@ -186,33 +186,36 @@ mod pg {
     /// exists yet. So each audit row names the body that its change
     /// replaced. The caller validates `body` first.
     ///
+    /// Returns `None` when the revision counter is full. Nothing changes
+    /// then.
+    ///
+    /// The transaction is `READ COMMITTED` whatever the session default.
+    /// So the read after the lock sees the write that the lock waited for.
+    ///
     /// # Errors
     ///
-    /// Returns [`HarvestError::Database`] when a statement fails or the
-    /// revision counter is full.
+    /// Returns [`HarvestError::Database`] when a statement fails.
     pub async fn write_agent_policy(
         conn: &mut AsyncPgConnection,
         kind: &str,
         policy: &str,
         body: Option<&str>,
         actor: &str,
-    ) -> HarvestResult<PolicyChangeRow> {
-        use diesel_async::AsyncConnection;
-
+    ) -> HarvestResult<Option<PolicyChangeRow>> {
         let action = if body.is_some() {
             ACTION_SET
         } else {
             ACTION_RESET
         };
-        Box::pin(conn.transaction(async |conn| {
+        Box::pin(conn.build_transaction().read_committed().run(async |conn| {
             lock_policy(conn, kind, policy).await?;
             let stored = select_policy(conn, kind, policy, true).await?;
             let current = stored.as_ref().map_or(0, |row| row.revision);
-            let revision = next_policy_revision(current)
-                .and_then(|next| i64::try_from(next).ok())
-                .ok_or_else(|| {
-                    HarvestError::Database(format!("the policy revision of {kind:?} is full"))
-                })?;
+            let Some(revision) =
+                next_policy_revision(current).and_then(|next| i64::try_from(next).ok())
+            else {
+                return Ok(None);
+            };
             let old = stored.and_then(|row| row.body);
             upsert_policy(conn, kind, policy, body, revision, actor).await?;
             insert_policy_audit(
@@ -228,11 +231,11 @@ mod pg {
                 },
             )
             .await?;
-            Ok(PolicyChangeRow {
+            Ok(Some(PolicyChangeRow {
                 old,
                 new: body.map(str::to_owned),
                 revision: to_revision(revision)?,
-            })
+            }))
         }))
         .await
     }
@@ -261,13 +264,14 @@ mod pg {
         actor: &str,
     ) -> HarvestResult<()> {
         diesel::sql_query(
-            "INSERT INTO harvest_agent_policies (kind, policy, body, revision, updated_by)
-             VALUES ($1, $2, CAST($3 AS jsonb), $4, $5)
+            "INSERT INTO harvest_agent_policies
+                 (kind, policy, body, revision, updated_by, updated_at)
+             VALUES ($1, $2, CAST($3 AS jsonb), $4, $5, clock_timestamp())
              ON CONFLICT (kind, policy) DO UPDATE
                  SET body = EXCLUDED.body,
                      revision = EXCLUDED.revision,
                      updated_by = EXCLUDED.updated_by,
-                     updated_at = NOW()",
+                     updated_at = clock_timestamp()",
         )
         .bind::<Text, _>(kind)
         .bind::<Text, _>(policy)
@@ -298,8 +302,9 @@ mod pg {
     ) -> HarvestResult<()> {
         diesel::sql_query(
             "INSERT INTO harvest_agent_policy_audit
-                 (kind, policy, revision, action, actor, old_body, new_body)
-             VALUES ($1, $2, $3, $4, $5, CAST($6 AS jsonb), CAST($7 AS jsonb))",
+                 (kind, policy, revision, action, actor, old_body, new_body, at)
+             VALUES ($1, $2, $3, $4, $5, CAST($6 AS jsonb), CAST($7 AS jsonb),
+                     clock_timestamp())",
         )
         .bind::<Text, _>(row.kind)
         .bind::<Text, _>(row.policy)

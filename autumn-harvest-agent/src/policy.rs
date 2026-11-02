@@ -113,8 +113,9 @@ impl ToolRules {
             .unknown(Rule::Deny("this run may only call known tools".to_owned()))
     }
 
-    /// Rules for a run with an effect set (issue #2439): a tool whose effect
-    /// is not in `allowed` is refused, and so is a tool that is not known.
+    /// Rules for a run with an effect set (issue #2439). A tool whose effect
+    /// is not in `allowed` is refused. A tool that is not known is refused
+    /// too.
     #[must_use]
     pub fn only_effects(allowed: &BTreeSet<ToolEffect>) -> Self {
         ToolEffect::ALL

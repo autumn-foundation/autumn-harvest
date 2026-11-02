@@ -436,6 +436,7 @@ fn next_request(
         tool_guidance: task.tool_guidance.clone(),
         skills: !task.skills.is_empty(),
         allowed_effects: task.allowed_effects.clone(),
+        no_response_cache: task.no_response_cache,
     }
 }
 
@@ -2597,6 +2598,7 @@ fn child_task(
         skills: std::collections::BTreeMap::new(),
         // A child never runs a wider effect than its parent (issue #2439).
         allowed_effects: task.allowed_effects.clone(),
+        no_response_cache: task.no_response_cache,
     }
 }
 

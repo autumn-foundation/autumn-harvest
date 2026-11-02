@@ -11,6 +11,7 @@
 //! | `describe` | `GET /workflows/by-id/agent/{id}/query/harvest.entity.state` |
 //! | `pause`, `resume` | `POST /workflows/by-id/agent/{id}/signal/harvest.entity.op` |
 //! | `erase` | the signal route, then `POST /workflows/{id}/erase-payloads` for each run |
+//! | `sampling policy <kind> show`, `set`, `reset` | `GET`, `PUT`, `DELETE /admin/agents/{kind}/sampling-policy` |
 //!
 //! `erase` restarts an agent that ended with `POST /workflows/agent/signal-with-start`.
 //! The new run clears the memory and the workspace of the agent.
@@ -21,7 +22,7 @@ use std::fmt::Write as _;
 use clap::Subcommand;
 use serde_json::{Map, Value, json};
 
-use crate::{ApiRequest, Cli, CliError, execute_request, path_segment, query_encode};
+use crate::{ApiMethod, ApiRequest, Cli, CliError, execute_request, path_segment, query_encode};
 
 /// The workflow name of a durable agent. It is
 /// `autumn_harvest_agent::AGENT_WORKFLOW_NAME`.
@@ -113,6 +114,80 @@ pub enum AgentCommand {
         #[arg(long, default_value_t = 60)]
         wait_timeout_secs: u64,
     },
+    /// Read and change the operator sampling policy of an agent kind (issue
+    /// #2439).
+    Sampling {
+        #[command(subcommand)]
+        command: SamplingCommand,
+    },
+}
+
+/// The `harvest agents sampling` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum SamplingCommand {
+    /// Show, set or reset the sampling policy of one agent kind.
+    ///
+    /// Only an operator can set or reset it. Each change writes an audit row
+    /// with the old and new policy.
+    Policy {
+        /// The agent kind, such as `researcher`.
+        kind: String,
+        #[command(subcommand)]
+        action: PolicyCommand,
+    },
+}
+
+/// The actions of `harvest agents sampling policy <kind>`.
+#[derive(Debug, Subcommand)]
+pub enum PolicyCommand {
+    /// Show the policy with each default, its revision and its newest audit
+    /// rows.
+    Show,
+    /// Replace the whole policy.
+    ///
+    /// A setting that you leave out takes its default. It does not keep its
+    /// stored value. Give each setting that you want, or give the whole
+    /// policy with `--json`.
+    Set(PolicySetArgs),
+    /// Restore every default.
+    Reset,
+}
+
+/// The settings of `harvest agents sampling policy <kind> set`.
+///
+/// A list flag takes comma-separated values. An empty value, such as
+/// `--strategies ''`, gives an empty list. At least one flag is required, so
+/// a bare `set` never restores every default. Use `reset` for that.
+#[derive(Debug, Default, clap::Args)]
+#[group(required = true, multiple = true)]
+pub struct PolicySetArgs {
+    /// The strategies that the kind may use: `best_of_n`, `rejection`,
+    /// `vote`, `cascade`, `beam`. Default: none.
+    #[arg(long, conflicts_with = "json")]
+    pub strategies: Option<String>,
+    /// The most draws of one strategy run, 1 to 256. Default: 1.
+    #[arg(long, conflicts_with = "json")]
+    pub max_draws: Option<u32>,
+    /// The most draws at the same time, 1 to 16. Default: 1.
+    #[arg(long, conflicts_with = "json")]
+    pub max_concurrent_draws: Option<u32>,
+    /// The tool effects that a draw may run: `read_only`, `internal`,
+    /// `write`, `external`. Default: `read_only`.
+    #[arg(long, conflicts_with = "json")]
+    pub draw_effects: Option<String>,
+    /// `deterministic`, or a list of scorer ids. A list allows only those
+    /// scorers. Default: `deterministic`.
+    #[arg(long, conflicts_with = "json")]
+    pub scorers: Option<String>,
+    /// The models that a judge scorer may call. Default: none.
+    #[arg(long, conflicts_with = "json")]
+    pub judge_models: Option<String>,
+    /// The cap of the in-loop answer check, 0 to 16. Default: 0.
+    #[arg(long, conflicts_with = "json")]
+    pub max_answer_retries: Option<u32>,
+    /// The whole policy as one JSON object. It replaces every other flag.
+    #[arg(long)]
+    pub json: Option<String>,
 }
 
 /// The request of a one-request agent command. `erase` has none.
@@ -151,7 +226,88 @@ pub fn agent_request(command: &AgentCommand) -> Result<ApiRequest, CliError> {
         }
         AgentCommand::Resume { agent_id } => Ok(signal(agent_id, control_payload("resume"))),
         AgentCommand::Erase { .. } => Err(CliError::AgentEraseIsMultiStep),
+        AgentCommand::Sampling {
+            command: SamplingCommand::Policy { kind, action },
+        } => policy_request(kind, action),
     }
+}
+
+/// The route of the sampling policy of `kind`.
+fn policy_path(kind: &str) -> String {
+    format!("/admin/agents/{}/sampling-policy", path_segment(kind))
+}
+
+/// The request of one `agents sampling policy` action.
+fn policy_request(kind: &str, action: &PolicyCommand) -> Result<ApiRequest, CliError> {
+    let path = policy_path(kind);
+    Ok(match action {
+        PolicyCommand::Show => ApiRequest::get(path),
+        PolicyCommand::Set(args) => ApiRequest {
+            method: ApiMethod::Put,
+            path,
+            body: Some(json!({"policy": policy_body(args)?})),
+        },
+        PolicyCommand::Reset => ApiRequest {
+            method: ApiMethod::Delete,
+            path,
+            body: None,
+        },
+    })
+}
+
+/// The comma-separated values of a list flag. An empty value gives an empty
+/// list.
+fn list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The policy object of `set`. It holds only the given settings. The server
+/// fills in each default and checks each bound.
+fn policy_body(args: &PolicySetArgs) -> Result<Value, CliError> {
+    if let Some(raw) = &args.json {
+        let policy: Value = serde_json::from_str(raw).map_err(|source| CliError::InvalidJson {
+            label: "sampling policy",
+            source,
+        })?;
+        if !policy.is_object() {
+            return Err(CliError::InvalidInput(
+                "--json must be a JSON object".to_owned(),
+            ));
+        }
+        return Ok(policy);
+    }
+    let mut policy = Map::new();
+    for (key, value) in [
+        ("strategies", &args.strategies),
+        ("draw_effects", &args.draw_effects),
+        ("judge_models", &args.judge_models),
+    ] {
+        if let Some(raw) = value {
+            policy.insert(key.to_owned(), json!(list(raw)));
+        }
+    }
+    for (key, value) in [
+        ("max_draws", args.max_draws),
+        ("max_concurrent_draws", args.max_concurrent_draws),
+        ("max_answer_retries", args.max_answer_retries),
+    ] {
+        if let Some(value) = value {
+            policy.insert(key.to_owned(), json!(value));
+        }
+    }
+    if let Some(raw) = &args.scorers {
+        let scorers = if raw.trim() == "deterministic" {
+            json!("deterministic")
+        } else {
+            json!({"only": list(raw)})
+        };
+        policy.insert("scorers".to_owned(), scorers);
+    }
+    Ok(Value::Object(policy))
 }
 
 /// The filters of `agents list`.
