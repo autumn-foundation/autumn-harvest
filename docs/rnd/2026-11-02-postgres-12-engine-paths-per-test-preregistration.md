@@ -74,16 +74,21 @@ The lines are the lines of #16. They do not move.
 
 | line | rule | verdict if met |
 |:--|:--|:--|
-| L4 (validity) | the PG 16 control passes at least 90% of the registered module set in each of 3 runs, and every run ends inside 90 minutes | else `undetermined`: the harness is broken |
+| L4 (validity) | at least 90% of the **candidate** tests pass in all 3 PG 16 control runs, and every run ends inside 90 minutes | else `undetermined`: the harness is broken |
 | L1 (kill) | at least 1 SQL-version failure on PG 12, after the exclusions | "12+" is a measured false claim in the engine |
 | L2 (kill) | at least 1 SQL-version failure on PG 14, after the exclusions | the PG 14 floor is a measured false claim |
 | L3 (pursue) | no SQL-version failure on PG 12 or PG 14, **and** unclassified differential failures at most 2% of in-scope tests on each arm | engine paths hold on the in-scope tests |
 | L5 (undetermined) | no SQL-version failure, but unclassified differential failures above 2% on an arm | a difference exists that the harness cannot attribute |
 
-Pursue needs L3 and L4 together. A miss on L1 or L2 is a kill. L4 is graded on the
-module set that #16 registered (152 module files at `38209c8`), then narrowed by the
-per-test rule above. The 90% line applies to that narrowed set, with the control as the
-only input to the narrowing.
+Pursue needs L3 and L4 together. A miss on L1 or L2 is a kill.
+
+**Candidate set (the L4 denominator).** Every test function in the 152 module files
+that #16 registered, minus the tests whose control log names `/var/run/docker.sock`.
+A Docker failure does not depend on the Postgres version, so it is the only
+exclusion. The candidate set does not depend on which tests pass. The in-scope set
+(passes in all 3 control runs) is a subset of it. A test that passes in some control
+runs but not all counts against L4 and stays out of the in-scope set. The report
+states the in-scope share of the candidate set.
 
 ## Conditions
 
