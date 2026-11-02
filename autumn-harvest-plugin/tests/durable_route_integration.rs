@@ -169,6 +169,24 @@ async fn dr_switch_mid(ctx: &WorkflowContext, _input: Value) -> Result<Value, St
     Ok(Value::Null)
 }
 
+/// Continues as new into `dr_park_mid`. The chain ends in a parked run.
+#[workflow]
+async fn dr_park_start(ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
+    ctx.continue_as_new_as_type("dr_park_mid", input)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Value::Null)
+}
+
+/// Continues as new into `dr_parked`: the second change of type.
+#[workflow]
+async fn dr_park_mid(ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
+    ctx.continue_as_new_as_type("dr_parked", input)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Value::Null)
+}
+
 /// The end of a cross-type continue-as-new chain.
 #[workflow]
 async fn dr_chain_end(_ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
@@ -369,6 +387,8 @@ fn base_plugin() -> HarvestPlugin {
             __autumn_workflow_info_dr_chain_end(),
             __autumn_workflow_info_dr_switch_start(),
             __autumn_workflow_info_dr_switch_mid(),
+            __autumn_workflow_info_dr_park_start(),
+            __autumn_workflow_info_dr_park_mid(),
             __autumn_workflow_info_dr_debounced(),
             dr_batched_info(),
             dr_throttled_info(),
@@ -2345,18 +2365,61 @@ struct Id {
 
 /// The one completed run of `workflow`.
 async fn completed_run(db: &TestPg, workflow: &str) -> ExecutionId {
+    run_in_state(db, workflow, "COMPLETED").await
+}
+
+/// The one run of `workflow` in `state`.
+async fn run_in_state(db: &TestPg, workflow: &str, state: &str) -> ExecutionId {
     let mut conn = db.pool.get().await.expect("conn");
     diesel::sql_query(
         "SELECT id::text AS id FROM harvest_workflow_executions \
-         WHERE workflow_name = $1 AND state = 'COMPLETED'",
+         WHERE workflow_name = $1 AND state = $2",
     )
     .bind::<Text, _>(workflow)
+    .bind::<Text, _>(state)
     .get_result::<Id>(&mut conn)
     .await
-    .expect("one completed run")
+    .expect("one run in the state")
     .id
     .parse()
     .expect("execution id")
+}
+
+/// Issue #2491. The walk reads only ended runs and stops at the cap, but
+/// the last run of the chain is still live. The answer is pending. It is
+/// final only after the chain ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn chain_step_cap_answers_pending_while_the_chain_runs() {
+    let db = setup_db().await;
+    let client = app_with(&db, base_plugin().durable_route_max_chain_steps(1)).build();
+    let extra = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_park_start"),
+        ("x-wait-ms", "0"),
+    ];
+    let body = json!({"tag": "i2491"});
+    let first = post(&client, Some("key-i2491"), &extra, &body).await;
+    assert_ne!(first.status.as_u16(), 500, "{}", first.text());
+    until_state(&db, "dr_park_mid", "CONTINUED_AS_NEW").await;
+    until_state(&db, "dr_parked", "RUNNING").await;
+    // One step reaches `dr_park_mid` only. The parked run is past the cap.
+    let pending = post(&client, Some("key-i2491"), &extra, &body).await;
+    assert_eq!(pending.status.as_u16(), 202, "{}", pending.text());
+
+    let parked = run_in_state(&db, "dr_parked", "RUNNING").await;
+    signal(&client, parked, json!("done")).await;
+    until_state(&db, "dr_parked", "COMPLETED").await;
+    // The chain has ended, so a retry walks the same runs: final.
+    let capped = post(&client, Some("key-i2491"), &extra, &body).await;
+    assert_eq!(capped.status.as_u16(), 500, "{}", capped.text());
+    assert!(
+        capped.header("retry-after").is_none(),
+        "the answer is final"
+    );
+    assert_eq!(
+        problem_type(&capped.json::<Value>()),
+        slug_type("result-unavailable")
+    );
 }
 
 // AC-79

@@ -142,10 +142,12 @@ A live run waits for up to the budget.
   retry. A chain needs at most one step more than its changes of type and
   its retries. The cap is 1024 steps. Set it with
   `HarvestPlugin::durable_route_max_chain_steps(n)`.
-- Past the cap, a walk that met a live run answers pending, because a retry
-  can need fewer steps once the chain ends. A walk that read only ended runs
-  answers `result-unavailable`, because a retry repeats the same walk. A
-  chain that loops back answers `result-unavailable` too.
+- Past the cap, a chain that still has a live run answers pending, because
+  a retry can need fewer steps once the chain ends. A chain that has ended
+  gets a second walk, which reads only frozen data. A walk that read only
+  ended runs answers `result-unavailable` when the second walk stops at the
+  same run, because a retry repeats the same walk. A chain that loops back
+  answers `result-unavailable` too.
 - A read error other than a codec error also answers pending, because the
   run exists. A workflow-level retry chain past the engine's walk depth
   (256 attempts) answers `result-unavailable`, because it never shrinks.
