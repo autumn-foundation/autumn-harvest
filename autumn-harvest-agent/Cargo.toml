@@ -92,6 +92,10 @@ name = "mesh"
 required-features = ["sqlite"]
 
 [[test]]
+name = "model_turn_span"
+required-features = ["sqlite"]
+
+[[test]]
 name = "durable_agent"
 required-features = ["sqlite"]
 
@@ -166,6 +170,14 @@ required-features = ["sqlite", "eval"]
 [[test]]
 name = "refine_propose"
 required-features = ["sqlite"]
+
+[[test]]
+name = "score"
+required-features = ["sqlite"]
+
+[[test]]
+name = "score_postgres"
+required-features = ["postgres"]
 
 [lints]
 workspace = true

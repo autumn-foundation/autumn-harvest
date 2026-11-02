@@ -47,6 +47,7 @@
 //! deliberately before autovacuum runs: it measures the debt the DELETE path
 //! creates, not a steady state.
 
+#[allow(unused_imports)]
 #[path = "../tests/integration/retention_reclaim_support.rs"]
 mod support;
 
@@ -113,15 +114,15 @@ mod runner {
 
     /// Swap the database component of a libpq URL.
     fn replace_database(url: &str, name: &str) -> String {
-        match url.rfind('/') {
-            Some(i) => {
+        url.rfind('/').map_or_else(
+            || url.to_string(),
+            |i| {
                 let (head, tail) = url.split_at(i + 1);
                 // Preserve any query string (sslmode=…, application_name=…).
                 let query = tail.find('?').map_or("", |q| &tail[q..]);
                 format!("{head}{name}{query}")
-            }
-            None => url.to_string(),
-        }
+            },
+        )
     }
 
     async fn run_arm(url: &str, partitioned: bool, scale: Scale) -> Measurement {

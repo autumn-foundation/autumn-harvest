@@ -29,7 +29,7 @@ fn fresh_db() -> (tempfile::TempDir, PathBuf) {
 }
 
 fn state(rt: &SqliteRuntime, agent: &AgentId) -> impl Future<Output = AgentState> + Send + 'static {
-    let query = sqlite::state(rt, agent);
+    let query = Box::pin(sqlite::state(rt, agent));
     async move { query.await.unwrap().expect("the agent runs") }
 }
 

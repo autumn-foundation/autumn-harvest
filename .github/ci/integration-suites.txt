@@ -311,6 +311,7 @@ linux        autumn-harvest         integration                      testing    
 linux        autumn-harvest         integration                      wasm-activities            wasm_activities_tests
 linux        autumn-harvest-agent   overlay_read_postgres            postgres                   -
 linux        autumn-harvest-agent   overlay_store_postgres           postgres                   -
+linux        autumn-harvest-agent   score_postgres                   postgres                   -
 linux        autumn-harvest-conformance  conformance                  -                          -
 linux        autumn-harvest-plugin  activity_info_api_integration    -                          -
 linux        autumn-harvest-plugin  admission_gate_authoritative_localpg  -                          -

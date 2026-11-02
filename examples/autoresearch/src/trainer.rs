@@ -485,6 +485,10 @@ pub async fn run(
 /// # Errors
 ///
 /// Returns an error when the kernel refuses.
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(clippy::missing_const_for_fn, reason = "the body is empty off Linux")
+)]
 pub fn hide_runner() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)

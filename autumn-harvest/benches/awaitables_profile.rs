@@ -120,6 +120,7 @@ const QUEUES: [&str; 4] = ["payments", "email", "webhooks", "inventory"];
 /// timers, and children in the same 9:1 closed:open ratio — a long-running
 /// fan-out workflow near completion with a genuine handful of things still
 /// open, exactly the shape an operator's diagnostic request targets.
+#[allow(clippy::too_many_lines, reason = "one straight-line event list")]
 fn build_workload(
     n: usize,
     start: DateTime<Utc>,

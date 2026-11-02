@@ -133,7 +133,7 @@ chrono-tz = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
-lru = "0.18.2"
+lru = "0.19.0"
 croner = "2.2"
 seahash = "4.1"
 rand = { workspace = true }
@@ -161,7 +161,7 @@ tokio-postgres-rustls = { version = "0.14", optional = true }
 metrics = { version = "0.24.6", optional = true }
 # Hashes the `metrics-rs` label interner. SipHash cost more than the copy it saves.
 foldhash = { version = "0.2", optional = true }
-schemars = { version = "0.8", optional = true }
+schemars = { version = "1.2", optional = true }
 # wasmtime 48's own minimum Rust is 1.95, so the `wasm-activities` feature that
 # enables these has an effective MSRV of 1.95 (the crate's core MSRV stays 1.88).
 # 48.0.3 is the first 48.x release with the RUSTSEC-2026-0316 fix (46.x has no
@@ -384,7 +384,7 @@ tempfile = "3"
 # here because a `[dependencies]` entry is not visible to integration test
 # binaries, and the round-49 regression test drives the real `do_heartbeat_tick`.
 tokio-util = { version = "0.7", features = ["rt"] }
-schemars = { version = "0.8" }
+schemars = { version = "1.2" }
 # Assemble `.wat` text into `.wasm` bytes in the `wasm-activities` integration
 # tests. Already a (feature-gated) dependency of the crate; a plain dev-dep here
 # so the integration test binaries can build guest modules regardless of feature
@@ -416,8 +416,11 @@ testcontainers-modules = { workspace = true }
 
 # Runs the real `agent_loop` on a Postgres worker to measure the resident hit
 # rate (issue #2013). The loom and shuttle models never use it.
+# Keep this dependency path-only, with no `version`. The agent crate depends on
+# this crate, so a versioned edge makes a cycle. Cargo then cannot order a
+# workspace `cargo publish`. A path-only dev-dependency is stripped on publish.
 [target.'cfg(not(any(loom, shuttle)))'.dev-dependencies]
-autumn-harvest-agent = { version = "0.8.0", path = "../autumn-harvest-agent" }
+autumn-harvest-agent = { path = "../autumn-harvest-agent" }
 # Explores every interleaving of the DST oracles within a bound (the
 # `stateright` test target). Dev-only, so it never ships. The loom and Shuttle
 # builds skip it, so `--cfg loom` cannot reach its dependencies.
@@ -822,4 +825,11 @@ harness = false
 [[bench]]
 name = "update_lookup_profile"
 required-features = ["testing"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation profiling harness for
+# `schema_contract::diff_schema_contracts`.
+# See `benches/schema_contract_diff_profile.rs`.
+[[bench]]
+name = "schema_contract_diff_profile"
 harness = false
