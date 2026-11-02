@@ -18,6 +18,11 @@ pub enum Step {
     /// The event commits with the cycle that wrote it. A later step therefore
     /// reaches the run only after that cycle.
     AwaitEvent { event: &'static str, count: usize },
+    /// Run this function once, between two steps.
+    ///
+    /// A scenario uses it to open a gate that an activity waits on. The step
+    /// then fixes the order of an external input and an activity result.
+    Run(fn()),
     /// Run a declarative update and record its result.
     Update { name: &'static str, input: Value },
     /// Request a cancel with this reason.
