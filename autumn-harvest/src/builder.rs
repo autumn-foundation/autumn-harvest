@@ -1864,6 +1864,26 @@ impl HarvestBuilder {
         self
     }
 
+    /// Move the registered state out of this builder (issue #2467).
+    ///
+    /// The plugin's SQLite backend gives this map to `SqliteRuntime`, so
+    /// `ctx.state::<T>()` reads the same values as on Postgres. The builder
+    /// keeps an empty map afterwards.
+    #[must_use]
+    pub fn take_state(&mut self) -> SharedStateMap {
+        std::mem::take(&mut self.state)
+    }
+
+    /// Move the registered activities out of this builder (issue #2467).
+    ///
+    /// [`ActivityInfo`] is not `Clone`. The plugin's SQLite backend registers
+    /// these on `SqliteRuntime` instead of building a Postgres worker. The
+    /// builder keeps no activities afterwards.
+    #[must_use]
+    pub fn take_activities(&mut self) -> Vec<ActivityInfo> {
+        std::mem::take(&mut self.activities)
+    }
+
     /// Install a [`TelemetryConfig`] so the worker captures trace context at
     /// enqueue, reinstates it on claim, and emits workflow / activity / timer
     /// metrics through the supplied recorder.

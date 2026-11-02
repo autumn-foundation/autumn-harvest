@@ -7,8 +7,14 @@
 -- whole executions table, on every shard.
 --
 -- This migration builds `idx_harvest_we_retention_candidates` with all six
--- states, then drops the old index. Six states imply each subset of them. So
--- the new index also serves each query that the old index served.
+-- states. Six states imply each subset of them. So the new index also serves
+-- each query that the old index served.
+--
+-- `20261101012649` drops the old index in its own transaction. This file
+-- dropped it too when it shipped in 0.8.0. That drop asked for
+-- `ACCESS EXCLUSIVE` while the build still held `SHARE`. It deadlocked with
+-- any step transaction that waited behind the build, and the whole build
+-- rolled back. The header of `20261101012649` gives the detail.
 --
 -- `MIGRATED` stays out. A sealed source row is not purgeable (issue #964).
 --
@@ -17,7 +23,6 @@
 -- `CREATE INDEX` (not `CONCURRENTLY`) takes `SHARE` on
 -- `harvest_workflow_executions`. That blocks every state change until the
 -- build ends. The index is partial, but the build still reads every row.
--- `DROP INDEX` takes `ACCESS EXCLUSIVE` for a short time.
 --
 -- On a live, large deployment, build the new index out of band first:
 --
@@ -26,7 +31,6 @@
 --         WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT',
 --                         'CONTINUED_AS_NEW','TERMINATED')
 --           AND completed_at IS NOT NULL;
---     DROP INDEX CONCURRENTLY IF EXISTS idx_harvest_we_retention_scan;
 --
 -- Then run this migration. The guard below accepts an index that already
 -- exists with the expected definition and is valid. It rejects a same-named
@@ -34,7 +38,7 @@
 -- out-of-band build. Drop that one with `DROP INDEX CONCURRENTLY` and build
 -- it again.
 --
--- `lock_timeout` bounds the wait for each lock (issue #1810).
+-- `lock_timeout` bounds the wait for `SHARE` (issue #1810).
 SET LOCAL lock_timeout = '5s';
 
 DO $$
@@ -68,6 +72,3 @@ BEGIN
             'idx_harvest_we_retention_candidates already exists but is INVALID -- DROP INDEX CONCURRENTLY it and retry the out-of-band build before retrying this migration';
     END IF;
 END $$;
-
--- lock-safety: allow blocking-index #2395 operators drop it CONCURRENTLY first, see the header
-DROP INDEX IF EXISTS idx_harvest_we_retention_scan;

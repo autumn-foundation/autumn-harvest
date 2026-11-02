@@ -18,7 +18,8 @@ runtime-config key now drive autumn jobs and Harvest activities.
   retry budget, and holds no slot. Workflow tasks and other activity types
   run. A held dispatch reference returns after the recheck delay.
 - `try_build` rejects a local activity in the hold. An unregistered name and
-  a `schedule_to_start` default log a warning.
+  a `schedule_to_start` default log a warning. The plugin's `sqlite` build
+  refuses a cost hold and names the SQLite epic (#2466).
 - New gauge `harvest.cost.hold` (`METRIC_COST_HOLD`, no label), bridged by
   the metrics-rs adapter and the plugin scrape endpoint, with a starter
   dashboard panel. `GET /admin/config` reports `cost_hold_activities`.

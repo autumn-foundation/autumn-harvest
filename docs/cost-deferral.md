@@ -137,4 +137,6 @@ incident.
   Replicas that read one runtime-config key agree within
   `signal_refresh_secs`.
 - **Postgres only.** The `autumn-harvest-sqlite` backend does not use the
-  hold.
+  hold. On the plugin's `sqlite` feature, `cost_deferrable_activities` and
+  `WorkerConfig::with_cost_hold` fail the build and name the SQLite epic
+  (#2466), so a held type never runs unheld by accident.

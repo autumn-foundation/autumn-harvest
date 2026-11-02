@@ -53,6 +53,7 @@ use crate::loop_guard::LoopGuard;
 use crate::memory::MemoryScope;
 use crate::mesh::{Mandate, Refusal};
 use crate::message::{ChatMessage, ChatRole, RunId, SessionId};
+use crate::skill::SkillText;
 use crate::types::{AgentStop, AgentTask, DEFAULT_APPROVAL_TIMEOUT_SECS, DEFAULT_MAX_STEPS};
 use crate::workflow::{
     Member, Outbox, Progress, Run, SteerBook, Tree, deliver, discover, harness, run_segment,
@@ -662,6 +663,14 @@ pub struct AgentProfile {
     /// Install a store with `AgentHarness::workspace`.
     #[serde(default, skip_serializing_if = "crate::types::is_false")]
     pub workspace: bool,
+    /// The text that replaces the description of each named tool (issue
+    /// #2373). See [`AgentTask::tool_guidance`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_guidance: BTreeMap<String, String>,
+    /// The skills of the agents of the kind (issue #2373). See
+    /// [`AgentTask::skills`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skills: BTreeMap<String, SkillText>,
 }
 
 const fn default_max_steps() -> u32 {
@@ -703,7 +712,23 @@ impl AgentProfile {
             mesh: None,
             stream: false,
             workspace: false,
+            tool_guidance: BTreeMap::new(),
+            skills: BTreeMap::new(),
         }
+    }
+
+    /// Show `text` to the model in place of the description of `tool`.
+    #[must_use]
+    pub fn tool_guidance(mut self, tool: impl Into<String>, text: impl Into<String>) -> Self {
+        self.tool_guidance.insert(tool.into(), text.into());
+        self
+    }
+
+    /// Add the skill `name` to the agents of the kind.
+    #[must_use]
+    pub fn skill(mut self, name: impl Into<String>, text: SkillText) -> Self {
+        self.skills.insert(name.into(), text);
+        self
     }
 
     /// Give each agent of the kind a persistent workspace. See
@@ -880,6 +905,8 @@ impl AgentProfile {
         task.mesh.clone_from(&self.mesh);
         task.memory_in_state = self.memory == AgentMemory::State;
         task.stream = self.stream;
+        task.tool_guidance.clone_from(&self.tool_guidance);
+        task.skills.clone_from(&self.skills);
         if self.workspace {
             task.workspace = Some(WorkspaceMount {
                 scope: WorkspaceMount::agent_scope(id.as_str()),

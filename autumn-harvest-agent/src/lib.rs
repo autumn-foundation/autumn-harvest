@@ -91,9 +91,11 @@ pub mod mesh_control;
 pub mod message;
 pub mod model;
 pub mod policy;
+pub mod refine;
 pub mod response_cache;
 #[cfg(feature = "sandbox")]
 pub mod sandbox;
+pub mod skill;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod tool;
@@ -103,7 +105,7 @@ pub mod workflow;
 pub mod workspace;
 
 pub use agent::overlay::{
-    Ceilings, GUARDRAILS_HEADING, ModelRegistry, OverlayError, ProfileOverlay,
+    Ceilings, GUARDRAILS_HEADING, ModelRegistry, OverlayError, ProfileOverlay, ToolRegistry,
 };
 pub use agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentHeartbeat, AgentId, AgentIdError, AgentMemory, AgentOp,
@@ -134,9 +136,16 @@ pub use message::{
 };
 pub use model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
 pub use policy::{AllowAll, Rule, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
+pub use refine::{
+    DEFAULT_PROPOSAL_ATTEMPTS, DEFAULT_PROPOSER_OUTPUT_TOKENS, DEFAULT_PROPOSER_TIMEOUT, Dimension,
+    Evidence, KEEP_BASE, MAX_PROPOSAL_ATTEMPTS, ModelProposer, OUTPUT_CONTRACT, OverlayProposer,
+    ProposalAttempts, ProposalAttemptsError, ProposeContext, ProposeRequest, ProposerReply, Stage,
+    StageOutcome, agent_refine_propose, agent_refine_propose_info,
+};
 pub use response_cache::{
     CacheIndex, CacheKey, CacheScope, InMemoryCacheIndex, KeyTenant, ResponseCache,
 };
+pub use skill::{LOAD_SKILL_TOOL, SkillText};
 pub use tool::{FnTool, Tool, ToolContext, ToolEffect};
 pub use transcript::{InMemoryTranscriptStore, PrefixRef, TranscriptStore};
 pub use types::{
