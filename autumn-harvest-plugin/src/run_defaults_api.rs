@@ -1,15 +1,17 @@
 //! `GET` and `PATCH /admin/workflow-types/{workflow_name}/run-defaults`
-//! (issue #2387).
+//! (issues #2387 and #2406).
 //!
-//! The routes read and change the operator override of the `sla` and
-//! `execution_timeout` of one workflow type. A DAG uses its own name. The
-//! override lives on the default shard. See
+//! The routes read and change the operator override of the `sla`, the
+//! `execution_timeout` and the `chain_execution_timeout` of one workflow
+//! type. A DAG uses its own name. A DAG declares no chain cap, so the route
+//! refuses a chain cap for a DAG. The override lives on the default shard. See
 //! [`autumn_harvest::run_defaults`] for the precedence and the cache.
 //!
 //! A change reaches new starts in this process at once, through a write
 //! through to the cache. Other processes see it within their refresh period.
 //! `recompute_in_flight` also moves the SLA deadline of the runs that are in
-//! flight, on every shard.
+//! flight, on every shard. It never moves a chain deadline. A chain in flight
+//! keeps the deadline that its first run stored.
 
 use std::time::Duration;
 
@@ -36,13 +38,15 @@ use crate::shard_fanout::UnavailableShard;
 
 const ROUTE: &str = "PATCH /admin/workflow-types/{workflow_name}/run-defaults";
 
-/// The two run-default fields, in whole seconds. `None` sets no value.
+/// The run-default fields, in whole seconds. `None` sets no value.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct RunDefaultSecs {
     /// The soft SLA.
     pub sla_secs: Option<u64>,
     /// The hard execution timeout.
     pub execution_timeout_secs: Option<u64>,
+    /// The cap of a continue-as-new chain (issue #2406).
+    pub chain_execution_timeout_secs: Option<u64>,
 }
 
 impl From<RunDefaultFields> for RunDefaultSecs {
@@ -50,6 +54,7 @@ impl From<RunDefaultFields> for RunDefaultSecs {
         Self {
             sla_secs: fields.sla.map(|d| d.as_secs()),
             execution_timeout_secs: fields.execution_timeout.map(|d| d.as_secs()),
+            chain_execution_timeout_secs: fields.chain_execution_timeout.map(|d| d.as_secs()),
         }
     }
 }
@@ -61,6 +66,8 @@ pub struct RunDefaultOverrideView {
     pub sla_secs: Option<u64>,
     /// The hard execution timeout that the override sets, if any.
     pub execution_timeout_secs: Option<u64>,
+    /// The chain cap that the override sets, if any (issue #2406).
+    pub chain_execution_timeout_secs: Option<u64>,
     /// The operator's stated reason.
     pub reason: Option<String>,
     /// The actor that last changed the override.
@@ -75,6 +82,7 @@ impl From<RunDefaultOverride> for RunDefaultOverrideView {
         Self {
             sla_secs: secs.sla_secs,
             execution_timeout_secs: secs.execution_timeout_secs,
+            chain_execution_timeout_secs: secs.chain_execution_timeout_secs,
             reason: stored.reason,
             updated_by: stored.updated_by,
             updated_at: stored.updated_at,
@@ -127,6 +135,8 @@ pub struct RunDefaultsPatchRequest {
     sla_secs: Option<Option<u64>>,
     #[serde(default, deserialize_with = "deserialize_tristate")]
     execution_timeout_secs: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    chain_execution_timeout_secs: Option<Option<u64>>,
     #[serde(default)]
     clear_override: bool,
     reason: Option<String>,
@@ -140,14 +150,21 @@ impl RunDefaultsPatchRequest {
         RunDefaultPatch {
             execution_timeout: to_duration(self.execution_timeout_secs),
             sla: to_duration(self.sla_secs),
+            chain_execution_timeout: to_duration(self.chain_execution_timeout_secs),
         }
     }
 
     const fn is_empty(&self) -> bool {
         self.sla_secs.is_none()
             && self.execution_timeout_secs.is_none()
+            && self.chain_execution_timeout_secs.is_none()
             && !self.clear_override
             && !self.recompute_in_flight
+    }
+
+    /// Whether the request sets a chain cap. A `null` sets none.
+    const fn sets_chain_cap(&self) -> bool {
+        matches!(self.chain_execution_timeout_secs, Some(Some(_)))
     }
 }
 
@@ -159,6 +176,7 @@ fn code_fields(runtime: &HarvestApiRuntime, workflow_name: &str) -> Option<RunDe
         Some(info) => Some(RunDefaultFields {
             execution_timeout: info.execution_timeout,
             sla: info.sla,
+            chain_execution_timeout: info.chain_execution_timeout,
         }),
         None if runtime.is_registered_dag(workflow_name) => Some(RunDefaultFields::default()),
         None => None,
@@ -170,12 +188,14 @@ fn effective_fields(
     code: RunDefaultFields,
     stored: Option<&RunDefaultOverride>,
 ) -> RunDefaultFields {
-    let (execution_timeout, sla) = stored.map_or((code.execution_timeout, code.sla), |stored| {
-        stored.fields.apply(code.execution_timeout, code.sla)
-    });
+    let Some(stored) = stored else {
+        return code;
+    };
+    let (execution_timeout, sla) = stored.fields.apply(code.execution_timeout, code.sla);
     RunDefaultFields {
         execution_timeout,
         sla,
+        chain_execution_timeout: stored.fields.apply_chain(code.chain_execution_timeout),
     }
 }
 
@@ -333,8 +353,8 @@ pub async fn patch_run_defaults(
     // audit row, not the plain-text 422 of axum.
     let request = match request {
         Ok(Json(request)) if request.is_empty() => Err(String::from(
-            "empty patch: set sla_secs, execution_timeout_secs, clear_override or \
-             recompute_in_flight",
+            "empty patch: set sla_secs, execution_timeout_secs, \
+             chain_execution_timeout_secs, clear_override or recompute_in_flight",
         )),
         Ok(Json(request)) => Ok(request),
         Err(rejection) => Err(format!("invalid request body: {}", rejection.body_text())),
@@ -356,6 +376,11 @@ pub async fn patch_run_defaults(
         .await?;
         return Err(not_registered(&workflow_name));
     };
+    if request.sets_chain_cap() && runtime.is_registered_dag(&workflow_name) {
+        let summary = "a DAG declares no chain cap, so chain_execution_timeout_secs is refused";
+        audit_patch(&mut conn, ctx, &workflow_name, Some(summary)).await?;
+        return Err(AutumnError::bad_request_msg(summary));
+    }
 
     let change = RunDefaultChange {
         workflow_name: &workflow_name,

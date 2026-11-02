@@ -1,12 +1,14 @@
-//! Operator overrides for per-type run defaults (issue #2387).
+//! Operator overrides for per-type run defaults (issues #2387 and #2406).
 //!
-//! [`WorkflowInfo::sla`](crate::info::WorkflowInfo::sla) and
+//! [`WorkflowInfo::sla`](crate::info::WorkflowInfo::sla),
 //! [`WorkflowInfo::execution_timeout`](crate::info::WorkflowInfo::execution_timeout)
+//! and
+//! [`WorkflowInfo::chain_execution_timeout`](crate::info::WorkflowInfo::chain_execution_timeout)
 //! are declared in code. A DAG lowers to a shadow workflow type of the same
 //! name, so its `DagInfo` values arrive here too. Each start path resolves the
 //! deadlines of a new run from them, so a change needed a restart.
 //!
-//! An override is a persisted operator value for one or both fields, keyed by
+//! An override is a persisted operator value for one or more fields, keyed by
 //! the workflow type name. The precedence is fixed:
 //!
 //! > override, then code.
@@ -25,12 +27,15 @@
 //!
 //! The existing clamps still apply after the override. An `sla` above the
 //! effective `execution_timeout` is clamped to it, and the fleet-wide ceiling
-//! still caps `execution_timeout`.
+//! still caps `execution_timeout`. The fleet chain ceiling
+//! `max_workflow_chain_timeout` still caps `chain_execution_timeout`.
 //!
 //! ## Runs already in flight
 //!
 //! A change applies to new starts only. A continue-as-new successor of the
-//! same type keeps the values of its run, as before. The opt-in
+//! same type keeps the values of its run, as before. Each successor copies
+//! the stored `chain_deadline_at` of its chain, for a cross-type successor
+//! too. So a chain in flight keeps its chain deadline. The opt-in
 //! [`recompute_in_flight_sla`] moves the SLA deadline of the non-terminal
 //! runs of a type that have not breached yet. It never changes a hard
 //! `deadline_at`, because a shorter one could end a run at once.
@@ -67,13 +72,23 @@ pub struct RunDefaultFields {
     pub execution_timeout: Option<Duration>,
     /// The soft SLA of a new run.
     pub sla: Option<Duration>,
+    /// The cap of a new continue-as-new chain (issue #2406).
+    pub chain_execution_timeout: Option<Duration>,
 }
 
 impl RunDefaultFields {
     /// Whether the override sets no field.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.execution_timeout.is_none() && self.sla.is_none()
+        self.execution_timeout.is_none()
+            && self.sla.is_none()
+            && self.chain_execution_timeout.is_none()
+    }
+
+    /// Apply this override to the code chain cap of one type.
+    #[must_use]
+    pub fn apply_chain(&self, chain_execution_timeout: Option<Duration>) -> Option<Duration> {
+        self.chain_execution_timeout.or(chain_execution_timeout)
     }
 
     /// Apply this override to the code values of one type.
@@ -103,6 +118,8 @@ pub struct RunDefaultPatch {
     pub execution_timeout: Option<Option<Duration>>,
     /// The soft SLA.
     pub sla: Option<Option<Duration>>,
+    /// The chain cap.
+    pub chain_execution_timeout: Option<Option<Duration>>,
 }
 
 impl RunDefaultPatch {
@@ -112,6 +129,9 @@ impl RunDefaultPatch {
         RunDefaultFields {
             execution_timeout: self.execution_timeout.unwrap_or(stored.execution_timeout),
             sla: self.sla.unwrap_or(stored.sla),
+            chain_execution_timeout: self
+                .chain_execution_timeout
+                .unwrap_or(stored.chain_execution_timeout),
         }
     }
 }
@@ -174,6 +194,27 @@ impl RunDefaultsCache {
             .get(workflow_name)
             .map_or((execution_timeout, sla), |fields| {
                 fields.apply(execution_timeout, sla)
+            })
+    }
+
+    /// The effective chain cap of one type (issue #2406).
+    ///
+    /// `chain_execution_timeout` is the code value. A poisoned lock returns
+    /// it unchanged. The start applies the fleet chain ceiling after this.
+    #[must_use]
+    pub fn apply_chain(
+        &self,
+        workflow_name: &str,
+        chain_execution_timeout: Option<Duration>,
+    ) -> Option<Duration> {
+        let Ok(snapshot) = self.snapshot.read() else {
+            return chain_execution_timeout;
+        };
+        snapshot
+            .overrides
+            .get(workflow_name)
+            .map_or(chain_execution_timeout, |fields| {
+                fields.apply_chain(chain_execution_timeout)
             })
     }
 
@@ -258,6 +299,7 @@ mod db {
         workflow_name: String,
         sla_secs: Option<i64>,
         execution_timeout_secs: Option<i64>,
+        chain_execution_timeout_secs: Option<i64>,
         reason: Option<String>,
         updated_by: String,
         created_at: DateTime<Utc>,
@@ -282,6 +324,10 @@ mod db {
             let fields = RunDefaultFields {
                 execution_timeout: secs("execution_timeout_secs", self.execution_timeout_secs)?,
                 sla: secs("sla_secs", self.sla_secs)?,
+                chain_execution_timeout: secs(
+                    "chain_execution_timeout_secs",
+                    self.chain_execution_timeout_secs,
+                )?,
             };
             Ok(RunDefaultOverride {
                 workflow_name: self.workflow_name,
@@ -368,7 +414,7 @@ mod db {
     /// shard.
     ///
     /// A zero duration is rejected, because a zero SLA breaches at once and a
-    /// zero timeout ends the run at once. A merge that sets no field deletes
+    /// zero timeout ends the run or the chain at once. A merge that sets no field deletes
     /// the row. Returns the stored override after the change.
     ///
     /// # Errors
@@ -385,6 +431,10 @@ mod db {
         for (field, value) in [
             ("execution_timeout", change.patch.execution_timeout),
             ("sla", change.patch.sla),
+            (
+                "chain_execution_timeout",
+                change.patch.chain_execution_timeout,
+            ),
         ] {
             if value.flatten().is_some_and(|d| d.as_secs() == 0) {
                 return Err(HarvestError::Config(format!(
@@ -421,11 +471,13 @@ mod db {
             let now = Utc::now();
             let sla_secs = merged.sla.map(to_secs);
             let execution_timeout_secs = merged.execution_timeout.map(to_secs);
+            let chain_execution_timeout_secs = merged.chain_execution_timeout.map(to_secs);
             diesel::insert_into(dsl::harvest_run_default_overrides)
                 .values((
                     dsl::workflow_name.eq(change.workflow_name),
                     dsl::sla_secs.eq(sla_secs),
                     dsl::execution_timeout_secs.eq(execution_timeout_secs),
+                    dsl::chain_execution_timeout_secs.eq(chain_execution_timeout_secs),
                     dsl::reason.eq(change.reason),
                     dsl::updated_by.eq(change.actor),
                     dsl::created_at.eq(now),
@@ -436,6 +488,7 @@ mod db {
                 .set((
                     dsl::sla_secs.eq(sla_secs),
                     dsl::execution_timeout_secs.eq(execution_timeout_secs),
+                    dsl::chain_execution_timeout_secs.eq(chain_execution_timeout_secs),
                     dsl::reason.eq(change.reason),
                     dsl::updated_by.eq(change.actor),
                     dsl::updated_at.eq(now),
@@ -656,6 +709,7 @@ mod tests {
             RunDefaultFields {
                 execution_timeout: Some(mins(30)),
                 sla: Some(mins(10)),
+                ..RunDefaultFields::default()
             },
         )]);
         assert_eq!(
@@ -691,10 +745,82 @@ mod tests {
     }
 
     #[test]
+    fn a_chain_override_wins_and_an_unset_chain_inherits() {
+        let cache = RunDefaultsCache::new();
+        cache.replace([stored(
+            "etl",
+            RunDefaultFields {
+                chain_execution_timeout: Some(mins(120)),
+                ..RunDefaultFields::default()
+            },
+        )]);
+        assert_eq!(cache.apply_chain("etl", Some(mins(60))), Some(mins(120)));
+        assert_eq!(cache.apply_chain("etl", None), Some(mins(120)));
+        assert_eq!(
+            cache.apply_chain("other", Some(mins(60))),
+            Some(mins(60)),
+            "another type keeps its code value"
+        );
+        assert_eq!(
+            cache.apply("etl", Some(mins(30)), Some(mins(10))),
+            (Some(mins(30)), Some(mins(10))),
+            "a chain override leaves the per-run fields alone"
+        );
+    }
+
+    #[test]
+    fn a_never_loaded_cache_returns_the_code_chain_value() {
+        let cache = RunDefaultsCache::new();
+        assert_eq!(cache.apply_chain("etl", Some(mins(60))), Some(mins(60)));
+        assert_eq!(cache.apply_chain("etl", None), None);
+    }
+
+    #[test]
+    fn a_chain_only_override_is_not_empty() {
+        let fields = RunDefaultFields {
+            chain_execution_timeout: Some(mins(5)),
+            ..RunDefaultFields::default()
+        };
+        assert!(!fields.is_empty());
+        let cache = RunDefaultsCache::new();
+        cache.write_through("etl", fields);
+        assert_eq!(cache.get("etl"), Some(fields));
+    }
+
+    #[test]
+    fn patch_merge_keeps_the_chain_field_it_does_not_name() {
+        let base = RunDefaultFields {
+            execution_timeout: Some(mins(60)),
+            sla: Some(mins(5)),
+            chain_execution_timeout: Some(mins(600)),
+        };
+        let clear_sla = RunDefaultPatch {
+            sla: Some(None),
+            ..RunDefaultPatch::default()
+        };
+        assert_eq!(
+            clear_sla.merge(base).chain_execution_timeout,
+            Some(mins(600))
+        );
+        let clear_chain = RunDefaultPatch {
+            chain_execution_timeout: Some(None),
+            ..RunDefaultPatch::default()
+        };
+        assert_eq!(
+            clear_chain.merge(base),
+            RunDefaultFields {
+                chain_execution_timeout: None,
+                ..base
+            }
+        );
+    }
+
+    #[test]
     fn patch_merge_sets_clears_and_keeps() {
         let base = RunDefaultFields {
             execution_timeout: Some(mins(60)),
             sla: Some(mins(5)),
+            ..RunDefaultFields::default()
         };
         let patch = RunDefaultPatch {
             sla: Some(None),
@@ -705,12 +831,14 @@ mod tests {
             RunDefaultFields {
                 execution_timeout: Some(mins(60)),
                 sla: None,
+                ..RunDefaultFields::default()
             }
         );
         assert!(
             RunDefaultPatch {
                 execution_timeout: Some(None),
                 sla: Some(None),
+                ..RunDefaultPatch::default()
             }
             .merge(base)
             .is_empty()

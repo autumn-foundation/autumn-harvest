@@ -1,10 +1,13 @@
-# Runtime SLA and execution-timeout overrides
+# Runtime SLA, execution-timeout and chain-cap overrides
 
-A workflow type declares its soft `sla` and its hard `execution_timeout` in
-code, through `#[workflow(sla = ..., execution_timeout = ...)]`. A DAG declares
-them through `#[dag(...)]` or `DagInfo`, and its runs take them through its
-shadow workflow type of the same name. An operator override changes them at
-runtime, with no restart and no deploy (issue #2387, epic #2384).
+A workflow type declares its soft `sla`, its hard `execution_timeout` and its
+chain cap `chain_execution_timeout` in code, through
+`#[workflow(sla = ..., execution_timeout = ..., chain_execution_timeout = ...)]`.
+A DAG declares `sla` and `execution_timeout` through `#[dag(...)]` or
+`DagInfo`, and its runs take them through its shadow workflow type of the
+same name. A DAG declares no chain cap. An operator override changes these
+values at runtime, with no restart and no deploy (issues #2387 and #2406,
+epic #2384).
 
 ## Quick reference
 
@@ -19,6 +22,11 @@ curl -X PATCH https://<host>/api/harvest/admin/workflow-types/nightly_etl/run-de
 curl -X PATCH https://<host>/api/harvest/admin/workflow-types/nightly_etl/run-defaults \
      -H 'Content-Type: application/json' \
      -d '{"sla_secs": 300, "recompute_in_flight": true}'
+
+# Give new continue-as-new chains of a poller a 7-day cap.
+curl -X PATCH https://<host>/api/harvest/admin/workflow-types/inbox_poller/run-defaults \
+     -H 'Content-Type: application/json' \
+     -d '{"chain_execution_timeout_secs": 604800, "reason": "INC-4822"}'
 
 # Return the SLA to its code value, and keep any timeout override.
 curl -X PATCH https://<host>/api/harvest/admin/workflow-types/nightly_etl/run-defaults \
@@ -43,6 +51,7 @@ Both routes need the admin role. Each `PATCH` writes one
 |-------|---------|
 | `sla_secs` | The soft SLA in whole seconds, from 1 to 3153600000 (100 years). A breach is reported. It never ends a run. |
 | `execution_timeout_secs` | The hard execution timeout in whole seconds, from 1 to 3153600000 (100 years). A run past it is ended. |
+| `chain_execution_timeout_secs` | The cap of a new continue-as-new chain in whole seconds, from 1 to 3153600000 (100 years). A chain past it is ended. Refused for a DAG. |
 | `clear_override` | `true` deletes the stored override before the other fields merge. |
 | `reason` | Free text stored with the override. |
 | `recompute_in_flight` | `true` moves the SLA deadline of the runs in flight. Default `false`. |
@@ -66,6 +75,8 @@ The start clamps still apply after the override:
   So an override of `execution_timeout_secs: 600` on a type declared
   `sla = 3h` gives new runs a 10-minute SLA.
 - The fleet ceiling `max_workflow_execution_timeout` still caps the timeout.
+- The fleet chain ceiling `max_workflow_chain_timeout` still caps the chain
+  cap. A type with no chain cap takes the ceiling as its default, as before.
 - A per-start `sla_secs` or `execution_timeout_secs` in the start request
   still wins over both.
 
@@ -89,10 +100,19 @@ Each process holds a copy in memory, and a start never queries the table.
 
 A change applies to new runs only, by default. A continue-as-new successor of
 the same type keeps the values of its run. A successor of a different type is
-a new run of that type, so it takes the override.
+a new run of that type, so it takes the override of `sla` and
+`execution_timeout`.
 
-`recompute_in_flight: true` moves the SLA deadline of every RUNNING,
-SUSPENDED or PAUSED run of the type that has not breached yet, on every shard:
+A chain cap applies to the next chain that starts. A chain starts at a root
+run or a child run. Each continue-as-new successor copies the stored
+`chain_deadline_at` of its chain, also a successor of a different type. So a
+chain in flight keeps its chain deadline, and no option moves it. A shorter
+deadline could end a chain at once. To end a chain early, cancel or terminate
+its current run.
+
+`recompute_in_flight: true` moves the SLA deadline only. It moves the SLA
+deadline of every RUNNING, SUSPENDED or PAUSED run of the type that has not
+breached yet, on every shard:
 
 - The run keeps its anchor. The new deadline is the old deadline minus the
   old SLA, plus the new one. A run with no SLA so far anchors at its start.

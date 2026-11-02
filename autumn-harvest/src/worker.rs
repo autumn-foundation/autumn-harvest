@@ -1101,6 +1101,33 @@ impl HandlerRegistry {
             .apply(workflow_name, execution_timeout, sla)
     }
 
+    /// The effective chain cap of a registered workflow type (issue #2406).
+    ///
+    /// An operator override wins over the declared value. Every start of a
+    /// new chain resolves its chain cap here, or through
+    /// [`Self::apply_chain_run_default`]. The start then applies the fleet
+    /// chain ceiling. The call reads memory only.
+    #[must_use]
+    pub fn chain_execution_timeout(&self, workflow_name: &str) -> Option<std::time::Duration> {
+        let declared = self
+            .workflows
+            .get(workflow_name)
+            .and_then(|info| info.chain_execution_timeout);
+        self.apply_chain_run_default(workflow_name, declared)
+    }
+
+    /// Apply the chain cap override to a declared value (issue #2406).
+    ///
+    /// A start path that already holds the declared value calls this.
+    #[must_use]
+    pub fn apply_chain_run_default(
+        &self,
+        workflow_name: &str,
+        declared: Option<std::time::Duration>,
+    ) -> Option<std::time::Duration> {
+        self.run_defaults.apply_chain(workflow_name, declared)
+    }
+
     /// Attach the large-payload offloader (issue #524).
     #[must_use]
     pub fn with_payload_offloader(
@@ -1879,6 +1906,40 @@ mod resolve_dispatch_deadline_tests {
                 max_execution_timeout_ceiling: Some(chrono::Duration::seconds(3600)),
             }
         );
+    }
+
+    /// Issue #2406: the operator override of the chain cap wins over the
+    /// declared value. A field that the override does not set inherits it.
+    #[test]
+    fn the_chain_override_wins_over_the_declared_value() {
+        let hour = std::time::Duration::from_secs(3600);
+        let mut declared = deadline_info_fixture("wf", None, None);
+        declared.chain_execution_timeout = Some(hour);
+        let registry = HandlerRegistry::new(vec![declared], vec![]);
+        assert_eq!(registry.chain_execution_timeout("wf"), Some(hour));
+
+        registry.run_defaults().write_through(
+            "wf",
+            crate::run_defaults::RunDefaultFields {
+                chain_execution_timeout: Some(2 * hour),
+                ..crate::run_defaults::RunDefaultFields::default()
+            },
+        );
+        assert_eq!(registry.chain_execution_timeout("wf"), Some(2 * hour));
+        assert_eq!(registry.apply_chain_run_default("wf", None), Some(2 * hour));
+        assert_eq!(registry.chain_execution_timeout("unregistered"), None);
+
+        // A child is a new chain, so it takes the override too.
+        let child = resolve_child_workflow_defaults(&registry, "wf");
+        assert_eq!(
+            child.chain_execution_timeout,
+            chrono::Duration::from_std(2 * hour).ok()
+        );
+
+        registry
+            .run_defaults()
+            .write_through("wf", crate::run_defaults::RunDefaultFields::default());
+        assert_eq!(registry.chain_execution_timeout("wf"), Some(hour));
     }
 
     /// A DAG's shadow `WorkflowInfo` resolves through the exact same code
@@ -13593,30 +13654,22 @@ fn resolve_child_workflow_defaults(
     workflow_name: &str,
 ) -> ChildWorkflowDefaults {
     let child_wf_info = registry.workflows.get(workflow_name);
-    let (
-        owner,
-        runbook_url,
-        severity,
-        sla,
-        execution_timeout,
-        chain_execution_timeout,
-        retry_policy,
-        quota,
-    ) = child_wf_info.map_or((None, None, None, None, None, None, None, None), |w| {
-        (
-            w.owner,
-            w.runbook_url,
-            w.severity,
-            w.sla,
-            w.execution_timeout,
-            w.chain_execution_timeout,
-            w.retry_policy.clone(),
-            w.quota,
-        )
-    });
-    // Issue #2387: an operator override wins over the declared value.
+    let (owner, runbook_url, severity, sla, execution_timeout, retry_policy, quota) = child_wf_info
+        .map_or((None, None, None, None, None, None, None), |w| {
+            (
+                w.owner,
+                w.runbook_url,
+                w.severity,
+                w.sla,
+                w.execution_timeout,
+                w.retry_policy.clone(),
+                w.quota,
+            )
+        });
+    // Issues #2387 and #2406: an operator override wins over the declared value.
     let (execution_timeout, sla) =
         registry.apply_run_defaults(workflow_name, execution_timeout, sla);
+    let chain_execution_timeout = registry.chain_execution_timeout(workflow_name);
     let execution_timeout = execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
     let sla = sla.and_then(|d| chrono::Duration::from_std(d).ok());
     let deadline_at = execution_timeout.map(|d| chrono::Utc::now() + d);

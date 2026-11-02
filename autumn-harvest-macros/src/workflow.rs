@@ -1134,10 +1134,14 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Shared by `start_with_options` and `signal_with_start` below, which
     // read both fields identically (see `optional_chrono_duration_tokens`'s
-    // doc comment).
+    // doc comment). An operator override in the client cache wins over the
+    // declared value (issue #2387).
     let stub_execution_timeout_tokens = crate::attr_util::optional_chrono_duration_tokens(
         "execution_timeout",
-        &quote! { opts.execution_timeout.or(info.execution_timeout) },
+        &quote! {
+            opts.execution_timeout
+                .or(client.apply_run_defaults(info.name, info.execution_timeout, info.sla).0)
+        },
     );
     let stub_max_execution_timeout_ceiling_tokens =
         crate::attr_util::optional_chrono_duration_tokens(
@@ -1145,10 +1149,11 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             &quote! { client.max_workflow_execution_timeout() },
         );
     // `start_with_options`-only (issue #617): `signal_with_start` and
-    // `update.rs`'s `update_with_start` pass `None` for both instead.
+    // `update.rs`'s `update_with_start` pass `None` for both instead. The
+    // operator override of the chain cap wins (issue #2406).
     let stub_chain_execution_timeout_tokens = crate::attr_util::optional_chrono_duration_tokens(
         "chain_execution_timeout",
-        &quote! { info.chain_execution_timeout },
+        &quote! { client.apply_chain_run_default(info.name, info.chain_execution_timeout) },
     );
     let stub_max_workflow_chain_timeout_ceiling_tokens =
         crate::attr_util::optional_chrono_duration_tokens(
@@ -1323,7 +1328,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         runbook_url: info.runbook_url,
                         severity: info.severity,
                         context_headers: opts.context_headers,
-                        sla: opts.sla.or(info.sla).and_then(|d|
+                        sla: opts.sla
+                            .or(client.apply_run_defaults(info.name, info.execution_timeout, info.sla).1)
+                            .and_then(|d|
                             ::autumn_harvest::chrono::Duration::from_std(d).ok()
                         ),
                         workflow_retry_policy: info.retry_policy.clone(),
@@ -1426,7 +1433,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         runbook_url: info.runbook_url,
                         severity: info.severity,
                         context_headers: opts.context_headers,
-                        sla: opts.sla.or(info.sla).and_then(|d|
+                        sla: opts.sla
+                            .or(client.apply_run_defaults(info.name, info.execution_timeout, info.sla).1)
+                            .and_then(|d|
                             ::autumn_harvest::chrono::Duration::from_std(d).ok()
                         ),
                         // Typed stubs already reject debounced workflows up front.

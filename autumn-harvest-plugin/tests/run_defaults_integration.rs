@@ -44,6 +44,9 @@ use uuid::Uuid;
 const WF: &str = "nightly_etl";
 const OTHER_WF: &str = "hourly_report";
 const THREE_HOURS: Duration = Duration::from_secs(3 * 3600);
+/// A type that declares `chain_execution_timeout = 1h` in code (issue #2406).
+const CHAIN_WF: &str = "looping_poller";
+const HOUR: Duration = Duration::from_secs(3600);
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
@@ -104,12 +107,16 @@ fn info(name: &'static str, sla: Option<Duration>) -> WorkflowInfo {
     }
 }
 
-/// Both types declare `sla = 3h` in code.
+/// `WF` and `OTHER_WF` declare `sla = 3h` in code. `CHAIN_WF` declares a
+/// one-hour chain cap.
 fn registry() -> Arc<HandlerRegistry> {
+    let mut chain = info(CHAIN_WF, None);
+    chain.chain_execution_timeout = Some(HOUR);
     Arc::new(HandlerRegistry::new(
         vec![
             info(WF, Some(THREE_HOURS)),
             info(OTHER_WF, Some(THREE_HOURS)),
+            chain,
         ],
         vec![],
     ))
@@ -120,7 +127,47 @@ fn build_app(pool: &DbPool) -> axum::Router {
 }
 
 fn build_app_with_admin(pool: &DbPool, admin: bool) -> axum::Router {
+    build_app_with(pool, admin, None)
+}
+
+fn build_app_with(pool: &DbPool, admin: bool, chain_ceiling: Option<Duration>) -> axum::Router {
+    build_app_from(pool, admin, chain_ceiling, DagCatalog::default())
+}
+
+/// A DAG named `DAG` with no declared durations.
+const DAG: &str = "nightly_dag";
+
+fn dag_catalog() -> DagCatalog {
+    autumn_harvest::compile_dag_catalog(vec![autumn_harvest::info::DagInfo {
+        name: DAG,
+        module: "run_defaults_integration",
+        schedule: Some(autumn_harvest::policy::Schedule::Manual),
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: None,
+        builder: |_dag| {},
+        workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        mcp: false,
+        execution_timeout: None,
+        sla: None,
+    }])
+    .expect("dag compiles")
+}
+
+fn build_app_from(
+    pool: &DbPool,
+    admin: bool,
+    chain_ceiling: Option<Duration>,
+    dags: DagCatalog,
+) -> axum::Router {
     let api_state = HarvestApiState::new();
+    api_state.set_max_workflow_chain_timeout(chain_ceiling);
     // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.set_admin_auth_boundary(admin);
@@ -128,7 +175,7 @@ fn build_app_with_admin(pool: &DbPool, admin: bool) -> axum::Router {
     api_state.install(
         HarvestApiRuntime::new(
             registry(),
-            Arc::new(DagCatalog::default()),
+            Arc::new(dags),
             Arc::new(Vec::new()),
             Some("api-only".to_string()),
             vec!["default".to_string()],
@@ -521,4 +568,207 @@ async fn the_override_list_requires_admin_auth() {
     let app = build_app_with_admin(&build_test_pool(&url), false);
     let (status, _) = request_json(&app, "GET", "/admin/overrides", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// The chain cap of one run, from `started_at` to `chain_deadline_at`.
+async fn chain_cap(url: &str, id: Uuid) -> (Option<chrono::Duration>, Option<chrono::Duration>) {
+    use harvest_workflow_executions::dsl;
+    let mut conn = connect(url).await;
+    let (started_at, timeout, deadline) = harvest_workflow_executions::table
+        .find(id)
+        .select((
+            dsl::started_at,
+            harvest_workflow_executions_ext::chain_execution_timeout,
+            harvest_workflow_executions_ext::chain_deadline_at,
+        ))
+        .first::<(
+            DateTime<Utc>,
+            Option<chrono::Duration>,
+            Option<DateTime<Utc>>,
+        )>(&mut conn)
+        .await
+        .expect("load execution");
+    (timeout, deadline.map(|at| whole_secs(started_at, at)))
+}
+
+/// Issue #2406 AC1: an override of the chain cap applies to the next chain
+/// that starts. A run that started before it keeps its stored deadline.
+#[tokio::test]
+async fn a_chain_override_applies_to_the_next_chain() {
+    let (url, _container) = setup_test_database_url().await;
+    let app = build_app(&build_test_pool(&url));
+
+    let before = start(&app, CHAIN_WF).await;
+    let stored_before = chain_cap(&url, before).await;
+    assert_eq!(stored_before, (secs(3600), secs(3600)));
+
+    let (status, body) = patch(
+        &app,
+        CHAIN_WF,
+        json!({ "chain_execution_timeout_secs": 7200, "reason": "longer backfill" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["code"]["chain_execution_timeout_secs"], json!(3600));
+    assert_eq!(
+        body["override"]["chain_execution_timeout_secs"],
+        json!(7200)
+    );
+    assert_eq!(
+        body["effective"]["chain_execution_timeout_secs"],
+        json!(7200)
+    );
+    assert_eq!(body["override"]["sla_secs"], Value::Null, "{body}");
+
+    let after = start(&app, CHAIN_WF).await;
+    assert_eq!(chain_cap(&url, after).await, (secs(7200), secs(7200)));
+    assert_eq!(
+        chain_cap(&url, before).await,
+        stored_before,
+        "a chain in flight keeps its stored deadline"
+    );
+
+    // The override is per type.
+    let other = start(&app, WF).await;
+    assert_eq!(chain_cap(&url, other).await, (None, None));
+
+    let (status, body) = request_json(&app, "GET", &route(CHAIN_WF), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["effective"]["chain_execution_timeout_secs"],
+        json!(7200)
+    );
+
+    // `recompute_in_flight` moves the SLA only. The chain deadline stays.
+    let (status, body) = patch(&app, CHAIN_WF, json!({ "recompute_in_flight": true })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(chain_cap(&url, before).await, stored_before);
+}
+
+/// Issue #2406 AC1: a type that declares no chain cap takes one from the
+/// override.
+#[tokio::test]
+async fn a_chain_override_sets_a_cap_that_code_leaves_unset() {
+    let (url, _container) = setup_test_database_url().await;
+    let app = build_app(&build_test_pool(&url));
+
+    let (status, body) = patch(&app, WF, json!({ "chain_execution_timeout_secs": 600 })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["code"]["chain_execution_timeout_secs"], Value::Null);
+    let id = start(&app, WF).await;
+    assert_eq!(chain_cap(&url, id).await, (secs(600), secs(600)));
+    // The SLA keeps its code value.
+    assert_eq!(deadlines(&url, id).await.sla(), secs(3 * 3600));
+}
+
+/// Issue #2406 AC2: the fleet chain ceiling still caps the override.
+#[tokio::test]
+async fn the_fleet_chain_ceiling_caps_the_override() {
+    let (url, _container) = setup_test_database_url().await;
+    let app = build_app_with(&build_test_pool(&url), true, Some(2 * HOUR));
+
+    let (status, body) = patch(
+        &app,
+        CHAIN_WF,
+        json!({ "chain_execution_timeout_secs": 10 * 3600 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let capped = start(&app, CHAIN_WF).await;
+    assert_eq!(chain_cap(&url, capped).await, (secs(7200), secs(7200)));
+
+    // An override below the ceiling is kept.
+    patch(
+        &app,
+        CHAIN_WF,
+        json!({ "chain_execution_timeout_secs": 1800 }),
+    )
+    .await;
+    let below = start(&app, CHAIN_WF).await;
+    assert_eq!(chain_cap(&url, below).await, (secs(1800), secs(1800)));
+}
+
+/// Issue #2406 AC3: clearing the override restores the code value.
+#[tokio::test]
+async fn clearing_the_chain_override_restores_the_code_value() {
+    let (url, _container) = setup_test_database_url().await;
+    let app = build_app(&build_test_pool(&url));
+
+    patch(
+        &app,
+        CHAIN_WF,
+        json!({ "chain_execution_timeout_secs": 7200, "sla_secs": 60 }),
+    )
+    .await;
+
+    // A null returns the chain cap to code and keeps the other field.
+    let (status, body) = patch(
+        &app,
+        CHAIN_WF,
+        json!({ "chain_execution_timeout_secs": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["override"]["chain_execution_timeout_secs"],
+        Value::Null,
+        "{body}"
+    );
+    assert_eq!(body["override"]["sla_secs"], json!(60), "{body}");
+    assert_eq!(
+        body["effective"]["chain_execution_timeout_secs"],
+        json!(3600)
+    );
+    let id = start(&app, CHAIN_WF).await;
+    assert_eq!(chain_cap(&url, id).await, (secs(3600), secs(3600)));
+
+    // `clear_override` deletes the whole row.
+    patch(
+        &app,
+        CHAIN_WF,
+        json!({ "chain_execution_timeout_secs": 7200 }),
+    )
+    .await;
+    let (status, body) = patch(&app, CHAIN_WF, json!({ "clear_override": true })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["override"], Value::Null, "{body}");
+    let id = start(&app, CHAIN_WF).await;
+    assert_eq!(chain_cap(&url, id).await, (secs(3600), secs(3600)));
+}
+
+/// Issue #2406: the chain cap takes the bound of the other fields.
+#[tokio::test]
+async fn a_chain_cap_out_of_bounds_is_a_400() {
+    let (url, _container) = setup_test_database_url().await;
+    let app = build_app(&build_test_pool(&url));
+    for value in [json!(0), json!(3_153_600_001_u64), json!(-1)] {
+        let (status, body) = patch(
+            &app,
+            CHAIN_WF,
+            json!({ "chain_execution_timeout_secs": value }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}: {body}");
+    }
+}
+
+/// Issue #2406: a DAG declares no chain cap, so the route refuses one. Its
+/// other fields still take an override.
+#[tokio::test]
+async fn a_dag_refuses_a_chain_cap() {
+    let (url, _container) = setup_test_database_url().await;
+    let app = build_app_from(&build_test_pool(&url), true, None, dag_catalog());
+
+    let (status, body) = patch(&app, DAG, json!({ "chain_execution_timeout_secs": 600 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = patch(&app, DAG, json!({ "sla_secs": 600 })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["code"]["chain_execution_timeout_secs"], Value::Null);
+    let (status, body) = patch(&app, DAG, json!({ "chain_execution_timeout_secs": null })).await;
+    assert_eq!(status, StatusCode::OK, "a null sets no chain cap: {body}");
+
+    let mut conn = connect(&url).await;
+    let mut statuses = audit_statuses(&mut conn).await;
+    statuses.sort();
+    assert_eq!(statuses, ["failed", "succeeded", "succeeded"]);
 }
