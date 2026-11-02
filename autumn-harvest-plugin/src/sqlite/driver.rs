@@ -150,6 +150,21 @@ pub struct StopAck {
     pub newly: bool,
 }
 
+/// A signal by business key, with the run that the key resolved to
+/// (issue #2489).
+///
+/// The driver resolves the key and delivers the signal in one command, so
+/// no other write runs between them. The answer then names the run that
+/// governed the delivery.
+#[derive(Debug)]
+pub struct KeyedSignal {
+    /// The run that the key resolved to: the running run of the key, or
+    /// else the newest, as on Postgres. `None` when the key has no run.
+    pub resolved: Option<ExecutionId>,
+    /// The delivery, or the refusal.
+    pub delivery: SqliteResult<SignalDelivery>,
+}
+
 /// An update that the driver ran on a run (issue #2489).
 #[derive(Debug, Clone)]
 pub struct RoutedUpdate {
@@ -184,7 +199,7 @@ pub enum Command {
         name: String,
         payload: Value,
         idempotency_key: Option<String>,
-        reply: oneshot::Sender<SqliteResult<SignalDelivery>>,
+        reply: oneshot::Sender<KeyedSignal>,
     },
     Cancel {
         exec: ExecutionId,
@@ -386,6 +401,7 @@ async fn handle(runtime: &mut SqliteRuntime, command: Command) {
             idempotency_key,
             reply,
         } => {
+            let resolved = resolve_key(runtime, &workflow_name, &workflow_id);
             let delivery = signal_by_workflow_id(
                 runtime,
                 &workflow_name,
@@ -394,7 +410,7 @@ async fn handle(runtime: &mut SqliteRuntime, command: Command) {
                 payload,
                 idempotency_key.as_deref(),
             );
-            let _ = reply.send(delivery);
+            let _ = reply.send(KeyedSignal { resolved, delivery });
         }
         Command::Cancel {
             exec,
@@ -505,6 +521,31 @@ fn signal_with_start(
         idempotency_key: request.idempotency_key.as_deref(),
     })?;
     Ok(Started::read(runtime, outcome.exec_id, outcome))
+}
+
+/// The run of a `(workflow_name, workflow_id)` key: the running run, or else
+/// the newest, as on Postgres. `None` when the key has no run or the read
+/// fails. The answer then carries no header, and the signal reports the
+/// error.
+fn resolve_key(
+    runtime: &SqliteRuntime,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> Option<ExecutionId> {
+    let key = autumn_harvest_sqlite::ExecutionFilter::new()
+        .workflow_name(workflow_name.to_owned())
+        .workflow_id(workflow_id.to_owned())
+        .limit(1);
+    [key.clone().state("RUNNING"), key]
+        .iter()
+        .find_map(|filter| {
+            runtime
+                .list_executions(filter)
+                .ok()?
+                .executions
+                .first()
+                .and_then(autumn_harvest_sqlite::ExecutionSummary::execution_id)
+        })
 }
 
 /// Signal the run of a `(workflow_name, workflow_id)` key.

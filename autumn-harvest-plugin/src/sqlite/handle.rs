@@ -19,8 +19,8 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use super::driver::{
-    Command, MAX_CHAIN_HOPS, MAX_RETRY_HOPS, RoutedSignal, RoutedUpdate, SignalWithStartParams,
-    Started, StopAck,
+    Command, KeyedSignal, MAX_CHAIN_HOPS, MAX_RETRY_HOPS, RoutedSignal, RoutedUpdate,
+    SignalWithStartParams, Started, StopAck,
 };
 
 /// Why a [`HarvestSqlite`] call failed.
@@ -353,22 +353,43 @@ impl HarvestSqlite {
         payload: Value,
         idempotency_key: Option<String>,
     ) -> Result<SignalDelivery, HarvestSqliteError> {
+        Self::lift(
+            self.signal_by_key(workflow_name, workflow_id, name, payload, idempotency_key)
+                .await?
+                .delivery,
+        )
+    }
+
+    /// [`signal_by_workflow_id`](Self::signal_by_workflow_id), with the run
+    /// that the key resolved to in the same driver command.
+    pub(crate) async fn signal_by_key(
+        &self,
+        workflow_name: &str,
+        workflow_id: &str,
+        name: &str,
+        payload: Value,
+        idempotency_key: Option<String>,
+    ) -> Result<KeyedSignal, HarvestSqliteError> {
         let (workflow_name, workflow_id, name) = (
             workflow_name.to_owned(),
             workflow_id.to_owned(),
             name.to_owned(),
         );
-        Self::lift(
-            self.call(|reply| Command::SignalByWorkflowId {
-                workflow_name,
-                workflow_id,
-                name,
-                payload,
-                idempotency_key,
-                reply,
-            })
-            .await?,
-        )
+        self.call(|reply| Command::SignalByWorkflowId {
+            workflow_name,
+            workflow_id,
+            name,
+            payload,
+            idempotency_key,
+            reply,
+        })
+        .await
+    }
+
+    /// Lift a runtime refusal, as each write does. A by-id route calls it
+    /// after it reads the resolved run.
+    pub(crate) fn lift_reply<T>(reply: Result<T, SqliteError>) -> Result<T, HarvestSqliteError> {
+        Self::lift(reply)
     }
 
     /// Ask a run to cancel. The next drive replays it with the reason set.

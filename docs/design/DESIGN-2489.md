@@ -70,6 +70,8 @@ These stay a documented subset:
 - A list row carries the fields that this backend stores. `workflow_id` and
   `workflow_id_prefix` are SQLite filters.
 - `/health` adds `backend` and `path`.
+- A cancel or a terminate cuts its trimmed reason to 500 characters, so a
+  request cannot store a large reason. Postgres keeps the whole reason.
 - A cancel or a terminate body has no `failed_task_count`. This backend
   deletes the pending tasks. It does not mark them failed.
 

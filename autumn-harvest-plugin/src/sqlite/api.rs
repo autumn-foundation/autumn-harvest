@@ -1100,18 +1100,29 @@ async fn signal_by_id(
         Err(response) => return Ok(*response),
     };
     let payload: Value = optional_body::<Option<Value>>(&body)?.unwrap_or(Value::Null);
+    if workflow_id.is_empty() {
+        return Err(AutumnError::bad_request_msg(
+            "workflow_id must not be empty",
+        ));
+    }
     let handle = state.handle()?;
     // `execution_id` and the header name the run that the key resolves to,
-    // as on Postgres (issue #805). The run that took the signal can differ:
-    // a failed run hands it to its live retry (issue #843).
-    let resolved = resolve_key(handle, &workflow_name, &workflow_id).await?;
-    let delivery = match handle
-        .signal_by_workflow_id(&workflow_name, &workflow_id, &signal_name, payload, key)
+    // as on Postgres (issue #805). The driver resolves it in the command that
+    // delivers, so the answer names the run that governed the delivery. The
+    // run that took the signal can differ: a failed run hands it to its live
+    // retry (issue #843).
+    let keyed = handle
+        .signal_by_key(&workflow_name, &workflow_id, &signal_name, payload, key)
         .await
-    {
-        Ok(delivery) => delivery,
-        Err(error) => return Ok(with_execution_id(signal_error(error), resolved)),
+        .map_err(map_error)?;
+    let delivery = match (HarvestSqlite::lift_reply(keyed.delivery), keyed.resolved) {
+        (Ok(delivery), _) => delivery,
+        (Err(error), Some(resolved)) => {
+            return Ok(with_execution_id(signal_error(error), resolved));
+        }
+        (Err(error), None) => return Ok(signal_error(error)),
     };
+    let resolved = keyed.resolved.unwrap_or(delivery.exec_id);
     let mut ack = json!({
         "execution_id": resolved.to_string(),
         "ok": true,
@@ -1151,10 +1162,10 @@ async fn cancel(
 ) -> Result<(StatusCode, Json<Value>), AutumnError> {
     let exec = parse_exec(&id)?;
     let ReasonBody { reason } = optional_body(&body)?;
-    // The runtime trims the reason and applies the default, as on Postgres.
+    let reason = capped_reason(reason.as_deref());
     let ack = state
         .handle()?
-        .cancel(exec, reason.as_deref().unwrap_or_default())
+        .cancel(exec, &reason)
         .await
         .map_err(map_error)?;
     let deferred = ack.state == "RUNNING";
@@ -1173,15 +1184,27 @@ async fn terminate(
 ) -> Result<(StatusCode, Json<Value>), AutumnError> {
     let exec = parse_exec(&id)?;
     let ReasonBody { reason } = optional_body(&body)?;
+    let reason = capped_reason(reason.as_deref());
     let ack = state
         .handle()?
-        .terminate(exec, reason.as_deref().unwrap_or_default())
+        .terminate(exec, &reason)
         .await
         .map_err(map_error)?;
     Ok((
         StatusCode::ACCEPTED,
         Json(stop_json(&ack, "newly_terminated", None)),
     ))
+}
+
+/// The reason of a cancel or a terminate, trimmed, then cut to the
+/// operator-reason cap.
+///
+/// The run keeps the reason in its cancel state and in history. The cap
+/// bounds that storage. Postgres stores the whole reason. The trim runs
+/// first, so a reason with long leading white space still keeps its text.
+/// The runtime gives an empty reason its default.
+fn capped_reason(reason: Option<&str>) -> String {
+    crate::api::truncate_operator_reason(reason.unwrap_or_default().trim())
 }
 
 /// The Postgres body of a cancel or a terminate.
@@ -1488,6 +1511,11 @@ mod tests {
             Some("k2")
         );
         assert!(idempotency_key(&none, Some("other=1")).is_err());
+        let padded = format!("{}why", " ".repeat(600));
+        assert_eq!(capped_reason(Some(&padded)), "why");
+        let long = "x".repeat(600);
+        assert_eq!(capped_reason(Some(&long)).chars().count(), 500);
+        assert_eq!(capped_reason(None), "");
         // The engine owns the `conn:` namespace, as on Postgres.
         let reserved = idempotency_key(&none, Some("idempotency_key=conn:x")).unwrap_err();
         assert_eq!(reserved.status(), StatusCode::BAD_REQUEST);
