@@ -300,9 +300,9 @@ impl ResponseCache {
     /// The key of `request` for `model_id`, as seen by `tenant`.
     ///
     /// The key is the SHA-256 hash of one JSON document. The document holds
-    /// the namespace, the scope, the tenant and its source, the model id,
-    /// the output cap, the temperature, the tools, the messages and the
-    /// draw. Under [`CacheScope::Shared`] it holds no tenant.
+    /// the namespace, the scope, the tenant and its source, and the model id.
+    /// It also holds the output cap, the temperature, the tools, the messages
+    /// and the draw. Under [`CacheScope::Shared`] it holds no tenant.
     ///
     /// The document holds the draw only when the request has one (issue
     /// #2440). A request with no draw then keeps the key it had before

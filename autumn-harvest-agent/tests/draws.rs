@@ -115,8 +115,8 @@ async fn replays(rt: &SqliteRuntime, exec: ExecutionId) {
     }
 }
 
-// AC: with the cache on, a 3-draw run against a model that answers "a",
-// "b", "c" in order gets three different answers and makes three calls.
+// AC: a 3-draw run with the cache on gets three different answers. The
+// model answers "a", "b", "c" in order, and it gets three calls.
 #[tokio::test(flavor = "multi_thread")]
 async fn three_draws_with_the_cache_on_get_three_answers_from_three_calls() {
     let (_dir, db) = fresh_db();
