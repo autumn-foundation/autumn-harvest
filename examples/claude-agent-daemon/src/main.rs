@@ -478,7 +478,7 @@ fn breaks_one_line(character: char) -> bool {
 }
 
 /// Would a terminal act on this character rather than print it?
-fn is_obeyed(character: char) -> bool {
+const fn is_obeyed(character: char) -> bool {
     // The Unicode `Bidi_Control` property, in full: the marks, the embeddings
     // and overrides, and the isolates.
     let bidi = matches!(character,

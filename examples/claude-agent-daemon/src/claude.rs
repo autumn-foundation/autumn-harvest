@@ -37,7 +37,7 @@ pub const DEFAULT_MODEL: &str = "claude-opus-5";
 /// The default output cap for a non-streaming request.
 pub const DEFAULT_MAX_TOKENS: u32 = 16_000;
 /// The request timeout. It sits under the activity `start_to_close` budget.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(840);
+const HTTP_TIMEOUT: Duration = Duration::from_mins(14);
 
 /// Everything the model activity needs.
 pub struct ModelConfig {
