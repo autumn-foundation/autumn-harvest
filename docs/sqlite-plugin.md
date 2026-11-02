@@ -166,6 +166,8 @@ sequenceDiagram
   its `-wal`, `-shm` and `-journal` sidecars. The `.lock` file stays.
 - **No fleet, no boot.** The boot fails when the app has no
   `[database.fleet]`.
+- **Shutdown.** The plugin's shutdown hook releases the shared registry, so
+  a stopped app frees its state. Tenants that open after it get no driver.
 
 App code reaches a tenant through `HarvestFleet`, an `AppState` extension
 and an axum extractor:
@@ -194,7 +196,9 @@ while any clone of it lives. The fleet owns the tenant driver:
 `{path}/tenants/{key}/..`. `{key}` is the routing key. For example,
 `POST /harvest/tenants/acme/workflows/process_order/start`. These routes
 never create a tenant, whatever `create_on_demand` says. A tenant that does
-not exist is `404`. The fleet rules the rest: a bad key is `400` and a tenant
+not exist is `404`. A route opens its tenant as background work: it never
+goes past `max_open` and never evicts a tenant that the app uses. A full
+fleet is `503`. The fleet rules the rest: a bad key is `400` and a tenant
 in a delete is `410`. Without `sqlite_per_tenant()` they answer `404`.
 
 The auth layer and the #1802 mutation gate cover these routes too. The gate

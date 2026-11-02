@@ -72,6 +72,8 @@ struct Slot {
     code_path: Option<PathBuf>,
     /// Whether to run one Harvest per open fleet tenant.
     per_tenant: bool,
+    /// The per-tenant Harvests. The shutdown hook releases them.
+    fleet: Option<HarvestFleet>,
 }
 
 struct StartParts {
@@ -130,6 +132,7 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         driver: None,
         code_path,
         per_tenant,
+        fleet: None,
     }));
     let startup_slot = Arc::clone(&slot);
     let startup_handles = handles.clone();
@@ -144,11 +147,13 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         .on_shutdown(move || {
             let slot = Arc::clone(&slot);
             async move {
-                let driver = slot
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .driver
-                    .take();
+                let (driver, fleet) = {
+                    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+                    (slot.driver.take(), slot.fleet.take())
+                };
+                if let Some(fleet) = fleet {
+                    fleet.release();
+                }
                 if let Some(driver) = driver {
                     driver.shutdown().await;
                 }
@@ -429,6 +434,7 @@ async fn start(
         let tenants = HarvestFleet::new(fleet, registry, infos, tick);
         tenants.install().await;
         state.insert_extension(tenants.clone());
+        slot.lock().unwrap_or_else(PoisonError::into_inner).fleet = Some(tenants.clone());
         let _ = handles.fleet.set(tenants);
         tracing::info!("harvest runs one SQLite file per open fleet tenant");
     }

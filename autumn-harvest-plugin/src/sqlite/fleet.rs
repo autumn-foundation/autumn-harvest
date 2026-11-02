@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use autumn_harvest::info::WorkflowInfo;
 use autumn_web::AppState;
-use autumn_web::db::fleet::{DatabaseFleet, FleetDatabase, FleetError, FleetLifecycle};
+use autumn_web::db::fleet::{DatabaseFleet, FleetDatabase, FleetLifecycle};
 use autumn_web::error::AutumnError;
 use autumn_web::fleet_layout::FleetDbKey;
 use autumn_web::reexports::axum;
@@ -106,7 +106,9 @@ enum TenantState {
 /// What every tenant driver shares.
 struct Shared {
     fleet: DatabaseFleet,
-    registry: Arc<Registry>,
+    /// `None` once [`HarvestFleet::release`] ran. The registry holds a clone
+    /// of `AppState`, which holds this fleet, so the release breaks a cycle.
+    registry: Mutex<Option<Arc<Registry>>>,
     infos: Vec<WorkflowInfo>,
     tick: Duration,
     tenants: Mutex<HashMap<FleetDbKey, Slot>>,
@@ -150,7 +152,7 @@ impl HarvestFleet {
         Self {
             shared: Arc::new(Shared {
                 fleet,
-                registry,
+                registry: Mutex::new(Some(registry)),
                 infos,
                 tick,
                 tenants: Mutex::new(HashMap::new()),
@@ -202,15 +204,22 @@ impl HarvestFleet {
     ///
     /// The management API uses it, so a request never creates a tenant,
     /// whatever the fleet's `create_on_demand`.
+    ///
+    /// It uses a background open. That open never creates a database, so a
+    /// delete that races the request cannot bring the tenant back. It never
+    /// goes past `max_open`, and it does not count as a use. So a management
+    /// read never evicts a tenant that the app uses.
     pub(crate) async fn open_existing_for(
         &self,
         routing_key: &str,
     ) -> Result<HarvestSqlite, HarvestSqliteError> {
         let key = self.shared.fleet.key_for(routing_key)?;
-        if !self.shared.fleet.exists(&key) {
-            return Err(FleetError::NotFound { name: key.name() }.into());
-        }
-        self.open(&key).await
+        let Some(background) = self.shared.fleet.open_background(&key).await? else {
+            return Err(HarvestSqliteError::Tenant(format!(
+                "the fleet has no room to open {key} now (max_open)"
+            )));
+        };
+        self.handle_for(background.db).await
     }
 
     /// The Harvest of the tenant database `key`. It opens the database when
@@ -224,10 +233,29 @@ impl HarvestFleet {
     /// As [`open_for`](Self::open_for).
     pub async fn open(&self, key: &FleetDbKey) -> Result<HarvestSqlite, HarvestSqliteError> {
         let db = self.shared.fleet.open(key).await?;
+        self.handle_for(db).await
+    }
+
+    /// Release the shared registry at shutdown. Later starts refuse.
+    ///
+    /// The registry holds a clone of `AppState`, and `AppState` holds this
+    /// fleet. Without the release, an app that stops never frees its state.
+    /// A running tenant driver keeps its own copy until the fleet closes it.
+    pub fn release(&self) {
+        *self
+            .shared
+            .registry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// The leased handle of the open database `db`.
+    async fn handle_for(&self, db: FleetDatabase) -> Result<HarvestSqlite, HarvestSqliteError> {
+        let key = db.key().clone();
         let lease = db.lease();
         let deadline = Instant::now() + START_WAIT;
         loop {
-            match self.state(key) {
+            match self.state(&key) {
                 TenantState::Running(handle) => return Ok(handle.with_lease(lease)),
                 // The fleet opened it before the lifecycle saw it.
                 TenantState::Absent => self.start_blocking(db.clone()).await?,
@@ -328,7 +356,16 @@ impl Shared {
         let path = tenant_harvest_file(db.path());
         let tokio = tokio::runtime::Handle::try_current()
             .map_err(|error| format!("no Tokio runtime to run the Harvest of {key}: {error}"))?;
-        let runtime = Driver::open(&path, &self.registry)?;
+        let registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                format!("the per-tenant Harvest has stopped, so {key} gets no driver")
+            })?;
+        let runtime = Driver::open(&path, &registry)?;
+        drop(registry);
         let reader = autumn_harvest_sqlite::SqliteReader::open(&path)
             .map_err(|error| format!("cannot open a reader on {}: {error}", path.display()))?;
         let stop = CancellationToken::new();
@@ -364,6 +401,13 @@ impl Shared {
         if ours {
             tenants.remove(key);
         }
+    }
+
+    fn released(&self) -> bool {
+        self.registry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none()
     }
 
     fn forget(&self, key: &FleetDbKey) {
@@ -416,7 +460,13 @@ struct TenantLifecycle(Weak<Shared>);
 
 impl FleetLifecycle for TenantLifecycle {
     fn on_open(&self, db: &FleetDatabase) -> Result<(), String> {
-        self.0.upgrade().map_or(Ok(()), |shared| shared.start(db))
+        match self.0.upgrade() {
+            // After the release, the app still opens its tenants. They only
+            // get no Harvest driver.
+            Some(shared) if shared.released() => Ok(()),
+            Some(shared) => shared.start(db),
+            None => Ok(()),
+        }
     }
 
     fn on_close(&self, db: &FleetDatabase) {
@@ -527,6 +577,42 @@ mod tests {
             armed: false,
         });
         assert!(shared.lock().contains_key(&key), "a finished start stays");
+    }
+
+    /// The registry holds a clone of `AppState`, and `AppState` holds the
+    /// fleet handle. A release breaks that cycle at shutdown, and a later
+    /// start refuses.
+    #[tokio::test]
+    async fn a_release_drops_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: autumn_web::config::DatabaseFleetConfig =
+            serde_json::from_value(serde_json::json!({
+                "mode": "tenant",
+                "root": dir.path().display().to_string(),
+                "create_on_demand": true,
+            }))
+            .expect("fleet config");
+        let fleet = DatabaseFleet::builder(config).build().expect("fleet");
+        let registry = Arc::new(Registry {
+            workflows: Vec::new(),
+            activities: Vec::new(),
+            updates: Vec::new(),
+            signals: Vec::new(),
+            state: autumn_harvest::context::empty_shared_state(),
+        });
+        let harvest = HarvestFleet::new(
+            fleet.clone(),
+            Arc::clone(&registry),
+            Vec::new(),
+            Duration::from_millis(250),
+        );
+        harvest.install().await;
+        assert_eq!(Arc::strong_count(&registry), 2);
+        harvest.release();
+        assert_eq!(Arc::strong_count(&registry), 1, "the fleet let go");
+        let error = harvest.open_for("acme").await.unwrap_err();
+        assert!(error.to_string().contains("stopped"), "{error}");
+        fleet.close_all().await;
     }
 
     #[test]
