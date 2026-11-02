@@ -1,0 +1,26 @@
+-- psql -d dl_before -f measure.sql
+ buffers | rows |                                                query                                                 
+---------+------+------------------------------------------------------------------------------------------------------
+    5884 |    1 | DELETE FROM harvest_dead_letters WHERE original_task_id = $1 AND task_type = $2
+    5883 |    1 | SELECT CEIL(EXTRACT($1 FROM (NOW() - MAX(failed_at))))::BIGINT AS age FROM harvest_dead_letters
+    5883 |    1 | SELECT COUNT(*) FROM harvest_dead_letters WHERE error ILIKE $1
+    5883 |    1 | SELECT COUNT(*) FROM harvest_dead_letters WHERE queue_name = $1
+    5959 |   50 | SELECT id, original_task_id, queue_name, failed_at FROM harvest_dead_letters ORDER BY failed_at DESC
+    5883 |  100 | SELECT id, original_task_id, queue_name, failed_at FROM harvest_dead_letters WHERE queue_name = $1 O
+(6 rows)
+
+             relname             | relpages 
+---------------------------------+----------
+ harvest_dead_letters            |     5883
+ harvest_dead_letters_pkey       |      535
+ idx_harvest_dl_owner            |        1
+ idx_harvest_dl_quota            |        1
+ idx_harvest_dl_workflow_exec_id |      534
+(5 rows)
+
+-- psql -d dl_before -f write.sql
+ buffers | rows | wal_records | wal_fpi | wal_bytes |                            query                             
+---------+------+-------------+---------+-----------+--------------------------------------------------------------
+    7141 | 1000 |        3004 |     903 |   5545869 | INSERT INTO harvest_dead_letters (original_task_id, queue_na
+(1 row)
+

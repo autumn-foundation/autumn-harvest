@@ -69,7 +69,7 @@ driver = "per_request"
 backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_completion_deliveries", "harvest_dead_letters"]
-measured = "unmeasured"
+measured = "docs/performance-dead-letter-indexes.md"
 plan = "docs/ledger/plans/autumn-harvest/completion_callback.md"
 
 ["reread_claimed_payloads"]
