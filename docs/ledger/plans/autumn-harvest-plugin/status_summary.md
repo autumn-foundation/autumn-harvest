@@ -28,9 +28,9 @@ Statements: 1. Tables with no usable index: none.
 
 ## `dlq_newest_age_secs`
 
-Statements: 1. Tables with no usable index: `harvest_dead_letters`.
+Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT CEIL(EXTRACT(EPOCH FROM (NOW() - MAX(failed_at))))::BIGINT AS age FROM harvest_dead_letters` | `harvest_dead_letters`: no usable index |
+| 1 | `SELECT CEIL(EXTRACT(EPOCH FROM (NOW() - MAX(failed_at))))::BIGINT AS age FROM harvest_dead_letters` | `harvest_dead_letters`: Index Only Scan on `idx_harvest_dl_failed_at` |
 

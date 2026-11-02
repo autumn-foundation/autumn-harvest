@@ -25,17 +25,17 @@ Statements: 4. Tables with no usable index: `harvest_dead_letters`.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."workflow_exec_id", "harvest_dead_lett...` | `harvest_dead_letters`: no usable index |
-| 2 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."workflow_exec_id", "harvest_dead_lett...` | `harvest_dead_letters`: no usable index |
+| 2 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."workflow_exec_id", "harvest_dead_lett...` | `harvest_dead_letters`: Index Scan on `idx_harvest_dl_queue_failed` |
 | 3 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."workflow_exec_id", "harvest_dead_lett...` | `harvest_dead_letters`: Index Scan on `idx_harvest_dl_workflow_exec_id`<br>`harvest_workflow_executions`: Index Scan on `idx_harvest_wfx_workflow_identity` |
-| 4 | `SELECT COUNT(*) FROM "harvest_dead_letters"` | `harvest_dead_letters`: Bitmap Heap Scan on `harvest_dead_letters_pkey` |
+| 4 | `SELECT COUNT(*) FROM "harvest_dead_letters"` | `harvest_dead_letters`: Bitmap Heap Scan on `idx_harvest_dl_queue_failed` |
 
 ## `count_bulk_filter_matches`
 
-Statements: 1. Tables with no usable index: `harvest_dead_letters`.
+Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT COUNT(*) FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."queue_name" = $1)` | `harvest_dead_letters`: no usable index |
+| 1 | `SELECT COUNT(*) FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."queue_name" = $1)` | `harvest_dead_letters`: Index Only Scan on `idx_harvest_dl_queue_failed` |
 
 ## `count_redrive_filter_matches`
 
@@ -45,7 +45,7 @@ Statements: 3. Tables with no usable index: `harvest_dead_letters`.
 |---|---|---|
 | 1 | `SELECT COUNT(*) FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."error" ILIKE $1)` | `harvest_dead_letters`: no usable index |
 | 2 | `SELECT COUNT(*) FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."id" = ANY($1))` | `harvest_dead_letters`: Bitmap Heap Scan on `harvest_dead_letters_pkey` |
-| 3 | `SELECT COUNT(*) FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."queue_name" = $1)` | `harvest_dead_letters`: no usable index |
+| 3 | `SELECT COUNT(*) FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."queue_name" = $1)` | `harvest_dead_letters`: Index Only Scan on `idx_harvest_dl_queue_failed` |
 
 ## `dead_letter_count`
 
@@ -53,7 +53,7 @@ Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT COUNT(*) FROM "harvest_dead_letters"` | `harvest_dead_letters`: Bitmap Heap Scan on `harvest_dead_letters_pkey` |
+| 1 | `SELECT COUNT(*) FROM "harvest_dead_letters"` | `harvest_dead_letters`: Bitmap Heap Scan on `idx_harvest_dl_queue_failed` |
 
 ## `dead_letter_with_codecs`
 
@@ -79,11 +79,11 @@ Statements: 1. Tables with no usable index: none.
 
 ## `list_dead_letters`
 
-Statements: 1. Tables with no usable index: `harvest_dead_letters`.
+Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: no usable index |
+| 1 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: full scan of index `idx_harvest_dl_failed_at` |
 
 ## `load_workflow_names`
 
@@ -95,21 +95,21 @@ Statements: 1. Tables with no usable index: none.
 
 ## `query_dead_letters_for_bulk`
 
-Statements: 1. Tables with no usable index: `harvest_dead_letters`.
+Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: no usable index |
+| 1 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: Index Scan on `idx_harvest_dl_queue_failed` |
 
 ## `query_dead_letters_for_redrive`
 
-Statements: 3. Tables with no usable index: `harvest_dead_letters`.
+Statements: 3. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: no usable index |
-| 2 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: Bitmap Heap Scan on `harvest_dead_letters_pkey` |
-| 3 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: no usable index |
+| 1 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: full scan of index `idx_harvest_dl_failed_at` |
+| 2 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: full scan of index `idx_harvest_dl_failed_at` |
+| 3 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: Index Scan on `idx_harvest_dl_queue_failed` |
 
 ## `redrive_dead_letter_at`
 
