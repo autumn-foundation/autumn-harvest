@@ -1782,7 +1782,7 @@ Enable the `schema` Cargo feature and derive `JsonSchema` on your types:
 ```toml
 # In your Cargo.toml:
 autumn-harvest = { version = "0.9", features = ["schema"] }
-schemars = "0.8"
+schemars = "1.2"
 ```
 
 ```rust
