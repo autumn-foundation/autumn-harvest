@@ -13,19 +13,25 @@ Design decisions (`docs/design/DESIGN-2440.md`):
 - `ModelTurnRequest::draw` and `AgentTask::draw` are not written when
   `None`. A history recorded before the change replays. A test replays a
   fixture history from `trunk-dev`.
-- The root of a draw is the execution id of the caller, so no later run
-  reuses a draw run id. `shares_run_id` reads a `:s{n}` suffix as it reads
-  `:d{n}`.
+- Each `run_draws` call records a new UUID as its root. Two batches never
+  share a run id, and a reset or a fork replays the same root. `drive`
+  refuses a root that is not a UUID. `shares_run_id` reads a `:s{n}`
+  suffix as it reads `:d{n}`.
 - A delegated child keeps the draw id and drops the root.
 - A draw never delivers, and it reports a failure, so the caller keeps its
-  usage.
+  usage. It has no memory, no workspace and no follow-ups. Each draw gets
+  the whole token cap. `agent_sample` (#2443) will split it.
 - A batch over `MAX_PARALLEL_CHILDREN`, or with one id twice, starts no
   draw.
 
 Breaking change: `ChatRequest` has a new public field. A struct literal
-outside the crate adds `draw: None`.
+outside the crate adds `draw: None`. See `docs/upgrading/0.8.0.md`.
+
+Fleet rule: call `run_draws` only after every worker runs this release. An
+older binary drops the field.
 
 No new `WorkflowEvent` variant. No migration. No new query.
 
-Tests: `autumn-harvest-agent/tests/draws.rs`, and the key tests in
-`response_cache.rs`.
+Tests: `autumn-harvest-agent/tests/draws.rs`, the key tests in
+`response_cache.rs`, the root tests in `draw.rs` and
+`a_draw_of_a_workflow_id_run_skips_the_cache` in `workflow.rs`.

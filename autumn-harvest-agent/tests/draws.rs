@@ -11,6 +11,7 @@
 mod common;
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::prelude::*;
@@ -18,33 +19,34 @@ use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_agent::mesh::DELEGATE_TOOL;
 use autumn_harvest_agent::workflow::agent_loop_info;
 use autumn_harvest_agent::{
-    AgentHarness, AgentReport, AgentStop, AgentTask, ChatRole, ContentPart, DrawId, FnTool,
-    Mandate, ModelTurnRequest, Peer, ToolEffect, run_draws, sqlite,
+    AgentHarness, AgentReport, AgentStop, AgentTask, ChatRequest, ChatRole, ContentPart, DrawId,
+    FnTool, Followups, MAX_PARALLEL_CHILDREN, Mandate, MemoryScope, ModelTurnRequest, Peer, Tool,
+    ToolEffect, run_draws, sqlite,
 };
 use autumn_harvest_sqlite::{ExecutionId, RunState, SqliteRuntime};
 use common::{MemStore, ScriptedModel, TryFnModel, answer, calls, response_cache};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// The input of the test workflow: a task and the draw ids to run.
+/// The input of the test workflow: a task and the batches of draw ids.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DrawsInput {
     task: AgentTask,
-    draws: Vec<u32>,
+    batches: Vec<Vec<u32>>,
 }
 
-/// Runs one batch of draws and returns each report, or the error text.
+type Ended = Result<Vec<Result<AgentReport, String>>, String>;
+
+/// Runs each batch of draws in turn. Returns every report, or the error
+/// text, in order.
 #[workflow]
-async fn some_draws(
-    ctx: &WorkflowContext,
-    input: DrawsInput,
-) -> Result<Vec<Result<AgentReport, String>>, String> {
-    run_draws(
-        ctx,
-        &input.task,
-        input.draws.iter().copied().map(DrawId::new),
-    )
-    .await
+async fn some_draws(ctx: &WorkflowContext, input: DrawsInput) -> Ended {
+    let mut ended = Vec::new();
+    for batch in &input.batches {
+        let ids = batch.iter().copied().map(DrawId::new);
+        ended.extend(run_draws(ctx, &input.task, ids).await?);
+    }
+    Ok(ended)
 }
 
 fn fresh_db() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -60,18 +62,15 @@ fn runtime(db: &std::path::Path, harness: AgentHarness) -> SqliteRuntime {
     rt
 }
 
-/// Start the test workflow and drive it to its end.
-async fn draw(
+/// Start the test workflow with `batches` and drive it to its end.
+async fn batches(
     rt: &mut SqliteRuntime,
     task: &AgentTask,
-    draws: &[u32],
-) -> (
-    ExecutionId,
-    Result<Vec<Result<AgentReport, String>>, String>,
-) {
+    batches: &[&[u32]],
+) -> (ExecutionId, Ended) {
     let input = DrawsInput {
         task: task.clone(),
-        draws: draws.to_vec(),
+        batches: batches.iter().map(|batch| batch.to_vec()).collect(),
     };
     let exec = rt
         .start_workflow("some_draws", serde_json::to_value(input).unwrap())
@@ -84,7 +83,12 @@ async fn draw(
     (exec, ended)
 }
 
-fn reports(ended: Result<Vec<Result<AgentReport, String>>, String>) -> Vec<AgentReport> {
+/// Start the test workflow with one batch and drive it to its end.
+async fn draw(rt: &mut SqliteRuntime, task: &AgentTask, draws: &[u32]) -> (ExecutionId, Ended) {
+    batches(rt, task, &[draws]).await
+}
+
+fn reports(ended: Ended) -> Vec<AgentReport> {
     ended
         .unwrap()
         .into_iter()
@@ -92,27 +96,88 @@ fn reports(ended: Result<Vec<Result<AgentReport, String>>, String>) -> Vec<Agent
         .collect()
 }
 
-/// Replay the parent run, then each draw run, from history.
-async fn replays(rt: &SqliteRuntime, exec: ExecutionId) {
+type Run = (ExecutionId, WorkflowInfo, Vec<WorkflowEvent>);
+
+/// The histories of the parent run and of each draw run, each with the
+/// handler that replays it.
+fn histories(rt: &SqliteRuntime, exec: ExecutionId) -> Vec<Run> {
     let history = rt.load_history(exec).unwrap();
-    let mut runs = vec![(exec, some_draws_info())];
+    let mut runs = Vec::new();
     for event in &history {
         if let WorkflowEvent::ChildWorkflowStarted { child_id, .. } = event {
-            runs.push((*child_id, agent_loop_info()));
+            let child = rt.load_history(*child_id).unwrap();
+            runs.push((*child_id, agent_loop_info(), child));
         }
     }
-    assert!(runs.len() > 1, "the parent started no draw");
-    for (run, info) in runs {
+    assert!(!runs.is_empty(), "the parent started no draw");
+    runs.insert(0, (exec, some_draws_info(), history));
+    runs
+}
+
+/// Replay each run from its history.
+async fn replays(runs: Vec<Run>) {
+    for (run, info, events) in runs {
         let replay = WorkflowReplayer::new()
             .register(vec![info])
             .with_execution_id(run)
-            .replay_from_events(rt.load_history(run).unwrap())
+            .replay_from_events(events)
             .await;
         assert!(
             matches!(replay.status, ReplayStatus::ReplaySucceeded),
             "{replay}"
         );
     }
+}
+
+/// The root of a draw run id, and its draw suffix.
+fn split(run_id: &str) -> (&str, &str) {
+    run_id.rsplit_once(':').unwrap()
+}
+
+/// The run id of each report.
+fn run_ids(reports: &[AgentReport]) -> Vec<String> {
+    reports
+        .iter()
+        .map(|report| report.run_id.clone().unwrap())
+        .collect()
+}
+
+/// The text of the first user message of a request.
+fn first_user(request: &ChatRequest) -> String {
+    request
+        .messages
+        .iter()
+        .find(|message| message.role == ChatRole::User)
+        .and_then(|message| match message.content.first() {
+            Some(ContentPart::Text(text)) => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a request already holds a tool result.
+fn answered(request: &ChatRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .any(|message| message.role == ChatRole::Tool)
+}
+
+/// A turn that delegates each `(agent, task)` pair.
+fn delegations(list: &[(&str, &str)]) -> common::Reply {
+    let ids: Vec<String> = (1..=list.len()).map(|n| format!("d{n}")).collect();
+    let calls_list: Vec<(&str, &str, Value)> = list
+        .iter()
+        .zip(&ids)
+        .map(|((agent, task), id)| {
+            (
+                id.as_str(),
+                DELEGATE_TOOL,
+                json!({"agent": agent, "task": task}),
+            )
+        })
+        .collect();
+    calls(&calls_list, 1)
 }
 
 // AC: a 3-draw run with the cache on gets three different answers. The
@@ -129,6 +194,8 @@ async fn three_draws_with_the_cache_on_get_three_answers_from_three_calls() {
     let (exec, ended) = draw(&mut rt, &AgentTask::new("pick a colour"), &[0, 1, 2]).await;
     let reports = reports(ended);
 
+    // SQLite drives one draw after another, so draw 1 starts after draw 0
+    // stored its answer. Without the draw in the key, draws 1 and 2 hit it.
     let mut texts: Vec<&str> = reports.iter().map(|report| report.text.as_str()).collect();
     texts.sort_unstable();
     assert_eq!(texts, ["a", "b", "c"]);
@@ -137,23 +204,22 @@ async fn three_draws_with_the_cache_on_get_three_answers_from_three_calls() {
     draws.sort_unstable();
     assert_eq!(
         draws,
-        [
-            Some(DrawId::new(0)),
-            Some(DrawId::new(1)),
-            Some(DrawId::new(2))
-        ],
+        [0, 1, 2].map(|n| Some(DrawId::new(n))),
         "each draw reaches the model"
     );
-    let run_ids: Vec<String> = reports
-        .iter()
-        .map(|report| report.run_id.clone().unwrap())
-        .collect();
+    let run_ids = run_ids(&reports);
+    let root = split(&run_ids[0]).0;
+    assert!(
+        autumn_harvest::uuid::Uuid::parse_str(root).is_ok(),
+        "{root}"
+    );
+    assert_ne!(root, exec.to_string(), "history records the root");
     assert_eq!(
         run_ids,
-        [0, 1, 2].map(|n| format!("{exec}:s{n}")),
+        [0, 1, 2].map(|n| format!("{root}:s{n}")),
         "the reports come back in draw order"
     );
-    replays(&rt, exec).await;
+    replays(histories(&rt, exec)).await;
 }
 
 // The same draw of the same request is one sample, so the cache serves it.
@@ -176,7 +242,7 @@ async fn a_second_run_of_the_same_draw_hits_the_cache() {
 }
 
 /// A tool that records the run id and the step of each call.
-fn run_id_tool(seen: &Arc<Mutex<Vec<(String, u32)>>>) -> Arc<dyn autumn_harvest_agent::Tool> {
+fn run_id_tool(seen: &Arc<Mutex<Vec<(String, u32)>>>) -> Arc<dyn Tool> {
     let seen = Arc::clone(seen);
     FnTool::with_context(
         "lookup",
@@ -203,11 +269,7 @@ async fn two_draws_at_step_zero_give_tools_two_run_ids() {
     let (_dir, db) = fresh_db();
     // Both draws ask for the same call with the same call id.
     let model = TryFnModel::new(|request| {
-        let answered = request
-            .messages
-            .iter()
-            .any(|message| message.role == ChatRole::Tool);
-        if answered {
+        if answered(request) {
             answer("done", 1)
         } else {
             calls(&[("c1", "lookup", json!({}))], 1)
@@ -225,67 +287,41 @@ async fn two_draws_at_step_zero_give_tools_two_run_ids() {
 
     let mut seen = seen.lock().unwrap().clone();
     seen.sort();
+    let root = split(&seen[0].0).0.to_owned();
     assert_eq!(
         seen,
-        [(format!("{exec}:s0"), 0), (format!("{exec}:s1"), 0)],
+        [(format!("{root}:s0"), 0), (format!("{root}:s1"), 0)],
         "each draw has its own idempotency key"
     );
-    replays(&rt, exec).await;
+    replays(histories(&rt, exec)).await;
 }
 
-/// The text of the first user message of a request.
-fn first_user(request: &autumn_harvest_agent::ChatRequest) -> String {
-    request
-        .messages
-        .iter()
-        .find(|message| message.role == ChatRole::User)
-        .and_then(|message| match message.content.first() {
-            Some(ContentPart::Text(text)) => Some(text.clone()),
-            _ => None,
-        })
-        .unwrap_or_default()
-}
-
-// A delegated child keeps the draw id, so two draws that delegate the same
+// An inline child keeps the draw id, so two draws that delegate the same
 // task do not share one cached child answer. Its run id nests in the draw.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_delegated_child_keeps_the_draw_and_nests_its_run_id() {
+async fn an_inline_child_keeps_the_draw_and_nests_its_run_id() {
     let (_dir, db) = fresh_db();
     let model = TryFnModel::new(|request| {
         if first_user(request) == "find flights" {
-            return answer("flight", 1);
-        }
-        let answered = request
-            .messages
-            .iter()
-            .any(|message| message.role == ChatRole::Tool);
-        if answered {
+            answer("flight", 1)
+        } else if answered(request) {
             answer("planned", 1)
         } else {
-            calls(
-                &[(
-                    "d1",
-                    DELEGATE_TOOL,
-                    json!({"agent": "flights", "task": "find flights"}),
-                )],
-                1,
-            )
+            delegations(&[("flights", "find flights")])
         }
     });
     let harness = AgentHarness::new(model.clone()).peer(Peer::new("flights", "Finds flights."));
     let mut rt = runtime(&db, harness);
     let task = AgentTask::new("plan the trip").mandate(Mandate::new("planner").peers(["flights"]));
-    let (exec, ended) = draw(&mut rt, &task, &[3]).await;
+    let (_, ended) = draw(&mut rt, &task, &[3]).await;
     let report = reports(ended).remove(0);
 
     assert_eq!(report.text, "planned");
-    assert_eq!(
-        report.run_id.as_deref(),
-        Some(format!("{exec}:s3").as_str())
-    );
+    let run_id = report.run_id.clone().unwrap();
+    assert_eq!(split(&run_id).1, "s3");
     assert_eq!(
         report.delegations[0].run_id.as_deref(),
-        Some(format!("{exec}:s3:d1").as_str())
+        Some(format!("{run_id}:d1").as_str())
     );
     let child = model
         .requests()
@@ -295,13 +331,65 @@ async fn a_delegated_child_keeps_the_draw_and_nests_its_run_id() {
     assert_eq!(child.draw, Some(DrawId::new(3)));
 }
 
-// A draw does not deliver its answer. The caller picks the answer.
+// A fan-out child of a draw keeps the draw id and runs under its own
+// execution id, so it never reuses the run id of its draw.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_draw_never_delivers() {
+async fn a_fan_out_child_of_a_draw_has_its_own_run_id() {
+    let (_dir, db) = fresh_db();
+    let model = TryFnModel::new(|request| {
+        let input = first_user(request);
+        if input != "plan the trip" {
+            answer(&format!("done: {input}"), 1)
+        } else if answered(request) {
+            answer("planned", 1)
+        } else {
+            delegations(&[("flights", "find flights"), ("hotels", "find hotels")])
+        }
+    });
+    let harness = AgentHarness::new(model.clone())
+        .peer(Peer::new("flights", "Finds flights."))
+        .peer(Peer::new("hotels", "Finds hotels."));
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("plan the trip")
+        .mandate(Mandate::new("planner").peers(["flights", "hotels"]))
+        .parallel_children(2);
+    let (_, ended) = draw(&mut rt, &task, &[5]).await;
+    let report = reports(ended).remove(0);
+
+    assert_eq!(report.text, "planned");
+    let draw_run = report.run_id.clone().unwrap();
+    let children: Vec<String> = report
+        .delegations
+        .iter()
+        .map(|record| record.run_id.clone().unwrap())
+        .collect();
+    assert_eq!(children.len(), 2);
+    assert_ne!(children[0], children[1]);
+    for child in &children {
+        assert!(!child.starts_with(split(&draw_run).0), "{child}");
+    }
+    let child_draws: Vec<Option<DrawId>> = model
+        .requests()
+        .iter()
+        .filter(|request| first_user(request) != "plan the trip")
+        .map(|request| request.draw)
+        .collect();
+    assert_eq!(child_draws, [Some(DrawId::new(5)); 2]);
+}
+
+// A draw does not deliver its answer, because the caller picks the answer.
+// It keeps no durable state, so a draw that loses leaves nothing behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draw_never_delivers_and_keeps_no_state() {
     let (_dir, db) = fresh_db();
     let model = ScriptedModel::new(vec![answer("a", 1)]);
     let mut rt = runtime(&db, AgentHarness::new(model));
-    let (exec, ended) = draw(&mut rt, &AgentTask::new("hi").deliver(), &[0]).await;
+    let task = AgentTask::new("hi")
+        .deliver()
+        .memory(MemoryScope::new("team"))
+        .followups(Followups::new(Duration::from_secs(60)))
+        .unattended_memory_writes();
+    let (exec, ended) = draw(&mut rt, &task, &[0]).await;
     assert_eq!(reports(ended)[0].text, "a");
     let started: Vec<Value> = rt
         .load_history(exec)
@@ -313,8 +401,13 @@ async fn a_draw_never_delivers() {
         })
         .collect();
     assert_eq!(started.len(), 1);
-    assert_eq!(started[0]["deliver"], json!(false));
-    assert_eq!(started[0]["report_failure"], json!(true));
+    let input = &started[0];
+    assert_eq!(input["deliver"], json!(false));
+    assert_eq!(input["report_failure"], json!(true));
+    assert_eq!(input["memory_scope"], Value::Null);
+    assert_eq!(input["followups"], Value::Null);
+    assert_eq!(input["unattended_memory_writes"], json!(false));
+    assert!(input.get("workspace").is_none());
 }
 
 // A batch over the bound, or with one draw id twice, starts no draw.
@@ -326,11 +419,77 @@ async fn a_bad_batch_starts_no_draw() {
     let task = AgentTask::new("hi");
     let (_, twice) = draw(&mut rt, &task, &[1, 1]).await;
     assert!(twice.unwrap_err().contains("twice"));
-    let many: Vec<u32> = (0..=autumn_harvest_agent::MAX_PARALLEL_CHILDREN).collect();
+    let many: Vec<u32> = (0..=MAX_PARALLEL_CHILDREN).collect();
     let (_, over) = draw(&mut rt, &task, &many).await;
     assert!(over.unwrap_err().contains("at most"));
     let (_, none) = draw(&mut rt, &task, &[]).await;
-    assert!(none.unwrap().is_empty());
+    assert_eq!(none.unwrap().len(), 0);
+    assert_eq!(model.calls(), 0);
+}
+
+// A batch of exactly the bound runs every draw.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_at_the_bound_runs() {
+    let (_dir, db) = fresh_db();
+    let model = TryFnModel::new(|_| answer("x", 1));
+    let mut rt = runtime(&db, AgentHarness::new(model.clone()));
+    let all: Vec<u32> = (0..MAX_PARALLEL_CHILDREN).collect();
+    let (_, ended) = draw(&mut rt, &AgentTask::new("hi"), &all).await;
+    assert_eq!(reports(ended).len(), all.len());
+    assert_eq!(model.requests().len(), all.len());
+}
+
+// Two batches of one run never share a run id. A beam or a vote calls
+// `run_draws` once per round with the same draw ids.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_batches_of_one_run_get_two_roots() {
+    let (_dir, db) = fresh_db();
+    let model = TryFnModel::new(|_| answer("x", 1));
+    let mut rt = runtime(&db, AgentHarness::new(model));
+    let (exec, ended) = batches(&mut rt, &AgentTask::new("hi"), &[&[0], &[0]]).await;
+    let run_ids = run_ids(&reports(ended));
+    assert_eq!(run_ids.len(), 2);
+    assert_ne!(run_ids[0], run_ids[1]);
+    assert!(run_ids.iter().all(|id| split(id).1 == "s0"));
+    replays(histories(&rt, exec)).await;
+}
+
+// A reset or a fork replays the parent under a new execution id. History
+// holds the root, so the recorded draw inputs still match.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parent_replays_under_a_new_execution_id() {
+    let (_dir, db) = fresh_db();
+    let model = TryFnModel::new(|_| answer("x", 1));
+    let mut rt = runtime(&db, AgentHarness::new(model));
+    let (exec, ended) = draw(&mut rt, &AgentTask::new("hi"), &[0, 1]).await;
+    assert_eq!(reports(ended).len(), 2);
+    let events = rt.load_history(exec).unwrap();
+    let replay = WorkflowReplayer::new()
+        .register(vec![some_draws_info()])
+        .with_execution_id(ExecutionId::new())
+        .replay_from_events(events)
+        .await;
+    assert!(
+        matches!(replay.status, ReplayStatus::ReplaySucceeded),
+        "{replay}"
+    );
+}
+
+// A root that is not a UUID never becomes a run id. A caller that writes a
+// workflow id as the root would repeat the run id each day.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_root_that_is_not_a_uuid_fails_the_run() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![answer("never", 1)]);
+    let mut rt = runtime(&db, AgentHarness::new(model.clone()));
+    let mut task = serde_json::to_value(AgentTask::new("hi")).unwrap();
+    task["draw"] = json!({"id": 0, "root": "daily"});
+    let exec = sqlite::start(&mut rt, &serde_json::from_value(task).unwrap()).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(&state, RunState::Failed(error) if error.contains("draw root")),
+        "{state:?}"
+    );
     assert_eq!(model.calls(), 0);
 }
 

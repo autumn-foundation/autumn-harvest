@@ -14,7 +14,8 @@ but it does not depend on that crate. On the engine:
 
 It also has the always-on primitives: heartbeats, follow-ups on a durable
 timer, delivery, a frozen memory snapshot, and a loop guard. An opt-in
-response cache serves an identical model call across runs, per tenant. An
+response cache serves an identical model call across runs, per tenant. A
+draw id (issue #2440) keeps each sample of a run apart in that cache. An
 opt-in context reset (issue #2453) lets a long run save progress notes and
 restart from them near the request cap.
 

@@ -57,8 +57,9 @@ pub struct ChatResponse {
 ///
 /// A model may read [`ChatRequest::draw`] and pass it to its provider as a
 /// seed (issue #2440). Then each draw of one request is its own sample. The
-/// default ignores it. A model that sends the draw must put that fact in
-/// [`model_id`](Self::model_id), because the answer then depends on it.
+/// default ignores it. Draw 0 of each run then has the same seed, and the
+/// cache shares that answer across runs. Name the change in
+/// [`model_id`](Self::model_id), as for any client setting.
 pub trait AgentModel: Send + Sync + std::fmt::Debug {
     /// Send one request and decode the answer.
     fn chat<'a>(

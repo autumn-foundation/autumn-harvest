@@ -739,11 +739,18 @@ namespace and the draw.
 **The draw (issue #2440).** `ChatRequest::draw` names one sample of a run.
 Two draws of one request get two keys, so each draw has its own entry. A
 request with no draw keeps the key that it had before draws, so stored
-entries still hit. `run_draws` runs each draw as a child `agent_loop` run
-with the run id `{root}:s{n}`. The root is the execution id of the caller.
-Tools then get one idempotency key per draw. A delegated child keeps the
-draw id. A model may pass the draw to its provider as a seed. Such a model
-must say so in its model id.
+entries still hit.
+
+`run_draws` runs each draw as a child `agent_loop` run with the run id
+`{root}:s{n}`. Each call records a new UUID as its root, so two batches never
+share a run id. Tools then get one idempotency key per draw. A draw does not
+deliver, and it has no memory, no workspace and no follow-ups. Each draw gets
+the whole token cap of the task, so the caller bounds the total.
+
+A delegated child keeps the draw id and gets its own run id. A durable agent
+segment also ends in `:s{n}`, but its root is an incarnation id. A model may
+pass the draw to its provider as a seed. Then draw 0 of each run has the
+same seed, and the cache shares that answer across runs.
 
 **The model id.** A model names itself through `AgentModel::model_id`. A
 model with no id is never cached. The crate ships no model with an id. The
@@ -823,6 +830,9 @@ because a custom codec can quote the answer.
 - A run that sets `tenant` records it in each model-turn input. An older
   binary rebuilds that input without it, so set `tenant` only after the
   whole fleet runs this release.
+- A draw records `draw` in its task and in each model-turn input. An older
+  binary drops the field. Its draws then share one key, and its run ids
+  change. Call `run_draws` only after the whole fleet runs this release.
 
 ## 12. Evaluate a candidate model or prompt
 

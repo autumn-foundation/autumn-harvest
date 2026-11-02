@@ -47,12 +47,16 @@ Decision: 1, 5 and the helper of 6. The registered workflow belongs to
 | Way to break it | Guard |
 |---|---|
 | Change the key bytes of a request with no draw. Every stored entry then misses. | The draw is not written when it is `None`. A golden test pins one key. |
-| Write `"draw": null` into a recorded input. | `skip_serializing_if` on each new field. A test replays a history recorded before the change. |
+| Write `"draw": null` into a recorded input. | `skip_serializing_if` on each new field. `a_run_with_no_draw_records_no_draw_field` checks it. A test also replays a history recorded before the change. |
 | Give two draws one run id. | Run id `{root}:s{n}`. A test checks the run id that tools see. |
 | Let two draws delegate the same task. Their children share a key. | A delegated child keeps the draw id. |
-| Let a fan-out child keep the root. It then reuses the run id of its parent. | A child keeps the draw id and drops the root. |
-| Take the root from a workflow id that a later run reuses. | `run_draws` takes the execution id. `shares_run_id` reads a `:s{n}` suffix as it reads `:d{n}`. |
+| Let a fan-out child keep the root. It then reuses the run id of its parent. | A child keeps the draw id and drops the root. A test checks a fan-out child. |
+| Take the root from a workflow id that a later run reuses. | `run_draws` records a UUID. `drive` refuses a root that is not a UUID. `shares_run_id` reads a `:s{n}` suffix as it reads `:d{n}`. |
+| Take the root from the execution id. A reset or a fork replays under a new id, and the child inputs differ. Two batches of one run share run ids. | Each `run_draws` call records a new UUID with `ctx.new_uuid`. Tests replay under a new execution id and run two batches. |
+| Check the root against the parent execution id. The replayer has no parent, so replay fails where the live run passed. | The check reads the input only. |
 | Let each draw deliver its answer. | `run_draws` turns delivery off. |
+| Let a draw that loses write memory, a workspace head or a follow-up. | `run_draws` clears them, as `child_task` does. |
+| Let an older worker run a draw. It drops the field. | A Limits note in section 11 of `agent-adapter.md`. |
 | Lose the usage of a failed draw. | `run_draws` sets `report_failure`. |
 | Start an unbounded batch. | A batch over `MAX_PARALLEL_CHILDREN` is refused. |
 
@@ -61,6 +65,7 @@ Decision: 1, 5 and the helper of 6. The registered workflow belongs to
 - **White.** The facts above. `ChatRequest` has no `non_exhaustive`, so a
   new field breaks each struct literal outside the crate.
 - **Red.** A root in the task is a risk. Derive it, do not trust the caller.
+  `Draw::root` is private, and the loop refuses a root that is not a UUID.
 - **Black.** The breaking change on `ChatRequest`. A provider that maps the
   draw to a seed gives draw 0 of two runs the same seed. The cache already
   shares that answer, so the behaviour agrees.
@@ -80,8 +85,10 @@ Decision: 1, 5 and the helper of 6. The registered workflow belongs to
 - `AgentTask::draw: Option<Draw>`. `Draw { id, root }`. With a root, the run
   id is `{root}:s{id}`. A delegated child keeps `id` and has no root.
 - `run_draws(ctx, task, ids)` starts one child `agent_loop` run per draw id
-  and returns the reports in order. The root is the execution id of the
-  caller.
+  and returns the reports in order. Each call records a new UUID as the
+  root. A draw has no memory, no workspace, no follow-ups and no delivery.
+- Budgets are not split here. Each draw gets the whole cap. `agent_sample`
+  (#2443) puts the draws in one budget tree.
 - `AgentModel` documents that a model may pass the draw as a seed. The
   default ignores it.
 

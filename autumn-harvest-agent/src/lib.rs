@@ -11,7 +11,8 @@
 //! always-on primitives: [`heartbeat`], [`followup`], [`delivery`],
 //! [`memory`] and [`loop_guard`]. [`context_reset`] lets a long run save
 //! notes and restart from them. [`ResponseCache`] serves an identical
-//! model call across runs. The `eval` feature adds the `eval` module.
+//! model call across runs. The [`draw`] module gives each sample of a run its
+//! own identity, so the cache keeps the samples apart. The `eval` feature adds the `eval` module.
 //! That module re-drives a recorded run with a candidate model or prompt.
 //! The `sandbox` feature adds the `sandbox` module. Its `SandboxTool` runs
 //! agent code in a sandbox.

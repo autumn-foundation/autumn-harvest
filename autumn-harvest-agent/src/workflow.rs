@@ -481,10 +481,11 @@ pub(crate) async fn drive(
     source: ReportSource,
 ) -> Result<(AgentReport, u32), String> {
     // A draw with a root has the run id `{root}:s{n}` (issue #2440).
-    let run_id = match (
-        task.draw.as_ref().and_then(Draw::run_id),
-        task.run_id_source,
-    ) {
+    let draw_run_id = match &task.draw {
+        Some(draw) => draw.run_id()?,
+        None => None,
+    };
+    let run_id = match (draw_run_id, task.run_id_source) {
         (Some(draw), _) => draw,
         (None, RunIdSource::ExecutionId) => ctx.execution_id().to_string(),
         // A run recorded before the change keeps its recorded run id.
@@ -3248,7 +3249,8 @@ mod tests {
         // A draw started by `run_draws` has the execution id of its parent
         // as its root, so the child sees no shared id.
         assert!(!shares_run_id("p-exec:s0", "child-wf", "child-exec"));
-        assert!(!shares_run_id("daily:sx", "daily:s", "0e3c"));
+        // Only a numeric suffix marks a child.
+        assert!(!shares_run_id("daily:sx", "daily", "0e3c"));
     }
 
     #[test]
