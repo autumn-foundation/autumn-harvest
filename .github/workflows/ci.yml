@@ -2186,7 +2186,7 @@ jobs:
       - name: Clippy autumn-harvest-plugin (sqlite feature)
         run: cargo clippy -p autumn-harvest-plugin --features sqlite --lib --test sqlite_plugin --test sqlite_plugin_fleet --test sqlite_plugin_split -- -D warnings
       - name: SQLite plugin unit tests
-        run: "cargo test -p autumn-harvest-plugin --features sqlite --lib sqlite::"
+        run: "cargo test -p autumn-harvest-plugin --features sqlite --lib -- sqlite:: sqlite_split_tests state::tests"
       - name: SQLite plugin end-to-end suite
         run: cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin
       # Per-tenant Harvest in a SQLite fleet (issue #2472). No Docker.
@@ -2201,6 +2201,7 @@ jobs:
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
@@ -2209,6 +2210,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
+      # `testcontainers` retries no pull, so a registry blip would fail the
+      # suite. The script retries it.
+      - name: Pre-pull the Postgres image
+        run: bash .github/ci/pull-test-images.sh postgres:16
       # A SQLite app with a Postgres Harvest database. The test starts a
       # Postgres container, so this lane needs the runner's Docker.
       - name: SQLite app on a Postgres Harvest database

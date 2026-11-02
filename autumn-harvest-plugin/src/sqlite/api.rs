@@ -95,6 +95,7 @@ struct TenantParams {
 ///
 /// The tenant handle holds a lease, so the tenant stays open until the
 /// response is ready. Each handler reads it through [`ApiState::handle`].
+/// A tenant that does not exist is a `404`. The API never creates one.
 async fn tenant_scope(
     State(state): State<ApiState>,
     Path(TenantParams { tenant }): Path<TenantParams>,
@@ -112,7 +113,7 @@ async fn tenant_scope(
         )
             .into_response();
     };
-    match fleet.open_for(&tenant).await {
+    match fleet.open_existing_for(&tenant).await {
         Ok(handle) => TENANT.scope(handle, next.run(request)).await,
         Err(error) => map_error(error).into_response(),
     }

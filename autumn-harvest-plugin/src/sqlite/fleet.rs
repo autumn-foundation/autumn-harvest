@@ -18,12 +18,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use autumn_harvest::info::WorkflowInfo;
 use autumn_web::AppState;
-use autumn_web::db::fleet::{DatabaseFleet, FleetDatabase, FleetLifecycle};
+use autumn_web::db::fleet::{DatabaseFleet, FleetDatabase, FleetError, FleetLifecycle};
 use autumn_web::error::AutumnError;
 use autumn_web::fleet_layout::FleetDbKey;
 use autumn_web::reexports::axum;
@@ -46,10 +47,11 @@ tokio::task_local! {
     static CURRENT: FleetDbKey;
 }
 
-/// The tenant of the running activity.
+/// The fleet database of the running activity.
 ///
 /// A tenant driver runs each activity inline on its own task. That task
-/// carries the tenant key. Code on the control driver, or on a task that an
+/// carries the database key. In a `slot` fleet the key is the slot, which
+/// many tenants share. Code on the control driver, or on a task that an
 /// activity spawns, sees `None`.
 ///
 /// ```rust,ignore
@@ -79,12 +81,16 @@ pub fn tenant_harvest_file(database: &Path) -> PathBuf {
     super::sibling_harvest_file(database)
 }
 
-/// One tenant in the registry.
+/// One tenant in the registry. The number is the start generation.
+///
+/// Each start takes a new generation. A start or a driver exit changes only
+/// the slot of its own generation, so a late one never removes a newer
+/// driver.
 enum Slot {
     /// A task opens the file now. Another start returns at once.
-    Starting,
+    Starting(u64),
     /// The driver runs. This copy holds no lease.
-    Running(HarvestSqlite),
+    Running(u64, HarvestSqlite),
 }
 
 /// A tenant as [`HarvestFleet::open`] sees it.
@@ -104,6 +110,8 @@ struct Shared {
     infos: Vec<WorkflowInfo>,
     tick: Duration,
     tenants: Mutex<HashMap<FleetDbKey, Slot>>,
+    /// The last start generation.
+    generation: AtomicU64,
 }
 
 /// The per-tenant Harvests of a fleet app.
@@ -146,6 +154,7 @@ impl HarvestFleet {
                 infos,
                 tick,
                 tenants: Mutex::new(HashMap::new()),
+                generation: AtomicU64::new(0),
             }),
         }
     }
@@ -156,12 +165,23 @@ impl HarvestFleet {
         self.shared
             .fleet
             .add_lifecycle(Arc::new(TenantLifecycle(Arc::downgrade(&self.shared))));
-        for key in self.shared.fleet.open_keys() {
-            let Some(db) = self.shared.fleet.get_open(&key) else {
-                continue;
+        let fleet = &self.shared.fleet;
+        for key in fleet.open_keys() {
+            // A tenant in the middle of its open may have read the hooks
+            // before the install. A background open waits for that open.
+            let (db, opened) = match fleet.get_open(&key) {
+                Some(db) => (db, false),
+                None => match fleet.open_background(&key).await {
+                    Ok(Some(background)) => (background.db, background.opened),
+                    Ok(None) | Err(_) => continue,
+                },
             };
             if let Err(error) = self.start_blocking(db).await {
                 tracing::warn!(tenant = %key, %error, "cannot start the tenant Harvest");
+            }
+            if opened {
+                // The scan opened a closed tenant. Leave it closed again.
+                let _ = fleet.close_if_unused(&key);
             }
         }
     }
@@ -175,6 +195,21 @@ impl HarvestFleet {
     /// open. [`HarvestSqliteError::Tenant`] when the driver cannot start.
     pub async fn open_for(&self, routing_key: &str) -> Result<HarvestSqlite, HarvestSqliteError> {
         let key = self.shared.fleet.key_for(routing_key)?;
+        self.open(&key).await
+    }
+
+    /// As [`open_for`](Self::open_for), but only for a database that exists.
+    ///
+    /// The management API uses it, so a request never creates a tenant,
+    /// whatever the fleet's `create_on_demand`.
+    pub(crate) async fn open_existing_for(
+        &self,
+        routing_key: &str,
+    ) -> Result<HarvestSqlite, HarvestSqliteError> {
+        let key = self.shared.fleet.key_for(routing_key)?;
+        if !self.shared.fleet.exists(&key) {
+            return Err(FleetError::NotFound { name: key.name() }.into());
+        }
         self.open(&key).await
     }
 
@@ -214,7 +249,7 @@ impl HarvestFleet {
         let tenants = self.shared.lock();
         let mut keys: Vec<FleetDbKey> = tenants
             .iter()
-            .filter(|(_, slot)| matches!(slot, Slot::Running(_)))
+            .filter(|(_, slot)| matches!(slot, Slot::Running(..)))
             .map(|(key, _)| key.clone())
             .collect();
         drop(tenants);
@@ -225,8 +260,8 @@ impl HarvestFleet {
     fn state(&self, key: &FleetDbKey) -> TenantState {
         match self.shared.lock().get(key) {
             None => TenantState::Absent,
-            Some(Slot::Starting) => TenantState::Starting,
-            Some(Slot::Running(handle)) => TenantState::Running(handle.clone()),
+            Some(Slot::Starting(_)) => TenantState::Starting,
+            Some(Slot::Running(_, handle)) => TenantState::Running(handle.clone()),
         }
     }
 
@@ -248,29 +283,47 @@ impl Shared {
     ///
     /// It blocks on file IO. A second call for a tenant that runs or starts
     /// returns at once, so one file never gets two runtimes.
-    fn start(&self, db: &FleetDatabase) -> Result<(), String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the file cannot open, or when the fleet closed
+    /// the tenant while its Harvest started.
+    fn start(self: &Arc<Self>, db: &FleetDatabase) -> Result<(), String> {
         let key = db.key().clone();
-        {
+        let generation = {
             let mut tenants = self.lock();
             if tenants.contains_key(&key) {
                 return Ok(());
             }
-            tenants.insert(key.clone(), Slot::Starting);
+            let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+            tenants.insert(key.clone(), Slot::Starting(generation));
+            generation
+        };
+        // A failed or a panicked start clears its `Starting` slot.
+        let mut guard = StartGuard {
+            shared: self,
+            key: &key,
+            generation,
+            armed: true,
+        };
+        let handle = self.open_driver(db, generation)?;
+        guard.armed = false;
+        let mut tenants = self.lock();
+        if !matches!(tenants.get(&key), Some(Slot::Starting(slot)) if *slot == generation) {
+            // A close removed the slot. The fleet has stopped the driver.
+            return Err(format!("{key} closed while its Harvest started"));
         }
-        match self.open_driver(db) {
-            Ok(handle) => {
-                self.lock().insert(key.clone(), Slot::Running(handle));
-                tracing::info!(tenant = %key, "tenant Harvest is running");
-                Ok(())
-            }
-            Err(error) => {
-                self.lock().remove(&key);
-                Err(error)
-            }
-        }
+        tenants.insert(key.clone(), Slot::Running(generation, handle));
+        drop(tenants);
+        tracing::info!(tenant = %key, "tenant Harvest is running");
+        Ok(())
     }
 
-    fn open_driver(&self, db: &FleetDatabase) -> Result<HarvestSqlite, String> {
+    fn open_driver(
+        self: &Arc<Self>,
+        db: &FleetDatabase,
+        generation: u64,
+    ) -> Result<HarvestSqlite, String> {
         let key = db.key().clone();
         let path = tenant_harvest_file(db.path());
         let tokio = tokio::runtime::Handle::try_current()
@@ -279,11 +332,38 @@ impl Shared {
         let reader = autumn_harvest_sqlite::SqliteReader::open(&path)
             .map_err(|error| format!("cannot open a reader on {}: {error}", path.display()))?;
         let stop = CancellationToken::new();
+        let weak = Arc::downgrade(self);
+        let exit_key = key.clone();
+        // The driver clears its own slot when it ends, so a dead driver
+        // never stays in the registry.
+        let on_exit = Box::new(move || {
+            if let Some(shared) = weak.upgrade() {
+                shared.remove_generation(&exit_key, generation);
+            }
+        });
         let _entered = tokio.enter();
-        let (sender, task) = Driver::spawn_tenant(runtime, self.tick, key.clone(), stop.clone());
+        let (sender, task) =
+            Driver::spawn_tenant(runtime, self.tick, key.clone(), stop.clone(), on_exit);
         // The fleet stops the driver before it closes the database.
-        db.register_worker(stop, task);
+        db.register_worker(stop.clone(), task);
+        if stop.is_cancelled() {
+            // The fleet had begun to close the tenant, so it stopped the
+            // driver at once.
+            return Err(format!("{key} closed while its Harvest started"));
+        }
         Ok(HarvestSqlite::new(sender, reader, path, self.infos.clone()).for_tenant(key))
+    }
+
+    /// Remove the slot of `key` when it still has `generation`.
+    fn remove_generation(&self, key: &FleetDbKey, generation: u64) {
+        let mut tenants = self.lock();
+        let ours = match tenants.get(key) {
+            Some(Slot::Starting(slot) | Slot::Running(slot, _)) => *slot == generation,
+            None => false,
+        };
+        if ours {
+            tenants.remove(key);
+        }
     }
 
     fn forget(&self, key: &FleetDbKey) {
@@ -310,6 +390,22 @@ impl Shared {
                     "cannot remove the tenant Harvest file"
                 ),
             }
+        }
+    }
+}
+
+/// Clears a `Starting` slot when its start does not finish.
+struct StartGuard<'a> {
+    shared: &'a Shared,
+    key: &'a FleetDbKey,
+    generation: u64,
+    armed: bool,
+}
+
+impl Drop for StartGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared.remove_generation(self.key, self.generation);
         }
     }
 }
@@ -363,4 +459,81 @@ pub fn scoped<F: std::future::Future>(
     future: F,
 ) -> impl std::future::Future<Output = F::Output> {
     CURRENT.scope(key, future)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shared(root: &Path) -> Arc<Shared> {
+        let config: autumn_web::config::DatabaseFleetConfig =
+            serde_json::from_value(serde_json::json!({
+                "mode": "tenant",
+                "root": root.display().to_string(),
+            }))
+            .expect("fleet config");
+        let fleet = DatabaseFleet::builder(config).build().expect("fleet");
+        let registry = Arc::new(Registry {
+            workflows: Vec::new(),
+            activities: Vec::new(),
+            updates: Vec::new(),
+            signals: Vec::new(),
+            state: autumn_harvest::context::empty_shared_state(),
+        });
+        HarvestFleet::new(fleet, registry, Vec::new(), Duration::from_millis(250)).shared
+    }
+
+    fn acme(shared: &Shared) -> FleetDbKey {
+        shared.fleet.key_for("acme").expect("key")
+    }
+
+    /// A late exit of an old driver never removes the slot of a newer one.
+    #[test]
+    fn only_the_own_generation_leaves_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path());
+        let key = acme(&shared);
+        shared.lock().insert(key.clone(), Slot::Starting(2));
+        shared.remove_generation(&key, 1);
+        assert!(shared.lock().contains_key(&key), "an old generation");
+        shared.remove_generation(&key, 2);
+        assert!(!shared.lock().contains_key(&key), "its own generation");
+    }
+
+    /// A start that fails or panics never leaves its tenant `Starting`.
+    #[test]
+    fn an_unfinished_start_clears_its_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path());
+        let key = acme(&shared);
+        shared.lock().insert(key.clone(), Slot::Starting(7));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = StartGuard {
+                shared: &shared,
+                key: &key,
+                generation: 7,
+                armed: true,
+            };
+            panic!("the open panicked");
+        }));
+        assert!(panicked.is_err());
+        assert!(!shared.lock().contains_key(&key));
+
+        shared.lock().insert(key.clone(), Slot::Starting(8));
+        drop(StartGuard {
+            shared: &shared,
+            key: &key,
+            generation: 8,
+            armed: false,
+        });
+        assert!(shared.lock().contains_key(&key), "a finished start stays");
+    }
+
+    #[test]
+    fn the_harvest_file_sits_next_to_the_tenant_file() {
+        assert_eq!(
+            tenant_harvest_file(Path::new("/f/00a/acme.db")),
+            PathBuf::from("/f/00a/acme.harvest.db")
+        );
+    }
 }

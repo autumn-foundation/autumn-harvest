@@ -8,8 +8,9 @@ use autumn_harvest::worker::DbPool;
 
 /// The app pool as a Postgres pool, for the Postgres path (issue #2467).
 ///
-/// The `sqlite` feature flips `autumn-web` to a SQLite pool. The Postgres path
-/// never runs then, but it must still compile, so this returns `None` there.
+/// Under `sqlite` the app pool is SQLite, so this returns `None`. Split and
+/// external mode run the Postgres path with its own Harvest pool (issue
+/// #2472).
 #[cfg_attr(
     feature = "sqlite",
     allow(
@@ -55,8 +56,9 @@ pub(crate) fn create_postgres_pool(
 ///
 /// It keeps the `autumn-web` pool settings: the size, the wait and create
 /// timeouts, and fast recycling. Each connection opens with
-/// [`autumn_harvest::pg_tls::connect`], so the DSN's `sslmode` keeps its
-/// meaning.
+/// [`autumn_harvest::pg_tls::connect`]. Its TLS rules differ from those of
+/// `autumn-web`: `sslmode=require` checks the certificate chain and the host
+/// name, and `sslrootcert` is not read. `SSL_CERT_FILE` names a private CA.
 #[cfg(feature = "sqlite")]
 fn postgres_pool_on_sqlite(
     config: &autumn_web::config::DatabaseConfig,

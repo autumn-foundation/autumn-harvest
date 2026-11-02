@@ -93,8 +93,11 @@ This issue adds two things:
 | R8 | A closed tenant keeps a driver and its writer lock. | The driver watches the worker token. `on_close` drops the handle. |
 | R9 | A deleted tenant keeps its workflow history. | `on_delete` removes the Harvest file and its sidecars. |
 | R10 | The registry handle keeps the tenant open forever. | The registry copy holds no lease. Only a handle given to a caller holds one. |
-| R11 | A tenant route reaches another tenant. | The route resolves the key with the app's own `key_for`. One handle serves one request. |
+| R11 | A tenant route reaches another tenant. | The route resolves the key with the app's own `key_for`. One handle serves one request. In `slot` mode the slot database is the unit, as it is for the app's data. |
 | R12 | A tenant route skips the mutation gate. | The tenant routes sit inside the gated router. A test checks a `401`. |
+| R13 | An anonymous read creates tenants on demand. | A tenant route opens only a database that exists. Otherwise it answers `404`. |
+| R14 | A close during a start leaves a dead driver in the registry. | Each start has a generation. A start saves only its own `Starting` slot. A driver clears its own slot when it ends. A guard clears a failed start. |
+| R15 | The split pool and the migrator read `sslmode` differently. | The boot opens one connection and logs the remedy. The guide states the difference. |
 
 ### 0.5 Six thinking hats
 
@@ -143,10 +146,14 @@ This issue adds two things:
 4. The startup hook also starts a driver for each tenant that is open
    already.
 5. `HarvestFleet` is an `AppState` extension and an extractor. `open_for`
-   and `open` return a `HarvestSqlite` that holds the tenant's lease.
+   and `open` return a `HarvestSqlite` that holds the tenant's lease. They
+   follow the fleet's `create_on_demand`.
 6. `HarvestTenant::current()` gives the tenant key inside an activity.
 7. `.api(path)` also serves `{path}/tenants/{key}/..`. `{key}` is the
-   app's routing key. The routes are the slice 1 routes.
+   app's routing key. The routes are the slice 1 routes. They serve only a
+   tenant that exists.
+8. In `slot` mode, the slot database is the unit. Tenants that share a slot
+   share its Harvest, as they share its app data.
 
 ### 1.3 The dependencies
 
@@ -168,12 +175,14 @@ This issue adds two things:
 
 ## 3. Tests
 
-- `sqlite::tests` and `plugin::tests`: mode routing, refusals, the pool
-  builder, the file name and the registry.
+- `sqlite::tests`, `sqlite::fleet::tests`, `plugin::sqlite_split_tests`
+  and `state::tests`: mode routing, refusals, the pool builder, the file
+  name and the registry generations.
 - `tests/sqlite_plugin_fleet.rs`: a fleet app with two tenants, the
   lifecycle, the tenant routes and a delete. No Docker.
 - `tests/sqlite_plugin_split.rs`: a SQLite app on a Postgres Harvest
-  database in a container. CI runs it in the `sqlite-plugin-split` job.
+  database in a container, and the build refusals. CI runs it in the
+  `sqlite-plugin-split` job.
 
 ## 4. Limits
 
@@ -181,4 +190,5 @@ This issue adds two things:
   The next open resumes its runs.
 - A fleet restore does not roll back the tenant's Harvest file.
 - Fleet replication does not ship Harvest files.
+- A failed Harvest open refuses the open of its tenant database.
 - The transactional outbox is not available on a SQLite app (#2470).

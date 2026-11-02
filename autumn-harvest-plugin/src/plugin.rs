@@ -75,9 +75,9 @@ const PLUGIN_HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrati
 /// in [`ensure_runtime_migrations`], which connects to `harvest.database.url`
 /// directly.
 ///
-/// The outbox set goes to the application database in every mode: an embedder
-/// writes to the transactional-outbox table in their own business transaction.
-/// A SQLite build registers no outbox set (see [`app_outbox_set_applies`]).
+/// On a Postgres app, the outbox set goes to the application database in every
+/// mode. An embedder writes to its table in their own business transaction. A
+/// SQLite build registers no outbox set (see [`app_outbox_set_applies`]).
 ///
 /// If the Harvest config cannot be loaded here, registration fails immediately
 /// rather than guessing: applying the sets to the app database for an unknown
@@ -2261,6 +2261,16 @@ async fn start_harvest_runtime(
             harvest_config.mode
         )));
     }
+    // The build of a SQLite app read a split or external mode. A mode that
+    // changed since then would need the SQLite path, which this build did
+    // not mount (issue #2472).
+    #[cfg(feature = "sqlite")]
+    if crate::sqlite::backend_for(harvest_config.mode) == crate::sqlite::Backend::Sqlite {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "harvest.mode changed to {:?} after the build. Restart the app",
+            harvest_config.mode
+        )));
+    }
     let workflow_result_notification_url = harvest_database_url(&app_config, &harvest_config)?;
     api_state.set_health_requires_shard_readiness(harvest_config.readiness.require_shard_readiness);
     api_state
@@ -2270,6 +2280,8 @@ async fn start_harvest_runtime(
     let runtime_state = state.clone();
     let app_pool = crate::state::app_postgres_pool(state);
     let harvest_pool = resolve_harvest_pool(state, &harvest_config)?;
+    #[cfg(feature = "sqlite")]
+    probe_harvest_pool(&harvest_pool).await;
     let router = ShardRouter::single();
 
     let (builder, cost_deferral, runtime_already_started) = {
@@ -2827,6 +2839,25 @@ fn transactional_client_workflows<'a>(
         .filter(|info| !registered_dag_names.contains(info.name))
         .cloned()
         .collect()
+}
+
+/// Check one connection of the Postgres Harvest pool of a SQLite app
+/// (issue #2472).
+///
+/// The pool connects lazily, so a bad URL or certificate shows only at the
+/// first query. The probe logs it at boot. Its TLS rules differ from those of
+/// the migrator: `sslmode=require` checks the certificate, and `sslrootcert`
+/// is not read. The log names the remedy.
+#[cfg(feature = "sqlite")]
+async fn probe_harvest_pool(pool: &DbPool) {
+    if let Err(error) = pool.get().await {
+        tracing::error!(
+            %error,
+            "cannot connect to harvest.database.url. On a SQLite app, sslmode=require checks \
+             the server certificate, and sslrootcert is not read: set SSL_CERT_FILE for a \
+             private CA (autumn-harvest#2472)"
+        );
+    }
 }
 
 fn resolve_harvest_pool(

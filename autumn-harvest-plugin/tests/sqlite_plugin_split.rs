@@ -2,8 +2,9 @@
 //!
 //! The app database is a SQLite file. `harvest.mode` is `split` or
 //! `external`, so Harvest runs the Postgres path on `harvest.database.url`.
-//! The test checks that a workflow runs there, and that no Harvest file and
-//! no Harvest table reach the SQLite side.
+//! The test checks that a workflow runs there, and that no SQLite Harvest
+//! file appears. It also checks that the build refuses each SQLite-only
+//! setting in these modes.
 //!
 //! The suite prefers `HARVEST_TEST_DATABASE_URL` (a server where it may
 //! create databases). Otherwise it starts a Postgres container, so it needs
@@ -203,5 +204,34 @@ async fn a_sqlite_app_runs_its_workflows_on_a_postgres_harvest_database() {
             "{mode}: no SQLite Harvest file"
         );
         drop(client);
+
+        // A SQLite-only setting has no effect in this mode. The build
+        // refuses it and names it.
+        let refused = build_panic(dir.path(), HarvestPlugin::new().sqlite_per_tenant());
+        assert!(refused.contains("sqlite_per_tenant"), "{mode}: {refused}");
+        // SAFETY: as in `set_env`.
+        unsafe { std::env::set_var("AUTUMN_HARVEST_SQLITE__PATH", "/srv/h.db") };
+        let refused = build_panic(dir.path(), HarvestPlugin::new());
+        unsafe { std::env::remove_var("AUTUMN_HARVEST_SQLITE__PATH") };
+        assert!(refused.contains("harvest.sqlite.path"), "{mode}: {refused}");
     }
+}
+
+/// The panic message of a build that must fail.
+fn build_panic(dir: &Path, plugin: HarvestPlugin) -> String {
+    let mut config = AutumnConfig::default();
+    config.database.url = Some(format!("sqlite://{}", dir.join("refused.db").display()));
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _client = TestApp::new()
+            .config(config)
+            .profile("dev")
+            .plugin(plugin.api("/harvest"))
+            .build();
+    }))
+    .expect_err("the build must refuse the setting");
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+        .unwrap_or_default()
 }

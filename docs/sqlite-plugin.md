@@ -98,7 +98,11 @@ not `HarvestSqlite`.
 
 - **Its own pool.** The plugin builds a Postgres pool from
   `harvest.database.url`. Each connection follows the DSN's `sslmode`, as
-  in [`pg_tls`](../autumn-harvest/src/pg_tls.rs).
+  in [`pg_tls`](../autumn-harvest/src/pg_tls.rs). Those rules are stricter
+  than in `autumn-web` and libpq: `sslmode=require` checks the certificate
+  chain and the host name, and `sslrootcert` is not read. Point
+  `SSL_CERT_FILE` at a private CA. The boot opens one connection and logs
+  an error that names this remedy when it fails.
 - **Migrations.** The `dev` profile applies the Harvest migrations to that
   database. Elsewhere, run `harvest migrate run` against it.
 - **The app pool stays SQLite.** No Postgres migration set goes to the app
@@ -114,7 +118,10 @@ not `HarvestSqlite`.
 ## Per-tenant Harvest in a fleet
 
 `sqlite_per_tenant()` runs one Harvest for each open database of the app's
-SQLite fleet (autumn ADR 0019). A fleet in `slot` mode works the same way:
+SQLite fleet (autumn ADR 0019). A fleet in `slot` mode works the same way,
+with one Harvest per slot database. The fleet database is the isolation
+unit: in `slot` mode, every tenant that routes to one slot shares its
+Harvest, as it shares the slot's app data.
 
 ```rust,ignore
 HarvestPlugin::new()
@@ -152,8 +159,8 @@ sequenceDiagram
   Harvest.
 - **The same registry.** Every tenant runs the workflows and activities that
   the plugin registers.
-- **The tenant key.** `HarvestTenant::current()` gives the tenant key inside
-  an activity that a tenant driver runs. It is `None` on the control
+- **The tenant key.** `HarvestTenant::current()` gives the fleet database
+  key (a tenant or a slot) inside an activity that a tenant driver runs. It is `None` on the control
   driver, and on a task that an activity spawns.
 - **A delete erases.** A fleet delete removes the tenant's Harvest file and
   its `-wal`, `-shm` and `-journal` sidecars. The `.lock` file stays.
@@ -178,16 +185,21 @@ async fn create(fleet: HarvestFleet, Path(tenant): Path<String>) -> AutumnResult
 ```
 
 `open_for` takes the app's routing key. `open` takes a `FleetDbKey`. Both
-open a closed tenant. The handle holds a lease, so the tenant stays open
+open a closed tenant. Both follow the fleet's `create_on_demand`, so they
+create a tenant only when the fleet does. The handle holds a lease, so the tenant stays open
 while any clone of it lives. The fleet owns the tenant driver:
 `shutdown()` on a tenant handle is an error.
 
 `.api(path)` also serves every core route on one tenant, under
 `{path}/tenants/{key}/..`. `{key}` is the routing key. For example,
-`POST /harvest/tenants/acme/workflows/process_order/start`. The fleet rules
-the key: a bad key is `400`, a tenant that does not exist is `404`, a tenant
-in a delete is `410`. The auth layer and the #1802 mutation gate cover these
-routes too. Without `sqlite_per_tenant()` they answer `404`.
+`POST /harvest/tenants/acme/workflows/process_order/start`. These routes
+never create a tenant, whatever `create_on_demand` says. A tenant that does
+not exist is `404`. The fleet rules the rest: a bad key is `400` and a tenant
+in a delete is `410`. Without `sqlite_per_tenant()` they answer `404`.
+
+The auth layer and the #1802 mutation gate cover these routes too. The gate
+passes a read, and a read opens its tenant, which starts its driver. Put the
+API behind `api_with_auth` outside `dev`.
 
 ### Limits
 

@@ -199,6 +199,7 @@ impl Driver {
     /// The loop runs with `key` as [`HarvestTenant::current`]. It stops when
     /// `stop` fires, after the command or pass in flight. The caller hands
     /// the task to the fleet, which waits for it before the tenant closes.
+    /// `on_exit` runs when the task ends or is aborted.
     ///
     /// [`HarvestTenant::current`]: super::HarvestTenant::current
     pub(crate) fn spawn_tenant(
@@ -206,9 +207,13 @@ impl Driver {
         tick: Duration,
         key: FleetDbKey,
         stop: CancellationToken,
+        on_exit: Box<dyn FnOnce() + Send>,
     ) -> (mpsc::Sender<Command>, tokio::task::JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(COMMAND_BACKLOG);
         let task = tokio::spawn(super::fleet::scoped(key, async move {
+            // Declared first, so it runs last: after the runtime drops, on a
+            // return and on an abort alike.
+            let _exit = OnExit(Some(on_exit));
             let reply = drive(runtime, receiver, tick, &stop).await;
             if let Some(reply) = reply {
                 let _ = reply.send(());
@@ -228,6 +233,17 @@ impl Driver {
             && task.await.is_err()
         {
             tracing::warn!("the harvest-sqlite driver did not stop cleanly");
+        }
+    }
+}
+
+/// Runs its closure when dropped.
+struct OnExit(Option<Box<dyn FnOnce() + Send>>);
+
+impl Drop for OnExit {
+    fn drop(&mut self) {
+        if let Some(on_exit) = self.0.take() {
+            on_exit();
         }
     }
 }

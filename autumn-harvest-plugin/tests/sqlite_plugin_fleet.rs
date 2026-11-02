@@ -51,9 +51,9 @@ struct Fixture {
     client: TestClient,
 }
 
-fn fleet(root: &Path) -> DatabaseFleet {
+fn fleet(root: &Path, mode: &str) -> DatabaseFleet {
     let config: DatabaseFleetConfig = serde_json::from_value(json!({
-        "mode": "tenant",
+        "mode": mode,
         "root": root.display().to_string(),
         "max_open": 8,
         "pool_size": 2,
@@ -73,6 +73,12 @@ fn plugin() -> HarvestPlugin {
 }
 
 fn boot(profile: &str) -> Fixture {
+    boot_with(profile, "tenant", &[])
+}
+
+/// Boot an app on a fresh fleet. Each tenant in `open` is open before the
+/// plugin starts.
+fn boot_with(profile: &str, mode: &str, open: &[&str]) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let mut config = AutumnConfig::default();
     let url = format!("sqlite://{}", dir.path().join("control.db").display());
@@ -83,7 +89,24 @@ fn boot(profile: &str) -> Fixture {
     })
     .expect("control pool")
     .expect("a url gives a pool");
-    let fleet = fleet(&dir.path().join("fleet"));
+    let fleet = fleet(&dir.path().join("fleet"), mode);
+    for tenant in open {
+        let key = fleet.key_for(tenant).expect("key");
+        let opened = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("runtime")
+                        .block_on(fleet.provision(&key))
+                })
+                .join()
+                .expect("provision thread")
+        });
+        // The fleet keeps the database open after the handle drops.
+        drop(opened.expect("provision"));
+    }
     let client = TestApp::new()
         .config(config)
         .profile(profile)
@@ -92,6 +115,18 @@ fn boot(profile: &str) -> Fixture {
         .plugin(plugin())
         .build();
     Fixture { dir, fleet, client }
+}
+
+/// Create each tenant database, as an app does before it serves a tenant.
+async fn provision(fleet: &DatabaseFleet, tenants: &[&str]) {
+    for tenant in tenants {
+        drop(
+            fleet
+                .provision(&key(fleet, tenant))
+                .await
+                .expect("provision"),
+        );
+    }
 }
 
 fn key(fleet: &DatabaseFleet, tenant: &str) -> FleetDbKey {
@@ -154,6 +189,7 @@ async fn list_len(client: &TestClient, path: &str) -> usize {
 #[tokio::test(flavor = "multi_thread")]
 async fn each_open_tenant_runs_its_own_harvest_file() {
     let fx = boot("dev");
+    provision(&fx.fleet, &["acme", "bee"]).await;
 
     let acme = start(&fx.client, "acme", false).await;
     let bee = start(&fx.client, "bee", false).await;
@@ -241,10 +277,16 @@ async fn app_code_starts_a_run_in_one_tenant() {
     // The fleet owns the tenant driver, so a handle cannot stop it.
     assert!(tenant.shutdown().await.is_err());
 
-    // While a caller holds the handle, the fleet keeps the tenant open.
-    assert!(!fx.fleet.close_if_unused(&key(&fx.fleet, "acme")));
+    // The fleet counts a tenant idle when only its own lease is left. A
+    // caller's handle adds one. The plugin's registry adds none.
+    let leases = || {
+        let lease = fx.fleet.get_open(&key(&fx.fleet, "acme")).unwrap().lease();
+        std::sync::Arc::strong_count(&lease) - 1
+    };
+    assert_eq!(leases(), 2, "the fleet and the caller's handle");
     assert_eq!(harvest.open_tenants(), vec![key(&fx.fleet, "acme")]);
     drop(tenant);
+    assert_eq!(leases(), 1, "the registry holds no lease");
     fx.fleet.close_all().await;
 }
 
@@ -253,6 +295,7 @@ async fn app_code_starts_a_run_in_one_tenant() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_close_stops_the_driver_and_a_reopen_resumes() {
     let fx = boot("dev");
+    provision(&fx.fleet, &["acme"]).await;
     let exec = start(&fx.client, "acme", true).await;
     wait_for(
         &fx.client,
@@ -290,10 +333,18 @@ async fn a_close_stops_the_driver_and_a_reopen_resumes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delete_removes_the_tenant_harvest_file() {
     let fx = boot("dev");
+    provision(&fx.fleet, &["acme"]).await;
     let exec = start(&fx.client, "acme", false).await;
     completed(&fx.client, "acme", &exec).await;
     let path = harvest_file(&fx.fleet, "acme");
     assert!(path.exists());
+    let sibling = |suffix: &str| PathBuf::from(format!("{}{suffix}", path.display()));
+    // A clean close removes the WAL files. Stubs prove the delete removes
+    // each sidecar itself.
+    fx.fleet.close(&key(&fx.fleet, "acme")).await;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        std::fs::write(sibling(suffix), b"stub").unwrap();
+    }
 
     assert!(
         fx.fleet
@@ -302,9 +353,10 @@ async fn a_delete_removes_the_tenant_harvest_file() {
             .expect("delete")
     );
     for suffix in ["", "-wal", "-shm", "-journal"] {
-        let file = PathBuf::from(format!("{}{suffix}", path.display()));
-        assert!(!file.exists(), "{} survived the delete", file.display());
+        assert!(!sibling(suffix).exists(), "{suffix} survived the delete");
     }
+    // The writer lock file stays, as the lock module requires.
+    assert!(sibling(".lock").exists());
     let harvest = fx.client.state().extension::<HarvestFleet>().unwrap();
     assert_eq!(harvest.open_tenants(), Vec::<FleetDbKey>::new());
     fx.fleet.close_all().await;
@@ -316,6 +368,7 @@ async fn an_anonymous_tenant_mutation_outside_dev_is_refused() {
     // `test` is not `dev`, so the gate is closed. `prod` would also check
     // the `Host` header, which this test does not exercise.
     let fx = boot("test");
+    provision(&fx.fleet, &["acme"]).await;
     let response = fx
         .client
         .post("/harvest/tenants/acme/workflows/tenant_flow/start")
@@ -329,6 +382,32 @@ async fn an_anonymous_tenant_mutation_outside_dev_is_refused() {
         .send()
         .await
         .assert_ok();
+    fx.fleet.close_all().await;
+}
+
+/// The management API never creates a tenant, even when the fleet creates
+/// on demand. An unknown tenant is a `404` and leaves no file behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_route_never_creates_a_tenant() {
+    let fx = boot("dev");
+    for (method, path) in [
+        ("GET", "/harvest/tenants/ghost/workflows"),
+        ("GET", "/harvest/tenants/ghost/health/live"),
+        ("POST", "/harvest/tenants/ghost/workflows/tenant_flow/start"),
+    ] {
+        let response = if method == "GET" {
+            fx.client.get(path).send().await
+        } else {
+            fx.client
+                .post(path)
+                .json(&json!({ "input": false }))
+                .send()
+                .await
+        };
+        response.assert_status(404);
+    }
+    assert!(!fx.fleet.exists(&key(&fx.fleet, "ghost")));
+    assert!(!harvest_file(&fx.fleet, "ghost").exists());
     fx.fleet.close_all().await;
 }
 
@@ -386,4 +465,30 @@ async fn a_slot_fleet_never_lists_a_harvest_file() {
     std::fs::write(&harvest, b"").unwrap();
     assert_eq!(fleet.list().await.expect("list"), vec![key]);
     fleet.close_all().await;
+}
+
+/// A tenant that is open before the plugin starts gets a driver at startup,
+/// before any request reaches it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_open_before_startup_gets_a_driver() {
+    let fx = boot_with("dev", "tenant", &["acme"]);
+    let harvest = fx.client.state().extension::<HarvestFleet>().unwrap();
+    assert_eq!(harvest.open_tenants(), vec![key(&fx.fleet, "acme")]);
+    fx.fleet.close_all().await;
+}
+
+/// A slot fleet works the same way. A routing key reaches its slot, and the
+/// slot is the isolation unit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slot_fleet_runs_one_harvest_per_slot() {
+    let fx = boot_with("dev", "slot", &["acme"]);
+    let exec = start(&fx.client, "acme", false).await;
+    let slot = key(&fx.fleet, "acme");
+    assert!(matches!(slot, FleetDbKey::Slot(_)), "{slot:?}");
+    assert_eq!(
+        completed(&fx.client, "acme", &exec).await["who"],
+        slot.name()
+    );
+    assert!(harvest_file(&fx.fleet, "acme").exists());
+    fx.fleet.close_all().await;
 }
