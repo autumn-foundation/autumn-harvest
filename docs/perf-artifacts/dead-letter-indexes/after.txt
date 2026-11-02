@@ -1,0 +1,60 @@
+-- psql -d dl_after -f measure.sql
+ buffers | rows |                                                query                                                 
+---------+------+------------------------------------------------------------------------------------------------------
+       5 |    1 | DELETE FROM harvest_dead_letters WHERE original_task_id = $1 AND task_type = $2
+       3 |    1 | SELECT CEIL(EXTRACT($1 FROM (NOW() - MAX(failed_at))))::BIGINT AS age FROM harvest_dead_letters
+    5883 |    1 | SELECT COUNT(*) FROM harvest_dead_letters WHERE error ILIKE $1
+      24 |    1 | SELECT COUNT(*) FROM harvest_dead_letters WHERE queue_name = $1
+       5 |   50 | SELECT id, original_task_id, queue_name, failed_at FROM harvest_dead_letters ORDER BY failed_at DESC
+     125 |  100 | SELECT id, original_task_id, queue_name, failed_at FROM harvest_dead_letters WHERE queue_name = $1 O
+(6 rows)
+
+             relname             | relpages 
+---------------------------------+----------
+ harvest_dead_letters            |     5883
+ harvest_dead_letters_pkey       |      522
+ idx_harvest_dl_failed_at        |      276
+ idx_harvest_dl_original_task    |      388
+ idx_harvest_dl_owner            |        1
+ idx_harvest_dl_queue_failed     |      443
+ idx_harvest_dl_quota            |        1
+ idx_harvest_dl_workflow_exec_id |      554
+(8 rows)
+
+-- psql -d dl_after -f write.sql (run 1)
+ buffers | rows | wal_records | wal_fpi | wal_bytes |                            query                             
+---------+------+-------------+---------+-----------+--------------------------------------------------------------
+   15198 | 1000 |        6043 |    1285 |   8532671 | INSERT INTO harvest_dead_letters (original_task_id, queue_na
+(1 row)
+
+-- psql -d dl_after -f write.sql (run 2)
+ buffers | rows | wal_records | wal_fpi | wal_bytes |                            query                             
+---------+------+-------------+---------+-----------+--------------------------------------------------------------
+   15190 | 1000 |        6138 |    1274 |   8547898 | INSERT INTO harvest_dead_letters (original_task_id, queue_na
+(1 row)
+
+-- psql -d dl_after -f tradeoff.sql
+                                            QUERY PLAN                                             
+---------------------------------------------------------------------------------------------------
+ Limit (actual rows=100 loops=1)
+   Buffers: shared hit=5856
+   ->  Index Scan using idx_harvest_dl_failed_at on harvest_dead_letters (actual rows=100 loops=1)
+         Filter: (activity_name = 'refund'::text)
+         Rows Removed by Filter: 95000
+         Buffers: shared hit=5856
+ Planning:
+   Buffers: shared hit=2
+(8 rows)
+
+                                            QUERY PLAN                                             
+---------------------------------------------------------------------------------------------------
+ Limit (actual rows=100 loops=1)
+   Buffers: shared hit=95393
+   ->  Index Scan using idx_harvest_dl_failed_at on harvest_dead_letters (actual rows=100 loops=1)
+         Filter: (activity_name = 'refund'::text)
+         Rows Removed by Filter: 95000
+         Buffers: shared hit=95393
+ Planning:
+   Buffers: shared hit=2
+(8 rows)
+

@@ -801,6 +801,15 @@ pub async fn dead_letter_count(conn: &mut AsyncPgConnection) -> HarvestResult<i6
     Ok(count)
 }
 
+/// The age in whole seconds of the newest dead letter, or `NULL` with none.
+///
+/// The plugin status summary sends this on each request. A backward scan of
+/// `idx_harvest_dl_failed_at` reads one row (issue #2401).
+pub const DLQ_NEWEST_AGE_SQL: &str = concat!(
+    "SELECT CEIL(EXTRACT(EPOCH FROM (NOW() - MAX(failed_at))))::BIGINT AS age ",
+    "FROM harvest_dead_letters",
+);
+
 /// List dead-letter entries, newest first.
 ///
 /// # Errors
