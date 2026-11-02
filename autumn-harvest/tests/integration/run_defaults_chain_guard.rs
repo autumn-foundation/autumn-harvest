@@ -71,7 +71,7 @@ fn rust_files(root: &Path, dir: &str, out: &mut Vec<String>) {
             .replace('\\', "/");
         if path.is_dir() {
             rust_files(root, &relative, out);
-        } else if relative.ends_with(".rs") {
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
             out.push(relative);
         }
     }
@@ -161,7 +161,7 @@ fn the_guard_flags_a_bare_read_only() {
         .collect();
     assert_eq!(lines, [1, 4, 6]);
     let wrapped = "cache.apply_chain(name, wf.chain_execution_timeout)\n";
-    assert!(unwrapped_reads(wrapped).is_empty());
+    assert_eq!(unwrapped_reads(wrapped), []);
     let resolver = std::fs::read_to_string(repo_root().join("autumn-harvest/src/worker.rs"))
         .expect("read worker.rs");
     assert!(

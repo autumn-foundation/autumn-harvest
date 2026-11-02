@@ -30,7 +30,7 @@ const THREE_HOURS: Option<Duration> = Some(Duration::from_secs(3 * 3600));
 /// Serializes the tests on a shared database.
 ///
 /// They share one table, and one test renames it away for a moment.
-pub(crate) static SHARED_DB: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub static SHARED_DB: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Keeps a test database alive: its container, or the shared-database lock.
 struct Hold {
