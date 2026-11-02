@@ -171,6 +171,14 @@ required-features = ["sqlite", "eval"]
 name = "refine_propose"
 required-features = ["sqlite"]
 
+[[test]]
+name = "score"
+required-features = ["sqlite"]
+
+[[test]]
+name = "score_postgres"
+required-features = ["postgres"]
+
 [lints]
 workspace = true
 

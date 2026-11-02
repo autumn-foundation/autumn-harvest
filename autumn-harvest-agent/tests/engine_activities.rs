@@ -1,7 +1,12 @@
 //! The activities on the engine path: the `#[activity]` handlers read the
 //! harness from worker state, as `HarvestBuilder::state` installs it.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unnecessary_literal_bound
+)]
 
 mod common;
 
@@ -272,6 +277,7 @@ fn the_engine_registration_builds() {
             "agent_workspace_reset",
             "agent_workspace_floor",
             "agent_refine_propose",
+            "agent_score",
         ]
     );
     let flows: Vec<&str> = workflows().iter().map(|w| w.name).collect();
@@ -759,4 +765,84 @@ async fn a_zero_result_cap_leaves_a_big_reply_and_a_big_tool_result_alone() {
         .unwrap();
     assert!(outcome.content.len() >= 50_000, "{}", outcome.content.len());
     assert!(!outcome.content.ends_with("…[truncated]"));
+}
+
+/// A judge scorer: one judge call, then its reply text as the score.
+#[derive(Debug)]
+struct ReplyScore;
+
+impl autumn_harvest_agent::Scorer for ReplyScore {
+    fn id(&self) -> &str {
+        "reply"
+    }
+
+    fn score<'a>(
+        &'a self,
+        input: &'a autumn_harvest_agent::ScoreInput,
+        cx: &'a autumn_harvest_agent::ScoreContext<'_>,
+    ) -> autumn_harvest_agent::model::BoxFuture<'a, Result<autumn_harvest_agent::Verdict, AgentError>>
+    {
+        Box::pin(async move {
+            let request = ChatRequest {
+                messages: vec![ChatMessage::text(ChatRole::User, input.answer.clone())],
+                tools: Vec::new(),
+                max_tokens: None,
+                temperature: None,
+                draw: None,
+            };
+            let reply = cx.chat(None, &request).await?;
+            let text: String = reply
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    autumn_harvest_agent::ContentPart::Text(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            autumn_harvest_agent::Verdict::score(text.parse().unwrap_or(f64::NAN))
+        })
+    }
+}
+
+fn score_request(scorer: &str) -> serde_json::Value {
+    use autumn_harvest_agent::{AgentStop, ScoreInput, ScoreRequest};
+    let input = ScoreInput::new("Rate it.", "An answer.", AgentStop::Completed);
+    serde_json::to_value(ScoreRequest::new(scorer, input)).unwrap()
+}
+
+#[tokio::test]
+async fn the_score_handler_records_each_judge_call_on_the_context() {
+    use autumn_harvest_agent::{Verdict, agent_score_info};
+
+    let model = ScriptedModel::new(vec![answer("0.4", 9)]);
+    let harness =
+        AgentHarness::new(Arc::new(PricedModel(Arc::clone(&model)))).scorer(Arc::new(ReplyScore));
+    let ctx = with_harness(harness);
+    let out = (agent_score_info().handler)(&ctx, score_request("reply"))
+        .await
+        .unwrap();
+    let verdict: Verdict = serde_json::from_value(out).unwrap();
+    assert_eq!(verdict, Verdict::score(0.4).unwrap());
+    assert_eq!(model.calls(), 1);
+    let calls = ctx.llm_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].model(), "test-model-1");
+}
+
+#[tokio::test]
+async fn the_score_handler_fails_a_nan_score_with_decode() {
+    use autumn_harvest_agent::agent_score_info;
+
+    let model = ScriptedModel::new(vec![answer("not a number", 9)]);
+    let harness = AgentHarness::new(Arc::new(PricedModel(model))).scorer(Arc::new(ReplyScore));
+    let ctx = with_harness(harness);
+    let err = (agent_score_info().handler)(&ctx, score_request("reply"))
+        .await
+        .unwrap_err();
+    let failure = parse_typed_payload(&err).expect("a typed failure");
+    assert_eq!(failure.error_type, "Decode");
+    assert!(failure.non_retryable);
+    // The context holds the call. The engine writes no row for a failed
+    // attempt.
+    assert_eq!(ctx.llm_calls().len(), 1);
 }
