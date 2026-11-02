@@ -100,8 +100,8 @@ fn payload_schema(i: usize, variant: usize) -> Value {
     })
 }
 
-fn variant_for(i: usize, current: bool) -> usize {
-    if current && i % CHANGE_EVERY == 0 {
+const fn variant_for(i: usize, current: bool) -> usize {
+    if current && i.is_multiple_of(CHANGE_EVERY) {
         1 + (i / CHANGE_EVERY) % 3
     } else {
         0
