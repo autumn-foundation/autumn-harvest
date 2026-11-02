@@ -92,10 +92,10 @@ Statements: 6. Tables with no usable index: `harvest_dead_letters`.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT "harvest_dead_letters"."error" FROM "harvest_dead_letters"` | `harvest_dead_letters`: no usable index |
-| 2 | `SELECT "harvest_dead_letters"."error" FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."...` | `harvest_dead_letters`: no usable index |
+| 2 | `SELECT "harvest_dead_letters"."error" FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."...` | `harvest_dead_letters`: Index Scan on `idx_harvest_dl_queue_failed` |
 | 3 | `SELECT COUNT(*) FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."activity_name" = $1)` | `harvest_dead_letters`: no usable index |
 | 4 | `SELECT COUNT(*) FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."id" = $1)` | `harvest_dead_letters`: Index Only Scan on `harvest_dead_letters_pkey` |
-| 5 | `SELECT COUNT(*) FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."queue_name" = $1)` | `harvest_dead_letters`: no usable index |
+| 5 | `SELECT COUNT(*) FROM "harvest_dead_letters" WHERE ("harvest_dead_letters"."queue_name" = $1)` | `harvest_dead_letters`: Index Only Scan on `idx_harvest_dl_queue_failed` |
 | 6 | `SELECT COUNT(*) FROM "harvest_dead_letters" WHERE (("harvest_dead_letters"."activity_name" = $1) ...` | `harvest_dead_letters`: no usable index |
 
 ## `count_existing_in_window`
@@ -395,16 +395,16 @@ Statements: 1. Tables with no usable index: none.
 
 ## `query_dead_letters_for_api_bulk`
 
-Statements: 6. Tables with no usable index: `harvest_dead_letters`.
+Statements: 6. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: no usable index |
-| 2 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: no usable index |
+| 1 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: full scan of index `idx_harvest_dl_failed_at` |
+| 2 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: full scan of index `idx_harvest_dl_failed_at` |
 | 3 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: Index Scan on `harvest_dead_letters_pkey` |
-| 4 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: no usable index |
-| 5 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: no usable index |
-| 6 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: no usable index |
+| 4 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: Index Scan on `idx_harvest_dl_queue_failed` |
+| 5 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: Index Scan on `idx_harvest_dl_queue_failed` |
+| 6 | `SELECT "harvest_dead_letters"."id", "harvest_dead_letters"."original_task_id", "harvest_dead_lett...` | `harvest_dead_letters`: full scan of index `idx_harvest_dl_failed_at` |
 
 ## `query_running_count`
 
