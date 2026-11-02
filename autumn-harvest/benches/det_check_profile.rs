@@ -35,9 +35,10 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 fn main() {
-    let dir: PathBuf = std::env::var("DET_CHECK_PROFILE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+    let dir: PathBuf = std::env::var("DET_CHECK_PROFILE_DIR").map_or_else(
+        |_| Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        PathBuf::from,
+    );
     let reps = env_usize("DET_CHECK_PROFILE_REPS", 1);
 
     let mut total_findings = 0usize;

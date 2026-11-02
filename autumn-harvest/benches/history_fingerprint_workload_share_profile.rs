@@ -17,6 +17,7 @@
 //! `HFP_PROFILE_N`/`HFP_PROFILE_REPS` match `history_fingerprint_profile.rs`,
 //! so the two binaries compare at the same input size.
 
+#[allow(dead_code)]
 #[path = "replay_profile_support.rs"]
 mod support;
 
