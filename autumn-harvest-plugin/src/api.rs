@@ -17288,7 +17288,7 @@ fn validate_start_idempotency_key(
 /// Returns `Some(400)` when the key is reserved, `None` when it is fine. Uses
 /// the core predicate and message so every path refuses identically.
 #[must_use]
-fn reject_reserved_idempotency_key(key: &str) -> Option<axum::response::Response> {
+pub(crate) fn reject_reserved_idempotency_key(key: &str) -> Option<axum::response::Response> {
     use axum::response::IntoResponse as _;
     if !autumn_harvest::start_idempotency::is_reserved_key(key) {
         return None;

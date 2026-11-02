@@ -19,7 +19,8 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use super::driver::{
-    Command, MAX_CHAIN_HOPS, RoutedSignal, RoutedUpdate, SignalWithStartParams, StopAck,
+    Command, MAX_CHAIN_HOPS, MAX_RETRY_HOPS, RoutedSignal, RoutedUpdate, SignalWithStartParams,
+    Started, StopAck,
 };
 
 /// Why a [`HarvestSqlite`] call failed.
@@ -235,6 +236,19 @@ impl HarvestSqlite {
         input: Value,
         options: StartOptions,
     ) -> Result<StartOutcome, HarvestSqliteError> {
+        Ok(self
+            .start_with_state(workflow_name, input, options)
+            .await?
+            .outcome)
+    }
+
+    /// [`start`](Self::start), and the state of the run right after it.
+    pub(crate) async fn start_with_state(
+        &self,
+        workflow_name: &str,
+        input: Value,
+        options: StartOptions,
+    ) -> Result<Started<StartOutcome>, HarvestSqliteError> {
         self.validate_input(workflow_name, &input)
             .map_err(HarvestSqliteError::InvalidInput)?;
         let workflow_name = workflow_name.to_owned();
@@ -258,6 +272,15 @@ impl HarvestSqlite {
         &self,
         request: SignalWithStartParams,
     ) -> Result<SignalWithStartOutcome, HarvestSqliteError> {
+        Ok(self.signal_with_start_state(request).await?.outcome)
+    }
+
+    /// [`signal_with_start`](Self::signal_with_start), and the state of the
+    /// run right after it.
+    pub(crate) async fn signal_with_start_state(
+        &self,
+        request: SignalWithStartParams,
+    ) -> Result<Started<SignalWithStartOutcome>, HarvestSqliteError> {
         // The runtime checks the start input only when it creates a run, and
         // the signal only after the key probe, as Postgres does (issue
         // #2467). So an attach needs no input, and a delivered keyed retry
@@ -540,11 +563,27 @@ impl HarvestSqlite {
     ///
     /// # Errors
     ///
-    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, or a
-    /// read error.
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id,
+    /// [`SqliteError::RetryChainTooDeep`] for a retry chain past its bound,
+    /// or a read error.
     pub async fn result(&self, exec: ExecutionId) -> Result<WorkflowResult, HarvestSqliteError> {
-        self.read(move |reader| last_run_of_chain(reader, exec).map(|row| compact_result(&row)))
-            .await
+        Ok(self.chain_result(exec).await?.result)
+    }
+
+    /// [`result`](Self::result), with the last run that the walk reached.
+    pub(crate) async fn chain_result(
+        &self,
+        exec: ExecutionId,
+    ) -> Result<ChainResult, HarvestSqliteError> {
+        self.read(move |reader| {
+            let (row, last, exhausted) = last_run_of_chain(reader, exec)?;
+            Ok(ChainResult {
+                result: compact_result(&row),
+                last,
+                exhausted,
+            })
+        })
+        .await
     }
 
     /// The run that a by-id route acts on: the running run of the key, or
@@ -585,42 +624,79 @@ impl HarvestSqlite {
 
     /// Check that the Harvest file answers a read.
     ///
+    /// The check opens its own read-only connection. A busy shared reader,
+    /// for example under many `/result` long polls, then cannot fail it.
+    ///
     /// # Errors
     ///
-    /// Returns the read error.
+    /// Returns the open or read error.
     pub async fn ping(&self) -> Result<(), HarvestSqliteError> {
-        self.read(|reader| reader.list_executions(&ExecutionFilter::new().limit(1)))
-            .await
-            .map(|_| ())
+        let path = self.inner.path.clone();
+        tokio::task::spawn_blocking(move || {
+            SqliteReader::open(&path)?.list_executions(&ExecutionFilter::new().limit(1))
+        })
+        .await
+        .map_err(|error| HarvestSqliteError::Read(error.to_string()))?
+        .map(|_| ())
+        .map_err(HarvestSqliteError::from)
     }
 }
 
-/// The last run of the chain that `exec` starts.
+/// The result of a chain walk (issue #2489).
+pub struct ChainResult {
+    /// The compact result of the last run that the walk reached.
+    pub result: WorkflowResult,
+    /// That run. A long poll resumes the walk from it.
+    pub last: ExecutionId,
+    /// `true` when the walk stopped at [`MAX_CHAIN_HOPS`] continue-as-new
+    /// hops with more chain left.
+    pub exhausted: bool,
+}
+
+/// The last run of the chain that `exec` starts, that run's id, and whether
+/// the walk ran out of hops.
 ///
 /// A `CONTINUED_AS_NEW` run hands over to its successor. A `FAILED` run hands
-/// over to its workflow retry. The walk stops after [`MAX_CHAIN_HOPS`] runs,
-/// as on Postgres. A successor row that is gone ends the walk at the run
-/// before it.
+/// over to its workflow retry. The budgets follow Postgres: at most
+/// [`MAX_CHAIN_HOPS`] continue-as-new hops, and at most [`MAX_RETRY_HOPS`]
+/// retry hops in one retry walk. A successor row that is gone ends the walk
+/// at the run before it.
 fn last_run_of_chain(
     reader: &SqliteReader,
     exec: ExecutionId,
-) -> Result<ExecutionDescription, SqliteError> {
+) -> Result<(ExecutionDescription, ExecutionId, bool), SqliteError> {
     let mut row = reader.describe(exec)?;
     let mut current = exec;
-    for _ in 0..MAX_CHAIN_HOPS {
+    let mut continued = 0_usize;
+    let mut retried = 0_usize;
+    loop {
         let Some(next) = reader.successor(current)? else {
-            break;
+            return Ok((row, current, false));
         };
+        if row.summary.state.value().map(String::as_str) == Some("FAILED") {
+            retried += 1;
+            if retried > MAX_RETRY_HOPS {
+                return Err(SqliteError::RetryChainTooDeep {
+                    exec_id: exec,
+                    max_depth: MAX_RETRY_HOPS,
+                });
+            }
+        } else {
+            if continued == MAX_CHAIN_HOPS {
+                return Ok((row, current, true));
+            }
+            continued += 1;
+            retried = 0;
+        }
         match reader.describe(next) {
             Ok(next_row) => {
                 row = next_row;
                 current = next;
             }
-            Err(SqliteError::ExecutionNotFound(_)) => break,
+            Err(SqliteError::ExecutionNotFound(_)) => return Ok((row, current, false)),
             Err(error) => return Err(error),
         }
     }
-    Ok(row)
 }
 
 /// The compact Postgres result form of one run. It mirrors
@@ -672,5 +748,67 @@ impl axum::extract::FromRequestParts<AppState> for HarvestSqlite {
                     )
                 }),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // The `#[workflow]` macro needs an `async fn`.
+    #![allow(clippy::unused_async)]
+
+    use super::*;
+    use autumn_harvest::prelude::*;
+    use autumn_harvest_sqlite::{RunState, SqliteRuntime};
+
+    /// Continues as new until its input reaches the stop value.
+    #[workflow]
+    async fn counts(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+        if n < STOP {
+            ctx.continue_as_new(serde_json::json!(n + 1))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(n)
+    }
+
+    /// Two hops past the bound of a `/result` walk.
+    const STOP: i64 = 130;
+
+    #[tokio::test]
+    async fn a_result_walk_stops_at_the_continue_as_new_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.db");
+        let mut runtime = SqliteRuntime::open(&path).unwrap();
+        runtime.register_workflow(&counts_info());
+        let first = runtime
+            .start_workflow("counts", serde_json::json!(0))
+            .unwrap();
+        let mut runs = vec![first];
+        loop {
+            match runtime
+                .run_until_blocked(runs[runs.len() - 1])
+                .await
+                .unwrap()
+            {
+                RunState::ContinuedAsNew(next) => runs.push(next),
+                RunState::Completed(_) => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let reader = SqliteReader::open(&path).unwrap();
+
+        let (row, last, exhausted) = last_run_of_chain(&reader, first).unwrap();
+        assert!(exhausted, "the chain is longer than the bound");
+        assert_eq!(last, runs[MAX_CHAIN_HOPS]);
+        assert_eq!(
+            compact_result(&row).state,
+            WorkflowResultState::ContinuedAsNew
+        );
+
+        // A walk that starts inside the bound reaches the end.
+        let (row, last, exhausted) = last_run_of_chain(&reader, runs[10]).unwrap();
+        assert!(!exhausted);
+        assert_eq!(last, runs[runs.len() - 1]);
+        assert_eq!(compact_result(&row).output, Some(serde_json::json!(STOP)));
     }
 }

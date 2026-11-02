@@ -100,7 +100,9 @@ Decision: 2, 6 (`SqliteReader::successor`), 7 and a new column for 8.
 | Answer `200` with `state: "running"` for a running run. A client then treats it as done. | `result_is_pending` asserts `204`, `Retry-After: 1` and no body. |
 | Stop at the `CONTINUED_AS_NEW` run. | `result_is_terminal` on the first id of a two-run chain. |
 | Stop at a `FAILED` run with a live retry. | A test reads `/result` of the failed run and gets `204`. |
-| Loop on a cycle in a corrupt chain. | The walk stops after 128 hops, as on Postgres. |
+| Loop on a cycle in a corrupt chain. | A walk stops after 128 continue-as-new hops and fails closed after 256 retry hops, as on Postgres. |
+| Report a by-id signal against the retry, not the key. | `execution_id` and the header name the key's run. `routed_execution_id` names the retry. |
+| Read the start state after the next drive. | The driver reads it in the same command as the write. |
 | Use `id = seq`. Then `after=0` skips the first event. | `id = seq + 1`. A test reads `after=0`. |
 | Count filtered events in `total_events`. | `history_filter_holds_only` checks the total. |
 | Bind one parameter per `event_type`. A long filter then hits the SQLite limit. | One JSON array parameter through `json_each`. |

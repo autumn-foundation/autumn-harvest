@@ -270,11 +270,13 @@ async fn a_failed_run_routes_to_its_live_retry() {
     assert_eq!(signal.status, 202, "{signal:?}");
     assert_eq!(signal.body["routed_execution_id"], retry, "{signal:?}");
     assert_eq!(signal.body["signal_delivered"], true);
-    // The key still names the failed run. Its retry takes the signal.
+    // The key still names the failed run, in the body and the header, as on
+    // Postgres. Its retry takes the signal.
     let by_id = post(&client, "/workflows/by-id/brittle/b-1/signal/go", &json!(2)).await;
     assert_eq!(by_id.status, 202, "{by_id:?}");
-    assert_eq!(by_id.body["execution_id"], retry, "{by_id:?}");
-    assert_eq!(by_id.execution_id.as_deref(), Some(retry.as_str()));
+    assert_eq!(by_id.body["execution_id"], first, "{by_id:?}");
+    assert_eq!(by_id.body["routed_execution_id"], retry, "{by_id:?}");
+    assert_eq!(by_id.execution_id.as_deref(), Some(first.as_str()));
 
     // A cancel of the failed run cancels the retry.
     let cancel = post_empty(&client, &format!("/workflows/{first}/cancel")).await;
@@ -418,10 +420,23 @@ async fn the_read_routes_keep_the_postgres_shape() {
     assert_eq!(describe.body["legal_hold"], false);
 
     contract::by_id_names_its_run(&get(&client, "/workflows/by-id/parked/d-1").await, &exec);
-    for path in ["/workflows/by-id/parked/", "/workflows/by-id/parked"] {
+    for path in [
+        "/workflows/by-id/parked/",
+        "/workflows/by-id/parked",
+        "/workflows/by-id/parked//result",
+    ] {
         let answer = get(&client, path).await;
         assert_eq!(answer.status, 400, "{path}: {answer:?}");
     }
+    let missing = post(&client, "/workflows/by-id/parked", &json!({})).await;
+    assert_eq!(
+        missing.body["error"], "workflow_id is required",
+        "{missing:?}"
+    );
+    // A bad `wait` is checked after the lookup, so its `400` names the run.
+    let bad_wait = get(&client, "/workflows/by-id/parked/d-1/result?wait=soon").await;
+    assert_eq!(bad_wait.status, 400, "{bad_wait:?}");
+    assert_eq!(bad_wait.execution_id.as_deref(), Some(exec.as_str()));
 
     contract::list_refuses_an_unknown_state(&get(&client, "/workflows?state=BOGUS").await);
     // The state check is case sensitive, as on Postgres.
@@ -444,6 +459,27 @@ async fn the_read_routes_keep_the_postgres_shape() {
 }
 
 // ── Writes ───────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_signal_with_start_is_the_postgres_400() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = app(dir.path());
+    let blank = post(
+        &client,
+        "/workflows/parked/signal-with-start",
+        &json!({ "workflow_id": "", "signal_name": "go" }),
+    )
+    .await;
+    assert_eq!(blank.status, 400, "{blank:?}");
+    assert_eq!(blank.body["error"], "workflow_id must not be empty");
+    let reserved = post(
+        &client,
+        "/workflows/parked/signal-with-start",
+        &json!({ "workflow_id": "w-0", "signal_name": "go", "idempotency_key": "conn:x" }),
+    )
+    .await;
+    assert_eq!(reserved.status, 400, "{reserved:?}");
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_write_routes_answer_the_postgres_codes() {
@@ -585,4 +621,14 @@ async fn an_update_answers_the_postgres_body() {
     )
     .await;
     assert_eq!(admitted.status, 400, "{admitted:?}");
+
+    // An update with no handler fails as it does on Postgres.
+    let missing = post(
+        &client,
+        &format!("/workflows/{exec}/update/nope"),
+        &json!({ "input": 1 }),
+    )
+    .await;
+    assert_eq!(missing.status, 409, "{missing:?}");
+    assert_eq!(missing.body["error"], "update handler 'nope' not found");
 }

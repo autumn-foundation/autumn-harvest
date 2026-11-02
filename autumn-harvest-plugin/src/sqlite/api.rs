@@ -126,11 +126,11 @@ pub fn router(state: ApiState) -> Router<()> {
         // `400`, not the catch-all `501` (issue #1353).
         .route(
             "/workflows/by-id/{workflow_name}",
-            get(by_id_without_id).route_layer(no_query.clone()),
+            get(by_id_without_id).post(by_id_without_id),
         )
         .route(
             "/workflows/by-id/{workflow_name}/",
-            get(by_id_without_id).route_layer(no_query),
+            get(by_id_with_empty_id).route_layer(no_query),
         )
         .route(
             "/workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
@@ -175,7 +175,8 @@ fn map_error(error: HarvestSqliteError) -> AutumnError {
         | SqliteError::WorkflowInputInvalid { .. }
         | SqliteError::PayloadTooDeep { .. }
         | SqliteError::QueryFailed { .. }
-        | SqliteError::NonDeterministic { .. } => AutumnError::bad_request_msg(message),
+        | SqliteError::NonDeterministic { .. }
+        | SqliteError::RetryChainTooDeep { .. } => AutumnError::bad_request_msg(message),
         SqliteError::PayloadTooLarge { .. } => {
             AutumnError::bad_request_msg(message).with_status(StatusCode::PAYLOAD_TOO_LARGE)
         }
@@ -193,10 +194,12 @@ fn map_error(error: HarvestSqliteError) -> AutumnError {
         SqliteError::UpdateTimedOut { .. } => {
             AutumnError::service_unavailable_msg(message).with_status(StatusCode::GATEWAY_TIMEOUT)
         }
-        // A panicked query handler is an engine fault, `503` on Postgres.
-        SqliteError::QueryPanicked { .. } | SqliteError::DatabaseLocked { .. } => {
-            AutumnError::service_unavailable_msg(message)
-        }
+        // A panicked query handler is an engine fault, and a storage error
+        // is safe to retry. Postgres answers both with `503`.
+        SqliteError::QueryPanicked { .. }
+        | SqliteError::DatabaseLocked { .. }
+        | SqliteError::Sqlite(_)
+        | SqliteError::TaskFailed { .. } => AutumnError::service_unavailable_msg(message),
         _ => AutumnError::internal_server_error_msg(message),
     }
 }
@@ -514,7 +517,6 @@ async fn describe_json(handle: &HarvestSqlite, exec: ExecutionId) -> Result<Valu
         .filter_map(|paged| serde_json::to_value(&paged.event).ok())
         .collect();
     let mut body = json!({
-        "backend": "sqlite",
         "parent_id": parent.map(|parent| parent.to_string()),
         "execution": execution_json(&description),
         "history": events,
@@ -578,25 +580,52 @@ fn by_id_response<T: IntoResponse>(out: Result<T, AutumnError>, exec: ExecutionI
     )
 }
 
+/// Resolve a business key for a by-id route. An empty id is the Postgres
+/// `400`, before any lookup (issue #1353).
+async fn resolve_key(
+    handle: &HarvestSqlite,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> Result<ExecutionId, AutumnError> {
+    if workflow_id.is_empty() {
+        return Err(AutumnError::bad_request_msg(
+            "workflow_id must not be empty",
+        ));
+    }
+    handle
+        .resolve_by_id(workflow_name, workflow_id)
+        .await
+        .map_err(map_error)
+}
+
 async fn get_by_id(
     State(state): State<ApiState>,
     Path((workflow_name, workflow_id)): Path<(String, String)>,
 ) -> Result<Response, AutumnError> {
     let handle = state.handle()?;
-    let exec = handle
-        .resolve_by_id(&workflow_name, &workflow_id)
-        .await
-        .map_err(map_error)?;
+    let exec = resolve_key(handle, &workflow_name, &workflow_id).await?;
     Ok(by_id_response(
         describe_json(handle, exec).await.map(Json),
         exec,
     ))
 }
 
-/// `/workflows/by-id/{workflow_name}` with no id, with or without the
-/// trailing slash.
-async fn by_id_without_id() -> AutumnError {
-    AutumnError::bad_request_msg("workflow_id is required and must not be empty")
+/// `/workflows/by-id/{workflow_name}` with no id segment. The body is the
+/// Postgres guard body.
+async fn by_id_without_id() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "workflow_id is required",
+            "detail": "address the business-id form as /workflows/by-id/{workflow_name}/{workflow_id}",
+        })),
+    )
+        .into_response()
+}
+
+/// `/workflows/by-id/{workflow_name}/`: an empty id, as on Postgres.
+async fn by_id_with_empty_id() -> AutumnError {
+    AutumnError::bad_request_msg("workflow_id must not be empty")
 }
 
 /// `GET /workflows/{id}/history`. It follows the Postgres cursor contract:
@@ -672,15 +701,23 @@ async fn result_response(
     wait: Duration,
 ) -> Result<Response, AutumnError> {
     let deadline = Instant::now() + wait;
+    let mut from = exec;
     loop {
-        let result = handle.result(exec).await.map_err(map_error)?;
-        if result.is_terminal() {
-            return Ok((StatusCode::OK, Json(result)).into_response());
+        let walk = handle.chain_result(from).await.map_err(map_error)?;
+        // A chain past its hop bound answers the run it reached at once, as
+        // the Postgres zero-wait read does. A long poll answers `204`.
+        if walk.exhausted && !wait.is_zero() {
+            return Ok(crate::api::workflow_result_pending_response());
+        }
+        if walk.exhausted || walk.result.is_terminal() {
+            return Ok((StatusCode::OK, Json(walk.result)).into_response());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Ok(crate::api::workflow_result_pending_response());
         }
+        // The next poll resumes at the run that this one reached.
+        from = walk.last;
         tokio::time::sleep(remaining.min(RESULT_POLL)).await;
     }
 }
@@ -690,21 +727,19 @@ async fn get_result_by_id(
     Path((workflow_name, workflow_id)): Path<(String, String)>,
     RawQuery(raw): RawQuery,
 ) -> Result<Response, AutumnError> {
-    // A bad query is a `400` before the lookup, as on Postgres.
+    // Only a bad encoding is a `400` before the lookup, as on Postgres. The
+    // `wait` check runs after it, so its `400` carries the header.
     let pairs = crate::strict_query::decode_or_autumn_error(raw.as_deref())?;
-    let wait = crate::api::parse_workflow_result_wait_query(
+    let handle = state.handle()?;
+    let exec = resolve_key(handle, &workflow_name, &workflow_id).await?;
+    let answer = match crate::api::parse_workflow_result_wait_query(
         &pairs,
         state.api_state.workflow_result_max_wait(),
-    )?;
-    let handle = state.handle()?;
-    let exec = handle
-        .resolve_by_id(&workflow_name, &workflow_id)
-        .await
-        .map_err(map_error)?;
-    Ok(by_id_response(
-        result_response(handle, exec, wait).await,
-        exec,
-    ))
+    ) {
+        Ok(wait) => result_response(handle, exec, wait).await,
+        Err(error) => Err(error),
+    };
+    Ok(by_id_response(answer, exec))
 }
 
 // ── Writes ───────────────────────────────────────────────────────────────────
@@ -852,28 +887,28 @@ async fn start(
     options.memo = request.memo;
     options.search_attributes = request.search_attrs.unwrap_or_default();
     let input = request.input.unwrap_or(Value::Null);
-    let started = match state.handle()?.start(&workflow_name, input, options).await {
+    let started = match state
+        .handle()?
+        .start_with_state(&workflow_name, input, options)
+        .await
+    {
         Ok(started) => started,
         Err(error) => return Ok(write_error(error)),
     };
-    let description = state
-        .handle()?
-        .describe(started.exec_id)
-        .await
-        .map_err(map_error)?;
-    let status = if started.created {
+    let status = if started.outcome.created {
         StatusCode::CREATED
     } else {
         StatusCode::OK
     };
+    // Postgres sends `started_fresh` only for an idempotency key or a
+    // `conflict_policy`. This backend refuses both, so the field is absent.
     Ok((
         status,
         Json(json!({
-            "execution_id": started.exec_id.to_string(),
+            "execution_id": started.outcome.exec_id.to_string(),
             "workflow_name": workflow_name,
-            "workflow_id": stored_json(&description.summary.workflow_id),
-            "state": stored_json(&description.summary.state),
-            "started_fresh": started.created,
+            "workflow_id": started.workflow_id,
+            "state": started.state,
         })),
     )
         .into_response())
@@ -908,6 +943,16 @@ async fn signal_with_start(
     session: Option<axum::Extension<Session>>,
     Json(body): Json<SignalWithStartBody>,
 ) -> Result<Response, AutumnError> {
+    if let Err(response) = crate::api::reject_empty_workflow_id(Some(&body.workflow_id)) {
+        return Ok(response);
+    }
+    if let Some(response) = body
+        .idempotency_key
+        .as_deref()
+        .and_then(crate::api::reject_reserved_idempotency_key)
+    {
+        return Ok(response);
+    }
     refuse_unsupported(&[
         ("queue", body.queue.is_some()),
         ("memo", body.memo.is_some()),
@@ -921,10 +966,10 @@ async fn signal_with_start(
     require_admin_for_policy(&state, body.id_reuse_policy.as_deref(), session).await?;
     let reuse_policy = crate::api::parse_reuse_policy(body.id_reuse_policy.as_deref())?;
     let handle = state.handle()?;
-    // The handle checks the start input even when the call attaches, and
-    // the signal payload, as Postgres does.
-    let outcome = match handle
-        .signal_with_start(SignalWithStartParams {
+    // The runtime checks the start input when the call starts a run, and the
+    // signal payload, as Postgres does.
+    let started = match handle
+        .signal_with_start_state(SignalWithStartParams {
             workflow_name: workflow_name.clone(),
             workflow_id: body.workflow_id.clone(),
             input: body.start_input.unwrap_or(Value::Null),
@@ -935,10 +980,10 @@ async fn signal_with_start(
         })
         .await
     {
-        Ok(outcome) => outcome,
+        Ok(started) => started,
         Err(error) => return Ok(write_error(error)),
     };
-    let description = handle.describe(outcome.exec_id).await.map_err(map_error)?;
+    let outcome = started.outcome;
     let status = if outcome.started_fresh {
         StatusCode::CREATED
     } else {
@@ -950,7 +995,7 @@ async fn signal_with_start(
             "execution_id": outcome.exec_id.to_string(),
             "workflow_name": workflow_name,
             "workflow_id": body.workflow_id,
-            "state": stored_json(&description.summary.state),
+            "state": started.state,
             "started_fresh": outcome.started_fresh,
             "signal_delivered": outcome.signal_delivered,
         })),
@@ -963,6 +1008,23 @@ async fn signal_with_start(
 /// Postgres, so a client that asked for exactly-once never silently gets
 /// at-least-once.
 fn idempotency_key(
+    headers: &axum::http::HeaderMap,
+    raw_query: Option<&str>,
+) -> Result<Option<String>, Box<Response>> {
+    let key =
+        raw_idempotency_key(headers, raw_query).map_err(|error| Box::new(error.into_response()))?;
+    // The `conn:` namespace belongs to the engine, as on Postgres.
+    if let Some(response) = key
+        .as_deref()
+        .and_then(crate::api::reject_reserved_idempotency_key)
+    {
+        return Err(Box::new(response));
+    }
+    Ok(key)
+}
+
+/// The key as the request carries it, before the namespace check.
+fn raw_idempotency_key(
     headers: &axum::http::HeaderMap,
     raw_query: Option<&str>,
 ) -> Result<Option<String>, AutumnError> {
@@ -999,7 +1061,10 @@ async fn signal(
     body: Bytes,
 ) -> Result<Response, AutumnError> {
     let exec = parse_exec(&id)?;
-    let key = idempotency_key(&headers, raw.as_deref())?;
+    let key = match idempotency_key(&headers, raw.as_deref()) {
+        Ok(key) => key,
+        Err(response) => return Ok(*response),
+    };
     let payload: Value = optional_body::<Option<Value>>(&body)?.unwrap_or(Value::Null);
     let routed = match state
         .handle()?
@@ -1013,7 +1078,6 @@ async fn signal(
     // live retry of a failed run (issue #843), and is absent otherwise.
     let mut ack = json!({
         "ok": true,
-        "execution_id": exec.to_string(),
         "signal_delivered": routed.delivered,
     });
     if routed.exec != exec
@@ -1031,33 +1095,40 @@ async fn signal_by_id(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response, AutumnError> {
-    let key = idempotency_key(&headers, raw.as_deref())?;
+    let key = match idempotency_key(&headers, raw.as_deref()) {
+        Ok(key) => key,
+        Err(response) => return Ok(*response),
+    };
     let payload: Value = optional_body::<Option<Value>>(&body)?.unwrap_or(Value::Null);
     let handle = state.handle()?;
+    // `execution_id` and the header name the run that the key resolves to,
+    // as on Postgres (issue #805). The run that took the signal can differ:
+    // a failed run hands it to its live retry (issue #843).
+    let resolved = resolve_key(handle, &workflow_name, &workflow_id).await?;
     let delivery = match handle
         .signal_by_workflow_id(&workflow_name, &workflow_id, &signal_name, payload, key)
         .await
     {
         Ok(delivery) => delivery,
-        Err(error) => {
-            // A key with a run still names that run, as on Postgres.
-            let response = signal_error(error);
-            return Ok(
-                match handle.resolve_by_id(&workflow_name, &workflow_id).await {
-                    Ok(exec) => with_execution_id(response, exec),
-                    Err(_) => response,
-                },
-            );
-        }
+        Err(error) => return Ok(with_execution_id(signal_error(error), resolved)),
     };
-    let ack = json!({
+    let mut ack = json!({
+        "execution_id": resolved.to_string(),
         "ok": true,
-        "execution_id": delivery.exec_id.to_string(),
         "signal_delivered": delivery.delivered,
     });
+    if delivery.delivered
+        && delivery.exec_id != resolved
+        && let Value::Object(fields) = &mut ack
+    {
+        fields.insert(
+            "routed_execution_id".into(),
+            delivery.exec_id.to_string().into(),
+        );
+    }
     Ok(with_execution_id(
         (StatusCode::ACCEPTED, Json(ack)).into_response(),
-        delivery.exec_id,
+        resolved,
     ))
 }
 
@@ -1080,10 +1151,10 @@ async fn cancel(
 ) -> Result<(StatusCode, Json<Value>), AutumnError> {
     let exec = parse_exec(&id)?;
     let ReasonBody { reason } = optional_body(&body)?;
-    let reason = crate::api::truncate_operator_reason(reason.as_deref().unwrap_or_default());
+    // The runtime trims the reason and applies the default, as on Postgres.
     let ack = state
         .handle()?
-        .cancel(exec, &reason)
+        .cancel(exec, reason.as_deref().unwrap_or_default())
         .await
         .map_err(map_error)?;
     let deferred = ack.state == "RUNNING";
@@ -1102,10 +1173,9 @@ async fn terminate(
 ) -> Result<(StatusCode, Json<Value>), AutumnError> {
     let exec = parse_exec(&id)?;
     let ReasonBody { reason } = optional_body(&body)?;
-    let reason = crate::api::truncate_operator_reason(reason.as_deref().unwrap_or_default());
     let ack = state
         .handle()?
-        .terminate(exec, &reason)
+        .terminate(exec, reason.as_deref().unwrap_or_default())
         .await
         .map_err(map_error)?;
     Ok((
@@ -1203,6 +1273,28 @@ async fn update(
             return Ok((
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({ "error": "update rejected by validator", "reason": reason })),
+            )
+                .into_response());
+        }
+        // Postgres admits an update with no handler, and its replay fails it.
+        // This backend writes no event, but the answer is the same.
+        Err(HarvestSqliteError::Sqlite(SqliteError::UpdateHandlerNotFound { name, .. })) => {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "update_id": autumn_harvest::UpdateId::new().to_string(),
+                    "error": format!("update handler '{name}' not found"),
+                })),
+            )
+                .into_response());
+        }
+        Err(HarvestSqliteError::Sqlite(error @ SqliteError::UpdateTimedOut { .. })) => {
+            return Ok((
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(json!({
+                    "update_id": autumn_harvest::UpdateId::new().to_string(),
+                    "message": error.to_string(),
+                })),
             )
                 .into_response());
         }
@@ -1396,5 +1488,8 @@ mod tests {
             Some("k2")
         );
         assert!(idempotency_key(&none, Some("other=1")).is_err());
+        // The engine owns the `conn:` namespace, as on Postgres.
+        let reserved = idempotency_key(&none, Some("idempotency_key=conn:x")).unwrap_err();
+        assert_eq!(reserved.status(), StatusCode::BAD_REQUEST);
     }
 }

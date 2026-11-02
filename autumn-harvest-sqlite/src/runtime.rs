@@ -1607,7 +1607,12 @@ impl SqliteRuntime {
     /// cancel or terminate then finds the run sealed, and the state check
     /// reports `WorkflowNotRunning`. A keyed signal retry stays a no-op, as on
     /// any other terminal run. An unknown `exec` reports `ExecutionNotFound`.
-    fn seal_if_overdue(&mut self, exec: ExecutionId) -> SqliteResult<()> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, or a
+    /// persistence error if the seal cannot be written.
+    pub fn seal_if_overdue(&mut self, exec: ExecutionId) -> SqliteResult<()> {
         let now = (self.now_fn)().timestamp_millis();
         self.seal_if_overdue_at(exec, now)
     }

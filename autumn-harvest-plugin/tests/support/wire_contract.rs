@@ -59,7 +59,8 @@ pub fn result_is_terminal<'a>(reply: &'a Reply, state: &str) -> &'a Value {
         "completed" => assert!(body.get("error").is_none(), "{body}"),
         "failed" | "cancelled" | "timed_out" | "terminated" => {
             assert!(body.get("output").is_none(), "{body}");
-            assert!(body["error"].is_string(), "{body}");
+            // A run with no stored error has no `error` field.
+            assert!(body.get("error").is_none_or(Value::is_string), "{body}");
         }
         other => panic!("not a terminal state: {other}"),
     }
@@ -80,6 +81,9 @@ pub fn result_refuses_a_bad_query(reply: &Reply) {
 // ── GET /workflows/{id}/history ──────────────────────────────────────────────
 
 /// The page envelope and the fields of each event.
+///
+/// A SQLite event written before #2489 has no time, so call this on a run
+/// that this build wrote.
 pub fn history_page_shape(body: &Value) {
     assert!(body["events"].is_array(), "{body}");
     assert!(body["total_events"].is_u64(), "{body}");

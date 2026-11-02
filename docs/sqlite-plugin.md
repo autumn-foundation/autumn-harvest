@@ -220,6 +220,8 @@ Every other management route answers `501` and links the epic.
   are refused.
 - An event written before #2489 has `timestamp: null`. A Postgres event
   always has a time.
+- A start or a signal-with-start checks its body before the workflow name.
+  So a bad body is a `400` where Postgres answers `404` for an unknown name.
 - A cancel or a terminate body has no `failed_task_count`. This backend
   deletes the pending tasks of the run. It does not mark them failed.
 

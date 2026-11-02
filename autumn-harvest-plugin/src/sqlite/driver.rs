@@ -84,8 +84,48 @@ pub struct SignalWithStartParams {
     pub idempotency_key: Option<String>,
 }
 
-/// The most runs that a chain walk visits, as on Postgres.
+/// The most continue-as-new hops that a `/result` walk follows, as on
+/// Postgres.
 pub const MAX_CHAIN_HOPS: usize = 128;
+
+/// The most retry hops that one walk of a retry chain follows, as on
+/// Postgres (issue #843).
+pub const MAX_RETRY_HOPS: usize = autumn_harvest::RETRY_CHAIN_MAX_DEPTH;
+
+/// A run that a start or a signal-with-start resolved to, with its state at
+/// that moment (issue #2489).
+///
+/// The driver reads the state in the same command, so no drive runs between
+/// the write and the read. The response then reports the state that the
+/// write left, as on Postgres.
+#[derive(Debug, Clone)]
+pub struct Started<T> {
+    /// The outcome of the write.
+    pub outcome: T,
+    /// The state of the run right after the write.
+    pub state: String,
+    /// The business id of the run. A start with no id gets one.
+    pub workflow_id: Option<String>,
+}
+
+impl<T> Started<T> {
+    /// Read the state and the business id of `exec` right after a write.
+    ///
+    /// A failed read reports `RUNNING` and no id, because a committed start
+    /// must not answer an error. A client would retry it and start a second
+    /// run.
+    fn read(runtime: &SqliteRuntime, exec: ExecutionId, outcome: T) -> Self {
+        let summary = runtime.describe(exec).ok().map(|row| row.summary);
+        Self {
+            outcome,
+            state: summary
+                .as_ref()
+                .and_then(|summary| summary.state.value().cloned())
+                .unwrap_or_else(|| "RUNNING".to_owned()),
+            workflow_id: summary.and_then(|summary| summary.workflow_id.into_value()),
+        }
+    }
+}
 
 /// A signal that reached a run (issue #2489).
 #[derive(Debug, Clone, Copy)]
@@ -125,11 +165,11 @@ pub enum Command {
         workflow_name: String,
         input: Value,
         options: StartOptions,
-        reply: oneshot::Sender<SqliteResult<StartOutcome>>,
+        reply: oneshot::Sender<SqliteResult<Started<StartOutcome>>>,
     },
     SignalWithStart {
         request: SignalWithStartParams,
-        reply: oneshot::Sender<SqliteResult<SignalWithStartOutcome>>,
+        reply: oneshot::Sender<SqliteResult<Started<SignalWithStartOutcome>>>,
     },
     Signal {
         exec: ExecutionId,
@@ -316,19 +356,13 @@ async fn handle(runtime: &mut SqliteRuntime, command: Command) {
             options,
             reply,
         } => {
-            let _ = reply.send(runtime.start_workflow_with_options(&workflow_name, input, options));
+            let started = runtime
+                .start_workflow_with_options(&workflow_name, input, options)
+                .map(|outcome| Started::read(runtime, outcome.exec_id, outcome));
+            let _ = reply.send(started);
         }
         Command::SignalWithStart { request, reply } => {
-            let outcome = runtime.signal_with_start(SignalWithStart {
-                workflow_name: &request.workflow_name,
-                workflow_id: &request.workflow_id,
-                input: request.input,
-                reuse_policy: request.reuse_policy,
-                signal_name: &request.signal_name,
-                signal_payload: request.signal_payload,
-                idempotency_key: request.idempotency_key.as_deref(),
-            });
-            let _ = reply.send(outcome);
+            let _ = reply.send(signal_with_start(runtime, request));
         }
         Command::Signal {
             exec,
@@ -426,18 +460,51 @@ fn state_of(runtime: &SqliteRuntime, exec: ExecutionId) -> SqliteResult<String> 
 /// retry, as on Postgres. The walk follows the retry chain only. A
 /// `CONTINUED_AS_NEW` run is not routed, as on Postgres. A retry row that is
 /// gone ends the walk at the run before it.
+///
+/// # Errors
+///
+/// Returns [`SqliteError::RetryChainTooDeep`] past [`MAX_RETRY_HOPS`]. The
+/// walk fails closed, so a write never lands on a failed run while its
+/// retry runs on.
 fn live_attempt(runtime: &SqliteRuntime, exec: ExecutionId) -> SqliteResult<ExecutionId> {
     let mut current = exec;
-    for _ in 0..MAX_CHAIN_HOPS {
+    for _ in 0..MAX_RETRY_HOPS {
         if state_of(runtime, current)? != "FAILED" {
             return Ok(current);
         }
-        match runtime.successor(current)? {
-            Some(next) if runtime.describe(next).is_ok() => current = next,
-            _ => return Ok(current),
+        let Some(next) = runtime.successor(current)? else {
+            return Ok(current);
+        };
+        match runtime.describe(next) {
+            Ok(_) => current = next,
+            Err(SqliteError::ExecutionNotFound(_)) => return Ok(current),
+            Err(error) => return Err(error),
         }
     }
+    if state_of(runtime, current)? == "FAILED" && runtime.successor(current)?.is_some() {
+        return Err(SqliteError::RetryChainTooDeep {
+            exec_id: exec,
+            max_depth: MAX_RETRY_HOPS,
+        });
+    }
     Ok(current)
+}
+
+/// Run a signal-with-start, and read the state that it left.
+fn signal_with_start(
+    runtime: &mut SqliteRuntime,
+    request: SignalWithStartParams,
+) -> SqliteResult<Started<SignalWithStartOutcome>> {
+    let outcome = runtime.signal_with_start(SignalWithStart {
+        workflow_name: &request.workflow_name,
+        workflow_id: &request.workflow_id,
+        input: request.input,
+        reuse_policy: request.reuse_policy,
+        signal_name: &request.signal_name,
+        signal_payload: request.signal_payload,
+        idempotency_key: request.idempotency_key.as_deref(),
+    })?;
+    Ok(Started::read(runtime, outcome.exec_id, outcome))
 }
 
 /// Signal the run of a `(workflow_name, workflow_id)` key.
@@ -503,6 +570,9 @@ fn already_stopped(runtime: &SqliteRuntime, exec: ExecutionId) -> SqliteResult<S
 /// on Postgres.
 fn cancel(runtime: &mut SqliteRuntime, exec: ExecutionId, reason: &str) -> SqliteResult<StopAck> {
     let exec = live_attempt(runtime, exec)?;
+    // A run past its deadline ends `TIMED_OUT` first, as every other write
+    // does. A repeat cancel then answers `409`, not a stale `RUNNING`.
+    runtime.seal_if_overdue(exec)?;
     if state_of(runtime, exec)? == "CANCELLED" {
         return already_stopped(runtime, exec);
     }
