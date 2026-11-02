@@ -15,3 +15,12 @@ harvest-verify-corpus-helpers = { version = "0.8.0", path = "../helpers" }
 harvest-verify-corpus-helpers-deep = { version = "0.8.0", path = "../helpers-deep" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+# Verifier fixture code. Each function has the exact shape that
+# `corpus/expectations.toml` pins, so a rewrite to suit a style lint
+# changes the MIR under test. Style, complexity and perf lints only
+# suggest rewrites, so they are off. Correctness and suspicious stay on.
+[lints.clippy]
+style = { level = "allow", priority = -1 }
+complexity = { level = "allow", priority = -1 }
+perf = { level = "allow", priority = -1 }

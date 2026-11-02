@@ -934,6 +934,10 @@ jobs:
       - name: Compile db-backed tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         shell: bash
+        env:
+          # The same limit as the manifest compile step above. Without it, the
+          # Windows runner fails with os error 1455 here too.
+          CARGO_BUILD_JOBS: ${{ runner.os == 'Windows' && '2' || 'default' }}
         run: |
           cargo test -p autumn-harvest --all-features --lib --no-run
           cargo test -p autumn-harvest --all-features --tests --no-run
@@ -2276,12 +2280,34 @@ jobs:
       # crate's no-default-features debt as a redis-crate failure.
       - name: Clippy autumn-harvest-redis
         run: cargo clippy -p autumn-harvest-redis --all-targets --no-deps -- -D warnings
-      # Issue #962: a new workspace member gets NO clippy coverage unless a step
-      # is added to one of the clippy jobs — there is no `--workspace` clippy
-      # invocation, only per-crate ones. The verify crate opts into the workspace's pedantic
+      # Issue #962: a per-crate step gives a member its own flags and
+      # features. `clippy-workspace` gives every member a default-features
+      # baseline, so a missing step no longer means no coverage. The verify crate opts into the workspace's pedantic
       # + nursery lints, which `-D warnings` makes effectively deny.
       - name: Clippy autumn-harvest-verify
         run: cargo clippy -p autumn-harvest-verify --all-targets -- -D warnings
+
+  # The release gate (`validate` in release.yml) runs this exact command on a
+  # tag push. The per-crate jobs above cover only the members they name, so
+  # a member without a step went unlinted until release time. The verifier
+  # corpus crates did, and 0.8.0's tag failed on a Rust 1.99 lint. This job
+  # runs the release command on every PR, so a tag cannot fail clippy first.
+  # Keep its command identical to release.yml's Clippy step.
+  clippy-workspace:
+    name: Clippy (whole workspace, as the release gate runs it)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+      - name: Clippy --workspace (same command as release.yml validate)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   clippy-examples:
     name: Clippy (example crates)
@@ -2484,6 +2510,11 @@ jobs:
         # and weight builders a reader pastes verbatim. Nothing compiled them.
         # See scripts/check-worker-routing-examples.sh.
         run: ./scripts/check-worker-routing-examples.sh
+      - name: Check chapter 8 DAG snippets compile
+        # Chapter 8 shows 15 DAG blocks a reader pastes verbatim. A syntax
+        # check covered them. Nothing compiled them against the API.
+        # See scripts/check-dags-schedules-examples.sh.
+        run: ./scripts/check-dags-schedules-examples.sh
 
   # One check for branch protection to require in place of every leg above.
   # A skipped leg (a draft PR) counts as a pass, as a skipped job does
@@ -2491,7 +2522,7 @@ jobs:
   lint-compile:
     name: Lint (compile)
     runs-on: ubuntu-latest
-    needs: [clippy-core, clippy-plugin, clippy-plugin-backends, clippy-plugin-cloud, clippy-crates, clippy-examples, doc-snippets]
+    needs: [clippy-core, clippy-plugin, clippy-plugin-backends, clippy-plugin-cloud, clippy-crates, clippy-workspace, clippy-examples, doc-snippets]
     if: always()
     steps:
       - name: Every compile-checking lint job passed or was skipped
@@ -2687,7 +2718,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: cargo-deny@0.20.2
       - name: cargo deny check (advisories, licenses, bans, sources)
