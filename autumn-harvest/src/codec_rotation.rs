@@ -3874,18 +3874,30 @@ mod tests {
     }
 
     /// Every JSONB column `schema.rs` declares, as `table.column`.
+    ///
+    /// A declaration with `#[sql_name]` names its physical table. A split
+    /// table's extension declaration therefore reads as the table itself
+    /// (issue #2492).
     fn jsonb_columns(schema: &str) -> Vec<String> {
         let mut table = "";
+        let mut sql_name: Option<&str> = None;
         let mut out = Vec::new();
         for line in schema.lines() {
             let trimmed = line.trim();
+            if let Some(name) = trimmed
+                .strip_prefix("#[sql_name = \"")
+                .and_then(|rest| rest.strip_suffix("\"]"))
+            {
+                sql_name = Some(name);
+                continue;
+            }
             if let Some(name) = trimmed.strip_suffix(" (id) {").or_else(|| {
                 trimmed
                     .split_once(" (")
                     .filter(|(_, rest)| rest.ends_with(") {"))
                     .map(|(name, _)| name)
             }) {
-                table = name;
+                table = sql_name.take().unwrap_or(name);
                 continue;
             }
             if let Some((column, kind)) = trimmed.split_once("->") {

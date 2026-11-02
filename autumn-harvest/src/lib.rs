@@ -555,6 +555,9 @@ pub mod slot_tuner;
 pub mod stall_diagnosis;
 /// Request-scoped idempotency keys for plain workflow starts (issue #808).
 pub mod start_idempotency;
+/// One physical table over two diesel `table!` declarations (issue #2492).
+#[cfg(feature = "db")]
+pub mod table_split;
 /// OpenTelemetry integration: trace-context propagation and metrics.
 pub mod telemetry;
 /// Tenant keys: validation shared by tokens, starts and retention (issue #1977).

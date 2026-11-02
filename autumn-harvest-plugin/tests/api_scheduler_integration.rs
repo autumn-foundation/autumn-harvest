@@ -1,3 +1,5 @@
+use autumn_harvest::schema::harvest_task_queue_ext;
+use autumn_harvest::table_split::SetExt;
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -3560,7 +3562,9 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
                 harvest_task_queue::max_attempts.eq(1),
                 harvest_task_queue::started_at
                     .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(60))),
-                harvest_task_queue::start_to_close.eq(Some(chrono::Duration::seconds(1))),
+                SetExt(
+                    harvest_task_queue_ext::start_to_close.eq(Some(chrono::Duration::seconds(1))),
+                ),
             ))
             .execute(&mut setup_conn)
             .await

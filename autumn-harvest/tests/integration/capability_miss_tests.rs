@@ -42,6 +42,8 @@
 //! against it directly; otherwise a fresh testcontainers Postgres is booted
 //! with the full migration bundle.
 
+use autumn_harvest::schema::harvest_task_queue_ext;
+use autumn_harvest::table_split::SetExt;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -529,10 +531,12 @@ async fn seed_prior_missing_workers(
     .set((
         harvest_task_queue::capability_miss_workers.eq(owned),
         harvest_task_queue::capability_misses.eq(misses),
-        harvest_task_queue::capability_miss_handler.eq(Some(format!(
-            "{}:{missing_workflow}",
-            autumn_harvest::worker::CapabilityMissKind::Workflow.as_str()
-        ))),
+        SetExt(
+            harvest_task_queue_ext::capability_miss_handler.eq(Some(format!(
+                "{}:{missing_workflow}",
+                autumn_harvest::worker::CapabilityMissKind::Workflow.as_str()
+            ))),
+        ),
     ))
     .execute(&mut conn)
     .await

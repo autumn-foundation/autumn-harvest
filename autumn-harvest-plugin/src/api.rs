@@ -1,6 +1,7 @@
 //! Axum management routes for Harvest workflows and DAGs.
 #![allow(clippy::literal_string_with_formatting_args)]
 
+use autumn_harvest::schema::{harvest_task_queue_ext, harvest_workflow_executions_ext};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -15222,12 +15223,12 @@ pub(crate) async fn build_diagnosis_report(
             harvest_task_queue::attempt,
             harvest_task_queue::error,
             harvest_task_queue::scheduled_at,
-            harvest_task_queue::rate_limit_key,
+            harvest_task_queue_ext::rate_limit_key,
             harvest_task_queue::concurrency_key,
-            harvest_task_queue::concurrency_cap,
+            harvest_task_queue_ext::concurrency_cap,
             harvest_task_queue::task_type,
-            harvest_task_queue::required_build_id,
-            harvest_task_queue::required_capabilities,
+            harvest_task_queue_ext::required_build_id,
+            harvest_task_queue_ext::required_capabilities,
             // Worker sessions (issue #606): the claim predicate admits a
             // session member ONLY from `sticky_worker_id`, with no expiry, so
             // a session whose host is gone is a permanent stall.
@@ -15308,8 +15309,8 @@ pub(crate) async fn build_diagnosis_report(
             // predicate's `required_build_id` clause has no task-type guard),
             // so its liveness answer needs the same eligibility check an
             // activity row gets.
-            harvest_task_queue::required_build_id,
-            harvest_task_queue::required_capabilities,
+            harvest_task_queue_ext::required_build_id,
+            harvest_task_queue_ext::required_capabilities,
             harvest_task_queue::session_id,
             harvest_task_queue::sticky_worker_id,
             // Issue #1191: the provenance fingerprint
@@ -16391,7 +16392,7 @@ async fn gather_run_chain_rows(
         .filter(
             harvest_workflow_executions::id
                 .eq(head_uuid)
-                .or(harvest_workflow_executions::first_exec_id.eq(Some(head_uuid))),
+                .or(harvest_workflow_executions_ext::first_exec_id.eq(Some(head_uuid))),
         )
         .select(WorkflowExecution::as_select())
         .load(conn)
@@ -26166,7 +26167,7 @@ async fn reject_inadmissible_fork_callbacks(
     // A missing source is left to the fork, which refuses it with `404`.
     let stored: Option<Option<Value>> = match harvest_workflow_executions::table
         .find(exec_id.as_uuid())
-        .select(harvest_workflow_executions::completion_callbacks)
+        .select(harvest_workflow_executions_ext::completion_callbacks)
         .first(conn)
         .await
         .optional()
@@ -33915,7 +33916,7 @@ async fn list_dead_letters(
             };
             let rows: Vec<(uuid::Uuid, Option<String>)> = match wf_dsl::harvest_workflow_executions
                 .filter(wf_dsl::id.eq_any(&ids))
-                .select((wf_dsl::id, wf_dsl::runbook_url))
+                .select((wf_dsl::id, harvest_workflow_executions_ext::runbook_url))
                 .load::<(uuid::Uuid, Option<String>)>(&mut conn)
                 .await
             {
@@ -43690,7 +43691,7 @@ fn workflow_list_query(
         query = query.filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(predicate));
     }
     if filters.sla_breached {
-        query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
+        query = query.filter(harvest_workflow_executions_ext::sla_breached.eq(true));
     }
     if filters.nd_blocked {
         // Only RUNNING rows: operator cancel/terminate escape hatches
@@ -43706,7 +43707,7 @@ fn workflow_list_query(
         // predicates, cross-shard safe. Composes (AND) with all other filters.
         let now = chrono::Utc::now();
         query = query
-            .filter(harvest_workflow_executions::legal_hold_set_at.is_not_null())
+            .filter(harvest_workflow_executions_ext::legal_hold_set_at.is_not_null())
             .filter(
                 harvest_workflow_executions::legal_hold_until
                     .is_null()
@@ -44108,7 +44109,7 @@ pub(crate) async fn load_stalled_workflows(
     // this, `?sla_breached=true&no_progress_minutes=N` would return unbreached
     // stalled rows because this loader bypasses `load_workflows`.
     if filters.sla_breached {
-        query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
+        query = query.filter(harvest_workflow_executions_ext::sla_breached.eq(true));
     }
     // Honor the ND-block filter on the stalled path too (issue #603), for the
     // same bypass reason as sla_breached above.
@@ -44122,7 +44123,7 @@ pub(crate) async fn load_stalled_workflows(
     if filters.legal_hold {
         let now = chrono::Utc::now();
         query = query
-            .filter(harvest_workflow_executions::legal_hold_set_at.is_not_null())
+            .filter(harvest_workflow_executions_ext::legal_hold_set_at.is_not_null())
             .filter(
                 harvest_workflow_executions::legal_hold_until
                     .is_null()
@@ -44511,7 +44512,7 @@ pub(crate) async fn load_history_bloat_workflows(
         query = query.filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(predicate));
     }
     if filters.sla_breached {
-        query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
+        query = query.filter(harvest_workflow_executions_ext::sla_breached.eq(true));
     }
     if filters.nd_blocked {
         query = query
@@ -44521,7 +44522,7 @@ pub(crate) async fn load_history_bloat_workflows(
     if filters.legal_hold {
         let now = chrono::Utc::now();
         query = query
-            .filter(harvest_workflow_executions::legal_hold_set_at.is_not_null())
+            .filter(harvest_workflow_executions_ext::legal_hold_set_at.is_not_null())
             .filter(
                 harvest_workflow_executions::legal_hold_until
                     .is_null()
@@ -60677,7 +60678,6 @@ mod tests {
         WorkflowExecution {
             migrated_to_shard: None,
             migrated_at: None,
-            migrated_from_shards: None,
             quota_key: None,
             id: uuid::Uuid::new_v4(),
             workflow_name: "decode-wf".to_string(),
@@ -60736,9 +60736,7 @@ mod tests {
             history_bloat_warned_at: None,
             triage_note: None,
             migrated_run_terminal_at: None,
-            migrated_run_terminal_state: None,
-            staging_vacated_state: None,
-            staging_vacated_by: None,
+            rebalance: autumn_harvest::models::RebalanceMarkers::default(),
             tenant: None,
         }
     }

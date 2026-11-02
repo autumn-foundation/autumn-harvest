@@ -35,8 +35,10 @@ use autumn_harvest::external_target_location::{TargetLocation, resolve_location_
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
 use autumn_harvest::schema::harvest_workflow_executions;
+use autumn_harvest::schema::harvest_workflow_executions_ext;
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::store;
+use autumn_harvest::table_split::SetExt;
 use autumn_harvest::types::{
     ExecutionId, ExternalCancelId, ExternalSignalId, ExternalTarget, ShardId,
 };
@@ -2483,7 +2485,9 @@ async fn awaits_outbox_does_not_wait_on_a_peer_shard_whose_only_connection_is_bu
         .await
         .expect("seed target history");
         diesel::update(harvest_workflow_executions::table.find(target.as_uuid()))
-            .set(harvest_workflow_executions::migrated_to_shard.eq(Some(1)))
+            .set(SetExt(
+                harvest_workflow_executions_ext::migrated_to_shard.eq(Some(1)),
+            ))
             .execute(&mut seed)
             .await
             .expect("seal the target as rebalanced onto shard 1");
@@ -2632,7 +2636,9 @@ async fn cancel_outbox_deferred_check_does_not_wait_on_a_peer_shard_whose_only_c
         .await
         .expect("seed child history");
         diesel::update(harvest_workflow_executions::table.find(child.as_uuid()))
-            .set(harvest_workflow_executions::migrated_to_shard.eq(Some(1)))
+            .set(SetExt(
+                harvest_workflow_executions_ext::migrated_to_shard.eq(Some(1)),
+            ))
             .execute(&mut seed)
             .await
             .expect("seal the child as rebalanced onto shard 1");

@@ -10,6 +10,8 @@
 //! the [`HandlerRegistry`], and spawns a task. The actual execution semantics
 //! (replay, retries, heartbeats) live in the executor and context modules.
 
+use crate::schema::harvest_workflow_executions_ext;
+use crate::table_split::SetExt;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -6727,7 +6729,7 @@ async fn update_workflow_execution_completed(
         // bypass the pause-guarded persist transaction (and its clear hook)
         // must not leave a stale block marker on a closed run.
         dsl::nd_blocked_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-        dsl::nd_block_reason.eq(None::<String>),
+        SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
         dsl::nd_block_count.eq(0),
     ))
     .execute(conn)
@@ -9378,7 +9380,7 @@ async fn update_workflow_execution_failed(
         // history-cap/dispatch-error terminal) closes the run — a stale block
         // marker must not survive on a terminal row.
         dsl::nd_blocked_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-        dsl::nd_block_reason.eq(None::<String>),
+        SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
         dsl::nd_block_count.eq(0),
     ))
     .execute(conn)
@@ -9594,7 +9596,7 @@ async fn block_workflow_for_non_determinism(
         )
         .set((
             exec_dsl::nd_blocked_at.eq(Some(chrono::Utc::now())),
-            exec_dsl::nd_block_reason.eq(Some(error_owned.clone())),
+            SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(Some(error_owned.clone()))),
             exec_dsl::nd_block_count.eq(exec_dsl::nd_block_count + 1),
         ))
         .execute(conn)
@@ -9675,7 +9677,7 @@ async fn clear_nd_block(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> H
     diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
         .set((
             dsl::nd_blocked_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-            dsl::nd_block_reason.eq(None::<String>),
+            SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
             dsl::nd_block_count.eq(0),
         ))
         .execute(conn)
@@ -43497,7 +43499,7 @@ async fn quarantine_workflow_task_timeout_outcome(
                     exec_dsl::parent_close_policy,
                     exec_dsl::workflow_id,
                     exec_dsl::schedule_id,
-                    exec_dsl::origin,
+                    harvest_workflow_executions_ext::origin,
                     exec_dsl::shard_id,
                     exec_dsl::workflow_name,
                     exec_dsl::queue_name,
@@ -55868,7 +55870,6 @@ mod tests {
         WorkflowExecution {
             migrated_to_shard: None,
             migrated_at: None,
-            migrated_from_shards: None,
             id: uuid::Uuid::new_v4(),
             workflow_name: "trial_subscription".to_string(),
             workflow_id: "sub-42".to_string(),
@@ -55927,9 +55928,7 @@ mod tests {
             quota_key: None,
             created_at: chrono::Utc::now(),
             migrated_run_terminal_at: None,
-            migrated_run_terminal_state: None,
-            staging_vacated_state: None,
-            staging_vacated_by: None,
+            rebalance: crate::models::RebalanceMarkers::default(),
             tenant: None,
         }
     }

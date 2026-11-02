@@ -17,6 +17,7 @@
 //!
 //! Each test names the acceptance criterion it discharges.
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -645,7 +646,7 @@ async fn a_cross_shard_childs_chain_deadline_is_anchored_at_its_own_creation() {
             .find(child_id.as_uuid())
             .select((
                 harvest_workflow_executions::created_at,
-                harvest_workflow_executions::chain_deadline_at,
+                harvest_workflow_executions_ext::chain_deadline_at,
             ))
             .first(&mut *child_conn)
             .await
@@ -3019,7 +3020,7 @@ async fn an_encoded_spec_is_ciphertext_and_the_relay_starts_the_child_on_plainte
     );
     let headers: Option<Value> = harvest_workflow_executions::table
         .find(child_id.as_uuid())
-        .select(harvest_workflow_executions::context_headers)
+        .select(harvest_workflow_executions_ext::context_headers)
         .first(&mut *child_conn)
         .await
         .expect("child headers");

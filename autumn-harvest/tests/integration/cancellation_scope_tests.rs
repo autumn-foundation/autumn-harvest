@@ -7,6 +7,7 @@
 //!   it replaces a continue-as-new.
 //! - A full replay of each recorded history stays deterministic.
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -643,7 +644,7 @@ async fn deferred_cancel_replaces_a_continue_as_new() {
         .await
         .expect("connect");
     let successors: i64 = harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::continued_from_exec_id.eq(Some(exec_id.as_uuid())))
+        .filter(harvest_workflow_executions_ext::continued_from_exec_id.eq(Some(exec_id.as_uuid())))
         .count()
         .get_result(&mut conn)
         .await

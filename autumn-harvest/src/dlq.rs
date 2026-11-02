@@ -4,6 +4,7 @@
 //! table for post-mortem inspection and potential manual reprocessing. This is
 //! the final resting place for permanently failed tasks.
 
+use crate::schema::harvest_workflow_executions_ext;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
@@ -742,7 +743,10 @@ pub async fn dead_letter_with_codecs(
         if let Some(exec_id) = entry.workflow_exec_id {
             exec_dsl::harvest_workflow_executions
                 .find(exec_id)
-                .select((exec_dsl::workflow_name, exec_dsl::quota_key))
+                .select((
+                    exec_dsl::workflow_name,
+                    harvest_workflow_executions_ext::quota_key,
+                ))
                 .first::<(String, Option<String>)>(conn)
                 .await
                 .optional()
@@ -909,7 +913,7 @@ pub async fn replay_dead_letter_at(
                     exec_dsl::harvest_workflow_executions
                         .find(exec_id)
                         .select((
-                            exec_dsl::assigned_build_id,
+                            harvest_workflow_executions_ext::assigned_build_id,
                             exec_dsl::workflow_name,
                             exec_dsl::state,
                         ))
@@ -1534,7 +1538,7 @@ pub async fn redrive_dead_letter_at(
                     exec_dsl::harvest_workflow_executions
                         .find(exec_uuid)
                         .select((
-                            exec_dsl::assigned_build_id,
+                            harvest_workflow_executions_ext::assigned_build_id,
                             exec_dsl::workflow_name,
                             exec_dsl::state,
                         ))

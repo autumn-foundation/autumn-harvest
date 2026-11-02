@@ -203,6 +203,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          ramp_guard_tests
 linux        autumn-harvest         integration                      -                          rate_limit_bucket_gc_tests
 linux        autumn-harvest         integration                      -                          rate_limit_key
+linux        autumn-harvest         integration                      -                          rebalance_markers_db_tests
 linux        autumn-harvest         integration                      -                          redrive_tests
 linux        autumn-harvest         integration                      -                          resident_hit_rate_db_tests
 linux        autumn-harvest         integration                      -                          resident_outcome_tests
@@ -246,6 +247,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          sticky_default_tests
 linux        autumn-harvest         integration                      -                          sticky_routing_tests
 linux        autumn-harvest         integration                      -                          stream_append_count_perf
+linux        autumn-harvest         integration                      -                          table_split_db_tests
 linux        autumn-harvest         integration                      -                          telemetry_span_tests
 linux        autumn-harvest         integration                      -                          tenant_cell_isolation_tests
 linux        autumn-harvest         integration                      -                          tenant_propagation_tests

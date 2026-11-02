@@ -11,6 +11,7 @@
 //! Set `HARVEST_TEST_DATABASE_URL` to use a migrated Postgres. Otherwise the
 //! suite starts a testcontainers Postgres 16.
 
+use autumn_harvest::schema::harvest_task_queue_ext;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -690,7 +691,7 @@ async fn a_timeout_before_the_drain_release_settles_the_attempt() {
     let claims: Option<Vec<Option<String>>> = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
         .filter(harvest_task_queue::task_type.eq("activity"))
-        .select(harvest_task_queue::timed_out_claims)
+        .select(harvest_task_queue_ext::timed_out_claims)
         .first(&mut conn)
         .await
         .expect("load the timeout record");

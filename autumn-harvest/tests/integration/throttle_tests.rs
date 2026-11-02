@@ -25,6 +25,8 @@
 //! - **Independent keys** — distinct keys throttle independently.
 //! - **Operator visibility** — the per-key backlog read returns the counts.
 
+use autumn_harvest::schema::harvest_schedules_ext;
+use autumn_harvest::table_split::Ext;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -1962,7 +1964,7 @@ async fn insert_schedule_with_input(
             dsl::buffered_runs.eq(serde_json::json!([])),
             dsl::buffer_all_max.eq(0),
             dsl::skip_policy.eq("skip"),
-            dsl::workflow_input.eq(input),
+            Ext(harvest_schedules_ext::workflow_input.eq(input)),
         ))
         .execute(conn)
         .await
@@ -1981,7 +1983,7 @@ async fn schedule_row(
     use harvest_schedules::dsl;
     dsl::harvest_schedules
         .filter(dsl::id.eq(id))
-        .select((dsl::last_run_at, dsl::next_run_at))
+        .select((harvest_schedules_ext::last_run_at, dsl::next_run_at))
         .first(conn)
         .await
         .expect("schedule row")
@@ -2225,7 +2227,7 @@ async fn insert_schedule_with_buffered_slot(
             dsl::buffered_runs.eq(serde_json::json!([buffered_slot.to_rfc3339()])),
             dsl::buffer_all_max.eq(10),
             dsl::skip_policy.eq("skip"),
-            dsl::workflow_input.eq(input),
+            Ext(harvest_schedules_ext::workflow_input.eq(input)),
         ))
         .execute(conn)
         .await

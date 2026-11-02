@@ -389,6 +389,8 @@ pub struct ErasedResidence {
 
 #[cfg(feature = "db")]
 mod db {
+    use crate::schema::harvest_workflow_executions_ext;
+    use crate::table_split::SetExt;
     use std::collections::HashSet;
     use std::future::Future;
     use std::pin::Pin;
@@ -1299,9 +1301,9 @@ mod db {
             .find(exec_id.as_uuid())
             .select((
                 harvest_workflow_executions::state,
-                harvest_workflow_executions::legal_hold_set_at,
+                harvest_workflow_executions_ext::legal_hold_set_at,
                 harvest_workflow_executions::legal_hold_until,
-                harvest_workflow_executions::legal_hold_reason,
+                harvest_workflow_executions_ext::legal_hold_reason,
             ))
             .for_update()
             .first::<EraseGateRow>(conn)
@@ -1379,9 +1381,11 @@ mod db {
             .set((
                 harvest_workflow_executions::input.eq(&tombstone),
                 harvest_workflow_executions::output.eq(Some(&tombstone)),
-                harvest_workflow_executions::memo.eq(Some(&tombstone)),
+                SetExt(harvest_workflow_executions_ext::memo.eq(Some(&tombstone))),
                 harvest_workflow_executions::search_attrs.eq(Some(&tombstone)),
-                harvest_workflow_executions::context_headers.eq(None::<serde_json::Value>),
+                SetExt(
+                    harvest_workflow_executions_ext::context_headers.eq(None::<serde_json::Value>),
+                ),
             ))
             .execute(conn)
             .await

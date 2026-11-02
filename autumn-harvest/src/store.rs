@@ -4,6 +4,8 @@
 //! The `UNIQUE(workflow_exec_id, event_id)` constraint guarantees
 //! that two workers can't append conflicting events to the same workflow.
 
+use crate::schema::harvest_workflow_executions_ext;
+use crate::table_split::SetExt;
 use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
@@ -2699,7 +2701,9 @@ pub async fn update_current_details(
     use crate::schema::harvest_workflow_executions::dsl;
 
     diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
-        .set(dsl::current_details.eq(details))
+        .set(SetExt(
+            harvest_workflow_executions_ext::current_details.eq(details),
+        ))
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -3303,9 +3307,11 @@ pub async fn mark_history_bloat_warned(
     let rows = diesel::update(
         dsl::harvest_workflow_executions
             .find(exec_id.as_uuid())
-            .filter(dsl::history_bloat_warned_at.is_null()),
+            .filter(harvest_workflow_executions_ext::history_bloat_warned_at.is_null()),
     )
-    .set(dsl::history_bloat_warned_at.eq(diesel::dsl::now))
+    .set(SetExt(
+        harvest_workflow_executions_ext::history_bloat_warned_at.eq(diesel::dsl::now),
+    ))
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;

@@ -8,6 +8,7 @@
 //! `GET /admin/overrides` and the `overrides` count on `GET /admin/config`
 //! (issue #2388) are tested here too, because they read these overrides.
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -257,9 +258,9 @@ async fn deadlines(url: &str, id: Uuid) -> Deadlines {
             .find(id)
             .select((
                 dsl::started_at,
-                dsl::sla_deadline_at,
+                harvest_workflow_executions_ext::sla_deadline_at,
                 dsl::deadline_at,
-                dsl::sla_breached,
+                harvest_workflow_executions_ext::sla_breached,
             ))
             .first::<(
                 DateTime<Utc>,
