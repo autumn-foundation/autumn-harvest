@@ -74,6 +74,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_RS = REPO_ROOT / "autumn-harvest-plugin/src/config.rs"
 CLI_RS = REPO_ROOT / "autumn-harvest-cli/src/lib.rs"
+# The CLI also declares flags in submodules, such as `agents.rs` (issue
+# #2439). Each `.rs` file in this directory is scanned.
+CLI_SRC = CLI_RS.parent
 
 # `corpus-link-check.py` can't be `import`ed by its literal (hyphenated) name;
 # loaded by path instead so this script shares that one's process-artifact
@@ -164,7 +167,20 @@ NEXT_FIELD_RE = re.compile(r"^\s*(?:pub\s+)?(\w+)\s*:")
 
 
 def extract_cli_ground_truth():
-    text = CLI_RS.read_text(encoding="utf-8")
+    flags = set()
+    env_vars = set()
+    for path in sorted(CLI_SRC.rglob("*.rs")):
+        file_flags, file_env = extract_cli_file(path.read_text(encoding="utf-8"))
+        flags |= file_flags
+        env_vars |= file_env
+    # clap's derive `Parser`/`Subcommand` adds `--help` and `--version` to
+    # every level of the command tree, so they are always real.
+    flags.add("help")
+    flags.add("version")
+    return flags, env_vars
+
+
+def extract_cli_file(text):
     lines = text.splitlines()
 
     # Join the whole file so a multi-line #[arg(...)] attribute is captured
