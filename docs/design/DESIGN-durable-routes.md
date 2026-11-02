@@ -186,10 +186,12 @@ cycle. Each successor lookup is one step. The first read of the started run is
 free. The lookup finds the newest run of this chain with the business id, so
 an operator rerun, which starts its own chain, never stands in for it. A step
 also crosses one workflow-level retry, so a chain needs at most one step more
-than its changes of type and its retries. The walk takes at most `durable_route_max_chain_steps` steps (1024 by
-default). Past the cap it answers `result-unavailable` when every run it read
-had ended, and pending when it met a live run. The walk reads runs through a private
-trait, so unit tests drive it on a fake chain.
+than its changes of type and its retries. The walk takes at most
+`durable_route_max_chain_steps` steps (1024 by default). Past the cap, a chain
+with a live run answers pending. An ended chain gets a second walk. It answers
+`result-unavailable` when that walk stops at the same run (issue #2491). The
+walk reads runs through a private trait, so unit tests drive it on a fake
+chain.
 
 ### 1.5 Responses
 

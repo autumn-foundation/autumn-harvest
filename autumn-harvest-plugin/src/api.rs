@@ -1940,18 +1940,11 @@ struct RedactedPayloadSummary {
     summary: &'static str,
 }
 
-/// The states of a run that has ended. A migration seal is not in this list.
-pub(crate) const TERMINAL_STATES: &[&str] = &[
-    "COMPLETED",
-    "FAILED",
-    "CANCELLED",
-    "TIMED_OUT",
-    "CONTINUED_AS_NEW",
-    "TERMINATED",
-];
-
 pub(crate) fn is_terminal_state(state: &str) -> bool {
-    TERMINAL_STATES.contains(&state)
+    matches!(
+        state,
+        "COMPLETED" | "FAILED" | "CANCELLED" | "TIMED_OUT" | "CONTINUED_AS_NEW" | "TERMINATED"
+    )
 }
 
 #[derive(Debug, Serialize)]

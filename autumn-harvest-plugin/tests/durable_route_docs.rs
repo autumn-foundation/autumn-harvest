@@ -100,8 +100,8 @@ fn page_states_layer_timeout_and_key_guidance() {
         "Do not turn on `.idempotent()` for such an API",
         "PII erasure does not remove it",
         "do not turn on `.idempotent()` for durable routes",
-        "A walk that read only ended runs answers `result-unavailable`",
         "a chain that still has a live run answers pending",
+        "It answers `result-unavailable` when that walk stops at the same run",
         "## Known limits",
     ] {
         assert!(

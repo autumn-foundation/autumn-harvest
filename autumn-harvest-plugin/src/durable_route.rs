@@ -1264,7 +1264,8 @@ async fn wait_for_result(
             );
             Waited::NoResult(ReadFailure::Unreadable)
         }
-        // The two walks differ, so the chain moved. A retry decides.
+        // The second walk differs or met a live run, so the chain moved. A
+        // retry decides.
         Walked::Capped { .. } => capped_on_a_live_chain(max_steps),
     }
 }
@@ -1280,7 +1281,9 @@ fn capped_on_a_live_chain(max_steps: usize) -> Waited {
 
 /// The wait state that the walks of one request share.
 struct WaitBudget<'a> {
+    /// The permits that cap the waits that hold a `LISTEN` connection.
     waiters: &'a Arc<Semaphore>,
+    /// The end of the request budget.
     deadline: Instant,
     /// The permit lives until the wait ends. One request holds at most one.
     permit: Option<OwnedSemaphorePermit>,
@@ -1357,6 +1360,8 @@ async fn walk_chain(
 }
 
 /// Wait on a live run until it ends, or until the deadline.
+///
+/// With no budget left or no free permit, the answer is pending.
 async fn wait_on_live_run(
     reads: &impl RunReads,
     wait: &mut WaitBudget<'_>,
@@ -1468,28 +1473,38 @@ async fn newest_chain_run(
 /// Whether the chain of `exec_id` has a run that has not ended.
 ///
 /// The chain is the chain of the live attempt, as in [`chain_successor`].
-/// The read runs on the shard that holds that attempt.
+/// A rebalance can move any run of the chain to another shard. The read
+/// therefore asks each physical database once, and stops at the first live
+/// run.
 async fn chain_has_live_run(
     runtime: &DurableRouteRuntime,
     exec_id: ExecutionId,
 ) -> HarvestResult<bool> {
     let sharded = runtime.pool.sharded_pool();
-    let shard = sharded.routed_shard_for_execution(exec_id);
-    let mut held = autumn_harvest::pool::acquire_within_pool_bound(sharded.pool_for(shard)).await?;
-    let (live, live_shard) =
-        autumn_harvest::execution::resolve_live_attempt(&mut held, sharded, shard, exec_id).await?;
-    let mut resident =
-        autumn_harvest::shard_rebalance::bind_to_shard(&mut held, sharded, shard, live_shard)
-            .await?;
-    let chain = live.first_exec_id.unwrap_or(live.id);
-    live_chain_run_exists(resident.as_mut(), &live.workflow_id, chain).await
+    let (workflow_id, chain) = {
+        let shard = sharded.routed_shard_for_execution(exec_id);
+        let mut held =
+            autumn_harvest::pool::acquire_within_pool_bound(sharded.pool_for(shard)).await?;
+        let (live, _) =
+            autumn_harvest::execution::resolve_live_attempt(&mut held, sharded, shard, exec_id)
+                .await?;
+        (live.workflow_id, live.first_exec_id.unwrap_or(live.id))
+    };
+    // The connection above is free again, so a size-one pool cannot block.
+    for (pool, _) in sharded.pool_groups() {
+        let mut conn = autumn_harvest::pool::acquire_within_pool_bound(pool).await?;
+        if live_chain_run_exists(&mut conn, &workflow_id, chain).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether a run of the chain that starts at `chain` has not ended.
 ///
-/// A run of any type counts, because a successor can change the type. An
-/// unreconciled migration seal counts as live, because its copy can still
-/// run. A reconciled seal does not count.
+/// A run of any type counts, because a successor can change the type. A
+/// migration seal does not count. Its copy on the target shard is the run,
+/// and the read of that shard counts it.
 async fn live_chain_run_exists(
     conn: &mut diesel_async::AsyncPgConnection,
     workflow_id: &str,
@@ -1510,8 +1525,8 @@ async fn live_chain_run_exists(
                     .nullable()
                     .or(harvest_workflow_executions_ext::first_exec_id.eq(chain)),
             )
-            .filter(executions::migrated_run_terminal_at.is_null())
-            .filter(executions::state.ne_all(crate::api::TERMINAL_STATES)),
+            // The engine list holds `MIGRATED`, so no seal counts.
+            .filter(executions::state.ne_all(autumn_harvest::erase::TERMINAL_STATES)),
     ))
     .get_result::<bool>(conn)
     .await
@@ -3351,41 +3366,80 @@ mod tests {
             .block_on(future)
     }
 
+    /// The answer that the route must give at the step cap `cap`. `first`
+    /// is the path of the first walk, `second` the path after a tail read.
+    fn expected_answer(first: &[usize], second: &[usize], cap: usize) -> &'static str {
+        if first.len() - 1 <= cap || second.len() - 1 <= cap {
+            "tail"
+        } else if first[cap] == second[cap] {
+            "final"
+        } else {
+            "pending"
+        }
+    }
+
+    fn answer_of(waited: &Waited, tail: ExecutionId) -> &'static str {
+        match waited {
+            Waited::Terminal { exec_id, .. } if *exec_id == tail => "tail",
+            Waited::NoResult(ReadFailure::Unreadable) => "final",
+            Waited::NoResult(ReadFailure::Pending) => "pending",
+            Waited::Terminal { .. } => "another run",
+        }
+    }
+
     proptest! {
         // Issue #2491 (property). A chain with a live tail never gets a
-        // final answer. An ended chain gets the same answer on each request:
-        // its tail when the cap allows, else a final 500.
+        // final answer. On an ended chain, a lookup after the tail read can
+        // jump to run `jump`. The route then answers the tail, a final 500,
+        // or pending when the second walk differs. A retry gives the tail or
+        // a final 500.
         #[test]
         fn chain_walk_is_final_only_over_an_ended_chain(
             len in 1usize..12,
             cap in 0usize..12,
-            moved in any::<bool>(),
+            jump in 0usize..12,
         ) {
-            let (mut live, runs) = linear_chain(len, WorkflowResultState::Running);
-            if moved {
-                live.run_mut(runs[0]).next_after_tail = runs.last().copied();
-            }
+            let (live, runs) = linear_chain(len, WorkflowResultState::Running);
             let waited = block_on(wait_for_result(&live, &waiters(1), cap, runs[0], ONE_SECOND));
-            prop_assert!(matches!(waited, Waited::NoResult(ReadFailure::Pending)));
+            prop_assert_eq!(answer_of(&waited, runs[len - 1]), "pending");
 
             let (mut ended, runs) = linear_chain(len, WorkflowResultState::Completed);
             let tail = runs[len - 1];
-            // A lookup after the tail read can find the tail in one step.
-            if moved && len > 1 {
-                ended.run_mut(runs[0]).next_after_tail = Some(tail);
-            }
-            let reach = if moved && len > 1 { 1 } else { len - 1 };
+            let stale: Vec<usize> = (0..len).collect();
+            let fresh: Vec<usize> = if jump > 1 && jump < len {
+                ended.run_mut(runs[0]).next_after_tail = Some(runs[jump]);
+                std::iter::once(0).chain(jump..len).collect()
+            } else {
+                stale.clone()
+            };
             let first = block_on(wait_for_result(&ended, &waiters(1), cap, runs[0], ONE_SECOND));
+            prop_assert_eq!(answer_of(&first, tail), expected_answer(&stale, &fresh, cap));
             let again = block_on(wait_for_result(&ended, &waiters(1), cap, runs[0], ONE_SECOND));
-            for waited in [first, again] {
-                if len - 1 <= cap || reach <= cap {
-                    let reached = matches!(waited, Waited::Terminal { exec_id, .. } if exec_id == tail);
-                    prop_assert!(reached, "the walk reaches the tail");
-                } else {
-                    prop_assert!(matches!(waited, Waited::NoResult(ReadFailure::Unreadable)));
-                }
-            }
+            let retried = expected_answer(&fresh, &fresh, cap);
+            prop_assert_ne!(retried, "pending");
+            prop_assert_eq!(answer_of(&again, tail), retried);
         }
+    }
+
+    /// A second walk that caps at the same run, but met a live run on its
+    /// way, answers pending. A run went live after the tail read.
+    #[tokio::test]
+    async fn chain_walk_answers_pending_when_the_second_walk_caps_on_a_live_path() {
+        let mut chain = FakeChain::default();
+        let end = chain.run(WorkflowResultState::Completed, None);
+        let capped = chain.run(WorkflowResultState::ContinuedAsNew, Some(end));
+        let middle = chain.run(WorkflowResultState::ContinuedAsNew, Some(capped));
+        let first = chain.run(WorkflowResultState::ContinuedAsNew, Some(middle));
+        // After the tail read, the lookup finds a live run that continues as
+        // new into the same run at the cap.
+        let live = chain.run(WorkflowResultState::Running, Some(capped));
+        chain.run_mut(live).wait_state = Some(WorkflowResultState::ContinuedAsNew);
+        chain.run_mut(first).next_after_tail = Some(live);
+        chain.tail_live = Some(false);
+        let waited = wait_for_result(&chain, &waiters(1), 2, first, ONE_SECOND).await;
+        assert!(matches!(waited, Waited::NoResult(ReadFailure::Pending)));
+        assert_eq!(chain.waits(), 1, "the second walk waits on the live run");
+        assert_eq!(chain.tail_reads(), 1);
     }
 
     // AC-59

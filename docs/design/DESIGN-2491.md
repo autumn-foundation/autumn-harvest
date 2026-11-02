@@ -50,7 +50,7 @@ So the client stops.
 |---|------|---------|
 | B1 | Set `Successor.live` on every lookup path. | Rejected alone. It does not catch a stale prefix (§0.1, `A -> B -> A`). |
 | B2 | At the cap, always answer pending. | Rejected. A chain that has ended and is too long would answer pending forever. |
-| B3 | At the cap, ask for one more successor and read it. | Rejected. The tail can move again. The race moves one step, it does not go away. |
+| B3 | At the cap, ask for one more successor and read it. | Rejected. The tail can move again. The race moves one step. It does not go away. |
 | B4 | At the cap, read the chain tail. Live tail: pending. | **Adopted.** One indexed query, on the cap path only. |
 | B5 | After a tail read that saw an ended chain, walk again. Final only when the second walk caps at the same run. | **Adopted.** The second walk reads frozen data, so a retry repeats it. |
 | B6 | Compare the tail `completed_at` with the walk start time. | Rejected. It mixes the app clock and the database clock. |
@@ -61,12 +61,12 @@ So the client stops.
 
 | # | How to make it harmful | Mitigation |
 |---|------------------------|------------|
-| R1 | Answer pending forever on a chain that has ended. | The tail read excludes a reconciled migration seal, as `newest_chain_run` does. A test runs an ended long chain and expects a final 500. |
+| R1 | Answer pending forever on a chain that has ended. | No migration seal counts as live, because nothing reconciles a seal on its own. Its copy is the run. Tests run an ended long chain, with and without a seal, and expect a final 500. |
 | R2 | Answer final while a run is still live. | A final answer needs an ended tail and an equal second walk. Red tests cover the race and the stale prefix. |
 | R3 | Double the work of every request. | The tail read and the second walk run only at the cap. A walk that reaches its end does not change. |
 | R4 | Let the second walk wait on a live run past the budget. | Both walks share one deadline and one permit. |
-| R5 | Scan the whole executions table. | The query filters by `id` and `first_exec_id`. Both have an index. A Ledger profile records it. |
-| R6 | Read the tail on the wrong shard after a rebalance. | The tail read binds to the shard of the live attempt, as `chain_successor` does. |
+| R5 | Scan the whole executions table. | The query filters by `id` and `first_exec_id`. The planner can combine the primary key and `idx_harvest_wfx_first_exec_id`. The Ledger profile lists the query. Ledger has not measured it yet. |
+| R6 | Miss a live run that a rebalance moved to another shard. | The tail read asks each physical database once. It takes one connection at a time, so a size-one pool cannot block. |
 | R7 | Loosen the integration tests to accept 500. | Not done. The tests keep `200` and gain a live-tail case. |
 | R8 | Let a tail read error become a final answer. | `read_error` classifies it. A database error is pending. |
 
@@ -80,7 +80,7 @@ So the client stops.
   timing needs a proof by test, not a comment.
 - **Black (risk).** A second walk doubles the cost at the cap. A tail query
   with a wrong scope gives a final answer too early, or a pending answer
-  for ever. See R1 to R6.
+  forever. See R1 to R6.
 - **Yellow (value).** Clients that treat 500 as final no longer lose a
   result that exists. The rule is simple to state: final means frozen.
 - **Green (options).** B1 to B8. A later option: store the chain tail on
@@ -88,7 +88,7 @@ So the client stops.
   is out of scope.
 - **Blue (process).** Red: unit tests on the fake chain. Green: the tail
   read and the second walk. Refactor: remove `Successor.live`. Then a
-  Postgres test with a live tail, the gates, and a multi-angle review.
+  Postgres test with a live tail, and the gates.
 
 ---
 
@@ -102,10 +102,11 @@ fn chain_live(&self, exec_id: ExecutionId)
     -> impl Future<Output = HarvestResult<bool>> + Send;
 ```
 
-The Postgres reader resolves the live attempt of the run and binds to its
-shard, as `chain_successor` does. It then asks whether a run with the same
-business id, in the chain of that attempt, has a state that is not
-terminal. A reconciled migration seal does not count.
+The Postgres reader resolves the live attempt of the run, as
+`chain_successor` does. It then asks each physical database whether a run
+with the same business id, in the chain of that attempt, has a state that is
+not terminal. The engine list `erase::TERMINAL_STATES` holds `MIGRATED`, so
+no migration seal counts. The copy of a moved run counts on its own shard.
 
 ### 1.2 `wait_for_result`
 
@@ -116,11 +117,11 @@ or `Capped { at, saw_live }`. `wait_for_result` then decides:
 |---|---|---|---|
 | ends or fails | — | — | that answer |
 | capped, saw a live run | — | — | pending |
-| capped | error | — | `read_error` |
-| capped | live | — | pending |
-| capped at `X` | ended | ends or fails | that answer |
-| capped at `X` | ended | capped at `X`, no live run | **final 500** |
-| capped at `X` | ended | capped elsewhere, or saw a live run | pending |
+| capped, no live run | error | — | `read_error` |
+| capped, no live run | live | — | pending |
+| capped at `X`, no live run | ended | ends or fails | that answer |
+| capped at `X`, no live run | ended | capped at `X`, no live run | **final 500** |
+| capped at `X`, no live run | ended | capped elsewhere, or saw a live run | pending |
 
 Both walks share the deadline, the permit and the waiter semaphore.
 
@@ -128,24 +129,38 @@ Both walks share the deadline, the permit and the waiter semaphore.
 
 Unit tests on the fake chain (`durable_route.rs`):
 
-- a lookup that returns a run, which continues as new before its snapshot,
-  with a live tail, answers pending (the race in the issue);
+- a walk over ended runs that caps before a live tail answers pending;
 - a chain that ends during the walk gets a second walk and a result;
 - a chain that has ended and is too long stays final, with one tail read;
 - a walk that saw a live run reads no tail;
 - a tail read error maps like any other read error;
-- a second walk that caps at another run answers pending.
+- a second walk that caps at another run, or meets a live run, answers
+  pending;
+- a property test over chain length, cap and a moved lookup.
 
 Postgres test (`durable_route_integration.rs`): a chain that changes type
 twice, with a parked last run, answers pending at `max_chain_steps(1)`. It
-answers the final 500 after the last run ends.
+answers the final 500 after the last run ends. It still answers the final
+500 when an unreconciled migration seal takes the place of the last run.
 
 ## 2. Acceptance criteria
 
-- AC-1: A cap with a live tail answers pending.
-- AC-2: A cap after the chain ended answers from a walk that read only
-  ended runs.
-- AC-3: A final 500 needs an ended tail and two equal capped walks.
-- AC-4: `same_type_chain_takes_one_step` and
-  `rerun_of_a_chain_end_keeps_the_original_outcome` keep their assertions.
-- AC-5: The new query has a Ledger profile.
+| AC | Rule | Tests |
+|---|---|---|
+| AC-1 | A cap with a live tail answers pending. | `chain_walk_answers_pending_at_the_cap_when_the_tail_is_live`, `chain_step_cap_answers_pending_while_the_chain_runs` |
+| AC-2 | A cap after the chain ended answers from a walk that read only ended runs. | `chain_walk_walks_again_when_the_chain_ended_during_the_walk` |
+| AC-3 | A final 500 needs an ended tail and two equal capped walks. | `chain_walk_is_final_after_two_equal_walks_over_an_ended_chain`, `chain_walk_answers_pending_when_the_second_walk_differs`, `chain_walk_is_final_only_over_an_ended_chain` |
+| AC-4 | A tail read error maps like any other read error. | `chain_walk_maps_a_tail_read_error` |
+| AC-5 | `same_type_chain_takes_one_step` and `rerun_of_a_chain_end_keeps_the_original_outcome` keep their assertions. | those two tests |
+| AC-6 | The new query has a Ledger profile. | `docs/audits/ledger-profiles.py` |
+| AC-7 | A migration seal does not count as a live run. | `chain_step_cap_answers_pending_while_the_chain_runs` |
+
+## 3. Known limits
+
+- A final 500 costs two walks and one tail read. Only a chain that is
+  longer than the cap pays it.
+- No test runs the route on two databases. The tail read asks each one in
+  turn, and the code path is the same for one database.
+- A rerun can seal a chain end with no successor event. A walk that reaches
+  that run at the cap answers a final 500. A retry does the same, so the
+  answer is still final. This predates issue #2491.

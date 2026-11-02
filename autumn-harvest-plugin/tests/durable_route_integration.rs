@@ -2420,6 +2420,22 @@ async fn chain_step_cap_answers_pending_while_the_chain_runs() {
         problem_type(&capped.json::<Value>()),
         slug_type("result-unavailable")
     );
+
+    // A rebalance leaves a migration seal. Its copy is the run, so a seal
+    // that nobody reconciles must not hold the answer at pending.
+    let mut conn = db.pool.get().await.expect("conn");
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'MIGRATED', \
+         migrated_to_shard = 1, migrated_at = now(), \
+         migrated_run_terminal_at = NULL WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(parked.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("seal the parked run");
+    drop(conn);
+    let sealed = post(&client, Some("key-i2491"), &extra, &body).await;
+    assert_eq!(sealed.status.as_u16(), 500, "{}", sealed.text());
 }
 
 // AC-79
