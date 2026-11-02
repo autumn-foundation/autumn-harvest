@@ -203,9 +203,7 @@ impl Backend for Pg {
         let handle = tokio::spawn({
             let worker = Arc::clone(&worker);
             let pool = self.pool.clone();
-            async move {
-                let _ = worker.run(&pool).await;
-            }
+            async move { worker.run(&pool).await }
         });
         self.worker = Some((worker, handle));
     }

@@ -1409,14 +1409,17 @@ impl AgentRun<'_> {
     /// `agent_profile_overlay`. The activity applies it to the run profile.
     /// The op then takes the overlay fields of the read. The read sets
     /// [`AgentState::profile_version`]. A failed read keeps it.
-    async fn op_profile(&self, state: &mut AgentState) -> Result<AgentProfile, String> {
+    ///
+    /// The box keeps the op future small, because the op holds the
+    /// profile across its segment.
+    async fn op_profile(&self, state: &mut AgentState) -> Result<Box<AgentProfile>, String> {
         let (id, profile) = match (&self.id, &self.profile) {
             (Ok(id), Ok(profile)) => (id, profile),
             (Err(err), _) | (_, Err(err)) => return Err(err.clone()),
         };
         if !self.overlays {
             state.profile_version = None;
-            return Ok(profile.clone());
+            return Ok(Box::new(profile.clone()));
         }
         let request = OverlayRead {
             kind: id.kind().to_owned(),
@@ -1428,10 +1431,10 @@ impl AgentRun<'_> {
             .await
             .map_err(|err| err.to_string())?;
         state.profile_version = read.overlay_version;
-        Ok(match read.overlay_version {
+        Ok(Box::new(match read.overlay_version {
             Some(_) => overlaid(profile, &read.profile),
             None => profile.clone(),
-        })
+        }))
     }
 
     /// Book the next heartbeat. See [`wake::next_heartbeat`].

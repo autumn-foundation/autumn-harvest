@@ -37,7 +37,7 @@ impl Sqlite {
         }
     }
 
-    fn rt(&mut self) -> &mut SqliteRuntime {
+    const fn rt(&mut self) -> &mut SqliteRuntime {
         self.rt.as_mut().expect("serve first")
     }
 
@@ -64,6 +64,9 @@ impl Sqlite {
     }
 }
 
+// The trait is async for the Postgres backend. The SQLite runtime answers
+// some calls at once.
+#[allow(clippy::unused_async_trait_impl)]
 impl Backend for Sqlite {
     fn kind(&self) -> String {
         "support".to_owned()

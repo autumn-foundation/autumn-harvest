@@ -75,7 +75,7 @@ fn text_of(message: &ChatMessage) -> String {
         .collect()
 }
 
-fn reply(content: Vec<ContentPart>, stop_reason: StopReason) -> ChatResponse {
+const fn reply(content: Vec<ContentPart>, stop_reason: StopReason) -> ChatResponse {
     ChatResponse {
         content,
         stop_reason,
@@ -241,7 +241,7 @@ pub fn recorded(
                 input,
                 ..
             } if scheduled == name => {
-                inputs.insert(activity_id.clone(), input.clone());
+                inputs.insert(*activity_id, input.clone());
             }
             WorkflowEvent::ActivityCompleted {
                 activity_id,
@@ -409,7 +409,7 @@ pub async fn bad_stored_data_fails_safe<B: Backend>(backend: &mut B) {
     let kind = backend.kind();
     let named = PromptModel::new();
     let base = |model: Arc<PromptModel>| {
-        let harness = base_harness(&kind, model.clone());
+        let harness = base_harness(&kind, model);
         let profile = harness.agent_profile(&kind).unwrap().model("m2");
         harness.agent(profile)
     };
@@ -461,7 +461,7 @@ pub async fn a_narrowed_deploy_fails_safe<B: Backend>(backend: &mut B) {
     let id = agent(&kind, "narrowed");
     backend.send(&id, &AgentOp::message("hello")).await;
     let state = backend.settle(&id, &failures(1)).await;
-    let error = state.last_error.clone().unwrap_or_default();
+    let error = state.last_error.unwrap_or_default();
     assert!(
         error.contains(&format!("the overlay {v1}")) && error.contains("max_steps"),
         "the error names the version and the bound: {error}"
