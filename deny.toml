@@ -344,15 +344,62 @@ ignore = true
 # Bans — duplicate-version and wildcard/feature policy.
 # ---------------------------------------------------------------------------
 [bans]
-# `warn`, not `deny`: as of this baseline there are 33 duplicated crate names
-# in the graph (see the harness PR's ledger report for the full list and
-# which party's version constraint causes each). The large majority are
-# driven by external hires (autumn-web, testcontainers, redis, diesel_migrations)
-# whose own transitive versions we don't control from this manifest; treating
-# every one as a hard failure would block CI on constraints this repo can't
-# resolve unilaterally. `croner` is the one duplicate where BOTH sides are in
-# reach (our own direct `croner = "2.2"` vs. autumn-web's `^3.0`) — a
-# candidate for a dedicated dedup PR, not bundled into this harness.
+# `warn`, not `deny`: the duplicate-version count grows with the graph and
+# keeps growing — 33 at this harness's original baseline (PR #1303,
+# 2026-09-02), 66 as of this comment (2026-11-02). Reproduce the current
+# count with `cargo deny check -s`, which prints it per check; don't trust
+# this literal, it goes stale the moment anyone bumps a dependency, and a
+# live count in prose is a conflict magnet. The large majority of duplicates
+# are driven by external hires (autumn-web, testcontainers, redis,
+# diesel_migrations) whose own transitive versions we don't control from
+# this manifest; treating every one as a hard failure would block CI on
+# constraints this repo can't resolve unilaterally.
+#
+# `croner` is the one duplicate where our own side is in reach: the direct
+# `croner = "2.2"` pin in autumn-harvest/Cargo.toml. It stays pinned there,
+# proven by a rehearsal, not by inertia.
+#
+# Ballast rehearsed croner 2.2 -> 3.0.1 (PR #2142, 2026-10-12): migrated all
+# 4 call sites (`policy.rs` x2, `scheduler.rs` x2) to the 3.x `CronParser`
+# builder API and ran the full `scheduler::tests` suite. It found a real
+# correctness regression, not just an API rename — 3 of 98 tests failed
+# (`plan_backfill_timestamps_hourly_cron_inclusive_bounds`,
+# `catchup_run_plan_window_cron_jump_starts_at_cutoff`,
+# `plan_backfill_timestamps_7_day_hourly_cron_within_default_limit`). Two
+# call sites deliberately pass a reference 1ms/1ns below a whole-second
+# boundary so a strict (exclusive) search lands exactly on it —
+# `plan_backfill_timestamps` and the window-cutoff jump-start fallback in
+# `window_eligible_slots`, at the line numbers current as of that PR. Under
+# 2.2.0 the search lands on the boundary; under 3.0.1 the returned instant
+# carries the input's sub-second remainder forward instead, landing roughly
+# a full second late and dropping one occurrence from the walk. The
+# rehearsal was reverted and the upgrade deferred rather than shipped.
+#
+# That PR never merged — not because the finding was wrong, but because its
+# one CI run hit an infra loss (runner shutdown, exit 143) unrelated to its
+# docs-only diff, and the PR went stale and was closed unmerged on
+# 2026-10-26 with no follow-up push. The rehearsal itself is still valid
+# evidence; only the place it was meant to be recorded — this file — never
+# got the update. This comment restores it (Ballast, 2026-11-02).
+#
+# Since that rehearsal, the graph picked up a third `croner` instance:
+# 2.2.0 (ours, direct), 3.0.1 (tokio-cron-scheduler's own pin, transitive
+# through autumn-web, unchanged), and now 4.0.2 (autumn-web's own direct
+# use, newly resolved). autumn-web is still locked at exactly 0.9.0 in our
+# Cargo.lock, so this is Cargo's resolver picking up a newer croner release
+# against autumn-web's own requirement string on a lockfile refresh, not an
+# autumn-web version bump — that requirement string lives in autumn-web's
+# manifest, outside this repo. Nobody has rehearsed whether croner 4.x still
+# has the 3.0.1 inclusive-boundary regression above; that is an open
+# question, not a finding either way.
+#
+# Revisit trigger: (a) tokio-cron-scheduler's own croner pin and autumn-web's
+# direct one converge on one version — collapses this duplicate with no
+# action needed here; or (b) someone rehearses croner 4.x the same way PR
+# #2142 rehearsed 3.0.1 (same 4 call sites, same `scheduler::tests` suite)
+# and it comes back clean — then our own pin can move. Until one of those
+# happens, `croner = "2.2"` stays, and this is a documented pin, not a stale
+# one.
 multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
