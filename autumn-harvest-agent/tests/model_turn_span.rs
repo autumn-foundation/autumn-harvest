@@ -42,8 +42,8 @@ fn turn_request() -> ModelTurnRequest {
         mesh: None,
         prefix: None,
         remember: false,
-        skills: false,
         tool_guidance: std::collections::BTreeMap::new(),
+        skills: false,
         draw: None,
     }
 }
