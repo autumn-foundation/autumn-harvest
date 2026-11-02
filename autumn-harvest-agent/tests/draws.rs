@@ -331,7 +331,7 @@ async fn an_inline_child_keeps_the_draw_and_nests_its_run_id() {
     assert_eq!(child.draw, Some(DrawId::new(3)));
 }
 
-// A fan-out child of a draw keeps the draw id and runs under its own
+// A fan-out child of a draw keeps the draw id. It runs under its own
 // execution id, so it never reuses the run id of its draw.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fan_out_child_of_a_draw_has_its_own_run_id() {
