@@ -1572,6 +1572,7 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_schedules.buffered_runs` | Clear | Fire times only. |
 | `harvest_schedules.retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_schedule_overrides.workflow_fields` | Clear | Operator schedule settings of a code-declared workflow schedule (#2386): cadence, policies and caps. An override never holds a run input. |
+| `harvest_agent_overlays.body` | Clear | An agent profile overlay (#2371): prompt text, bounds and a model name. `BYTEA`, not `JSONB`. A run reads it as configuration. Do not put secrets or PII in an overlay. |
 | `harvest_signals.payload` | Covered | The signal payload. Signal ingest decodes it before it records `SignalReceived`. |
 | `harvest_entity_state.snapshot` | Covered | The latest keyed-entity state (#2259). A trigger copies the encoded value of the snapshot event, so it holds the same envelope. Entity reads decode it. Erasure tombstones it. |
 | `harvest_stream_chunks.chunk` | Clear | Durable output chunks (#1974). The stream route sends them as stored. PII erasure deletes them. Do not put secrets in a chunk. |
