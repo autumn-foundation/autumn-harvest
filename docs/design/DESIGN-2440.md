@@ -53,6 +53,7 @@ Decision: 1, 5 and the helper of 6. The registered workflow belongs to
 | Let a fan-out child keep the root. It then reuses the run id of its parent. | A child keeps the draw id and drops the root. A test checks a fan-out child. |
 | Take the root from a workflow id that a later run reuses. | `run_draws` records a UUID. `drive` refuses a root that is not a UUID. `shares_run_id` reads a `:s{n}` suffix as it reads `:d{n}`. |
 | Take the root from the execution id. A reset or a fork replays under a new id, and the child inputs differ. Two batches of one run share run ids. | Each `run_draws` call records a new UUID with `ctx.new_uuid`. Tests replay under a new execution id and run two batches. |
+| A reset or a fork starts new draws under a recorded root. | Not reachable. `validate_reset_point` refuses a point with an unfinished child, and fork uses it too. The UUID and the child starts share one decision. |
 | Check the root against the parent execution id. The replayer has no parent, so replay fails where the live run passed. | The check reads the input only. |
 | Let each draw deliver its answer. | `run_draws` turns delivery off. |
 | Let a draw that loses write memory, a workspace head or a follow-up. | `run_draws` clears them, as `child_task` does. |

@@ -489,7 +489,8 @@ impl AgentTask {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnRequest {
-    /// The execution id. Tools and the policy see it as the run id.
+    /// The run id that tools and the policy see. See
+    /// [`RunId`](crate::RunId).
     pub run_id: String,
     /// The session the run belongs to.
     #[serde(default)]
@@ -665,7 +666,7 @@ impl ModelTurn {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallRequest {
-    /// The execution id: the run id.
+    /// The run id. See [`RunId`](crate::RunId).
     pub run_id: String,
     /// The session the run belongs to.
     #[serde(default)]

@@ -3246,9 +3246,13 @@ mod tests {
         assert!(shares_run_id("daily:s1:d2", "daily", "0e3c"));
         assert!(!shares_run_id("0e3c:s1", "daily", "0e3c"));
         assert!(!shares_run_id("0e3c:s1:d2", "daily", "0e3c"));
-        // A draw started by `run_draws` has the execution id of its parent
-        // as its root, so the child sees no shared id.
-        assert!(!shares_run_id("p-exec:s0", "child-wf", "child-exec"));
+        // A draw that `run_draws` starts has a recorded UUID as its root, so
+        // the child sees no shared id.
+        assert!(!shares_run_id(
+            "01890a5d-ac96-774b-bcce-b302099a8057:s0",
+            "child-wf",
+            "child-exec"
+        ));
         // Only a numeric suffix marks a child.
         assert!(!shares_run_id("daily:sx", "daily", "0e3c"));
     }
