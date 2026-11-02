@@ -207,6 +207,8 @@ pub mod adaptive_limit;
 pub mod admission_gate;
 /// AES-256-GCM payload codec and data-key providers (issue #1825).
 pub mod aead_codec;
+/// The operator policies of agent kinds (issue #2439).
+pub mod agent_policy_log;
 /// History analyzer and linter.
 pub mod analyzer;
 /// Pure token-secret helpers shared by the mint route and the CLI (issue #942).

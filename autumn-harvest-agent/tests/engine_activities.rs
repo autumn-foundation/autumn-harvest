@@ -50,6 +50,7 @@ fn with_harness(harness: AgentHarness) -> ActivityContext {
 fn turn_request() -> ModelTurnRequest {
     ModelTurnRequest {
         skills: false,
+        allowed_effects: None,
         tool_guidance: std::collections::BTreeMap::new(),
         run_id: "run-1".into(),
         session_id: None,
@@ -154,6 +155,7 @@ async fn the_tool_handler_runs_the_named_tool_with_its_context() {
     let ctx = with_harness(harness);
     let request = ToolCallRequest {
         skill: None,
+        allowed_effects: None,
         run_id: "run-1".into(),
         session_id: None,
         step: 0,
@@ -252,7 +254,7 @@ fn the_engine_registration_builds() {
         .activities(activities())
         .state(AgentHarness::new(ScriptedModel::new(Vec::new())))
         .build();
-    assert_eq!(built.workflow_count(), 3);
+    assert_eq!(built.workflow_count(), 4);
     assert!(built.state::<AgentHarness>().is_some());
     let names: Vec<&str> = activities().iter().map(|a| a.name).collect();
     assert_eq!(
@@ -270,6 +272,7 @@ fn the_engine_registration_builds() {
             "agent_workspace_reset",
             "agent_workspace_floor",
             "agent_refine_propose",
+            "agent_sampling_policy",
         ]
     );
     let flows: Vec<&str> = workflows().iter().map(|w| w.name).collect();
@@ -279,6 +282,7 @@ fn the_engine_registration_builds() {
             autumn_harvest_agent::WORKFLOW_NAME,
             autumn_harvest_agent::heartbeat::HEARTBEAT_WORKFLOW_NAME,
             autumn_harvest_agent::AGENT_WORKFLOW_NAME,
+            autumn_harvest_agent::sampling::DRAWS_WORKFLOW_NAME,
         ]
     );
 }
@@ -375,6 +379,7 @@ async fn a_huge_tool_error_still_fits_the_result_cap() {
     let outcome = harness
         .tool_call(ToolCallRequest {
             skill: None,
+            allowed_effects: None,
             run_id: "run-1".into(),
             session_id: None,
             step: 0,
@@ -605,6 +610,7 @@ async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
     let outcome = harness
         .tool_call(ToolCallRequest {
             skill: None,
+            allowed_effects: None,
             run_id: "run-1".into(),
             session_id: None,
             step: 0,
@@ -738,6 +744,7 @@ async fn a_zero_result_cap_leaves_a_big_reply_and_a_big_tool_result_alone() {
     let outcome = harness
         .tool_call(ToolCallRequest {
             skill: None,
+            allowed_effects: None,
             run_id: "run-1".into(),
             session_id: None,
             step: 0,

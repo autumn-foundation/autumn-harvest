@@ -121,18 +121,7 @@ impl Provenance {
         let Self::Operator(id) = self else {
             return Ok(());
         };
-        let reason = if id.trim().is_empty() {
-            "the operator id is empty"
-        } else if id.chars().count() > MAX_AUTHOR_LEN {
-            "the operator id is too long"
-        } else if id.trim() != id {
-            "the operator id starts or ends with white space"
-        } else if id.chars().any(|c| c.is_control() || is_invisible(c)) {
-            "the operator id holds a control or invisible character"
-        } else {
-            return Ok(());
-        };
-        Err(OverlayStoreError::InvalidProvenance { reason })
+        check_operator_id(id).map_err(|reason| OverlayStoreError::InvalidProvenance { reason })
     }
 
     /// The provenance of a stored row.
@@ -274,6 +263,23 @@ pub enum OverlayStoreError {
 /// A pointer for an error message: `v3`, or `unset`.
 fn show_active(active: Option<OverlayVersion>) -> String {
     active.map_or_else(|| "unset".to_owned(), |version| version.to_string())
+}
+
+/// Refuse an operator id that is empty or long, that starts or ends with
+/// white space, or that holds a control or invisible character. So two ids
+/// that look the same in an audit are the same id.
+pub(crate) fn check_operator_id(id: &str) -> Result<(), &'static str> {
+    if id.trim().is_empty() {
+        Err("the operator id is empty")
+    } else if id.chars().count() > MAX_AUTHOR_LEN {
+        Err("the operator id is too long")
+    } else if id.trim() != id {
+        Err("the operator id starts or ends with white space")
+    } else if id.chars().any(|c| c.is_control() || is_invisible(c)) {
+        Err("the operator id holds a control or invisible character")
+    } else {
+        Ok(())
+    }
 }
 
 /// Whether `c` is a format character that shows no glyph. These are the

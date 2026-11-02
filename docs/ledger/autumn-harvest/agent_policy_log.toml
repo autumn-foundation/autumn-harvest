@@ -1,0 +1,36 @@
+# Ledger profiles for `autumn-harvest/src/agent_policy_log.rs`. See `docs/ledger/README.md`.
+
+["pg::insert_policy_audit"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_agent_policy_audit"]
+measured = "unmeasured"
+
+["pg::list_agent_policy_audit"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_agent_policy_audit"]
+measured = "unmeasured"
+
+["pg::lock_policy"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["pg::select_policy"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_agent_policies"]
+measured = "unmeasured"
+
+["pg::upsert_policy"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_agent_policies"]
+measured = "unmeasured"

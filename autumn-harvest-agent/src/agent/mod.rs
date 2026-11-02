@@ -486,8 +486,10 @@ pub struct PeerReply {
 ///
 /// The wire form is internally tagged by `type`. A tick op does not decode
 /// from a signal: only the agent itself makes one.
+// The derives are remote, so the trait impls below wrap them. The
+// `Deserialize` impl refuses each sampling policy field first (issue #2439).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(remote = "Self", tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 // `PeerMessage` holds its envelope inline for harvest-verify. See there.
 #[allow(clippy::large_enum_variant)]
@@ -512,6 +514,24 @@ pub enum AgentOp {
     /// hook makes it.
     #[serde(skip_deserializing)]
     Unpark,
+}
+
+impl Serialize for AgentOp {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+/// The decode refuses each name in
+/// [`SAMPLING_POLICY_FIELDS`](crate::sampling::SAMPLING_POLICY_FIELDS). The
+/// wire form is internally tagged, so the fields of each variant are at the
+/// top level. A signal therefore never carries a policy.
+impl<'de> Deserialize<'de> for AgentOp {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        crate::sampling::refuse_policy_fields::<D::Error>(&value, "an AgentOp")?;
+        Self::deserialize(value).map_err(serde::de::Error::custom)
+    }
 }
 
 impl AgentOp {

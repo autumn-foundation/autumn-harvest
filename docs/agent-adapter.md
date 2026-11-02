@@ -1371,3 +1371,81 @@ ceilings too. It checks each reply with
 The default templates adapt Harness² text under Apache-2.0. See
 `autumn-harvest-agent/NOTICE`. The design is in
 [`DESIGN-2379.md`](design/DESIGN-2379.md).
+
+## 17. Sampling policy (issue #2439)
+
+Each strategy of epic #2438 runs more than one draw. A draw can call
+tools. An operator sets the limits of each agent kind in one
+`SamplingPolicy`. A missing policy means every default, and each default
+is the safe value.
+
+| Setting | Meaning | Default |
+|---|---|---|
+| `strategies` | The strategies that the kind may use: `best_of_n`, `rejection`, `vote`, `cascade`, `beam` | none, so each run is a single draw |
+| `max_draws` | The most draws of one strategy run, across all rounds. 1 to 256. | 1 |
+| `max_concurrent_draws` | The most draws that run at the same time. 1 to `MAX_PARALLEL_CHILDREN` (16). | 1 |
+| `draw_effects` | The `ToolEffect`s that a draw may run | `[read_only]` |
+| `scorers` | The scorer ids that the kind may use: `deterministic`, or `{"only": [ids]}` | `deterministic`: each scorer that calls no model |
+| `judge_models` | The models that a judge scorer may call | none |
+| `max_answer_retries` | The cap of the in-loop answer check (#2442). 0 to 16. | 0 |
+
+An unknown key fails the decode. So an older worker never drops a setting
+that a newer worker recorded.
+
+### Who sets it
+
+Only an operator. The routes are `PUT` and `DELETE`
+`/admin/agents/{kind}/sampling-policy`, and both need the operator role.
+Without it, the call returns 403 and nothing changes. `GET` reads the
+policy and its newest audit rows.
+
+```sh
+harvest agents sampling policy researcher show
+harvest agents sampling policy researcher set --strategies best_of_n --max-draws 4 --max-concurrent-draws 2
+harvest agents sampling policy researcher reset
+```
+
+`set` replaces the whole policy. A setting that you leave out takes its
+default. Each set and reset writes a row to `harvest_agent_policy_audit`
+with the old and new policy, in the transaction of the change. The HTTP
+call also writes a `harvest_audit_log` row.
+
+Install a store with `AgentHarness::sampling_policies`. The stores are
+`InMemorySamplingPolicyStore`, `SqliteSamplingPolicyStore` (feature
+`sqlite`) and `PostgresSamplingPolicyStore` (feature `postgres`). Each
+read sends one query, so a change reaches the next strategy run of every
+process, with no restart. A harness with no store reads every default.
+
+### What a strategy run does
+
+`agent_draws` takes a `DrawsInput`: the kind, the task, the strategy, the
+draw count, an optional concurrency and an optional scorer.
+
+1. It reads the policy once, in the recorded activity
+   `agent_sampling_policy`. Replay reads the record, so a change during
+   the run does not reach it.
+2. `sampling::admit` checks the strategy, the draw count, the
+   concurrency, the scorer and the judge model, in that order. A request
+   over the policy fails with `sampling refused (<code>)` before any model
+   call. The codes are the variants of `sampling::Refusal`.
+3. It runs the draws as child `agent_loop` runs, in waves of at most the
+   admitted concurrency.
+
+Each draw sets `AgentTask::allowed_effects` to `draw_effects` met with
+the effects of its task. The decision phase denies a tool of any other
+effect, and the tool-call activity checks it again. So a draw never gets
+wider effects than a single run of its task. An inline child of a draw
+keeps the set. A delegation from a draw to a durable peer is refused. A
+draw delivers nothing, books no follow-up and has no workspace.
+
+`agent_draws` returns each draw report. Draw identity (#2440), the
+scorers (#2441) and the selection (#2443) build on it.
+
+### A run never carries a policy
+
+`AgentTask`, `AgentOp` and `DrawsInput` fail to decode when they carry a
+key from `sampling::SAMPLING_POLICY_FIELDS`. Any other unknown key of
+`AgentTask` and `AgentOp` still decodes, as before. So a client cannot
+widen its own policy.
+
+The design is in [`DESIGN-2439.md`](design/DESIGN-2439.md).

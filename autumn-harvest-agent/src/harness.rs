@@ -24,9 +24,12 @@ use crate::mesh::{DELEGATE_TOOL, Peer, delegate_definition, valid_name};
 use crate::mesh_control::{MESH_BUDGET_EXCEEDED, MeshBudget, MeshBudgetExceeded, MeshSpend};
 use crate::message::{ChatMessage, ContentPart, RunId, TokenUsage, ToolDefinition};
 use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MODEL_ID};
-use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
+use crate::policy::{
+    AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules, effect_refusal,
+};
 use crate::refine::{DEFAULT_PROPOSER_TIMEOUT, OverlayProposer};
 use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
+use crate::sampling::{PolicyRead, PolicyStoreError, SamplingPolicy, SamplingPolicyStore};
 use crate::skill::{LOAD_SKILL_TOOL, SkillTool};
 use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
@@ -127,6 +130,7 @@ pub struct AgentHarness {
     workspace: Option<WorkspaceStore>,
     proposer: Option<Arc<dyn OverlayProposer>>,
     proposer_timeout: Duration,
+    sampling: Option<Arc<dyn SamplingPolicyStore>>,
 }
 
 impl AgentHarness {
@@ -143,6 +147,7 @@ impl AgentHarness {
             workspace: None,
             proposer: None,
             proposer_timeout: DEFAULT_PROPOSER_TIMEOUT,
+            sampling: None,
             tools: Vec::new(),
             policy: Arc::new(AllowAll),
             temperature: None,
@@ -247,6 +252,49 @@ impl AgentHarness {
             timeout.min(DEFAULT_PROPOSER_TIMEOUT)
         };
         self
+    }
+
+    /// Set the store of the sampling policies (issue #2439).
+    ///
+    /// Without a store, each strategy run reads every default, so it is
+    /// refused.
+    #[must_use]
+    pub fn sampling_policies(mut self, store: Arc<dyn SamplingPolicyStore>) -> Self {
+        self.sampling = Some(store);
+        self
+    }
+
+    /// The sampling policy of `kind`, for the `agent_sampling_policy`
+    /// activity.
+    ///
+    /// A harness with no store reads every default.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable error for a kind that is not valid or a
+    /// stored policy that does not decode. Returns a retryable error when
+    /// the store fails. The model reads neither.
+    pub async fn sampling_policy(&self, kind: &str) -> Result<PolicyRead, String> {
+        let Some(store) = &self.sampling else {
+            return Ok(PolicyRead {
+                policy: SamplingPolicy::default(),
+                revision: 0,
+            });
+        };
+        match tokio::time::timeout(self.hook_timeout, store.read(kind)).await {
+            Ok(Ok(read)) => Ok(read),
+            Ok(Err(
+                err @ (PolicyStoreError::InvalidKind { .. } | PolicyStoreError::Corrupt { .. }),
+            )) => Err(
+                ActivityFailure::non_retryable("SamplingPolicyInvalid", err.to_string())
+                    .into_error_payload(),
+            ),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_) => Err(format!(
+                "the sampling policy store did not answer within {:?}",
+                self.hook_timeout
+            )),
+        }
     }
 
     /// The overlay proposer, if one is installed.
@@ -832,6 +880,7 @@ impl AgentHarness {
                     allowed,
                     exercised: &request.flow_labels,
                     released: &request.flow_released,
+                    allowed_effects: request.allowed_effects.as_ref(),
                 },
                 &mut policy_budget,
             )
@@ -946,20 +995,27 @@ impl AgentHarness {
             allowed,
             exercised,
             released,
+            allowed_effects,
         } = scope;
         let started = tokio::time::Instant::now();
         let deadline = started + *budget;
-        let read_only_policy: Arc<dyn ToolPolicy>;
-        let policy: &dyn ToolPolicy = if read_only {
-            // The read-only rules go first. Their deny ends the decision, so
-            // the app policy is not asked about a call that cannot run.
-            read_only_policy = Arc::new(Strictest::new(vec![
-                Arc::new(ToolRules::read_only()),
-                Arc::clone(&self.policy),
-            ]));
-            read_only_policy.as_ref()
-        } else {
+        // The effect rules and the read-only rules go first. Their deny ends
+        // the decision, so the app policy is not asked about a call that
+        // cannot run.
+        let mut layers: Vec<Arc<dyn ToolPolicy>> = Vec::new();
+        if let Some(effects) = allowed_effects {
+            layers.push(Arc::new(ToolRules::only_effects(effects)));
+        }
+        if read_only {
+            layers.push(Arc::new(ToolRules::read_only()));
+        }
+        let layered: Arc<dyn ToolPolicy>;
+        let policy: &dyn ToolPolicy = if layers.is_empty() {
             self.policy.as_ref()
+        } else {
+            layers.push(Arc::clone(&self.policy));
+            layered = Arc::new(Strictest::new(layers));
+            layered.as_ref()
         };
         // Each call that is not denied may run. Its labels count for the
         // calls after it in this turn before it runs, so the check fails
@@ -1191,6 +1247,12 @@ impl AgentHarness {
         // run on workers with different tool lists, for example in a deploy.
         if request.read_only && tool.effect() >= ToolEffect::Write {
             return Ok(self.error_outcome("this run may only read data"));
+        }
+        // The same reason applies to the effect set of a draw (issue #2439).
+        if let Some(effects) = &request.allowed_effects
+            && !effects.contains(&tool.effect())
+        {
+            return Ok(self.error_outcome(&effect_refusal(tool.effect())));
         }
         // The same reason applies to the flow labels. A tool that gained a
         // label after the decision did not pass the flow rules with it.
@@ -1544,6 +1606,8 @@ struct Scope<'a> {
     exercised: &'a BTreeSet<String>,
     /// The flow rules that a person released before the turn.
     released: &'a Released,
+    /// The tool effects that the run may run. `None` allows each effect.
+    allowed_effects: Option<&'a BTreeSet<ToolEffect>>,
 }
 
 /// The definition of `tool` that the model sees. Guidance replaces the
