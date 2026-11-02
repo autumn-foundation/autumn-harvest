@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use super::AgentProfile;
@@ -16,6 +17,7 @@ use crate::mesh::MAX_NAME_LEN;
 #[cfg(test)]
 use crate::skill::MAX_SKILL_SUMMARY_CHARS;
 use crate::skill::{SkillText, first_invalid};
+use crate::transcript::hex;
 
 /// The heading of the guardrails in the system prompt.
 pub const GUARDRAILS_HEADING: &str = "## Guardrails";
@@ -56,6 +58,20 @@ pub struct ProfileOverlay {
     /// The skills that the agent loads on demand (issue #2373).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub skills: BTreeMap<String, SkillText>,
+}
+
+impl ProfileOverlay {
+    /// The SHA-256 digest of the overlay, as `sha256:<hex>` (issue #2375).
+    ///
+    /// The digest reads the JSON of the overlay. The JSON holds the fields in
+    /// declaration order, leaves out each unset field and sorts the map keys.
+    /// Thus equal overlays have equal digests.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        // An overlay holds strings, numbers and maps only, so it encodes.
+        let bytes = serde_json::to_vec(self).unwrap_or_default();
+        format!("sha256:{}", hex(&Sha256::digest(&bytes)))
+    }
 }
 
 /// The limits of the profile that [`apply`] returns.
@@ -397,6 +413,35 @@ mod tests {
         profile.window = 50;
         profile.max_ops_per_run = Some(7);
         profile
+    }
+
+    #[test]
+    fn the_digest_names_one_overlay() {
+        assert_eq!(
+            ProfileOverlay::default().digest(),
+            "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "the digest of an empty JSON object"
+        );
+        let a = ProfileOverlay {
+            system: Some("s".to_owned()),
+            tool_guidance: BTreeMap::from([
+                ("b".to_owned(), "2".to_owned()),
+                ("a".to_owned(), "1".to_owned()),
+            ]),
+            ..ProfileOverlay::default()
+        };
+        let b: ProfileOverlay = serde_json::from_value(json!({
+            "tool_guidance": {"a": "1", "b": "2"},
+            "system": "s",
+            "model": null,
+        }))
+        .expect("decode");
+        assert_eq!(a.digest(), b.digest(), "one overlay has one digest");
+        let c = ProfileOverlay {
+            system: Some("t".to_owned()),
+            ..a.clone()
+        };
+        assert_ne!(a.digest(), c.digest());
     }
 
     #[test]

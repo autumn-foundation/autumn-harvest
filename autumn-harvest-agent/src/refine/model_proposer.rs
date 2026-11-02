@@ -312,6 +312,32 @@ mod tests {
     }
 
     #[test]
+    fn the_output_contract_names_every_overlay_key() {
+        // The literal names each field, so a new field fails to compile here.
+        let overlay = ProfileOverlay {
+            system: Some(String::new()),
+            guardrails: Some(String::new()),
+            model: Some(String::new()),
+            max_steps: Some(1),
+            max_total_tokens: Some(1),
+            max_output_tokens: Some(1),
+            read_only: Some(true),
+            tool_guidance: std::collections::BTreeMap::from([("lookup".to_owned(), String::new())]),
+            skills: std::collections::BTreeMap::from([(
+                "triage".to_owned(),
+                crate::skill::SkillText::new("s", "b"),
+            )]),
+        };
+        let serde_json::Value::Object(keys) = serde_json::to_value(&overlay).expect("encode")
+        else {
+            panic!("an overlay encodes as an object");
+        };
+        for key in keys.keys() {
+            assert!(OUTPUT_CONTRACT.contains(&format!("`{key}`")), "{key}");
+        }
+    }
+
+    #[test]
     fn the_default_templates_name_their_dimension() {
         assert!(INV_TEMPLATE.contains("YOUR DIMENSION: INV"));
         assert!(DOM_TEMPLATE.contains("YOUR DIMENSION: DOM"));
