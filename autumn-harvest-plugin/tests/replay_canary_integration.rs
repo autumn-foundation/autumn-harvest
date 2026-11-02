@@ -1,3 +1,5 @@
+use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::table_split::Ext;
 use autumn_web::reexports::axum;
 use autumn_web::reexports::http;
 use axum::body::Body;
@@ -170,7 +172,7 @@ async fn test_replay_canary_api_endpoint_fails_on_divergence() {
             harvest_workflow_executions::id.eq(exec_id.as_uuid()),
             harvest_workflow_executions::workflow_name.eq("activity_wf".to_string()),
             harvest_workflow_executions::workflow_id.eq("wf-3".to_string()),
-            harvest_workflow_executions::run_id.eq(run_id),
+            Ext(harvest_workflow_executions_ext::run_id.eq(run_id)),
             harvest_workflow_executions::shard_id.eq(0),
             harvest_workflow_executions::state.eq("RUNNING".to_string()),
             harvest_workflow_executions::input.eq(json!("hi")),

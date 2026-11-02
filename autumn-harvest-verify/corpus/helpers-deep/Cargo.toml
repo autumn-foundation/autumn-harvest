@@ -10,3 +10,12 @@ description = "Seeded determinism corpus for harvest-verify (issue #962); delibe
 path = "src/lib.rs"
 
 [dependencies]
+
+# Verifier fixture code. Each function has the exact shape that
+# `corpus/expectations.toml` pins, so a rewrite to suit a style lint
+# changes the MIR under test. Style, complexity and perf lints only
+# suggest rewrites, so they are off. Correctness and suspicious stay on.
+[lints.clippy]
+style = { level = "allow", priority = -1 }
+complexity = { level = "allow", priority = -1 }
+perf = { level = "allow", priority = -1 }

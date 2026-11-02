@@ -13,6 +13,8 @@
 //! - AC6: chain timeouts increment `harvest.workflow.chain_timeout`; per-run
 //!   timeouts increment `harvest.workflow.timeout`.
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::table_split::SetExt;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -163,8 +165,8 @@ async fn set_chain_columns(
 ) {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
-            harvest_workflow_executions::chain_execution_timeout.eq(chain_timeout),
-            harvest_workflow_executions::chain_deadline_at.eq(chain_deadline_at),
+            SetExt(harvest_workflow_executions_ext::chain_execution_timeout.eq(chain_timeout)),
+            SetExt(harvest_workflow_executions_ext::chain_deadline_at.eq(chain_deadline_at)),
         ))
         .execute(conn)
         .await
@@ -179,8 +181,8 @@ async fn load_chain_columns(
     harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .select((
-            harvest_workflow_executions::chain_execution_timeout,
-            harvest_workflow_executions::chain_deadline_at,
+            harvest_workflow_executions_ext::chain_execution_timeout,
+            harvest_workflow_executions_ext::chain_deadline_at,
         ))
         .first(conn)
         .await
@@ -979,8 +981,8 @@ async fn scheduler_tick_applies_fleet_wide_chain_ceiling() {
             .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
             .select((
                 harvest_workflow_executions::id,
-                harvest_workflow_executions::chain_execution_timeout,
-                harvest_workflow_executions::chain_deadline_at,
+                harvest_workflow_executions_ext::chain_execution_timeout,
+                harvest_workflow_executions_ext::chain_deadline_at,
             ))
             .first(&mut conn)
             .await

@@ -722,6 +722,7 @@ mod tests {
                 tools: Vec::new(),
                 max_tokens: Some(64),
                 temperature: None,
+                draw: None,
             },
             autumn_harvest_agent::ChatResponse {
                 content: vec![ContentPart::Text(format!("answer to {text}"))],

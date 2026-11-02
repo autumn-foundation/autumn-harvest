@@ -14,3 +14,5 @@ mod agent_overlay;
 mod overlay_log;
 mod agent_propose;
 mod agent_sampling;
+mod agent_select;
+mod agent_profile_read;

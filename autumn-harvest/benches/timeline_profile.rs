@@ -78,7 +78,7 @@ const ACTIVITY_NAMES: [&str; 4] = [
 ];
 const QUEUES: [&str; 4] = ["payments", "email", "webhooks", "inventory"];
 
-fn row(timestamp: DateTime<Utc>, event: WorkflowEvent) -> TimelineEventRow {
+const fn row(timestamp: DateTime<Utc>, event: WorkflowEvent) -> TimelineEventRow {
     TimelineEventRow { timestamp, event }
 }
 
@@ -96,6 +96,7 @@ fn row(timestamp: DateTime<Utc>, event: WorkflowEvent) -> TimelineEventRow {
 /// the fixed history outlast a hardcoded horizon and produces "future"
 /// events relative to the clock the timeline is derived against (Codex
 /// review on #1372).
+#[allow(clippy::too_many_lines, reason = "one straight-line event list")]
 fn build_workload(n: usize, start: DateTime<Utc>) -> (Vec<TimelineEventRow>, DateTime<Utc>) {
     let mut rows: Vec<TimelineEventRow> = Vec::new();
     let mut t = start;

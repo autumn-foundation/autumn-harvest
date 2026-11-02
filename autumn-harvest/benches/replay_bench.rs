@@ -143,6 +143,10 @@ fn bench_decisions(
 ///
 /// `decision_cost_warm` measures a resident decision (issue #1798, step 2).
 /// It does not replay, so its cost stays roughly constant.
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "Criterion needs each group alive until finish"
+)]
 fn bench_decision_cost(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 

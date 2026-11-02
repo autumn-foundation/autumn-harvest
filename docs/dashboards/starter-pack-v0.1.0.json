@@ -6375,6 +6375,57 @@
       "description": "Alert: harvest_queue_paused_too_long (docs/runbooks/harvest-alerts.md#harvest_queue_paused_too_long) 1 while an operator hold is in effect on a queue, 0 otherwise (issue #619). max by (queue) avoids double-counting when several worker replicas sample the same fleet-wide pause. Pair with the queue-depth and oldest-pending-age panels: a rising backlog WITH this at 1 is a deliberate hold, not a capacity incident \u2014 the single most common false page during an outage freeze."
     },
     {
+      "id": 937,
+      "type": "timeseries",
+      "title": "Cost hold (deferrable activities wait)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 44
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(harvest_cost_hold)",
+          "legendFormat": "held",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "1 while a cost signal (carbon intensity or price) holds the deferrable activity types of a worker, 0 otherwise (autumn#1720). Only a worker with a cost hold reports it. max() shows whether any replica holds work. A rising queue depth or oldest-pending age WITH this at 1 is deferred work waiting for a cheaper window, not a capacity incident."
+    },
+    {
       "id": 924,
       "type": "row",
       "title": "Broker connectors",

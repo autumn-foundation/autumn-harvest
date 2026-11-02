@@ -1,7 +1,8 @@
 //! The gate and the fan-out of a strategy run (issue #2439).
 //!
 //! [`agent_draws`] reads the profile of its kind and the policy of that
-//! kind once each, in recorded activities. It admits the request with
+//! kind once each, in recorded activities. The profile read applies the
+//! active overlay, as the op of a durable agent does (issue #2372). It admits the request with
 //! [`admit`], then runs each draw as a child `agent_loop` run. Replay reads
 //! the records, so a change during the run never reaches it.
 //!
@@ -28,11 +29,13 @@ use serde::{Deserialize, Serialize};
 use super::admit::{Admission, Ask, Refusal, admit, wave_end};
 use super::policy::{ScorerRef, Strategy};
 use super::store::PolicyRead;
-use crate::agent::{AgentProfile, agent_profile_info};
+use crate::agent::profile_read::{OverlayRead, ProfileRead, overlaid};
+use crate::agent::{AgentProfile, agent_profile_info, agent_profile_overlay_info};
+use crate::draw::DrawId;
 use crate::mesh::valid_name;
 use crate::tool::ToolEffect;
 use crate::types::{AgentReport, AgentTask, RunIdSource};
-use crate::workflow::{WORKFLOW_NAME, harness};
+use crate::workflow::harness;
 
 /// The workflow name of [`agent_draws`].
 pub const DRAWS_WORKFLOW_NAME: &str = "agent_draws";
@@ -124,11 +127,7 @@ pub async fn agent_draws(ctx: &WorkflowContext, input: DrawsInput) -> Result<Dra
     if !valid_name(&input.kind) {
         return Err(Refusal::InvalidKind.error_text());
     }
-    let profile: Option<AgentProfile> = ctx
-        .execute_activity(&agent_profile_info(), input.kind.clone())
-        .await
-        .map_err(|err| err.to_string())?;
-    let Some(profile) = profile else {
+    let Some(profile) = read_profile(ctx, &input.kind).await? else {
         return Err(Refusal::UnknownKind.error_text());
     };
     let read = read_policy(ctx, &input.kind).await?;
@@ -140,7 +139,7 @@ pub async fn agent_draws(ctx: &WorkflowContext, input: DrawsInput) -> Result<Dra
     };
     let admission = admit(&read.policy, &ask).map_err(|refusal| refusal.error_text())?;
     let task = profile_task(&profile, &input.input);
-    let draws = run_draws(ctx, &task, &admission).await?;
+    let draws = run_admitted(ctx, &task, &admission).await?;
     Ok(DrawsReport {
         kind: input.kind,
         strategy: input.strategy,
@@ -148,6 +147,34 @@ pub async fn agent_draws(ctx: &WorkflowContext, input: DrawsInput) -> Result<Dra
         concurrency: admission.concurrency,
         draws,
     })
+}
+
+/// The profile of `kind`, as a durable agent reads it for one op (issue
+/// #2372). With an overlay store, the active overlay applies. `None` means
+/// that no profile has the kind.
+async fn read_profile(ctx: &WorkflowContext, kind: &str) -> Result<Option<AgentProfile>, String> {
+    let read: Option<ProfileRead> = ctx
+        .execute_activity(&agent_profile_info(), kind.to_owned())
+        .await
+        .map_err(|err| err.to_string())?;
+    let Some(read) = read else {
+        return Ok(None);
+    };
+    if !read.overlay_store {
+        return Ok(Some(read.profile));
+    }
+    let request = OverlayRead {
+        kind: kind.to_owned(),
+        profile: read.profile.clone(),
+    };
+    let op: ProfileRead = ctx
+        .execute_activity(&agent_profile_overlay_info(), request)
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(Some(match op.overlay_version {
+        Some(_) => overlaid(&read.profile, &op.profile),
+        None => read.profile,
+    }))
 }
 
 /// Read the policy of `kind` once, through the recorded activity.
@@ -159,29 +186,24 @@ pub async fn read_policy(ctx: &WorkflowContext, kind: &str) -> Result<PolicyRead
 
 /// Run the admitted draws of `task` in waves, and return their reports in
 /// draw order.
-pub async fn run_draws(
+///
+/// Each wave is one [`run_draws`](crate::run_draws) batch, so each draw has
+/// its own draw id, run id and cache key (issue #2440). Draw `n` has the id
+/// `n` across all waves. A wave holds at most `MAX_PARALLEL_CHILDREN`
+/// draws, the bound of one batch.
+pub async fn run_admitted(
     ctx: &WorkflowContext,
     task: &AgentTask,
     admission: &Admission,
 ) -> Result<Vec<AgentReport>, String> {
     let draw = draw_task(task, &admission.draw_effects);
-    let input = serde_json::to_value(&draw).map_err(|err| err.to_string())?;
     let mut reports = Vec::new();
     let mut start = 0;
     while start < admission.draws {
         let end = wave_end(admission.draws, admission.concurrency, start);
-        let wave = (start..end)
-            .map(|_| (WORKFLOW_NAME.to_owned(), input.clone()))
-            .collect();
-        let ended = ctx
-            .spawn_child_workflow_fan_out_collect_raw(wave)
-            .await
-            .map_err(|err| err.to_string())?;
-        for output in ended {
-            let report = output.and_then(|value| {
-                serde_json::from_value::<AgentReport>(value).map_err(|err| err.to_string())
-            })?;
-            reports.push(report);
+        let ended = crate::draw::run_draws(ctx, &draw, (start..end).map(DrawId::new)).await?;
+        for report in ended {
+            reports.push(report?);
         }
         start = end;
     }
@@ -229,7 +251,8 @@ fn profile_task(profile: &AgentProfile, input: &str) -> AgentTask {
 ///   may reach a person.
 /// - It has no memory and no workspace, so N draws never make N writes to
 ///   one store (issue #2274).
-/// - It skips the response cache, so N draws are N samples.
+/// - `run_draws` gives it a draw id, so its cache key differs from the key
+///   of each other draw (issue #2440).
 fn draw_task(task: &AgentTask, draw_effects: &BTreeSet<ToolEffect>) -> AgentTask {
     let allowed_effects: BTreeSet<ToolEffect> = task.allowed_effects.as_ref().map_or_else(
         || draw_effects.clone(),
@@ -252,7 +275,6 @@ fn draw_task(task: &AgentTask, draw_effects: &BTreeSet<ToolEffect>) -> AgentTask
         memory_in_state: false,
         parallel_children: 0,
         context_reset,
-        no_response_cache: true,
         ..task.clone()
     }
 }
@@ -296,7 +318,6 @@ mod tests {
         assert!(!draw.deliver);
         assert!(draw.read_only, "a draw with no write effect is read-only");
         assert_eq!(draw.parallel_children, 0);
-        assert!(draw.no_response_cache);
         assert_eq!(draw.run_id_source, RunIdSource::ExecutionId);
         assert!(!open.read_only, "a draw with a write effect may write");
     }

@@ -23,6 +23,7 @@ use autumn_harvest::payload_store::PayloadStore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::draw::DrawId;
 use crate::error::{AgentError, ErrorKind};
 use crate::message::{ChatMessage, ContentPart, StopReason, TokenUsage, ToolDefinition};
 use crate::model::{BoxFuture, ChatRequest, ChatResponse};
@@ -299,9 +300,13 @@ impl ResponseCache {
     /// The key of `request` for `model_id`, as seen by `tenant`.
     ///
     /// The key is the SHA-256 hash of one JSON document. The document holds
-    /// the namespace, the scope, the tenant and its source, the model id,
-    /// the output cap, the temperature, the tools and the messages. Under
-    /// [`CacheScope::Shared`] it holds no tenant.
+    /// the namespace, the scope, the tenant and its source, and the model id.
+    /// It also holds the output cap, the temperature, the tools, the messages
+    /// and the draw. Under [`CacheScope::Shared`] it holds no tenant.
+    ///
+    /// The document holds the draw only when the request has one (issue
+    /// #2440). A request with no draw then keeps the key it had before
+    /// draws, so stored entries still hit.
     ///
     /// # Errors
     ///
@@ -338,6 +343,7 @@ impl ResponseCache {
             temperature_bits: request.temperature.map(f32::to_bits),
             tools: &request.tools,
             messages: &request.messages,
+            draw: request.draw.map(DrawId::get),
         };
         let bytes = serde_json::to_vec(&material)
             .map_err(|err| AgentError::new(ErrorKind::Decode, format!("cache key: {err}")))?;
@@ -499,6 +505,10 @@ struct KeyMaterial<'a> {
     temperature_bits: Option<u32>,
     tools: &'a [ToolDefinition],
     messages: &'a [ChatMessage],
+    /// The last field. With no draw, the document is the one of format
+    /// version 1 before draws.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draw: Option<u32>,
 }
 
 /// One stored answer. It repeats its key, so a read can check it. It holds
@@ -604,6 +614,7 @@ mod tests {
             tools: Vec::new(),
             max_tokens: Some(64),
             temperature: Some(0.0),
+            draw: None,
         }
     }
 
@@ -920,5 +931,40 @@ mod tests {
         assert_eq!(store.blobs().len(), 1);
         assert_eq!(cache.lookup(&one).await.unwrap(), None);
         assert_eq!(cache.lookup(&two).await.unwrap(), Some(response("2")));
+    }
+
+    // AC (#2440): two draws of one request get two keys.
+    #[test]
+    fn two_draws_of_one_request_get_two_keys() {
+        let (cache, _) = cache();
+        let draw = |n: Option<u32>| {
+            let mut request = request("hi");
+            request.draw = n.map(DrawId::new);
+            cache.key(KeyTenant::None, "m-1", &request).unwrap()
+        };
+        assert_ne!(draw(Some(0)), draw(Some(1)));
+        assert_ne!(draw(Some(0)), draw(None));
+        assert_eq!(draw(Some(1)), draw(Some(1)));
+    }
+
+    // AC (#2440): a request with no draw keeps the key bytes of the code
+    // before draws. The hex below came from `trunk-dev` at c0d70ed.
+    #[test]
+    fn a_request_with_no_draw_keeps_its_key_from_before_draws() {
+        let (cache, _) = cache();
+        let request = ChatRequest {
+            messages: vec![ChatMessage::text(ChatRole::User, "pick a colour")],
+            tools: Vec::new(),
+            max_tokens: Some(64),
+            temperature: Some(0.7),
+            draw: None,
+        };
+        let key = cache
+            .key(KeyTenant::Declared("acme"), "m-1", &request)
+            .unwrap();
+        assert_eq!(
+            key.as_str(),
+            "721672d9616f24dea805eb771bd6533246ccaf650e06308419d9461b1526824c"
+        );
     }
 }

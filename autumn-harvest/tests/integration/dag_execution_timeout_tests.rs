@@ -24,6 +24,8 @@
 //! - AC7: a DAG registered without the new attributes gets `None`/`NULL`
 //!   deadlines end to end (zero regression).
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::table_split::SetExt;
 use std::sync::{Arc, Mutex};
 
 use autumn_harvest::execution::{StartWorkflowParams, start_or_load_workflow_execution};
@@ -166,8 +168,8 @@ async fn load_row(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Deadlin
         .select((
             harvest_workflow_executions::state,
             harvest_workflow_executions::deadline_at,
-            harvest_workflow_executions::sla_deadline_at,
-            harvest_workflow_executions::sla_breached,
+            harvest_workflow_executions_ext::sla_deadline_at,
+            harvest_workflow_executions_ext::sla_breached,
             harvest_workflow_executions::error,
         ))
         .first(conn)
@@ -188,10 +190,10 @@ async fn backdate_deadline_at(conn: &mut AsyncPgConnection, exec_id: ExecutionId
 
 async fn backdate_sla_deadline_at(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set(
-            harvest_workflow_executions::sla_deadline_at
+        .set(SetExt(
+            harvest_workflow_executions_ext::sla_deadline_at
                 .eq(Some(Utc::now() - ChronoDuration::minutes(5))),
-        )
+        ))
         .execute(conn)
         .await
         .expect("backdate sla_deadline_at");
@@ -652,7 +654,7 @@ async fn load_fired_deadline(
         .select((
             harvest_workflow_executions::id,
             harvest_workflow_executions::deadline_at,
-            harvest_workflow_executions::sla_deadline_at,
+            harvest_workflow_executions_ext::sla_deadline_at,
         ))
         .first(conn)
         .await

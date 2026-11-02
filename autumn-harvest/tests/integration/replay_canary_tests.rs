@@ -1,5 +1,7 @@
 #![cfg(feature = "db")]
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::table_split::Ext;
 use chrono::Utc;
 use serde_json::{Value, json};
 use std::future::Future;
@@ -75,7 +77,7 @@ async fn test_replay_canary_simple_pass() {
             harvest_workflow_executions::id.eq(exec_id.as_uuid()),
             harvest_workflow_executions::workflow_name.eq("hello".to_string()),
             harvest_workflow_executions::workflow_id.eq("wf-1".to_string()),
-            harvest_workflow_executions::run_id.eq(run_id),
+            Ext(harvest_workflow_executions_ext::run_id.eq(run_id)),
             harvest_workflow_executions::shard_id.eq(0),
             harvest_workflow_executions::state.eq("RUNNING".to_string()),
             harvest_workflow_executions::input.eq(json!("hi")),
@@ -160,7 +162,7 @@ async fn test_replay_canary_suspended_workflow() {
             harvest_workflow_executions::id.eq(exec_id.as_uuid()),
             harvest_workflow_executions::workflow_name.eq("activity_wf".to_string()),
             harvest_workflow_executions::workflow_id.eq("wf-2".to_string()),
-            harvest_workflow_executions::run_id.eq(run_id),
+            Ext(harvest_workflow_executions_ext::run_id.eq(run_id)),
             harvest_workflow_executions::shard_id.eq(0),
             harvest_workflow_executions::state.eq("RUNNING".to_string()),
             harvest_workflow_executions::input.eq(json!("hi")),
@@ -255,7 +257,7 @@ async fn test_replay_canary_divergent_workflow() {
             harvest_workflow_executions::id.eq(exec_id.as_uuid()),
             harvest_workflow_executions::workflow_name.eq("activity_wf".to_string()),
             harvest_workflow_executions::workflow_id.eq("wf-3".to_string()),
-            harvest_workflow_executions::run_id.eq(run_id),
+            Ext(harvest_workflow_executions_ext::run_id.eq(run_id)),
             harvest_workflow_executions::shard_id.eq(0),
             harvest_workflow_executions::state.eq("RUNNING".to_string()),
             harvest_workflow_executions::input.eq(json!("hi")),

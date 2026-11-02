@@ -992,7 +992,7 @@ async fn a_corrupt_stored_policy_fails_the_run_and_a_reset_recovers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn each_draw_skips_the_response_cache() {
+async fn each_draw_has_its_own_cache_entry() {
     let (_dir, db) = fresh_db();
     let replies = (0..5).map(|n| answer(&format!("answer {n}"), 5)).collect();
     let model = common::ScriptedModel::named("m1", replies);
@@ -1018,4 +1018,56 @@ async fn each_draw_skips_the_response_cache() {
     let texts: BTreeSet<String> = report.draws.iter().map(|draw| draw.text.clone()).collect();
     assert_eq!(model.calls(), 4, "each draw calls the model");
     assert_eq!(texts.len(), 3, "three distinct samples: {texts:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_draw_runs_the_active_overlay_of_its_kind() {
+    use autumn_harvest_agent::{
+        InMemoryOverlayStore, ProfileOverlay, ProfileOverlayStore, Provenance,
+    };
+
+    let (_dir, db) = fresh_db();
+    let model = plain_model();
+    let base = AgentHarness::new(model.clone())
+        .agent(AgentProfile::new(KIND).system("The base prompt."))
+        .sampling_policies(store_with(Some(best_of_n_up_to(2))));
+    let overlays = Arc::new(InMemoryOverlayStore::new(Arc::new(base.clone())));
+    let overlay = ProfileOverlay {
+        system: Some("The overlaid prompt.".to_owned()),
+        ..ProfileOverlay::default()
+    };
+    let version = overlays
+        .put(KIND, &overlay, Provenance::operator("ops@example.com"))
+        .await
+        .expect("the overlay is valid");
+    overlays
+        .activate(KIND, version, None)
+        .await
+        .expect("the version activates");
+    let harness = base.overlay_store(overlays);
+    let mut rt = runtime(&db, harness);
+
+    assert_eq!(
+        draws_report(drive(&mut rt, &best_of(2)).await).draws.len(),
+        2
+    );
+    let systems: Vec<Option<String>> = model
+        .requests()
+        .iter()
+        .map(|request| {
+            request
+                .messages
+                .first()
+                .filter(|message| message.role == autumn_harvest_agent::ChatRole::System)
+                .and_then(|message| match message.content.first() {
+                    Some(autumn_harvest_agent::ContentPart::Text(text)) => Some(text.clone()),
+                    _ => None,
+                })
+        })
+        .collect();
+    assert_eq!(systems.len(), 2);
+    for system in systems {
+        let system = system.expect("each draw has a system prompt");
+        assert!(system.starts_with("The overlaid prompt."), "{system}");
+    }
 }

@@ -18,9 +18,10 @@ use autumn_harvest_agent::eval::{
 use autumn_harvest_agent::followup::FOLLOWUP_TOOL;
 use autumn_harvest_agent::memory::{MEMORY_TOOL, MemoryStore};
 use autumn_harvest_agent::{
-    AgentError, AgentHarness, AgentStop, AgentTask, Approval, BoxFuture, ChatRole, ContentPart,
-    Delivery, ErrorKind, FnTool, Followups, InMemoryMemoryStore, MemoryScope, Report, Rule,
-    RunInfo, Tool, ToolCall, ToolDecision, ToolEffect, ToolPolicy, ToolRules, sqlite,
+    AgentError, AgentHarness, AgentStop, AgentTask, Approval, BoxFuture, Ceilings, ChatRole,
+    ContentPart, Delivery, ErrorKind, FnTool, Followups, InMemoryMemoryStore, MemoryScope,
+    OverlayError, ProfileOverlay, Report, Rule, RunInfo, Tool, ToolCall, ToolDecision, ToolEffect,
+    ToolPolicy, ToolRules, sqlite,
 };
 use autumn_harvest_sqlite::RunState;
 use common::{
@@ -136,6 +137,11 @@ async fn the_recorded_model_reports_no_divergence() {
         "the candidate reads the recorded tool output"
     );
     assert!(!evaluation.end_diverged);
+    assert_eq!(
+        evaluation.overlay_digest,
+        ProfileOverlay::default().digest(),
+        "a plain candidate runs the empty overlay"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1829,4 +1835,400 @@ async fn a_fan_out_child_with_no_recorded_run_fails_the_candidate() {
     };
     assert!(error.contains(NO_CHILD_RUN), "{error}");
     assert!(evaluation.diverged(), "{evaluation:#?}");
+}
+
+// ---------------------------------------------------------------------------
+// A whole overlay (issue #2375)
+// ---------------------------------------------------------------------------
+
+/// The scripted replies that repeat the source of [`one_lookup`].
+fn one_lookup_replies() -> Vec<Reply> {
+    vec![
+        calls(&[("c1", "lookup", json!({"q": "x"}))], 5),
+        answer("done", 5),
+    ]
+}
+
+/// The description of the tool `name` in `request`.
+fn description(request: &autumn_harvest_agent::ChatRequest, name: &str) -> String {
+    request
+        .tools
+        .iter()
+        .find(|tool| tool.name == name)
+        .unwrap_or_else(|| panic!("the model sees {name}"))
+        .description
+        .clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overlay_system_reaches_the_model_on_every_turn() {
+    let source = one_lookup().await;
+    let model = ScriptedModel::new(one_lookup_replies());
+    let (harness, _) = candidate(model.clone());
+    let overlay = ProfileOverlay {
+        system: Some("Answer in French.".to_owned()),
+        ..ProfileOverlay::default()
+    };
+
+    let evaluation = evaluate(&source, &Candidate::new(harness).overlay(overlay.clone()))
+        .await
+        .unwrap();
+
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2, "{evaluation:#?}");
+    for request in &requests {
+        assert_eq!(request.messages[0].role, ChatRole::System);
+        assert_eq!(
+            request.messages[0].content,
+            vec![ContentPart::Text("Answer in French.".into())]
+        );
+    }
+    assert_eq!(evaluation.overlay_digest, overlay.digest());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_widening_overlay_is_refused_before_any_model_call() {
+    let source = one_lookup().await;
+    let cases = [
+        (
+            ProfileOverlay {
+                max_steps: Some(9_999),
+                ..ProfileOverlay::default()
+            },
+            OverlayError::AboveCeiling { field: "max_steps" },
+        ),
+        (
+            ProfileOverlay {
+                model: Some("other".to_owned()),
+                ..ProfileOverlay::default()
+            },
+            OverlayError::ModelNotAllowed {
+                model: "other".to_owned(),
+            },
+        ),
+        (
+            ProfileOverlay {
+                tool_guidance: [("missing".to_owned(), "Use it.".to_owned())].into(),
+                ..ProfileOverlay::default()
+            },
+            OverlayError::UnknownTool {
+                tool: "missing".to_owned(),
+            },
+        ),
+    ];
+    for (overlay, expected) in cases {
+        let model = ScriptedModel::new(one_lookup_replies());
+        let (harness, recorder) = candidate(model.clone());
+        let harness = harness.model_named("other", ScriptedModel::new(Vec::new()));
+
+        let result = evaluate(&source, &Candidate::new(harness).overlay(overlay)).await;
+
+        let Err(EvalError::Overlay(error)) = result else {
+            panic!("the overlay is refused: {result:?}");
+        };
+        assert_eq!(error, expected);
+        assert_eq!(model.calls(), 0, "a refused overlay costs no model call");
+        assert_eq!(recorder.runs(), Vec::<Value>::new());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_overlay_replays_the_source() {
+    let source = one_lookup().await;
+    let model = ScriptedModel::new(one_lookup_replies());
+    let (harness, _) = candidate(model.clone());
+
+    let evaluation = evaluate(
+        &source,
+        &Candidate::new(harness).overlay(ProfileOverlay::default()),
+    )
+    .await
+    .unwrap();
+
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!(evaluation.stubbed_tool_calls, 0);
+    assert_eq!(evaluation.replayed_tool_calls, 1);
+    assert_eq!(
+        evaluation.overlay_digest,
+        ProfileOverlay::default().digest()
+    );
+    assert_eq!(model.calls(), 2);
+    let (RunEnd::Completed(recorded), RunEnd::Completed(candidate)) =
+        (&evaluation.recorded, &evaluation.candidate)
+    else {
+        panic!("both complete: {evaluation:#?}");
+    };
+    assert_eq!(
+        candidate.run_id, recorded.run_id,
+        "the candidate report shows the recorded run id"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_guidance_reaches_the_definitions_and_keeps_the_matching() {
+    let source = one_lookup().await;
+    let model = ScriptedModel::new(one_lookup_replies());
+    let (harness, recorder) = candidate(model.clone());
+    let overlay = ProfileOverlay {
+        tool_guidance: [("lookup".to_owned(), "Look up one key at a time.".to_owned())].into(),
+        ..ProfileOverlay::default()
+    };
+
+    let evaluation = evaluate(&source, &Candidate::new(harness).overlay(overlay))
+        .await
+        .unwrap();
+
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        for tool in &request.tools {
+            let want = if tool.name == "lookup" {
+                "Look up one key at a time."
+            } else {
+                "A test tool."
+            };
+            assert_eq!(tool.description, want, "{}", tool.name);
+        }
+    }
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!(
+        (
+            evaluation.replayed_tool_calls,
+            evaluation.stubbed_tool_calls
+        ),
+        (1, 0),
+        "the recorded outcome still answers the call"
+    );
+    assert_eq!(recorder.runs(), Vec::<Value>::new(), "no tool runs live");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_system_prompt_is_a_one_part_overlay() {
+    let source = one_lookup().await;
+    let run = |candidate: fn(AgentHarness) -> Candidate| {
+        let source = source.clone();
+        async move {
+            let model = ScriptedModel::new(one_lookup_replies());
+            let (harness, _) = self::candidate(model.clone());
+            let evaluation = evaluate(&source, &candidate(harness)).await.unwrap();
+            (evaluation, model.requests())
+        }
+    };
+
+    let short = run(|harness| Candidate::new(harness).system_prompt("Answer in French.")).await;
+    let whole = run(|harness| {
+        Candidate::new(harness).overlay(ProfileOverlay {
+            system: Some("Answer in French.".to_owned()),
+            ..ProfileOverlay::default()
+        })
+    })
+    .await;
+
+    assert_eq!(short.0, whole.0);
+    assert_eq!(short.1, whole.1, "the model sees the same requests");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compare_takes_two_overlay_candidates() {
+    let source = one_lookup().await;
+    let first_model = ScriptedModel::new(one_lookup_replies());
+    let second_model = ScriptedModel::new(vec![
+        calls(&[("c9", "lookup", json!({"q": "y"}))], 5),
+        answer("done", 5),
+    ]);
+    let terse = ProfileOverlay {
+        system: Some("Be terse.".to_owned()),
+        ..ProfileOverlay::default()
+    };
+    let guided = ProfileOverlay {
+        max_steps: Some(2),
+        tool_guidance: [("lookup".to_owned(), "Ask for y.".to_owned())].into(),
+        ..ProfileOverlay::default()
+    };
+    let first = Candidate::new(candidate(first_model.clone()).0).overlay(terse.clone());
+    let second = Candidate::new(candidate(second_model.clone()).0).overlay(guided.clone());
+
+    let comparison = compare(&source, &first, &second).await.unwrap();
+
+    assert_eq!(comparison.first.overlay_digest, terse.digest());
+    assert_eq!(comparison.second.overlay_digest, guided.digest());
+    assert_ne!(terse.digest(), guided.digest());
+    assert!(!comparison.first.diverged());
+    assert_eq!(comparison.first_divergence, Some(0));
+    assert_eq!(
+        comparison.turns[0].verdict,
+        Verdict::Diverged(Divergence::Calls)
+    );
+    assert_eq!(
+        description(&second_model.requests()[0], "lookup"),
+        "Ask for y."
+    );
+    assert_eq!(comparison.second.stubbed_tool_calls, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_model_shorthand_is_an_admitted_overlay_model() {
+    let source = one_lookup().await;
+    let a = ScriptedModel::named("model-a", one_lookup_replies());
+    let (harness, fallback) = two_models(a.clone(), ScriptedModel::new(Vec::new()));
+
+    let evaluation = evaluate(&source, &Candidate::shared(Arc::clone(&harness)).model("a"))
+        .await
+        .unwrap();
+    let named = ProfileOverlay {
+        model: Some("a".to_owned()),
+        ..ProfileOverlay::default()
+    };
+    assert_eq!(evaluation.overlay_digest, named.digest());
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!((a.calls(), fallback.calls()), (2, 0));
+
+    // An overlay that a model wrote must not pick another model.
+    let refused = evaluate(
+        &source,
+        &Candidate::shared(Arc::clone(&harness)).overlay(named),
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(EvalError::Overlay(OverlayError::ModelNotAllowed { .. }))
+        ),
+        "{refused:?}"
+    );
+    // A shorthand model that the harness does not hold fails before any call.
+    let unknown = evaluate(&source, &Candidate::shared(harness).model("missing")).await;
+    assert!(
+        matches!(
+            unknown,
+            Err(EvalError::Overlay(OverlayError::UnknownModel { .. }))
+        ),
+        "{unknown:?}"
+    );
+    assert_eq!((a.calls(), fallback.calls()), (2, 0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn operator_ceilings_admit_a_wider_overlay() {
+    let source = one_lookup().await;
+    let model = ScriptedModel::new(one_lookup_replies());
+    let (harness, _) = candidate(model.clone());
+    let overlay = ProfileOverlay {
+        max_steps: Some(20),
+        ..ProfileOverlay::default()
+    };
+    let ceilings = Ceilings {
+        max_steps: Some(40),
+        max_total_tokens: None,
+        max_output_tokens: None,
+        models: [autumn_harvest_agent::DEFAULT_MODEL.to_owned()].into(),
+        allow_clear_read_only: false,
+    };
+
+    let evaluation = evaluate(
+        &source,
+        &Candidate::new(harness).overlay(overlay).ceilings(ceilings),
+    )
+    .await
+    .unwrap();
+
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!(model.calls(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overlay_after_a_shorthand_replaces_it() {
+    let source = one_lookup().await;
+    let a = ScriptedModel::named("model-a", one_lookup_replies());
+    let fallback = ScriptedModel::new(one_lookup_replies());
+    let recorder = Arc::new(Recorder::default());
+    let harness = AgentHarness::new(fallback.clone())
+        .model_named("a", a.clone())
+        .tool(recorded_tool("lookup", ToolEffect::ReadOnly, &recorder));
+
+    let evaluation = evaluate(
+        &source,
+        &Candidate::new(harness)
+            .model("a")
+            .system_prompt("Old.")
+            .overlay(ProfileOverlay::default()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        evaluation.overlay_digest,
+        ProfileOverlay::default().digest()
+    );
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!(
+        (a.calls(), fallback.calls()),
+        (0, 2),
+        "the overlay drops the route of the shorthand"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bounded_read_only_source_refuses_a_wider_overlay() {
+    let mut task = AgentTask::new("look it up")
+        .system("Be brief.")
+        .max_total_tokens(1_000);
+    task.read_only = true;
+    let source = record(&task, one_lookup_replies()).await;
+    for (overlay, expected) in [
+        (
+            ProfileOverlay {
+                read_only: Some(false),
+                ..ProfileOverlay::default()
+            },
+            OverlayError::ClearsReadOnly,
+        ),
+        (
+            ProfileOverlay {
+                max_total_tokens: Some(1_001),
+                ..ProfileOverlay::default()
+            },
+            OverlayError::AboveCeiling {
+                field: "max_total_tokens",
+            },
+        ),
+    ] {
+        let model = ScriptedModel::new(one_lookup_replies());
+        let (harness, _) = candidate(model.clone());
+
+        let result = evaluate(&source, &Candidate::new(harness).overlay(overlay)).await;
+
+        let Err(EvalError::Overlay(error)) = result else {
+            panic!("the overlay is refused: {result:?}");
+        };
+        assert_eq!(error, expected);
+        assert_eq!(model.calls(), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compare_refuses_a_bad_second_overlay_before_any_model_call() {
+    let source = one_lookup().await;
+    let first_model = ScriptedModel::new(one_lookup_replies());
+    let second_model = ScriptedModel::new(one_lookup_replies());
+    let first = Candidate::new(candidate(first_model.clone()).0);
+    let second = Candidate::new(candidate(second_model.clone()).0).overlay(ProfileOverlay {
+        max_steps: Some(9_999),
+        ..ProfileOverlay::default()
+    });
+
+    let result = compare(&source, &first, &second).await;
+
+    assert!(
+        matches!(
+            result,
+            Err(EvalError::Overlay(OverlayError::AboveCeiling { .. }))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(
+        (first_model.calls(), second_model.calls()),
+        (0, 0),
+        "the first candidate never runs"
+    );
 }

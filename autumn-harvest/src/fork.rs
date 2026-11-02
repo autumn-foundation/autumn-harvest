@@ -19,6 +19,7 @@
 //!
 //! [`ForkEffects::Live`] runs effects for real. The caller must ask for it.
 
+use crate::schema::harvest_workflow_executions_ext;
 use std::collections::{HashMap, HashSet};
 
 use diesel::prelude::*;
@@ -919,7 +920,7 @@ pub(crate) async fn erased_fork_ancestor(
                 .select((
                     harvest_workflow_executions::input,
                     harvest_workflow_executions::start_source,
-                    harvest_workflow_executions::start_source_ref,
+                    harvest_workflow_executions_ext::start_source_ref,
                     harvest_workflow_executions::state,
                 ))
                 .first(conn)

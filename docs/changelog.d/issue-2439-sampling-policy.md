@@ -21,8 +21,8 @@ a safe default, and a change needs no restart.
 - `AgentTask::allowed_effects` narrows the tool effects of a run. A draw
   gets `draw_effects` met with the effects of its profile. The decision
   phase and the tool-call activity both refuse any other effect. A draw
-  with no write effect is also read-only. A draw skips the response cache
-  (`AgentTask::no_response_cache`), so N draws are N samples.
+  with no write effect is also read-only. Each wave is one `run_draws`
+  batch (#2440), so each draw has its own draw id and cache key.
 - `AgentTask`, `AgentOp` and `DrawsInput` fail to decode with a key of
   `SAMPLING_POLICY_FIELDS`.
 - `GET`, `PUT` and `DELETE /admin/agents/{kind}/sampling-policy`. `PUT`

@@ -27,8 +27,10 @@ use autumn_harvest::execution::{self, ByIdCancelOutcome};
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
 use autumn_harvest::schema::harvest_workflow_executions;
+use autumn_harvest::schema::harvest_workflow_executions_ext;
 use autumn_harvest::signal::{self, ByIdSignalOutcome};
 use autumn_harvest::store;
+use autumn_harvest::table_split::SetExt;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
@@ -658,8 +660,8 @@ async fn resolver_never_returns_a_reconciled_seal() {
     diesel::update(harvest_workflow_executions::table.find(seal.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("MIGRATED"),
-            harvest_workflow_executions::migrated_to_shard.eq(1),
-            harvest_workflow_executions::migrated_at.eq(chrono::Utc::now()),
+            SetExt(harvest_workflow_executions_ext::migrated_to_shard.eq(1)),
+            SetExt(harvest_workflow_executions_ext::migrated_at.eq(chrono::Utc::now())),
             harvest_workflow_executions::migrated_run_terminal_at.eq(chrono::Utc::now()),
         ))
         .execute(&mut conn)

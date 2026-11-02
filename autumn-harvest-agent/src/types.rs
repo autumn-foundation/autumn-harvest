@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crate::context_reset::ContextReset;
+use crate::draw::{Draw, DrawId};
 use crate::flow::Released;
 use crate::followup::Followups;
 use crate::loop_guard::LoopGuard;
@@ -200,11 +201,11 @@ pub struct AgentTask {
     /// policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_effects: Option<BTreeSet<ToolEffect>>,
-    /// Neither read nor write the response cache (issue #2439). A strategy
-    /// draw sets it, so N draws are N samples, not one cached answer.
-    /// #2440 replaces it with a draw id in the cache key.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub no_response_cache: bool,
+    /// The draw of the run (issue #2440). Each model request carries its id.
+    /// With a root, the run id is `{root}:s{n}`. A delegated child keeps the
+    /// id. Use [`run_draws`](crate::run_draws) to start draws.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draw: Option<Draw>,
 }
 
 impl Serialize for AgentTask {
@@ -276,7 +277,7 @@ impl AgentTask {
             tool_guidance: BTreeMap::new(),
             skills: BTreeMap::new(),
             allowed_effects: None,
-            no_response_cache: false,
+            draw: None,
         }
     }
 
@@ -518,7 +519,8 @@ impl AgentTask {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnRequest {
-    /// The execution id. Tools and the policy see it as the run id.
+    /// The run id that tools and the policy see. See
+    /// [`RunId`](crate::RunId).
     pub run_id: String,
     /// The session the run belongs to.
     #[serde(default)]
@@ -596,9 +598,10 @@ pub struct ModelTurnRequest {
     /// unknown tool. `None` allows each effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_effects: Option<BTreeSet<ToolEffect>>,
-    /// Skip the response cache for this turn (issue #2439).
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub no_response_cache: bool,
+    /// The draw of this turn (issue #2440). A recorded input with no field
+    /// decodes as `None`, so a run in flight replays as it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draw: Option<DrawId>,
 }
 
 /// The recorded result of one model-turn activity.
@@ -698,7 +701,7 @@ impl ModelTurn {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallRequest {
-    /// The execution id: the run id.
+    /// The run id. See [`RunId`](crate::RunId).
     pub run_id: String,
     /// The session the run belongs to.
     #[serde(default)]

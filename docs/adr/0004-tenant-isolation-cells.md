@@ -206,7 +206,9 @@ scope inside the engine.
   A bound caller cannot use them.
 - `harvest_workflow_executions` now has 65 columns. The workspace enables
   diesel's `128-column-tables` feature, which makes a cold diesel build
-  slower.
+  slower. Issue #2492 reverses this. Four rebalance columns leave the
+  `table!`, and the table splits over two declarations of 32 columns or
+  fewer. The workspace is on the default diesel tier.
 - A deployment with no bound callers sees no change.
 
 ### Proof

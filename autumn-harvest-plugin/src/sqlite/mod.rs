@@ -189,6 +189,11 @@ fn builder_refusals(builder: &HarvestBuilder) -> Vec<(&'static str, u32)> {
     if purges_runs(builder.retention_config()) {
         refused.push(("HarvestPlugin::retention", 2471));
     }
+    // The SQLite worker reads no cost hold, so a held type would run
+    // (autumn#1720).
+    if builder.worker_config().cost_hold.is_some() {
+        refused.push(("WorkerConfig::with_cost_hold", EPIC_ISSUE));
+    }
     refused
 }
 
@@ -465,6 +470,21 @@ mod tests {
     #[test]
     fn a_plain_builder_has_no_refusal() {
         assert!(builder_refusals(&HarvestBuilder::default()).is_empty());
+    }
+
+    /// The SQLite worker reads no cost hold, so a hold is refused rather than
+    /// silently ignored (autumn#1720).
+    #[test]
+    fn a_cost_hold_is_refused_with_the_epic() {
+        let builder = HarvestBuilder::default().worker(
+            autumn_harvest::builder::WorkerConfig::default().with_cost_hold(
+                autumn_harvest::cost_hold::CostHold::new(|| true, ["train_model"]),
+            ),
+        );
+        assert_eq!(
+            builder_refusals(&builder),
+            [("WorkerConfig::with_cost_hold", EPIC_ISSUE)]
+        );
     }
 
     #[test]

@@ -8,6 +8,8 @@
     clippy::too_many_lines
 )]
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::table_split::Ext;
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -112,6 +114,7 @@ async fn wait_for_run(pool: &DbPool, workflow_id: &str) -> WorkflowExecution {
             let mut conn = pool.get().await.unwrap();
             let found: Option<WorkflowExecution> = harvest_workflow_executions::table
                 .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+                .select(WorkflowExecution::as_select())
                 .first(&mut conn)
                 .await
                 .optional()
@@ -518,6 +521,7 @@ async fn test_trigger_evaluations_same_shard() {
     // Verify it is in RUNNING state
     let exec: WorkflowExecution = harvest_workflow_executions::table
         .find(source_exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
         .first(&mut conn)
         .await
         .unwrap();
@@ -543,6 +547,7 @@ async fn test_trigger_evaluations_same_shard() {
     let target_workflow_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
     let target_exec: WorkflowExecution = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id))
+        .select(WorkflowExecution::as_select())
         .first(&mut conn)
         .await
         .unwrap();
@@ -659,6 +664,7 @@ async fn test_terminate_fires_terminated_trigger_not_cancelled() {
 
     let source: WorkflowExecution = harvest_workflow_executions::table
         .find(source_exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
         .first(&mut conn)
         .await
         .unwrap();
@@ -671,6 +677,7 @@ async fn test_terminate_fires_terminated_trigger_not_cancelled() {
     );
     let terminated_target: WorkflowExecution = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(&terminated_target_id))
+        .select(WorkflowExecution::as_select())
         .first(&mut conn)
         .await
         .expect("Terminated trigger must fire on a force-terminate");
@@ -684,6 +691,7 @@ async fn test_terminate_fires_terminated_trigger_not_cancelled() {
     );
     let cancelled_target = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(&cancelled_target_id))
+        .select(WorkflowExecution::as_select())
         .first::<WorkflowExecution>(&mut conn)
         .await
         .optional()
@@ -792,6 +800,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
     );
     let target_exec_static: WorkflowExecution = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(&target_wf_id_static))
+        .select(WorkflowExecution::as_select())
         .first(&mut conn)
         .await
         .unwrap();
@@ -896,6 +905,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
     );
     let target_exec_proj: WorkflowExecution = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(&target_wf_id_proj))
+        .select(WorkflowExecution::as_select())
         .first(&mut conn)
         .await
         .unwrap();
@@ -1009,6 +1019,7 @@ async fn test_outcome_mapping_delivers_failure_cause_to_target() {
     let target_wf_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
     let target_exec: WorkflowExecution = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(&target_wf_id))
+        .select(WorkflowExecution::as_select())
         .first(&mut conn)
         .await
         .unwrap();
@@ -1178,6 +1189,7 @@ async fn test_outcome_mapping_delivers_output_on_completed_source() {
     let target_wf_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
     let target_exec: WorkflowExecution = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(&target_wf_id))
+        .select(WorkflowExecution::as_select())
         .first(&mut conn)
         .await
         .unwrap();
@@ -1297,6 +1309,7 @@ async fn test_trigger_state_matching_and_deduplication() {
     let target_wf_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
     let target_exists = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(&target_wf_id))
+        .select(WorkflowExecution::as_select())
         .first::<WorkflowExecution>(&mut conn)
         .await
         .optional()
@@ -1321,6 +1334,7 @@ async fn test_trigger_state_matching_and_deduplication() {
     // Target SHOULD be started
     let target_exec = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(&target_wf_id))
+        .select(WorkflowExecution::as_select())
         .first::<WorkflowExecution>(&mut conn)
         .await
         .unwrap();
@@ -1606,6 +1620,7 @@ async fn test_completion_trigger_via_worker_run() {
             let mut conn = pool.get().await.unwrap();
             let exec: WorkflowExecution = harvest_workflow_executions::table
                 .find(source_exec_id.as_uuid())
+                .select(WorkflowExecution::as_select())
                 .first(&mut conn)
                 .await
                 .unwrap();
@@ -1626,6 +1641,7 @@ async fn test_completion_trigger_via_worker_run() {
     let target_workflow_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
     let target_exec: WorkflowExecution = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id))
+        .select(WorkflowExecution::as_select())
         .first(&mut conn)
         .await
         .unwrap();
@@ -1741,6 +1757,7 @@ async fn test_trigger_with_custom_queue() {
     let target_workflow_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
     let target_exec: WorkflowExecution = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id))
+        .select(WorkflowExecution::as_select())
         .first(&mut conn)
         .await
         .unwrap();
@@ -2018,6 +2035,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
     let mut conn1 = pool1.get().await.unwrap();
     let target_exec: WorkflowExecution = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id))
+        .select(WorkflowExecution::as_select())
         .first(&mut conn1)
         .await
         .unwrap();
@@ -2435,7 +2453,7 @@ async fn test_exact_pool_routing_cross_shard() {
             execs_dsl::id.eq(source_exec_id.as_uuid()),
             execs_dsl::workflow_name.eq("source_wf"),
             execs_dsl::workflow_id.eq("source-exec-1"),
-            execs_dsl::run_id.eq(uuid::Uuid::new_v4()),
+            Ext(harvest_workflow_executions_ext::run_id.eq(uuid::Uuid::new_v4())),
             execs_dsl::shard_id.eq(0),
             execs_dsl::state.eq("COMPLETED"),
             execs_dsl::input.eq(json!({})),
@@ -2696,6 +2714,7 @@ async fn test_trigger_evaluations_schema_validation() {
         format!("completion-trigger-{}-{}", trigger_id, source_exec_id_valid);
     let target_exec_valid: Option<WorkflowExecution> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id_valid))
+        .select(WorkflowExecution::as_select())
         .first(&mut conn)
         .await
         .optional()
@@ -2786,6 +2805,7 @@ async fn test_trigger_evaluations_schema_validation() {
     );
     let target_exec_invalid: Option<WorkflowExecution> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id_invalid))
+        .select(WorkflowExecution::as_select())
         .first(&mut conn)
         .await
         .optional()

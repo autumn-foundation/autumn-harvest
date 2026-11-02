@@ -15,6 +15,7 @@
 //! The engine still reads plaintext, so the workflow sees its real input and
 //! signal, and the caller gets the real result.
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -629,7 +630,7 @@ async fn a_workflow_retry_runs_on_the_plaintext_input() {
         use autumn_harvest::schema::harvest_workflow_executions;
         harvest_workflow_executions::table
             .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(exec_id.as_uuid())))
-            .select(harvest_workflow_executions::memo)
+            .select(harvest_workflow_executions_ext::memo)
             .first(&mut conn)
             .await
             .expect("load the retry memo")
@@ -3181,7 +3182,7 @@ async fn a_workflow_retry_keeps_the_headers_one_layer_deep() {
         use autumn_harvest::schema::harvest_workflow_executions;
         harvest_workflow_executions::table
             .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(exec_id.as_uuid())))
-            .select(harvest_workflow_executions::context_headers)
+            .select(harvest_workflow_executions_ext::context_headers)
             .first(&mut conn)
             .await
             .expect("load the retry row")
@@ -4179,7 +4180,9 @@ async fn wait_for_successor(
     use autumn_harvest::schema::harvest_workflow_executions;
     for _ in 0..100 {
         let found: Option<WorkflowExecution> = harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::continued_from_exec_id.eq(Some(exec_id.as_uuid())))
+            .filter(
+                harvest_workflow_executions_ext::continued_from_exec_id.eq(Some(exec_id.as_uuid())),
+            )
             .select(WorkflowExecution::as_select())
             .first(conn)
             .await

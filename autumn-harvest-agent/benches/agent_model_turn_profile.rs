@@ -286,7 +286,6 @@ impl Conversation {
             tool_guidance: std::collections::BTreeMap::new(),
             skills: false,
             allowed_effects: None,
-            no_response_cache: false,
             run_id: "run-agent-model-turn-profile".into(),
             session_id: None,
             steps_used: u32::try_from(page).expect("a turn number fits in u32"),
@@ -309,6 +308,7 @@ impl Conversation {
             // `send_turn` sets `remember` on every turn of the delta form.
             remember: shape != Shape::Full,
             model: None,
+            draw: None,
         }
     }
 

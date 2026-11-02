@@ -92,6 +92,10 @@ name = "mesh"
 required-features = ["sqlite"]
 
 [[test]]
+name = "model_turn_span"
+required-features = ["sqlite"]
+
+[[test]]
 name = "durable_agent"
 required-features = ["sqlite"]
 
@@ -113,6 +117,10 @@ required-features = ["sqlite"]
 
 [[test]]
 name = "fan_out"
+required-features = ["sqlite"]
+
+[[test]]
+name = "draws"
 required-features = ["sqlite"]
 
 [[test]]
@@ -152,6 +160,14 @@ name = "sampling_policy"
 required-features = ["sqlite"]
 
 [[test]]
+name = "overlay_read"
+required-features = ["sqlite"]
+
+[[test]]
+name = "overlay_read_postgres"
+required-features = ["postgres"]
+
+[[test]]
 name = "context_reset"
 required-features = ["sqlite"]
 
@@ -162,6 +178,14 @@ required-features = ["sqlite", "eval"]
 [[test]]
 name = "refine_propose"
 required-features = ["sqlite"]
+
+[[test]]
+name = "score"
+required-features = ["sqlite"]
+
+[[test]]
+name = "score_postgres"
+required-features = ["postgres"]
 
 [lints]
 workspace = true

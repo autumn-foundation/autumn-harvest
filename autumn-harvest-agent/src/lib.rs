@@ -10,11 +10,14 @@
 //! [`ToolPolicy`], [`Approval`] and the message types. It also has the
 //! always-on primitives: [`heartbeat`], [`followup`], [`delivery`],
 //! [`memory`] and [`loop_guard`]. [`context_reset`] lets a long run save
-//! notes and restart from them. [`ResponseCache`] serves an identical
-//! model call across runs. The `eval` feature adds the `eval` module.
-//! That module re-drives a recorded run with a candidate model or prompt.
-//! The `sandbox` feature adds the `sandbox` module. Its `SandboxTool` runs
-//! agent code in a sandbox.
+//! notes and restart from them. A [`Scorer`] checks a run and returns a
+//! recorded [`Verdict`], and [`select`] picks the best draw (issue #2441).
+//! [`ResponseCache`] serves an identical model call across runs. The
+//! [`draw`] module gives each sample of a run its own identity, so the cache
+//! keeps the samples apart. The `eval` feature adds the `eval` module. That
+//! module re-drives a recorded run with a candidate model or prompt. The
+//! `sandbox` feature adds the `sandbox` module. Its `SandboxTool` runs agent
+//! code in a sandbox.
 //!
 //! A durable [`Agent`] (issue #2263) is a named, long-lived actor. It is the
 //! agent loop inside a keyed entity: the workflow `agent`, with its
@@ -82,6 +85,7 @@ pub mod approval;
 pub mod bounds;
 pub mod context_reset;
 pub mod delivery;
+pub mod draw;
 pub mod error;
 #[cfg(feature = "eval")]
 pub mod eval;
@@ -102,6 +106,7 @@ pub mod response_cache;
 pub mod sampling;
 #[cfg(feature = "sandbox")]
 pub mod sandbox;
+pub mod score;
 pub mod skill;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
@@ -122,21 +127,24 @@ pub use agent::overlay_store::{
     InMemoryOverlayStore, MAX_AUTHOR_LEN, OverlayStoreError, OverlayValidator, OverlayVersion,
     ProfileOverlayStore, Provenance, StoredOverlay,
 };
+pub use agent::profile_read::{OverlayRead, ProfileRead};
 pub use agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentHeartbeat, AgentId, AgentIdError, AgentMemory, AgentOp,
     AgentProfile, AgentState, AgentStatus, Control, HeartbeatSetting, INTERRUPT_SIGNAL, Interrupt,
-    PeerEnvelope, PeerReply, STEER_SIGNAL, Steer, Urgency, UserMessage, agent, agent_info,
-    agent_memory_reset, agent_memory_reset_info, agent_profile, agent_profile_info,
-    agent_workspace_floor, agent_workspace_floor_info, agent_workspace_reset,
-    agent_workspace_reset_info, agent_workspace_retain, agent_workspace_retain_info,
+    PROFILE_VERSION_ATTR, PeerEnvelope, PeerReply, STEER_SIGNAL, Steer, Urgency, UserMessage,
+    agent, agent_info, agent_memory_reset, agent_memory_reset_info, agent_profile,
+    agent_profile_info, agent_profile_overlay, agent_profile_overlay_info, agent_workspace_floor,
+    agent_workspace_floor_info, agent_workspace_reset, agent_workspace_reset_info,
+    agent_workspace_retain, agent_workspace_retain_info,
 };
 pub use approval::Approval;
 pub use context_reset::{ContextReset, ProgressNotes};
 pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
+pub use draw::{Draw, DrawId, run_draws};
 pub use error::{AgentError, ErrorKind};
 pub use flow::{FlowRule, FlowRules, Recheck, Released};
 pub use followup::Followups;
-pub use harness::{AgentHarness, DEFAULT_MODEL};
+pub use harness::{AgentHarness, DEFAULT_MODEL, DEFAULT_SCORE_TIMEOUT};
 pub use heartbeat::{
     HEARTBEAT_WORKFLOW_NAME, HeartbeatReport, HeartbeatTask, Precheck, agent_heartbeat,
     agent_heartbeat_info,
@@ -160,6 +168,10 @@ pub use refine::{
 };
 pub use response_cache::{
     CacheIndex, CacheKey, CacheScope, InMemoryCacheIndex, KeyTenant, ResponseCache,
+};
+pub use score::{
+    ExactMatch, FiniteF64, JsonSchema, MAX_REJECT_REASON_BYTES, NonFinite, ScoreContext,
+    ScoreInput, ScoreRequest, Scorer, ToolRecord, Verdict, agent_score, agent_score_info, select,
 };
 pub use skill::{LOAD_SKILL_TOOL, SkillText};
 pub use tool::{FnTool, Tool, ToolContext, ToolEffect};

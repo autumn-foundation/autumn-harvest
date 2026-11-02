@@ -63,7 +63,7 @@ pub fn chain(prev: Option<&str>, added: &[ChatMessage]) -> String {
     digest
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes
         .iter()

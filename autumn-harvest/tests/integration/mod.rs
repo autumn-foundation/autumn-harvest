@@ -112,6 +112,8 @@ mod concurrency_model_ci;
 mod concurrency_supersede_tests;
 mod contention_adaptive_atomicity_docs;
 mod context_headers_tests;
+#[cfg(feature = "db")]
+mod cost_hold_tests;
 mod coverage_nightly_wiring;
 mod cross_region_dr_docs;
 #[cfg(feature = "db")]
@@ -303,6 +305,8 @@ mod quota_supersede_ordering_tests;
 mod ramp_guard_tests;
 mod rate_limit_bucket_gc_tests;
 mod rate_limit_key_tests;
+#[cfg(feature = "db")]
+mod rebalance_markers_db_tests;
 mod redrive_tests;
 #[cfg(all(feature = "testing", feature = "db"))]
 mod remote_task_db_tests;
@@ -407,6 +411,8 @@ mod sticky_routing_tests;
 #[cfg(feature = "db")]
 mod stream_append_count_perf;
 mod supply_chain_ci;
+#[cfg(feature = "db")]
+mod table_split_db_tests;
 mod telemetry_span_tests;
 #[cfg(feature = "db")]
 mod tenant_cell_isolation_tests;

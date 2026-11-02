@@ -100,7 +100,20 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # `cargo test --workspace` builds every test, bench and example in one
+      # target directory. The 0.8.0 tag run filled the runner disk here.
+      # Free the disk as the ci.yml `test` jobs do.
+      - name: Free runner disk before the workspace test build
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
       - name: Run tests
+        env:
+          # No debug info. It halves the size of the debug build, as in the
+          # ci.yml mixed-version smoke job.
+          CARGO_PROFILE_DEV_DEBUG: "0"
         run: cargo test --workspace
 
   meta:
@@ -162,7 +175,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: cargo-auditable@0.7.7,cargo-cyclonedx@0.5.9
       - name: Build with cargo auditable
@@ -584,7 +597,7 @@ jobs:
           persist-credentials: false
       # `validate` has checked that CHANGELOG.md has a section for the tag.
       - name: Install git-cliff
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: git-cliff
       # The notes name the image by digest, the form to pin.

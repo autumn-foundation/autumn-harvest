@@ -6,7 +6,8 @@
 use serde::{Deserialize, Serialize};
 
 /// Identifies one agent run. The loop uses the execution id, which no other
-/// run shares.
+/// run shares. A delegated child adds `:d{n}` to the id of its root, and a
+/// draw (issue #2440) has `{root}:s{n}`.
 ///
 /// Tools receive it with the step and the call id. Together they are an
 /// idempotency key.

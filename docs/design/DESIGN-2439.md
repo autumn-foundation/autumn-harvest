@@ -43,9 +43,9 @@ rule.
 | A newer worker records a field that an older worker drops. | `SamplingPolicy` denies unknown fields, so the older worker fails closed. |
 | A draw writes N times. | Each draw gets `draw_effects` meet the effects of its task. The decision and the tool call both check it. |
 | A draw delegates, and its child writes. | An inline child keeps the effects of its parent. A delegation to a durable peer from a narrowed run is refused. |
-| A judge calls an expensive model. | A judge scorer names its model. The kernel refuses a model outside `judge_models`. #2441 must classify each scorer id itself. |
+| A judge calls an expensive model. | A judge scorer names its model. The kernel refuses a model outside `judge_models`. #2443 must check each judge call too, because a `Scorer` does not say that it is a judge. |
 | A caller names a kind with a wide policy for its own task. | The profile of the kind builds each draw. A kind with no profile is refused. |
-| N draws hit one cached answer. | A draw skips the response cache. |
+| N draws hit one cached answer. | Each wave is one `run_draws` batch, so each draw has its own draw id and cache key (#2440). |
 | An older worker drops `allowed_effects`. | A draw with no write effect is also read-only. The upgrade guide says to upgrade every worker first. |
 | A policy asks for 1000 parallel draws. | The validation caps `max_concurrent_draws` at `MAX_PARALLEL_CHILDREN`, and the kernel caps it again. |
 | A viewer sets the policy. | The set and reset routes are `Mutating`. The middleware returns 403 before the handler. |
@@ -120,9 +120,9 @@ body no longer decodes.
 once each. It admits the request, and runs the draws as child `agent_loop`
 runs in waves. The profile builds each draw, and the caller gives only the
 input text. Each draw has `allowed_effects = draw_effects ∩ profile
-effects`. It is read-only with no write effect, skips the response cache
-and reports a failure as a report. #2440 adds draw identity. #2441 and
-#2443 add the score and the selection.
+effects`. It is read-only with no write effect and reports a failure as a
+report. Each wave is one `run_draws` batch of #2440, so each draw has its
+own draw id. #2441 scores a draw, and #2443 adds the selection.
 
 ### Who sets it
 

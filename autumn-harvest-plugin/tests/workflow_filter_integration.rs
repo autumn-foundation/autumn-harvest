@@ -5,6 +5,8 @@
 //! GIN index `idx_harvest_we_search` covers the search-attribute predicate via
 //! `EXPLAIN`.
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::table_split::SetExt;
 use std::collections::BTreeMap;
 
 use autumn_harvest::schema::harvest_workflow_executions;
@@ -861,9 +863,9 @@ async fn workflow_list_filter_nd_blocked() {
     diesel::update(harvest_workflow_executions::table.find(blocked.as_uuid()))
         .set((
             harvest_workflow_executions::nd_blocked_at.eq(Some(now)),
-            harvest_workflow_executions::nd_block_reason.eq(Some(
+            SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(Some(
                 "non-deterministic replay: activity mismatch".to_string(),
-            )),
+            ))),
             harvest_workflow_executions::nd_block_count.eq(2),
         ))
         .execute(&mut conn)
@@ -873,8 +875,10 @@ async fn workflow_list_filter_nd_blocked() {
         .set((
             harvest_workflow_executions::state.eq("CANCELLED"),
             harvest_workflow_executions::nd_blocked_at.eq(Some(now)),
-            harvest_workflow_executions::nd_block_reason
-                .eq(Some("non-deterministic replay: timer mismatch".to_string())),
+            SetExt(
+                harvest_workflow_executions_ext::nd_block_reason
+                    .eq(Some("non-deterministic replay: timer mismatch".to_string())),
+            ),
             harvest_workflow_executions::nd_block_count.eq(1),
         ))
         .execute(&mut conn)

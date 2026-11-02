@@ -10,6 +10,8 @@
 //! - **Schedule-to-start timeout**: PENDING tasks whose `scheduled_at` plus
 //!   `schedule_to_start` interval has elapsed.
 
+use crate::schema::harvest_workflow_executions_ext;
+use crate::table_split::SetExt;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -1876,7 +1878,7 @@ async fn update_workflow_execution_timed_out(
         // precedent already applied to the two worker.rs terminal
         // writers.
         dsl::nd_blocked_at.eq(None::<chrono::DateTime<Utc>>),
-        dsl::nd_block_reason.eq(None::<String>),
+        SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
         dsl::nd_block_count.eq(0),
     ))
     .execute(conn)
@@ -3409,9 +3411,9 @@ pub async fn enforce_workflow_execution_timeouts(
             harvest_workflow_executions::deadline_at
                 .is_not_null()
                 .and(harvest_workflow_executions::deadline_at.lt(Some(now)))
-                .or(harvest_workflow_executions::chain_deadline_at
+                .or(harvest_workflow_executions_ext::chain_deadline_at
                     .is_not_null()
-                    .and(harvest_workflow_executions::chain_deadline_at.lt(Some(now)))),
+                    .and(harvest_workflow_executions_ext::chain_deadline_at.lt(Some(now)))),
         )
         .select(WorkflowExecution::as_select())
         .load(conn)
@@ -3624,8 +3626,8 @@ pub async fn enforce_workflow_sla_breaches(
             // Exclude only PAUSED (pause suspends the SLA clock); RUNNING and all
             // terminal states are eligible.
             .filter(harvest_workflow_executions::state.ne("PAUSED"))
-            .filter(harvest_workflow_executions::sla_deadline_at.is_not_null())
-            .filter(harvest_workflow_executions::sla_breached.eq(false))
+            .filter(harvest_workflow_executions_ext::sla_deadline_at.is_not_null())
+            .filter(harvest_workflow_executions_ext::sla_breached.eq(false))
             // RUNNING rows compare against NOW(); terminal rows against their
             // actual completion instant, so finishing before the deadline never
             // counts as a breach.
@@ -3641,8 +3643,8 @@ pub async fn enforce_workflow_sla_breaches(
                  AND (completed_at IS NULL OR completed_at > sla_deadline_at)",
             ))
             .set((
-                harvest_workflow_executions::sla_breached.eq(true),
-                harvest_workflow_executions::sla_breached_at.eq(Some(now)),
+                SetExt(harvest_workflow_executions_ext::sla_breached.eq(true)),
+                SetExt(harvest_workflow_executions_ext::sla_breached_at.eq(Some(now))),
             ))
             .returning((
                 harvest_workflow_executions::id,
@@ -7568,19 +7570,27 @@ mod tests {
     }
 
     /// The column names of `harvest_task_queue`, read from the schema.
+    ///
+    /// The table splits over a core and an extension declaration (issue
+    /// #2492). This reads both, so a moved column stays in the check.
     fn task_queue_columns() -> Vec<String> {
         let schema = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/schema.rs"))
             .expect("read the schema");
-        let start = schema
-            .find("harvest_task_queue (id)")
-            .expect("the task queue table");
-        let body = &schema[start..];
-        let body = &body[..body.find("\n    }").expect("the end of the table")];
-        body.lines()
-            .filter_map(|line| line.split_once("->"))
-            .map(|(name, _)| name.trim().to_owned())
-            .filter(|name| !name.is_empty() && !name.contains(' '))
-            .collect()
+        let mut columns = Vec::new();
+        for declaration in ["harvest_task_queue (id)", "harvest_task_queue_ext (id)"] {
+            let start = schema.find(declaration).expect("the task queue table");
+            let body = &schema[start..];
+            let body = &body[..body.find("\n    }").expect("the end of the table")];
+            columns.extend(
+                body.lines()
+                    .filter_map(|line| line.split_once("->"))
+                    .map(|(name, _)| name.trim().to_owned())
+                    .filter(|name| !name.is_empty() && !name.contains(' ')),
+            );
+        }
+        columns.sort();
+        columns.dedup();
+        columns
     }
 
     /// Whether `sql` names `column` as a whole word.

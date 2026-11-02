@@ -311,6 +311,27 @@ fn an_option_with_no_sqlite_port_fails_the_build_and_names_its_issue() {
     assert!(message.contains("enable_api_tokens (#2469)"), "{message}");
 }
 
+/// The SQLite worker reads no cost hold, so the plugin refuses the option
+/// rather than run a held type (autumn#1720).
+#[test]
+fn a_cost_hold_fails_the_build_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let built = std::panic::catch_unwind(|| {
+        TestApp::new()
+            .config(config(dir.path()))
+            .plugin(plugin().cost_deferrable_activities(["shout"]))
+    });
+    let payload = built.err().expect("the build refuses the option");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        message.contains("HarvestPlugin::cost_deferrable_activities (#2466)"),
+        "{message}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restart_resumes_the_run_from_the_harvest_file() {
     let dir = tempfile::tempdir().unwrap();

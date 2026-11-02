@@ -19,6 +19,7 @@ use autumn_harvest::prelude::*;
 use autumn_harvest::upgrade_check::{UpgradeCheck, run_command};
 
 #[activity]
+#[allow(clippy::unused_async, reason = "#[activity] requires an async fn")]
 async fn reserve_stock(_ctx: &ActivityContext, sku: String) -> Result<u32, String> {
     Ok(u32::try_from(sku.len()).unwrap_or(u32::MAX))
 }

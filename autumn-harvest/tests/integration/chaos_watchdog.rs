@@ -10,7 +10,9 @@
 //! tests run on Linux only. The script uses GNU `date` and `jq`, which the
 //! `ubuntu-latest` runner has.
 
-use super::ci_run_coverage::{parse_workflow, repo_root, workflow_crons, workflow_run_commands};
+#[cfg(target_os = "linux")]
+use super::ci_run_coverage::repo_root;
+use super::ci_run_coverage::{parse_workflow, workflow_crons, workflow_run_commands};
 
 const WATCHDOG_WORKFLOW: &str = ".github/workflows/chaos-watchdog.yml";
 const WATCHDOG_SCRIPT: &str = ".github/ci/chaos-watchdog.sh";

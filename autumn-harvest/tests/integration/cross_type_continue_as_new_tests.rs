@@ -32,6 +32,8 @@
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it, otherwise a testcontainers instance is booted.
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::table_split::SetExt;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -520,8 +522,13 @@ async fn successor_resolves_lifecycle_defaults_from_the_new_type() {
             harvest_workflow_executions::sla.eq(Some(ChronoDuration::seconds(300))),
             harvest_workflow_executions::owner.eq(Some("growth-team")),
             harvest_workflow_executions::severity.eq(Some("SEV3")),
-            harvest_workflow_executions::chain_execution_timeout.eq(Some(ChronoDuration::days(7))),
-            harvest_workflow_executions::chain_deadline_at.eq(Some(frozen_chain_deadline)),
+            SetExt(
+                harvest_workflow_executions_ext::chain_execution_timeout
+                    .eq(Some(ChronoDuration::days(7))),
+            ),
+            SetExt(
+                harvest_workflow_executions_ext::chain_deadline_at.eq(Some(frozen_chain_deadline)),
+            ),
         ))
         .execute(&mut conn)
         .await
@@ -885,7 +892,7 @@ async fn a_cap_rejected_transition_increments_the_schedules_failure_counter() {
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set((
             harvest_workflow_executions::schedule_id.eq(Some(schedule_id)),
-            harvest_workflow_executions::origin.eq(Some("scheduled")),
+            SetExt(harvest_workflow_executions_ext::origin.eq(Some("scheduled"))),
         ))
         .execute(&mut conn)
         .await
@@ -2000,12 +2007,17 @@ async fn stamp_type_agnostic_carryover(
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set((
             harvest_workflow_executions::schedule_id.eq(Some(carried.schedule_id)),
-            harvest_workflow_executions::scheduled_for.eq(Some(carried.slot)),
-            harvest_workflow_executions::memo.eq(Some(carried.memo.clone())),
+            SetExt(harvest_workflow_executions_ext::scheduled_for.eq(Some(carried.slot))),
+            SetExt(harvest_workflow_executions_ext::memo.eq(Some(carried.memo.clone()))),
             harvest_workflow_executions::search_attrs.eq(Some(carried.search_attrs.clone())),
-            harvest_workflow_executions::context_headers.eq(Some(carried.headers.clone())),
-            harvest_workflow_executions::completion_callbacks.eq(Some(carried.callbacks.clone())),
-            harvest_workflow_executions::assigned_build_id.eq(Some("build-2026.08.1")),
+            SetExt(
+                harvest_workflow_executions_ext::context_headers.eq(Some(carried.headers.clone())),
+            ),
+            SetExt(
+                harvest_workflow_executions_ext::completion_callbacks
+                    .eq(Some(carried.callbacks.clone())),
+            ),
+            SetExt(harvest_workflow_executions_ext::assigned_build_id.eq(Some("build-2026.08.1"))),
         ))
         .execute(conn)
         .await

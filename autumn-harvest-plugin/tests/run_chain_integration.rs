@@ -19,6 +19,8 @@
 
 #![allow(clippy::too_many_lines, clippy::similar_names)]
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::table_split::SetExt;
 use std::sync::Arc;
 
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
@@ -188,9 +190,11 @@ async fn seed_run(
             harvest_workflow_executions::state.eq(state),
             harvest_workflow_executions::started_at.eq(started_at),
             harvest_workflow_executions::completed_at.eq(completed_at),
-            harvest_workflow_executions::continued_from_exec_id
-                .eq(continued_from.map(|e| e.as_uuid())),
-            harvest_workflow_executions::first_exec_id.eq(first.map(|e| e.as_uuid())),
+            SetExt(
+                harvest_workflow_executions_ext::continued_from_exec_id
+                    .eq(continued_from.map(|e| e.as_uuid())),
+            ),
+            SetExt(harvest_workflow_executions_ext::first_exec_id.eq(first.map(|e| e.as_uuid()))),
         ))
         .execute(conn)
         .await
