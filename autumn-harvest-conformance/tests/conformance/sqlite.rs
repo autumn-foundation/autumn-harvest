@@ -226,6 +226,7 @@ impl Driver {
                     };
                     update_results.push(result);
                 }
+                Step::Run(hook) => hook(),
                 Step::Cancel(reason) => self.rt.cancel(root, reason).expect("cancel the run"),
                 Step::Terminate(reason) => {
                     self.rt.terminate(root, reason).expect("terminate the run");

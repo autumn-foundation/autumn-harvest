@@ -242,6 +242,7 @@ async fn run_steps(conn: &mut AsyncPgConnection, root: ExecutionId, steps: &[Ste
         match step {
             Step::Signals(batch) => send_batch(conn, root, batch).await,
             Step::AwaitEvent { event, count } => await_event(conn, root, event, *count).await,
+            Step::Run(hook) => hook(),
             Step::Update { name, input } => {
                 update_results.push(update(conn, root, name, input.clone()).await);
             }

@@ -15,6 +15,7 @@
     clippy::unnecessary_wraps
 )]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -87,6 +88,35 @@ pub async fn very_slow_retry(ctx: &ActivityContext, n: i64) -> Result<i64, Strin
 #[activity(local = true, retry = RetryPolicy::fixed(2, Duration::ZERO))]
 pub async fn local_double(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
     Ok(n * 2)
+}
+
+/// Keeps `gated_retry` failing until a step opens the gate.
+static RETRY_GATE: AtomicBool = AtomicBool::new(false);
+
+/// Fails the first attempt, and every later attempt while the gate is closed.
+///
+/// The gate fixes the order of a signal and the activity result. A fixed
+/// backoff would let a late signal lose the race on a loaded runner. A closed
+/// gate fails the attempt and never waits, so the inline `SQLite` driver
+/// cannot block on a gate that only a later step opens.
+#[activity(retry = RetryPolicy::fixed(10, Duration::from_secs(2)))]
+pub async fn gated_retry(ctx: &ActivityContext, n: i64) -> Result<i64, String> {
+    if ctx.info().attempt == 1 || !RETRY_GATE.load(Ordering::SeqCst) {
+        return Err("the gate is closed".to_owned());
+    }
+    Ok(n)
+}
+
+/// Close the gate. Each run of a scenario registers its activities first.
+fn gated_activities() -> Vec<ActivityInfo> {
+    RETRY_GATE.store(false, Ordering::SeqCst);
+    let mut all = shared_activities();
+    all.push(gated_retry_info());
+    all
+}
+
+fn open_retry_gate() {
+    RETRY_GATE.store(true, Ordering::SeqCst);
 }
 
 fn shared_activities() -> Vec<ActivityInfo> {
@@ -222,7 +252,7 @@ pub fn local_activity() -> Scenario {
 
 #[workflow]
 pub async fn joins_activity_and_signal(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
-    let info = slow_retry_info();
+    let info = gated_retry_info();
     let (out, go) = tokio::join!(
         ctx.execute_activity::<_, i64>(&info, n),
         ctx.wait_for_signal("go"),
@@ -230,8 +260,11 @@ pub async fn joins_activity_and_signal(ctx: &WorkflowContext, n: i64) -> Result<
     Ok(json!({ "out": out.map_err(err)?, "go": go.map_err(err)? }))
 }
 
-/// A signal wakes the run while its activity waits out a retry backoff.
+/// A signal wakes the run while its activity has a retry pending.
 ///
+/// Each attempt fails while a gate is closed. A step opens the gate after the
+/// history holds the signal, so the signal always precedes the activity
+/// result. A signal event is written by a decision cycle, not by the send.
 /// The cycle that the signal starts finds the activity in progress, so it
 /// re-parks on it.
 pub fn signal_while_activity_retries() -> Scenario {
@@ -242,12 +275,17 @@ pub fn signal_while_activity_retries() -> Scenario {
         &[K::ScheduleActivity, K::WaitForActivity, K::WaitForSignal],
     )
     .input(json!(5))
-    .activities(shared_activities)
+    .activities(gated_activities)
     .step(Step::AwaitEvent {
         event: "ActivityScheduled",
         count: 1,
     })
     .step(Step::Signals(vec![("go", json!("now"))]))
+    .step(Step::AwaitEvent {
+        event: "SignalReceived",
+        count: 1,
+    })
+    .step(Step::Run(open_retry_gate))
 }
 
 // ── Signals, in every style ──────────────────────────────────────────────────
