@@ -14,6 +14,11 @@
 //! pending index skips consumed rows. The idempotency index skips rows with no
 //! key. So neither index can serve these statements.
 //!
+//! The same gates cover the `harvest_dead_letters` finding (issue #2401). No
+//! index held `failed_at`, `original_task_id` or `queue_name`. So the DLQ
+//! list, the callback redrive delete, each queue filter and the newest-age
+//! probe of the status summary read the whole table.
+//!
 //! Most gates plan the statement text that the engine runs, with
 //! `enable_seqscan` off and a generic plan. The planner then takes any usable
 //! index, and a bound value cannot make a partial index usable. The deciding
@@ -25,8 +30,9 @@
 //! - The cutover gate plans `QUIESCENCE_SQL` inside a `SELECT`, not the whole
 //!   cutover.
 //! - The erasure child gate plans the Diesel query that `erase.rs` builds.
-//! - The retry, erasure signal and pending-signal gates capture the SQL that
-//!   the engine function sends.
+//! - The retry, erasure signal, pending-signal and DLQ gates capture the SQL
+//!   that the engine function sends. The newest-age gate plans
+//!   `DLQ_NEWEST_AGE_SQL`, which the plugin sends.
 //! - The cascade gate deletes an execution and counts the scans of the index.
 
 use std::fmt::Write as _;
@@ -359,18 +365,29 @@ fn record_statements(conn: &mut AsyncPgConnection) -> Arc<Mutex<Vec<String>>> {
 
 /// Take the one recorded statement that starts with `prefix`, with no binds.
 fn take_statement(log: &Mutex<Vec<String>>, prefix: &str) -> String {
+    let [sql] = take_statements(log, [prefix]);
+    sql
+}
+
+/// Take one recorded statement for each prefix, with no binds.
+///
+/// The call empties the log. So a test that needs two statements of one call
+/// takes both here.
+fn take_statements<const N: usize>(log: &Mutex<Vec<String>>, prefixes: [&str; N]) -> [String; N] {
     let statements = std::mem::take(&mut *log.lock().expect("statement log"));
-    let matches: Vec<&str> = statements
-        .iter()
-        .filter(|sql| sql.starts_with(prefix))
-        .map(|sql| sql.split(" -- binds:").next().expect("a query text"))
-        .collect();
-    assert_eq!(
-        matches.len(),
-        1,
-        "expected one statement that starts with {prefix}:\n{statements:#?}"
-    );
-    matches[0].to_owned()
+    prefixes.map(|prefix| {
+        let matches: Vec<&str> = statements
+            .iter()
+            .filter(|sql| sql.starts_with(prefix))
+            .map(|sql| sql.split(" -- binds:").next().expect("a query text"))
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected one statement that starts with {prefix}:\n{statements:#?}"
+        );
+        matches[0].to_owned()
+    })
 }
 
 /// A workflow retry moves every signal of the failed attempt by index.
@@ -612,4 +629,353 @@ fn no_query_binds_the_consumed_flag() {
         "use diesel::dsl::not(consumed), not consumed.eq(false):\n{}",
         found.join("\n")
     );
+}
+
+/// The table of the issue #2401 gates.
+const DLQ: &str = "harvest_dead_letters";
+
+/// The index that serves the newest-first list and the newest-age probe.
+const DLQ_FAILED_AT_INDEX: &str = "idx_harvest_dl_failed_at";
+
+/// The index that serves the callback redrive delete.
+const DLQ_ORIGINAL_TASK_INDEX: &str = "idx_harvest_dl_original_task";
+
+/// The index that serves each filter on `queue_name`.
+const DLQ_QUEUE_INDEX: &str = "idx_harvest_dl_queue_failed";
+
+/// Append to `sql` an `INSERT` of one dead letter.
+///
+/// `error` names the row, so a test can check the order of a read.
+fn seed_dead_letter(
+    sql: &mut String,
+    original_task_id: uuid::Uuid,
+    queue: &str,
+    task_type: &str,
+    error: &str,
+    failed_at: &str,
+) {
+    write!(
+        sql,
+        "INSERT INTO harvest_dead_letters \
+             (original_task_id, queue_name, task_type, input, error, attempts, failed_at) \
+         VALUES ('{original_task_id}', '{queue}', '{task_type}', '{{}}'::jsonb, '{error}', 1, \
+                 {failed_at});"
+    )
+    .expect("write to a String");
+}
+
+/// The DLQ list reads the newest rows by index, newest first, up to its limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn dead_letter_list_reads_the_newest_rows_by_index() {
+    let bench = plan_gate_db().await;
+    let mut conn = claim_bench_db::connect(&bench.url).await;
+
+    let mut sql = String::new();
+    for (error, age) in [("old", "3"), ("newest", "1"), ("middle", "2")] {
+        let failed_at = format!("NOW() - INTERVAL '{age} minutes'");
+        seed_dead_letter(
+            &mut sql,
+            uuid::Uuid::new_v4(),
+            "alpha",
+            "activity",
+            error,
+            &failed_at,
+        );
+    }
+    conn.batch_execute(&sql).await.expect("seed dead letters");
+
+    let log = record_statements(&mut conn);
+    let rows = autumn_harvest::dlq::list_dead_letters(&mut conn, 2, None)
+        .await
+        .expect("list dead letters");
+    let list = take_statement(&log, "SELECT");
+    let errors: Vec<&str> = rows.iter().map(|r| r.error.as_str()).collect();
+    assert_eq!(errors, ["newest", "middle"]);
+
+    let plan = generic_plan(&mut conn, &list).await;
+    assert_served(&plan, DLQ, DLQ_FAILED_AT_INDEX, "list_dead_letters");
+}
+
+#[derive(QueryableByName, Debug)]
+struct DeadLetterAge {
+    #[diesel(sql_type = Nullable<BigInt>)]
+    age: Option<i64>,
+}
+
+/// The newest-age probe of the status summary reads one row by index.
+///
+/// The probe gives `NULL` for an empty DLQ, and the age of the newest row.
+#[tokio::test(flavor = "multi_thread")]
+async fn dead_letter_newest_age_reads_one_row_by_index() {
+    use autumn_harvest::dlq::DLQ_NEWEST_AGE_SQL;
+
+    let bench = plan_gate_db().await;
+    let mut conn = claim_bench_db::connect(&bench.url).await;
+
+    let empty: DeadLetterAge = diesel::sql_query(DLQ_NEWEST_AGE_SQL)
+        .get_result(&mut conn)
+        .await
+        .expect("the age of an empty DLQ");
+    assert_eq!(empty.age, None, "an empty DLQ has no age");
+
+    let mut sql = String::new();
+    for (error, failed_at) in [
+        ("old", "NOW() - INTERVAL '1 hour'"),
+        ("new", "NOW() - INTERVAL '2 minutes'"),
+    ] {
+        seed_dead_letter(
+            &mut sql,
+            uuid::Uuid::new_v4(),
+            "alpha",
+            "activity",
+            error,
+            failed_at,
+        );
+    }
+    conn.batch_execute(&sql).await.expect("seed dead letters");
+    let newest: DeadLetterAge = diesel::sql_query(DLQ_NEWEST_AGE_SQL)
+        .get_result(&mut conn)
+        .await
+        .expect("the age of the newest dead letter");
+    let age = newest.age.expect("a DLQ with rows has an age");
+    assert!(
+        (120..1800).contains(&age),
+        "the age comes from the newest row: {age}"
+    );
+
+    let plan = generic_plan(&mut conn, DLQ_NEWEST_AGE_SQL).await;
+    assert_served(&plan, DLQ, DLQ_FAILED_AT_INDEX, "the newest-age probe");
+}
+
+#[derive(QueryableByName, Debug)]
+struct DeadLetterError {
+    #[diesel(sql_type = Text)]
+    error: String,
+}
+
+/// A callback redrive deletes its own dead letter by index, and no other row.
+///
+/// The seed shares the delivery id with an activity row. It also has a
+/// callback row of another delivery. Both rows stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn callback_redrive_deletes_its_dead_letter_by_index() {
+    use autumn_harvest::completion_callback::{DeliveryRedriveOutcome, redrive_delivery_at};
+
+    let bench = plan_gate_db().await;
+    let mut conn = claim_bench_db::connect(&bench.url).await;
+
+    let exec_id = ExecutionId::new();
+    let delivery_id = uuid::Uuid::new_v4();
+    let mut sql = format!(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, run_id, shard_id, state, input, queue_name, \
+              started_at, created_at, completed_at) \
+         VALUES ('{exec_id}', 'callback_redrive', 'callback_redrive', gen_random_uuid(), 0, \
+                 'FAILED', '{{}}'::jsonb, 'default', NOW(), NOW(), NOW()); \
+         INSERT INTO harvest_completion_deliveries \
+             (id, workflow_exec_id, shard_id, callback_index, workflow_name, workflow_id, \
+              target_url, event_filter, terminal_state, payload, state, attempt, max_attempts, \
+              retry_policy, next_attempt_at) \
+         VALUES ('{delivery_id}', '{exec_id}', 0, 0, 'callback_redrive', 'callback_redrive', \
+                 'https://example.test/hook', '{{}}'::jsonb, 'failed', '{{}}'::jsonb, \
+                 'FAILED', 1, 1, '{{}}'::jsonb, NOW());"
+    );
+    seed_dead_letter(
+        &mut sql,
+        delivery_id,
+        "callbacks",
+        "CALLBACK",
+        "this delivery",
+        "NOW()",
+    );
+    seed_dead_letter(
+        &mut sql,
+        delivery_id,
+        "alpha",
+        "activity",
+        "same id, activity",
+        "NOW()",
+    );
+    seed_dead_letter(
+        &mut sql,
+        uuid::Uuid::new_v4(),
+        "callbacks",
+        "CALLBACK",
+        "another delivery",
+        "NOW()",
+    );
+    conn.batch_execute(&sql)
+        .await
+        .expect("seed a failed delivery and three dead letters");
+
+    let log = record_statements(&mut conn);
+    let outcome = redrive_delivery_at(&mut conn, exec_id, delivery_id, None)
+        .await
+        .expect("redrive the delivery");
+    let delete = take_statement(&log, "DELETE FROM \"harvest_dead_letters\"");
+    assert_eq!(outcome, DeliveryRedriveOutcome::Redriven);
+
+    let mut left: Vec<String> = diesel::sql_query("SELECT error FROM harvest_dead_letters")
+        .load::<DeadLetterError>(&mut conn)
+        .await
+        .expect("load the dead letters left")
+        .into_iter()
+        .map(|r| r.error)
+        .collect();
+    left.sort();
+    assert_eq!(left, ["another delivery", "same id, activity"]);
+
+    let plan = generic_plan(&mut conn, &delete).await;
+    assert_served(
+        &plan,
+        DLQ,
+        DLQ_ORIGINAL_TASK_INDEX,
+        "the callback redrive delete",
+    );
+}
+
+/// Seed two queues of dead letters. `alpha` holds three, `beta` holds one.
+async fn seed_two_queues(conn: &mut AsyncPgConnection) {
+    let mut sql = String::new();
+    for (queue, error, age) in [
+        ("alpha", "alpha middle", "2"),
+        ("beta", "beta oldest", "9"),
+        ("alpha", "alpha oldest", "3"),
+        ("alpha", "alpha newest", "1"),
+    ] {
+        let failed_at = format!("NOW() - INTERVAL '{age} minutes'");
+        seed_dead_letter(
+            &mut sql,
+            uuid::Uuid::new_v4(),
+            queue,
+            "activity",
+            error,
+            &failed_at,
+        );
+    }
+    conn.batch_execute(&sql).await.expect("seed dead letters");
+}
+
+/// Assert that the queue filter of each statement reads the queue index.
+async fn assert_queue_served(conn: &mut AsyncPgConnection, statements: [(String, &str); 2]) {
+    for (sql, what) in statements {
+        let plan = generic_plan(conn, &sql).await;
+        assert_served(&plan, DLQ, DLQ_QUEUE_INDEX, what);
+    }
+}
+
+/// A redrive by queue counts and reads that queue by index, oldest first.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_redrive_reads_the_queue_by_index() {
+    use autumn_harvest::dlq::{RedriveFilter, redrive_dead_letters};
+
+    let bench = plan_gate_db().await;
+    let mut conn = claim_bench_db::connect(&bench.url).await;
+    seed_two_queues(&mut conn).await;
+
+    let filter = RedriveFilter {
+        queue: Some("alpha".to_owned()),
+        max: Some(2),
+        dry_run: true,
+        ..RedriveFilter::default()
+    };
+    let log = record_statements(&mut conn);
+    let result = redrive_dead_letters(
+        &mut conn,
+        &filter,
+        None,
+        None,
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("a dry-run redrive");
+    let [count, read] =
+        take_statements(&log, ["SELECT COUNT(*)", "SELECT \"harvest_dead_letters\""]);
+    assert_eq!(result.matched, 3, "the count ignores the cap");
+
+    let ids: Vec<uuid::Uuid> = result
+        .ids
+        .iter()
+        .map(|id| id.parse().expect("a dead-letter id"))
+        .collect();
+    let mut errors = Vec::new();
+    for id in ids {
+        let row: DeadLetterError =
+            diesel::sql_query("SELECT error FROM harvest_dead_letters WHERE id = $1")
+                .bind::<diesel::sql_types::Uuid, _>(id)
+                .get_result(&mut conn)
+                .await
+                .expect("load a dead letter");
+        errors.push(row.error);
+    }
+    assert_eq!(errors, ["alpha oldest", "alpha middle"]);
+
+    assert_queue_served(
+        &mut conn,
+        [
+            (count, "count_redrive_filter_matches"),
+            (read, "query_dead_letters_for_redrive"),
+        ],
+    )
+    .await;
+}
+
+/// A bulk replay by queue counts and reads that queue by index.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_bulk_replay_reads_the_queue_by_index() {
+    use autumn_harvest::dlq::{BulkDlqFilter, bulk_replay_dead_letters};
+
+    let bench = plan_gate_db().await;
+    let mut conn = claim_bench_db::connect(&bench.url).await;
+    seed_two_queues(&mut conn).await;
+
+    let filter = BulkDlqFilter {
+        queue_name: Some("alpha".to_owned()),
+        limit: Some(2),
+        dry_run: true,
+        ..BulkDlqFilter::default()
+    };
+    let log = record_statements(&mut conn);
+    let result = bulk_replay_dead_letters(&mut conn, &filter, None)
+        .await
+        .expect("a dry-run bulk replay");
+    let [count, read] =
+        take_statements(&log, ["SELECT COUNT(*)", "SELECT \"harvest_dead_letters\""]);
+    assert_eq!(result.matched, 3, "the count ignores the limit");
+
+    assert_queue_served(
+        &mut conn,
+        [
+            (count, "count_bulk_filter_matches"),
+            (read, "query_dead_letters_for_bulk"),
+        ],
+    )
+    .await;
+}
+
+/// A DLQ aggregate by queue reads that queue by index.
+///
+/// The unfiltered total still counts every row. That count is inherent.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_aggregate_reads_the_queue_by_index() {
+    use autumn_harvest::dlq::{DlqAggregateParams, aggregate_dead_letters};
+
+    let bench = plan_gate_db().await;
+    let mut conn = claim_bench_db::connect(&bench.url).await;
+    seed_two_queues(&mut conn).await;
+
+    let params = DlqAggregateParams {
+        queue_name: Some("alpha".to_owned()),
+        ..DlqAggregateParams::default()
+    };
+    let log = record_statements(&mut conn);
+    let partial = aggregate_dead_letters(&mut conn, &params)
+        .await
+        .expect("aggregate the DLQ");
+    let read = take_statement(&log, "SELECT \"harvest_dead_letters\"");
+    assert_eq!(partial.total, 4, "the total counts every queue");
+    assert_eq!(partial.filtered_total, 3, "the filter keeps one queue");
+
+    let plan = generic_plan(&mut conn, &read).await;
+    assert_served(&plan, DLQ, DLQ_QUEUE_INDEX, "aggregate_dead_letters");
 }
