@@ -1382,26 +1382,6 @@ impl AgentRun<'_> {
         Ok(state)
     }
 
-    /// Check the run, then drop each stale interrupt, before an op reads
-    /// its profile.
-    ///
-    /// An interrupt that arrived while no op ran is stale. The drain comes
-    /// before the op read, so an interrupt that arrives during the read
-    /// stops the op.
-    fn start_op(&self) -> Result<(), String> {
-        let profile = match (&self.id, &self.profile) {
-            (Ok(_), Ok(profile)) => profile,
-            (Err(err), _) | (_, Err(err)) => return Err(err.clone()),
-        };
-        if let Some(Err(err)) = profile.mandate.as_ref().map(Mandate::validate) {
-            return Err(format!("the profile mandate is not valid: {err}"));
-        }
-        self.ctx
-            .drain_signals_raw(INTERRUPT_SIGNAL)
-            .map(drop)
-            .map_err(|err| err.to_string())
-    }
-
     /// The profile of one op (issue #2372).
     ///
     /// With no overlay store, it is the run profile, with no version. Else
@@ -1409,17 +1389,14 @@ impl AgentRun<'_> {
     /// `agent_profile_overlay`. The activity applies it to the run profile.
     /// The op then takes the overlay fields of the read. The read sets
     /// [`AgentState::profile_version`]. A failed read keeps it.
-    ///
-    /// The box keeps the op future small, because the op holds the
-    /// profile across its segment.
-    async fn op_profile(&self, state: &mut AgentState) -> Result<Box<AgentProfile>, String> {
+    async fn op_profile(&self, state: &mut AgentState) -> Result<AgentProfile, String> {
         let (id, profile) = match (&self.id, &self.profile) {
             (Ok(id), Ok(profile)) => (id, profile),
             (Err(err), _) | (_, Err(err)) => return Err(err.clone()),
         };
         if !self.overlays {
             state.profile_version = None;
-            return Ok(Box::new(profile.clone()));
+            return Ok(profile.clone());
         }
         let request = OverlayRead {
             kind: id.kind().to_owned(),
@@ -1431,10 +1408,10 @@ impl AgentRun<'_> {
             .await
             .map_err(|err| err.to_string())?;
         state.profile_version = read.overlay_version;
-        Ok(Box::new(match read.overlay_version {
+        Ok(match read.overlay_version {
             Some(_) => overlaid(profile, &read.profile),
             None => profile.clone(),
-        }))
+        })
     }
 
     /// Book the next heartbeat. See [`wake::next_heartbeat`].
@@ -1744,44 +1721,13 @@ impl AgentRun<'_> {
             Ok(id) => self.local_mandate(id).accept(&envelope.mandate),
             Err(_) => Err(Refusal::InvalidMandate),
         };
-        // The sender cannot see the model of this agent, so the receiver
-        // checks it against the mandate that it accepts (issue #2271). The
-        // op profile names the model, so the op reads it first.
-        let accepted = match accepted {
-            Ok(mandate) => {
-                let read = match self.start_op() {
-                    Ok(()) => self.op_profile(&mut state).await,
-                    Err(err) => Err(err),
-                };
-                match read {
-                    Ok(profile) if mandate.allows_model(profile.model.as_deref()) => {
-                        Ok((mandate, profile))
-                    }
-                    Ok(_) => Err(Some(Refusal::ModelForbidden)),
-                    // With no run profile, the model is the default one. Its
-                    // refusal comes first, as before the op read.
-                    Err(_) if self.profile.is_err() && !mandate.allows_model(None) => {
-                        Err(Some(Refusal::ModelForbidden))
-                    }
-                    Err(err) => {
-                        fail(&mut state, &err);
-                        Err(None)
-                    }
-                }
-            }
-            Err(refusal) => Err(Some(refusal)),
-        };
         let reply = match accepted {
             Err(refusal) => PeerReply {
-                error: refusal
-                    .is_none()
-                    .then(|| state.last_error.clone())
-                    .flatten(),
-                refusal,
+                refusal: Some(refusal),
                 flow_labels: state.flow_labels.clone(),
                 ..PeerReply::default()
             },
-            Ok((mandate, profile)) => {
+            Ok(mandate) => {
                 let member = self.member.as_ref().map_or_else(
                     || Member::bare(mandate.clone()),
                     |member| member.narrowed(mandate.clone()),
@@ -1797,22 +1743,31 @@ impl AgentRun<'_> {
                     waiting: &envelope.waiting,
                 };
                 let (next, outcome) = self
-                    .run_segment_as(state, &input, Mode::Peer, Some(peer), &profile)
+                    .run_segment_as(state, &input, Mode::Peer, Some(peer))
                     .await;
                 state = next;
-                // Only this segment answers. A failed segment sends no text,
-                // never the answer of an earlier op.
-                let (stop, answer) =
-                    outcome.map_or((None, String::new()), |(stop, answer)| (Some(stop), answer));
-                PeerReply {
-                    stop,
-                    answer,
-                    refusal: None,
-                    error: (state.failures > failures)
-                        .then(|| state.last_error.clone())
-                        .flatten(),
-                    flow_labels: state.flow_labels.clone(),
-                    tokens: state.tokens_used.saturating_sub(before),
+                match outcome {
+                    Err(refusal) => PeerReply {
+                        refusal: Some(refusal),
+                        flow_labels: state.flow_labels.clone(),
+                        ..PeerReply::default()
+                    },
+                    Ok(outcome) => {
+                        // Only this segment answers. A failed segment sends
+                        // no text, never the answer of an earlier op.
+                        let (stop, answer) = outcome
+                            .map_or((None, String::new()), |(stop, answer)| (Some(stop), answer));
+                        PeerReply {
+                            stop,
+                            answer,
+                            refusal: None,
+                            error: (state.failures > failures)
+                                .then(|| state.last_error.clone())
+                                .flatten(),
+                            flow_labels: state.flow_labels.clone(),
+                            tokens: state.tokens_used.saturating_sub(before),
+                        }
+                    }
                 }
             }
         };
@@ -1882,47 +1837,94 @@ impl AgentRun<'_> {
             .map_err(|err| err.to_string())
     }
 
-    /// Read the op profile, then run one segment with `input` and fold it
-    /// into `state`. A failed read fails the op before any model call.
-    async fn segment(&self, mut state: AgentState, input: &str, mode: Mode<'_>) -> AgentState {
-        if let Err(err) = self.start_op() {
-            fail(&mut state, &err);
-            return state;
-        }
-        match self.op_profile(&mut state).await {
-            Ok(profile) => {
-                self.run_segment_as(state, input, mode, None, &profile)
-                    .await
-                    .0
-            }
-            Err(err) => {
-                fail(&mut state, &err);
-                state
-            }
-        }
+    /// Run one segment with `input` and fold it into `state`.
+    async fn segment(&self, state: AgentState, input: &str, mode: Mode<'_>) -> AgentState {
+        self.run_segment_as(state, input, mode, None).await.0
     }
 
-    /// Run one segment on the op `profile`, as [`Self::segment`] does. A
-    /// peer message passes its narrowed member and its waiting chain.
+    /// Start one op: check the run, drain the stale interrupts, read the op
+    /// profile, and build the task of its segment (issue #2372).
+    ///
+    /// Without a store, the order is the old one. With a store, an
+    /// interrupt that arrives during the read stops the op. The op profile
+    /// drops on return, so the op future holds no profile across the
+    /// segment.
+    ///
+    /// `Err(Some)` is a refusal of a peer message, which changes no state.
+    /// `Err(None)` is a failed op, which `state` records.
+    async fn open_op(
+        &self,
+        state: &mut AgentState,
+        input: &str,
+        mode: Mode<'_>,
+        peer: Option<&PeerSegment<'_>>,
+    ) -> Result<AgentTask, Option<Refusal>> {
+        // The sender cannot see the model of this agent, so the receiver
+        // checks it against the mandate that it accepts (issue #2271).
+        // Without a store, the run profile names the model, so the check
+        // comes first, as before the op read.
+        let forbids = |model: Option<&str>| {
+            peer.is_some_and(|peer| !peer.member.mandate().allows_model(model))
+        };
+        if !self.overlays {
+            let model = self.profile.as_ref().ok().and_then(|p| p.model.as_deref());
+            if forbids(model) {
+                return Err(Some(Refusal::ModelForbidden));
+            }
+        }
+        let failed = |state: &mut AgentState, err: &str| {
+            fail(state, err);
+            None
+        };
+        let (id, profile) = match (&self.id, &self.profile) {
+            (Ok(id), Ok(profile)) => (id, profile),
+            (Err(err), _) | (_, Err(err)) => return Err(failed(state, err)),
+        };
+        if let Some(Err(err)) = profile.mandate.as_ref().map(Mandate::validate) {
+            let reason = format!("the profile mandate is not valid: {err}");
+            return Err(failed(state, &reason));
+        }
+        // An interrupt that arrived while no op ran is stale.
+        if let Err(err) = self.ctx.drain_signals_raw(INTERRUPT_SIGNAL) {
+            return Err(failed(state, &err.to_string()));
+        }
+        let op = match self.op_profile(state).await {
+            Ok(op) => op,
+            Err(err) => return Err(failed(state, &err)),
+        };
+        if self.overlays && forbids(op.model.as_deref()) {
+            return Err(Some(Refusal::ModelForbidden));
+        }
+        Ok(op.segment_task(id, input, mode))
+    }
+
+    /// Run one segment, as [`Self::segment`] does. A peer message passes
+    /// its narrowed member and its waiting chain.
     ///
     /// It also returns the stop and the answer of a segment that completed.
+    /// A peer message gets `Err` when the mandate of the message forbids the
+    /// model of the op. See [`Self::open_op`].
     async fn run_segment_as(
         &self,
         mut state: AgentState,
         input: &str,
         mode: Mode<'_>,
         peer: Option<PeerSegment<'_>>,
-        profile: &AgentProfile,
-    ) -> (AgentState, Option<(AgentStop, String)>) {
-        let id = match &self.id {
-            Ok(id) => id,
-            Err(err) => {
+    ) -> (AgentState, Result<Option<(AgentStop, String)>, Refusal>) {
+        let mut task = match self.open_op(&mut state, input, mode, peer.as_ref()).await {
+            Ok(task) => task,
+            Err(Some(refusal)) => return (state, Err(refusal)),
+            Err(None) => return (state, Ok(None)),
+        };
+        // The tree and the window are run fields, so they read the run
+        // profile. `open_op` found both parts.
+        let (id, profile) = match (&self.id, &self.profile) {
+            (Ok(id), Ok(profile)) => (id, profile),
+            (Err(err), _) | (_, Err(err)) => {
                 fail(&mut state, err);
-                return (state, None);
+                return (state, Ok(None));
             }
         };
-        // `start_op` checked the mandate and drained the stale interrupts.
-        let mut task = profile.segment_task(id, input, mode);
         if let Some(peer) = &peer {
             let mandate = peer.member.mandate();
             task.mandate = Some(mandate.clone());
@@ -1935,7 +1937,7 @@ impl AgentRun<'_> {
             .await
         {
             fail(&mut state, &err);
-            return (state, None);
+            return (state, Ok(None));
         }
         let run_id = format!("{}:s{}", state.incarnation, state.segments);
         state.segments = state.segments.saturating_add(1);
@@ -2013,7 +2015,7 @@ impl AgentRun<'_> {
             // run as its own op later.
             state.steer.steered = steered_before;
         }
-        (state, outcome)
+        (state, Ok(outcome))
     }
 
     /// Send the answer of one segment to the delivery.
