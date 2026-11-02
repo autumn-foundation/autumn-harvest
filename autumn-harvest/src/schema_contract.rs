@@ -1355,52 +1355,74 @@ fn is_integral_format(format: &str) -> bool {
 ///   removed and two branches added".
 #[must_use]
 pub fn canonicalize_schema(schema: &Value) -> Value {
-    canonicalize_node(schema, 0)
+    canonicalize_node(schema, 0).unwrap_or_else(|| schema.clone())
 }
 
-fn canonicalize_node(schema: &Value, depth: usize) -> Value {
+/// Canonical form of `schema`, or `None` when it already is canonical.
+///
+/// A `None` result means the canonical form equals the input, so a caller
+/// can borrow the input and skip the deep copy. Stored contracts are already
+/// canonical, so the diff walk takes this path for most nodes.
+fn canonicalize_node(schema: &Value, depth: usize) -> Option<Value> {
     if depth >= MAX_DIFF_DEPTH {
-        return schema.clone();
+        return None;
     }
     match schema {
-        Value::Array(items) => Value::Array(
-            items
+        Value::Array(items) => {
+            let canon: Vec<Option<Value>> = items
                 .iter()
                 .map(|i| canonicalize_node(i, depth + 1))
-                .collect(),
-        ),
+                .collect();
+            if canon.iter().all(Option::is_none) {
+                return None;
+            }
+            Some(Value::Array(
+                canon
+                    .into_iter()
+                    .zip(items)
+                    .map(|(c, original)| c.unwrap_or_else(|| original.clone()))
+                    .collect(),
+            ))
+        }
         Value::Object(obj) => {
-            let mut out = Map::new();
+            // One slot per entry: `Some(None)` keeps the value, `Some(Some(v))`
+            // replaces it, `None` drops the entry as an annotation.
+            let mut slots: Vec<Option<Option<Value>>> = Vec::with_capacity(obj.len());
             for (k, v) in obj {
                 if ANNOTATION_KEYWORDS.contains(&k.as_str()) {
-                    continue;
+                    slots.push(None);
+                } else if k == "format" || INSTANCE_VALUE_KEYWORDS.contains(&k.as_str()) {
+                    // Instance data, not a schema: preserve it byte-for-byte.
+                    slots.push(Some(None));
+                } else if k == "enum" {
+                    let sorted = sorted_enum(v);
+                    slots.push(Some((sorted != *v).then_some(sorted)));
+                } else if SCHEMA_MAP_KEYWORDS.contains(&k.as_str()) {
+                    // A map of author-chosen NAMES to sub-schemas: the keys are not
+                    // keywords, so the annotation filter must not see them.
+                    slots.push(Some(canonicalize_schema_map(v, depth + 1)));
+                } else {
+                    slots.push(Some(canonicalize_node(v, depth + 1)));
                 }
-                if k == "format" {
-                    out.insert(k.clone(), v.clone());
-                    continue;
+            }
+            // Only these keys can trigger the whole-object rewrites below.
+            let may_rewrite = ["oneOf", "anyOf", "allOf"]
+                .iter()
+                .any(|k| obj.contains_key(*k));
+            if !may_rewrite && slots.iter().all(|s| matches!(s, Some(None))) {
+                return None;
+            }
+            let mut out = Map::new();
+            for ((k, v), slot) in obj.iter().zip(slots) {
+                if let Some(canon) = slot {
+                    out.insert(k.clone(), canon.unwrap_or_else(|| v.clone()));
                 }
-                if k == "enum" {
-                    out.insert(k.clone(), sorted_enum(v));
-                    continue;
-                }
-                // Instance data, not a schema: preserve it byte-for-byte.
-                if INSTANCE_VALUE_KEYWORDS.contains(&k.as_str()) {
-                    out.insert(k.clone(), v.clone());
-                    continue;
-                }
-                // A map of author-chosen NAMES to sub-schemas: the keys are not
-                // keywords, so the annotation filter must not see them.
-                if SCHEMA_MAP_KEYWORDS.contains(&k.as_str()) {
-                    out.insert(k.clone(), canonicalize_schema_map(v, depth + 1));
-                    continue;
-                }
-                out.insert(k.clone(), canonicalize_node(v, depth + 1));
             }
             collapse_unit_enum_branches(&mut out);
             flatten_single_member_all_of(&mut out);
-            Value::Object(out)
+            (out != *obj).then_some(Value::Object(out))
         }
-        other => other.clone(),
+        _ => None,
     }
 }
 
@@ -1410,21 +1432,29 @@ fn canonicalize_node(schema: &Value, depth: usize) -> Value {
 /// not a schema keyword — while every value is canonicalised as a schema. This
 /// is the whole difference between a schema object and a `properties` map, and
 /// [`canonicalize_node`] cannot tell them apart from shape alone: both are JSON
-/// objects.
-fn canonicalize_schema_map(value: &Value, depth: usize) -> Value {
+/// objects. Returns `None` when every value is already canonical.
+fn canonicalize_schema_map(value: &Value, depth: usize) -> Option<Value> {
     if depth >= MAX_DIFF_DEPTH {
-        return value.clone();
+        return None;
     }
     let Value::Object(map) = value else {
         // Malformed (a `properties` that is not an object). Leave it to the
         // fail-closed sweep rather than guessing at a shape it does not have.
-        return value.clone();
+        return None;
     };
-    Value::Object(
+    let canon: Vec<Option<Value>> = map
+        .values()
+        .map(|v| canonicalize_node(v, depth + 1))
+        .collect();
+    if canon.iter().all(Option::is_none) {
+        return None;
+    }
+    Some(Value::Object(
         map.iter()
-            .map(|(k, v)| (k.clone(), canonicalize_node(v, depth + 1)))
+            .zip(canon)
+            .map(|((k, v), c)| (k.clone(), c.unwrap_or_else(|| v.clone())))
             .collect(),
-    )
+    ))
 }
 
 /// Collapse `{"allOf": [X]}` into `X`.
@@ -1994,19 +2024,20 @@ fn diff_role(
             ),
         )),
         (Some(b), Some(c)) => {
-            let bc = canonicalize_schema(b);
-            let cc = canonicalize_schema(c);
+            let bc = canonicalize_node(b, 0);
+            let cc = canonicalize_node(c, 0);
+            let (bc, cc) = (bc.as_ref().unwrap_or(b), cc.as_ref().unwrap_or(c));
             let mut ctx = DiffCtx {
                 subject,
                 role,
-                base_root: &bc,
-                cur_root: &cc,
+                base_root: bc,
+                cur_root: cc,
                 visited: BTreeMap::new(),
                 active_hits: Vec::new(),
                 pending_branch_guards: Vec::new(),
                 suppressed_changes: 0,
             };
-            diff_node(&mut ctx, &bc, &cc, "", 0, diff);
+            diff_node(&mut ctx, bc, cc, "", 0, diff);
         }
     }
 }
@@ -4457,6 +4488,27 @@ fn escape_pointer_token(name: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn canonical_schema_is_borrowed_and_dirty_schema_is_rewritten() {
+        let canonical = json!({
+            "type": "object",
+            "properties": {"description": {"type": "string"}},
+            "enum": ["a", "b"],
+            "oneOf": [{"type": "string", "enum": ["a", "b"]}, {"type": "integer"}]
+        });
+        assert!(canonicalize_node(&canonical, 0).is_none());
+        assert_eq!(canonicalize_schema(&canonical), canonical);
+
+        let dirty = json!({
+            "description": "doc",
+            "properties": {"a": {"title": "t", "type": "string"}},
+            "enum": ["b", "a"]
+        });
+        let want = json!({"properties": {"a": {"type": "string"}}, "enum": ["a", "b"]});
+        assert_eq!(canonicalize_node(&dirty, 0), Some(want.clone()));
+        assert_eq!(canonicalize_schema(&dirty), want);
+    }
 
     #[test]
     fn numeric_format_ranges_encode_width_and_signedness() {

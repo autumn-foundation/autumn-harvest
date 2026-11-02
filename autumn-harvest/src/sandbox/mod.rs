@@ -80,6 +80,13 @@ const FAR_FUTURE: std::time::Duration = std::time::Duration::from_secs(30 * 365 
 
 /// The instant `wait` after now. A wait past [`FAR_FUTURE`] counts as no
 /// bound, so a configured `Duration::MAX` cannot overflow the `Instant`.
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(
+        dead_code,
+        reason = "only the Linux cgroup and Firecracker paths call it"
+    )
+)]
 pub(crate) fn deadline_after(wait: std::time::Duration) -> std::time::Instant {
     std::time::Instant::now() + wait.min(FAR_FUTURE)
 }
