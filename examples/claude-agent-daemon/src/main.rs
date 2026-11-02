@@ -473,7 +473,7 @@ fn shown(text: &str, refused: fn(char) -> bool) -> std::borrow::Cow<'_, str> {
 /// they copy.
 ///
 /// A log field has the same shape of fault. See [`one_line`].
-fn breaks_one_line(character: char) -> bool {
+const fn breaks_one_line(character: char) -> bool {
     is_obeyed(character) || character == '\n' || character == '\t'
 }
 
