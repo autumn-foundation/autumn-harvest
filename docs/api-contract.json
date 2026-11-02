@@ -7245,7 +7245,7 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "Empty patch, unknown field, or a duration of zero or past 100 years."
+          "description": "Empty patch, unknown field, a duration of zero or past 100 years, or chain_execution_timeout_secs for a DAG."
         },
         {
           "status": 404,
