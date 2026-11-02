@@ -2455,6 +2455,11 @@ jobs:
         # and weight builders a reader pastes verbatim. Nothing compiled them.
         # See scripts/check-worker-routing-examples.sh.
         run: ./scripts/check-worker-routing-examples.sh
+      - name: Check chapter 8 DAG snippets compile
+        # Chapter 8 shows 15 DAG blocks a reader pastes verbatim. A syntax
+        # check covered them. Nothing compiled them against the API.
+        # See scripts/check-dags-schedules-examples.sh.
+        run: ./scripts/check-dags-schedules-examples.sh
 
   # One check for branch protection to require in place of every leg above.
   # A skipped leg (a draft PR) counts as a pass, as a skipped job does
