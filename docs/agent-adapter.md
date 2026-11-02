@@ -288,6 +288,8 @@ shows what ran. The text of that turn is not the answer either.
 
 A `transcript_full` transcript is too large for one request. Do not pass it
 whole as the `history` of a new run. Summarise it, or keep its last turns.
+A run with `AgentTask::context_reset` can reset before it reaches the cap. See
+[Context reset](#context-reset-issue-2453).
 
 Retries follow `ErrorKind::is_retryable`. `RateLimited`, `Transport` and
 `Unavailable` retry with backoff, up to four attempts. So does a model call
@@ -654,6 +656,63 @@ before the guard existed replays as it ran.
 The guard is not a cost control. A model that changes its arguments, or a
 tool whose result changes, does not trip it. Use `max_steps`,
 `max_total_tokens` and the chain cap for cost.
+
+### Context reset (issue #2453)
+
+A long run can save its progress and restart from it, after CORAL. The
+setting is off by default.
+
+```rust
+use autumn_harvest_agent::{AgentTask, ContextReset};
+
+// Up to 2 resets, each before a request that reaches 80 % of the cap.
+let task = AgentTask::new("audit the ledger")
+    .context_reset(ContextReset::new(2, 80).max_notes_bytes(4_096));
+```
+
+- The model gets the `save_progress` tool. Its `notes` argument replaces
+  the notes of the run. The workflow handles the call, so no activity runs.
+  Replay reads the call from the recorded model turn.
+- Notes over `max_notes_bytes` get an error result. The earlier notes stay.
+  The default bound is 8 192 bytes.
+- Before each request, the loop measures it against the request cap of
+  [Payload caps](#payload-caps-issue-2040). When the request reaches
+  `reset_at_percent` of the cap and a reset is left, a reset is due. 0 counts
+  as 1, and a value over 100 counts as 100. A zero cap is no cap, so it never
+  resets. The loop measures the reset window with the notes of that time. A
+  reset whose window still reaches the threshold frees no room, so it does
+  not run.
+- A due reset first asks for a save turn. The loop sends the window with the
+  fixed notice `RESET_NOTICE`. The model reads the last round, and only
+  `save_progress` runs in that turn. Each other call gets an error result.
+- The reset runs before the next request. It also runs when the save turn
+  answers in text, or when its round does not fit the cap. The reply to the
+  notice is no answer. A failed save keeps the earlier notes.
+- The save turn needs room under the cap for the notice and
+  `max_notes_bytes`. Without that room, the reset runs at once.
+- The new window is the system prompt and `AgentTask::input`. In a segment
+  that a follow-up woke, the booking that woke it and the wake message
+  follow. A booking of the segment itself follows them. Then the notes and
+  the steers of a durable agent op follow.
+- The notes are the model's own `save_progress` call, with a fixed result.
+  The model wrote them, maybe under the influence of a tool result, so they
+  never go into a user message.
+- `max_resets` counts per run, follow-ups included. With no reset left, the
+  run ends as `transcript_full`, as before. `AgentReport::resets` counts the
+  resets. A report with no reset does not write the field.
+- A reset changes only the transcript. The flow labels belong to the run, so
+  a reset clears no taint.
+- A delegated child takes the setting and starts with no notes. Its resets
+  are its own. `DelegationRecord::resets` counts them.
+- The reset reads only recorded data, so replay takes the same reset. The
+  next turn after a reset goes in full, not as a delta.
+
+A tool round that passes the cap in one step still ends as `transcript_full`.
+The reset runs only before a request. Issue #2461 tracks this limit. A task with no `context_reset` field
+takes no new path, so a recorded run replays as it ran.
+`formal/verus/src/agent_reset.rs` proves that a request over the cap always
+reaches the threshold, and that no run passes `max_resets`.
+`docs/design/DESIGN-2453.md` records the design.
 
 ## 11. Response cache
 
@@ -1068,6 +1127,27 @@ and the edit lands once. No store and no edit key are involved.
 
 `autumn-harvest-agent/examples/agent_session_entity.rs` runs a chat session
 as an agent.
+
+### Progress notes (issue #2453)
+
+`AgentProfile::context_reset` gives each op the
+[context reset](#context-reset-issue-2453). The agent keeps its notes in
+`AgentState::notes`, with the flow labels of the op that saved them.
+
+- Each op shows the notes after its input, as a `save_progress` call and its
+  result. `trim_window` drops old turns, but the notes stay.
+- The transcript in the state holds no copy of the notes. The first turn of
+  an op with notes therefore goes in full, not as a delta.
+- An op that reads the notes takes their labels, so the taint follows the
+  text.
+- Only a segment that may write memory gets the reset and the
+  `save_progress` tool. A read-only op, a heartbeat tick, a follow-up and a
+  peer message get neither, unless the segment has
+  `unattended_memory_writes`. Such a segment can read untrusted data, and a
+  later op with write tools reads the notes. It still reads the notes.
+- A silent tick or a failed op keeps no transcript, so it changes no notes
+  either.
+- `Control::ClearTranscript` clears the notes too.
 
 ### Workspaces (issue #2274)
 

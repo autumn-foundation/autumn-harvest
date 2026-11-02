@@ -144,6 +144,10 @@ name = "overlay_store_postgres"
 required-features = ["postgres"]
 
 [[test]]
+name = "context_reset"
+required-features = ["sqlite"]
+
+[[test]]
 name = "skills"
 required-features = ["sqlite", "eval"]
 

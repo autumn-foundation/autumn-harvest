@@ -6,6 +6,54 @@ use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::DbPool;
 
+/// The app pool as a Postgres pool, for the Postgres path (issue #2467).
+///
+/// The `sqlite` feature flips `autumn-web` to a SQLite pool. The Postgres path
+/// never runs then, but it must still compile, so this returns `None` there.
+#[cfg_attr(
+    feature = "sqlite",
+    allow(
+        clippy::missing_const_for_fn,
+        reason = "only the sqlite body could be const; the Postgres body cannot"
+    )
+)]
+pub(crate) fn app_postgres_pool(state: &autumn_web::AppState) -> Option<DbPool> {
+    #[cfg(not(feature = "sqlite"))]
+    {
+        state.pool().cloned()
+    }
+    #[cfg(feature = "sqlite")]
+    {
+        let _ = state;
+        None
+    }
+}
+
+/// A Postgres pool from `config`, through `autumn-web` (issue #2467).
+///
+/// Under `sqlite`, `autumn-web` builds SQLite pools only, so this refuses.
+///
+/// # Errors
+///
+/// Returns the pool error, or the refusal under `sqlite`.
+pub(crate) fn create_postgres_pool(
+    config: &autumn_web::config::DatabaseConfig,
+) -> Result<Option<DbPool>, String> {
+    #[cfg(not(feature = "sqlite"))]
+    {
+        autumn_web::db::create_pool(config).map_err(|error| error.to_string())
+    }
+    #[cfg(feature = "sqlite")]
+    {
+        let _ = config;
+        Err(
+            "a Postgres Harvest pool is not available in a build with the `sqlite` feature \
+             (autumn-harvest#2472)"
+                .to_owned(),
+        )
+    }
+}
+
 /// Application/business database role exposed to Harvest activities.
 ///
 /// In embedded mode this may point to the same underlying Postgres pool as

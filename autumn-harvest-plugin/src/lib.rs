@@ -79,6 +79,8 @@ pub mod same_origin;
 pub mod schedule_runs;
 pub mod shard_fanout;
 pub mod shard_health;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 pub mod state;
 pub mod status_summary;
 /// Strict percent-decoding for raw HTTP query strings.

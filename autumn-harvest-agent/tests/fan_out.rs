@@ -461,6 +461,7 @@ fn child_report(input: &Value) -> Value {
         run_id: Some(format!("child-{}", task.input.replace(' ', "-"))),
         workspace: None,
         error: None,
+        resets: 0,
     })
 }
 
