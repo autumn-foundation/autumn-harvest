@@ -136,9 +136,10 @@ psql -d dl_after -f measure.sql -f write.sql -f tradeoff.sql
 ## 🔒 Gate
 
 `census_scan_index_tests` plans each indexed statement with `enable_seqscan`
-off and a generic plan. The `error ILIKE` count has no gate. Each engine gate captures the SQL that the engine function
-sends: the list, the redrive delete, the redrive and bulk-replay counts and
-reads, and the aggregate read. The newest-age gate plans
-`DLQ_NEWEST_AGE_SQL`. The list and probe gates also require a backward scan
-under a `Limit`. The gates check the list order, the probe age, the queue
-order, and the rows that the redrive delete keeps.
+off and a generic plan. The `error ILIKE` count has no gate. Each engine
+gate captures the SQL that the engine function sends. The engine gates cover
+the list, the redrive delete, the redrive and bulk-replay counts and reads,
+and the aggregate read. The newest-age gate plans `DLQ_NEWEST_AGE_SQL`. The
+list and probe gates also require a backward scan under a `Limit`. The gates
+check the list order, the probe age, the queue order, and the rows that the
+redrive delete keeps.
