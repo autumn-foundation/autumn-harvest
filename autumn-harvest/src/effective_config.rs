@@ -296,6 +296,9 @@ pub struct WorkerConfigView {
     /// policy turns the limit off for that type.
     pub adaptive_limit_overrides:
         std::collections::BTreeMap<String, Option<crate::policy::AdaptiveLimitPolicy>>,
+    /// The activity types that a cost signal can hold (autumn#1720). Empty
+    /// when the worker has no cost hold. The live signal is not reported.
+    pub cost_hold_activities: Vec<String>,
     /// Max panic strikes before a panicking workflow task fails terminally
     /// (0 = terminal on first panic).
     pub workflow_panic_max_attempts: u32,
@@ -464,6 +467,7 @@ impl WorkerConfigView {
             scanner,
             retry_budget,
             adaptive_limit,
+            cost_hold,
             // REDACTED — the registry holds live codec handles that may close
             // over key material. Only the operator-chosen key IDENTIFIERS are
             // safe to report, and those are served by
@@ -548,6 +552,10 @@ impl WorkerConfigView {
             retry_budget_overrides: retry_budget.overrides(),
             adaptive_limit_default: adaptive_limit.default_policy(),
             adaptive_limit_overrides: adaptive_limit.overrides(),
+            cost_hold_activities: cost_hold
+                .as_ref()
+                .map(|hold| hold.activities().to_vec())
+                .unwrap_or_default(),
             workflow_panic_max_attempts: *workflow_panic_max_attempts,
             notification_channel_configured: notification_database_url.is_some(),
             shard_notification_channels_configured: shard_notification_database_urls.len(),
@@ -891,6 +899,25 @@ mod tests {
     }
 
     /// The view reports the adaptive limit config (issue #1836).
+    #[test]
+    fn view_reports_the_cost_hold_activities() {
+        let off = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default(),
+            Duration::from_millis(500),
+        );
+        assert_eq!(off.cost_hold_activities, Vec::<String>::new());
+        let worker = WorkerConfig::default().with_cost_hold(crate::cost_hold::CostHold::new(
+            || true,
+            ["train_model", "rebuild_index"],
+        ));
+        let view = WorkerConfigView::from_worker_config(&worker, Duration::from_millis(500));
+        let json = serde_json::to_value(&view).expect("serialize");
+        assert_eq!(
+            json["cost_hold_activities"],
+            serde_json::json!(["rebuild_index", "train_model"])
+        );
+    }
+
     #[test]
     fn view_reports_the_adaptive_limit() {
         let worker = WorkerConfig::default().with_adaptive_limit(

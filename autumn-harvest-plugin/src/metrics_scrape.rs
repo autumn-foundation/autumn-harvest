@@ -152,6 +152,9 @@ struct Inner {
     // The starter alert `harvest_queue_backlog_growth` leaves a paused queue
     // out at the depth cap by this gauge (issue #2356).
     queue_paused: Gauge,
+    // One unlabeled sample: 1 while a cost signal holds deferrable activity
+    // types (autumn#1720).
+    cost_hold: Gauge,
     dlq_entries: Gauge,
     schedule_runs: Counter,
     schedule_skipped: Counter,
@@ -434,6 +437,12 @@ impl MetricsRecorder for HarvestMetricsRecorder {
         self.0
             .queue_paused
             .set(vec![queue.to_owned()], if paused { 1.0 } else { 0.0 });
+    }
+
+    fn record_cost_hold(&self, held: bool) {
+        self.0
+            .cost_hold
+            .set(Vec::new(), if held { 1.0 } else { 0.0 });
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -800,6 +809,13 @@ fn push_catalogue_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
         "1 while an operator pause holds the queue, else 0",
         &[METRIC_LABEL_QUEUE],
         inner.queue_paused.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_cost_hold",
+        "1 while a cost signal holds the deferrable activity types, else 0",
+        &[],
+        inner.cost_hold.snapshot(),
     );
     push_gauge(
         families,
@@ -1206,6 +1222,23 @@ mod tests {
         assert_eq!(f.kind, MetricKind::Gauge);
         assert_eq!(sample_value(f, &[("queue", "payments")]), 1.0);
         assert_eq!(sample_value(f, &[("queue", "default")]), 0.0);
+    }
+
+    /// The cost hold gauge has one unlabeled sample (autumn#1720).
+    #[test]
+    fn cost_hold_is_an_unlabeled_binary_gauge() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_cost_hold(true);
+        let families = recorder.collect();
+        let f = family(&families, "harvest_cost_hold");
+        assert_eq!(f.kind, MetricKind::Gauge);
+        assert_eq!(sample_value(f, &[]), 1.0);
+        recorder.record_cost_hold(false);
+        let families = recorder.collect();
+        assert_eq!(
+            sample_value(family(&families, "harvest_cost_hold"), &[]),
+            0.0
+        );
     }
 
     #[test]

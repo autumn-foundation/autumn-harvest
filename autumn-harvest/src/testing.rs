@@ -40,6 +40,8 @@
 //! # }
 //! ```
 
+#[cfg(feature = "db")]
+use crate::schema::harvest_workflow_executions_ext;
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -2155,12 +2157,12 @@ async fn query_running_executions(
     )>,
 > {
     use crate::schema::harvest_workflow_executions::dsl::{
-        context_headers, continued_from_exec_id, created_at, deadline_at, execution_timeout,
-        harvest_workflow_executions, id, parent_id, queue_name, start_source, state, workflow_id,
-        workflow_name,
+        created_at, deadline_at, execution_timeout, harvest_workflow_executions, id, parent_id,
+        queue_name, start_source, state, workflow_id, workflow_name,
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
+    use harvest_workflow_executions_ext::{context_headers, continued_from_exec_id};
 
     let mut query = harvest_workflow_executions
         .filter(state.eq("RUNNING".to_string()))
@@ -2343,7 +2345,6 @@ async fn load_workflow_name_and_headers(
 ) -> crate::error::HarvestResult<DbReplayMeta> {
     use crate::error::{HarvestError, database_error};
     use crate::schema::harvest_workflow_executions::dsl::{
-        context_headers as context_headers_col, continued_from_exec_id as continued_from_col,
         deadline_at as deadline_at_col, execution_timeout as execution_timeout_col,
         harvest_workflow_executions, id as id_col, parent_id as parent_id_col,
         queue_name as queue_name_col, start_source as start_source_col,
@@ -2351,6 +2352,9 @@ async fn load_workflow_name_and_headers(
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
+    use harvest_workflow_executions_ext::{
+        context_headers as context_headers_col, continued_from_exec_id as continued_from_col,
+    };
 
     let exec_uuid = exec_id.as_uuid();
 

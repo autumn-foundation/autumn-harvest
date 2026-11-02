@@ -156,6 +156,7 @@ impl ModelProposer {
             tools: Vec::new(),
             max_tokens: self.max_output_tokens,
             temperature: None,
+            draw: None,
         }
     }
 }

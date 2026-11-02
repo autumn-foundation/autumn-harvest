@@ -14,6 +14,7 @@
 //!   PAUSED rows are excluded (pause suspends the SLA clock); NULL-sla is never
 //!   selected.
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
 use std::sync::Mutex;
 
 use autumn_harvest::event::WorkflowEvent;
@@ -158,8 +159,8 @@ async fn load_breach_flags(
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
         .select((
-            harvest_workflow_executions::sla_breached,
-            harvest_workflow_executions::sla_breached_at,
+            harvest_workflow_executions_ext::sla_breached,
+            harvest_workflow_executions_ext::sla_breached_at,
             harvest_workflow_executions::state,
         ))
         .first(conn)

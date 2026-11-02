@@ -126,6 +126,7 @@ impl Scorer for Judge {
                 tools: Vec::new(),
                 max_tokens: Some(8),
                 temperature: None,
+                draw: None,
             };
             let reply = cx.chat(None, &request).await?;
             let Some(ContentPart::Text(text)) = reply.content.first() else {

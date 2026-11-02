@@ -550,6 +550,14 @@ jobs:
           python3 docs/audits/required-migration-versions-sync.py --self-test
           python3 docs/audits/required-migration-versions-sync.py
 
+      # Issue #2492: every diesel table! keeps 32 columns or fewer, so the
+      # workspace and every embedder build diesel at its default tier. A wider
+      # table splits over two declarations (autumn-harvest/src/table_split.rs).
+      - name: Diesel table width (docs/audits/diesel-table-width.py)
+        run: |
+          python3 docs/audits/diesel-table-width.py --self-test
+          python3 docs/audits/diesel-table-width.py
+
       # Only listed files sit at the repository root. A design record goes in
       # docs/design/. The script lists each root file with a reason.
       - name: Root files (docs/audits/root-files.py)

@@ -23,6 +23,7 @@ use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::draw::DrawId;
 use crate::error::{AgentError, ErrorKind};
 use crate::harness::{AgentHarness, cut_bytes, model_failure};
 use crate::message::ContentPart;
@@ -149,7 +150,8 @@ impl fmt::Display for FiniteF64 {
 
 /// The verdict of one scorer on one run.
 ///
-/// It encodes as `{"score": 0.5}` or `{"reject": "reason"}`.
+/// It encodes as `{"score": 0.5}` or `{"reject": "reason"}`. It stays
+/// exhaustive, because history pins these two shapes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
@@ -192,19 +194,6 @@ impl Verdict {
     }
 }
 
-/// The id of one draw of a strategy.
-///
-/// `Verdict` stays exhaustive, because history pins its two shapes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct DrawId(pub u32);
-
-impl fmt::Display for DrawId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 /// Pick the draw with the highest score.
 ///
 /// A tie goes to the lowest draw id. A reject never beats a score. The
@@ -214,9 +203,9 @@ impl fmt::Display for DrawId {
 pub fn select(verdicts: &[(DrawId, Verdict)]) -> Option<DrawId> {
     let entries: Vec<(u32, Option<i64>)> = verdicts
         .iter()
-        .map(|(draw, verdict)| (draw.0, verdict.as_score().map(FiniteF64::order_key)))
+        .map(|(draw, verdict)| (draw.get(), verdict.as_score().map(FiniteF64::order_key)))
         .collect();
-    best_draw(&entries).map(|(draw, _key)| DrawId(draw))
+    best_draw(&entries).map(|(draw, _key)| DrawId::new(draw))
 }
 
 /// The better of `best` and the entry `next`.
@@ -837,7 +826,7 @@ mod tests {
     fn draws(verdicts: Vec<(u32, Verdict)>) -> Vec<(DrawId, Verdict)> {
         verdicts
             .into_iter()
-            .map(|(draw, verdict)| (DrawId(draw), verdict))
+            .map(|(draw, verdict)| (DrawId::new(draw), verdict))
             .collect()
     }
 
@@ -949,7 +938,7 @@ mod tests {
     #[test]
     fn a_very_low_score_beats_a_reject() {
         let input = draws(vec![(0, reject()), (1, score(-1e300))]);
-        assert_eq!(select(&input), Some(DrawId(1)));
+        assert_eq!(select(&input), Some(DrawId::new(1)));
     }
 
     #[test]
@@ -966,15 +955,15 @@ mod tests {
     #[test]
     fn the_highest_score_wins() {
         let input = draws(vec![(0, score(0.2)), (1, score(0.9)), (2, score(0.5))]);
-        assert_eq!(select(&input), Some(DrawId(1)));
+        assert_eq!(select(&input), Some(DrawId::new(1)));
     }
 
     #[test]
     fn a_tie_goes_to_the_lowest_draw_id() {
         let input = draws(vec![(7, score(1.0)), (3, score(1.0)), (5, score(0.1))]);
-        assert_eq!(select(&input), Some(DrawId(3)));
+        assert_eq!(select(&input), Some(DrawId::new(3)));
         let zeros = draws(vec![(4, score(0.0)), (2, score(-0.0))]);
-        assert_eq!(select(&zeros), Some(DrawId(2)));
+        assert_eq!(select(&zeros), Some(DrawId::new(2)));
     }
 
     #[test]
@@ -1011,7 +1000,7 @@ mod tests {
     fn entries() -> impl Strategy<Value = Vec<(DrawId, Verdict)>> {
         proptest::collection::vec((0_u32..12, verdict_strategy()), 0..16).prop_map(|v| {
             v.into_iter()
-                .map(|(draw, verdict)| (DrawId(draw), verdict))
+                .map(|(draw, verdict)| (DrawId::new(draw), verdict))
                 .collect()
         })
     }
@@ -1151,6 +1140,7 @@ mod tests {
                     tools: Vec::new(),
                     max_tokens: Some(8),
                     temperature: None,
+                    draw: None,
                 };
                 let reply = match cx.chat(None, &request).await {
                     Ok(reply) => reply,
@@ -1316,6 +1306,7 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            draw: None,
         };
         let err = cx.chat(Some("nope"), &request).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Config);
@@ -1341,6 +1332,7 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            draw: None,
         };
         let err = cx.chat(None, &request).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Unavailable);
@@ -1509,6 +1501,7 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            draw: None,
         }
     }
 

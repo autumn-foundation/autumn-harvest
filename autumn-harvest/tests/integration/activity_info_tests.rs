@@ -53,6 +53,7 @@
 //! against it directly; otherwise a fresh testcontainers Postgres is booted
 //! with the full migration bundle.
 
+use autumn_harvest::schema::harvest_task_queue_ext;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -947,7 +948,7 @@ async fn reported_deadline_agrees_with_the_start_to_close_scanner() {
             .filter(harvest_task_queue::task_type.eq("activity"))
             .select((
                 harvest_task_queue::started_at,
-                harvest_task_queue::start_to_close,
+                harvest_task_queue_ext::start_to_close,
             ))
             .first(&mut conn)
             .await

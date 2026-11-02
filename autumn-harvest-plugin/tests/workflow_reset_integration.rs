@@ -2,6 +2,8 @@
 
 #![allow(clippy::similar_names)]
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
+use autumn_harvest::table_split::SetExt;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -618,9 +620,9 @@ async fn reset_strips_stale_nd_diagnostic_search_attrs_from_fork() {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::nd_blocked_at.eq(Some(Utc::now())),
-            harvest_workflow_executions::nd_block_reason.eq(Some(
+            SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(Some(
                 "non-deterministic replay: activity mismatch".to_string(),
-            )),
+            ))),
             harvest_workflow_executions::nd_block_count.eq(1),
             harvest_workflow_executions::search_attrs.eq(Some(json!({
                 "failure_cause": "non_determinism",
@@ -748,7 +750,7 @@ fn batch_item(body: &Value, exec_id: ExecutionId) -> Value {
 async fn fork_count(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::start_source.eq(Some("reset")))
-        .filter(harvest_workflow_executions::start_source_ref.eq(Some(exec_id.to_string())))
+        .filter(harvest_workflow_executions_ext::start_source_ref.eq(Some(exec_id.to_string())))
         .count()
         .get_result(conn)
         .await

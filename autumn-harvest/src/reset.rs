@@ -2050,7 +2050,6 @@ pub(crate) mod tests {
         crate::models::WorkflowExecution {
             migrated_to_shard: None,
             migrated_at: None,
-            migrated_from_shards: None,
             id: ExecutionId::new().as_uuid(),
             workflow_name: "wf".into(),
             workflow_id: "id".into(),
@@ -2109,9 +2108,7 @@ pub(crate) mod tests {
             triage_note: None,
             quota_key: None,
             migrated_run_terminal_at: None,
-            migrated_run_terminal_state: None,
-            staging_vacated_state: None,
-            staging_vacated_by: None,
+            rebalance: crate::models::RebalanceMarkers::default(),
             tenant: None,
         }
     }

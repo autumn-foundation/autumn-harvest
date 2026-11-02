@@ -77,6 +77,7 @@ fn turn_request() -> ModelTurnRequest {
         prefix: None,
         remember: false,
         stream: false,
+        draw: None,
     }
 }
 
@@ -270,6 +271,7 @@ fn the_engine_registration_builds() {
             "agent_precheck",
             "agent_discover_peers",
             "agent_profile",
+            "agent_profile_overlay",
             "agent_memory_reset",
             "agent_workspace_retain",
             "agent_workspace_reset",
@@ -786,6 +788,7 @@ impl autumn_harvest_agent::Scorer for ReplyScore {
                 tools: Vec::new(),
                 max_tokens: None,
                 temperature: None,
+                draw: None,
             };
             let reply = cx.chat(None, &request).await?;
             let text: String = reply

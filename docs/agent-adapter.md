@@ -102,9 +102,9 @@ let built = HarvestBuilder::new()
 `agent` (section 15). `activities()` returns `agent_model_turn`,
 `agent_tool_call`, `agent_memory_snapshot`, `agent_deliver`,
 `agent_precheck`, `agent_discover_peers`, `agent_profile`,
-`agent_memory_reset`, `agent_workspace_retain`, `agent_workspace_reset`,
-`agent_workspace_floor`, `agent_refine_propose` (section 16) and
-`agent_score` (section 17).
+`agent_profile_overlay` (section 15), `agent_memory_reset`,
+`agent_workspace_retain`, `agent_workspace_reset`, `agent_workspace_floor`,
+`agent_refine_propose` (section 16) and `agent_score` (section 17).
 The test `the_engine_registration_builds` builds this
 exact registration.
 
@@ -734,8 +734,24 @@ let harness = AgentHarness::new(model).response_cache(cache);
 ```
 
 **The key.** The key is a SHA-256 hash of the model id, the output cap, the
-temperature, the tools, the messages, the tenant and its source, and the
-namespace.
+temperature, the tools, the messages, the tenant and its source, the
+namespace and the draw.
+
+**The draw (issue #2440).** `ChatRequest::draw` names one sample of a run.
+Two draws of one request get two keys, so each draw has its own entry. A
+request with no draw keeps the key that it had before draws, so stored
+entries still hit.
+
+`run_draws` runs each draw as a child `agent_loop` run with the run id
+`{root}:s{n}`. Each call records a new UUID as its root, so two batches never
+share a run id. Tools then get one idempotency key per draw. A draw does not
+deliver, and it has no memory, no workspace and no follow-ups. Each draw gets
+the whole token cap of the task, so the caller bounds the total.
+
+A delegated child keeps the draw id and gets its own run id. A durable agent
+segment also ends in `:s{n}`, but its root is an incarnation id. A model may
+pass the draw to its provider as a seed. Then draw 0 of each run has the
+same seed, and the cache shares that answer across runs.
 
 **The model id.** A model names itself through `AgentModel::model_id`. A
 model with no id is never cached. The crate ships no model with an id. The
@@ -767,7 +783,8 @@ history and never reads the cache.
 **Tool idempotency.** A hit repeats the tool-call ids of the stored answer.
 Tools take the run id, the step and the call id as an idempotency key. With
 `RunIdSource::WorkflowId`, two runs can share a run id. On Postgres, such a
-turn skips the cache. On SQLite, start each run from `AgentTask::new`, which
+turn skips the cache. A child run id `{root}:d{n}` or `{root}:s{n}` of such
+a run skips it too. On SQLite, start each run from `AgentTask::new`, which
 uses the execution id.
 
 **Storage.** The answer goes to your `PayloadStore`, inside a codec
@@ -801,7 +818,7 @@ because a custom codec can quote the answer.
 **Limits.**
 
 - A hit repeats one sample. At a high temperature, a second run gets the
-  same answer.
+  same answer. Give each sample its own draw to keep the samples apart.
 - `max_age` limits what the cache serves, not what the store keeps. Change
   `namespace` to make every old entry a miss. The old blobs stay in the store
   until the index drops them.
@@ -814,6 +831,9 @@ because a custom codec can quote the answer.
 - A run that sets `tenant` records it in each model-turn input. An older
   binary rebuilds that input without it, so set `tenant` only after the
   whole fleet runs this release.
+- A draw records `draw` in its task and in each model-turn input. An older
+  binary drops the field. Its draws then share one key, and its run ids
+  change. Call `run_draws` only after the whole fleet runs this release.
 
 ## 12. Evaluate a candidate model or prompt
 
@@ -1040,8 +1060,8 @@ the [module guide](architecture.md).
 **Search attributes.** Each op upserts `agent_kind`, `agent_status`
 (`running`, `waiting_approval`, `idle`, `paused` or `parked`),
 `agent_last_active_at`, `agent_next_wake_at`, `agent_wake_reason`,
-`agent_tenant`, `agent_mesh` and `agent_tokens_used`. Times are epoch
-milliseconds. The `filter` grammar of `GET /workflows` lists by them. The
+`agent_tenant`, `agent_mesh`, `agent_tokens_used` and
+`agent_profile_version`. Times are epoch milliseconds. The `filter` grammar of `GET /workflows` lists by them. The
 index `idx_harvest_we_agent_wake` serves a range on `agent_next_wake_at`,
 so a list of the agents due to wake reads only those agents.
 
@@ -1279,6 +1299,43 @@ the answer of each model turn in two layers:
   See [durable routes](durable-routes.md#live-chunks).
 - The live text is a preview. The `TurnText` and the run result are the
   answer.
+
+### Profile overlays (issue #2372)
+
+An activated overlay changes the next op only, because each op reads it
+through a recorded activity and keeps that read to its end.
+
+```rust,ignore
+let store = Arc::new(SqliteOverlayStore::open(&db, Arc::new(base.clone()))?);
+let harness = base.overlay_store(store);
+```
+
+- The run reads its profile through `agent_profile`. With a store, the
+  result sets `overlay_store`, and each op that runs a segment also calls
+  `agent_profile_overlay` with the run profile. That result holds the
+  run profile with the overlay applied, and its `overlay_version`. Replay
+  reads both results from history.
+- The version must still validate under the current harness profile.
+  Then it applies to the run profile under the run ceilings. The op takes
+  only the fields that an overlay can set. The mandate, the peers and the heartbeat stay those of the
+  run, so a deploy still changes the next run only.
+- With no store, the op schedules no read. With no active version, the
+  read records `overlay_version: None`, and the op runs on the run
+  profile.
+- A version that `overlay::apply` refuses fails the op. `last_error` names
+  the version, and no model call runs. The agent never runs bare in its
+  place. A deploy that removes a model or lowers a bound refuses an old
+  version in this way.
+- A heartbeat sets its own bounds and model for a tick. They take
+  precedence over the overlay, as they do over the profile.
+- `AgentState::profile_version` keeps the version of the last op that read
+  one. Each op upserts it as `agent_profile_version`, for example `"v2"`.
+  `filter=attrs.agent_profile_version = 'v2'` lists the agents whose last op
+  ran on version 2.
+- Install the store on every worker, and only after every worker runs
+  this version. An older worker cannot replay a history that holds an op
+  read. On a worker with no store, the op read fails and retries. See
+  `docs/design/DESIGN-2372.md`.
 
 ### Tool guidance and skills (issue #2373)
 

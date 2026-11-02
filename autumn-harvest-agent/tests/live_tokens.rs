@@ -240,6 +240,7 @@ fn request(stream: bool) -> ModelTurnRequest {
         prefix: None,
         remember: false,
         model: None,
+        draw: None,
     }
 }
 

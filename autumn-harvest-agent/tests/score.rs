@@ -324,6 +324,7 @@ impl Scorer for TwoJudges {
                 tools: Vec::new(),
                 max_tokens: Some(8),
                 temperature: None,
+                draw: None,
             };
             let mut sum = 0.0;
             for model in [None, Some("judge")] {

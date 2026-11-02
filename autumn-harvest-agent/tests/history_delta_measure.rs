@@ -103,6 +103,7 @@ fn agent_loop_history(filler: Filler) -> Vec<WorkflowEvent> {
             mesh: None,
             prefix: None,
             remember: false,
+            draw: None,
         };
         let call = ToolCall {
             id: format!("call-{turn}"),

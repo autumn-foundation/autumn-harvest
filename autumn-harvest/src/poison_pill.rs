@@ -671,7 +671,7 @@ mod scanner {
                 exec_dsl::workflow_id,
                 exec_dsl::workflow_name,
                 exec_dsl::schedule_id,
-                exec_dsl::origin,
+                crate::schema::harvest_workflow_executions_ext::origin,
                 exec_dsl::shard_id,
             ))
             .first(conn)

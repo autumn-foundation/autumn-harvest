@@ -12,6 +12,7 @@ use std::time::Duration;
 use tracing::Instrument;
 
 use crate::agent::AgentProfile;
+use crate::agent::overlay_store::ProfileOverlayStore;
 use crate::bounds::{exceeds_bytes, json_len};
 use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::{AgentError, ErrorKind};
@@ -138,6 +139,7 @@ pub struct AgentHarness {
     proposer_timeout: Duration,
     scorers: BTreeMap<String, Arc<dyn Scorer>>,
     score_timeout: Duration,
+    overlays: Option<Arc<dyn ProfileOverlayStore>>,
 }
 
 impl AgentHarness {
@@ -156,6 +158,7 @@ impl AgentHarness {
             proposer_timeout: DEFAULT_PROPOSER_TIMEOUT,
             scorers: BTreeMap::new(),
             score_timeout: DEFAULT_SCORE_TIMEOUT,
+            overlays: None,
             tools: Vec::new(),
             policy: Arc::new(AllowAll),
             temperature: None,
@@ -260,6 +263,18 @@ impl AgentHarness {
             timeout.min(DEFAULT_PROPOSER_TIMEOUT)
         };
         self
+    }
+
+    /// Read the active overlay of each kind from `store` (issue #2372).
+    #[must_use]
+    pub fn overlay_store(mut self, store: Arc<dyn ProfileOverlayStore>) -> Self {
+        self.overlays = Some(store);
+        self
+    }
+
+    /// The overlay store, if one is installed.
+    pub(crate) fn overlays(&self) -> Option<&Arc<dyn ProfileOverlayStore>> {
+        self.overlays.as_ref()
     }
 
     /// The overlay proposer, if one is installed.
@@ -828,6 +843,7 @@ impl AgentHarness {
             tools,
             max_tokens: request.max_output_tokens,
             temperature: self.temperature,
+            draw: request.draw,
         };
         // The key holds the model id, so one model never reads the answer
         // of another.

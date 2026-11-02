@@ -116,6 +116,10 @@ name = "fan_out"
 required-features = ["sqlite"]
 
 [[test]]
+name = "draws"
+required-features = ["sqlite"]
+
+[[test]]
 name = "transcript_delta"
 required-features = ["sqlite", "eval"]
 
@@ -141,6 +145,14 @@ required-features = ["sqlite"]
 
 [[test]]
 name = "overlay_store_postgres"
+required-features = ["postgres"]
+
+[[test]]
+name = "overlay_read"
+required-features = ["sqlite"]
+
+[[test]]
+name = "overlay_read_postgres"
 required-features = ["postgres"]
 
 [[test]]

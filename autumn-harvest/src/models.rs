@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use uuid::Uuid;
 
+use crate::schema::harvest_workflow_executions_unmapped as unmapped;
 use crate::schema::{
     harvest_admission_gates, harvest_api_tokens, harvest_audit_export_cursor, harvest_audit_log,
     harvest_backfill_log, harvest_batch_jobs, harvest_build_compat, harvest_build_policies,
@@ -20,6 +21,9 @@ use crate::schema::{
     harvest_schedule_decisions, harvest_schedules, harvest_sessions, harvest_signals,
     harvest_stream_chunks, harvest_task_queue, harvest_timers, harvest_wasm_modules,
     harvest_workers, harvest_workflow_executions, harvest_workflow_logs,
+};
+use crate::schema::{
+    harvest_schedules_ext, harvest_task_queue_ext, harvest_workflow_executions_ext,
 };
 use crate::shared_json::SharedJson;
 
@@ -75,11 +79,8 @@ pub struct NewHarvestCalendarExclusion<'a> {
 // ── WorkflowExecution ─────────────────────────────────────────────────────────
 
 /// A single workflow execution instance (one row per run).
-#[derive(
-    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Identifiable, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = harvest_workflow_executions)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct WorkflowExecution {
     pub id: Uuid,
     pub workflow_name: String,
@@ -232,41 +233,18 @@ pub struct WorkflowExecution {
     /// Non-NULL exactly when `state = 'MIGRATED'`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migrated_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Every shard that previously hosted this execution (issue #964), oldest
-    /// first, as a JSON array of shard ids. `None` for a run that never moved.
-    /// Together with the shard this row is on, it is the complete set of shards
-    /// still holding a copy of the run's bytes — which is what a cross-residence
-    /// payload erasure traverses, and why it is kept separately from the
-    /// deliberately-collapsed `migrated_to_shard` pointer.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub migrated_from_shards: Option<serde_json::Value>,
     /// Wall-clock a reconciler observed this seal's live copy as terminal
     /// (issue #1317). `None` until observed; non-`None` releases the row
     /// from active-conflict classification without changing `state`, so
     /// retention and erasure keep treating it as a `MIGRATED` seal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migrated_run_terminal_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// The live copy's own terminal state, recorded alongside
-    /// `migrated_run_terminal_at` by the same reconciler pass (fresh
-    /// review, P2 follow-up). `state` on this row stays `MIGRATED`
-    /// forever; a reuse-policy decision that needs to know whether the
-    /// live copy actually finished FAILED/CANCELLED reads this instead.
-    /// See [`Self::effective_terminal_state`].
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub migrated_run_terminal_state: Option<String>,
-    /// The state a shard-rebalance staging vacate sealed over (issue #1317
-    /// review). Non-`None` only while the migration that vacated this row
-    /// is still in flight. An abort restores `state` to this value and
-    /// clears it. A successful cutover just clears it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub staging_vacated_state: Option<String>,
-    /// The execution id of the migration whose staging vacated this row
-    /// (issue #1596 review). Non-`None` exactly when `staging_vacated_state`
-    /// is. Lets `activate_target` finalize this row's marker with a direct
-    /// match on the vacating migration's own execution id, with no
-    /// cross-database write and no retry race.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub staging_vacated_by: Option<Uuid>,
+    /// The shard-rebalance markers (issue #2492).
+    ///
+    /// They sit outside both `table!` declarations of the table. `flatten`
+    /// keeps their JSON keys at the top level, as before.
+    #[serde(flatten)]
+    pub rebalance: RebalanceMarkers,
     /// Verified tenant of the run (issue #1977). `None` means no tenant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
@@ -311,13 +289,69 @@ impl WorkflowExecution {
     #[must_use]
     pub fn effective_terminal_state(&self) -> &str {
         if self.state == "MIGRATED" {
-            self.migrated_run_terminal_state
+            self.rebalance
+                .migrated_run_terminal_state
                 .as_deref()
                 .unwrap_or(&self.state)
         } else {
             &self.state
         }
     }
+}
+
+/// The shard-rebalance columns of `harvest_workflow_executions` (issue #2492).
+///
+/// Both `table!` declarations of the table leave these columns out. Each
+/// field selects through a typed fragment in
+/// [`crate::schema::harvest_workflow_executions_unmapped`].
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    Queryable,
+    Selectable,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[diesel(table_name = harvest_workflow_executions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct RebalanceMarkers {
+    /// Every shard that previously hosted this execution (issue #964), oldest
+    /// first, as a JSON array of shard ids. `None` for a run that never moved.
+    ///
+    /// The array plus the shard of this row is the complete set of shards
+    /// that still hold a copy of the run. A cross-residence payload erasure
+    /// traverses that set. `migrated_to_shard` collapses hops, so it cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[diesel(select_expression = unmapped::migrated_from_shards())]
+    #[diesel(select_expression_type = unmapped::types::MigratedFromShards)]
+    pub migrated_from_shards: Option<serde_json::Value>,
+    /// The terminal state of the live copy (issue #1317).
+    ///
+    /// The reconciler writes it with `migrated_run_terminal_at`. The `state`
+    /// of a seal stays `MIGRATED` forever. A reuse-policy decision reads this
+    /// field instead. See [`WorkflowExecution::effective_terminal_state`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[diesel(select_expression = unmapped::migrated_run_terminal_state())]
+    #[diesel(select_expression_type = unmapped::types::MigratedRunTerminalState)]
+    pub migrated_run_terminal_state: Option<String>,
+    /// The state a shard-rebalance staging vacate sealed over (issue #1317).
+    ///
+    /// It is `Some` only while the migration that vacated this row is in
+    /// flight. An abort restores `state` to this value and clears it. A
+    /// successful cutover clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[diesel(select_expression = unmapped::staging_vacated_state())]
+    #[diesel(select_expression_type = unmapped::types::StagingVacatedState)]
+    pub staging_vacated_state: Option<String>,
+    /// The execution id of the migration whose staging vacated this row
+    /// (issue #1596). It is `Some` exactly when `staging_vacated_state` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[diesel(select_expression = unmapped::staging_vacated_by())]
+    #[diesel(select_expression_type = unmapped::types::StagingVacatedBy)]
+    pub staging_vacated_by: Option<Uuid>,
 }
 
 /// Serialize a nullable `start_source` column, reporting a `None` (pre-upgrade /
@@ -335,8 +369,7 @@ where
 }
 
 /// Insert struct for creating a new workflow execution.
-#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
-#[diesel(table_name = harvest_workflow_executions)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct NewWorkflowExecution<'a> {
     pub id: Uuid,
     pub workflow_name: &'a str,
@@ -413,6 +446,123 @@ pub struct NewWorkflowExecution<'a> {
     pub tenant: Option<&'a str>,
 }
 
+crate::split_queryable!(
+    WorkflowExecution,
+    core harvest_workflow_executions {
+        id: Uuid,
+        workflow_name: String,
+        workflow_id: String,
+        shard_id: i32,
+        state: String,
+        input: serde_json::Value,
+        output: Option<serde_json::Value>,
+        error: Option<String>,
+        parent_id: Option<Uuid>,
+        sticky_worker_id: Option<String>,
+        queue_name: String,
+        started_at: DateTime<Utc>,
+        completed_at: Option<DateTime<Utc>>,
+        execution_timeout: Option<chrono::Duration>,
+        deadline_at: Option<DateTime<Utc>>,
+        search_attrs: Option<serde_json::Value>,
+        created_at: DateTime<Utc>,
+        parent_close_policy: Option<String>,
+        owner: Option<String>,
+        severity: Option<String>,
+        paused_at: Option<DateTime<Utc>>,
+        pause_reason: Option<String>,
+        pause_actor: Option<String>,
+        sla: Option<chrono::Duration>,
+        schedule_id: Option<Uuid>,
+        retry_of_exec_id: Option<Uuid>,
+        nd_blocked_at: Option<DateTime<Utc>>,
+        nd_block_count: i32,
+        legal_hold_until: Option<DateTime<Utc>>,
+        start_source: Option<String>,
+        migrated_run_terminal_at: Option<chrono::DateTime<chrono::Utc>>,
+        tenant: Option<String>,
+    },
+    ext harvest_workflow_executions_ext {
+        run_id: Uuid,
+        chain_execution_timeout: Option<chrono::Duration>,
+        chain_deadline_at: Option<DateTime<Utc>>,
+        memo: Option<serde_json::Value>,
+        assigned_build_id: Option<String>,
+        runbook_url: Option<String>,
+        current_details: Option<String>,
+        context_headers: Option<serde_json::Value>,
+        sla_deadline_at: Option<DateTime<Utc>>,
+        sla_breached: bool,
+        sla_breached_at: Option<DateTime<Utc>>,
+        scheduled_for: Option<DateTime<Utc>>,
+        workflow_attempt: i32,
+        workflow_retry_policy: Option<serde_json::Value>,
+        origin: Option<String>,
+        nd_block_reason: Option<String>,
+        completion_callbacks: Option<serde_json::Value>,
+        continued_from_exec_id: Option<Uuid>,
+        first_exec_id: Option<Uuid>,
+        legal_hold_set_at: Option<DateTime<Utc>>,
+        legal_hold_reason: Option<String>,
+        legal_hold_actor: Option<String>,
+        start_source_ref: Option<String>,
+        started_by: Option<String>,
+        history_bloat_warned_at: Option<chrono::DateTime<chrono::Utc>>,
+        triage_note: Option<String>,
+        quota_key: Option<String>,
+        migrated_to_shard: Option<i32>,
+        migrated_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    embed {
+        rebalance: RebalanceMarkers,
+    }
+);
+
+crate::split_insertable!(
+    mod new_workflow_execution_insert,
+    NewWorkflowExecution<'a>,
+    core harvest_workflow_executions {
+        id: Uuid,
+        workflow_name: &'a str,
+        workflow_id: &'a str,
+        shard_id: i32,
+        input: SharedJson,
+        parent_id: Option<Uuid>,
+        queue_name: &'a str,
+        execution_timeout: Option<chrono::Duration>,
+        deadline_at: Option<DateTime<Utc>>,
+        search_attrs: Option<serde_json::Value>,
+        parent_close_policy: Option<String>,
+        owner: Option<&'a str>,
+        severity: Option<&'a str>,
+        sla: Option<chrono::Duration>,
+        schedule_id: Option<Uuid>,
+        retry_of_exec_id: Option<Uuid>,
+        start_source: Option<&'a str>,
+        tenant: Option<&'a str>,
+    },
+    ext harvest_workflow_executions_ext {
+        run_id: Uuid,
+        chain_execution_timeout: Option<chrono::Duration>,
+        chain_deadline_at: Option<DateTime<Utc>>,
+        memo: Option<serde_json::Value>,
+        assigned_build_id: Option<String>,
+        runbook_url: Option<&'a str>,
+        context_headers: Option<serde_json::Value>,
+        sla_deadline_at: Option<DateTime<Utc>>,
+        scheduled_for: Option<DateTime<Utc>>,
+        workflow_attempt: i32,
+        workflow_retry_policy: Option<serde_json::Value>,
+        origin: Option<&'a str>,
+        completion_callbacks: Option<serde_json::Value>,
+        continued_from_exec_id: Option<Uuid>,
+        first_exec_id: Option<Uuid>,
+        start_source_ref: Option<&'a str>,
+        started_by: Option<&'a str>,
+        quota_key: Option<&'a str>,
+    },
+);
+
 // ── HarvestEvent ──────────────────────────────────────────────────────────────
 
 /// A single event in the workflow execution history (append-only).
@@ -474,18 +624,8 @@ pub struct NewHarvestPayloadRef {
 // ── TaskQueueItem ─────────────────────────────────────────────────────────────
 
 /// A pending or in-progress task in the work queue.
-#[derive(
-    Debug,
-    Clone,
-    Queryable,
-    QueryableByName,
-    Selectable,
-    Identifiable,
-    serde::Serialize,
-    serde::Deserialize,
-)]
+#[derive(Debug, Clone, QueryableByName, Identifiable, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = harvest_task_queue)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct TaskQueueItem {
     pub id: Uuid,
     pub queue_name: String,
@@ -504,23 +644,31 @@ pub struct TaskQueueItem {
     pub completed_at: Option<DateTime<Utc>>,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
     pub heartbeat_details: Option<serde_json::Value>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
     pub heartbeat_timeout: Option<chrono::Duration>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
     pub start_to_close: Option<chrono::Duration>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
     pub schedule_to_start: Option<chrono::Duration>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
     pub retry_policy: Option<serde_json::Value>,
     pub output: Option<serde_json::Value>,
     pub error: Option<String>,
     pub sticky_worker_id: Option<String>,
     pub sticky_until: Option<DateTime<Utc>>,
     pub sticky_timeout: Option<chrono::Duration>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
     pub trace_context: Option<serde_json::Value>,
     /// Cluster-wide concurrency group key. NULL = no cap enforced.
     pub concurrency_key: Option<String>,
     /// Maximum concurrent RUNNING tasks allowed for this `concurrency_key`.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Int4>)]
     pub concurrency_cap: Option<i32>,
     /// Build ID required to claim this task (issue #171). NULL = any worker.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     pub required_build_id: Option<String>,
     /// Optional rate limit key to throttle execution throughput.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     pub rate_limit_key: Option<String>,
     /// Consecutive worker crashes attributed to this task (issue #367).
     ///
@@ -533,6 +681,7 @@ pub struct TaskQueueItem {
     /// retry. NULL = no total deadline (unbounded retries).
     pub schedule_to_close_at: Option<DateTime<Utc>>,
     /// Structured capability requirements JSONB payload (issue #382).
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
     pub required_capabilities: Option<serde_json::Value>,
     /// Ambient context headers propagated from the parent workflow (issue #481).
     #[serde(skip)]
@@ -547,6 +696,7 @@ pub struct TaskQueueItem {
     /// Durable "please wake this task" flag (dropped-wake fix, issue #601 CI
     /// hardening). See `wake_workflow_task`/`park_workflow_task` in `queue.rs`.
     #[serde(default)]
+    #[diesel(sql_type = diesel::sql_types::Bool)]
     pub wake_requested: bool,
     /// Worker session this activity belongs to (issue #606). `None` for an
     /// ordinary activity dispatch.
@@ -603,6 +753,7 @@ pub struct TaskQueueItem {
     /// the counts already `0` a stale key is inert, since a match increments
     /// `0 -> 1` and a mismatch resets to `1` — the same row either way.
     #[serde(default)]
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     pub capability_miss_handler: Option<String>,
     /// The `fires_at` of the durable timer this row is armed for (issue
     /// #1402). Set only by `queue::reschedule_task`. Survives a later
@@ -621,24 +772,27 @@ pub struct TaskQueueItem {
     /// worker that held a claim takes its own entry out of here. `NULL`
     /// until a claim times out.
     #[serde(default)]
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Array<diesel::sql_types::Nullable<diesel::sql_types::Text>>>)]
     pub timed_out_claims: Option<Vec<Option<String>>>,
     /// When the handler of `handler_started_attempt` started (issue #1809).
     /// A timeout enforcer measures the attempt duration from it.
     #[serde(default)]
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
     pub handler_started_at: Option<DateTime<Utc>>,
     /// `true` on the first workflow task of a freshly admitted run (issue
     /// #1824). See [`crate::queue::CLAIM_ORDER_DUE_SQL`].
     #[serde(default)]
+    #[diesel(sql_type = diesel::sql_types::Bool)]
     pub new_start: bool,
     /// The fairness key of the task (issue #1976). `None` is the default
     /// key. See [`crate::queue_fairness::FairClock`].
     #[serde(default)]
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     pub fairness_key: Option<String>,
 }
 
 /// Insert struct for enqueuing a new task.
-#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
-#[diesel(table_name = harvest_task_queue)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct NewTaskQueueItem<'a> {
     pub id: Uuid,
     pub queue_name: &'a str,
@@ -684,6 +838,100 @@ pub struct NewTaskQueueItem<'a> {
     /// an activity, or when the writer does not know the workflow id.
     pub decision_partition: Option<i16>,
 }
+
+crate::split_queryable!(
+    TaskQueueItem,
+    core harvest_task_queue {
+        id: Uuid,
+        queue_name: String,
+        task_type: String,
+        workflow_exec_id: Option<Uuid>,
+        activity_name: Option<String>,
+        activity_id: Option<Uuid>,
+        input: serde_json::Value,
+        state: String,
+        priority: i32,
+        worker_id: Option<String>,
+        attempt: i32,
+        max_attempts: i32,
+        scheduled_at: DateTime<Utc>,
+        started_at: Option<DateTime<Utc>>,
+        completed_at: Option<DateTime<Utc>>,
+        last_heartbeat_at: Option<DateTime<Utc>>,
+        heartbeat_details: Option<serde_json::Value>,
+        output: Option<serde_json::Value>,
+        error: Option<String>,
+        sticky_worker_id: Option<String>,
+        sticky_until: Option<DateTime<Utc>>,
+        sticky_timeout: Option<chrono::Duration>,
+        concurrency_key: Option<String>,
+        crash_strikes: i32,
+        schedule_to_close_at: Option<DateTime<Utc>>,
+        context_headers: Option<serde_json::Value>,
+        created_at: Option<DateTime<Utc>>,
+        session_id: Option<Uuid>,
+        capability_misses: i32,
+        capability_miss_workers: Vec<String>,
+        timer_fires_at: Option<DateTime<Utc>>,
+        handler_started_attempt: Option<i32>,
+    },
+    ext harvest_task_queue_ext {
+        heartbeat_timeout: Option<chrono::Duration>,
+        start_to_close: Option<chrono::Duration>,
+        schedule_to_start: Option<chrono::Duration>,
+        retry_policy: Option<serde_json::Value>,
+        trace_context: Option<serde_json::Value>,
+        concurrency_cap: Option<i32>,
+        required_build_id: Option<String>,
+        rate_limit_key: Option<String>,
+        required_capabilities: Option<serde_json::Value>,
+        wake_requested: bool,
+        capability_miss_handler: Option<String>,
+        timed_out_claims: Option<Vec<Option<String>>>,
+        handler_started_at: Option<DateTime<Utc>>,
+        new_start: bool,
+        fairness_key: Option<String>,
+    }
+);
+
+crate::split_insertable!(
+    mod new_task_queue_item_insert,
+    NewTaskQueueItem<'a>,
+    core harvest_task_queue {
+        id: Uuid,
+        queue_name: &'a str,
+        task_type: &'a str,
+        workflow_exec_id: Option<Uuid>,
+        activity_name: Option<&'a str>,
+        activity_id: Option<Uuid>,
+        input: SharedJson,
+        priority: i32,
+        max_attempts: i32,
+        scheduled_at: DateTime<Utc>,
+        heartbeat_details: Option<serde_json::Value>,
+        sticky_worker_id: Option<&'a str>,
+        sticky_until: Option<DateTime<Utc>>,
+        sticky_timeout: Option<chrono::Duration>,
+        concurrency_key: Option<&'a str>,
+        schedule_to_close_at: Option<DateTime<Utc>>,
+        context_headers: Option<serde_json::Value>,
+        session_id: Option<Uuid>,
+    },
+    ext harvest_task_queue_ext {
+        heartbeat_timeout: Option<chrono::Duration>,
+        start_to_close: Option<chrono::Duration>,
+        schedule_to_start: Option<chrono::Duration>,
+        retry_policy: Option<serde_json::Value>,
+        trace_context: Option<serde_json::Value>,
+        concurrency_cap: Option<i32>,
+        required_build_id: Option<&'a str>,
+        rate_limit_key: Option<&'a str>,
+        required_capabilities: Option<serde_json::Value>,
+        new_start: bool,
+        fairness_key: Option<&'a str>,
+        decision_partition: Option<i16>,
+    },
+);
 
 /// Database representation of a rate limit bucket.
 #[derive(
@@ -744,11 +992,8 @@ pub struct NewRateLimitBucket<'a> {
 // ── Schedule ──────────────────────────────────────────────────────────────────
 
 /// A DAG or workflow schedule configuration.
-#[derive(
-    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Identifiable, serde::Serialize, serde::Deserialize)]
 #[diesel(table_name = harvest_schedules)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct HarvestSchedule {
     pub id: Uuid,
     /// Set for DAG schedules, NULL for workflow-only schedules.
@@ -823,8 +1068,7 @@ pub struct HarvestSchedule {
 }
 
 /// Insert struct for registering a new schedule (DAG or workflow).
-#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
-#[diesel(table_name = harvest_schedules)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct NewHarvestSchedule<'a> {
     pub id: Uuid,
     /// Set for DAG schedules, None for workflow-only schedules.
@@ -852,6 +1096,77 @@ pub struct NewHarvestSchedule<'a> {
     /// What to do when the fire date is calendar-excluded (issue #337).
     pub skip_policy: &'a str,
 }
+
+crate::split_queryable!(
+    HarvestSchedule,
+    core harvest_schedules {
+        id: Uuid,
+        dag_name: Option<String>,
+        schedule_expr: Option<String>,
+        timezone: String,
+        catchup: bool,
+        max_active_runs: i32,
+        is_paused: bool,
+        next_run_at: Option<DateTime<Utc>>,
+        created_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+        workflow_name: Option<String>,
+        queue_name: Option<String>,
+        paused_at: Option<DateTime<Utc>>,
+        paused_by: Option<String>,
+        pause_reason: Option<String>,
+        jitter_secs: i64,
+        overlap_policy: String,
+        buffered_runs: serde_json::Value,
+        buffer_all_max: i32,
+        calendar_name: Option<String>,
+        skip_policy: String,
+        fire_claim_token: Option<Uuid>,
+        fire_claimed_until: Option<DateTime<Utc>>,
+        consecutive_failure_limit: Option<i32>,
+        consecutive_failure_count: i32,
+        auto_paused_at: Option<DateTime<Utc>>,
+        end_at: Option<DateTime<Utc>>,
+        max_runs: Option<i32>,
+        runs_started: i32,
+        exhausted_at: Option<DateTime<Utc>>,
+        exhausted_reason: Option<String>,
+        last_catchup_dropped: i32,
+    },
+    ext harvest_schedules_ext {
+        last_run_at: Option<DateTime<Utc>>,
+        workflow_input: Option<serde_json::Value>,
+        catchup_policy: Option<String>,
+        catchup_window_secs: Option<i64>,
+        last_catchup_at: Option<DateTime<Utc>>,
+        retry_policy: Option<serde_json::Value>,
+    }
+);
+
+crate::split_insertable!(
+    mod new_harvest_schedule_insert,
+    NewHarvestSchedule<'a>,
+    core harvest_schedules {
+        id: Uuid,
+        dag_name: Option<&'a str>,
+        schedule_expr: Option<&'a str>,
+        timezone: &'a str,
+        catchup: bool,
+        max_active_runs: i32,
+        is_paused: bool,
+        workflow_name: Option<&'a str>,
+        queue_name: Option<&'a str>,
+        jitter_secs: i64,
+        overlap_policy: &'a str,
+        buffered_runs: serde_json::Value,
+        buffer_all_max: i32,
+        calendar_name: Option<&'a str>,
+        skip_policy: &'a str,
+    },
+    ext harvest_schedules_ext {
+        workflow_input: Option<serde_json::Value>,
+    },
+);
 
 // ── Signal ────────────────────────────────────────────────────────────────────
 
@@ -2042,11 +2357,8 @@ mod effective_terminal_state_tests {
             quota_key: None,
             migrated_to_shard: None,
             migrated_at: None,
-            migrated_from_shards: None,
             migrated_run_terminal_at: None,
-            migrated_run_terminal_state: None,
-            staging_vacated_state: None,
-            staging_vacated_by: None,
+            rebalance: super::RebalanceMarkers::default(),
             tenant: None,
         }
     }
@@ -2069,7 +2381,7 @@ mod effective_terminal_state_tests {
     fn a_reconciled_seal_reads_the_live_copy_s_recorded_outcome() {
         let mut row = stub("MIGRATED");
         row.migrated_run_terminal_at = Some(chrono::Utc::now());
-        row.migrated_run_terminal_state = Some("FAILED".to_string());
+        row.rebalance.migrated_run_terminal_state = Some("FAILED".to_string());
         assert_eq!(
             row.effective_terminal_state(),
             "FAILED",
@@ -2081,8 +2393,36 @@ mod effective_terminal_state_tests {
     fn a_reconciled_seal_with_a_successful_outcome_still_reads_as_that_outcome() {
         let mut row = stub("MIGRATED");
         row.migrated_run_terminal_at = Some(chrono::Utc::now());
-        row.migrated_run_terminal_state = Some("COMPLETED".to_string());
+        row.rebalance.migrated_run_terminal_state = Some("COMPLETED".to_string());
         assert_eq!(row.effective_terminal_state(), "COMPLETED");
+    }
+
+    /// The embedded markers keep their JSON keys at the top level (issue #2492).
+    #[test]
+    fn the_rebalance_markers_serialize_flat_and_round_trip() {
+        let mut row = stub("MIGRATED");
+        let vacated_by = uuid::Uuid::new_v4();
+        row.rebalance = super::RebalanceMarkers {
+            migrated_from_shards: Some(serde_json::json!([2, 7])),
+            migrated_run_terminal_state: Some("FAILED".to_string()),
+            staging_vacated_state: Some("COMPLETED".to_string()),
+            staging_vacated_by: Some(vacated_by),
+        };
+        let json = serde_json::to_value(&row).expect("serialize the row");
+        assert!(json.get("rebalance").is_none(), "the group must not nest");
+        assert_eq!(json["migrated_from_shards"], serde_json::json!([2, 7]));
+        assert_eq!(json["migrated_run_terminal_state"], "FAILED");
+        assert_eq!(json["staging_vacated_state"], "COMPLETED");
+        assert_eq!(json["staging_vacated_by"], vacated_by.to_string());
+
+        let back: super::WorkflowExecution =
+            serde_json::from_value(json).expect("deserialize the row");
+        assert_eq!(back.rebalance, row.rebalance);
+
+        let empty = serde_json::to_value(stub("RUNNING")).expect("serialize");
+        for key in crate::schema::harvest_workflow_executions_unmapped::COLUMNS {
+            assert!(empty.get(key).is_none(), "`{key}` is skipped when None");
+        }
     }
 
     #[test]

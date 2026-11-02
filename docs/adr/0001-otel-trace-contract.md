@@ -269,6 +269,7 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 | `METRIC_QUEUE_DISPATCHED`  | `harvest.queue.dispatched`    | Counter      | `queue` (bounded)                             | `execution.id` — per-queue dispatch split for weighted-drain verification (issue #515) |
 | `METRIC_TASK_CAPABILITY_MISS` | `harvest.task.capability_miss` | Counter | `queue` (bounded), `task_type` (2 values: workflow/activity), `outcome` (3 values: released/escalated/escalated_never_offered) | `execution.id`, workflow/activity name |
 | `METRIC_QUEUE_PAUSED`      | `harvest.queue.paused`        | Gauge        | `queue` (bounded)                             | 1 = operator hold in effect (issue #619) |
+| `METRIC_COST_HOLD`         | `harvest.cost.hold`           | Gauge        | none                                          | 1 = a cost signal holds deferrable activity types (autumn#1720) |
 | `METRIC_SCHEDULE_RUNS`     | `harvest.schedule.runs`       | Counter      | `kind` (2 values), `name` (bounded)           |                       |
 | `METRIC_SCHEDULE_SKIPPED`  | `harvest.schedule.skipped`    | Counter      | `kind`, `name`, `reason` (3 values)           |                       |
 | `METRIC_SCHEDULE_OVERDUE`  | `harvest.schedule.overdue`    | Gauge        | `kind` (2 values), `name` (bounded)           | `execution.id`        |

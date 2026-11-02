@@ -10,6 +10,8 @@
 //! the [`HandlerRegistry`], and spawns a task. The actual execution semantics
 //! (replay, retries, heartbeats) live in the executor and context modules.
 
+use crate::schema::harvest_workflow_executions_ext;
+use crate::table_split::SetExt;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -629,6 +631,9 @@ pub struct HandlerRegistry {
     /// Per-activity-type adaptive concurrency limits (issue #1836). Off by
     /// default.
     adaptive_limits: Arc<crate::adaptive_limit::AdaptiveLimitRegistry>,
+    /// Holds the deferrable activity types while a cost signal is high
+    /// (autumn#1720). `None` holds nothing.
+    cost_hold: Option<crate::cost_hold::CostHold>,
     /// The owner tenures of this worker, one per decision partition (issue
     /// #2251). Empty until the acquisition loop of issue #2252 fills it. A
     /// decision of a held partition fences its commit with the tenure.
@@ -814,6 +819,9 @@ impl HandlerRegistry {
     /// instrumentation inherits whatever the application configured. Callers
     /// that do not care about telemetry should prefer [`Self::with_state`],
     /// which installs safe no-op defaults.
+    // too_many_lines: the struct literal sets every registry field, one per
+    // line. Splitting it would hide a missed field from the compiler.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn with_state_and_telemetry(
         workflows: Vec<WorkflowInfo>,
@@ -913,6 +921,7 @@ impl HandlerRegistry {
             )),
             retry_budgets,
             adaptive_limits,
+            cost_hold: None,
             decision_owner: Arc::default(),
             owner_disk_cache_dir: None,
             owner_disk_cache_min_events: crate::builder::DEFAULT_OWNER_DISK_CACHE_MIN_EVENTS,
@@ -1569,6 +1578,24 @@ impl HandlerRegistry {
         self
     }
 
+    /// Hold the deferrable activity types while a cost signal is high
+    /// (autumn#1720).
+    ///
+    /// Mirrors [`crate::builder::WorkerConfig::with_cost_hold`]. `None`
+    /// holds nothing. The hold reports its changes to this registry's
+    /// metrics recorder.
+    #[must_use]
+    pub fn with_cost_hold(mut self, hold: Option<crate::cost_hold::CostHold>) -> Self {
+        self.cost_hold = hold.map(|hold| hold.with_metrics(Arc::clone(&self.telemetry.metrics)));
+        self
+    }
+
+    /// The cost hold of this registry, if one is set (autumn#1720).
+    #[must_use]
+    pub const fn cost_hold(&self) -> Option<&crate::cost_hold::CostHold> {
+        self.cost_hold.as_ref()
+    }
+
     /// Set the directory of the owner-local disk cache, and the fewest
     /// events that a run needs before the cache keeps it (issue #2258).
     #[must_use]
@@ -1916,6 +1943,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("circuit_breakers", &self.circuit_breakers)
             .field("retry_budgets", &self.retry_budgets)
             .field("adaptive_limits", &self.adaptive_limits)
+            .field("cost_hold", &self.cost_hold)
             .field("decision_owner", &self.decision_owner)
             .field(
                 "max_workflow_attempts_ceiling",
@@ -6727,7 +6755,7 @@ async fn update_workflow_execution_completed(
         // bypass the pause-guarded persist transaction (and its clear hook)
         // must not leave a stale block marker on a closed run.
         dsl::nd_blocked_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-        dsl::nd_block_reason.eq(None::<String>),
+        SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
         dsl::nd_block_count.eq(0),
     ))
     .execute(conn)
@@ -9378,7 +9406,7 @@ async fn update_workflow_execution_failed(
         // history-cap/dispatch-error terminal) closes the run — a stale block
         // marker must not survive on a terminal row.
         dsl::nd_blocked_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-        dsl::nd_block_reason.eq(None::<String>),
+        SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
         dsl::nd_block_count.eq(0),
     ))
     .execute(conn)
@@ -9594,7 +9622,7 @@ async fn block_workflow_for_non_determinism(
         )
         .set((
             exec_dsl::nd_blocked_at.eq(Some(chrono::Utc::now())),
-            exec_dsl::nd_block_reason.eq(Some(error_owned.clone())),
+            SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(Some(error_owned.clone()))),
             exec_dsl::nd_block_count.eq(exec_dsl::nd_block_count + 1),
         ))
         .execute(conn)
@@ -9675,7 +9703,7 @@ async fn clear_nd_block(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> H
     diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
         .set((
             dsl::nd_blocked_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-            dsl::nd_block_reason.eq(None::<String>),
+            SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
             dsl::nd_block_count.eq(0),
         ))
         .execute(conn)
@@ -17195,7 +17223,7 @@ fn timed_out_from_row(
 }
 
 /// Whether a claim's exclusion list marked `activity_name` as saturated
-/// (issue #1836).
+/// (issue #1836), or as held by a cost signal (autumn#1720).
 ///
 /// The by-id claim keeps this answer. The limiter state can change between
 /// the claim and the decision about its reference.
@@ -17306,16 +17334,19 @@ fn ineligible_activities(
 /// These are the names with unmet requirements, plus the types at their
 /// adaptive limit. A saturated type carries
 /// [`queue::SATURATED_ACTIVITY_MARKER`], so the claim skips it even on a row
-/// with capability requirements. The common case has no saturated type and
-/// allocates nothing.
-fn claim_exclusions(
-    ineligible: &[String],
+/// with capability requirements. `held` holds the types that a cost signal
+/// holds (autumn#1720). They carry the marker already. The common case has
+/// no saturated type and no held type, and allocates nothing.
+fn claim_exclusions<'a>(
+    ineligible: &'a [String],
+    held: &[String],
     saturated: Vec<String>,
-) -> std::borrow::Cow<'_, [String]> {
-    if saturated.is_empty() {
+) -> std::borrow::Cow<'a, [String]> {
+    if saturated.is_empty() && held.is_empty() {
         return std::borrow::Cow::Borrowed(ineligible);
     }
     let mut names = ineligible.to_vec();
+    names.extend_from_slice(held);
     names.extend(
         saturated
             .into_iter()
@@ -17638,7 +17669,7 @@ mod adaptive_limit_gate_tests {
     #[test]
     fn claim_exclusions_borrow_when_no_type_is_saturated() {
         let ineligible = vec!["gpu_job".to_owned()];
-        let out = claim_exclusions(&ineligible, Vec::new());
+        let out = claim_exclusions(&ineligible, &[], Vec::new());
         assert!(matches!(out, Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), ineligible.as_slice());
     }
@@ -17648,10 +17679,34 @@ mod adaptive_limit_gate_tests {
     #[test]
     fn claim_exclusions_add_the_saturated_types_with_the_marker() {
         let ineligible = vec!["gpu_job".to_owned()];
-        let out = claim_exclusions(&ineligible, vec!["charge_card".to_owned()]);
+        let out = claim_exclusions(&ineligible, &[], vec!["charge_card".to_owned()]);
         assert_eq!(
             out.as_ref(),
             ["gpu_job".to_owned(), "\u{1}charge_card".to_owned()].as_slice()
+        );
+    }
+
+    /// A type that a cost signal holds is skipped like a saturated one
+    /// (autumn#1720). Its name already carries the marker.
+    #[test]
+    fn claim_exclusions_add_the_cost_held_types() {
+        let ineligible = vec!["gpu_job".to_owned()];
+        let held = ["\u{1}train_model".to_owned()];
+        let out = claim_exclusions(&ineligible, &held, Vec::new());
+        assert!(matches!(out, Cow::Owned(_)));
+        assert_eq!(
+            out.as_ref(),
+            ["gpu_job".to_owned(), "\u{1}train_model".to_owned()].as_slice()
+        );
+        let out = claim_exclusions(&ineligible, &held, vec!["charge_card".to_owned()]);
+        assert_eq!(
+            out.as_ref(),
+            [
+                "gpu_job".to_owned(),
+                "\u{1}train_model".to_owned(),
+                "\u{1}charge_card".to_owned()
+            ]
+            .as_slice()
         );
     }
 }
@@ -39939,16 +39994,11 @@ impl Worker {
                 // The claim's own exclusions tell whether saturation caused
                 // the miss. The slot may have freed since, so a type that is
                 // no longer saturated retries after the shortest delay.
+                // A cost hold marks its types the same way (autumn#1720).
                 let saturated_delay = probe
                     .as_ref()
                     .and_then(|p| p.activity_name.as_deref())
-                    .filter(|name| excluded_as_saturated(&exclusions, name))
-                    .map(|name| {
-                        self.registry
-                            .adaptive_limits
-                            .saturated_delay(name)
-                            .unwrap_or(crate::adaptive_limit::MIN_LIMIT_DEFER)
-                    });
+                    .and_then(|name| self.excluded_delay(&exclusions, name));
                 let outcome = reference_outcome(
                     probe.as_ref(),
                     lease.redeliveries,
@@ -41258,17 +41308,49 @@ impl Worker {
     /// requirements, plus the types at their adaptive limit (issue #1836).
     fn claim_exclusions(&self) -> std::borrow::Cow<'_, [String]> {
         let limits = &self.registry.adaptive_limits;
+        // A cost hold reads its signal once per claim (autumn#1720).
+        let held = self
+            .registry
+            .cost_hold()
+            .map_or(&[][..], crate::cost_hold::CostHold::exclusions);
         // The common case reads one atomic and takes no lock.
-        if !limits.any_saturated() {
-            return std::borrow::Cow::Borrowed(&self.ineligible_activities);
-        }
-        let exclusions = claim_exclusions(&self.ineligible_activities, limits.saturated());
-        if matches!(exclusions, std::borrow::Cow::Owned(_))
-            && !self.limit_refused.swap(true, Ordering::Relaxed)
-        {
+        let saturated = if limits.any_saturated() {
+            limits.saturated()
+        } else {
+            Vec::new()
+        };
+        // Only a saturated type arms the capacity wake. A freed slot ends a
+        // saturation. It does not end a cost window.
+        let limit_refused = !saturated.is_empty();
+        let exclusions = claim_exclusions(&self.ineligible_activities, held, saturated);
+        if limit_refused && !self.limit_refused.swap(true, Ordering::Relaxed) {
             self.refusal_recorded.notify_waiters();
         }
         exclusions
+    }
+
+    /// The delay before a dispatch reference that the claim skipped returns
+    /// (issues #1836, autumn#1720).
+    ///
+    /// `None` when the claim's exclusions did not mark `activity_name`. A
+    /// type that a cost signal holds waits the hold's recheck time. A
+    /// saturated type waits its limit delay. A type that is both waits the
+    /// longer one.
+    fn excluded_delay(&self, exclusions: &[String], activity_name: &str) -> Option<Duration> {
+        if !excluded_as_saturated(exclusions, activity_name) {
+            return None;
+        }
+        let saturated = self.registry.adaptive_limits.saturated_delay(activity_name);
+        let held = self
+            .registry
+            .cost_hold()
+            .filter(|hold| hold.is_deferrable(activity_name) && hold.last_state() == Some(true))
+            .map(crate::cost_hold::CostHold::recheck);
+        Some(match (saturated, held) {
+            (Some(a), Some(b)) => a.max(b),
+            (Some(delay), None) | (None, Some(delay)) => delay,
+            (None, None) => crate::adaptive_limit::MIN_LIMIT_DEFER,
+        })
     }
 
     /// Run the single-pool leader loop and its followers until shutdown.
@@ -43497,7 +43579,7 @@ async fn quarantine_workflow_task_timeout_outcome(
                     exec_dsl::parent_close_policy,
                     exec_dsl::workflow_id,
                     exec_dsl::schedule_id,
-                    exec_dsl::origin,
+                    harvest_workflow_executions_ext::origin,
                     exec_dsl::shard_id,
                     exec_dsl::workflow_name,
                     exec_dsl::queue_name,
@@ -46910,6 +46992,7 @@ mod tests {
             scanner: crate::scanner_lease::ScannerConfig::default(),
             retry_budget: crate::retry_budget::RetryBudgetConfig::default(),
             adaptive_limit: crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
+            cost_hold: None,
             #[cfg(feature = "db")]
             sharded_pool: None,
             fairness_keys: false,
@@ -55868,7 +55951,6 @@ mod tests {
         WorkflowExecution {
             migrated_to_shard: None,
             migrated_at: None,
-            migrated_from_shards: None,
             id: uuid::Uuid::new_v4(),
             workflow_name: "trial_subscription".to_string(),
             workflow_id: "sub-42".to_string(),
@@ -55927,9 +56009,7 @@ mod tests {
             quota_key: None,
             created_at: chrono::Utc::now(),
             migrated_run_terminal_at: None,
-            migrated_run_terminal_state: None,
-            staging_vacated_state: None,
-            staging_vacated_by: None,
+            rebalance: crate::models::RebalanceMarkers::default(),
             tenant: None,
         }
     }

@@ -19,6 +19,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use autumn_harvest::schema::harvest_workflow_executions_ext;
 use std::sync::Arc;
 
 use autumn_harvest::models::NewHarvestEvent;
@@ -2061,7 +2062,7 @@ async fn engine_written_column_envelopes_decode_on_operator_reads() {
             .select((
                 harvest_workflow_executions::input,
                 harvest_workflow_executions::output,
-                harvest_workflow_executions::memo,
+                harvest_workflow_executions_ext::memo,
             ))
             .first(&mut conn)
             .await

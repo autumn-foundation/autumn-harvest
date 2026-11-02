@@ -83,7 +83,7 @@ a rule.
 ```rust
 pub struct FiniteF64(f64);                   // no NaN, no infinity, no -0.0
 pub enum Verdict { Score(FiniteF64), Reject(String) }
-pub struct DrawId(pub u32);
+// `DrawId` is `draw::DrawId` of issue #2440.
 pub trait Scorer: Send + Sync + Debug {
     fn id(&self) -> &str;
     fn score<'a>(&'a self, input: &'a ScoreInput, cx: &'a ScoreContext<'_>)

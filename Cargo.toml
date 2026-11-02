@@ -53,7 +53,10 @@ futures = "0.3"
 rand = "0.8"
 
 # Database
-diesel = { version = "2.3", features = ["postgres_backend", "uuid", "chrono", "serde_json", "128-column-tables"] }
+# The default 32-column tier only: every `table!` fits it (issue #2492).
+# `table_split` bridges a wide table over two declarations. Its insert bridge
+# needs the trait that the long feature below exposes.
+diesel = { version = "2.3", features = ["postgres_backend", "uuid", "chrono", "serde_json", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 diesel-async = { version = "0.9", features = ["deadpool", "postgres"] }
 diesel_migrations = "2"
 deadpool = { version = "0.13", features = ["rt_tokio_1"] }
