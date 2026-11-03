@@ -400,9 +400,11 @@ async fn health_live() -> Json<Value> {
 /// `GET /health/ready`. The replica is ready once the driver runs and the
 /// Harvest file answers a read. The body keeps the Postgres fields.
 async fn health_ready(State(state): State<ApiState>) -> Response {
-    let handle = state.handle.get();
+    // A tenant route reads the tenant's own file. The control file does not
+    // decide whether a tenant is ready.
+    let handle = state.handle().ok();
     // The Postgres probe gives its database check one second.
-    let reachable = match handle {
+    let reachable = match &handle {
         Some(handle) => Some(matches!(
             tokio::time::timeout(READY_BUDGET, handle.ping()).await,
             Ok(Ok(()))

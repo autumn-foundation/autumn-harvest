@@ -493,3 +493,32 @@ async fn a_slot_fleet_runs_one_harvest_per_slot() {
     assert!(harvest_file(&fx.fleet, "acme").exists());
     fx.fleet.close_all().await;
 }
+
+/// A tenant readiness probe reads the tenant's Harvest file, not the
+/// control file (issue #2489).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_ready_probe_reads_the_tenant_file() {
+    let fx = boot("dev");
+    provision(&fx.fleet, &["acme"]).await;
+    start(&fx.client, "acme", true).await;
+
+    // Take the control file away. Only the control probe sees it.
+    let control = fx.dir.path().join("control.harvest.db");
+    let moved = fx.dir.path().join("control.harvest.moved");
+    std::fs::rename(&control, &moved).unwrap();
+    let ready = fx.client.get("/harvest/health/ready").send().await;
+    ready.assert_status(503);
+    let ready: Value = ready.json();
+    assert_eq!(ready["reasons"], json!(["database_unreachable"]));
+    let tenant = fx
+        .client
+        .get("/harvest/tenants/acme/health/ready")
+        .send()
+        .await;
+    tenant.assert_ok();
+    let tenant: Value = tenant.json();
+    assert_eq!(tenant["database_reachable"], true);
+
+    std::fs::rename(&moved, &control).unwrap();
+    fx.fleet.close_all().await;
+}
