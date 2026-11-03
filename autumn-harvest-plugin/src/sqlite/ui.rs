@@ -20,7 +20,7 @@ use autumn_harvest::ExecutionId;
 use autumn_harvest_sqlite::{ExecutionFilter, ExecutionSummary, HistoryFilter, ListCursor};
 use autumn_web::reexports::axum;
 use axum::Router;
-use axum::extract::{OriginalUri, Path, RawQuery, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
@@ -47,15 +47,12 @@ pub(super) fn routes() -> Router<ApiState> {
         .route("/ui/workflows/{id}", get(detail))
 }
 
-/// `GET ui` goes to the run list.
-async fn index(OriginalUri(uri): OriginalUri) -> Redirect {
-    // A relative target keeps the mount path. It resolves against the last
-    // segment, so `ui` and `ui/` need different targets.
-    if uri.path().ends_with('/') {
-        Redirect::to("workflows")
-    } else {
-        Redirect::to("ui/workflows")
-    }
+/// `GET ui` goes to the run list, with the Postgres `Location`.
+///
+/// The target is `workflows` for both `ui` and `ui/`, as on Postgres. The
+/// shared OIDC check asserts it on both backends.
+async fn index() -> Redirect {
+    Redirect::to("workflows")
 }
 
 /// The page shell. `up` leads from the page to the `ui` directory.

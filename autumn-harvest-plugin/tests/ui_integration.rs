@@ -6076,6 +6076,135 @@ async fn ui_trigger_now_threads_dag_execution_timeout_sla_and_fleet_ceiling() {
     );
 }
 
+/// Issue #2406: a UI trigger-now starts a chain, so it takes the chain cap of
+/// the type, the operator override and the fleet chain ceiling.
+#[tokio::test]
+async fn ui_trigger_now_takes_the_chain_cap_override_and_the_ceiling() {
+    let (database_url, _container) = overdue_read_database_url().await;
+    let pool = build_test_pool(&database_url);
+    // A unique name, so a run left over on a shared database is no overlap.
+    let workflow_name: &'static str = Box::leak(
+        format!("ui_trigger_chain_wf_{}", uuid::Uuid::new_v4().simple()).into_boxed_str(),
+    );
+    let registry = Arc::new(
+        HandlerRegistry::new(vec![bare_workflow_info(workflow_name)], vec![])
+            .with_max_workflow_chain_timeout(Some(std::time::Duration::from_hours(2))),
+    );
+    let schedule_id = insert_test_schedule(&database_url, "Workflow", workflow_name, false).await;
+    let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
+    api_state.set_allow_unauthenticated_mutations(true);
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::new(autumn_harvest::scheduler::DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_ui_router(api_state);
+    let url = database_url.clone();
+    let trigger = move |app: axum::Router| {
+        let url = url.clone();
+        async move {
+            let (status, _headers, _body) = post_form(
+                &app,
+                &format!("/schedules/{schedule_id}/trigger-now"),
+                String::new(),
+            )
+            .await;
+            assert!(
+                status.is_redirection(),
+                "UI trigger must redirect; got {status}"
+            );
+            let run = load_latest_workflow_execution_by_name_from_url(&url, workflow_name)
+                .await
+                .expect("triggered execution should exist");
+            // Complete the run, so the next trigger is not an overlap.
+            let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+            diesel::sql_query(
+                "UPDATE harvest_workflow_executions \
+                 SET state = 'COMPLETED', completed_at = NOW() WHERE id = $1",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(run.id)
+            .execute(&mut conn)
+            .await
+            .expect("complete the run");
+            run
+        }
+    };
+
+    // The type declares no chain cap, so the fleet ceiling is the default.
+    let first = trigger(app.clone()).await;
+    assert_eq!(
+        first.chain_execution_timeout,
+        Some(chrono::Duration::hours(2))
+    );
+
+    // An override below the ceiling applies.
+    registry.run_defaults().write_through(
+        workflow_name,
+        autumn_harvest::run_defaults::RunDefaultFields {
+            chain_execution_timeout: Some(std::time::Duration::from_mins(30)),
+            ..autumn_harvest::run_defaults::RunDefaultFields::default()
+        },
+    );
+    let second = trigger(app.clone()).await;
+    assert_eq!(
+        second.chain_execution_timeout,
+        Some(chrono::Duration::seconds(1800))
+    );
+    let chain_deadline_at = second.chain_deadline_at.expect("a chain deadline");
+    let delta = (chain_deadline_at - second.started_at) - chrono::Duration::seconds(1800);
+    assert!(delta.num_milliseconds().abs() < 2000, "delta={delta}");
+
+    // The ceiling caps an override above it.
+    registry.run_defaults().write_through(
+        workflow_name,
+        autumn_harvest::run_defaults::RunDefaultFields {
+            chain_execution_timeout: Some(std::time::Duration::from_hours(10)),
+            ..autumn_harvest::run_defaults::RunDefaultFields::default()
+        },
+    );
+    let third = trigger(app).await;
+    assert_eq!(
+        third.chain_execution_timeout,
+        Some(chrono::Duration::hours(2))
+    );
+}
+
+/// A bare `WorkflowInfo` that declares no durations.
+fn bare_workflow_info(name: &'static str) -> WorkflowInfo {
+    WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
+        mcp: false,
+        name,
+        module: "tests",
+        handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        execution_timeout: None,
+        chain_execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+    }
+}
+
 async fn load_latest_workflow_execution_by_name_from_url(
     database_url: &str,
     workflow_name: &str,

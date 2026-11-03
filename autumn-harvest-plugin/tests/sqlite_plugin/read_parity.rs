@@ -715,10 +715,7 @@ async fn the_awaitables_of_an_unregistered_workflow_read_history_only() {
 async fn vantage_redirects_keep_the_mount_and_the_list_pages() {
     let dir = tempfile::tempdir().unwrap();
     let client = app(dir.path(), "dev");
-    for (path, target) in [
-        ("/harvest/ui", "ui/workflows"),
-        ("/harvest/ui/", "workflows"),
-    ] {
+    for (path, target) in [("/harvest/ui", "workflows"), ("/harvest/ui/", "workflows")] {
         let index = client.get(path).send().await;
         assert!(index.status.is_redirection(), "{path}: {:?}", index.status);
         assert_eq!(index.header("location"), Some(target), "{path}");

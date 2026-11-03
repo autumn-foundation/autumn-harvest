@@ -619,6 +619,18 @@ pub(crate) async fn dispatch_workflow_start_request(
         .as_ref()
         .and_then(|registry| registry.max_workflow_execution_timeout)
         .map(to_chrono);
+    // Issue #2406: an outbox start begins a new chain. It takes the chain cap
+    // of the type, the operator override and the fleet chain ceiling, as the
+    // API start does.
+    let to_chrono_opt = |d: std::time::Duration| chrono::Duration::from_std(d).ok();
+    let chain_execution_timeout = registry_ext
+        .as_ref()
+        .and_then(|registry| registry.chain_execution_timeout(&request.workflow_name))
+        .and_then(to_chrono_opt);
+    let max_workflow_chain_timeout_ceiling = registry_ext
+        .as_ref()
+        .and_then(|registry| registry.max_workflow_chain_timeout)
+        .and_then(to_chrono_opt);
 
     // Issue #1243: `WorkflowStarted.input` is payload-bearing. Fall back to
     // the identity registry only when no `HandlerRegistry` extension is
@@ -640,6 +652,8 @@ pub(crate) async fn dispatch_workflow_start_request(
             sla,
             execution_timeout,
             max_execution_timeout_ceiling,
+            chain_execution_timeout,
+            max_workflow_chain_timeout_ceiling,
             workflow_retry_policy: info_retry_policy,
             max_workflow_attempts_ceiling,
             // Started by the cross-shard outbox dispatcher (issue #740).
