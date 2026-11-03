@@ -381,6 +381,9 @@ pub struct AutoAdoptRequest<'a> {
     pub cap: Option<u32>,
     /// The time of the move. Its UTC day is the day of the cap.
     pub at: DateTime<Utc>,
+    /// The policy revision that the gate read. The transaction compares
+    /// it, so a policy change after the gate refuses the move.
+    pub policy_revision: Option<u64>,
 }
 
 /// The outcome of an auto adoption. Only `Adopted` changes the store.
@@ -400,6 +403,12 @@ pub enum AutoAdoptRaw {
     },
     /// The version counter of the kind is full.
     Full,
+    /// The policy changed after the gate read it. The caller runs the gate
+    /// again.
+    PolicyMoved {
+        /// The policy revision at the time of the refusal.
+        actual: Option<u64>,
+    },
 }
 
 #[cfg(feature = "db")]
@@ -869,6 +878,26 @@ mod pg {
     /// another writer committed a row.
     const POLICY_TRIES: usize = 8;
 
+    /// The transaction lock of the refine policy of a kind. Its key space
+    /// is a 64-bit hash with a prefix of its own, as the fairness weights
+    /// lock does.
+    const POLICY_LOCK_SQL: &str =
+        "SELECT pg_advisory_xact_lock(hashtextextended('harvest_agent_refine_policy:' || $1, 0))";
+
+    /// Take the transaction lock of the refine policy of `kind`.
+    ///
+    /// A policy write and an auto adoption of one kind take it first. So a
+    /// policy change never commits between the gate check of an adoption
+    /// and its move.
+    async fn lock_policy(conn: &mut AsyncPgConnection, kind: &str) -> HarvestResult<()> {
+        diesel::sql_query(POLICY_LOCK_SQL)
+            .bind::<Text, _>(kind)
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
     /// Append one row to the refine policy log of `kind`.
     ///
     /// A write with a compare that does not match, or that loses a race,
@@ -896,16 +925,24 @@ mod pg {
             }
         };
         for _ in 0..POLICY_TRIES {
-            let result: Result<Vec<Policy>, diesel::result::Error> =
-                diesel::sql_query(APPEND_POLICY_SQL)
-                    .bind::<Text, _>(kind)
-                    .bind::<Nullable<Binary>, _>(write.body)
-                    .bind::<Text, _>(write.actor_kind)
-                    .bind::<Text, _>(write.actor)
-                    .bind::<Bool, _>(compare)
-                    .bind::<Nullable<BigInt>, _>(expected)
-                    .load(conn)
-                    .await;
+            let result: Result<Vec<Policy>, diesel::result::Error> = Box::pin(
+                diesel_async::AsyncConnection::transaction(conn, async |conn| {
+                    diesel::sql_query(POLICY_LOCK_SQL)
+                        .bind::<Text, _>(kind)
+                        .execute(conn)
+                        .await?;
+                    diesel::sql_query(APPEND_POLICY_SQL)
+                        .bind::<Text, _>(kind)
+                        .bind::<Nullable<Binary>, _>(write.body)
+                        .bind::<Text, _>(write.actor_kind)
+                        .bind::<Text, _>(write.actor)
+                        .bind::<Bool, _>(compare)
+                        .bind::<Nullable<BigInt>, _>(expected)
+                        .load(conn)
+                        .await
+                }),
+            )
+            .await;
             match result {
                 Ok(rows) => {
                     if let Some(row) = rows.into_iter().next() {
@@ -962,7 +999,10 @@ mod pg {
     /// Put `request.body` as the next version of `kind`, and make it active,
     /// in one transaction (issue #2394).
     ///
-    /// The put takes the lock of the head row. Under it, the transaction
+    /// The transaction first takes the policy lock of the kind, and checks
+    /// that the policy revision is the one that the gate read. A changed
+    /// policy returns [`AutoAdoptRaw::PolicyMoved`]. Then the put takes the
+    /// lock of the head row. Under it, the transaction
     /// checks the pointer and counts the auto moves of the UTC day of
     /// `request.at`. [`decide_auto_move`] decides. A refusal rolls the put
     /// back, so nothing changes. The move logs `request.at` as its time, so
@@ -982,6 +1022,13 @@ mod pg {
             return Ok(AutoAdoptRaw::Conflict { actual: None });
         };
         let outcome = Box::pin(conn.transaction(async |conn| {
+            lock_policy(conn, kind).await?;
+            let revision = last_policy(conn, kind).await?.map(|row| row.seq);
+            if revision != request.policy_revision {
+                return Err(Stop::Refused(AutoAdoptRaw::PolicyMoved {
+                    actual: revision,
+                }));
+            }
             let rows: Vec<Row> = diesel::sql_query(append_overlay_sql())
                 .bind::<Text, _>(kind)
                 .bind::<Binary, _>(request.body)

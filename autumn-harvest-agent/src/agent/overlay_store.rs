@@ -855,6 +855,7 @@ fn auto_adopted(cap: DailyCap, raw: AutoAdoptRaw) -> Result<AutoAdoptOutcome, Ov
                 .transpose()?,
         }),
         AutoAdoptRaw::Full => Err(OverlayStoreError::Full),
+        AutoAdoptRaw::PolicyMoved { actual } => Err(OverlayStoreError::PolicyConflict { actual }),
     }
 }
 
@@ -882,7 +883,53 @@ enum AutoGate {
         bytes: Vec<u8>,
         /// The stricter daily cap of the two policies.
         cap: DailyCap,
+        /// The policy revision that the gate read. The transaction checks
+        /// it.
+        revision: Option<u64>,
     },
+}
+
+/// The most times an auto adoption runs its gate. Each new run means that
+/// an operator changed the policy during the last one.
+const AUTO_GATE_TRIES: usize = 4;
+
+/// Run the gate of an auto adoption, then `commit` its move.
+///
+/// `commit` gets the encoded overlay, the cap and the policy revision that
+/// the gate read. A policy change after the gate refuses the move with
+/// [`AutoAdoptRaw::PolicyMoved`]. The gate then runs again on the new
+/// policy. So a policy change that commits first always binds the move.
+async fn auto_adopt_gated<S, F, Fut>(
+    store: &S,
+    validator: &dyn OverlayValidator,
+    kind: &str,
+    overlay: &ProfileOverlay,
+    expected: Option<OverlayVersion>,
+    run_policy: &RefinePolicy,
+    mut commit: F,
+) -> Result<AutoAdoptOutcome, OverlayStoreError>
+where
+    S: ProfileOverlayStore + ?Sized,
+    F: FnMut(Vec<u8>, DailyCap, Option<u64>) -> Fut,
+    Fut: Future<Output = Result<AutoAdoptRaw, OverlayStoreError>>,
+{
+    let mut actual = None;
+    for _ in 0..AUTO_GATE_TRIES {
+        let (bytes, cap, revision) =
+            match auto_gate(store, validator, kind, overlay, expected, run_policy).await? {
+                AutoGate::Done(outcome) => return Ok(outcome),
+                AutoGate::Go {
+                    bytes,
+                    cap,
+                    revision,
+                } => (bytes, cap, revision),
+            };
+        match commit(bytes, cap, revision).await? {
+            AutoAdoptRaw::PolicyMoved { actual: moved } => actual = moved,
+            raw => return auto_adopted(cap, raw),
+        }
+    }
+    Err(OverlayStoreError::PolicyConflict { actual })
 }
 
 /// The gate of an auto adoption through `store`.
@@ -900,7 +947,8 @@ async fn auto_gate<S: ProfileOverlayStore + ?Sized>(
     expected: Option<OverlayVersion>,
     run_policy: &RefinePolicy,
 ) -> Result<AutoGate, OverlayStoreError> {
-    let current = store.policy(kind).await?.policy;
+    let state = store.policy(kind).await?;
+    let (current, revision) = (state.policy, state.revision);
     let base = match expected {
         Some(version) => store
             .get(kind, version)
@@ -929,6 +977,7 @@ async fn auto_gate<S: ProfileOverlayStore + ?Sized>(
                     .auto_adopt
                     .max_per_day
                     .stricter(current.auto_adopt.max_per_day),
+                revision,
             },
         },
     )
@@ -1282,25 +1331,27 @@ impl ProfileOverlayStore for InMemoryOverlayStore {
         run_policy: &'a RefinePolicy,
     ) -> BoxFuture<'a, Result<AutoAdoptOutcome, OverlayStoreError>> {
         Box::pin(async move {
-            let gate = auto_gate(
+            let provenance = Provenance::auto(run);
+            auto_adopt_gated(
                 self,
                 &*self.validator,
                 kind,
                 overlay,
                 expected_active,
                 run_policy,
+                |bytes, cap, revision| {
+                    let raw = self.auto_adopt_now(
+                        kind,
+                        bytes,
+                        &provenance,
+                        expected_active,
+                        cap,
+                        revision,
+                    );
+                    std::future::ready(raw)
+                },
             )
-            .await?;
-            let (bytes, cap) = match gate {
-                AutoGate::Done(outcome) => return Ok(outcome),
-                AutoGate::Go { bytes, cap } => (bytes, cap),
-            };
-            let provenance = Provenance::auto(run);
-            let at = (self.clock)();
-            auto_adopted(
-                cap,
-                self.auto_adopt_now(kind, bytes, &provenance, expected_active, cap, at)?,
-            )
+            .await
         })
     }
 }
@@ -1374,10 +1425,15 @@ impl InMemoryOverlayStore {
         provenance: &Provenance,
         expected: Option<OverlayVersion>,
         cap: DailyCap,
-        at: DateTime<Utc>,
+        policy_revision: Option<u64>,
     ) -> Result<AutoAdoptRaw, OverlayStoreError> {
+        let at = (self.clock)();
         let mut kinds = self.lock();
         let log = kinds.entry(kind.to_owned()).or_default();
+        let revision = log.policies.last().map(PolicyLogEntry::revision);
+        if revision != policy_revision {
+            return Ok(AutoAdoptRaw::PolicyMoved { actual: revision });
+        }
         let (start, end) = utc_day(at);
         let used = log
             .moves
@@ -1682,28 +1738,27 @@ impl ProfileOverlayStore for SqliteOverlayStore {
         run_policy: &'a RefinePolicy,
     ) -> BoxFuture<'a, Result<AutoAdoptOutcome, OverlayStoreError>> {
         Box::pin(async move {
-            let gate = auto_gate(
+            let actor = Provenance::auto(run).author();
+            auto_adopt_gated(
                 self,
                 &*self.validator,
                 kind,
                 overlay,
                 expected_active,
                 run_policy,
+                |bytes, cap, revision| {
+                    let request = AutoAdoptRequest {
+                        body: &bytes,
+                        expected: expected_active.map(OverlayVersion::get),
+                        actor: &actor,
+                        cap: cap.limit(),
+                        at: (self.clock)(),
+                        policy_revision: revision,
+                    };
+                    std::future::ready(self.log.auto_adopt(kind, &request).map_err(backend))
+                },
             )
-            .await?;
-            let (bytes, cap) = match gate {
-                AutoGate::Done(outcome) => return Ok(outcome),
-                AutoGate::Go { bytes, cap } => (bytes, cap),
-            };
-            let actor = Provenance::auto(run).author();
-            let request = AutoAdoptRequest {
-                body: &bytes,
-                expected: expected_active.map(OverlayVersion::get),
-                actor: &actor,
-                cap: cap.limit(),
-                at: (self.clock)(),
-            };
-            auto_adopted(cap, self.log.auto_adopt(kind, &request).map_err(backend)?)
+            .await
         })
     }
 }
@@ -1977,32 +2032,31 @@ impl ProfileOverlayStore for PostgresOverlayStore {
         run_policy: &'a RefinePolicy,
     ) -> BoxFuture<'a, Result<AutoAdoptOutcome, OverlayStoreError>> {
         Box::pin(async move {
-            let gate = auto_gate(
+            let actor = Provenance::auto(run).author();
+            let actor = actor.as_str();
+            auto_adopt_gated(
                 self,
                 &*self.validator,
                 kind,
                 overlay,
                 expected_active,
                 run_policy,
+                |bytes, cap, revision| async move {
+                    let request = AutoAdoptRequest {
+                        body: &bytes,
+                        expected: expected_active.map(OverlayVersion::get),
+                        actor,
+                        cap: cap.limit(),
+                        at: (self.clock)(),
+                        policy_revision: revision,
+                    };
+                    let mut conn = self.conn().await?;
+                    autumn_harvest::overlay_log::auto_adopt_overlay(&mut conn, kind, &request)
+                        .await
+                        .map_err(backend)
+                },
             )
-            .await?;
-            let (bytes, cap) = match gate {
-                AutoGate::Done(outcome) => return Ok(outcome),
-                AutoGate::Go { bytes, cap } => (bytes, cap),
-            };
-            let actor = Provenance::auto(run).author();
-            let request = AutoAdoptRequest {
-                body: &bytes,
-                expected: expected_active.map(OverlayVersion::get),
-                actor: &actor,
-                cap: cap.limit(),
-                at: (self.clock)(),
-            };
-            let mut conn = self.conn().await?;
-            let raw = autumn_harvest::overlay_log::auto_adopt_overlay(&mut conn, kind, &request)
-                .await
-                .map_err(backend)?;
-            auto_adopted(cap, raw)
+            .await
         })
     }
 }

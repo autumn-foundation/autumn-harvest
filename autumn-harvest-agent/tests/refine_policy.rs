@@ -324,6 +324,66 @@ async fn a_retry_never_undoes_a_rollback() {
     assert_eq!(store.list(KIND).await.expect("list").len(), 2);
 }
 
+/// A validator that resets the policy of the kind once, from a second
+/// connection. It runs after the gate reads the policy and before the
+/// adoption commits, so it models a reset that lands in that window.
+struct ResetDuringGate {
+    db: std::path::PathBuf,
+    armed: std::sync::atomic::AtomicBool,
+    inner: AgentHarness,
+}
+
+impl autumn_harvest_agent::OverlayValidator for ResetDuringGate {
+    fn validate(
+        &self,
+        kind: &str,
+        overlay: &ProfileOverlay,
+        policy: &RefinePolicy,
+    ) -> Result<(), autumn_harvest_agent::OverlayStoreError> {
+        use autumn_harvest::overlay_log::{PolicyExpect, PolicyWrite};
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            let log = autumn_harvest_sqlite::SqliteOverlayLog::open(&self.db).expect("open");
+            let write = PolicyWrite {
+                body: None,
+                expected: PolicyExpect::Any,
+                actor_kind: "operator",
+                actor: "oncall",
+            };
+            log.append_policy(kind, &write).expect("reset");
+        }
+        self.inner.validate(kind, overlay, policy)
+    }
+}
+
+/// A policy reset that commits after the gate reads the policy still wins.
+/// The adoption sees the new revision, runs the gate again, and waits.
+#[tokio::test]
+async fn a_reset_during_the_gate_still_wins() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("race.db");
+    let gate = Arc::new(ResetDuringGate {
+        db: db.clone(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+        inner: harness(),
+    });
+    let store = SqliteOverlayStore::open(&db, gate.clone()).expect("store");
+    let allow = operator_sets(
+        &store,
+        json!({"auto_adopt": {"parts": ["system"], "max_per_day": "unlimited"}}),
+    )
+    .await;
+    gate.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let adoption = adopt(&store, KIND, &system("New."), ExecutionId::new(), &allow)
+        .await
+        .expect("adopt");
+    assert_eq!(adoption.refine_status, RefineStatus::AwaitingApproval);
+    assert_eq!(store.active(KIND).await.expect("active"), None);
+    assert!(
+        !store.policy(KIND).await.expect("policy").custom,
+        "the reset holds"
+    );
+}
+
 /// A run keeps the gate that it read, but a narrowing in the store reaches
 /// the adoption at once. The stricter policy decides.
 #[tokio::test]

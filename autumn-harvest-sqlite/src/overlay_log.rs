@@ -476,6 +476,12 @@ fn auto_adopt_in(
     request: &AutoAdoptRequest<'_>,
 ) -> SqliteResult<AutoAdoptRaw> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // The `IMMEDIATE` transaction holds the write lock, so no policy write
+    // commits between this check and the move.
+    let revision = last_policy_in(&tx, kind)?.map(|row| row.seq);
+    if revision != request.policy_revision {
+        return Ok(AutoAdoptRaw::PolicyMoved { actual: revision });
+    }
     let head: Option<(i64, Option<i64>)> = tx
         .query_row(
             "SELECT latest, active FROM harvest_agent_overlay_heads WHERE kind = ?1",

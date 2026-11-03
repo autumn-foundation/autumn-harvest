@@ -606,3 +606,50 @@ async fn postgres_races_pass_the_cap_and_the_revision_once() {
         assert_eq!(pair[1].revision(), pair[0].revision() + 1);
     }
 }
+
+/// Issue #2394: an auto adoption checks the policy revision that its gate
+/// read, under the policy lock. A stale revision moves nothing.
+#[tokio::test]
+async fn postgres_refuses_an_auto_move_over_a_stale_policy() {
+    use autumn_harvest::chrono::Utc;
+    use autumn_harvest::overlay_log::{AutoAdoptRaw, AutoAdoptRequest, auto_adopt_overlay};
+    use autumn_harvest_agent::RefinePolicy;
+
+    let (url, _container) = database().await;
+    let store =
+        PostgresOverlayStore::new(pool(&url), Arc::new(overlay_store_suite::Gate::default()));
+    let kind = unique("stale-policy");
+    store
+        .set_policy(
+            &kind,
+            &RefinePolicy::default(),
+            None,
+            Provenance::operator("ops"),
+        )
+        .await
+        .expect("set");
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let request = |policy_revision| AutoAdoptRequest {
+        body: b"{}",
+        expected: None,
+        actor: "00000000-0000-0000-0000-000000000001",
+        cap: None,
+        at: Utc::now(),
+        policy_revision,
+    };
+    for stale in [None, Some(2)] {
+        let raw = auto_adopt_overlay(&mut conn, &kind, &request(stale))
+            .await
+            .expect("adopt");
+        assert_eq!(
+            raw,
+            AutoAdoptRaw::PolicyMoved { actual: Some(1) },
+            "{stale:?}"
+        );
+    }
+    assert_eq!(store.list(&kind).await.expect("list"), []);
+    let raw = auto_adopt_overlay(&mut conn, &kind, &request(Some(1)))
+        .await
+        .expect("adopt");
+    assert!(matches!(raw, AutoAdoptRaw::Adopted(_)), "{raw:?}");
+}

@@ -86,9 +86,15 @@ The store enforces the gate itself:
    counts the auto moves of the UTC day of the store clock, and moves the
    pointer. `decide_auto_move` decides under the head lock. A full cap
    rolls the transaction back. So two runs at once never pass the cap.
-4. `put`, `activate` and `rollback` refuse an `auto` actor. So each auto
+4. The transaction first checks that the policy revision is the one that
+   the gate read. On Postgres, a policy write and an adoption of one kind
+   take the same advisory lock. On SQLite, the `IMMEDIATE` transaction
+   holds the write lock. A changed policy refuses the move, and the store
+   runs the gate again, at most four times. So a policy change that
+   commits first always binds the adoption.
+5. `put`, `activate` and `rollback` refuse an `auto` actor. So each auto
    move passes the count.
-5. The embedder sets the store clock. No caller of a store method picks
+6. The embedder sets the store clock. No caller of a store method picks
    the day of the cap.
 
 | Result | `refine_status` |
@@ -212,6 +218,7 @@ How can the policy fail its promise? Each attack has a guard.
 | A long audit summary hides a widening. | The gate settings come first. A list shows only what it adds and removes. A cut summary names its revision. |
 | A viewer sets the policy. | The route is `Mutating`. The role layer refuses it with `403`. |
 | Two refine runs pass a cap of 1 at once. | The count runs under the head lock, in the move. |
+| An operator resets the policy between the gate and the move. | The move checks the policy revision under the policy lock, and runs the gate again. |
 | An empty overlay goes live under the defaults. | The kernel returns `Unchanged` first. |
 | A policy sets `max_per_day: 1000000`. | The decode refuses a value above 1000. |
 | A policy sets `approval_timeout: "0s"`. | The decode refuses a value under 1 minute. |
