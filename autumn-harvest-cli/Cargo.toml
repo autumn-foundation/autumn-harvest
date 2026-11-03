@@ -27,7 +27,7 @@ default-run = "harvest"
 # so a managed Postgres that refuses plaintext is reachable. Its rustls crates
 # are the ones `harvest migrate` already uses.
 autumn-harvest = { version = "0.9.0", path = "../autumn-harvest", default-features = false, features = ["db", "testing", "debugger", "tls"] }
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 # `harvest migrate` builds its own Postgres connection so it can offer TLS,
 # which `AsyncPgConnection::establish` (NoTls) cannot -- a managed Harvest
 # database with `sslmode=require` is the common production shape (issue #1240).
@@ -45,8 +45,8 @@ rustls-native-certs = "0.8"
 url = "2"
 crossterm = "0.29.0"
 percent-encoding = "2"
-ratatui = "0.30.0"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ratatui = "0.30.2"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

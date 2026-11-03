@@ -4375,7 +4375,7 @@ async fn a_retention_pass_reclaims_an_expired_cohort_by_dropping_its_partition()
     );
 
     let pool = build_pool(&url);
-    let config = RetentionConfig::with_max_age(Duration::from_secs(86_400));
+    let config = RetentionConfig::with_max_age(Duration::from_hours(24));
     let result = run_one_tick(pool, config, None).await;
     assert_eq!(result.deleted_count, 5, "all five executions collected");
 
@@ -4436,7 +4436,7 @@ async fn reclamation_leaves_no_dead_tuples_behind() {
     let pool = build_pool(&url);
     run_one_tick(
         pool,
-        RetentionConfig::with_max_age(Duration::from_secs(86_400)),
+        RetentionConfig::with_max_age(Duration::from_hours(24)),
         None,
     )
     .await;
@@ -4491,7 +4491,7 @@ async fn a_cohort_with_a_surviving_execution_is_never_dropped() {
     let pool = build_pool(&url);
     run_one_tick(
         pool,
-        RetentionConfig::with_max_age(Duration::from_secs(86_400)),
+        RetentionConfig::with_max_age(Duration::from_hours(24)),
         None,
     )
     .await;
@@ -4535,7 +4535,7 @@ async fn the_archiver_receives_full_history_before_the_partition_is_dropped() {
     let pool = build_pool(&url);
     run_one_tick(
         pool,
-        RetentionConfig::with_max_age(Duration::from_secs(86_400)),
+        RetentionConfig::with_max_age(Duration::from_hours(24)),
         Some(archiver.clone() as Arc<dyn HistoryArchiver>),
     )
     .await;
@@ -4578,7 +4578,7 @@ async fn a_failing_archiver_blocks_both_the_delete_and_the_partition_drop() {
     let pool = build_pool(&url);
     run_one_tick(
         pool,
-        RetentionConfig::with_max_age(Duration::from_secs(86_400)),
+        RetentionConfig::with_max_age(Duration::from_hours(24)),
         Some(archiver as Arc<dyn HistoryArchiver>),
     )
     .await;
@@ -4634,7 +4634,7 @@ async fn a_legal_hold_deterministically_blocks_the_partition_drop() {
     let pool = build_pool(&url);
     run_one_tick(
         pool.clone(),
-        RetentionConfig::with_max_age(Duration::from_secs(86_400)),
+        RetentionConfig::with_max_age(Duration::from_hours(24)),
         None,
     )
     .await;
@@ -4668,7 +4668,7 @@ async fn a_legal_hold_deterministically_blocks_the_partition_drop() {
     .expect("lift hold");
     run_one_tick(
         pool,
-        RetentionConfig::with_max_age(Duration::from_secs(86_400)),
+        RetentionConfig::with_max_age(Duration::from_hours(24)),
         None,
     )
     .await;
@@ -4699,8 +4699,8 @@ async fn a_longer_per_type_override_blocks_the_partition_drop() {
         old,
         partition::DEFAULT_COHORT_WIDTH_SECS,
     ));
-    let config = RetentionConfig::with_max_age(Duration::from_secs(86_400))
-        .with_workflow_override("long_wf", Duration::from_secs(86_400 * 365));
+    let config = RetentionConfig::with_max_age(Duration::from_hours(24))
+        .with_workflow_override("long_wf", Duration::from_hours(8760));
 
     let pool = build_pool(&url);
     run_one_tick(pool, config, None).await;
@@ -4850,7 +4850,7 @@ async fn the_retention_tick_pre_creates_future_partitions_with_no_operator_cron(
     let pool = build_pool(&url);
     run_one_tick(
         pool,
-        RetentionConfig::with_max_age(Duration::from_secs(86_400)),
+        RetentionConfig::with_max_age(Duration::from_hours(24)),
         None,
     )
     .await;
@@ -4964,7 +4964,7 @@ async fn the_startup_pass_runs_partition_maintenance_only_not_the_whole_tick() {
         // before the assertion below. Not this test's own patience, and
         // not `run_now()` — it is not called yet.
         tick_interval_secs: 3600,
-        ..RetentionConfig::with_max_age(Duration::from_secs(86_400))
+        ..RetentionConfig::with_max_age(Duration::from_hours(24))
     };
 
     let started = Utc::now();
@@ -5045,7 +5045,7 @@ async fn partition_maintenance_stays_none_on_a_shard_that_never_converted() {
 
     let pool = build_pool(&url);
     let pools = ShardedDbPool::single(pool);
-    let config = RetentionConfig::with_max_age(Duration::from_secs(86_400));
+    let config = RetentionConfig::with_max_age(Duration::from_hours(24));
     assert!(
         config.partitions.enabled,
         "precondition: partition maintenance must be on so this test actually \
@@ -6574,7 +6574,7 @@ async fn a_cohort_proved_droppable_by_the_exact_scan_is_actually_dropped() {
     // A cap BELOW the survivor count is what forces tier 3. With the stock cap
     // of 1000 the narrow probe would answer, and this test would pass without
     // ever reaching the code path it exists for.
-    let mut config = RetentionConfig::with_max_age(Duration::from_secs(86_400));
+    let mut config = RetentionConfig::with_max_age(Duration::from_hours(24));
     config.partitions.owner_probe_cap = 2;
     assert!(
         config.partitions.owner_probe_cap < 6,

@@ -473,12 +473,12 @@ fn shown(text: &str, refused: fn(char) -> bool) -> std::borrow::Cow<'_, str> {
 /// they copy.
 ///
 /// A log field has the same shape of fault. See [`one_line`].
-fn breaks_one_line(character: char) -> bool {
+const fn breaks_one_line(character: char) -> bool {
     is_obeyed(character) || character == '\n' || character == '\t'
 }
 
 /// Would a terminal act on this character rather than print it?
-fn is_obeyed(character: char) -> bool {
+const fn is_obeyed(character: char) -> bool {
     // The Unicode `Bidi_Control` property, in full: the marks, the embeddings
     // and overrides, and the isolates.
     let bidi = matches!(character,

@@ -34,7 +34,7 @@ use crate::loom_sync::{Arc, Mutex};
 /// mid-session failover the way an ordinary sticky lease would. Generously
 /// long so operator-facing views of `sticky_until` never read as "about to
 /// expire" for a legitimately still-open session.
-pub const SESSION_MEMBER_STICKY_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+pub const SESSION_MEMBER_STICKY_TIMEOUT: Duration = Duration::from_hours(24);
 
 /// Lower/upper bounds for [`acquire_retry_backoff`]'s randomized reschedule
 /// delay after a session-acquire task loses the in-process semaphore race.

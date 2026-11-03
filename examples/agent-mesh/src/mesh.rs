@@ -88,12 +88,12 @@ pub struct MeshConfig {
 ///
 /// The agent default is one hour. Each `tick` moves the desk clock 16
 /// minutes, so four ticks would deny a reply that nobody saw yet.
-pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+pub const APPROVAL_TIMEOUT: Duration = Duration::from_hours(24);
 
 impl Default for MeshConfig {
     fn default() -> Self {
         Self {
-            heartbeat: Duration::from_secs(15 * 60),
+            heartbeat: Duration::from_mins(15),
             daily_tokens: Some(200_000),
             approval_timeout: APPROVAL_TIMEOUT,
         }

@@ -378,7 +378,10 @@ impl SandboxRuntime {
             }
         }
         let mut entropy = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy);
+        rand::Rng::fill_bytes(
+            &mut rand::rand_core::UnwrapErr(rand::rngs::SysRng),
+            &mut entropy,
+        );
         let job = SandboxJob {
             run_id: uuid::Uuid::new_v4().to_string(),
             entropy,

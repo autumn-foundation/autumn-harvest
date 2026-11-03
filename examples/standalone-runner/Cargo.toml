@@ -24,7 +24,10 @@ autumn-harvest-cli = { version = "0.9.0", path = "../../autumn-harvest-cli" }
 diesel = { workspace = true }
 hex = "0.4"
 hmac = "0.13"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+# A workspace build unifies reqwest features, so `rustls-no-provider` can reach
+# this test client. Reqwest then needs a provider.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 sha2 = "0.11"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }

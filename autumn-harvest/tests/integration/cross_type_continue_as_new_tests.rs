@@ -537,7 +537,7 @@ async fn successor_resolves_lifecycle_defaults_from_the_new_type() {
     // The TARGET type declares its own, different defaults.
     let mut target = wf(phase2, phase_two);
     target.execution_timeout = Some(std::time::Duration::from_secs(7_200));
-    target.sla = Some(std::time::Duration::from_secs(1_800));
+    target.sla = Some(std::time::Duration::from_mins(30));
     target.owner = Some("billing-team");
     target.severity = Some("SEV1");
 

@@ -240,7 +240,7 @@ fn dag_macro_execution_timeout_attribute_populates_field() {
     let info = __autumn_dag_info_nightly_deadline_etl();
     assert_eq!(
         info.execution_timeout,
-        Some(Duration::from_secs(4 * 3600)),
+        Some(Duration::from_hours(4)),
         "execution_timeout should be 4 hours"
     );
 }
@@ -250,7 +250,7 @@ fn dag_macro_sla_attribute_populates_field() {
     let info = __autumn_dag_info_nightly_deadline_etl();
     assert_eq!(
         info.sla,
-        Some(Duration::from_secs(3 * 3600)),
+        Some(Duration::from_hours(3)),
         "sla should be 3 hours"
     );
 }
@@ -261,7 +261,7 @@ fn dag_macro_execution_timeout_propagates_to_shadow_workflow_info() {
     let workflow_info = __autumn_workflow_info_nightly_deadline_etl();
     assert_eq!(
         workflow_info.execution_timeout,
-        Some(Duration::from_secs(4 * 3600)),
+        Some(Duration::from_hours(4)),
         "the shadow WorkflowInfo companion must carry the same execution_timeout as the DagInfo"
     );
 }
@@ -272,7 +272,7 @@ fn dag_macro_sla_propagates_to_shadow_workflow_info() {
     let workflow_info = __autumn_workflow_info_nightly_deadline_etl();
     assert_eq!(
         workflow_info.sla,
-        Some(Duration::from_secs(3 * 3600)),
+        Some(Duration::from_hours(3)),
         "the shadow WorkflowInfo companion must carry the same sla as the DagInfo"
     );
 }

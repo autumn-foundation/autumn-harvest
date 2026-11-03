@@ -19,7 +19,7 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 /// The shortest accepted time between two guard passes.
 pub const MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// The longest accepted time between two guard passes.
-pub const MAX_INTERVAL: Duration = Duration::from_secs(60 * 60);
+pub const MAX_INTERVAL: Duration = Duration::from_hours(1);
 /// The default minimum number of runs of each build for a verdict.
 pub const DEFAULT_MIN_SAMPLES: u64 = 20;
 /// The default maximum increase of the failure rate over the base build.
@@ -27,15 +27,15 @@ pub const DEFAULT_MAX_FAILURE_RATE_INCREASE: f64 = 0.05;
 /// The default maximum increase of the ND-block rate over the base build.
 pub const DEFAULT_MAX_ND_BLOCK_RATE_INCREASE: f64 = 0.05;
 /// Default age after which a pass reports an unreported abort.
-pub const DEFAULT_REPORT_GRACE: Duration = Duration::from_secs(10 * 60);
+pub const DEFAULT_REPORT_GRACE: Duration = Duration::from_mins(10);
 /// Maximum report grace.
-pub const MAX_REPORT_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+pub const MAX_REPORT_GRACE: Duration = Duration::from_hours(24);
 /// Minimum age of a reported marker before a pass removes it.
 ///
 /// A ramp fan-out that is still in flight can write the marked `ramp_id` to
 /// a later pool. The marker must still be there to finish that late ramp.
 /// The report grace can be zero, so this floor keeps the fence positive.
-pub const MIN_MARKER_RETENTION: Duration = Duration::from_secs(10 * 60);
+pub const MIN_MARKER_RETENTION: Duration = Duration::from_mins(10);
 
 /// The settings of the ramp guard.
 #[derive(Debug, Clone, Copy, PartialEq)]

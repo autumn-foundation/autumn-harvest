@@ -39,7 +39,7 @@ use diesel::sql_types::{Text, Uuid as SqlUuid};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
 use uuid::Uuid;
@@ -124,7 +124,7 @@ fn spawn_killer(
         let mut conn = AsyncPgConnection::establish(&url).await.expect("killer");
         let mut total = 0;
         while !AtomicBool::load(&stop, Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(rng.gen_range(pause_ms.clone()))).await;
+            tokio::time::sleep(Duration::from_millis(rng.random_range(pause_ms.clone()))).await;
             total += diesel::sql_query(
                 // Count only a `true` result. A session that ends before
                 // the call returns `false`, and no kill landed.
@@ -315,7 +315,7 @@ async fn start_idempotency_history_is_linearizable_under_crashes() {
                         candidate: exec.as_uuid(),
                     },
                 );
-                let budget = Duration::from_millis(rng.gen_range(1..250));
+                let budget = Duration::from_millis(rng.random_range(1..250));
                 let out = tokio::time::timeout(
                     budget,
                     start_or_load_workflow_execution_idempotent(
@@ -504,9 +504,9 @@ async fn schedule_fire_history_is_exactly_once_under_crashes() {
             // until the budget ends, so a tick after a kill can still fire.
             // The tick that the budget cuts off is a crash.
             let budget = if replica == 0 {
-                rng.gen_range(1..20)
+                rng.random_range(1..20)
             } else {
-                rng.gen_range(300..1500)
+                rng.random_range(300..1500)
             };
             let deadline = tokio::time::Instant::now() + Duration::from_millis(budget);
             replicas.push(tokio::spawn(async move {

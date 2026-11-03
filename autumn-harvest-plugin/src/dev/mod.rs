@@ -1222,7 +1222,7 @@ const HEALTH_PROBE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::f
     reason = "only a TLS backend that cannot start fails here, and `Client::new` panics on that too"
 )]
 fn health_probe_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::http::client_builder()
         .timeout(HEALTH_PROBE_TIMEOUT)
         .connect_timeout(HEALTH_PROBE_CONNECT_TIMEOUT)
         .build()
