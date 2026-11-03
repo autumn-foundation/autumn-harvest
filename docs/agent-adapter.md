@@ -1113,7 +1113,7 @@ the [module guide](architecture.md).
 index `idx_harvest_we_agent_wake` serves a range on `agent_next_wake_at`,
 so a list of the agents due to wake reads only those agents.
 
-**Operate.** `harvest agents` composes the generic management routes:
+**Operate.** `harvest agents` composes management routes:
 
 | Command | Route |
 |---|---|
@@ -1122,6 +1122,38 @@ so a list of the agents due to wake reads only those agents.
 | `harvest agents pause <id> --reason <text>` | `POST /workflows/by-id/agent/{id}/signal/harvest.entity.op` |
 | `harvest agents resume <id>` | the same route, with `resume` |
 | `harvest agents erase <id>` | the signal route, then `POST /workflows/{exec}/erase-payloads` for each run |
+| `harvest agents profile list <kind>` | `GET /agents/{kind}/profile/versions` |
+| `harvest agents profile show <kind> [--version v]` | `GET /agents/{kind}/profile`, or `GET /agents/{kind}/profile/versions/{v}` |
+| `harvest agents profile diff <kind> <a> <b>` | `GET /agents/{kind}/profile/diff?a=&b=` |
+| `harvest agents profile activate <kind> <v> [--expected v\|none]` | `POST /agents/{kind}/profile/activate`, after the `list` route when `--expected` is absent |
+| `harvest agents profile rollback <kind>` | `POST /agents/{kind}/profile/rollback` |
+
+**Profile overlays (issue #2374).** The `profile` commands use the routes
+of the overlay store. Install the store with
+`HarvestPlugin::agent_overlay_store`. Without it, each route is `404`. The
+SQLite plugin does not serve these routes yet (#2471).
+
+- `list` shows each version with its provenance and created time. The
+  active version has `active: true`.
+- `show` prints one overlay as JSON. `diff` prints only the parts that
+  differ, each with its path and both values.
+- `activate` is a compare-and-swap on the active version. Without
+  `--expected`, the command reads the active version first. A `409` names
+  the version that is active.
+- `rollback` activates the version that was active before the current
+  one. A second rollback undoes the first one. With no earlier
+  activation, it exits non-zero and changes nothing. A move after its
+  read, also a move away and back, makes it a `409`.
+- `activate` and `rollback` need the `mutate` scope, as the
+  `harvest-operator` role has. See
+  [Custom roles](security-posture.md#custom-roles). A `read` role, or a
+  read-only principal (`docs/operator-role.md`), gets `403`.
+- Each activate and rollback request writes an audit row,
+  `agent_profile.activate` or `agent_profile.rollback`. The row holds the
+  kind, the operator id, and `from vN to vM`. A refused request writes a
+  failed row. The audit export ships each row.
+- The store logs each move with its actor, also a move from code. See
+  [`docs/design/DESIGN-2374.md`](design/DESIGN-2374.md).
 
 **Erase.** `harvest agents erase` erases an agent and prints one report.
 It removes the history payloads, the entity state, the memory, the

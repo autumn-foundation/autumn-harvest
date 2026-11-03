@@ -81,7 +81,7 @@ pub const MAX_TENANT_KEY_LEN: usize = autumn_harvest::tenant::MAX_TENANT_LEN;
 const MAX_AUDITED_PATH_LEN: usize = 256;
 
 /// Longest `error_summary` an audit row records.
-const MAX_AUDITED_SUMMARY_LEN: usize = 512;
+pub(crate) const MAX_AUDITED_SUMMARY_LEN: usize = 512;
 
 /// Longest caller-supplied actor or request id an audit row records.
 ///
@@ -295,7 +295,7 @@ pub(crate) struct DenyAudit<'a> {
 }
 
 /// Cut `s` to at most `max` bytes on a char boundary.
-fn truncate(s: &str, max: usize) -> &str {
+pub(crate) fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }

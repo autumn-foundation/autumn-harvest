@@ -20,6 +20,7 @@ pub mod authz;
 pub mod callback_deliverer;
 pub mod http;
 
+mod agent_profile_api;
 /// Default `reqwest`-based signed-webhook sink for audit-record export.
 ///
 /// Implements [`autumn_harvest::audit_export::AuditSink`], auto-wired by

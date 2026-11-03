@@ -484,6 +484,9 @@ pub struct HarvestApiState {
     /// read model can resolve the probe interval / staleness window. `None`
     /// when the canary is disabled.
     canary_config: Arc<Mutex<Option<crate::canary::CanaryConfig>>>,
+    /// The agent profile overlay store of the `/agents/{kind}/profile`
+    /// routes (issue #2374). `None` makes each of those routes answer `404`.
+    agent_overlay_store: Arc<Mutex<Option<Arc<dyn autumn_harvest_agent::ProfileOverlayStore>>>>,
     /// Refuse `start_harvest_runtime` unless ambient Harvest configuration
     /// resolves to `embedded` mode (issue #1291).
     ///
@@ -553,6 +556,7 @@ impl Default for HarvestApiState {
                 crate::status_summary::StatusThresholds::default(),
             )),
             canary_config: Arc::new(Mutex::new(None)),
+            agent_overlay_store: Arc::new(Mutex::new(None)),
             require_embedded_harvest_mode: Arc::new(Mutex::new(false)),
         }
     }
@@ -749,6 +753,29 @@ impl HarvestApiState {
     #[must_use]
     pub fn canary_config(&self) -> Option<crate::canary::CanaryConfig> {
         self.canary_config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Install the agent profile overlay store of the
+    /// `/agents/{kind}/profile` routes (issue #2374). `None` removes it.
+    pub fn set_agent_overlay_store(
+        &self,
+        store: Option<Arc<dyn autumn_harvest_agent::ProfileOverlayStore>>,
+    ) {
+        *self
+            .agent_overlay_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = store;
+    }
+
+    /// The installed agent profile overlay store, if any (issue #2374).
+    #[must_use]
+    pub fn agent_overlay_store(
+        &self,
+    ) -> Option<Arc<dyn autumn_harvest_agent::ProfileOverlayStore>> {
+        self.agent_overlay_store
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -5298,6 +5325,32 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
                 .patch(crate::run_defaults_api::patch_run_defaults)
                 .route_layer(require_admin.clone()),
         )
+        // Agent profile overlays (issue #2374). Not in `ADMIN_SCOPE_ROUTES`,
+        // so the `mutate` scope reaches the two writes.
+        .route(
+            "/agents/{kind}/profile",
+            get(crate::agent_profile_api::get_active).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/agents/{kind}/profile/versions",
+            get(crate::agent_profile_api::list_versions).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/agents/{kind}/profile/versions/{version}",
+            get(crate::agent_profile_api::get_version).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/agents/{kind}/profile/diff",
+            get(crate::agent_profile_api::diff_versions).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/agents/{kind}/profile/activate",
+            post(crate::agent_profile_api::activate).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/agents/{kind}/profile/rollback",
+            post(crate::agent_profile_api::rollback).route_layer(require_admin.clone()),
+        )
         .route(
             "/admin/retention",
             get(retention_status).route_layer(require_admin.clone()),
@@ -7303,6 +7356,13 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
             "PATCH",
             "/admin/workflow-types/{workflow_name}/run-defaults",
         ),
+        // Agent profile overlays (issue #2374).
+        ("GET", "/agents/{kind}/profile"),
+        ("GET", "/agents/{kind}/profile/versions"),
+        ("GET", "/agents/{kind}/profile/versions/{version}"),
+        ("GET", "/agents/{kind}/profile/diff"),
+        ("POST", "/agents/{kind}/profile/activate"),
+        ("POST", "/agents/{kind}/profile/rollback"),
         ("GET", "/admin/retention"),
         ("POST", "/admin/retention/run-now"),
         ("POST", "/admin/workflows/replay-canary"),
@@ -7632,6 +7692,13 @@ pub const fn management_api_request_fields()
                 "recompute_in_flight",
             ]),
         ),
+        // Agent profile overlays (issue #2374). A rollback takes no field.
+        (
+            "POST",
+            "/agents/{kind}/profile/activate",
+            Some(&["version", "expected_active"]),
+        ),
+        ("POST", "/agents/{kind}/profile/rollback", Some(&[])),
         // ── dead-letter queue ─────────────────────────────────────────────────
         (
             "POST",
@@ -8847,6 +8914,53 @@ pub const fn management_api_response_fields()
             "PATCH",
             "/admin/workflow-types/{workflow_name}/run-defaults",
             Some(&["workflow_name", "code", "override", "effective"]),
+        ),
+        // Agent profile overlays (issue #2374).
+        (
+            "GET",
+            "/agents/{kind}/profile",
+            Some(&[
+                "kind",
+                "version",
+                "active",
+                "provenance",
+                "created_at",
+                "digest",
+                "overlay",
+            ]),
+        ),
+        (
+            "GET",
+            "/agents/{kind}/profile/versions",
+            Some(&["kind", "active", "versions"]),
+        ),
+        (
+            "GET",
+            "/agents/{kind}/profile/versions/{version}",
+            Some(&[
+                "kind",
+                "version",
+                "active",
+                "provenance",
+                "created_at",
+                "digest",
+                "overlay",
+            ]),
+        ),
+        (
+            "GET",
+            "/agents/{kind}/profile/diff",
+            Some(&["kind", "a", "b", "changes"]),
+        ),
+        (
+            "POST",
+            "/agents/{kind}/profile/activate",
+            Some(&["kind", "from", "to", "actor"]),
+        ),
+        (
+            "POST",
+            "/agents/{kind}/profile/rollback",
+            Some(&["kind", "from", "to", "actor"]),
         ),
         ("GET", "/admin/retention", None), // RetentionStatus (external model)
         ("POST", "/admin/retention/run-now", Some(&["ok"])),

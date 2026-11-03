@@ -12,7 +12,8 @@ use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
 use autumn_harvest::overlay_log::{
-    ActivateDecision, ActivateOutcome, OverlayRow, decide_activate, next_overlay_version,
+    ActivateDecision, ActivateOutcome, ActivationRow, MoveRequest, OverlayRow, logs_activation,
+    next_overlay_version,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension as _, Row, TransactionBehavior, params};
@@ -27,6 +28,8 @@ use crate::error::{SqliteError, SqliteResult};
 ///   version, also on a connection with no `foreign_keys` pragma.
 /// - The `DELETE` trigger on the heads keeps each counter, so no version
 ///   number comes back.
+/// - The `UPDATE` and `INSERT` triggers on the activation log refuse each
+///   change of a move (issue #2374).
 ///
 /// `author_kind` has no `CHECK`. `SQLite` cannot widen a `CHECK` in place,
 /// and a later author kind would need one. The typed store checks it on
@@ -70,6 +73,29 @@ CREATE TRIGGER IF NOT EXISTS harvest_agent_overlay_heads_keep_del
     BEFORE DELETE ON harvest_agent_overlay_heads
 BEGIN
     SELECT RAISE(ABORT, 'harvest_agent_overlay_heads keeps its rows (issue #2371)');
+END;
+CREATE TABLE IF NOT EXISTS harvest_agent_overlay_activations (
+    kind            TEXT    NOT NULL CHECK (kind <> ''),
+    seq             INTEGER NOT NULL CHECK (seq >= 1),
+    from_version    INTEGER CHECK (from_version >= 1),
+    to_version      INTEGER NOT NULL CHECK (to_version >= 1),
+    actor_kind      TEXT    NOT NULL,
+    actor           TEXT    NOT NULL CHECK (actor <> ''),
+    activated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (kind, seq),
+    CHECK (from_version IS NOT to_version)
+);
+CREATE TRIGGER IF NOT EXISTS harvest_agent_overlay_activations_immutable_upd
+    BEFORE UPDATE ON harvest_agent_overlay_activations
+BEGIN
+    SELECT RAISE(ABORT, 'harvest_agent_overlay_activations is append-only (issue #2374)');
+END;
+CREATE TRIGGER IF NOT EXISTS harvest_agent_overlay_activations_immutable_ins
+    BEFORE INSERT ON harvest_agent_overlay_activations
+    WHEN EXISTS (SELECT 1 FROM harvest_agent_overlay_activations
+                 WHERE kind = NEW.kind AND seq = NEW.seq)
+BEGIN
+    SELECT RAISE(ABORT, 'harvest_agent_overlay_activations is append-only (issue #2374)');
 END;
 ";
 
@@ -151,25 +177,32 @@ impl SqliteOverlayLog {
         self.with_conn(|conn| append_in(conn, kind, body, author_kind, author))
     }
 
-    /// Move the pointer of `kind` to `version` when it is `expected`.
+    /// Move the pointer of `kind` as `request` asks, and log the move with
+    /// its actor.
     ///
-    /// One `IMMEDIATE` transaction reads the pointer, checks the version and
-    /// sets the pointer. So of two activations with the same `expected`, only
-    /// one moves the pointer.
+    /// One `IMMEDIATE` transaction reads the pointer, checks the version,
+    /// sets the pointer and logs the move. So of two activations with the
+    /// same `expected`, only one moves the pointer. A rollback also needs
+    /// the move that it read to be the last one. An activation of the
+    /// active version logs nothing.
     ///
     /// # Errors
     ///
     /// Returns [`SqliteError::Sqlite`] when a statement fails.
-    pub fn activate(
-        &self,
-        kind: &str,
-        version: u64,
-        expected: Option<u64>,
-    ) -> SqliteResult<ActivateOutcome> {
-        let Ok(stored) = i64::try_from(version) else {
+    pub fn activate(&self, kind: &str, request: &MoveRequest<'_>) -> SqliteResult<ActivateOutcome> {
+        let Ok(stored) = i64::try_from(request.version) else {
             return Ok(ActivateOutcome::UnknownVersion);
         };
-        self.with_conn(|conn| activate_in(conn, kind, stored, expected))
+        self.with_conn(|conn| activate_in(conn, kind, stored, request))
+    }
+
+    /// The last move of the pointer of `kind`, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] when the query fails.
+    pub fn last_activation(&self, kind: &str) -> SqliteResult<Option<ActivationRow>> {
+        self.with_conn(|conn| last_move(conn, kind))
     }
 
     /// The active version of `kind`, or `None`.
@@ -288,12 +321,25 @@ fn append_in(
     }))
 }
 
+/// The last move of `kind` on `conn`, or `None`.
+fn last_move(conn: &Connection, kind: &str) -> SqliteResult<Option<ActivationRow>> {
+    conn.query_row(
+        "SELECT seq, from_version, to_version, actor_kind, actor, activated_at_ms
+         FROM harvest_agent_overlay_activations
+         WHERE kind = ?1 ORDER BY seq DESC LIMIT 1",
+        params![kind],
+        read_move,
+    )
+    .optional()?
+    .transpose()
+}
+
 /// The body of [`SqliteOverlayLog::activate`].
 fn activate_in(
     conn: &mut Connection,
     kind: &str,
     stored: i64,
-    expected: Option<u64>,
+    request: &MoveRequest<'_>,
 ) -> SqliteResult<ActivateOutcome> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let head: Option<(Option<i64>, bool)> = tx
@@ -310,14 +356,35 @@ fn activate_in(
         return Ok(ActivateOutcome::UnknownVersion);
     };
     let actual = active.map(to_version).transpose()?;
-    let outcome = match decide_activate(known, expected, actual) {
+    let last_seq = match request.after_seq {
+        Some(_) => last_move(&tx, kind)?.map(|row| row.seq),
+        None => None,
+    };
+    let outcome = match request.decide(known, actual, last_seq) {
         ActivateDecision::UnknownVersion => ActivateOutcome::UnknownVersion,
         ActivateDecision::Conflict => ActivateOutcome::Conflict { actual },
         ActivateDecision::Activate => {
-            tx.execute(
-                "UPDATE harvest_agent_overlay_heads SET active = ?2 WHERE kind = ?1",
-                params![kind, stored],
-            )?;
+            if logs_activation(actual, request.version) {
+                tx.execute(
+                    "UPDATE harvest_agent_overlay_heads SET active = ?2 WHERE kind = ?1",
+                    params![kind, stored],
+                )?;
+                tx.execute(
+                    "INSERT INTO harvest_agent_overlay_activations
+                         (kind, seq, from_version, to_version, actor_kind, actor,
+                          activated_at_ms)
+                     SELECT ?1, COALESCE(MAX(seq), 0) + 1, ?2, ?3, ?4, ?5, ?6
+                     FROM harvest_agent_overlay_activations WHERE kind = ?1",
+                    params![
+                        kind,
+                        active,
+                        stored,
+                        request.actor_kind,
+                        request.actor,
+                        Utc::now().timestamp_millis()
+                    ],
+                )?;
+            }
             ActivateOutcome::Activated
         }
     };
@@ -340,6 +407,35 @@ fn read_row(row: &Row<'_>) -> rusqlite::Result<SqliteResult<OverlayRow>> {
         author_kind: row.get(2)?,
         author: row.get(3)?,
         created_at,
+    }))
+}
+
+/// One move row. The outer error is a read error. The inner one is a
+/// stored value that does not decode.
+fn read_move(row: &Row<'_>) -> rusqlite::Result<SqliteResult<ActivationRow>> {
+    let seq: i64 = row.get(0)?;
+    let from: Option<i64> = row.get(1)?;
+    let to: i64 = row.get(2)?;
+    let activated_at_ms: i64 = row.get(5)?;
+    let decoded = (|| {
+        Ok((
+            to_version(seq)?,
+            from.map(to_version).transpose()?,
+            to_version(to)?,
+            from_millis(activated_at_ms)?,
+        ))
+    })();
+    let (seq, from, to, activated_at) = match decoded {
+        Ok(decoded) => decoded,
+        Err(err) => return Ok(Err(err)),
+    };
+    Ok(Ok(ActivationRow {
+        seq,
+        from,
+        to,
+        actor_kind: row.get(3)?,
+        actor: row.get(4)?,
+        activated_at,
     }))
 }
 
