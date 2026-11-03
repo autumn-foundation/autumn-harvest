@@ -314,6 +314,17 @@ impl StartOptions {
     }
 }
 
+/// An update that the runtime admitted (issue #2489). See
+/// [`SqliteRuntime::update_admitted`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct AdmittedUpdate {
+    /// The id that `UpdateAdmitted` records.
+    pub update_id: UpdateId,
+    /// The handler output, or its error.
+    pub result: Result<Value, String>,
+}
+
 /// The result of [`SqliteRuntime::send_signal_by_workflow_id`] (issue #2028).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SignalDelivery {
@@ -1506,6 +1517,24 @@ impl SqliteRuntime {
         )
     }
 
+    /// The reason of the pending cancel request of `exec`, if any (issue
+    /// #2489).
+    ///
+    /// A request is pending from [`cancel`](Self::cancel) until the run is
+    /// terminal. A repeat cancel keeps the first reason, so the management
+    /// API reports that reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, or a
+    /// persistence error.
+    pub fn pending_cancel_reason(&self, exec: ExecutionId) -> SqliteResult<Option<String>> {
+        if store::execution_state(&self.conn, exec)? != "RUNNING" {
+            return Ok(None);
+        }
+        Ok(store::cancel_request(&self.conn, exec)?.map(|(reason, _)| reason))
+    }
+
     /// Request a cooperative cancel of `exec` (issue #2021).
     ///
     /// The call stores the request and appends no event. The next drive
@@ -1578,7 +1607,12 @@ impl SqliteRuntime {
     /// cancel or terminate then finds the run sealed, and the state check
     /// reports `WorkflowNotRunning`. A keyed signal retry stays a no-op, as on
     /// any other terminal run. An unknown `exec` reports `ExecutionNotFound`.
-    fn seal_if_overdue(&mut self, exec: ExecutionId) -> SqliteResult<()> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, or a
+    /// persistence error if the seal cannot be written.
+    pub fn seal_if_overdue(&mut self, exec: ExecutionId) -> SqliteResult<()> {
         let now = (self.now_fn)().timestamp_millis();
         self.seal_if_overdue_at(exec, now)
     }
@@ -1739,13 +1773,40 @@ impl SqliteRuntime {
     /// - [`SqliteError::UpdateFailed`] if the handler returns an error or
     ///   panics. History records `WorkflowEvent::UpdateFailed`.
     /// - A persistence error if the history cannot be read or written.
-    #[allow(clippy::too_many_lines)] // one linear admission sequence
     pub async fn update(
         &mut self,
         exec: ExecutionId,
         name: &str,
         input: Value,
     ) -> SqliteResult<Value> {
+        self.update_admitted(exec, name, input)
+            .await?
+            .result
+            .map_err(|error| SqliteError::UpdateFailed {
+                execution_id: exec,
+                name: name.to_string(),
+                error,
+            })
+    }
+
+    /// [`update`](Self::update), and return the id of the admitted update
+    /// (issue #2489).
+    ///
+    /// The management API answers the id, as on Postgres. A handler error is
+    /// [`AdmittedUpdate::result`], not [`SqliteError::UpdateFailed`], because
+    /// history holds the admission.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`update`](Self::update), except
+    /// [`SqliteError::UpdateFailed`].
+    #[allow(clippy::too_many_lines)] // one linear admission sequence
+    pub async fn update_admitted(
+        &mut self,
+        exec: ExecutionId,
+        name: &str,
+        input: Value,
+    ) -> SqliteResult<AdmittedUpdate> {
         self.seal_if_overdue(exec)?;
         refuse_unless_running(&self.conn, exec)?;
         check_depth("update_input", &input)?;
@@ -1850,12 +1911,7 @@ impl SqliteRuntime {
             });
         }
         tx.commit()?;
-
-        result.map_err(|error| SqliteError::UpdateFailed {
-            execution_id: exec,
-            name: name.to_string(),
-            error,
-        })
+        Ok(AdmittedUpdate { update_id, result })
     }
 
     /// The declarative update handlers of `workflow_name`.
@@ -1920,11 +1976,7 @@ impl SqliteRuntime {
     /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns a
     /// persistence error if the history cannot be read.
     pub fn successor(&self, exec: ExecutionId) -> SqliteResult<Option<ExecutionId>> {
-        match store::execution_state(&self.conn, exec)?.as_str() {
-            SEALED_STATE => store::successor_of(&self.conn, exec),
-            "FAILED" => store::retry_of(&self.conn, exec),
-            _ => Ok(None),
-        }
+        store::successor(&self.conn, exec)
     }
 
     /// The full ordered event history — the canonical, replayable log.

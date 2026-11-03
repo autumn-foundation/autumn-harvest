@@ -25,7 +25,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const WF: &str = "run_defaults_db_wf";
-const THREE_HOURS: Option<Duration> = Some(Duration::from_secs(3 * 3600));
+const THREE_HOURS: Option<Duration> = Some(Duration::from_hours(3));
 
 /// Serializes the tests on a shared database.
 ///

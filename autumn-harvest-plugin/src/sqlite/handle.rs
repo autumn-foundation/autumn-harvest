@@ -6,18 +6,24 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use autumn_harvest::info::{SchemaViolation, WorkflowInfo};
-use autumn_harvest::{ExecutionId, WorkflowEvent};
+use autumn_harvest::{ExecutionId, WorkflowEvent, WorkflowResult, WorkflowResultState};
 use autumn_harvest_sqlite::{
-    ExecutionDescription, ExecutionFilter, ExecutionPage, SignalDelivery, SignalWithStartOutcome,
-    SqliteError, SqliteReader, StartOptions, StartOutcome,
+    ExecutionDescription, ExecutionFilter, ExecutionPage, ExecutionSummary, HistoryFilter,
+    HistoryPage, SignalDelivery, SignalWithStartOutcome, SqliteError, SqliteReader, StartOptions,
+    StartOutcome,
 };
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
+use autumn_web::fleet_layout::FleetDbKey;
 use autumn_web::reexports::axum;
+use autumn_web::sharding::ShardLease;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use super::driver::{Command, SignalWithStartParams};
+use super::driver::{
+    Command, KeyedSignal, MAX_CHAIN_HOPS, MAX_RETRY_HOPS, RoutedSignal, RoutedUpdate,
+    SignalWithStartParams, Started, StopAck,
+};
 
 /// Why a [`HarvestSqlite`] call failed.
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +47,12 @@ pub enum HarvestSqliteError {
     /// (issue #610).
     #[error("signal payload validation failed: {}", describe_violations(.0))]
     InvalidSignal(Vec<SchemaViolation>),
+    /// The fleet refused the tenant key or the open (issue #2472).
+    #[error(transparent)]
+    Fleet(#[from] autumn_web::db::fleet::FleetError),
+    /// The tenant's Harvest cannot serve the call (issue #2472).
+    #[error("tenant Harvest: {0}")]
+    Tenant(String),
 }
 
 fn describe_violations(violations: &[SchemaViolation]) -> String {
@@ -80,6 +92,9 @@ fn describe_violations(violations: &[SchemaViolation]) -> String {
 #[derive(Clone)]
 pub struct HarvestSqlite {
     inner: Arc<Inner>,
+    /// A tenant handle that a caller holds keeps its tenant open. The
+    /// fleet's own copy has none (issue #2472).
+    lease: Option<ShardLease>,
 }
 
 struct Inner {
@@ -92,12 +107,15 @@ struct Inner {
     workflows: Vec<String>,
     /// The registered definitions, for their input schemas.
     infos: HashMap<String, WorkflowInfo>,
+    /// The fleet tenant of this Harvest. `None` for the control Harvest.
+    tenant: Option<FleetDbKey>,
 }
 
 impl std::fmt::Debug for HarvestSqlite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HarvestSqlite")
             .field("path", &self.inner.path)
+            .field("tenant", &self.inner.tenant)
             .finish_non_exhaustive()
     }
 }
@@ -123,8 +141,30 @@ impl HarvestSqlite {
                 path,
                 workflows,
                 infos,
+                tenant: None,
             }),
+            lease: None,
         }
+    }
+
+    /// Mark a new handle as the Harvest of fleet tenant `key`.
+    pub(crate) fn for_tenant(mut self, key: FleetDbKey) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.tenant = Some(key);
+        }
+        self
+    }
+
+    /// A copy that keeps its tenant database open while it lives.
+    pub(crate) fn with_lease(mut self, lease: ShardLease) -> Self {
+        self.lease = Some(lease);
+        self
+    }
+
+    /// The fleet tenant of this Harvest, or `None` for the control Harvest.
+    #[must_use]
+    pub fn tenant(&self) -> Option<&FleetDbKey> {
+        self.inner.tenant.as_ref()
     }
 
     /// The Harvest database file.
@@ -156,6 +196,12 @@ impl HarvestSqlite {
     #[must_use]
     pub fn workflow_names(&self) -> &[String] {
         &self.inner.workflows
+    }
+
+    /// The registered workflow definition of `name`, if any.
+    #[must_use]
+    pub fn workflow_info(&self, name: &str) -> Option<&WorkflowInfo> {
+        self.inner.infos.get(name)
     }
 
     async fn call<T>(
@@ -205,11 +251,19 @@ impl HarvestSqlite {
     /// later call returns [`HarvestSqliteError::Stopped`]. The plugin's
     /// shutdown hook does the same, so an app does not need to call this.
     ///
+    /// The fleet owns the driver of a tenant Harvest. Close the tenant
+    /// database to stop it.
+    ///
     /// # Errors
     ///
     /// Returns [`HarvestSqliteError::Stopped`] when the driver had already
-    /// stopped.
+    /// stopped, and [`HarvestSqliteError::Tenant`] for a tenant Harvest.
     pub async fn shutdown(&self) -> Result<(), HarvestSqliteError> {
+        if let Some(key) = &self.inner.tenant {
+            return Err(HarvestSqliteError::Tenant(format!(
+                "the fleet owns the driver of {key}: close the tenant database to stop it"
+            )));
+        }
         self.call(|reply| Command::Shutdown { reply: Some(reply) })
             .await
     }
@@ -226,6 +280,19 @@ impl HarvestSqlite {
         input: Value,
         options: StartOptions,
     ) -> Result<StartOutcome, HarvestSqliteError> {
+        Ok(self
+            .start_with_state(workflow_name, input, options)
+            .await?
+            .outcome)
+    }
+
+    /// [`start`](Self::start), and the state of the run right after it.
+    pub(crate) async fn start_with_state(
+        &self,
+        workflow_name: &str,
+        input: Value,
+        options: StartOptions,
+    ) -> Result<Started<StartOutcome>, HarvestSqliteError> {
         self.validate_input(workflow_name, &input)
             .map_err(HarvestSqliteError::InvalidInput)?;
         let workflow_name = workflow_name.to_owned();
@@ -249,6 +316,15 @@ impl HarvestSqlite {
         &self,
         request: SignalWithStartParams,
     ) -> Result<SignalWithStartOutcome, HarvestSqliteError> {
+        Ok(self.signal_with_start_state(request).await?.outcome)
+    }
+
+    /// [`signal_with_start`](Self::signal_with_start), and the state of the
+    /// run right after it.
+    pub(crate) async fn signal_with_start_state(
+        &self,
+        request: SignalWithStartParams,
+    ) -> Result<Started<SignalWithStartOutcome>, HarvestSqliteError> {
         // The runtime checks the start input only when it creates a run, and
         // the signal only after the key probe, as Postgres does (issue
         // #2467). So an attach needs no input, and a delivered keyed retry
@@ -262,6 +338,10 @@ impl HarvestSqlite {
     /// Signal one run. Returns `false` when the idempotency key was already
     /// delivered.
     ///
+    /// A signal to a `FAILED` run with a live retry reaches the retry, as on
+    /// Postgres (issue #843). [`signal_routed`](Self::signal_routed) names
+    /// the run that took it.
+    ///
     /// # Errors
     ///
     /// Returns the backend's refusal, such as a terminal run, or
@@ -273,6 +353,24 @@ impl HarvestSqlite {
         payload: Value,
         idempotency_key: Option<String>,
     ) -> Result<bool, HarvestSqliteError> {
+        Ok(self
+            .signal_routed(exec, name, payload, idempotency_key)
+            .await?
+            .delivered)
+    }
+
+    /// [`signal`](Self::signal), and name the run that took the signal.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`signal`](Self::signal).
+    pub async fn signal_routed(
+        &self,
+        exec: ExecutionId,
+        name: &str,
+        payload: Value,
+        idempotency_key: Option<String>,
+    ) -> Result<RoutedSignal, HarvestSqliteError> {
         let name = name.to_owned();
         Self::lift(
             self.call(|reply| Command::Signal {
@@ -299,30 +397,59 @@ impl HarvestSqlite {
         payload: Value,
         idempotency_key: Option<String>,
     ) -> Result<SignalDelivery, HarvestSqliteError> {
+        Self::lift(
+            self.signal_by_key(workflow_name, workflow_id, name, payload, idempotency_key)
+                .await?
+                .delivery,
+        )
+    }
+
+    /// [`signal_by_workflow_id`](Self::signal_by_workflow_id), with the run
+    /// that the key resolved to in the same driver command.
+    pub(crate) async fn signal_by_key(
+        &self,
+        workflow_name: &str,
+        workflow_id: &str,
+        name: &str,
+        payload: Value,
+        idempotency_key: Option<String>,
+    ) -> Result<KeyedSignal, HarvestSqliteError> {
         let (workflow_name, workflow_id, name) = (
             workflow_name.to_owned(),
             workflow_id.to_owned(),
             name.to_owned(),
         );
-        Self::lift(
-            self.call(|reply| Command::SignalByWorkflowId {
-                workflow_name,
-                workflow_id,
-                name,
-                payload,
-                idempotency_key,
-                reply,
-            })
-            .await?,
-        )
+        self.call(|reply| Command::SignalByWorkflowId {
+            workflow_name,
+            workflow_id,
+            name,
+            payload,
+            idempotency_key,
+            reply,
+        })
+        .await
+    }
+
+    /// Lift a runtime refusal, as each write does. A by-id route calls it
+    /// after it reads the resolved run.
+    pub(crate) fn lift_reply<T>(reply: Result<T, SqliteError>) -> Result<T, HarvestSqliteError> {
+        Self::lift(reply)
     }
 
     /// Ask a run to cancel. The next drive replays it with the reason set.
     ///
+    /// A cancelled run and a repeat request answer with `newly: false`. A
+    /// `FAILED` run with a live retry hands the request to the retry.
+    ///
     /// # Errors
     ///
-    /// Returns the backend's refusal or [`HarvestSqliteError::Stopped`].
-    pub async fn cancel(&self, exec: ExecutionId, reason: &str) -> Result<(), HarvestSqliteError> {
+    /// Returns the backend's refusal, such as a run that ended another way,
+    /// or [`HarvestSqliteError::Stopped`].
+    pub async fn cancel(
+        &self,
+        exec: ExecutionId,
+        reason: &str,
+    ) -> Result<StopAck, HarvestSqliteError> {
         let reason = reason.to_owned();
         Ok(self
             .call(|reply| Command::Cancel {
@@ -335,6 +462,9 @@ impl HarvestSqlite {
 
     /// End a run `TERMINATED` at once.
     ///
+    /// A terminal run answers with `newly: false`. A `FAILED` run with a live
+    /// retry hands the request to the retry.
+    ///
     /// # Errors
     ///
     /// Returns the backend's refusal or [`HarvestSqliteError::Stopped`].
@@ -342,7 +472,7 @@ impl HarvestSqlite {
         &self,
         exec: ExecutionId,
         reason: &str,
-    ) -> Result<(), HarvestSqliteError> {
+    ) -> Result<StopAck, HarvestSqliteError> {
         let reason = reason.to_owned();
         Ok(self
             .call(|reply| Command::Terminate {
@@ -380,13 +510,38 @@ impl HarvestSqlite {
     ///
     /// # Errors
     ///
-    /// Returns the backend's refusal or [`HarvestSqliteError::Stopped`].
+    /// Returns the backend's refusal or [`HarvestSqliteError::Stopped`]. A
+    /// handler error is [`SqliteError::UpdateFailed`].
     pub async fn update(
         &self,
         exec: ExecutionId,
         name: &str,
         input: Value,
     ) -> Result<Value, HarvestSqliteError> {
+        let routed = self.update_routed(exec, name, input).await?;
+        routed.update.result.map_err(|error| {
+            HarvestSqliteError::Sqlite(SqliteError::UpdateFailed {
+                execution_id: routed.exec,
+                name: name.to_owned(),
+                error,
+            })
+        })
+    }
+
+    /// [`update`](Self::update), and return the update id and the run that
+    /// took it. A handler error is in the result, because history holds the
+    /// admission.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`update`](Self::update), except
+    /// [`SqliteError::UpdateFailed`].
+    pub async fn update_routed(
+        &self,
+        exec: ExecutionId,
+        name: &str,
+        input: Value,
+    ) -> Result<RoutedUpdate, HarvestSqliteError> {
         let name = name.to_owned();
         Ok(self
             .call(|reply| Command::Update {
@@ -434,6 +589,211 @@ impl HarvestSqlite {
     ) -> Result<Vec<WorkflowEvent>, HarvestSqliteError> {
         self.read(move |reader| reader.load_history(exec)).await
     }
+
+    /// One page of the event history of one run, oldest first (issue
+    /// #2489).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, or a
+    /// read error.
+    pub async fn history_page(
+        &self,
+        exec: ExecutionId,
+        filter: HistoryFilter,
+    ) -> Result<HistoryPage, HarvestSqliteError> {
+        self.read(move |reader| reader.history_page(exec, &filter))
+            .await
+    }
+
+    /// The parent run of `exec`, if it is a child run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, or a
+    /// read error.
+    pub async fn parent(
+        &self,
+        exec: ExecutionId,
+    ) -> Result<Option<ExecutionId>, HarvestSqliteError> {
+        self.read(move |reader| reader.parent(exec)).await
+    }
+
+    /// The result of the logical run that `exec` starts (issue #2489).
+    ///
+    /// The read follows the `continue_as_new` chain and the workflow retry
+    /// chain to the last run, as `GET /workflows/{id}/result` does on
+    /// Postgres. A run that is not terminal reads
+    /// [`WorkflowResultState::Running`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id,
+    /// [`SqliteError::RetryChainTooDeep`] for a retry chain past its bound,
+    /// or a read error.
+    pub async fn result(&self, exec: ExecutionId) -> Result<WorkflowResult, HarvestSqliteError> {
+        Ok(self.chain_result(exec).await?.result)
+    }
+
+    /// [`result`](Self::result), with the last run that the walk reached.
+    pub(crate) async fn chain_result(
+        &self,
+        exec: ExecutionId,
+    ) -> Result<ChainResult, HarvestSqliteError> {
+        self.read(move |reader| {
+            let (row, last, exhausted) = last_run_of_chain(reader, exec)?;
+            Ok(ChainResult {
+                result: compact_result(&row),
+                last,
+                exhausted,
+            })
+        })
+        .await
+    }
+
+    /// The run that a by-id route acts on: the running run of the key, or
+    /// else the newest run, as on Postgres.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::WorkflowIdNotFound`] when the key has no run,
+    /// or a read error.
+    pub async fn resolve_by_id(
+        &self,
+        workflow_name: &str,
+        workflow_id: &str,
+    ) -> Result<ExecutionId, HarvestSqliteError> {
+        let (workflow_name, workflow_id) = (workflow_name.to_owned(), workflow_id.to_owned());
+        self.read(move |reader| {
+            let key = ExecutionFilter::new()
+                .workflow_name(workflow_name.clone())
+                .workflow_id(workflow_id.clone())
+                .limit(1);
+            for filter in [key.clone().state("RUNNING"), key] {
+                let page = reader.list_executions(&filter)?;
+                if let Some(exec) = page
+                    .executions
+                    .first()
+                    .and_then(ExecutionSummary::execution_id)
+                {
+                    return Ok(exec);
+                }
+            }
+            Err(SqliteError::WorkflowIdNotFound {
+                workflow_name,
+                workflow_id,
+            })
+        })
+        .await
+    }
+
+    /// Check that the Harvest file answers a read.
+    ///
+    /// The check opens its own read-only connection. A busy shared reader,
+    /// for example under many `/result` long polls, then cannot fail it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the open or read error.
+    pub async fn ping(&self) -> Result<(), HarvestSqliteError> {
+        let path = self.inner.path.clone();
+        tokio::task::spawn_blocking(move || {
+            SqliteReader::open(&path)?.list_executions(&ExecutionFilter::new().limit(1))
+        })
+        .await
+        .map_err(|error| HarvestSqliteError::Read(error.to_string()))?
+        .map(|_| ())
+        .map_err(HarvestSqliteError::from)
+    }
+}
+
+/// The result of a chain walk (issue #2489).
+pub struct ChainResult {
+    /// The compact result of the last run that the walk reached.
+    pub result: WorkflowResult,
+    /// That run. A long poll resumes the walk from it.
+    pub last: ExecutionId,
+    /// `true` when the walk stopped at [`MAX_CHAIN_HOPS`] continue-as-new
+    /// hops with more chain left.
+    pub exhausted: bool,
+}
+
+/// The last run of the chain that `exec` starts, that run's id, and whether
+/// the walk ran out of hops.
+///
+/// A `CONTINUED_AS_NEW` run hands over to its successor. A `FAILED` run hands
+/// over to its workflow retry. The budgets follow Postgres: at most
+/// [`MAX_CHAIN_HOPS`] continue-as-new hops, and at most [`MAX_RETRY_HOPS`]
+/// retry hops in one retry walk. A successor row that is gone ends the walk
+/// at the run before it.
+fn last_run_of_chain(
+    reader: &SqliteReader,
+    exec: ExecutionId,
+) -> Result<(ExecutionDescription, ExecutionId, bool), SqliteError> {
+    let mut row = reader.describe(exec)?;
+    let mut current = exec;
+    let mut continued = 0_usize;
+    let mut retried = 0_usize;
+    loop {
+        let Some(next) = reader.successor(current)? else {
+            return Ok((row, current, false));
+        };
+        if row.summary.state.value().map(String::as_str) == Some("FAILED") {
+            retried += 1;
+            if retried > MAX_RETRY_HOPS {
+                return Err(SqliteError::RetryChainTooDeep {
+                    exec_id: exec,
+                    max_depth: MAX_RETRY_HOPS,
+                });
+            }
+        } else {
+            if continued == MAX_CHAIN_HOPS {
+                return Ok((row, current, true));
+            }
+            continued += 1;
+            retried = 0;
+        }
+        match reader.describe(next) {
+            Ok(next_row) => {
+                row = next_row;
+                current = next;
+            }
+            Err(SqliteError::ExecutionNotFound(_)) => return Ok((row, current, false)),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// The compact Postgres result form of one run. It mirrors
+/// `WorkflowResult::from_execution`.
+fn compact_result(row: &ExecutionDescription) -> WorkflowResult {
+    let state = WorkflowResultState::from_execution_state(
+        row.summary.state.value().map_or("", String::as_str),
+    );
+    let completed_at = row.summary.closed_at.value().copied();
+    let output = || {
+        row.output_json
+            .value()
+            .and_then(|text| serde_json::from_str(text).ok())
+    };
+    match state {
+        WorkflowResultState::Running => WorkflowResult::running(),
+        WorkflowResultState::Completed | WorkflowResultState::ContinuedAsNew => WorkflowResult {
+            state,
+            output: output(),
+            error: None,
+            completed_at,
+        },
+        WorkflowResultState::Failed
+        | WorkflowResultState::Cancelled
+        | WorkflowResultState::TimedOut
+        | WorkflowResultState::Terminated => WorkflowResult {
+            state,
+            output: None,
+            error: row.error.value().cloned(),
+            completed_at,
+        },
+    }
 }
 
 impl axum::extract::FromRequestParts<AppState> for HarvestSqlite {
@@ -453,5 +813,67 @@ impl axum::extract::FromRequestParts<AppState> for HarvestSqlite {
                     )
                 }),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // The `#[workflow]` macro needs an `async fn`.
+    #![allow(clippy::unused_async)]
+
+    use super::*;
+    use autumn_harvest::prelude::*;
+    use autumn_harvest_sqlite::{RunState, SqliteRuntime};
+
+    /// Continues as new until its input reaches the stop value.
+    #[workflow]
+    async fn counts(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+        if n < STOP {
+            ctx.continue_as_new(serde_json::json!(n + 1))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(n)
+    }
+
+    /// Two hops past the bound of a `/result` walk.
+    const STOP: i64 = 130;
+
+    #[tokio::test]
+    async fn a_result_walk_stops_at_the_continue_as_new_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.db");
+        let mut runtime = SqliteRuntime::open(&path).unwrap();
+        runtime.register_workflow(&counts_info());
+        let first = runtime
+            .start_workflow("counts", serde_json::json!(0))
+            .unwrap();
+        let mut runs = vec![first];
+        loop {
+            match runtime
+                .run_until_blocked(runs[runs.len() - 1])
+                .await
+                .unwrap()
+            {
+                RunState::ContinuedAsNew(next) => runs.push(next),
+                RunState::Completed(_) => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let reader = SqliteReader::open(&path).unwrap();
+
+        let (row, last, exhausted) = last_run_of_chain(&reader, first).unwrap();
+        assert!(exhausted, "the chain is longer than the bound");
+        assert_eq!(last, runs[MAX_CHAIN_HOPS]);
+        assert_eq!(
+            compact_result(&row).state,
+            WorkflowResultState::ContinuedAsNew
+        );
+
+        // A walk that starts inside the bound reaches the end.
+        let (row, last, exhausted) = last_run_of_chain(&reader, runs[10]).unwrap();
+        assert!(!exhausted);
+        assert_eq!(last, runs[runs.len() - 1]);
+        assert_eq!(compact_result(&row).output, Some(serde_json::json!(STOP)));
     }
 }

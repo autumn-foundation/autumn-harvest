@@ -50,7 +50,9 @@ async fn fake_gcs() -> FakeGcs {
     let host = container.get_host().await.unwrap();
     let port = container.get_host_port_ipv4(4443).await.unwrap();
     let endpoint = format!("http://{host}:{port}");
-    let http = reqwest::Client::new();
+    let http = autumn_harvest_plugin::http::client_builder()
+        .build()
+        .expect("client");
     let response = http
         .post(format!("{endpoint}/storage/v1/b"))
         .header("content-type", "application/json")

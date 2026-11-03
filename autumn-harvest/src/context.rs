@@ -6244,8 +6244,8 @@ impl WorkflowContext {
     /// Deterministic random value drawn uniformly from `range`, captured once and
     /// replayed verbatim.
     ///
-    /// Mirrors [`rand::Rng::gen_range`]; works for any range whose element type
-    /// implements [`rand::distributions::uniform::SampleUniform`] and round-trips
+    /// Mirrors [`rand::RngExt::random_range`]; works for any range whose element type
+    /// implements [`rand::distr::uniform::SampleUniform`] and round-trips
     /// through JSON (e.g. `0..100`, `1.0..2.0`).
     ///
     /// On replay, if the recorded value falls outside the current `range` bounds a
@@ -6261,9 +6261,9 @@ impl WorkflowContext {
     where
         T: serde::Serialize
             + serde::de::DeserializeOwned
-            + rand::distributions::uniform::SampleUniform
+            + rand::distr::uniform::SampleUniform
             + PartialOrd,
-        R: rand::distributions::uniform::SampleRange<T> + std::ops::RangeBounds<T>,
+        R: rand::distr::uniform::SampleRange<T> + std::ops::RangeBounds<T>,
     {
         use crate::event::SideEffectKind;
 
@@ -6281,7 +6281,7 @@ impl WorkflowContext {
                              within the current range, got an out-of-range replayed value"
                                 .to_string(),
                         );
-                        rand::Rng::gen_range(&mut rand::thread_rng(), range)
+                        rand::RngExt::random_range(&mut rand::rng(), range)
                     }
                 }
                 Err(e) => {
@@ -6289,7 +6289,7 @@ impl WorkflowContext {
                         "side-effect drift mismatch: expected SideEffectRecorded(random), \
                          got an undeserialisable recorded value ({e})"
                     ));
-                    rand::Rng::gen_range(&mut rand::thread_rng(), range)
+                    rand::RngExt::random_range(&mut rand::rng(), range)
                 }
             },
             HistoryMatch::Diverged {
@@ -6298,7 +6298,7 @@ impl WorkflowContext {
                 self.record_deferred_nd(format!(
                     "side-effect drift mismatch: expected {expected}, got {actual}"
                 ));
-                rand::Rng::gen_range(&mut rand::thread_rng(), range)
+                rand::RngExt::random_range(&mut rand::rng(), range)
             }
             // Frontier read — see the identical arm in `capture_builtin_validated`.
             // `random_range` carries its own copy of the match because its generic
@@ -6330,11 +6330,11 @@ impl WorkflowContext {
                         }
                     });
                 let result = captured.unwrap_or_else(|| match seeded {
-                    Some((seed, _)) => rand::Rng::gen_range(
+                    Some((seed, _)) => rand::RngExt::random_range(
                         &mut <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed),
                         range,
                     ),
-                    None => rand::Rng::gen_range(&mut rand::thread_rng(), range),
+                    None => rand::RngExt::random_range(&mut rand::rng(), range),
                 });
                 let value = serde_json::to_value(&result)
                     .expect("built-in side-effect value must serialise");

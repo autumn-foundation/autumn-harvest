@@ -121,7 +121,7 @@ fn days_ago(days: i64) -> DateTime<Utc> {
     Utc::now() - chrono::Duration::days(days)
 }
 
-const WEEK: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const WEEK: Duration = Duration::from_hours(168);
 
 /// Every pass off except the terminal-task janitor. The runtime then spawns
 /// for the janitor alone.

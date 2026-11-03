@@ -139,7 +139,7 @@ pub fn one_line(text: &str) -> String {
 /// `true` for a control character, or a format character that can hide or
 /// reorder text, such as a bidirectional override.
 #[must_use]
-pub fn hidden(c: char) -> bool {
+pub const fn hidden(c: char) -> bool {
     c.is_control()
         || matches!(
             c,

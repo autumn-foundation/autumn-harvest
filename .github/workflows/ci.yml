@@ -12,6 +12,13 @@
 #      touching only docs/** or **/*.md doesn't run the compile/test matrix. A job
 #      skipped via `if:` still reports success to branch protection, so this is safe
 #      for required status checks (unlike paths-ignore, which reports nothing).
+#   4. No release-PR rerun — pull_request runs target trunk-dev only. The
+#      release PR from trunk-dev into trunk has the trunk-dev tip as its head,
+#      and the push run on trunk-dev already tested that commit. Its check
+#      runs report on the release PR. release-pr.yml checks that the merge
+#      equals the head, and runs the two gates that diff against trunk. A
+#      push run on trunk-dev decides docs-only against trunk, so a cancelled
+#      run cannot leave code untested (see the `changes` job).
 name: CI
 
 on:
@@ -24,7 +31,9 @@ on:
     # triggers a fresh run; the GitHub default [opened, synchronize, reopened]
     # does not include it. The other three keep normal PR pushes triggering.
     types: [opened, synchronize, reopened, ready_for_review]
-    branches: [trunk, trunk-dev]
+    # Not trunk: the push run on trunk-dev covers the release PR. See item 4
+    # of the header.
+    branches: [trunk-dev]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -74,9 +83,25 @@ jobs:
           fi
           echo "Comparing ${base}...${head}"
           echo "base_sha=${base}" >> "$GITHUB_OUTPUT"
+          # A push to trunk-dev decides docs-only against trunk, the last
+          # release, not against the last push. A newer push cancels the run
+          # of an older one. A diff against a docs-only newer push would skip
+          # the tests, and the code of the older push would never run. The
+          # release PR gets no ci.yml run, so this push run is its backstop.
+          # `base_sha` above stays per push, for the issue #794 gate.
+          diff_base="$base"
+          if [ "${{ github.event_name }}" = "push" ] \
+            && [ "${{ github.ref }}" = "refs/heads/trunk-dev" ]; then
+            if git fetch --no-tags origin trunk; then
+              diff_base="$(git rev-parse FETCH_HEAD)"
+              echo "trunk-dev push: deciding docs-only against trunk (${diff_base})"
+            else
+              echo "::warning::could not fetch trunk; deciding docs-only against ${base}"
+            fi
+          fi
           # --no-renames disables rename detection so a code->docs move surfaces
           # the deleted source path (setting code=true) instead of a docs-only add.
-          changed="$(git diff --name-only --no-renames "$base" "$head")"
+          changed="$(git diff --name-only --no-renames "$diff_base" "$head")"
           echo "Changed files:"
           echo "$changed"
           # Docs-only = every changed path matches docs/** or **/*.md. If any
@@ -714,14 +739,10 @@ jobs:
           python3 docs/audits/openapi-response-coverage.py --self-test
           python3 docs/audits/openapi-response-coverage.py
 
-      # Comment hygiene. A PR ratchets against its merge base, or against
-      # the commit that added this gate if the merge base predates it. Only
-      # the release PR (trunk-dev into trunk) hits the second case, and only
-      # while trunk is older than the gate. Its merge base is then the last
-      # release. That counts the legacy debt from before the gate as new.
-      # The gate commit still checks the whole release cumulatively. That
-      # matters because a push run on trunk-dev can be cancelled, and two
-      # clean PRs can merge into a new finding.
+      # Comment hygiene. A PR ratchets against its merge base. A push
+      # ratchets against the commit before the push. release-pr.yml ratchets
+      # the whole release against trunk, because a push run on trunk-dev can
+      # be cancelled, and two clean PRs can merge into a new finding.
       - name: Comment hygiene (docs/audits/comment-hygiene.py)
         env:
           BASE_REF: ${{ github.base_ref }}
@@ -730,14 +751,7 @@ jobs:
           BEFORE="${{ github.event.before }}"
           if [ -n "$BASE_REF" ]; then
             git fetch --no-tags origin "$BASE_REF"
-            BASE=FETCH_HEAD
-            GATE=$(git log --diff-filter=A --format=%H -1 -- docs/audits/comment-hygiene.py)
-            MB=$(git merge-base FETCH_HEAD HEAD || true)
-            if [ -n "$GATE" ] && [ -n "$MB" ] \
-              && ! git merge-base --is-ancestor "$GATE" "$MB"; then
-              BASE="$GATE"
-            fi
-            python3 docs/audits/comment-hygiene.py --base "$BASE"
+            python3 docs/audits/comment-hygiene.py --base FETCH_HEAD
           elif [ -n "$BEFORE" ] \
             && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
             # The whole push, not just its last commit. `HEAD~1` would let a
@@ -2188,11 +2202,40 @@ jobs:
       # the lane builds the library and the SQLite suite only. No Postgres and
       # no Docker run here.
       - name: Clippy autumn-harvest-plugin (sqlite feature)
-        run: cargo clippy -p autumn-harvest-plugin --features sqlite --lib --test sqlite_plugin -- -D warnings
+        run: cargo clippy -p autumn-harvest-plugin --features sqlite --lib --test sqlite_plugin --test sqlite_plugin_fleet --test sqlite_plugin_split -- -D warnings
       - name: SQLite plugin unit tests
-        run: "cargo test -p autumn-harvest-plugin --features sqlite --lib sqlite::"
+        run: "cargo test -p autumn-harvest-plugin --features sqlite --lib -- sqlite:: sqlite_split_tests state::tests"
       - name: SQLite plugin end-to-end suite
         run: cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin
+      # Per-tenant Harvest in a SQLite fleet (issue #2472). No Docker.
+      - name: SQLite plugin fleet suite
+        run: cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin_fleet
+
+  sqlite-plugin-split:
+    name: SQLite HarvestPlugin, split mode (issue #2472)
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+      # `testcontainers` retries no pull, so a registry blip would fail the
+      # suite. The script retries it.
+      - name: Pre-pull the Postgres image
+        run: bash .github/ci/pull-test-images.sh postgres:16
+      # A SQLite app with a Postgres Harvest database. The test starts a
+      # Postgres container, so this lane needs the runner's Docker.
+      - name: SQLite app on a Postgres Harvest database
+        run: cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin_split
 
   clippy-crates:
     name: Clippy (macros, cli, sqlite, agent, redis, verify)
@@ -2509,7 +2552,7 @@ jobs:
           done
 
   msrv:
-    name: MSRV (1.88.0)
+    name: MSRV (1.97.0)
     needs: changes
     # Draft-skip (see lint) + docs-only skip via the `changes` guard.
     if: >-
@@ -2521,12 +2564,12 @@ jobs:
     # action sets. The environment variable outranks the file, so every
     # cargo call in this job really compiles with the MSRV.
     env:
-      RUSTUP_TOOLCHAIN: 1.88.0
+      RUSTUP_TOOLCHAIN: 1.97.0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.97.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Check MSRV compiles
         run: cargo check --workspace
@@ -2535,8 +2578,8 @@ jobs:
       # `runner.rs` never reach the MSRV compiler. Issue #1312.
       - name: Check MSRV compiles (autumn-harvest-plugin redis feature, issue #1312)
         run: cargo check -p autumn-harvest-plugin --features redis
-      # Issue #1983. The locked `aws-sdk-s3` declares Rust 1.88, the MSRV
-      # itself. This step makes a lockfile bump past it fail.
+      # Issue #1983. This step makes an `aws-sdk-s3` lockfile bump past the MSRV
+      # fail.
       - name: Check MSRV compiles (autumn-harvest-plugin s3 and gcs features, issue #1983)
         run: cargo check -p autumn-harvest-plugin --features s3,gcs
 

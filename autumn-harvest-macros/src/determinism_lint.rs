@@ -609,6 +609,11 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
                 || path_str == "random_bool"
                 || path_str == "rand::thread_rng"
                 || path_str == "thread_rng"
+                || path_str == "rand::rng"
+                || path_str == "rand::random_ratio"
+                || path_str == "random_ratio"
+                || path_str.starts_with("rand::RngExt::")
+                || path_str.starts_with("RngExt::")
                 || path_str == "Uuid::new_v4"
                 || path_str == "uuid::Uuid::new_v4"
                 || path_str == "Uuid::now_v7"
@@ -622,6 +627,10 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
                         || path_str.ends_with("::r#gen_range")
                         || path_str.ends_with("::gen_bool")
                         || path_str.ends_with("::gen_ratio")
+                        || path_str.ends_with("::random")
+                        || path_str.ends_with("::random_range")
+                        || path_str.ends_with("::random_bool")
+                        || path_str.ends_with("::random_ratio")
                         || path_str.ends_with("::sample")
                         || path_str.ends_with("::fill")
                         || path_str.ends_with("::try_fill")))
@@ -728,7 +737,11 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
             || method_str == "gen_range"
             || method_str == "r#gen_range"
             || method_str == "gen_bool"
-            || method_str == "gen_ratio")
+            || method_str == "gen_ratio"
+            || method_str == "random"
+            || method_str == "random_range"
+            || method_str == "random_bool"
+            || method_str == "random_ratio")
             && is_rng_receiver(&i.receiver)
         {
             self.add_finding("HVG002", i.method.span());
@@ -831,7 +844,11 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
 
     fn visit_path(&mut self, i: &'ast syn::Path) {
         let path_str = path_to_string(i);
-        if path_str == "rand::rngs::OsRng" || path_str == "OsRng" {
+        if path_str == "rand::rngs::OsRng"
+            || path_str == "OsRng"
+            || path_str == "rand::rngs::SysRng"
+            || path_str == "SysRng"
+        {
             self.add_finding("HVG002", i.segments.last().unwrap().ident.span());
         }
         if path_str == "std::process::Command" {

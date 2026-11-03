@@ -371,7 +371,7 @@ impl Browser {
         let start = self.get(&format!("{MOUNT}{LOGIN_PATH}")).await;
         assert_eq!(start.status, StatusCode::SEE_OTHER, "login: {}", start.body);
         let authorize = start.location.expect("login redirects to the provider");
-        let client = reqwest::Client::builder()
+        let client = autumn_harvest_plugin::http::client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .build()

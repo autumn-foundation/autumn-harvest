@@ -484,6 +484,9 @@ pub struct HarvestApiState {
     /// read model can resolve the probe interval / staleness window. `None`
     /// when the canary is disabled.
     canary_config: Arc<Mutex<Option<crate::canary::CanaryConfig>>>,
+    /// The agent profile overlay store of the `/agents/{kind}/profile`
+    /// routes (issue #2374). `None` makes each of those routes answer `404`.
+    agent_overlay_store: Arc<Mutex<Option<Arc<dyn autumn_harvest_agent::ProfileOverlayStore>>>>,
     /// Refuse `start_harvest_runtime` unless ambient Harvest configuration
     /// resolves to `embedded` mode (issue #1291).
     ///
@@ -523,9 +526,7 @@ impl Default for HarvestApiState {
             max_workflow_chain_timeout: Arc::new(Mutex::new(None)),
             sse_keepalive_interval: Arc::new(Mutex::new(std::time::Duration::from_secs(15))),
             sse_buffer_depth: Arc::new(Mutex::new(1024)),
-            max_workflow_start_delay: Arc::new(Mutex::new(std::time::Duration::from_secs(
-                365 * 24 * 60 * 60,
-            ))),
+            max_workflow_start_delay: Arc::new(Mutex::new(std::time::Duration::from_hours(8760))),
             batch_start_max_items: Arc::new(Mutex::new(DEFAULT_BATCH_START_MAX_ITEMS)),
             batch_start_max_bytes: Arc::new(Mutex::new(DEFAULT_BATCH_START_MAX_BYTES)),
             gate_cache: Arc::new(autumn_harvest::AdmissionGateCache::new()),
@@ -555,6 +556,7 @@ impl Default for HarvestApiState {
                 crate::status_summary::StatusThresholds::default(),
             )),
             canary_config: Arc::new(Mutex::new(None)),
+            agent_overlay_store: Arc::new(Mutex::new(None)),
             require_embedded_harvest_mode: Arc::new(Mutex::new(false)),
         }
     }
@@ -751,6 +753,29 @@ impl HarvestApiState {
     #[must_use]
     pub fn canary_config(&self) -> Option<crate::canary::CanaryConfig> {
         self.canary_config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Install the agent profile overlay store of the
+    /// `/agents/{kind}/profile` routes (issue #2374). `None` removes it.
+    pub fn set_agent_overlay_store(
+        &self,
+        store: Option<Arc<dyn autumn_harvest_agent::ProfileOverlayStore>>,
+    ) {
+        *self
+            .agent_overlay_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = store;
+    }
+
+    /// The installed agent profile overlay store, if any (issue #2374).
+    #[must_use]
+    pub fn agent_overlay_store(
+        &self,
+    ) -> Option<Arc<dyn autumn_harvest_agent::ProfileOverlayStore>> {
+        self.agent_overlay_store
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -3323,8 +3348,8 @@ pub(crate) const KNOWN_WORKFLOW_STATES: &[&str] = &[
     "MIGRATED",
 ];
 
-const DEFAULT_WORKFLOW_LIMIT: i64 = 50;
-const MAX_WORKFLOW_LIMIT: i64 = 200;
+pub(crate) const DEFAULT_WORKFLOW_LIMIT: i64 = 50;
+pub(crate) const MAX_WORKFLOW_LIMIT: i64 = 200;
 const DEFAULT_WORKFLOW_CHILDREN_LIMIT: usize = 50;
 const MAX_WORKFLOW_CHILDREN_LIMIT: usize = 500;
 const MAX_WORKFLOW_CHILDREN_DEPTH: u8 = 5;
@@ -5299,6 +5324,32 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             get(crate::run_defaults_api::get_run_defaults)
                 .patch(crate::run_defaults_api::patch_run_defaults)
                 .route_layer(require_admin.clone()),
+        )
+        // Agent profile overlays (issue #2374). Not in `ADMIN_SCOPE_ROUTES`,
+        // so the `mutate` scope reaches the two writes.
+        .route(
+            "/agents/{kind}/profile",
+            get(crate::agent_profile_api::get_active).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/agents/{kind}/profile/versions",
+            get(crate::agent_profile_api::list_versions).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/agents/{kind}/profile/versions/{version}",
+            get(crate::agent_profile_api::get_version).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/agents/{kind}/profile/diff",
+            get(crate::agent_profile_api::diff_versions).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/agents/{kind}/profile/activate",
+            post(crate::agent_profile_api::activate).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/agents/{kind}/profile/rollback",
+            post(crate::agent_profile_api::rollback).route_layer(require_admin.clone()),
         )
         .route(
             "/admin/retention",
@@ -7305,6 +7356,13 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
             "PATCH",
             "/admin/workflow-types/{workflow_name}/run-defaults",
         ),
+        // Agent profile overlays (issue #2374).
+        ("GET", "/agents/{kind}/profile"),
+        ("GET", "/agents/{kind}/profile/versions"),
+        ("GET", "/agents/{kind}/profile/versions/{version}"),
+        ("GET", "/agents/{kind}/profile/diff"),
+        ("POST", "/agents/{kind}/profile/activate"),
+        ("POST", "/agents/{kind}/profile/rollback"),
         ("GET", "/admin/retention"),
         ("POST", "/admin/retention/run-now"),
         ("POST", "/admin/workflows/replay-canary"),
@@ -7635,6 +7693,13 @@ pub const fn management_api_request_fields()
                 "recompute_in_flight",
             ]),
         ),
+        // Agent profile overlays (issue #2374). A rollback takes no field.
+        (
+            "POST",
+            "/agents/{kind}/profile/activate",
+            Some(&["version", "expected_active"]),
+        ),
+        ("POST", "/agents/{kind}/profile/rollback", Some(&[])),
         // ── dead-letter queue ─────────────────────────────────────────────────
         (
             "POST",
@@ -8850,6 +8915,53 @@ pub const fn management_api_response_fields()
             "PATCH",
             "/admin/workflow-types/{workflow_name}/run-defaults",
             Some(&["workflow_name", "code", "override", "effective"]),
+        ),
+        // Agent profile overlays (issue #2374).
+        (
+            "GET",
+            "/agents/{kind}/profile",
+            Some(&[
+                "kind",
+                "version",
+                "active",
+                "provenance",
+                "created_at",
+                "digest",
+                "overlay",
+            ]),
+        ),
+        (
+            "GET",
+            "/agents/{kind}/profile/versions",
+            Some(&["kind", "active", "versions"]),
+        ),
+        (
+            "GET",
+            "/agents/{kind}/profile/versions/{version}",
+            Some(&[
+                "kind",
+                "version",
+                "active",
+                "provenance",
+                "created_at",
+                "digest",
+                "overlay",
+            ]),
+        ),
+        (
+            "GET",
+            "/agents/{kind}/profile/diff",
+            Some(&["kind", "a", "b", "changes"]),
+        ),
+        (
+            "POST",
+            "/agents/{kind}/profile/activate",
+            Some(&["kind", "from", "to", "actor"]),
+        ),
+        (
+            "POST",
+            "/agents/{kind}/profile/rollback",
+            Some(&["kind", "from", "to", "actor"]),
         ),
         ("GET", "/admin/retention", None), // RetentionStatus (external model)
         ("POST", "/admin/retention/run-now", Some(&["ok"])),
@@ -12035,8 +12147,8 @@ async fn get_workflow(
 }
 
 /// Default and maximum page sizes for `GET /workflows/{id}/history`.
-const DEFAULT_HISTORY_PAGE: i64 = 100;
-const MAX_HISTORY_PAGE: i64 = 1000;
+pub(crate) const DEFAULT_HISTORY_PAGE: i64 = 100;
+pub(crate) const MAX_HISTORY_PAGE: i64 = 1000;
 
 /// Per-event entry returned by `GET /workflows/{id}/history`.
 #[derive(Debug, Serialize)]
@@ -12069,7 +12181,7 @@ struct WorkflowHistoryPage {
 /// Parse query parameters for `GET /workflows/{id}/history`.
 ///
 /// Returns `(limit, after_id, event_types)` or a 400 error.
-fn parse_workflow_history_query(
+pub(crate) fn parse_workflow_history_query(
     pairs: &[(String, String)],
 ) -> Result<(i64, Option<i64>, Vec<String>), AutumnError> {
     let mut limit = DEFAULT_HISTORY_PAGE;
@@ -12660,7 +12772,7 @@ fn start_error_response(error: HarvestError) -> axum::response::Response {
     }
 }
 
-fn workflow_result_pending_response() -> axum::response::Response {
+pub(crate) fn workflow_result_pending_response() -> axum::response::Response {
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
         axum::http::header::RETRY_AFTER,
@@ -17217,7 +17329,7 @@ const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
 /// A whitespace-only id is out of scope. It is a normal, non-empty final
 /// path segment, so it does not trigger the router gap this issue addresses.
 #[allow(clippy::result_large_err)]
-fn reject_empty_workflow_id(raw: Option<&str>) -> Result<(), axum::response::Response> {
+pub(crate) fn reject_empty_workflow_id(raw: Option<&str>) -> Result<(), axum::response::Response> {
     use axum::response::IntoResponse as _;
     if raw == Some("") {
         return Err((
@@ -17289,7 +17401,7 @@ fn validate_start_idempotency_key(
 /// Returns `Some(400)` when the key is reserved, `None` when it is fine. Uses
 /// the core predicate and message so every path refuses identically.
 #[must_use]
-fn reject_reserved_idempotency_key(key: &str) -> Option<axum::response::Response> {
+pub(crate) fn reject_reserved_idempotency_key(key: &str) -> Option<axum::response::Response> {
     use axum::response::IntoResponse as _;
     if !autumn_harvest::start_idempotency::is_reserved_key(key) {
         return None;
@@ -18405,7 +18517,7 @@ pub(crate) async fn start_workflow(
                     macro_policy.map_or(std::time::Duration::from_secs(10), |p| p.max_wait)
                 };
 
-            if max_wait > std::time::Duration::from_secs(86400) {
+            if max_wait > std::time::Duration::from_hours(24) {
                 return Err((
                     axum::http::StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({
@@ -45965,7 +46077,7 @@ fn parse_shard_placement(
     }
 }
 
-fn parse_workflow_result_wait_query(
+pub(crate) fn parse_workflow_result_wait_query(
     pairs: &[(String, String)],
     max_wait: Duration,
 ) -> Result<Duration, AutumnError> {
@@ -61794,8 +61906,8 @@ mod tests {
         let registry = HandlerRegistry::new(
             vec![deadline_info_fixture(
                 "deadline_wf",
-                Some(std::time::Duration::from_secs(4 * 3600)),
-                Some(std::time::Duration::from_secs(3 * 3600)),
+                Some(std::time::Duration::from_hours(4)),
+                Some(std::time::Duration::from_hours(3)),
             )],
             vec![],
         );
@@ -61815,7 +61927,7 @@ mod tests {
             vec![deadline_info_fixture(
                 "clamp_wf",
                 Some(std::time::Duration::from_secs(3600)),
-                Some(std::time::Duration::from_secs(10 * 3600)),
+                Some(std::time::Duration::from_hours(10)),
             )],
             vec![],
         );
@@ -61850,8 +61962,8 @@ mod tests {
         let registry = HandlerRegistry::new(
             vec![deadline_info_fixture(
                 "ceiling_wf",
-                Some(std::time::Duration::from_secs(10 * 3600)),
-                Some(std::time::Duration::from_secs(8 * 3600)),
+                Some(std::time::Duration::from_hours(10)),
+                Some(std::time::Duration::from_hours(8)),
             )],
             vec![],
         )
@@ -61871,7 +61983,7 @@ mod tests {
         let registry = HandlerRegistry::new(
             vec![deadline_info_fixture(
                 "small_wf",
-                Some(std::time::Duration::from_secs(1800)),
+                Some(std::time::Duration::from_mins(30)),
                 None,
             )],
             vec![],
@@ -61899,8 +62011,8 @@ mod tests {
         let registry = HandlerRegistry::new(
             vec![deadline_info_fixture(
                 "nightly_reconciliation",
-                Some(std::time::Duration::from_secs(4 * 3600)),
-                Some(std::time::Duration::from_secs(3 * 3600)),
+                Some(std::time::Duration::from_hours(4)),
+                Some(std::time::Duration::from_hours(3)),
             )],
             vec![],
         );

@@ -784,6 +784,7 @@ pub mod append_only;
 mod composition;
 mod error;
 mod history_cap;
+mod history_page;
 mod llm_ledger;
 mod lock;
 mod mutex;
@@ -804,14 +805,17 @@ pub use autumn_harvest::{ExecutionId, WorkflowEvent};
 
 pub use crate::error::{SqliteError, SqliteResult};
 pub use crate::history_cap::HistoryCapReason;
+pub use crate::history_page::{
+    DEFAULT_HISTORY_PAGE, HistoryFilter, HistoryPage, MAX_HISTORY_PAGE, PagedEvent,
+};
 pub use crate::llm_ledger::LlmLedgerRow;
 #[doc(hidden)]
 pub use crate::overlay_log::SqliteOverlayLog;
 pub use crate::query::DEFAULT_QUERY_TIMEOUT;
 pub use crate::runtime::{
-    ActivityBody, ActivitySpec, ExecutionOutcome, LedgerActivityBody, RunState, SignalDelivery,
-    SignalWithStart, SignalWithStartOutcome, SqliteRuntime, StartOptions, StartOutcome,
-    UNSUPPORTED_FEATURE_ERROR_TYPE,
+    ActivityBody, ActivitySpec, AdmittedUpdate, ExecutionOutcome, LedgerActivityBody, RunState,
+    SignalDelivery, SignalWithStart, SignalWithStartOutcome, SqliteRuntime, StartOptions,
+    StartOutcome, UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
 // The depth cap is shared with the Postgres backend (issue #2225).
 pub use crate::schedule::{ScheduleOverride, ScheduleSummary};

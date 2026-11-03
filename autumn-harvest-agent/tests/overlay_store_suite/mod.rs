@@ -12,7 +12,7 @@ use autumn_harvest::ExecutionId;
 use autumn_harvest_agent::agent::overlay::apply;
 use autumn_harvest_agent::{
     AgentProfile, Ceilings, OverlayError, OverlayStoreError, OverlayValidator, OverlayVersion,
-    ProfileOverlay, ProfileOverlayStore, Provenance,
+    ProfileOverlay, ProfileOverlayStore, Provenance, Rollback,
 };
 
 /// Makes a store that validates with the given validator.
@@ -97,6 +97,10 @@ pub async fn run_all(make: MakeStore<'_>) {
     concurrent_puts_get_distinct_versions(make).await;
     kinds_do_not_share_versions(make).await;
     the_pointer_compares_exactly(make).await;
+    each_move_is_logged_with_its_actor(make).await;
+    a_rollback_activates_the_version_before(make).await;
+    a_rollback_with_no_earlier_activation_changes_nothing(make).await;
+    an_activation_checks_its_actor(make).await;
 }
 
 /// After `put` v2, `get(kind, v1)` returns the bytes written for v1.
@@ -152,7 +156,7 @@ pub async fn activate_of_an_unknown_version_changes_nothing(make: MakeStore<'_>)
     let store = make(Arc::new(Gate::default()));
     let kind = kind("unknown");
     let missing = version(99);
-    let err = store.activate(&kind, missing, None).await;
+    let err = store.activate(&kind, missing, None, ops()).await;
     assert_eq!(
         err,
         Err(OverlayStoreError::UnknownVersion { version: missing })
@@ -160,8 +164,11 @@ pub async fn activate_of_an_unknown_version_changes_nothing(make: MakeStore<'_>)
     assert_eq!(store.active(&kind).await.expect("active"), None);
 
     let v1 = store.put(&kind, &narrow(9, "a"), ops()).await.expect("v1");
-    store.activate(&kind, v1, None).await.expect("activate v1");
-    let err = store.activate(&kind, missing, Some(v1)).await;
+    store
+        .activate(&kind, v1, None, ops())
+        .await
+        .expect("activate v1");
+    let err = store.activate(&kind, missing, Some(v1), ops()).await;
     assert_eq!(
         err,
         Err(OverlayStoreError::UnknownVersion { version: missing })
@@ -184,10 +191,13 @@ pub async fn two_activates_with_one_expected_pointer_have_one_winner(make: MakeS
         let v1 = store.put(&kind, &narrow(9, "a"), ops()).await.expect("v1");
         let v2 = store.put(&kind, &narrow(8, "b"), ops()).await.expect("v2");
         let v3 = store.put(&kind, &narrow(7, "c"), ops()).await.expect("v3");
-        store.activate(&kind, v1, None).await.expect("activate v1");
+        store
+            .activate(&kind, v1, None, ops())
+            .await
+            .expect("activate v1");
         let (left, right) = tokio::join!(
-            store.activate(&kind, v2, Some(v1)),
-            store.activate(&kind, v3, Some(v1)),
+            store.activate(&kind, v2, Some(v1), ops()),
+            store.activate(&kind, v3, Some(v1), ops()),
         );
         let winner = match (&left, &right) {
             (Ok(()), Err(_)) => v2,
@@ -203,6 +213,13 @@ pub async fn two_activates_with_one_expected_pointer_have_one_winner(make: MakeS
         );
         let active = store.active(&kind).await.expect("active").expect("set");
         assert_eq!(active.version(), winner);
+        // The race logs one move only: from v1 to the winner (issue #2374).
+        let last = store
+            .last_activation(&kind)
+            .await
+            .expect("last")
+            .expect("move");
+        assert_eq!((last.seq(), last.from(), last.to()), (2, Some(v1), winner));
     }
 }
 
@@ -240,7 +257,7 @@ pub async fn activate_validates_the_version_again(make: MakeStore<'_>) {
     let v1 = store.put(&kind, &narrow(8, "a"), ops()).await.expect("v1");
     gate.tight.store(true, Ordering::SeqCst);
     assert_eq!(
-        store.activate(&kind, v1, None).await,
+        store.activate(&kind, v1, None, ops()).await,
         Err(OverlayStoreError::Overlay(OverlayError::AboveCeiling {
             field: "max_steps"
         }))
@@ -261,10 +278,13 @@ pub async fn a_rollback_restores_an_exact_earlier_version(make: MakeStore<'_>) {
         .put(&kind, &narrow(6, "Two."), ops())
         .await
         .expect("v2");
-    store.activate(&kind, v1, None).await.expect("v1");
-    store.activate(&kind, v2, Some(v1)).await.expect("v2");
+    store.activate(&kind, v1, None, ops()).await.expect("v1");
     store
-        .activate(&kind, v1, Some(v2))
+        .activate(&kind, v2, Some(v1), ops())
+        .await
+        .expect("v2");
+    store
+        .activate(&kind, v1, Some(v2), ops())
         .await
         .expect("roll back");
     let active = store.active(&kind).await.expect("active").expect("set");
@@ -349,7 +369,7 @@ pub async fn kinds_do_not_share_versions(make: MakeStore<'_>) {
         .expect("v1");
     assert_eq!(store.get(&right, v1).await.expect("get"), None);
     assert_eq!(
-        store.activate(&right, v1, None).await,
+        store.activate(&right, v1, None, ops()).await,
         Err(OverlayStoreError::UnknownVersion { version: v1 })
     );
     let r1 = store
@@ -369,21 +389,162 @@ pub async fn the_pointer_compares_exactly(make: MakeStore<'_>) {
     let kind = kind("pointer");
     let v1 = store.put(&kind, &narrow(9, "a"), ops()).await.expect("v1");
     assert_eq!(
-        store.activate(&kind, v1, Some(v1)).await,
+        store.activate(&kind, v1, Some(v1), ops()).await,
         Err(OverlayStoreError::Conflict { actual: None })
     );
-    store.activate(&kind, v1, None).await.expect("activate v1");
+    store
+        .activate(&kind, v1, None, ops())
+        .await
+        .expect("activate v1");
     assert_eq!(
-        store.activate(&kind, v1, None).await,
+        store.activate(&kind, v1, None, ops()).await,
         Err(OverlayStoreError::Conflict { actual: Some(v1) })
     );
     store
-        .activate(&kind, v1, Some(v1))
+        .activate(&kind, v1, Some(v1), ops())
         .await
         .expect("the same version again");
     let far = OverlayVersion::new(u64::MAX).expect("max");
     assert_eq!(
-        store.activate(&kind, v1, Some(far)).await,
+        store.activate(&kind, v1, Some(far), ops()).await,
         Err(OverlayStoreError::Conflict { actual: Some(v1) })
     );
+}
+
+/// Each move of the pointer logs its start, its end and its actor (issue
+/// #2374). A refused activation and an activation of the active version
+/// log nothing.
+pub async fn each_move_is_logged_with_its_actor(make: MakeStore<'_>) {
+    let store = make(Arc::new(Gate::default()));
+    let kind = kind("log");
+    assert_eq!(store.last_activation(&kind).await.expect("last"), None);
+    let v1 = store.put(&kind, &narrow(9, "a"), ops()).await.expect("v1");
+    let v2 = store.put(&kind, &narrow(8, "b"), ops()).await.expect("v2");
+    store.activate(&kind, v1, None, ops()).await.expect("v1");
+    let first = store
+        .last_activation(&kind)
+        .await
+        .expect("last")
+        .expect("v1");
+    assert_eq!(first.seq(), 1);
+    assert_eq!(first.from(), None);
+    assert_eq!(first.to(), v1);
+    assert_eq!(first.actor(), &ops());
+    assert_eq!(first.kind(), kind);
+
+    let run = ExecutionId::new();
+    store
+        .activate(&kind, v2, Some(v1), Provenance::refine(run))
+        .await
+        .expect("v2");
+    let second = store
+        .last_activation(&kind)
+        .await
+        .expect("last")
+        .expect("v2");
+    assert_eq!(second.seq(), 2);
+    assert_eq!((second.from(), second.to()), (Some(v1), v2));
+    assert_eq!(second.actor(), &Provenance::refine(run));
+    assert!(second.activated_at() >= first.activated_at());
+
+    store
+        .activate(&kind, v2, Some(v2), ops())
+        .await
+        .expect("the active version again");
+    assert!(store.activate(&kind, v1, None, ops()).await.is_err());
+    let last = store
+        .last_activation(&kind)
+        .await
+        .expect("last")
+        .expect("v2");
+    assert_eq!(last, second, "a stay in place and a refusal log nothing");
+}
+
+/// `rollback` after v1 then v2 makes v1 active, and logs the move back. A
+/// second rollback restores v2, as `kubectl rollout undo` does.
+pub async fn a_rollback_activates_the_version_before(make: MakeStore<'_>) {
+    let store = make(Arc::new(Gate::default()));
+    let kind = kind("undo");
+    let v1 = store
+        .put(&kind, &narrow(9, "One."), ops())
+        .await
+        .expect("v1");
+    let v2 = store
+        .put(&kind, &narrow(6, "Two."), ops())
+        .await
+        .expect("v2");
+    store.activate(&kind, v1, None, ops()).await.expect("v1");
+    store
+        .activate(&kind, v2, Some(v1), ops())
+        .await
+        .expect("v2");
+
+    let back = store
+        .rollback(&kind, Provenance::operator("oncall"))
+        .await
+        .expect("rollback");
+    assert_eq!(back, Rollback { from: v2, to: v1 });
+    let active = store.active(&kind).await.expect("active").expect("set");
+    assert_eq!(active.version(), v1);
+    assert_eq!(
+        active.bytes(),
+        serde_json::to_vec(&narrow(9, "One.")).expect("encode")
+    );
+    let last = store
+        .last_activation(&kind)
+        .await
+        .expect("last")
+        .expect("move");
+    assert_eq!((last.from(), last.to()), (Some(v2), v1));
+    assert_eq!(last.actor(), &Provenance::operator("oncall"));
+
+    let again = store.rollback(&kind, ops()).await.expect("rollback again");
+    assert_eq!(again, Rollback { from: v1, to: v2 });
+    let active = store.active(&kind).await.expect("active").expect("set");
+    assert_eq!(active.version(), v2);
+}
+
+/// `rollback` with no earlier activation returns `NoEarlierActivation` and
+/// changes nothing: with no activation, and after one first activation.
+pub async fn a_rollback_with_no_earlier_activation_changes_nothing(make: MakeStore<'_>) {
+    let store = make(Arc::new(Gate::default()));
+    let kind = kind("no-undo");
+    assert_eq!(
+        store.rollback(&kind, ops()).await,
+        Err(OverlayStoreError::NoEarlierActivation)
+    );
+    let v1 = store.put(&kind, &narrow(9, "a"), ops()).await.expect("v1");
+    assert_eq!(
+        store.rollback(&kind, ops()).await,
+        Err(OverlayStoreError::NoEarlierActivation)
+    );
+    assert_eq!(store.active(&kind).await.expect("active"), None);
+    assert_eq!(store.last_activation(&kind).await.expect("last"), None);
+
+    store.activate(&kind, v1, None, ops()).await.expect("v1");
+    let before = store.last_activation(&kind).await.expect("last");
+    assert_eq!(
+        store.rollback(&kind, ops()).await,
+        Err(OverlayStoreError::NoEarlierActivation)
+    );
+    let active = store.active(&kind).await.expect("active").expect("set");
+    assert_eq!(active.version(), v1);
+    assert_eq!(store.last_activation(&kind).await.expect("last"), before);
+}
+
+/// An activation refuses a bad actor, and the pointer does not move.
+pub async fn an_activation_checks_its_actor(make: MakeStore<'_>) {
+    let store = make(Arc::new(Gate::default()));
+    let kind = kind("actor");
+    let v1 = store.put(&kind, &narrow(9, "a"), ops()).await.expect("v1");
+    for bad in ["", " ops", "o\u{200B}ps"] {
+        assert!(matches!(
+            store
+                .activate(&kind, v1, None, Provenance::operator(bad))
+                .await,
+            Err(OverlayStoreError::InvalidProvenance { .. })
+        ));
+    }
+    assert_eq!(store.active(&kind).await.expect("active"), None);
+    assert_eq!(store.last_activation(&kind).await.expect("last"), None);
 }

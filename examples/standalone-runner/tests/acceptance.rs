@@ -33,6 +33,8 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Every request times out, so a hung runner fails the test.
 static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    // Reqwest panics without a provider. An `Err` means that one is installed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -558,6 +560,7 @@ async fn sigterm_stops_cleanly_with_an_open_stream() {
         .await
         .expect("start returns JSON");
     let exec_id = started["execution_id"].as_str().expect("an execution id");
+    LazyLock::force(&HTTP);
     let stream = reqwest::Client::new()
         .get(runner.url(&format!("/api/harvest/workflows/{exec_id}/stream")))
         .send()

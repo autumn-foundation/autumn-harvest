@@ -35,4 +35,5 @@ compares this table with `ALLOWLIST`. Change both in the same commit.
 | `core:chaos_tests` | won't wire | Runs nightly in `.github/workflows/chaos.yml` with the `chaos` feature (issue #940). It is too slow for each PR. |
 | `plugin:connector_kafka_broker` | won't wire | Runs in CI from its own Linux step in `ci.yml` (issue #944). The step installs `librdkafka` build dependencies first. |
 | `plugin:outbox_start_relay_perf` | won't wire | Manual `pg_stat_statements` evidence (issue #1620). Run it by hand, as `docs/performance-outbox-start-relay.md` tells. |
+| `plugin:sqlite_plugin_split` | won't wire | Runs in CI from its own `sqlite-plugin-split` job in `ci.yml` (issue #2472). The `sqlite` feature flips `autumn-web` for the whole build, so the manifest shards cannot build it. |
 <!-- allowlist-tracking:end -->

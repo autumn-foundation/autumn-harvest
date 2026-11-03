@@ -117,18 +117,16 @@ pub fn acquire(conn: &Connection, requested: &Path) -> SqliteResult<Option<Write
     })?;
     let mut attempt = 1;
     loop {
-        // Fully qualified: std has an inherent `File::try_lock` from Rust 1.89
-        // with a different error type, and the MSRV is 1.88.
-        match fs4::FileExt::try_lock(&file) {
+        match file.try_lock() {
             Ok(()) => return Ok(Some(WriterLock::File(file))),
-            Err(fs4::TryLockError::WouldBlock) if attempt < LOCK_ATTEMPTS => {
+            Err(std::fs::TryLockError::WouldBlock) if attempt < LOCK_ATTEMPTS => {
                 attempt += 1;
                 std::thread::sleep(LOCK_RETRY_DELAY);
             }
-            Err(fs4::TryLockError::WouldBlock) => {
+            Err(std::fs::TryLockError::WouldBlock) => {
                 return Err(SqliteError::DatabaseLocked { path });
             }
-            Err(fs4::TryLockError::Error(source)) => {
+            Err(std::fs::TryLockError::Error(source)) => {
                 return Err(SqliteError::Io { path, source });
             }
         }

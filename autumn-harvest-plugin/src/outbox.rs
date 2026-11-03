@@ -259,6 +259,16 @@ fn outbox_mark_flush_due_now(
         .is_zero()
 }
 
+/// Why the outbox has no app pool. A SQLite app has no Postgres outbox at
+/// all (issue #2472). Its own outbox is #2470.
+const fn no_outbox_pool() -> &'static str {
+    if cfg!(feature = "sqlite") {
+        "the transactional outbox is not available on a SQLite app (autumn-harvest#2470)"
+    } else {
+        "Database not configured for Harvest outbox"
+    }
+}
+
 async fn drain_workflow_start_outbox_batch(
     state: &AppState,
     limit: i64,
@@ -269,9 +279,7 @@ async fn drain_workflow_start_outbox_batch(
     }
 
     let Some(app_pool) = crate::state::app_postgres_pool(state) else {
-        return Err(AutumnError::service_unavailable_msg(
-            "Database not configured for Harvest outbox",
-        ));
+        return Err(AutumnError::service_unavailable_msg(no_outbox_pool()));
     };
 
     let claimant = format!("harvest-outbox-{}", Uuid::new_v4().simple());

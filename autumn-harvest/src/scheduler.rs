@@ -8360,7 +8360,7 @@ mod tests {
     #[test]
     fn catchup_run_plan_most_recent_fires_exactly_one_newest_slot() {
         use crate::policy::CatchupPolicy;
-        let schedule = Schedule::Interval(Duration::from_secs(60 * 15)); // 15-min
+        let schedule = Schedule::Interval(Duration::from_mins(15)); // 15-min
         let now = parse_utc("2026-04-06T12:00:00Z");
         // Simulate 24-hour outage: first_due = 24h ago.
         let first_due = now - chrono::Duration::hours(24);
@@ -8410,7 +8410,7 @@ mod tests {
     #[test]
     fn catchup_run_plan_window_fires_in_window_drops_older() {
         use crate::policy::CatchupPolicy;
-        let schedule = Schedule::Interval(Duration::from_secs(60 * 15)); // 15-min
+        let schedule = Schedule::Interval(Duration::from_mins(15)); // 15-min
         let now = parse_utc("2026-04-06T12:00:00Z");
         let first_due = now - chrono::Duration::hours(24); // 96 missed slots
 
@@ -8476,7 +8476,7 @@ mod tests {
         let schedule = Schedule::Cron("0 * * * *".to_string()); // top of every hour
         let now = parse_utc("2026-04-08T00:00:00Z");
         let first_due = now - chrono::Duration::days(7);
-        let window = Duration::from_secs(2 * 3600); // 2 hours
+        let window = Duration::from_hours(2); // 2 hours
 
         let plan = catchup_run_plan(
             Some(&schedule),
@@ -8537,7 +8537,7 @@ mod tests {
         // 15-min interval; end_at sits between older slots and the newest slot.
         // MostRecent must pick the newest slot STRICTLY BEFORE end_at, not the
         // newest overdue slot (which is at/after end_at).
-        let schedule = Schedule::Interval(Duration::from_secs(60 * 15));
+        let schedule = Schedule::Interval(Duration::from_mins(15));
         let first_due = parse_utc("2026-04-06T00:00:00Z");
         let now = parse_utc("2026-04-06T02:00:00Z"); // 8 missed slots + slot at now = 9
         // end_at at 01:00: eligible slots are 00:00,00:15,00:30,00:45 (4 slots,
@@ -8567,7 +8567,7 @@ mod tests {
     #[test]
     fn catchup_run_plan_most_recent_all_slots_after_end_at_fires_nothing() {
         use crate::policy::CatchupPolicy;
-        let schedule = Schedule::Interval(Duration::from_secs(60 * 15));
+        let schedule = Schedule::Interval(Duration::from_mins(15));
         let first_due = parse_utc("2026-04-06T05:00:00Z");
         let now = parse_utc("2026-04-06T06:00:00Z");
         // end_at before first_due: no eligible slots at all.
@@ -8591,7 +8591,7 @@ mod tests {
     #[test]
     fn catchup_run_plan_window_respects_end_at() {
         use crate::policy::CatchupPolicy;
-        let schedule = Schedule::Interval(Duration::from_secs(60 * 15));
+        let schedule = Schedule::Interval(Duration::from_mins(15));
         let first_due = parse_utc("2026-04-06T00:00:00Z");
         let now = parse_utc("2026-04-06T03:00:00Z");
         // 2-hour window keeps slots >= 01:00; end_at at 02:00 caps the top.
@@ -8603,7 +8603,7 @@ mod tests {
             Some(&schedule),
             first_due,
             now,
-            CatchupPolicy::Window(Duration::from_secs(2 * 3600)),
+            CatchupPolicy::Window(Duration::from_hours(2)),
             Some(end_at),
         );
 
@@ -9251,7 +9251,7 @@ mod tests {
         // rebased it to a future business day and pinned next_run_at at the (now
         // 2-day-past) original slot. next_run_at alone is far past grace, but the
         // calendar-adjusted fire is still ahead ⇒ not overdue.
-        let sched = Schedule::Interval(Duration::from_secs(86_400)); // daily
+        let sched = Schedule::Interval(Duration::from_hours(24)); // daily
         let now = dt(2026, 1, 5, 12, 0, 0);
         let next_run_at = now - chrono::Duration::days(2); // well past grace
         let v = schedule_overdue(&OverdueInputs {
@@ -9270,7 +9270,7 @@ mod tests {
         // The calendar-adjusted fire is itself now in the past by > grace: the
         // scheduler is genuinely wedged past the business-day fire ⇒ still flagged
         // (detection preserved, not blanket-suppressed for calendar schedules).
-        let sched = Schedule::Interval(Duration::from_secs(86_400)); // daily, grace ≈ 1 day
+        let sched = Schedule::Interval(Duration::from_hours(24)); // daily, grace ≈ 1 day
         let now = dt(2026, 1, 5, 12, 0, 0);
         let next_run_at = now - chrono::Duration::days(3);
         let effective = now - chrono::Duration::days(2); // adjusted fire 2 days past
@@ -9292,7 +9292,7 @@ mod tests {
         // next_run_at. `max(next_run_at, effective_fire_at)` keeps the raw slot as
         // the anchor, so a genuinely stale slot is still flagged (never
         // under-detected by a backward rebase).
-        let sched = Schedule::Interval(Duration::from_secs(86_400)); // daily
+        let sched = Schedule::Interval(Duration::from_hours(24)); // daily
         let now = dt(2026, 1, 5, 12, 0, 0);
         let next_run_at = now - chrono::Duration::days(2); // past grace
         let v = schedule_overdue(&OverdueInputs {
@@ -10850,7 +10850,7 @@ mod tests {
     fn window_eligible_slots_of_an_interval_past_the_end_of_time_is_empty() {
         // The period has no nanosecond value, and its first step leaves the
         // range of chrono. The walk stops at once.
-        let huge = Schedule::Interval(Duration::from_secs(9_000_000_000_000_000));
+        let huge = Schedule::Interval(Duration::from_hours(2_500_000_000_000));
         let first_due = parse_utc("2026-01-01T00:00:00Z");
         let now = first_due + chrono::Duration::hours(2);
         let cutoff = first_due + chrono::Duration::hours(1);

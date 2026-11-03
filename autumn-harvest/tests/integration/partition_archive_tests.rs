@@ -946,7 +946,7 @@ async fn the_retention_runtime_exports_before_it_drops() {
     let started = Utc::now();
     let runtime = RetentionRuntime::spawn_with_hooks(
         ShardedDbPool::single(build_pool(&url)),
-        RetentionConfig::with_max_age(Duration::from_secs(86_400)),
+        RetentionConfig::with_max_age(Duration::from_hours(24)),
         Arc::new(NoopMetrics),
         RetentionHooks::default().with_partition_archiver(Some(disk.clone())),
     )
@@ -1124,7 +1124,7 @@ async fn a_dry_run_writes_no_marker() {
     ));
 
     let backend = Arc::new(TestArchiver::default());
-    let mut config = RetentionConfig::with_max_age(Duration::from_secs(86_400));
+    let mut config = RetentionConfig::with_max_age(Duration::from_hours(24));
     config.dry_run = true;
     let started = Utc::now();
     let runtime = RetentionRuntime::spawn_with_hooks(

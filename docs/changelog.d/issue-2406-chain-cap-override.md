@@ -33,6 +33,16 @@ nullable column `chain_execution_timeout_secs` to
 No `WorkflowEvent` variant and no replay impact. Design:
 `docs/design/DESIGN-2406.md`.
 
+**Upgrade guide (for the next release).** Run the migration. Who is
+affected: a deployment that starts runs through the outbox, a Vantage
+trigger-now or the typed `signal_with_start` stub, and that sets
+`max_workflow_chain_timeout` or declares `chain_execution_timeout`. Those
+runs now get a chain deadline, or a shorter one. A child run is now capped
+by the fleet chain ceiling. During a roll, an older process refuses
+`chain_execution_timeout_secs` with a 400 and starts chains with the code
+value. So set a chain cap only after every process runs the new release.
+See the migration row in `docs/upgrading/0.5.0.md`.
+
 **Tests.** Unit tests on the fields, the cache and the resolver. DB tests on
 a chain-only row, the bound and the table check. HTTP tests for each
 acceptance criterion and for the DAG refusal. Worker tests for a same-type

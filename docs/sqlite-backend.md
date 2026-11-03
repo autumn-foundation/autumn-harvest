@@ -76,8 +76,8 @@ management routes on this backend: see [`sqlite-plugin.md`](sqlite-plugin.md)
 
 ```toml
 [dependencies]
-autumn-harvest = { version = "0.8", default-features = false }
-autumn-harvest-sqlite = "0.8"
+autumn-harvest = { version = "0.9", default-features = false }
+autumn-harvest-sqlite = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

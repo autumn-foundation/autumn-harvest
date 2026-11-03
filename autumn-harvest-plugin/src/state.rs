@@ -8,8 +8,9 @@ use autumn_harvest::worker::DbPool;
 
 /// The app pool as a Postgres pool, for the Postgres path (issue #2467).
 ///
-/// The `sqlite` feature flips `autumn-web` to a SQLite pool. The Postgres path
-/// never runs then, but it must still compile, so this returns `None` there.
+/// Under `sqlite` the app pool is SQLite, so this returns `None`. Split and
+/// external mode run the Postgres path with its own Harvest pool (issue
+/// #2472).
 #[cfg_attr(
     feature = "sqlite",
     allow(
@@ -29,13 +30,15 @@ pub(crate) fn app_postgres_pool(state: &autumn_web::AppState) -> Option<DbPool> 
     }
 }
 
-/// A Postgres pool from `config`, through `autumn-web` (issue #2467).
+/// A Postgres pool from `config`.
 ///
-/// Under `sqlite`, `autumn-web` builds SQLite pools only, so this refuses.
+/// The default build asks `autumn-web`. Under `sqlite`, `autumn-web` builds
+/// SQLite pools only, so the pool comes from [`postgres_pool_on_sqlite`]
+/// (issue #2472).
 ///
 /// # Errors
 ///
-/// Returns the pool error, or the refusal under `sqlite`.
+/// Returns the pool error, or a refusal of a URL that is not Postgres.
 pub(crate) fn create_postgres_pool(
     config: &autumn_web::config::DatabaseConfig,
 ) -> Result<Option<DbPool>, String> {
@@ -45,13 +48,50 @@ pub(crate) fn create_postgres_pool(
     }
     #[cfg(feature = "sqlite")]
     {
-        let _ = config;
-        Err(
-            "a Postgres Harvest pool is not available in a build with the `sqlite` feature \
-             (autumn-harvest#2472)"
-                .to_owned(),
-        )
+        postgres_pool_on_sqlite(config)
     }
+}
+
+/// A Postgres pool in a build where `autumn-web` is SQLite (issue #2472).
+///
+/// It keeps the `autumn-web` pool settings: the size, the wait and create
+/// timeouts, and fast recycling. Each connection opens with
+/// [`autumn_harvest::pg_tls::connect`]. Its TLS rules differ from those of
+/// `autumn-web`: `sslmode=require` checks the certificate chain and the host
+/// name, and `sslrootcert` is not read. `SSL_CERT_FILE` names a private CA.
+#[cfg(feature = "sqlite")]
+fn postgres_pool_on_sqlite(
+    config: &autumn_web::config::DatabaseConfig,
+) -> Result<Option<DbPool>, String> {
+    use diesel_async::AsyncPgConnection;
+    use diesel_async::pooled_connection::{
+        AsyncDieselConnectionManager, ManagerConfig, RecyclingMethod,
+    };
+
+    let Some(url) = config.effective_primary_url() else {
+        return Ok(None);
+    };
+    if autumn_web::config::DatabaseBackend::detect(url)
+        != Some(autumn_web::config::DatabaseBackend::Postgres)
+    {
+        return Err(
+            "harvest.database.url is not a Postgres URL. Split and external mode keep \
+             Harvest in Postgres (autumn-harvest#2472)"
+                .to_owned(),
+        );
+    }
+    let mut manager = ManagerConfig::<AsyncPgConnection>::default();
+    manager.recycling_method = RecyclingMethod::Fast;
+    manager.custom_setup = Box::new(|url| Box::pin(autumn_harvest::pg_tls::connect(url)));
+    let timeout = std::time::Duration::from_secs(config.connect_timeout_secs);
+    deadpool::managed::Pool::builder(AsyncDieselConnectionManager::new_with_config(url, manager))
+        .max_size(config.effective_primary_pool_size().max(1))
+        .wait_timeout(Some(timeout))
+        .create_timeout(Some(timeout))
+        .runtime(deadpool::Runtime::Tokio1)
+        .build()
+        .map(Some)
+        .map_err(|error| format!("cannot build the Postgres Harvest pool: {error}"))
 }
 
 /// Application/business database role exposed to Harvest activities.
@@ -214,5 +254,50 @@ impl std::fmt::Debug for HarvestDbPool {
             .field("shards", &self.sharded.shard_ids())
             .field("default_shard", &self.sharded.default_shard())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use autumn_web::config::DatabaseConfig;
+
+    fn config(url: Option<&str>, pool_size: usize) -> DatabaseConfig {
+        DatabaseConfig {
+            url: url.map(str::to_owned),
+            pool_size,
+            ..DatabaseConfig::default()
+        }
+    }
+
+    /// A SQLite app in split mode still gets a Postgres Harvest pool. The
+    /// pool connects lazily, so no server is needed here (issue #2472).
+    #[tokio::test]
+    async fn a_postgres_pool_builds_in_every_build() {
+        let pool = create_postgres_pool(&config(Some("postgres://h:h@localhost:5432/h"), 4))
+            .expect("the pool builds")
+            .expect("a url gives a pool");
+        assert_eq!(pool.status().max_size, 4);
+    }
+
+    #[test]
+    fn no_url_gives_no_pool() {
+        assert!(create_postgres_pool(&config(None, 4)).unwrap().is_none());
+    }
+
+    /// A SQLite URL is not a Postgres Harvest database.
+    #[test]
+    fn a_sqlite_url_is_refused() {
+        let Err(error) = create_postgres_pool(&config(Some("sqlite://h.db"), 4)) else {
+            panic!("a SQLite URL must not give a Postgres pool");
+        };
+        assert!(error.contains("Postgres"), "{error}");
+    }
+
+    /// The SQLite app pool never reaches a Postgres path (issue #2472).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn the_sqlite_app_pool_is_never_a_postgres_pool() {
+        assert!(app_postgres_pool(&autumn_web::AppState::for_test()).is_none());
     }
 }

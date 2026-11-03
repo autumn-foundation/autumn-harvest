@@ -435,7 +435,7 @@ mod tests {
             .collect()
     }
 
-    const CEILING: std::time::Duration = std::time::Duration::from_secs(90 * 24 * 60 * 60);
+    const CEILING: std::time::Duration = std::time::Duration::from_hours(2160);
     const TEST_MAX_GROUPS: usize = 1000;
 
     // ── UsageParams::from_query_pairs ──────────────────────────────────────
@@ -595,16 +595,13 @@ mod tests {
 
     #[test]
     fn format_ceiling_prefers_whole_days() {
-        assert_eq!(
-            format_ceiling(std::time::Duration::from_secs(2 * 86_400)),
-            "2-day"
-        );
+        assert_eq!(format_ceiling(std::time::Duration::from_hours(48)), "2-day");
     }
 
     #[test]
     fn format_ceiling_falls_back_to_whole_hours() {
         assert_eq!(
-            format_ceiling(std::time::Duration::from_secs(30 * 3600)),
+            format_ceiling(std::time::Duration::from_hours(30)),
             "30-hour"
         );
     }
@@ -620,7 +617,7 @@ mod tests {
     #[test]
     fn params_rejects_window_wider_than_non_whole_day_ceiling_and_names_hours_not_misrounded_days()
     {
-        let ceiling = std::time::Duration::from_secs(30 * 3600); // 30h — not a whole day
+        let ceiling = std::time::Duration::from_hours(30); // 30h — not a whole day
         let err = UsageParams::from_query_pairs(
             &pairs(&[
                 ("from", "2026-01-01T00:00:00Z"),

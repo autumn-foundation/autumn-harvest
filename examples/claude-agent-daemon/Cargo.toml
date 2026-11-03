@@ -11,12 +11,13 @@ path = "src/main.rs"
 
 [dependencies]
 # The backend-neutral determinism core only: no Diesel, no Postgres.
-autumn-harvest = { version = "0.8.0", path = "../../autumn-harvest", default-features = false }
-autumn-harvest-sqlite = { version = "0.8.0", path = "../../autumn-harvest-sqlite" }
+autumn-harvest = { version = "0.9.0", path = "../../autumn-harvest", default-features = false }
+autumn-harvest-sqlite = { version = "0.9.0", path = "../../autumn-harvest-sqlite" }
 # The agent adapter (issue #1973): approval signal names and payload-cap checks.
-autumn-harvest-agent = { version = "0.8.0", path = "../../autumn-harvest-agent" }
-clap = { version = "4.5", features = ["derive", "env"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+autumn-harvest-agent = { version = "0.9.0", path = "../../autumn-harvest-agent" }
+clap = { version = "4.6", features = ["derive", "env"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 # `flock` for the per-database daemon lock. The kernel releases the lock when
 # the holder dies, so a crashed daemon strands nothing.
 rustix = { version = "1", features = ["fs", "process"] }

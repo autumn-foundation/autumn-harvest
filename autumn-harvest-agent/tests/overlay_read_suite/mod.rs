@@ -211,7 +211,7 @@ pub async fn adopt(
         .await
         .expect("put");
     store
-        .activate(kind, version, expected)
+        .activate(kind, version, expected, Provenance::operator("ops"))
         .await
         .expect("activate");
     version
@@ -467,4 +467,35 @@ pub async fn a_narrowed_deploy_fails_safe<B: Backend>(backend: &mut B) {
         "the error names the version and the bound: {error}"
     );
     assert_eq!(fallback.calls() + old.calls(), 0, "no model ran bare");
+}
+
+/// Issue #2374: `rollback` after v1 then v2 makes v1 active. The next op
+/// sends v1's prompt to the model.
+pub async fn a_rollback_restores_v1<B: Backend>(backend: &mut B) {
+    let kind = backend.kind();
+    let model = PromptModel::new();
+    let (harness, store) = with_store(backend, base_harness(&kind, model.clone()));
+    let v1 = adopt(store.as_ref(), &kind, &prompt(PROMPT_V1), None).await;
+    let v2 = adopt(store.as_ref(), &kind, &prompt(PROMPT_V2), Some(v1)).await;
+    backend.serve(harness).await;
+    let id = agent(&kind, "rollback");
+
+    backend.send(&id, &AgentOp::message("one")).await;
+    let state = backend.settle(&id, &segments(1)).await;
+    assert_eq!(state.profile_version, Some(v2));
+
+    let back = store
+        .rollback(&kind, Provenance::operator("oncall"))
+        .await
+        .expect("rollback");
+    assert_eq!((back.from, back.to), (v2, v1));
+    backend.send(&id, &AgentOp::message("two")).await;
+    let state = backend.settle(&id, &segments(2)).await;
+    assert_eq!(state.failures, 0, "{:?}", state.last_error);
+    assert_eq!(state.profile_version, Some(v1));
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains(PROMPT_V2), "{prompts:?}");
+    assert!(prompts[1].contains(PROMPT_V1), "{prompts:?}");
+    assert!(!prompts[1].contains(PROMPT_V2), "{prompts:?}");
 }

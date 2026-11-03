@@ -874,13 +874,10 @@ async fn purge_removes_old_finished_runs() {
     let exec = runtime::start(&mut rt, &fx.config("old", 1)).unwrap();
     run_to_end(&mut rt, exec).await;
     // AC25: nothing is old enough yet.
-    assert_eq!(
-        rt.purge_terminal(Duration::from_secs(30 * 86_400)).unwrap(),
-        0
-    );
+    assert_eq!(rt.purge_terminal(Duration::from_hours(30 * 24)).unwrap(), 0);
     let later = Utc::now() + chrono::Duration::days(31);
     let removed = rt
-        .purge_terminal_as_of(later, Duration::from_secs(30 * 86_400))
+        .purge_terminal_as_of(later, Duration::from_hours(30 * 24))
         .unwrap();
     assert!(removed >= 3, "{removed}");
     assert_eq!(runs_of(&rt, SESSION), Vec::new());
@@ -1436,7 +1433,7 @@ async fn a_purge_refuses_to_remove_a_session_whose_report_runs() {
         .expect("the report agent waits");
     let refusal = runtime::purge(&mut rt, Duration::ZERO).unwrap_err();
     assert!(refusal.contains("autoresearch serve"), "{refusal}");
-    let day = Duration::from_secs(86_400);
+    let day = Duration::from_hours(24);
     assert_eq!(runtime::purge(&mut rt, day).unwrap(), 0);
     runtime::drive_report(&mut rt, &reporter).await.unwrap();
     assert!(runtime::purge(&mut rt, Duration::ZERO).unwrap() > 0);

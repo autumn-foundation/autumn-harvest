@@ -5209,7 +5209,7 @@ fn dead_letter_return_to_path(
     }
 }
 
-fn dead_letter_task_kind_label(task_type: &str) -> &'static str {
+const fn dead_letter_task_kind_label(task_type: &str) -> &'static str {
     if task_type.eq_ignore_ascii_case("activity") {
         "Activity"
     } else if task_type.eq_ignore_ascii_case("workflow") {

@@ -114,13 +114,14 @@ pub mod workspace;
 pub use agent::overlay::{
     Ceilings, GUARDRAILS_HEADING, ModelRegistry, OverlayError, ProfileOverlay, ToolRegistry,
 };
+pub use agent::overlay_diff::{OverlayChange, diff as overlay_diff};
 #[cfg(feature = "postgres")]
 pub use agent::overlay_store::PostgresOverlayStore;
 #[cfg(feature = "sqlite")]
 pub use agent::overlay_store::SqliteOverlayStore;
 pub use agent::overlay_store::{
-    InMemoryOverlayStore, MAX_AUTHOR_LEN, OverlayStoreError, OverlayValidator, OverlayVersion,
-    ProfileOverlayStore, Provenance, StoredOverlay,
+    Activation, InMemoryOverlayStore, MAX_AUTHOR_LEN, OverlayStoreError, OverlayValidator,
+    OverlayVersion, ProfileOverlayStore, Provenance, Rollback, StoredOverlay,
 };
 pub use agent::profile_read::{OverlayRead, ProfileRead};
 pub use agent::{

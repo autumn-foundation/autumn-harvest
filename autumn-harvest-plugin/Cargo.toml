@@ -41,7 +41,8 @@ sqs = ["connectors", "dep:aws-config", "dep:aws-sdk-sqs"]
 # trait, so the core crate keeps zero cloud dependencies (the issue #944 rule,
 # enforced by `tests/connector_dependency_graph.rs`). Like `sqs`, it brings in
 # `aws-lc-rs`, which needs cmake and a C compiler. The locked `aws-sdk-kms`
-# 1.99.0 needs Rust 1.88, so the effective MSRV does not rise.
+# 1.99.0 needs Rust 1.88, below the workspace MSRV, so the effective MSRV does
+# not rise.
 aws-kms = ["dep:aws-sdk-kms", "dep:async-trait"]
 # Object-store adapters for `PayloadStore` and `HistoryArchiver` (issue #1983).
 # `object-store` holds the backend-agnostic adapters and adds no client.
@@ -74,11 +75,9 @@ dev-runtime = ["dep:tokio-postgres"]
 # and extracts the archive; the cluster is still driven by our own lifecycle
 # code, so ephemerality and teardown stay under this crate's control.
 #
-# `postgresql_archive` 0.19 (not 0.21) deliberately: it is what `autumn-web`'s
-# own `managed-pg` feature resolves to, its rustls feature unifies on the
-# reqwest already in the graph rather than pulling a second copy, and its MSRV
-# (1.87) is below this workspace's 1.88 — so unlike `wasm-activities` this
-# feature raises no effective MSRV at all.
+# `postgresql_archive` uses its `tls-rustls-ring` feature, so it shares this
+# crate's reqwest and adds no `aws-lc-rs`. Its MSRV is below the workspace MSRV,
+# so this feature raises no effective MSRV.
 dev-runtime-managed = ["dev-runtime", "dep:postgresql_archive"]
 # Redis dispatch channel (issue #1312). Off by default: with the feature off
 # the runtime keeps the Postgres claim path, and `[harvest.redis] url` is
@@ -101,7 +100,10 @@ sqlite = ["autumn-web/sqlite", "dep:autumn-harvest-sqlite"]
 
 
 [dependencies]
-autumn-harvest = { version = "0.8.0", path = "../autumn-harvest", features = ["db", "testing"] }
+autumn-harvest = { version = "0.9.0", path = "../autumn-harvest", features = ["db", "testing"] }
+# The agent profile overlay routes (issue #2374) use the store trait and the
+# overlay diff. The crate builds on the core crate only, so no cycle forms.
+autumn-harvest-agent = { version = "0.9.0", path = "../autumn-harvest-agent" }
 autumn-web = "0.9"
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -151,14 +153,17 @@ tokio-postgres = { version = "0.7.18", optional = true }
 # graph for a cluster we already drive ourselves. `default-features = false`
 # drops its native-tls default in favour of rustls, matching the rest of the
 # crate's pure-Rust TLS story (no OpenSSL on Windows).
-postgresql_archive = { version = "0.19", default-features = false, features = ["theseus", "rustls"], optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+postgresql_archive = { version = "0.22", default-features = false, features = ["theseus", "tls-rustls-ring"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+# Reqwest gets its crypto provider from here, so `aws-lc-rs` stays out of the
+# default build. See `src/http.rs`.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 thiserror = { workspace = true }
 # Redis Streams dispatch channel (issue #1312), behind the `redis` feature.
 # Optional so the default build keeps a Postgres-only dependency graph.
-autumn-harvest-redis = { version = "0.8.0", path = "../autumn-harvest-redis", optional = true }
+autumn-harvest-redis = { version = "0.9.0", path = "../autumn-harvest-redis", optional = true }
 # The SQLite backend (issue #2467), behind the `sqlite` feature.
-autumn-harvest-sqlite = { version = "0.8.0", path = "../autumn-harvest-sqlite", optional = true }
+autumn-harvest-sqlite = { version = "0.9.0", path = "../autumn-harvest-sqlite", optional = true }
 
 # ── Broker connectors (issue #944) — all optional, all off by default ──
 # Object-safe async traits for the EventSource / DeadLetterSink seams
@@ -207,8 +212,8 @@ autumn-web = { version = "0.9", features = ["test-support", "mcp"] }
 # The dev-runtime lifecycle test drives the running dev runtime over real HTTP
 # (start a workflow, poll its status, fetch the Vantage page). The crate already
 # depends on reqwest for the callback deliverer; the test needs `json` on top.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-autumn-harvest = { version = "0.8.0", path = "../autumn-harvest", features = ["db", "testing"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+autumn-harvest = { version = "0.9.0", path = "../autumn-harvest", features = ["db", "testing"] }
 tower = "0.5"
 # `test-util` for `#[tokio::test(start_paused = true)]`: the shutdown-drain
 # deadline is a 30s wall-clock wait that must be asserted, not slept through.
@@ -304,4 +309,16 @@ required-features = ["sqs"]
 # Postgres and no Docker. CI runs it in the `sqlite-plugin` job.
 [[test]]
 name = "sqlite_plugin"
+required-features = ["sqlite"]
+
+# A SQLite app with a Postgres Harvest database (issue #2472). It starts a
+# Postgres container, so it needs Docker. CI runs it in the
+# `sqlite-plugin-split` job.
+[[test]]
+name = "sqlite_plugin_split"
+required-features = ["sqlite"]
+
+# Per-tenant Harvest in a SQLite fleet app (issue #2472). It needs no Docker.
+[[test]]
+name = "sqlite_plugin_fleet"
 required-features = ["sqlite"]

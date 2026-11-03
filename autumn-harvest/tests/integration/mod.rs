@@ -308,6 +308,7 @@ mod rate_limit_key_tests;
 #[cfg(feature = "db")]
 mod rebalance_markers_db_tests;
 mod redrive_tests;
+mod release_pr_ci;
 #[cfg(all(feature = "testing", feature = "db"))]
 mod remote_task_db_tests;
 #[cfg(feature = "testing")]

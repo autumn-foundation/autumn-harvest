@@ -404,7 +404,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         workflow_panic_max_attempts: 3,
                         labels: std::collections::HashMap::new(),
                         queue_weights: std::collections::HashMap::new(),
-                        max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                        max_workflow_pause_duration: std::time::Duration::from_hours(24),
                         max_workflow_history_events: None,
                         shard_notification_database_urls: Vec::new(),
                         sharded_pool: None,

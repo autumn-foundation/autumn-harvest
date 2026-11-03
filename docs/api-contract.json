@@ -1,5 +1,5 @@
 {
-  "version": "0.8.0",
+  "version": "0.9.0",
   "contract_version": "2",
   "description": "Versioned machine-readable contract for the Harvest management API. Update this file and CHANGELOG.md whenever a route is added, removed, renamed, or its request/response shape changes.",
   "compatibility": {
@@ -7254,6 +7254,309 @@
         {
           "status": 500,
           "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/agents/{kind}/profile",
+      "category": "agent",
+      "read_only": true,
+      "description": "Show the active profile overlay of an agent kind (issue #2374). The body holds the version, its provenance ({author, id}), its created time, the sha256 digest and the overlay as JSON.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: the name of an AgentProfile."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "version",
+          "active",
+          "provenance",
+          "created_at",
+          "digest",
+          "overlay"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store), or the kind has no active version."
+        },
+        {
+          "status": 500,
+          "description": "Store or database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/agents/{kind}/profile/versions",
+      "category": "agent",
+      "read_only": true,
+      "description": "List the profile overlay versions of an agent kind, oldest first (issue #2374). Each version has its provenance ({author, id}) and created time. active names the active version, or null, and the active entry has active true. An unknown kind has no versions.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: the name of an AgentProfile."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "active",
+          "versions"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store)."
+        },
+        {
+          "status": 500,
+          "description": "Store or database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/agents/{kind}/profile/versions/{version}",
+      "category": "agent",
+      "read_only": true,
+      "description": "Show one profile overlay version of an agent kind as JSON (issue #2374). The body has the same shape as GET /agents/{kind}/profile.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: the name of an AgentProfile."
+        },
+        {
+          "name": "version",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "The version, from 1. A v prefix is accepted, such as v2."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "version",
+          "active",
+          "provenance",
+          "created_at",
+          "digest",
+          "overlay"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "The version is not a number from 1."
+        },
+        {
+          "status": 404,
+          "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store), or the kind has no such version."
+        },
+        {
+          "status": 500,
+          "description": "Store or database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/agents/{kind}/profile/diff",
+      "category": "agent",
+      "read_only": true,
+      "description": "Show only the parts that differ between two profile overlay versions of an agent kind (issue #2374). Each entry of changes has a path (the keys from the root of the overlay JSON), the a value and the b value. An unset side is null. When both versions hold a map field, only the entries that differ show. Two equal versions give no change.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: the name of an AgentProfile."
+        },
+        {
+          "name": "a",
+          "in": "query",
+          "type": "string",
+          "required": true,
+          "description": "The first version, from 1. A v prefix is accepted."
+        },
+        {
+          "name": "b",
+          "in": "query",
+          "type": "string",
+          "required": true,
+          "description": "The second version, from 1. A v prefix is accepted."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "a",
+          "b",
+          "changes"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "A or b is absent, or is not a version."
+        },
+        {
+          "status": 404,
+          "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store), or the kind has no such version."
+        },
+        {
+          "status": 500,
+          "description": "Store or database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/agents/{kind}/profile/activate",
+      "category": "agent",
+      "read_only": false,
+      "description": "Make a profile overlay version active, with a compare-and-swap on the active version (issue #2374). The store validates the version again under the current profile, then moves the pointer and logs the move with the operator id. The next op of each agent of the kind reads the new version. The routes are not in ADMIN_SCOPE_ROUTES, so the mutate scope (the harvest-operator role) is enough. Audited under agent_profile.activate: the row has the kind as target_id, the operator id as actor, and from vN to vM in error_summary.",
+      "idempotency": "Idempotent: activating the active version over itself is a 200 that moves nothing and logs no move. Its audit row says unchanged at vN. A stale expected_active is a 409.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: the name of an AgentProfile."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "version",
+            "required": true,
+            "description": "The version to activate, from 1."
+          },
+          {
+            "name": "expected_active",
+            "required": true,
+            "description": "The active version that the caller read, or null for an unset pointer. A different active version refuses the call."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "from",
+          "to",
+          "actor"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Bad body: no expected_active, version 0, an unknown field, an invalid operator id, or a kind over 200 bytes."
+        },
+        {
+          "status": 404,
+          "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store), the kind has no profile, or the kind has no such version."
+        },
+        {
+          "status": 409,
+          "description": "The active version is not expected_active. The message names the actual active version."
+        },
+        {
+          "status": 422,
+          "description": "The version no longer validates under the current profile."
+        },
+        {
+          "status": 500,
+          "description": "Store or database error. When the move committed but its audit row failed, the body holds committed true, kind, from and to. Do not send the request again."
+        },
+        {
+          "status": 503,
+          "description": "The database is unavailable."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/agents/{kind}/profile/rollback",
+      "category": "agent",
+      "read_only": false,
+      "description": "Activate the version that was active before the current one (issue #2374). The store reads the last move from vN to vM, and activates vN over vM. The swap also needs that move to be the last one, so a pointer that moved after the read is a 409, also when it moved back. A second rollback undoes the first one. The routes are not in ADMIN_SCOPE_ROUTES, so the mutate scope (the harvest-operator role) is enough. Audited under agent_profile.rollback, with the same row form as activate.",
+      "idempotency": "Not idempotent: each rollback reverses the last move, so a second call restores the version before it.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: the name of an AgentProfile."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "from",
+          "to",
+          "actor"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "The body is not an empty JSON object, the operator id is invalid, or the kind is over 200 bytes."
+        },
+        {
+          "status": 404,
+          "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store), the kind has no profile, or the earlier version no longer exists."
+        },
+        {
+          "status": 409,
+          "description": "No earlier activation exists, or another call moved the pointer after the read. Nothing changed."
+        },
+        {
+          "status": 422,
+          "description": "The earlier version no longer validates under the current profile."
+        },
+        {
+          "status": 500,
+          "description": "Store or database error. When the move committed but its audit row failed, the body holds committed true, kind, from and to. Do not send the request again."
+        },
+        {
+          "status": 503,
+          "description": "The database is unavailable."
         }
       ]
     },

@@ -5970,8 +5970,8 @@ async fn ui_trigger_now_threads_dag_execution_timeout_sla_and_fleet_ceiling() {
         runbook_url: None,
         severity: None,
         mcp: false,
-        execution_timeout: Some(std::time::Duration::from_secs(10 * 3600)),
-        sla: Some(std::time::Duration::from_secs(5 * 3600)),
+        execution_timeout: Some(std::time::Duration::from_hours(10)),
+        sla: Some(std::time::Duration::from_hours(5)),
     };
 
     let dag_catalog =
@@ -5992,9 +5992,9 @@ async fn ui_trigger_now_threads_dag_execution_timeout_sla_and_fleet_ceiling() {
                 name: dag_name,
                 module: "tests",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
-                execution_timeout: Some(std::time::Duration::from_secs(10 * 3600)),
+                execution_timeout: Some(std::time::Duration::from_hours(10)),
                 chain_execution_timeout: None,
-                sla: Some(std::time::Duration::from_secs(5 * 3600)),
+                sla: Some(std::time::Duration::from_hours(5)),
                 concurrency: None,
                 debounce: None,
                 batch: None,

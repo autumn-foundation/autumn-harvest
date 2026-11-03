@@ -255,7 +255,7 @@ async fn seed_fixture(conn: &mut AsyncPgConnection, n: i64) {
             params.activity_id = Some(activity_id.as_uuid());
             let params = params
                 .with_session_id(session_uuid(i))
-                .with_sticky(&host, std::time::Duration::from_secs(24 * 3600));
+                .with_sticky(&host, std::time::Duration::from_hours(24));
             let task_id = queue::enqueue(conn, &params).await.expect("enqueue");
             if shape == Shape::LeaseExpiredRunning && k == 0 {
                 diesel::sql_query("UPDATE harvest_task_queue SET state = 'RUNNING' WHERE id = $1")

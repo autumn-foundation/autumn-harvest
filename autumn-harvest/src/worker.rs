@@ -158,7 +158,7 @@ pub fn labels_to_clear<S: std::hash::BuildHasher>(
 /// A timed-out owner takes its timeout record after the grace ends. The
 /// terminal-task janitor keeps a row with an untaken record for at least 7
 /// days. A grace within this bound always ends first.
-pub const MAX_CANCELLATION_GRACE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
+pub const MAX_CANCELLATION_GRACE_PERIOD: Duration = Duration::from_hours(24);
 
 /// Validated, runtime-ready worker configuration.
 ///
@@ -42044,8 +42044,7 @@ impl Worker {
                 &self.config.queues,
                 &self.config.queue_weights,
             );
-            let ordered =
-                crate::queue_fairness::weighted_queue_order(&pairs, &mut rand::thread_rng());
+            let ordered = crate::queue_fairness::weighted_queue_order(&pairs, &mut rand::rng());
 
             for queue_name in &ordered {
                 // `claim_task_on_shard` takes `&[String]`. `ordered` now
@@ -46105,7 +46104,7 @@ mod tests {
             capability_miss_max_redeliveries: 5,
             workflow_task_timeout: Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
-            max_workflow_pause_duration: Duration::from_secs(24 * 3600),
+            max_workflow_pause_duration: Duration::from_hours(24),
             max_workflow_history_events: None,
             labels: std::collections::HashMap::new(),
             queue_weights: std::collections::HashMap::new(),
@@ -47064,13 +47063,13 @@ mod tests {
             deployment_name: None,
             query_timeout: Duration::from_secs(5),
             priority_aging_secs: None,
-            max_workflow_start_delay: Duration::from_secs(365 * 24 * 3600),
+            max_workflow_start_delay: Duration::from_hours(8760),
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
             capability_miss_max_redeliveries: 5,
             workflow_task_timeout: Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
-            max_workflow_pause_duration: Duration::from_secs(24 * 3600),
+            max_workflow_pause_duration: Duration::from_hours(24),
             default_debounce_max_wait: Duration::from_secs(3600),
             mutex_lease_ttl: crate::mutex::DEFAULT_MUTEX_LEASE_TTL,
             labels: std::collections::HashMap::new(),
@@ -55719,7 +55718,7 @@ mod tests {
             .with_retry_after(Duration::from_millis(1))
             .into_error_payload();
         let delay =
-            next_retry_delay(&task, &error, Some(&policy), Duration::from_secs(900)).unwrap();
+            next_retry_delay(&task, &error, Some(&policy), Duration::from_mins(15)).unwrap();
         assert_eq!(delay, None);
     }
 
@@ -55734,7 +55733,7 @@ mod tests {
             .with_retry_after(Duration::from_secs(1))
             .into_error_payload();
         let delay =
-            next_retry_delay(&task, &error, Some(&policy), Duration::from_secs(900)).unwrap();
+            next_retry_delay(&task, &error, Some(&policy), Duration::from_mins(15)).unwrap();
         assert_eq!(delay, None);
     }
 
@@ -55746,7 +55745,7 @@ mod tests {
         let error = ActivityFailure::retryable("Http429", "rate limited")
             .with_retry_after(Duration::from_secs(1))
             .into_error_payload();
-        let delay = next_retry_delay(&task, &error, None, Duration::from_secs(900)).unwrap();
+        let delay = next_retry_delay(&task, &error, None, Duration::from_mins(15)).unwrap();
         assert_eq!(delay, None);
     }
 
@@ -55759,7 +55758,7 @@ mod tests {
         let error = ActivityFailure::retryable("Http429", "rate limited")
             .with_retry_after(Duration::from_secs(2))
             .into_error_payload();
-        let delay = next_retry_delay(&task, &error, Some(&policy), Duration::from_secs(900))
+        let delay = next_retry_delay(&task, &error, Some(&policy), Duration::from_mins(15))
             .unwrap()
             .expect("an attempt is still available");
         assert_eq!(delay, chrono::Duration::seconds(2));
@@ -55788,7 +55787,7 @@ mod tests {
         let error = ActivityFailure::retryable("Http429", "rate limited")
             .with_retry_after(Duration::ZERO)
             .into_error_payload();
-        let delay = next_retry_delay(&task, &error, Some(&policy), Duration::from_secs(900))
+        let delay = next_retry_delay(&task, &error, Some(&policy), Duration::from_mins(15))
             .unwrap()
             .expect("an attempt is still available");
         assert_eq!(
@@ -55804,7 +55803,7 @@ mod tests {
         // `retry_after` is `None` and the policy delay is used verbatim.
         let task = retry_after_test_task(1, 3);
         let policy = RetryPolicy::fixed(3, Duration::from_secs(5)).with_jitter(JitterPolicy::None);
-        let delay = next_retry_delay(&task, "boom", Some(&policy), Duration::from_secs(900))
+        let delay = next_retry_delay(&task, "boom", Some(&policy), Duration::from_mins(15))
             .unwrap()
             .expect("an attempt is still available");
         assert_eq!(delay, chrono::Duration::seconds(5));
@@ -55839,7 +55838,7 @@ mod tests {
                 activity_id: Some(uuid::Uuid::from_u128(n)),
                 ..retry_after_test_task(1, 3)
             };
-            let delay = next_retry_delay(&task, "boom", None, Duration::from_secs(900))
+            let delay = next_retry_delay(&task, "boom", None, Duration::from_mins(15))
                 .unwrap()
                 .expect("an attempt is still available");
             assert!(delay >= chrono::Duration::zero());
@@ -55859,7 +55858,7 @@ mod tests {
                 activity_id: Some(uuid::Uuid::from_u128(n)),
                 ..retry_after_test_task(1, 3)
             };
-            let delay = next_retry_delay(&task, "boom", Some(&policy), Duration::from_secs(900))
+            let delay = next_retry_delay(&task, "boom", Some(&policy), Duration::from_mins(15))
                 .unwrap()
                 .expect("an attempt is still available");
             assert!(delay <= chrono::Duration::seconds(1), "{delay:?} > 1s");
@@ -55916,7 +55915,7 @@ mod tests {
         let error = ActivityFailure::retryable("Http429", "rate limited")
             .with_retry_after(Duration::from_millis(250))
             .into_error_payload();
-        let delay = next_retry_delay(&task, &error, None, Duration::from_secs(900))
+        let delay = next_retry_delay(&task, &error, None, Duration::from_mins(15))
             .unwrap()
             .expect("an attempt is still available");
         assert_eq!(delay, chrono::Duration::milliseconds(250));
@@ -55941,14 +55940,14 @@ mod tests {
         let delay = local_retry_delay(
             Some(Duration::from_secs(999)),
             Some(&failure),
-            Duration::from_secs(900),
+            Duration::from_mins(15),
         );
         assert_eq!(delay, Some(Duration::from_secs(2)));
     }
 
     #[test]
     fn local_retry_delay_no_hint_falls_through_to_exact_policy_delay() {
-        let delay = local_retry_delay(Some(Duration::from_secs(5)), None, Duration::from_secs(900));
+        let delay = local_retry_delay(Some(Duration::from_secs(5)), None, Duration::from_mins(15));
         assert_eq!(delay, Some(Duration::from_secs(5)));
     }
 
@@ -55958,7 +55957,7 @@ mod tests {
         let delay = local_retry_delay(
             Some(Duration::from_secs(5)),
             Some(&failure),
-            Duration::from_secs(900),
+            Duration::from_mins(15),
         );
         assert_eq!(delay, Some(Duration::from_secs(5)));
     }
@@ -55981,7 +55980,7 @@ mod tests {
         // non-terminal attempt, where `policy_delay` is always `Some` in
         // practice (see `local_retry_delay`'s doc comment) -- but the helper
         // itself must not panic or fabricate a delay when it is `None`.
-        let delay = local_retry_delay(None, None, Duration::from_secs(900));
+        let delay = local_retry_delay(None, None, Duration::from_mins(15));
         assert_eq!(delay, None);
     }
 
@@ -55989,7 +55988,7 @@ mod tests {
     fn local_retry_delay_hint_present_with_no_policy_delay_still_uses_hint() {
         let failure =
             ActivityFailure::retryable("Http429", "x").with_retry_after(Duration::from_secs(3));
-        let delay = local_retry_delay(None, Some(&failure), Duration::from_secs(900));
+        let delay = local_retry_delay(None, Some(&failure), Duration::from_mins(15));
         assert_eq!(delay, Some(Duration::from_secs(3)));
     }
 
@@ -56180,7 +56179,7 @@ mod tests {
         let execution = can803_predecessor();
         let mut target = can803_wf_info("paid_subscription");
         target.execution_timeout = Some(Duration::from_secs(7_200));
-        target.sla = Some(Duration::from_secs(1_800));
+        target.sla = Some(Duration::from_mins(30));
         target.owner = Some("billing-team");
         target.runbook_url = Some("https://runbooks/paid");
         target.severity = Some("SEV1");
@@ -56454,7 +56453,7 @@ mod tests {
     fn can803_cross_type_applies_the_execution_timeout_ceiling() {
         let execution = can803_predecessor();
         let mut target = can803_wf_info("paid_subscription");
-        target.execution_timeout = Some(Duration::from_secs(30 * 24 * 3_600));
+        target.execution_timeout = Some(Duration::from_hours(720));
 
         let now = chrono::Utc::now();
         let defaults = resolve_continue_as_new_successor_defaults(
@@ -56712,7 +56711,7 @@ mod tests {
     fn can803_ceiling_rescues_an_unrepresentable_declaration() {
         let execution = can803_predecessor();
         let mut target = can803_wf_info("paid_subscription");
-        target.execution_timeout = Some(Duration::from_secs(8_640_000_000_000));
+        target.execution_timeout = Some(Duration::from_hours(2_400_000_000));
         let now = chrono::Utc::now();
 
         let defaults = resolve_continue_as_new_successor_defaults(
@@ -56743,7 +56742,7 @@ mod tests {
     fn can803_unrepresentable_sla_maps_to_no_sla_not_a_lying_field() {
         let execution = can803_predecessor();
         let mut target = can803_wf_info("paid_subscription");
-        target.sla = Some(Duration::from_secs(8_640_000_000_000));
+        target.sla = Some(Duration::from_hours(2_400_000_000));
         let now = chrono::Utc::now();
 
         let defaults =

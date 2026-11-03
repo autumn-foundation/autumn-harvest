@@ -194,6 +194,11 @@ async fn a_narrowed_deploy_fails_safe() {
     overlay_read_suite::a_narrowed_deploy_fails_safe(&mut Sqlite::new()).await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_restores_v1() {
+    overlay_read_suite::a_rollback_restores_v1(&mut Sqlite::new()).await;
+}
+
 /// Every search attribute that an agent publishes is named in the
 /// "Search attributes" paragraph of `docs/agent-adapter.md` section 15.
 /// The agent sets each one: a tenant, a mesh, a heartbeat and a version.

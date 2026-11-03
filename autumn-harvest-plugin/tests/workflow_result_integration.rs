@@ -37,6 +37,11 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
+#[path = "support/wire_contract.rs"]
+mod wire_contract;
+
+use wire_contract::Reply;
+
 fn init_sql() -> Vec<u8> {
     autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
@@ -115,6 +120,46 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
     (status, json)
 }
 
+fn header_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+/// One GET as the shared wire contract reads it (issue #2489).
+async fn get_reply(app: &HarvestApiApp, uri: &str) -> Reply {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("x-harvest-admin", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("GET request");
+    let retry_after = header_value(response.headers(), "retry-after");
+    let execution_id = header_value(response.headers(), wire_contract::EXECUTION_ID_HEADER);
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    Reply {
+        status,
+        retry_after,
+        execution_id,
+        body,
+    }
+}
+
 async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> ExecutionId {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     start_or_load_workflow_execution(
@@ -182,6 +227,19 @@ async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId, outp
         .unwrap();
 }
 
+/// Seal `exec_id` in a terminal failure `state` with `error`.
+async fn mark_ended(conn: &mut AsyncPgConnection, exec_id: ExecutionId, state: &str, error: &str) {
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq(state),
+            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::error.eq(Some(error)),
+        ))
+        .execute(conn)
+        .await
+        .unwrap();
+}
+
 async fn mark_continued_as_new(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -229,6 +287,13 @@ async fn result_unknown_id_returns_404() {
     let unknown = ExecutionId::new_for_shard(ShardId::new(0));
     let (status, _body) = get_json(&app, &format!("/workflows/{unknown}/result")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    wire_contract::result_of_unknown_run(
+        &get_reply(&app, &format!("/workflows/{unknown}/result")).await,
+        &get_reply(&app, "/workflows/not-an-id/result").await,
+    );
+    wire_contract::result_refuses_a_bad_query(
+        &get_reply(&app, &format!("/workflows/{unknown}/result?bogus=1")).await,
+    );
 }
 
 /// (b) A COMPLETED execution → 200 OK with state=completed and its output.
@@ -246,6 +311,8 @@ async fn result_completed_returns_200_with_output() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["state"], "completed");
     assert_eq!(body["output"]["answer"], 42);
+    let reply = get_reply(&app, &format!("/workflows/{exec_id}/result")).await;
+    wire_contract::result_is_terminal(&reply, "completed");
 }
 
 /// (c) A RUNNING execution with no wait → 204 No Content + Retry-After.
@@ -264,6 +331,9 @@ async fn result_running_no_wait_returns_204() {
         body["__retry_after"].as_str(),
         Some("1"),
         "Retry-After header must be present"
+    );
+    wire_contract::result_is_pending(
+        &get_reply(&app, &format!("/workflows/{exec_id}/result")).await,
     );
 }
 
@@ -294,6 +364,8 @@ async fn result_follows_continue_as_new_to_final_output() {
         body["output"]["final"], "result",
         "must return the successor's output"
     );
+    let reply = get_reply(&app, &format!("/workflows/{predecessor_id}/result")).await;
+    wire_contract::result_is_terminal(&reply, "completed");
 }
 
 #[tokio::test]
@@ -459,4 +531,42 @@ async fn test_get_update_result_orphaned_timed_out() {
     assert_eq!(body["update_id"], update_id.to_string());
     assert_eq!(body["error_type"], "update_orphaned");
     assert_eq!(body["workflow_state"], "TIMED_OUT");
+}
+
+/// The failure states keep the compact form that the SQLite suite checks
+/// too (issue #2489).
+#[tokio::test]
+async fn result_of_a_failed_or_cancelled_run_carries_the_error() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    for (state, compact) in [("FAILED", "failed"), ("CANCELLED", "cancelled")] {
+        let exec_id = seed_running(&mut conn, &format!("ended-{compact}")).await;
+        mark_ended(&mut conn, exec_id, state, "it broke").await;
+        let reply = get_reply(&app, &format!("/workflows/{exec_id}/result")).await;
+        let body = wire_contract::result_is_terminal(&reply, compact);
+        assert_eq!(body["error"], "it broke");
+    }
+}
+
+/// The list, registered and health checks of the shared contract (issue
+/// #2489). The SQLite suite runs the same checks.
+#[tokio::test]
+async fn list_registered_and_health_keep_the_shared_contract() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    wire_contract::list_refuses_an_unknown_state(&get_reply(&app, "/workflows?state=BOGUS").await);
+    wire_contract::list_refuses_an_unknown_state(
+        &get_reply(&app, "/workflows?state=running").await,
+    );
+    let page = get_reply(&app, "/workflows?page_size=1").await;
+    assert_eq!(page.status, 200, "{page:?}");
+    wire_contract::list_envelope_shape(&page.body);
+    let registered = get_reply(&app, "/workflows/registered").await;
+    assert_eq!(registered.status, 200, "{registered:?}");
+    wire_contract::registered_shape(&registered.body);
+    wire_contract::live_shape(&get_reply(&app, "/health/live").await);
+    wire_contract::ready_shape(&get_reply(&app, "/health/ready").await);
 }

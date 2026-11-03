@@ -14,6 +14,9 @@
 //!
 //! `erase` restarts an agent that ended with `POST /workflows/agent/signal-with-start`.
 //! The new run clears the memory and the workspace of the agent.
+//!
+//! `profile` operates the overlay versions of a kind (issue #2374). See
+//! [`crate::agent_profile`].
 
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, ENTITY_STATE_QUERY};
 use std::fmt::Write as _;
@@ -113,6 +116,12 @@ pub enum AgentCommand {
         #[arg(long, default_value_t = 60)]
         wait_timeout_secs: u64,
     },
+    /// List, show, diff, activate and roll back the profile overlays of an
+    /// agent kind.
+    Profile {
+        #[command(subcommand)]
+        command: crate::agent_profile::ProfileCommand,
+    },
 }
 
 /// The request of a one-request agent command. `erase` has none.
@@ -151,6 +160,7 @@ pub fn agent_request(command: &AgentCommand) -> Result<ApiRequest, CliError> {
         }
         AgentCommand::Resume { agent_id } => Ok(signal(agent_id, control_payload("resume"))),
         AgentCommand::Erase { .. } => Err(CliError::AgentEraseIsMultiStep),
+        AgentCommand::Profile { command } => crate::agent_profile::profile_request(command),
     }
 }
 
