@@ -2407,7 +2407,7 @@ mod tests {
 
     #[test]
     fn ttl_is_open_while_the_run_lives() {
-        let day = std::time::Duration::from_secs(86_400);
+        let day = std::time::Duration::from_hours(24);
         assert_eq!(ttl_ms(at(0), None, Some(day)), None);
         assert_eq!(ttl_ms(at(0), Some(at(10)), None), None);
         assert_eq!(

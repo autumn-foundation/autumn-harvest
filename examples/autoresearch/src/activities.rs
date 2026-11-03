@@ -319,7 +319,7 @@ pub fn check_trainer(trainer: &TrainerSpec) -> Result<(), String> {
 
 /// How long a call waits for its lock. Another delivery of the call holds
 /// it for one run at most, and a run ends inside the budget of [`train`].
-const CALL_LOCK_WAIT: Duration = Duration::from_secs(16 * 60);
+const CALL_LOCK_WAIT: Duration = Duration::from_mins(16);
 
 /// Hold an exclusive lock on the lock file beside `saved` until the file
 /// drops. Two deliveries of one call that run at once take turns. A run can

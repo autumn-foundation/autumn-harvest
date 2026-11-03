@@ -184,7 +184,9 @@ async fn serve_app(db: &TestDb) -> Served {
 }
 
 async fn start_caller(served: &Served, month: &str) -> String {
-    let response = reqwest::Client::new()
+    let response = autumn_harvest_plugin::http::client_builder()
+        .build()
+        .expect("client")
         .post(format!(
             "{}/api/harvest/workflows/report_caller/start",
             served.base
@@ -207,7 +209,9 @@ async fn wait_for_end(served: &Served, poller: &RemoteTaskPoller, exec_id: &str)
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
         poller.poll_once(&served.pool).await.expect("poll");
-        let detail: Value = reqwest::Client::new()
+        let detail: Value = autumn_harvest_plugin::http::client_builder()
+            .build()
+            .expect("client")
             .get(format!("{}/api/harvest/workflows/{exec_id}", served.base))
             .send()
             .await

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use diesel::sql_types::BigInt;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 use super::backout::{StepFn, run_backout};
 use super::rule::{Atomicity, WorkloadProfile};
@@ -693,10 +693,10 @@ async fn drive(
             let mut stats = ClientStats::default();
             while Instant::now() < deadline {
                 let order = Order {
-                    sku: rng.gen_range(0..skus),
-                    account: rng.gen_range(0..ACCOUNTS),
-                    amount: rng.gen_range(1..=MAX_AMOUNT),
-                    decline: rng.gen_bool(config.fail_rate),
+                    sku: rng.random_range(0..skus),
+                    account: rng.random_range(0..ACCOUNTS),
+                    amount: rng.random_range(1..=MAX_AMOUNT),
+                    decline: rng.random_bool(config.fail_rate),
                 };
                 let began = Instant::now();
                 let outcome =

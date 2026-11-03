@@ -473,7 +473,7 @@ mod tests {
             .with_requires("kvm")
             .with_max_concurrent(4)
             .with_schedule_to_start(Some(Duration::from_secs(60)))
-            .with_schedule_to_close(Some(Duration::from_secs(900)))
+            .with_schedule_to_close(Some(Duration::from_mins(15)))
             .activity_info();
         assert_eq!(info.requires, Some("kvm"));
         assert_eq!(info.max_concurrent, Some(4));
@@ -483,7 +483,7 @@ mod tests {
         );
         assert_eq!(
             info.default_schedule_to_close,
-            Some(Duration::from_secs(900))
+            Some(Duration::from_mins(15))
         );
     }
 

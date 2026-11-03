@@ -37,7 +37,7 @@ pub const DEFAULT_MODEL: &str = "claude-opus-5";
 /// The default output cap for a non-streaming request.
 pub const DEFAULT_MAX_TOKENS: u32 = 16_000;
 /// The request timeout. It sits under the activity `start_to_close` budget.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(840);
+const HTTP_TIMEOUT: Duration = Duration::from_mins(14);
 
 /// Everything the model activity needs.
 pub struct ModelConfig {
@@ -150,10 +150,14 @@ impl ModelConfig {
                  offline."
             ));
         }
-        let http = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .map_err(|e| format!("cannot build the HTTP client: {e}"))?;
+        let http = {
+            // Reqwest panics without a provider. An `Err` means that one is installed.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            reqwest::Client::builder()
+        }
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .map_err(|e| format!("cannot build the HTTP client: {e}"))?;
         Ok(Self {
             api_key,
             model,

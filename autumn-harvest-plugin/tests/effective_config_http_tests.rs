@@ -81,7 +81,7 @@ fn sample_view() -> EffectiveConfigView {
         None,
         None,
         None,
-        Duration::from_secs(90 * 24 * 3600),
+        Duration::from_hours(2160),
         10_000,
         false,
         262_144,

@@ -75,9 +75,9 @@ const PLUGIN_HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrati
 /// in [`ensure_runtime_migrations`], which connects to `harvest.database.url`
 /// directly.
 ///
-/// The outbox set is unconditional: the transactional-outbox table an embedder
-/// writes to in their own business transaction always lives in the application
-/// database, in every mode.
+/// On a Postgres app, the outbox set goes to the application database in every
+/// mode. An embedder writes to its table in their own business transaction. A
+/// SQLite build registers no outbox set (see [`app_outbox_set_applies`]).
 ///
 /// If the Harvest config cannot be loaded here, registration fails immediately
 /// rather than guessing: applying the sets to the app database for an unknown
@@ -89,7 +89,11 @@ const PLUGIN_HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrati
 /// already refuses this earlier; this is a backstop for ambient
 /// configuration changing in the narrow window since that check.
 fn register_plugin_migrations(app: AppBuilder, require_embedded: bool) -> AppBuilder {
-    let app = app.plugin_migrations("autumn-harvest-plugin (outbox)", OUTBOX_MIGRATIONS);
+    let app = if app_outbox_set_applies() {
+        app.plugin_migrations("autumn-harvest-plugin (outbox)", OUTBOX_MIGRATIONS)
+    } else {
+        app
+    };
 
     let mode = migration_registration_mode(HarvestRuntimeConfig::load());
     assert!(
@@ -105,6 +109,14 @@ fn register_plugin_migrations(app: AppBuilder, require_embedded: bool) -> AppBui
             .plugin_migrations("autumn-harvest-plugin", PLUGIN_HARVEST_MIGRATIONS),
         HarvestMode::Split | HarvestMode::External => app,
     }
+}
+
+/// Whether the outbox set goes to the app database.
+///
+/// The set is Postgres SQL. Under `sqlite` the app database is SQLite, so
+/// the set never goes there (issue #2472). The SQLite outbox is #2470.
+const fn app_outbox_set_applies() -> bool {
+    !cfg!(feature = "sqlite")
 }
 
 /// Whether the dev runtime's embedded-only backstop (issue #1291) should
@@ -305,6 +317,10 @@ pub struct HarvestPlugin {
     /// [`Self::sqlite_path`]. Operator config wins over it.
     #[cfg(feature = "sqlite")]
     sqlite_path: Option<std::path::PathBuf>,
+    /// One Harvest per open fleet tenant (issue #2472). Set via
+    /// [`Self::sqlite_per_tenant`].
+    #[cfg(feature = "sqlite")]
+    sqlite_per_tenant: bool,
 }
 
 /// One registered broker connector: a binding plus the source that feeds it.
@@ -399,6 +415,8 @@ impl HarvestPlugin {
             cost_deferral: crate::cost::CostDeferral::default(),
             #[cfg(feature = "sqlite")]
             sqlite_path: None,
+            #[cfg(feature = "sqlite")]
+            sqlite_per_tenant: false,
         }
     }
 
@@ -626,6 +644,26 @@ impl HarvestPlugin {
     #[must_use]
     pub fn sqlite_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.sqlite_path = Some(path.into());
+        self
+    }
+
+    /// Run one Harvest per open tenant of the app's SQLite fleet (issue
+    /// #2472).
+    ///
+    /// Each tenant database `acme.db` gets its own Harvest file,
+    /// `acme.harvest.db`, and its own driver. The fleet starts the driver
+    /// when it opens the tenant and stops it when it closes the tenant. A
+    /// tenant delete removes the Harvest file. The control Harvest keeps
+    /// running beside them.
+    ///
+    /// App code reaches a tenant through
+    /// [`HarvestFleet`](crate::sqlite::HarvestFleet). `.api(path)` also
+    /// serves `{path}/tenants/{key}/..`. The boot fails when the app has no
+    /// fleet. Split and external mode refuse it at build.
+    #[cfg(feature = "sqlite")]
+    #[must_use]
+    pub const fn sqlite_per_tenant(mut self) -> Self {
+        self.sqlite_per_tenant = true;
         self
     }
 
@@ -1412,7 +1450,13 @@ impl Plugin for HarvestPlugin {
     fn build(self, app: AppBuilder) -> AppBuilder {
         #[cfg(feature = "sqlite")]
         {
-            self.build_sqlite(app)
+            let mode = HarvestRuntimeConfig::load()
+                .unwrap_or_else(|error| panic!("cannot load the Harvest configuration: {error}"))
+                .mode;
+            match crate::sqlite::backend_for(mode) {
+                crate::sqlite::Backend::Sqlite => self.build_sqlite(app),
+                crate::sqlite::Backend::Postgres => self.build_postgres_on_sqlite(app, mode),
+            }
         }
         #[cfg(not(feature = "sqlite"))]
         {
@@ -1510,15 +1554,49 @@ impl HarvestPlugin {
                 api_middleware: self.api_middleware,
                 allow_unauthenticated_mutations: self.allow_unauthenticated_mutations,
                 path: self.sqlite_path,
+                per_tenant: self.sqlite_per_tenant,
                 refused,
             },
         )
     }
 
+    /// Build a SQLite app whose Harvest lives in Postgres (issue #2472).
+    ///
+    /// Split and external mode take the Postgres path. It builds its own
+    /// pool from `harvest.database.url`. The SQLite app pool never reaches
+    /// it, so the outbox relay and `AppDbPool` stay off.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a SQLite-only setting, which has no effect here.
+    #[cfg(feature = "sqlite")]
+    fn build_postgres_on_sqlite(mut self, app: AppBuilder, mode: HarvestMode) -> AppBuilder {
+        let configured = crate::config::HarvestSqliteConfig::load()
+            .unwrap_or_else(|error| panic!("cannot load the Harvest SQLite configuration: {error}"))
+            .path;
+        if let Some(message) =
+            crate::sqlite::split_refusal(mode, self.sqlite_per_tenant, configured.as_deref())
+        {
+            panic!("{message}");
+        }
+        if let Some(path) = self.sqlite_path.take() {
+            // A default location for embedded mode. The operator chose
+            // another mode, so the value is unused, not wrong.
+            tracing::warn!(
+                path = %path.display(),
+                ?mode,
+                "HarvestPlugin::sqlite_path has no effect: Harvest uses harvest.database.url"
+            );
+        }
+        tracing::info!(
+            ?mode,
+            "harvest runs on Postgres; the transactional outbox is off on a SQLite app \
+             (autumn-harvest#2470)"
+        );
+        self.build_postgres(app)
+    }
+
     /// Build on the Postgres backend, the default.
-    // Under `sqlite` nothing calls it. The allow keeps the Postgres code that
-    // it reaches live, so that build does not drown in dead-code warnings.
-    #[cfg_attr(feature = "sqlite", allow(dead_code))]
     #[allow(clippy::too_many_lines)]
     fn build_postgres(self, app: AppBuilder) -> AppBuilder {
         let Self {
@@ -1555,6 +1633,8 @@ impl HarvestPlugin {
             cost_deferral,
             #[cfg(feature = "sqlite")]
                 sqlite_path: _,
+            #[cfg(feature = "sqlite")]
+                sqlite_per_tenant: _,
         } = self;
         #[cfg(not(feature = "mcp"))]
         let _ = (
@@ -2208,6 +2288,16 @@ async fn start_harvest_runtime(
             harvest_config.mode
         )));
     }
+    // The build of a SQLite app read a split or external mode. A mode that
+    // changed since then would need the SQLite path, which this build did
+    // not mount (issue #2472).
+    #[cfg(feature = "sqlite")]
+    if crate::sqlite::backend_for(harvest_config.mode) == crate::sqlite::Backend::Sqlite {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "harvest.mode changed to {:?} after the build. Restart the app",
+            harvest_config.mode
+        )));
+    }
     let workflow_result_notification_url = harvest_database_url(&app_config, &harvest_config)?;
     api_state.set_health_requires_shard_readiness(harvest_config.readiness.require_shard_readiness);
     api_state
@@ -2217,6 +2307,8 @@ async fn start_harvest_runtime(
     let runtime_state = state.clone();
     let app_pool = crate::state::app_postgres_pool(state);
     let harvest_pool = resolve_harvest_pool(state, &harvest_config)?;
+    #[cfg(feature = "sqlite")]
+    probe_harvest_pool(&harvest_pool).await;
     let router = ShardRouter::single();
 
     let (builder, cost_deferral, runtime_already_started) = {
@@ -2776,6 +2868,25 @@ fn transactional_client_workflows<'a>(
         .collect()
 }
 
+/// Check one connection of the Postgres Harvest pool of a SQLite app
+/// (issue #2472).
+///
+/// The pool connects lazily, so a bad URL or certificate shows only at the
+/// first query. The probe logs it at boot. Its TLS rules differ from those of
+/// the migrator: `sslmode=require` checks the certificate, and `sslrootcert`
+/// is not read. The log names the remedy.
+#[cfg(feature = "sqlite")]
+async fn probe_harvest_pool(pool: &DbPool) {
+    if let Err(error) = pool.get().await {
+        tracing::error!(
+            %error,
+            "cannot connect to harvest.database.url. On a SQLite app, sslmode=require checks \
+             the server certificate, and sslrootcert is not read: set SSL_CERT_FILE for a \
+             private CA (autumn-harvest#2472)"
+        );
+    }
+}
+
 fn resolve_harvest_pool(
     state: &AppState,
     config: &HarvestRuntimeConfig,
@@ -3075,6 +3186,39 @@ fn apply_migrations_for_profile(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod sqlite_split_tests {
+    use super::*;
+
+    /// The outbox set is Postgres SQL. A SQLite app database cannot apply
+    /// it, so a SQLite build never registers it (issue #2472).
+    #[test]
+    fn the_outbox_set_goes_to_a_postgres_app_database_only() {
+        assert_eq!(app_outbox_set_applies(), !cfg!(feature = "sqlite"));
+    }
+
+    /// Split mode on a SQLite app builds its own Postgres pool. The app
+    /// state has no Postgres pool to lend (issue #2472).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn split_mode_on_a_sqlite_app_builds_its_own_pool() {
+        let state = AppState::for_test();
+        let config = HarvestRuntimeConfig {
+            mode: HarvestMode::Split,
+            database: crate::config::HarvestDatabaseConfig {
+                url: Some("postgres://harvest:harvest@localhost:5432/harvest".to_owned()),
+            },
+            ..HarvestRuntimeConfig::default()
+        };
+        let pool = resolve_harvest_pool(&state, &config).expect("a dedicated pool");
+        assert_eq!(pool.status().max_size, 10);
+        assert!(crate::state::app_postgres_pool(&state).is_none());
+
+        let embedded = HarvestRuntimeConfig::default();
+        assert!(resolve_harvest_pool(&state, &embedded).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -4589,7 +4733,7 @@ mod tests {
             workflow: "cart",
             signal_name: "add_item",
         };
-        let week = Duration::from_secs(7 * 24 * 60 * 60);
+        let week = Duration::from_hours(168);
 
         // `Starts` reserves a `harvest_start_idempotency` row, so the window IS
         // the bound and an untuned one is the thing worth saying.
@@ -4633,10 +4777,10 @@ mod tests {
                 IdempotencyMode::BrokerCoordinates,
                 SIGNALS,
                 Some(week),
-                Some(Duration::from_secs(3 * 24 * 60 * 60)),
+                Some(Duration::from_hours(72)),
             ),
             Some(UntunedDedupeBound::ExecutionRetention {
-                max_age: Duration::from_secs(3 * 24 * 60 * 60),
+                max_age: Duration::from_hours(72),
             }),
             "a tuned window must not silence the retention bound it does not govern",
         );
@@ -4675,8 +4819,8 @@ mod tests {
         const STARTS: ConnectorTarget = ConnectorTarget::Starts {
             workflow: "order_flow",
         };
-        let three_days = Duration::from_secs(3 * 24 * 60 * 60);
-        let week = Duration::from_secs(7 * 24 * 60 * 60);
+        let three_days = Duration::from_hours(72);
+        let week = Duration::from_hours(168);
 
         assert_eq!(
             untuned_dedupe_bound(IdempotencyMode::WorkflowId, STARTS, None, Some(three_days)),

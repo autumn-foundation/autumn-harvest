@@ -127,7 +127,7 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
 
             workflow_task_timeout: std::time::Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
-            max_workflow_pause_duration: Duration::from_secs(24 * 3600),
+            max_workflow_pause_duration: Duration::from_hours(24),
             labels: std::collections::HashMap::new(),
             queue_weights: std::collections::HashMap::new(),
             max_workflow_history_events: None,
@@ -1900,10 +1900,9 @@ async fn auto_resume_expired_pauses_force_resumes() {
         .await
         .unwrap();
 
-    let resumed =
-        auto_resume_expired_pauses(&mut conn, Duration::from_secs(24 * 3600), &NoOpMetrics)
-            .await
-            .expect("auto-resume scan should succeed");
+    let resumed = auto_resume_expired_pauses(&mut conn, Duration::from_hours(24), &NoOpMetrics)
+        .await
+        .expect("auto-resume scan should succeed");
     assert_eq!(resumed, 1, "the over-long pause must be auto-resumed");
     assert_eq!(get_state(&mut conn, exec_id).await, "RUNNING");
 

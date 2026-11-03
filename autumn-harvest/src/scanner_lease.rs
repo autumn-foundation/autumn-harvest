@@ -74,7 +74,7 @@ pub const MIN_SCANNER_INTERVAL: Duration = Duration::from_millis(10);
 /// The lease TTL must cover [`MIN_LEASE_TICKS`] of the longest sleeps, and it
 /// is capped at one day. Four hours at the largest jitter needs 22.8 hours.
 /// A longer interval would let a live leader wake after its lease ends.
-pub const MAX_SCANNER_INTERVAL: Duration = Duration::from_secs(4 * 3600);
+pub const MAX_SCANNER_INTERVAL: Duration = Duration::from_hours(4);
 
 /// `interval`, kept within [`MIN_SCANNER_INTERVAL`] and
 /// [`MAX_SCANNER_INTERVAL`].
@@ -100,7 +100,7 @@ pub const ABDICATE_AFTER_FAILED_PASSES: u32 = 3;
 ///
 /// The TTL goes into a Postgres `make_interval`. An unbounded value can
 /// overflow the timestamp, and every tick then fails open.
-const LEASE_TTL_HARD_CAP: Duration = Duration::from_secs(86_400);
+const LEASE_TTL_HARD_CAP: Duration = Duration::from_hours(24);
 
 /// How replicas share one per-shard background scanner.
 #[derive(Debug, Clone, PartialEq)]

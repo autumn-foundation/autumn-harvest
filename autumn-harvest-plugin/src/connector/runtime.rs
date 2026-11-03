@@ -226,7 +226,7 @@ impl Default for ConnectorRuntimeConfig {
             // costs a redelivered poison message a full strike countdown.
             // An hour covers a 30s visibility timeout against SQS's
             // `maxReceiveCount` maximum of 1000 with room to spare.
-            poison_retention: std::time::Duration::from_secs(60 * 60),
+            poison_retention: std::time::Duration::from_hours(1),
             // The engine's own worker drain default, for the same reason. It
             // is long enough that an ordinary in-flight dispatch settles and
             // gets acked. It is short enough that one wedged call cannot hold

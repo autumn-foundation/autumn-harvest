@@ -8519,7 +8519,7 @@ pub(crate) async fn execute_request(cli: &Cli, request: &ApiRequest) -> Result<V
 ///
 /// Returns [`CliError::Request`] if the TLS backend fails to start.
 pub(crate) fn http_client(timeout: std::time::Duration) -> Result<reqwest::Client, CliError> {
-    Ok(reqwest::Client::builder()
+    Ok(http_client_builder()
         .timeout(timeout)
         .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
         .build()?)
@@ -8530,7 +8530,7 @@ pub(crate) fn http_client(timeout: std::time::Duration) -> Result<reqwest::Clien
 /// A total timeout would cut a live stream. So this client bounds only the
 /// connect phase and the silence between two reads.
 fn sse_client(timeout: std::time::Duration) -> Result<reqwest::Client, CliError> {
-    Ok(reqwest::Client::builder()
+    Ok(http_client_builder()
         .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
         .read_timeout(timeout.max(SSE_IDLE_TIMEOUT))
         .build()?)
@@ -20369,4 +20369,14 @@ mod partition_shard_prep_tests {
         let reason = row.unreachable_reason.expect("a reason");
         assert!(!reason.contains("s3cret"), "{reason}");
     }
+}
+
+/// Return a client builder with a process crypto provider in place.
+///
+/// Reqwest 0.13 builds with `rustls-no-provider` and panics when no provider is
+/// installed. This keeps `aws-lc-rs` out of the CLI build.
+fn http_client_builder() -> reqwest::ClientBuilder {
+    // An `Err` means that a provider is already installed, which is sufficient.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
 }

@@ -1679,7 +1679,7 @@ const INDEX_BUILD_RETRY: std::time::Duration = std::time::Duration::from_secs(30
 
 /// Gate wait while a build task is alive. The end of the task replaces it.
 #[cfg(feature = "db")]
-const INDEX_BUILD_IN_FLIGHT: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
+const INDEX_BUILD_IN_FLIGHT: std::time::Duration = std::time::Duration::from_hours(8760);
 
 /// Wait after a build the role may not run. Only an operator can fix it.
 #[cfg(feature = "db")]

@@ -844,10 +844,10 @@ async fn resolve_owner_notes(conn: &mut AsyncPgConnection, notes: &mut Vec<Note>
 /// after one wake.
 #[must_use]
 pub(crate) fn settle_delay() -> Duration {
-    use rand::Rng as _;
+    use rand::RngExt as _;
     let min = u64::try_from(SETTLE_DELAY_MIN.as_micros()).unwrap_or(u64::MAX);
     let max = u64::try_from(SETTLE_DELAY_MAX.as_micros()).unwrap_or(u64::MAX);
-    Duration::from_micros(rand::thread_rng().gen_range(min..=max))
+    Duration::from_micros(rand::rng().random_range(min..=max))
 }
 
 /// Notifications lost to an error since the process started.

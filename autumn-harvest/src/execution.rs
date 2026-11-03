@@ -10803,7 +10803,7 @@ mod pause_helper_tests {
         let now = Utc::now();
         let paused_at = now - ChronoDuration::hours(25);
         assert!(
-            pause_timeout_exceeded(paused_at, now, Duration::from_secs(24 * 3600)),
+            pause_timeout_exceeded(paused_at, now, Duration::from_hours(24)),
             "a 25-hour pause must exceed the 24-hour ceiling"
         );
     }
@@ -10813,7 +10813,7 @@ mod pause_helper_tests {
         let now = Utc::now();
         let paused_at = now - ChronoDuration::hours(24);
         assert!(
-            pause_timeout_exceeded(paused_at, now, Duration::from_secs(24 * 3600)),
+            pause_timeout_exceeded(paused_at, now, Duration::from_hours(24)),
             "a pause exactly at the ceiling is expired (>=)"
         );
     }

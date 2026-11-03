@@ -7,15 +7,18 @@ SQLite fleet app.
 
 Epic [#2466](https://github.com/autumn-foundation/autumn-harvest/issues/2466)
 tracks the work. This page describes slice 1,
-[#2467](https://github.com/autumn-foundation/autumn-harvest/issues/2467).
+[#2467](https://github.com/autumn-foundation/autumn-harvest/issues/2467), and
+[#2472](https://github.com/autumn-foundation/autumn-harvest/issues/2472):
+split mode and per-tenant Harvest. The design record is
+[`DESIGN-2472.md`](design/DESIGN-2472.md).
 
 ## Turn it on
 
 ```toml
 [dependencies]
 autumn-web = { version = "0.9", features = ["sqlite"] }
-autumn-harvest = { version = "0.8", default-features = false }
-autumn-harvest-plugin = { version = "0.8", features = ["sqlite"] }
+autumn-harvest = { version = "0.9", default-features = false }
+autumn-harvest-plugin = { version = "0.9", features = ["sqlite"] }
 ```
 
 The feature is a backend flip, like `autumn-web/sqlite`, which it turns on.
@@ -49,7 +52,9 @@ Harvest has its own SQLite file. It sits next to the app database:
 | `file:/srv/app.db?mode=rwc` | `/srv/app.harvest.db` |
 
 In a fleet app, `database.url` is the control database, so Harvest sits beside
-it. No fleet file gets Harvest tables.
+it. No fleet file gets Harvest tables. With
+[`sqlite_per_tenant()`](#per-tenant-harvest-in-a-fleet), each tenant also gets
+its own Harvest file.
 
 Set the file explicitly with `harvest.sqlite.path` or
 `AUTUMN_HARVEST_SQLITE__PATH`, or in code with
@@ -72,6 +77,141 @@ history out, and the reverse.
 The plugin registers no migration set on a SQLite app. The Postgres sets would
 fail on SQLite. `autumn-harvest-sqlite` applies its own schema when it opens
 its file.
+
+## Split and external mode
+
+A SQLite app can keep Harvest in a Postgres database. Set the mode and the
+Harvest database URL, as on Postgres:
+
+```toml
+[harvest]
+mode = "split"            # or "external"
+
+[harvest.database]
+url = "postgres://harvest:secret@db.internal:5432/harvest"
+```
+
+The plugin then takes its Postgres path. That path serves the whole
+Postgres management API, Vantage and every builder option. The SQLite
+slice limits on this page do not apply. App code uses the Postgres client,
+not `HarvestSqlite`.
+
+- **Its own pool.** The plugin builds a Postgres pool from
+  `harvest.database.url`. Each connection follows the DSN's `sslmode`, as
+  in [`pg_tls`](../autumn-harvest/src/pg_tls.rs). Those rules are stricter
+  than in `autumn-web` and libpq: `sslmode=require` checks the certificate
+  chain and the host name, and `sslrootcert` is not read. Point
+  `SSL_CERT_FILE` at a private CA. The boot opens one connection and logs
+  an error that names this remedy when it fails.
+- **Migrations.** The `dev` profile applies the Harvest migrations to that
+  database. Elsewhere, run `harvest migrate run` against it.
+- **The app pool stays SQLite.** No Postgres migration set goes to the app
+  database. The transactional outbox relay does not run, and activities get
+  no `AppDbPool`. An activity reads the SQLite app pool through
+  `ctx.state::<AppState>()`. The SQLite outbox is
+  [#2470](https://github.com/autumn-foundation/autumn-harvest/issues/2470).
+- **Loud conflicts.** `harvest.sqlite.path` and `sqlite_per_tenant()` have
+  no effect in this mode, so the build refuses them.
+  `HarvestPlugin::sqlite_path` is a default for embedded mode. It only logs
+  a warning.
+
+## Per-tenant Harvest in a fleet
+
+`sqlite_per_tenant()` runs one Harvest for each open database of the app's
+SQLite fleet (autumn ADR 0019). A fleet in `slot` mode works the same way,
+with one Harvest per slot database. The fleet database is the isolation
+unit: in `slot` mode, every tenant that routes to one slot shares its
+Harvest, as it shares the slot's app data.
+
+```rust,ignore
+HarvestPlugin::new()
+    .workflows(workflows![process_order])
+    .activities(activities![charge_card])
+    .sqlite_per_tenant()
+    .api("/harvest")
+```
+
+| Tenant database | Its Harvest file |
+| --- | --- |
+| `{root}/{bucket}/acme.db` | `{root}/{bucket}/acme.harvest.db` |
+| `{root}/{bucket}/slot-00042.db` | `{root}/{bucket}/slot-00042.harvest.db` |
+
+A tenant id and a slot number hold no `.`, so the fleet never lists a
+Harvest file as a database.
+
+```mermaid
+sequenceDiagram
+    participant F as DatabaseFleet
+    participant L as Harvest lifecycle
+    participant D as tenant driver
+    F->>L: on_open(acme)
+    L->>D: open acme.harvest.db, start, register as a worker
+    F->>D: close: stop the worker, wait for it
+    F->>L: on_close(acme): drop the handle
+    F->>L: on_delete(acme): remove acme.harvest.db
+```
+
+- **The fleet decides.** The plugin installs a `FleetLifecycle`. An open
+  starts the tenant's driver. A close stops it, after the command or pass in
+  flight. The plugin never keeps a tenant open by itself.
+- **The control Harvest stays.** It runs beside the tenant Harvests, for
+  platform workflows such as a tenant purge. `HarvestSqlite` is the control
+  Harvest.
+- **The same registry.** Every tenant runs the workflows and activities that
+  the plugin registers.
+- **The tenant key.** `HarvestTenant::current()` gives the fleet database
+  key (a tenant or a slot) inside an activity that a tenant driver runs. It is `None` on the control
+  driver, and on a task that an activity spawns.
+- **A delete erases.** A fleet delete removes the tenant's Harvest file and
+  its `-wal`, `-shm` and `-journal` sidecars. The `.lock` file stays.
+- **No fleet, no boot.** The boot fails when the app has no
+  `[database.fleet]`.
+- **Shutdown.** The plugin's shutdown hook releases the shared registry, so
+  a stopped app frees its state. Tenants that open after it get no driver.
+
+App code reaches a tenant through `HarvestFleet`, an `AppState` extension
+and an axum extractor:
+
+```rust,ignore
+use autumn_harvest_plugin::sqlite::{HarvestFleet, StartOptions};
+
+#[post("/{tenant}/orders")]
+async fn create(fleet: HarvestFleet, Path(tenant): Path<String>) -> AutumnResult<String> {
+    let harvest = fleet.open_for(&tenant).await.map_err(to_http)?;
+    let run = harvest
+        .start("process_order", json!({}), StartOptions::new())
+        .await
+        .map_err(to_http)?;
+    Ok(run.exec_id.to_string())
+}
+```
+
+`open_for` takes the app's routing key. `open` takes a `FleetDbKey`. Both
+open a closed tenant. Both follow the fleet's `create_on_demand`, so they
+create a tenant only when the fleet does. The handle holds a lease, so the tenant stays open
+while any clone of it lives. The fleet owns the tenant driver:
+`shutdown()` on a tenant handle is an error.
+
+`.api(path)` also serves every core route on one tenant, under
+`{path}/tenants/{key}/..`. `{key}` is the routing key. For example,
+`POST /harvest/tenants/acme/workflows/process_order/start`. These routes
+never create a tenant, whatever `create_on_demand` says. A tenant that does
+not exist is `404`. A route opens its tenant as background work: it never
+goes past `max_open` and never evicts a tenant that the app uses. A full
+fleet is `503`. The fleet rules the rest: a bad key is `400` and a tenant
+in a delete is `410`. Without `sqlite_per_tenant()` they answer `404`.
+
+The auth layer and the #1802 mutation gate cover these routes too. The gate
+passes a read, and a read opens its tenant, which starts its driver. Put the
+API behind `api_with_auth` outside `dev`.
+
+### Limits
+
+- A closed tenant runs no timer, retry or activity. The next open resumes
+  its runs. The fleet sweeper wakes a tenant for outbox, hook and backfill
+  work only.
+- A fleet restore rolls back the tenant database, not its Harvest file.
+- Fleet replication does not ship Harvest files.
 
 ## How it runs
 
@@ -198,9 +338,11 @@ issue #1802 mutation gate refuses an anonymous mutating call outside `dev`.
 `allow_unauthenticated_mutations()` opens it. `reuse_policy =
 "terminate_if_running"` needs harvest admin access.
 
-## What slice 1 refuses
+## What the SQLite backend refuses
 
-Each of these fails the build or the boot and names its issue. A silent
+This list covers embedded mode. Split and external mode take the Postgres
+path, which honours every option. Each of these fails the build or the boot
+and names its issue. A silent
 no-op would let an app believe a protection or a feature is on.
 
 | Option or mode | Issue |
@@ -209,7 +351,8 @@ no-op would let an app believe a protection or a feature is on.
 | Vantage, `decode_payloads_on_read`, the other read routes, declarative `queries![..]` (a query that the workflow registers with `ctx.register_query` works) | [#2468](https://github.com/autumn-foundation/autumn-harvest/issues/2468) |
 | The transactional outbox | [#2470](https://github.com/autumn-foundation/autumn-harvest/issues/2470) |
 | Workflow schedules, `retention`, `mcp_tools`, `mcp_tasks`, `webhooks`, `connector`, `synthetic_canary`, `agent_overlay_store` | [#2471](https://github.com/autumn-foundation/autumn-harvest/issues/2471) |
-| `harvest.mode = "split"` / `"external"`, per-tenant Harvest in a fleet | [#2472](https://github.com/autumn-foundation/autumn-harvest/issues/2472) |
+| `harvest.sqlite.path` or `sqlite_per_tenant()` with `harvest.mode = "split"` / `"external"` | [#2472](https://github.com/autumn-foundation/autumn-harvest/issues/2472): no effect in that mode |
+| `sqlite_per_tenant()` in an app with no `[database.fleet]` | [#2472](https://github.com/autumn-foundation/autumn-harvest/issues/2472) |
 | `harvest.worker_enabled = false` | not planned: the app process is the only writer |
 | DAGs | an engine non-goal of the SQLite backend (#2019) |
 | `with_metrics_scrape` | the epic |
@@ -226,6 +369,18 @@ directory, with no Postgres and no Docker:
 
 ```bash
 cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin
+cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin_fleet
 ```
 
-CI runs it in the `sqlite-plugin` job.
+CI runs both in the `sqlite-plugin` job. The fleet suite boots a tenant
+fleet. It covers each tenant's file and driver, the tenant routes, a close,
+a reopen and a delete.
+
+`tests/sqlite_plugin_split.rs` runs a SQLite app on a Postgres Harvest
+database in split and external mode. It starts a Postgres container, or
+uses `HARVEST_TEST_DATABASE_URL`. CI runs it in the `sqlite-plugin-split`
+job:
+
+```bash
+cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin_split
+```
