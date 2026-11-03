@@ -69,12 +69,13 @@ moment the tool cannot tell what changed is the worst option available.
 (This is why the `lint` checkout uses `fetch-depth: 0`: without real
 history there is no merge base, and the step would silently stop gating.)
 
-A PR ratchets against its merge base, or against the commit that added
-the gate if the merge base predates it. Only the release PR from
-`trunk-dev` into `trunk` hits the second case, and only while `trunk` is
-older than the gate. Its merge base is then the last release, so the
-legacy population from before the gate would count as new. The gate
-commit still checks the whole release cumulatively. A push run on
+A PR into `trunk-dev` ratchets against its merge base, and a push
+against the commit before it. The release PR from `trunk-dev` into `trunk`
+gets no `ci.yml` run. `.github/workflows/release-pr.yml` ratchets the
+whole release there instead. It uses the merge base with `trunk`, or the
+commit that added the gate if the merge base predates it. While `trunk` is
+older than the gate, its merge base is the last release, so the legacy
+population from before the gate would count as new. A push run on
 `trunk-dev` can be cancelled, and two clean PRs can merge into a new
 finding, so the release PR is the last place to catch either.
 
