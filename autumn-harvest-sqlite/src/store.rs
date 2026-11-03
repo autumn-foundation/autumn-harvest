@@ -679,8 +679,14 @@ pub fn append_event_seq(
 ) -> SqliteResult<i64> {
     let seq = next_seq(conn, exec_id)?;
     conn.execute(
-        "INSERT INTO harvest_events (exec_id, seq, event_json) VALUES (?1, ?2, ?3)",
-        params![exec_id.to_string(), seq, serde_json::to_string(event)?],
+        "INSERT INTO harvest_events (exec_id, seq, event_json, recorded_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            exec_id.to_string(),
+            seq,
+            serde_json::to_string(event)?,
+            now_micros()
+        ],
     )?;
     Ok(seq)
 }
@@ -721,6 +727,19 @@ pub fn successor_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Opt
         Some(WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. }) => Some(new_exec_id),
         _ => None,
     })
+}
+
+/// The run that `exec_id` continued as, or the retry that it started, if any
+/// (issues #2023 and #2029).
+///
+/// A run sealed `CONTINUED_AS_NEW` names its successor. A `FAILED` run names
+/// its retry. Every other state has none.
+pub fn successor(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<ExecutionId>> {
+    match execution_state(conn, exec_id)?.as_str() {
+        "CONTINUED_AS_NEW" => successor_of(conn, exec_id),
+        "FAILED" => retry_of(conn, exec_id),
+        _ => Ok(None),
+    }
 }
 
 /// The retry that the failed `exec_id` started, if any (issue #2029). Only a

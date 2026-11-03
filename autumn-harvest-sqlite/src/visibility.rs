@@ -345,6 +345,49 @@ impl SqliteReader {
         Ok(history)
     }
 
+    /// One page of the event history of `exec`, oldest first (issue #2489).
+    ///
+    /// It follows the Postgres cursor contract. See
+    /// [`HistoryPage`](crate::HistoryPage) for the ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
+    /// [`SqliteError::Sqlite`] if the query fails, and a JSON error for a row
+    /// that does not parse.
+    pub fn history_page(
+        &self,
+        exec: ExecutionId,
+        filter: &crate::HistoryFilter,
+    ) -> SqliteResult<crate::HistoryPage> {
+        crate::history_page::history_page(&self.conn, exec, filter)
+    }
+
+    /// The run that `exec` continued as, or the retry that it started, if
+    /// any (issue #2489). See
+    /// [`SqliteRuntime::successor`](crate::SqliteRuntime::successor).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
+    /// [`SqliteError::Sqlite`] if the query fails.
+    pub fn successor(&self, exec: ExecutionId) -> SqliteResult<Option<ExecutionId>> {
+        crate::store::successor(&self.conn, exec)
+    }
+
+    /// The parent run of `exec`, if it is a child run (issue #2489).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
+    /// [`SqliteError::Sqlite`] if the query fails.
+    pub fn parent(&self, exec: ExecutionId) -> SqliteResult<Option<ExecutionId>> {
+        if !crate::store::execution_exists(&self.conn, exec)? {
+            return Err(SqliteError::ExecutionNotFound(exec));
+        }
+        Ok(crate::store::parent_link(&self.conn, exec)?.map(|(parent, _)| parent))
+    }
+
     /// The cost ledger rows of `exec` (issue #2275). See
     /// [`SqliteRuntime::llm_ledger`](crate::SqliteRuntime::llm_ledger).
     ///

@@ -148,6 +148,9 @@ CREATE TABLE IF NOT EXISTS harvest_events (
     exec_id    TEXT NOT NULL,
     seq        INTEGER NOT NULL,
     event_json TEXT NOT NULL,
+    recorded_at INTEGER,                   -- the append time in epoch microseconds
+                                           -- (issue #2489). NULL on a row written
+                                           -- before that issue. Replay never reads it.
     PRIMARY KEY (exec_id, seq)
 );
 
@@ -599,8 +602,31 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         "ALTER TABLE harvest_executions ADD COLUMN schedule_name TEXT",
     )?;
     conn.execute_batch(SCHEDULE_AND_RETENTION_INDEXES)?;
+    add_recorded_at(conn)?;
     add_schedule_code(conn)?;
     add_signal_key(conn)
+}
+
+/// Issue #2489: the append time that the history page reports.
+///
+/// A file opened by `SqliteRuntime::open` always has the table, because the
+/// base [`SCHEMA`] creates it first. A bare older file may not.
+fn add_recorded_at(conn: &Connection) -> SqliteResult<()> {
+    let has_events: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master \
+           WHERE type = 'table' AND name = 'harvest_events')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_events {
+        add_column_if_absent(
+            conn,
+            "harvest_events",
+            "recorded_at",
+            "ALTER TABLE harvest_events ADD COLUMN recorded_at INTEGER",
+        )?;
+    }
+    Ok(())
 }
 
 /// Issue #2390: the code value of a schedule, which an override merges over.
@@ -729,7 +755,7 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> SqliteResult<b
 mod tests {
     use rusqlite::Connection;
 
-    use super::{SCHEMA, column_exists, migrate};
+    use super::{SCHEMA, add_recorded_at, column_exists, migrate};
 
     // The pre-#1068 `harvest_tasks` shape (no freeze columns) — the 14 columns that
     // existed before this change.
@@ -828,6 +854,28 @@ mod tests {
         conn.execute(insert, rusqlite::params!["e1", None::<String>])
             .unwrap();
         assert!(conn.execute(insert, ["e1", "k"]).is_err());
+    }
+
+    #[test]
+    fn migrate_adds_the_event_append_time() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE harvest_events (exec_id TEXT NOT NULL, seq INTEGER NOT NULL, \
+             event_json TEXT NOT NULL, PRIMARY KEY (exec_id, seq));",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO harvest_events (exec_id, seq, event_json) VALUES ('e', 0, '{}')",
+        )
+        .unwrap();
+        add_recorded_at(&conn).unwrap();
+        add_recorded_at(&conn).unwrap();
+        let old_row: Option<i64> = conn
+            .query_row("SELECT recorded_at FROM harvest_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(old_row, None, "an old event has no append time");
     }
 
     // A fresh database already has the freeze columns from `SCHEMA`, so `migrate` is

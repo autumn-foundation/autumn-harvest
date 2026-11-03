@@ -32,14 +32,15 @@ use autumn_web::AppState;
 use autumn_web::app::AppBuilder;
 use autumn_web::error::AutumnError;
 
-pub use driver::SignalWithStartParams;
+pub use driver::{RoutedSignal, RoutedUpdate, SignalWithStartParams, StopAck};
 pub use fleet::{HarvestFleet, HarvestTenant, tenant_harvest_file};
 pub use handle::{HarvestSqlite, HarvestSqliteError};
 
 /// The `autumn-harvest-sqlite` types that [`HarvestSqlite`] takes and returns.
 pub use autumn_harvest_sqlite::{
-    ExecutionDescription, ExecutionFilter, ExecutionPage, ExecutionSummary, ListCursor,
-    SignalDelivery, SignalWithStartOutcome, SqliteError, StartOptions, StartOutcome, Stored,
+    AdmittedUpdate, ExecutionDescription, ExecutionFilter, ExecutionPage, ExecutionSummary,
+    HistoryFilter, HistoryPage, ListCursor, PagedEvent, SignalDelivery, SignalWithStartOutcome,
+    SqliteError, StartOptions, StartOutcome, Stored,
 };
 
 use crate::api::HarvestApiState;

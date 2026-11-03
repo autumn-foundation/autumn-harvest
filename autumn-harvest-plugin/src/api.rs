@@ -3348,8 +3348,8 @@ pub(crate) const KNOWN_WORKFLOW_STATES: &[&str] = &[
     "MIGRATED",
 ];
 
-const DEFAULT_WORKFLOW_LIMIT: i64 = 50;
-const MAX_WORKFLOW_LIMIT: i64 = 200;
+pub(crate) const DEFAULT_WORKFLOW_LIMIT: i64 = 50;
+pub(crate) const MAX_WORKFLOW_LIMIT: i64 = 200;
 const DEFAULT_WORKFLOW_CHILDREN_LIMIT: usize = 50;
 const MAX_WORKFLOW_CHILDREN_LIMIT: usize = 500;
 const MAX_WORKFLOW_CHILDREN_DEPTH: u8 = 5;
@@ -12146,8 +12146,8 @@ async fn get_workflow(
 }
 
 /// Default and maximum page sizes for `GET /workflows/{id}/history`.
-const DEFAULT_HISTORY_PAGE: i64 = 100;
-const MAX_HISTORY_PAGE: i64 = 1000;
+pub(crate) const DEFAULT_HISTORY_PAGE: i64 = 100;
+pub(crate) const MAX_HISTORY_PAGE: i64 = 1000;
 
 /// Per-event entry returned by `GET /workflows/{id}/history`.
 #[derive(Debug, Serialize)]
@@ -12180,7 +12180,7 @@ struct WorkflowHistoryPage {
 /// Parse query parameters for `GET /workflows/{id}/history`.
 ///
 /// Returns `(limit, after_id, event_types)` or a 400 error.
-fn parse_workflow_history_query(
+pub(crate) fn parse_workflow_history_query(
     pairs: &[(String, String)],
 ) -> Result<(i64, Option<i64>, Vec<String>), AutumnError> {
     let mut limit = DEFAULT_HISTORY_PAGE;
@@ -12771,7 +12771,7 @@ fn start_error_response(error: HarvestError) -> axum::response::Response {
     }
 }
 
-fn workflow_result_pending_response() -> axum::response::Response {
+pub(crate) fn workflow_result_pending_response() -> axum::response::Response {
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
         axum::http::header::RETRY_AFTER,
@@ -17328,7 +17328,7 @@ const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
 /// A whitespace-only id is out of scope. It is a normal, non-empty final
 /// path segment, so it does not trigger the router gap this issue addresses.
 #[allow(clippy::result_large_err)]
-fn reject_empty_workflow_id(raw: Option<&str>) -> Result<(), axum::response::Response> {
+pub(crate) fn reject_empty_workflow_id(raw: Option<&str>) -> Result<(), axum::response::Response> {
     use axum::response::IntoResponse as _;
     if raw == Some("") {
         return Err((
@@ -17400,7 +17400,7 @@ fn validate_start_idempotency_key(
 /// Returns `Some(400)` when the key is reserved, `None` when it is fine. Uses
 /// the core predicate and message so every path refuses identically.
 #[must_use]
-fn reject_reserved_idempotency_key(key: &str) -> Option<axum::response::Response> {
+pub(crate) fn reject_reserved_idempotency_key(key: &str) -> Option<axum::response::Response> {
     use axum::response::IntoResponse as _;
     if !autumn_harvest::start_idempotency::is_reserved_key(key) {
         return None;
@@ -46110,7 +46110,7 @@ fn parse_shard_placement(
     }
 }
 
-fn parse_workflow_result_wait_query(
+pub(crate) fn parse_workflow_result_wait_query(
     pairs: &[(String, String)],
     max_wait: Duration,
 ) -> Result<Duration, AutumnError> {

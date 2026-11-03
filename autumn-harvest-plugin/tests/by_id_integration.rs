@@ -53,6 +53,9 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
+#[path = "support/wire_contract.rs"]
+mod wire_contract;
+
 type HarvestApiApp = axum::Router;
 
 // Paved-path migration bundle (issue #604): the whole `migrations/` directory,
@@ -429,6 +432,15 @@ async fn describe_by_id_returns_resolved_execution_id() {
         resp.body["execution"]["id"].as_str(),
         Some(exec_id.to_string().as_str())
     );
+    // The same checks run on SQLite (issue #2489).
+    let reply = wire_contract::Reply {
+        status: resp.status.as_u16(),
+        retry_after: None,
+        execution_id: resp.exec_id_header.clone(),
+        body: resp.body.clone(),
+    };
+    wire_contract::by_id_names_its_run(&reply, &exec_id.to_string());
+    wire_contract::describe_shape(&resp.body);
 }
 
 // ── AC5: unknown (name, id) → 404, never 500 ─────────────────────────────────

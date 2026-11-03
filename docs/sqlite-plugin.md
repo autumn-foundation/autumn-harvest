@@ -300,38 +300,73 @@ HTTP it is the Postgres `400` with `violations`.
 
 ## The management API
 
-`.api(path)` mounts these routes. Each one keeps its Postgres path and field
-names. A body carries the fields this backend stores, so it can be a subset
-of the Postgres body.
+`.api(path)` mounts these routes. Each one keeps its Postgres path, status
+codes and field names (#2489). A body carries the fields this backend
+stores, so it can be a subset of the Postgres body.
 
 | Route | Notes |
 | --- | --- |
-| `GET /health`, `/health/live`, `/health/ready` | `backend: "sqlite"` |
+| `GET /health`, `/health/live`, `/health/ready` | `/health` adds `backend: "sqlite"` and `path`. `/health/ready` reads the file |
 | `GET /workflows` | `workflow_name`, `workflow_id`, `workflow_id_prefix`, `state`, `limit`, `page_size`, `cursor` |
 | `GET /workflows/registered` | |
-| `GET /workflows/{id}` | the run and its whole history |
-| `GET /workflows/{id}/history` | |
+| `GET /workflows/{id}` | the run and the first 100 events |
+| `GET /workflows/{id}/history` | `after`, `limit`, `event_type` |
+| `GET /workflows/{id}/result` | `wait` |
 | `POST /workflows/{workflow_name}/start` | `workflow_id`, `input`, `memo`, `search_attrs`, `reuse_policy` |
 | `POST /workflows/{workflow_name}/signal-with-start` | |
 | `POST /workflows/{id}/signal/{signal_name}` | `Idempotency-Key` header or `idempotency_key` query |
 | `POST /workflows/{id}/cancel`, `/terminate` | optional `reason` |
 | `GET`/`POST /workflows/{id}/query/{query_name}` | |
-| `POST /workflows/{id}/update/{update_name}` | runs in the request and answers `200` with the output |
-| `GET /workflows/by-id/{workflow_name}/{workflow_id}` | |
+| `POST /workflows/{id}/update/{update_name}` | runs in the request and answers `200` with `update_id` and `output` |
+| `GET /workflows/by-id/{workflow_name}/{workflow_id}` | also `/result` |
 | `POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}` | |
 
-Every other management route answers `501` and links the epic. That
-includes `GET /workflows/{id}/result`: its Postgres polling contract (`204`
-with `Retry-After` while running, the compact state, the successor chain) is
-not ported yet ([#2489](https://github.com/autumn-foundation/autumn-harvest/issues/2489)).
-Poll `GET /workflows/{id}` and read `execution.state` and `execution.output`.
+`GET /workflows/{id}/result` follows the Postgres polling contract. A run
+that is not terminal answers `204` with `Retry-After: 1`. A terminal run
+answers the compact form, with a lower-case `state`. The read follows the
+`continue_as_new` chain and the workflow retry chain to the last run. `wait`
+polls the file until the run ends or the wait elapses.
 
-A route that reads no query parameter refuses one with a `400`. For example,
-`GET /workflows/{id}/history` does not page yet, so `?after=`, `?event_type=`
-and `?limit=` are refused. They are not ignored, so the full history never
-passes for a filtered page (#2489). A start
-option this backend cannot honour, such as `queue`, `priority`, `start_at` or
-the `Idempotency-Key` header, is a `400` that names it. Neither is ever an empty `200`.
+`GET /workflows/{id}/history` pages with the Postgres cursor. An event `id`
+is its 0-based `event_id` plus one, so `after=0` reads from the first event.
+`timestamp` is the append time. An event written before #2489 has a `null`
+`timestamp`.
+
+A signal, cancel, terminate, query or update to a `FAILED` run with a live
+retry acts on the retry, as on Postgres (#843). A signal names the retry in
+`routed_execution_id`.
+
+`tests/support/wire_contract.rs` holds the checks of this contract. The
+SQLite suite and the Postgres integration tests run them both.
+
+Every other management route answers `501` and links the epic.
+
+### Where the contract differs
+
+- A cancel is cooperative. It answers `202` with `state: "RUNNING"` and
+  `deferred: true`. The next drive ends the run. A repeat cancel answers
+  `newly_cancelled: false` and the first reason.
+- A route refuses a query parameter that it does not read with a `400`.
+  Postgres ignores it. `/history` ignores it, as on Postgres. `/result`
+  refuses it on both backends. A start option this backend cannot honour, such as
+  `queue`, `priority`, `start_at` or the `Idempotency-Key` header, is a `400`
+  that names it. Neither is ever an empty `200`.
+- An empty request body is the default body. Postgres needs a JSON body.
+- A signal idempotency key dedupes across the whole run chain. Postgres
+  dedupes it per run.
+- `workflow_id` and `workflow_id_prefix` filter a listing on this backend
+  only.
+- An update completes in the request. `?wait=admitted` and `timeout_secs`
+  are refused.
+- An event written before #2489 has `timestamp: null`. A Postgres event
+  always has a time.
+- A start or a signal-with-start checks its body before the workflow name.
+  So a bad body is a `400` where Postgres answers `404` for an unknown name.
+- A cancel or a terminate cuts its trimmed reason to 500 characters. The run
+  keeps the reason in its cancel state and in history, so the cap bounds that
+  storage. Postgres keeps the whole reason.
+- A cancel or a terminate body has no `failed_task_count`. This backend
+  deletes the pending tasks of the run. It does not mark them failed.
 
 Auth works as on Postgres. `api_with_auth(path, mw)` wraps the router. The
 issue #1802 mutation gate refuses an anonymous mutating call outside `dev`.
@@ -384,3 +419,9 @@ job:
 ```bash
 cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin_split
 ```
+
+The SQLite suite's `wire_parity` module runs the checks of
+`tests/support/wire_contract.rs`. The Postgres suites
+`workflow_result_integration`, `workflow_history_pagination_integration`
+and `by_id_integration` run the same checks. A change to the contract
+changes that one file, and both backends then test it.
