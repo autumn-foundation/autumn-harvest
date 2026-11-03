@@ -321,9 +321,10 @@ impl Candidate {
     /// The names that identify this candidate in a failure text (issue
     /// #2376): the label, both digests, each route and each model id.
     ///
-    /// `task` is the recorded task under the overlay. A candidate with no
-    /// model of its own keeps the route of `task`, so that route counts too.
-    fn identities(&self, task: &AgentTask) -> Vec<String> {
+    /// `asked` holds each route that a run of this candidate asked for. A
+    /// candidate can keep a route of the source, such as the model of a
+    /// recorded peer. So the routes that a run asks for count too.
+    fn identities(&self, asked: &BTreeSet<Option<String>>) -> Vec<String> {
         let mut names = vec![self.digest(), self.overlay.digest()];
         names.extend(self.label.clone());
         let routes: BTreeSet<&String> = self
@@ -333,7 +334,7 @@ impl Candidate {
             .chain(&self.route)
             .chain(&self.admitted)
             .chain(self.agent_models.values())
-            .chain(&task.model)
+            .chain(asked.iter().flatten())
             .collect();
         let mut ids = vec![self.harness.model(None).ok()];
         for route in routes {
@@ -669,6 +670,21 @@ async fn run(
     task: AgentTask,
     candidate: &Candidate,
 ) -> Result<Evaluation, EvalError> {
+    Ok(run_with_routes(recording, task, candidate).await?.0)
+}
+
+/// [`run`], with each model route that a candidate turn asked for. `None`
+/// is the default model. An anonymised pool redacts these routes (issue
+/// #2376).
+///
+/// # Errors
+///
+/// The errors of [`run`].
+async fn run_with_routes(
+    recording: &Recording,
+    task: AgentTask,
+    candidate: &Candidate,
+) -> Result<(Evaluation, BTreeSet<Option<String>>), EvalError> {
     let handle = multi_thread_handle()?;
 
     let input = serde_json::to_value(&task).map_err(|e| EvalError::Undecodable(e.to_string()))?;
@@ -689,6 +705,7 @@ async fn run(
         root: None,
         replayed: 0,
         stubbed: 0,
+        routes: BTreeSet::new(),
     }));
 
     let model = model_mock(&session, candidate, recording, handle);
@@ -742,28 +759,26 @@ async fn run(
     let outcome = env.run(agent_loop_info().handler, input).await;
 
     let candidate_turns = model_turns(outcome.events())?;
-    let (replayed, stubbed, cap_reached, root) = {
-        let session = lock(&session);
+    let (replayed, stubbed, cap_reached, root, routes) = {
+        let mut session = lock(&session);
         let root = session.root.clone();
-        (session.replayed, session.stubbed, session.cap_reached, root)
+        let routes = std::mem::take(&mut session.routes);
+        (
+            session.replayed,
+            session.stubbed,
+            session.cap_reached,
+            root,
+            routes,
+        )
     };
-    let candidate_end = match outcome.result {
-        Ok(output) => {
-            let mut report: AgentReport = decode(output).map_err(EvalError::Undecodable)?;
-            if let (Some(from), Some(to)) = (&root, &recording.run_id) {
-                rebase_run_ids(&mut report, from, to);
-            }
-            RunEnd::Completed(report)
-        }
-        Err(error) => RunEnd::Failed(error),
-    };
+    let candidate_end = run_end_of(outcome.result, root.as_deref(), recording)?;
 
     let turns = diff_turns(&recording.turns, &candidate_turns);
     let first_divergence = turns
         .iter()
         .position(|turn| matches!(turn.verdict, Verdict::Diverged(_)));
     let end_diverged = ends_differ(&recording.end, &candidate_end);
-    Ok(Evaluation {
+    let evaluation = Evaluation {
         turns,
         first_divergence,
         recorded: recording.end.clone(),
@@ -773,7 +788,8 @@ async fn run(
         stubbed_tool_calls: stubbed,
         turn_cap_reached: cap_reached,
         overlay_digest: candidate.overlay.digest(),
-    })
+    };
+    Ok((evaluation, routes))
 }
 
 /// Two candidates on one source, such as two models for one agent (issue
@@ -857,6 +873,29 @@ pub async fn compare(
         turns,
         first_divergence,
         end_diverged,
+    })
+}
+
+/// How the candidate run ended, from the engine `result`. The run ids of a
+/// report take the recorded root in place of the engine `root`.
+///
+/// # Errors
+///
+/// Returns [`EvalError::Undecodable`] for a report that does not decode.
+fn run_end_of(
+    result: Result<Value, String>,
+    root: Option<&str>,
+    recording: &Recording,
+) -> Result<RunEnd, EvalError> {
+    Ok(match result {
+        Ok(output) => {
+            let mut report: AgentReport = decode(output).map_err(EvalError::Undecodable)?;
+            if let (Some(from), Some(to)) = (root, &recording.run_id) {
+                rebase_run_ids(&mut report, from, to);
+            }
+            RunEnd::Completed(report)
+        }
+        Err(error) => RunEnd::Failed(error),
     })
 }
 
@@ -1296,6 +1335,9 @@ struct Session {
     root: Option<String>,
     replayed: u32,
     stubbed: u32,
+    /// Each model route that a candidate turn asked for. `None` is the
+    /// default model.
+    routes: BTreeSet<Option<String>>,
 }
 
 impl Session {
@@ -1461,6 +1503,7 @@ fn model_mock(
             session
                 .candidate_names
                 .insert(lane.clone(), request.agent.clone());
+            session.routes.insert(request.model.clone());
             // The test engine has its own ids. The policy sees the recorded
             // run id instead, with the lane of the same agent.
             if let Some(run_id) = &run_id {

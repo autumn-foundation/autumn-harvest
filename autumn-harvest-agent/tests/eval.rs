@@ -2801,3 +2801,58 @@ async fn an_inherited_route_and_its_model_id_are_redacted() {
         assert!(!report.text.contains(identity), "{}", report.text);
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recorded_peer_route_and_its_model_id_are_redacted() {
+    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
+    use autumn_harvest_agent::{Mandate, Peer};
+
+    // The source delegates to a peer that names its own model route.
+    let route = "route-peer-9a3c";
+    let delegate = || {
+        calls(
+            &[(
+                "d1",
+                DELEGATE_TOOL,
+                json!({"agent": "planner", "task": "plan"}),
+            )],
+            2,
+        )
+    };
+    let (_dir, db) = fresh_db();
+    let harness = AgentHarness::new(ScriptedModel::new(vec![delegate(), answer("done", 2)]))
+        .model_named(route, ScriptedModel::new(vec![answer("the plan", 2)]))
+        .peer(Peer::new("planner", "Plans.").model(route));
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("go").mandate(Mandate::new("triage").peers(["planner"]));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    let source = rt.load_history(exec).unwrap();
+    // Each candidate keeps the peer route. Its harness maps the route to a
+    // model that fails with its own id.
+    let failing = |id: &'static str, label: &str| {
+        let peer = ScriptedModel::named(
+            id,
+            vec![Err(AgentError::new(
+                ErrorKind::Provider,
+                format!("{id} on {route} is down"),
+            ))],
+        );
+        let harness = AgentHarness::new(ScriptedModel::new(vec![delegate(), answer("done", 2)]))
+            .model_named(route, peer);
+        Candidate::new(harness).label(label)
+    };
+    let pool = [
+        failing("model-peer-one-id-1f", "label-peer-one-3a"),
+        failing("model-peer-two-id-2e", "label-peer-two-4b"),
+    ];
+
+    let report = compare_anonymised(&source, &pool, 8).await.unwrap();
+
+    let pool_json = serde_json::to_string(&report.pool).unwrap();
+    for identity in ["model-peer-one-id-1f", "model-peer-two-id-2e", route] {
+        assert!(!report.text.contains(identity), "{}", report.text);
+        assert!(!pool_json.contains(identity), "{pool_json}");
+    }
+}

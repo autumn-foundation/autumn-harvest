@@ -21,7 +21,8 @@ labels or order. Parent: #2369. It builds on the overlay candidates of
   Equal digests give `EvalError::DuplicateCandidate` before any model call.
 - **Failure texts.** Each run end error and report error replaces each
   label, digest, route and model id of the pool with `[redacted]`. The
-  source end and a route that a candidate keeps from the source count too.
+  source end counts too. The routes are each route that a run asks for,
+  so a root or peer route that a candidate keeps from the source counts.
   Only a whole name is replaced.
 - **Behaviour change.** A `Candidate::agent_model` route to a model that the
   harness does not hold now gives `OverlayError::UnknownModel` before any
@@ -33,7 +34,7 @@ labels or order. Parent: #2369. It builds on the overlay candidates of
 - **Proof.** `formal/verus/src/agent_anonymise.rs` mirrors `shared_digits`
   and `id_width`. It proves that the width is the least safe width from
   the floor, and that two prefixes of that width differ.
-- **Tests.** The change adds fourteen integration tests to
+- **Tests.** The change adds fifteen integration tests to
   `autumn-harvest-agent/tests/eval.rs` and twelve unit tests. One unit
   test is a proptest. It checks that any input order gives each candidate
   the same id and rank.

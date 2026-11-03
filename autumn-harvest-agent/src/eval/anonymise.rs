@@ -24,7 +24,8 @@
 //! A failure text comes from the harness or the provider, so it can name a
 //! model. Each run end error and each report error replaces every identity
 //! of every candidate in the pool with [`REDACTED`]. The source end gets the
-//! same treatment. An identity is a label,
+//! same treatment. The routes include each route that a run asked for, such
+//! as the model of a recorded peer. An identity is a label,
 //! a digest, a route or a model id. Only a whole name is replaced. A name
 //! ends at a character that is not a letter, a digit, `-` or `_`. So a
 //! short route, such as `a`, also replaces that word.
@@ -37,7 +38,7 @@
 //! reason. Keep the seed from the reader, because the seed and the digests
 //! give the ids.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 
 use autumn_harvest::event::WorkflowEvent;
@@ -46,10 +47,9 @@ use sha2::{Digest as _, Sha256};
 
 use super::{
     Candidate, Divergence, EvalError, Evaluation, Recording, RunEnd, Side, TurnDecision, TurnDiff,
-    Verdict, run,
+    Verdict, run_with_routes,
 };
 use crate::transcript::hex;
-use crate::types::AgentTask;
 
 /// The least number of hex digits in an id.
 pub const MIN_ID_DIGITS: usize = 12;
@@ -189,7 +189,25 @@ pub async fn compare_anonymised(
     let digests: Vec<String> = candidates.iter().map(Candidate::digest).collect();
     let source = recording.run_id.as_deref().unwrap_or_default();
     let slots = pool_slots(seed, source, &digests)?;
-    let identities = identities(candidates, &tasks);
+
+    let mut jobs: Vec<_> = candidates
+        .iter()
+        .zip(tasks)
+        .zip(slots)
+        .enumerate()
+        .collect();
+    jobs.sort_by_key(|(_, (_, (rank, _)))| *rank);
+    let mut runs = Vec::with_capacity(jobs.len());
+    let mut asked = BTreeSet::new();
+    for (index, ((candidate, task), (_, id))) in jobs {
+        let (evaluation, routes) = run_with_routes(&recording, task, candidate).await?;
+        asked.extend(routes);
+        runs.push((index, candidate, id, evaluation));
+    }
+
+    // The identities wait for every run, so each route that any run asked
+    // for counts.
+    let identities = identities(candidates, &asked);
     let scrub = Scrub {
         identities: identities.clone(),
         clear_run_ids: recording.run_id.is_none(),
@@ -199,18 +217,9 @@ pub async fn compare_anonymised(
         identities,
         clear_run_ids: false,
     };
-
-    let mut jobs: Vec<_> = candidates
-        .iter()
-        .zip(tasks)
-        .zip(slots)
-        .enumerate()
-        .collect();
-    jobs.sort_by_key(|(_, (_, (rank, _)))| *rank);
-    let mut entries = Vec::with_capacity(jobs.len());
+    let mut entries = Vec::with_capacity(runs.len());
     let mut key = BTreeMap::new();
-    for (index, ((candidate, task), (_, id))) in jobs {
-        let evaluation = run(&recording, task, candidate).await?;
+    for (index, candidate, id, evaluation) in runs {
         key.insert(
             id.clone(),
             CandidateRef {
@@ -243,13 +252,12 @@ struct Scrub {
 }
 
 /// Every identity of every candidate, longest first, so that a longer name
-/// is replaced before a name inside it. `tasks` holds the task of each
-/// candidate under its overlay, in input order.
-fn identities(candidates: &[Candidate], tasks: &[AgentTask]) -> Vec<String> {
+/// is replaced before a name inside it. `asked` holds each route that any
+/// run asked for. Each candidate harness resolves each such route.
+fn identities(candidates: &[Candidate], asked: &BTreeSet<Option<String>>) -> Vec<String> {
     let mut names: Vec<String> = candidates
         .iter()
-        .zip(tasks)
-        .flat_map(|(candidate, task)| candidate.identities(task))
+        .flat_map(|candidate| candidate.identities(asked))
         .filter(|name| !name.is_empty())
         .collect();
     names.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));

@@ -47,7 +47,7 @@ Each answer gives a rule.
 | Two equal candidates get one id, so the map loses one. | Equal digests give equal keys. The harness refuses the pool before any model call. |
 | A caller serialises the whole report into a prompt. | `AnonymisedReport` does not derive `Serialize`. Its `Debug` form hides the key. The pool and the key encode apart. |
 | A route to a missing model fails the run, and the harness error names the model. | A candidate refuses each route that its harness does not hold, before any model call. |
-| A provider error names its model. | Each failure text replaces each label, digest, route and model id of the pool. The source end and an inherited route count too. Only a whole name is replaced. |
+| A provider error names its model. | Each failure text replaces each label, digest, route and model id of the pool. The source end counts too. The routes are the routes that each run asked for, so an inherited root or peer route counts. Only a whole name is replaced. |
 | A new call id holds the provider id, and its form names the vendor. | A new `eval_` id holds the turn and the position only. |
 | A source with no run id leaves the engine run id in the candidate report, so two runs differ. | The pool clears the run ids of such a report. |
 | A model reply names its own model. | Out of scope. The text renders model output as written, because that output is what the reader judges. The guide states this limit, with the token usage and the policy reasons. |
@@ -121,5 +121,5 @@ All tests are in `autumn-harvest-agent/tests/eval.rs` unless named.
 | The report keeps every non-identity field of `Evaluation` | `the_report_keeps_every_field_that_is_not_an_identity`, and `anonymise` destructures `Evaluation` exhaustively |
 | The id width rule | `formal/verus/src/agent_anonymise.rs`, and the unit test `a_shared_prefix_widens_every_id` |
 | Duplicates and bad overlays cost no model call | `equal_candidates_are_refused_before_any_model_call`, `a_bad_overlay_in_the_pool_is_refused_before_any_model_call`, `an_unknown_agent_route_is_refused_before_any_model_call` |
-| Failure texts name no candidate | `a_failure_text_names_no_candidate`, `a_failed_source_end_names_no_candidate`, `an_inherited_route_and_its_model_id_are_redacted`, and the unit test `only_a_whole_name_is_redacted` |
+| Failure texts name no candidate | `a_failure_text_names_no_candidate`, `a_failed_source_end_names_no_candidate`, `an_inherited_route_and_its_model_id_are_redacted`, `a_recorded_peer_route_and_its_model_id_are_redacted`, and the unit test `only_a_whole_name_is_redacted` |
 | The run order is the pool order | `the_candidates_run_in_pool_order` |
