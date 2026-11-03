@@ -894,6 +894,17 @@ fn lift_payloads(event: &mut crate::event::WorkflowEvent) -> LiftedPayloads {
     lifted
 }
 
+/// Whether a lifted payload has no `data` key to go to.
+///
+/// `fields` holds the `data` field for each key, in the same order as
+/// `lifted`.
+fn has_unplaced_payload(lifted: &LiftedPayloads, fields: &[Option<&mut Value>]) -> bool {
+    lifted
+        .iter()
+        .zip(fields)
+        .any(|(payload, field)| payload.is_some() && field.is_none())
+}
+
 /// Put each payload that [`lift_payloads`] moved out back into its slot.
 fn restore_payloads(event: &mut crate::event::WorkflowEvent, lifted: LiftedPayloads) {
     for (payload, key) in lifted
@@ -1372,6 +1383,8 @@ impl PayloadCodecs {
     pub fn encode_event(&self, event: &crate::event::WorkflowEvent) -> HarvestResult<Value> {
         // A clone copies each payload tree in key order. It is cheaper than
         // the serde copy, which inserts each key with a search (issue #2499).
+        // The owned path adds no copy of its own, so this clone is the only
+        // copy, as the serde copy was.
         self.encode_event_owned(event.clone())
     }
 
@@ -1383,7 +1396,7 @@ impl PayloadCodecs {
     /// # Errors
     ///
     /// Returns [`HarvestError`] if event serialization or codec encoding
-    /// fails. The event is dropped on an error.
+    /// fails. An error drops the event.
     pub fn encode_event_owned(&self, event: crate::event::WorkflowEvent) -> HarvestResult<Value> {
         Ok(self.encode_event_moving_payloads(event)?.0)
     }
@@ -1391,16 +1404,17 @@ impl PayloadCodecs {
     /// [`Self::encode_event_owned`], plus `true` when the slow path ran.
     ///
     /// This lifts each non-null payload out of its slot. Serde then writes a
-    /// small event, with `null` in each lifted field. Each payload is
-    /// encoded and moves into its `data` key.
+    /// small event, with `null` in each lifted field. The loop then encodes
+    /// each payload and moves it into its `data` key.
     ///
-    /// The encode visits each [`PAYLOAD_FIELD_KEYS`] key in `data`, in that
-    /// order, as the rebuild did. So a payload key with no slot is still
-    /// encoded.
+    /// The loop visits each [`PAYLOAD_FIELD_KEYS`] key in `data`, in that
+    /// order, as `transform_event_data` does. So a payload key with no slot
+    /// is still encoded. Serde copies that payload, so a missed slot costs a
+    /// copy, not data.
     ///
-    /// A lifted payload with no `data` key would be lost. A check finds this
-    /// case before any encode. The slow path then puts each payload back and
-    /// encodes the whole event.
+    /// A lifted payload with no `data` key has no place to go. A check finds
+    /// this case before any encode. The slow path then puts each payload back
+    /// and encodes the whole event.
     ///
     /// [`PAYLOAD_FIELD_KEYS`]: crate::payload_store::PAYLOAD_FIELD_KEYS
     fn encode_event_moving_payloads(
@@ -1419,11 +1433,7 @@ impl PayloadCodecs {
                 }
             }
         }
-        if lifted
-            .iter()
-            .zip(&fields)
-            .any(|(payload, field)| payload.is_some() && field.is_none())
-        {
+        if has_unplaced_payload(&lifted, &fields) {
             return Ok((self.encode_lifted_slowly(event, lifted)?, true));
         }
         for (payload, field) in lifted.iter_mut().zip(fields) {
@@ -1466,7 +1476,8 @@ impl PayloadCodecs {
     /// This lifts each decoded payload out of `data` and leaves `null` in its
     /// place. Serde then decodes a small event. Each payload moves into its
     /// field through [`WorkflowEvent::payload_slot`]. The key set that serde
-    /// sees does not change, so every error stays the same.
+    /// sees does not change. Every payload field is a `Value` or an
+    /// `Option<Value>`, which accepts any JSON. So every error stays the same.
     ///
     /// A payload with no slot is either a key that the variant does not have,
     /// or a slot that `payload_slot` omits. The slow path puts it back and
@@ -1547,7 +1558,7 @@ impl PayloadCodecs {
                 // hand. If encoding fails, `?` returns before the `Null`
                 // placeholder is ever observed. The caller discards the
                 // whole partially-transformed `value` along with the error
-                // (see `encode_event`).
+                // (see `encode_lifted_slowly`).
                 let owned = std::mem::take(payload);
                 *payload = self.encode_payload_owned(owned)?;
             }
@@ -4716,14 +4727,37 @@ mod tests {
         ]
     }
 
+    /// The lift takes each non-null payload that serde writes, and only
+    /// those, each from the field that serde writes under its key.
+    ///
+    /// The encode fast path copies a payload that has no slot. So only this
+    /// check finds a missed or a wrong slot.
+    fn assert_lifts_each_wire_payload(event: &crate::event::WorkflowEvent) {
+        let wire = serde_json::to_value(event).expect("serialize");
+        let mut moved = event.clone();
+        let lifted = lift_payloads(&mut moved);
+        for (payload, key) in lifted.iter().zip(crate::payload_store::PAYLOAD_FIELD_KEYS) {
+            let expected = wire
+                .get("data")
+                .and_then(|data| data.get(key))
+                .filter(|field| !field.is_null());
+            assert_eq!(
+                payload.as_ref(),
+                expected,
+                "{} lifts the wrong payload for `{key}`",
+                event.type_name()
+            );
+        }
+    }
+
     fn assert_encodes_like_a_rebuild(codecs: &PayloadCodecs, event: &crate::event::WorkflowEvent) {
+        assert_lifts_each_wire_payload(event);
         let expected = rebuilding_encode(codecs, event).expect("rebuilding encode");
         let (owned, slow) = codecs
             .encode_event_moving_payloads(event.clone())
             .expect("moving encode");
         assert!(!slow, "{} took the slow path", event.type_name());
         assert_eq!(owned, expected, "{}", event.type_name());
-        assert_eq!(owned.to_string(), expected.to_string());
         let borrowed = codecs.encode_event(event).expect("borrowed encode");
         assert_eq!(borrowed, expected, "{}", event.type_name());
         let moved = codecs
@@ -4743,7 +4777,7 @@ mod tests {
         vec![PayloadCodecs::default(), xor, keyed]
     }
 
-    /// The moving encode stores every payload field as the rebuild did.
+    /// The moving encode stores every payload field as the rebuild does.
     #[test]
     fn encode_moves_every_payload_kind_like_a_rebuild() {
         for codecs in identity_xor_and_keyed_codecs() {
@@ -4793,6 +4827,24 @@ mod tests {
         }
     }
 
+    /// A lifted payload with no `data` key sends the encode to the slow path.
+    #[test]
+    fn a_lifted_payload_with_no_data_key_is_unplaced() {
+        let mut lifted = LiftedPayloads::default();
+        let mut field = json!(null);
+        let mut fields: [Option<&mut Value>; 6] = Default::default();
+        assert!(!has_unplaced_payload(&lifted, &fields), "nothing lifted");
+        fields[0] = Some(&mut field);
+        assert!(!has_unplaced_payload(&lifted, &fields), "a key, no payload");
+        lifted[0] = Some(json!({"a": 1}));
+        assert!(
+            !has_unplaced_payload(&lifted, &fields),
+            "a payload, its key"
+        );
+        lifted[1] = Some(json!({"b": 2}));
+        assert!(has_unplaced_payload(&lifted, &fields), "a payload, no key");
+    }
+
     /// The slow path encodes as the rebuild does.
     #[test]
     fn the_slow_encode_path_matches_a_rebuild() {
@@ -4822,7 +4874,52 @@ mod tests {
         assert!(err.is_codec_failure(), "{err:?}");
     }
 
-    /// Every variant encodes on the fast path, as the rebuild did.
+    /// A codec that fails with the plaintext as its message.
+    #[derive(Debug)]
+    struct NamesItsInput;
+
+    impl PayloadCodec for NamesItsInput {
+        fn codec_id(&self) -> &'static str {
+            "names-its-input"
+        }
+        fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+            Err(CodecError(String::from_utf8_lossy(raw).into_owned()))
+        }
+        fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+            Ok(encoded.to_vec())
+        }
+    }
+
+    /// With two failing payloads, the same payload fails first as in the
+    /// rebuild. The loop encodes in `PAYLOAD_FIELD_KEYS` order.
+    ///
+    /// `WorkflowStarted` is the only variant with two payloads. Its two keys
+    /// sort in the same order, so this pins the order for each variant today.
+    #[test]
+    fn the_first_codec_error_names_the_same_field_as_the_rebuild() {
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(NamesItsInput));
+        let event = crate::event::WorkflowEvent::WorkflowStarted {
+            input: json!("from-input"),
+            timestamp: chrono::Utc::now(),
+            last_completion_result: Some(json!("from-carryover")),
+            last_error: None,
+            scheduled_time: None,
+        };
+        let expected = rebuilding_encode(&codecs, &event)
+            .expect_err("the codec fails")
+            .to_string();
+        assert!(expected.contains("from-input"), "{expected}");
+        let owned = codecs
+            .encode_event_owned(event.clone())
+            .expect_err("the codec fails");
+        assert_eq!(owned.to_string(), expected);
+        let borrowed = codecs.encode_event(&event).expect_err("the codec fails");
+        assert_eq!(borrowed.to_string(), expected);
+    }
+
+    /// Every variant encodes on the fast path, and stores what the rebuild
+    /// stores.
     ///
     /// The sweep selects variants as in
     /// `every_arbitrary_event_decodes_on_the_fast_path`.

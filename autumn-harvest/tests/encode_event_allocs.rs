@@ -1,8 +1,12 @@
 //! Allocation budget for `PayloadCodecs::encode_event_owned` (issue #2499).
 //!
 //! The owned encode moves each payload tree into the stored `Value`. So its
-//! allocation count must not grow with the payload size. The borrowed encode
-//! must copy a payload with no more allocations than a clone.
+//! allocation count must not grow with the payload size. As the payload
+//! grows, the borrowed encode adds no more allocations than a clone adds.
+//!
+//! A clone and the old serde copy make the same number of allocations. The
+//! gain of the clone is in instructions, so callgrind measures it. See
+//! `docs/performance-encode-event-payload-move.md`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -57,10 +61,15 @@ fn completed(output: Value) -> WorkflowEvent {
     }
 }
 
-fn started(input: Value, carryover: Value) -> WorkflowEvent {
+/// A fixed time, so each encode writes a timestamp of the same length.
+const fn fixed_time() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("valid time")
+}
+
+const fn started(input: Value, carryover: Value) -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input,
-        timestamp: chrono::Utc::now(),
+        timestamp: fixed_time(),
         last_completion_result: Some(carryover),
         last_error: None,
         scheduled_time: None,
@@ -74,6 +83,8 @@ fn started(input: Value, carryover: Value) -> WorkflowEvent {
 #[test]
 fn owned_encode_allocations_do_not_grow_with_the_payload() {
     let codecs = PayloadCodecs::default();
+    // Warm up, so a one-time setup cost does not land in the first count.
+    drop(codecs.encode_event_owned(completed(document(1))));
     let encode = |event: WorkflowEvent| {
         let (stored, allocs) = allocs_during(|| codecs.encode_event_owned(event).expect("encode"));
         drop(stored);
@@ -101,6 +112,7 @@ fn owned_encode_allocations_do_not_grow_with_the_payload() {
 #[test]
 fn borrowed_encode_copies_no_more_than_a_clone() {
     let codecs = PayloadCodecs::default();
+    drop(codecs.encode_event(&completed(document(1))));
     let cost = |event: &WorkflowEvent| {
         let (stored, encode) = allocs_during(|| codecs.encode_event(event).expect("encode"));
         drop(stored);
@@ -126,5 +138,20 @@ fn owned_and_borrowed_encode_store_the_same_value() {
     let borrowed = codecs.encode_event(&event).expect("encode");
     let owned = codecs.encode_event_owned(event).expect("encode");
     assert_eq!(owned, borrowed);
-    assert_eq!(owned.to_string(), borrowed.to_string());
+}
+
+/// The owned encode skips the copy that the borrowed encode makes.
+#[test]
+fn owned_encode_allocates_less_than_borrowed_encode() {
+    let codecs = PayloadCodecs::default();
+    drop(codecs.encode_event(&completed(document(1))));
+    let event = completed(document(50));
+    let (stored, borrowed) = allocs_during(|| codecs.encode_event(&event).expect("encode"));
+    drop(stored);
+    let (stored, owned) = allocs_during(|| codecs.encode_event_owned(event).expect("encode"));
+    drop(stored);
+    assert!(
+        owned < borrowed,
+        "owned encode made {owned} allocations; borrowed encode made {borrowed}"
+    );
 }

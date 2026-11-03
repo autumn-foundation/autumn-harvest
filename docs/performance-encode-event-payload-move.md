@@ -41,7 +41,7 @@ The stored value does not change:
   order. A payload key with no slot is still encoded, as before.
 - A lifted `Option` payload leaves `Some(null)`, so serde keeps its key.
 - A lifted payload with no `data` key takes a slow path. The payloads go
-  back into the event, and the whole event is encoded as before.
+  back into the event, and the slow path encodes the whole event as before.
 - Each payload replaces its `null` in place, so each key keeps its position.
 
 ## Measurement
@@ -74,14 +74,16 @@ owns its event skips it.
 
 `tests/encode_event_allocs.rs` pins the result:
 `owned_encode_allocations_do_not_grow_with_the_payload` asserts that a
-1-item and a 50-item payload encode with the same allocation count.
+1-item and a 50-item payload encode with the same allocation count. A clone
+and the serde copy make the same number of allocations. So the borrowed
+gain shows in instructions only.
 
 ## What is left
 
 - `index_into_mut` is still 3.6%. These are the six lookups that
   `decode_event_moving_payloads` makes per event.
-- Most of the borrowed cost is the clone. A store append API that takes
-  owned events would remove it. The callers keep their events after the
+- About half of the borrowed cost is the clone. A store append API that
+  takes owned events would remove it. The callers keep their events after the
   append, so that is a larger change.
 
 ## Reproduce
@@ -92,7 +94,11 @@ BIN=$(cargo bench -p autumn-harvest --no-default-features \
   | jq -r 'select(.reason=="compiler-artifact" and .target.name=="payload_codec_profile") | .executable')
 PAYLOAD_CODEC_PROFILE_REPS=20 valgrind --tool=callgrind --branch-sim=no --cache-sim=no --callgrind-out-file=cg.out "$BIN"
 callgrind_annotate --threshold=95 cg.out
+callgrind_annotate --inclusive=yes cg.out | grep -E 'encode_event|decode_event'
 PAYLOAD_CODEC_PROFILE_REPS=20 valgrind --tool=dhat "$BIN"
 ```
 
-Artifacts: `docs/perf-artifacts/encode-event-payload-move/`.
+Artifacts are in `docs/perf-artifacts/encode-event-payload-move/`. The
+flat profiles are `before-callgrind-flat.txt` and `after-callgrind-flat.txt`.
+The inclusive figures are in `inclusive-summary.txt`, and the dhat totals
+are in `dhat-summary.txt`.
