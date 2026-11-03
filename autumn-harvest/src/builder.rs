@@ -48,9 +48,9 @@ pub const DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES: u64 = 256 * 1024; // 256 KiB
 /// Default maximum workflow input payload size.
 pub const DEFAULT_MAX_WORKFLOW_INPUT_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
 /// Default maximum workflow start delay (365 days).
-pub const DEFAULT_MAX_WORKFLOW_START_DELAY: Duration = Duration::from_secs(365 * 24 * 3600);
+pub const DEFAULT_MAX_WORKFLOW_START_DELAY: Duration = Duration::from_hours(8760);
 /// Default bounded-pause ceiling before auto-resume (24 hours, issue #383).
-pub const DEFAULT_MAX_WORKFLOW_PAUSE_DURATION: Duration = Duration::from_secs(24 * 3600);
+pub const DEFAULT_MAX_WORKFLOW_PAUSE_DURATION: Duration = Duration::from_hours(24);
 /// Default max-wait cap for debounced workflow starts (1 hour, issue #499).
 pub const DEFAULT_DEBOUNCE_MAX_WAIT: Duration = Duration::from_secs(3600);
 /// Default large-payload offload threshold (issue #524): 256 KiB.
@@ -64,10 +64,10 @@ pub const DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD: u64 = 256 * 1024;
 /// Bounds abuse from a misbehaving/malicious downstream without rejecting a
 /// legitimate hint outright — an over-ceiling value is clamped down, never
 /// an error. Configurable via [`WorkerConfig::with_retry_after_ceiling`].
-pub const DEFAULT_RETRY_AFTER_CEILING: Duration = Duration::from_secs(15 * 60);
+pub const DEFAULT_RETRY_AFTER_CEILING: Duration = Duration::from_mins(15);
 
 /// Default activity `start_to_close` timeout (issue #1808): 10 minutes.
-pub const DEFAULT_ACTIVITY_START_TO_CLOSE: Duration = Duration::from_secs(10 * 60);
+pub const DEFAULT_ACTIVITY_START_TO_CLOSE: Duration = Duration::from_mins(10);
 
 /// Default worker drain budget (issue #1813): 25 seconds.
 ///
@@ -5827,7 +5827,7 @@ mod tests {
         let config = WorkerConfig::default();
         assert_eq!(
             config.max_workflow_pause_duration,
-            Duration::from_secs(24 * 3600),
+            Duration::from_hours(24),
             "bounded-pause ceiling must default to 24 hours"
         );
     }
@@ -6067,7 +6067,7 @@ mod tests {
             .workflows(vec![fake_workflow_info()])
             .workflow_schedule(WorkflowSchedule::new(
                 "test",
-                Schedule::Interval(Duration::from_secs(9_000_000_000_000_000)),
+                Schedule::Interval(Duration::from_hours(2_500_000_000_000)),
             ))
             .try_build()
             .unwrap_err();
@@ -6085,9 +6085,7 @@ mod tests {
     fn harvest_builder_rejects_dag_schedule_over_the_interval_cap() {
         // The DAG path has its own validation call (issue #2048).
         let dag = DagInfo {
-            schedule: Some(Schedule::Interval(Duration::from_secs(
-                9_000_000_000_000_000,
-            ))),
+            schedule: Some(Schedule::Interval(Duration::from_hours(2_500_000_000_000))),
             ..fake_dag_info()
         };
         let err = HarvestBuilder::new()
@@ -6763,7 +6761,7 @@ mod tests {
 
         // A custom window distinct from the 24h default and the sibling test's
         // values (7200s / 1.5s) so a stale/default read fails loudly.
-        let custom = Duration::from_secs(3 * 24 * 3600);
+        let custom = Duration::from_hours(72);
         let built = HarvestBuilder::new()
             .start_idempotency_window(custom)
             .build();
@@ -7236,7 +7234,7 @@ mod tests {
     /// seconds) but far past chrono's ceiling.
     #[test]
     fn validate_workflow_duration_fields_rejects_the_issue_repro_value() {
-        let almost_2_7_billion_years = Duration::from_secs(999_999_999_999 * 86_400);
+        let almost_2_7_billion_years = Duration::from_hours(23_999_999_999_976);
         let err = validate_workflow_duration_fields(&[wf_info_with_durations(
             Some(almost_2_7_billion_years),
             None,
@@ -7822,7 +7820,7 @@ mod tests {
 
     #[test]
     fn builder_max_workflow_execution_timeout_is_carried_through_build() {
-        let ceiling = Duration::from_secs(86_400);
+        let ceiling = Duration::from_hours(24);
         let built = HarvestBuilder::new()
             .max_workflow_execution_timeout(ceiling)
             .build();

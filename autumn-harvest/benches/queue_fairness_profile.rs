@@ -30,7 +30,7 @@
 //! that page. The queue list and weight map are built ONCE, outside the
 //! measured loop, isolating the two functions' own cost from setup.
 //!
-//! A fixed-seed `StdRng` is used instead of `rand::thread_rng()` so the
+//! A fixed-seed `StdRng` is used instead of `rand::rng()` so the
 //! instruction count is bit-for-bit reproducible across runs. The RNG
 //! itself is deterministic once seeded; only which draws are made must not
 //! depend on wall-clock or OS entropy timing.

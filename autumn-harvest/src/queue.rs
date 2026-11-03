@@ -2531,7 +2531,7 @@ pub async fn claim_task_with_owner(
     if fairness == ClaimFairness::Keys && queues.len() > 1 {
         use rand::seq::SliceRandom as _;
         let mut order = distinct_queues(queues);
-        order.shuffle(&mut rand::thread_rng());
+        order.shuffle(&mut rand::rng());
         for queue in order {
             let claimed = claim_task_one_statement(
                 conn,

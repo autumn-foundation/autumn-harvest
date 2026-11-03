@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{AeadInOut, KeyInit, Nonce, Tag};
-use rand::RngCore as _;
+use rand::Rng as _;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -244,9 +244,9 @@ struct Sealer {
 impl Sealer {
     fn new() -> Self {
         let mut key = zeroize::Zeroizing::new([0_u8; 32]);
-        rand::rngs::OsRng.fill_bytes(key.as_mut_slice());
+        rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(key.as_mut_slice());
         let mut prefix = [0_u8; 4];
-        rand::rngs::OsRng.fill_bytes(&mut prefix);
+        rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut prefix);
         Self {
             cipher: Aes256Gcm::new((&*key).into()),
             prefix,
@@ -1354,15 +1354,13 @@ fn lock_dir(dir: &Path) -> HarvestResult<File> {
         options.mode(0o600);
     }
     let file = options.open(&path).map_err(|e| io_config(&path, &e))?;
-    // Fully qualified: std has an inherent `File::try_lock` from Rust 1.89,
-    // above the MSRV.
-    match fs4::FileExt::try_lock(&file) {
+    match file.try_lock() {
         Ok(()) => Ok(file),
-        Err(fs4::TryLockError::WouldBlock) => Err(HarvestError::Config(format!(
+        Err(std::fs::TryLockError::WouldBlock) => Err(HarvestError::Config(format!(
             "owner disk cache: another process holds {}",
             path.display()
         ))),
-        Err(fs4::TryLockError::Error(err)) => Err(io_config(&path, &err)),
+        Err(std::fs::TryLockError::Error(err)) => Err(io_config(&path, &err)),
     }
 }
 

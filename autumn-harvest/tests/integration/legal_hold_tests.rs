@@ -329,7 +329,7 @@ async fn held_execution_survives_and_metric_is_zero_for_it() {
     // Unheld control at the same age -> deleted.
     insert_completed(&mut conn, "plain_wf", "p1", two_days_ago, None, None).await;
 
-    let config = history_only(Some(Duration::from_secs(86_400))); // global 1 day
+    let config = history_only(Some(Duration::from_hours(24))); // global 1 day
     let metrics = Arc::new(CapturingMetrics::default());
     let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
 
@@ -372,7 +372,7 @@ async fn expired_hold_becomes_eligible_and_is_deleted() {
     )
     .await;
 
-    let config = history_only(Some(Duration::from_secs(86_400)));
+    let config = history_only(Some(Duration::from_hours(24)));
     let metrics = Arc::new(CapturingMetrics::default());
     let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
 
@@ -401,7 +401,7 @@ async fn hold_trumps_global_and_override() {
     // Unheld sibling of the same type -> deleted by the short override.
     insert_completed(&mut conn, "short_wf", "s2", two_days_ago, None, None).await;
 
-    let config = history_only(Some(Duration::from_secs(86_400)))
+    let config = history_only(Some(Duration::from_hours(24)))
         .with_workflow_override("short_wf", Duration::from_secs(3_600));
     let metrics = Arc::new(CapturingMetrics::default());
     let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
@@ -633,7 +633,7 @@ async fn hold_placed_mid_tick_is_not_deleted() {
         archived: Mutex::new(Vec::new()),
         place_hold_on: Some(mid_id),
     });
-    let config = history_only(Some(Duration::from_secs(86_400))); // global 1 day
+    let config = history_only(Some(Duration::from_hours(24))); // global 1 day
     let metrics = Arc::new(CapturingMetrics::default());
     let result = run_one_tick_with_archiver(
         pool,
@@ -691,7 +691,7 @@ async fn held_row_is_not_archived() {
         archived: Mutex::new(Vec::new()),
         place_hold_on: None,
     });
-    let config = history_only(Some(Duration::from_secs(86_400)));
+    let config = history_only(Some(Duration::from_hours(24)));
     let metrics = Arc::new(CapturingMetrics::default());
     let result = run_one_tick_with_archiver(
         pool,
@@ -910,7 +910,7 @@ async fn indefinitely_held_row_survives_two_ticks_metric_zero() {
 
     let metrics = Arc::new(CapturingMetrics::default());
     for pass in 1..=2 {
-        let config = history_only(Some(Duration::from_secs(86_400)));
+        let config = history_only(Some(Duration::from_hours(24)));
         let result = run_one_tick(pool.clone(), config, Arc::clone(&metrics)).await;
         assert_eq!(result.deleted_count, 0, "held row must survive tick {pass}");
         assert_eq!(

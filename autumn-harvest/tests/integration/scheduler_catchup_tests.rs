@@ -72,7 +72,7 @@ fn catchup_policy_from_db_window() {
     let policy = CatchupPolicy::from_db(Some("window"), Some(900), false);
     assert_eq!(
         policy,
-        CatchupPolicy::Window(std::time::Duration::from_secs(900))
+        CatchupPolicy::Window(std::time::Duration::from_mins(15))
     );
 }
 

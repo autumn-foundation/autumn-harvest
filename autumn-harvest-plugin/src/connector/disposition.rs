@@ -413,7 +413,7 @@ pub const ACTIVE_STRIKE_RETENTION_FLOOR: std::time::Duration =
 ///
 /// Named rather than inlined so [`ACTIVE_STRIKE_RETENTION_FLOOR`] derives from
 /// it and the two cannot drift.
-const MAX_BROKER_INVISIBILITY: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+const MAX_BROKER_INVISIBILITY: std::time::Duration = std::time::Duration::from_hours(12);
 
 impl PoisonTracker {
     /// A tracker with no recorded strikes.
@@ -1767,8 +1767,8 @@ mod tests {
         // so it retires on exactly the window the operator configured.
         let mut t = PoisonTracker::new();
         let t0 = std::time::Instant::now();
-        let retention = std::time::Duration::from_secs(60 * 60);
-        let two_hours = std::time::Duration::from_secs(2 * 60 * 60);
+        let retention = std::time::Duration::from_hours(1);
+        let two_hours = std::time::Duration::from_hours(2);
 
         // Terminal first: the queue is FIFO and breaks at its front, so a young
         // active entry ahead of this one would hold it back (see
@@ -1805,8 +1805,8 @@ mod tests {
         // strike-based quarantine altogether.
         let mut t = PoisonTracker::new();
         let t0 = std::time::Instant::now();
-        let retention = std::time::Duration::from_secs(60 * 60);
-        let max_invisibility = std::time::Duration::from_secs(12 * 60 * 60);
+        let retention = std::time::Duration::from_hours(1);
+        let max_invisibility = std::time::Duration::from_hours(12);
 
         t.strike("k", t0);
 
@@ -1818,7 +1818,7 @@ mod tests {
         );
 
         t.expire_stale_as_of(
-            t0 + max_invisibility + std::time::Duration::from_secs(60 * 60),
+            t0 + max_invisibility + std::time::Duration::from_hours(1),
             retention,
         );
         assert_eq!(
@@ -1837,8 +1837,8 @@ mod tests {
         // eviction is kind-blind precisely so this cannot grow past it.
         let mut t = PoisonTracker::new();
         let t0 = std::time::Instant::now();
-        let retention = std::time::Duration::from_secs(60 * 60);
-        let two_hours = std::time::Duration::from_secs(2 * 60 * 60);
+        let retention = std::time::Duration::from_hours(1);
+        let two_hours = std::time::Duration::from_hours(2);
 
         t.strike("slow-redelivery", t0);
         t.mark_terminal_as_of("handed-to-broker", t0);

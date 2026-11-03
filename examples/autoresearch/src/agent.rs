@@ -236,7 +236,7 @@ pub fn harness(model: Arc<dyn AgentModel>, parts: &HarnessParts) -> Result<Agent
     // is on disk, so a call whose result a crash lost is not paid twice.
     let index = FileCacheIndex::new(parts.state_dir.join("cache-index"), 1_024)?;
     let cache = ResponseCache::new(Arc::new(blobs), Arc::new(index), PayloadCodecs::default())
-        .max_age(Duration::from_secs(24 * 3_600));
+        .max_age(Duration::from_hours(24));
     Ok(AgentHarness::new(model)
         .tools(tools(&parts.labs))
         .policy(Arc::new(policy()))

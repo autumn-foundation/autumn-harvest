@@ -120,7 +120,9 @@ async fn main() {
         // before dispatching the demo's single workflow run, over the same
         // HTTP API a real caller would use.
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let resp = reqwest::Client::new()
+        let resp = autumn_harvest_plugin::http::client_builder()
+            .build()
+            .expect("client")
             .post("http://localhost:3000/api/harvest/workflows/onboarding/start")
             .json(&serde_json::json!({ "input": 42 }))
             .send()

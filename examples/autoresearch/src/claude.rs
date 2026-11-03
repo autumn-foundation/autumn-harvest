@@ -75,11 +75,15 @@ impl ClaudeModel {
     /// memory only.
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .connect_timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_default();
+        let client = {
+            // Reqwest panics without a provider. An `Err` means that one is installed.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            reqwest::Client::builder()
+        }
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
         Self {
             api_key: api_key.into(),
             model: DEFAULT_MODEL.into(),

@@ -34,7 +34,7 @@ use crate::model::BoxFuture;
 pub const MAX_PROPOSAL_ATTEMPTS: u32 = 8;
 
 /// The default and highest time budget of one proposer call: 13 minutes.
-pub const DEFAULT_PROPOSER_TIMEOUT: Duration = Duration::from_secs(13 * 60);
+pub const DEFAULT_PROPOSER_TIMEOUT: Duration = Duration::from_mins(13);
 
 /// The default number of attempts of one stage, as in Harness².
 pub const DEFAULT_PROPOSAL_ATTEMPTS: u32 = 2;

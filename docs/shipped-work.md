@@ -36177,6 +36177,563 @@ folds fragments in here.
 
   **No migration. No new `WorkflowEvent` variant. No public API change.** The
   `wasm-activities` feature still needs Rust 1.95, as `wasmtime` 48 does.
+- **Performance** (implemented): signal reads by execution use an index — see issue #2367. The Ledger census found statements that read every signal of one execution, consumed rows included. The issue adds the `ON DELETE CASCADE`, which the census cannot see. `idx_harvest_signals_pending` skips consumed rows, and `uq_harvest_signals_idem` skips rows with no key. So each statement read the whole table:
+
+  - the signal move of a workflow-level retry,
+    `signal::forward_signals_to_retry_attempt` (issue #843);
+  - the signal scrub of a PII erasure, `erase::db::scrub_execution_node`
+    (issue #495);
+  - the signal copy and the staged signal delete of a shard rebalance. The
+    copy statement moves to `shard_rebalance::STAGED_SIGNALS_SQL`;
+  - each `ON DELETE CASCADE` from an execution, which retention triggers;
+  - the unkeyed signal check of `backup_verify::probes::effect_verdict`.
+
+  Migration `20261030182800_harvest_signals_exec_index` builds
+  `idx_harvest_signals_exec` on `harvest_signals (workflow_exec_id)`. On
+  100,000 signals, the retry move falls from 4,480 to 529 buffers, and the
+  execution delete from 4,150 to 149. Each signal write costs about 2 more
+  buffers. An insert after a checkpoint writes about 400 more WAL bytes. See
+  `docs/performance-signals-exec-index.md`.
+
+  **Pending reads send `NOT consumed` as a literal.** They bound the flag as
+  `consumed = $n` before. A generic plan cannot use the partial pending index
+  with a bound flag. With the new index, a cached statement could switch to a
+  generic plan that reads every signal of the run. Twelve filters in the
+  engine and the plugin now use `diesel::dsl::not`.
+
+  The `harvest_timers` cascade that the issue also names shipped in issue
+  #2424 as `idx_harvest_timers_exec`.
+
+  **Upgrade.** A plain `CREATE INDEX` takes `SHARE` on `harvest_signals` and
+  blocks each write to the table until the build ends. On a large deployment,
+  build the index `CONCURRENTLY` first. The header of the migration's `up.sql`
+  gives the statement.
+
+  `census_scan_index_tests` gates each plan with `enable_seqscan` off and a
+  generic plan. The retry, erasure and pending-signal gates plan the SQL that
+  the engine sends. The erasure gate also checks that a consumed signal is
+  scrubbed. The cascade gate runs a real delete and counts the index scans.
+  `no_query_binds_the_consumed_flag` keeps the literal form. No new
+  `WorkflowEvent` variant and no replay impact.
+- **Phase X.Y** (implemented): `*_info()` doc example names the real function. `#[workflow]` and `#[activity]` generate a `*_info()` function with a doc example. The example showed the literal text `#public_info_name()`, because `quote!` does not interpolate inside a `///` comment. The macros now build the doc line with `format!`, so the example names the real function, for example `send_email_info()`.
+
+  The example fence is now `text`, not `rust,ignore`. The fragment uses `ctx`
+  and `input`, which a doctest does not define. `cargo test -- --ignored` and
+  `--include-ignored` compile `ignore` fences. They then failed once for each
+  `*_info()` function, in every crate that uses the macros. A downstream crate
+  that runs its database tests with `--ignored` hit this (force-sync).
+
+  No generated code changes. Only the doc attribute text changes.
+
+  Test evidence: `info_doc_tests` in `autumn-harvest-macros/src/activity.rs`
+  and `src/workflow.rs` (6 tests, red before the fix).
+  `cargo test -p autumn-harvest-agent --doc -- --include-ignored` failed on
+  each `*_info()` function before the fix and passes after it.
+- **Agents** (implemented): Profile overlays under ceilings — see issue #2370 (epic #2369). `agent::overlay` adds `ProfileOverlay`, `Ceilings`, `ModelRegistry`, `OverlayError`, `GUARDRAILS_HEADING` and the pure kernel `apply`. The crate root re-exports each of them except `apply`. A model writes an overlay, and `apply` merges it into an `AgentProfile`. An overlay sets only `system`, `guardrails`, `model`, the three bounds and `read_only`. It is `deny_unknown_fields`, so a JSON overlay that names `tools`, `mandate` or `tenant` fails to decode.
+
+  `apply` checks the result, not only the overlay. No result bound may be
+  above its ceiling. A `None` bound is above every set ceiling. A cleared
+  `read_only` needs `allow_clear_read_only`. The ceilings must hold the
+  result model. The profile mandate and the registry must hold an overlay
+  model. Each refusal is a named `OverlayError` variant. Under
+  `Ceilings::from_profile`, an overlay can only narrow the profile. The
+  guardrails go after the system prompt under `## Guardrails`, once.
+  `AgentHarness::has_model` is new.
+
+  No event, migration or SQL changes. The design is in
+  `docs/design/DESIGN-2370.md`.
+
+  Tests: `formal/verus/src/agent_overlay.rs` mirrors `merged_bound` and
+  `merged_read_only`. It proves the ceiling, read-only, model, unchanged-field
+  and idempotency properties of a spec of `apply`, and when `apply` refuses.
+  The unit tests in `agent/overlay.rs` cover each criterion of the issue. The
+  proptests `apply_matches_the_oracle`, `apply_is_idempotent`,
+  `a_result_stays_under_the_ceilings`, `an_empty_overlay_keeps_any_profile`
+  and `default_ceilings_only_narrow` check the engine `apply`.
+- **Agents** (implemented): The proposer contract — see issue #2379 (epic #2369). The new `refine` module turns evidence into a candidate overlay. An app implements `OverlayProposer` for its provider. `ModelProposer` implements it over any `AgentModel`, with default INV and DOM templates. An app can replace each template. `AgentHarness::proposer` installs a proposer, and `AgentHarness::proposer_timeout` sets the budget of one call (at most 13 minutes).
+
+  The activity `agent_refine_propose` runs one stage. It asks the proposer
+  up to `ProposalAttempts` times (1 to 8, default 2). It checks each reply
+  with `overlay::apply` under the ceilings of the run. The next attempt gets
+  the last rejection. The proposer reads the base profile and the ceilings.
+  The stage returns `Proposed(overlay)`, `KeptBase` or `FellBack { error }`.
+  A fallback inherits the current overlay, so the current overlay must apply.
+  A retryable proposer error retries the whole stage. A `Config`,
+  `Authentication` or `Budget` error fails it for good. A rejection fits the
+  result cap. The retries run inside the activity, so one stage is one
+  recorded result. `Ceilings` now encodes as JSON, and each of its keys is
+  required. `ModelProposer` tags each data block with a digest boundary.
+  `activities()` and `sqlite::register` add the new activity.
+
+  The default templates adapt `harness2/core/prompts.py` at commit
+  `1cfe254e8d25b15f37048c3730134686abe60335` under Apache-2.0.
+  `autumn-harvest-agent/NOTICE` and `third_party/harness2/` hold the
+  attribution and the license.
+
+  No event, migration or SQL changes. The design is in
+  `docs/design/DESIGN-2379.md`.
+
+  Tests: the unit tests in `refine/propose.rs` cover each criterion of the
+  issue with a scripted proposer. `tests/refine_propose.rs` aborts a child
+  process inside a DOM retry and resumes the run on SQLite. A call counter
+  shows that the completed INV stage is never asked again. History holds one
+  result per stage, and replay asks no proposer.
+  `formal/verus/src/agent_propose.rs` mirrors `next_step`. It proves that a
+  stage uses 1 to `max` attempts, falls back exactly when every attempt is
+  invalid, and never asks again after a valid reply.
+- **Fix** (implemented): the retention index migration no longer deadlocks — see issue #2395. Migration `20261029034500_harvest_retention_candidates_index` shipped in 0.8.0. It built `idx_harvest_we_retention_candidates` and dropped `idx_harvest_we_retention_scan` in one transaction. The plain build holds `SHARE` on `harvest_workflow_executions` until the commit. The drop then asks for `ACCESS EXCLUSIVE` on the same table.
+
+  A step transaction that read or locked an execution row waits behind the
+  build for its write. The drop then waits behind that step transaction. That
+  is a deadlock. Postgres aborted the migration, and the whole build rolled
+  back. On Postgres 16, one such step transaction was enough. An open reader
+  also blocked the drop until `lock_timeout` failed the migration. So on a busy
+  deployment, the migration could fail each time after it blocked every state
+  change for the full build.
+
+  `20261029034500` now builds the new index only. The new migration
+  `20261101012649_harvest_retention_scan_index_drop` drops the old index in its
+  own transaction. That drop holds no earlier lock, so it cannot deadlock. A
+  lost wait fails the drop only, and the committed build stays. A database that
+  applied the 0.8.0 form has no old index, so the new migration takes no lock.
+  The end schema is the same.
+
+  **Lint.** `migration_lock_safety` has a new rule, `lock-upgrade`. It fails a
+  plain `DROP INDEX` or `ALTER TABLE` of a hot table after a plain build of the
+  same table in one file. No annotation allows it. The other build-and-drop
+  migrations in the tree drop first, so none of them breaks the rule.
+
+  **Upgrade.** On a large deployment, build the new index `CONCURRENTLY` first,
+  as before, then run
+  `DROP INDEX CONCURRENTLY IF EXISTS idx_harvest_we_retention_scan;`. Both
+  migration headers give the statements. No new `WorkflowEvent` variant and no
+  replay impact.
+- **Agents** (implemented): Tool guidance and skills as overlay parts — see issue #2373 (epic #2369). `ProfileOverlay`, `AgentProfile` and `AgentTask` get `tool_guidance` and `skills`. `skill` adds `SkillText`, `LOAD_SKILL_TOOL`, `SKILLS_HEADING`, `MAX_SKILL_SUMMARY_CHARS`, `MAX_SKILLS`, `MAX_SKILL_BODY_BYTES` and `check`. `overlay` adds `ToolRegistry`, and `OverlayError` adds `UnknownTool` and `InvalidSkill`. `AgentHarness::has_tool` is new.
+
+  - **Tool guidance.** The text replaces the description of an app tool in
+    the definition that the model sees. The name, the schema, the effect and
+    the policy stay. `apply` refuses a key that names no app tool.
+  - **Skills.** The system prompt lists each name and summary, never a body.
+    The model gets `load_skill`, with `ToolEffect::ReadOnly`. A call is an
+    ordinary `agent_tool_call`. The workflow reads the body from the task, so
+    history records it and replay reads it from there. The body is cut like
+    any tool result. Without skills, the tool is not offered. The name
+    `load_skill` is reserved, so an existing app tool with that name is no
+    longer shown, and `AgentHarness::tool` logs a warning. Upgrade every
+    worker before a run carries skills.
+  - A skill has a valid name, a one-line summary with no control character,
+    and a body of at most 32 KiB. A map holds at most 32 skills. Each
+    segment checks them, durable agents included.
+  - `apply` merges each map over the profile map, and an overlay entry wins.
+    It checks the result, so a stale profile key fails too.
+
+  `ModelTurnRequest` gets `tool_guidance` and `skills`. `ToolCallRequest`
+  gets `skill`, a `SkillLookup`. Each new field is skipped when empty, so a
+  recorded history keeps its bytes. No event, migration or SQL changes. The
+  design is in `docs/design/DESIGN-2373.md`.
+
+  Tests: `formal/verus/src/agent_overlay.rs` models the guidance keys. It
+  proves that `apply` refuses exactly when a key names no registered tool,
+  and that guidance changes only the description of an app tool.
+  `tests/skills.rs` covers the run criteria on SQLite and in
+  `eval::evaluate`. The unit tests in `src/agent/overlay.rs` cover the
+  refusals of `apply`. The overlay proptests check the new rules against the
+  oracle.
+- **Plugin** (implemented): `HarvestPlugin` on SQLite, slice 1 — see issue #2467 (epic #2466). `autumn-harvest-plugin` gains a `sqlite` feature. It turns on `autumn-web/sqlite` and `autumn-harvest-sqlite`, so `HarvestPlugin` builds and boots in an Autumn app on the SQLite lane, including a SQLite fleet app. Like `autumn-web/sqlite`, only an end application may enable it. The Postgres default build does not change.
+
+  - **Storage.** Harvest opens its own file next to the app database:
+    `app.db` gives `app.harvest.db`. In a fleet app that is the control
+    database. `HarvestPlugin::sqlite_path`, then `[harvest.sqlite] path` /
+    `AUTUMN_HARVEST_SQLITE__PATH` override it. No Postgres migration set is registered on a SQLite app.
+  - **Driver.** One task on the app's runtime owns the `SqliteRuntime` and drives it after each
+    command and on `[harvest.sqlite] tick_ms` (default 250). Reads use a
+    read-only `SqliteReader`. A query replays on the caller's task.
+  - **App state.** `HarvestPlugin::state(..)` values and `AppState` reach
+    `ctx.state::<T>()` in workflows, activities, local activities and query
+    replays, as on Postgres. `SqliteRuntime::set_shared_state` is new.
+  - **Handle.** `autumn_harvest_plugin::sqlite::HarvestSqlite` is an `AppState`
+    extension and an axum extractor: start, signal-with-start, signal (by run
+    or workflow id), cancel, terminate, query, update, describe, list,
+    history, and `shutdown`, which releases the writer lock. A start checks
+    the workflow's `input_schema`, and a signal checks its `#[signal]`
+    `arg_schema`, as on Postgres.
+  - **Management API.** The core routes keep their Postgres paths and field
+    names. Every other route answers `501` and links the epic, including
+    `GET /workflows/{id}/result` (#2489). An unsupported
+    start option is a `400` that names it. The #1802 mutation gate and
+    `api_with_auth` work as on Postgres.
+  - **Loud refusals.** Each builder option or mode with no SQLite port fails
+    the build or the boot and names its issue (#2468 to #2472).
+
+  Supporting changes: `HarvestBuilder::take_state` and `take_activities`,
+  `SqliteReader::load_history`, and `SqliteRuntime::register_signal_handler`.
+  `SqliteError` gains `SignalPayloadInvalid` and `WorkflowInputInvalid`: the
+  runtime checks a signal's `arg_schema` after its key probe, and a
+  signal-with-start's `input_schema` only when it creates a run. The `[harvest.sqlite]` section is refused in a
+  build without the feature. No `WorkflowEvent` variant, no migration.
+
+  Tests: `autumn-harvest-plugin/tests/sqlite_plugin.rs` boots real apps on a
+  temp directory: an end-to-end run over HTTP, the `501` fallback, a refused
+  start option, the 401 gate outside `dev`, the app handle, a build refusal,
+  `sqlite_path` on an in-memory app database, and a restart that resumes a
+  parked run. `autumn-harvest-sqlite`'s
+  `shared_state` suite covers the state map in every context. CI runs the
+  plugin suite in the new `sqlite-plugin` job. See `docs/sqlite-plugin.md`.
+- **Phase 2452.2453** (implemented): Progress notes and context reset in one agent run — see issue #2453. `ContextReset` is a new operator setting on `AgentTask` and `AgentProfile`. It is off by default. With it on, the model gets the `save_progress` tool. The workflow handles the call itself, as it handles `schedule_followup`. Before each request, the loop measures the request. A request that reaches `reset_at_percent` of the cap makes a reset due. The loop then asks for a save turn. It sends a fixed notice, and only `save_progress` runs in that round. The reset runs before the next request. The new window is the system prompt, the task, the follow-up bookings and the notes. The steers of a durable agent op follow.
+
+  Design decisions (`docs/design/DESIGN-2453.md`):
+
+  - The notes stay in an assistant `save_progress` call with a fixed result.
+    No user message holds model text, as in `followup.rs`.
+  - The save turn lets the model read the last round before the reset drops
+    it. No call with an effect runs in that turn.
+  - A reset whose window still reaches the threshold does not run.
+  - A reset clears the last sent window, so the next turn goes in full.
+  - A reset changes only the transcript. A reset clears no taint.
+  - A durable agent keeps the notes in `AgentState::notes`, with their flow
+    labels. Each op shows them after its input. The transcript holds no copy,
+    so `trim_window` never drops them. Only a segment that may write memory
+    keeps them, and only such a segment gets the reset and the tool.
+    `Control::ClearTranscript` clears them.
+  - A delegated child takes the setting and starts with no notes.
+  - `AgentReport::resets` and `DelegationRecord::resets` count the resets.
+    Neither is written when zero.
+
+  History: no new `WorkflowEvent` variant, no migration and no patch gate. A
+  task with no `context_reset` field takes no new path, so a recorded run
+  replays as it ran. The reset reads only recorded data, so replay takes the
+  same reset.
+
+  Proof: `formal/verus/src/agent_reset.rs` proves `reaches_percent` and
+  `reset_due` in `bounds.rs`. A request over the cap always reaches the
+  threshold, and no run passes `max_resets`. `formal/verus/contracts.txt`
+  lists the new contracts.
+
+  Tests: `autumn-harvest-agent/tests/context_reset.rs` covers each acceptance
+  criterion, a crash right after a reset included. Unit tests and proptests
+  are in `bounds.rs` and `context_reset.rs`.
+
+  Known limit: a tool round that passes the cap in one step still ends as
+  `transcript_full`. The reset runs only before a request. Issue #2461 tracks
+  it.
+- **Agents** (implemented): Versioned profile overlay store — see issue #2371. `agent::overlay_store` adds `ProfileOverlayStore`. It keeps each overlay version of an agent kind, and one active pointer. Parent: #2369. It builds on the overlay kernel of #2370.
+
+  - `put(kind, overlay, provenance)` validates the overlay with
+    `overlay::apply`, then appends it. Versions start at 1 and rise by 1
+    for each kind. `Provenance` is an operator id or the execution id of a
+    refine run.
+  - `activate(kind, version, expected_active)` validates the version again,
+    then moves the pointer with a compare-and-swap. An unknown version
+    returns `UnknownVersion`. A stale pointer returns `Conflict { actual }`.
+    A rollback activates an earlier version.
+  - `active`, `get` and `list` read the log. `StoredOverlay::bytes` returns
+    the exact bytes that the put wrote.
+  - `put` refuses JSON above `MAX_OVERLAY_BYTES` (64 KiB), and an operator
+    id with padded or invisible text.
+  - `AgentHarness` implements `OverlayValidator` under
+    `Ceilings::from_profile`. #2394 adds operator ceilings.
+
+  Three stores: `InMemoryOverlayStore`, `SqliteOverlayStore` (feature
+  `sqlite`) and `PostgresOverlayStore` (new feature `postgres`). The SQL is in
+  `autumn_harvest::overlay_log` and `autumn_harvest_sqlite::SqliteOverlayLog`,
+  so the agent crate adds no Diesel code.
+
+  **Migration.** `20261031200812_harvest_agent_overlays` adds
+  `harvest_agent_overlays` and `harvest_agent_overlay_heads`. The trigger
+  `harvest_agent_overlays_immutable_trg` refuses each `UPDATE` of a version
+  row. The trigger `harvest_agent_overlay_heads_keep_trg` refuses each
+  `DELETE` of a head row, so no version number comes back. The tables are new and not hot. No `WorkflowEvent` variant and no
+  replay impact.
+
+  **Proof.** `formal/verus/src/overlay_log.rs` mirrors `next_overlay_version`
+  and `decide_activate`. It proves that a put keeps every earlier version,
+  that the pointer always names a stored version, and that one of two
+  activations with the same expected pointer wins.
+
+  **Tests.** One shared suite runs on all three stores. The Postgres target
+  `overlay_store_postgres` shows that Postgres refuses an `UPDATE` of a
+  version row and a delete of the active version. The SQLite integration
+  tests show the same for `SQLite`. Design: `docs/design/DESIGN-2371.md`.
+- **Phase X.Y** (implemented): Every diesel table fits the default 32-column tier — see issue #2492. `harvest_workflow_executions` had 65 columns in its `table!`, so the workspace enabled diesel's `128-column-tables` feature. Cargo unifies features, so every embedder built diesel at that tier too. Compiling diesel alone at that tier passes 9.9 GB RSS. The workspace now builds diesel at its default tier, 32 columns. That tier compiles diesel in about a third of the time and memory of `64-column-tables`.
+
+  - **Split tables.** `harvest_workflow_executions` (61 columns),
+    `harvest_task_queue` (48) and `harvest_schedules` (38) each have a core
+    `table!` of 32 columns and an extension `table!`, `<table>_ext`, with
+    `#[sql_name]` set to the same table. The physical tables do not change, so
+    there is no migration.
+  - **`table_split` bridges the two declarations.** An extension column selects,
+    filters, orders and joins in a query on the core table. `Ext(..)` adds
+    extension values to an insert into the core table, `ON CONFLICT` and batch
+    inserts included. `SetExt(..)` assigns an extension column in an update of
+    the core table. Each statement renders the same SQL as one wide declaration.
+    The insert bridge needs diesel's
+    `i-implement-a-third-party-backend-and-opt-into-breaking-changes` feature,
+    which the workspace now names.
+  - **Flat models.** `WorkflowExecution`, `TaskQueueItem`, `HarvestSchedule`
+    and their `New*` structs keep their fields and their JSON. `split_queryable!`
+    and `split_insertable!` implement `Selectable`, `Queryable` and `Insertable`
+    over both declarations. An insert borrows its row, so pass `&row`, or a
+    slice for a batch.
+  - **Rebalance markers.** Four shard-rebalance columns of the executions table
+    read through typed SQL fragments in
+    `schema::harvest_workflow_executions_unmapped`. `WorkflowExecution` embeds
+    them as `rebalance: RebalanceMarkers` with `#[serde(flatten)]`.
+  - **Guard.** `docs/audits/diesel-table-width.py` runs in the `lint` job. It
+    fails on a `table!` over 32 columns, and on a manifest outside `docs/` that
+    enables `64-column-tables` or `128-column-tables`.
+
+  Code that names a moved column changes its path from `<table>::<column>` to
+  `<table>_ext::<column>`. An embedder that queries these tables through
+  `autumn_harvest::schema` changes the same way.
+
+  No new `WorkflowEvent` variant. No migration. `harvest_events` is untouched.
+  `table_split_db_tests` and `rebalance_markers_db_tests` round-trip every moved
+  field against Postgres. The unit tests in `table_split` pin the SQL of each
+  bridged statement.
+- **Phase X.Y** (implemented): Cost-aware deferral of activities from the autumn cost signal (autumn#1720). A worker can now hold named activity types while a cost signal is high. The signal is the autumn-web `CostSignal`: grid carbon intensity or a price, with a threshold from autumn's `[cost] defer_threshold`. autumn uses the same signal to defer `#[job(deferrable)]` work, so one threshold and one runtime-config key now drive autumn jobs and Harvest activities.
+
+  - `autumn_harvest::cost_hold`: `CostSignalSource` (any `Fn() -> bool` is
+    one) and `CostHold`. Set it with `WorkerConfig::with_cost_hold`.
+  - `HarvestPlugin::cost_deferrable_activities` reads the app's `CostSignal`
+    at startup. `HarvestPlugin::cost_hold_recheck` sets the dispatch-channel
+    retry delay. `autumn_harvest_plugin::cost::autumn_cost_hold` builds a hold
+    for a `HarvestEmbedding`.
+  - While the signal is high, the worker puts each held type into the claim
+    skip list with `SATURATED_ACTIVITY_MARKER`, the path the adaptive limit
+    (issue #1836) uses. A held task stays `PENDING`, uses no attempt and no
+    retry budget, and holds no slot. Workflow tasks and other activity types
+    run. A held dispatch reference returns after the recheck delay.
+  - `try_build` rejects a local activity in the hold. An unregistered name and
+    a `schedule_to_start` default log a warning. The plugin's `sqlite` build
+    refuses a cost hold and names the SQLite epic (#2466).
+  - New gauge `harvest.cost.hold` (`METRIC_COST_HOLD`, no label), bridged by
+    the metrics-rs adapter and the plugin scrape endpoint, with a starter
+    dashboard panel. `GET /admin/config` reports `cost_hold_activities`.
+
+  No new `WorkflowEvent` variant, no migration, no new SQL. The
+  `schedule_to_start` timer keeps running for a held task. See
+  `docs/cost-deferral.md` for that and the other limits.
+
+  Test evidence: `cost_hold_tests` (Postgres) holds a type while the signal is
+  high, runs an unheld type on the same queue, then runs the held task at
+  attempt 1 after the signal falls. Unit tests cover the skip list, the gauge
+  edges, the build validation, the effective-config view, the plugin bridge
+  and the scrape gauge.
+- **Phase 2438.2440** (implemented): Draw identity: run id, request and cache key — see issue #2440. `DrawId` is a new `u32` newtype. `ChatRequest::draw` carries it to the model, and `ResponseCache::key` puts it in the key. Two draws of one request now get two cache entries. Before, best-of-N with the cache on collapsed to one sample. `run_draws` runs each draw as a child `agent_loop` run with the run id `{root}:s{n}`, so tools get one idempotency key per draw.
+
+  Design decisions (`docs/design/DESIGN-2440.md`):
+
+  - The key document holds the draw only when it is `Some`. A request with no
+    draw keeps its key bytes. A golden test pins one key from `trunk-dev`.
+  - `ModelTurnRequest::draw` and `AgentTask::draw` are not written when
+    `None`. A history recorded before the change replays. A test replays a
+    fixture history from `trunk-dev`.
+  - Each `run_draws` call records a new UUID as its root. Two batches never
+    share a run id, and a reset or a fork replays the same root. `drive`
+    refuses a root that is not a UUID. `shares_run_id` reads a `:s{n}`
+    suffix as it reads `:d{n}`.
+  - A delegated child keeps the draw id and drops the root.
+  - A draw never delivers, and it reports a failure, so the caller keeps its
+    usage. It has no memory, no workspace and no follow-ups. Each draw gets
+    the whole token cap. `agent_sample` (#2443) will split it.
+  - A batch over `MAX_PARALLEL_CHILDREN`, or with one id twice, starts no
+    draw.
+
+  Breaking change: `ChatRequest` has a new public field. A struct literal
+  outside the crate adds `draw: None`. See `docs/upgrading/0.9.0.md`.
+
+  Fleet rule: call `run_draws` only after every worker runs this release. An
+  older binary drops the field.
+
+  No new `WorkflowEvent` variant. No migration. No new query.
+
+  Tests: `autumn-harvest-agent/tests/draws.rs`, the key tests in
+  `response_cache.rs`, the root tests in `draw.rs` and
+  `a_draw_of_a_workflow_id_run_skips_the_cache` in `workflow.rs`.
+- **Agents** (implemented): Recorded overlay read: an activation changes the next op only — see issue #2372. A durable agent now reads the active overlay of its kind once per op. Parent: #2369. It builds on the overlay kernel of #2370 and the store of #2371.
+
+  - `AgentHarness::overlay_store` installs a `ProfileOverlayStore`.
+  - The run read `agent_profile` now returns a `ProfileRead`. It flattens the
+    profile, so a result that an old worker recorded still decodes. With a
+    store, it sets `overlay_store: true`.
+  - With that flag, each op that runs a segment calls the new activity
+    `agent_profile_overlay` with an `OverlayRead`: the kind and the run
+    profile. It returns the run profile with the overlay applied, and its
+    `overlay_version`. History records both, so a replay never reads the
+    store. An old history has no flag and schedules no new activity.
+  - The version must still validate under the current harness profile.
+    Then it applies to the run profile under the run ceilings. The op takes
+    only the fields that an overlay can set.
+    The mandate, the peers and the heartbeat stay those of the run.
+  - A worker with no store fails the op read with a retryable error.
+  - Each op drains its stale interrupts before the read, so an interrupt
+    during the read stops the op.
+  - A version that `overlay::apply` refuses fails the op with a
+    non-retryable error that names the version. The agent never runs on the
+    bare profile in its place.
+  - `AgentState::profile_version` keeps the version of the last op that read
+    one. Each op upserts it as the search attribute `agent_profile_version`,
+    as text, for example `"v2"`.
+
+  **Proof.** `formal/verus/src/agent_profile_read.rs` mirrors the kernel
+  `op_profile`. It proves that an active version never yields the bare
+  profile, and that an op records the version that it applied.
+
+  **Deploy order.** An older worker cannot replay a history that holds an
+  op read. Install the store only after every worker runs this version.
+
+  **Tests.** `tests/overlay_read_suite` holds six tests: an exact replay,
+  the next op, a mid-op activation, the search attribute, and two cases of
+  bad stored data. `overlay_read.rs` runs them on SQLite, and `overlay_read_postgres.rs`
+  runs them on a Postgres worker. No `WorkflowEvent` variant and no
+  migration. Design: `docs/design/DESIGN-2372.md`.
+- **Agents** (implemented): An evaluation candidate takes a whole overlay — see issue #2375 (epic #2369). `eval::Candidate::overlay` runs a recorded history under a whole `ProfileOverlay`. The harness reads the source profile from the recorded task and applies the overlay with `overlay::apply` before the engine starts. A refused overlay returns `EvalError::Overlay` and costs no model call. The default ceilings are `Ceilings::from_profile` of the source, so an overlay can only narrow its bounds and model. `Candidate::ceilings` sets operator ceilings. `Candidate::system_prompt` sets the overlay prompt. `Candidate::model` sets the overlay model, admits it past the ceilings and still asks it for every turn. `Candidate::agent_model` stays a route. `compare` checks both overlays before the first model call.
+
+  `Evaluation::overlay_digest` holds `ProfileOverlay::digest`, a SHA-256 of
+  the canonical JSON. A candidate report now shows the recorded run id, so
+  two evaluations of one candidate compare equal. The tool guidance and the
+  skills of #2373 reach the candidate task, so the model sees the guided
+  text and the skill list.
+
+  Behaviour change: `Candidate::model` now sets the task model and checks
+  it before any call. A model that the harness does not hold used to fail at
+  the first turn. A model that the source mandate forbids used to run
+  unchecked. Both now fail with `EvalError::Overlay`. A delegated child
+  with no peer model now inherits the model.
+
+  No event, migration or SQL changes. A struct literal of `Evaluation`
+  needs the new field. The design is in `docs/design/DESIGN-2375.md`.
+
+  Tests: `autumn-harvest-agent/tests/eval.rs` covers each criterion of the
+  issue and the early refusal of `compare`. Unit tests in `eval.rs` show
+  that every overlay part reaches the task and that the rebase changes only
+  the root id and its lanes. `overlay.rs` pins the digest.
+- **Tooling** (implemented): Dependency ledger: restore the lost `croner` pin rehearsal, correct a stale duplicate count. Routine Ballast ledger sweep (2026-11-02). `cargo deny check` came back fully green: 0 errors, 0 warnings on advisories, 66 warnings on bans (all duplicate-version, `multiple-versions = "warn"`), 0 on licenses and sources. All 12 advisory notes matched the 6 documented `[advisories] ignore` entries exactly — no new RUSTSEC advisory, no stale ignore entry, no duplicate ignore entries. No security-class action needed this run.
+
+  Two documentation defects found and fixed, both in `deny.toml`'s `[bans]`
+  comment, neither a dependency-graph change:
+
+  1. **A finished rehearsal never landed.** PR #2142 (2026-10-12) rehearsed
+     bumping our direct `croner = "2.2"` to 3.0.1 (the version
+     tokio-cron-scheduler pulls in transitively through autumn-web), migrated
+     all 4 call sites to the 3.x builder API, and ran the full
+     `scheduler::tests` suite. It found a real correctness regression: 3 of 98
+     tests failed, because two call sites rely on a strict (exclusive) search
+     landing exactly on a reference 1ms/1ns below a whole-second boundary, and
+     croner 3.0.1 instead carries the sub-second remainder forward, landing a
+     full second late and dropping one occurrence from the walk. The PR
+     reverted the rehearsal and was meant to record the finding as a
+     documented pin in `deny.toml` — but its one CI run hit an infra loss
+     (runner shutdown, exit 143) on an unrelated test, unrelated to its
+     docs-only diff, and the PR went stale and was closed unmerged on
+     2026-10-26 with no follow-up push. The rehearsal itself is still valid
+     evidence; the `deny.toml` comment never got the update it described.
+     This sweep restores it in full, with the regression mechanism, the two
+     call sites, and a revisit trigger.
+
+  2. **A stale graph fact.** The same comment still said "33 duplicated crate
+     names," the count from this harness's original baseline (PR #1303,
+     2026-09-02). It's 66 now — `cargo deny check -s` is the reproduction
+     command. Restated the sentence to point at that command instead of a
+     literal, per this repo's own "a live count in prose is a conflict
+     magnet" rule (`CLAUDE.md` § Keep docs guards from becoming conflict
+     magnets), so the next sweep doesn't have to fix the same drift again.
+
+  New graph fact recorded while restoring the comment: `croner` now resolves
+  to **three** instances, not two — 2.2.0 (ours, direct), 3.0.1
+  (tokio-cron-scheduler's own pin, unchanged), and a newly-appeared 4.0.2
+  (autumn-web's own direct use). `autumn-web` is still locked at exactly
+  0.9.0 in our `Cargo.lock`, so the third instance is Cargo's resolver
+  picking up a newer croner release against autumn-web's own requirement
+  string on a lockfile refresh, not an autumn-web version bump. Nobody has
+  rehearsed croner 4.x against the same regression; that's an open question
+  for a future sweep, not a finding either way. Our own pin stays at 2.2
+  until either the two external instances converge on one version, or
+  someone rehearses 4.x clean the same way PR #2142 rehearsed 3.0.1.
+
+  Rehearsal for this PR's own diff: `cargo deny check -s` before and after the
+  comment edit — identical output (0 errors, 0/66/0/0 warnings, 12/0/747/0
+  notes). No `Cargo.toml`/`Cargo.lock` change, so no `cargo check`/`cargo
+  test` rehearsal applies; this is a documented-pin restoration, not a
+  dependency bump, and the impact floor doesn't apply to it.
+
+  No `WorkflowEvent` variant, no migration, no engine-runtime change — this
+  touches only `deny.toml`'s comment and this fragment.
+- **Phase X.Y** (implemented): Schema contract diff borrows canonical schemas. `diff_schema_contracts` no longer copies a schema that is already canonical. `canonicalize_node` returns `None` when the canonical form equals its input, and `diff_role` borrows the input then. Output is unchanged. On 200 workflows and 400 activities the diff takes 13.5% fewer instructions and allocates 12.9% fewer bytes. See `docs/performance-schema-contract-diff.md`.
+- **Agents** (implemented): Scorer contract and selection kernel — see issue #2441 (epic #2438). The new `score` module gives a run a recorded quality signal. A `Scorer` checks one run and returns a `Verdict`: `Score(FiniteF64)` or `Reject(reason)`. `FiniteF64` refuses NaN and both infinities, and stores `-0.0` as `0.0`. `AgentHarness::scorer` installs a scorer under its id.
+
+  The activity `agent_score` calls the scorer that a `ScoreRequest` names.
+  History records the verdict, so replay never calls the scorer again. A
+  non-finite score fails the activity with `ErrorKind::Decode`. An unknown
+  scorer fails it as `ScorerMissing`. `activities()` and `sqlite::register`
+  add the new activity.
+
+  A judge scorer calls `ScoreContext::chat`. Each call checks the LLM budget
+  first, then keeps one cost ledger call under the run that scores. An error
+  after a paid judge call is never retried. `AgentHarness::score_timeout`
+  bounds a score at 13 minutes. A budget
+  refusal fails the activity with `LlmBudgetExceeded`, even when the scorer
+  hides the error. SQLite has no run budget, so there the check passes.
+
+  `ExactMatch` and `JsonSchema` ship with the crate. `select` picks the draw
+  with the highest score. A tie goes to the lowest draw id, and a reject never
+  beats a score.
+
+  No event, migration or SQL changes. The design is in
+  `docs/design/DESIGN-2441.md`.
+
+  Tests: unit tests in `score.rs` cover the verdict, the kernel, each
+  built-in scorer and the judge path. Proptests cover the order key and
+  permutations. `tests/score.rs` aborts a child process after a score and
+  resumes the run on SQLite. The scorer stays at one call. It also checks a
+  NaN score and the judge ledger rows. `tests/score_postgres.rs` runs a real
+  worker. It checks the ledger rows, and that a run budget of 0 stops the
+  judge before its call. `formal/verus/src/agent_select.rs` mirrors `pick`,
+  `best_draw` and `key_of_bits`. The winner has the top key. A reject never
+  wins while a score exists. The input order does not change the result. The
+  key keeps the order of the bits, and a proptest checks the floats.
+- **Performance** (implemented): dead-letter reads use an index — see issue #2401. The Ledger census found DLQ statements that read the whole of `harvest_dead_letters`. No index held `failed_at`, `original_task_id` or `queue_name`:
+
+  - the newest-first list, `dlq::list_dead_letters`, and the plugin DLQ page;
+  - the newest-age probe of the status summary. It moves to
+    `dlq::DLQ_NEWEST_AGE_SQL`;
+  - the callback redrive delete, `completion_callback::redrive_delivery_at`.
+    A bulk callback redrive sends it once per row;
+  - each `queue_name` filter of a redrive, a bulk replay, a bulk discard and
+    an aggregate, in the engine and the plugin API.
+
+  Migration `20261102143438_harvest_dead_letter_indexes` builds
+  `idx_harvest_dl_failed_at` on `(failed_at)`, `idx_harvest_dl_original_task`
+  on `(original_task_id)` and `idx_harvest_dl_queue_failed` on
+  `(queue_name, failed_at)`. Each index is full. The redrive delete binds
+  `task_type`, so a generic plan cannot use a partial index on it. On 100,000
+  rows, a list page falls from 5,959 to 5 buffers. The probe falls from 5,883
+  to 3, and the redrive delete from 5,884 to 5. Each dead-letter insert costs
+  about 8 more buffers. After a checkpoint, it writes about 3,000 more WAL
+  bytes, most of it in full-page images of the random `original_task_id`
+  leaves. See `docs/performance-dead-letter-indexes.md`.
+
+  The `error ILIKE` filter still reads the whole table. A btree index cannot
+  serve it.
+
+  **Trade-off.** A filter that no index serves, ordered by `failed_at` with a
+  `LIMIT`, can now walk `idx_harvest_dl_failed_at`. When the matches are the
+  newest rows and the read wants the oldest, the walk reads most of the index.
+  On a shuffled heap, it read 95,393 buffers where the old scan read 5,883. A
+  time window or a queue filter bounds the read.
+
+  **Upgrade.** A plain `CREATE INDEX` takes `SHARE` on `harvest_dead_letters`.
+  It blocks each dead-letter insert, and so each terminal task failure, until
+  the build ends. A blocked failure keeps its row locks, so signals and
+  cancels on that run wait too. On a large DLQ, build the indexes `CONCURRENTLY` first. The
+  header of the migration's `up.sql` gives the statements.
+
+  `census_scan_index_tests` gates each indexed DLQ statement above in six
+  tests, with `enable_seqscan` off and a generic plan. Each engine gate captures the SQL that the engine sends.
+  The gates also check the list order, the probe age, the queue order, and the
+  rows that the redrive delete keeps. Design record:
+  `docs/design/DESIGN-2401.md`. No new `WorkflowEvent` variant and no replay
+  impact.
 - **Phase 4** (next): production hardening -- sharding, observability, metrics, dashboard (Vantage UI — Workers tab shipped in issue #142; DLQ, schedules, and DAG visualization pages remain); Step 5 of issue #256 (remove classic DAG executor, drop `harvest_dag_runs`). Note: the cancellation primitive and `Saga` both ship; their interaction semantics, idempotency contract, and replay-determinism contract are documented in `docs/saga.md` and locked in by three integration tests in `tests/saga_tests.rs` (issue #238).
 
 ---

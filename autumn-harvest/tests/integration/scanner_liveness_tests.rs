@@ -148,7 +148,7 @@ fn success_metric_detection_bound_holds_for_every_shipped_interval() {
         // DEFAULT_SCHEDULER_TICK_INTERVAL
         (Scanner::Schedule, Duration::from_secs(1)),
         // RetentionConfig's DEFAULT_TICK_INTERVAL
-        (Scanner::Retention, Duration::from_secs(60 * 60)),
+        (Scanner::Retention, Duration::from_hours(1)),
     ];
 
     for (scanner, interval) in shipped {
@@ -197,8 +197,8 @@ fn success_metric_detection_bound_holds_for_every_shipped_interval() {
     );
     // And the 2x multiplier genuinely dominates for the hourly janitor.
     assert_eq!(
-        staleness_threshold(Duration::from_secs(60 * 60)),
-        Duration::from_secs(2 * 60 * 60),
+        staleness_threshold(Duration::from_hours(1)),
+        Duration::from_hours(2),
         "the hourly retention janitor is detected in 2h — 2x its interval"
     );
 }
@@ -457,7 +457,7 @@ fn a_wedged_instance_is_not_laundered_by_a_lenient_siblings_interval() {
     let wedged = liveness.register_at(Scanner::Timeout, Duration::from_secs(30), t0);
     liveness.tick_at(wedged, t0);
     // B: hourly cadence => 7200s threshold. Ticking normally.
-    let lenient = liveness.register_at(Scanner::Timeout, Duration::from_secs(60 * 60), t0);
+    let lenient = liveness.register_at(Scanner::Timeout, Duration::from_hours(1), t0);
 
     let now = t0 + Duration::from_secs(200);
     liveness.tick_at(lenient, now);

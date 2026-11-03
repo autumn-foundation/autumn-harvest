@@ -243,7 +243,7 @@ fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) ->
                 labels: HashMap::new(),
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 queue_weights: HashMap::new(),
-                max_workflow_pause_duration: Duration::from_secs(24 * 3600),
+                max_workflow_pause_duration: Duration::from_hours(24),
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
@@ -590,7 +590,7 @@ async fn heartbeat_timeout_activity_skips_the_default() {
 /// A `schedule_to_close` is an attempt bound, so the default does not apply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn schedule_to_close_activity_skips_the_default() {
-    let s2c = Duration::from_secs(2 * 3600);
+    let s2c = Duration::from_hours(2);
     let task = running_row_under_default(hang_info("hang_s2c", None, Some(s2c), None)).await;
     assert_eq!(task.start_to_close, None);
     assert!(task.schedule_to_close_at.is_some());
