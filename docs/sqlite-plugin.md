@@ -418,7 +418,8 @@ Each of these writes one audit row:
 The tenant routes run the same stack, inside the `/tenants/{key}` nest. So
 each layer sees the core route, and a read token reads a tenant. The
 authorizer sees `{key}` as the tenant. A `x-harvest-tenant` header that
-names another tenant is a `400`.
+names another tenant is a `400`. With `api_with_oidc`, the session boundary
+also runs inside the nest, so a tenant health route stays public.
 
 To seed a first `admin` token offline, as `harvest token bootstrap` does on
 Postgres, store its hash with `autumn_harvest_sqlite::SqliteAuthStore`:

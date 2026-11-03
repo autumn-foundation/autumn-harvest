@@ -208,8 +208,9 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
 
 /// The management router with its auth (issue #2469).
 ///
-/// The one layer stack of both backends wraps the routes. Host auth runs
-/// outside it, then the OIDC session boundary, as on Postgres.
+/// The one layer stack of both backends wraps the routes, and the OIDC
+/// session boundary wraps the stack, as on Postgres. Host auth runs outside
+/// them. A login and host auth are alternatives, so one of them is `None`.
 fn api_router(
     handles: Handles,
     api_state: &HarvestApiState,
@@ -223,8 +224,18 @@ fn api_router(
         .rate_limit
         .clone()
         .map(crate::api_rate_limit::ApiRateLimiter::new);
-    let stack =
-        |router| crate::api::apply_admin_auth_layers_with(router, api_state, auth, limiter.clone());
+    // The OIDC session boundary joins the stack, inside the tenant nest too.
+    // It then sees the core path, so a tenant health route stays public.
+    let stack = |router| {
+        let router =
+            crate::api::apply_admin_auth_layers_with(router, api_state, auth, limiter.clone());
+        #[cfg(feature = "oidc")]
+        let router = match oidc {
+            Some(login) => crate::oidc::session_boundary(router, login, auth.api_tokens),
+            None => router,
+        };
+        router
+    };
     let mut router = api::router(
         api::ApiState {
             handle: handles.control,
@@ -236,9 +247,10 @@ fn api_router(
     if let Some(middleware) = api_middleware {
         router = middleware(router);
     }
+    // The login routes sit once, at the top, outside the boundary.
     #[cfg(feature = "oidc")]
     if let Some(login) = oidc {
-        router = crate::oidc::apply_oidc(router, login, auth.api_tokens);
+        router = router.merge(crate::oidc::login_router(login.clone()));
     }
     router
 }

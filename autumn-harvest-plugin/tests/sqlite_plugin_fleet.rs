@@ -629,3 +629,55 @@ async fn the_authorizer_sees_the_path_tenant_and_the_start_body() {
     plain.assert_status(201);
     fx.fleet.close_all().await;
 }
+
+/// With OIDC login, a tenant health route stays public. Each other tenant
+/// route needs a login (issue #2469).
+#[cfg(feature = "oidc")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oidc_login_keeps_tenant_health_public() {
+    use autumn_harvest_plugin::oidc::{OAuth2ProviderConfig, OidcLogin};
+    use autumn_harvest_plugin::roles::{ClaimRoleMap, ClaimRule, HarvestRoles, ROLE_VIEWER};
+
+    // No request here logs in, so the provider is never called.
+    let issuer = "http://127.0.0.1:9";
+    let provider = OAuth2ProviderConfig {
+        client_id: "harvest".to_owned(),
+        client_secret: "secret".to_owned(),
+        authorize_url: format!("{issuer}/authorize"),
+        token_url: format!("{issuer}/token"),
+        userinfo_url: None,
+        redirect_uri: "http://127.0.0.1/harvest/auth/oidc/callback".to_owned(),
+        scope: "openid".to_owned(),
+        issuer: Some(issuer.to_owned()),
+        jwks_url: Some(format!("{issuer}/jwks")),
+        discovery_url: None,
+    };
+    let roles = HarvestRoles::builder().builtin_roles().build().unwrap();
+    let claims = ClaimRoleMap::new().rule(ClaimRule::new("groups", "ops", ROLE_VIEWER));
+    let login = OidcLogin::new(provider, roles, claims).unwrap();
+    let plugin = HarvestPlugin::new()
+        .workflows(workflows![tenant_flow])
+        .activities(activities![whoami])
+        .sqlite_per_tenant()
+        .api_with_oidc("/harvest", login);
+    let fx = boot_plugin("dev", "tenant", &[], plugin);
+    provision(&fx.fleet, &["acme"]).await;
+
+    let control = fx.client.get("/harvest/health/ready").send().await;
+    control.assert_ok();
+    let tenant = fx
+        .client
+        .get("/harvest/tenants/acme/health/ready")
+        .send()
+        .await;
+    tenant.assert_ok();
+    let runs = fx
+        .client
+        .get("/harvest/tenants/acme/workflows")
+        .send()
+        .await;
+    runs.assert_status(401);
+    let login_route = fx.client.get("/harvest/auth/oidc/login").send().await;
+    assert_ne!(login_route.status.as_u16(), 404, "the login route exists");
+    fx.fleet.close_all().await;
+}
