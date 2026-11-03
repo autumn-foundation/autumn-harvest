@@ -321,7 +321,8 @@ async fn a_close_stops_the_driver_and_a_reopen_resumes() {
         .json(&json!({}))
         .send()
         .await;
-    signal.assert_ok();
+    // A signal answers `202`, as on Postgres (issue #2489).
+    signal.assert_status(202);
     assert_eq!(
         completed(&fx.client, "acme", &exec).await["who"],
         "tenant:acme"
