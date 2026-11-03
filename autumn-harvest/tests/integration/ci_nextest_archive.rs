@@ -374,3 +374,101 @@ fn both_ends_of_the_archive_use_one_nextest_version() {
         "the archive format is internal to nextest, so both jobs must pin one version"
     );
 }
+
+// ── The image pre-pull on a hash-partitioned shard ──────────────────────────
+
+/// The emulator images that only some suites need.
+const EMULATORS: &[&str] = &[
+    "softwaremill/elasticmq:",
+    "pgsty/minio:",
+    "fsouza/fake-gcs-server:",
+];
+
+/// A hash partition sends the tests of each emulator suite to many shards.
+/// The row plan of `pull-test-images.sh` cannot name those shards, so each
+/// shard must pull every emulator.
+#[test]
+fn every_shard_pulls_every_emulator_image() {
+    let ci = parse_workflow(".github/workflows/ci.yml");
+    let pulls = steps_running(&ci["jobs"]["test-db-linux"], "pull-test-images.sh");
+    assert_eq!(pulls.len(), 1, "`test-db-linux` must pre-pull its images");
+    assert_eq!(
+        str_at(pulls[0], &["env", "PULL_EVERY_SUITE_IMAGE"]),
+        "1",
+        "the pre-pull step must set PULL_EVERY_SUITE_IMAGE=1"
+    );
+}
+
+/// Runs `pull-test-images.sh` with a `docker` stub that prints each pull.
+#[cfg(unix)]
+fn pulled_images(env: &[(&str, &str)]) -> String {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("make a temp dir");
+    let stub = dir.path().join("docker");
+    std::fs::write(
+        &stub,
+        "#!/usr/bin/env bash\n[ \"$1\" = pull ] && echo \"PULL $2\"\nexit 0\n",
+    )
+    .expect("write the docker stub");
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+        .expect("make the stub executable");
+    let path = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg(repo_root().join(".github/ci/pull-test-images.sh"))
+        .current_dir(repo_root())
+        .env("PATH", path)
+        .env_remove("PULL_EVERY_SUITE_IMAGE")
+        .env_remove("SEMAPHORE_SHARD_COUNT")
+        .env_remove("SEMAPHORE_SHARD_INDEX");
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let out = cmd.output().expect("start bash");
+    assert!(
+        out.status.success(),
+        "the pre-pull failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The first shard of 21 whose rows hold no emulator suite under the row plan.
+///
+/// The coverage nightly keeps the row plan, so such a shard pulls no
+/// emulator there.
+#[cfg(unix)]
+fn shard_without_emulator_rows() -> String {
+    (0..21)
+        .map(|i| i.to_string())
+        .find(|index| {
+            let pulled = pulled_images(&[
+                ("SEMAPHORE_SHARD_COUNT", "21"),
+                ("SEMAPHORE_SHARD_INDEX", index),
+            ]);
+            EMULATORS.iter().all(|e| !pulled.contains(e))
+        })
+        .expect("under the row plan, some shard of 21 must pull no emulator image")
+}
+
+/// On that same shard, `PULL_EVERY_SUITE_IMAGE=1` still pulls each emulator.
+#[cfg(unix)]
+#[test]
+fn pull_every_suite_image_pulls_each_emulator_on_any_shard() {
+    let index = shard_without_emulator_rows();
+    let pulled = pulled_images(&[
+        ("SEMAPHORE_SHARD_COUNT", "21"),
+        ("SEMAPHORE_SHARD_INDEX", &index),
+        ("PULL_EVERY_SUITE_IMAGE", "1"),
+    ]);
+    for image in EMULATORS {
+        assert!(
+            pulled.contains(&format!("PULL {image}")),
+            "shard {index} with PULL_EVERY_SUITE_IMAGE=1 must pull {image}: {pulled}"
+        );
+    }
+}

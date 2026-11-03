@@ -61,6 +61,10 @@ bash .github/ci/run-suites.sh filterset linux
 Each test runs in its own process, one at a time. A suite that serializes
 on process-global state is therefore still serial.
 
+The hash sends the tests of one suite to many shards. So each shard sets
+`PULL_EVERY_SUITE_IMAGE=1` and pre-pulls every emulator image. The row
+plan of `pull-test-images.sh` cannot name the shards that need one.
+
 ## Run a shard locally
 
 Docker must run. Build the archive, unpack it, and run one shard:

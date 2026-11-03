@@ -1643,6 +1643,10 @@ jobs:
       - name: Pre-pull Docker test images (retry transient pull failures)
         if: needs.changes.outputs.code == 'true'
         shell: bash
+        env:
+          # The hash partition sends tests of each emulator suite to many
+          # shards, so every shard pulls every emulator image.
+          PULL_EVERY_SUITE_IMAGE: "1"
         run: bash .github/ci/pull-test-images.sh
       - name: Run Linux Docker-backed manifest suites (shard)
         if: needs.changes.outputs.code == 'true'
