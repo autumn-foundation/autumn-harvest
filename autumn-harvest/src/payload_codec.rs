@@ -2705,8 +2705,9 @@ mod tests {
 
     /// The lifted decode in `decode_event` must match serde's own decode.
     ///
-    /// A payload key without a slot reads back as null. So this checks
-    /// every payload key of every payload-bearing variant.
+    /// A payload key without a slot sends the decode to the slow path. So
+    /// this checks that every payload key of each payload-bearing variant
+    /// has a slot.
     #[test]
     fn lifted_decode_matches_serde_for_every_payload_field() {
         let codecs = PayloadCodecs::default();

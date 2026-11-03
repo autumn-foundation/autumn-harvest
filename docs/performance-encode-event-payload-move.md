@@ -80,8 +80,9 @@ gain shows in instructions only.
 
 ## What is left
 
-- `index_into_mut` is still 3.6%. These are the six lookups that
-  `decode_event_moving_payloads` makes per event.
+- `index_into_mut` is still 3.6%. These are mostly the seven lookups that
+  `decode_event_moving_payloads` makes per event. The encode path makes one,
+  for `data`.
 - About half of the borrowed cost is the clone. A store append API that
   takes owned events would remove it. The callers keep their events after the
   append, so that is a larger change.

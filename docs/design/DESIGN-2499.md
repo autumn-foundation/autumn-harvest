@@ -24,8 +24,10 @@ makes that choice.
   `WorkflowEvent::payload_slot`.
 - Each production caller borrows its events. `store.rs` keeps the slice for
   later use. `fork.rs` encodes a clone that it owns and then drops.
-- The six `PAYLOAD_FIELD_KEYS` lookups on `data` cost about 5.35%. The
-  issue rates a one-pass rewrite at under 5% alone.
+- `Value` key lookups cost about 5.35%. Encode and decode each make seven
+  per event: one for `data` and one for each `PAYLOAD_FIELD_KEYS` key. So
+  the six encode key lookups cost about 2.4%. The issue rates a one-pass
+  rewrite at under 5% alone.
 - An `Option` payload is `skip_serializing_if = "Option::is_none"`. A
   `None` field is therefore absent from the wire.
 
@@ -75,7 +77,8 @@ serde rebuild. `fork.rs` calls the owned variant, so it copies nothing.
 - **Red (feeling).** An owned API with one caller feels thin. The clone
   path gives each current caller a gain, so the API is not dead weight.
 - **Black (risk).** A lost or plaintext payload is the worst outcome. Each
-  row in §0.4 except row 7 has a test.
+  row in §0.4 except rows 7 and 9 has a test. Row 9 is a callgrind
+  measurement, not a test.
 - **Yellow (benefit).** Each append is cheaper, and no caller changes.
   A caller that owns its event can skip the copy.
 - **Green (new ideas).** Pass owned events from the executor to the store
