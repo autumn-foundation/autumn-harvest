@@ -320,7 +320,10 @@ impl Candidate {
 
     /// The names that identify this candidate in a failure text (issue
     /// #2376): the label, both digests, each route and each model id.
-    fn identities(&self) -> Vec<String> {
+    ///
+    /// `task` is the recorded task under the overlay. A candidate with no
+    /// model of its own keeps the route of `task`, so that route counts too.
+    fn identities(&self, task: &AgentTask) -> Vec<String> {
         let mut names = vec![self.digest(), self.overlay.digest()];
         names.extend(self.label.clone());
         let routes: BTreeSet<&String> = self
@@ -330,6 +333,7 @@ impl Candidate {
             .chain(&self.route)
             .chain(&self.admitted)
             .chain(self.agent_models.values())
+            .chain(&task.model)
             .collect();
         let mut ids = vec![self.harness.model(None).ok()];
         for route in routes {

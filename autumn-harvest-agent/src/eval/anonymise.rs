@@ -23,7 +23,8 @@
 //!
 //! A failure text comes from the harness or the provider, so it can name a
 //! model. Each run end error and each report error replaces every identity
-//! of every candidate in the pool with [`REDACTED`]. An identity is a label,
+//! of every candidate in the pool with [`REDACTED`]. The source end gets the
+//! same treatment. An identity is a label,
 //! a digest, a route or a model id. Only a whole name is replaced. A name
 //! ends at a character that is not a letter, a digit, `-` or `_`. So a
 //! short route, such as `a`, also replaces that word.
@@ -48,6 +49,7 @@ use super::{
     Verdict, run,
 };
 use crate::transcript::hex;
+use crate::types::AgentTask;
 
 /// The least number of hex digits in an id.
 pub const MIN_ID_DIGITS: usize = 12;
@@ -187,9 +189,15 @@ pub async fn compare_anonymised(
     let digests: Vec<String> = candidates.iter().map(Candidate::digest).collect();
     let source = recording.run_id.as_deref().unwrap_or_default();
     let slots = pool_slots(seed, source, &digests)?;
+    let identities = identities(candidates, &tasks);
     let scrub = Scrub {
-        identities: identities(candidates),
+        identities: identities.clone(),
         clear_run_ids: recording.run_id.is_none(),
+    };
+    // The source run id is the same for each candidate, so it stays.
+    let source_scrub = Scrub {
+        identities,
+        clear_run_ids: false,
     };
 
     let mut jobs: Vec<_> = candidates
@@ -215,7 +223,7 @@ pub async fn compare_anonymised(
         entries.push(anonymise(evaluation, id, &scrub));
     }
     let pool = AnonymisedPool {
-        recorded: recording.end,
+        recorded: scrub_end(recording.end, &source_scrub),
         candidates: entries,
     };
     Ok(AnonymisedReport {
@@ -235,11 +243,13 @@ struct Scrub {
 }
 
 /// Every identity of every candidate, longest first, so that a longer name
-/// is replaced before a name inside it.
-fn identities(candidates: &[Candidate]) -> Vec<String> {
+/// is replaced before a name inside it. `tasks` holds the task of each
+/// candidate under its overlay, in input order.
+fn identities(candidates: &[Candidate], tasks: &[AgentTask]) -> Vec<String> {
     let mut names: Vec<String> = candidates
         .iter()
-        .flat_map(Candidate::identities)
+        .zip(tasks)
+        .flat_map(|(candidate, task)| candidate.identities(task))
         .filter(|name| !name.is_empty())
         .collect();
     names.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));

@@ -2725,3 +2725,79 @@ async fn a_failure_text_names_no_candidate() {
         assert!(!report.text.contains(identity), "{}", report.text);
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_source_end_names_no_candidate() {
+    // The source fails on a provider error that names the model of a.
+    let (_dir, db) = fresh_db();
+    let harness = AgentHarness::new(ScriptedModel::new(vec![Err(AgentError::new(
+        ErrorKind::Provider,
+        "model-alpha-id-3c1e refused the request",
+    ))]));
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &AgentTask::new("look it up")).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Failed(_)), "{state:?}");
+    let source = rt.load_history(exec).unwrap();
+    let (candidates, _) = pool_of(&[alpha(), beta()]);
+
+    let report = compare_anonymised(&source, &candidates, 3).await.unwrap();
+
+    let RunEnd::Failed(error) = &report.pool.recorded else {
+        panic!("the source failed: {:#?}", report.pool.recorded);
+    };
+    assert!(error.contains("[redacted] refused the request"), "{error}");
+    assert!(
+        !report.text.contains("model-alpha-id-3c1e"),
+        "{}",
+        report.text
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inherited_route_and_its_model_id_are_redacted() {
+    // The source names its model. Each candidate keeps that route, and its
+    // own harness maps the route to a model that fails with its id.
+    let route = "route-shared-3d5a";
+    let source = {
+        let (_dir, db) = fresh_db();
+        let recorder = Arc::new(Recorder::default());
+        let model = ScriptedModel::new(one_lookup_replies());
+        let harness = AgentHarness::new(ScriptedModel::new(Vec::new()))
+            .model_named(route, model)
+            .tool(recorded_tool("lookup", ToolEffect::ReadOnly, &recorder));
+        let mut rt = runtime(&db, harness);
+        let task = AgentTask::new("look it up").model(route);
+        let exec = sqlite::start(&mut rt, &task).unwrap();
+        let state = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+        rt.load_history(exec).unwrap()
+    };
+    let failing = |id: &'static str, label: &str| {
+        let model = ScriptedModel::named(
+            id,
+            vec![Err(AgentError::new(
+                ErrorKind::Provider,
+                format!("{id} on {route} is down"),
+            ))],
+        );
+        let harness = AgentHarness::new(ScriptedModel::new(Vec::new())).model_named(route, model);
+        Candidate::new(harness).label(label)
+    };
+    let pool = [
+        failing("model-one-id-5c2e", "label-one-6b"),
+        failing("model-two-id-7d4f", "label-two-8e"),
+    ];
+
+    let report = compare_anonymised(&source, &pool, 6).await.unwrap();
+
+    for entry in &report.pool.candidates {
+        let RunEnd::Failed(error) = &entry.end else {
+            panic!("the candidate fails: {entry:#?}");
+        };
+        assert_eq!(error.matches("[redacted]").count(), 2, "{error}");
+    }
+    for identity in ["model-one-id-5c2e", "model-two-id-7d4f", route] {
+        assert!(!report.text.contains(identity), "{}", report.text);
+    }
+}
