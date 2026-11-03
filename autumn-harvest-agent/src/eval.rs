@@ -15,6 +15,12 @@
 //! [`Evaluation::overlay_digest`] names the overlay. [`compare`] checks both
 //! overlays before the first model call.
 //!
+//! # A pool
+//!
+//! [`compare_anonymised`] runs any number of candidates on one source (issue
+//! #2376). It gives each one an opaque [`CandidateId`] in a seeded order. Its
+//! text names no model, overlay or label. See [`AnonymisedReport`].
+//!
 //! # How it runs
 //!
 //! The harness runs the real `agent_loop` body in the in-memory test engine.
@@ -124,6 +130,13 @@ use crate::policy::ToolDecision;
 use crate::types::{
     AgentReport, AgentTask, ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome,
 };
+mod anonymise;
+
+pub use anonymise::{
+    AnonymisedEvaluation, AnonymisedPool, AnonymisedReport, CandidateId, CandidateRef,
+    compare_anonymised,
+};
+
 use crate::workflow::{
     WORKFLOW_NAME, agent_deliver_info, agent_discover_peers_info, agent_loop_info,
     agent_memory_snapshot_info, agent_model_turn_info, agent_tool_call_info,
@@ -171,6 +184,8 @@ pub struct Candidate {
     /// The model of every turn, from [`model`](Self::model).
     route: Option<String>,
     agent_models: BTreeMap<String, String>,
+    /// The operator label, from [`label`](Self::label).
+    label: Option<String>,
 }
 
 impl Candidate {
@@ -202,7 +217,55 @@ impl Candidate {
             max_turns: None,
             route: None,
             agent_models: BTreeMap::new(),
+            label: None,
         }
+    }
+
+    /// Name this candidate with an operator `label`, such as an overlay
+    /// version id (issue #2376).
+    ///
+    /// The label enters [`digest`](Self::digest). An anonymised report keeps
+    /// it in its key only, never in its text. It is not a flow label. An
+    /// overlay or a shorthand keeps it.
+    #[must_use]
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// The SHA-256 digest of what this candidate sets, as `sha256:<hex>`
+    /// (issue #2376).
+    ///
+    /// It reads the overlay digest, the label, the routes, the admitted
+    /// models, the ceilings and the turn cap. It cannot read the harness.
+    /// So two candidates that differ only in the harness have equal digests.
+    /// Give each one a [`label`](Self::label).
+    #[must_use]
+    pub fn digest(&self) -> String {
+        use sha2::{Digest as _, Sha256};
+
+        #[derive(Serialize)]
+        struct Identity<'a> {
+            overlay: String,
+            label: Option<&'a str>,
+            route: Option<&'a str>,
+            agent_models: &'a BTreeMap<String, String>,
+            admitted: &'a BTreeSet<String>,
+            ceilings: Option<&'a Ceilings>,
+            max_turns: Option<usize>,
+        }
+        let identity = Identity {
+            overlay: self.overlay.digest(),
+            label: self.label.as_deref(),
+            route: self.route.as_deref(),
+            agent_models: &self.agent_models,
+            admitted: &self.admitted,
+            ceilings: self.ceilings.as_ref(),
+            max_turns: self.max_turns,
+        };
+        // The identity holds strings, numbers and maps only, so it encodes.
+        let bytes = serde_json::to_vec(&identity).unwrap_or_default();
+        format!("sha256:{}", crate::transcript::hex(&Sha256::digest(&bytes)))
     }
 
     /// Run the source under `overlay` (issue #2375).
@@ -353,6 +416,16 @@ pub enum EvalError {
     /// or a tool that the harness does not hold (issue #2375).
     #[error("the candidate overlay is refused: {0}")]
     Overlay(#[from] OverlayError),
+    /// Two candidates of an anonymised pool have equal digests, so they
+    /// would get one id (issue #2376). The values are their input indices.
+    /// Give each one a [`Candidate::label`].
+    #[error("candidates {first} and {second} have equal digests; give each a label")]
+    DuplicateCandidate {
+        /// The input index of the first candidate.
+        first: usize,
+        /// The input index of the second candidate.
+        second: usize,
+    },
 }
 
 /// One side of a comparison.
@@ -1749,6 +1822,39 @@ mod tests {
         // The parts that an overlay cannot set keep the recorded values.
         assert_eq!(task.input, source.input);
         assert_eq!(task.run_id_source, source.run_id_source);
+    }
+
+    #[test]
+    fn each_set_part_changes_the_candidate_digest() {
+        let base = || Candidate::new(lookup_harness());
+        let plain = base().digest();
+        assert!(plain.starts_with("sha256:"), "{plain}");
+        assert_eq!(
+            plain,
+            base().digest(),
+            "equal candidates have equal digests"
+        );
+        let named = lookup_harness().model_named("m", Arc::new(NoModel));
+        let variants = [
+            base().label("v7").digest(),
+            base().system_prompt("Be kind.").digest(),
+            Candidate::new(named).model("m").digest(),
+            base().agent_model("planner", "m").digest(),
+            base().max_turns(3).digest(),
+            base()
+                .ceilings(Ceilings::from_profile(&AgentProfile::new("x")))
+                .digest(),
+        ];
+        let distinct: BTreeSet<&String> = variants.iter().chain([&plain]).collect();
+        assert_eq!(distinct.len(), variants.len() + 1, "{variants:?}");
+        assert_eq!(
+            base()
+                .label("v7")
+                .overlay(ProfileOverlay::default())
+                .digest(),
+            base().label("v7").digest(),
+            "an overlay keeps the label"
+        );
     }
 
     #[test]

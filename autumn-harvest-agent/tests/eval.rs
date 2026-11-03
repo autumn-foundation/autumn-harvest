@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::eval::{
-    Candidate, DEFAULT_EXTRA_TURNS, Divergence, EvalError, Evaluation, RunEnd, Side, Verdict,
-    compare, evaluate,
+    AnonymisedReport, Candidate, CandidateId, DEFAULT_EXTRA_TURNS, Divergence, EvalError,
+    Evaluation, RunEnd, Side, Verdict, compare, compare_anonymised, evaluate,
 };
 use autumn_harvest_agent::followup::FOLLOWUP_TOOL;
 use autumn_harvest_agent::memory::{MEMORY_TOOL, MemoryStore};
@@ -2231,4 +2231,329 @@ async fn compare_refuses_a_bad_second_overlay_before_any_model_call() {
         (0, 0),
         "the first candidate never runs"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Anonymised comparison reports (issue #2376)
+// ---------------------------------------------------------------------------
+
+/// The identity of one pool member. Each string is distinct, so a search
+/// of the text finds only a real leak.
+struct Member {
+    route: &'static str,
+    model_id: &'static str,
+    label: &'static str,
+    overlay: ProfileOverlay,
+    replies: fn() -> Vec<Reply>,
+}
+
+/// The replies of a model that looks up another key.
+fn other_key_replies() -> Vec<Reply> {
+    vec![
+        calls(&[("c9", "lookup", json!({"q": "y"}))], 5),
+        answer("done", 5),
+    ]
+}
+
+fn alpha() -> Member {
+    Member {
+        route: "route-alpha-7f3a",
+        model_id: "model-alpha-id-3c1e",
+        label: "triage-overlay-v7",
+        overlay: ProfileOverlay {
+            system: Some("Be terse.".to_owned()),
+            ..ProfileOverlay::default()
+        },
+        replies: one_lookup_replies,
+    }
+}
+
+fn beta() -> Member {
+    Member {
+        route: "route-beta-9d2b",
+        model_id: "model-beta-id-6a4f",
+        label: "triage-overlay-v8",
+        overlay: ProfileOverlay {
+            tool_guidance: [("lookup".to_owned(), "Ask for y.".to_owned())].into(),
+            ..ProfileOverlay::default()
+        },
+        replies: other_key_replies,
+    }
+}
+
+fn gamma() -> Member {
+    Member {
+        route: "route-gamma-1e8c",
+        model_id: "model-gamma-id-2b7d",
+        label: "triage-overlay-v9",
+        overlay: ProfileOverlay {
+            max_steps: Some(2),
+            ..ProfileOverlay::default()
+        },
+        replies: one_lookup_replies,
+    }
+}
+
+/// Fresh candidates for `members`, in order, on one shared harness. Each
+/// member has its own named model. Returns the models in the same order.
+fn pool_of(members: &[Member]) -> (Vec<Candidate>, Vec<Arc<ScriptedModel>>) {
+    let recorder = Arc::new(Recorder::default());
+    let mut harness = AgentHarness::new(ScriptedModel::new(Vec::new())).tool(recorded_tool(
+        "lookup",
+        ToolEffect::ReadOnly,
+        &recorder,
+    ));
+    let mut models = Vec::new();
+    for member in members {
+        let model = ScriptedModel::named(member.model_id, (member.replies)());
+        harness = harness.model_named(member.route, model.clone());
+        models.push(model);
+    }
+    let harness = Arc::new(harness);
+    let candidates = members
+        .iter()
+        .map(|member| {
+            Candidate::shared(Arc::clone(&harness))
+                .overlay(member.overlay.clone())
+                .model(member.route)
+                .label(member.label)
+        })
+        .collect();
+    (candidates, models)
+}
+
+/// The id of the candidate at input `index`.
+fn id_of(report: &AnonymisedReport, index: usize) -> CandidateId {
+    report
+        .key
+        .iter()
+        .find(|(_, entry)| entry.index == index)
+        .map(|(id, _)| id.clone())
+        .expect("the key names every input")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_anonymised_text_names_no_candidate() {
+    let source = one_lookup().await;
+    let members = [alpha(), beta()];
+    let (candidates, _) = pool_of(&members);
+
+    let report = compare_anonymised(&source, &candidates, 7).await.unwrap();
+
+    let pool_json = serde_json::to_string(&report.pool).unwrap();
+    for (member, candidate) in members.iter().zip(&candidates) {
+        let identities = [
+            member.route.to_owned(),
+            member.model_id.to_owned(),
+            member.label.to_owned(),
+            member.overlay.digest(),
+            candidate.digest(),
+        ];
+        for identity in &identities {
+            assert!(
+                !report.text.contains(identity.as_str()),
+                "the text names {identity}:\n{}",
+                report.text
+            );
+            assert!(
+                !pool_json.contains(identity.as_str()),
+                "the pool names {identity}"
+            );
+        }
+    }
+    for id in report.key.keys() {
+        assert!(report.text.contains(id.as_str()), "the text shows {id}");
+    }
+    assert!(report.text.contains("diverged"), "{}", report.text);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_input_order_changes_no_id_and_no_text() {
+    let source = one_lookup().await;
+    let (ab, _) = pool_of(&[alpha(), beta()]);
+    let (ba, _) = pool_of(&[beta(), alpha()]);
+
+    let forward = compare_anonymised(&source, &ab, 11).await.unwrap();
+    let backward = compare_anonymised(&source, &ba, 11).await.unwrap();
+
+    assert_eq!(id_of(&forward, 0), id_of(&backward, 1), "a keeps its id");
+    assert_eq!(id_of(&forward, 1), id_of(&backward, 0), "b keeps its id");
+    assert_eq!(forward.text, backward.text);
+    assert_eq!(forward.pool, backward.pool);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_seed_reorders_the_pool() {
+    let source = one_lookup().await;
+    let mut orders = std::collections::BTreeSet::new();
+    for seed in 0..64 {
+        let (candidates, _) = pool_of(&[alpha(), beta()]);
+        let report = compare_anonymised(&source, &candidates, seed)
+            .await
+            .unwrap();
+        let order: Vec<usize> = report
+            .pool
+            .candidates
+            .iter()
+            .map(|entry| report.key[&entry.id].index)
+            .collect();
+        orders.insert(order);
+        if orders.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(orders.len(), 2, "some seed puts b before a: {orders:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_key_resolves_every_id_once() {
+    let source = one_lookup().await;
+    let members = [alpha(), beta(), gamma()];
+    let (candidates, _) = pool_of(&members);
+
+    let report = compare_anonymised(&source, &candidates, 3).await.unwrap();
+
+    assert_eq!(report.key.len(), 3, "no id repeats");
+    let pool_ids: std::collections::BTreeSet<&CandidateId> = report
+        .pool
+        .candidates
+        .iter()
+        .map(|entry| &entry.id)
+        .collect();
+    assert_eq!(pool_ids.len(), 3);
+    assert!(pool_ids.iter().copied().eq(report.key.keys()));
+    for (id, entry) in &report.key {
+        assert!(id.as_str().starts_with("c-"), "{id}");
+        assert!(id.as_str().len() >= 14, "{id}");
+        assert_eq!(report.resolve(id), Some(entry));
+        let member = &members[entry.index];
+        assert_eq!(entry.digest, candidates[entry.index].digest());
+        assert_eq!(entry.label.as_deref(), Some(member.label));
+        let mut overlay = member.overlay.clone();
+        overlay.model = Some(member.route.to_owned());
+        assert_eq!(entry.overlay_digest, overlay.digest());
+    }
+    let mut indices: Vec<usize> = report.key.values().map(|entry| entry.index).collect();
+    indices.sort_unstable();
+    assert_eq!(indices, [0, 1, 2]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_report_keeps_every_field_that_is_not_an_identity() {
+    let source = one_lookup().await;
+    let members = [alpha(), beta()];
+    let (candidates, _) = pool_of(&members);
+    let report = compare_anonymised(&source, &candidates, 5).await.unwrap();
+
+    for (id, entry) in &report.key {
+        let (fresh, _) = pool_of(&members);
+        let alone = evaluate(&source, &fresh[entry.index]).await.unwrap();
+        // An exhaustive destructure. A new field of `Evaluation` fails the
+        // build here until the test classifies it.
+        let Evaluation {
+            turns,
+            first_divergence,
+            recorded,
+            candidate,
+            end_diverged,
+            replayed_tool_calls,
+            stubbed_tool_calls,
+            turn_cap_reached,
+            overlay_digest: _,
+        } = alone;
+        let kept = report
+            .pool
+            .candidates
+            .iter()
+            .find(|kept| &kept.id == id)
+            .expect("the pool holds every id");
+        assert_eq!(kept.turns, turns);
+        assert_eq!(kept.first_divergence, first_divergence);
+        assert_eq!(report.pool.recorded, recorded);
+        assert_eq!(kept.end, candidate);
+        assert_eq!(kept.end_diverged, end_diverged);
+        assert_eq!(kept.replayed_tool_calls, replayed_tool_calls);
+        assert_eq!(kept.stubbed_tool_calls, stubbed_tool_calls);
+        assert_eq!(kept.turn_cap_reached, turn_cap_reached);
+    }
+    let beta = report
+        .pool
+        .candidates
+        .iter()
+        .find(|kept| report.key[&kept.id].index == 1)
+        .expect("b is in the pool");
+    assert_eq!(beta.first_divergence, Some(0), "b diverges");
+    assert_eq!(beta.stubbed_tool_calls, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn equal_candidates_are_refused_before_any_model_call() {
+    let source = one_lookup().await;
+    let model = ScriptedModel::new(one_lookup_replies());
+    let (harness, _) = candidate(model.clone());
+    let harness = Arc::new(harness);
+    let pool = [
+        Candidate::shared(Arc::clone(&harness)),
+        Candidate::shared(Arc::clone(&harness)).label("other"),
+        Candidate::shared(harness),
+    ];
+
+    let result = compare_anonymised(&source, &pool, 1).await;
+
+    assert!(
+        matches!(
+            result,
+            Err(EvalError::DuplicateCandidate {
+                first: 0,
+                second: 2
+            })
+        ),
+        "{result:?}"
+    );
+    assert_eq!(model.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_overlay_in_the_pool_is_refused_before_any_model_call() {
+    let source = one_lookup().await;
+    let (mut candidates, models) = pool_of(&[alpha(), beta()]);
+    candidates.push(
+        candidates[0]
+            .clone()
+            .label("wide")
+            .ceilings(Ceilings {
+                max_steps: Some(1),
+                max_total_tokens: None,
+                max_output_tokens: None,
+                models: std::collections::BTreeSet::new(),
+                allow_clear_read_only: false,
+            })
+            .overlay(ProfileOverlay {
+                max_steps: Some(9_999),
+                ..ProfileOverlay::default()
+            }),
+    );
+
+    let result = compare_anonymised(&source, &candidates, 1).await;
+
+    assert!(
+        matches!(
+            result,
+            Err(EvalError::Overlay(OverlayError::AboveCeiling { .. }))
+        ),
+        "{result:?}"
+    );
+    let calls: Vec<usize> = models.iter().map(|model| model.calls()).collect();
+    assert_eq!(calls, [0, 0]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_pool_reports_no_candidate() {
+    let source = one_lookup().await;
+
+    let report = compare_anonymised(&source, &[], 1).await.unwrap();
+
+    assert_eq!(report.key.len(), 0);
+    assert_eq!(report.pool.candidates, Vec::new());
+    assert!(matches!(report.pool.recorded, RunEnd::Completed(_)));
 }

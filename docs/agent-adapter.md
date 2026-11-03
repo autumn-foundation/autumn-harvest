@@ -973,6 +973,39 @@ run the evaluation on a multi-thread Tokio runtime.
 The evaluation is an in-memory fork at the first event. The database fork of
 issue #2000 is a separate feature.
 
+### Anonymise a pool
+
+`eval::compare_anonymised` runs any number of candidates on one source
+(issue #2376). A model that reads the report to pick a candidate then sees
+no label and no input order. Harness² does the same before selection.
+
+```rust,ignore
+use autumn_harvest_agent::eval::{Candidate, compare_anonymised};
+
+let pool = [
+    Candidate::new(harness_a).overlay(v7).label("triage@v7"),
+    Candidate::new(harness_b).overlay(v8).label("triage@v8"),
+];
+let report = compare_anonymised(&history, &pool, seed).await?;
+let pick = ask_a_model(&report.text).await?;          // a CandidateId
+let chosen = &pool[report.resolve(&pick).ok_or("not in the pool")?.index];
+```
+
+| Part | In an anonymised report |
+|---|---|
+| `CandidateId` | `c-` and a hex prefix of `SHA-256(seed, source run id, Candidate::digest)`. The prefix has at least 12 digits. It grows until no two ids are equal. `formal/verus/src/agent_anonymise.rs` proves the width rule. |
+| The order | The pool sorts by that hash. The input order changes no id and no text. The candidates also run in pool order. |
+| `text` | `AnonymisedPool::render`: the source end, then per id the counts, the end and each `TurnDiff` as JSON. It holds no model name, overlay digest, label or input index. |
+| `pool` | The same content as JSON. Each `AnonymisedEvaluation` keeps every field of `Evaluation` except `overlay_digest`. The recorded end is in the pool once. |
+| `key` | Each id with its `CandidateRef`: the input index, the candidate digest, the overlay digest and the label. Keep it from the reader. `AnonymisedReport` does not implement `Serialize`, so one call cannot encode it with the text. |
+| `Candidate::label` | An operator name, such as an overlay version id. It enters the digest, never the text. |
+| `Candidate::digest` | The SHA-256 of the overlay digest, the label, the routes, the ceilings and the turn cap. It cannot read the harness. |
+| Equal digests | `EvalError::DuplicateCandidate` with both input indices, before any model call. Give each candidate a label. |
+
+The text renders each model reply as written, so a reply can name its own
+model. Keep the seed from the reader, because the seed and the digests give
+the ids.
+
 ## 13. The daemon example
 
 `examples/claude-agent-daemon` speaks the Anthropic Messages API and replays
