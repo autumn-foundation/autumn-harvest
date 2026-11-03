@@ -354,7 +354,11 @@ fn ordered_candidates(
 ///
 /// Returns [`EvidenceError::BadHiddenName`] for a name inside [`MASK`].
 fn hidden_names(hidden: &BTreeSet<String>) -> Result<Vec<String>, EvidenceError> {
-    if let Some(name) = hidden.iter().find(|name| MASK.contains(name.as_str())) {
+    // An empty name hides nothing, so it skips the check.
+    if let Some(name) = hidden
+        .iter()
+        .find(|name| !name.is_empty() && MASK.contains(name.as_str()))
+    {
         return Err(EvidenceError::BadHiddenName(name.clone()));
     }
     let escaped = hidden.iter().filter_map(|name| {
@@ -1179,6 +1183,20 @@ mod tests {
             bundle.flow_labels.contains("peer"),
             "a peer signal labels the run"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_hidden_name_hides_nothing() {
+        let store = WorkspaceStore::new(
+            Arc::new(crate::workspace::InMemoryWorkspaceBlobs::default()),
+            PayloadCodecs::default(),
+        );
+        let workspace = EvidenceWorkspace::new(store, "evidence:empty", 1).hide("");
+
+        let result =
+            write_bundle(&workspace, &history("hi"), &[], &ProfileOverlay::default()).await;
+
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
