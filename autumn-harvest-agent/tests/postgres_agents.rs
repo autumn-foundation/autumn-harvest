@@ -464,6 +464,135 @@ impl Drop for OneShardRouter {
     }
 }
 
+/// A migrated database next to the one at `url`, on the same server.
+async fn second_database(url: &str) -> String {
+    let name = unique("harvest_agents_b").replace('-', "_");
+    let mut admin = AsyncPgConnection::establish(url).await.expect("connect");
+    diesel_async::SimpleAsyncConnection::batch_execute(
+        &mut admin,
+        &format!("CREATE DATABASE \"{name}\""),
+    )
+    .await
+    .expect("create the second database");
+    let (base, _old) = url.rsplit_once('/').expect("a database path");
+    let other = format!("{base}/{name}");
+    let mut conn = AsyncPgConnection::establish(&other).await.expect("connect");
+    migrate::apply_to_connection(&mut conn, &migrate::embedded())
+        .await
+        .expect("migrate");
+    other
+}
+
+/// The number of signals of `exec` in the database at `url`.
+async fn signal_rows(url: &str, exec: autumn_harvest::ExecutionId) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let mut conn = AsyncPgConnection::establish(url).await.expect("connect");
+    let row: Count = diesel_async::RunQueryDsl::get_result(
+        diesel::sql_query("SELECT count(*) AS n FROM harvest_signals WHERE workflow_exec_id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(exec.as_uuid()),
+        &mut conn,
+    )
+    .await
+    .expect("count signals");
+    row.n
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rebalanced_agent_is_reached_on_its_new_shard_and_counted_once() {
+    let (url, _container) = database().await;
+    let _restore = OneShardRouter;
+    let target_url = second_database(&url).await;
+    let (source, target) = (ShardId::new(0), ShardId::new(1));
+    let pools = ShardedDbPool::from_map(
+        BTreeMap::from([(source, pool(&url)), (target, pool(&target_url))]),
+        source,
+    );
+    // New runs land on the source. Both shards stay readable.
+    let router = ShardRouter::new(vec![source, target], vec![source], source);
+    autumn_harvest::shard::install_global_router(router.clone());
+    let queue = unique("pg-move");
+    let kind = unique("mover");
+    let mesh = unique("moving");
+    let pg = PostgresAgents::sharded(&pools, router).with_queue(&queue);
+    let id = AgentId::new(&kind, "a").unwrap();
+    let since = Utc::now();
+    {
+        let harness = AgentHarness::new(echo_model(9)).agent(AgentProfile::new(&kind).mesh(&mesh));
+        let _worker = run_worker(&url, &queue, harness, &[source]);
+        postgres::send(
+            &pg,
+            &id,
+            &AgentOp::message_with_id("hi", "m-1"),
+            Some("m-1"),
+        )
+        .await
+        .unwrap();
+        settled(&pg, &id, |state| state.segments >= 1).await;
+        // The worker stops here, so the run is quiescent for the move.
+    }
+    let exec = postgres::current_run(&pg, &id).await.unwrap().unwrap();
+    assert_eq!(exec.shard(), source);
+    let outcome = autumn_harvest::shard_rebalance::migrate_execution(
+        &pools,
+        exec,
+        source,
+        target,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            autumn_harvest::shard_rebalance::MigrationOutcome::Migrated { .. }
+        ),
+        "{outcome:?}"
+    );
+
+    // The id is kept, and the live row is on the target now.
+    assert_eq!(postgres::current_run(&pg, &id).await.unwrap(), Some(exec));
+    assert_eq!(
+        postgres::run_state(&pg, exec).await.unwrap(),
+        RunState::Running
+    );
+    assert_eq!(
+        postgres::pending_approvals(&pg, exec).await.unwrap(),
+        Vec::<String>::new()
+    );
+    let state = postgres::state(&pg, &id)
+        .await
+        .unwrap()
+        .expect("the moved state");
+    assert_eq!(state.segments, 1);
+
+    // A send after the move reaches the moved run, not the source seal.
+    let source_signals = signal_rows(&url, exec).await;
+    let target_signals = signal_rows(&target_url, exec).await;
+    let sent = postgres::send(
+        &pg,
+        &id,
+        &AgentOp::message_with_id("again", "m-2"),
+        Some("m-2"),
+    )
+    .await
+    .unwrap();
+    assert!(!sent.started_fresh, "the send found the moved run");
+    assert_eq!(sent.exec_id, exec);
+    assert_eq!(signal_rows(&target_url, exec).await, target_signals + 1);
+    assert_eq!(signal_rows(&url, exec).await, source_signals);
+
+    // Both databases hold the ledger row of the turn. It counts once.
+    let total = LedgerSpend::new(pg.clone())
+        .spent(&mesh, since)
+        .await
+        .unwrap();
+    assert_eq!(total.tokens, 9, "the moved run counts once");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sharded_target_finds_the_run_on_the_picked_shard() {
     let (url, _container) = database().await;

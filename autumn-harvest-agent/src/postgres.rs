@@ -79,6 +79,10 @@ pub struct PostgresAgents {
     groups: Vec<(DbPool, Vec<ShardId>)>,
     /// The pool of a shard that no group names.
     fallback: DbPool,
+    /// The sharded pool, for a target that `sharded` built. A lookup by
+    /// execution id follows its forwarding chain, because a rebalance moves
+    /// a run and keeps its id.
+    sharded: Option<ShardedDbPool>,
     router: ShardRouter,
     codecs: PayloadCodecs,
     queue: String,
@@ -109,6 +113,7 @@ impl PostgresAgents {
         Self {
             groups: vec![(pool.clone(), vec![shard])],
             fallback: pool,
+            sharded: None,
             router: ShardRouter::single(),
             codecs: PayloadCodecs::default(),
             queue: DEFAULT_QUEUE.to_owned(),
@@ -130,6 +135,7 @@ impl PostgresAgents {
         Self {
             groups,
             fallback: pools.pool_for(pools.default_shard()).clone(),
+            sharded: Some(pools.clone()),
             router,
             codecs: PayloadCodecs::default(),
             queue: DEFAULT_QUEUE.to_owned(),
@@ -178,9 +184,18 @@ impl PostgresAgents {
         autumn_harvest::pool::acquire_within_pool_bound(self.pool_for(shard)).await
     }
 
-    /// The shard that holds `exec`.
-    fn shard_of(&self, exec: ExecutionId) -> ShardId {
-        self.router.shard_for_execution(exec)
+    /// The shard that holds `exec` now.
+    ///
+    /// A rebalance moves a run to another database and keeps its id. The
+    /// source row becomes a forwarding seal. On a sharded target, the lookup
+    /// follows that chain. One database holds every run of a `single` target.
+    async fn shard_of(&self, exec: ExecutionId) -> HarvestResult<ShardId> {
+        match &self.sharded {
+            Some(pools) => {
+                autumn_harvest::shard_rebalance::resolve_execution_shard(pools, exec).await
+            }
+            None => Ok(self.router.shard_for_execution(exec)),
+        }
     }
 }
 
@@ -253,7 +268,7 @@ pub async fn decide(
     signal: &str,
     approval: &Approval,
 ) -> HarvestResult<()> {
-    let mut conn = pg.conn(pg.shard_of(exec)).await?;
+    let mut conn = pg.conn(pg.shard_of(exec).await?).await?;
     let payload = serde_json::to_value(approval)?;
     send_signal_idempotent_with_codecs(&mut conn, exec, signal, payload, None, &pg.codecs).await?;
     Ok(())
@@ -307,12 +322,12 @@ async fn signal(
     payload: Value,
     idempotency_key: Option<&str>,
 ) -> HarvestResult<SignalWithStartOutcome> {
-    let shard = current_run(pg, id).await?.map_or_else(
+    let shard = live_run(pg, id).await?.map_or_else(
         || {
             pg.router
                 .pick_for_new_workflow(AGENT_WORKFLOW_NAME, id.as_str())
         },
-        |exec| pg.shard_of(exec),
+        |(shard, _exec)| shard,
     );
     let mut conn = pg.conn(shard).await?;
     let params = SignalWithStartParams {
@@ -367,21 +382,41 @@ async fn signal(
 ///
 /// Returns an error when a read fails.
 pub async fn current_run(pg: &PostgresAgents, id: &AgentId) -> HarvestResult<Option<ExecutionId>> {
-    let mut best: Option<(DateTime<Utc>, ExecutionId)> = None;
+    Ok(live_run(pg, id).await?.map(|(_shard, exec)| exec))
+}
+
+/// The live run of the agent `id`, with a shard of the database that holds
+/// it.
+///
+/// A rebalance leaves a `MIGRATED` seal on the source and a `MIGRATING` copy
+/// on the target until the cutover. Neither one is the live run. The engine
+/// does not count them as terminal, so the read skips them by name.
+async fn live_run(
+    pg: &PostgresAgents,
+    id: &AgentId,
+) -> HarvestResult<Option<(ShardId, ExecutionId)>> {
+    let mut best: Option<(DateTime<Utc>, ShardId, ExecutionId)> = None;
     for shard in pg.group_shards() {
         let mut conn = pg.conn(shard).await?;
         let found =
             resolve_execution_id_by_workflow_id(&mut conn, AGENT_WORKFLOW_NAME, id.as_str())
                 .await?;
         let Some(run) = found else { continue };
-        if WorkflowResultState::from_execution_state(&run.state).is_terminal() {
+        if is_migration_copy(&run.state)
+            || WorkflowResultState::from_execution_state(&run.state).is_terminal()
+        {
             continue;
         }
-        if best.is_none_or(|(at, _exec)| run.started_at > at) {
-            best = Some((run.started_at, run.exec_id));
+        if best.is_none_or(|(at, _shard, _exec)| run.started_at > at) {
+            best = Some((run.started_at, shard, run.exec_id));
         }
     }
-    Ok(best.map(|(_at, exec)| exec))
+    Ok(best.map(|(_at, shard, exec)| (shard, exec)))
+}
+
+/// Whether `state` names a row that a rebalance left behind or staged.
+fn is_migration_copy(state: &str) -> bool {
+    matches!(state, "MIGRATED" | "MIGRATING")
 }
 
 /// The committed state of the agent `id`.
@@ -420,10 +455,10 @@ pub async fn state(pg: &PostgresAgents, id: &AgentId) -> HarvestResult<Option<Ag
     let answer = match &row.snapshot {
         ProjectedSnapshot::Erased => return Ok(None),
         ProjectedSnapshot::Offloaded | ProjectedSnapshot::Omitted => {
-            let Some(exec) = current_run(pg, id).await? else {
+            let Some((shard, exec)) = live_run(pg, id).await? else {
                 return Ok(None);
             };
-            replay_state(pg, exec).await?
+            replay_state(pg, shard, exec).await?
         }
         snapshot => snapshot.query_answer(ENTITY_STATE_QUERY),
     };
@@ -436,13 +471,17 @@ pub async fn state(pg: &PostgresAgents, id: &AgentId) -> HarvestResult<Option<Ag
 /// The longest replay that [`replay_state`] drives.
 const REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Replay the run `exec` of an agent, and answer the state query.
+/// Replay the run `exec` of an agent on `shard`, and answer the state query.
 ///
 /// The context carries the facts of the run row, as the query route sets
 /// them, so the replay takes the same path as the run. Returns `None` when
 /// the run has ended.
-async fn replay_state(pg: &PostgresAgents, exec: ExecutionId) -> HarvestResult<Option<Value>> {
-    let mut conn = pg.conn(pg.shard_of(exec)).await?;
+async fn replay_state(
+    pg: &PostgresAgents,
+    shard: ShardId,
+    exec: ExecutionId,
+) -> HarvestResult<Option<Value>> {
+    let mut conn = pg.conn(shard).await?;
     let run = load_execution(&mut conn, exec).await?;
     if WorkflowResultState::from_execution_state(&run.state).is_terminal() {
         return Ok(None);
@@ -540,7 +579,7 @@ pub enum RunState {
 ///
 /// Returns an error when the run does not exist or a read fails.
 pub async fn run_state(pg: &PostgresAgents, exec: ExecutionId) -> HarvestResult<RunState> {
-    let mut conn = pg.conn(pg.shard_of(exec)).await?;
+    let mut conn = pg.conn(pg.shard_of(exec).await?).await?;
     let run = load_execution(&mut conn, exec).await?;
     let state = match run.state.as_str() {
         "COMPLETED" => {
@@ -608,7 +647,7 @@ pub async fn pending_approvals(
     pg: &PostgresAgents,
     exec: ExecutionId,
 ) -> HarvestResult<Vec<String>> {
-    let mut conn = pg.conn(pg.shard_of(exec)).await?;
+    let mut conn = pg.conn(pg.shard_of(exec).await?).await?;
     let queued = autumn_harvest::signal::load_pending_signals(&mut conn, exec).await?;
     let history =
         autumn_harvest::store::load_history_with_codecs(&mut conn, exec, &pg.codecs).await?;
@@ -790,10 +829,10 @@ async fn signal_live(
     idempotency_key: Option<&str>,
 ) -> HarvestResult<()> {
     for _attempt in 0..SUCCESSOR_ATTEMPTS {
-        let Some(exec) = current_run(pg, id).await? else {
+        let Some((shard, _exec)) = live_run(pg, id).await? else {
             return Ok(());
         };
-        let mut conn = pg.conn(pg.shard_of(exec)).await?;
+        let mut conn = pg.conn(shard).await?;
         let outcome = resolve_and_signal_by_workflow_id_with_codecs(
             &mut conn,
             AGENT_WORKFLOW_NAME,

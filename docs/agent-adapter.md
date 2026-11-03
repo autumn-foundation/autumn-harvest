@@ -176,6 +176,10 @@ let state = postgres::wait_run(&pg, exec, limit).await?;
   and after an erasure.
 - A lookup by agent id reads each physical database once. A first send goes
   to the shard that the router picks for the id.
+- A shard rebalance moves a run and keeps its execution id. A sharded target
+  follows the forwarding chain for each call by execution id. A lookup by
+  agent id skips the `MIGRATED` seal and the `MIGRATING` copy, and so does
+  `LedgerSpend`, so a moved run counts once.
 - A steer or an interrupt that races a continue-as-new resolves the
   successor run and goes again.
 

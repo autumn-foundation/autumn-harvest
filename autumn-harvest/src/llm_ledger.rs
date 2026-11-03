@@ -357,6 +357,11 @@ pub struct LedgerTotal {
 /// The sum over each ledger row of a run whose search attributes contain
 /// `attrs`. Only rows recorded at or after `since` count.
 ///
+/// A shard rebalance copies a run and its ledger rows to the target. The
+/// source keeps a `MIGRATED` seal, and the target holds a `MIGRATING` copy
+/// until the cutover. Neither copy is the live run, so the sum skips both. A
+/// moved run then counts once, on its current shard.
+///
 /// The SUM is numeric in Postgres. `LEAST` caps it at the largest `bigint`
 /// before the cast, so a huge total saturates and does not fail the read.
 #[cfg(feature = "db")]
@@ -367,7 +372,8 @@ const SPEND_FOR_SEARCH_ATTRS_SQL: &str = "\
                AS cost_usd_micros \
       FROM harvest_llm_ledger l \
       JOIN harvest_workflow_executions e ON e.id = l.workflow_exec_id \
-     WHERE e.search_attrs @> $1 AND l.recorded_at >= $2";
+     WHERE e.search_attrs @> $1 AND l.recorded_at >= $2 \
+       AND e.state NOT IN ('MIGRATED', 'MIGRATING')";
 
 #[cfg(feature = "db")]
 #[derive(diesel::QueryableByName)]
