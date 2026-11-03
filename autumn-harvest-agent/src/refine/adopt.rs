@@ -99,8 +99,9 @@ pub struct Adoption {
 ///   [`RefineStatus::AwaitingApproval`]. A wait on the cap writes a
 ///   `harvest.audit` tracing event that names the cap.
 ///
-/// A retry after a lost reply finds its own `auto:<run>` version active,
-/// and reports it as adopted.
+/// A retry after a lost reply finds its own `auto:<run>` version, and
+/// reports it as adopted with no move. The version need not be active, so
+/// a retry never undoes a rollback or a later adoption.
 ///
 /// # Errors
 ///
@@ -113,17 +114,20 @@ pub async fn adopt(
     run: ExecutionId,
     policy: &RefinePolicy,
 ) -> Result<Adoption, OverlayStoreError> {
-    let active = store.active(kind).await?;
-    if let Some(stored) = &active
-        && stored.provenance() == &Provenance::auto(run)
-        && stored.overlay() == candidate
+    let own = Provenance::auto(run);
+    if let Some(done) = store
+        .list(kind)
+        .await?
+        .iter()
+        .find(|stored| stored.provenance() == &own)
     {
         return Ok(Adoption {
             refine_status: RefineStatus::AutoAdopted,
-            version: Some(stored.version()),
+            version: Some(done.version()),
             wait: None,
         });
     }
+    let active = store.active(kind).await?;
     let expected = active.as_ref().map(StoredOverlay::version);
     let wait = match store
         .auto_adopt(kind, candidate, run, expected, policy)

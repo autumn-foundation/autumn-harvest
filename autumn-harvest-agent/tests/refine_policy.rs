@@ -288,6 +288,42 @@ async fn an_unchanged_candidate_stores_nothing() {
     assert_eq!(store.list(KIND).await.expect("list").len(), 1);
 }
 
+/// A retry after a lost reply never moves the pointer again. An operator
+/// rolled the adoption back before the retry, and the rollback holds.
+#[tokio::test]
+async fn a_retry_never_undoes_a_rollback() {
+    let store = store();
+    let allow = operator_sets(
+        &store,
+        json!({"auto_adopt": {"parts": ["system"], "max_per_day": "unlimited"}}),
+    )
+    .await;
+    let v1 = store
+        .put(KIND, &system("Old."), Provenance::operator("ops"))
+        .await
+        .expect("v1");
+    store
+        .activate(KIND, v1, None, Provenance::operator("ops"))
+        .await
+        .expect("v1");
+    let run = ExecutionId::new();
+    let first = adopt(&store, KIND, &system("New."), run, &allow)
+        .await
+        .expect("adopt");
+    assert_eq!(first.refine_status, RefineStatus::AutoAdopted);
+    store
+        .rollback(KIND, Provenance::operator("oncall"))
+        .await
+        .expect("rollback");
+    let retry = adopt(&store, KIND, &system("New."), run, &allow)
+        .await
+        .expect("retry");
+    assert_eq!(retry, first, "the retry reports the first adoption");
+    let active = store.active(KIND).await.expect("active").expect("set");
+    assert_eq!(active.version(), v1, "the rollback holds");
+    assert_eq!(store.list(KIND).await.expect("list").len(), 2);
+}
+
 /// A run keeps the gate that it read, but a narrowing in the store reaches
 /// the adoption at once. The stricter policy decides.
 #[tokio::test]

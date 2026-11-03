@@ -291,11 +291,15 @@ fn put(policy: &mut Value, path: &[&str], value: Value) {
 ///
 /// # Errors
 ///
-/// Returns [`CliError::InvalidInput`] for a flag value that does not
-/// parse.
+/// Returns [`CliError::InvalidInput`] for a policy that is not a JSON
+/// object, and for a flag value that does not parse. A non-object is never
+/// read as the defaults, so a bad file cannot reset the policy.
 pub fn patched(mut policy: Value, set: &PolicySet) -> Result<Value, CliError> {
     if !policy.is_object() {
-        policy = json!({});
+        return Err(CliError::InvalidInput(format!(
+            "the refine policy must be a JSON object, not {}",
+            kind_of(&policy)
+        )));
     }
     let mut changes: Vec<(&[&str], Value)> = Vec::new();
     if let Some(parts) = &set.auto_adopt_parts {
@@ -345,6 +349,18 @@ pub fn patched(mut policy: Value, set: &PolicySet) -> Result<Value, CliError> {
     Ok(policy)
 }
 
+/// The JSON type of `value`, for an error message.
+const fn kind_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 /// An `--expected` revision: a number, or `none`.
 fn revision(text: &str) -> Result<Option<u64>, CliError> {
     if text.trim().eq_ignore_ascii_case("none") {
@@ -389,7 +405,10 @@ pub async fn run_policy_set(cli: &Cli, kind: &str, set: &PolicySet) -> Result<()
                 CliError::InvalidInput(format!("{} is not JSON: {error}", file.display()))
             })?
         }
-        None => current.get("policy").cloned().unwrap_or_else(|| json!({})),
+        None => current
+            .get("policy")
+            .cloned()
+            .ok_or_else(|| CliError::InvalidInput("the policy answer has no policy".to_owned()))?,
     };
     let expected = match &set.expected {
         Some(text) => revision(text)?,
@@ -597,6 +616,19 @@ mod tests {
         assert_eq!(revision_of(&json!({"revision": null})).ok(), Some(None));
         assert_eq!(revision_of(&json!({"revision": 2})).ok(), Some(Some(2)));
         assert!(revision_of(&json!({})).is_err());
+    }
+
+    #[test]
+    fn set_refuses_a_policy_that_is_not_an_object() {
+        for bad in [json!(null), json!([]), json!("policy"), json!(3)] {
+            assert!(
+                matches!(
+                    patched(bad.clone(), &PolicySet::default()),
+                    Err(CliError::InvalidInput(_))
+                ),
+                "{bad} is not refused"
+            );
+        }
     }
 
     fn patched_or_panic(policy: Value, set: &PolicySet) -> Value {
