@@ -881,7 +881,8 @@ A recorded outcome answers a call with the same step, tool name and
 arguments. A candidate call that equals the recorded call at the same turn
 and position, of the same agent, takes the recorded call id. Approval signal names hold the call
 id, so the recorded approvals stay valid. Any other call gets a new `eval_`
-id, so no recorded approval can release it. The harness sends again only an
+id, so no recorded approval can release it. That id holds the turn and the
+position, not the provider id. The harness sends again only an
 approval for a wait that the source opened, when it arrived before the
 deadline. An approval sent before its wait opened leaves no deadline timer,
 so the harness drops it, and the candidate times out at that wait.
@@ -924,7 +925,7 @@ println!("{}", evaluation.overlay_digest);
 | `skills` | The skill list in the system prompt and the `load_skill` tool. A `load_skill` call is a tool call like any other: a recorded outcome answers it, or it gets the stub. |
 | `Candidate::system_prompt` | A one-part overlay that sets `system`. |
 | `Candidate::model` | A one-part overlay that sets `model`. The ceilings admit the model, because the operator names it. The harness and the source mandate must still hold it, or the evaluation fails before any call. Every turn asks it. |
-| `Candidate::agent_model` | A route for one agent. It is not an overlay part. |
+| `Candidate::agent_model` | A route for one agent. It is not an overlay part. A route to a model that the harness does not hold gives `OverlayError::UnknownModel` before any call (issue #2376). |
 | `Candidate::overlay` | Replaces the parts and the route that a shorthand set before it. It keeps the ceilings and the agent routes. |
 | `Evaluation::overlay_digest` | `ProfileOverlay::digest`: the SHA-256 of the JSON of the overlay. Equal overlays have equal digests. The digest leaves out the ceilings and the agent routes. |
 
@@ -995,16 +996,18 @@ let chosen = &pool[report.resolve(&pick).ok_or("not in the pool")?.index];
 |---|---|
 | `CandidateId` | `c-` and a hex prefix of `SHA-256(seed, source run id, Candidate::digest)`. The prefix has at least 12 digits. It grows until no two ids are equal. `formal/verus/src/agent_anonymise.rs` proves the width rule. |
 | The order | The pool sorts by that hash. The input order changes no id and no text. The candidates also run in pool order. |
-| `text` | `AnonymisedPool::render`: the source end, then per id the counts, the end and each `TurnDiff` as JSON. It holds no model name, overlay digest, label or input index. |
+| `text` | `AnonymisedPool::render`: the source end, then per id the counts, the end, each turn verdict, and each turn decision as JSON. It holds no model name, overlay digest, label or input index. |
 | `pool` | The same content as JSON. Each `AnonymisedEvaluation` keeps every field of `Evaluation` except `overlay_digest`. The recorded end is in the pool once. |
-| `key` | Each id with its `CandidateRef`: the input index, the candidate digest, the overlay digest and the label. Keep it from the reader. `AnonymisedReport` does not implement `Serialize`, so one call cannot encode it with the text. |
+| `key` | Each id with its `CandidateRef`: the input index, the candidate digest, the overlay digest and the label. Keep it from the reader. `AnonymisedReport` does not implement `Serialize`, and its `Debug` form hides the key. |
+| A failure text | Each run end error and report error replaces each label, digest, route and model id of the pool with `[redacted]`. Only a whole name is replaced, so a short route such as `a` also replaces that word. |
 | `Candidate::label` | An operator name, such as an overlay version id. It enters the digest, never the text. |
-| `Candidate::digest` | The SHA-256 of the overlay digest, the label, the routes, the ceilings and the turn cap. It cannot read the harness. |
+| `Candidate::digest` | The SHA-256 of the overlay digest, the label, the routes, the admitted models, the ceilings and the turn cap. It cannot read the harness. |
 | Equal digests | `EvalError::DuplicateCandidate` with both input indices, before any model call. Give each candidate a label. |
 
 The text renders each model reply as written, so a reply can name its own
-model. Keep the seed from the reader, because the seed and the digests give
-the ids.
+model. The pool keeps the token usage, and a tokenizer can show a model
+family. A policy reason can show a harness setting, such as a timeout. Keep
+the seed from the reader, because the seed and the digests give the ids.
 
 ## 13. The daemon example
 

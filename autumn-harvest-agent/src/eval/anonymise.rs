@@ -15,13 +15,25 @@
 //! no two ids are equal. `formal/verus/src/agent_anonymise.rs` proves the
 //! width rule.
 //!
-//! The source run id is the execution id of the source, unless its task
-//! names another run id source.
+//! The source run id is the run id of the first recorded model request. It
+//! is the execution id of the source, unless its task names another run id
+//! source. A source with no model turn uses the empty string.
+//!
+//! # Failure texts
+//!
+//! A failure text comes from the harness or the provider, so it can name a
+//! model. Each run end error and each report error replaces every identity
+//! of every candidate in the pool with [`REDACTED`]. An identity is a label,
+//! a digest, a route or a model id. Only a whole name is replaced. A name
+//! ends at a character that is not a letter, a digit, `-` or `_`. So a
+//! short route, such as `a`, also replaces that word.
 //!
 //! # Limits
 //!
 //! The text renders each model reply as written. A reply can name its own
-//! model. Keep the seed from the reader, because the seed and the digests
+//! model. Token usage stays in the pool, and the tokenizer can show a model
+//! family. A harness setting, such as a policy timeout, can show in a policy
+//! reason. Keep the seed from the reader, because the seed and the digests
 //! give the ids.
 
 use std::collections::BTreeMap;
@@ -45,6 +57,9 @@ const KEY_DIGITS: usize = 64;
 
 /// The domain tag of a sort key. A change of the key layout changes it.
 const KEY_DOMAIN: &[u8] = b"autumn-harvest/eval/anonymised/v1\0";
+
+/// The text that replaces an identity in a failure text.
+pub const REDACTED: &str = "[redacted]";
 
 /// The opaque id of one candidate in a pool, such as `c-3f9a1b2c4d5e`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -116,8 +131,9 @@ pub struct AnonymisedPool {
 ///
 /// Give [`text`](Self::text) or [`pool`](Self::pool) to the reader. Keep
 /// [`key`](Self::key) apart. The type does not implement `Serialize`, so
-/// one call cannot encode the text with the key.
-#[derive(Debug, Clone, PartialEq)]
+/// one call cannot encode the text with the key. Its `Debug` form shows
+/// the number of keys only.
+#[derive(Clone, PartialEq)]
 pub struct AnonymisedReport {
     /// The rendered pool. It equals [`AnonymisedPool::render`].
     pub text: String,
@@ -125,6 +141,16 @@ pub struct AnonymisedReport {
     pub pool: AnonymisedPool,
     /// Each id and its candidate.
     pub key: BTreeMap<CandidateId, CandidateRef>,
+}
+
+impl fmt::Debug for AnonymisedReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnonymisedReport")
+            .field("text", &self.text)
+            .field("pool", &self.pool)
+            .field("key", &format_args!("<{} ids, hidden>", self.key.len()))
+            .finish()
+    }
 }
 
 impl AnonymisedReport {
@@ -139,8 +165,9 @@ impl AnonymisedReport {
 /// report them under opaque ids in an order seeded by `seed` (issue #2376).
 ///
 /// Each overlay passes [`overlay::apply`](crate::agent::overlay::apply)
-/// before the first model call. So do the ids. The candidates then run one
-/// after the other, in pool order. An empty slice gives an empty pool.
+/// before the first model call. The pool also checks the ids for a
+/// duplicate first. The candidates then run one after the other, in pool
+/// order. An empty slice gives an empty pool.
 ///
 /// # Errors
 ///
@@ -160,6 +187,10 @@ pub async fn compare_anonymised(
     let digests: Vec<String> = candidates.iter().map(Candidate::digest).collect();
     let source = recording.run_id.as_deref().unwrap_or_default();
     let slots = pool_slots(seed, source, &digests)?;
+    let scrub = Scrub {
+        identities: identities(candidates),
+        clear_run_ids: recording.run_id.is_none(),
+    };
 
     let mut jobs: Vec<_> = candidates
         .iter()
@@ -181,7 +212,7 @@ pub async fn compare_anonymised(
                 label: candidate.label.clone(),
             },
         );
-        entries.push(anonymise(evaluation, id));
+        entries.push(anonymise(evaluation, id, &scrub));
     }
     let pool = AnonymisedPool {
         recorded: recording.end,
@@ -194,8 +225,31 @@ pub async fn compare_anonymised(
     })
 }
 
-/// `evaluation` under `id`, with every identity field left out.
-fn anonymise(evaluation: Evaluation, id: CandidateId) -> AnonymisedEvaluation {
+/// What [`anonymise`] removes from the values that it keeps.
+struct Scrub {
+    /// Each identity of the pool, longest first.
+    identities: Vec<String>,
+    /// The source has no run id. The candidate report then holds the run id
+    /// of the test engine, which changes on each run.
+    clear_run_ids: bool,
+}
+
+/// Every identity of every candidate, longest first, so that a longer name
+/// is replaced before a name inside it.
+fn identities(candidates: &[Candidate]) -> Vec<String> {
+    let mut names: Vec<String> = candidates
+        .iter()
+        .flat_map(Candidate::identities)
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    names.dedup();
+    names
+}
+
+/// `evaluation` under `id`, with every identity field left out, and with
+/// the run end scrubbed.
+fn anonymise(evaluation: Evaluation, id: CandidateId, scrub: &Scrub) -> AnonymisedEvaluation {
     // An exhaustive destructure. A new field of `Evaluation` fails the build
     // here until this function keeps it or names it an identity.
     let Evaluation {
@@ -215,12 +269,56 @@ fn anonymise(evaluation: Evaluation, id: CandidateId) -> AnonymisedEvaluation {
         id,
         turns,
         first_divergence,
-        end: candidate,
+        end: scrub_end(candidate, scrub),
         end_diverged,
         replayed_tool_calls,
         stubbed_tool_calls,
         turn_cap_reached,
     }
+}
+
+/// `end` with each identity of `scrub` replaced in its error texts.
+fn scrub_end(end: RunEnd, scrub: &Scrub) -> RunEnd {
+    match end {
+        RunEnd::Completed(mut report) => {
+            report.error = report.error.map(|error| redact(&error, &scrub.identities));
+            if scrub.clear_run_ids {
+                report.run_id = None;
+                for delegation in &mut report.delegations {
+                    delegation.run_id = None;
+                }
+            }
+            RunEnd::Completed(report)
+        }
+        RunEnd::Failed(error) => RunEnd::Failed(redact(&error, &scrub.identities)),
+    }
+}
+
+/// `text` with each whole occurrence of each of `names` replaced by
+/// [`REDACTED`].
+fn redact(text: &str, names: &[String]) -> String {
+    names
+        .iter()
+        .fold(text.to_owned(), |text, name| redact_one(&text, name))
+}
+
+/// `text` with each whole occurrence of `name` replaced by [`REDACTED`].
+fn redact_one(text: &str, name: &str) -> String {
+    let is_name_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    for (at, _) in text.match_indices(name) {
+        let before = text[..at].chars().next_back();
+        let after = text[at + name.len()..].chars().next();
+        if before.is_some_and(is_name_char) || after.is_some_and(is_name_char) {
+            continue;
+        }
+        out.push_str(&text[from..at]);
+        out.push_str(REDACTED);
+        from = at + name.len();
+    }
+    out.push_str(&text[from..]);
+    out
 }
 
 /// The pool rank and the id of each candidate digest, by input index.
@@ -497,6 +595,25 @@ mod tests {
     fn a_key_parts_list_gives_one_input_only() {
         assert_ne!(sort_key(0, "ab", "c"), sort_key(0, "a", "bc"));
         assert_eq!(sort_key(0, "a", "b").len(), KEY_DIGITS);
+    }
+
+    #[test]
+    fn only_a_whole_name_is_redacted() {
+        let names = vec!["gpt-x-mini".to_owned(), "gpt-x".to_owned()];
+        assert_eq!(
+            redact("no model \"gpt-x\"; gpt-x-mini failed; gpt-x2 ok", &names),
+            "no model \"[redacted]\"; [redacted] failed; gpt-x2 ok"
+        );
+        assert_eq!(
+            redact("a plan for a", &["a".to_owned()]),
+            "[redacted] plan for [redacted]"
+        );
+        assert_eq!(
+            redact("abc", &[String::new()]),
+            "abc",
+            "an empty name changes nothing"
+        );
+        assert_eq!(redact("é-x é", &["é".to_owned()]), "é-x [redacted]");
     }
 
     #[test]

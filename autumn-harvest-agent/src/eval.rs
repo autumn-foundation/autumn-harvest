@@ -318,6 +318,32 @@ impl Candidate {
         self
     }
 
+    /// The names that identify this candidate in a failure text (issue
+    /// #2376): the label, both digests, each route and each model id.
+    fn identities(&self) -> Vec<String> {
+        let mut names = vec![self.digest(), self.overlay.digest()];
+        names.extend(self.label.clone());
+        let routes: BTreeSet<&String> = self
+            .overlay
+            .model
+            .iter()
+            .chain(&self.route)
+            .chain(&self.admitted)
+            .chain(self.agent_models.values())
+            .collect();
+        let mut ids = vec![self.harness.model(None).ok()];
+        for route in routes {
+            names.push(route.clone());
+            ids.push(self.harness.model(Some(route)).ok());
+        }
+        names.extend(
+            ids.into_iter()
+                .flatten()
+                .filter_map(|model| model.model_id().map(str::to_owned)),
+        );
+        names
+    }
+
     /// The model name that this candidate sets for a turn of `agent`, if any.
     fn model_for(&self, agent: Option<&str>) -> Option<&String> {
         agent
@@ -359,6 +385,17 @@ impl Candidate {
             .unwrap_or_else(|| Ceilings::from_profile(&source));
         ceilings.models.extend(self.admitted.iter().cloned());
         let profile = overlay::apply(&source, &self.overlay, &ceilings, self.harness.as_ref())?;
+        // A route to a missing model would fail the run with an error that
+        // names the model. So it is refused first, as an overlay model is.
+        if let Some(model) = self
+            .agent_models
+            .values()
+            .find(|model| !self.harness.has_model(model))
+        {
+            return Err(OverlayError::UnknownModel {
+                model: model.clone(),
+            });
+        }
         let mut task = task.clone();
         task.system = profile.system;
         task.max_steps = profile.max_steps;
@@ -1357,7 +1394,9 @@ fn align_call_ids(
                 id.clone_from(&original.id);
             }
             _ => {
-                let base = format!("{EVAL_ID_PREFIX}{index}_{position}_{id}");
+                // The provider id stays out, because its form names the
+                // vendor (issue #2376).
+                let base = format!("{EVAL_ID_PREFIX}{index}_{position}");
                 let mut fresh = base.clone();
                 let mut suffix = 0_u32;
                 while taken.contains(&fresh) {
@@ -1991,18 +2030,17 @@ mod tests {
         let mut turn = turn_of(&[call("c1", "a", json!(1)), call("c2", "b", json!(3))]);
         align_call_ids(&mut turn.content, &recorded, &HashSet::new(), 4);
         let ids: Vec<String> = turn.calls().into_iter().map(|call| call.id).collect();
-        assert_eq!(ids, vec!["r1".to_owned(), "eval_4_1_c2".to_owned()]);
+        assert_eq!(ids, vec!["r1".to_owned(), "eval_4_1".to_owned()]);
     }
 
     #[test]
     fn a_new_id_never_equals_a_recorded_id() {
-        let recorded = vec![call("eval_0_0_c1", "a", json!(1))];
+        let recorded = vec![call("eval_0_0", "a", json!(1))];
         let taken: HashSet<String> = recorded.iter().map(|call| call.id.clone()).collect();
         let mut turn = turn_of(&[call("c1", "b", json!(2))]);
         align_call_ids(&mut turn.content, &recorded, &taken, 0);
         let id = turn.calls()[0].id.clone();
-        assert!(id.starts_with("eval_0_0_c1"), "{id}");
-        assert_ne!(id, "eval_0_0_c1");
+        assert_eq!(id, "eval_0_0_1", "the provider id stays out");
     }
 
     #[test]

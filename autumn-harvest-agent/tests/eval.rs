@@ -975,7 +975,7 @@ async fn the_candidate_policy_sees_the_recorded_call_ids() {
 
     assert_eq!(
         *policy.0.lock().unwrap(),
-        vec!["c1".to_owned(), "eval_0_1_n2".to_owned()],
+        vec!["c1".to_owned(), "eval_0_1".to_owned()],
         "the policy sees the ids that the transcript records"
     );
 }
@@ -2245,6 +2245,9 @@ struct Member {
     label: &'static str,
     overlay: ProfileOverlay,
     replies: fn() -> Vec<Reply>,
+    /// A route for the `planner` agent, with its model id.
+    planner: Option<(&'static str, &'static str)>,
+    max_turns: Option<usize>,
 }
 
 /// The replies of a model that looks up another key.
@@ -2265,6 +2268,8 @@ fn alpha() -> Member {
             ..ProfileOverlay::default()
         },
         replies: one_lookup_replies,
+        planner: Some(("route-planner-5e0c", "model-planner-id-8f2a")),
+        max_turns: None,
     }
 }
 
@@ -2278,6 +2283,8 @@ fn beta() -> Member {
             ..ProfileOverlay::default()
         },
         replies: other_key_replies,
+        planner: None,
+        max_turns: None,
     }
 }
 
@@ -2291,6 +2298,21 @@ fn gamma() -> Member {
             ..ProfileOverlay::default()
         },
         replies: one_lookup_replies,
+        planner: None,
+        max_turns: None,
+    }
+}
+
+/// A member that the turn cap stops after one turn, so its end diverges.
+fn delta() -> Member {
+    Member {
+        route: "route-delta-4c6e",
+        model_id: "model-delta-id-0d9b",
+        label: "triage-overlay-v10",
+        overlay: ProfileOverlay::default(),
+        replies: one_lookup_replies,
+        planner: None,
+        max_turns: Some(1),
     }
 }
 
@@ -2307,16 +2329,26 @@ fn pool_of(members: &[Member]) -> (Vec<Candidate>, Vec<Arc<ScriptedModel>>) {
     for member in members {
         let model = ScriptedModel::named(member.model_id, (member.replies)());
         harness = harness.model_named(member.route, model.clone());
+        if let Some((route, id)) = member.planner {
+            harness = harness.model_named(route, ScriptedModel::named(id, Vec::new()));
+        }
         models.push(model);
     }
     let harness = Arc::new(harness);
     let candidates = members
         .iter()
         .map(|member| {
-            Candidate::shared(Arc::clone(&harness))
+            let mut candidate = Candidate::shared(Arc::clone(&harness))
                 .overlay(member.overlay.clone())
                 .model(member.route)
-                .label(member.label)
+                .label(member.label);
+            if let Some((route, _)) = member.planner {
+                candidate = candidate.agent_model("planner", route);
+            }
+            if let Some(max_turns) = member.max_turns {
+                candidate = candidate.max_turns(max_turns);
+            }
+            candidate
         })
         .collect();
     (candidates, models)
@@ -2341,14 +2373,24 @@ async fn the_anonymised_text_names_no_candidate() {
     let report = compare_anonymised(&source, &candidates, 7).await.unwrap();
 
     let pool_json = serde_json::to_string(&report.pool).unwrap();
+    let debug = format!("{report:?}");
     for (member, candidate) in members.iter().zip(&candidates) {
-        let identities = [
+        let mut overlay = member.overlay.clone();
+        overlay.model = Some(member.route.to_owned());
+        let mut identities = vec![
             member.route.to_owned(),
             member.model_id.to_owned(),
             member.label.to_owned(),
             member.overlay.digest(),
+            overlay.digest(),
             candidate.digest(),
         ];
+        if let Some((route, id)) = member.planner {
+            identities.extend([route.to_owned(), id.to_owned()]);
+        }
+        for entry in report.key.values() {
+            identities.push(entry.overlay_digest.clone());
+        }
         for identity in &identities {
             assert!(
                 !report.text.contains(identity.as_str()),
@@ -2358,6 +2400,10 @@ async fn the_anonymised_text_names_no_candidate() {
             assert!(
                 !pool_json.contains(identity.as_str()),
                 "the pool names {identity}"
+            );
+            assert!(
+                !debug.contains(identity.as_str()),
+                "the debug form names {identity}"
             );
         }
     }
@@ -2441,7 +2487,7 @@ async fn the_key_resolves_every_id_once() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_report_keeps_every_field_that_is_not_an_identity() {
     let source = one_lookup().await;
-    let members = [alpha(), beta()];
+    let members = [alpha(), beta(), delta()];
     let (candidates, _) = pool_of(&members);
     let report = compare_anonymised(&source, &candidates, 5).await.unwrap();
 
@@ -2484,6 +2530,27 @@ async fn the_report_keeps_every_field_that_is_not_an_identity() {
         .expect("b is in the pool");
     assert_eq!(beta.first_divergence, Some(0), "b diverges");
     assert_eq!(beta.stubbed_tool_calls, 1);
+    let capped = report
+        .pool
+        .candidates
+        .iter()
+        .find(|kept| report.key[&kept.id].index == 2)
+        .expect("d is in the pool");
+    assert!(capped.turn_cap_reached, "{capped:#?}");
+    assert!(
+        capped.end_diverged,
+        "a capped run fails, the source completes"
+    );
+    assert!(
+        report.text.contains("- Turn cap reached: yes"),
+        "{}",
+        report.text
+    );
+    assert!(
+        report.text.contains("- End diverged: yes"),
+        "{}",
+        report.text
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2556,4 +2623,105 @@ async fn an_empty_pool_reports_no_candidate() {
     assert_eq!(report.key.len(), 0);
     assert_eq!(report.pool.candidates, Vec::new());
     assert!(matches!(report.pool.recorded, RunEnd::Completed(_)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_candidates_run_in_pool_order() {
+    let source = one_lookup().await;
+    // One shared model. The candidate that runs first takes the first two
+    // replies, so a run in input order would change the text.
+    let pool = |labels: [&str; 2]| {
+        let mut replies = one_lookup_replies();
+        replies.extend(other_key_replies());
+        let model = ScriptedModel::new(replies);
+        let harness = Arc::new(candidate(model.clone()).0);
+        let pool = labels.map(|label| Candidate::shared(Arc::clone(&harness)).label(label));
+        (pool, model)
+    };
+    let (forward, one) = pool(["label-only-one-1a", "label-only-two-2b"]);
+    let (backward, two) = pool(["label-only-two-2b", "label-only-one-1a"]);
+
+    let a = compare_anonymised(&source, &forward, 4).await.unwrap();
+    let b = compare_anonymised(&source, &backward, 4).await.unwrap();
+
+    assert_eq!(a.text, b.text);
+    assert_eq!(a.pool, b.pool);
+    assert_eq!((one.calls(), two.calls()), (4, 4));
+    assert_eq!(a.key.len(), 2, "a label alone tells two candidates apart");
+    for label in ["label-only-one-1a", "label-only-two-2b"] {
+        assert!(!a.text.contains(label), "{}", a.text);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_single_candidate_gets_a_short_id() {
+    let source = one_lookup().await;
+    let (candidates, models) = pool_of(&[alpha()]);
+
+    let report = compare_anonymised(&source, &candidates, 0).await.unwrap();
+
+    let [entry] = report.pool.candidates.as_slice() else {
+        panic!("one entry: {:#?}", report.pool);
+    };
+    assert_eq!(entry.id.as_str().len(), 2 + 12, "{}", entry.id);
+    assert_eq!(report.resolve(&entry.id).map(|r| r.index), Some(0));
+    assert!(!entry.end_diverged);
+    assert_eq!(models[0].calls(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_agent_route_is_refused_before_any_model_call() {
+    let source = one_lookup().await;
+    let (candidates, models) = pool_of(&[alpha(), beta()]);
+    let routed = candidates[1]
+        .clone()
+        .agent_model("planner", "route-missing-7b1f");
+
+    let alone = evaluate(&source, &routed).await;
+    let pooled = compare_anonymised(&source, &[candidates[0].clone(), routed], 1).await;
+
+    for result in [alone.map(|_| ()), pooled.map(|_| ())] {
+        let Err(EvalError::Overlay(OverlayError::UnknownModel { model })) = result else {
+            panic!("the route is refused: {result:?}");
+        };
+        assert_eq!(model, "route-missing-7b1f");
+    }
+    let calls: Vec<usize> = models.iter().map(|model| model.calls()).collect();
+    assert_eq!(calls, [0, 0]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failure_text_names_no_candidate() {
+    let source = one_lookup().await;
+    let mut member = alpha();
+    member.replies = || {
+        vec![Err(AgentError::new(
+            ErrorKind::Provider,
+            "404: model model-alpha-id-3c1e on route-alpha-7f3a (triage-overlay-v7) not found",
+        ))]
+    };
+    let (candidates, _) = pool_of(&[member, beta()]);
+
+    let report = compare_anonymised(&source, &candidates, 2).await.unwrap();
+
+    let failed = report
+        .pool
+        .candidates
+        .iter()
+        .find(|kept| report.key[&kept.id].index == 0)
+        .expect("a is in the pool");
+    let RunEnd::Failed(error) = &failed.end else {
+        panic!("the provider error fails the run: {failed:#?}");
+    };
+    assert!(
+        error.contains("404: model [redacted] on [redacted] ([redacted]) not found"),
+        "{error}"
+    );
+    for identity in [
+        "model-alpha-id-3c1e",
+        "route-alpha-7f3a",
+        "triage-overlay-v7",
+    ] {
+        assert!(!report.text.contains(identity), "{}", report.text);
+    }
 }
