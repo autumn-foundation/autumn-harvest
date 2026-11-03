@@ -56,3 +56,10 @@ kind = ["read"]
 tables = ["harvest_api_tokens"]
 measured = "unmeasured"
 
+
+["SqliteAuthStore::purge_audit_before"]
+driver = "per_tick"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"

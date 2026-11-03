@@ -1,7 +1,8 @@
 //! OIDC login round trip against a local mock identity provider (issue #1978).
 //!
 //! Harvest runs behind a real autumn-web session layer, and each test
-//! carries the session cookie like a browser does. No database is needed.
+//! carries the session cookie like a browser does. The tests need no
+//! database.
 //!
 //! The shared checks live in `support/oidc_contract.rs`. The SQLite suite
 //! runs them on a SQLite app (issue #2469). The tests at the end of this
@@ -60,6 +61,11 @@ impl OidcBackend for Standalone {
 
     fn serves_vantage(&self) -> bool {
         true
+    }
+
+    /// The standalone mount here has no storage pool.
+    fn has_token_store(&self) -> bool {
+        false
     }
 }
 

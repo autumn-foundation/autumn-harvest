@@ -28,6 +28,19 @@ The Postgres default build does not change. The design record is
   `custom_roles` and `oidc_login` run them on Postgres. The `auth_parity`
   module of `tests/sqlite_plugin.rs` runs them on a SQLite app. CI's
   `sqlite-plugin` job turns on `oidc`.
-- **No new `WorkflowEvent` variant. No Postgres migration.** The SQLite
-  tables are created when the store opens the file.
+- **One connection per call on Postgres.** An `AuthSession` holds one
+  connection, so a lookup or a change and its audit row share it. The
+  token layer gives it back before the handler runs (#1827).
+- **Two writers on one file.** The store reads on a read-only connection.
+  Each `SqliteRuntime` transaction now begins `IMMEDIATE`. The runtime and
+  the store then wait for each other on the busy timeout, and neither fails
+  with `SQLITE_BUSY`. The store opens before the driver starts.
+- **Audit retention.** The store honours `audit_retention_days`, at boot
+  and after each 256 audit writes.
+- **Tenant routes.** The stack wraps the `/tenants/{key}` routes inside the
+  nest, with one shared rate limiter. Each layer sees the core route. The
+  authorizer sees `{key}` as the tenant, and a header that names another
+  tenant is a `400`.
+- **No new `WorkflowEvent` variant. No Postgres migration.** The store
+  creates the SQLite tables when it opens the file.
 - **Limits.** The workflow routes on SQLite write no audit row yet.

@@ -79,6 +79,10 @@ fn boot(profile: &str) -> Fixture {
 /// Boot an app on a fresh fleet. Each tenant in `open` is open before the
 /// plugin starts.
 fn boot_with(profile: &str, mode: &str, open: &[&str]) -> Fixture {
+    boot_plugin(profile, mode, open, plugin())
+}
+
+fn boot_plugin(profile: &str, mode: &str, open: &[&str], plugin: HarvestPlugin) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let mut config = AutumnConfig::default();
     let url = format!("sqlite://{}", dir.path().join("control.db").display());
@@ -112,7 +116,7 @@ fn boot_with(profile: &str, mode: &str, open: &[&str]) -> Fixture {
         .profile(profile)
         .with_db(control)
         .with_fleet(fleet.clone())
-        .plugin(plugin())
+        .plugin(plugin)
         .build();
     Fixture { dir, fleet, client }
 }
@@ -520,5 +524,108 @@ async fn a_tenant_ready_probe_reads_the_tenant_file() {
     assert_eq!(tenant["database_reachable"], true);
 
     std::fs::rename(&moved, &control).unwrap();
+    fx.fleet.close_all().await;
+}
+
+// ── Auth on the tenant routes (issue #2469) ─────────────────────────────────
+
+/// A tenant route keeps the class of its core route. A read token reads a
+/// tenant, and gets `403` on a tenant mutation.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_token_reads_a_tenant_and_cannot_mutate_it() {
+    let fx = boot_plugin("dev", "tenant", &[], plugin().enable_api_tokens());
+    provision(&fx.fleet, &["acme"]).await;
+    let minted = fx
+        .client
+        .post("/harvest/admin/tokens")
+        .json(&json!({ "name": "reader", "scope": "read" }))
+        .send()
+        .await;
+    minted.assert_status(201);
+    let secret = minted.json::<Value>()["secret"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let bearer = format!("Bearer {secret}");
+
+    let read = fx
+        .client
+        .get("/harvest/tenants/acme/workflows")
+        .header("authorization", &bearer)
+        .send()
+        .await;
+    read.assert_ok();
+    let start = fx
+        .client
+        .post("/harvest/tenants/acme/workflows/tenant_flow/start")
+        .header("authorization", &bearer)
+        .json(&json!({ "input": false }))
+        .send()
+        .await;
+    start.assert_status(403);
+    fx.fleet.close_all().await;
+}
+
+/// Denies the tenant `blocked` and the business key `secret`.
+struct Policy;
+
+impl autumn_harvest_plugin::authz::HarvestAuthorizer for Policy {
+    fn authorize<'a>(
+        &'a self,
+        request: &'a autumn_harvest_plugin::authz::AuthzRequest<'a>,
+    ) -> autumn_harvest_plugin::authz::AuthzFuture<'a> {
+        use autumn_harvest_plugin::authz::AuthzDecision;
+        let decision = if request.tenant_key == Some("blocked") {
+            AuthzDecision::deny("tenant is blocked")
+        } else if request.workflow_id == Some("secret") {
+            AuthzDecision::deny("key is secret")
+        } else {
+            AuthzDecision::Allow
+        };
+        Box::pin(std::future::ready(decision))
+    }
+}
+
+/// The authorizer sees the path tenant and the fields of a tenant start. A
+/// tenant header that names another tenant is a `400`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_authorizer_sees_the_path_tenant_and_the_start_body() {
+    let fx = boot_plugin("dev", "tenant", &[], plugin().with_authorizer(Policy));
+    provision(&fx.fleet, &["acme", "blocked"]).await;
+
+    let open = fx
+        .client
+        .get("/harvest/tenants/acme/workflows")
+        .send()
+        .await;
+    open.assert_ok();
+    let blocked = fx
+        .client
+        .get("/harvest/tenants/blocked/workflows")
+        .send()
+        .await;
+    blocked.assert_status(403);
+    let forged = fx
+        .client
+        .get("/harvest/tenants/blocked/workflows")
+        .header("x-harvest-tenant", "acme")
+        .send()
+        .await;
+    forged.assert_status(400);
+
+    let secret = fx
+        .client
+        .post("/harvest/tenants/acme/workflows/tenant_flow/start")
+        .json(&json!({ "workflow_id": "secret", "input": false }))
+        .send()
+        .await;
+    secret.assert_status(403);
+    let plain = fx
+        .client
+        .post("/harvest/tenants/acme/workflows/tenant_flow/start")
+        .json(&json!({ "workflow_id": "plain", "input": false }))
+        .send()
+        .await;
+    plain.assert_status(201);
     fx.fleet.close_all().await;
 }

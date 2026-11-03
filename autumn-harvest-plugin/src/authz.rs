@@ -72,7 +72,7 @@ use crate::api::{
     execution_id_in_path, is_form_urlencoded, match_route,
 };
 use crate::api_token::{TokenPrincipal, TokenScope};
-use crate::auth_store::AuthStore;
+use crate::auth_store::{AuthSession, AuthStore};
 
 /// Longest accepted [`HEADER_TENANT`] value, in bytes.
 pub const MAX_TENANT_KEY_LEN: usize = autumn_harvest::tenant::MAX_TENANT_LEN;
@@ -306,18 +306,41 @@ pub(crate) fn truncate(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-/// Write one `authz.deny` row to the control store.
+/// Write one `authz.deny` row in `session`.
 ///
 /// Best effort: a failed write is logged. The caller returns the deny anyway.
-pub(crate) async fn audit_deny(store: &AuthStore, deny: &DenyAudit<'_>) {
-    audit_route_event(store, OP_AUTHZ_DENY, deny).await;
+pub(crate) async fn audit_deny(session: &mut AuthSession, deny: &DenyAudit<'_>) {
+    audit_route_event(session, OP_AUTHZ_DENY, deny).await;
+}
+
+/// Write one `authz.deny` row to `store`, in a session of its own.
+pub(crate) async fn audit_deny_to(store: &AuthStore, deny: &DenyAudit<'_>) {
+    audit_route_event_to(store, OP_AUTHZ_DENY, deny).await;
+}
+
+/// Write one failed-request row for `operation` to `store`, in a session
+/// of its own. A store that cannot open a session is logged.
+pub(crate) async fn audit_route_event_to(store: &AuthStore, operation: &str, deny: &DenyAudit<'_>) {
+    match store.session().await {
+        Ok(mut session) => audit_route_event(&mut session, operation, deny).await,
+        Err(e) => tracing::error!(
+            error = %e,
+            path = %deny.path,
+            operation,
+            "harvest: no audit connection for route event"
+        ),
+    }
 }
 
 /// Write one failed-request row for `operation` to the control store.
 ///
 /// The API rate limiter (issue #1827) writes its sustained rows with this. The
 /// fields are cut to the same limits as an `authz.deny` row.
-pub(crate) async fn audit_route_event(store: &AuthStore, operation: &str, deny: &DenyAudit<'_>) {
+pub(crate) async fn audit_route_event(
+    session: &mut AuthSession,
+    operation: &str,
+    deny: &DenyAudit<'_>,
+) {
     let route = format!(
         "{} {}",
         deny.method,
@@ -338,7 +361,7 @@ pub(crate) async fn audit_route_event(store: &AuthStore, operation: &str, deny: 
         shard_id: deny.shard.map(ShardId::as_i32),
         source: deny.source,
     };
-    if let Err(e) = store.insert_audit(&record).await {
+    if let Err(e) = session.insert_audit(&record).await {
         tracing::error!(
             error = %e,
             route = %route,
@@ -971,7 +994,7 @@ pub(crate) async fn enforce_authorizer(
             shard.map_or_else(|| "-".to_string(), |s| s.as_i32().to_string()),
         );
         if let Some(store) = api_state.auth_store() {
-            audit_deny(
+            audit_deny_to(
                 &store,
                 &DenyAudit {
                     actor: &actor,

@@ -61,7 +61,7 @@ use crate::api::{
     execution_id_in_path, match_route,
 };
 use crate::api_token::TokenPrincipal;
-use crate::authz::{DenyAudit, audit_deny};
+use crate::authz::{DenyAudit, audit_deny_to};
 
 /// A tenant that the embedder's own auth layer has verified (issue #1977).
 ///
@@ -307,7 +307,7 @@ async fn audit_refusal(api_state: &HarvestApiState, fields: &AuditFields, summar
         tracing::error!("harvest: no audit store for tenant binding refusal");
         return;
     };
-    audit_deny(
+    audit_deny_to(
         &store,
         &DenyAudit {
             actor: &fields.actor,
@@ -372,6 +372,8 @@ pub(crate) async fn enforce_tenant_binding_once(
 }
 
 /// The tenant binding layer (issue #1977). See the module docs.
+// One linear pass over the contract steps reads best as one function.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn enforce_tenant_binding(
     State(api_state): State<HarvestApiState>,
     mut request: Request,

@@ -394,13 +394,31 @@ The #1802 mutation gate refuses an anonymous mutating call outside `dev`.
 "terminate_if_running"` needs harvest admin access.
 
 Tokens and audit rows live in the Harvest file, in `harvest_api_tokens` and
-`harvest_audit_log`. A trigger refuses each `UPDATE` of an audit row. The
-store has its own connection to the file. So a token check never waits for
-the driver, which runs activity bodies inline.
+`harvest_audit_log`. A trigger refuses each `UPDATE` of an audit row.
 
-These write one audit row each: a token mint and a revoke, and each deny of
-the token scope, a role, the authorizer, the tenant check and a sustained
-rate limit. `GET /admin/audit` reads them, with the Postgres filters.
+- **Reads never wait.** The store reads on a read-only connection. In WAL
+  mode a read never waits for a writer, so a token check never waits for
+  the driver, which runs activity bodies inline.
+- **Writes take turns.** The store writes on its own connection. Each
+  store write is one short statement. Each driver transaction begins
+  `IMMEDIATE`, so the driver and the store wait for each other on the busy
+  timeout. Neither fails with `SQLITE_BUSY`.
+- **Retention.** The store deletes audit rows older than
+  `audit_retention_days` (90 by default), as on Postgres. It does so at boot
+  and after each 256 audit writes. Zero, or a dry run, keeps every row.
+
+Each of these writes one audit row:
+
+- a token mint or a revoke;
+- a deny of the token scope, a role, the authorizer or the tenant check;
+- a sustained rate limit.
+
+`GET /admin/audit` reads them, with the Postgres filters.
+
+The tenant routes run the same stack, inside the `/tenants/{key}` nest. So
+each layer sees the core route, and a read token reads a tenant. The
+authorizer sees `{key}` as the tenant. A `x-harvest-tenant` header that
+names another tenant is a `400`.
 
 To seed a first `admin` token offline, as `harvest token bootstrap` does on
 Postgres, store its hash with `autumn_harvest_sqlite::SqliteAuthStore`:
@@ -461,7 +479,7 @@ limits and the status thresholds.
 directory, with no Postgres and no Docker:
 
 ```bash
-cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin
+cargo test -p autumn-harvest-plugin --features sqlite,oidc --test sqlite_plugin
 cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin_fleet
 ```
 

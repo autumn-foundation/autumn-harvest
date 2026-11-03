@@ -23,6 +23,9 @@
 
 // Local `#[derive(QueryableByName)]` row structs sit next to their query.
 #![allow(clippy::items_after_statements)]
+// A `TokenBackend` method is async for the SQLite harness. A Postgres app
+// builds at once.
+#![allow(clippy::unused_async_trait_impl)]
 
 use std::sync::Arc;
 
@@ -147,7 +150,7 @@ impl Pg {
 }
 
 impl TokenBackend for Pg {
-    fn prefix(&self) -> &str {
+    fn prefix(&self) -> &'static str {
         ""
     }
 

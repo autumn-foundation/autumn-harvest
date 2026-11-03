@@ -609,7 +609,7 @@ pub(crate) async fn audit_role_deny(
     let (actor, source, request_id) = audit_context(headers, api_state);
     let summary = format!("roles {:?} do not allow this route", join_role_list(names));
     if let Some(store) = api_state.auth_store() {
-        crate::authz::audit_deny(
+        crate::authz::audit_deny_to(
             &store,
             &crate::authz::DenyAudit {
                 actor: &actor,

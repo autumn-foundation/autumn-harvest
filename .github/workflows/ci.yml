@@ -2219,6 +2219,9 @@ jobs:
       # lane builds the crate once.
       - name: Clippy autumn-harvest-plugin (sqlite feature)
         run: cargo clippy -p autumn-harvest-plugin --features sqlite,oidc --lib --test sqlite_plugin --test sqlite_plugin_fleet --test sqlite_plugin_split -- -D warnings
+      # The same targets with no `oidc`, for the code that `oidc` turns off.
+      - name: Clippy autumn-harvest-plugin (sqlite feature, no oidc)
+        run: cargo clippy -p autumn-harvest-plugin --features sqlite --lib --test sqlite_plugin -- -D warnings
       - name: SQLite plugin unit tests
         run: "cargo test -p autumn-harvest-plugin --features sqlite,oidc --lib -- sqlite:: sqlite_split_tests state::tests"
       - name: SQLite plugin end-to-end suite

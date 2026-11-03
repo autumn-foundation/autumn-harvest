@@ -7,6 +7,9 @@
 
 // The `#[workflow]` macro reads the unused `_input` through its expansion.
 #![allow(clippy::used_underscore_binding)]
+// A `TokenBackend` method is async for the Postgres harness. The SQLite
+// store answers at once.
+#![allow(clippy::unused_async_trait_impl)]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -130,7 +133,7 @@ impl Sqlite {
 }
 
 impl TokenBackend for Sqlite {
-    fn prefix(&self) -> &str {
+    fn prefix(&self) -> &'static str {
         PREFIX
     }
 
@@ -236,8 +239,8 @@ fn give_roles(request: &mut Request, source: &Source) {
 }
 
 impl RoleBackend for Apps {
-    /// Host auth gives the roles. It is the `api_with_auth` layer, so the
-    /// app declares a boundary. The role layer still decides alone.
+    /// An app-level layer gives the roles, as host middleware does. The app
+    /// declares no boundary, as in the Postgres harness.
     fn app(&self, source: Source) -> axum::Router {
         let dir = self.dir();
         let host_auth = axum::middleware::from_fn(move |mut request: Request, next: Next| {
@@ -249,8 +252,19 @@ impl RoleBackend for Apps {
         });
         let plugin = plugin(&dir.join("app.harvest.db"))
             .with_roles(role_contract::roles())
-            .api_with_auth(role_contract::MOUNT, host_auth);
-        boot(&dir, "prod", plugin).0
+            .api(role_contract::MOUNT);
+        let client = TestApp::new()
+            .config(config(&dir))
+            .profile("prod")
+            .layer(host_auth)
+            .plugin(plugin)
+            .build();
+        client.into_router()
+    }
+
+    /// Vantage is #2468.
+    fn serves_vantage(&self) -> bool {
+        false
     }
 
     fn bare(&self) -> axum::Router {
@@ -317,6 +331,11 @@ mod oidc {
         /// Vantage is #2468.
         fn serves_vantage(&self) -> bool {
             false
+        }
+
+        /// The Harvest file holds the tokens.
+        fn has_token_store(&self) -> bool {
+            true
         }
     }
 
@@ -443,6 +462,43 @@ async fn a_role_deny_is_audited_in_the_harvest_file() {
     assert_eq!(stored.len(), 1, "{stored:?}");
     let summary = stored[0].error_summary.as_deref().unwrap_or_default();
     assert!(summary.contains("harvest-viewer"), "{summary}");
+
+    // The viewer reads the same row through the API.
+    let (status, rows) = send(
+        &app,
+        role_contract::MOUNT,
+        Call::new("GET", "/admin/audit?operation=authz.deny"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+    assert_eq!(rows[0]["id"], stored[0].id.to_string());
+}
+
+/// The read-only role of `api_with_role_auth` (issue #776) works on
+/// SQLite. A read-only session reads and gets `403` on a mutation.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_read_only_role_reads_and_cannot_mutate() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_auth = axum::middleware::from_fn(|mut request: Request, next: Next| async move {
+        let mut data = HashMap::new();
+        data.insert("role".to_owned(), "harvest_readonly".to_owned());
+        request
+            .extensions_mut()
+            .insert(Session::new_for_test("readonly".to_owned(), data));
+        next.run(request).await
+    });
+    let plugin = plugin(&dir.path().join("app.harvest.db")).api_with_role_auth(PREFIX, host_auth);
+    let (app, _handle) = boot(dir.path(), "prod", plugin);
+
+    assert_eq!(axum_get(&app, "/workflows", &[]).await, StatusCode::OK);
+    let (status, body) = send(
+        &app,
+        PREFIX,
+        Call::new("POST", "/workflows/wf/start").body(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
 /// The SQLite store keeps no run tenant, so a tenant-bound token cannot be
@@ -460,7 +516,7 @@ async fn a_tenant_bound_token_is_refused() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.to_string().contains("#2466"), "{body}");
-    assert!(backend.stored_hashes().await.is_empty());
+    assert_eq!(backend.stored_hashes().await.len(), 0, "nothing is minted");
 }
 
 /// A seeded tenant-bound token, or any verified tenant, gets `501` on every
@@ -510,8 +566,8 @@ async fn a_verified_tenant_is_refused_and_audited() {
     assert!(actors.iter().all(|a| a == &format!("token:{id}")));
 }
 
-/// A token minted on SQLite drives a run end to end, and the run has the
-/// token's actor nowhere in its payload.
+/// A token minted on SQLite starts and signals a run. A read token and an
+/// anonymous caller cannot change it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mutate_token_starts_and_signals_a_run() {
     let mut backend = Sqlite::new();
@@ -576,6 +632,7 @@ async fn the_api_rate_limit_applies() {
     for _ in 0..6 {
         statuses.push(axum_get(&app, "/workflows", &[]).await);
     }
+    assert_eq!(statuses[0], StatusCode::OK, "the first call passes");
     assert!(
         statuses.contains(&StatusCode::TOO_MANY_REQUESTS),
         "{statuses:?}"

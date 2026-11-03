@@ -766,7 +766,7 @@ fn audit_sustained(
             summary: &summary,
         };
         // The write logs its own failure.
-        let write = crate::authz::audit_route_event(&store, OP_API_RATE_LIMIT_SUSTAINED, &deny);
+        let write = crate::authz::audit_route_event_to(&store, OP_API_RATE_LIMIT_SUSTAINED, &deny);
         if tokio::time::timeout(AUDIT_WRITE_TIMEOUT, write)
             .await
             .is_err()

@@ -90,7 +90,15 @@ impl ApiState {
 }
 
 /// The SQLite management router, gated like the Postgres one.
-pub fn router(state: ApiState) -> Router<()> {
+///
+/// `auth` wraps a router in the admin-auth layer stack. It wraps the control
+/// routes and the tenant routes apart, inside the tenant nest (issue #2469).
+/// Each layer then reads the path of a core route, such as `/workflows`,
+/// not `/tenants/{key}/workflows`. So a route keeps its class, its role
+/// grant and its authorizer fields on a tenant.
+// `{tenant}` is an axum path parameter, not a format argument.
+#[allow(clippy::literal_string_with_formatting_args)]
+pub fn router(state: ApiState, auth: &dyn Fn(Router<()>) -> Router<()>) -> Router<()> {
     let gate = middleware::from_fn_with_state(
         state.flags.clone(),
         crate::api::require_mutation_auth_by_method,
@@ -99,11 +107,50 @@ pub fn router(state: ApiState) -> Router<()> {
     // The token and audit routes use the Harvest file of the control
     // Harvest, so no tenant route serves them (issue #2469).
     let admin = crate::api::auth_admin_routes(state.flags.clone());
-    routes()
-        .nest("/tenants/{tenant}", routes().layer(scope))
-        .with_state(state)
-        .merge(admin)
-        .layer(gate)
+    // The gate runs inside the stack, after the token and role layers, as on
+    // Postgres. A verified token or role then counts as a credential.
+    let control = auth(
+        routes()
+            .with_state(state.clone())
+            .merge(admin)
+            .layer(gate.clone()),
+    );
+    let tenant = auth(routes().layer(scope).with_state(state).layer(gate))
+        .layer(middleware::from_fn(bind_path_tenant));
+    // A layer of `control` does not reach the routes nested after it.
+    control.nest("/tenants/{tenant}", tenant)
+}
+
+/// Name the path tenant in the tenant header, for the authorizer (issue
+/// #2469).
+///
+/// The authorizer reads the tenant from `x-harvest-tenant`. On a tenant
+/// route the path picks the tenant, so the header must name the same one.
+/// A header that names another tenant is a `400`. With no header, the layer
+/// adds one.
+async fn bind_path_tenant(
+    Path(TenantParams { tenant }): Path<TenantParams>,
+    mut request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let header = autumn_harvest::audit::HEADER_TENANT;
+    let other = request
+        .headers()
+        .get_all(header)
+        .iter()
+        .any(|value| value.to_str().map(str::trim).ok() != Some(tenant.as_str()));
+    if other {
+        return AutumnError::bad_request_msg(format!(
+            "{header} names another tenant than the path"
+        ))
+        .into_response();
+    }
+    let Ok(value) = axum::http::HeaderValue::from_str(&tenant) else {
+        return AutumnError::bad_request_msg(format!("{header} cannot carry the path tenant"))
+            .into_response();
+    };
+    request.headers_mut().insert(header, value);
+    next.run(request).await
 }
 
 /// The `{tenant}` segment of a tenant route. The other segments are ignored.

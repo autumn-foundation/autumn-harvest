@@ -6,6 +6,8 @@
 
 // Each test binary uses a different subset of the checks.
 #![allow(dead_code)]
+// Each check runs on the test task. No future crosses a thread.
+#![allow(clippy::future_not_send)]
 
 use autumn_harvest_plugin::api_token::TokenScope;
 use autumn_harvest_plugin::roles::{
@@ -61,6 +63,8 @@ pub trait RoleBackend {
     fn app(&self, source: Source) -> axum::Router;
     /// An app with no roles and no auth boundary.
     fn bare(&self) -> axum::Router;
+    /// Whether the app serves Vantage under `/ui`.
+    fn serves_vantage(&self) -> bool;
 }
 
 /// Send one request with a `{}` JSON body.
@@ -121,7 +125,12 @@ fn at(path: &str) -> String {
 }
 
 pub async fn viewer_reads_the_api_and_vantage(backend: &impl RoleBackend) {
-    for path in ["/workflows", "/ui"] {
+    let paths: &[&str] = if backend.serves_vantage() {
+        &["/workflows", "/ui"]
+    } else {
+        &["/workflows"]
+    };
+    for path in paths {
         let out = call(
             backend.app(Source::Session(ROLE_VIEWER)),
             Method::GET,

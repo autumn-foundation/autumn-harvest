@@ -13,6 +13,8 @@
 
 // Each test binary uses a different subset of the checks.
 #![allow(dead_code)]
+// Each check runs on the test task. No future crosses a thread.
+#![allow(clippy::future_not_send)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -430,6 +432,9 @@ pub trait OidcBackend {
     fn app_with_tokens(&self, login: OidcLogin) -> axum::Router;
     /// Whether the app serves Vantage under `/ui`.
     fn serves_vantage(&self) -> bool;
+    /// Whether the app has a token store, so the token layer can look up a
+    /// token.
+    fn has_token_store(&self) -> bool;
 }
 
 // ── Checks ───────────────────────────────────────────────────────────────────
@@ -743,12 +748,15 @@ pub async fn an_api_token_bearer_passes_the_boundary_only_with_tokens_on(
     let reply = with_tokens
         .send(Method::GET, &format!("{MOUNT}/workflows"), &bearer)
         .await;
-    // With no store the token layer refuses to trust the token (`503`).
-    // With a store it finds no such token (`401`).
-    let token_layer = (reply.status == StatusCode::SERVICE_UNAVAILABLE
-        && reply.body.contains("token store unavailable"))
-        || (reply.status == StatusCode::UNAUTHORIZED && reply.body.contains("invalid api token"));
-    assert!(token_layer, "{} {}", reply.status, reply.body);
+    // With no store the token layer refuses to trust the token. With a
+    // store it finds no such token.
+    let (status, error) = if backend.has_token_store() {
+        (StatusCode::UNAUTHORIZED, "invalid api token")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "token store unavailable")
+    };
+    assert_eq!(reply.status, status, "{}", reply.body);
+    assert!(reply.body.contains(error), "{}", reply.body);
 
     let mut without = Browser::new(backend.app(login(&idp)));
     let reply = without

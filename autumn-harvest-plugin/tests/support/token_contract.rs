@@ -6,7 +6,7 @@
 //! audit route is under test on both backends.
 //!
 //! The checks cover:
-//!   - create returns the secret exactly once; only the hash is stored;
+//!   - create returns the secret exactly once; the store keeps only the hash;
 //!   - `GET /admin/tokens` returns metadata only;
 //!   - a minted `hvst_` bearer authenticates a read route;
 //!   - revocation and expiry take effect on the next request;
@@ -20,6 +20,8 @@
 
 // Each test binary uses a different subset of the checks.
 #![allow(dead_code)]
+// Each check runs on the test task. No future crosses a thread.
+#![allow(clippy::future_not_send)]
 // A trait in a test binary needs no `Send` bound on its futures.
 #![allow(async_fn_in_trait)]
 // "actor must be token:{{id}}" holds literal braces, not a format argument.
@@ -90,8 +92,11 @@ impl<'a> Call<'a> {
     }
 }
 
-/// Send `call` under `prefix`. The `x-harvest-admin` header rides along,
-/// as a host session marker would. Only a declared boundary admits it.
+/// Send `call` under `prefix`.
+///
+/// Each call also carries `x-harvest-admin: true`, as the original suite
+/// did. No Harvest code reads that header. It shows that a header never
+/// grants admin access.
 pub async fn send(app: &axum::Router, prefix: &str, call: Call<'_>) -> (StatusCode, Value) {
     let mut builder = Request::builder()
         .method(call.method)
@@ -561,7 +566,9 @@ pub async fn bootstrap_seeded_token_authenticates_identically_to_route_minted(
     assert_ne!(authed, StatusCode::UNAUTHORIZED, "seeded admin must pass");
     assert_ne!(authed, StatusCode::FORBIDDEN, "seeded admin is not read");
 
-    // A mutation by the seeded token audits as `token:{id}`.
+    // A mutation by the seeded token audits as `token:{id}`. A backend
+    // with one writer per file runs one app at a time, so ask again.
+    let boundary = backend.boundary().await;
     mint(&boundary, &prefix, "throwaway", "read", None).await;
     let throwaway_id = token_id(&boundary, &prefix, "throwaway").await;
     let (status, _) = send(

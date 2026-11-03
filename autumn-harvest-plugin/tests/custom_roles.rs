@@ -57,6 +57,10 @@ impl RoleBackend for Standalone {
             .mount(router, &api_state);
         axum::Router::new().nest(MOUNT, mounted)
     }
+
+    fn serves_vantage(&self) -> bool {
+        true
+    }
 }
 
 /// Put the roles of `source` on `request`, as host auth does.

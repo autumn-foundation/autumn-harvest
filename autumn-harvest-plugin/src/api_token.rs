@@ -492,8 +492,11 @@ pub async fn enforce_token_scope(
     let Some(store) = api_state.auth_store() else {
         return service_unavailable("harvest token store unavailable");
     };
+    let Ok(mut session) = store.session().await else {
+        return service_unavailable("harvest token store unavailable");
+    };
 
-    let token = match store.token_by_secret(&secret).await {
+    let token = match session.token_by_secret(&secret).await {
         Ok(Some(t)) => t,
         Ok(None) => return unauthorized("invalid api token"),
         Err(_) => return service_unavailable("harvest token store unavailable"),
@@ -521,7 +524,7 @@ pub async fn enforce_token_scope(
         let (_, source, request_id) = audit_context(request.headers(), &api_state);
         let actor = format!("{TOKEN_ACTOR_PREFIX}{}", token.id);
         crate::authz::audit_deny(
-            &store,
+            &mut session,
             &crate::authz::DenyAudit {
                 actor: &actor,
                 method: request.method(),
@@ -541,6 +544,11 @@ pub async fn enforce_token_scope(
         response.extensions_mut().insert(ScopeDeniedToken);
         return response;
     }
+
+    // Issue #1827: give the connection back before the handler runs. The
+    // handler takes its own, so a held one would double each request's pool
+    // use. A rate-limited request would also hold one for nothing.
+    drop(session);
 
     // AC6/D3: mark the verified principal so `require_admin` admits it.
     request.extensions_mut().insert(TokenPrincipal {
@@ -627,7 +635,10 @@ pub async fn enforce_token_scope_mcp_mutation(
     let Some(store) = api_state.auth_store() else {
         return service_unavailable("harvest token store unavailable");
     };
-    let token = match store.token_by_secret(&secret).await {
+    let Ok(mut session) = store.session().await else {
+        return service_unavailable("harvest token store unavailable");
+    };
+    let token = match session.token_by_secret(&secret).await {
         Ok(Some(t)) => t,
         Ok(None) => return unauthorized("invalid api token"),
         Err(_) => return service_unavailable("harvest token store unavailable"),
@@ -649,7 +660,7 @@ pub async fn enforce_token_scope_mcp_mutation(
         let (_, source, request_id) = audit_context(request.headers(), &api_state);
         let actor = format!("{TOKEN_ACTOR_PREFIX}{}", token.id);
         crate::authz::audit_deny(
-            &store,
+            &mut session,
             &crate::authz::DenyAudit {
                 actor: &actor,
                 method: request.method(),
@@ -675,7 +686,7 @@ pub async fn enforce_token_scope_mcp_mutation(
         let (_, source, request_id) = audit_context(request.headers(), &api_state);
         let actor = format!("{TOKEN_ACTOR_PREFIX}{}", token.id);
         crate::authz::audit_deny(
-            &store,
+            &mut session,
             &crate::authz::DenyAudit {
                 actor: &actor,
                 method: request.method(),
@@ -689,6 +700,8 @@ pub async fn enforce_token_scope_mcp_mutation(
         .await;
         return read_only_forbidden_response();
     }
+    // Give the connection back before the tool runs (issue #1827).
+    drop(session);
     next.run(request).await
 }
 

@@ -3,8 +3,8 @@
 //! Each test boots a real app through `TestApp`, with the app database and
 //! the Harvest file in a temp directory. No Postgres and no Docker run.
 //!
-//! Run it with `cargo test -p autumn-harvest-plugin --features sqlite --test
-//! sqlite_plugin`.
+//! Run it with `cargo test -p autumn-harvest-plugin --features sqlite,oidc
+//! --test sqlite_plugin`. Without `oidc`, the OIDC checks do not run.
 
 #![cfg(feature = "sqlite")]
 // The `#[workflow]` and `#[activity]` macros need an `async fn`.

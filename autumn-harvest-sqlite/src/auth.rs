@@ -8,20 +8,29 @@
 //!   #158). A trigger refuses each `UPDATE`, so a row cannot change after
 //!   its write.
 //!
-//! [`SqliteAuthStore`] opens its own connection. It can share the file of a
-//! [`SqliteRuntime`](crate::SqliteRuntime). WAL mode lets the two
-//! connections work side by side. A token check then never waits for the
-//! driver task, which runs activity bodies inline.
+//! [`SqliteAuthStore`] opens its own connections. It can share the file of
+//! a [`SqliteRuntime`](crate::SqliteRuntime):
+//!
+//! - Reads use a read-only connection. In WAL mode a read never waits for a
+//!   writer, so a token check never waits for the driver task.
+//! - Writes use a second connection. Only one connection writes at a time.
+//!   A write waits on the busy timeout while the runtime writes. Each
+//!   runtime transaction begins `IMMEDIATE`, so the runtime waits for a
+//!   store write in the same way. Each store write is one short statement.
+//!
+//! With an audit retention, the store deletes the audit rows older than it.
+//! It does so when it opens, and after each [`PURGE_EVERY`] audit writes.
 //!
 //! Each time is stored in epoch microseconds, the precision of a Postgres
 //! `timestamptz`.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use chrono::{DateTime, Utc};
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OptionalExtension as _, Row, params, params_from_iter};
+use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Row, params, params_from_iter};
 use uuid::Uuid;
 
 use crate::error::{SqliteError, SqliteResult};
@@ -80,8 +89,11 @@ const AUDIT_COLUMNS: &str = "id, occurred_at_us, actor, operation, target_type, 
 /// The most audit rows one read returns, as on Postgres.
 pub const MAX_AUDIT_PAGE: i64 = 500;
 
+/// The store deletes the expired audit rows after this many audit writes.
+pub const PURGE_EVERY: u64 = 256;
+
 /// A token to store.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NewToken<'a> {
     /// The token id.
     pub id: Uuid,
@@ -99,6 +111,19 @@ pub struct NewToken<'a> {
     pub created_by: &'a str,
     /// The tenant claim, if any.
     pub tenant: Option<&'a str>,
+}
+
+impl std::fmt::Debug for NewToken<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The hash is the lookup key, so a log line must not show it.
+        f.debug_struct("NewToken")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("token_hash", &"<redacted>")
+            .field("scope", &self.scope)
+            .field("tenant", &self.tenant)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One stored token row.
@@ -225,7 +250,14 @@ pub struct AuditFilter {
 
 /// The token and audit tables of one `SQLite` file.
 pub struct SqliteAuthStore {
+    /// The connection of each write.
     conn: Mutex<Connection>,
+    /// A read-only connection, or `None` for an in-memory store.
+    reader: Option<Mutex<Connection>>,
+    /// Audit rows older than this many days are deleted. `None` keeps them.
+    audit_retention_days: Option<i64>,
+    /// The audit writes since the last purge.
+    audit_writes: AtomicU64,
 }
 
 impl std::fmt::Debug for SqliteAuthStore {
@@ -242,7 +274,12 @@ impl SqliteAuthStore {
     /// Returns [`SqliteError::Sqlite`] if the file cannot be opened or the
     /// schema cannot be applied.
     pub fn open(path: impl AsRef<Path>) -> SqliteResult<Self> {
-        Self::prepare(Connection::open(path)?)
+        let mut store = Self::prepare(Connection::open(path.as_ref())?)?;
+        // The read connection opens after the schema exists.
+        let reader = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        reader.busy_timeout(std::time::Duration::from_secs(5))?;
+        store.reader = Some(Mutex::new(reader));
+        Ok(store)
     }
 
     /// Open a store in a new, private in-memory database.
@@ -265,13 +302,66 @@ impl SqliteAuthStore {
         conn.execute_batch(AUTH_SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            reader: None,
+            audit_retention_days: None,
+            audit_writes: AtomicU64::new(0),
         })
     }
 
-    /// Run `f` on the connection under its lock.
+    /// Keep audit rows for `days` days, as `audit_retention_days` does on
+    /// Postgres. Zero or less keeps them for ever. The store deletes the
+    /// expired rows now.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] when the first purge fails.
+    pub fn with_audit_retention_days(mut self, days: i64) -> SqliteResult<Self> {
+        self.audit_retention_days = (days > 0).then_some(days);
+        self.purge_expired_audit()?;
+        Ok(self)
+    }
+
+    /// Run `f` on the write connection under its lock.
     fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> SqliteResult<T>) -> SqliteResult<T> {
         let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         f(&conn)
+    }
+
+    /// Run `f` on the read connection under its lock. An in-memory store
+    /// has one connection only.
+    fn with_reader<T>(&self, f: impl FnOnce(&Connection) -> SqliteResult<T>) -> SqliteResult<T> {
+        let Some(reader) = &self.reader else {
+            return self.with_conn(f);
+        };
+        let conn = reader.lock().unwrap_or_else(PoisonError::into_inner);
+        f(&conn)
+    }
+
+    /// Delete the audit rows older than `cutoff`. Returns how many it
+    /// deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] when the delete fails.
+    pub fn purge_audit_before(&self, cutoff: DateTime<Utc>) -> SqliteResult<usize> {
+        self.with_conn(|conn| {
+            Ok(conn.execute(
+                "DELETE FROM harvest_audit_log WHERE occurred_at_us < ?1",
+                params![cutoff.timestamp_micros()],
+            )?)
+        })
+    }
+
+    /// Delete the audit rows that the retention no longer keeps.
+    fn purge_expired_audit(&self) -> SqliteResult<()> {
+        if let Some(days) = self.audit_retention_days {
+            let cutoff = Utc::now() - chrono::Duration::days(days);
+            let deleted = self.purge_audit_before(cutoff)?;
+            if deleted > 0 {
+                tracing::info!(deleted, days, "harvest: purged expired audit rows");
+            }
+        }
+        Ok(())
     }
 
     /// Store a new token, and return the stored row.
@@ -309,7 +399,7 @@ impl SqliteAuthStore {
     /// Returns [`SqliteError::Sqlite`] when the query fails, or
     /// [`SqliteError::Corrupt`] for a row that does not decode.
     pub fn list_tokens(&self) -> SqliteResult<Vec<StoredToken>> {
-        self.with_conn(|conn| {
+        self.with_reader(|conn| {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {TOKEN_COLUMNS} FROM harvest_api_tokens
                  ORDER BY created_at_us DESC, id DESC"
@@ -326,7 +416,7 @@ impl SqliteAuthStore {
     /// Returns [`SqliteError::Sqlite`] when the query fails, or
     /// [`SqliteError::Corrupt`] for a row that does not decode.
     pub fn token_by_hash(&self, token_hash: &str) -> SqliteResult<Option<StoredToken>> {
-        self.with_conn(|conn| token_where(conn, "token_hash = ?1", token_hash))
+        self.with_reader(|conn| token_where(conn, "token_hash = ?1", token_hash))
     }
 
     /// Revoke the token `id` at `now`. Returns `false` when the token is
@@ -392,7 +482,14 @@ impl SqliteAuthStore {
                 ],
             )?;
             Ok(id)
-        })
+        })?;
+        // A purge failure must not lose the row just written.
+        if self.audit_writes.fetch_add(1, Ordering::Relaxed) % PURGE_EVERY == PURGE_EVERY - 1
+            && let Err(error) = self.purge_expired_audit()
+        {
+            tracing::warn!(%error, "harvest: audit purge failed");
+        }
+        Ok(id)
     }
 
     /// The audit rows that match `filter`, newest first.
@@ -442,7 +539,7 @@ impl SqliteAuthStore {
             format!("WHERE {}", clauses.join(" AND "))
         };
         values.push(SqlValue::Integer(filter.limit.clamp(1, MAX_AUDIT_PAGE)));
-        self.with_conn(|conn| {
+        self.with_reader(|conn| {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {AUDIT_COLUMNS} FROM harvest_audit_log {filter_sql}
                  ORDER BY occurred_at_us DESC, id DESC LIMIT ?"
@@ -759,6 +856,57 @@ mod tests {
             })
             .unwrap();
         assert_eq!(newest[0].id, ids[2], "a v7 id breaks the tie by order");
+    }
+
+    #[test]
+    fn the_debug_form_of_a_new_token_hides_the_hash() {
+        let new = token("ci", "secret-hash", at(0));
+        assert!(!format!("{new:?}").contains("secret-hash"));
+    }
+
+    #[test]
+    fn the_retention_purges_at_open_and_after_each_batch_of_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.db");
+        let old = Utc::now() - Duration::days(10);
+        let store = SqliteAuthStore::open(&path).unwrap();
+        store.insert_audit(&audit("a", "old", old)).unwrap();
+        store.insert_audit(&audit("a", "new", Utc::now())).unwrap();
+        drop(store);
+
+        let ops = |store: &SqliteAuthStore| -> Vec<String> {
+            let filter = AuditFilter {
+                limit: 500,
+                ..AuditFilter::default()
+            };
+            let rows = store.list_audit(&filter).unwrap();
+            rows.into_iter().map(|row| row.operation).collect()
+        };
+        let kept = SqliteAuthStore::open(&path)
+            .unwrap()
+            .with_audit_retention_days(0)
+            .unwrap();
+        assert_eq!(ops(&kept).len(), 2, "zero keeps every row");
+        let store = SqliteAuthStore::open(&path)
+            .unwrap()
+            .with_audit_retention_days(7)
+            .unwrap();
+        assert_eq!(ops(&store), ["new"], "the open purges the old row");
+
+        // The write that ends a batch of `PURGE_EVERY` runs the purge.
+        for _ in 0..PURGE_EVERY - 2 {
+            store.insert_audit(&audit("a", "fill", Utc::now())).unwrap();
+        }
+        store.insert_audit(&audit("a", "late", old)).unwrap();
+        assert!(
+            ops(&store).contains(&"late".to_owned()),
+            "before the batch ends"
+        );
+        store.insert_audit(&audit("a", "end", Utc::now())).unwrap();
+        assert!(
+            !ops(&store).contains(&"late".to_owned()),
+            "the batch purges it"
+        );
     }
 
     #[test]

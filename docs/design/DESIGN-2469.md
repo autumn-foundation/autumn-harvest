@@ -16,7 +16,7 @@ against a SQLite app.
 
 - `apply_admin_auth_layers` in `api.rs` is the one place that orders the
   layers. Postgres and the standalone mount both call it.
-- Storage is reached in six places, all through `storage_pool()`:
+- These callers reach storage through `storage_pool()`:
   - the token layer looks up a token and writes `last_used_at`;
   - the token routes create, list and revoke tokens;
   - the authorizer, the role layer, the tenant binding layer and the rate
@@ -26,7 +26,8 @@ against a SQLite app.
   session. Its denies go through the role layer.
 - `SqliteRuntime` holds an exclusive lock on `<file>.lock`, not on the
   database. `SqliteOverlayLog` already opens a second connection to the
-  Harvest file. WAL mode lets the two connections work side by side.
+  Harvest file. In WAL mode a reader works beside the writer. Two writers
+  take turns on the write lock.
 - The driver runs activity bodies inline, outside any transaction. A
   command sent to the driver waits for the activity in progress.
 - The SQLite store has no run tenant. The tenant binding layer (#1977)
@@ -57,17 +58,17 @@ against a SQLite app.
 - A tenant-bound token starts a run on SQLite. The run has no tenant, so
   the token later gets `503` on its own run. Worse, a start can attach to
   a run of another tenant, because SQLite has no engine tenant check.
+- A later write changes a stored audit row.
 - A copied test passes on SQLite while its Postgres original changes.
   Option 6 does this. Option 7 does not.
 - A blocking SQLite call runs on an async worker thread and starves the
   runtime.
-- An audit row is rewritten after the fact.
 - A store that is not open yet answers as "no token". A claimed token would
   then pass through unverified.
 
 ## Six hats
 
-- **White (facts).** Six storage call sites. Two tables. Three suites:
+- **White (facts).** Eight storage call sites. Two tables. Three suites:
   `token_auth_integration`, `custom_roles` and `oidc_login`.
 - **Red (feel).** A third file is simple but surprising. The issue asks for
   the Harvest file.
@@ -102,6 +103,25 @@ against a SQLite app.
 - **Shared tests.** `tests/support/token_contract.rs`,
   `role_contract.rs` and `oidc_contract.rs` hold the test bodies. The
   Postgres suites and `tests/sqlite_plugin.rs` run them.
+
+## Review outcome
+
+A review by four agents and Codex found these issues. Each is fixed:
+
+- **Two writers.** The store writes beside the runtime. A deferred runtime
+  transaction that reads, then writes, fails with `SQLITE_BUSY_SNAPSHOT`
+  after a store write. Each runtime transaction now begins `IMMEDIATE`.
+  `a_runtime_transaction_takes_the_write_lock_at_begin` proves it.
+- **Schema race.** The store now opens before the driver starts.
+- **Lookups behind writes.** Reads now use a read-only connection.
+- **Unbounded audit table.** The store honours `audit_retention_days`.
+- **Two connections on Postgres.** A deny, a mint and a revoke took a
+  second connection for the audit row. `AuthSession` now holds one.
+- **Tenant routes.** The stack saw `/tenants/{key}/..`, so every tenant
+  route counted as a mutation, and the authorizer saw no tenant. The stack
+  now wraps the tenant routes inside the nest, and `{key}` sets the tenant
+  header. Two fleet tests prove it.
+- **`NewToken` debug output** showed the hash. It now hides it.
 
 ## Out of scope
 

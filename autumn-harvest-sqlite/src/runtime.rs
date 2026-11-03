@@ -533,7 +533,16 @@ impl SqliteRuntime {
         Ok(())
     }
 
-    fn from_connection(conn: Connection, writer_lock: Option<WriterLock>) -> SqliteResult<Self> {
+    fn from_connection(
+        mut conn: Connection,
+        writer_lock: Option<WriterLock>,
+    ) -> SqliteResult<Self> {
+        // Each transaction takes the write lock when it begins (issue #2469).
+        // A second writer, such as the auth store, can share the file. A
+        // deferred transaction that reads and then writes would fail at once
+        // with `SQLITE_BUSY` or `SQLITE_BUSY_SNAPSHOT` after a write of that
+        // writer. An immediate one waits on the busy timeout instead.
+        conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
         // A failed setup builds no runtime, so `Drop` never runs. Release the
         // lock here, or an in-memory owner row would outlive the failed open.
         if let Err(err) = Self::prepare(&conn) {
@@ -7048,5 +7057,34 @@ mod panic_strike_tests {
             rt.workflow_panic_strikes.is_empty(),
             "the cascade is forgotten"
         );
+    }
+}
+
+#[cfg(test)]
+mod transaction_behavior_tests {
+    use rusqlite::{Connection, ErrorCode};
+
+    use super::SqliteRuntime;
+
+    /// A runtime transaction takes the write lock when it begins (issue
+    /// #2469). A second writer on the file then waits for it, so the
+    /// runtime never meets `SQLITE_BUSY_SNAPSHOT` after a read.
+    #[test]
+    fn a_runtime_transaction_takes_the_write_lock_at_begin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.db");
+        let mut runtime = SqliteRuntime::open(&path).unwrap();
+        let other = Connection::open(&path).unwrap();
+        other.busy_timeout(std::time::Duration::ZERO).unwrap();
+
+        let tx = runtime.conn.transaction().unwrap();
+        let refused = other
+            .execute_batch("CREATE TABLE IF NOT EXISTS probe (x INTEGER)")
+            .unwrap_err();
+        assert_eq!(refused.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
+        tx.commit().unwrap();
+        other
+            .execute_batch("CREATE TABLE IF NOT EXISTS probe (x INTEGER)")
+            .unwrap();
     }
 }

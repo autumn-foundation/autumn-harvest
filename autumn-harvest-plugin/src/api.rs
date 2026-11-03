@@ -1394,13 +1394,15 @@ impl HarvestApiState {
     /// uses the Harvest pool.
     pub(crate) fn auth_store(&self) -> Option<crate::auth_store::AuthStore> {
         #[cfg(feature = "sqlite")]
-        if let Some(store) = self
-            .sqlite_auth_store
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
         {
-            return Some(crate::auth_store::AuthStore::Sqlite(store));
+            let store = self
+                .sqlite_auth_store
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(store) = store {
+                return Some(crate::auth_store::AuthStore::Sqlite(store));
+            }
         }
         self.storage_pool()
             .ok()
@@ -4289,8 +4291,13 @@ async fn create_token_handler(
     let Some(store) = api_state.auth_store() else {
         return no_auth_store().into_response();
     };
+    // One session, so the change and its audit row share one connection.
+    let mut session = match store.session().await {
+        Ok(session) => session,
+        Err(e) => return store_error(e).into_response(),
+    };
 
-    match store
+    match session
         .create_token(
             &body.name,
             scope,
@@ -4315,7 +4322,7 @@ async fn create_token_handler(
                 shard_id: None,
                 source: &source,
             };
-            let _ = store.insert_audit(&ar).await;
+            let _ = session.insert_audit(&ar).await;
 
             // Flatten the metadata view and attach the one-time secret.
             let mut value =
@@ -4341,7 +4348,7 @@ async fn create_token_handler(
                 shard_id: None,
                 source: &source,
             };
-            let _ = store.insert_audit(&ar).await;
+            let _ = session.insert_audit(&ar).await;
             // Do NOT surface the raw DB error text (a unique-violation `DETAIL`
             // echoes the row) into the HTTP response; the real error is captured
             // in the audit `error_summary` above. Return a clean generic 500.
@@ -4362,7 +4369,12 @@ async fn list_tokens_handler(
     let Some(store) = api_state.auth_store() else {
         return no_auth_store().into_response();
     };
-    match store.list_tokens().await {
+    // One session, so the change and its audit row share one connection.
+    let mut session = match store.session().await {
+        Ok(session) => session,
+        Err(e) => return store_error(e).into_response(),
+    };
+    match session.list_tokens().await {
         Ok(views) => (StatusCode::OK, Json(views)).into_response(),
         Err(e) => store_error(e).into_response(),
     }
@@ -4396,9 +4408,14 @@ async fn revoke_token_handler(
     let Some(store) = api_state.auth_store() else {
         return no_auth_store().into_response();
     };
+    // One session, so the change and its audit row share one connection.
+    let mut session = match store.session().await {
+        Ok(session) => session,
+        Err(e) => return store_error(e).into_response(),
+    };
 
     let id_str = id.to_string();
-    match store.revoke_token(id).await {
+    match session.revoke_token(id).await {
         Ok(revoked) => {
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -4413,7 +4430,7 @@ async fn revoke_token_handler(
                 shard_id: None,
                 source: &source,
             };
-            let _ = store.insert_audit(&ar).await;
+            let _ = session.insert_audit(&ar).await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "revoked": revoked })),
@@ -6134,6 +6151,23 @@ pub(crate) fn apply_admin_auth_layers(
     api_state: &HarvestApiState,
     layers: &AdminAuthLayers,
 ) -> Router<()> {
+    let limiter = layers
+        .rate_limit
+        .clone()
+        .map(crate::api_rate_limit::ApiRateLimiter::new);
+    apply_admin_auth_layers_with(router, api_state, layers, limiter)
+}
+
+/// [`apply_admin_auth_layers`] with a given rate limiter.
+///
+/// The SQLite router applies the stack to two routers (issue #2469). They
+/// share one limiter, so a client gets one budget across both.
+pub(crate) fn apply_admin_auth_layers_with(
+    router: Router<()>,
+    api_state: &HarvestApiState,
+    layers: &AdminAuthLayers,
+    limiter: Option<crate::api_rate_limit::ApiRateLimiter>,
+) -> Router<()> {
     let mut router = router;
     if let Some(authorizer) = &layers.authorizer {
         router = router.layer(middleware::from_fn_with_state(
@@ -6156,10 +6190,6 @@ pub(crate) fn apply_admin_auth_layers(
         api_state.clone(),
         crate::tenant::enforce_tenant_binding,
     ));
-    let limiter = layers
-        .rate_limit
-        .clone()
-        .map(crate::api_rate_limit::ApiRateLimiter::new);
     if let Some(limiter) = &limiter {
         router = router.layer(middleware::from_fn_with_state(
             (api_state.clone(), limiter.clone()),
