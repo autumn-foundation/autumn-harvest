@@ -460,6 +460,7 @@ diesel::table! {
         updated_by -> Text,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        chain_execution_timeout_secs -> Nullable<Int8>,
     }
 }
 
