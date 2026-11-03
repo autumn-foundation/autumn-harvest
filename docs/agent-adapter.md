@@ -108,9 +108,76 @@ let built = HarvestBuilder::new()
 The test `the_engine_registration_builds` builds this
 exact registration.
 
-Start a run under the name `agent_loop` with an `AgentTask` as input. To
-decide on a gated call, send a signal to the run, with a serialised
-`Approval` as the payload. Read the signal name from the wait: the
+### The `postgres` module
+
+The `postgres` feature adds the module `postgres`. It mirrors `sqlite`
+function by function: `register`, `start`, `start_heartbeat`, `decide`,
+`send`, `delete`, `current_run`, `state`, `LedgerSpend` and `pause_mesh`. A
+worker drives each run, so a function records a start or a signal and
+returns. It does not drive the run. `wait_run` and `wait_for` take the place
+of `sqlite::drive`.
+
+The example needs a database that it may migrate, and no API key. It runs a
+worker in the process. The first worker stops at the approval wait, as a
+crashed process does. A second worker takes the approval and finishes:
+
+```sh
+export DATABASE_URL=postgres://postgres:postgres@localhost:5432/harvest
+cargo run -p autumn-harvest-agent --features postgres --example postgres_agent
+```
+
+```text
+waiting on tool_approval:0:1:write_1 for call Some("write_1")
+  write_note ran with {"text":"remember the milk"}
+stop:   Completed
+answer: The note is saved.
+model calls: 1 before the restart, 1 after it
+agent support/acct-42: 2 ops, 26 tokens, last answer Some("Your order ships tomorrow.")
+```
+
+The core of it:
+
+```rust
+use autumn_harvest_agent::postgres::{self, PostgresAgents, RunState};
+use autumn_harvest_agent::{AgentTask, Approval};
+
+// On each worker:
+let builder = postgres::register(HarvestBuilder::new(), harness);
+
+// In the app:
+let pg = PostgresAgents::single(pool);
+let exec = postgres::start(&pg, &AgentTask::new("Save a note.")).await?;
+if let RunState::WaitingSignal(signal) = postgres::wait_run(&pg, exec, limit).await? {
+    // Show the call to a person, then send the decision.
+    postgres::decide(&pg, exec, &signal, &Approval::Approve).await?;
+}
+let state = postgres::wait_run(&pg, exec, limit).await?;
+```
+
+| Function | What it does |
+|---|---|
+| `PostgresAgents::single(pool)` | Targets one database. Each run lands on shard 0. |
+| `PostgresAgents::sharded(&pools, router)` | Targets a sharded fleet. Pass the pools and the router of the workers. |
+| `with_codecs`, `with_queue` | Use the payload codecs and the queue of the workers. The default queue is `default`. |
+| `run_state`, `wait_run` | Where one run stands: `Completed`, `Failed`, `WaitingSignal`, `Ended` or `Running`. |
+| `pending_approvals` | The approval signals that one run waits for now. |
+| `wait_for` | Waits until the state of a durable agent passes a test. |
+
+- `pending_approvals` reads the history of the run. Each approval wait has
+  a deadline timer, `__signal_timeout:<seq>:<signal name>`. A wait is open
+  until its timer fires or is cancelled, or its signal arrives. A decision
+  that is queued but not yet read also closes it. It reads that run only,
+  not its child runs.
+- `state` reads the entity projection, so it replays nothing. It returns
+  `None` before the first op commits, and after a delete.
+- A lookup by agent id reads each physical database once. A first send goes
+  to the shard that the router picks for the id.
+- A steer or an interrupt that races a continue-as-new resolves the
+  successor run and goes again.
+
+To start a run without the module, start the name `agent_loop` with an
+`AgentTask` as input. To decide on a gated call, send a signal to the run,
+with a serialised `Approval` as the payload. Read the signal name from the wait: the
 deadline timer of the wait is `__signal_timeout:<seq>:<signal name>`. On
 SQLite, `RunState::WaitingSignal` holds the name. For a run with no
 delegation, `approval::approval_signal(step, position, call_id)` also builds
@@ -478,7 +545,7 @@ it does in a plain run.
 
 | Primitive | Engine primitive | Turn it on |
 |---|---|---|
-| Heartbeat | Workflow `agent_heartbeat`: one tick per run | `heartbeat::schedule` (Postgres), `sqlite::start_heartbeat` |
+| Heartbeat | Workflow `agent_heartbeat`: one tick per run | `heartbeat::schedule`, `postgres::start_heartbeat`, `sqlite::start_heartbeat` |
 | Follow-up | A durable timer, then a new segment in the same workflow | `AgentTask::followups` |
 | Delivery | Activity `agent_deliver` | `AgentTask::deliver`, `AgentHarness::delivery` |
 | Memory | Activity `agent_memory_snapshot`, once per segment | `AgentTask::memory`, `AgentHarness::memory` |
@@ -552,7 +619,7 @@ let built = HarvestBuilder::new()
 
 On SQLite, pass the same `heartbeat::schedule` to
 `SqliteRuntime::upsert_schedule` (issue #2031). An app can also call
-`sqlite::start_heartbeat` on each tick.
+`sqlite::start_heartbeat` or `postgres::start_heartbeat` on each tick.
 
 The engine keeps one schedule per workflow name, so a deployment has one
 heartbeat schedule. For one heartbeat per agent, use a durable `Agent`
@@ -1090,9 +1157,21 @@ sqlite::drive(&mut rt, &id).await?;
 let state = sqlite::state(&rt, &id).await?;
 ```
 
-On Postgres, send a signal-with-start to the workflow `agent`. Use the agent
-id as the workflow id, `{}` as the start input, and `Agent::payload(&op)` as
-the signal payload. Pass the message id as the idempotency key.
+On Postgres, the `postgres` module has the same calls. A worker runs the
+op, so wait on the state instead of a drive:
+
+```rust
+use autumn_harvest_agent::postgres::{self, PostgresAgents};
+
+let pg = PostgresAgents::single(pool);
+postgres::send(&pg, &id, &AgentOp::message_with_id("Where is my order?", "m-1"), Some("m-1")).await?;
+let state = postgres::wait_for(&pg, &id, limit, |state| state.segments >= 1).await?;
+```
+
+`postgres::send` sends a signal-with-start to the workflow `agent`. It
+uses the agent id as the workflow id, `{}` as the start input, and
+`Agent::payload(&op)` as the signal payload. The message id is the
+idempotency key. An app without the module sends the same signal.
 
 ### The inbox
 
@@ -1248,9 +1327,9 @@ The spend of an erased run leaves the LLM budget and mesh budget sums.
 
 ### Mid-turn messages (issue #2265)
 
-A message carries an `Urgency`. `sqlite::send` sends the extra signal first,
-then the op. On Postgres, send the signal of `Agent::urgency_signal(&op)` to
-the running run, then the op.
+A message carries an `Urgency`. `sqlite::send` and `postgres::send` send the
+extra signal first, then the op. Without the module, send the signal of
+`Agent::urgency_signal(&op)` to the running run, then the op.
 
 | Urgency | Signal | Effect |
 |---|---|---|
