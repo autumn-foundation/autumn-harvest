@@ -648,6 +648,38 @@ mod tests {
         );
     }
 
+    /// A copy of `digests` in an order that `shuffle` picks.
+    fn shuffled(digests: &[String], shuffle: u64) -> Vec<String> {
+        let mut out = digests.to_vec();
+        let mut state = shuffle;
+        for i in (1..out.len()).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let j = usize::try_from(state >> 33).unwrap_or(0) % (i + 1);
+            out.swap(i, j);
+        }
+        out
+    }
+
+    /// The pool slot of each digest, by digest.
+    fn slots_by_digest(seed: u64, digests: &[String]) -> BTreeMap<String, (usize, CandidateId)> {
+        let slots = pool_slots(seed, "exec-1", digests).unwrap();
+        digests.iter().cloned().zip(slots).collect()
+    }
+
+    /// The number of distinct ids in `slots`.
+    fn distinct_ids(slots: &BTreeMap<String, (usize, CandidateId)>) -> usize {
+        slots
+            .values()
+            .map(|slot| &slot.1)
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    // `harvest-verify` reads each bare type name in the tokens of a macro
+    // with no local definition as a type that can write through. So the
+    // body below names no type. The helpers above hold the types.
     proptest! {
         /// Any order of the input gives each digest the same id and rank.
         #[test]
@@ -656,23 +688,11 @@ mod tests {
             seed in any::<u64>(),
             shuffle in any::<u64>(),
         ) {
-            let forward: Vec<String> = names.into_iter().collect();
-            let mut shuffled = forward.clone();
-            let mut state = shuffle;
-            for i in (1..shuffled.len()).rev() {
-                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                let j = usize::try_from(state >> 33).unwrap_or(0) % (i + 1);
-                shuffled.swap(i, j);
-            }
-            let by_digest = |digests: &[String]| -> BTreeMap<String, (usize, CandidateId)> {
-                let slots = pool_slots(seed, "exec-1", digests).unwrap();
-                digests.iter().cloned().zip(slots).collect()
-            };
-            let one = by_digest(&forward);
-            let two = by_digest(&shuffled);
+            let forward = names.into_iter().collect::<Vec<_>>();
+            let one = slots_by_digest(seed, &forward);
+            let two = slots_by_digest(seed, &shuffled(&forward, shuffle));
             prop_assert_eq!(&one, &two);
-            let ids: std::collections::BTreeSet<_> = one.values().map(|slot| &slot.1).collect();
-            prop_assert_eq!(ids.len(), forward.len(), "no id repeats");
+            prop_assert_eq!(distinct_ids(&one), forward.len(), "no id repeats");
         }
     }
 }
