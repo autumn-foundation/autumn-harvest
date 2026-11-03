@@ -7,3 +7,10 @@ kind = ["read"]
 tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest-plugin/durable_route.md"
+
+["live_chain_run_exists"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
