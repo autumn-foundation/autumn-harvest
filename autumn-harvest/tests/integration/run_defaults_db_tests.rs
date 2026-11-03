@@ -342,7 +342,7 @@ async fn a_chain_only_override_is_stored_and_cleared() {
         .expect("a chain-only row is stored");
     assert_eq!(
         stored.fields.chain_execution_timeout,
-        Some(Duration::from_secs(7_200))
+        Some(Duration::from_hours(2))
     );
     assert_eq!(stored.fields.sla, None);
     assert_eq!(stored.fields.execution_timeout, None);
@@ -362,14 +362,14 @@ async fn a_chain_only_override_is_stored_and_cleared() {
         .expect("the chain field keeps the row");
     assert_eq!(
         stored.fields.chain_execution_timeout,
-        Some(Duration::from_secs(7_200))
+        Some(Duration::from_hours(2))
     );
 
     let cache = RunDefaultsCache::new();
     cache.refresh(&mut conn).await.expect("load");
     assert_eq!(
-        cache.apply_chain(WF, Some(Duration::from_secs(60))),
-        Some(Duration::from_secs(7_200))
+        cache.apply_chain(WF, Some(Duration::from_mins(1))),
+        Some(Duration::from_hours(2))
     );
 
     change(

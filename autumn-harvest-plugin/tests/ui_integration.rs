@@ -6088,7 +6088,7 @@ async fn ui_trigger_now_takes_the_chain_cap_override_and_the_ceiling() {
     );
     let registry = Arc::new(
         HandlerRegistry::new(vec![bare_workflow_info(workflow_name)], vec![])
-            .with_max_workflow_chain_timeout(Some(std::time::Duration::from_secs(2 * 3600))),
+            .with_max_workflow_chain_timeout(Some(std::time::Duration::from_hours(2))),
     );
     let schedule_id = insert_test_schedule(&database_url, "Workflow", workflow_name, false).await;
     let api_state = HarvestApiState::new();
@@ -6148,7 +6148,7 @@ async fn ui_trigger_now_takes_the_chain_cap_override_and_the_ceiling() {
     registry.run_defaults().write_through(
         workflow_name,
         autumn_harvest::run_defaults::RunDefaultFields {
-            chain_execution_timeout: Some(std::time::Duration::from_secs(1800)),
+            chain_execution_timeout: Some(std::time::Duration::from_mins(30)),
             ..autumn_harvest::run_defaults::RunDefaultFields::default()
         },
     );
@@ -6165,7 +6165,7 @@ async fn ui_trigger_now_takes_the_chain_cap_override_and_the_ceiling() {
     registry.run_defaults().write_through(
         workflow_name,
         autumn_harvest::run_defaults::RunDefaultFields {
-            chain_execution_timeout: Some(std::time::Duration::from_secs(10 * 3600)),
+            chain_execution_timeout: Some(std::time::Duration::from_hours(10)),
             ..autumn_harvest::run_defaults::RunDefaultFields::default()
         },
     );

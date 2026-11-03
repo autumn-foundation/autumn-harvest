@@ -29,7 +29,7 @@ use crate::integration_e2e::{
     spawn_test_worker, wait_for_execution_state,
 };
 
-const HOUR: Duration = Duration::from_secs(3600);
+const HOUR: Duration = Duration::from_hours(1);
 
 /// Give each test its own type names. The worker registry is global.
 fn leaked(prefix: &str) -> &'static str {

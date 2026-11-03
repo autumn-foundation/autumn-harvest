@@ -1912,7 +1912,7 @@ mod resolve_dispatch_deadline_tests {
     /// declared value. A field that the override does not set inherits it.
     #[test]
     fn the_chain_override_wins_over_the_declared_value() {
-        let hour = std::time::Duration::from_secs(3600);
+        let hour = std::time::Duration::from_hours(1);
         let mut declared = deadline_info_fixture("wf", None, None);
         declared.chain_execution_timeout = Some(hour);
         let registry = HandlerRegistry::new(vec![declared], vec![]);
@@ -1946,7 +1946,7 @@ mod resolve_dispatch_deadline_tests {
     /// override included. A child type with no cap stays uncapped.
     #[test]
     fn the_fleet_chain_ceiling_caps_a_child_override() {
-        let hour = std::time::Duration::from_secs(3600);
+        let hour = std::time::Duration::from_hours(1);
         let registry = HandlerRegistry::new(
             vec![
                 deadline_info_fixture("wf", None, None),

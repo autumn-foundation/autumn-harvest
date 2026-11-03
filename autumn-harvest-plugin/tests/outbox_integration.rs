@@ -123,7 +123,7 @@ async fn framework_outbox_start_takes_the_run_default_override() {
         autumn_harvest::run_defaults::RunDefaultFields {
             execution_timeout: Some(std::time::Duration::from_secs(600)),
             sla: None,
-            chain_execution_timeout: Some(std::time::Duration::from_secs(900)),
+            chain_execution_timeout: Some(std::time::Duration::from_mins(15)),
         },
     );
     state.insert_extension(registry);

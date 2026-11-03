@@ -2855,7 +2855,7 @@ mod tests {
     /// A client with no cache returns the declared values.
     #[test]
     fn the_client_applies_the_run_default_overrides() {
-        let hour = Duration::from_secs(3600);
+        let hour = Duration::from_hours(1);
         let bare = residency_client();
         assert_eq!(bare.apply_chain_run_default("wf", Some(hour)), Some(hour));
         assert_eq!(
