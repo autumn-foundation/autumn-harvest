@@ -325,10 +325,10 @@ pub async fn read_bundle(
 
 /// The flow labels that the source run recorded.
 ///
-/// The set holds the task labels, the labels of each model request and
-/// tool call, each model turn, each labelled memory snapshot, each child
-/// run and each report. A label that a run tree exercised shows in at
-/// least one of them.
+/// The set holds the task labels and the labels of each model request and
+/// tool call. It also holds the labels of each model turn, labelled memory
+/// snapshot, child run and report. A label that a run tree exercised shows
+/// in at least one of them.
 ///
 /// # Errors
 ///
@@ -471,9 +471,9 @@ fn json_text<T: Serialize>(value: &T) -> Result<String, EvidenceError> {
 
 /// The source run as one text.
 ///
-/// The text holds the task, each model turn with its calls and decisions,
-/// each tool result, each other activity, signal and child run, and the
-/// end. It cuts nothing. [`split_parts`] of it gives the parts of
+/// The text holds the task and each model turn with its calls and
+/// decisions. It also holds each tool result, each other activity, signal
+/// and child run, and the end. It cuts nothing. [`split_parts`] of it gives the parts of
 /// `rollouts/source.md`.
 ///
 /// # Errors
