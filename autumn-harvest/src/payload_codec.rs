@@ -4710,7 +4710,7 @@ mod tests {
             WorkflowEvent::WorkflowCompleted {
                 output: Value::Null,
             },
-            started(json!({"nested": envelope.clone()})),
+            started(json!({"nested": envelope})),
             WorkflowEvent::WorkflowCompleted { output: envelope },
             WorkflowEvent::WorkflowCancelled { reason: "r".into() },
         ]
