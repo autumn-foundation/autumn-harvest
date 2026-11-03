@@ -856,14 +856,9 @@ impl std::fmt::Debug for PayloadCodecs {
 /// stays the same. That covers a non-object root, a missing `type`, and extra
 /// keys.
 ///
-/// Serde also rebuilds a `Value` field node by node, even from a `Value`. So
-/// the tagged path lifts each non-null payload field out first, leaving
-/// null. Serde then reads a small event, and each tree moves into its field.
-/// Every payload field is a `Value` or an `Option<Value>`, which accepts any
-/// JSON. The lift therefore changes no error. A null reads as `None` either way.
+/// The caller lifts each payload out of `data` first. See
+/// [`PayloadCodecs::decode_event_moving_payloads`].
 fn event_from_wire(value: Value) -> Result<crate::event::WorkflowEvent, serde_json::Error> {
-    use crate::event::PayloadSlot;
-    use crate::payload_store::PAYLOAD_FIELD_KEYS;
     use serde::de::IntoDeserializer;
     use serde::de::value::MapDeserializer;
 
@@ -876,33 +871,50 @@ fn event_from_wire(value: Value) -> Result<crate::event::WorkflowEvent, serde_js
         return serde_json::from_value(Value::Object(map));
     }
     let tag = map.remove("type").unwrap_or_default();
-    let mut data = map.remove("data");
-    let mut lifted: [Option<Value>; PAYLOAD_FIELD_KEYS.len()] = Default::default();
-    if let Some(Value::Object(fields)) = data.as_mut() {
-        for (slot, key) in lifted.iter_mut().zip(PAYLOAD_FIELD_KEYS) {
-            if let Some(field) = fields.get_mut(key)
-                && !field.is_null()
-            {
-                *slot = Some(std::mem::take(field));
-            }
-        }
-    }
-    let pairs = std::iter::once(("type", tag)).chain(data.map(|data| ("data", data)));
+    let pairs = std::iter::once(("type", tag)).chain(map.remove("data").map(|data| ("data", data)));
     let de: MapDeserializer<'_, _, serde_json::Error> =
         MapDeserializer::new(pairs.map(|(key, value)| (key.into_deserializer(), value)));
-    let mut event: crate::event::WorkflowEvent = serde::Deserialize::deserialize(de)?;
-    for (payload, key) in lifted.into_iter().zip(PAYLOAD_FIELD_KEYS) {
-        let Some(payload) = payload else {
-            continue;
-        };
-        match event.payload_slot_mut(key) {
-            Some(PayloadSlot::Required(field)) => *field = payload,
-            Some(PayloadSlot::Optional(field)) => *field = Some(payload),
-            // Serde ignores a key that the variant does not have.
-            None => {}
+    serde::Deserialize::deserialize(de)
+}
+
+/// The payloads that [`lift_payloads`] moved out, in
+/// [`PAYLOAD_FIELD_KEYS`](crate::payload_store::PAYLOAD_FIELD_KEYS) order.
+type LiftedPayloads = [Option<Value>; crate::payload_store::PAYLOAD_FIELD_KEYS.len()];
+
+/// Move each non-null payload out of `event`, and leave `null` in its slot.
+fn lift_payloads(event: &mut crate::event::WorkflowEvent) -> LiftedPayloads {
+    use crate::event::PayloadSlot;
+    let mut lifted = LiftedPayloads::default();
+    for (payload, key) in lifted
+        .iter_mut()
+        .zip(crate::payload_store::PAYLOAD_FIELD_KEYS)
+    {
+        *payload = event.payload_slot(key).and_then(PayloadSlot::lift);
+    }
+    lifted
+}
+
+/// Whether a lifted payload has no `data` key to go to.
+///
+/// `fields` holds the `data` field for each key, in the same order as
+/// `lifted`.
+fn has_unplaced_payload(lifted: &LiftedPayloads, fields: &[Option<&mut Value>]) -> bool {
+    lifted
+        .iter()
+        .zip(fields)
+        .any(|(payload, field)| payload.is_some() && field.is_none())
+}
+
+/// Put each payload that [`lift_payloads`] moved out back into its slot.
+fn restore_payloads(event: &mut crate::event::WorkflowEvent, lifted: LiftedPayloads) {
+    for (payload, key) in lifted
+        .into_iter()
+        .zip(crate::payload_store::PAYLOAD_FIELD_KEYS)
+    {
+        if let (Some(payload), Some(slot)) = (payload, event.payload_slot(key)) {
+            slot.fill(payload);
         }
     }
-    Ok(event)
 }
 
 /// Validate an operator-supplied codec key id (issue #948).
@@ -1369,7 +1381,79 @@ impl PayloadCodecs {
     ///
     /// Returns [`HarvestError`] if event serialization or codec encoding fails.
     pub fn encode_event(&self, event: &crate::event::WorkflowEvent) -> HarvestResult<Value> {
-        let mut value = serde_json::to_value(event)?;
+        // A clone copies each payload tree in key order. It is cheaper than
+        // the serde copy, which inserts each key with a search (issue #2499).
+        // The owned path adds no copy of its own, so this clone is the only
+        // copy, as the serde copy was.
+        self.encode_event_owned(event.clone())
+    }
+
+    /// [`Self::encode_event`], taking the event by value (issue #2499).
+    ///
+    /// Each payload tree moves into the stored `Value`, so no tree is copied.
+    /// Use this when the caller does not need the event after the encode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError`] if event serialization or codec encoding
+    /// fails. An error drops the event.
+    pub fn encode_event_owned(&self, event: crate::event::WorkflowEvent) -> HarvestResult<Value> {
+        Ok(self.encode_event_moving_payloads(event)?.0)
+    }
+
+    /// [`Self::encode_event_owned`], plus `true` when the slow path ran.
+    ///
+    /// This lifts each non-null payload out of its slot. Serde then writes a
+    /// small event, with `null` in each lifted field. The loop then encodes
+    /// each payload and moves it into its `data` key.
+    ///
+    /// The loop visits each [`PAYLOAD_FIELD_KEYS`] key in `data`, in that
+    /// order, as `transform_event_data` does. So a payload key with no slot
+    /// is still encoded. Serde copies that payload, so a missed slot costs a
+    /// copy, not data.
+    ///
+    /// A lifted payload with no `data` key has no place to go. A check finds
+    /// this case before any encode. The slow path then puts each payload back
+    /// and encodes the whole event.
+    ///
+    /// [`PAYLOAD_FIELD_KEYS`]: crate::payload_store::PAYLOAD_FIELD_KEYS
+    fn encode_event_moving_payloads(
+        &self,
+        mut event: crate::event::WorkflowEvent,
+    ) -> HarvestResult<(Value, bool)> {
+        use crate::payload_store::PAYLOAD_FIELD_KEYS;
+
+        let mut lifted = lift_payloads(&mut event);
+        let mut value = serde_json::to_value(&event)?;
+        let mut fields: [Option<&mut Value>; PAYLOAD_FIELD_KEYS.len()] = Default::default();
+        if let Some(Value::Object(data)) = value.get_mut("data") {
+            for (key, field) in data.iter_mut() {
+                if let Some(i) = PAYLOAD_FIELD_KEYS.iter().position(|k| *k == key) {
+                    fields[i] = Some(field);
+                }
+            }
+        }
+        if has_unplaced_payload(&lifted, &fields) {
+            return Ok((self.encode_lifted_slowly(event, lifted)?, true));
+        }
+        for (payload, field) in lifted.iter_mut().zip(fields) {
+            let Some(field) = field else {
+                continue;
+            };
+            let payload = payload.take().unwrap_or_else(|| std::mem::take(field));
+            *field = self.encode_payload_owned(payload)?;
+        }
+        Ok((value, false))
+    }
+
+    /// Put each lifted payload back, then encode the whole event.
+    fn encode_lifted_slowly(
+        &self,
+        mut event: crate::event::WorkflowEvent,
+        lifted: LiftedPayloads,
+    ) -> HarvestResult<Value> {
+        restore_payloads(&mut event, lifted);
+        let mut value = serde_json::to_value(&event)?;
         self.transform_event_data(&mut value)?;
         Ok(value)
     }
@@ -1392,7 +1476,8 @@ impl PayloadCodecs {
     /// This lifts each decoded payload out of `data` and leaves `null` in its
     /// place. Serde then decodes a small event. Each payload moves into its
     /// field through [`WorkflowEvent::payload_slot`]. The key set that serde
-    /// sees does not change, so every error stays the same.
+    /// sees does not change. Every payload field is a `Value` or an
+    /// `Option<Value>`, which accepts any JSON. So every error stays the same.
     ///
     /// A payload with no slot is either a key that the variant does not have,
     /// or a slot that `payload_slot` omits. The slow path puts it back and
@@ -1473,7 +1558,7 @@ impl PayloadCodecs {
                 // hand. If encoding fails, `?` returns before the `Null`
                 // placeholder is ever observed. The caller discards the
                 // whole partially-transformed `value` along with the error
-                // (see `encode_event`).
+                // (see `encode_lifted_slowly`).
                 let owned = std::mem::take(payload);
                 *payload = self.encode_payload_owned(owned)?;
             }
@@ -2618,10 +2703,11 @@ mod tests {
         ]
     }
 
-    /// The lifted decode in `event_from_wire` must match serde's own decode.
+    /// The lifted decode in `decode_event` must match serde's own decode.
     ///
-    /// A payload key without a slot reads back as null. So this checks
-    /// every payload key of every payload-bearing variant.
+    /// A payload key without a slot sends the decode to the slow path. So
+    /// this checks that every payload key of each payload-bearing variant
+    /// has a slot.
     #[test]
     fn lifted_decode_matches_serde_for_every_payload_field() {
         let codecs = PayloadCodecs::default();
@@ -2640,7 +2726,7 @@ mod tests {
             for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
                 if stored["data"].get(key).is_some() {
                     assert!(
-                        decoded.payload_slot_mut(key).is_some(),
+                        decoded.payload_slot(key).is_some(),
                         "{} has no payload slot for `{key}`",
                         event.type_name()
                     );
@@ -4589,6 +4675,279 @@ mod tests {
         }
         // History is append-only, so no variant is ever removed. The count
         // only grows, and this bound never needs an edit.
+        assert!(types.len() >= 53, "the sweep reached {types:?}");
+    }
+
+    // ── encode moves payload trees (issue #2499) ─────────────────────────
+
+    /// The encode that issue #2499 replaced: serialize the whole event, then
+    /// encode each payload in place.
+    fn rebuilding_encode(
+        codecs: &PayloadCodecs,
+        event: &crate::event::WorkflowEvent,
+    ) -> HarvestResult<Value> {
+        let mut value = serde_json::to_value(event)?;
+        codecs.transform_event_data(&mut value)?;
+        Ok(value)
+    }
+
+    /// Each payload-bearing event, with a nested tree in each payload field.
+    fn every_payload_bearing_event_with_trees() -> Vec<crate::event::WorkflowEvent> {
+        let mut events = every_payload_bearing_event();
+        for event in &mut events {
+            for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
+                if let Some(slot) = event.payload_slot(key) {
+                    slot.fill(json!({"key": key, "tree": [1, {"x": "y"}, null]}));
+                }
+            }
+        }
+        events
+    }
+
+    /// Payload values that the encode must store exactly as before.
+    fn edge_case_events() -> Vec<crate::event::WorkflowEvent> {
+        use crate::event::WorkflowEvent;
+        let failed = |details| WorkflowEvent::WorkflowFailed {
+            error: "e".into(),
+            error_type: None,
+            details,
+            non_retryable: None,
+        };
+        let envelope = json!({
+            CODEC_ENVELOPE_KEY: 1, "codec_id": "identity", "data": "e30="
+        });
+        vec![
+            failed(None),
+            failed(Some(Value::Null)),
+            WorkflowEvent::WorkflowCompleted {
+                output: Value::Null,
+            },
+            started(json!({"nested": envelope})),
+            WorkflowEvent::WorkflowCompleted { output: envelope },
+            WorkflowEvent::WorkflowCancelled { reason: "r".into() },
+        ]
+    }
+
+    /// The lift takes each non-null payload that serde writes, and only
+    /// those, each from the field that serde writes under its key.
+    ///
+    /// The encode fast path copies a payload that has no slot. So only this
+    /// check finds a missed or a wrong slot.
+    fn assert_lifts_each_wire_payload(event: &crate::event::WorkflowEvent) {
+        let wire = serde_json::to_value(event).expect("serialize");
+        let mut moved = event.clone();
+        let lifted = lift_payloads(&mut moved);
+        for (payload, key) in lifted.iter().zip(crate::payload_store::PAYLOAD_FIELD_KEYS) {
+            let expected = wire
+                .get("data")
+                .and_then(|data| data.get(key))
+                .filter(|field| !field.is_null());
+            assert_eq!(
+                payload.as_ref(),
+                expected,
+                "{} lifts the wrong payload for `{key}`",
+                event.type_name()
+            );
+        }
+    }
+
+    fn assert_encodes_like_a_rebuild(codecs: &PayloadCodecs, event: &crate::event::WorkflowEvent) {
+        assert_lifts_each_wire_payload(event);
+        let expected = rebuilding_encode(codecs, event).expect("rebuilding encode");
+        let (owned, slow) = codecs
+            .encode_event_moving_payloads(event.clone())
+            .expect("moving encode");
+        assert!(!slow, "{} took the slow path", event.type_name());
+        assert_eq!(owned, expected, "{}", event.type_name());
+        let borrowed = codecs.encode_event(event).expect("borrowed encode");
+        assert_eq!(borrowed, expected, "{}", event.type_name());
+        let moved = codecs
+            .encode_event_owned(event.clone())
+            .expect("owned encode");
+        assert_eq!(moved, expected, "{}", event.type_name());
+    }
+
+    fn identity_xor_and_keyed_codecs() -> Vec<PayloadCodecs> {
+        let mut xor = PayloadCodecs::default();
+        xor.set_default(Arc::new(XorCodec(0x5a)));
+        let keyed = PayloadCodecs::default();
+        keyed
+            .register_key("k-2499", Arc::new(XorCodec(0x33)))
+            .expect("register key");
+        keyed.set_active_key("k-2499").expect("activate key");
+        vec![PayloadCodecs::default(), xor, keyed]
+    }
+
+    /// The moving encode stores every payload field as the rebuild does.
+    #[test]
+    fn encode_moves_every_payload_kind_like_a_rebuild() {
+        for codecs in identity_xor_and_keyed_codecs() {
+            for event in every_payload_bearing_event_with_trees() {
+                assert_encodes_like_a_rebuild(&codecs, &event);
+            }
+        }
+    }
+
+    /// A null payload, an absent `Option` payload, an envelope-shaped
+    /// payload and an event with no payload all encode as before.
+    #[test]
+    fn encode_keeps_null_absent_and_escaped_payloads() {
+        for codecs in identity_xor_and_keyed_codecs() {
+            for event in edge_case_events() {
+                assert_encodes_like_a_rebuild(&codecs, &event);
+            }
+        }
+        let codecs = PayloadCodecs::default();
+        let absent = codecs.encode_event(&edge_case_events()[0]).expect("encode");
+        assert!(absent["data"].get("details").is_none(), "{absent}");
+        let escaped = codecs.encode_event(&edge_case_events()[4]).expect("encode");
+        assert_eq!(
+            escaped["data"]["output"][CODEC_ENVELOPE_KEY]["codec_id"], "identity",
+            "an envelope-shaped payload is escaped: {escaped}"
+        );
+    }
+
+    /// A lifted payload goes back to its field unchanged.
+    #[test]
+    fn restore_returns_each_lifted_payload_to_its_field() {
+        for original in every_payload_bearing_event_with_trees() {
+            let mut event = original.clone();
+            let lifted = lift_payloads(&mut event);
+            assert!(
+                lifted.iter().any(Option::is_some),
+                "{}",
+                original.type_name()
+            );
+            restore_payloads(&mut event, lifted);
+            assert_eq!(
+                serde_json::to_value(&event).unwrap(),
+                serde_json::to_value(&original).unwrap(),
+                "{}",
+                original.type_name()
+            );
+        }
+    }
+
+    /// A lifted payload with no `data` key sends the encode to the slow path.
+    #[test]
+    fn a_lifted_payload_with_no_data_key_is_unplaced() {
+        let mut lifted = LiftedPayloads::default();
+        let mut field = json!(null);
+        let mut fields: [Option<&mut Value>; 6] = Default::default();
+        assert!(!has_unplaced_payload(&lifted, &fields), "nothing lifted");
+        fields[0] = Some(&mut field);
+        assert!(!has_unplaced_payload(&lifted, &fields), "a key, no payload");
+        lifted[0] = Some(json!({"a": 1}));
+        assert!(
+            !has_unplaced_payload(&lifted, &fields),
+            "a payload, its key"
+        );
+        lifted[1] = Some(json!({"b": 2}));
+        assert!(has_unplaced_payload(&lifted, &fields), "a payload, no key");
+    }
+
+    /// The slow path encodes as the rebuild does.
+    #[test]
+    fn the_slow_encode_path_matches_a_rebuild() {
+        for codecs in identity_xor_and_keyed_codecs() {
+            for event in every_payload_bearing_event_with_trees() {
+                let mut moved = event.clone();
+                let lifted = lift_payloads(&mut moved);
+                let slow = codecs
+                    .encode_lifted_slowly(moved, lifted)
+                    .expect("slow encode");
+                assert_eq!(slow, rebuilding_encode(&codecs, &event).unwrap());
+            }
+        }
+    }
+
+    /// A codec failure fails the moving encode, as it failed the rebuild.
+    #[test]
+    fn the_moving_encode_reports_a_codec_failure() {
+        let event = started(json!({"secret": 1}));
+        let err = broken_codecs()
+            .encode_event_owned(event.clone())
+            .expect_err("the codec fails");
+        assert!(err.is_codec_failure(), "{err:?}");
+        let err = broken_codecs()
+            .encode_event(&event)
+            .expect_err("the codec fails");
+        assert!(err.is_codec_failure(), "{err:?}");
+    }
+
+    /// A codec that fails with the plaintext as its message.
+    #[derive(Debug)]
+    struct NamesItsInput;
+
+    impl PayloadCodec for NamesItsInput {
+        fn codec_id(&self) -> &'static str {
+            "names-its-input"
+        }
+        fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+            Err(CodecError(String::from_utf8_lossy(raw).into_owned()))
+        }
+        fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+            Ok(encoded.to_vec())
+        }
+    }
+
+    /// With two failing payloads, the same payload fails first as in the
+    /// rebuild. The loop encodes in `PAYLOAD_FIELD_KEYS` order.
+    ///
+    /// `WorkflowStarted` is the only variant with two payloads. Its two keys
+    /// sort in the same order, so this pins the order for each variant today.
+    #[test]
+    fn the_first_codec_error_names_the_same_field_as_the_rebuild() {
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(NamesItsInput));
+        let event = crate::event::WorkflowEvent::WorkflowStarted {
+            input: json!("from-input"),
+            timestamp: chrono::Utc::now(),
+            last_completion_result: Some(json!("from-carryover")),
+            last_error: None,
+            scheduled_time: None,
+        };
+        let expected = rebuilding_encode(&codecs, &event)
+            .expect_err("the codec fails")
+            .to_string();
+        assert!(expected.contains("from-input"), "{expected}");
+        let owned = codecs
+            .encode_event_owned(event.clone())
+            .expect_err("the codec fails");
+        assert_eq!(owned.to_string(), expected);
+        let borrowed = codecs.encode_event(&event).expect_err("the codec fails");
+        assert_eq!(borrowed.to_string(), expected);
+    }
+
+    /// Every variant encodes on the fast path, and stores what the rebuild
+    /// stores.
+    ///
+    /// The sweep selects variants as in
+    /// `every_arbitrary_event_decodes_on_the_fast_path`.
+    #[cfg(feature = "fuzzing")]
+    #[test]
+    fn every_arbitrary_event_encodes_like_a_rebuild() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let all = identity_xor_and_keyed_codecs();
+        let mut state: u64 = 0x2499;
+        let mut types = std::collections::BTreeSet::new();
+        for b in 0..=u8::MAX {
+            for _ in 0..16 {
+                let mut bytes = vec![b; 4];
+                bytes.extend((0..1024).map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state.to_le_bytes()[0]
+                }));
+                let event = crate::event::WorkflowEvent::arbitrary(&mut Unstructured::new(&bytes))
+                    .expect("1028 bytes build an event");
+                types.insert(event.type_name());
+                for codecs in &all {
+                    assert_encodes_like_a_rebuild(codecs, &event);
+                }
+            }
+        }
         assert!(types.len() >= 53, "the sweep reached {types:?}");
     }
 }
