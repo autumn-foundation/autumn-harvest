@@ -310,6 +310,11 @@ pub fn episode_scope(id: &AgentId) -> MemoryScope {
 /// overlap policy `skip`, so two passes of one agent never run at once.
 /// Use it with `ConsolidationTrigger::Schedule`.
 ///
+/// The engine keys a schedule by its workflow name. So a deployment can
+/// schedule passes for one agent only, and a second schedule replaces the
+/// first. For many agents, use `EpisodeSettings::every`, or start each
+/// pass from the app. Issue #2540 tracks a dispatcher for many agents.
+///
 /// # Errors
 ///
 /// Returns an error when the task cannot encode as JSON.

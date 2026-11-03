@@ -1360,8 +1360,11 @@ let harness = AgentHarness::new(model)
   waits for `n` more appends, also when the log is full. A pass that
   does not write all its facts fails the op with a named error. With the
   default `ConsolidationTrigger::Schedule`, an engine schedule starts each
-  pass: register `consolidate::schedule(when, &agent_id)`. On SQLite,
-  `sqlite::consolidate` starts one pass.
+  pass: register `consolidate::schedule(when, &agent_id)`. The engine keys
+  a schedule by its workflow name, so this serves one agent per
+  deployment. A second schedule replaces the first. For many agents, use
+  `every(n)`, or start each pass from the app. Issue #2540 tracks a
+  dispatcher. On SQLite, `sqlite::consolidate` starts one pass.
 - **Report.** A pass returns a `ConsolidationReport`. Its `stop` is
   `completed`, `nothing_to_do`, `budget_exceeded`, `invalid_reply`,
   `disabled` or `reset`. A refused budget and a reply that does not parse
