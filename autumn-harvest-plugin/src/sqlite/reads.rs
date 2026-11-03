@@ -675,34 +675,18 @@ pub(super) async fn awaitables(
     use autumn_harvest::awaitables::AWAITABLE_CATEGORY_CAP;
     let exec = parse_exec(&id)?;
     let handle = state.handle()?;
-    let terminal = handle
-        .read(move |reader| {
-            let run = Run::read(reader, exec)?;
-            Ok(api::is_terminal_state(&run.state).then_some(run))
-        })
-        .await
-        .map_err(map_error)?;
-    if let Some(run) = terminal {
-        return Ok(Json(api::WorkflowAwaitablesResponse {
-            execution_id: exec.to_string(),
-            workflow_id: run.workflow_id,
-            workflow_name: run.workflow_name,
-            state: run.state,
-            is_terminal: true,
-            wait_set: "terminal".to_owned(),
-            wait_set_reason: None,
-            awaitables: Vec::new(),
-            truncated: false,
-            truncated_kinds: Vec::new(),
-            category_cap: AWAITABLE_CATEGORY_CAP,
-        }));
-    }
+    // One read decides the branch and loads the rows. A run that ends
+    // between two reads then cannot answer as live with a terminal state.
     let read = handle
         .read(move |reader| {
+            let replay = reader.replay_input(exec)?;
             let run = Run::read(reader, exec)?;
+            if replay.is_terminal() || api::is_terminal_state(&run.state) {
+                return Ok(Err(run));
+            }
             let rows = timed_rows(reader, exec, or_epoch(run.started_at))?;
             let work = reader.pending_work(exec)?;
-            Ok(AwaitablesRows {
+            Ok(Ok(AwaitablesRows {
                 rows,
                 timers: work
                     .timers
@@ -714,12 +698,30 @@ pub(super) async fn awaitables(
                     .into_iter()
                     .filter_map(|task| Some((task.activity_id, task.schedule_to_close_at?)))
                     .collect(),
-                replay: reader.replay_input(exec)?,
+                replay,
                 run,
-            })
+            }))
         })
         .await
         .map_err(map_error)?;
+    let read = match read {
+        Ok(read) => read,
+        Err(run) => {
+            return Ok(Json(api::WorkflowAwaitablesResponse {
+                execution_id: exec.to_string(),
+                workflow_id: run.workflow_id,
+                workflow_name: run.workflow_name,
+                state: run.state,
+                is_terminal: true,
+                wait_set: "terminal".to_owned(),
+                wait_set_reason: None,
+                awaitables: Vec::new(),
+                truncated: false,
+                truncated_kinds: Vec::new(),
+                category_cap: AWAITABLE_CATEGORY_CAP,
+            }));
+        }
+    };
     let AwaitablesRows {
         run,
         rows,
