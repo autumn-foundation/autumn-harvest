@@ -13,7 +13,9 @@ use autumn_harvest_sqlite::{
 };
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
+use autumn_web::fleet_layout::FleetDbKey;
 use autumn_web::reexports::axum;
+use autumn_web::sharding::ShardLease;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
@@ -41,6 +43,12 @@ pub enum HarvestSqliteError {
     /// (issue #610).
     #[error("signal payload validation failed: {}", describe_violations(.0))]
     InvalidSignal(Vec<SchemaViolation>),
+    /// The fleet refused the tenant key or the open (issue #2472).
+    #[error(transparent)]
+    Fleet(#[from] autumn_web::db::fleet::FleetError),
+    /// The tenant's Harvest cannot serve the call (issue #2472).
+    #[error("tenant Harvest: {0}")]
+    Tenant(String),
 }
 
 fn describe_violations(violations: &[SchemaViolation]) -> String {
@@ -80,6 +88,9 @@ fn describe_violations(violations: &[SchemaViolation]) -> String {
 #[derive(Clone)]
 pub struct HarvestSqlite {
     inner: Arc<Inner>,
+    /// A tenant handle that a caller holds keeps its tenant open. The
+    /// fleet's own copy has none (issue #2472).
+    lease: Option<ShardLease>,
 }
 
 struct Inner {
@@ -92,12 +103,15 @@ struct Inner {
     workflows: Vec<String>,
     /// The registered definitions, for their input schemas.
     infos: HashMap<String, WorkflowInfo>,
+    /// The fleet tenant of this Harvest. `None` for the control Harvest.
+    tenant: Option<FleetDbKey>,
 }
 
 impl std::fmt::Debug for HarvestSqlite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HarvestSqlite")
             .field("path", &self.inner.path)
+            .field("tenant", &self.inner.tenant)
             .finish_non_exhaustive()
     }
 }
@@ -123,8 +137,30 @@ impl HarvestSqlite {
                 path,
                 workflows,
                 infos,
+                tenant: None,
             }),
+            lease: None,
         }
+    }
+
+    /// Mark a new handle as the Harvest of fleet tenant `key`.
+    pub(crate) fn for_tenant(mut self, key: FleetDbKey) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.tenant = Some(key);
+        }
+        self
+    }
+
+    /// A copy that keeps its tenant database open while it lives.
+    pub(crate) fn with_lease(mut self, lease: ShardLease) -> Self {
+        self.lease = Some(lease);
+        self
+    }
+
+    /// The fleet tenant of this Harvest, or `None` for the control Harvest.
+    #[must_use]
+    pub fn tenant(&self) -> Option<&FleetDbKey> {
+        self.inner.tenant.as_ref()
     }
 
     /// The Harvest database file.
@@ -205,11 +241,19 @@ impl HarvestSqlite {
     /// later call returns [`HarvestSqliteError::Stopped`]. The plugin's
     /// shutdown hook does the same, so an app does not need to call this.
     ///
+    /// The fleet owns the driver of a tenant Harvest. Close the tenant
+    /// database to stop it.
+    ///
     /// # Errors
     ///
     /// Returns [`HarvestSqliteError::Stopped`] when the driver had already
-    /// stopped.
+    /// stopped, and [`HarvestSqliteError::Tenant`] for a tenant Harvest.
     pub async fn shutdown(&self) -> Result<(), HarvestSqliteError> {
+        if let Some(key) = &self.inner.tenant {
+            return Err(HarvestSqliteError::Tenant(format!(
+                "the fleet owns the driver of {key}: close the tenant database to stop it"
+            )));
+        }
         self.call(|reply| Command::Shutdown { reply: Some(reply) })
             .await
     }
