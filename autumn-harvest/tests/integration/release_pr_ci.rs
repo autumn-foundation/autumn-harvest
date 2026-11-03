@@ -7,9 +7,9 @@
 //!
 //! `release-pr.yml` keeps what the second run gave. It fails when the merge
 //! result differs from the head, because the push run did not test that
-//! merge. It also runs the two gates that diff against the PR base over the
-//! whole release, because a push run diffs against one push only and a newer
-//! push can cancel it.
+//! merge. It also runs the two gates that diff against the PR base. They
+//! cover the whole release there. A push run diffs against one push only, and
+//! a newer push can cancel it.
 
 use serde_yaml::Value;
 
@@ -87,7 +87,10 @@ fn release_pr_fails_when_the_merge_differs_from_the_head() {
     let doc = parse_workflow(RELEASE_PR);
     let runs = job_runs(&doc, "merge-equals-head");
     for needle in ["HEAD^{tree}", "^{tree}", "exit 1"] {
-        assert!(runs.contains(needle), "the tree check must use `{needle}`:\n{runs}");
+        assert!(
+            runs.contains(needle),
+            "the tree check must use `{needle}`:\n{runs}"
+        );
     }
 }
 
@@ -100,7 +103,10 @@ fn release_pr_ratchets_comment_hygiene_over_the_whole_release() {
         "comment-hygiene.py --base \"$BASE\"",
         "git merge-base --is-ancestor",
     ] {
-        assert!(runs.contains(needle), "the release ratchet must run `{needle}`:\n{runs}");
+        assert!(
+            runs.contains(needle),
+            "the release ratchet must run `{needle}`:\n{runs}"
+        );
     }
 }
 
@@ -117,7 +123,10 @@ fn release_pr_checks_schema_acknowledgements_since_trunk() {
         let found = runs.contains(needle)
             || serde_yaml::to_string(&doc["jobs"]["schema-acknowledgement"])
                 .is_ok_and(|job| job.contains(needle));
-        assert!(found, "the release schema gate must use `{needle}`:\n{runs}");
+        assert!(
+            found,
+            "the release schema gate must use `{needle}`:\n{runs}"
+        );
     }
 }
 
