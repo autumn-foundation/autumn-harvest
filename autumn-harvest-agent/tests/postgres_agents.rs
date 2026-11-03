@@ -27,6 +27,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_harvest::chrono::{DateTime, Utc};
+use autumn_harvest::entity::ENTITY_STATE_QUERY;
+use autumn_harvest::entity_state::ProjectedSnapshot;
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{HarvestBuilder, ShardId, WorkerConfig, migrate};
@@ -110,15 +112,27 @@ impl Drop for Running {
 /// The worker claims work on `shards`. The agent activities name no queue,
 /// so they go to `default`, and the worker polls that queue too.
 fn run_worker(url: &str, queue: &str, harness: AgentHarness, shards: &[ShardId]) -> Running {
+    run_worker_with(url, queue, harness, shards, |builder| builder)
+}
+
+/// [`run_worker`], with `tune` applied to the builder.
+fn run_worker_with(
+    url: &str,
+    queue: &str,
+    harness: AgentHarness,
+    shards: &[ShardId],
+    tune: impl FnOnce(HarvestBuilder) -> HarvestBuilder,
+) -> Running {
     let mut config = WorkerConfig::default()
         .with_queues([queue, "default"])
         .with_shard_assignments(shards.iter().copied());
     config.max_concurrent_workflows = 8;
     config.max_concurrent_activities = 8;
-    let (registry, _dags, _schedules, config) = postgres::register(HarvestBuilder::new(), harness)
-        .worker(config)
-        .build()
-        .into_worker_parts();
+    let (registry, _dags, _schedules, config) =
+        tune(postgres::register(HarvestBuilder::new(), harness))
+            .worker(config)
+            .build()
+            .into_worker_parts();
     let mut runtime = WorkerRuntimeConfig::from(config);
     runtime.poll_interval = Duration::from_millis(25);
     let worker = Arc::new(Worker::new(runtime, Arc::new(registry)).expect("worker"));
@@ -234,6 +248,67 @@ async fn a_durable_agent_runs_one_op_for_each_message_id() {
     let state = settled(&pg, &id, |state| state.segments >= 2).await;
     assert_eq!(state.segments, 2, "the retry of m-1 ran no op");
     assert_eq!(state.tokens_used, 10);
+}
+
+/// The projection row of `id`, once its snapshot is an omitted marker.
+async fn omitted_row(url: &str, id: &AgentId) -> autumn_harvest::entity_state::EntityStateRow {
+    let deadline = std::time::Instant::now() + LIMIT;
+    loop {
+        let mut conn = AsyncPgConnection::establish(url).await.unwrap();
+        let row = autumn_harvest::entity_state::read(
+            &mut conn,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            "agent",
+            id.as_str(),
+        )
+        .await
+        .unwrap();
+        if let Some(row) = row
+            && matches!(row.snapshot, ProjectedSnapshot::Omitted)
+        {
+            return row;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the snapshot was never omitted"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_state_past_the_snapshot_cap_is_read_by_replay() {
+    let (url, _container) = database().await;
+    let queue = unique("pg-big");
+    let kind = unique("verbose");
+    let long = "x".repeat(6_000);
+    let model = TryFnModel::new(move |_request: &ChatRequest| answer(&long, 1));
+    let harness = AgentHarness::new(model).agent(AgentProfile::new(&kind));
+    let pg = PostgresAgents::single(pool(&url)).with_queue(&queue);
+    // The side-effect cap is the workflow input cap. A 6000-byte answer is
+    // past it, so the snapshot holds an omitted marker, not the state.
+    let _worker = run_worker_with(&url, &queue, harness, &[ShardId::new(0)], |builder| {
+        builder.max_workflow_input_bytes(4_096)
+    });
+    let id = AgentId::new(&kind, "a").unwrap();
+
+    postgres::send(
+        &pg,
+        &id,
+        &AgentOp::message_with_id("talk", "m-1"),
+        Some("m-1"),
+    )
+    .await
+    .unwrap();
+    let row = omitted_row(&url, &id).await;
+    assert_eq!(row.snapshot.query_answer(ENTITY_STATE_QUERY), None);
+
+    let state = postgres::state(&pg, &id)
+        .await
+        .unwrap()
+        .expect("replay recovers the state");
+    assert_eq!(state.segments, 1);
+    assert_eq!(state.last_answer.as_deref().map(str::len), Some(6_000));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

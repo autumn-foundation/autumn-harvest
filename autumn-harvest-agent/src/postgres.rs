@@ -20,7 +20,9 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use autumn_harvest::builder::HarvestBuilder;
+use autumn_harvest::context::{WorkflowContext, WorkflowHistoryPolicy};
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, ENTITY_STATE_QUERY};
+use autumn_harvest::entity_state::ProjectedSnapshot;
 use autumn_harvest::error::{HarvestError, HarvestResult};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::execution::{
@@ -29,17 +31,19 @@ use autumn_harvest::execution::{
     signal_with_start_workflow_execution_with_metrics_and_codecs,
     start_or_load_workflow_execution_with_codecs,
 };
+use autumn_harvest::executor::{QueryReplayOutcome, drive_query_replay_async};
 use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::signal::{
     ByIdSignalOutcome, resolve_and_signal_by_workflow_id_with_codecs,
     send_signal_idempotent_with_codecs,
 };
+use autumn_harvest::types::StartProvenance;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::{ExecutionId, ShardId, WorkflowIdReusePolicy, WorkflowResultState};
 use serde_json::Value;
 
-use crate::agent::{AGENT_WORKFLOW_NAME, Agent, AgentId, AgentOp, AgentState, Control};
+use crate::agent::{AGENT_WORKFLOW_NAME, Agent, AgentId, AgentOp, AgentState, Control, agent_info};
 use crate::agent::{INTERRUPT_SIGNAL, Interrupt};
 use crate::approval::{Approval, approval_call_id};
 use crate::error::{AgentError, ErrorKind};
@@ -382,8 +386,11 @@ pub async fn current_run(pg: &PostgresAgents, id: &AgentId) -> HarvestResult<Opt
 
 /// The committed state of the agent `id`.
 ///
-/// It reads the entity projection, so it replays nothing. Returns `None`
-/// before the first op commits, and after a delete.
+/// It reads the entity projection first. A projection row can hold no
+/// readable state: the payload store holds it, or it was past the
+/// side-effect cap. The read then replays the live run, as the query route
+/// does. Returns `None` before the first op commits, after a delete, and
+/// after an erasure.
 ///
 /// # Errors
 ///
@@ -410,10 +417,69 @@ pub async fn state(pg: &PostgresAgents, id: &AgentId) -> HarvestResult<Option<Ag
     let Some(row) = latest.filter(|row| !row.deleted) else {
         return Ok(None);
     };
-    let Some(answer) = row.snapshot.query_answer(ENTITY_STATE_QUERY) else {
-        return Ok(None);
+    let answer = match &row.snapshot {
+        ProjectedSnapshot::Erased => return Ok(None),
+        ProjectedSnapshot::Offloaded | ProjectedSnapshot::Omitted => {
+            let Some(exec) = current_run(pg, id).await? else {
+                return Ok(None);
+            };
+            replay_state(pg, exec).await?
+        }
+        snapshot => snapshot.query_answer(ENTITY_STATE_QUERY),
     };
-    Ok(Some(serde_json::from_value(answer)?))
+    answer
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(Into::into)
+}
+
+/// The longest replay that [`replay_state`] drives.
+const REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Replay the run `exec` of an agent, and answer the state query.
+///
+/// The context carries the facts of the run row, as the query route sets
+/// them, so the replay takes the same path as the run. Returns `None` when
+/// the run has ended.
+async fn replay_state(pg: &PostgresAgents, exec: ExecutionId) -> HarvestResult<Option<Value>> {
+    let mut conn = pg.conn(pg.shard_of(exec)).await?;
+    let run = load_execution(&mut conn, exec).await?;
+    if WorkflowResultState::from_execution_state(&run.state).is_terminal() {
+        return Ok(None);
+    }
+    let input = pg.codecs.decode_column(&run.input)?;
+    let history =
+        autumn_harvest::store::load_history_with_codecs(&mut conn, exec, &pg.codecs).await?;
+    drop(conn);
+    let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+        exec,
+        history.events,
+        autumn_harvest::context::empty_shared_state(),
+        WorkflowHistoryPolicy::default(),
+    )
+    .with_execution_timeout(run.execution_timeout)
+    .with_deadline(run.deadline_at)
+    .with_current_shard_id(Some(ShardId::new(run.shard_id)))
+    .with_parent_execution_id(run.parent_id.map(ExecutionId::from_uuid))
+    .with_start_provenance(StartProvenance::from_row(
+        run.start_source.as_deref(),
+        run.continued_from_exec_id,
+    ))
+    .with_workflow_name(run.workflow_name.clone())
+    .with_workflow_id(run.workflow_id.clone());
+    let outcome = drive_query_replay_async(&ctx, agent_info().handler, input, REPLAY_TIMEOUT).await;
+    match outcome {
+        QueryReplayOutcome::Panicked => Err(HarvestError::QueryHandlerPanicked(format!(
+            "the agent workflow panicked in the replay of {exec}"
+        ))),
+        QueryReplayOutcome::TimedOut => Err(HarvestError::QueryTimedOut {
+            query_name: ENTITY_STATE_QUERY.to_owned(),
+            timeout_ms: u64::try_from(REPLAY_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+        }),
+        QueryReplayOutcome::ReachedTerminal | QueryReplayOutcome::Suspended => {
+            ctx.execute_query(ENTITY_STATE_QUERY).map(Some)
+        }
+    }
 }
 
 /// Wait until the state of the agent `id` passes `until`, up to `limit`.
@@ -530,21 +596,24 @@ pub async fn wait_run(
 /// the wait, because the run needs no other input. The read covers this run
 /// only, not its child runs.
 ///
+/// The queued signals are read first, and the history second. A worker
+/// consumes a signal and appends its `SignalReceived` in one transaction. So
+/// each decision is in one read or the other, even when a worker consumes it
+/// between the reads.
+///
 /// # Errors
 ///
-/// Returns an error when the history read fails.
+/// Returns an error when a read fails.
 pub async fn pending_approvals(
     pg: &PostgresAgents,
     exec: ExecutionId,
 ) -> HarvestResult<Vec<String>> {
     let mut conn = pg.conn(pg.shard_of(exec)).await?;
+    let queued = autumn_harvest::signal::load_pending_signals(&mut conn, exec).await?;
     let history =
         autumn_harvest::store::load_history_with_codecs(&mut conn, exec, &pg.codecs).await?;
     let mut open = open_approval_waits(&history.events);
-    if !open.is_empty() {
-        let queued = autumn_harvest::signal::load_pending_signals(&mut conn, exec).await?;
-        open.retain(|signal| !queued.iter().any(|row| &row.signal_name == signal));
-    }
+    open.retain(|signal| !queued.iter().any(|row| &row.signal_name == signal));
     Ok(open)
 }
 

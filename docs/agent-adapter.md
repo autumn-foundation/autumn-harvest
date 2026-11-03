@@ -166,10 +166,14 @@ let state = postgres::wait_run(&pg, exec, limit).await?;
 - `pending_approvals` reads the history of the run. Each approval wait has
   a deadline timer, `__signal_timeout:<seq>:<signal name>`. A wait is open
   until its timer fires or is cancelled, or its signal arrives. A decision
-  that is queued but not yet read also closes it. It reads that run only,
-  not its child runs.
-- `state` reads the entity projection, so it replays nothing. It returns
-  `None` before the first op commits, and after a delete.
+  that is queued but not yet read also closes it. The queued signals are
+  read before the history, so a decision that a worker consumes between the
+  reads still closes the wait. It reads that run only, not its child runs.
+- `state` reads the entity projection, so it usually replays nothing. A
+  snapshot in the payload store, or one past the side-effect cap, has no
+  readable state in the row. `state` then replays the live run, as the query
+  route does. It returns `None` before the first op commits, after a delete,
+  and after an erasure.
 - A lookup by agent id reads each physical database once. A first send goes
   to the shard that the router picks for the id.
 - A steer or an interrupt that races a continue-as-new resolves the

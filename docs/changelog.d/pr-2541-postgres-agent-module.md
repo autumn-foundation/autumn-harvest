@@ -26,8 +26,9 @@ profile: `execution::list_running_with_search_attrs` (`per_request`) and
 No migration, no new `WorkflowEvent` variant, and no write to
 `harvest_events`.
 
-Test evidence: `autumn-harvest-agent/tests/postgres_agents.rs` runs seven
+Test evidence: `autumn-harvest-agent/tests/postgres_agents.rs` runs eight
 tests on a real Postgres worker. They cover an approval round trip,
 message-id dedupe, delete, a mesh pause that spares another mesh, the mesh
-spend sum, a heartbeat tick and a two-shard lookup. Five unit tests cover
+spend sum, a heartbeat tick, a two-shard lookup, and a state read by replay
+when the snapshot is past the side-effect cap. Five unit tests cover
 the approval-wait scan.
