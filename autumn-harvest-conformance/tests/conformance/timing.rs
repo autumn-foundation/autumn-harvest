@@ -20,12 +20,13 @@ const SEEDS: u64 = 1_000;
 /// The corpus source. Each `#[activity]` in it must be in the guard list.
 const CORPUS: &str = include_str!("corpus.rs");
 
-/// The function name after each `#[activity(...)]` attribute of the corpus.
+/// The function name after each `#[activity]` attribute of the corpus.
 fn declared_activities() -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     let mut lines = CORPUS.lines();
     while let Some(line) = lines.next() {
-        if !line.trim_start().starts_with("#[activity(") {
+        let line = line.trim_start();
+        if !(line.starts_with("#[activity(") || line.starts_with("#[activity]")) {
             continue;
         }
         let name = lines
