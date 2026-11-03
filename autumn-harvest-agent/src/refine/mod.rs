@@ -1,14 +1,17 @@
 //! The refine loop of an agent kind (epic #2369).
 //!
 //! [`propose`] turns evidence into a candidate overlay (issue #2379).
+//! [`bundle`] holds the manifest of an evidence bundle (issue #2377).
 //! [`ModelProposer`] runs a proposer over an [`AgentModel`](crate::AgentModel)
 //! with the default templates of [`prompts`]. The design is in
 //! `docs/design/DESIGN-2379.md`.
 
+pub mod bundle;
 pub mod model_proposer;
 pub mod prompts;
 pub mod propose;
 
+pub use bundle::{BundleCandidate, BundleFile, BundleManifest};
 pub use model_proposer::{
     DEFAULT_PROPOSER_OUTPUT_TOKENS, KEEP_BASE, ModelProposer, OUTPUT_CONTRACT,
 };

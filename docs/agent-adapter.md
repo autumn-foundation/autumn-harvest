@@ -973,6 +973,58 @@ run the evaluation on a multi-thread Tokio runtime.
 The evaluation is an in-memory fork at the first event. The database fork of
 issue #2000 is a separate feature.
 
+### Write an evidence bundle
+
+`eval::evidence::write_bundle` writes the evidence of a probe into one
+workspace snapshot (issue #2377). A proposer or a composer then reads the
+whole run from files. Its prompt holds only the short pointer in
+`MISSION.md`, so no prompt cap cuts a long run.
+
+```rust,ignore
+use autumn_harvest_agent::eval::evidence::{EvidenceWorkspace, read_bundle, write_bundle};
+
+let workspace = EvidenceWorkspace::new(store.clone(), "evidence:run-7")
+    .seed(42)
+    .hide("fast-model")
+    .hide(version_id);
+let manifest = write_bundle(&workspace, &history, &[first, second], &current).await?;
+let bundle = read_bundle(&store, &manifest).await?;
+```
+
+| File | Content |
+|---|---|
+| `task.md` | The user message of the source run. |
+| `rollouts/source.md` | The full source run: the task, each turn with its calls and decisions, each tool result and the end. |
+| `rollouts/<id>.md` | The turns and the end of one candidate. |
+| `diffs/<id>.md` | Each `TurnDiff` of one candidate against the source. |
+| `overlay/current.json` | The overlay that the editor changes. |
+| `flow_labels.json` | The flow labels of the source run. |
+| `MISSION.md` | A short pointer to the other files. |
+
+- A Markdown file over the part cap (`DEFAULT_PART_BYTES`, 256 KiB) splits
+  into `<stem>.part-001.md` and on. The parts joined in order equal the
+  single text. Nothing is cut. `formal/verus/src/evidence_parts.rs`
+  proves it.
+- The writer saves the bundle with one put. A put that stops before its
+  rename leaves no key, so no reader sees a partial bundle.
+- An erased source gives `EvidenceError::Erased`.
+- `read_bundle` returns the files and the flow labels. A run that reads
+  the bundle must start with those labels, as `AgentTask::flow_labels`
+  does for a transcript.
+- Each candidate has an anonymous id `c-<hex>` from `eval::anon`. The
+  hex derives from the seed, the source run id and the overlay digest.
+  The files list the candidates in id order, so the input order does not
+  show. Only `BundleManifest::candidates` maps an id to its evaluation.
+- The writer masks each candidate overlay digest and each `hide` name in
+  the Markdown files. It then checks every file and refuses a leak with
+  `EvidenceError::Leak`. `overlay/current.json` goes in as it is, so it
+  can name its own model. A candidate digest in it is a leak.
+- `Evidence::Bundle(manifest)` passes a bundle to a proposer. Its
+  `render` is the text of `MISSION.md`. `ModelProposer` has no workspace,
+  so it refuses a bundle as a `Config` error.
+
+The design is in [`DESIGN-2377.md`](design/DESIGN-2377.md).
+
 ## 13. The daemon example
 
 `examples/claude-agent-daemon` speaks the Anthropic Messages API and replays
