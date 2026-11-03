@@ -169,6 +169,7 @@ The tests are in `autumn-harvest-agent/tests/episodes.rs` unless noted.
 | The pass tokens are in the ledger under the pass run | `the_pass_tokens_are_in_the_ledger_under_its_run` |
 | Erase removes episodes and facts, with matching counts | `a_memory_reset_removes_episodes_and_facts_and_counts_them`; `the_report_counts_the_erased_episodes_and_facts` in `autumn-harvest-cli/src/agents.rs`; `erase_also_erases_each_scheduled_pass_of_the_agent` in `autumn-harvest-cli/tests/integration/agents_cli.rs` |
 | `max_episodes = 2`: a third episode evicts the oldest, and the next pass counts it | `a_third_episode_evicts_the_oldest_and_the_next_pass_counts_it` |
+| The operator picks the pass model | `a_pass_runs_on_the_model_that_the_operator_names` |
 | Review fixes | `a_pass_across_a_reset_writes_no_fact`, `a_required_reset_with_no_store_fails` (unit, `consolidate.rs`); `a_mark_of_an_older_generation_changes_nothing`, `a_read_episode_evicted_during_the_pass_is_not_dropped` (unit, `episode.rs`); `a_failed_child_pass_waits_for_more_episodes_and_fails_the_op`, `episodes_with_no_episode_store_fail_the_op_with_a_named_error` |
 
 `formal/verus/src/agent_episodes.rs` proves the eviction and trigger

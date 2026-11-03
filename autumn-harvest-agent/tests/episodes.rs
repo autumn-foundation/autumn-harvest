@@ -542,6 +542,26 @@ async fn a_pass_of_a_kind_with_no_setting_is_disabled() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_pass_runs_on_the_model_that_the_operator_names() {
+    let (_dir, db) = fresh_db();
+    let episodes = Arc::new(InMemoryEpisodeStore::default());
+    seed(episodes.as_ref(), &[episode("e1", "ada likes tea", &[])]).await;
+    let default = model(two_facts);
+    let cheap = model(two_facts);
+    let harness = AgentHarness::new(default.clone())
+        .model_named("cheap", cheap.clone())
+        .memory(Arc::new(InMemoryMemoryStore::new()))
+        .episodes(episodes)
+        .agent(profile(Some(EpisodeSettings::default().model("cheap"))));
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::consolidate(&mut rt, &agent()).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    assert_eq!(report_of(&rt, exec).unwrap().facts_written, 2);
+    assert_eq!(pass_count(&cheap), 1, "the named model serves the pass");
+    assert_eq!(default.requests().len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_fact_from_a_labelled_episode_carries_its_labels() {
     let (_dir, db) = fresh_db();
     let episodes = Arc::new(InMemoryEpisodeStore::default());
