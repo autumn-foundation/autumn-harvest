@@ -72,7 +72,7 @@ use autumn_harvest::models::{ApiToken, NewApiToken};
 use autumn_harvest::schema::harvest_api_tokens;
 
 use crate::api::{
-    HarvestApiState, acquire_conn, audit_context, classify_route, read_only_forbidden_response,
+    HarvestApiState, audit_context, classify_route, read_only_forbidden_response,
     requires_admin_scope,
 };
 
@@ -165,7 +165,7 @@ pub struct TokenView {
 }
 
 impl TokenView {
-    fn from_row(t: &ApiToken) -> Self {
+    pub(crate) fn from_row(t: &ApiToken) -> Self {
         // Exhaustive destructure is the #695 redaction guard — do NOT add `..`.
         // `token_hash` and `created_by` are deliberately dropped: the hash must
         // never leave the process, and the response shape is metadata-only.
@@ -202,6 +202,14 @@ pub struct MintResult {
 }
 
 impl MintResult {
+    /// The result of minting `token` with `secret`.
+    pub(crate) fn new(token: &ApiToken, secret: String) -> Self {
+        Self {
+            view: TokenView::from_row(token),
+            secret,
+        }
+    }
+
     /// The plaintext secret, surfaced exactly once in the create response.
     #[must_use]
     pub(crate) fn secret(&self) -> &str {
@@ -289,10 +297,7 @@ pub(crate) async fn create_token(
         .returning(ApiToken::as_returning())
         .get_result(conn)
         .await?;
-    Ok(MintResult {
-        view: TokenView::from_row(&row),
-        secret,
-    })
+    Ok(MintResult::new(&row, secret))
 }
 
 /// List all tokens, newest first, as metadata-only [`TokenView`]s.
@@ -484,14 +489,11 @@ pub async fn enforce_token_scope(
 
     // A claimed `hvst_` token that we cannot verify (store unavailable) must
     // NOT pass through: under the admin boundary that would be an auth bypass.
-    let Ok(pool) = api_state.storage_pool() else {
-        return service_unavailable("harvest token store unavailable");
-    };
-    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+    let Some(store) = api_state.auth_store() else {
         return service_unavailable("harvest token store unavailable");
     };
 
-    let token = match lookup_by_secret(&mut conn, &secret).await {
+    let token = match store.token_by_secret(&secret).await {
         Ok(Some(t)) => t,
         Ok(None) => return unauthorized("invalid api token"),
         Err(_) => return service_unavailable("harvest token store unavailable"),
@@ -519,7 +521,7 @@ pub async fn enforce_token_scope(
         let (_, source, request_id) = audit_context(request.headers(), &api_state);
         let actor = format!("{TOKEN_ACTOR_PREFIX}{}", token.id);
         crate::authz::audit_deny(
-            &mut conn,
+            &store,
             &crate::authz::DenyAudit {
                 actor: &actor,
                 method: request.method(),
@@ -539,11 +541,6 @@ pub async fn enforce_token_scope(
         response.extensions_mut().insert(ScopeDeniedToken);
         return response;
     }
-
-    // Issue #1827: give the connection back before the handler runs. The
-    // handler takes its own, so a held one would double each request's pool
-    // use. A rate-limited request would also hold one for nothing.
-    drop(conn);
 
     // AC6/D3: mark the verified principal so `require_admin` admits it.
     request.extensions_mut().insert(TokenPrincipal {
@@ -569,12 +566,9 @@ pub async fn enforce_token_scope(
         .last_used_at
         .is_none_or(|at| now.signed_duration_since(at).num_seconds() >= LAST_USED_DEBOUNCE_SECS);
     if stale {
-        let touch_pool = pool.default_pool().clone();
         let id = token.id;
         tokio::spawn(async move {
-            if let Ok(mut c) = touch_pool.get().await {
-                let _ = touch_last_used(&mut c, id).await;
-            }
+            let _ = store.touch_token(id).await;
         });
     }
 
@@ -630,13 +624,10 @@ pub async fn enforce_token_scope_mcp_mutation(
     let Some(secret) = harvest_bearer(request.headers()) else {
         return next.run(request).await;
     };
-    let Ok(pool) = api_state.storage_pool() else {
+    let Some(store) = api_state.auth_store() else {
         return service_unavailable("harvest token store unavailable");
     };
-    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
-        return service_unavailable("harvest token store unavailable");
-    };
-    let token = match lookup_by_secret(&mut conn, &secret).await {
+    let token = match store.token_by_secret(&secret).await {
         Ok(Some(t)) => t,
         Ok(None) => return unauthorized("invalid api token"),
         Err(_) => return service_unavailable("harvest token store unavailable"),
@@ -658,7 +649,7 @@ pub async fn enforce_token_scope_mcp_mutation(
         let (_, source, request_id) = audit_context(request.headers(), &api_state);
         let actor = format!("{TOKEN_ACTOR_PREFIX}{}", token.id);
         crate::authz::audit_deny(
-            &mut conn,
+            &store,
             &crate::authz::DenyAudit {
                 actor: &actor,
                 method: request.method(),
@@ -684,7 +675,7 @@ pub async fn enforce_token_scope_mcp_mutation(
         let (_, source, request_id) = audit_context(request.headers(), &api_state);
         let actor = format!("{TOKEN_ACTOR_PREFIX}{}", token.id);
         crate::authz::audit_deny(
-            &mut conn,
+            &store,
             &crate::authz::DenyAudit {
                 actor: &actor,
                 method: request.method(),

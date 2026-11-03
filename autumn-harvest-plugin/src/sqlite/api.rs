@@ -16,6 +16,11 @@
 //! mutating call needs a declared auth boundary, an admin session or the
 //! explicit opt-out.
 //!
+//! `GET`/`POST /admin/tokens`, `DELETE /admin/tokens/{id}` and
+//! `GET /admin/audit` are the Postgres handlers (issue #2469). They read
+//! the token and audit tables of the Harvest file. `sqlite::build` wraps
+//! this router in the admin-auth layer stack of `api.rs`, as on Postgres.
+//!
 //! With `sqlite_per_tenant`, `/tenants/{key}/..` serves the same routes on
 //! one fleet tenant (issue #2472). `{key}` is the app's routing key. The gate
 //! covers these routes too.
@@ -91,10 +96,14 @@ pub fn router(state: ApiState) -> Router<()> {
         crate::api::require_mutation_auth_by_method,
     );
     let scope = middleware::from_fn_with_state(state.clone(), tenant_scope);
+    // The token and audit routes use the Harvest file of the control
+    // Harvest, so no tenant route serves them (issue #2469).
+    let admin = crate::api::auth_admin_routes(state.flags.clone());
     routes()
         .nest("/tenants/{tenant}", routes().layer(scope))
-        .layer(gate)
         .with_state(state)
+        .merge(admin)
+        .layer(gate)
 }
 
 /// The `{tenant}` segment of a tenant route. The other segments are ignored.

@@ -781,6 +781,7 @@
 
 #[doc(hidden)]
 pub mod append_only;
+mod auth;
 mod composition;
 mod error;
 mod history_cap;
@@ -803,6 +804,9 @@ mod worker;
 pub use autumn_harvest::llm_ledger::LlmCall;
 pub use autumn_harvest::{ExecutionId, WorkflowEvent};
 
+pub use crate::auth::{
+    AuditFilter, AuditRow, MAX_AUDIT_PAGE, NewAuditRow, NewToken, SqliteAuthStore, StoredToken,
+};
 pub use crate::error::{SqliteError, SqliteResult};
 pub use crate::history_cap::HistoryCapReason;
 pub use crate::history_page::{

@@ -13,6 +13,9 @@
 //!   the app's pooled file.
 //! - One driver task owns the runtime. See [`driver`].
 //! - The management API serves the core routes. See [`api`].
+//! - API tokens, roles, OIDC, the authorizer and the rate limiter run the
+//!   admin-auth layer stack of the Postgres path (issue #2469). Tokens and
+//!   audit rows live in the Harvest file.
 //!
 //! Every builder option and mode that this slice cannot honour fails the
 //! build or the boot, and names the issue that ports it. A silent no-op would
@@ -60,6 +63,11 @@ pub(crate) struct SqliteParts {
     pub path: Option<PathBuf>,
     /// One Harvest per open fleet tenant (issue #2472).
     pub per_tenant: bool,
+    /// The admin-auth layers (issue #2469). They run as on Postgres.
+    pub auth: crate::api::AdminAuthLayers,
+    /// The OIDC login (issue #2469).
+    #[cfg(feature = "oidc")]
+    pub oidc: Option<crate::oidc::OidcLogin>,
     /// Each option that was set but has no SQLite port: its name and issue.
     pub refused: Vec<(&'static str, u32)>,
 }
@@ -102,6 +110,9 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         allow_unauthenticated_mutations,
         path: code_path,
         per_tenant,
+        auth,
+        #[cfg(feature = "oidc")]
+        oidc,
         mut refused,
     } = parts;
 
@@ -125,7 +136,23 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
 
     let api_state = HarvestApiState::new();
     api_state.set_allow_unauthenticated_mutations(allow_unauthenticated_mutations);
-    api_state.set_admin_auth_boundary(api_middleware.is_some());
+    // A login declares the boundary, as on Postgres.
+    #[cfg(feature = "oidc")]
+    let boundary = api_middleware.is_some() || oidc.is_some();
+    #[cfg(not(feature = "oidc"))]
+    let boundary = api_middleware.is_some();
+    api_state.set_admin_auth_boundary(boundary);
+    // The SQLite store keeps no run tenant, so tenant binding fails closed.
+    api_state.set_no_run_tenants();
+    // The roles of a login replace those of `with_roles`, as on Postgres.
+    #[cfg(feature = "oidc")]
+    let auth = crate::api::AdminAuthLayers {
+        roles: oidc
+            .as_ref()
+            .map(|login| login.roles().clone())
+            .or(auth.roles),
+        ..auth
+    };
     let handles = Handles::default();
 
     let slot = Arc::new(Mutex::new(Slot {
@@ -167,10 +194,17 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
     let mut router = api::router(api::ApiState {
         handle: handles.control,
         fleet: handles.fleet,
-        flags: api_state,
+        flags: api_state.clone(),
     });
+    // The one layer stack of both backends (issue #2469). Host auth runs
+    // outside it, then the OIDC session boundary.
+    router = crate::api::apply_admin_auth_layers(router, &api_state, &auth);
     if let Some(middleware) = api_middleware {
         router = middleware(router);
+    }
+    #[cfg(feature = "oidc")]
+    if let Some(login) = &oidc {
+        router = crate::oidc::apply_oidc(router, login, auth.api_tokens);
     }
     // `AppBuilder::nest` takes a `Router<AppState>`. No handler reads it.
     app.nest(&path, router.with_state(()))
@@ -425,6 +459,19 @@ async fn start(
             )));
         }
     };
+    // Tokens and audit rows live in the Harvest file (issue #2469). The store
+    // has its own connection, so a token check never waits for the driver.
+    let auth_store = match autumn_harvest_sqlite::SqliteAuthStore::open(&path) {
+        Ok(store) => store,
+        Err(error) => {
+            driver.shutdown().await;
+            return Err(AutumnError::service_unavailable_msg(format!(
+                "cannot open the token and audit store on {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    api_state.install_sqlite_auth_store(Arc::new(auth_store));
     let handle = HarvestSqlite::new(driver.sender.clone(), reader, path.clone(), infos.clone());
     slot.lock().unwrap_or_else(PoisonError::into_inner).driver = Some(driver);
     state.insert_extension(handle.clone());

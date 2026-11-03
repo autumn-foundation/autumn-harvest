@@ -751,37 +751,27 @@ fn audit_sustained(
     let (_, source, request_id) = crate::api::audit_context(request.headers(), api_state);
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
-    let Ok(pool) = api_state.storage_pool() else {
+    let Some(store) = api_state.auth_store() else {
         tracing::error!(path = %path, "harvest: no audit store for api rate limit");
         return;
     };
     tokio::spawn(async move {
-        let write = async {
-            let mut conn = crate::api::acquire_conn(pool.default_pool())
-                .await
-                .map_err(|e| e.to_string())?;
-            crate::authz::audit_route_event(
-                &mut conn,
-                OP_API_RATE_LIMIT_SUSTAINED,
-                &crate::authz::DenyAudit {
-                    actor: &actor,
-                    method: &method,
-                    path: &path,
-                    request_id: request_id.as_deref(),
-                    source: &source,
-                    shard: None,
-                    summary: &summary,
-                },
-            )
-            .await;
-            Ok::<(), String>(())
+        let deny = crate::authz::DenyAudit {
+            actor: &actor,
+            method: &method,
+            path: &path,
+            request_id: request_id.as_deref(),
+            source: &source,
+            shard: None,
+            summary: &summary,
         };
-        match tokio::time::timeout(AUDIT_WRITE_TIMEOUT, write).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::error!(error = %error, "harvest: failed to audit api rate limit");
-            }
-            Err(_) => tracing::error!("harvest: api rate limit audit write timed out"),
+        // The write logs its own failure.
+        let write = crate::authz::audit_route_event(&store, OP_API_RATE_LIMIT_SUSTAINED, &deny);
+        if tokio::time::timeout(AUDIT_WRITE_TIMEOUT, write)
+            .await
+            .is_err()
+        {
+            tracing::error!("harvest: api rate limit audit write timed out");
         }
     });
 }

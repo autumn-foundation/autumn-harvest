@@ -34,6 +34,9 @@
 //!
 //! # Limits
 //!
+//! A store that keeps no run tenant, as on SQLite, answers `501` to each
+//! verified tenant on a non-public route (issue #2469).
+//!
 //! Harvest does not filter list routes by tenant. A tenant-bound caller
 //! cannot use them. Generated MCP tool routes are outside the management
 //! router, so this layer does not cover them. Do not expose them to a
@@ -54,8 +57,8 @@ use autumn_harvest::tenant::{InvalidTenant, validate_tenant};
 use autumn_harvest::types::ExecutionId;
 
 use crate::api::{
-    HarvestApiState, RouteMatchers, acquire_conn, audit_context, build_route_matchers,
-    classify_route, execution_id_in_path, match_route,
+    HarvestApiState, RouteMatchers, audit_context, build_route_matchers, classify_route,
+    execution_id_in_path, match_route,
 };
 use crate::api_token::TokenPrincipal;
 use crate::authz::{DenyAudit, audit_deny};
@@ -171,6 +174,28 @@ fn conflict() -> Response {
         .into_response()
 }
 
+/// The issue that tracks run tenants on a store with none (issue #2469).
+const RUN_TENANTS_ISSUE: u32 = 2466;
+
+/// The answer to a verified tenant on a store with no run tenants.
+///
+/// The store cannot prove which runs the tenant owns, and the engine
+/// cannot refuse a start that meets a run of another tenant. So the layer
+/// refuses each such request. It never runs it unchecked.
+fn run_tenants_unsupported() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        axum::Json(serde_json::json!({
+            "error": "tenant binding needs a tenant on each run; this backend keeps none",
+            "backend": "sqlite",
+            "issue": format!(
+                "https://github.com/autumn-foundation/autumn-harvest/issues/{RUN_TENANTS_ISSUE}"
+            ),
+        })),
+    )
+        .into_response()
+}
+
 fn unavailable() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -278,16 +303,12 @@ async fn audit_refusal(api_state: &HarvestApiState, fields: &AuditFields, summar
         summary,
         "harvest: tenant binding refused request"
     );
-    let Ok(pool) = api_state.storage_pool() else {
+    let Some(store) = api_state.auth_store() else {
         tracing::error!("harvest: no audit store for tenant binding refusal");
         return;
     };
-    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
-        tracing::error!("harvest: no audit connection for tenant binding refusal");
-        return;
-    };
     audit_deny(
-        &mut conn,
+        &store,
         &DenyAudit {
             actor: &fields.actor,
             method: &fields.method,
@@ -393,6 +414,11 @@ pub(crate) async fn enforce_tenant_binding(
     }
     if classify_route(&method, &path) == RouteClass::PublicSafe {
         return next.run(request).await;
+    }
+    if !api_state.stores_run_tenants() {
+        let summary = format!("this backend keeps no run tenant (tenant={tenant:?})");
+        audit_refusal(&api_state, &fields, &summary).await;
+        return run_tenants_unsupported();
     }
     let Some(scope) = route_scope(&method, &path) else {
         let summary = format!("route is not tenant-scoped (tenant={tenant:?})");

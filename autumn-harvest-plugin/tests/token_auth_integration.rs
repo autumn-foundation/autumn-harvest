@@ -17,19 +17,15 @@
 //!     never the secret/hash, and a client `x-harvest-actor` cannot override it
 //!     (AC6)
 //!   - an unknown `hvst_` bearer is rejected 401 (AC5/AC7)
+//!
+//! The checks live in `support/token_contract.rs`. The SQLite suite runs the
+//! same checks on a SQLite app (issue #2469).
 
-#![allow(clippy::similar_names)]
-#![allow(clippy::too_many_lines)]
-// Local `#[derive(QueryableByName)]` row structs are declared next to the query
-// that uses them, mid-function — a common test idiom that trips this pedantic lint.
+// Local `#[derive(QueryableByName)]` row structs sit next to their query.
 #![allow(clippy::items_after_statements)]
-// `"actor must be token:{{id}}"` is a diagnostic message with intentional literal
-// braces, not a format argument.
-#![allow(clippy::literal_string_with_formatting_args)]
 
 use std::sync::Arc;
 
-use autumn_harvest::audit::{CLASSIFIED_ROUTES, RouteClass};
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
@@ -39,16 +35,17 @@ use autumn_harvest_plugin::api::{
     harvest_api_router,
 };
 use autumn_web::reexports::axum;
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use tower::ServiceExt;
+
+#[path = "support/token_contract.rs"]
+mod token_contract;
+
+use token_contract::TokenBackend;
 
 type HarvestApiApp = axum::Router;
 
@@ -130,699 +127,144 @@ async fn scrub(conn: &mut AsyncPgConnection) {
     }
 }
 
-/// Send a request. If `bearer` is set, it is sent as `Authorization: Bearer`;
-/// if `admin` a `x-harvest-admin: true` header is added; `actor` (if set) is
-/// sent as a (spoofable) `x-harvest-actor` header.
-async fn send(
-    app: &HarvestApiApp,
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    bearer: Option<&str>,
-    admin: bool,
-    actor: Option<&str>,
-) -> (StatusCode, Value) {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    if admin {
-        builder = builder.header("x-harvest-admin", "true");
-    }
-    if let Some(b) = bearer {
-        builder = builder.header("authorization", format!("Bearer {b}"));
-    }
-    if let Some(a) = actor {
-        builder = builder.header("x-harvest-actor", a);
-    }
-    let req = builder
-        .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
-        .unwrap();
-    let response = app.clone().oneshot(req).await.expect("request");
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let json = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes)
-            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).to_string()))
-    };
-    (status, json)
+/// One Postgres database, scrubbed. Both apps share its pool.
+struct Pg {
+    pool: DbPool,
+    _container: Option<ContainerAsync<Postgres>>,
 }
 
-/// Send a GET request with a caller-controlled raw `Authorization` header value
-/// (so a test can exercise a mixed-case auth scheme). Returns the status.
-async fn send_with_raw_auth(app: &HarvestApiApp, uri: &str, authorization: &str) -> StatusCode {
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .header("authorization", authorization)
-        .body(Body::empty())
-        .unwrap();
-    app.clone().oneshot(req).await.expect("request").status()
-}
-
-/// Mint a token via the boundary app and return its plaintext secret.
-async fn mint(app: &HarvestApiApp, name: &str, scope: &str, expires_at: Option<&str>) -> String {
-    let mut body = json!({ "name": name, "scope": scope });
-    if let Some(e) = expires_at {
-        body["expires_at"] = json!(e);
-    }
-    let (status, resp) = send(app, "POST", "/admin/tokens", Some(body), None, true, None).await;
-    assert_eq!(status, StatusCode::CREATED, "mint should 201: {resp:?}");
-    resp["secret"]
-        .as_str()
-        .expect("mint response carries a secret")
-        .to_string()
-}
-
-async fn count_tokens(conn: &mut AsyncPgConnection) -> i64 {
-    #[derive(diesel::QueryableByName)]
-    struct C {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        n: i64,
-    }
-    diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_api_tokens")
-        .get_result::<C>(conn)
-        .await
-        .unwrap()
-        .n
-}
-
-#[tokio::test]
-async fn create_returns_secret_once_and_stores_only_hash() {
-    let (url, _c) = setup_database().await;
-    let pool = build_pool(&url);
-    let mut conn = pool.get().await.unwrap();
-    scrub(&mut conn).await;
-    let app = build_app_boundary(&pool);
-
-    let (status, resp) = send(
-        &app,
-        "POST",
-        "/admin/tokens",
-        Some(json!({ "name": "ci-bot", "scope": "read" })),
-        None,
-        true,
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "resp: {resp:?}");
-    let secret = resp["secret"].as_str().expect("secret in create response");
-    assert!(secret.starts_with("hvst_"), "secret must be hvst_-prefixed");
-    assert_eq!(resp["scope"], "read");
-    assert_eq!(resp["name"], "ci-bot");
-
-    // Only the hash is stored; the plaintext secret is nowhere in the DB.
-    #[derive(diesel::QueryableByName)]
-    struct Row {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        token_hash: String,
-    }
-    let rows: Vec<Row> = diesel::sql_query("SELECT token_hash FROM harvest_api_tokens")
-        .load(&mut conn)
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_ne!(rows[0].token_hash, secret, "hash must not equal the secret");
-    assert!(
-        !rows[0].token_hash.contains(secret),
-        "stored hash must not contain the plaintext"
-    );
-}
-
-#[tokio::test]
-async fn list_returns_metadata_only() {
-    let (url, _c) = setup_database().await;
-    let pool = build_pool(&url);
-    let mut conn = pool.get().await.unwrap();
-    scrub(&mut conn).await;
-    let app = build_app_boundary(&pool);
-
-    let secret = mint(&app, "dash", "read", None).await;
-
-    let (status, resp) = send(&app, "GET", "/admin/tokens", None, None, true, None).await;
-    assert_eq!(status, StatusCode::OK);
-    let body = serde_json::to_string(&resp).unwrap();
-    assert!(!body.contains("token_hash"), "list leaked token_hash");
-    assert!(!body.contains(&secret), "list leaked the plaintext secret");
-    assert!(body.contains("\"name\":\"dash\""));
-    assert!(body.contains("\"scope\":\"read\""));
-    // metadata fields present
-    assert!(body.contains("created_at"));
-    assert!(body.contains("last_used_at"));
-}
-
-#[tokio::test]
-async fn verify_with_secret_authenticates_a_read_route() {
-    let (url, _c) = setup_database().await;
-    let pool = build_pool(&url);
-    let mut conn = pool.get().await.unwrap();
-    scrub(&mut conn).await;
-    let app = build_app_boundary(&pool);
-
-    let secret = mint(&app, "ci", "read", None).await;
-    // A read route with the minted bearer authenticates and is not denied.
-    let (status, _resp) = send(&app, "GET", "/workflows", None, Some(&secret), false, None).await;
-    assert_ne!(status, StatusCode::UNAUTHORIZED);
-    assert_ne!(status, StatusCode::FORBIDDEN);
-}
-
-/// RFC 7235 §2.1 (Codex P2): the `Authorization` scheme is case-insensitive, so
-/// a valid `hvst_` token presented with a mixed-case scheme (`BEARER`, `bEaReR`)
-/// must authenticate **identically** to the canonical `Bearer`. The credential
-/// itself stays case-sensitive — only the scheme is folded.
-#[tokio::test]
-async fn mixed_case_bearer_scheme_authenticates_identically() {
-    let (url, _c) = setup_database().await;
-    let pool = build_pool(&url);
-    let mut conn = pool.get().await.unwrap();
-    scrub(&mut conn).await;
-    let app = build_app_boundary(&pool);
-
-    let secret = mint(&app, "case", "read", None).await;
-
-    // Canonical scheme: authenticates (not 401/403).
-    let canonical = send_with_raw_auth(&app, "/workflows", &format!("Bearer {secret}")).await;
-    assert_ne!(canonical, StatusCode::UNAUTHORIZED);
-    assert_ne!(canonical, StatusCode::FORBIDDEN);
-
-    // Mixed-case schemes must reach the same route with the same result.
-    for scheme in ["BEARER", "bEaReR", "bearer"] {
-        let status = send_with_raw_auth(&app, "/workflows", &format!("{scheme} {secret}")).await;
-        assert_eq!(
-            status, canonical,
-            "scheme `{scheme}` must authenticate identically to canonical `Bearer`"
-        );
-        assert_ne!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "mixed-case scheme `{scheme}` must not 401 a valid token"
-        );
-    }
-}
-
-#[tokio::test]
-async fn unknown_hvst_bearer_is_401() {
-    let (url, _c) = setup_database().await;
-    let pool = build_pool(&url);
-    let mut conn = pool.get().await.unwrap();
-    scrub(&mut conn).await;
-    let app = build_app_boundary(&pool);
-
-    let (status, _resp) = send(
-        &app,
-        "GET",
-        "/workflows",
-        None,
-        Some("hvst_thisdoesnotexist"),
-        false,
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn revoke_denies_next_request() {
-    let (url, _c) = setup_database().await;
-    let pool = build_pool(&url);
-    let mut conn = pool.get().await.unwrap();
-    scrub(&mut conn).await;
-    let app = build_app_boundary(&pool);
-
-    let secret = mint(&app, "rot", "read", None).await;
-    // works before revoke
-    let (before, _) = send(&app, "GET", "/workflows", None, Some(&secret), false, None).await;
-    assert_ne!(before, StatusCode::UNAUTHORIZED);
-
-    // find the id and revoke it
-    let (_, list) = send(&app, "GET", "/admin/tokens", None, None, true, None).await;
-    let id = list[0]["id"].as_str().unwrap().to_string();
-    let (status, resp) = send(
-        &app,
-        "DELETE",
-        &format!("/admin/tokens/{id}"),
-        None,
-        None,
-        true,
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "revoke resp: {resp:?}");
-    assert_eq!(resp["revoked"], true);
-
-    // next request with the revoked token is denied (no grant cache)
-    let (after, _) = send(&app, "GET", "/workflows", None, Some(&secret), false, None).await;
-    assert_eq!(after, StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn expired_token_is_401() {
-    let (url, _c) = setup_database().await;
-    let pool = build_pool(&url);
-    let mut conn = pool.get().await.unwrap();
-    scrub(&mut conn).await;
-    let app = build_app_boundary(&pool);
-
-    let secret = mint(&app, "short", "read", Some("2000-01-01T00:00:00Z")).await;
-    let (status, _) = send(&app, "GET", "/workflows", None, Some(&secret), false, None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-}
-
-/// The AC3/AC4 success-metric sweep: a `read` token receives 403 on 100% of
-/// mutating routes and is never denied a read-only route.
-#[tokio::test]
-async fn read_token_403_on_all_mutations_and_reaches_reads() {
-    let (url, _c) = setup_database().await;
-    let pool = build_pool(&url);
-    let mut conn = pool.get().await.unwrap();
-    scrub(&mut conn).await;
-    let app = build_app_boundary(&pool);
-
-    let secret = mint(&app, "reader", "read", None).await;
-
-    for (template, class) in CLASSIFIED_ROUTES {
-        let Some((method, tmpl)) = template.split_once(' ') else {
-            continue;
-        };
-        // Concrete path: substitute each {param} with a placeholder segment.
-        let path: String = tmpl
-            .split('/')
-            .map(|seg| {
-                if seg.starts_with('{') && seg.ends_with('}') {
-                    "x"
-                } else {
-                    seg
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("/");
-        let (status, _) = send(&app, method, &path, None, Some(&secret), false, None).await;
-        match class {
-            RouteClass::Mutating => assert_eq!(
-                status,
-                StatusCode::FORBIDDEN,
-                "read token must be 403 on mutating route {template}"
-            ),
-            RouteClass::ReadOnly | RouteClass::PublicSafe => assert_ne!(
-                status,
-                StatusCode::FORBIDDEN,
-                "read token must NOT be 403 on read route {template}"
-            ),
+impl Pg {
+    async fn new() -> Self {
+        let (url, container) = setup_database().await;
+        let pool = build_pool(&url);
+        let mut conn = pool.get().await.unwrap();
+        scrub(&mut conn).await;
+        Self {
+            pool,
+            _container: container,
         }
     }
 }
 
-/// AC7/D3: a `mutate` token reaches an admin-gated mutation with NO embedder
-/// boundary, via the `require_admin` composition (`TokenPrincipal` extension).
+impl TokenBackend for Pg {
+    fn prefix(&self) -> &str {
+        ""
+    }
+
+    async fn boundary(&mut self) -> axum::Router {
+        build_app_boundary(&self.pool)
+    }
+
+    async fn standalone(&mut self) -> axum::Router {
+        build_app_standalone(&self.pool)
+    }
+
+    async fn stored_hashes(&self) -> Vec<(String, String)> {
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            name: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            token_hash: String,
+        }
+        let mut conn = self.pool.get().await.unwrap();
+        let rows: Vec<Row> = diesel::sql_query("SELECT name, token_hash FROM harvest_api_tokens")
+            .load(&mut conn)
+            .await
+            .unwrap();
+        rows.into_iter().map(|r| (r.name, r.token_hash)).collect()
+    }
+
+    async fn seed_admin_token(&self, name: &str, token_hash: &str) -> String {
+        #[derive(diesel::QueryableByName)]
+        struct IdRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            id: String,
+        }
+        let mut conn = self.pool.get().await.unwrap();
+        // The SQL that `harvest token bootstrap` prints.
+        let row: IdRow = diesel::sql_query(
+            "INSERT INTO harvest_api_tokens (name, token_hash, scope, created_by) \
+             VALUES ($1, $2, 'admin', 'bootstrap') RETURNING id::text AS id",
+        )
+        .bind::<diesel::sql_types::Text, _>(name)
+        .bind::<diesel::sql_types::Text, _>(token_hash)
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+        row.id
+    }
+}
+
+#[tokio::test]
+async fn create_returns_secret_once_and_stores_only_hash() {
+    token_contract::create_returns_secret_once_and_stores_only_hash(&mut Pg::new().await).await;
+}
+
+#[tokio::test]
+async fn list_returns_metadata_only() {
+    token_contract::list_returns_metadata_only(&mut Pg::new().await).await;
+}
+
+#[tokio::test]
+async fn verify_with_secret_authenticates_a_read_route() {
+    token_contract::verify_with_secret_authenticates_a_read_route(&mut Pg::new().await).await;
+}
+
+#[tokio::test]
+async fn mixed_case_bearer_scheme_authenticates_identically() {
+    token_contract::mixed_case_bearer_scheme_authenticates_identically(&mut Pg::new().await).await;
+}
+
+#[tokio::test]
+async fn unknown_hvst_bearer_is_401() {
+    token_contract::unknown_hvst_bearer_is_401(&mut Pg::new().await).await;
+}
+
+#[tokio::test]
+async fn revoke_denies_next_request() {
+    token_contract::revoke_denies_next_request(&mut Pg::new().await).await;
+}
+
+#[tokio::test]
+async fn expired_token_is_401() {
+    token_contract::expired_token_is_401(&mut Pg::new().await).await;
+}
+
+#[tokio::test]
+async fn read_token_403_on_all_mutations_and_reaches_reads() {
+    token_contract::read_token_403_on_all_mutations_and_reaches_reads(&mut Pg::new().await).await;
+}
+
 #[tokio::test]
 async fn mutate_token_reaches_admin_route_standalone() {
-    let (url, _c) = setup_database().await;
-    let pool = build_pool(&url);
-    let mut conn = pool.get().await.unwrap();
-    scrub(&mut conn).await;
-
-    // Mint with the boundary app...
-    let boundary = build_app_boundary(&pool);
-    let secret = mint(&boundary, "deployer", "mutate", None).await;
-
-    // ...then present it to the standalone (no-boundary) app.
-    let standalone = build_app_standalone(&pool);
-    // A mutating admin route: without the token, standalone 401s (no admin).
-    let (unauth, _) = send(
-        &standalone,
-        "POST",
-        "/workflows/some-wf/cancel",
-        Some(json!({})),
-        None,
-        false,
-        None,
-    )
-    .await;
-    assert_eq!(unauth, StatusCode::UNAUTHORIZED, "no creds → 401");
-
-    // With the mutate token, require_admin admits it (not 401/403 from auth).
-    let (authed, _) = send(
-        &standalone,
-        "POST",
-        "/workflows/some-wf/cancel",
-        Some(json!({})),
-        Some(&secret),
-        false,
-        None,
-    )
-    .await;
-    assert_ne!(
-        authed,
-        StatusCode::UNAUTHORIZED,
-        "mutate token must pass admin"
-    );
-    assert_ne!(
-        authed,
-        StatusCode::FORBIDDEN,
-        "mutate token is not read-scoped"
-    );
+    token_contract::mutate_token_reaches_admin_route_standalone(&mut Pg::new().await).await;
 }
 
-/// AC6: a token-authed mutation records `actor = token:{id}`, never the
-/// secret/hash, and a spoofed `x-harvest-actor` header cannot override it.
 #[tokio::test]
 async fn token_authed_mutation_audit_actor_is_token_id() {
-    let (url, _c) = setup_database().await;
-    let pool = build_pool(&url);
-    let mut conn = pool.get().await.unwrap();
-    scrub(&mut conn).await;
-    let app = build_app_boundary(&pool);
-
-    // Mint a token WITH the admin scope. Only admin may revoke (issue #1803).
-    let secret = mint(&app, "actor-test", "admin", None).await;
-    let (_, list) = send(&app, "GET", "/admin/tokens", None, None, true, None).await;
-    let id = list[0]["id"].as_str().unwrap().to_string();
-
-    // Clear the mint audit rows for a clean assertion. KEEP the api token rows.
-    // The admin token (`secret`) authenticates the revoke below. The two-table
-    // `scrub` also wipes `harvest_api_tokens`. It would delete that token, and
-    // the revoke would 401 before the actor assertion runs.
-    let _ = diesel::sql_query("DELETE FROM harvest_audit_log")
-        .execute(&mut conn)
-        .await;
-    // Now perform a mutation with the token bearer: revoke a (freshly minted)
-    // throwaway token.
-    let throwaway = mint(&app, "throwaway", "read", None).await;
-    let _ = throwaway;
-    let (_, list2) = send(&app, "GET", "/admin/tokens", None, None, true, None).await;
-    let throwaway_id = list2
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|t| t["name"] == "throwaway")
-        .unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    // Revoke the throwaway, authenticating with the admin token, and try to
-    // spoof a different actor via the header — the server must ignore it.
-    let (status, _) = send(
-        &app,
-        "DELETE",
-        &format!("/admin/tokens/{throwaway_id}"),
-        None,
-        Some(&secret),
-        true,
-        Some("attacker@evil"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    // The revoke audit row's actor is token:{id-of-the-admin-token}.
-    #[derive(diesel::QueryableByName)]
-    struct A {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        actor: String,
-    }
-    let rows: Vec<A> =
-        diesel::sql_query("SELECT actor FROM harvest_audit_log WHERE operation = 'token.revoke'")
-            .load(&mut conn)
-            .await
-            .unwrap();
-    assert!(!rows.is_empty(), "a revoke audit row must exist");
-    for r in &rows {
-        assert_eq!(r.actor, format!("token:{id}"), "actor must be token:{{id}}");
-        assert_ne!(r.actor, "attacker@evil", "spoofed actor must be ignored");
-        assert!(
-            !r.actor.contains(&secret),
-            "actor must not carry the secret"
-        );
-    }
+    token_contract::token_authed_mutation_audit_actor_is_token_id(&mut Pg::new().await).await;
 }
 
-/// AC6 anti-spoof (P2-1): with the token layer installed, a caller admitted by
-/// the embedder admin boundary but carrying NO valid `hvst_` token cannot forge
-/// a `token:`-namespaced audit actor — the reserved namespace is stripped on the
-/// pass-through path — while a legitimate non-`token:` actor still passes
-/// through unchanged (the embedder's own actor mechanism).
 #[tokio::test]
 async fn passthrough_cannot_forge_token_namespaced_actor() {
-    let (url, _c) = setup_database().await;
-    let pool = build_pool(&url);
-    let mut conn = pool.get().await.unwrap();
-    scrub(&mut conn).await;
-    let app = build_app_boundary(&pool);
-
-    // No bearer at all, admin-authorized by the embedder boundary, carrying a
-    // spoofed `token:`-namespaced actor. The mint is an audited mutation.
-    let (status, _) = send(
-        &app,
-        "POST",
-        "/admin/tokens",
-        Some(json!({ "name": "spoofer", "scope": "read" })),
-        None,
-        true,
-        Some("token:deadbeef-0000-0000-0000-000000000000"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "mint should 201");
-
-    // A second mint with a legitimate (non-`token:`) actor must pass through.
-    let (status2, _) = send(
-        &app,
-        "POST",
-        "/admin/tokens",
-        Some(json!({ "name": "legit", "scope": "read" })),
-        None,
-        true,
-        Some("release-eng"),
-    )
-    .await;
-    assert_eq!(status2, StatusCode::CREATED, "second mint should 201");
-
-    #[derive(diesel::QueryableByName)]
-    struct A {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        actor: String,
-    }
-    let rows: Vec<A> =
-        diesel::sql_query("SELECT actor FROM harvest_audit_log WHERE operation = 'token.create'")
-            .load(&mut conn)
-            .await
-            .unwrap();
-    assert_eq!(rows.len(), 2, "two mints must be audited");
-    for r in &rows {
-        assert_ne!(
-            r.actor, "token:deadbeef-0000-0000-0000-000000000000",
-            "a non-token caller must not forge a token:-namespaced audit actor"
-        );
-        assert!(
-            !r.actor.starts_with("token:"),
-            "the reserved token: namespace must be stripped on the pass-through path: {}",
-            r.actor
-        );
-    }
-    assert!(
-        rows.iter().any(|r| r.actor == "release-eng"),
-        "a legitimate non-token actor must pass through unchanged"
-    );
+    token_contract::passthrough_cannot_forge_token_namespaced_actor(&mut Pg::new().await).await;
 }
 
-/// AC6 companion: the create/revoke operations themselves write an audit row
-/// with a non-empty actor.
 #[tokio::test]
 async fn create_and_revoke_are_audited_with_actor() {
-    let (url, _c) = setup_database().await;
-    let pool = build_pool(&url);
-    let mut conn = pool.get().await.unwrap();
-    scrub(&mut conn).await;
-    let app = build_app_boundary(&pool);
-
-    // Mint (embedder-authed, actor from header).
-    let (status, _) = send(
-        &app,
-        "POST",
-        "/admin/tokens",
-        Some(json!({ "name": "audited", "scope": "read" })),
-        None,
-        true,
-        Some("release-eng"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(count_tokens(&mut conn).await, 1);
-
-    #[derive(diesel::QueryableByName)]
-    struct A {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        actor: String,
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        operation: String,
-    }
-    let rows: Vec<A> =
-        diesel::sql_query("SELECT actor, operation FROM harvest_audit_log ORDER BY occurred_at")
-            .load(&mut conn)
-            .await
-            .unwrap();
-    assert!(
-        rows.iter().any(|r| r.operation == "token.create"),
-        "create must be audited"
-    );
-    for r in &rows {
-        assert!(!r.actor.is_empty(), "audit actor must be non-empty");
-    }
+    token_contract::create_and_revoke_are_audited_with_actor(&mut Pg::new().await).await;
 }
 
-/// Offline `harvest token bootstrap` parity (issue #942, Codex P1 — the
-/// no-drift guarantee).
-///
-/// A token row seeded OUT-OF-BAND — its secret minted and hash computed with the
-/// SAME shared `autumn_harvest::api_token::{mint_secret, hash_secret}` helpers
-/// the CLI `harvest token bootstrap` command and the server mint route both use,
-/// then inserted directly as the operator would run the printed SQL — must
-/// authenticate and audit **byte-for-byte identically** to a route-minted token.
-/// This locks in that the offline seed path and the server mint path can never
-/// drift on how a secret is generated or hashed.
 #[tokio::test]
 async fn bootstrap_seeded_token_authenticates_identically_to_route_minted() {
-    let (url, _c) = setup_database().await;
-    let pool = build_pool(&url);
-    let mut conn = pool.get().await.unwrap();
-    scrub(&mut conn).await;
-
-    // ── Part A: the route stores exactly `hash_secret(secret)` ────────────────
-    // Prove the server mint path uses the SAME shared hashing helper the offline
-    // bootstrap does: hash the route's returned secret with the shared helper and
-    // confirm it equals the hash the route persisted.
-    let boundary = build_app_boundary(&pool);
-    let route_secret = mint(&boundary, "route-minted", "read", None).await;
-    #[derive(diesel::QueryableByName)]
-    struct HashRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        token_hash: String,
-    }
-    let route_hash: HashRow =
-        diesel::sql_query("SELECT token_hash FROM harvest_api_tokens WHERE name = 'route-minted'")
-            .get_result(&mut conn)
-            .await
-            .unwrap();
-    assert_eq!(
-        route_hash.token_hash,
-        autumn_harvest::api_token::hash_secret(&route_secret),
-        "the mint route must store hash_secret(secret) — the shared bootstrap helper"
-    );
-
-    // ── Part B: a bootstrap-seeded row authenticates + audits identically ─────
-    //
-    // Seed an `admin` token EXACTLY as `harvest token bootstrap` does. Mint the
-    // secret and compute the hash with the shared helpers. Then INSERT the row
-    // directly, as the operator runs the printed SQL. The SQL stores ONLY the
-    // hash, never the secret.
-    let seed_secret = autumn_harvest::api_token::mint_secret();
-    let seed_hash = autumn_harvest::api_token::hash_secret(&seed_secret);
-    assert!(seed_secret.starts_with("hvst_"));
-    assert_ne!(
-        seed_hash, seed_secret,
-        "the stored hash must not be the plaintext secret"
-    );
-
-    #[derive(diesel::QueryableByName)]
-    struct IdRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        id: String,
-    }
-    let seeded: IdRow = diesel::sql_query(
-        "INSERT INTO harvest_api_tokens (name, token_hash, scope, created_by) \
-         VALUES ('bootstrap-seed', $1, 'admin', 'bootstrap') RETURNING id::text AS id",
-    )
-    .bind::<diesel::sql_types::Text, _>(&seed_hash)
-    .get_result(&mut conn)
-    .await
-    .unwrap();
-    let seed_id = seeded.id;
-
-    // B1: parity with `mutate_token_reaches_admin_route_standalone` — the seeded
-    // admin token satisfies `require_admin` on the standalone (no-boundary) app.
-    let standalone = build_app_standalone(&pool);
-    let (authed, _) = send(
-        &standalone,
-        "POST",
-        "/workflows/some-wf/cancel",
-        Some(json!({})),
-        Some(&seed_secret),
-        false,
-        None,
+    token_contract::bootstrap_seeded_token_authenticates_identically_to_route_minted(
+        &mut Pg::new().await,
     )
     .await;
-    assert_ne!(
-        authed,
-        StatusCode::UNAUTHORIZED,
-        "bootstrap-seeded admin token must pass require_admin standalone"
-    );
-    assert_ne!(
-        authed,
-        StatusCode::FORBIDDEN,
-        "bootstrap-seeded admin token is not read-scoped"
-    );
+}
 
-    // B2: parity with `token_authed_mutation_audit_actor_is_token_id` — a
-    // mutation authenticated by the seeded token audits as `token:{id}`,
-    // spoof-proof, never carrying the secret.
-    let throwaway = mint(&boundary, "throwaway", "read", None).await;
-    let _ = throwaway;
-    let (_, list) = send(&boundary, "GET", "/admin/tokens", None, None, true, None).await;
-    let throwaway_id = list
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|t| t["name"] == "throwaway")
-        .unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    // Isolate the revoke audit row (KEEP api token rows — the seeded token
-    // authenticates the revoke below).
-    let _ = diesel::sql_query("DELETE FROM harvest_audit_log")
-        .execute(&mut conn)
-        .await;
-
-    let (status, _) = send(
-        &boundary,
-        "DELETE",
-        &format!("/admin/tokens/{throwaway_id}"),
-        None,
-        Some(&seed_secret),
-        true,
-        Some("attacker@evil"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the bootstrap-seeded token must authorize the revoke"
-    );
-
-    #[derive(diesel::QueryableByName)]
-    struct A {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        actor: String,
-    }
-    let rows: Vec<A> =
-        diesel::sql_query("SELECT actor FROM harvest_audit_log WHERE operation = 'token.revoke'")
-            .load(&mut conn)
-            .await
-            .unwrap();
-    assert!(!rows.is_empty(), "a revoke audit row must exist");
-    for r in &rows {
-        assert_eq!(
-            r.actor,
-            format!("token:{seed_id}"),
-            "a bootstrap-seeded token must audit as token:{{id}}, identical to a route-minted token"
-        );
-        assert_ne!(r.actor, "attacker@evil", "spoofed actor must be ignored");
-        assert!(
-            !r.actor.contains(&seed_secret),
-            "actor must not carry the secret"
-        );
-    }
+#[tokio::test]
+async fn mutate_token_is_denied_token_admin_and_audited() {
+    token_contract::mutate_token_is_denied_token_admin_and_audited(&mut Pg::new().await).await;
 }

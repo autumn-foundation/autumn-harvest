@@ -2213,15 +2213,19 @@ jobs:
       # The Postgres test binaries of this crate need a Postgres app pool, so
       # the lane builds the library and the SQLite suite only. No Postgres and
       # no Docker run here.
+      #
+      # `oidc` is on so the suite also runs the shared OIDC checks on a
+      # SQLite app (issue #2469). Each step uses the same features, so the
+      # lane builds the crate once.
       - name: Clippy autumn-harvest-plugin (sqlite feature)
-        run: cargo clippy -p autumn-harvest-plugin --features sqlite --lib --test sqlite_plugin --test sqlite_plugin_fleet --test sqlite_plugin_split -- -D warnings
+        run: cargo clippy -p autumn-harvest-plugin --features sqlite,oidc --lib --test sqlite_plugin --test sqlite_plugin_fleet --test sqlite_plugin_split -- -D warnings
       - name: SQLite plugin unit tests
-        run: "cargo test -p autumn-harvest-plugin --features sqlite --lib -- sqlite:: sqlite_split_tests state::tests"
+        run: "cargo test -p autumn-harvest-plugin --features sqlite,oidc --lib -- sqlite:: sqlite_split_tests state::tests"
       - name: SQLite plugin end-to-end suite
-        run: cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin
+        run: cargo test -p autumn-harvest-plugin --features sqlite,oidc --test sqlite_plugin
       # Per-tenant Harvest in a SQLite fleet (issue #2472). No Docker.
       - name: SQLite plugin fleet suite
-        run: cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin_fleet
+        run: cargo test -p autumn-harvest-plugin --features sqlite,oidc --test sqlite_plugin_fleet
 
   sqlite-plugin-split:
     name: SQLite HarvestPlugin, split mode (issue #2472)

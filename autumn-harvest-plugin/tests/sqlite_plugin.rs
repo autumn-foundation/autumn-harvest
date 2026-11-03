@@ -27,6 +27,19 @@ mod wire_contract;
 #[path = "sqlite_plugin/wire_parity.rs"]
 mod wire_parity;
 
+#[path = "support/token_contract.rs"]
+mod token_contract;
+
+#[path = "support/role_contract.rs"]
+mod role_contract;
+
+#[cfg(feature = "oidc")]
+#[path = "support/oidc_contract.rs"]
+mod oidc_contract;
+
+#[path = "sqlite_plugin/auth_parity.rs"]
+mod auth_parity;
+
 /// A value given to `HarvestPlugin::state`. The activity reads it back.
 #[derive(Debug)]
 struct Prefix(&'static str);
@@ -291,14 +304,17 @@ fn an_option_with_no_sqlite_port_fails_the_build_and_names_its_issue() {
     let built = std::panic::catch_unwind(|| {
         TestApp::new()
             .config(config(dir.path()))
-            .plugin(plugin().enable_api_tokens())
+            .plugin(plugin().decode_payloads_on_read())
     });
     let payload = built.err().expect("the build refuses the option");
     let message = payload
         .downcast_ref::<String>()
         .cloned()
         .unwrap_or_default();
-    assert!(message.contains("enable_api_tokens (#2469)"), "{message}");
+    assert!(
+        message.contains("decode_payloads_on_read (#2468)"),
+        "{message}"
+    );
 }
 
 /// The SQLite worker reads no cost hold, so the plugin refuses the option

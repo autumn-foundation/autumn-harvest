@@ -1,0 +1,58 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/auth.rs`. See `docs/ledger/README.md`.
+
+["SqliteAuthStore::insert_audit"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+
+["SqliteAuthStore::insert_token"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_api_tokens"]
+measured = "unmeasured"
+
+["SqliteAuthStore::list_audit"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_audit_log"]
+measured = "unmeasured"
+
+["SqliteAuthStore::list_tokens"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_api_tokens"]
+measured = "unmeasured"
+
+["SqliteAuthStore::prepare"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["ddl", "read"]
+tables = ["harvest_api_tokens", "harvest_audit_log"]
+measured = "unmeasured"
+
+["SqliteAuthStore::revoke_token"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_api_tokens"]
+measured = "unmeasured"
+
+["SqliteAuthStore::touch_token"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_api_tokens"]
+measured = "unmeasured"
+
+["token_where"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_api_tokens"]
+measured = "unmeasured"
+
