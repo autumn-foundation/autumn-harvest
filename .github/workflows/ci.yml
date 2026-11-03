@@ -16,7 +16,9 @@
 #      release PR from trunk-dev into trunk has the trunk-dev tip as its head,
 #      and the push run on trunk-dev already tested that commit. Its check
 #      runs report on the release PR. release-pr.yml checks that the merge
-#      equals the head, and runs the two gates that diff against trunk.
+#      equals the head, and runs the two gates that diff against trunk. A
+#      push run on trunk-dev decides docs-only against trunk, so a cancelled
+#      run cannot leave code untested (see the `changes` job).
 name: CI
 
 on:
@@ -81,9 +83,25 @@ jobs:
           fi
           echo "Comparing ${base}...${head}"
           echo "base_sha=${base}" >> "$GITHUB_OUTPUT"
+          # A push to trunk-dev decides docs-only against trunk, the last
+          # release, not against the last push. A newer push cancels the run
+          # of an older one. A diff against a docs-only newer push would skip
+          # the tests, and the code of the older push would never run. The
+          # release PR gets no ci.yml run, so this push run is its backstop.
+          # `base_sha` above stays per push, for the issue #794 gate.
+          diff_base="$base"
+          if [ "${{ github.event_name }}" = "push" ] \
+            && [ "${{ github.ref }}" = "refs/heads/trunk-dev" ]; then
+            if git fetch --no-tags origin trunk; then
+              diff_base="$(git rev-parse FETCH_HEAD)"
+              echo "trunk-dev push: deciding docs-only against trunk (${diff_base})"
+            else
+              echo "::warning::could not fetch trunk; deciding docs-only against ${base}"
+            fi
+          fi
           # --no-renames disables rename detection so a code->docs move surfaces
           # the deleted source path (setting code=true) instead of a docs-only add.
-          changed="$(git diff --name-only --no-renames "$base" "$head")"
+          changed="$(git diff --name-only --no-renames "$diff_base" "$head")"
           echo "Changed files:"
           echo "$changed"
           # Docs-only = every changed path matches docs/** or **/*.md. If any

@@ -141,3 +141,31 @@ fn release_pr_workflow_runs_no_test_suite() {
         );
     }
 }
+
+/// A push to `trunk-dev` decides docs-only against `trunk`, not the last push.
+///
+/// A newer push cancels the run of an older one. If the newer push changes
+/// docs only, a diff against it skips the tests, and the code of the older
+/// push is never tested. The release PR run once caught that, because it
+/// diffed against `trunk`. The push run does the same now.
+#[test]
+fn a_trunk_dev_push_decides_docs_only_against_trunk() {
+    let ci = parse_workflow(CI);
+    let runs = ci["jobs"]["changes"]["steps"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(|step| step.get("run").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for needle in [
+        "refs/heads/trunk-dev",
+        "git fetch --no-tags origin trunk",
+        "git diff --name-only --no-renames \"$diff_base\" \"$head\"",
+    ] {
+        assert!(
+            runs.contains(needle),
+            "the changes job must use `{needle}`:\n{runs}"
+        );
+    }
+}
