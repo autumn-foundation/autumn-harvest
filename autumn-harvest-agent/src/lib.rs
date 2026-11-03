@@ -120,8 +120,9 @@ pub use agent::overlay_store::PostgresOverlayStore;
 #[cfg(feature = "sqlite")]
 pub use agent::overlay_store::SqliteOverlayStore;
 pub use agent::overlay_store::{
-    Activation, InMemoryOverlayStore, MAX_AUTHOR_LEN, OverlayStoreError, OverlayValidator,
-    OverlayVersion, ProfileOverlayStore, Provenance, Rollback, StoredOverlay,
+    Activation, AutoAdoptOutcome, InMemoryOverlayStore, MAX_AUTHOR_LEN, OverlayStoreError,
+    OverlayValidator, OverlayVersion, PolicyLogEntry, PolicyState, ProfileOverlayStore, Provenance,
+    Rollback, StoreClock, StoredOverlay,
 };
 pub use agent::profile_read::{OverlayRead, ProfileRead};
 pub use agent::{
@@ -156,6 +157,11 @@ pub use message::{
 };
 pub use model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
 pub use policy::{AllowAll, Rule, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
+pub use refine::{
+    AdoptDecision, Adoption, ApprovalTimeout, AutoAdopt, DailyCap, GateState, OverlayPart,
+    PolicyCeilings, RefinePolicy, RefineStatus, WaitReason, adopt, agent_refine_policy,
+    agent_refine_policy_info, read_refine_policy,
+};
 pub use refine::{
     DEFAULT_PROPOSAL_ATTEMPTS, DEFAULT_PROPOSER_OUTPUT_TOKENS, DEFAULT_PROPOSER_TIMEOUT, Dimension,
     Evidence, KEEP_BASE, MAX_PROPOSAL_ATTEMPTS, ModelProposer, OUTPUT_CONTRACT, OverlayProposer,

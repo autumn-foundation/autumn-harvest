@@ -322,3 +322,76 @@ fn sqlite_logs_each_move_and_refuses_a_rewrite() {
         (Some(1), 2, "oncall")
     );
 }
+
+/// Issue #2394: each policy write keeps the body before it. A stale
+/// compare changes nothing. The guard refuses each rewrite, and a writer
+/// that is not an operator.
+#[test]
+fn sqlite_logs_each_policy_change_and_refuses_a_rewrite() {
+    use autumn_harvest::overlay_log::{PolicyAppend, PolicyExpect, PolicyWrite};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("harvest.db");
+    let log = SqliteOverlayLog::open(&path).expect("open");
+    let write = |body: Option<&'static [u8]>, expected| PolicyWrite {
+        body,
+        expected,
+        actor_kind: "operator",
+        actor: "ops",
+    };
+    let PolicyAppend::Appended(first) = log
+        .append_policy(
+            "support",
+            &write(Some(b"{\"a\":1}"), PolicyExpect::Revision(None)),
+        )
+        .expect("first")
+    else {
+        panic!("the first write passes");
+    };
+    assert_eq!((first.seq, first.old_body.as_deref()), (1, None));
+    assert_eq!(
+        log.append_policy(
+            "support",
+            &write(Some(b"{}"), PolicyExpect::Revision(Some(7)))
+        )
+        .expect("stale"),
+        PolicyAppend::Conflict { actual: Some(1) }
+    );
+    let PolicyAppend::Appended(reset) = log
+        .append_policy("support", &write(None, PolicyExpect::Any))
+        .expect("reset")
+    else {
+        panic!("a reset needs no revision");
+    };
+    assert_eq!(reset.seq, 2);
+    assert_eq!(reset.old_body.as_deref(), Some(&b"{\"a\":1}"[..]));
+    assert_eq!(reset.new_body, None);
+    assert_eq!(log.policy_log("support").expect("log").len(), 2);
+    assert_eq!(log.last_policy("other").expect("last"), None);
+
+    let raw = rusqlite::Connection::open(&path).expect("raw");
+    for statement in [
+        "UPDATE harvest_agent_refine_policies SET new_body = NULL",
+        "INSERT OR REPLACE INTO harvest_agent_refine_policies \
+         (kind, seq, actor_kind, actor, changed_at_ms) \
+         VALUES ('support', 1, 'operator', 'mallory', 0)",
+    ] {
+        let err = raw
+            .execute(statement, [])
+            .expect_err("the guard refuses it");
+        assert!(
+            err.to_string()
+                .contains("harvest_agent_refine_policies is append-only"),
+            "{statement}: {err}"
+        );
+    }
+    let err = raw
+        .execute(
+            "INSERT INTO harvest_agent_refine_policies \
+             (kind, seq, actor_kind, actor, changed_at_ms) \
+             VALUES ('support', 9, 'refine', 'run', 0)",
+            [],
+        )
+        .expect_err("only an operator writes");
+    assert!(err.to_string().contains("CHECK"), "{err}");
+}

@@ -9,15 +9,45 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use autumn_harvest::ExecutionId;
+use autumn_harvest::chrono::{DateTime, TimeDelta, Utc};
 use autumn_harvest_agent::agent::overlay::apply;
+use autumn_harvest_agent::agent::overlay_store::AutoAdoptOutcome;
+use autumn_harvest_agent::refine::policy::{OverlayPart, RefinePolicy};
 use autumn_harvest_agent::{
-    AgentProfile, Ceilings, OverlayError, OverlayStoreError, OverlayValidator, OverlayVersion,
-    ProfileOverlay, ProfileOverlayStore, Provenance, Rollback,
+    AgentProfile, OverlayError, OverlayStoreError, OverlayValidator, OverlayVersion,
+    ProfileOverlay, ProfileOverlayStore, Provenance, Rollback, StoreClock,
 };
 
 /// Makes a store that validates with the given validator.
 pub type MakeStore<'a> =
     &'a (dyn Fn(Arc<dyn OverlayValidator>) -> Box<dyn ProfileOverlayStore> + Sync);
+
+/// Makes a store that validates with the given validator and reads the
+/// given clock (issue #2394).
+pub type MakeClockedStore<'a> =
+    &'a (dyn Fn(Arc<dyn OverlayValidator>, StoreClock) -> Box<dyn ProfileOverlayStore> + Sync);
+
+/// A clock that a test moves by hand.
+#[derive(Clone)]
+pub struct HandClock(Arc<std::sync::Mutex<DateTime<Utc>>>);
+
+impl HandClock {
+    /// A clock at `at`.
+    pub fn at(at: DateTime<Utc>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(at)))
+    }
+
+    /// Move the clock to `at`.
+    pub fn set(&self, at: DateTime<Utc>) {
+        *self.0.lock().expect("clock") = at;
+    }
+
+    /// The clock as a store clock.
+    pub fn clock(&self) -> StoreClock {
+        let cell = Arc::clone(&self.0);
+        Arc::new(move || *cell.lock().expect("clock"))
+    }
+}
 
 /// A validator for any kind. Its base profile allows 10 steps, or 5 when
 /// it is tight, and the model `m1`.
@@ -42,13 +72,18 @@ impl Gate {
 }
 
 impl OverlayValidator for Gate {
-    fn validate(&self, kind: &str, overlay: &ProfileOverlay) -> Result<(), OverlayStoreError> {
+    fn validate(
+        &self,
+        kind: &str,
+        overlay: &ProfileOverlay,
+        policy: &RefinePolicy,
+    ) -> Result<(), OverlayStoreError> {
         let profile = self.base(kind);
         let registry: BTreeSet<String> = ["m1", "m2"].map(str::to_owned).into();
         apply(
             &profile,
             overlay,
-            &Ceilings::from_profile(&profile),
+            &policy.ceilings.resolve(&profile),
             &registry,
         )?;
         Ok(())
@@ -83,8 +118,8 @@ const fn version(n: u64) -> OverlayVersion {
     }
 }
 
-/// Run every case on stores from `make`.
-pub async fn run_all(make: MakeStore<'_>) {
+/// Run every case on stores from `make` and `clocked`.
+pub async fn run_all(make: MakeStore<'_>, clocked: MakeClockedStore<'_>) {
     get_returns_the_bytes_written_for_each_version(make).await;
     put_twice_returns_increasing_versions(make).await;
     activate_of_an_unknown_version_changes_nothing(make).await;
@@ -101,6 +136,18 @@ pub async fn run_all(make: MakeStore<'_>) {
     a_rollback_activates_the_version_before(make).await;
     a_rollback_with_no_earlier_activation_changes_nothing(make).await;
     an_activation_checks_its_actor(make).await;
+    a_kind_with_no_policy_reads_every_default(make).await;
+    a_set_policy_is_read_back_and_logged(make).await;
+    a_stale_policy_revision_changes_nothing(make).await;
+    reset_restores_every_default_and_is_logged(make).await;
+    only_an_operator_sets_the_policy(make).await;
+    a_policy_ceiling_widens_the_validator(make).await;
+    an_auto_adoption_records_auto_provenance(clocked).await;
+    the_daily_cap_holds_in_the_store(clocked).await;
+    an_auto_adoption_checks_the_pointer(make).await;
+    a_rollback_undoes_an_auto_adoption(make).await;
+    the_store_enforces_both_policies(make).await;
+    only_auto_adopt_writes_an_auto_actor(make).await;
 }
 
 /// After `put` v2, `get(kind, v1)` returns the bytes written for v1.
@@ -547,4 +594,445 @@ pub async fn an_activation_checks_its_actor(make: MakeStore<'_>) {
     }
     assert_eq!(store.active(&kind).await.expect("active"), None);
     assert_eq!(store.last_activation(&kind).await.expect("last"), None);
+}
+
+/// A fixed time in one UTC day, so a cap test never spans midnight.
+fn noon() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("2026-11-03T12:00:00Z")
+        .expect("time")
+        .with_timezone(&Utc)
+}
+
+fn policy(json: serde_json::Value) -> RefinePolicy {
+    serde_json::from_value(json).expect("a valid policy")
+}
+
+/// Issue #2394: with no policy stored, every setting reads its default.
+pub async fn a_kind_with_no_policy_reads_every_default(make: MakeStore<'_>) {
+    let store = make(Arc::new(Gate::default()));
+    let kind = kind("no-policy");
+    let state = store.policy(&kind).await.expect("policy");
+    assert_eq!(state.policy, RefinePolicy::default());
+    assert_eq!(state.revision, None);
+    assert!(!state.custom);
+    assert_eq!(store.policy_log(&kind).await.expect("log"), []);
+}
+
+/// A set policy reads back. The log keeps the old and the new value.
+pub async fn a_set_policy_is_read_back_and_logged(make: MakeStore<'_>) {
+    let store = make(Arc::new(Gate::default()));
+    let kind = kind("set-policy");
+    let wide = policy(serde_json::json!({"auto_adopt": {"parts": ["system"]}}));
+    let first = store
+        .set_policy(&kind, &wide, None, ops())
+        .await
+        .expect("set");
+    assert_eq!(first.revision(), 1);
+    assert_eq!(first.before(), None);
+    assert_eq!(first.after(), Some(&wide));
+    assert_eq!(first.actor(), &ops());
+    let state = store.policy(&kind).await.expect("policy");
+    assert_eq!(state.policy, wide);
+    assert_eq!(state.revision, Some(1));
+    assert!(state.custom);
+
+    let wider = policy(serde_json::json!({
+        "auto_adopt": {"parts": ["system"], "max_per_day": "unlimited"}
+    }));
+    let second = store
+        .set_policy(&kind, &wider, Some(1), Provenance::operator("lead"))
+        .await
+        .expect("set again");
+    assert_eq!(second.revision(), 2);
+    assert_eq!(second.before(), Some(&wide));
+    assert_eq!(second.after(), Some(&wider));
+    let log = store.policy_log(&kind).await.expect("log");
+    assert_eq!(log, [first, second]);
+    let other = store.policy(&self::kind("other")).await.expect("policy");
+    assert_eq!(other.policy, RefinePolicy::default(), "kinds do not share");
+}
+
+/// A set over a stale revision is a `PolicyConflict`. Nothing changes.
+pub async fn a_stale_policy_revision_changes_nothing(make: MakeStore<'_>) {
+    let store = make(Arc::new(Gate::default()));
+    let kind = kind("stale-policy");
+    let one = policy(serde_json::json!({"lessons": {"max_entries": 10}}));
+    let two = policy(serde_json::json!({"lessons": {"max_entries": 20}}));
+    store
+        .set_policy(&kind, &one, None, ops())
+        .await
+        .expect("set");
+    for stale in [None, Some(7)] {
+        let err = store.set_policy(&kind, &two, stale, ops()).await;
+        assert_eq!(
+            err,
+            Err(OverlayStoreError::PolicyConflict { actual: Some(1) }),
+            "{stale:?}"
+        );
+    }
+    let empty = self::kind("stale-empty");
+    let err = store.set_policy(&empty, &two, Some(1), ops()).await;
+    assert_eq!(err, Err(OverlayStoreError::PolicyConflict { actual: None }));
+    assert_eq!(store.policy(&kind).await.expect("policy").policy, one);
+    assert_eq!(store.policy_log(&kind).await.expect("log").len(), 1);
+}
+
+/// `reset` restores every default, and the log records it.
+pub async fn reset_restores_every_default_and_is_logged(make: MakeStore<'_>) {
+    let store = make(Arc::new(Gate::default()));
+    let kind = kind("reset-policy");
+    let wide = policy(serde_json::json!({"probe_effects": ["read_only", "internal"]}));
+    store
+        .set_policy(&kind, &wide, None, ops())
+        .await
+        .expect("set");
+    let reset = store
+        .reset_policy(&kind, Provenance::operator("oncall"))
+        .await
+        .expect("reset");
+    assert_eq!(reset.revision(), 2);
+    assert_eq!(reset.before(), Some(&wide));
+    assert_eq!(reset.after(), None);
+    assert_eq!(reset.actor(), &Provenance::operator("oncall"));
+    let state = store.policy(&kind).await.expect("policy");
+    assert_eq!(state.policy, RefinePolicy::default());
+    assert_eq!(state.revision, Some(2));
+    assert!(!state.custom);
+    let again = store.reset_policy(&kind, ops()).await.expect("reset again");
+    assert_eq!((again.revision(), again.before()), (3, None));
+}
+
+/// Only an operator writes the policy. A refine or auto run cannot.
+pub async fn only_an_operator_sets_the_policy(make: MakeStore<'_>) {
+    let store = make(Arc::new(Gate::default()));
+    let kind = kind("operator-only");
+    let wide = policy(serde_json::json!({"auto_adopt": {"parts": ["system"]}}));
+    let run = ExecutionId::new();
+    for actor in [Provenance::refine(run), Provenance::auto(run)] {
+        assert!(
+            matches!(
+                store.set_policy(&kind, &wide, None, actor.clone()).await,
+                Err(OverlayStoreError::InvalidProvenance { .. })
+            ),
+            "{actor:?} set the policy"
+        );
+        assert!(
+            matches!(
+                store.reset_policy(&kind, actor.clone()).await,
+                Err(OverlayStoreError::InvalidProvenance { .. })
+            ),
+            "{actor:?} reset the policy"
+        );
+    }
+    assert!(matches!(
+        store
+            .set_policy(&kind, &wide, None, Provenance::operator(" "))
+            .await,
+        Err(OverlayStoreError::InvalidProvenance { .. })
+    ));
+    assert_eq!(store.policy_log(&kind).await.expect("log"), []);
+}
+
+/// `ceilings.max_steps = 40`, over a profile of 10: a put of 30 passes,
+/// and a put of 50 fails. The default refuses 30.
+pub async fn a_policy_ceiling_widens_the_validator(make: MakeStore<'_>) {
+    let store = make(Arc::new(Gate::default()));
+    let kind = kind("ceiling");
+    let steps = |n| ProfileOverlay {
+        max_steps: Some(n),
+        ..ProfileOverlay::default()
+    };
+    assert!(matches!(
+        store.put(&kind, &steps(30), ops()).await,
+        Err(OverlayStoreError::Overlay(
+            OverlayError::AboveCeiling { .. }
+        ))
+    ));
+    let wide = policy(serde_json::json!({"ceilings": {"max_steps": 40}}));
+    store
+        .set_policy(&kind, &wide, None, ops())
+        .await
+        .expect("set");
+    let v1 = store.put(&kind, &steps(30), ops()).await.expect("30 fits");
+    assert!(matches!(
+        store.put(&kind, &steps(50), ops()).await,
+        Err(OverlayStoreError::Overlay(
+            OverlayError::AboveCeiling { .. }
+        ))
+    ));
+    store.reset_policy(&kind, ops()).await.expect("reset");
+    assert!(
+        matches!(
+            store.activate(&kind, v1, None, ops()).await,
+            Err(OverlayStoreError::Overlay(_))
+        ),
+        "a lowered ceiling refuses the activation"
+    );
+}
+
+/// A policy that auto-adopts `system` and `bounds` under `cap`.
+fn auto_policy(cap: &serde_json::Value) -> RefinePolicy {
+    policy(serde_json::json!({
+        "auto_adopt": {"parts": ["system", "bounds"], "max_per_day": cap}
+    }))
+}
+
+/// Store `policy` for `kind`, as an operator does.
+async fn allow(store: &dyn ProfileOverlayStore, kind: &str, policy: &RefinePolicy) {
+    let revision = store.policy(kind).await.expect("policy").revision;
+    store
+        .set_policy(kind, policy, revision, ops())
+        .await
+        .expect("set");
+}
+
+/// An auto adoption puts the version as `auto:<run>` and moves the
+/// pointer, with `auto:<run>` as the actor, at the time of the store clock.
+pub async fn an_auto_adoption_records_auto_provenance(make: MakeClockedStore<'_>) {
+    let clock = HandClock::at(noon());
+    let store = make(Arc::new(Gate::default()), clock.clock());
+    let kind = kind("auto");
+    let unlimited = auto_policy(&serde_json::json!("unlimited"));
+    allow(store.as_ref(), &kind, &unlimited).await;
+    let v1 = store.put(&kind, &narrow(9, "a"), ops()).await.expect("v1");
+    store.activate(&kind, v1, None, ops()).await.expect("v1");
+    let run = ExecutionId::new();
+    let outcome = store
+        .auto_adopt(&kind, &narrow(9, "b"), run, Some(v1), &unlimited)
+        .await
+        .expect("auto adopt");
+    let AutoAdoptOutcome::Adopted(v2) = outcome else {
+        panic!("want Adopted, got {outcome:?}");
+    };
+    assert_eq!(v2, version(2));
+    let active = store.active(&kind).await.expect("active").expect("set");
+    assert_eq!(active.version(), v2);
+    assert_eq!(active.provenance(), &Provenance::auto(run));
+    assert!(active.provenance().to_string().starts_with("auto:"));
+    let last = store
+        .last_activation(&kind)
+        .await
+        .expect("last")
+        .expect("a move");
+    assert_eq!((last.from(), last.to()), (Some(v1), v2));
+    assert_eq!(last.actor(), &Provenance::auto(run));
+    assert_eq!(last.activated_at(), noon());
+}
+
+/// With a cap of 1, a second auto adoption in the same UTC day of the store
+/// clock reaches the cap. Nothing is stored and the pointer stays. The
+/// next day adopts. `unlimited` never reaches a cap.
+pub async fn the_daily_cap_holds_in_the_store(make: MakeClockedStore<'_>) {
+    let clock = HandClock::at(noon());
+    let store = make(Arc::new(Gate::default()), clock.clock());
+    let kind = kind("cap");
+    let unlimited = auto_policy(&serde_json::json!("unlimited"));
+    allow(store.as_ref(), &kind, &unlimited).await;
+    let one = auto_policy(&serde_json::json!(1));
+    let adopt = |text: &'static str, expected, run_policy: RefinePolicy| {
+        let store = &store;
+        let kind = &kind;
+        async move {
+            store
+                .auto_adopt(
+                    kind,
+                    &narrow(9, text),
+                    ExecutionId::new(),
+                    expected,
+                    &run_policy,
+                )
+                .await
+                .expect("auto adopt")
+        }
+    };
+    let AutoAdoptOutcome::Adopted(v1) = adopt("a", None, one.clone()).await else {
+        panic!("the first adoption passes");
+    };
+    clock.set(noon() + TimeDelta::hours(11));
+    assert_eq!(
+        adopt("b", Some(v1), one.clone()).await,
+        AutoAdoptOutcome::CapReached { cap: 1, used: 1 }
+    );
+    assert_eq!(store.list(&kind).await.expect("list").len(), 1);
+    let active = store.active(&kind).await.expect("active").expect("set");
+    assert_eq!(active.version(), v1);
+    store
+        .activate(&kind, v1, Some(v1), ops())
+        .await
+        .expect("an operator move is not capped");
+
+    assert_eq!(
+        adopt("c", Some(v1), auto_policy(&serde_json::json!(0))).await,
+        AutoAdoptOutcome::CapReached { cap: 0, used: 1 }
+    );
+    let AutoAdoptOutcome::Adopted(v2) = adopt("d", Some(v1), unlimited.clone()).await else {
+        panic!("unlimited never waits");
+    };
+    allow(store.as_ref(), &kind, &one).await;
+    assert_eq!(
+        adopt("e", Some(v2), unlimited).await,
+        AutoAdoptOutcome::CapReached { cap: 1, used: 2 },
+        "the stricter cap of the store counts"
+    );
+    clock.set(noon() + TimeDelta::days(1));
+    let AutoAdoptOutcome::Adopted(v3) = adopt("f", Some(v2), one).await else {
+        panic!("a new UTC day has a new cap");
+    };
+    assert!(v1 < v2 && v2 < v3);
+}
+
+/// An auto adoption is a compare-and-swap on the pointer, and it validates
+/// the overlay first.
+pub async fn an_auto_adoption_checks_the_pointer(make: MakeStore<'_>) {
+    let store = make(Arc::new(Gate::default()));
+    let kind = kind("auto-cas");
+    let unlimited = auto_policy(&serde_json::json!("unlimited"));
+    allow(store.as_ref(), &kind, &unlimited).await;
+    let v1 = store.put(&kind, &narrow(9, "a"), ops()).await.expect("v1");
+    store.activate(&kind, v1, None, ops()).await.expect("v1");
+    let run = ExecutionId::new();
+    let stale = store
+        .auto_adopt(&kind, &narrow(9, "b"), run, None, &unlimited)
+        .await;
+    assert_eq!(stale, Err(OverlayStoreError::Conflict { actual: Some(v1) }));
+    let wide = store
+        .auto_adopt(&kind, &narrow(50, "b"), run, Some(v1), &unlimited)
+        .await;
+    assert!(
+        matches!(wide, Err(OverlayStoreError::Overlay(_))),
+        "{wide:?}"
+    );
+    let missing = store
+        .auto_adopt(&kind, &narrow(9, "b"), run, Some(version(9)), &unlimited)
+        .await;
+    assert_eq!(
+        missing,
+        Err(OverlayStoreError::UnknownVersion {
+            version: version(9)
+        })
+    );
+    assert_eq!(store.list(&kind).await.expect("list").len(), 1);
+}
+
+/// `rollback` after an auto adoption restores the version before it.
+pub async fn a_rollback_undoes_an_auto_adoption(make: MakeStore<'_>) {
+    let store = make(Arc::new(Gate::default()));
+    let kind = kind("auto-rollback");
+    let unlimited = auto_policy(&serde_json::json!("unlimited"));
+    allow(store.as_ref(), &kind, &unlimited).await;
+    let v1 = store.put(&kind, &narrow(9, "a"), ops()).await.expect("v1");
+    store.activate(&kind, v1, None, ops()).await.expect("v1");
+    let outcome = store
+        .auto_adopt(
+            &kind,
+            &narrow(9, "b"),
+            ExecutionId::new(),
+            Some(v1),
+            &unlimited,
+        )
+        .await
+        .expect("auto adopt");
+    let AutoAdoptOutcome::Adopted(v2) = outcome else {
+        panic!("want Adopted, got {outcome:?}");
+    };
+    let back = store.rollback(&kind, ops()).await.expect("rollback");
+    assert_eq!(back, Rollback { from: v2, to: v1 });
+    let active = store.active(&kind).await.expect("active").expect("set");
+    assert_eq!(active.version(), v1);
+}
+
+/// The store enforces the gate. A part goes live only when the run policy
+/// and the stored policy both allow it. An unchanged overlay stores
+/// nothing. With no stored policy, nothing goes live.
+pub async fn the_store_enforces_both_policies(make: MakeStore<'_>) {
+    let store = make(Arc::new(Gate::default()));
+    let kind = kind("both");
+    let wide = auto_policy(&serde_json::json!("unlimited"));
+    let run = ExecutionId::new();
+    let refused = store
+        .auto_adopt(&kind, &narrow(9, "a"), run, None, &wide)
+        .await
+        .expect("gate");
+    assert_eq!(
+        refused,
+        AutoAdoptOutcome::NeedsApproval {
+            parts: BTreeSet::from([OverlayPart::System, OverlayPart::Bounds])
+        },
+        "the stored default allows nothing"
+    );
+    let system_only = policy(serde_json::json!({"auto_adopt": {"parts": ["system"]}}));
+    allow(store.as_ref(), &kind, &system_only).await;
+    let refused = store
+        .auto_adopt(&kind, &narrow(9, "a"), run, None, &wide)
+        .await
+        .expect("gate");
+    assert_eq!(
+        refused,
+        AutoAdoptOutcome::NeedsApproval {
+            parts: BTreeSet::from([OverlayPart::Bounds])
+        }
+    );
+    let prompt_only = ProfileOverlay {
+        system: Some("Only the prompt.".to_owned()),
+        ..ProfileOverlay::default()
+    };
+    let AutoAdoptOutcome::Adopted(v1) = store
+        .auto_adopt(&kind, &prompt_only, run, None, &wide)
+        .await
+        .expect("gate")
+    else {
+        panic!("both policies allow system");
+    };
+    assert_eq!(
+        store
+            .auto_adopt(&kind, &prompt_only, run, Some(v1), &wide)
+            .await
+            .expect("gate"),
+        AutoAdoptOutcome::Unchanged
+    );
+    let narrow_run = RefinePolicy::default();
+    let other = ProfileOverlay {
+        system: Some("Another prompt.".to_owned()),
+        ..ProfileOverlay::default()
+    };
+    assert_eq!(
+        store
+            .auto_adopt(&kind, &other, run, Some(v1), &narrow_run)
+            .await
+            .expect("gate"),
+        AutoAdoptOutcome::NeedsApproval {
+            parts: BTreeSet::from([OverlayPart::System])
+        },
+        "the run policy also binds"
+    );
+    assert_eq!(store.list(&kind).await.expect("list").len(), 1);
+}
+
+/// Only `auto_adopt` writes an `auto` actor. A put, an activation and a
+/// rollback with one are refused, so each auto move passes the cap.
+pub async fn only_auto_adopt_writes_an_auto_actor(make: MakeStore<'_>) {
+    let store = make(Arc::new(Gate::default()));
+    let kind = kind("auto-actor");
+    let auto = Provenance::auto(ExecutionId::new());
+    assert!(matches!(
+        store.put(&kind, &narrow(9, "a"), auto.clone()).await,
+        Err(OverlayStoreError::InvalidProvenance { .. })
+    ));
+    let v1 = store.put(&kind, &narrow(9, "a"), ops()).await.expect("v1");
+    assert!(matches!(
+        store.activate(&kind, v1, None, auto.clone()).await,
+        Err(OverlayStoreError::InvalidProvenance { .. })
+    ));
+    let v2 = store.put(&kind, &narrow(8, "b"), ops()).await.expect("v2");
+    store.activate(&kind, v1, None, ops()).await.expect("v1");
+    store
+        .activate(&kind, v2, Some(v1), ops())
+        .await
+        .expect("v2");
+    assert!(matches!(
+        store.rollback(&kind, auto).await,
+        Err(OverlayStoreError::InvalidProvenance { .. })
+    ));
+    let active = store.active(&kind).await.expect("active").expect("set");
+    assert_eq!(active.version(), v2);
 }

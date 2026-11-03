@@ -5351,6 +5351,22 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             "/agents/{kind}/profile/rollback",
             post(crate::agent_profile_api::rollback).route_layer(require_admin.clone()),
         )
+        // The refine policy of an agent kind (issue #2394). The set and the
+        // reset are mutating, so only the operator role reaches them.
+        .route(
+            "/agents/{kind}/profile/policy",
+            get(crate::agent_profile_api::get_policy)
+                .put(crate::agent_profile_api::set_policy)
+                .route_layer(require_admin.clone()),
+        )
+        .route(
+            "/agents/{kind}/profile/policy/reset",
+            post(crate::agent_profile_api::reset_policy).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/agents/{kind}/profile/policy/changes",
+            get(crate::agent_profile_api::list_policy_changes).route_layer(require_admin.clone()),
+        )
         .route(
             "/admin/retention",
             get(retention_status).route_layer(require_admin.clone()),
@@ -7363,6 +7379,11 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/agents/{kind}/profile/diff"),
         ("POST", "/agents/{kind}/profile/activate"),
         ("POST", "/agents/{kind}/profile/rollback"),
+        // The refine policy of an agent kind (issue #2394).
+        ("GET", "/agents/{kind}/profile/policy"),
+        ("PUT", "/agents/{kind}/profile/policy"),
+        ("POST", "/agents/{kind}/profile/policy/reset"),
+        ("GET", "/agents/{kind}/profile/policy/changes"),
         ("GET", "/admin/retention"),
         ("POST", "/admin/retention/run-now"),
         ("POST", "/admin/workflows/replay-canary"),
@@ -7699,6 +7720,13 @@ pub const fn management_api_request_fields()
             Some(&["version", "expected_active"]),
         ),
         ("POST", "/agents/{kind}/profile/rollback", Some(&[])),
+        // The refine policy (issue #2394). A reset takes no field.
+        (
+            "PUT",
+            "/agents/{kind}/profile/policy",
+            Some(&["policy", "expected_revision"]),
+        ),
+        ("POST", "/agents/{kind}/profile/policy/reset", Some(&[])),
         // ── dead-letter queue ─────────────────────────────────────────────────
         (
             "POST",
@@ -8961,6 +8989,26 @@ pub const fn management_api_response_fields()
             "POST",
             "/agents/{kind}/profile/rollback",
             Some(&["kind", "from", "to", "actor"]),
+        ),
+        (
+            "GET",
+            "/agents/{kind}/profile/policy",
+            Some(&["kind", "revision", "custom", "policy"]),
+        ),
+        (
+            "PUT",
+            "/agents/{kind}/profile/policy",
+            Some(&["kind", "revision", "custom", "policy", "actor", "changes"]),
+        ),
+        (
+            "POST",
+            "/agents/{kind}/profile/policy/reset",
+            Some(&["kind", "revision", "custom", "policy", "actor", "changes"]),
+        ),
+        (
+            "GET",
+            "/agents/{kind}/profile/policy/changes",
+            Some(&["kind", "changes"]),
         ),
         ("GET", "/admin/retention", None), // RetentionStatus (external model)
         ("POST", "/admin/retention/run-now", Some(&["ok"])),

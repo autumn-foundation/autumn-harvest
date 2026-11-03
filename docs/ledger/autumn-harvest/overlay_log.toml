@@ -62,3 +62,38 @@ backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_agent_overlay_activations"]
 measured = "unmeasured"
+
+["pg::append_policy"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_agent_refine_policies"]
+measured = "unmeasured"
+
+["pg::auto_adopt_overlay"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_agent_overlay_activations", "harvest_agent_overlay_heads", "harvest_agent_overlays"]
+measured = "unmeasured"
+
+["pg::count_auto_moves"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_agent_overlay_activations"]
+measured = "unmeasured"
+
+["pg::last_policy"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_agent_refine_policies"]
+measured = "unmeasured"
+
+["pg::policy_log"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_agent_refine_policies"]
+measured = "unmeasured"

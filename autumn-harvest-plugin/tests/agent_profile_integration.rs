@@ -16,7 +16,7 @@ use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest_agent::{
     InMemoryOverlayStore, OverlayStoreError, OverlayValidator, OverlayVersion, ProfileOverlay,
-    ProfileOverlayStore, Provenance,
+    ProfileOverlayStore, Provenance, RefinePolicy,
 };
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
@@ -48,7 +48,12 @@ const ROLE_HEADER: &str = "x-test-role";
 struct AnyOverlay;
 
 impl OverlayValidator for AnyOverlay {
-    fn validate(&self, kind: &str, _overlay: &ProfileOverlay) -> Result<(), OverlayStoreError> {
+    fn validate(
+        &self,
+        kind: &str,
+        _overlay: &ProfileOverlay,
+        _policy: &RefinePolicy,
+    ) -> Result<(), OverlayStoreError> {
         if kind == KIND {
             Ok(())
         } else {
@@ -709,4 +714,230 @@ async fn a_committed_move_with_no_audit_row_says_so() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+const POLICY: &str = "/agents/support/profile/policy";
+
+fn default_policy() -> Value {
+    serde_json::to_value(RefinePolicy::default()).expect("encode")
+}
+
+async fn set_policy(
+    app: &axum::Router,
+    role: &str,
+    policy: Value,
+    expected: Option<u64>,
+) -> (StatusCode, Value) {
+    call(
+        app,
+        role,
+        "PUT",
+        POLICY,
+        Some(json!({"policy": policy, "expected_revision": expected})),
+    )
+    .await
+}
+
+/// Issue #2394: with no policy stored, the route reads every default. An
+/// operator sets the policy, and the store and the route read it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_operator_sets_the_policy() {
+    let fx = fixture(true).await;
+    let (status, body) = call(&fx.app, ROLE_VIEWER, "GET", POLICY, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({"kind": KIND, "revision": null, "custom": false, "policy": default_policy()})
+    );
+
+    let (status, body) = set_policy(
+        &fx.app,
+        ROLE_OPERATOR,
+        json!({"auto_adopt": {"parts": ["system"]}, "ceilings": {"max_steps": 40}}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revision"], 1);
+    assert_eq!(body["custom"], true);
+    assert_eq!(body["actor"], "alice@example.com");
+    assert_eq!(body["policy"]["auto_adopt"]["parts"], json!(["system"]));
+    assert_eq!(body["policy"]["ceilings"]["max_steps"], 40);
+    let state = fx.store.policy(KIND).await.expect("policy");
+    assert_eq!(state.revision, Some(1));
+    assert_eq!(
+        state
+            .policy
+            .ceilings
+            .max_steps
+            .map(std::num::NonZeroU32::get),
+        Some(40)
+    );
+
+    let (status, body) = call(&fx.app, ROLE_VIEWER, "GET", POLICY, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revision"], 1);
+    assert_eq!(body["policy"]["auto_adopt"]["parts"], json!(["system"]));
+}
+
+/// Issue #2394: setting the policy without the operator role returns
+/// `403`, and the stored policy is unchanged. A viewer still reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_viewer_cannot_set_or_reset_the_policy() {
+    let fx = fixture(true).await;
+    let wide = json!({"auto_adopt": {"parts": ["system", "model"], "max_per_day": "unlimited"}});
+    let (status, body) = set_policy(&fx.app, ROLE_VIEWER, wide, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(error_text(&body).contains(ROLE_DENIED_ERROR), "{body}");
+    let (status, body) = call(
+        &fx.app,
+        ROLE_VIEWER,
+        "POST",
+        "/agents/support/profile/policy/reset",
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let state = fx.store.policy(KIND).await.expect("policy");
+    assert_eq!(state.policy, RefinePolicy::default());
+    assert_eq!(state.revision, None);
+    assert_eq!(fx.store.policy_log(KIND).await.expect("log"), []);
+    for uri in [POLICY, "/agents/support/profile/policy/changes"] {
+        let (status, body) = call(&fx.app, ROLE_VIEWER, "GET", uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    }
+}
+
+/// A set needs `expected_revision`. A stale one is a `409`. A policy key
+/// that does not exist, or a value out of range, is a `400`. Nothing
+/// changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bad_or_stale_set_changes_nothing() {
+    let fx = fixture(true).await;
+    let (status, _) = set_policy(&fx.app, ROLE_OPERATOR, json!({}), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = set_policy(&fx.app, ROLE_OPERATOR, json!({}), Some(5)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(error_text(&body).contains("revision 1"), "{body}");
+    for bad in [
+        json!({"policy": {}}),
+        json!({"policy": {"tools": ["shell"]}, "expected_revision": 1}),
+        json!({"policy": {"auto_adopt": {"max_per_day": 5000}}, "expected_revision": 1}),
+        json!({"policy": {"approval_timeout": "0s"}, "expected_revision": 1}),
+        json!({"policy": {}, "expected_revision": 1, "actor": "root"}),
+    ] {
+        let (status, body) = call(&fx.app, ROLE_OPERATOR, "PUT", POLICY, Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
+    assert_eq!(fx.store.policy_log(KIND).await.expect("log").len(), 1);
+}
+
+/// Issue #2394: `reset` restores every default. Each change is in the
+/// store log with its old and new value, and in the audit export with the
+/// keys that changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_restores_every_default_and_each_change_is_audited() {
+    let fx = fixture(true).await;
+    let (status, body) = set_policy(
+        &fx.app,
+        ROLE_OPERATOR,
+        json!({"auto_adopt": {"parts": ["system"], "max_per_day": "unlimited"}}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call_as(
+        &fx.app,
+        "bob@example.com",
+        ROLE_OPERATOR,
+        "POST",
+        "/agents/support/profile/policy/reset",
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revision"], 2);
+    assert_eq!(body["custom"], false);
+    assert_eq!(body["policy"], default_policy());
+    let state = fx.store.policy(KIND).await.expect("policy");
+    assert_eq!(state.policy, RefinePolicy::default());
+    assert!(!state.custom);
+
+    let (status, body) = call(
+        &fx.app,
+        ROLE_VIEWER,
+        "GET",
+        "/agents/support/profile/policy/changes",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let changes = body["changes"].as_array().expect("changes");
+    assert_eq!(changes.len(), 2, "{body}");
+    assert_eq!(changes[0]["revision"], 1);
+    assert_eq!(changes[0]["actor"], "alice@example.com");
+    assert_eq!(changes[0]["old"], Value::Null);
+    assert_eq!(changes[0]["new"]["auto_adopt"]["parts"], json!(["system"]));
+    assert_eq!(changes[1]["revision"], 2);
+    assert_eq!(changes[1]["actor"], "bob@example.com");
+    assert_eq!(changes[1]["old"]["auto_adopt"]["max_per_day"], "unlimited");
+    assert_eq!(changes[1]["new"], Value::Null);
+
+    let mut conn = AsyncPgConnection::establish(&fx.url)
+        .await
+        .expect("connect");
+    ensure_cursor_row(&mut conn, 0).await.expect("cursor");
+    let claim = claim_shard(
+        &mut conn,
+        0,
+        100,
+        std::time::Duration::from_secs(0),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("claim")
+    .expect("rows to export");
+    let body = serialize_batch(&claim.records).expect("serialize");
+    let rows: Vec<Value> = String::from_utf8(body)
+        .expect("utf8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("json line"))
+        .filter(|row: &Value| {
+            row["operation"]
+                .as_str()
+                .is_some_and(|op| op.starts_with("agent_profile.policy"))
+        })
+        .collect();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0]["operation"], "agent_profile.policy_set");
+    assert_eq!(rows[0]["status"], "succeeded");
+    assert_eq!(rows[0]["target_id"], KIND);
+    assert_eq!(rows[0]["actor"], "alice@example.com");
+    let set = rows[0]["error_summary"].as_str().unwrap_or_default();
+    assert!(set.contains("revision 1"), "{set}");
+    assert!(set.contains(r#"auto_adopt.parts +["system"] -[]"#), "{set}");
+    assert!(
+        set.contains(r#"auto_adopt.max_per_day 1 -> "unlimited""#),
+        "{set}"
+    );
+    assert_eq!(rows[1]["operation"], "agent_profile.policy_reset");
+    assert_eq!(rows[1]["actor"], "bob@example.com");
+    let reset = rows[1]["error_summary"].as_str().unwrap_or_default();
+    assert!(reset.contains("revision 2"), "{reset}");
+    assert!(
+        reset.contains(r#"auto_adopt.parts +[] -["system"]"#),
+        "{reset}"
+    );
+}
+
+/// With no store, each policy route is a `404` that names the builder
+/// method.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_policy_routes_need_a_store() {
+    let fx = fixture(false).await;
+    let (status, body) = call(&fx.app, ROLE_VIEWER, "GET", POLICY, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(error_text(&body).contains("agent_overlay_store"), "{body}");
+    let (status, _) = set_policy(&fx.app, ROLE_OPERATOR, json!({}), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
