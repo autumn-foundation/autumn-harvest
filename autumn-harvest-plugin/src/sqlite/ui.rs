@@ -1,7 +1,7 @@
 //! Vantage on the SQLite backend (issue #2468).
 //!
 //! `.api(path)` serves two read-only pages under `{path}/ui`, as on
-//! Postgres:
+//! Postgres. A tenant route serves them under `{path}/tenants/{key}/ui`:
 //!
 //! - `ui/workflows`: the run list, with the state, name and id filters of
 //!   `GET /workflows`, and a cursor for the next page.
@@ -332,10 +332,17 @@ fn summary_card(exec: ExecutionId, detail: &Detail) -> Markup {
     }
 }
 
-fn children_table(children: &[autumn_harvest_sqlite::ChildRun]) -> Markup {
+fn children_table(exec: ExecutionId, children: &[autumn_harvest_sqlite::ChildRun]) -> Markup {
+    let capped = children.len() >= usize::try_from(LIST_PAGE).unwrap_or(usize::MAX);
     html! {
         @if !children.is_empty() {
             h3 { "Children" }
+            @if capped {
+                p {
+                    "The first " (LIST_PAGE) " children. "
+                    a href={ "../../workflows/" (exec.to_string()) "/children" } { "All children (JSON)" }
+                }
+            }
             table {
                 thead { tr { th { "ID" } th { "Workflow" } th { "Mode" } th { "State" } } }
                 tbody {
@@ -397,7 +404,7 @@ fn detail_body(exec: ExecutionId, detail: &Detail) -> Markup {
         @if let Some(error) = detail.description.error.value() {
             div.card { h3 { "Error" } pre { (error) } }
         }
-        (children_table(&detail.children))
+        (children_table(exec, &detail.children))
         (events_table(exec, &detail.history))
         p {
             "JSON: "

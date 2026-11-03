@@ -19,7 +19,8 @@ registers no declarative query handler.
   - `LineageWalk` (tree);
   - `assemble_run_chain` and `reconstruct_legacy_chain_order` (run chain);
   - `derive_timeline` (timeline);
-  - `project_awaitables` and `drive_query_replay_async` (awaitables);
+  - `drive_query_replay_async`, then `project_awaitables` through the new
+    shared `classify_replayed_wait_set` (awaitables);
   - `export_history_decoded` (history export).
 - SQLite stores the parent of a child run (`parent_exec_id`) and its close
   policy. A `NULL` policy is an awaited child.

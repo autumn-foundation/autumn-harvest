@@ -4051,7 +4051,7 @@ impl SqliteRuntime {
         }
         // The lines of this cycle share its transaction. A rolled-back cycle
         // stores none, and its re-drive offers the same seqs again.
-        workflow_log::append_commands(&tx, exec, commands, log_policy)?;
+        workflow_log::append_commands(&tx, exec, commands, log_policy);
         if let Some(reason) = caps.reached(&tx, exec)? {
             return Ok(Applied::CapReached(reason));
         }
@@ -5788,7 +5788,7 @@ fn persist_terminal_pending_commands<'c>(
         }
     }
     // The terminal cycle's lines share the terminal transaction (issue #2468).
-    workflow_log::append_commands(conn, exec, pending, drain.log_policy)?;
+    workflow_log::append_commands(conn, exec, pending, drain.log_policy);
     Ok(())
 }
 

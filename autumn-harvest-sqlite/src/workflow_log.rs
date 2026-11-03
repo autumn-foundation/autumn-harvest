@@ -64,22 +64,21 @@ impl LogFilter {
     }
 }
 
-/// Store the `RecordLog` lines of one cycle.
+/// Store the `RecordLog` lines of one cycle. It is best effort, as on
+/// Postgres.
 ///
-/// It does nothing when `policy` is `None`. Returns the number of lines that
-/// the insert added.
-///
-/// # Errors
-///
-/// Returns [`SqliteError::Sqlite`] if a statement fails.
+/// A log line is observational only. So a failed write never fails the
+/// cycle: a savepoint rolls back the write alone, and a warning logs the
+/// error. It does nothing when `policy` is `None`. Returns the number of
+/// lines that the insert added.
 pub fn append_commands<'c>(
     conn: &Connection,
     exec: ExecutionId,
     commands: impl IntoIterator<Item = &'c WorkflowCommand>,
     policy: Option<WorkflowLogPolicy>,
-) -> SqliteResult<usize> {
+) -> usize {
     let Some(policy) = policy else {
-        return Ok(0);
+        return 0;
     };
     let lines: Vec<(i64, &'static str, &str)> = commands
         .into_iter()
@@ -99,7 +98,24 @@ pub fn append_commands<'c>(
             _ => None,
         })
         .collect();
-    append(conn, exec, &lines, policy.max_lines())
+    if lines.is_empty() {
+        return 0;
+    }
+    let written = conn
+        .execute_batch("SAVEPOINT harvest_workflow_logs")
+        .map_err(SqliteError::from)
+        .and_then(|()| append(conn, exec, &lines, policy.max_lines()));
+    let undo = match &written {
+        Ok(_) => "RELEASE harvest_workflow_logs",
+        Err(_) => "ROLLBACK TO harvest_workflow_logs; RELEASE harvest_workflow_logs",
+    };
+    if let Err(error) = conn.execute_batch(undo) {
+        tracing::warn!(%exec, %error, "harvest-sqlite: the log savepoint did not close");
+    }
+    written.unwrap_or_else(|error| {
+        tracing::warn!(%exec, %error, "harvest-sqlite: dropped the log lines of a cycle");
+        0
+    })
 }
 
 /// Store `lines` under the cap `max_lines`. See the module docs.

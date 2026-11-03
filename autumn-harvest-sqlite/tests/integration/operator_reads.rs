@@ -346,3 +346,23 @@ async fn a_replay_input_rebuilds_the_wait_set_of_a_parked_run() {
     });
     assert!(waits_on_go, "the replay parks on the signal");
 }
+
+/// A log write is best effort, as on Postgres. A failed write drops the
+/// lines of the cycle and never fails the cycle.
+#[tokio::test]
+async fn a_failed_log_write_does_not_fail_the_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("h.db");
+    let mut rt = runtime(&db);
+    rt.set_workflow_log_policy(Some(WorkflowLogPolicy::new()));
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("DROP TABLE harvest_workflow_logs")
+        .unwrap();
+    let exec = rt.start_workflow("chatty", json!(0)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::WaitingSignal(_)), "{state:?}");
+    rt.send_signal(exec, "go", json!(1)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+}

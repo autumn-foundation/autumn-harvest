@@ -147,13 +147,17 @@ fn millis(value: i64, field: &str) -> SqliteResult<DateTime<Utc>> {
 }
 
 /// See [`SqliteReader::count_executions`](crate::SqliteReader::count_executions).
+///
+/// The filters compare as the listing does: by bytes, and a time bound
+/// matches only an integer time. A damaged row then counts as it lists.
 pub fn count(conn: &Connection, filter: &CountFilter) -> SqliteResult<Vec<ExecutionCount>> {
     let mut statement = conn.prepare_cached(
         "SELECT state, workflow_name, count(*) FROM harvest_executions \
-         WHERE (?1 IS NULL OR workflow_name = ?1) \
-           AND (json_array_length(?2) = 0 OR state IN (SELECT value FROM json_each(?2))) \
-           AND (?3 IS NULL OR started_at >= ?3) \
-           AND (?4 IS NULL OR started_at <= ?4) \
+         WHERE (?1 IS NULL OR cast(workflow_name as blob) = cast(?1 as blob)) \
+           AND (json_array_length(?2) = 0 \
+                OR cast(state as blob) IN (SELECT cast(value as blob) FROM json_each(?2))) \
+           AND (?3 IS NULL OR (typeof(started_at) = 'integer' AND started_at >= ?3)) \
+           AND (?4 IS NULL OR (typeof(started_at) = 'integer' AND started_at <= ?4)) \
          GROUP BY state, workflow_name",
     )?;
     let rows = statement.query_map(
@@ -194,7 +198,7 @@ pub fn children(
                 closed_at, error, parent_close_policy \
          FROM harvest_executions \
          WHERE parent_exec_id IN (SELECT value FROM json_each(?1)) \
-         ORDER BY rowid LIMIT ?2",
+         ORDER BY started_at, rowid LIMIT ?2",
     )?;
     let limit = limit.map_or(-1, i64::from);
     let rows = statement.query_map(params![id_array(parents)?, limit], |row| {

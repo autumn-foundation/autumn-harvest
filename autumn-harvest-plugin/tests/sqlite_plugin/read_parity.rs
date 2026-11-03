@@ -38,6 +38,14 @@ async fn family(ctx: &WorkflowContext, _n: Value) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Spawns an awaited `family`, so the tree has a grandchild level.
+#[workflow]
+async fn elder(ctx: &WorkflowContext, _n: Value) -> Result<Value, String> {
+    ctx.spawn_child_workflow_raw("family", json!(0))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Continues as new once. The successor waits for `go`.
 #[workflow]
 async fn relay(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
@@ -85,7 +93,7 @@ async fn rename(_ctx: &WorkflowContext, name: String) -> Result<String, String> 
 
 fn plugin() -> HarvestPlugin {
     HarvestPlugin::new()
-        .workflows(workflows![kid, family, relay, napper])
+        .workflows(workflows![kid, family, elder, relay, napper])
         .activities(activities![flaky])
         .queries(queries![whoami])
         .signals(signals![wave])
@@ -575,4 +583,174 @@ fn urlencode(raw: &str) -> String {
             other => format!("%{other:02X}"),
         })
         .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn children_and_tree_walk_the_depth_and_check_their_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = app(dir.path(), "dev");
+    let exec = start(&client, "elder", &json!({ "input": 0 })).await;
+    let deep = get_until(
+        &client,
+        &format!("/workflows/{exec}/children?depth=1"),
+        |body| {
+            body["items"]
+                .as_array()
+                .is_some_and(|items| items.len() == 3)
+        },
+    )
+    .await;
+    contract::children_shape(&deep);
+    let depths: Vec<u64> = deep["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|child| child["depth"].as_u64())
+        .collect();
+    assert_eq!(
+        depths.iter().filter(|depth| **depth == 1).count(),
+        2,
+        "{deep}"
+    );
+    let direct = get(&client, &format!("/workflows/{exec}/children")).await;
+    assert_eq!(direct.body["items"].as_array().map(Vec::len), Some(1));
+    for bad in ["depth=6", "depth=x", "cursor=garbage", "limit=x"] {
+        let answer = get(&client, &format!("/workflows/{exec}/children?{bad}")).await;
+        assert_eq!(answer.status, 400, "{bad}: {answer:?}");
+    }
+
+    let tree = get(&client, &format!("/workflows/{exec}/tree")).await;
+    contract::tree_shape(&tree.body);
+    assert_eq!(tree.body["node_count"], 4, "{tree:?}");
+    let shallow = get(&client, &format!("/workflows/{exec}/tree?max_depth=1")).await;
+    contract::tree_shape(&shallow.body);
+    assert_eq!(shallow.body["node_count"], 2, "{shallow:?}");
+    assert_eq!(shallow.body["truncated"], true, "{shallow:?}");
+    for bad in ["max_nodes=x", "max_depth=x", "summary=maybe"] {
+        let answer = get(&client, &format!("/workflows/{exec}/tree?{bad}")).await;
+        assert_eq!(answer.status, 400, "{bad}: {answer:?}");
+    }
+
+    // A detached child as the root keeps its own mode, as on Postgres.
+    let detached = tree.body["root"]["children"][0]["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["await_mode"] == "detached")
+        .expect("a detached grandchild")["execution_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let rooted = get(&client, &format!("/workflows/{detached}/tree")).await;
+    assert_eq!(rooted.body["root"]["await_mode"], "detached", "{rooted:?}");
+    assert_eq!(
+        rooted.body["root"]["parent_close_policy"], "abandon",
+        "{rooted:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_that_reads_no_query_key_refuses_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = app(dir.path(), "dev");
+    let exec = family_run(&client).await;
+    for path in [
+        format!("/workflows/{exec}/timeline?after=1"),
+        format!("/workflows/{exec}/run-chain?x=1"),
+        format!("/workflows/{exec}/awaitables?x=1"),
+        format!("/workflows/{exec}/stack?x=1"),
+        "/workflows/by-id/family/fam-1/stack?x=1".to_owned(),
+        "/workflows/registered/family/schema?x=1".to_owned(),
+        "/workflows/registered/family/interface?x=1".to_owned(),
+    ] {
+        assert_eq!(get(&client, &path).await.status, 400, "{path}");
+    }
+}
+
+/// A run of a workflow that this app no longer registers degrades to the
+/// history-only wait-set, as on Postgres.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_awaitables_of_an_unregistered_workflow_read_history_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let exec = {
+        let client = app(dir.path(), "dev");
+        let exec = start(&client, "napper", &json!({ "input": 1 })).await;
+        get_until(&client, &format!("/workflows/{exec}/stack"), |body| {
+            body["pending_timers"]
+                .as_array()
+                .is_some_and(|t| !t.is_empty())
+        })
+        .await;
+        let handle = client
+            .state()
+            .extension::<autumn_harvest_plugin::sqlite::HarvestSqlite>()
+            .unwrap();
+        handle.shutdown().await.unwrap();
+        exec
+    };
+    let client = TestApp::new()
+        .config(super::config(dir.path()))
+        .profile("dev")
+        .plugin(
+            HarvestPlugin::new()
+                .workflows(workflows![kid])
+                .api("/harvest"),
+        )
+        .build();
+    let awaitables = get(&client, &format!("/workflows/{exec}/awaitables")).await;
+    assert_eq!(awaitables.status, 200, "{awaitables:?}");
+    contract::awaitables_shape(&awaitables.body);
+    assert_eq!(awaitables.body["wait_set"], "history_only");
+    assert_eq!(awaitables.body["wait_set_reason"], "handler_not_registered");
+    let kinds: Vec<&str> = awaitables.body["awaitables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|awaitable| awaitable["kind"].as_str())
+        .collect();
+    assert!(kinds.contains(&"timer"), "{kinds:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vantage_redirects_keep_the_mount_and_the_list_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = app(dir.path(), "dev");
+    for (path, target) in [
+        ("/harvest/ui", "ui/workflows"),
+        ("/harvest/ui/", "workflows"),
+    ] {
+        let index = client.get(path).send().await;
+        assert!(index.status.is_redirection(), "{path}: {:?}", index.status);
+        assert_eq!(index.header("location"), Some(target), "{path}");
+    }
+    let mut runs = Vec::new();
+    for _ in 0..51 {
+        runs.push(start(&client, "kid", &json!({ "input": 0 })).await);
+    }
+    let first = client.get("/harvest/ui/workflows").send().await;
+    first.assert_ok();
+    let first = String::from_utf8(first.body.clone()).unwrap();
+    let marker = "href=\"workflows?cursor=";
+    let at = first.find(marker).expect("a next-page link");
+    let rest = &first[at + "href=\"".len()..];
+    let next = &rest[..rest.find('"').unwrap()];
+    // The oldest run is past the first page of 50.
+    assert!(
+        !first.contains(&format!("workflows/{}\"", runs[0])),
+        "page one"
+    );
+    let second = client
+        .get(&format!("/harvest/ui/{}", next.replace("&amp;", "&")))
+        .send()
+        .await;
+    second.assert_ok();
+    let second = String::from_utf8(second.body.clone()).unwrap();
+    assert!(
+        second.contains(&format!("workflows/{}", runs[0])),
+        "{second}"
+    );
+    let bad = client.get("/harvest/ui/workflows?state=nope").send().await;
+    bad.assert_ok();
+    let bad = String::from_utf8(bad.body).unwrap();
+    assert!(bad.contains("Not applied"), "{bad}");
 }

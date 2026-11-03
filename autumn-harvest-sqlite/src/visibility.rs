@@ -437,8 +437,8 @@ impl SqliteReader {
         crate::operator::count(&self.conn, filter)
     }
 
-    /// The child runs of each of `parents`, in insert order. `limit` caps the
-    /// rows over all parents.
+    /// The child runs of each of `parents`, oldest start first, as on
+    /// Postgres. `limit` caps the rows over all parents.
     ///
     /// # Errors
     ///
@@ -450,6 +450,25 @@ impl SqliteReader {
         limit: Option<u32>,
     ) -> SqliteResult<Vec<crate::ChildRun>> {
         crate::operator::children(&self.conn, parents, limit)
+    }
+
+    /// The parent of `exec` and its close policy, for a child run.
+    ///
+    /// The policy is `None` for an awaited child, and names the policy of a
+    /// detached child, such as `abandon`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
+    /// [`SqliteError::Sqlite`] if the query fails.
+    pub fn parent_link(
+        &self,
+        exec: ExecutionId,
+    ) -> SqliteResult<Option<(ExecutionId, Option<String>)>> {
+        if !crate::store::execution_exists(&self.conn, exec)? {
+            return Err(SqliteError::ExecutionNotFound(exec));
+        }
+        crate::store::parent_link(&self.conn, exec)
     }
 
     /// The runs of `parents` that have at least one child.

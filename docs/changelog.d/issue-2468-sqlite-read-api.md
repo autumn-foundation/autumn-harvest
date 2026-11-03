@@ -1,8 +1,9 @@
 ## Plugin — SQLite read API parity, Vantage and declarative queries (issue #2468, epic #2466)
 
 The SQLite `HarvestPlugin` now serves the read routes that slice 1 answered
-with `501`. Each route keeps its Postgres path, query keys, status codes
-and JSON shape. The plan is `docs/design/DESIGN-2468.md`.
+with `501`. Each route keeps its Postgres path, status codes and JSON
+shape. A route that reads no query key refuses one, as the core routes do.
+The plan is `docs/design/DESIGN-2468.md`.
 
 - **Read routes.** `GET /workflows/count`, `/workflows/summaries`,
   `/workflows/registered/{name}/schema` and `/interface`,
@@ -24,7 +25,8 @@ and JSON shape. The plan is `docs/design/DESIGN-2468.md`.
   `SqliteRuntime::set_workflow_log_policy` store the `ctx.log_*` lines in a
   new `harvest_workflow_logs` table. The dedup, the cap and the latched
   marker follow Postgres (#790). The lines share the cycle transaction, and
-  a purge removes them. The table is new, so an older file gets it on open.
+  a purge removes them. The write is best effort, as on Postgres: a failed
+  write never fails the cycle. The table is new, so an older file gets it on open.
   It is not `harvest_events`, so the append-only guard is unchanged.
 - **New reads.** `SqliteReader::count_executions`, `children`,
   `parents_with_children`, `timed_history`, `pending_work`, `workflow_logs`,

@@ -1312,6 +1312,8 @@ The rules are those of Postgres (issue #790):
 - Each line is stored once, also when a cycle runs again.
 - A run keeps at most `max_lines` lines. One marker row records the loss.
 - The lines share the cycle transaction. A purge removes them with the run.
+- The write is best effort. A savepoint rolls back a failed write, so the
+  cycle commits without those lines.
 
 Read them with `SqliteReader::workflow_logs`, `count_workflow_logs` and
 `workflow_log_truncated`.

@@ -365,19 +365,22 @@ and the awaitables replay all register it.
 
 `HarvestPlugin::workflow_log_persistence` stores the `ctx.log_*` lines in
 the Harvest file. `GET /workflows/{id}/logs` reads them. The cap and the
-marker follow Postgres.
+marker follow Postgres. The write is best effort, as on Postgres: a failed
+write drops the lines of that cycle and never fails the cycle.
 
 Every other management route answers `501` and links the epic.
 
 ## Vantage
 
-`.api(path)` also serves Vantage under `{path}/ui`, read-only:
+`.api(path)` also serves Vantage under `{path}/ui`, read-only. A tenant
+route serves it under `{path}/tenants/{key}/ui`:
 
 - `ui/workflows`: the runs, newest first, with the state, workflow and
   workflow id prefix filters, and a next-page link. A bad filter shows
   inline and is not applied.
-- `ui/workflows/{id}`: the run, its input, output and error, its children,
-  and its history in pages of 100 events. It links to the JSON routes.
+- `ui/workflows/{id}`: the run, its input, output and error, its first 50
+  children, and its history in pages of 100 events. It links to the JSON
+  routes.
 
 The pages link only to SQLite pages. The Postgres pages for DAGs, workers,
 schedules and dead letters read tables that this backend does not have, so
@@ -412,11 +415,13 @@ they stay off. The pages hold no form that writes.
 - `GET /workflows/summaries` is always empty. A purge removes a whole run,
   so no run is ever a summary.
 - A run chain gives each run its execution id as `run_id`. This backend
-  has no separate run id.
+  has no separate run id. A key with more than 256 runs answers the queried
+  run alone, with `head_unknown: true`. Postgres reads the whole chain.
 - A stack has no external handoff and no worker id. A task stores no
   attempt start and no heartbeat time, so `start_to_close_deadline`,
   `heartbeat_deadline` and `last_heartbeat_at` are `null`. `scheduled_at`
-  is the time that the next attempt may run, as on Postgres.
+  is the time that the next attempt may run, as on Postgres. For the same
+  reason, an awaitable activity gets only its `schedule_to_close` deadline.
 - A route that reads no query key refuses one: the schema, the interface,
   the run chain, the timeline, the awaitables and the stack.
 - A timeline event written before #2489 has no time. It takes the time of

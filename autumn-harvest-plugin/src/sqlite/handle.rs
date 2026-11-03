@@ -728,6 +728,8 @@ impl HarvestSqlite {
 pub struct Catalog {
     /// The `#[workflow]` definitions.
     pub workflows: Vec<WorkflowInfo>,
+    /// The declared attempt cap of each `#[activity]`, by name.
+    attempt_caps: HashMap<String, u32>,
     /// The declarative `#[signal]` handlers.
     pub signals: Vec<autumn_harvest::SignalHandlerInfo>,
     /// The declarative `#[query]` handlers.
@@ -747,11 +749,29 @@ impl Catalog {
     pub fn of(registry: &super::driver::Registry) -> Self {
         Self {
             workflows: registry.workflows.clone(),
+            attempt_caps: registry
+                .activities
+                .iter()
+                .map(|info| {
+                    let cap = info
+                        .default_retry_policy
+                        .as_ref()
+                        .map_or(1, |policy| policy.max_attempts.max(1));
+                    (info.name.to_owned(), cap)
+                })
+                .collect(),
             signals: registry.signals.clone(),
             queries: registry.queries.clone(),
             updates: registry.updates.clone(),
             state: Arc::downgrade(&registry.state),
         }
+    }
+
+    /// The attempt cap that a claim gives the activity `name`, as the
+    /// worker resolves it. An unknown activity gets one attempt.
+    pub fn max_attempts(&self, name: &str) -> i32 {
+        let max = self.attempt_caps.get(name).copied().unwrap_or(1);
+        i32::try_from(max).unwrap_or(i32::MAX)
     }
 
     /// The app state of a replay, or an empty one once the driver stopped.

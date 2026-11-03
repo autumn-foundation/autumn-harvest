@@ -1,7 +1,7 @@
 //! The read routes of the SQLite management API (issue #2468).
 //!
-//! Each route keeps its Postgres path, query keys, status codes and JSON
-//! shape. A route reads the file through `SqliteReader`, never the writer
+//! Each route keeps its Postgres path, status codes and JSON shape. A route
+//! that reads no query key refuses one, as the core routes do. A route reads the file through `SqliteReader`, never the writer
 //! task. It then calls the same pure step as the Postgres route:
 //!
 //! | Route | Pure step |
@@ -11,7 +11,7 @@
 //! | `tree` | `LineageWalk` |
 //! | `run-chain` | `reconstruct_legacy_chain_order`, `assemble_run_chain` |
 //! | `timeline` | `derive_timeline` |
-//! | `awaitables` | `classify_replayed_wait_set` |
+//! | `awaitables` | `drive_query_replay_async`, `classify_replayed_wait_set` |
 //! | `history/export` | `export_history_decoded` |
 //!
 //! So a change to one of these shapes changes both backends.
@@ -411,17 +411,24 @@ fn lineage_report(
             .collect();
         walk.record_probe_result(&with_children);
     }
+    let link = reader.parent_link(root.exec)?;
+    let policy = link.as_ref().and_then(|(_, policy)| policy.clone());
     let mut report = walk.finish(lineage_root_node(&LineageChildRow {
         exec_id: root.exec,
-        parent_id: reader.parent(root.exec)?,
+        parent_id: link.map(|(parent, _)| parent),
         workflow_name: root.workflow_name.clone(),
         workflow_id: root.workflow_id.clone(),
         state: root.state.clone(),
         started_at: or_epoch(root.started_at),
         completed_at: root.closed_at,
         shard_id: SHARD,
-        await_mode: AwaitMode::Awaited,
-        parent_close_policy: None,
+        // A detached child as the root keeps its own mode, as on Postgres.
+        await_mode: if policy.is_some() {
+            AwaitMode::Detached
+        } else {
+            AwaitMode::Awaited
+        },
+        parent_close_policy: policy.and_then(|policy| policy.parse().ok()),
     }));
     report.status = FanoutStatus::from_counts(1, 0);
     Ok(report)
@@ -507,7 +514,9 @@ fn run_chain(
             links.push((successor.as_uuid(), run.exec.as_uuid()));
         }
     }
-    let ordered = reconstruct_legacy_chain_order(exec.as_uuid(), &links, api::MAX_RUN_CHAIN_HOPS);
+    // The walk stays inside the runs of the key, so their number bounds it.
+    // Postgres reads a whole chain, so a fixed hop bound would cut a long one.
+    let ordered = reconstruct_legacy_chain_order(exec.as_uuid(), &links, candidates.len());
     let head = ordered.first().copied().unwrap_or_else(|| exec.as_uuid());
     let by_id: HashMap<uuid::Uuid, &Run> = candidates
         .iter()
@@ -812,6 +821,7 @@ struct StackRows {
 fn pending_activity(
     task: autumn_harvest_sqlite::PendingTask,
     now: DateTime<Utc>,
+    catalog: &super::handle::Catalog,
 ) -> api::PendingActivity {
     let (heartbeat_details, heartbeat_details_truncated, heartbeat_details_bytes) =
         api::project_heartbeat_details(
@@ -819,6 +829,12 @@ fn pending_activity(
             autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
         );
     let attempt = i32::try_from(task.attempt).unwrap_or(i32::MAX);
+    // A task that no claim resolved yet gets the cap that the claim will
+    // give it.
+    let max_attempts = task
+        .max_attempts
+        .and_then(|max| i32::try_from(max).ok())
+        .unwrap_or_else(|| catalog.max_attempts(&task.name));
     let last_failure = task.last_error.map(|error| api::LastFailure {
         error_type: "Error".to_owned(),
         error,
@@ -835,10 +851,7 @@ fn pending_activity(
         // time on this backend.
         scheduled_at: task.run_at,
         attempt,
-        max_attempts: task
-            .max_attempts
-            .and_then(|max| i32::try_from(max).ok())
-            .unwrap_or(1),
+        max_attempts,
         next_retry_at: (task.state == "PENDING" && task.run_at > now).then_some(task.run_at),
         task_status: task.state,
         claimed_by_worker_id: None,
@@ -904,7 +917,7 @@ async fn stack_body(
         .work
         .tasks
         .into_iter()
-        .map(|task| pending_activity(task, now))
+        .map(|task| pending_activity(task, now, handle.catalog()))
         .collect();
     body.checkpoints_truncated_for_budget = api::apply_checkpoint_response_budget(
         &mut body.pending_activities,
