@@ -179,6 +179,10 @@ const ALLOWLIST_CHAOS_REASON: &str = "chaos-feature-gated (issue #940): not in t
      `chaos_workflow_runs_the_chaos_suite_nightly` checks that claim. \
      .github/workflows/chaos-watchdog.yml opens an issue when no scheduled run succeeds in 48 h. \
      Before the fix for issue #1790, chaos.yml did not parse, and this suite never ran. Not a coverage gap.";
+const ALLOWLIST_SQLITE_SPLIT_REASON: &str = "sqlite-feature-gated (issue #2472): DOES run in CI, from \
+     the dedicated `sqlite-plugin-split` job in ci.yml. The `sqlite` feature flips autumn-web to SQLite \
+     for the whole build, so the shared manifest shards cannot build it. \
+     `sqlite_split_suite_runs_in_its_own_job` checks that claim. Not a coverage gap.";
 const ALLOWLIST_PERF_EVIDENCE_REASON: &str = "manual pg_stat_statements perf-evidence generator (issue #1620): its \
      one test is #[ignore]d by design, run by hand per docs/performance-outbox-start-relay.md's `Reproduce` \
      section against a real local Postgres — no CI run should execute it automatically. Not a coverage gap.";
@@ -206,6 +210,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "plugin:outbox_start_relay_perf",
         ALLOWLIST_PERF_EVIDENCE_REASON,
     ),
+    ("plugin:sqlite_plugin_split", ALLOWLIST_SQLITE_SPLIT_REASON),
     // `webhook_receiver_integration` is intentionally absent: its current-thread
     // `TestApp::plugin` deadlock was fixed (multi-thread flavor) and its tests
     // un-ignored, so it is now wired to a covering `linux` manifest row and runs
@@ -231,7 +236,9 @@ const ALLOWLIST: &[(&str, &str)] = &[
 /// Four of them needed a test fix first.
 /// Then 4: issue #1959 wired `plugin:mcp_tools_integration` and
 /// `plugin:webhook_durable_integration`. No debt entry is left.
-const ALLOWLIST_MAX_LEN: usize = 5;
+/// Then 6 with `plugin:sqlite_plugin_split` (issue #2472), which runs in
+/// its own `sqlite-plugin-split` job.
+const ALLOWLIST_MAX_LEN: usize = 6;
 
 fn allowlisted(key: &str) -> bool {
     ALLOWLIST.iter().any(|&(k, _)| k == key)
@@ -1418,6 +1425,7 @@ const WONT_WIRE: &str = "won't wire";
 /// Reasons that mark a suite that CI does not run by design. Every other
 /// reason is debt, so a new reason needs an owner until it is listed here.
 const BY_DESIGN_REASONS: &[&str] = &[
+    ALLOWLIST_SQLITE_SPLIT_REASON,
     ALLOWLIST_EVIDENCE_HARNESS_REASON,
     ALLOWLIST_CHAOS_REASON,
     ALLOWLIST_KAFKA_BROKER_REASON,
@@ -2183,4 +2191,29 @@ fn deep_case_count_rejects_gated_and_empty_runs() {
     );
     let lowered = "        env:\n          PROPTEST_CASES: \"1\"\n";
     assert_eq!(deep_cases(&step(lowered), "--test property"), 0);
+}
+
+/// The `plugin:sqlite_plugin_split` allowlist entry claims a dedicated CI job
+/// (issue #2472). The job must exist and run the suite with the feature.
+#[test]
+fn sqlite_split_suite_runs_in_its_own_job() {
+    let ci = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/ci.yml"),
+    )
+    .expect("read ci.yml");
+    let job = ci
+        .split("\n  sqlite-plugin-split:")
+        .nth(1)
+        .expect("ci.yml has a `sqlite-plugin-split` job");
+    // The job ends at the next top-level job key, indented by two spaces.
+    let body: Vec<&str> = job
+        .lines()
+        .skip(1)
+        .take_while(|line| line.starts_with("   ") || !line.starts_with("  "))
+        .collect();
+    assert!(
+        body.join("\n")
+            .contains("--features sqlite --test sqlite_plugin_split"),
+        "the `sqlite-plugin-split` job must run the suite with the `sqlite` feature"
+    );
 }

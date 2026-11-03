@@ -4154,7 +4154,7 @@ mod tests {
         let five_minutes = std::time::Duration::from_secs(300);
         assert_ne!(
             cohort(five_minutes, 120),
-            cohort(std::time::Duration::from_secs(1200), 120),
+            cohort(std::time::Duration::from_mins(20), 120),
             "another window"
         );
         assert_ne!(

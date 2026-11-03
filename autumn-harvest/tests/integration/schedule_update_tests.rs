@@ -162,7 +162,7 @@ async fn non_cadence_policy_change_preserves_next_run_at() {
     let (mut conn, _url, _c) = setup_db().await;
     let ws = WorkflowSchedule::new(
         "upd_policy_only_wf",
-        Schedule::Interval(std::time::Duration::from_secs(1800)),
+        Schedule::Interval(std::time::Duration::from_mins(30)),
     );
     let before = register_and_load(&mut conn, &ws).await;
 
@@ -481,8 +481,8 @@ async fn invalid_merged_schedule_writes_nothing() {
 
     // An interval over the cap is rejected before any write (issue #2048).
     let patch = WorkflowSchedulePatch {
-        schedule: Some(Schedule::Interval(std::time::Duration::from_secs(
-            9_000_000_000_000_000,
+        schedule: Some(Schedule::Interval(std::time::Duration::from_hours(
+            2_500_000_000_000,
         ))),
         ..Default::default()
     };

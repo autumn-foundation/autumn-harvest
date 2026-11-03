@@ -25,7 +25,7 @@ pub const MIN_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// sampler task. One hour keeps every such deadline finite. It is also far
 /// above any useful cadence, because the gate ignores a state older than
 /// [`STALE_AFTER_SAMPLES`] intervals.
-pub const MAX_SAMPLE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+pub const MAX_SAMPLE_INTERVAL: Duration = Duration::from_hours(1);
 
 /// The sampler read bound, in sample intervals.
 ///

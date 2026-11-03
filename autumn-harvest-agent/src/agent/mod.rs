@@ -2636,7 +2636,7 @@ mod tests {
             AgentProfile::new("watch").heartbeat(AgentHeartbeat::every(Duration::from_secs(3_600)));
         assert_eq!(floor(Some(&slow)), MIN_CUSTOM_HEARTBEAT_SECS);
         // An interval above the floor stays.
-        let lazy = AgentHeartbeat::every(Duration::from_secs(900));
+        let lazy = AgentHeartbeat::every(Duration::from_mins(15));
         assert_eq!(lazy.narrowed(Some(&quick)).every_secs, 900);
     }
 

@@ -7835,7 +7835,7 @@ mod tests {
     #[test]
     fn only_a_leased_checker_caps_its_interval() {
         use crate::scanner_lease::{MAX_SCANNER_INTERVAL, MIN_SCANNER_INTERVAL};
-        let day = Duration::from_secs(24 * 3600);
+        let day = Duration::from_hours(24);
         assert_eq!(checker_interval(day, true), MAX_SCANNER_INTERVAL);
         assert_eq!(checker_interval(day, false), day);
         for leased in [true, false] {

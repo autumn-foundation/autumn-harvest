@@ -380,7 +380,7 @@ async fn summary_disabled_deletes_and_writes_no_summary() {
     let old = Utc::now() - chrono::Duration::days(2);
     insert_completed(&mut conn, "wf", "w1", old).await;
 
-    let config = history_only(Some(Duration::from_secs(86_400))); // summary: None
+    let config = history_only(Some(Duration::from_hours(24))); // summary: None
     let metrics = Arc::new(CapturingMetrics::default());
     let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
 
@@ -428,7 +428,7 @@ async fn summary_disabled_still_tombstones_a_row_that_was_ever_a_migration_targe
     .await
     .expect("mark the row as a migration target");
 
-    let config = history_only(Some(Duration::from_secs(86_400))); // summary: None
+    let config = history_only(Some(Duration::from_hours(24))); // summary: None
     let metrics = Arc::new(CapturingMetrics::default());
     let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
 
@@ -506,7 +506,7 @@ async fn migration_tombstone_preserves_a_still_live_childs_parent_id() {
 
     // Summary retention OFF -- only the forced migration tombstone should
     // produce a summary row this tick.
-    let config = history_only(Some(Duration::from_secs(86_400)));
+    let config = history_only(Some(Duration::from_hours(24)));
     let metrics = Arc::new(CapturingMetrics::default());
     let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
 
@@ -555,7 +555,7 @@ async fn delete_demotes_into_a_summary_row() {
     .await;
 
     // capture_payload OFF by default here: identity/timing only, no PII.
-    let config = history_only(Some(Duration::from_secs(86_400)))
+    let config = history_only(Some(Duration::from_hours(24)))
         .with_summary_retention(SummaryPolicy::for_days(30));
     let metrics = Arc::new(CapturingMetrics::default());
     let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
@@ -616,7 +616,7 @@ async fn payload_capture_stores_verbatim_and_marks_oversized() {
     )
     .await;
 
-    let config = history_only(Some(Duration::from_secs(86_400))).with_summary_retention(
+    let config = history_only(Some(Duration::from_hours(24))).with_summary_retention(
         SummaryPolicy::for_days(30)
             .with_payload_capture()
             .with_max_payload_bytes(64),
@@ -674,7 +674,7 @@ async fn offloaded_payload_is_marked_not_stored() {
     )
     .await;
 
-    let config = history_only(Some(Duration::from_secs(86_400)))
+    let config = history_only(Some(Duration::from_hours(24)))
         .with_summary_retention(SummaryPolicy::for_days(30).with_payload_capture());
     let metrics = Arc::new(CapturingMetrics::default());
     run_one_tick(pool, config, Arc::clone(&metrics)).await;
@@ -706,7 +706,7 @@ async fn summary_gc_deletes_expired_and_emits_metric() {
 
     // History horizon present (so the janitor spawns) + a 1-hour summary
     // horizon. No executions exist, so history phase deletes nothing.
-    let config = history_only(Some(Duration::from_secs(86_400)))
+    let config = history_only(Some(Duration::from_hours(24)))
         .with_summary_retention(SummaryPolicy::for_duration(Duration::from_secs(3_600)));
     let metrics = Arc::new(CapturingMetrics::default());
     run_one_tick(pool, config, Arc::clone(&metrics)).await;
@@ -788,7 +788,7 @@ async fn count_fires(conn: &mut AsyncPgConnection) -> i64 {
 }
 
 fn summary_gc_config() -> RetentionConfig {
-    history_only(Some(Duration::from_secs(86_400)))
+    history_only(Some(Duration::from_hours(24)))
         .with_summary_retention(SummaryPolicy::for_duration(Duration::from_secs(3_600)))
 }
 
@@ -898,7 +898,7 @@ async fn fire_gc_is_off_without_a_summary_horizon() {
     )
     .await;
 
-    let config = history_only(Some(Duration::from_secs(86_400)));
+    let config = history_only(Some(Duration::from_hours(24)));
     run_one_tick(pool, config, Arc::new(CapturingMetrics::default())).await;
 
     assert_eq!(count_fires(&mut conn).await, 1);
@@ -1030,7 +1030,7 @@ async fn summary_gc_tombstones_but_never_deletes_a_migration_target_summary() {
     .expect("insert migration-target summary")
     .id;
 
-    let config = history_only(Some(Duration::from_secs(86_400)))
+    let config = history_only(Some(Duration::from_hours(24)))
         .with_summary_retention(SummaryPolicy::for_duration(Duration::from_secs(3_600)));
     let metrics = Arc::new(CapturingMetrics::default());
     run_one_tick(pool, config, Arc::clone(&metrics)).await;
@@ -1085,7 +1085,7 @@ async fn unbounded_summary_retention_never_gcs() {
     insert_summary(&mut conn, "keep", "k1", now - chrono::Duration::days(3650)).await;
     insert_summary(&mut conn, "keep", "k2", now - chrono::Duration::days(1000)).await;
 
-    let config = history_only(Some(Duration::from_secs(86_400)))
+    let config = history_only(Some(Duration::from_hours(24)))
         .with_summary_retention(SummaryPolicy::unbounded());
     let metrics = Arc::new(CapturingMetrics::default());
     run_one_tick(pool, config, Arc::clone(&metrics)).await;
@@ -1130,7 +1130,7 @@ async fn erase_before_gc_summary_captures_tombstone() {
         .expect("erase should succeed on a terminal execution");
 
     // Then retention demotes it, capturing the (now tombstoned) output.
-    let config = history_only(Some(Duration::from_secs(86_400)))
+    let config = history_only(Some(Duration::from_hours(24)))
         .with_summary_retention(SummaryPolicy::for_days(30).with_payload_capture());
     let metrics = Arc::new(CapturingMetrics::default());
     run_one_tick(pool, config, Arc::clone(&metrics)).await;
@@ -1173,7 +1173,7 @@ async fn erase_after_gc_scrubs_the_summary() {
 
     // Retention demotes it: the execution row is gone, only the summary (with
     // real PII) remains.
-    let config = history_only(Some(Duration::from_secs(86_400)))
+    let config = history_only(Some(Duration::from_hours(24)))
         .with_summary_retention(SummaryPolicy::for_days(30).with_payload_capture());
     let metrics = Arc::new(CapturingMetrics::default());
     run_one_tick(pool.clone(), config, Arc::clone(&metrics)).await;
@@ -1432,7 +1432,7 @@ async fn legal_held_execution_is_not_summarized_until_released() {
     .await
     .expect("set hold");
 
-    let config = history_only(Some(Duration::from_secs(86_400)))
+    let config = history_only(Some(Duration::from_hours(24)))
         .with_summary_retention(SummaryPolicy::for_days(30));
     let metrics = Arc::new(CapturingMetrics::default());
     run_one_tick(pool.clone(), config.clone(), Arc::clone(&metrics)).await;
@@ -1489,7 +1489,7 @@ async fn staging_vacated_row_is_not_summarized_until_the_marker_clears() {
     .await
     .expect("seal as an in-flight staging vacate");
 
-    let config = history_only(Some(Duration::from_secs(86_400)))
+    let config = history_only(Some(Duration::from_hours(24)))
         .with_summary_retention(SummaryPolicy::for_days(30));
     let metrics = Arc::new(CapturingMetrics::default());
     run_one_tick(pool.clone(), config.clone(), Arc::clone(&metrics)).await;
@@ -1561,7 +1561,7 @@ async fn erase_parent_scrubs_a_demoted_child_summary() {
     set_parent(&mut conn, child, parent).await;
 
     // Demote BOTH into summaries with payload capture (child captures its PII).
-    let config = history_only(Some(Duration::from_secs(86_400)))
+    let config = history_only(Some(Duration::from_hours(24)))
         .with_summary_retention(SummaryPolicy::for_days(30).with_payload_capture());
     let metrics = Arc::new(CapturingMetrics::default());
     let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
@@ -1668,7 +1668,7 @@ async fn erase_parent_recurses_into_grandchild_summary() {
     set_parent(&mut conn, child, parent).await;
     set_parent(&mut conn, grandchild, child).await;
 
-    let config = history_only(Some(Duration::from_secs(86_400)))
+    let config = history_only(Some(Duration::from_hours(24)))
         .with_summary_retention(SummaryPolicy::for_days(30).with_payload_capture());
     let metrics = Arc::new(CapturingMetrics::default());
     let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;

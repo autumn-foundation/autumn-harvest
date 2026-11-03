@@ -66,7 +66,7 @@ fn workflow_schedule_end_conditions_can_be_chained() {
     let cutoff = Utc::now() + chrono::Duration::days(30);
     let sched = WorkflowSchedule::new(
         "promo_wf",
-        Schedule::Interval(std::time::Duration::from_secs(86400)),
+        Schedule::Interval(std::time::Duration::from_hours(24)),
     )
     .with_end_at(cutoff)
     .with_max_runs(10);

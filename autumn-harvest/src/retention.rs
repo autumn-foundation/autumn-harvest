@@ -43,10 +43,10 @@ use crate::shard::ShardedDbPool;
 use crate::telemetry::MetricsRecorder;
 use crate::types::ShardId;
 
-const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const DEFAULT_TICK_INTERVAL: Duration = Duration::from_hours(1);
 const DEFAULT_BATCH_SIZE: usize = 1_000;
 const MIN_MAX_AGE: Duration = Duration::from_secs(1);
-const MAX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
+const MAX_MAX_AGE: Duration = Duration::from_hours(87600);
 const DEFAULT_ARCHIVAL_TIMEOUT_SECS: u64 = 30;
 
 /// Default idle window before an inert per-tenant rate-limit bucket is
@@ -71,7 +71,7 @@ pub const DEFAULT_RATE_LIMIT_BUCKET_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 /// [`crate::queue::RATE_LIMIT_BUCKET_TOUCH_INTERVAL_SECS`]). A window shorter
 /// than that touch interval would let a bucket become GC-eligible *without* the
 /// ensure path having touched it, reopening the stranding race.
-pub const MIN_RATE_LIMIT_BUCKET_RETENTION: Duration = Duration::from_secs(60 * 60);
+pub const MIN_RATE_LIMIT_BUCKET_RETENTION: Duration = Duration::from_hours(1);
 
 /// Default age after which a terminal task row is deleted (issue #1811):
 /// 7 days.
@@ -90,14 +90,14 @@ pub const DEFAULT_TERMINAL_TASK_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 /// (`retry-now`, `fail-now`, `GET /admin/tasks/{id}/eligibility`) for at least
 /// an hour. A late worker report is fenced on `state = 'RUNNING'`. It gets the
 /// same lease-lost result for a deleted row as for a finished one.
-pub const MIN_TERMINAL_TASK_RETENTION: Duration = Duration::from_secs(60 * 60);
+pub const MIN_TERMINAL_TASK_RETENTION: Duration = Duration::from_hours(1);
 
 /// Shortest grace period for the orphaned-blob sweep (issue #2123): 1 hour.
 ///
 /// The grace period must outlast any write transaction. A writer uploads its
 /// blobs first and commits the reference later. The sweep never deletes a
 /// blob younger than the grace period.
-pub const MIN_PAYLOAD_ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60);
+pub const MIN_PAYLOAD_ORPHAN_GRACE: Duration = Duration::from_hours(1);
 
 /// Default byte cap for an opt-in captured summary payload (issue #752).
 ///
@@ -5311,10 +5311,10 @@ mod tests {
     #[test]
     fn tenant_override_alone_enables_history_retention() {
         let config =
-            RetentionConfig::default().with_tenant_override("acme", Duration::from_secs(900));
+            RetentionConfig::default().with_tenant_override("acme", Duration::from_mins(15));
         assert!(config.enabled());
         assert!(config.history_retention_active());
-        assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(900)));
+        assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_mins(15)));
         assert_eq!(config.effective_max_age_for("wf", None), None);
         assert_eq!(config.effective_max_age_for("wf", Some("globex")), None);
         assert_eq!(
@@ -5327,7 +5327,7 @@ mod tests {
     #[test]
     fn loosest_cutoff_age_counts_tenant_overrides() {
         let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
-            .with_workflow_override("wf", Duration::from_secs(1800))
+            .with_workflow_override("wf", Duration::from_mins(30))
             .with_tenant_overrides([("acme", Duration::from_secs(120))]);
         assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(120)));
     }
@@ -5422,7 +5422,7 @@ mod tests {
 
         // no global, overrides only -> min override
         let config = RetentionConfig::default()
-            .with_workflow_override("a", Duration::from_secs(900))
+            .with_workflow_override("a", Duration::from_mins(15))
             .with_workflow_override("b", Duration::from_secs(300));
         assert_eq!(config.loosest_cutoff_age(), Some(Duration::from_secs(300)));
 
@@ -5461,7 +5461,7 @@ mod tests {
 
         // above MAX_MAX_AGE
         let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
-            .with_workflow_override("wf", Duration::from_secs(60 * 60 * 24 * 365 * 20));
+            .with_workflow_override("wf", Duration::from_hours(175_200));
         assert!(config.validate().is_err());
 
         // in range
@@ -5477,7 +5477,7 @@ mod tests {
 
         // exactly MAX_MAX_AGE (10 years) -> Ok (inclusive upper bound)
         let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
-            .with_workflow_override("wf", Duration::from_secs(60 * 60 * 24 * 365 * 10));
+            .with_workflow_override("wf", Duration::from_hours(87600));
         assert!(config.validate().is_ok());
 
         // empty overrides + valid global -> Ok
@@ -5584,7 +5584,7 @@ mod tests {
     #[test]
     fn summary_policy_builders() {
         let p = SummaryPolicy::for_days(7);
-        assert_eq!(p.retention_age(), Some(Duration::from_secs(7 * 86_400)));
+        assert_eq!(p.retention_age(), Some(Duration::from_hours(168)));
         assert!(!p.capture_payload());
         assert_eq!(p.max_payload_bytes(), DEFAULT_SUMMARY_PAYLOAD_CAP);
 
@@ -5621,7 +5621,7 @@ mod tests {
         .with_summary_retention_days(30);
         assert!(config.summary_enabled());
         assert!(config.summary_gc_active());
-        assert_eq!(config.summary_age(), Some(Duration::from_secs(30 * 86_400)));
+        assert_eq!(config.summary_age(), Some(Duration::from_hours(720)));
         assert!(config.enabled(), "bounded summary must enable the janitor");
 
         // Unbounded summary -> enabled but never GC'd; does NOT by itself spawn
@@ -5667,9 +5667,7 @@ mod tests {
 
         // above MAX_MAX_AGE
         let config = RetentionConfig::with_max_age(Duration::from_secs(3600))
-            .with_summary_retention(SummaryPolicy::for_duration(Duration::from_secs(
-                60 * 60 * 24 * 365 * 20,
-            )));
+            .with_summary_retention(SummaryPolicy::for_duration(Duration::from_hours(175_200)));
         assert!(config.validate().is_err());
 
         // in range
@@ -5703,11 +5701,11 @@ mod tests {
 
     #[test]
     fn rate_limit_bucket_gc_window_is_configurable_and_disablable() {
-        let config = RetentionConfig::default()
-            .with_rate_limit_bucket_retention(Duration::from_secs(6 * 60 * 60));
+        let config =
+            RetentionConfig::default().with_rate_limit_bucket_retention(Duration::from_hours(6));
         assert_eq!(
             config.rate_limit_bucket_retention(),
-            Some(Duration::from_secs(6 * 60 * 60))
+            Some(Duration::from_hours(6))
         );
 
         let off = RetentionConfig::default().without_rate_limit_bucket_gc();
@@ -5936,7 +5934,7 @@ mod tests {
 
     #[test]
     fn terminal_task_gc_window_is_configurable_and_disablable() {
-        let six_hours = Duration::from_secs(6 * 60 * 60);
+        let six_hours = Duration::from_hours(6);
         let config = RetentionConfig::default().with_terminal_task_retention(six_hours);
         assert_eq!(config.terminal_task_retention(), Some(six_hours));
 

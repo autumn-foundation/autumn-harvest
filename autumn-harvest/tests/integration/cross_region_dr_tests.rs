@@ -3960,8 +3960,8 @@ async fn a_retention_tick_waiting_for_a_connection_does_not_block_a_bump() {
         .expect("pool build");
     let runtime = autumn_harvest::retention::RetentionRuntime::spawn(
         autumn_harvest::shard::ShardedDbPool::single(pool.clone()),
-        autumn_harvest::retention::RetentionConfig::with_max_age(std::time::Duration::from_secs(
-            86_400,
+        autumn_harvest::retention::RetentionConfig::with_max_age(std::time::Duration::from_hours(
+            24,
         )),
         std::sync::Arc::new(autumn_harvest::telemetry::NoOpMetrics),
         None,

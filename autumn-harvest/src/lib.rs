@@ -1076,9 +1076,9 @@ mod tests {
 
     #[test]
     fn task_duration_parses_compound_values() {
-        assert_eq!(task_duration("1h 30m"), Some(Duration::from_secs(5_400)));
+        assert_eq!(task_duration("1h 30m"), Some(Duration::from_mins(90)));
         assert_eq!(task_duration("5s"), Some(Duration::from_secs(5)));
-        assert_eq!(task_duration("2d"), Some(Duration::from_secs(172_800)));
+        assert_eq!(task_duration("2d"), Some(Duration::from_hours(48)));
     }
 
     #[test]

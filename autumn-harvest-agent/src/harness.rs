@@ -56,7 +56,7 @@ pub const DEFAULT_MODEL: &str = "default";
 /// It stays below the 15-minute `start_to_close` of `agent_score`. A slow
 /// scorer therefore ends as a failure that the harness reports. SQLite
 /// reports an engine timeout only after the body returns.
-pub const DEFAULT_SCORE_TIMEOUT: Duration = Duration::from_secs(13 * 60);
+pub const DEFAULT_SCORE_TIMEOUT: Duration = Duration::from_mins(13);
 
 /// The default time budget of one model call: 13 minutes.
 ///
@@ -65,13 +65,13 @@ pub const DEFAULT_SCORE_TIMEOUT: Duration = Duration::from_secs(13 * 60);
 /// `agent_model_turn`. A slow call therefore ends as a
 /// retryable failure that the harness reports. It does not end as an engine
 /// timeout, which SQLite reports only after the body returns.
-pub const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(13 * 60);
+pub const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_mins(13);
 
 /// The default time budget of one tool call: 9 minutes.
 ///
 /// It is below the 10-minute `start_to_close` of `agent_tool_call`. A slow
 /// tool therefore gives the model an error result, and the run goes on.
-pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(9 * 60);
+pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_mins(9);
 
 /// The default time budget of the policy for all tool calls of one turn: one
 /// minute.
@@ -2212,7 +2212,7 @@ mod tests {
             + DEFAULT_POLICY_TIMEOUT
             + 3 * DEFAULT_CACHE_TIMEOUT
             + DEFAULT_BUDGET_TIMEOUT;
-        assert!(turn < Duration::from_secs(15 * 60), "{turn:?}");
+        assert!(turn < Duration::from_mins(15), "{turn:?}");
     }
 
     #[tokio::test]

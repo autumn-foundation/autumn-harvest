@@ -359,10 +359,7 @@ async fn archival_hook_fires_for_override_deleted_row() {
                     ..Default::default()
                 }
                 // Per-type override 7 days: makes the 10-day-old row deletable.
-                .with_workflow_override(
-                    "retention_fixture",
-                    std::time::Duration::from_secs(7 * 24 * 60 * 60),
-                ),
+                .with_workflow_override("retention_fixture", std::time::Duration::from_hours(168)),
             )
             .history_archiver(archiver)
             .build(),

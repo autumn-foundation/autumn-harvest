@@ -19,7 +19,7 @@ use autumn_harvest::queue::{self, TaskType};
 use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use futures::FutureExt;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::panic::AssertUnwindSafe;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -1373,17 +1373,17 @@ async fn randomized_drains_follow_the_reference_order() {
             let mut rng = StdRng::seed_from_u64(1971 + seed);
             let qs = queues(2);
             let mut values = Vec::new();
-            for _ in 0..rng.gen_range(150..400) {
-                let q = &qs[rng.gen_range(0..qs.len())];
-                let priority = [0, 0, 0, 1, 2][rng.gen_range(0..5)];
-                let age = rng.gen_range(0..120);
-                let kind = rng.gen_range(0..10);
+            for _ in 0..rng.random_range(150..400) {
+                let q = &qs[rng.random_range(0..qs.len())];
+                let priority = [0, 0, 0, 1, 2][rng.random_range(0..5)];
+                let age = rng.random_range(0..120);
+                let kind = rng.random_range(0..10);
                 let (task_type, activity, new_start) = match kind {
                     0..=3 => ("workflow", "NULL".to_string(), "TRUE"),
                     4 => ("activity", format!("'{paused}'"), "FALSE"),
                     _ => ("activity", "'noop'".to_string(), "FALSE"),
                 };
-                let (pin, until) = match rng.gen_range(0..10) {
+                let (pin, until) = match rng.random_range(0..10) {
                     0 => (format!("'{WORKER}'"), "NOW() + INTERVAL '1 hour'"),
                     1 | 2 => ("'someone-else'".to_string(), "NOW() + INTERVAL '1 hour'"),
                     3 => ("'someone-else'".to_string(), "NOW() - INTERVAL '1 minute'"),
@@ -1391,7 +1391,7 @@ async fn randomized_drains_follow_the_reference_order() {
                 };
                 // The cap counts per key and task type. The holder is an
                 // activity, so only an activity row is saturated.
-                let (key, cap) = if task_type == "activity" && rng.gen_range(0..4) == 0 {
+                let (key, cap) = if task_type == "activity" && rng.random_range(0..4) == 0 {
                     (format!("'{saturated}'"), "1")
                 } else {
                     ("NULL".to_string(), "NULL")

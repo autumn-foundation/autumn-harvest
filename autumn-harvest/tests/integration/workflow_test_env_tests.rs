@@ -2440,7 +2440,7 @@ fn signal_or_timer_now_workflow<'a>(
     Box::pin(async move {
         let t0 = ctx.now().timestamp();
         let won = match ctx
-            .wait_for_signal_timeout("approve", std::time::Duration::from_secs(30 * 24 * 3600))
+            .wait_for_signal_timeout("approve", std::time::Duration::from_hours(720))
             .await
         {
             Ok(Some(_)) => "signal",

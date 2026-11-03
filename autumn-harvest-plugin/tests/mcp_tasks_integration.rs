@@ -32,7 +32,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const TASKS: &str = "/api/harvest/mcp/tasks";
-const RETENTION: Duration = Duration::from_secs(30 * 86_400);
+const RETENTION: Duration = Duration::from_hours(720);
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 

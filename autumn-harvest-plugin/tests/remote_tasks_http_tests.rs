@@ -375,8 +375,12 @@ async fn a_redirect_to_another_origin_is_refused() {
     }))
     .await;
     // A caller client that follows redirects.
-    let client = HttpRemoteTasks::with_client(reqwest::Client::new())
-        .server("reports", RemoteServer::mcp(&url));
+    let client = HttpRemoteTasks::with_client(
+        autumn_harvest_plugin::http::client_builder()
+            .build()
+            .expect("client"),
+    )
+    .server("reports", RemoteServer::mcp(&url));
     let err = client
         .start(&request(RemoteProtocol::Mcp, "export"), "k")
         .await
@@ -460,7 +464,7 @@ async fn an_open_event_stream_returns_at_the_matching_response() {
             .expect("response")
     }))
     .await;
-    let client = reqwest::Client::builder()
+    let client = autumn_harvest_plugin::http::client_builder()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -499,7 +503,7 @@ async fn an_open_event_stream_returns_before_a_partial_character() {
             .expect("response")
     }))
     .await;
-    let client = reqwest::Client::builder()
+    let client = autumn_harvest_plugin::http::client_builder()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -534,7 +538,7 @@ async fn an_invalid_response_on_an_open_stream_fails_at_once() {
             .expect("response")
     }))
     .await;
-    let client = reqwest::Client::builder()
+    let client = autumn_harvest_plugin::http::client_builder()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .build()

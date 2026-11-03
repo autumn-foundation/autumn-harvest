@@ -5,7 +5,7 @@
 # `testcontainers` retries nothing on a pull, so a registry blip fails a
 # live-DB test. This script retries each pull. It reads SEMAPHORE_SHARD_COUNT
 # and SEMAPHORE_SHARD_INDEX through `run-suites.sh`, as the suite step does.
-# `ci.yml` (`test-db-linux`), `coverage-nightly.yml` (`db`) and
+# `ci.yml` (`test-db-linux`, `sqlite-plugin-split`), `coverage-nightly.yml` (`db`) and
 # `dst-nightly.yml` (`differential`, `world`) call it.
 #
 # Every tag the suites actually request, not just the testcontainers-modules

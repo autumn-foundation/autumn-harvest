@@ -253,7 +253,7 @@ fn deadline_probe_info() -> WorkflowInfo {
         name: "deadline_probe_wf",
         module: "tests",
         handler: deadline_probe_workflow,
-        execution_timeout: Some(Duration::from_secs(24 * 3600)),
+        execution_timeout: Some(Duration::from_hours(24)),
         chain_execution_timeout: None,
         sla: None,
         concurrency: None,

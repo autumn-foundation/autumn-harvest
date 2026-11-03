@@ -234,8 +234,8 @@ async fn override_longer_survives_shorter_deleted() {
     // without the override, a 2-hour-old row is not old enough to delete.
     insert_completed(&mut conn, "control_wf", "c1", two_hours_ago).await;
 
-    let config = history_only(Some(Duration::from_secs(86_400))) // global 1 day
-        .with_workflow_override("long_wf", Duration::from_secs(30 * 86_400))
+    let config = history_only(Some(Duration::from_hours(24))) // global 1 day
+        .with_workflow_override("long_wf", Duration::from_hours(720))
         .with_workflow_override("short_wf", Duration::from_secs(3_600));
 
     let metrics = Arc::new(CapturingMetrics::default());
@@ -281,7 +281,7 @@ async fn dry_run_reports_per_type_counts_without_deleting() {
     insert_completed(&mut conn, "dry_a", "a2", old).await;
     insert_completed(&mut conn, "dry_b", "b1", old).await;
 
-    let mut config = history_only(Some(Duration::from_secs(86_400)));
+    let mut config = history_only(Some(Duration::from_hours(24)));
     config.dry_run = true;
 
     let metrics = Arc::new(CapturingMetrics::default());
@@ -335,7 +335,7 @@ async fn no_overrides_behaves_like_global_only() {
     .await;
 
     // Global 1-day, no overrides.
-    let config = history_only(Some(Duration::from_secs(86_400)));
+    let config = history_only(Some(Duration::from_hours(24)));
     assert!(config.workflow_overrides().is_empty());
 
     let metrics = Arc::new(CapturingMetrics::default());
@@ -448,8 +448,8 @@ async fn not_yet_eligible_backlog_does_not_starve_eligible_deletion() {
 
     // Global 1 day; archive_wf retained 365 days. Small batch so the backlog
     // would exhaust it before reaching global_wf under the old loose cutoff.
-    let mut config = history_only(Some(Duration::from_secs(86_400)))
-        .with_workflow_override("archive_wf", Duration::from_secs(365 * 86_400));
+    let mut config = history_only(Some(Duration::from_hours(24)))
+        .with_workflow_override("archive_wf", Duration::from_hours(8760));
     config.batch_size = 2;
 
     let metrics = Arc::new(CapturingMetrics::default());
@@ -526,7 +526,7 @@ async fn retention_archive_carries_deadline_metadata() {
     .await;
 
     // Global 1-day age -> the 2-day-old row is eligible for deletion+archival.
-    let config = history_only(Some(Duration::from_secs(86_400)));
+    let config = history_only(Some(Duration::from_hours(24)));
     let metrics = Arc::new(CapturingMetrics::default());
     let archiver = Arc::new(CapturingArchiver::default());
 
@@ -633,7 +633,7 @@ async fn retention_archive_carries_parent_execution_id() {
     .expect("append child history");
 
     // Global 1-day age -> the 2-day-old child is eligible for deletion+archival.
-    let config = history_only(Some(Duration::from_secs(86_400)));
+    let config = history_only(Some(Duration::from_hours(24)));
     let metrics = Arc::new(CapturingMetrics::default());
     let archiver = Arc::new(CapturingArchiver::default());
 
@@ -793,7 +793,7 @@ async fn a_worker_sealed_run_is_a_retention_candidate() {
     let metrics = Arc::new(CapturingMetrics::default());
     let result = run_one_tick(
         pool,
-        history_only(Some(Duration::from_secs(86_400))),
+        history_only(Some(Duration::from_hours(24))),
         Arc::clone(&metrics),
     )
     .await;
@@ -880,8 +880,8 @@ async fn tenant_override_deletes_only_that_tenants_runs() {
     .await;
     insert_completed_for_tenant(&mut conn, "plain_wf", "none-plain", None, two_hours_ago).await;
 
-    let config = history_only(Some(Duration::from_secs(86_400)))
-        .with_workflow_override("long_wf", Duration::from_secs(30 * 86_400))
+    let config = history_only(Some(Duration::from_hours(24)))
+        .with_workflow_override("long_wf", Duration::from_hours(720))
         .with_tenant_override("acme", Duration::from_secs(3_600));
 
     let metrics = Arc::new(CapturingMetrics::default());
@@ -909,7 +909,7 @@ async fn tenant_override_only_config_keeps_other_tenants() {
     insert_completed_for_tenant(&mut conn, "plain_wf", "globex-old", Some("globex"), old).await;
     insert_completed_for_tenant(&mut conn, "plain_wf", "none-old", None, old).await;
 
-    let config = history_only(None).with_tenant_override("acme", Duration::from_secs(86_400));
+    let config = history_only(None).with_tenant_override("acme", Duration::from_hours(24));
     let metrics = Arc::new(CapturingMetrics::default());
     let result = run_one_tick(pool, config, Arc::clone(&metrics)).await;
 
@@ -941,8 +941,8 @@ async fn longer_tenant_override_keeps_runs_and_dry_run_deletes_nothing() {
     .await;
     insert_completed_for_tenant(&mut conn, "plain_wf", "none-old", None, two_days_ago).await;
 
-    let config = history_only(Some(Duration::from_secs(86_400)))
-        .with_tenant_override("acme", Duration::from_secs(30 * 86_400));
+    let config = history_only(Some(Duration::from_hours(24)))
+        .with_tenant_override("acme", Duration::from_hours(720));
     let metrics = Arc::new(CapturingMetrics::default());
     let result = run_one_tick(pool.clone(), config, Arc::clone(&metrics)).await;
     assert_eq!(

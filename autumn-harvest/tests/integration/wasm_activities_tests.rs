@@ -953,7 +953,7 @@ fn build_worker_with_shards(
                 workflow_panic_max_attempts: 3,
                 labels: HashMap::new(),
                 queue_weights: HashMap::new(),
-                max_workflow_pause_duration: Duration::from_secs(24 * 3600),
+                max_workflow_pause_duration: Duration::from_hours(24),
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool,

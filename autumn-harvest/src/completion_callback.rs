@@ -1660,7 +1660,7 @@ mod deliverer_trait_tests {
         // 2075 is 49 years ahead of 2026, so `75` means 2075.
         let in_2075 = parse_retry_after("Tuesday, 01-Jan-75 00:00:00 GMT", now())
             .expect("a valid RFC 850 date");
-        assert!(in_2075 > std::time::Duration::from_secs(48 * 365 * 86_400));
+        assert!(in_2075 > std::time::Duration::from_hours(420_480));
         // 2077 is 51 years ahead, so `77` means 1977, in the past.
         assert_eq!(
             parse_retry_after("Saturday, 01-Jan-77 00:00:00 GMT", now()),
@@ -1682,7 +1682,7 @@ mod deliverer_trait_tests {
         // 2076-10-05 is inside the cutoff, so `76` means 2076.
         let ahead =
             parse_retry_after("Monday, 05-Oct-76 00:00:00 GMT", now).expect("a valid RFC 850 date");
-        assert!(ahead > std::time::Duration::from_secs(49 * 365 * 86_400));
+        assert!(ahead > std::time::Duration::from_hours(429_240));
     }
 
     #[test]
@@ -1693,7 +1693,7 @@ mod deliverer_trait_tests {
             .with_timezone(&Utc);
         let ahead = parse_retry_after("Wednesday, 01-Jan-10 00:00:00 GMT", now)
             .expect("a valid RFC 850 date");
-        assert!(ahead > std::time::Duration::from_secs(33 * 365 * 86_400));
+        assert!(ahead > std::time::Duration::from_hours(289_080));
     }
 
     #[test]
@@ -2077,8 +2077,7 @@ mod classify_outcome_tests {
 
     #[test]
     fn retry_after_is_clamped_to_the_retry_after_ceiling() {
-        let outcome =
-            DeliveryAttempt::success(503).with_retry_after(StdDuration::from_secs(86_400));
+        let outcome = DeliveryAttempt::success(503).with_retry_after(StdDuration::from_hours(24));
         let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
         assert_eq!(
             backoff_delay(&action),
@@ -2258,8 +2257,8 @@ mod builder_config_tests {
             );
         }
         assert!(
-            total >= std::time::Duration::from_secs(30 * 60)
-                && total <= std::time::Duration::from_secs(120 * 60),
+            total >= std::time::Duration::from_mins(30)
+                && total <= std::time::Duration::from_hours(2),
             "expected a retry window in the neighborhood of 1 hour, got {total:?}"
         );
     }

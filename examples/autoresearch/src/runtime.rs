@@ -827,7 +827,7 @@ pub fn nightly(config: &SessionConfig) -> Result<WorkflowSchedule, String> {
 ///
 /// Returns an error when the tick does not encode.
 pub fn heartbeat(lab: &std::path::Path) -> Result<WorkflowSchedule, String> {
-    let every = Schedule::Interval(Duration::from_secs(30 * 60));
+    let every = Schedule::Interval(Duration::from_mins(30));
     let lab = std::path::PathBuf::from(canonical_lab(&lab.display().to_string()));
     heartbeat::schedule(every, &crate::agent::heartbeat_task(&lab)).map_err(|e| e.to_string())
 }

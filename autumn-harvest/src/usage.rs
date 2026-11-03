@@ -110,7 +110,7 @@ pub const UNATTRIBUTED_GROUP: &str = "(unattributed)";
 /// Default ceiling on the `[from, to]` usage window: 90 days.
 #[must_use]
 pub const fn default_usage_window_ceiling() -> std::time::Duration {
-    std::time::Duration::from_secs(90 * 24 * 60 * 60)
+    std::time::Duration::from_hours(2160)
 }
 
 /// Default cap on the number of distinct groups `GET /admin/usage` will
@@ -573,7 +573,7 @@ mod tests {
     fn default_usage_window_ceiling_is_ninety_days() {
         assert_eq!(
             default_usage_window_ceiling(),
-            std::time::Duration::from_secs(90 * 24 * 60 * 60)
+            std::time::Duration::from_hours(2160)
         );
     }
 
