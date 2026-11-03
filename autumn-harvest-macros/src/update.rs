@@ -170,18 +170,33 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mod_name = format_ident!("__autumn_update_impl_{fn_name}");
     let path_tokens = parsed_path.path_tokens;
-    // `update_with_start` reads only its own `opts`, with no `.or(info....)`
-    // fallback. See `optional_chrono_duration_tokens`'s doc comment for the
-    // full clone class this and `workflow.rs`'s two typed stubs share.
+    // `update_with_start` resolves the same three run defaults as the typed
+    // `start` stub (issues #2387, #2406 and #2511). An option of the call wins
+    // over an operator override, which wins over the declared value. See
+    // `optional_chrono_duration_tokens`'s doc comment for the clone class this
+    // and `workflow.rs`'s two typed stubs share.
     let update_with_start_execution_timeout_tokens =
         crate::attr_util::optional_chrono_duration_tokens(
             "execution_timeout",
-            &quote! { opts.execution_timeout },
+            &quote! {
+                opts.execution_timeout
+                    .or(client.apply_run_defaults(info.name, info.execution_timeout, info.sla).0)
+            },
         );
     let update_with_start_max_execution_timeout_ceiling_tokens =
         crate::attr_util::optional_chrono_duration_tokens(
             "max_execution_timeout_ceiling",
             &quote! { client.max_workflow_execution_timeout() },
+        );
+    let update_with_start_chain_execution_timeout_tokens =
+        crate::attr_util::optional_chrono_duration_tokens(
+            "chain_execution_timeout",
+            &quote! { client.apply_chain_run_default(info.name, info.chain_execution_timeout) },
+        );
+    let update_with_start_max_workflow_chain_timeout_ceiling_tokens =
+        crate::attr_util::optional_chrono_duration_tokens(
+            "max_workflow_chain_timeout_ceiling",
+            &quote! { client.max_workflow_chain_timeout() },
         );
     // The three typed-stub methods are identical whether `#stub_ident` is
     // implemented directly (same-module case) or inside a private mod that
@@ -273,8 +288,11 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let shard = client.pick_shard_for_new_workflow(#workflow_simple_name, &workflow_id);
                 ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
             });
+            let info = Self::info();
             let execution_timeout = #update_with_start_execution_timeout_tokens;
             let max_execution_timeout_ceiling = #update_with_start_max_execution_timeout_ceiling_tokens;
+            let chain_execution_timeout = #update_with_start_chain_execution_timeout_tokens;
+            let max_workflow_chain_timeout_ceiling = #update_with_start_max_workflow_chain_timeout_ceiling_tokens;
             let concurrency_key = Self::info().concurrency.and_then(|p|
                 ::autumn_harvest::concurrency::resolve_concurrency_key(p.key_expr, &start_input)
             );
@@ -294,12 +312,9 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ),
                 trace_context: opts.trace_context,
                 max_execution_timeout_ceiling,
-                // Chain-scoped lifetime cap (issue #617): the typed-stub
-                // update-with-start does NOT thread the chain cap; it is
-                // resolved on the HTTP update-with-start route and the
-                // typed stub's own `start`/`start_with_options` path.
-                chain_execution_timeout: ::std::option::Option::None,
-                max_workflow_chain_timeout_ceiling: ::std::option::Option::None,
+                // Chain-scoped lifetime cap (issues #617 and #2511).
+                chain_execution_timeout,
+                max_workflow_chain_timeout_ceiling,
                 concurrency_key,
                 concurrency_limit,
                 concurrency_on_conflict: Self::info()
@@ -317,9 +332,9 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 runbook_url: ::std::option::Option::None,
                 severity: ::std::option::Option::None,
                 context_headers: opts.context_headers,
-                sla: opts.sla.or_else(|| Self::info().sla).and_then(|d|
-                    ::autumn_harvest::chrono::Duration::from_std(d).ok()
-                ),
+                sla: opts.sla
+                    .or(client.apply_run_defaults(info.name, info.execution_timeout, info.sla).1)
+                    .and_then(|d| ::autumn_harvest::chrono::Duration::from_std(d).ok()),
                 workflow_retry_policy: Self::info().retry_policy
                     .and_then(|p| ::autumn_harvest::serde_json::to_value(&p).ok()),
                 max_workflow_attempts_ceiling: client.max_workflow_attempts(),

@@ -28,6 +28,17 @@ const ALLOWED_FILES: [&str; 4] = [
     "autumn-harvest-macros/src/attr_util.rs",
 ];
 
+/// The single lines that may read the declared value, as `(file, line)`.
+///
+/// A line here copies the value and starts no run. A file-level entry would
+/// hide a real read in the same file.
+const ALLOWED_LINES: [(&str, &str); 1] = [(
+    // The metadata mirror of the completion-trigger path (issue #2511).
+    // `resolve_target_run_defaults` applies the override when a start fires.
+    "autumn-harvest/src/worker.rs",
+    "chain_execution_timeout: w.chain_execution_timeout,",
+)];
+
 /// The receivers that name a `WorkflowInfo` in the scanned files.
 const INFO_NAMES: [&str; 9] = [
     "info",
@@ -79,11 +90,13 @@ fn rust_files(root: &Path, dir: &str, out: &mut Vec<String>) {
 
 /// Whether `code` reads the field of a receiver in [`INFO_NAMES`].
 ///
-/// A receiver may follow a `.`, as in `self.info`. An assignment is not a
+/// A receiver may follow a `.`, as in `self.info`. A call such as
+/// `Self::info()` is a receiver too (issue #2511). An assignment is not a
 /// read.
 fn reads_field(code: &str) -> bool {
     code.match_indices(FIELD).any(|(at, _)| {
-        let receiver: String = code[..at]
+        let before = code[..at].strip_suffix("()").unwrap_or(&code[..at]);
+        let receiver: String = before
             .chars()
             .rev()
             .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -135,6 +148,9 @@ fn no_start_path_reads_the_declared_chain_cap() {
     {
         let source = std::fs::read_to_string(root.join(file)).expect("read source");
         for (line, text) in unwrapped_reads(&source) {
+            if ALLOWED_LINES.contains(&(file.as_str(), text.as_str())) {
+                continue;
+            }
             offenders.push(format!("{file}:{line}: {text}"));
         }
     }
@@ -154,12 +170,13 @@ fn the_guard_flags_a_bare_read_only() {
                   // info.chain_execution_timeout in a comment\n\
                   .and_then(|i| i.chain_execution_timeout)\n\
                   info.chain_execution_timeout = Some(d);\n\
-                  let z = self.info.chain_execution_timeout;\n";
+                  let z = self.info.chain_execution_timeout;\n\
+                  let v = Self::info().chain_execution_timeout;\n";
     let lines: Vec<usize> = unwrapped_reads(sample)
         .into_iter()
         .map(|(n, _)| n)
         .collect();
-    assert_eq!(lines, [1, 4, 6]);
+    assert_eq!(lines, [1, 4, 6, 7]);
     let wrapped = "cache.apply_chain(name, wf.chain_execution_timeout)\n";
     assert_eq!(unwrapped_reads(wrapped), []);
     let resolver = std::fs::read_to_string(repo_root().join("autumn-harvest/src/worker.rs"))
@@ -168,4 +185,22 @@ fn the_guard_flags_a_bare_read_only() {
         resolver.contains("pub fn chain_execution_timeout(&self, workflow_name: &str)"),
         "the resolver must exist"
     );
+}
+
+/// AC3 of issue #2511: the scan covers both files that read the declared
+/// value and that no entry of the allow list exempts.
+#[test]
+fn the_scan_covers_the_completion_trigger_and_update_stub() {
+    let root = repo_root();
+    let mut files = Vec::new();
+    for dir in SOURCE_DIRS {
+        rust_files(&root, dir, &mut files);
+    }
+    for file in [
+        "autumn-harvest/src/completion_trigger.rs",
+        "autumn-harvest-macros/src/update.rs",
+    ] {
+        assert!(files.iter().any(|f| f == file), "{file} must be scanned");
+        assert!(!ALLOWED_FILES.contains(&file), "{file} must not be exempt");
+    }
 }

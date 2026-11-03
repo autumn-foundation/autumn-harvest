@@ -1730,6 +1730,8 @@ async fn a_fenced_worker_cannot_backfill_quota_keys() {
                 runbook_url: None,
                 severity: None,
                 input_schema: None,
+                execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 retry_policy: None,
                 quota: Some(policy),

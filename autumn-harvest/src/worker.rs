@@ -846,6 +846,8 @@ impl HandlerRegistry {
                             runbook_url: w.runbook_url.map(String::from),
                             severity: w.severity.map(String::from),
                             input_schema: w.input_schema,
+                            execution_timeout: w.execution_timeout,
+                            chain_execution_timeout: w.chain_execution_timeout,
                             sla: w.sla,
                             retry_policy: w.retry_policy.clone(),
                             quota: w.quota,
@@ -1041,12 +1043,16 @@ impl HandlerRegistry {
     /// chain default (issue #617). Applied to scheduler-fired starts so a whole
     /// scheduled continue-as-new chain is capped even when a workflow
     /// under-specifies (AC4).
+    ///
+    /// The setter also writes the mirror that the completion-trigger path
+    /// reads (issue #2511).
     #[must_use]
-    pub const fn with_max_workflow_chain_timeout(
-        mut self,
-        ceiling: Option<std::time::Duration>,
-    ) -> Self {
+    pub fn with_max_workflow_chain_timeout(mut self, ceiling: Option<std::time::Duration>) -> Self {
         self.max_workflow_chain_timeout = ceiling;
+        #[cfg(feature = "db")]
+        if let Ok(mut lock) = crate::completion_trigger::GLOBAL_MAX_WORKFLOW_CHAIN_TIMEOUT.write() {
+            *lock = ceiling;
+        }
         self
     }
 
@@ -1055,12 +1061,21 @@ impl HandlerRegistry {
     /// manual DAG trigger starts so a fleet-wide cap configured via
     /// `HarvestBuilder::max_workflow_execution_timeout` reaches
     /// scheduler-initiated starts identically to manual/HTTP starts.
+    ///
+    /// The setter also writes the mirror that the completion-trigger path
+    /// reads (issue #2511).
     #[must_use]
-    pub const fn with_max_workflow_execution_timeout(
+    pub fn with_max_workflow_execution_timeout(
         mut self,
         ceiling: Option<std::time::Duration>,
     ) -> Self {
         self.max_workflow_execution_timeout = ceiling;
+        #[cfg(feature = "db")]
+        if let Ok(mut lock) =
+            crate::completion_trigger::GLOBAL_MAX_WORKFLOW_EXECUTION_TIMEOUT.write()
+        {
+            *lock = ceiling;
+        }
         self
     }
 
