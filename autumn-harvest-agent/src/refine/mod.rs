@@ -4,11 +4,13 @@
 //! [`policy`] holds the operator refine policy of each kind, and
 //! [`adopt`] decides whether a candidate goes live without a person
 //! (issue #2394).
+//! [`bundle`] holds the manifest of an evidence bundle (issue #2377).
 //! [`ModelProposer`] runs a proposer over an [`AgentModel`](crate::AgentModel)
 //! with the default templates of [`prompts`]. The designs are in
 //! `docs/design/DESIGN-2379.md` and `docs/design/DESIGN-2394.md`.
 
 pub mod adopt;
+pub mod bundle;
 pub mod model_proposer;
 pub mod policy;
 pub mod policy_read;
@@ -16,6 +18,7 @@ pub mod prompts;
 pub mod propose;
 
 pub use adopt::{Adoption, RefineStatus, WaitReason, adopt};
+pub use bundle::{BundleFile, BundleManifest};
 pub use model_proposer::{
     DEFAULT_PROPOSER_OUTPUT_TOKENS, KEEP_BASE, ModelProposer, OUTPUT_CONTRACT,
 };

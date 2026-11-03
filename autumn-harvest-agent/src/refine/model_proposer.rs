@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use super::prompts::{DOM_TEMPLATE, INV_TEMPLATE};
-use super::propose::{Dimension, OverlayProposer, ProposeContext, ProposerReply};
+use super::propose::{Dimension, Evidence, OverlayProposer, ProposeContext, ProposerReply};
 use crate::agent::overlay::ProfileOverlay;
 use sha2::{Digest as _, Sha256};
 
@@ -216,6 +216,14 @@ impl OverlayProposer for ModelProposer {
         context: &'a ProposeContext<'a>,
     ) -> BoxFuture<'a, Result<ProposerReply, AgentError>> {
         Box::pin(async move {
+            // A bundle is files. This proposer has no workspace to read them,
+            // so the pointer alone would hide the evidence (issue #2377).
+            if matches!(context.evidence, Evidence::Bundle(_)) {
+                return Err(AgentError::new(
+                    ErrorKind::Config,
+                    "ModelProposer reads text evidence only, and it has no workspace to read a bundle",
+                ));
+            }
             let request = self.request(context);
             let response = self.model.chat(&request).await?;
             if response.stop_reason == StopReason::MaxTokens {
@@ -477,6 +485,30 @@ mod tests {
         let err = proposer.propose(&ctx).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Decode);
         assert!(err.message().contains("output cap"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_bundle_is_refused_for_good_and_costs_no_call() {
+        let model = TextModel::new(vec![Ok(KEEP_BASE.to_owned())]);
+        let proposer = ModelProposer::new(model.clone());
+        let manifest = crate::refine::BundleManifest {
+            scope: "evidence:x".to_owned(),
+            head: crate::workspace::WorkspaceRef {
+                digest: "0".repeat(64),
+                bytes: 0,
+                files: 0,
+                generation: 0,
+            },
+            files: Vec::new(),
+            candidates: Vec::new(),
+            flow_labels: std::collections::BTreeSet::new(),
+        };
+        let evidence = Evidence::Bundle(manifest);
+        let current = ProfileOverlay::default();
+        let ctx = context(&evidence, &current, None);
+        let err = proposer.propose(&ctx).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Config);
+        assert!(model.requests.lock().unwrap().is_empty(), "no model call");
     }
 
     #[test]

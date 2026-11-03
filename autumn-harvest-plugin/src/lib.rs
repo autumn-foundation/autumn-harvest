@@ -11,6 +11,7 @@ pub mod api;
 pub mod api_rate_limit;
 /// Scoped API tokens + rotation for the management API (issue #942).
 pub mod api_token;
+mod auth_store;
 /// Pluggable authorizer hook for the management API (issue #1803).
 pub mod authz;
 /// Default `reqwest`-based completion-callback deliverer (issue #605).

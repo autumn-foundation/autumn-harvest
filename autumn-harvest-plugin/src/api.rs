@@ -498,6 +498,11 @@ pub struct HarvestApiState {
     /// server starts. This only matters if ambient configuration changed in
     /// the narrow window after that.
     require_embedded_harvest_mode: Arc<Mutex<bool>>,
+    /// The token and audit store of a SQLite app (issue #2469).
+    #[cfg(feature = "sqlite")]
+    sqlite_auth_store: Arc<Mutex<Option<Arc<autumn_harvest_sqlite::SqliteAuthStore>>>>,
+    /// Set on a SQLite app, whose store keeps no run tenant (issue #2469).
+    no_run_tenants: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for HarvestApiState {
@@ -558,6 +563,9 @@ impl Default for HarvestApiState {
             canary_config: Arc::new(Mutex::new(None)),
             agent_overlay_store: Arc::new(Mutex::new(None)),
             require_embedded_harvest_mode: Arc::new(Mutex::new(false)),
+            #[cfg(feature = "sqlite")]
+            sqlite_auth_store: Arc::new(Mutex::new(None)),
+            no_run_tenants: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -1378,6 +1386,60 @@ impl HarvestApiState {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .ok_or_else(|| HarvestError::Config("harvest runtime is not started".to_string()))
+    }
+
+    /// The store of tokens and audit rows, or `None` before startup.
+    ///
+    /// A SQLite app uses its Harvest file (issue #2469). Every other app
+    /// uses the Harvest pool.
+    pub(crate) fn auth_store(&self) -> Option<crate::auth_store::AuthStore> {
+        #[cfg(feature = "sqlite")]
+        {
+            let store = self
+                .sqlite_auth_store
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(store) = store {
+                return Some(crate::auth_store::AuthStore::Sqlite(store));
+            }
+        }
+        self.storage_pool()
+            .ok()
+            .map(crate::auth_store::AuthStore::Postgres)
+    }
+
+    /// Install the token and audit store of a SQLite app (issue #2469).
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn install_sqlite_auth_store(
+        &self,
+        store: Arc<autumn_harvest_sqlite::SqliteAuthStore>,
+    ) {
+        *self
+            .sqlite_auth_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(store);
+    }
+
+    /// Mark a store that keeps no run tenant, as on SQLite (issue #2469).
+    ///
+    /// The tenant binding layer then refuses each verified tenant. It cannot
+    /// prove which runs that tenant owns.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn set_no_run_tenants(&self) {
+        std::sync::atomic::AtomicBool::store(
+            &self.no_run_tenants,
+            true,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// Whether the store keeps a tenant on each run.
+    pub(crate) fn stores_run_tenants(&self) -> bool {
+        !std::sync::atomic::AtomicBool::load(
+            &self.no_run_tenants,
+            std::sync::atomic::Ordering::Acquire,
+        )
     }
 
     pub(crate) fn storage_pool(&self) -> HarvestResult<HarvestDbPool> {
@@ -4213,24 +4275,37 @@ async fn create_token_handler(
             .into_response();
     }
 
-    let pool = match api_state.storage_pool() {
-        Ok(p) => p,
-        Err(e) => return AutumnError::internal_server_error(e).into_response(),
+    if body.tenant.is_some() && !api_state.stores_run_tenants() {
+        // Issue #2469: the binding layer would refuse every call of this
+        // token, so refuse the mint.
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "a tenant-bound token needs a tenant on each run; this backend keeps \
+                          none (autumn-harvest#2466)"
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(store) = api_state.auth_store() else {
+        return no_auth_store().into_response();
     };
-    let mut conn = match acquire_conn(pool.default_pool()).await {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
+    // One session, so the change and its audit row share one connection.
+    let mut session = match store.session().await {
+        Ok(session) => session,
+        Err(e) => return store_error(e).into_response(),
     };
 
-    match crate::api_token::create_token(
-        &mut conn,
-        &body.name,
-        scope,
-        body.expires_at,
-        &actor,
-        body.tenant.as_deref(),
-    )
-    .await
+    match session
+        .create_token(
+            &body.name,
+            scope,
+            body.expires_at,
+            &actor,
+            body.tenant.as_deref(),
+        )
+        .await
     {
         Ok(mint) => {
             let id_str = mint.view.id.to_string();
@@ -4247,7 +4322,7 @@ async fn create_token_handler(
                 shard_id: None,
                 source: &source,
             };
-            let _ = audit::insert_audit(&mut conn, &ar).await;
+            let _ = session.insert_audit(&ar).await;
 
             // Flatten the metadata view and attach the one-time secret.
             let mut value =
@@ -4257,7 +4332,8 @@ async fn create_token_handler(
             }
             (StatusCode::CREATED, Json(value)).into_response()
         }
-        Err(e) => {
+        Err(crate::auth_store::StoreError::Unavailable(e)) => e.into_response(),
+        Err(crate::auth_store::StoreError::Failed(e)) => {
             let err_str = e.to_string();
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -4272,7 +4348,7 @@ async fn create_token_handler(
                 shard_id: None,
                 source: &source,
             };
-            let _ = audit::insert_audit(&mut conn, &ar).await;
+            let _ = session.insert_audit(&ar).await;
             // Do NOT surface the raw DB error text (a unique-violation `DETAIL`
             // echoes the row) into the HTTP response; the real error is captured
             // in the audit `error_summary` above. Return a clean generic 500.
@@ -4290,17 +4366,33 @@ async fn create_token_handler(
 async fn list_tokens_handler(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> axum::response::Response {
-    let pool = match api_state.storage_pool() {
-        Ok(p) => p,
-        Err(e) => return AutumnError::internal_server_error(e).into_response(),
+    let Some(store) = api_state.auth_store() else {
+        return no_auth_store().into_response();
     };
-    let mut conn = match acquire_conn(pool.default_pool()).await {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
+    // One session, so the change and its audit row share one connection.
+    let mut session = match store.session().await {
+        Ok(session) => session,
+        Err(e) => return store_error(e).into_response(),
     };
-    match crate::api_token::list_tokens(&mut conn).await {
+    match session.list_tokens().await {
         Ok(views) => (StatusCode::OK, Json(views)).into_response(),
-        Err(e) => AutumnError::internal_server_error(e).into_response(),
+        Err(e) => store_error(e).into_response(),
+    }
+}
+
+/// The answer when no token or audit store is installed yet. It is the
+/// answer of the Postgres path before issue #2469.
+fn no_auth_store() -> AutumnError {
+    AutumnError::internal_server_error(HarvestError::Config(
+        "harvest storage pool is not configured".to_string(),
+    ))
+}
+
+/// The HTTP form of a failed token or audit store call.
+fn store_error(error: crate::auth_store::StoreError) -> AutumnError {
+    match error {
+        crate::auth_store::StoreError::Unavailable(e) => e,
+        crate::auth_store::StoreError::Failed(e) => AutumnError::internal_server_error(e),
     }
 }
 
@@ -4313,17 +4405,17 @@ async fn revoke_token_handler(
 ) -> axum::response::Response {
     let (actor, source, request_id) = audit_context(&headers, &api_state);
 
-    let pool = match api_state.storage_pool() {
-        Ok(p) => p,
-        Err(e) => return AutumnError::internal_server_error(e).into_response(),
+    let Some(store) = api_state.auth_store() else {
+        return no_auth_store().into_response();
     };
-    let mut conn = match acquire_conn(pool.default_pool()).await {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
+    // One session, so the change and its audit row share one connection.
+    let mut session = match store.session().await {
+        Ok(session) => session,
+        Err(e) => return store_error(e).into_response(),
     };
 
     let id_str = id.to_string();
-    match crate::api_token::revoke_token(&mut conn, id).await {
+    match session.revoke_token(id).await {
         Ok(revoked) => {
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -4338,14 +4430,14 @@ async fn revoke_token_handler(
                 shard_id: None,
                 source: &source,
             };
-            let _ = audit::insert_audit(&mut conn, &ar).await;
+            let _ = session.insert_audit(&ar).await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "revoked": revoked })),
             )
                 .into_response()
         }
-        Err(e) => AutumnError::internal_server_error(e).into_response(),
+        Err(e) => store_error(e).into_response(),
     }
 }
 
@@ -5748,6 +5840,29 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
         .layer(Extension(api_state))
 }
 
+/// The token and audit routes, for the SQLite router (issue #2469).
+///
+/// They are the routes and handlers of [`harvest_api_router`], with the same
+/// admin gate. The handlers reach storage through the auth store, so they
+/// serve either backend.
+#[cfg(feature = "sqlite")]
+pub(crate) fn auth_admin_routes(api_state: HarvestApiState) -> Router<()> {
+    let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
+    Router::new()
+        .route("/admin/audit", get(list_audit_records))
+        .route(
+            "/admin/tokens",
+            get(list_tokens_handler)
+                .post(create_token_handler)
+                .route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/tokens/{id}",
+            delete(revoke_token_handler).route_layer(require_admin),
+        )
+        .layer(Extension(api_state))
+}
+
 /// Admin-auth wiring a standalone mount declares for the management API
 /// (issue #1608).
 ///
@@ -6052,6 +6167,23 @@ pub(crate) fn apply_admin_auth_layers(
     api_state: &HarvestApiState,
     layers: &AdminAuthLayers,
 ) -> Router<()> {
+    let limiter = layers
+        .rate_limit
+        .clone()
+        .map(crate::api_rate_limit::ApiRateLimiter::new);
+    apply_admin_auth_layers_with(router, api_state, layers, limiter)
+}
+
+/// [`apply_admin_auth_layers`] with a given rate limiter.
+///
+/// The SQLite router applies the stack to two routers (issue #2469). They
+/// share one limiter, so a client gets one budget across both.
+pub(crate) fn apply_admin_auth_layers_with(
+    router: Router<()>,
+    api_state: &HarvestApiState,
+    layers: &AdminAuthLayers,
+    limiter: Option<crate::api_rate_limit::ApiRateLimiter>,
+) -> Router<()> {
     let mut router = router;
     if let Some(authorizer) = &layers.authorizer {
         router = router.layer(middleware::from_fn_with_state(
@@ -6074,10 +6206,6 @@ pub(crate) fn apply_admin_auth_layers(
         api_state.clone(),
         crate::tenant::enforce_tenant_binding,
     ));
-    let limiter = layers
-        .rate_limit
-        .clone()
-        .map(crate::api_rate_limit::ApiRateLimiter::new);
     if let Some(limiter) = &limiter {
         router = router.layer(middleware::from_fn_with_state(
             (api_state.clone(), limiter.clone()),
@@ -7701,13 +7829,14 @@ pub const fn management_api_request_fields()
                 "reason",
             ]),
         ),
-        // Run-default overrides of a workflow type (issue #2387).
+        // Run-default overrides of a workflow type (issues #2387 and #2406).
         (
             "PATCH",
             "/admin/workflow-types/{workflow_name}/run-defaults",
             Some(&[
                 "sla_secs",
                 "execution_timeout_secs",
+                "chain_execution_timeout_secs",
                 "clear_override",
                 "reason",
                 "recompute_in_flight",
@@ -10525,25 +10654,17 @@ async fn list_audit_records(
         limit,
     };
 
-    let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut records: Vec<AuditRecord> = Vec::new();
-
-    for (_shard, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let mut rows = audit::list_audit(&mut conn, &filters)
-            .await
-            .map_err(map_error)?;
-        records.append(&mut rows);
-    }
-
-    // Merge shards: sort by occurred_at DESC, then id for determinism.
-    records.sort_by(|a, b| {
-        b.occurred_at
-            .cmp(&a.occurred_at)
-            .then_with(|| b.id.cmp(&a.id))
-    });
-    records.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-
+    let store = api_state.auth_store().ok_or_else(|| {
+        // The answer of the Postgres path before issue #2469.
+        map_error(HarvestError::Config(
+            "harvest storage pool is not configured".to_string(),
+        ))
+    })?;
+    // Issue #2469: the store merges the shards, newest first.
+    let records = store.list_audit(&filters).await.map_err(|e| match e {
+        crate::auth_store::StoreError::Unavailable(e) => e,
+        crate::auth_store::StoreError::Failed(e) => map_error(e),
+    })?;
     Ok(Json(records))
 }
 
@@ -19181,12 +19302,11 @@ pub(crate) async fn start_workflow(
                 .map(|d| d.num_seconds());
             // Chain-scoped lifetime cap (issue #617): resolve the workflow-type
             // default + fleet-wide ceiling-as-default so a debounced start does not
-            // silently drop a declared chain cap.
+            // silently drop a declared chain cap. The operator override wins
+            // (issue #2406).
             let effective_chain_execution_timeout_secs = runtime
                 .registry
-                .workflows
-                .get(&workflow_name)
-                .and_then(|info| info.chain_execution_timeout)
+                .chain_execution_timeout(&workflow_name)
                 .and_then(|d| chrono::Duration::from_std(d).ok())
                 .map(|d| d.num_seconds());
             let effective_chain_ceiling_secs = api_state
@@ -19527,12 +19647,11 @@ pub(crate) async fn start_workflow(
             .map(|d| d.num_seconds());
         // Chain-scoped lifetime cap (issue #617): resolve the workflow-type
         // default + fleet-wide ceiling-as-default so a batched start does not
-        // silently drop a declared chain cap.
+        // silently drop a declared chain cap. The operator override wins
+        // (issue #2406).
         let effective_chain_execution_timeout_secs = runtime
             .registry
-            .workflows
-            .get(&workflow_name)
-            .and_then(|info| info.chain_execution_timeout)
+            .chain_execution_timeout(&workflow_name)
             .and_then(|d| chrono::Duration::from_std(d).ok())
             .map(|d| d.num_seconds());
         let effective_chain_ceiling_secs = api_state
@@ -19763,33 +19882,26 @@ pub(crate) async fn start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-    let (
-        owner,
-        runbook_url,
-        severity,
-        info_sla,
-        info_execution_timeout,
-        info_chain_execution_timeout,
-        info_retry_policy,
-    ) = runtime.registry.workflows.get(&workflow_name).map_or(
-        (None, None, None, None, None, None, None),
-        |info| {
-            (
-                info.owner,
-                info.runbook_url,
-                info.severity,
-                info.sla,
-                info.execution_timeout,
-                info.chain_execution_timeout,
-                info.retry_policy.clone(),
-            )
-        },
-    );
-    // Issue #2387: an operator override wins over the declared value.
+    let (owner, runbook_url, severity, info_sla, info_execution_timeout, info_retry_policy) =
+        runtime.registry.workflows.get(&workflow_name).map_or(
+            (None, None, None, None, None, None),
+            |info| {
+                (
+                    info.owner,
+                    info.runbook_url,
+                    info.severity,
+                    info.sla,
+                    info.execution_timeout,
+                    info.retry_policy.clone(),
+                )
+            },
+        );
+    // Issues #2387 and #2406: an operator override wins over the declared value.
     let (info_execution_timeout, info_sla) =
         runtime
             .registry
             .apply_run_defaults(&workflow_name, info_execution_timeout, info_sla);
+    let info_chain_execution_timeout = runtime.registry.chain_execution_timeout(&workflow_name);
     let workflow_retry_policy = info_retry_policy;
     // Chain-scoped lifetime cap (issue #617): resolve the workflow-type default,
     // at parity with `info_execution_timeout` above. The fleet-wide ceiling from
@@ -21471,34 +21583,29 @@ async fn batch_start_workflows(
             )
             .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-            let (
-                owner,
-                runbook_url,
-                severity,
-                info_sla,
-                info_execution_timeout,
-                info_chain_execution_timeout,
-                info_retry_policy,
-            ) = runtime.registry.workflows.get(&item.workflow_name).map_or(
-                (None, None, None, None, None, None, None),
-                |info| {
-                    (
-                        info.owner,
-                        info.runbook_url,
-                        info.severity,
-                        info.sla,
-                        info.execution_timeout,
-                        info.chain_execution_timeout,
-                        info.retry_policy.clone(),
-                    )
-                },
-            );
-            // Issue #2387: an operator override wins over the declared value.
+            let (owner, runbook_url, severity, info_sla, info_execution_timeout, info_retry_policy) =
+                runtime.registry.workflows.get(&item.workflow_name).map_or(
+                    (None, None, None, None, None, None),
+                    |info| {
+                        (
+                            info.owner,
+                            info.runbook_url,
+                            info.severity,
+                            info.sla,
+                            info.execution_timeout,
+                            info.retry_policy.clone(),
+                        )
+                    },
+                );
+            // Issues #2387 and #2406: an operator override wins over the declared value.
             let (info_execution_timeout, info_sla) = runtime.registry.apply_run_defaults(
                 &item.workflow_name,
                 info_execution_timeout,
                 info_sla,
             );
+            let info_chain_execution_timeout = runtime
+                .registry
+                .chain_execution_timeout(&item.workflow_name);
             let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
             let item_workflow_retry_policy = info_retry_policy;
 
@@ -22922,33 +23029,26 @@ pub(crate) async fn signal_with_start_workflow(
             },
         );
 
-    let (
-        owner,
-        runbook_url,
-        severity,
-        info_sla,
-        info_execution_timeout,
-        info_chain_execution_timeout,
-        info_retry_policy_sws,
-    ) = runtime.registry.workflows.get(&workflow_name).map_or(
-        (None, None, None, None, None, None, None),
-        |info| {
-            (
-                info.owner,
-                info.runbook_url,
-                info.severity,
-                info.sla,
-                info.execution_timeout,
-                info.chain_execution_timeout,
-                info.retry_policy.clone(),
-            )
-        },
-    );
-    // Issue #2387: an operator override wins over the declared value.
+    let (owner, runbook_url, severity, info_sla, info_execution_timeout, info_retry_policy_sws) =
+        runtime.registry.workflows.get(&workflow_name).map_or(
+            (None, None, None, None, None, None),
+            |info| {
+                (
+                    info.owner,
+                    info.runbook_url,
+                    info.severity,
+                    info.sla,
+                    info.execution_timeout,
+                    info.retry_policy.clone(),
+                )
+            },
+        );
+    // Issues #2387 and #2406: an operator override wins over the declared value.
     let (info_execution_timeout, info_sla) =
         runtime
             .registry
             .apply_run_defaults(&workflow_name, info_execution_timeout, info_sla);
+    let info_chain_execution_timeout = runtime.registry.chain_execution_timeout(&workflow_name);
     let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
     let sws_workflow_retry_policy =
         info_retry_policy_sws.and_then(|p| serde_json::to_value(&p).ok());
@@ -23690,33 +23790,26 @@ async fn update_with_start_workflow(
             },
         );
 
-    let (
-        owner,
-        runbook_url,
-        severity,
-        info_sla,
-        info_execution_timeout,
-        info_chain_execution_timeout,
-        info_retry_policy_uws,
-    ) = runtime.registry.workflows.get(&workflow_name).map_or(
-        (None, None, None, None, None, None, None),
-        |info| {
-            (
-                info.owner,
-                info.runbook_url,
-                info.severity,
-                info.sla,
-                info.execution_timeout,
-                info.chain_execution_timeout,
-                info.retry_policy.clone(),
-            )
-        },
-    );
-    // Issue #2387: an operator override wins over the declared value.
+    let (owner, runbook_url, severity, info_sla, info_execution_timeout, info_retry_policy_uws) =
+        runtime.registry.workflows.get(&workflow_name).map_or(
+            (None, None, None, None, None, None),
+            |info| {
+                (
+                    info.owner,
+                    info.runbook_url,
+                    info.severity,
+                    info.sla,
+                    info.execution_timeout,
+                    info.retry_policy.clone(),
+                )
+            },
+        );
+    // Issues #2387 and #2406: an operator override wins over the declared value.
     let (info_execution_timeout, info_sla) =
         runtime
             .registry
             .apply_run_defaults(&workflow_name, info_execution_timeout, info_sla);
+    let info_chain_execution_timeout = runtime.registry.chain_execution_timeout(&workflow_name);
     let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
     let uws_workflow_retry_policy =
         info_retry_policy_uws.and_then(|p| serde_json::to_value(&p).ok());
@@ -31391,12 +31484,11 @@ async fn trigger_schedule_now(
         .and_then(|(execution_timeout, _)| execution_timeout)
         .and_then(|d| chrono::Duration::from_std(d).ok());
     // Chain-scoped lifetime cap default (issue #617): only registered workflows
-    // carry it; DAGs have no chain-cap concept.
+    // carry it; DAGs have no chain-cap concept. The operator override wins
+    // (issue #2406).
     let info_chain_execution_timeout = runtime
         .registry
-        .workflows
-        .get(&workflow_name)
-        .and_then(|info| info.chain_execution_timeout)
+        .chain_execution_timeout(&workflow_name)
         .and_then(|d| chrono::Duration::from_std(d).ok());
     let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
@@ -32845,31 +32937,26 @@ pub(crate) async fn schedule_backfill_inner(
                     None => serde_json::Value::Null,
                 };
 
-                let (
-                    owner,
-                    runbook_url,
-                    severity,
-                    info_sla,
-                    info_execution_timeout,
-                    info_chain_execution_timeout,
-                ) = runtime.registry.workflows.get(&wf_name).map_or(
-                    (None, None, None, None, None, None),
-                    |info| {
+                let (owner, runbook_url, severity, info_sla, info_execution_timeout) = runtime
+                    .registry
+                    .workflows
+                    .get(&wf_name)
+                    .map_or((None, None, None, None, None), |info| {
                         (
                             info.owner,
                             info.runbook_url,
                             info.severity,
                             info.sla,
                             info.execution_timeout,
-                            info.chain_execution_timeout,
                         )
-                    },
-                );
-                // Issue #2387: an operator override wins over the declared value.
+                    });
+                // Issues #2387 and #2406: an operator override wins over the declared value.
                 let (info_execution_timeout, info_sla) =
                     runtime
                         .registry
                         .apply_run_defaults(&wf_name, info_execution_timeout, info_sla);
+                let info_chain_execution_timeout =
+                    runtime.registry.chain_execution_timeout(&wf_name);
                 let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
                 // Issue #1412: thread the declared execution_timeout and the
                 // fleet-wide ceiling into the start below, via the same shared

@@ -45,7 +45,7 @@ Declared with `#[workflow(...)]` and registered with `WorkerBuilder`.
 | `WorkflowInfo.module` | no | Grouping metadata. | deploy-only |
 | `WorkflowInfo.handler` | no | Code. | deploy-only |
 | `WorkflowInfo.execution_timeout` | yes, `PATCH /admin/workflow-types/{workflow_name}/run-defaults` (#2387) | New runs only. `deadline_at` of a run in flight never moves. | already runtime |
-| `WorkflowInfo.chain_execution_timeout` | no | Read when a chain starts, and stored as its chain deadline. Each continue-as-new copies that deadline, so a chain in flight keeps it. | override (#2406) |
+| `WorkflowInfo.chain_execution_timeout` | yes, run-defaults route (#2406) | Read when a chain starts, and stored as its chain deadline. Each continue-as-new copies that deadline, so a chain in flight keeps it. | already runtime |
 | `WorkflowInfo.sla` | yes, run-defaults route (#2387) | New runs. The opt-in recompute moves the SLA deadline of unbreached runs. | already runtime |
 | `WorkflowInfo.concurrency` | no. `GET /admin/concurrency` reads it. | `limit` is read at each start. A lower limit queues or rejects new starts, and never stops a run. `key_expr` and `on_conflict` change what a start means. | override (#2407), `limit` only |
 | `WorkflowInfo.debounce` | no. `GET /admin/debounce` reads pending bursts. | A burst in flight holds its window. A new window splits or merges bursts in a way that no caller can predict. | deploy-only |

@@ -5293,8 +5293,8 @@ async fn tick_one_workflow_schedule(
                     // + fleet-wide ceiling (via registry, since the core scheduler
                     // has no api_state) captured so a throttled scheduled fire keeps
                     // the cap — parity with the tick's normal start path.
-                    chain_execution_timeout_secs: wf_info
-                        .and_then(|info| info.chain_execution_timeout)
+                    chain_execution_timeout_secs: registry
+                        .chain_execution_timeout(wf_name)
                         .and_then(|d| chrono::Duration::from_std(d).ok())
                         .map(|d| d.num_seconds()),
                     max_workflow_chain_timeout_ceiling_secs: registry
@@ -5376,8 +5376,8 @@ async fn tick_one_workflow_schedule(
                     // the `HandlerRegistry` (it has no `api_state`), diverging from the
                     // per-run `execution_timeout` ceiling which is a pure cap, not a
                     // fleet-wide default.
-                    chain_execution_timeout: wf_info
-                        .and_then(|info| info.chain_execution_timeout)
+                    chain_execution_timeout: registry
+                        .chain_execution_timeout(wf_name)
                         .and_then(|d| chrono::Duration::from_std(d).ok()),
                     max_workflow_chain_timeout_ceiling: registry
                         .max_workflow_chain_timeout
@@ -7268,8 +7268,8 @@ async fn drain_claimed_buffered_schedule(
                     // Chain-scoped lifetime cap (issue #617): workflow-type
                     // default + fleet-wide ceiling (via registry) so a throttled
                     // buffered-drain fire keeps the cap.
-                    chain_execution_timeout_secs: wf_info
-                        .and_then(|info| info.chain_execution_timeout)
+                    chain_execution_timeout_secs: registry
+                        .chain_execution_timeout(wf_name)
                         .and_then(|d| chrono::Duration::from_std(d).ok())
                         .map(|d| d.num_seconds()),
                     max_workflow_chain_timeout_ceiling_secs: registry
@@ -7351,8 +7351,8 @@ async fn drain_claimed_buffered_schedule(
                     // workflow under-specifies (AC4) — IDENTICAL to the tick-direct
                     // start path above, and consistent with this site's own
                     // throttled sibling.
-                    chain_execution_timeout: wf_info
-                        .and_then(|info| info.chain_execution_timeout)
+                    chain_execution_timeout: registry
+                        .chain_execution_timeout(wf_name)
                         .and_then(|d| chrono::Duration::from_std(d).ok()),
                     max_workflow_chain_timeout_ceiling: registry
                         .max_workflow_chain_timeout
