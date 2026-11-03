@@ -35,7 +35,7 @@ use crate::approval::Approval;
 use crate::consolidate::{
     CONSOLIDATE_WORKFLOW_NAME, ConsolidateTask, agent_consolidate_info,
     agent_consolidate_read_info, agent_consolidate_turn_info, agent_consolidate_write_info,
-    agent_episode_append_info, agent_episodes_reset_info,
+    agent_episode_append_info, agent_episode_reset_info,
 };
 use crate::error::{AgentError, ErrorKind};
 use crate::harness::{AgentHarness, CacheTenant};
@@ -168,7 +168,7 @@ fn register_episodes(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
         })
     });
     let h = Arc::clone(harness);
-    rt.register_activity_with_body(&agent_episodes_reset_info(), move |input| {
+    rt.register_activity_with_body(&agent_episode_reset_info(), move |input| {
         call(input, |erase| {
             let h = Arc::clone(&h);
             async move { crate::consolidate::erase_episodes(&h, erase).await }

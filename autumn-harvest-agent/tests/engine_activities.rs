@@ -282,7 +282,7 @@ fn the_engine_registration_builds() {
             "agent_consolidate_turn",
             "agent_consolidate_write",
             "agent_episode_append",
-            "agent_episodes_reset",
+            "agent_episode_reset",
         ]
     );
     let flows: Vec<&str> = workflows().iter().map(|w| w.name).collect();

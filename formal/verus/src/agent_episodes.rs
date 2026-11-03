@@ -5,8 +5,8 @@
 //! that no step overflows and that each one equals its spec. The theorems
 //! show that an append never passes the bound and evicts only stored
 //! episodes. A log within the bound loses at most one episode per append.
-//! No sequence of appends takes the log past the bound. A trigger of 0
-//! never fires.
+//! No sequence of appends takes the log past the bound. A pass is due only
+//! at a positive multiple of the trigger, and a trigger of 0 never fires.
 
 use vstd::prelude::*;
 
@@ -52,9 +52,9 @@ pub fn episode_evictions(len: u64, max: u64) -> (r: u64)
     }
 }
 
-/// A pass is due when the trigger is set and enough episodes wait.
+/// A pass is due at each positive multiple of the trigger.
 pub open spec fn due(pending: int, every: int) -> bool {
-    every > 0 && pending >= every
+    every > 0 && pending >= every && pending % every == 0
 }
 
 // mirror: autumn-harvest-agent/src/bounds.rs consolidation_due
@@ -62,7 +62,7 @@ pub fn consolidation_due(pending: u64, every: u32) -> (r: bool)
     ensures
         r == due(pending as int, every as int),
 {
-    every > 0 && pending >= every as u64
+    every > 0 && pending >= every as u64 && pending % every as u64 == 0
 }
 
 /// An append never passes the bound, and it evicts only stored episodes.
@@ -120,13 +120,22 @@ pub proof fn theorem_a_zero_trigger_never_fires(pending: int)
 {
 }
 
-/// A due pass stays due while more episodes wait.
-pub proof fn theorem_the_trigger_is_monotone(small: int, large: int, every: int)
+/// A due pass has a positive trigger and at least that many episodes.
+pub proof fn theorem_a_due_pass_has_a_full_trigger(pending: int, every: int)
     requires
-        small <= large,
-        due(small, every),
+        due(pending, every),
     ensures
-        due(large, every),
+        pending >= every,
+        every > 0,
+{
+}
+
+/// Under the trigger, no pass is due.
+pub proof fn theorem_no_pass_is_due_under_the_trigger(pending: int, every: int)
+    requires
+        0 <= pending < every,
+    ensures
+        !due(pending, every),
 {
 }
 

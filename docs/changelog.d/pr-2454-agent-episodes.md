@@ -17,7 +17,11 @@ is in `docs/design/DESIGN-2454.md`.
 - A fact lists its source episode ids and carries the labels of every
   episode of its pass. A store with no label support refuses it.
 - The trigger is a schedule (`consolidate::schedule`) or every N episodes,
-  as a child pass. On SQLite, `sqlite::consolidate` starts one pass.
+  as a child pass. A failed child pass waits for N more episodes and fails
+  the op. On SQLite, `sqlite::consolidate` starts one pass.
+- A clear keeps an empty log with a new generation. A pass that runs
+  across a reset writes no fact after it and ends as `reset`. A log keeps
+  only hashes of derived facts.
 - `Control::ResetMemory` clears the episodes, behind the patch gate
   `agent_episode_reset`, and counts them in `AgentState::episode_reset`.
   `harvest agents erase` reports `episodes_erased` and `facts_erased`, and
@@ -25,7 +29,8 @@ is in `docs/design/DESIGN-2454.md`.
   `agent_consolidation_of`.
 - New activities: `agent_consolidate_read`, `agent_consolidate_turn`,
   `agent_consolidate_write`, `agent_episode_append` and
-  `agent_episodes_reset`. No new `WorkflowEvent` variant and no migration.
+  `agent_episode_reset`. A worker with a hand-picked activity list must add
+  them. No new `WorkflowEvent` variant and no migration.
 - `formal/verus/src/agent_episodes.rs` proves the eviction and trigger
   kernels in `bounds.rs`.
 

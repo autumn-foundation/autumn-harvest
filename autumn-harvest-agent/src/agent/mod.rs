@@ -49,8 +49,8 @@ use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::consolidate::{
-    ConsolidateTask, ConsolidationReport, EpisodeAppend, EpisodeErase, agent_consolidate_info,
-    agent_episode_append_info, agent_episodes_reset_info, episode_scope,
+    ConsolidateTask, ConsolidationReport, EpisodeAppend, EpisodeResetRequest,
+    agent_consolidate_info, agent_episode_append_info, agent_episode_reset_info, episode_scope,
 };
 use crate::context_reset::{ContextReset, ProgressNotes};
 use crate::delivery::{Report, ReportSource, is_silent, report_text};
@@ -1528,7 +1528,11 @@ impl AgentRun<'_> {
                 if self.ctx.patched(EPISODE_RESET_PATCH) {
                     match self.reset_episodes().await {
                         Ok(reset) => state.episode_reset = reset,
-                        Err(err) => fail(&mut state, &err),
+                        Err(err) => {
+                            // Old counts would claim a clear that failed.
+                            state.episode_reset = None;
+                            fail(&mut state, &err);
+                        }
                     }
                 }
                 if let Err(err) = self.reset_memory().await {
@@ -1615,18 +1619,15 @@ impl AgentRun<'_> {
         let Ok(id) = &self.id else {
             return Ok(None);
         };
-        let memory_scope = self
-            .profile
-            .as_ref()
-            .ok()
-            .and_then(|profile| profile.memory_scope(id));
-        let erase = EpisodeErase {
+        let profile = self.profile.as_ref().ok();
+        let erase = EpisodeResetRequest {
             scope: episode_scope(id),
-            memory_scope,
+            memory_scope: profile.and_then(|profile| profile.memory_scope(id)),
             key: EditKey::new(format!("reset:{}", self.ctx.new_uuid())),
+            required: profile.is_some_and(|profile| profile.episodes.is_some()),
         };
         self.ctx
-            .execute_activity(&agent_episodes_reset_info(), erase)
+            .execute_activity(&agent_episode_reset_info(), erase)
             .await
             .map_err(|err| format!("{err}"))
     }
@@ -1684,7 +1685,10 @@ impl AgentRun<'_> {
         let ConsolidationTrigger::Every { episodes } = settings.trigger else {
             return;
         };
-        if !crate::bounds::consolidation_due(appended.pending, episodes) {
+        // The log never holds more than its bound, so a larger trigger
+        // counts as the bound.
+        let every = episodes.min(settings.max_episodes.max(1));
+        if !crate::bounds::consolidation_due(appended.pending, every) {
             return;
         }
         let task = ConsolidateTask { agent: id.clone() };
@@ -1692,8 +1696,17 @@ impl AgentRun<'_> {
             .ctx
             .spawn_child_workflow(&agent_consolidate_info(), task)
             .await;
-        if let Err(err) = pass {
-            fail(state, &format!("the consolidation pass failed: {err}"));
+        match pass {
+            Ok(report) => {
+                // The pass spends tokens for the agent.
+                state.tokens_used = state
+                    .tokens_used
+                    .saturating_add(u64::from(report.usage.total()));
+                if let Some(problem) = pass_problem(&report) {
+                    fail(state, &problem);
+                }
+            }
+            Err(err) => fail(state, &format!("the consolidation pass failed: {err}")),
         }
     }
 
@@ -2351,6 +2364,21 @@ fn hold(state: &mut AgentState, op: AgentOp) -> Option<AgentOp> {
         ),
     );
     Some(op)
+}
+
+/// The error of a child pass that did not write all its facts, or `None`.
+fn pass_problem(report: &ConsolidationReport) -> Option<String> {
+    use crate::consolidate::ConsolidationStop;
+    match report.stop {
+        ConsolidationStop::Completed if report.facts_refused == 0 => None,
+        ConsolidationStop::NothingToDo => None,
+        ConsolidationStop::Completed => Some(format!(
+            "the consolidation pass refused {} facts: {}",
+            report.facts_refused,
+            report.refusals.first().map_or("", String::as_str)
+        )),
+        stop => Some(format!("the consolidation pass ended as {stop:?}")),
+    }
 }
 
 /// Count a failed op and keep its error.

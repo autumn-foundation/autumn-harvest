@@ -15,7 +15,8 @@
 //! [`ResponseCache`] serves an identical model call across runs. The
 //! [`draw`] module gives each sample of a run its own identity, so the cache
 //! keeps the samples apart. The [`episode`] log records each op, and
-//! [`consolidate`] turns the episodes into facts (issue #2454). The `eval` feature adds the `eval` module. That
+//! [`consolidate`] turns the episodes into facts (issue #2454). The `eval`
+//! feature adds the `eval` module. That
 //! module re-drives a recorded run with a candidate model or prompt. The
 //! `sandbox` feature adds the `sandbox` module. Its `SandboxTool` runs agent
 //! code in a sandbox.
@@ -145,8 +146,8 @@ pub use context_reset::{ContextReset, ProgressNotes};
 pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
 pub use draw::{Draw, DrawId, run_draws};
 pub use episode::{
-    ConsolidationTrigger, Episode, EpisodeReset, EpisodeSettings, EpisodeStore,
-    InMemoryEpisodeStore,
+    Appended, Cleared, ConsolidationTrigger, Episode, EpisodeLog, EpisodeReset, EpisodeSettings,
+    EpisodeStore, InMemoryEpisodeStore, PassMark,
 };
 pub use error::{AgentError, ErrorKind};
 pub use flow::{FlowRule, FlowRules, Recheck, Released};

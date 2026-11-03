@@ -2915,7 +2915,7 @@ pub fn activities() -> Vec<ActivityInfo> {
         crate::consolidate::agent_consolidate_turn_info(),
         crate::consolidate::agent_consolidate_write_info(),
         crate::consolidate::agent_episode_append_info(),
-        crate::consolidate::agent_episodes_reset_info(),
+        crate::consolidate::agent_episode_reset_info(),
     ]
 }
 

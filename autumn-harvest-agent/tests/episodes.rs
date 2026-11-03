@@ -304,7 +304,7 @@ async fn an_episode_keeps_the_flow_labels_of_its_op() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn episodes_without_a_memory_store_fail_the_op_with_a_named_error() {
+async fn episodes_with_state_memory_fail_the_op_with_a_named_error() {
     let (_dir, db) = fresh_db();
     let harness = AgentHarness::new(model(two_facts))
         .episodes(Arc::new(InMemoryEpisodeStore::default()))
@@ -344,7 +344,7 @@ async fn a_third_episode_evicts_the_oldest_and_the_next_pass_counts_it() {
     let log = episodes.load(&episode_scope()).await.unwrap();
     let texts: Vec<&str> = log.episodes().map(|item| item.text.as_str()).collect();
     assert_eq!(texts, ["answer 2", "answer 3"], "the oldest goes first");
-    assert_eq!(log.dropped, 1);
+    assert_eq!(log.dropped(), 1);
 
     let exec = sqlite::consolidate(&mut rt, &agent()).unwrap();
     rt.run_until_blocked(exec).await.unwrap();
@@ -352,8 +352,65 @@ async fn a_third_episode_evicts_the_oldest_and_the_next_pass_counts_it() {
     assert_eq!(report.stop, ConsolidationStop::Completed);
     assert_eq!(report.episodes, 2);
     assert_eq!(report.dropped, 1, "the next pass counts the eviction");
-    assert_eq!(episodes.load(&episode_scope()).await.unwrap().dropped, 0);
+    assert_eq!(episodes.load(&episode_scope()).await.unwrap().dropped(), 0);
     assert_eq!(pass_count(&model), 1);
+
+    // The next pass counts no drop twice.
+    say(&mut rt, "four").await;
+    let next = sqlite::consolidate(&mut rt, &agent()).unwrap();
+    rt.run_until_blocked(next).await.unwrap();
+    let report = report_of(&rt, next).unwrap();
+    assert_eq!(report.episodes, 1);
+    assert_eq!(report.dropped, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_child_pass_waits_for_more_episodes_and_fails_the_op() {
+    let (_dir, db) = fresh_db();
+    let model = model(|_| "no facts here".to_owned());
+    let harness = AgentHarness::new(model.clone())
+        .memory(Arc::new(InMemoryMemoryStore::new()))
+        .episodes(Arc::new(InMemoryEpisodeStore::default()))
+        .agent(profile(Some(EpisodeSettings::default().every(2))));
+    let mut rt = runtime(&db, harness);
+    say(&mut rt, "one").await;
+    say(&mut rt, "two").await;
+    assert_eq!(pass_count(&model), 1);
+    let state = state_of(&rt, &agent()).await;
+    assert_eq!(state.failures, 1);
+    assert!(
+        state
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("InvalidReply")),
+        "{:?}",
+        state.last_error
+    );
+    // The episodes stay pending, but no op pays for a pass until 2 more.
+    say(&mut rt, "three").await;
+    assert_eq!(pass_count(&model), 1, "no retry on the next op");
+    say(&mut rt, "four").await;
+    assert_eq!(pass_count(&model), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn episodes_with_no_episode_store_fail_the_op_with_a_named_error() {
+    let (_dir, db) = fresh_db();
+    let harness = AgentHarness::new(model(two_facts))
+        .memory(Arc::new(InMemoryMemoryStore::new()))
+        .agent(profile(Some(EpisodeSettings::default())));
+    let mut rt = runtime(&db, harness);
+    say(&mut rt, "hello").await;
+    let state = state_of(&rt, &agent()).await;
+    assert_eq!(state.failures, 1);
+    assert!(
+        state
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("call AgentHarness::episodes")),
+        "{:?}",
+        state.last_error
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +610,7 @@ async fn a_store_without_labels_refuses_a_labelled_fact() {
     .await;
     let harness = AgentHarness::new(model(two_facts))
         .memory(memory.clone())
-        .episodes(episodes)
+        .episodes(episodes.clone())
         .agent(profile(Some(EpisodeSettings::default())));
     let mut rt = runtime(&db, harness);
     let exec = sqlite::consolidate(&mut rt, &agent()).unwrap();
@@ -570,6 +627,8 @@ async fn a_store_without_labels_refuses_a_labelled_fact() {
         "{:?}",
         report.refusals
     );
+    let log = episodes.load(&episode_scope()).await.unwrap();
+    assert_eq!(log.pending(10).len(), 1, "a refused fact keeps its source");
     assert_eq!(facts(memory.as_ref()).await.entries.len(), 0, "fail closed");
 }
 
@@ -781,14 +840,15 @@ impl EpisodeStore for FileStores {
         &'a self,
         scope: &'a MemoryScope,
         mark: PassMark,
-    ) -> BoxFuture<'a, Result<(), AgentError>> {
+    ) -> BoxFuture<'a, Result<bool, AgentError>> {
         let mut disk = self.read();
-        disk.episodes
+        let applied = disk
+            .episodes
             .entry(scope.as_str().to_owned())
             .or_default()
             .mark(&mark);
         self.save(&disk, Abort::Append);
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(std::future::ready(Ok(applied)))
     }
 
     fn clear<'a>(
@@ -796,10 +856,13 @@ impl EpisodeStore for FileStores {
         scope: &'a MemoryScope,
         key: &'a EditKey,
     ) -> BoxFuture<'a, Result<Cleared, AgentError>> {
-        let mut disk = self.read();
-        let log = disk.episodes.remove(scope.as_str()).unwrap_or_default();
         let _ = key;
-        let cleared = log.into_cleared();
+        let mut disk = self.read();
+        let cleared = disk
+            .episodes
+            .entry(scope.as_str().to_owned())
+            .or_default()
+            .clear();
         self.save(&disk, Abort::Append);
         Box::pin(std::future::ready(Ok(cleared)))
     }
@@ -1014,4 +1077,7 @@ async fn a_crash_mid_pass_and_a_rerun_write_no_fact_twice() {
         ],
         "each fact once"
     );
+    // The text skip of `MemoryOp::Add` hides a lost key, so check the keys.
+    // The replay writes the second fact and repeats no key of the first.
+    assert_eq!(stores.read().applied.len(), 2, "one key per fact");
 }

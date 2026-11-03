@@ -44,6 +44,11 @@ Options for each open question. The chosen option is in bold.
 | A store that cannot keep labels holds a labelled fact with no taint. | The write goes through `MemoryStore::apply_labelled`. Its default refuses a labelled write. The report counts the refusal. |
 | A crash mid-pass writes a fact twice. | Replay reads the recorded model reply. Each fact write carries `<pass id>:<hash>`. `MemoryOp::Add` also skips an equal entry. |
 | A pass reads an episode that a person erased. | `ResetMemory` clears the episode scope and the memory scope. A child pass ends before the op ends, so it cannot run across a reset. |
+| A scheduled pass runs across a reset and writes its facts back. | A clear keeps an empty log with a new generation. The write checks the generation before each fact, and the mark refuses another generation. The pass ends as `reset`. |
+| A refused fact marks its episodes, so the knowledge goes silently. | The sources of a refused fact stay unconsolidated. A child pass that refuses a fact fails the op with a named error. |
+| A failed pass retries on every op and pays the model each time. | `Every` fires at each positive multiple of `n`, so a failed pass waits for `n` more episodes. |
+| An erased log keeps fact text for a retried clear. | A log keeps a hash of each derived fact, not its text. A cached clear holds counts and hashes only. |
+| A worker with no episode store reports a clear that did not happen. | A reset of a kind with episodes fails when the store is missing. |
 | An unattended tick plants facts that an attended op reads. | Only a segment that may write memory appends an episode, as for progress notes (#2453). |
 | The episode log grows without a bound. | `max_episodes` bounds it. The next pass reports each unconsolidated episode that an eviction dropped. |
 | A spent budget still pays for a pass. | The turn checks the LLM budget before the model call. A refusal ends the pass as `budget_exceeded`, with no write. |
@@ -104,19 +109,25 @@ pub enum ConsolidationTrigger {
    labels of the agent. The key is `episode:<run id>`.
 3. The store keeps at most `max_episodes`. It evicts the oldest first. An
    evicted unconsolidated episode adds one to `dropped`.
-4. With `Every { episodes: n }`, an append that leaves `n` or more
-   unconsolidated episodes runs the child workflow `agent_consolidate`. The
-   op awaits it.
+4. With `Every { episodes: n }`, an append that leaves a positive
+   multiple of `n` unconsolidated episodes runs the child workflow
+   `agent_consolidate`. The op awaits it. A pass that does not write all
+   its facts fails the op with a named error. Its tokens count in
+   `AgentState::tokens_used`. A value of `n` over `max_episodes` counts as
+   `max_episodes`.
 5. A pass reads at most `max_pass_episodes` unconsolidated episodes, oldest
    first, and the `dropped` count. It checks the LLM budget, calls the
    model once, and records one ledger call. It writes each valid fact with
    `apply_labelled` into `facts_block`. It then marks the episodes
-   consolidated, subtracts the `dropped` count that it read, and records
-   each written fact as derived.
+   consolidated, except the sources of a refused fact. It subtracts the
+   `dropped` count that it read, and records the hash of each written fact
+   as derived. Only a pass that marks reports `dropped`.
 6. A fact entry is `<subject> <relation> <object> [episodes: <id>, ...]`. It
    carries the union of the labels of every episode of the pass.
 7. `Control::ResetMemory` clears the episode scope and reports the counts
-   in `AgentState::episode_reset`. The facts count is the derived facts that
+   in `AgentState::episode_reset`. The clear keeps an empty log with a new
+   generation. A pass that read an older generation writes no fact after
+   the clear and ends as `reset`. The facts count is the derived facts that
    the memory scope still holds. The memory reset then removes them.
 8. `harvest agents erase` reports `episodes_erased` and `facts_erased`. It
    also erases each scheduled pass of the agent. A pass that still runs is
@@ -126,11 +137,16 @@ pub enum ConsolidationTrigger {
    must add them before it serves `Control::ResetMemory`.
 
 A pass ends with one `ConsolidationStop`: `completed`, `nothing_to_do`,
-`budget_exceeded`, `invalid_reply` or `disabled`.
+`budget_exceeded`, `invalid_reply`, `disabled` or `reset`.
 
-**Known limit.** A pass that a schedule starts during an erase can write a
-fact after the memory reset. Pause the schedule before an erase. A child
-pass has no such race.
+**Known limit.** The generation check runs before each fact write. A reset
+that lands between the check and one write can still keep that one fact.
+The memory reset runs after the episode reset, so it removes such a fact
+when the write lands first.
+
+**Known limit.** SQLite has no run budget, so its pass always passes the
+check. The budget test runs the engine check in a unit test and the
+workflow refusal in the in-memory test engine.
 
 **Known limit.** No Postgres or SQLite `EpisodeStore` ships. The memory
 store has none either. The trait is the extension point, as for
@@ -149,10 +165,11 @@ The tests are in `autumn-harvest-agent/tests/episodes.rs` unless noted.
 | A crash mid-pass and a rerun write no fact twice | `a_crash_mid_pass_and_a_rerun_write_no_fact_twice` |
 | A fact from a labelled episode keeps the labels | `a_fact_from_a_labelled_episode_carries_its_labels` |
 | A store with no label support refuses the write | `a_store_without_labels_refuses_a_labelled_fact` |
-| A run budget of 0 stops the pass before the model call | `a_zero_budget_stops_the_pass_before_its_model_call` (unit, `consolidate.rs`) and `a_refused_turn_ends_the_pass_as_budget_exceeded` |
+| A run budget of 0 stops the pass before the model call | `a_zero_budget_stops_the_pass_before_its_model_call` (unit, `consolidate.rs`, with the engine `check_llm_budget` and a `QuotaPolicy` of 0) and `a_refused_turn_ends_the_pass_as_budget_exceeded` |
 | The pass tokens are in the ledger under the pass run | `the_pass_tokens_are_in_the_ledger_under_its_run` |
 | Erase removes episodes and facts, with matching counts | `a_memory_reset_removes_episodes_and_facts_and_counts_them`; `the_report_counts_the_erased_episodes_and_facts` in `autumn-harvest-cli/src/agents.rs`; `erase_also_erases_each_scheduled_pass_of_the_agent` in `autumn-harvest-cli/tests/integration/agents_cli.rs` |
 | `max_episodes = 2`: a third episode evicts the oldest, and the next pass counts it | `a_third_episode_evicts_the_oldest_and_the_next_pass_counts_it` |
+| Review fixes | `a_pass_across_a_reset_writes_no_fact`, `a_required_reset_with_no_store_fails` (unit, `consolidate.rs`); `a_mark_of_an_older_generation_changes_nothing`, `a_read_episode_evicted_during_the_pass_is_not_dropped` (unit, `episode.rs`); `a_failed_child_pass_waits_for_more_episodes_and_fails_the_op`, `episodes_with_no_episode_store_fail_the_op_with_a_named_error` |
 
 `formal/verus/src/agent_episodes.rs` proves the eviction and trigger
 kernels.

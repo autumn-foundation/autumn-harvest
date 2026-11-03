@@ -1284,22 +1284,27 @@ let harness = AgentHarness::new(model)
   `<subject> <relation> <object> [episodes: <id>, ...]`.
 - **Labels.** A fact takes the labels of every episode of its pass. A
   memory store that cannot keep labels refuses a labelled fact, and the
-  report counts it under `facts_refused`.
+  report counts it under `facts_refused`. The sources of a refused fact
+  stay unconsolidated.
 - **Trigger.** `EpisodeSettings::every(n)` runs a child pass when an append
-  leaves `n` or more unconsolidated episodes. The op waits for it. With the
+  leaves a positive multiple of `n` unconsolidated episodes. The op waits
+  for it. A failed pass therefore waits for `n` more episodes. A pass that
+  does not write all its facts fails the op with a named error. With the
   default `ConsolidationTrigger::Schedule`, an engine schedule starts each
   pass: register `consolidate::schedule(when, &agent_id)`. On SQLite,
   `sqlite::consolidate` starts one pass.
 - **Report.** A pass returns a `ConsolidationReport`. Its `stop` is
-  `completed`, `nothing_to_do`, `budget_exceeded`, `invalid_reply` or
-  `disabled`. A refused budget and a reply that does not parse write no
-  fact and mark no episode.
+  `completed`, `nothing_to_do`, `budget_exceeded`, `invalid_reply`,
+  `disabled` or `reset`. A refused budget and a reply that does not parse
+  write no fact and mark no episode. SQLite has no run budget, so a pass
+  there always passes the budget check.
 - **Erase.** `Control::ResetMemory` clears the episode scope first, then the
   memory scope. `AgentState::episode_reset` counts the episodes and the
   derived facts. `harvest agents erase` reports them as `episodes_erased`
   and `facts_erased`. It also erases each pass that a schedule started, by
-  the search attribute `agent_consolidation_of`. Pause that schedule
-  before an erase: a running pass is a failure in the report.
+  the search attribute `agent_consolidation_of`. A pass that runs across
+  the reset writes no fact after it and ends as `reset`. A pass that still
+  runs is a failure in the report, so erase again after it ends.
 
 The crate ships `InMemoryEpisodeStore`. A durable store implements
 `EpisodeStore` and calls the methods of `EpisodeLog`, so the rules are the

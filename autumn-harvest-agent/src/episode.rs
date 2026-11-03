@@ -44,7 +44,9 @@ pub const MAX_KEPT_KEYS: usize = 4_096;
 pub const MAX_DERIVED_FACTS: usize = 1_024;
 
 /// One op that ended.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Its `Debug` output leaves out the text, which can hold personal data.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Episode {
     /// The id: the run id of the segment, `<incarnation>:s<n>`.
     pub id: String,
@@ -59,6 +61,35 @@ pub struct Episode {
     pub labels: BTreeSet<String>,
 }
 
+impl std::fmt::Debug for Episode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Episode")
+            .field("id", &self.id)
+            .field("text_bytes", &self.text.len())
+            .field("stop", &self.stop)
+            .field("at_ms", &self.at_ms)
+            .field("labels", &self.labels)
+            .finish()
+    }
+}
+
+/// The hash of a fact entry: the first 16 hex digits of its SHA-256.
+///
+/// A log keeps the hash of each derived fact, not its text. So an erased
+/// log keeps no fact text.
+#[must_use]
+pub fn fact_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    Sha256::digest(text.as_bytes()).iter().take(8).fold(
+        String::with_capacity(16),
+        |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        },
+    )
+}
+
 /// When a consolidation pass runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -68,10 +99,13 @@ pub enum ConsolidationTrigger {
     /// [`consolidate::schedule`](crate::consolidate::schedule).
     #[default]
     Schedule,
-    /// The agent runs a pass as a child workflow when an append leaves this
-    /// many unconsolidated episodes or more. The op waits for the pass.
+    /// The agent runs a pass as a child workflow when an append leaves a
+    /// positive multiple of this many unconsolidated episodes. The op waits
+    /// for the pass. A failed pass therefore retries only after `episodes`
+    /// more appends.
     Every {
-        /// The number of unconsolidated episodes. 0 never fires.
+        /// The number of unconsolidated episodes. 0 never fires. A value
+        /// over `max_episodes` counts as `max_episodes`.
         episodes: u32,
     },
 }
@@ -82,6 +116,7 @@ pub enum ConsolidationTrigger {
 /// scope of the agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct EpisodeSettings {
     /// The most episodes that the log keeps. The oldest goes first. 0
     /// counts as 1.
@@ -120,7 +155,7 @@ impl EpisodeSettings {
         self
     }
 
-    /// Run a pass after every `n` unconsolidated episodes.
+    /// Run a pass after every `n` unconsolidated episodes. 0 runs no pass.
     #[must_use]
     pub const fn every(mut self, n: u32) -> Self {
         self.trigger = ConsolidationTrigger::Every { episodes: n };
@@ -181,6 +216,10 @@ pub struct Appended {
 pub struct PassMark {
     /// The key of the pass. A log applies a key once.
     pub key: EditKey,
+    /// The generation of the log that the pass read. A log with another
+    /// generation refuses the mark.
+    #[serde(default)]
+    pub generation: u64,
     /// The ids of the episodes that the pass read.
     pub episodes: Vec<String>,
     /// The `dropped` count that the pass read.
@@ -189,17 +228,20 @@ pub struct PassMark {
     pub facts: Vec<String>,
 }
 
-/// What one clear removed.
+/// What one clear removed. It holds counts and hashes only, so a store
+/// can keep it for a retry with no personal data.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Cleared {
     /// The episodes removed, consolidated ones included.
     pub episodes: u64,
-    /// The fact entries that passes derived from them.
+    /// The [`fact_hash`] of each fact that passes derived from them.
     pub derived: Vec<String>,
 }
 
 /// The counts of one episode reset (issue #2454).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
 pub struct EpisodeReset {
     /// The episodes removed.
     pub episodes: u64,
@@ -213,15 +255,21 @@ pub struct EpisodeReset {
 /// A store keeps one log per scope. It calls these methods so that the
 /// rules are the same in every store. The log serialises, so a store can
 /// keep it as one value.
+///
+/// A clear keeps the log as an empty tombstone with a new generation. A
+/// pass that read an older generation then writes no fact and marks
+/// nothing. So a pass that runs across a reset cannot bring its facts back.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EpisodeLog {
+    /// The number of clears of the scope.
+    generation: u64,
     /// The episodes, oldest first.
     episodes: VecDeque<StoredEpisode>,
     /// Unconsolidated episodes that an eviction removed since the last
     /// pass read the count.
-    pub dropped: u64,
-    /// The fact entries that passes wrote, oldest first.
+    dropped: u64,
+    /// The [`fact_hash`] of each fact that passes wrote, oldest first.
     derived: VecDeque<String>,
     /// The applied keys, oldest first.
     keys: VecDeque<String>,
@@ -232,6 +280,19 @@ impl EpisodeLog {
     #[must_use]
     pub fn len(&self) -> usize {
         self.episodes.len()
+    }
+
+    /// The number of clears of the scope.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The unconsolidated episodes that an eviction removed since the last
+    /// pass read the count.
+    #[must_use]
+    pub const fn dropped(&self) -> u64 {
+        self.dropped
     }
 
     /// Whether the log holds no episode.
@@ -250,7 +311,7 @@ impl EpisodeLog {
         self.episodes.iter()
     }
 
-    /// The fact entries that passes wrote.
+    /// The [`fact_hash`] of each fact that passes wrote.
     pub fn derived(&self) -> impl Iterator<Item = &str> {
         self.derived.iter().map(String::as_str)
     }
@@ -308,39 +369,55 @@ impl EpisodeLog {
         }
     }
 
-    /// Apply one pass once for its key.
+    /// Apply one pass once for its key. Returns `false` when the pass read
+    /// another generation. The mark then changes nothing.
     ///
-    /// The episodes that the pass read are consolidated. The count that it
-    /// read leaves [`Self::dropped`], so an eviction during the pass stays
-    /// counted. Its facts join the derived entries.
-    pub fn mark(&mut self, mark: &PassMark) {
+    /// The episodes in `mark.episodes` are consolidated. The count that the
+    /// pass read leaves [`Self::dropped`], so an eviction during the pass
+    /// stays counted. A read episode that an eviction removed during the
+    /// pass leaves it too, because the pass consolidated it. The facts join
+    /// the derived hashes.
+    pub fn mark(&mut self, mark: &PassMark) -> bool {
+        if mark.generation != self.generation {
+            return false;
+        }
         if self.applied(&mark.key) {
-            return;
+            return true;
         }
         let read: BTreeSet<&str> = mark.episodes.iter().map(String::as_str).collect();
+        let mut found = 0_u64;
         for stored in &mut self.episodes {
             if read.contains(stored.episode.id.as_str()) {
                 stored.consolidated = true;
+                found = found.saturating_add(1);
             }
         }
-        self.dropped = self.dropped.saturating_sub(mark.dropped);
+        let evicted = (read.len() as u64).saturating_sub(found);
+        self.dropped = self
+            .dropped
+            .saturating_sub(mark.dropped)
+            .saturating_sub(evicted);
         for fact in &mark.facts {
-            if !self.derived.contains(fact) {
-                self.derived.push_back(fact.clone());
+            let hash = fact_hash(fact);
+            if !self.derived.contains(&hash) {
+                self.derived.push_back(hash);
             }
         }
         while self.derived.len() > MAX_DERIVED_FACTS {
             self.derived.pop_front();
         }
         self.remember(&mark.key);
+        true
     }
 
-    /// What a clear of this log removes.
-    #[must_use]
-    pub fn into_cleared(self) -> Cleared {
+    /// Empty the log, start a new generation, and return what it held.
+    pub fn clear(&mut self) -> Cleared {
+        let generation = self.generation.saturating_add(1);
+        let old = std::mem::take(self);
+        self.generation = generation;
         Cleared {
-            episodes: self.episodes.len() as u64,
-            derived: self.derived.into(),
+            episodes: old.episodes.len() as u64,
+            derived: old.derived.into(),
         }
     }
 
@@ -381,7 +458,7 @@ pub trait EpisodeStore: Send + Sync + std::fmt::Debug {
         max_episodes: u32,
     ) -> BoxFuture<'a, Result<Appended, AgentError>>;
 
-    /// Apply one pass with [`EpisodeLog::mark`].
+    /// Apply one pass with [`EpisodeLog::mark`], and return its result.
     ///
     /// # Errors
     ///
@@ -390,12 +467,13 @@ pub trait EpisodeStore: Send + Sync + std::fmt::Debug {
         &'a self,
         scope: &'a MemoryScope,
         mark: PassMark,
-    ) -> BoxFuture<'a, Result<(), AgentError>>;
+    ) -> BoxFuture<'a, Result<bool, AgentError>>;
 
-    /// Remove the log of `scope`, and return what it held.
+    /// Empty the log of `scope` with [`EpisodeLog::clear`], and return what
+    /// it held. Keep the emptied log, so its generation stays.
     ///
     /// A retry with the same `key` returns the first result, so a retried
-    /// reset reports the same counts.
+    /// reset reports the same counts. The result holds no personal data.
     ///
     /// # Errors
     ///
@@ -466,9 +544,10 @@ impl EpisodeStore for InMemoryEpisodeStore {
         &'a self,
         scope: &'a MemoryScope,
         mark: PassMark,
-    ) -> BoxFuture<'a, Result<(), AgentError>> {
-        self.with_state(|state| state.logs.entry(scope.clone()).or_default().mark(&mark));
-        Box::pin(std::future::ready(Ok(())))
+    ) -> BoxFuture<'a, Result<bool, AgentError>> {
+        let applied =
+            self.with_state(|state| state.logs.entry(scope.clone()).or_default().mark(&mark));
+        Box::pin(std::future::ready(Ok(applied)))
     }
 
     fn clear<'a>(
@@ -482,7 +561,7 @@ impl EpisodeStore for InMemoryEpisodeStore {
             {
                 return cleared.clone();
             }
-            let cleared = state.logs.remove(scope).unwrap_or_default().into_cleared();
+            let cleared = state.logs.entry(scope.clone()).or_default().clear();
             state
                 .cleared
                 .insert(scope.clone(), (key.clone(), cleared.clone()));
@@ -541,7 +620,7 @@ mod tests {
         log.append(&key("k2"), episode("e2"), 2);
         let third = log.append(&key("k3"), episode("e3"), 2);
         assert_eq!(third.evicted, 1);
-        assert_eq!(log.dropped, 1);
+        assert_eq!(log.dropped(), 1);
         let ids: Vec<&str> = log.episodes().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["e2", "e3"]);
     }
@@ -556,7 +635,7 @@ mod tests {
             ..PassMark::default()
         });
         log.append(&key("k2"), episode("e2"), 1);
-        assert_eq!(log.dropped, 0);
+        assert_eq!(log.dropped(), 0);
     }
 
     #[test]
@@ -568,15 +647,59 @@ mod tests {
         log.append(&key("k1"), episode("e1"), 10);
         let mark = PassMark {
             key: key("p1"),
+            generation: 0,
             episodes: vec!["e1".into()],
             dropped: 2,
             facts: vec!["a b c [episodes: e1]".into()],
         };
         log.mark(&mark);
         log.mark(&mark);
-        assert_eq!(log.dropped, 1, "a drop after the read stays counted");
+        assert_eq!(log.dropped(), 1, "a drop after the read stays counted");
+        assert_eq!(
+            log.derived().collect::<Vec<_>>(),
+            [fact_hash("a b c [episodes: e1]").as_str()],
+            "the log keeps a hash, not the text"
+        );
         assert_eq!(log.pending(10).len(), 0);
         assert_eq!(log.derived().count(), 1);
+    }
+
+    #[test]
+    fn a_mark_of_an_older_generation_changes_nothing() {
+        let mut log = EpisodeLog::default();
+        log.append(&key("k1"), episode("e1"), 10);
+        log.clear();
+        log.append(&key("k2"), episode("e2"), 10);
+        let stale = PassMark {
+            key: key("p1"),
+            generation: 0,
+            episodes: vec!["e2".into()],
+            ..PassMark::default()
+        };
+        assert!(!log.mark(&stale));
+        assert_eq!(log.pending(10).len(), 1, "e2 waits for a fresh pass");
+        assert_eq!(log.generation(), 1);
+    }
+
+    #[test]
+    fn a_read_episode_evicted_during_the_pass_is_not_dropped() {
+        let mut log = EpisodeLog::default();
+        log.append(&key("k1"), episode("e1"), 1);
+        // A pass reads e1. An append evicts it before the mark.
+        log.append(&key("k2"), episode("e2"), 1);
+        assert_eq!(log.dropped(), 1);
+        log.mark(&PassMark {
+            key: key("p1"),
+            episodes: vec!["e1".into()],
+            ..PassMark::default()
+        });
+        assert_eq!(log.dropped(), 0, "the pass consolidated e1");
+    }
+
+    #[test]
+    fn debug_of_an_episode_shows_no_text() {
+        let debug = format!("{:?}", episode("e1"));
+        assert!(!debug.contains("text of"), "{debug}");
     }
 
     #[test]
@@ -614,6 +737,7 @@ mod tests {
         assert_eq!(retry, first);
         let next = store.clear(&scope, &key("r2")).await.unwrap();
         assert_eq!(next.episodes, 0);
+        assert_eq!(store.load(&scope).await.unwrap().generation(), 2);
     }
 
     #[tokio::test]

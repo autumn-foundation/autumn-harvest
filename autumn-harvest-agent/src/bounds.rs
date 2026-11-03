@@ -169,11 +169,15 @@ pub const fn episode_evictions(len: u64, max: u64) -> u64 {
 /// Is a consolidation pass due with `pending` unconsolidated episodes and
 /// the trigger `every` (issue #2454)?
 ///
-/// A trigger of 0 never fires.
+/// A pass is due at each positive multiple of `every`. A failed pass keeps
+/// its episodes, so the next pass waits for `every` more. A trigger of 0
+/// never fires.
 /// `formal/verus/src/agent_episodes.rs` proves it for every input.
+// The Verus mirror needs the plain `%`, so the body keeps it.
+#[allow(clippy::manual_is_multiple_of)]
 #[must_use]
 pub const fn consolidation_due(pending: u64, every: u32) -> bool {
-    every > 0 && pending >= every as u64
+    every > 0 && pending >= every as u64 && pending % every as u64 == 0
 }
 
 #[cfg(test)]
@@ -194,9 +198,13 @@ mod tests {
 
     #[test]
     fn a_pass_is_due_at_the_trigger() {
+        assert!(!consolidation_due(0, 3));
         assert!(!consolidation_due(2, 3));
         assert!(consolidation_due(3, 3));
-        assert!(consolidation_due(4, 3));
+        // A failed pass at 3 waits for 6.
+        assert!(!consolidation_due(4, 3));
+        assert!(!consolidation_due(5, 3));
+        assert!(consolidation_due(6, 3));
         assert!(!consolidation_due(u64::MAX, 0));
     }
 
