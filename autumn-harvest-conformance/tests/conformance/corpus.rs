@@ -5,7 +5,8 @@
 //!
 //! A scenario must give one history for every legal timing on Postgres. A
 //! step therefore waits on an event, never on a sleep. A timer that a script
-//! races is at least one second longer than the script needs.
+//! races is at least one second longer than the script needs. A retry
+//! backoff has no jitter, so both backends wait the same time.
 
 // The `#[workflow]`, `#[activity]` and `#[update]` macros read their inputs,
 // so an unused input is a used underscore binding. Some bodies never await.
@@ -21,6 +22,7 @@ use std::time::Duration;
 
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::fan_out::{FanOutItem, FanOutOptions};
+use autumn_harvest::policy::JitterPolicy;
 use autumn_harvest::prelude::*;
 use autumn_harvest::types::ParentClosePolicy;
 use serde_json::{Value, json};
@@ -33,6 +35,15 @@ fn err(e: impl std::fmt::Display) -> String {
 }
 
 // ── Activities shared by the corpus ──────────────────────────────────────────
+
+/// Turn off the jitter of `policy`, so each retry waits its exact delay.
+///
+/// [`RetryPolicy::fixed`] draws each delay in `[0, interval]`. The Postgres
+/// worker applies that jitter, and `SQLite` does not (issue #2517). A
+/// positive backoff in the corpus must use this function.
+const fn exact(policy: RetryPolicy) -> RetryPolicy {
+    policy.with_jitter(JitterPolicy::None)
+}
 
 /// Doubles its input.
 #[activity(retry = RetryPolicy::fixed(3, Duration::ZERO))]
@@ -67,7 +78,7 @@ pub async fn declined(_ctx: &ActivityContext, _n: i64) -> Result<i64, String> {
 }
 
 /// Fails the first attempt. The retry waits two seconds.
-#[activity(retry = RetryPolicy::fixed(2, Duration::from_secs(2)))]
+#[activity(retry = exact(RetryPolicy::fixed(2, Duration::from_secs(2))))]
 pub async fn slow_retry(ctx: &ActivityContext, n: i64) -> Result<i64, String> {
     if ctx.info().attempt == 1 {
         return Err("first attempt fails".to_owned());
@@ -76,7 +87,7 @@ pub async fn slow_retry(ctx: &ActivityContext, n: i64) -> Result<i64, String> {
 }
 
 /// Fails the first attempt. The retry waits a minute, so a race loses it.
-#[activity(retry = RetryPolicy::fixed(2, Duration::from_secs(60)))]
+#[activity(retry = exact(RetryPolicy::fixed(2, Duration::from_secs(60))))]
 pub async fn very_slow_retry(ctx: &ActivityContext, n: i64) -> Result<i64, String> {
     if ctx.info().attempt == 1 {
         return Err("first attempt fails".to_owned());
@@ -99,7 +110,7 @@ static RETRY_GATE: AtomicBool = AtomicBool::new(false);
 /// backoff would let a late signal lose the race on a loaded runner. A closed
 /// gate fails the attempt and never waits, so the inline `SQLite` driver
 /// cannot block on a gate that only a later step opens.
-#[activity(retry = RetryPolicy::fixed(10, Duration::from_secs(2)))]
+#[activity(retry = exact(RetryPolicy::fixed(10, Duration::from_secs(2))))]
 pub async fn gated_retry(ctx: &ActivityContext, n: i64) -> Result<i64, String> {
     if ctx.info().attempt == 1 || !RETRY_GATE.load(Ordering::SeqCst) {
         return Err("the gate is closed".to_owned());
@@ -110,6 +121,13 @@ pub async fn gated_retry(ctx: &ActivityContext, n: i64) -> Result<i64, String> {
 /// Close the gate. Each run of a scenario registers its activities first.
 fn gated_activities() -> Vec<ActivityInfo> {
     RETRY_GATE.store(false, Ordering::SeqCst);
+    all_activities()
+}
+
+/// Every activity of the corpus. Add each new activity here.
+///
+/// The timing guard reads this list. It does not touch the gate.
+pub fn all_activities() -> Vec<ActivityInfo> {
     let mut all = shared_activities();
     all.push(gated_retry_info());
     all
@@ -563,12 +581,15 @@ pub async fn races_activity_and_timer(ctx: &WorkflowContext, n: i64) -> Result<S
     Ok(format!("{winner:?} then {after}"))
 }
 
+/// The timer of `race_timer_wins`. The retry of its activity comes later.
+pub const RACE_TIMER: Duration = Duration::from_secs(1);
+
 #[workflow]
 pub async fn timer_beats_activity(ctx: &WorkflowContext, n: i64) -> Result<String, String> {
     let winner = ctx
         .race()
         .activity(&very_slow_retry_info(), n)
-        .timer(Duration::from_secs(1))
+        .timer(RACE_TIMER)
         .run()
         .await
         .map_err(err)?;

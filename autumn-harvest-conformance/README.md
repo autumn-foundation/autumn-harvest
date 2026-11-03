@@ -70,6 +70,10 @@ Add a rule only with its reason, here and in `compare.rs`.
 - Each named rejection in `autumn-harvest-sqlite/src/runtime.rs` has a
   rejection scenario, or a reason in `UNREACHABLE_REJECTIONS`.
 
+`timing.rs` runs without Docker too. Each retry of a corpus activity waits
+its base delay for every jitter seed. The race loser of `race_timer_wins`
+retries after the race timer.
+
 `commands.rs` maps each `WorkflowCommand` variant with no wildcard arm. A new
 variant fails to compile until its author classifies it.
 
@@ -82,7 +86,10 @@ variant fails to compile until its author classifies it.
    await an event that the first cycle writes, such as the `parked()`
    marker. A timer that the script races must be at least one second longer
    than the script needs.
-4. List each command that the workflow emits in `covers`.
+4. Wrap a positive retry backoff in `exact`. Postgres jitters a backoff, and
+   SQLite does not, so a jittered backoff can change the history (issue
+   #2517). Add the activity to `all_activities`.
+5. List each command that the workflow emits in `covers`.
 
 ## Known Postgres defects
 
