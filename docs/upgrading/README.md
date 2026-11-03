@@ -5,6 +5,7 @@ which versions can run side by side, and in which order to upgrade.
 
 Each release also has its own guide:
 
+- [0.8.0 to 0.9.0](0.9.0.md)
 - [0.7.0 to 0.8.0](0.8.0.md)
 - [0.6.0 to 0.7.0](0.7.0.md)
 - [0.5.0 to 0.6.0](0.6.0.md)

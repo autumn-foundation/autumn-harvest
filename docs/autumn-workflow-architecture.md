@@ -5,7 +5,7 @@
 *Version 0.1 — Draft*
 *March 2026*
 
-**Release status note (0.8.0):** DAG scheduling, signals, queries, the
+**Release status note (0.9.0):** DAG scheduling, signals, queries, the
 management API, dead-letter list/replay endpoints, durable workflow
 cancellation, pause/resume controls, DLQ aggregation, DAG retry from failed
 nodes, timezone-aware cron schedules, scaling signals, and metrics endpoints
@@ -75,7 +75,7 @@ Workflow orchestration is a heavyweight dependency. Many Autumn users will never
 # Cargo.toml — only when you need workflows
 [dependencies]
 autumn-web = "0.9"
-autumn-harvest = "0.8"
+autumn-harvest = "0.9"
 ```
 
 The `autumn-harvest-macros` crate is separate from `autumn-macros` because proc-macro crates cannot export non-macro items. Harvest macros generate different companion functions (`__autumn_workflow_info_*`, `__autumn_activity_info_*`) that need their own expansion logic.

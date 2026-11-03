@@ -95,7 +95,7 @@ chaos = ["db"]
 owner-disk-cache = ["db", "dep:rusqlite"]
 
 [dependencies]
-autumn-harvest-macros = { version = "0.8.0", path = "../autumn-harvest-macros" }
+autumn-harvest-macros = { version = "0.9.0", path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
 async-trait = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }

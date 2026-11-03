@@ -100,7 +100,7 @@ sqlite = ["autumn-web/sqlite", "dep:autumn-harvest-sqlite"]
 
 
 [dependencies]
-autumn-harvest = { version = "0.8.0", path = "../autumn-harvest", features = ["db", "testing"] }
+autumn-harvest = { version = "0.9.0", path = "../autumn-harvest", features = ["db", "testing"] }
 autumn-web = "0.9"
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -158,9 +158,9 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 thiserror = { workspace = true }
 # Redis Streams dispatch channel (issue #1312), behind the `redis` feature.
 # Optional so the default build keeps a Postgres-only dependency graph.
-autumn-harvest-redis = { version = "0.8.0", path = "../autumn-harvest-redis", optional = true }
+autumn-harvest-redis = { version = "0.9.0", path = "../autumn-harvest-redis", optional = true }
 # The SQLite backend (issue #2467), behind the `sqlite` feature.
-autumn-harvest-sqlite = { version = "0.8.0", path = "../autumn-harvest-sqlite", optional = true }
+autumn-harvest-sqlite = { version = "0.9.0", path = "../autumn-harvest-sqlite", optional = true }
 
 # ── Broker connectors (issue #944) — all optional, all off by default ──
 # Object-safe async traits for the EventSource / DeadLetterSink seams
@@ -210,7 +210,7 @@ autumn-web = { version = "0.9", features = ["test-support", "mcp"] }
 # (start a workflow, poll its status, fetch the Vantage page). The crate already
 # depends on reqwest for the callback deliverer; the test needs `json` on top.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
-autumn-harvest = { version = "0.8.0", path = "../autumn-harvest", features = ["db", "testing"] }
+autumn-harvest = { version = "0.9.0", path = "../autumn-harvest", features = ["db", "testing"] }
 tower = "0.5"
 # `test-util` for `#[tokio::test(start_paused = true)]`: the shutdown-drain
 # deadline is a 30s wall-clock wait that must be asserted, not slept through.
