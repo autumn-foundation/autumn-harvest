@@ -1720,6 +1720,14 @@ impl HarvestBuilder {
         &self.signal_handlers
     }
 
+    /// The durable log sink policy, or `None` when the sink is off.
+    ///
+    /// The SQLite plugin gives it to its runtime (issue #2468).
+    #[must_use]
+    pub const fn workflow_log_policy(&self) -> Option<crate::context::WorkflowLogPolicy> {
+        self.workflow_log_policy
+    }
+
     /// Register activity definitions (output of `activities![]` macro).
     ///
     /// The runtime maps activity tasks to these definitions for execution.

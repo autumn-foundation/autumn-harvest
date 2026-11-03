@@ -856,6 +856,21 @@ fires no timer and runs no activity body.
 > event runs again in each query, a `ctx.side_effect` closure included. Keep
 > that code free of external effects. Put an external effect in an activity.
 
+A declarative `#[query(workflow = "...")]` handler works too (issue #2468).
+Register it with `register_query`. It serves only runs of its workflow. A
+handler that the body registers with the same name wins, as on Postgres.
+
+```rust
+#[query(workflow = "order")]
+fn phase(ctx: &WorkflowContext) -> Result<String, String> {
+    Ok(ctx.workflow_id().to_owned())
+}
+
+for info in queries![phase] {
+    rt.register_query(&info);
+}
+```
+
 The future resolves to one of these errors:
 
 | Error | Cause |
@@ -1017,6 +1032,22 @@ Limits:
   `upsert_search_attrs` rules, as on Postgres. Search attributes have no
   size cap of their own.
 - The memo is stored as plain JSON. This backend has no payload codec.
+
+### Operator reads (issue #2468)
+
+`SqliteReader` also serves the reads behind the plugin's management routes:
+
+| Read | Gives |
+|---|---|
+| `count_executions` | the number of runs per state and workflow name |
+| `children`, `parents_with_children` | the child runs of a set of parents |
+| `timed_history` | the history with the append time of each event |
+| `pending_work` | the open tasks, the unfired timers and the undelivered signals |
+| `workflow_logs`, `count_workflow_logs`, `workflow_log_truncated` | the durable log lines |
+| `replay_input` | the rows of a replay, with a context that matches the drive |
+
+These reads expect the current schema. Open the file with a runtime first,
+so that the runtime migrates it.
 
 ---
 
@@ -1272,8 +1303,18 @@ Six commands append no event: `SetCurrentDetails`
 (`ctx.set_current_details`), `PublishProgress`, `PublishDurableProgress`,
 `RecordLog`, a re-park `WaitForActivity` and `WaitForSignal`. Postgres
 appends no event for them either. `WaitForSignal` only names the wait. This
-backend does not keep the current details, the durable progress chunks or
-the log lines.
+backend does not keep the current details or the durable progress chunks.
+
+`RecordLog` goes to `harvest_workflow_logs` when a log policy is set (issue
+#2468). Set it with `set_workflow_log_policy(Some(WorkflowLogPolicy::new()))`.
+The rules are those of Postgres (issue #790):
+
+- Each line is stored once, also when a cycle runs again.
+- A run keeps at most `max_lines` lines. One marker row records the loss.
+- The lines share the cycle transaction. A purge removes them with the run.
+
+Read them with `SqliteReader::workflow_logs`, `count_workflow_logs` and
+`workflow_log_truncated`.
 
 ### Parity with Postgres (issue #2030)
 

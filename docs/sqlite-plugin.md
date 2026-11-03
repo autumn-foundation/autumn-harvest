@@ -11,6 +11,9 @@ tracks the work. This page describes slice 1,
 [#2472](https://github.com/autumn-foundation/autumn-harvest/issues/2472):
 split mode and per-tenant Harvest. The design record is
 [`DESIGN-2472.md`](design/DESIGN-2472.md).
+[#2468](https://github.com/autumn-foundation/autumn-harvest/issues/2468)
+ports the read routes, Vantage and declarative queries. Its design record
+is [`DESIGN-2468.md`](design/DESIGN-2468.md).
 
 ## Turn it on
 
@@ -320,6 +323,18 @@ stores, so it can be a subset of the Postgres body.
 | `POST /workflows/{id}/update/{update_name}` | runs in the request and answers `200` with `update_id` and `output` |
 | `GET /workflows/by-id/{workflow_name}/{workflow_id}` | also `/result` |
 | `POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}` | |
+| `GET /workflows/count` | `group_by`, `workflow_name`, `state`, `started_after`, `started_before`, `limit_groups` (#2468) |
+| `GET /workflows/summaries` | admin only. Always empty: this backend never demotes a run |
+| `GET /workflows/registered/{name}/schema`, `/interface` | |
+| `GET /workflows/{id}/children` | `status`, `workflow_name`, `limit`, `cursor`, `depth`. Also by-id |
+| `GET /workflows/{id}/tree` | `max_depth`, `max_nodes`, `summary` |
+| `GET /workflows/{id}/run-chain` | |
+| `GET /workflows/{id}/timeline` | |
+| `GET /workflows/{id}/logs` | admin only. `limit`, `cursor`, `level`, `since` |
+| `GET /workflows/{id}/awaitables` | admin only |
+| `GET /workflows/{id}/stack` | also by-id |
+| `GET /workflows/{id}/history/export` | `payload_policy`, `max_bytes` |
+| `GET /ui/workflows`, `/ui/workflows/{id}` | [Vantage](#vantage) |
 
 `GET /workflows/{id}/result` follows the Postgres polling contract. A run
 that is not terminal answers `204` with `Retry-After: 1`. A terminal run
@@ -339,7 +354,34 @@ retry acts on the retry, as on Postgres (#843). A signal names the retry in
 `tests/support/wire_contract.rs` holds the checks of this contract. The
 SQLite suite and the Postgres integration tests run them both.
 
+Each read route of #2468 reads the file through `SqliteReader`, never the
+driver. It then calls the same pure step as its Postgres route, so one
+function gives the shape on both backends. One file is one shard: a
+fan-out body reads `status: "complete"`, and a row carries `shard_id: 0`.
+
+A declarative `queries![..]` handler answers `GET` and `POST
+/workflows/{id}/query/{name}`, as on Postgres. The drive, the query replay
+and the awaitables replay all register it.
+
+`HarvestPlugin::workflow_log_persistence` stores the `ctx.log_*` lines in
+the Harvest file. `GET /workflows/{id}/logs` reads them. The cap and the
+marker follow Postgres.
+
 Every other management route answers `501` and links the epic.
+
+## Vantage
+
+`.api(path)` also serves Vantage under `{path}/ui`, read-only:
+
+- `ui/workflows`: the runs, newest first, with the state, workflow and
+  workflow id prefix filters, and a next-page link. A bad filter shows
+  inline and is not applied.
+- `ui/workflows/{id}`: the run, its input, output and error, its children,
+  and its history in pages of 100 events. It links to the JSON routes.
+
+The pages link only to SQLite pages. The Postgres pages for DAGs, workers,
+schedules and dead letters read tables that this backend does not have, so
+they stay off. The pages hold no form that writes.
 
 ### Where the contract differs
 
@@ -367,6 +409,22 @@ Every other management route answers `501` and links the epic.
   storage. Postgres keeps the whole reason.
 - A cancel or a terminate body has no `failed_task_count`. This backend
   deletes the pending tasks of the run. It does not mark them failed.
+- `GET /workflows/summaries` is always empty. A purge removes a whole run,
+  so no run is ever a summary.
+- A run chain gives each run its execution id as `run_id`. This backend
+  has no separate run id.
+- A stack has no external handoff and no worker id. A task stores no
+  attempt start and no heartbeat time, so `start_to_close_deadline`,
+  `heartbeat_deadline` and `last_heartbeat_at` are `null`. `scheduled_at`
+  is the time that the next attempt may run, as on Postgres.
+- A route that reads no query key refuses one: the schema, the interface,
+  the run chain, the timeline, the awaitables and the stack.
+- A timeline event written before #2489 has no time. It takes the time of
+  the event before it, so it adds no duration.
+- A row written before #2027 has no start time. A child, a tree node and a
+  chain run then read `started_at` as the Unix epoch.
+- `children` loads the descendants of the run to filter and sort them. One
+  Harvest file holds the runs of one app, so the set is local.
 
 Auth works as on Postgres. `api_with_auth(path, mw)` wraps the router. The
 issue #1802 mutation gate refuses an anonymous mutating call outside `dev`.
@@ -383,7 +441,7 @@ no-op would let an app believe a protection or a feature is on.
 | Option or mode | Issue |
 | --- | --- |
 | `enable_api_tokens`, `api_with_role_auth`, `with_roles`, `with_authorizer`, `with_api_rate_limit`, `api_with_oidc` | [#2469](https://github.com/autumn-foundation/autumn-harvest/issues/2469) |
-| Vantage, `decode_payloads_on_read`, the other read routes, declarative `queries![..]` (a query that the workflow registers with `ctx.register_query` works) | [#2468](https://github.com/autumn-foundation/autumn-harvest/issues/2468) |
+| `decode_payloads_on_read`: this backend stores no codec envelope, so a read has nothing to decode | the epic |
 | The transactional outbox | [#2470](https://github.com/autumn-foundation/autumn-harvest/issues/2470) |
 | Workflow schedules, `retention`, `mcp_tools`, `mcp_tasks`, `webhooks`, `connector`, `synthetic_canary`, `agent_overlay_store` | [#2471](https://github.com/autumn-foundation/autumn-harvest/issues/2471) |
 | `harvest.sqlite.path` or `sqlite_per_tenant()` with `harvest.mode = "split"` / `"external"` | [#2472](https://github.com/autumn-foundation/autumn-harvest/issues/2472): no effect in that mode |
@@ -394,8 +452,8 @@ no-op would let an app believe a protection or a feature is on.
 
 These options do nothing on SQLite, because they tune Postgres machinery that
 this backend does not have: `worker(..)`, `load_shed`, `ramp_guard`,
-`start_idempotency_window`, `workflow_log_persistence`, the durable-route
-limits and the status thresholds.
+`start_idempotency_window`, the durable-route limits and the status
+thresholds.
 
 ## Tests
 
@@ -420,8 +478,8 @@ job:
 cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin_split
 ```
 
-The SQLite suite's `wire_parity` module runs the checks of
-`tests/support/wire_contract.rs`. The Postgres suites
-`workflow_result_integration`, `workflow_history_pagination_integration`
-and `by_id_integration` run the same checks. A change to the contract
+The SQLite suite's `wire_parity` and `read_parity` modules run the checks
+of `tests/support/wire_contract.rs`. The Postgres suite of each route runs
+the same check, for example `workflow_result_integration`,
+`workflow_count_integration` and `lineage_tree_integration`. A change to the contract
 changes that one file, and both backends then test it.

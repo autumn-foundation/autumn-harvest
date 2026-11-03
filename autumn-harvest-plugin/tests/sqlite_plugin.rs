@@ -27,6 +27,9 @@ mod wire_contract;
 #[path = "sqlite_plugin/wire_parity.rs"]
 mod wire_parity;
 
+#[path = "sqlite_plugin/read_parity.rs"]
+mod read_parity;
+
 /// A value given to `HarvestPlugin::state`. The activity reads it back.
 #[derive(Debug)]
 struct Prefix(&'static str);

@@ -1534,10 +1534,12 @@ impl HarvestPlugin {
             "HarvestPlugin::agent_overlay_store",
             2471,
         );
+        // This backend stores no codec envelope, so a read has nothing to
+        // decode. The option would only look like a protection.
         refuse(
             self.decode_payloads_on_read,
             "HarvestPlugin::decode_payloads_on_read",
-            2468,
+            crate::sqlite::EPIC_ISSUE,
         );
         // The SQLite worker reads no cost hold, so a held type would run
         // (autumn#1720).

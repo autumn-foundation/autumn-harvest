@@ -22,6 +22,8 @@ mod api;
 mod driver;
 mod fleet;
 mod handle;
+mod reads;
+mod ui;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -83,6 +85,10 @@ struct StartParts {
     updates: Vec<autumn_harvest::UpdateHandlerInfo>,
     /// The declarative `#[signal]` handlers, for their payload schemas.
     signals: Vec<autumn_harvest::SignalHandlerInfo>,
+    /// The declarative `#[query]` handlers (issue #2468).
+    queries: Vec<autumn_harvest::QueryHandlerInfo>,
+    /// The durable log sink policy (issue #2468).
+    log_policy: Option<autumn_harvest::context::WorkflowLogPolicy>,
     /// The `HarvestPlugin::state` values. The startup hook adds `AppState`.
     state: autumn_harvest::context::SharedStateMap,
 }
@@ -120,6 +126,8 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         activities: builder.take_activities(),
         updates: builder.update_handlers().to_vec(),
         signals: builder.signal_handlers().to_vec(),
+        queries: builder.query_handlers().to_vec(),
+        log_policy: builder.workflow_log_policy(),
         state: builder.take_state(),
     };
 
@@ -182,12 +190,6 @@ fn builder_refusals(builder: &HarvestBuilder) -> Vec<(&'static str, u32)> {
     if !builder.dag_infos().is_empty() {
         // DAGs are an engine non-goal of the SQLite backend (#2019).
         refused.push(("HarvestPlugin::dags", 2019));
-    }
-    // The SQLite replay passes no declarative query handler, so a call to one
-    // would answer `QueryNotFound`. A query that the workflow body registers
-    // with `ctx.register_query` works.
-    if !builder.query_handlers().is_empty() {
-        refused.push(("HarvestPlugin::queries", 2468));
     }
     if !builder.workflow_schedules().is_empty() {
         refused.push(("workflow schedules", 2471));
@@ -399,14 +401,16 @@ async fn start(
         app_config.database.effective_primary_url(),
     )
     .map_err(AutumnError::service_unavailable_msg)?;
-    let infos = parts.workflows.clone();
     let registry = Arc::new(Registry {
         workflows: parts.workflows,
         activities: parts.activities,
         updates: parts.updates,
         signals: parts.signals,
+        queries: parts.queries,
+        log_policy: parts.log_policy,
         state: Arc::new(with_app_state(parts.state, state)),
     });
+    let catalog = Arc::new(handle::Catalog::of(&registry));
     let tick = Duration::from_millis(sqlite_config.tick_ms);
     let open_path = path.clone();
     let open_registry = Arc::clone(&registry);
@@ -425,14 +429,14 @@ async fn start(
             )));
         }
     };
-    let handle = HarvestSqlite::new(driver.sender.clone(), reader, path.clone(), infos.clone());
+    let handle = HarvestSqlite::new(driver.sender.clone(), reader, path.clone(), catalog);
     slot.lock().unwrap_or_else(PoisonError::into_inner).driver = Some(driver);
     state.insert_extension(handle.clone());
     let _ = handles.control.set(handle);
     tracing::info!(path = %path.display(), "harvest is running on SQLite");
 
     if let Some(fleet) = fleet {
-        let tenants = HarvestFleet::new(fleet, registry, infos, tick);
+        let tenants = HarvestFleet::new(fleet, registry, tick);
         tenants.install().await;
         state.insert_extension(tenants.clone());
         slot.lock().unwrap_or_else(PoisonError::into_inner).fleet = Some(tenants.clone());
@@ -597,8 +601,10 @@ mod tests {
         );
     }
 
+    /// The SQLite replay serves declarative queries (issue #2468), so the
+    /// build no longer refuses them.
     #[test]
-    fn a_declarative_query_is_refused_with_its_issue() {
+    fn a_declarative_query_is_not_refused() {
         fn answer(
             _ctx: &autumn_harvest::context::WorkflowContext,
             _args: serde_json::Value,
@@ -617,10 +623,7 @@ mod tests {
             response_schema: None,
         };
         let builder = HarvestBuilder::default().queries(vec![query]);
-        assert_eq!(
-            builder_refusals(&builder),
-            vec![("HarvestPlugin::queries", 2468)]
-        );
+        assert!(builder_refusals(&builder).is_empty());
     }
 
     #[test]

@@ -1,0 +1,36 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/workflow_log.rs`. See `docs/ledger/README.md`.
+
+["append"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_workflow_logs"]
+measured = "unmeasured"
+
+["count"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_workflow_logs"]
+measured = "unmeasured"
+
+["load"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_workflow_logs"]
+measured = "unmeasured"
+
+["table_exists"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_workflow_logs"]
+measured = "unmeasured"
+
+["truncated_on"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_workflow_logs"]
+measured = "unmeasured"

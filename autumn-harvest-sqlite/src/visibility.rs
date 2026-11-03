@@ -423,6 +423,111 @@ impl SqliteReader {
     }
 }
 
+/// The operator reads of the management API (issue #2468).
+impl SqliteReader {
+    /// The number of runs per `(state, workflow_name)` group.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if the query fails.
+    pub fn count_executions(
+        &self,
+        filter: &crate::CountFilter,
+    ) -> SqliteResult<Vec<crate::ExecutionCount>> {
+        crate::operator::count(&self.conn, filter)
+    }
+
+    /// The child runs of each of `parents`, in insert order. `limit` caps the
+    /// rows over all parents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if the query fails, and
+    /// [`SqliteError::Corrupt`] for a row that does not parse.
+    pub fn children(
+        &self,
+        parents: &[ExecutionId],
+        limit: Option<u32>,
+    ) -> SqliteResult<Vec<crate::ChildRun>> {
+        crate::operator::children(&self.conn, parents, limit)
+    }
+
+    /// The runs of `parents` that have at least one child.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`children`](Self::children).
+    pub fn parents_with_children(&self, parents: &[ExecutionId]) -> SqliteResult<Vec<ExecutionId>> {
+        crate::operator::parents_with_children(&self.conn, parents)
+    }
+
+    /// The history of `exec`, oldest first, with the append time of each
+    /// event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, and a
+    /// JSON error for a row that does not parse.
+    pub fn timed_history(&self, exec: ExecutionId) -> SqliteResult<Vec<crate::TimedEvent>> {
+        crate::operator::timed_history(&self.conn, exec)
+    }
+
+    /// The open tasks, the unfired timers and the undelivered signals of
+    /// `exec`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, and
+    /// [`SqliteError::Corrupt`] for a row that does not parse.
+    pub fn pending_work(&self, exec: ExecutionId) -> SqliteResult<crate::PendingWork> {
+        crate::operator::pending_work(&self.conn, exec)
+    }
+
+    /// One page of the durable log lines of `exec`, in emission order.
+    ///
+    /// The caller checks that the run exists. A run with no line reads as an
+    /// empty page.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if the query fails.
+    pub fn workflow_logs(
+        &self,
+        exec: ExecutionId,
+        filter: &crate::LogFilter,
+    ) -> SqliteResult<Vec<crate::LogLine>> {
+        crate::workflow_log::load(&self.conn, exec, filter)
+    }
+
+    /// The number of real log lines of `exec`. The marker does not count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if the query fails.
+    pub fn count_workflow_logs(&self, exec: ExecutionId) -> SqliteResult<i64> {
+        crate::workflow_log::count(&self.conn, exec)
+    }
+
+    /// Whether `exec` reached its log line cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if the query fails.
+    pub fn workflow_log_truncated(&self, exec: ExecutionId) -> SqliteResult<bool> {
+        crate::workflow_log::truncated(&self.conn, exec)
+    }
+
+    /// The rows that a replay of `exec` reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, or a
+    /// read error.
+    pub fn replay_input(&self, exec: ExecutionId) -> SqliteResult<crate::ReplayInput> {
+        crate::query::ReplayInput::load(&self.conn, exec)
+    }
+}
+
 /// See [`SqliteReader::list_executions`].
 pub fn list(conn: &Connection, filter: &ExecutionFilter) -> SqliteResult<ExecutionPage> {
     let mut executions = Vec::new();

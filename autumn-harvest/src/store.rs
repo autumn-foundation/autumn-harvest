@@ -3319,7 +3319,12 @@ pub async fn mark_history_bloat_warned(
     Ok(rows > 0)
 }
 
-fn summarize_error(error: Option<String>) -> Option<String> {
+/// The first line of `error`, cut to 240 characters, or `None` when blank.
+///
+/// A child row shows it as `error_summary`. The SQLite plugin calls it too
+/// (issue #2468).
+#[must_use]
+pub fn summarize_error(error: Option<String>) -> Option<String> {
     const MAX_ERROR_SUMMARY_CHARS: usize = 240;
 
     let first_line = error?.lines().next()?.trim().to_string();

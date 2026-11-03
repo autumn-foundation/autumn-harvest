@@ -39,6 +39,9 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
+#[path = "support/wire_contract.rs"]
+mod wire_contract;
+
 fn init_sql() -> Vec<u8> {
     autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
@@ -353,6 +356,8 @@ async fn a_four_level_tree_is_returned_nested_in_a_single_call() {
     assert_eq!(body["root"]["execution_id"], root.to_string());
     assert_eq!(body["node_count"], 4);
     assert_eq!(body["max_depth_reached"], 3);
+    // The shared shape check that the SQLite suite runs too (issue #2468).
+    wire_contract::tree_shape(&body);
 
     let n1 = &children_of(&body["root"])[0];
     assert_eq!(n1["execution_id"], l1.to_string());
