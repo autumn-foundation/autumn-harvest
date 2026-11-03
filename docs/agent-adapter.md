@@ -1292,9 +1292,9 @@ let harness = AgentHarness::new(model)
   memory store that cannot keep labels refuses a labelled fact, and the
   report counts it under `facts_refused`. The sources of a refused fact
   stay unconsolidated.
-- **Trigger.** `EpisodeSettings::every(n)` runs a child pass when an append
-  leaves a positive multiple of `n` unconsolidated episodes. The op waits
-  for it. A failed pass therefore waits for `n` more episodes. A pass that
+- **Trigger.** `EpisodeSettings::every(n)` runs a child pass at the `n`-th
+  append since the last pass. The op waits for it. A failed pass therefore
+  waits for `n` more appends, also when the log is full. A pass that
   does not write all its facts fails the op with a named error. With the
   default `ConsolidationTrigger::Schedule`, an engine schedule starts each
   pass: register `consolidate::schedule(when, &agent_id)`. On SQLite,

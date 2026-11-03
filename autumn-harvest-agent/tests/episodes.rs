@@ -368,10 +368,13 @@ async fn a_third_episode_evicts_the_oldest_and_the_next_pass_counts_it() {
 async fn a_failed_child_pass_waits_for_more_episodes_and_fails_the_op() {
     let (_dir, db) = fresh_db();
     let model = model(|_| "no facts here".to_owned());
+    // A full log keeps its pending count at 2, so only the append count
+    // can move the trigger.
+    let settings = EpisodeSettings::default().every(2).max_episodes(2);
     let harness = AgentHarness::new(model.clone())
         .memory(Arc::new(InMemoryMemoryStore::new()))
         .episodes(Arc::new(InMemoryEpisodeStore::default()))
-        .agent(profile(Some(EpisodeSettings::default().every(2))));
+        .agent(profile(Some(settings)));
     let mut rt = runtime(&db, harness);
     say(&mut rt, "one").await;
     say(&mut rt, "two").await;
@@ -391,6 +394,10 @@ async fn a_failed_child_pass_waits_for_more_episodes_and_fails_the_op() {
     assert_eq!(pass_count(&model), 1, "no retry on the next op");
     say(&mut rt, "four").await;
     assert_eq!(pass_count(&model), 2);
+    say(&mut rt, "five").await;
+    assert_eq!(pass_count(&model), 2, "a full log does not retry each op");
+    say(&mut rt, "six").await;
+    assert_eq!(pass_count(&model), 3, "a full log still runs a pass");
 }
 
 #[tokio::test(flavor = "multi_thread")]

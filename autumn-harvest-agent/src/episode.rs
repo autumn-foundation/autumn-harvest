@@ -99,13 +99,12 @@ pub enum ConsolidationTrigger {
     /// [`consolidate::schedule`](crate::consolidate::schedule).
     #[default]
     Schedule,
-    /// The agent runs a pass as a child workflow when an append leaves a
-    /// positive multiple of this many unconsolidated episodes. The op waits
-    /// for the pass. A failed pass therefore retries only after `episodes`
-    /// more appends.
+    /// The agent runs a pass as a child workflow after this many appends
+    /// since its last pass. The op waits for the pass. A failed pass
+    /// therefore retries only after `episodes` more appends, also when the
+    /// log is full.
     Every {
-        /// The number of unconsolidated episodes. 0 never fires. A value
-        /// over `max_episodes` counts as `max_episodes`.
+        /// The number of appends. 0 never fires.
         episodes: u32,
     },
 }

@@ -46,7 +46,8 @@ Options for each open question. The chosen option is in bold.
 | A pass reads an episode that a person erased. | `ResetMemory` clears the episode scope and the memory scope. A child pass ends before the op ends, so it cannot run across a reset. |
 | A scheduled pass runs across a reset and writes its facts back. | A clear keeps an empty log with a new generation. The write checks the generation before each fact, and the mark refuses another generation. The pass ends as `reset`. |
 | A refused fact marks its episodes, so the knowledge goes silently. | The sources of a refused fact stay unconsolidated. A child pass that refuses a fact fails the op with a named error. |
-| A failed pass retries on every op and pays the model each time. | `Every` fires at each positive multiple of `n`, so a failed pass waits for `n` more episodes. |
+| A failed pass retries on every op and pays the model each time. | `Every` counts appends since the last pass in `AgentState::appends_since_pass`. A failed pass waits for `n` more appends. |
+| A full log keeps its pending count, so a trigger on that count fires on every op or never. | The trigger reads the append count, which a full log still moves. |
 | An erased log keeps fact text for a retried clear. | A log keeps a hash of each derived fact, not its text. A cached clear holds counts and hashes only. |
 | A worker with no episode store reports a clear that did not happen. | A reset of a kind with episodes fails when the store is missing. |
 | An unattended tick plants facts that an attended op reads. | Only a segment that may write memory appends an episode, as for progress notes (#2453). |
@@ -109,12 +110,11 @@ pub enum ConsolidationTrigger {
    labels of the agent. The key is `episode:<run id>`.
 3. The store keeps at most `max_episodes`. It evicts the oldest first. An
    evicted unconsolidated episode adds one to `dropped`.
-4. With `Every { episodes: n }`, an append that leaves a positive
-   multiple of `n` unconsolidated episodes runs the child workflow
-   `agent_consolidate`. The op awaits it. A pass that does not write all
+4. With `Every { episodes: n }`, the `n`-th append since the last pass
+   runs the child workflow `agent_consolidate`, when an episode waits.
+   `AgentState::appends_since_pass` counts the appends. The op awaits it. A pass that does not write all
    its facts fails the op with a named error. Its tokens count in
-   `AgentState::tokens_used`. A value of `n` over `max_episodes` counts as
-   `max_episodes`.
+   `AgentState::tokens_used`.
 5. A pass reads at most `max_pass_episodes` unconsolidated episodes, oldest
    first, and the `dropped` count. It checks the LLM budget, calls the
    model once, and records one ledger call. It writes each valid fact with

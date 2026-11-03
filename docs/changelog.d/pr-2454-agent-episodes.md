@@ -17,8 +17,9 @@ is in `docs/design/DESIGN-2454.md`.
 - A fact lists its source episode ids and carries the labels of every
   episode of its pass. A store with no label support refuses it.
 - The trigger is a schedule (`consolidate::schedule`) or every N episodes,
-  as a child pass. A failed child pass waits for N more episodes and fails
-  the op. On SQLite, `sqlite::consolidate` starts one pass.
+  as a child pass. The trigger counts appends since the last pass, so a
+  failed pass waits for N more appends, also on a full log. A failed pass
+  fails the op. On SQLite, `sqlite::consolidate` starts one pass.
 - A clear keeps an empty log with a new generation. A pass that runs
   across a reset writes no fact after it and ends as `reset`. A log keeps
   only hashes of derived facts.

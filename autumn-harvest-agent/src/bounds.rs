@@ -166,18 +166,16 @@ pub const fn episode_evictions(len: u64, max: u64) -> u64 {
     if len < max { 0 } else { len - max + 1 }
 }
 
-/// Is a consolidation pass due with `pending` unconsolidated episodes and
-/// the trigger `every` (issue #2454)?
+/// Is a consolidation pass due after `appended` episodes since the last
+/// pass, with the trigger `every` (issue #2454)?
 ///
-/// A pass is due at each positive multiple of `every`. A failed pass keeps
-/// its episodes, so the next pass waits for `every` more. A trigger of 0
-/// never fires.
+/// The count is of appends, not of pending episodes. A full log keeps its
+/// pending count, so only an append count moves the trigger. A trigger of
+/// 0 never fires.
 /// `formal/verus/src/agent_episodes.rs` proves it for every input.
-// The Verus mirror needs the plain `%`, so the body keeps it.
-#[allow(clippy::manual_is_multiple_of)]
 #[must_use]
-pub const fn consolidation_due(pending: u64, every: u32) -> bool {
-    every > 0 && pending >= every as u64 && pending % every as u64 == 0
+pub const fn consolidation_due(appended: u64, every: u32) -> bool {
+    every > 0 && appended >= every as u64
 }
 
 #[cfg(test)]
@@ -201,10 +199,7 @@ mod tests {
         assert!(!consolidation_due(0, 3));
         assert!(!consolidation_due(2, 3));
         assert!(consolidation_due(3, 3));
-        // A failed pass at 3 waits for 6.
-        assert!(!consolidation_due(4, 3));
-        assert!(!consolidation_due(5, 3));
-        assert!(consolidation_due(6, 3));
+        assert!(consolidation_due(4, 3));
         assert!(!consolidation_due(u64::MAX, 0));
     }
 

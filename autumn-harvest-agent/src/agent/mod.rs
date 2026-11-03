@@ -1142,10 +1142,19 @@ pub struct AgentState {
     /// erase` reads them from the final state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub episode_reset: Option<EpisodeReset>,
+    /// The episode appends since the last pass that the agent ran (issue
+    /// #2454). `ConsolidationTrigger::Every` reads it.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub appends_since_pass: u32,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
 const fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
@@ -1523,6 +1532,7 @@ impl AgentRun<'_> {
             }
             Control::ResetMemory => {
                 state.memory.clear();
+                state.appends_since_pass = 0;
                 // The episodes go first. The reset counts the facts that the
                 // memory still holds, and the memory reset removes them.
                 if self.ctx.patched(EPISODE_RESET_PATCH) {
@@ -1685,12 +1695,14 @@ impl AgentRun<'_> {
         let ConsolidationTrigger::Every { episodes } = settings.trigger else {
             return;
         };
-        // The log never holds more than its bound, so a larger trigger
-        // counts as the bound.
-        let every = episodes.min(settings.max_episodes.max(1));
-        if !crate::bounds::consolidation_due(appended.pending, every) {
+        // A full log keeps its pending count, so the trigger counts appends.
+        state.appends_since_pass = state.appends_since_pass.saturating_add(1);
+        let since = u64::from(state.appends_since_pass);
+        if appended.pending == 0 || !crate::bounds::consolidation_due(since, episodes) {
             return;
         }
+        // A failed pass also waits for `episodes` more appends.
+        state.appends_since_pass = 0;
         let task = ConsolidateTask { agent: id.clone() };
         let pass: Result<ConsolidationReport, _> = self
             .ctx
