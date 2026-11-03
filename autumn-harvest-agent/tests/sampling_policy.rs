@@ -1041,7 +1041,7 @@ async fn each_draw_runs_the_active_overlay_of_its_kind() {
         .await
         .expect("the overlay is valid");
     overlays
-        .activate(KIND, version, None)
+        .activate(KIND, version, None, Provenance::operator("ops@example.com"))
         .await
         .expect("the version activates");
     let harness = base.overlay_store(overlays);
