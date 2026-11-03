@@ -1347,8 +1347,8 @@ let harness = AgentHarness::new(model)
   pass reports each unconsolidated episode that an eviction dropped.
 - **Pass.** The workflow `agent_consolidate` reads at most
   `max_pass_episodes` unconsolidated episodes. A model that the profile
-  mandate forbids disables the pass. It checks the LLM budget,
-  calls the model once, and records one cost ledger call under the pass
+  mandate forbids disables the pass. It checks the LLM budget and the
+  budget of the agent mesh (issue #2272). It then calls the model once, and records one cost ledger call under the pass
   run. Each valid fact becomes one entry of `facts_block`:
   `<subject> <relation> <object> [episodes: <id>, ...]`.
 - **Labels.** A fact takes the labels of every episode of its pass. A

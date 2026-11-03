@@ -144,6 +144,9 @@ pub struct ConsolidateRead {
     /// The generation of the log.
     #[serde(default)]
     pub generation: u64,
+    /// The mesh of the agent, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<String>,
 }
 
 impl ConsolidateRead {
@@ -165,6 +168,7 @@ impl ConsolidateRead {
             episodes,
             dropped,
             generation: 0,
+            mesh: None,
         }
     }
 
@@ -180,6 +184,7 @@ impl ConsolidateRead {
             episodes: Vec::new(),
             dropped: 0,
             generation: 0,
+            mesh: None,
         }
     }
 }
@@ -215,6 +220,9 @@ pub struct ConsolidateTurn {
     pub model: Option<String>,
     /// The episodes that the model reads.
     pub episodes: Vec<Episode>,
+    /// The mesh of the agent. Its budget bounds the turn (issue #2272).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<String>,
 }
 
 /// The recorded output of the model turn of a pass.
@@ -360,16 +368,21 @@ pub async fn agent_consolidate(
         report.stop = ConsolidationStop::NothingToDo;
         return Ok(report);
     }
+    publish_mesh(ctx, read.mesh.as_deref());
     let turn = ConsolidateTurn {
         model: read.model.clone(),
         episodes: read.episodes.clone(),
+        mesh: read.mesh.clone(),
     };
     let reply: ConsolidateFacts = match ctx
         .execute_activity(&agent_consolidate_turn_info(), turn)
         .await
     {
         Ok(reply) => reply,
-        Err(err) if LlmBudgetExceeded::is_refusal(&err) => {
+        Err(err)
+            if LlmBudgetExceeded::is_refusal(&err)
+                || err.activity_error_type() == Some(crate::mesh_control::MESH_BUDGET_EXCEEDED) =>
+        {
             report.stop = ConsolidationStop::BudgetExceeded;
             return Ok(report);
         }
@@ -412,6 +425,21 @@ fn publish_pass(ctx: &WorkflowContext, agent: &AgentId) {
     );
     if let Err(err) = ctx.upsert_search_attrs([attr]) {
         tracing::warn!(error = %err, "the pass search attribute was not set");
+    }
+}
+
+/// Put the pass run in the mesh of its agent, so the mesh spend counts
+/// its ledger rows (issue #2272).
+fn publish_mesh(ctx: &WorkflowContext, mesh: Option<&str>) {
+    let Some(mesh) = mesh else {
+        return;
+    };
+    let attr = (
+        crate::mesh_control::MESH_ATTR.to_owned(),
+        Some(serde_json::json!(mesh)),
+    );
+    if let Err(err) = ctx.upsert_search_attrs([attr]) {
+        tracing::warn!(error = %err, "the pass mesh attribute was not set");
     }
 }
 
@@ -584,19 +612,24 @@ pub fn parse_reply(content: &[ContentPart]) -> Option<Vec<ProposedFact>> {
 
 /// Run the model turn of one pass.
 ///
-/// It checks the LLM budget with `check` before the model call. A refusal
+/// It checks the LLM budget with `check`, then the budget of the mesh of
+/// the agent at the runtime clock `now`, before the model call. A refusal
 /// returns the refusal payload and no ledger call. Else it calls the model
 /// under the model timeout of the harness, and returns one ledger call.
 pub(crate) async fn run_turn<'a>(
     harness: &'a AgentHarness,
     turn: ConsolidateTurn,
     check: crate::score::BudgetCheck<'a>,
+    now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
 ) -> (Result<ConsolidateFacts, String>, Vec<LlmCall>) {
     let client = match harness.model(turn.model.as_deref()) {
         Ok(client) => client,
         Err(err) => return (Err(err), Vec::new()),
     };
     if let Err(refusal) = harness.check_budget(check).await {
+        return (Err(refusal), Vec::new());
+    }
+    if let Err(refusal) = harness.check_mesh_budget(turn.mesh.as_deref(), now).await {
         return (Err(refusal), Vec::new());
     }
     let request = pass_request(&turn.episodes);
@@ -661,6 +694,7 @@ pub(crate) async fn read_pass(
     let mut read = ConsolidateRead::new(settings, memory_scope, scope, episodes, log.dropped());
     read.generation = log.generation();
     read.model = model;
+    read.mesh = profile.mesh;
     Ok(read)
 }
 
@@ -832,7 +866,7 @@ pub async fn agent_consolidate_turn(
 ) -> Result<ConsolidateFacts, String> {
     let harness = harness(ctx)?;
     let check = Box::new(|| Box::pin(ctx.check_llm_budget()) as BoxFuture<'_, _>);
-    let (facts, calls) = run_turn(harness, turn, check).await;
+    let (facts, calls) = run_turn(harness, turn, check, autumn_harvest::chrono::Utc::now()).await;
     for call in calls {
         if let Err(err) = ctx.record_llm_call(call) {
             tracing::warn!(error = %err, "the agent cost ledger refused a pass turn");
@@ -1087,6 +1121,7 @@ mod tests {
         ConsolidateTurn {
             model: None,
             episodes: vec![episode("e1", &[])],
+            mesh: None,
         }
     }
 
@@ -1104,7 +1139,8 @@ mod tests {
                 })
             })
         });
-        let (facts, calls) = run_turn(&harness, turn(), zero).await;
+        let (facts, calls) =
+            run_turn(&harness, turn(), zero, autumn_harvest::chrono::Utc::now()).await;
         let payload = facts.unwrap_err();
         let failure = autumn_harvest::failure::parse_typed_payload(&payload).unwrap();
         assert_eq!(
@@ -1120,7 +1156,8 @@ mod tests {
         let model = Arc::new(Counting::default());
         let harness = AgentHarness::new(model.clone());
         let pass: crate::score::BudgetCheck<'_> = Box::new(|| Box::pin(async { Ok(()) }));
-        let (facts, calls) = run_turn(&harness, turn(), pass).await;
+        let (facts, calls) =
+            run_turn(&harness, turn(), pass, autumn_harvest::chrono::Utc::now()).await;
         let facts = facts.unwrap();
         assert_eq!(facts.facts, Some(Vec::new()));
         assert_eq!(facts.usage, TokenUsage::new(5, 2));
@@ -1135,7 +1172,8 @@ mod tests {
             Box::new(|| Box::pin(async { panic!("no check for an unknown model") }));
         let mut unknown = turn();
         unknown.model = Some("nope".to_owned());
-        let (facts, calls) = run_turn(&harness, unknown, never).await;
+        let (facts, calls) =
+            run_turn(&harness, unknown, never, autumn_harvest::chrono::Utc::now()).await;
         assert!(facts.unwrap_err().contains("UnknownModel"));
         assert_eq!(calls.len(), 0);
     }

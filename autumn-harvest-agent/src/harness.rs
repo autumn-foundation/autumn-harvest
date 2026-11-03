@@ -548,7 +548,7 @@ impl AgentHarness {
     /// Returns a non-retryable [`MESH_BUDGET_EXCEEDED`] payload with the
     /// period end. A budget with no spend source fails closed as a config
     /// error. A failed read is retryable.
-    async fn check_mesh_budget(
+    pub(crate) async fn check_mesh_budget(
         &self,
         mesh: Option<&str>,
         now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,

@@ -784,6 +784,42 @@ async fn the_pass_tokens_are_in_the_ledger_under_its_run() {
     assert_eq!(report.usage, TokenUsage::new(40, 9));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pass_counts_toward_its_mesh_and_obeys_its_budget() {
+    let (_dir, db) = fresh_db();
+    let episodes = Arc::new(InMemoryEpisodeStore::default());
+    seed(episodes.as_ref(), &[episode("e1", "ada likes tea", &[])]).await;
+    let model = model(two_facts);
+    let harness = AgentHarness::new(Arc::new(Priced(model.clone())))
+        .memory(Arc::new(InMemoryMemoryStore::new()))
+        .episodes(episodes.clone())
+        .mesh_budget(autumn_harvest_agent::MeshBudget::daily("support").max_tokens(10))
+        .mesh_spend(Arc::new(sqlite::LedgerSpend::open(&db)))
+        .agent(profile(Some(EpisodeSettings::default())).mesh("support"));
+    let mut rt = runtime(&db, harness);
+    // The first pass spends 49 tokens, over the cap of 10.
+    let first = sqlite::consolidate(&mut rt, &agent()).unwrap();
+    rt.run_until_blocked(first).await.unwrap();
+    assert_eq!(
+        report_of(&rt, first).unwrap().stop,
+        ConsolidationStop::Completed
+    );
+    // The spend of the first pass counts toward the mesh, so the next pass
+    // stops before its model call.
+    seed(
+        episodes.as_ref(),
+        &[episode("e2", "ada works at acme", &[])],
+    )
+    .await;
+    let second = sqlite::consolidate(&mut rt, &agent()).unwrap();
+    rt.run_until_blocked(second).await.unwrap();
+    assert_eq!(
+        report_of(&rt, second).unwrap().stop,
+        ConsolidationStop::BudgetExceeded
+    );
+    assert_eq!(pass_count(&model), 1, "no model call over the mesh cap");
+}
+
 // ---------------------------------------------------------------------------
 // Erase.
 // ---------------------------------------------------------------------------

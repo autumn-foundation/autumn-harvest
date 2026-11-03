@@ -189,13 +189,13 @@ fn register_episodes(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
         })
     });
     let h = Arc::clone(harness);
-    rt.register_activity_with_ledger(&agent_consolidate_turn_info(), move |input, _at| {
+    rt.register_activity_with_ledger(&agent_consolidate_turn_info(), move |input, at| {
         call_with_ledger(input, |turn| {
             let h = Arc::clone(&h);
             async move {
                 // SQLite has no run budget, so the turn passes the check.
                 let pass = Box::new(|| Box::pin(async { Ok(()) }) as BoxFuture<'_, _>);
-                let (facts, calls) = crate::consolidate::run_turn(&h, turn, pass).await;
+                let (facts, calls) = crate::consolidate::run_turn(&h, turn, pass, at).await;
                 facts.map(|facts| (facts, calls))
             }
         })
