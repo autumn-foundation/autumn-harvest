@@ -48,13 +48,18 @@ use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::consolidate::{
+    ConsolidateTask, ConsolidationReport, EpisodeAppend, EpisodeErase, agent_consolidate_info,
+    agent_episode_append_info, agent_episodes_reset_info, episode_scope,
+};
 use crate::context_reset::{ContextReset, ProgressNotes};
 use crate::delivery::{Report, ReportSource, is_silent, report_text};
+use crate::episode::{Appended, ConsolidationTrigger, Episode, EpisodeReset, EpisodeSettings};
 use crate::flow::Released;
 use crate::followup::{Followups, WAKE_MESSAGE};
 use crate::heartbeat::{DEFAULT_HEARTBEAT_PROMPT, HeartbeatTask};
 use crate::loop_guard::LoopGuard;
-use crate::memory::MemoryScope;
+use crate::memory::{EditKey, MemoryScope};
 use crate::mesh::{Mandate, Refusal};
 use crate::message::{ChatMessage, ChatRole, RunId, SessionId};
 use crate::skill::SkillText;
@@ -87,6 +92,10 @@ pub const MAX_AGENT_NAME_BYTES: usize = 200;
 /// The search attribute that holds the overlay version of the last op that
 /// read a profile, for example `"v2"` (issue #2372).
 pub const PROFILE_VERSION_ATTR: &str = "agent_profile_version";
+
+/// The patch gate of the episode reset in `Control::ResetMemory` (issue
+/// #2454). A run recorded before it replays with no reset activity.
+const EPISODE_RESET_PATCH: &str = "agent_episode_reset";
 
 /// The signal that interrupts the op that an agent runs (issue #2265).
 ///
@@ -687,6 +696,11 @@ pub struct AgentProfile {
     /// [`AgentTask::skills`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub skills: BTreeMap<String, SkillText>,
+    /// The episode log of the agents of the kind (issue #2454). `None`
+    /// keeps no episodes. It needs [`AgentMemory::Store`]. See
+    /// [`episode`](crate::episode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episodes: Option<EpisodeSettings>,
 }
 
 const fn default_max_steps() -> u32 {
@@ -731,7 +745,16 @@ impl AgentProfile {
             context_reset: None,
             tool_guidance: BTreeMap::new(),
             skills: BTreeMap::new(),
+            episodes: None,
         }
+    }
+
+    /// Keep an episode log for each agent of the kind, and consolidate it
+    /// into facts. See [`episode`](crate::episode).
+    #[must_use]
+    pub fn episodes(mut self, settings: EpisodeSettings) -> Self {
+        self.episodes = Some(settings);
+        self
     }
 
     /// Let the agents of the kind save notes and reset near the request
@@ -1115,6 +1138,10 @@ pub struct AgentState {
     /// #2372). `None` is the bare profile.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_version: Option<overlay_store::OverlayVersion>,
+    /// The counts of the last episode reset (issue #2454). `harvest agents
+    /// erase` reads them from the final state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub episode_reset: Option<EpisodeReset>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -1496,6 +1523,14 @@ impl AgentRun<'_> {
             }
             Control::ResetMemory => {
                 state.memory.clear();
+                // The episodes go first. The reset counts the facts that the
+                // memory still holds, and the memory reset removes them.
+                if self.ctx.patched(EPISODE_RESET_PATCH) {
+                    match self.reset_episodes().await {
+                        Ok(reset) => state.episode_reset = reset,
+                        Err(err) => fail(&mut state, &err),
+                    }
+                }
                 if let Err(err) = self.reset_memory().await {
                     fail(&mut state, &err);
                 }
@@ -1570,6 +1605,96 @@ impl AgentRun<'_> {
             .execute_activity(&agent_memory_reset_info(), scope)
             .await
             .map_err(|err| err.to_string())
+    }
+
+    /// Clear the episode scope of the agent, and count what it held (issue
+    /// #2454). It runs whatever the profile says, so an erase also reaches
+    /// the episodes of a kind that turned the setting off. Returns `None`
+    /// when the harness has no episode store.
+    async fn reset_episodes(&self) -> Result<Option<EpisodeReset>, String> {
+        let Ok(id) = &self.id else {
+            return Ok(None);
+        };
+        let memory_scope = self
+            .profile
+            .as_ref()
+            .ok()
+            .and_then(|profile| profile.memory_scope(id));
+        let erase = EpisodeErase {
+            scope: episode_scope(id),
+            memory_scope,
+            key: EditKey::new(format!("reset:{}", self.ctx.new_uuid())),
+        };
+        self.ctx
+            .execute_activity(&agent_episodes_reset_info(), erase)
+            .await
+            .map_err(|err| format!("{err}"))
+    }
+
+    /// Append the episode of one op that ended, and run a pass when the
+    /// trigger is due (issue #2454).
+    ///
+    /// The key is the run id, so a retried append adds nothing. The time is
+    /// a recorded clock read, so replay reads the same episode.
+    async fn keep_episode(
+        &self,
+        state: &mut AgentState,
+        run_id: &str,
+        stop: AgentStop,
+        answer: &str,
+    ) {
+        let (Ok(id), Ok(profile)) = (&self.id, &self.profile) else {
+            return;
+        };
+        let Some(settings) = &profile.episodes else {
+            return;
+        };
+        if profile.memory != AgentMemory::Store {
+            fail(
+                state,
+                "episodes need AgentMemory::Store, because the facts go into the memory store",
+            );
+            return;
+        }
+        let at_ms = self.ctx.system_now().timestamp_millis();
+        let max_text = usize::try_from(settings.max_text_bytes).unwrap_or(usize::MAX);
+        let append = EpisodeAppend {
+            scope: episode_scope(id),
+            key: EditKey::new(format!("episode:{run_id}")),
+            episode: Episode {
+                id: run_id.to_owned(),
+                text: cut(answer, max_text),
+                stop,
+                at_ms,
+                labels: state.flow_labels.clone(),
+            },
+            max_episodes: settings.max_episodes,
+        };
+        let appended: Appended = match self
+            .ctx
+            .execute_activity(&agent_episode_append_info(), append)
+            .await
+        {
+            Ok(appended) => appended,
+            Err(err) => {
+                fail(state, &format!("{err}"));
+                return;
+            }
+        };
+        let ConsolidationTrigger::Every { episodes } = settings.trigger else {
+            return;
+        };
+        if !crate::bounds::consolidation_due(appended.pending, episodes) {
+            return;
+        }
+        let task = ConsolidateTask { agent: id.clone() };
+        let pass: Result<ConsolidationReport, _> = self
+            .ctx
+            .spawn_child_workflow(&agent_consolidate_info(), task)
+            .await;
+        if let Err(err) = pass {
+            fail(state, &format!("the consolidation pass failed: {err}"));
+        }
     }
 
     /// Delete every workspace snapshot of the agent (issue #2274).
@@ -2009,6 +2134,11 @@ impl AgentRun<'_> {
                     };
                     self.deliver(&mut state, &task, sent).await;
                 }
+                // An episode lasts past the op, as a memory note does. So
+                // only a kept segment that may write memory appends one.
+                if kept && task.memory_writable() {
+                    self.keep_episode(&mut state, &run_id, stop, &answer).await;
+                }
                 outcome = Some((stop, answer));
             }
             Err(err) => fail(&mut state, &err),
@@ -2230,7 +2360,7 @@ fn fail(state: &mut AgentState, error: &str) {
 }
 
 /// Cut `text` to at most `max` bytes, on a `char` boundary.
-fn cut(text: &str, max: usize) -> String {
+pub(crate) fn cut(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_owned();
     }
