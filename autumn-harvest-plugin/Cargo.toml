@@ -101,8 +101,9 @@ sqlite = ["autumn-web/sqlite", "dep:autumn-harvest-sqlite"]
 
 [dependencies]
 autumn-harvest = { version = "0.9.0", path = "../autumn-harvest", features = ["db", "testing"] }
-# The sampling policy routes (issue #2439) call the Postgres policy store of
-# the agent crate. The agent crate never depends on this crate.
+# The agent profile overlay routes (issue #2374) use the store trait and the
+# overlay diff. The sampling policy routes (issue #2439) call the Postgres
+# policy store. The agent crate never depends on this crate.
 # `scripts/check-agent-adapter-deps.sh` checks that direction.
 autumn-harvest-agent = { version = "0.9.0", path = "../autumn-harvest-agent", features = ["postgres"] }
 autumn-web = "0.9"

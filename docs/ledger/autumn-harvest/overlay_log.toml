@@ -48,3 +48,17 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_agent_overlay_heads"]
 measured = "unmeasured"
+
+["pg::last_activation"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_agent_overlay_activations"]
+measured = "unmeasured"
+
+["pg::log_activation"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_agent_overlay_activations"]
+measured = "unmeasured"

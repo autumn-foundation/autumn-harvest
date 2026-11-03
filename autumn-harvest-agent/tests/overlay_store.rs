@@ -48,7 +48,10 @@ async fn the_sqlite_store_keeps_versions_across_a_reopen() {
             .put("support", &overlay, Provenance::operator("ops"))
             .await
             .expect("put");
-        store.activate("support", v1, None).await.expect("activate");
+        store
+            .activate("support", v1, None, Provenance::operator("ops"))
+            .await
+            .expect("activate");
         v1
     };
     let store = SqliteOverlayStore::open(&path, gate).expect("reopen");

@@ -5,6 +5,9 @@
 //! changes after the put. [`ProfileOverlayStore::activate`] moves the
 //! pointer with a compare-and-swap. A rollback activates an earlier version.
 //!
+//! Each move of the pointer logs an [`Activation`] with its actor (issue
+//! #2374). [`ProfileOverlayStore::rollback`] reverses the last move.
+//!
 //! Each store validates an overlay with its [`OverlayValidator`] before it
 //! stores it, and again before it activates it. A deploy can narrow a
 //! profile after an activation. So a reader of [`ProfileOverlayStore::active`]
@@ -13,7 +16,8 @@
 //! A store does its work when the future is polled. The `SQLite` store runs
 //! its statements on the calling thread, as `MemoryStore` stores do.
 //!
-//! The design is in `docs/design/DESIGN-2371.md`.
+//! The design is in `docs/design/DESIGN-2371.md` and
+//! `docs/design/DESIGN-2374.md`.
 //!
 //! [`overlay::apply`]: super::overlay::apply
 
@@ -23,8 +27,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use autumn_harvest::ExecutionId;
 use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::overlay_log::{
-    AUTHOR_OPERATOR, AUTHOR_REFINE, ActivateDecision, ActivateOutcome, OverlayRow, decide_activate,
-    next_overlay_version,
+    AUTHOR_OPERATOR, AUTHOR_REFINE, ActivateDecision, ActivateOutcome, MoveRequest, OverlayRow,
+    logs_activation, next_overlay_version, rollback_target,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -204,6 +208,82 @@ impl StoredOverlay {
     }
 }
 
+/// One move of the active pointer of a kind (issue #2374).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activation {
+    kind: String,
+    seq: u64,
+    from: Option<OverlayVersion>,
+    to: OverlayVersion,
+    actor: Provenance,
+    activated_at: DateTime<Utc>,
+}
+
+impl Activation {
+    /// The agent kind.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// The number of the move in its kind, from 1.
+    #[must_use]
+    pub const fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// The active version before the move, or `None` for an unset pointer.
+    #[must_use]
+    pub const fn from(&self) -> Option<OverlayVersion> {
+        self.from
+    }
+
+    /// The active version after the move.
+    #[must_use]
+    pub const fn to(&self) -> OverlayVersion {
+        self.to
+    }
+
+    /// Who or what moved the pointer.
+    #[must_use]
+    pub const fn actor(&self) -> &Provenance {
+        &self.actor
+    }
+
+    /// The time of the move.
+    #[must_use]
+    pub const fn activated_at(&self) -> DateTime<Utc> {
+        self.activated_at
+    }
+
+    /// Decode a stored move of `kind`. An error is
+    /// [`OverlayStoreError::Corrupt`].
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn from_row(
+        kind: &str,
+        row: &autumn_harvest::overlay_log::ActivationRow,
+    ) -> Result<Self, OverlayStoreError> {
+        let version = |n| OverlayVersion::new(n).ok_or_else(|| corrupt("a logged version is 0"));
+        Ok(Self {
+            kind: kind.to_owned(),
+            seq: row.seq,
+            from: row.from.map(version).transpose()?,
+            to: version(row.to)?,
+            actor: Provenance::decode(&row.actor_kind, &row.actor)?,
+            activated_at: row.activated_at,
+        })
+    }
+}
+
+/// The result of a rollback: the active version before and after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Rollback {
+    /// The version that was active.
+    pub from: OverlayVersion,
+    /// The version that is active now.
+    pub to: OverlayVersion,
+}
+
 /// Why a store refuses a call.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
@@ -246,6 +326,10 @@ pub enum OverlayStoreError {
     /// The version counter of the kind is full.
     #[error("the overlay version counter is full")]
     Full,
+    /// A rollback found no version that was active before the current
+    /// one. Nothing changed.
+    #[error("the kind has no earlier activation to roll back to")]
+    NoEarlierActivation,
     /// A stored row does not decode.
     #[error("a stored overlay row is corrupt: {reason}")]
     Corrupt {
@@ -359,10 +443,14 @@ pub trait ProfileOverlayStore: Send + Sync + std::fmt::Debug {
     ) -> BoxFuture<'a, Result<OverlayVersion, OverlayStoreError>>;
 
     /// Make `version` the active version of `kind` when the active version
-    /// is `expected_active`.
+    /// is `expected_active`. `actor` names who moves the pointer.
+    ///
+    /// A move logs an [`Activation`] in the same transaction. An activation
+    /// of the active version succeeds and logs nothing.
     ///
     /// # Errors
     ///
+    /// [`OverlayStoreError::InvalidProvenance`],
     /// [`OverlayStoreError::UnknownVersion`] for a version that does not
     /// exist, the errors of [`OverlayValidator::validate`],
     /// [`OverlayStoreError::Conflict`] for another active version, and
@@ -372,7 +460,37 @@ pub trait ProfileOverlayStore: Send + Sync + std::fmt::Debug {
         kind: &'a str,
         version: OverlayVersion,
         expected_active: Option<OverlayVersion>,
+        actor: Provenance,
     ) -> BoxFuture<'a, Result<(), OverlayStoreError>>;
+
+    /// The last move of the pointer of `kind`, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`OverlayStoreError::Corrupt`] and [`OverlayStoreError::Backend`].
+    fn last_activation<'a>(
+        &'a self,
+        kind: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Activation>, OverlayStoreError>>;
+
+    /// Activate the version that was active before the current one.
+    ///
+    /// It reads the last move `from -> to`, validates `from`, then activates
+    /// `from` over the expected pointer `to`. The swap also needs that move
+    /// to be the last one, so a pointer that moved after the read fails,
+    /// also when it moved back. A second rollback undoes the first one.
+    ///
+    /// # Errors
+    ///
+    /// [`OverlayStoreError::NoEarlierActivation`] when no move exists, or
+    /// the last move started from an unset pointer. Else the errors of
+    /// [`activate`](Self::activate). A move after the read gives
+    /// [`OverlayStoreError::Conflict`]. Nothing changes on an error.
+    fn rollback<'a>(
+        &'a self,
+        kind: &'a str,
+        actor: Provenance,
+    ) -> BoxFuture<'a, Result<Rollback, OverlayStoreError>>;
 
     /// The active version of `kind`, or `None`.
     ///
@@ -455,13 +573,15 @@ fn activated(version: OverlayVersion, outcome: ActivateOutcome) -> Result<(), Ov
     }
 }
 
-/// Activate through `store`: read the version, validate it, then call
-/// `swap`. A version row never changes, so the check holds at the swap.
+/// Activate through `store`: check the actor, read the version, validate
+/// it, then call `swap`. A version row never changes, so the check holds at
+/// the swap.
 async fn activate_checked<S, F, Fut>(
     store: &S,
     validator: &dyn OverlayValidator,
     kind: &str,
     version: OverlayVersion,
+    actor: &Provenance,
     swap: F,
 ) -> Result<(), OverlayStoreError>
 where
@@ -469,12 +589,65 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<ActivateOutcome, OverlayStoreError>>,
 {
+    actor.check()?;
     let stored = store
         .get(kind, version)
         .await?
         .ok_or(OverlayStoreError::UnknownVersion { version })?;
     validator.validate(kind, stored.overlay())?;
     activated(version, swap().await?)
+}
+
+/// The raw move request of `version` over `expected` by `author`.
+const fn move_request<'b>(
+    version: OverlayVersion,
+    expected: Option<OverlayVersion>,
+    actor: &Provenance,
+    author: &'b str,
+    after_seq: Option<u64>,
+) -> MoveRequest<'b> {
+    MoveRequest {
+        version: version.get(),
+        expected: match expected {
+            Some(expected) => Some(expected.get()),
+            None => None,
+        },
+        actor_kind: actor.author_kind(),
+        actor: author,
+        after_seq,
+    }
+}
+
+/// Roll back through `store`: check the actor, read the last move, then
+/// validate its start. `swap` then gets the target, the expected pointer
+/// and the `seq` of the move. The swap needs that move to be the last one.
+async fn rollback_checked<S, F, Fut>(
+    store: &S,
+    validator: &dyn OverlayValidator,
+    kind: &str,
+    actor: &Provenance,
+    swap: F,
+) -> Result<Rollback, OverlayStoreError>
+where
+    S: ProfileOverlayStore + ?Sized,
+    F: FnOnce(OverlayVersion, OverlayVersion, u64) -> Fut,
+    Fut: Future<Output = Result<ActivateOutcome, OverlayStoreError>>,
+{
+    actor.check()?;
+    let last = store
+        .last_activation(kind)
+        .await?
+        .ok_or(OverlayStoreError::NoEarlierActivation)?;
+    let plan = rollback_target(last.from.map(OverlayVersion::get), last.to.get())
+        .ok_or(OverlayStoreError::NoEarlierActivation)?;
+    let to = OverlayVersion::new(plan.target).ok_or_else(|| corrupt("a logged version is 0"))?;
+    let stored = store
+        .get(kind, to)
+        .await?
+        .ok_or(OverlayStoreError::UnknownVersion { version: to })?;
+    validator.validate(kind, stored.overlay())?;
+    activated(to, swap(to, last.to, last.seq).await?)?;
+    Ok(Rollback { from: last.to, to })
 }
 
 /// A [`ProfileOverlayStore`] in process memory. Its contents go when the
@@ -489,6 +662,7 @@ pub struct InMemoryOverlayStore {
 struct KindLog {
     versions: Vec<StoredOverlay>,
     active: Option<OverlayVersion>,
+    moves: Vec<Activation>,
 }
 
 impl std::fmt::Debug for InMemoryOverlayStore {
@@ -530,14 +704,50 @@ impl ProfileOverlayStore for InMemoryOverlayStore {
         kind: &'a str,
         version: OverlayVersion,
         expected_active: Option<OverlayVersion>,
+        actor: Provenance,
     ) -> BoxFuture<'a, Result<(), OverlayStoreError>> {
-        Box::pin(activate_checked(
-            self,
-            &*self.validator,
-            kind,
-            version,
-            move || async move { Ok(self.swap_now(kind, version, expected_active)) },
-        ))
+        Box::pin(async move {
+            activate_checked(self, &*self.validator, kind, version, &actor, || async {
+                let author = actor.author();
+                let request = move_request(version, expected_active, &actor, &author, None);
+                Ok(self.swap_now(kind, &request, &actor))
+            })
+            .await
+        })
+    }
+
+    fn rollback<'a>(
+        &'a self,
+        kind: &'a str,
+        actor: Provenance,
+    ) -> BoxFuture<'a, Result<Rollback, OverlayStoreError>> {
+        Box::pin(async move {
+            let actor = &actor;
+            rollback_checked(
+                self,
+                &*self.validator,
+                kind,
+                actor,
+                |to, from, seq| async move {
+                    let author = actor.author();
+                    let request = move_request(to, Some(from), actor, &author, Some(seq));
+                    Ok(self.swap_now(kind, &request, actor))
+                },
+            )
+            .await
+        })
+    }
+
+    fn last_activation<'a>(
+        &'a self,
+        kind: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Activation>, OverlayStoreError>> {
+        Box::pin(async move {
+            let kinds = self.lock();
+            let last = kinds.get(kind).and_then(|log| log.moves.last().cloned());
+            drop(kinds);
+            Ok(last)
+        })
     }
 
     fn active<'a>(
@@ -621,24 +831,39 @@ impl InMemoryOverlayStore {
         Ok(version)
     }
 
-    /// Swap the pointer under the lock.
+    /// Swap the pointer and log the move under the lock.
     fn swap_now(
         &self,
         kind: &str,
-        version: OverlayVersion,
-        expected: Option<OverlayVersion>,
+        request: &MoveRequest<'_>,
+        actor: &Provenance,
     ) -> ActivateOutcome {
+        let Some(version) = OverlayVersion::new(request.version) else {
+            return ActivateOutcome::UnknownVersion;
+        };
         let mut kinds = self.lock();
         let outcome = kinds
             .get_mut(kind)
             .map_or(ActivateOutcome::UnknownVersion, |log| {
                 let known = log.versions.iter().any(|stored| stored.version == version);
                 let actual = log.active.map(OverlayVersion::get);
-                match decide_activate(known, expected.map(OverlayVersion::get), actual) {
+                let last_seq = log.moves.last().map(|last| last.seq);
+                match request.decide(known, actual, last_seq) {
                     ActivateDecision::UnknownVersion => ActivateOutcome::UnknownVersion,
                     ActivateDecision::Conflict => ActivateOutcome::Conflict { actual },
                     ActivateDecision::Activate => {
-                        log.active = Some(version);
+                        if logs_activation(actual, version.get()) {
+                            let seq = log.moves.last().map_or(1, |last| last.seq + 1);
+                            log.moves.push(Activation {
+                                kind: kind.to_owned(),
+                                seq,
+                                from: log.active,
+                                to: version,
+                                actor: actor.clone(),
+                                activated_at: Utc::now(),
+                            });
+                            log.active = Some(version);
+                        }
                         ActivateOutcome::Activated
                     }
                 }
@@ -716,22 +941,51 @@ impl ProfileOverlayStore for SqliteOverlayStore {
         kind: &'a str,
         version: OverlayVersion,
         expected_active: Option<OverlayVersion>,
+        actor: Provenance,
     ) -> BoxFuture<'a, Result<(), OverlayStoreError>> {
-        Box::pin(activate_checked(
-            self,
-            &*self.validator,
-            kind,
-            version,
-            move || async move {
-                self.log
-                    .activate(
-                        kind,
-                        version.get(),
-                        expected_active.map(OverlayVersion::get),
-                    )
-                    .map_err(backend)
-            },
-        ))
+        Box::pin(async move {
+            activate_checked(self, &*self.validator, kind, version, &actor, || async {
+                let author = actor.author();
+                let request = move_request(version, expected_active, &actor, &author, None);
+                self.log.activate(kind, &request).map_err(backend)
+            })
+            .await
+        })
+    }
+
+    fn rollback<'a>(
+        &'a self,
+        kind: &'a str,
+        actor: Provenance,
+    ) -> BoxFuture<'a, Result<Rollback, OverlayStoreError>> {
+        Box::pin(async move {
+            let actor = &actor;
+            rollback_checked(
+                self,
+                &*self.validator,
+                kind,
+                actor,
+                |to, from, seq| async move {
+                    let author = actor.author();
+                    let request = move_request(to, Some(from), actor, &author, Some(seq));
+                    self.log.activate(kind, &request).map_err(backend)
+                },
+            )
+            .await
+        })
+    }
+
+    fn last_activation<'a>(
+        &'a self,
+        kind: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Activation>, OverlayStoreError>> {
+        Box::pin(async move {
+            self.log
+                .last_activation(kind)
+                .map_err(backend)?
+                .map(|row| Activation::from_row(kind, &row))
+                .transpose()
+        })
     }
 
     fn active<'a>(
@@ -785,6 +1039,18 @@ impl PostgresOverlayStore {
         Self { pool, validator }
     }
 
+    /// Run one raw move of `kind` on a pool connection.
+    async fn swap(
+        &self,
+        kind: &str,
+        request: &MoveRequest<'_>,
+    ) -> Result<ActivateOutcome, OverlayStoreError> {
+        let mut conn = self.conn().await?;
+        autumn_harvest::overlay_log::activate_overlay(&mut conn, kind, request)
+            .await
+            .map_err(backend)
+    }
+
     async fn conn(
         &self,
     ) -> Result<
@@ -824,24 +1090,52 @@ impl ProfileOverlayStore for PostgresOverlayStore {
         kind: &'a str,
         version: OverlayVersion,
         expected_active: Option<OverlayVersion>,
+        actor: Provenance,
     ) -> BoxFuture<'a, Result<(), OverlayStoreError>> {
-        Box::pin(activate_checked(
-            self,
-            &*self.validator,
-            kind,
-            version,
-            move || async move {
-                let mut conn = self.conn().await?;
-                autumn_harvest::overlay_log::activate_overlay(
-                    &mut conn,
-                    kind,
-                    version.get(),
-                    expected_active.map(OverlayVersion::get),
-                )
+        Box::pin(async move {
+            activate_checked(self, &*self.validator, kind, version, &actor, || async {
+                let author = actor.author();
+                let request = move_request(version, expected_active, &actor, &author, None);
+                self.swap(kind, &request).await
+            })
+            .await
+        })
+    }
+
+    fn rollback<'a>(
+        &'a self,
+        kind: &'a str,
+        actor: Provenance,
+    ) -> BoxFuture<'a, Result<Rollback, OverlayStoreError>> {
+        Box::pin(async move {
+            let actor = &actor;
+            rollback_checked(
+                self,
+                &*self.validator,
+                kind,
+                actor,
+                |to, from, seq| async move {
+                    let author = actor.author();
+                    let request = move_request(to, Some(from), actor, &author, Some(seq));
+                    self.swap(kind, &request).await
+                },
+            )
+            .await
+        })
+    }
+
+    fn last_activation<'a>(
+        &'a self,
+        kind: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Activation>, OverlayStoreError>> {
+        Box::pin(async move {
+            let mut conn = self.conn().await?;
+            autumn_harvest::overlay_log::last_activation(&mut conn, kind)
                 .await
-                .map_err(backend)
-            },
-        ))
+                .map_err(backend)?
+                .map(|row| Activation::from_row(kind, &row))
+                .transpose()
+        })
     }
 
     fn active<'a>(

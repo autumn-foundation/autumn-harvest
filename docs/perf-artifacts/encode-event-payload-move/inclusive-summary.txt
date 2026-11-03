@@ -1,0 +1,12 @@
+callgrind_annotate --inclusive=yes, payload_codec_profile, PAYLOAD_CODEC_PROFILE_REPS=20
+
+before (trunk-dev 4b6ec95)
+1,062,066,352 (100.0%)  PROGRAM TOTALS
+  526,805,033 (49.60%)  ???:<autumn_harvest::payload_codec::PayloadCodecs>::encode_event
+  262,866,942 (24.75%)  ???:<autumn_harvest::payload_codec::PayloadCodecs>::decode_event
+
+after (issue #2499)
+855,768,802 (100.0%)  PROGRAM TOTALS
+361,828,659 (42.28%)  ???:<autumn_harvest::payload_codec::PayloadCodecs>::encode_event
+221,464,380 (25.88%)  ???:<autumn_harvest::payload_codec::PayloadCodecs>::decode_event
+186,008,969 (21.74%)  ???:<autumn_harvest::payload_codec::PayloadCodecs>::encode_event_owned

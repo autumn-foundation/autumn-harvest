@@ -391,6 +391,31 @@ fn agents_pause_and_resume_are_covered() {
     }
 }
 
+// ── harvest agents profile (issue #2374) ───────────────────────────────────
+
+#[test]
+fn agents_profile_commands_are_covered() {
+    for args in [
+        &["agents", "profile", "list", "support"][..],
+        &["agents", "profile", "show", "support"][..],
+        &["agents", "profile", "show", "support", "--version", "v2"][..],
+        &["agents", "profile", "diff", "support", "1", "2"][..],
+        &[
+            "agents",
+            "profile",
+            "activate",
+            "support",
+            "2",
+            "--expected",
+            "1",
+        ][..],
+        &["agents", "profile", "rollback", "support"][..],
+    ] {
+        assert_covered(args);
+        assert_body_fields_documented(args);
+    }
+}
+
 #[test]
 fn agents_sampling_policy_is_covered() {
     // Issue #2439.

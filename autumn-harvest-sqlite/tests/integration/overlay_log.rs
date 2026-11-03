@@ -3,7 +3,18 @@
 //! The typed store and the shared suite are in `autumn-harvest-agent`.
 //! These tests cover the guard, which only raw SQL can reach.
 
-use autumn_harvest::overlay_log::ActivateOutcome;
+use autumn_harvest::overlay_log::{ActivateOutcome, MoveRequest};
+
+/// A plain activation by the operator `actor`.
+const fn mv(version: u64, expected: Option<u64>, actor: &str) -> MoveRequest<'_> {
+    MoveRequest {
+        version,
+        expected,
+        actor_kind: "operator",
+        actor,
+        after_seq: None,
+    }
+}
 use autumn_harvest_sqlite::SqliteOverlayLog;
 
 fn log_with_one_version(path: &std::path::Path) -> SqliteOverlayLog {
@@ -49,7 +60,8 @@ fn sqlite_refuses_a_delete_of_the_active_version() {
     let path = dir.path().join("harvest.db");
     let log = log_with_one_version(&path);
     assert_eq!(
-        log.activate("support", 1, None).expect("activate"),
+        log.activate("support", &mv(1, None, "ops"))
+            .expect("activate"),
         ActivateOutcome::Activated
     );
     // A raw connection has no `foreign_keys` pragma. The trigger refuses the
@@ -76,23 +88,28 @@ fn an_activation_is_a_compare_and_swap() {
         .expect("v2")
         .expect("a version");
     assert_eq!(
-        log.activate("support", 3, None).expect("activate"),
+        log.activate("support", &mv(3, None, "ops"))
+            .expect("activate"),
         ActivateOutcome::UnknownVersion
     );
     assert_eq!(
-        log.activate("other", 1, None).expect("activate"),
+        log.activate("other", &mv(1, None, "ops"))
+            .expect("activate"),
         ActivateOutcome::UnknownVersion
     );
     assert_eq!(
-        log.activate("support", 1, None).expect("activate"),
+        log.activate("support", &mv(1, None, "ops"))
+            .expect("activate"),
         ActivateOutcome::Activated
     );
     assert_eq!(
-        log.activate("support", 2, None).expect("activate"),
+        log.activate("support", &mv(2, None, "ops"))
+            .expect("activate"),
         ActivateOutcome::Conflict { actual: Some(1) }
     );
     assert_eq!(
-        log.activate("support", 2, Some(1)).expect("activate"),
+        log.activate("support", &mv(2, Some(1), "ops"))
+            .expect("activate"),
         ActivateOutcome::Activated
     );
     let versions: Vec<u64> = log
@@ -190,7 +207,8 @@ fn activates_on_two_connections_have_one_winner() {
         let target = u64::try_from(n).expect("small") + 2;
         (
             target,
-            log.activate("support", target, None).expect("activate"),
+            log.activate("support", &mv(target, None, "ops"))
+                .expect("activate"),
         )
     });
     let winners: Vec<u64> = outcomes
@@ -214,5 +232,93 @@ fn activates_on_two_connections_have_one_winner() {
             .expect("active")
             .map(|row| row.version),
         Some(winners[0])
+    );
+    // The race logs exactly one move: from unset to the winner (issue #2374).
+    let last = log.last_activation("support").expect("last").expect("move");
+    assert_eq!((last.seq, last.from, last.to), (1, None, winners[0]));
+}
+
+/// A rollback swap needs the move that it read to be the last one (issue
+/// #2374). The pointer moved v2 -> v3 -> v2 after the read, so the pointer
+/// matches again, but the swap is a conflict.
+#[test]
+fn sqlite_refuses_a_rollback_over_a_stale_move() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("harvest.db");
+    let log = log_with_one_version(&path);
+    for _ in 0..2 {
+        log.append("support", b"{}", "operator", "ops")
+            .expect("append")
+            .expect("a version");
+    }
+    log.activate("support", &mv(1, None, "ops")).expect("v1");
+    log.activate("support", &mv(2, Some(1), "ops")).expect("v2");
+    let read = log
+        .last_activation("support")
+        .expect("last")
+        .expect("v1 -> v2");
+    let stale = MoveRequest {
+        after_seq: Some(read.seq),
+        ..mv(1, Some(2), "ops")
+    };
+    log.activate("support", &mv(3, Some(2), "ops")).expect("v3");
+    log.activate("support", &mv(2, Some(3), "ops"))
+        .expect("v2 again");
+    assert_eq!(
+        log.activate("support", &stale).expect("swap"),
+        ActivateOutcome::Conflict { actual: Some(2) }
+    );
+    let last = log.last_activation("support").expect("last").expect("move");
+    assert_eq!((last.seq, last.from, last.to), (4, Some(3), 2));
+    let fresh = MoveRequest {
+        after_seq: Some(last.seq),
+        ..mv(3, Some(2), "ops")
+    };
+    assert_eq!(
+        log.activate("support", &fresh).expect("swap"),
+        ActivateOutcome::Activated
+    );
+}
+
+/// Each move logs one row, and the guard refuses a change of a row (issue
+/// #2374). An activation of the active version logs nothing.
+#[test]
+fn sqlite_logs_each_move_and_refuses_a_rewrite() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("harvest.db");
+    let log = log_with_one_version(&path);
+    log.append("support", b"{}", "operator", "ops")
+        .expect("append")
+        .expect("v2");
+    assert_eq!(log.last_activation("support").expect("last"), None);
+    log.activate("support", &mv(1, None, "ops")).expect("v1");
+    log.activate("support", &mv(2, Some(1), "oncall"))
+        .expect("v2");
+    log.activate("support", &mv(2, Some(2), "ops"))
+        .expect("stay");
+    let last = log.last_activation("support").expect("last").expect("move");
+    assert_eq!((last.seq, last.from, last.to), (2, Some(1), 2));
+    assert_eq!(last.actor, "oncall");
+
+    let raw = rusqlite::Connection::open(&path).expect("raw");
+    for statement in [
+        "UPDATE harvest_agent_overlay_activations SET from_version = 2",
+        "INSERT OR REPLACE INTO harvest_agent_overlay_activations \
+         (kind, seq, from_version, to_version, actor_kind, actor, activated_at_ms) \
+         VALUES ('support', 2, 2, 1, 'operator', 'mallory', 0)",
+    ] {
+        let err = raw
+            .execute(statement, [])
+            .expect_err("the guard refuses it");
+        assert!(
+            err.to_string()
+                .contains("harvest_agent_overlay_activations is append-only"),
+            "{statement}: {err}"
+        );
+    }
+    let last = log.last_activation("support").expect("last").expect("move");
+    assert_eq!(
+        (last.from, last.to, last.actor.as_str()),
+        (Some(1), 2, "oncall")
     );
 }

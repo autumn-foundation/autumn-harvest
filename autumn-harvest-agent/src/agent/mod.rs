@@ -35,6 +35,7 @@
 pub mod dedupe;
 pub mod inbox;
 pub mod overlay;
+pub mod overlay_diff;
 pub mod overlay_store;
 pub mod profile_read;
 pub mod wake;

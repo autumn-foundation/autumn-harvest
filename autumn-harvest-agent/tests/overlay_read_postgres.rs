@@ -404,3 +404,8 @@ async fn bad_stored_data_fails_safe() {
 async fn a_narrowed_deploy_fails_safe() {
     overlay_read_suite::a_narrowed_deploy_fails_safe(&mut Pg::new().await).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rollback_restores_v1() {
+    overlay_read_suite::a_rollback_restores_v1(&mut Pg::new().await).await;
+}

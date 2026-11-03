@@ -880,6 +880,11 @@ pub enum CliError {
     #[error("`agents erase` has no single API request")]
     AgentEraseIsMultiStep,
 
+    /// `agents profile activate` with no `--expected` reads the active
+    /// version first, so it has no single request (issue #2374).
+    #[error("`agents profile activate` with no --expected has no single API request")]
+    AgentProfileActivateIsMultiStep,
+
     /// `--wait` timed out before the worker reached `Stopped`.
     #[error("timed out waiting for worker '{worker_id}' to stop (last status: {last_status})")]
     DrainWaitTimeout {
@@ -1189,9 +1194,9 @@ enum Commands {
         #[command(subcommand)]
         command: ShardCommand,
     },
-    /// List, describe, pause, resume and erase durable agents (issue #2267).
-    /// Show, set and reset the sampling policy of an agent kind (issue
-    /// #2439).
+    /// List, describe, pause, resume and erase durable agents (issue #2267),
+    /// and operate their profile overlays (issue #2374). Show, set and reset
+    /// the sampling policy of an agent kind (issue #2439).
     #[command(alias = "agent")]
     Agents {
         #[command(subcommand)]
@@ -3900,6 +3905,7 @@ impl ApiRequest {
     }
 }
 
+mod agent_profile;
 mod agents;
 pub mod debug;
 pub mod debug_tui;
@@ -4131,6 +4137,23 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     {
         return agents::run_agent_erase(&cli, agent_id, reason.as_deref(), *wait_timeout_secs)
             .await;
+    }
+
+    // `agents profile activate` with no `--expected` reads the active
+    // version, then swaps over it (issue #2374).
+    if let Commands::Agents {
+        command:
+            agents::AgentCommand::Profile {
+                command:
+                    agent_profile::ProfileCommand::Activate {
+                        kind,
+                        version,
+                        expected: None,
+                    },
+            },
+    } = &cli.command
+    {
+        return agent_profile::run_profile_activate(&cli, kind, version).await;
     }
 
     // --wait mode: issue drain then poll until Stopped or timeout.

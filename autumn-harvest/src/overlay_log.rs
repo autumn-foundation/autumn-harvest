@@ -15,8 +15,13 @@
 //!   `harvest_agent_overlays_immutable_trg` refuses each `UPDATE`.
 //! - An activation is a compare-and-swap on the pointer. See
 //!   [`decide_activate`].
+//! - Each move of the pointer adds one row to the activation log, in the
+//!   same transaction (issue #2374). See [`logs_activation`]. A rollback
+//!   reverses the last move. See [`rollback_target`].
 //!
-//! The design is in `docs/design/DESIGN-2371.md`.
+//! The design is in `docs/design/DESIGN-2371.md` and
+//! `docs/design/DESIGN-2374.md`. `formal/verus/src/overlay_log.rs` proves
+//! the kernel.
 
 use chrono::{DateTime, Utc};
 
@@ -98,6 +103,127 @@ pub const fn decide_activate(
     }
 }
 
+/// Whether an activation of `version` logs a move. `actual` is the pointer
+/// under the lock. An activation of the active version moves nothing, so it
+/// logs nothing.
+///
+/// `formal/verus/src/overlay_log.rs` proves it.
+#[must_use]
+pub const fn logs_activation(actual: Option<u64>, version: u64) -> bool {
+    match actual {
+        Some(have) => have != version,
+        None => true,
+    }
+}
+
+/// The plan of a rollback: activate `target` over the pointer `expected`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RollbackPlan {
+    /// The version to activate: the start of the last move.
+    pub target: u64,
+    /// The expected pointer: the end of the last move.
+    pub expected: u64,
+}
+
+/// The plan that reverses the last move `from -> to`. `None` means that no
+/// version was active before the move, so no rollback exists.
+///
+/// `formal/verus/src/overlay_log.rs` proves it.
+#[must_use]
+pub const fn rollback_target(from: Option<u64>, to: u64) -> Option<RollbackPlan> {
+    match from {
+        Some(target) => Some(RollbackPlan {
+            target,
+            expected: to,
+        }),
+        None => None,
+    }
+}
+
+/// What a rollback swap does, under the lock of the head row. `read_seq` is
+/// the `seq` of the last move that the rollback read. `last_seq` is the
+/// `seq` of the last move under the lock.
+///
+/// A move after the read changes `last_seq`, so the swap is a conflict. A
+/// pointer that moved away and back therefore never passes.
+///
+/// `formal/verus/src/overlay_log.rs` proves it.
+#[must_use]
+pub const fn decide_rollback(
+    known: bool,
+    expected: u64,
+    actual: Option<u64>,
+    read_seq: u64,
+    last_seq: Option<u64>,
+) -> ActivateDecision {
+    match decide_activate(known, Some(expected), actual) {
+        ActivateDecision::Activate => match last_seq {
+            Some(seq) if seq == read_seq => ActivateDecision::Activate,
+            _ => ActivateDecision::Conflict,
+        },
+        other => other,
+    }
+}
+
+/// One move request for a raw log. The caller validates the version first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoveRequest<'a> {
+    /// The version to activate.
+    pub version: u64,
+    /// The pointer that the caller read.
+    pub expected: Option<u64>,
+    /// [`AUTHOR_OPERATOR`] or [`AUTHOR_REFINE`].
+    pub actor_kind: &'a str,
+    /// The operator id, or the execution id of the refine run.
+    pub actor: &'a str,
+    /// For a rollback, the `seq` of the last move that it read. The swap
+    /// then also needs that move to be the last one. See
+    /// [`decide_rollback`].
+    pub after_seq: Option<u64>,
+}
+
+impl MoveRequest<'_> {
+    /// The decision under the lock. `last_seq` is the `seq` of the last
+    /// move, and it counts only for a rollback.
+    #[must_use]
+    pub const fn decide(
+        &self,
+        known: bool,
+        actual: Option<u64>,
+        last_seq: Option<u64>,
+    ) -> ActivateDecision {
+        match (self.after_seq, self.expected) {
+            (Some(read_seq), Some(expected)) => {
+                decide_rollback(known, expected, actual, read_seq, last_seq)
+            }
+            // A rollback always expects a pointer. A guard with none never
+            // passes, so no caller can drop the guard by mistake.
+            (Some(_), None) => match decide_activate(known, None, actual) {
+                ActivateDecision::UnknownVersion => ActivateDecision::UnknownVersion,
+                _ => ActivateDecision::Conflict,
+            },
+            (None, _) => decide_activate(known, self.expected, actual),
+        }
+    }
+}
+
+/// One row of the activation log: a move of the pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationRow {
+    /// The number of the move in its kind, from 1.
+    pub seq: u64,
+    /// The pointer before the move.
+    pub from: Option<u64>,
+    /// The pointer after the move.
+    pub to: u64,
+    /// [`AUTHOR_OPERATOR`] or [`AUTHOR_REFINE`].
+    pub actor_kind: String,
+    /// The operator id, or the execution id of the refine run.
+    pub actor: String,
+    /// The time of the move.
+    pub activated_at: DateTime<Utc>,
+}
+
 /// One stored overlay version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayRow {
@@ -115,7 +241,9 @@ pub struct OverlayRow {
 
 #[cfg(feature = "db")]
 #[doc(hidden)]
-pub use pg::{activate_overlay, active_overlay, append_overlay, get_overlay, list_overlays};
+pub use pg::{
+    activate_overlay, active_overlay, append_overlay, get_overlay, last_activation, list_overlays,
+};
 
 /// The Postgres queries. They do not validate an overlay. Call them through
 /// `ProfileOverlayStore`, which does.
@@ -126,7 +254,9 @@ mod pg {
     use diesel::sql_types::{BigInt, Binary, Bool, Nullable, Text, Timestamptz};
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
-    use super::{ActivateDecision, ActivateOutcome, OverlayRow, decide_activate};
+    use super::{
+        ActivateDecision, ActivateOutcome, ActivationRow, MoveRequest, OverlayRow, logs_activation,
+    };
     use crate::error::{HarvestError, HarvestResult, database_error};
 
     /// The columns of one version row.
@@ -226,13 +356,16 @@ mod pg {
         rows.into_iter().next().map(Row::decode).transpose()
     }
 
-    /// Move the pointer of `kind` to `version` when it is `expected`.
+    /// Move the pointer of `kind` as `request` asks, and log the move with
+    /// its actor.
     ///
     /// One transaction locks the head row, then checks the version. The
     /// check is a new statement, so its snapshot sees each put that
-    /// committed while the lock waited. [`decide_activate`] then decides. So
-    /// of two activations with the same `expected`, only one moves the
-    /// pointer. A version or an `expected` above `i64::MAX` never matches.
+    /// committed while the lock waited. [`MoveRequest::decide`] then
+    /// decides. So of two activations with the same `expected`, only one
+    /// moves the pointer. A version or an `expected` above `i64::MAX` never
+    /// matches. The log row commits with the move. An activation of the
+    /// active version logs nothing.
     ///
     /// # Errors
     ///
@@ -240,12 +373,11 @@ mod pg {
     pub async fn activate_overlay(
         conn: &mut AsyncPgConnection,
         kind: &str,
-        version: u64,
-        expected: Option<u64>,
+        request: &MoveRequest<'_>,
     ) -> HarvestResult<ActivateOutcome> {
         use diesel_async::AsyncConnection;
 
-        let Ok(stored) = i64::try_from(version) else {
+        let Ok(stored) = i64::try_from(request.version) else {
             return Ok(ActivateOutcome::UnknownVersion);
         };
         Box::pin(conn.transaction(async |conn| {
@@ -254,11 +386,18 @@ mod pg {
             };
             let known = overlay_exists(conn, kind, stored).await?;
             let actual = head.active.map(to_version).transpose()?;
-            match decide_activate(known, expected, actual) {
+            let last_seq = match request.after_seq {
+                Some(_) => last_activation(conn, kind).await?.map(|row| row.seq),
+                None => None,
+            };
+            match request.decide(known, actual, last_seq) {
                 ActivateDecision::UnknownVersion => Ok(ActivateOutcome::UnknownVersion),
                 ActivateDecision::Conflict => Ok(ActivateOutcome::Conflict { actual }),
                 ActivateDecision::Activate => {
-                    set_overlay_pointer(conn, kind, stored, head.active).await?;
+                    if logs_activation(actual, request.version) {
+                        set_overlay_pointer(conn, kind, stored, head.active).await?;
+                        log_activation(conn, kind, head.active, stored, request).await?;
+                    }
                     Ok(ActivateOutcome::Activated)
                 }
             }
@@ -328,6 +467,81 @@ mod pg {
                 "the overlay pointer of {kind:?} moved under its lock"
             )))
         }
+    }
+
+    /// Add one move to the activation log of `kind`, under the lock of
+    /// [`lock_overlay_head`]. The lock makes the next `seq` safe.
+    async fn log_activation(
+        conn: &mut AsyncPgConnection,
+        kind: &str,
+        from: Option<i64>,
+        to: i64,
+        request: &MoveRequest<'_>,
+    ) -> HarvestResult<()> {
+        diesel::sql_query(
+            "INSERT INTO harvest_agent_overlay_activations
+                 (kind, seq, from_version, to_version, actor_kind, actor)
+             SELECT $1, COALESCE(MAX(seq), 0) + 1, $2, $3, $4, $5
+             FROM harvest_agent_overlay_activations WHERE kind = $1",
+        )
+        .bind::<Text, _>(kind)
+        .bind::<Nullable<BigInt>, _>(from)
+        .bind::<BigInt, _>(to)
+        .bind::<Text, _>(request.actor_kind)
+        .bind::<Text, _>(request.actor)
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+        Ok(())
+    }
+
+    #[derive(QueryableByName)]
+    struct Move {
+        #[diesel(sql_type = BigInt)]
+        seq: i64,
+        #[diesel(sql_type = Nullable<BigInt>)]
+        from_version: Option<i64>,
+        #[diesel(sql_type = BigInt)]
+        to_version: i64,
+        #[diesel(sql_type = Text)]
+        actor_kind: String,
+        #[diesel(sql_type = Text)]
+        actor: String,
+        #[diesel(sql_type = Timestamptz)]
+        activated_at: DateTime<Utc>,
+    }
+
+    /// The last move of the pointer of `kind`, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] when the query fails.
+    pub async fn last_activation(
+        conn: &mut AsyncPgConnection,
+        kind: &str,
+    ) -> HarvestResult<Option<ActivationRow>> {
+        let rows: Vec<Move> = diesel::sql_query(
+            "SELECT seq, from_version, to_version, actor_kind, actor, activated_at
+             FROM harvest_agent_overlay_activations
+             WHERE kind = $1 ORDER BY seq DESC LIMIT 1",
+        )
+        .bind::<Text, _>(kind)
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+        rows.into_iter()
+            .next()
+            .map(|row| {
+                Ok(ActivationRow {
+                    seq: to_version(row.seq)?,
+                    from: row.from_version.map(to_version).transpose()?,
+                    to: to_version(row.to_version)?,
+                    actor_kind: row.actor_kind,
+                    actor: row.actor,
+                    activated_at: row.activated_at,
+                })
+            })
+            .transpose()
     }
 
     /// The active version of `kind`, or `None`.
@@ -425,6 +639,57 @@ mod tests {
             decide_activate(false, None, None),
             ActivateDecision::UnknownVersion
         );
+    }
+
+    #[test]
+    fn only_a_move_logs_an_activation() {
+        assert!(logs_activation(None, 1));
+        assert!(logs_activation(Some(1), 2));
+        assert!(!logs_activation(Some(2), 2));
+    }
+
+    #[test]
+    fn a_rollback_swap_needs_the_move_that_it_read() {
+        use ActivateDecision::{Activate, Conflict, UnknownVersion};
+        assert_eq!(decide_rollback(true, 2, Some(2), 5, Some(5)), Activate);
+        assert_eq!(decide_rollback(true, 2, Some(2), 5, Some(7)), Conflict);
+        assert_eq!(decide_rollback(true, 2, Some(2), 5, None), Conflict);
+        assert_eq!(decide_rollback(true, 2, Some(3), 5, Some(5)), Conflict);
+        assert_eq!(
+            decide_rollback(false, 2, Some(2), 5, Some(5)),
+            UnknownVersion
+        );
+        let rollback = MoveRequest {
+            version: 1,
+            expected: Some(2),
+            actor_kind: AUTHOR_OPERATOR,
+            actor: "ops",
+            after_seq: Some(5),
+        };
+        assert_eq!(rollback.decide(true, Some(2), Some(6)), Conflict);
+        let plain = MoveRequest {
+            after_seq: None,
+            ..rollback
+        };
+        assert_eq!(plain.decide(true, Some(2), Some(6)), Activate);
+        let unguarded = MoveRequest {
+            expected: None,
+            ..rollback
+        };
+        assert_eq!(unguarded.decide(true, None, Some(5)), Conflict);
+        assert_eq!(unguarded.decide(false, None, Some(5)), UnknownVersion);
+    }
+
+    #[test]
+    fn a_rollback_reverses_the_last_move() {
+        assert_eq!(
+            rollback_target(Some(1), 2),
+            Some(RollbackPlan {
+                target: 1,
+                expected: 2
+            })
+        );
+        assert_eq!(rollback_target(None, 1), None);
     }
 
     #[test]

@@ -2650,6 +2650,10 @@ standalone note rather than part of the claim-path attribution table above:
   54.3% of its instructions in `payload_codec_profile`. The note also
   records the allocator and `preserve_order` alternatives measured for that
   issue.
+* [`docs/performance-encode-event-payload-move.md`](performance-encode-event-payload-move.md)
+  — `PayloadCodecs::encode_event_owned` moves each payload tree into the
+  stored value, and `encode_event` clones instead of a serde copy (issue
+  #2499). `payload_codec_profile` drops 19.4% of its instructions.
 * [`docs/performance-parent-close-cascade-unfinished-handlers.md`](performance-parent-close-cascade-unfinished-handlers.md)
   — the per-child `harvest_events` N+1 in
   `check_and_report_unfinished_handlers`'s parent-close-cascade callers,

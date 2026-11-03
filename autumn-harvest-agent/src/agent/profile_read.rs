@@ -312,9 +312,15 @@ mod tests {
         )
         .await
         .unwrap();
-        crate::ProfileOverlayStore::activate(&store, "support", version, None)
-            .await
-            .unwrap();
+        crate::ProfileOverlayStore::activate(
+            &store,
+            "support",
+            version,
+            None,
+            crate::Provenance::operator("ops"),
+        )
+        .await
+        .unwrap();
         AgentHarness::new(std::sync::Arc::new(NoModel))
             .agent(current)
             .overlay_store(std::sync::Arc::new(store))

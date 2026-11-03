@@ -79,6 +79,17 @@ pub const OP_AGENT_SAMPLING_POLICY_SET: &str = "agent.sampling_policy.set";
 /// Audit operation: Reset the sampling policy of an agent kind to every
 /// default (issue #2439).
 pub const OP_AGENT_SAMPLING_POLICY_RESET: &str = "agent.sampling_policy.reset";
+/// Audit operation: Activated an agent profile overlay version (issue
+/// #2374).
+///
+/// The target id is the agent kind. A succeeded row keeps `from v1 to v2` in
+/// `error_summary`, so the export ships both ends of the move.
+pub const OP_AGENT_PROFILE_ACTIVATE: &str = "agent_profile.activate";
+/// Audit operation: Rolled an agent profile overlay back to the version
+/// that was active before the current one (issue #2374).
+///
+/// The row has the same form as [`OP_AGENT_PROFILE_ACTIVATE`].
+pub const OP_AGENT_PROFILE_ROLLBACK: &str = "agent_profile.rollback";
 /// Audit operation: Created a new workflow schedule.
 pub const OP_SCHEDULE_CREATE: &str = "schedule.create";
 /// Audit operation: Edited an existing workflow schedule in place (issue #771).
@@ -320,6 +331,8 @@ pub const TARGET_ROUTE: &str = "route";
 pub const TARGET_WORKFLOW_TYPE: &str = "workflow_type";
 /// Audit target type: an agent kind (issue #2439).
 pub const TARGET_AGENT_KIND: &str = "agent_kind";
+/// Audit target type: the overlay pointer of one agent kind (issue #2374).
+pub const TARGET_AGENT_PROFILE: &str = "agent_profile";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 
@@ -576,6 +589,17 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "DELETE /admin/agents/{kind}/sampling-policy",
         RouteClass::Mutating,
     ),
+    // Agent profile overlays (issue #2374). The writes are not admin-only,
+    // so the `harvest-operator` role reaches them.
+    ("GET /agents/{kind}/profile", RouteClass::ReadOnly),
+    ("GET /agents/{kind}/profile/versions", RouteClass::ReadOnly),
+    (
+        "GET /agents/{kind}/profile/versions/{version}",
+        RouteClass::ReadOnly,
+    ),
+    ("GET /agents/{kind}/profile/diff", RouteClass::ReadOnly),
+    ("POST /agents/{kind}/profile/activate", RouteClass::Mutating),
+    ("POST /agents/{kind}/profile/rollback", RouteClass::Mutating),
     ("GET /admin/history/exports", RouteClass::ReadOnly),
     ("GET /admin/history/export-sample", RouteClass::ReadOnly),
     ("GET /admin/external-handoffs", RouteClass::ReadOnly),
@@ -961,6 +985,8 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_WORKFLOW_TYPE_RUN_DEFAULTS,
     OP_AGENT_SAMPLING_POLICY_SET,
     OP_AGENT_SAMPLING_POLICY_RESET,
+    OP_AGENT_PROFILE_ACTIVATE,
+    OP_AGENT_PROFILE_ROLLBACK,
     OP_SCHEDULE_CREATE,
     OP_SCHEDULE_UPDATE,
     OP_SCHEDULE_PAUSE,
@@ -1336,6 +1362,19 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     (
         "DELETE /admin/agents/{kind}/sampling-policy",
         Some(OP_AGENT_SAMPLING_POLICY_RESET),
+    ),
+    // Agent profile overlays (issue #2374).
+    ("GET /agents/{kind}/profile", None),
+    ("GET /agents/{kind}/profile/versions", None),
+    ("GET /agents/{kind}/profile/versions/{version}", None),
+    ("GET /agents/{kind}/profile/diff", None),
+    (
+        "POST /agents/{kind}/profile/activate",
+        Some(OP_AGENT_PROFILE_ACTIVATE),
+    ),
+    (
+        "POST /agents/{kind}/profile/rollback",
+        Some(OP_AGENT_PROFILE_ROLLBACK),
     ),
     ("GET /admin/history/exports", None),
     ("GET /admin/history/export-sample", None),
