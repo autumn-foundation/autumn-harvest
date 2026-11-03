@@ -983,12 +983,12 @@ whole run from files. Its prompt holds only the short pointer in
 ```rust,ignore
 use autumn_harvest_agent::eval::evidence::{EvidenceWorkspace, read_bundle, write_bundle};
 
-let workspace = EvidenceWorkspace::new(store.clone(), "evidence:run-7")
-    .seed(42)
+let workspace = EvidenceWorkspace::new(store.clone(), "evidence:run-7", random_seed)
     .hide("fast-model")
     .hide(version_id);
-let manifest = write_bundle(&workspace, &history, &[first, second], &current).await?;
-let bundle = read_bundle(&store, &manifest).await?;
+let written = write_bundle(&workspace, &history, &[first, second], &current).await?;
+let evidence = Evidence::Bundle(written.manifest.clone());
+let bundle = read_bundle(&store, &written.manifest).await?;
 ```
 
 | File | Content |
@@ -1002,23 +1002,33 @@ let bundle = read_bundle(&store, &manifest).await?;
 | `MISSION.md` | A short pointer to the other files. |
 
 - A Markdown file over the part cap (`DEFAULT_PART_BYTES`, 256 KiB) splits
-  into `<stem>.part-001.md` and on. The parts joined in order equal the
-  single text. Nothing is cut. `formal/verus/src/evidence_parts.rs`
-  proves it.
+  into `<stem>.part-001.md` and on. A part ends at a line outside a fence
+  when its window allows it. The parts joined in order equal the single
+  text. Nothing is cut. `formal/verus/src/evidence_parts.rs` proves it.
 - The writer saves the bundle with one put. A put that stops before its
   rename leaves no key, so no reader sees a partial bundle.
-- An erased source gives `EvidenceError::Erased`.
-- `read_bundle` returns the files and the flow labels. A run that reads
-  the bundle must start with those labels, as `AgentTask::flow_labels`
-  does for a transcript.
+- An erased source gives `EvidenceError::Erased`. Decode payload-store
+  references and encrypted payloads first, or the writer refuses them.
+- `read_bundle` returns the files and the flow labels. Start a run that
+  reads the bundle with those labels, as `AgentTask::flow_labels` does
+  for a transcript.
 - Each candidate has an anonymous id `c-<hex>` from `eval::anon`. The
   hex derives from the seed, the source run id and the overlay digest.
-  The files list the candidates in id order, so the input order does not
-  show. Only `BundleManifest::candidates` maps an id to its evaluation.
-- The writer masks each candidate overlay digest and each `hide` name in
-  the Markdown files. It then checks every file and refuses a leak with
-  `EvidenceError::Leak`. `overlay/current.json` goes in as it is, so it
-  can name its own model. A candidate digest in it is a leak.
+  Use a random seed for each bundle. The files and the manifest list the
+  candidates in id order, so the input order does not show.
+- `WrittenBundle::candidates` maps each id to its evaluation. Keep it
+  from the editor. The manifest holds the ids only.
+- An `Evaluation` names no model, so pass each candidate model name and
+  overlay version id to `hide`. The writer masks them, their JSON-escaped
+  form and each candidate digest in the Markdown files. It then checks
+  each Markdown file, `MISSION.md` and `flow_labels.json`, and refuses a
+  leak with `EvidenceError::Leak`. `overlay/current.json` goes in as it
+  is, so it can name its own model. A candidate digest in it is a leak.
+- Each recorded text sits in a fence that it cannot close. Each recorded
+  name is a JSON string in a code span. So recorded data cannot forge a
+  heading of the bundle.
+- The bundle copies payloads of the source run. When you erase the
+  source, erase the bundle scope with `WorkspaceStore::erase` too.
 - `Evidence::Bundle(manifest)` passes a bundle to a proposer. Its
   `render` is the text of `MISSION.md`. `ModelProposer` has no workspace,
   so it refuses a bundle as a `Config` error.

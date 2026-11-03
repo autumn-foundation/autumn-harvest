@@ -48,20 +48,10 @@ pub struct BundleFile {
     pub bytes: u64,
 }
 
-/// One candidate of a bundle.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BundleCandidate {
-    /// The anonymous id, as in `c-1a2b3c4d5e6f`. The file names use it.
-    pub id: String,
-    /// The place of the candidate in the evaluations that the writer got.
-    /// An index names no model and no overlay.
-    pub index: usize,
-}
-
-/// What `write_bundle` wrote.
+/// What `write_bundle` wrote. A reader of the bundle can see it.
 ///
-/// The manifest is the only place that maps an id to a candidate. No file
-/// of the bundle holds that map.
+/// It names each candidate by its anonymous id only. The map from an id to
+/// its evaluation stays with the caller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BundleManifest {
     /// The workspace scope of the snapshot.
@@ -70,8 +60,8 @@ pub struct BundleManifest {
     pub head: WorkspaceRef,
     /// Every file of the snapshot, in path order.
     pub files: Vec<BundleFile>,
-    /// The candidates, in id order.
-    pub candidates: Vec<BundleCandidate>,
+    /// The anonymous id of each candidate, in id order.
+    pub candidates: Vec<String>,
     /// The flow labels of the source run. `flow_labels.json` holds them too.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub flow_labels: BTreeSet<String>,
@@ -101,11 +91,11 @@ impl BundleManifest {
     }
 }
 
-/// The text of `MISSION.md` for `files` and `candidates`.
+/// The text of `MISSION.md` for `files` and the candidate ids `candidates`.
 ///
 /// It names each file of `files` once, and no model, overlay or order of
 /// the evaluations.
-pub(crate) fn mission_text(files: &[BundleFile], candidates: &[BundleCandidate]) -> String {
+pub(crate) fn mission_text(files: &[BundleFile], candidates: &[String]) -> String {
     let mut out = format!(
         "# Mission\n\n\
          Edit the overlay in `{OVERLAY_PATH}`.\n\n\
@@ -122,8 +112,7 @@ pub(crate) fn mission_text(files: &[BundleFile], candidates: &[BundleCandidate])
     if candidates.is_empty() {
         out.push_str("None.\n");
     }
-    for candidate in candidates {
-        let id = &candidate.id;
+    for id in candidates {
         let _ = writeln!(
             out,
             "- `{id}`: {} is its run. {} compares each turn with the source run.",
@@ -134,15 +123,25 @@ pub(crate) fn mission_text(files: &[BundleFile], candidates: &[BundleCandidate])
     out
 }
 
+/// The most parts of one file that `MISSION.md` names one by one. A file
+/// with more parts gets its first part, its last part and its count, so the
+/// pointer stays short.
+const LISTED_PARTS: usize = 3;
+
 /// The paths of the file `stem` in `files`, in part order, each in
 /// backticks.
 fn listed(files: &[BundleFile], stem: &str) -> String {
     let whole = format!("{stem}.md");
     let part = format!("{stem}{PART_INFIX}");
-    files
+    let paths: Vec<String> = files
         .iter()
         .filter(|file| file.path == whole || file.path.starts_with(&part))
         .map(|file| format!("`{}`", file.path))
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect();
+    match paths.as_slice() {
+        [first, .., last] if paths.len() > LISTED_PARTS => {
+            format!("{first} to {last} ({} parts)", paths.len())
+        }
+        _ => paths.join(", "),
+    }
 }

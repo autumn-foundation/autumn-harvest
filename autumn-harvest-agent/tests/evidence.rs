@@ -15,8 +15,8 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest_agent::eval::evidence::{
     DEFAULT_PART_BYTES, EvidenceError, EvidenceWorkspace, LABELS_PATH, MASK, MISSION_PATH,
-    OVERLAY_PATH, PART_INFIX, SOURCE_STEM, TASK_PATH, read_bundle, render_source, source_labels,
-    write_bundle,
+    OVERLAY_PATH, PART_INFIX, SOURCE_STEM, TASK_PATH, WrittenBundle, read_bundle, render_source,
+    source_labels, write_bundle,
 };
 use autumn_harvest_agent::eval::{Candidate, Evaluation, evaluate};
 use autumn_harvest_agent::flow::labels;
@@ -122,8 +122,15 @@ const VERSION_ID: &str = "ov-version-0042";
 /// Two evaluations of `source`: `FAST` repeats the source and names
 /// itself, and `SLOW` answers at once.
 async fn two_evaluations(source: &[WorkflowEvent]) -> [Evaluation; 2] {
-    let fast = ScriptedModel::new(lookup_then(&format!("I am {FAST}. done")));
-    let slow = ScriptedModel::new(vec![answer(&format!("{SLOW} says no"), 5)]);
+    // Each candidate names a hidden identity in its own text: a model name,
+    // the overlay version id and the overlay digest of the other candidate.
+    let fast_digest = ProfileOverlay {
+        model: Some(FAST.to_owned()),
+        ..ProfileOverlay::default()
+    }
+    .digest();
+    let fast = ScriptedModel::new(lookup_then(&format!("I am {FAST}, {VERSION_ID}. done")));
+    let slow = ScriptedModel::new(vec![answer(&format!("{SLOW} beats {fast_digest}"), 5)]);
     let recorder = Arc::new(Recorder::default());
     let harness = Arc::new(
         AgentHarness::new(ScriptedModel::new(Vec::new()))
@@ -143,6 +150,7 @@ async fn two_evaluations(source: &[WorkflowEvent]) -> [Evaluation; 2] {
     .await
     .unwrap();
     assert_ne!(a.overlay_digest, b.overlay_digest);
+    assert_eq!(a.overlay_digest, fast_digest);
     [a, b]
 }
 
@@ -203,12 +211,13 @@ async fn a_long_source_splits_into_parts_that_join_to_the_single_render() {
     assert!(single.contains(&big), "the render cuts nothing");
 
     let (_, store) = counting_store();
-    let workspace = EvidenceWorkspace::new(store.clone(), "evidence:long");
-    let manifest = write_bundle(&workspace, &source, &[], &current_overlay())
+    let workspace = EvidenceWorkspace::new(store.clone(), "evidence:long", 1);
+    let written = write_bundle(&workspace, &source, &[], &current_overlay())
         .await
         .unwrap();
+    let manifest = &written.manifest;
 
-    let files = files_of(&store, &manifest).await;
+    let files = files_of(&store, manifest).await;
     assert!(
         !files.contains_key(&format!("{SOURCE_STEM}.md")),
         "a long source has no single file"
@@ -236,13 +245,14 @@ async fn the_manifest_lists_every_file_and_each_file_exists() {
     let source = one_lookup().await;
     let [a, b] = two_evaluations(&source).await;
     let (_, store) = counting_store();
-    let workspace = EvidenceWorkspace::new(store.clone(), "evidence:layout").seed(7);
+    let workspace = EvidenceWorkspace::new(store.clone(), "evidence:layout", 7);
     let overlay = current_overlay();
-    let manifest = write_bundle(&workspace, &source, &[a, b], &overlay)
+    let written = write_bundle(&workspace, &source, &[a, b], &overlay)
         .await
         .unwrap();
+    let manifest = &written.manifest;
 
-    let files = files_of(&store, &manifest).await;
+    let files = files_of(&store, manifest).await;
     let listed: BTreeMap<String, u64> = manifest
         .files
         .iter()
@@ -256,10 +266,16 @@ async fn the_manifest_lists_every_file_and_each_file_exists() {
     assert_eq!(manifest.files.len(), listed.len(), "no path repeats");
     assert_eq!(manifest.head.files as usize, files.len());
 
-    assert_eq!(manifest.candidates.len(), 2);
-    let ids: BTreeSet<&str> = manifest.candidates.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(written.candidates.len(), 2);
+    let ids: BTreeSet<&str> = written.candidates.iter().map(|c| c.id.as_str()).collect();
     assert_eq!(ids.len(), 2, "no id repeats");
-    let indexes: BTreeSet<usize> = manifest.candidates.iter().map(|c| c.index).collect();
+    let listed_ids: BTreeSet<&str> = manifest.candidates.iter().map(String::as_str).collect();
+    assert_eq!(listed_ids, ids, "the manifest lists each id and no index");
+    assert!(
+        !serde_json::to_string(manifest).unwrap().contains("index"),
+        "the manifest holds no map"
+    );
+    let indexes: BTreeSet<usize> = written.candidates.iter().map(|c| c.index).collect();
     assert_eq!(indexes, BTreeSet::from([0, 1]));
     let mut want = vec![
         TASK_PATH.to_owned(),
@@ -302,7 +318,7 @@ async fn an_erased_source_is_refused_with_erased() {
         }
     }
     let (blobs, store) = counting_store();
-    let workspace = EvidenceWorkspace::new(store, "evidence:erased");
+    let workspace = EvidenceWorkspace::new(store, "evidence:erased", 1);
 
     let result = write_bundle(&workspace, &source, &[], &current_overlay()).await;
 
@@ -334,11 +350,12 @@ async fn a_labelled_source_reads_back_with_its_labels() {
     assert!(source_report.flow_labels.contains(labels::UNTRUSTED_INPUT));
 
     let (_, store) = counting_store();
-    let workspace = EvidenceWorkspace::new(store.clone(), "evidence:labels");
-    let manifest = write_bundle(&workspace, &source, &[], &current_overlay())
+    let workspace = EvidenceWorkspace::new(store.clone(), "evidence:labels", 1);
+    let written = write_bundle(&workspace, &source, &[], &current_overlay())
         .await
         .unwrap();
-    let bundle = read_bundle(&store, &manifest).await.unwrap();
+    let manifest = &written.manifest;
+    let bundle = read_bundle(&store, manifest).await.unwrap();
 
     assert!(
         bundle.flow_labels.is_superset(&source_report.flow_labels),
@@ -359,12 +376,11 @@ async fn no_file_names_a_candidate_model_or_overlay_id() {
     let [a, b] = two_evaluations(&source).await;
     let digests = [a.overlay_digest.clone(), b.overlay_digest.clone()];
     let (_, store) = counting_store();
-    let workspace = EvidenceWorkspace::new(store.clone(), "evidence:anon")
-        .seed(3)
+    let workspace = EvidenceWorkspace::new(store.clone(), "evidence:anon", 3)
         .hide(FAST)
         .hide(SLOW)
         .hide(VERSION_ID);
-    let manifest = write_bundle(
+    let written = write_bundle(
         &workspace,
         &source,
         &[a.clone(), b.clone()],
@@ -372,20 +388,20 @@ async fn no_file_names_a_candidate_model_or_overlay_id() {
     )
     .await
     .unwrap();
+    let manifest = &written.manifest;
 
-    let files = files_of(&store, &manifest).await;
+    let evaluations = serde_json::to_string(&[&a, &b]).unwrap();
+    for planted in [FAST, SLOW, VERSION_ID, digests[0].as_str()] {
+        assert!(evaluations.contains(planted), "the input names {planted}");
+    }
+    let files = files_of(&store, manifest).await;
     let needles = [FAST, SLOW, VERSION_ID, &digests[0], &digests[1]];
     for (path, text) in &files {
         for needle in needles {
             assert!(!text.contains(needle), "{path} names {needle}");
         }
     }
-    let a_id = &manifest
-        .candidates
-        .iter()
-        .find(|c| c.index == 0)
-        .unwrap()
-        .id;
+    let a_id = &written.candidates.iter().find(|c| c.index == 0).unwrap().id;
     assert!(
         files[&format!("rollouts/{a_id}.md")].contains(MASK),
         "the self-naming text is masked"
@@ -393,16 +409,21 @@ async fn no_file_names_a_candidate_model_or_overlay_id() {
 
     // The input order does not show: [b, a] gives the same files.
     let (_, other_store) = counting_store();
-    let swapped = EvidenceWorkspace::new(other_store.clone(), "evidence:anon")
-        .seed(3)
+    let swapped = EvidenceWorkspace::new(other_store.clone(), "evidence:anon", 3)
         .hide(FAST)
         .hide(SLOW)
         .hide(VERSION_ID);
-    let again = write_bundle(&swapped, &source, &[b, a], &current_overlay())
+    let again_written = write_bundle(&swapped, &source, &[b, a], &current_overlay())
         .await
         .unwrap();
-    assert_eq!(files_of(&other_store, &again).await, files);
-    let a_again = &again.candidates.iter().find(|c| c.index == 1).unwrap().id;
+    let again = &again_written.manifest;
+    assert_eq!(files_of(&other_store, again).await, files);
+    let a_again = &again_written
+        .candidates
+        .iter()
+        .find(|c| c.index == 1)
+        .unwrap()
+        .id;
     assert_eq!(a_again, a_id, "a keeps its id");
     assert_eq!(again.head.digest, manifest.head.digest);
 }
@@ -416,7 +437,7 @@ async fn a_hidden_digest_in_the_current_overlay_is_a_leak() {
         ..ProfileOverlay::default()
     };
     let (blobs, store) = counting_store();
-    let workspace = EvidenceWorkspace::new(store, "evidence:leak");
+    let workspace = EvidenceWorkspace::new(store, "evidence:leak", 1);
 
     let result = write_bundle(&workspace, &source, &[a, b], &overlay).await;
 
@@ -432,13 +453,14 @@ async fn the_bundle_is_one_put() {
     let source = one_lookup().await;
     let [a, b] = two_evaluations(&source).await;
     let (blobs, store) = counting_store();
-    let workspace = EvidenceWorkspace::new(store.clone(), "evidence:one-put")
+    let workspace = EvidenceWorkspace::new(store.clone(), "evidence:one-put", 1)
         .generation(4)
         .part_bytes(64);
 
-    let manifest = write_bundle(&workspace, &source, &[a, b], &current_overlay())
+    let written = write_bundle(&workspace, &source, &[a, b], &current_overlay())
         .await
         .unwrap();
+    let manifest = &written.manifest;
 
     assert_eq!(blobs.puts(), 1, "one put writes the whole bundle");
     assert_eq!(manifest.head.generation, 4);
@@ -450,4 +472,79 @@ async fn the_bundle_is_one_put() {
         store.blobs().list("evidence:one-put").await.unwrap(),
         vec![manifest.head.key()]
     );
+    // The manifest of a bundle in parts lists each stored part.
+    let files = files_of(&store, manifest).await;
+    let listed: BTreeMap<String, u64> = manifest
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), file.bytes))
+        .collect();
+    let stored: BTreeMap<String, u64> = files
+        .iter()
+        .map(|(path, text)| (path.clone(), text.len() as u64))
+        .collect();
+    assert_eq!(listed, stored);
+    assert!(files.contains_key("task.md"), "a short task stays one file");
+    assert!(files.contains_key("rollouts/source.part-001.md"));
+    // A file in many parts names its first part, its last part and the
+    // count, so the pointer stays short.
+    let mission = &files[MISSION_PATH];
+    let source_parts: Vec<&String> = files
+        .keys()
+        .filter(|path| path.starts_with("rollouts/source.part-"))
+        .collect();
+    assert!(source_parts.len() > 3, "{}", source_parts.len());
+    assert!(mission.contains(source_parts[0].as_str()));
+    assert!(mission.contains(source_parts.last().unwrap().as_str()));
+    assert!(mission.contains(&format!("({} parts)", source_parts.len())));
+    assert!(!mission.contains(source_parts[1].as_str()), "{mission}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_candidates_with_one_overlay_get_two_ids_in_any_order() {
+    let source = one_lookup().await;
+    let recorder = Arc::new(Recorder::default());
+    let evaluation =
+        |text: &'static str| {
+            let harness = AgentHarness::new(ScriptedModel::new(lookup_then(text)))
+                .tool(recorded_tool("lookup", ToolEffect::ReadOnly, &recorder));
+            let source = source.clone();
+            async move { evaluate(&source, &Candidate::new(harness)).await.unwrap() }
+        };
+    let a = evaluation("first").await;
+    let b = evaluation("second").await;
+    assert_eq!(a.overlay_digest, b.overlay_digest, "one overlay");
+
+    let write = |evaluations: Vec<Evaluation>| {
+        let source = source.clone();
+        async move {
+            let (_, store) = counting_store();
+            let workspace = EvidenceWorkspace::new(store.clone(), "evidence:twins", 5);
+            let written = write_bundle(&workspace, &source, &evaluations, &current_overlay())
+                .await
+                .unwrap();
+            let files = files_of(&store, &written.manifest).await;
+            (written, files)
+        }
+    };
+    let (forward, forward_files) = write(vec![a.clone(), b.clone()]).await;
+    let (backward, backward_files) = write(vec![b, a]).await;
+
+    let ids: BTreeSet<&str> = forward.candidates.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids.len(), 2, "no id repeats");
+    assert_eq!(
+        forward_files, backward_files,
+        "the input order does not show"
+    );
+    let id_of = |written: &WrittenBundle, index| {
+        written
+            .candidates
+            .iter()
+            .find(|c| c.index == index)
+            .unwrap()
+            .id
+            .clone()
+    };
+    assert_eq!(id_of(&forward, 0), id_of(&backward, 1));
+    assert!(forward_files[&format!("rollouts/{}.md", id_of(&forward, 0))].contains("first"));
 }

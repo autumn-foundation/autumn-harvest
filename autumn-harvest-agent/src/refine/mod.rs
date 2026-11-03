@@ -11,7 +11,7 @@ pub mod model_proposer;
 pub mod prompts;
 pub mod propose;
 
-pub use bundle::{BundleCandidate, BundleFile, BundleManifest};
+pub use bundle::{BundleFile, BundleManifest};
 pub use model_proposer::{
     DEFAULT_PROPOSER_OUTPUT_TOKENS, KEEP_BASE, ModelProposer, OUTPUT_CONTRACT,
 };

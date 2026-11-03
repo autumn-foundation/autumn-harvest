@@ -558,7 +558,7 @@ pub(crate) mod sync_log {
     }
 
     /// Remove and return the calls on a path below `root`.
-    pub(super) fn take_below(root: &Path) -> Vec<Call> {
+    pub fn take_below(root: &Path) -> Vec<Call> {
         let mut log = LOG.lock().unwrap_or_else(PoisonError::into_inner);
         let (taken, kept) = log.drain(..).partition(|(_, p)| p.starts_with(root));
         *log = kept;
