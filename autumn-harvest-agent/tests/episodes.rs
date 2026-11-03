@@ -569,6 +569,42 @@ async fn a_pass_runs_on_the_model_that_the_operator_names() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_pass_never_runs_on_a_model_that_the_mandate_forbids() {
+    let (_dir, db) = fresh_db();
+    let episodes = Arc::new(InMemoryEpisodeStore::default());
+    seed(episodes.as_ref(), &[episode("e1", "ada likes tea", &[])]).await;
+    let cheap = model(two_facts);
+    let strong = model(two_facts);
+    let mandate = autumn_harvest_agent::Mandate::new("desk").models(["cheap"]);
+    let harness = AgentHarness::new(cheap.clone())
+        .model_named("cheap", cheap.clone())
+        .model_named("strong", strong.clone())
+        .memory(Arc::new(InMemoryMemoryStore::new()))
+        .episodes(episodes.clone())
+        .agent(
+            profile(Some(EpisodeSettings::default().model("strong")))
+                .model("cheap")
+                .mandate(mandate),
+        );
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::consolidate(&mut rt, &agent()).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    let report = report_of(&rt, exec).unwrap();
+    assert_eq!(report.stop, ConsolidationStop::Disabled);
+    assert!(
+        report
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("mandate")),
+        "{:?}",
+        report.reason
+    );
+    assert_eq!(strong.requests().len(), 0, "no call to a forbidden model");
+    let log = episodes.load(&episode_scope()).await.unwrap();
+    assert_eq!(log.pending(10).len(), 1, "the episode waits");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_fact_from_a_labelled_episode_carries_its_labels() {
     let (_dir, db) = fresh_db();
     let episodes = Arc::new(InMemoryEpisodeStore::default());

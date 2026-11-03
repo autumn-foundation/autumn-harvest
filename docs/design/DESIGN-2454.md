@@ -53,6 +53,7 @@ Options for each open question. The chosen option is in bold.
 | An unattended tick plants facts that an attended op reads. | Only a segment that may write memory appends an episode, as for progress notes (#2453). |
 | The episode log grows without a bound. | `max_episodes` bounds it. The next pass reports each unconsolidated episode that an eviction dropped. |
 | A spent budget still pays for a pass. | The turn checks the LLM budget before the model call. A refusal ends the pass as `budget_exceeded`, with no write. |
+| A pass runs on a model that the mandate of the agent forbids. | The read checks the pass model against the profile mandate, as each op does. A forbidden model disables the pass before any model call. |
 | Pass tokens are not billed. | The turn records one cost ledger call. The ledger keys it under the pass run. |
 | A reply names an unknown episode id. | Unknown ids drop. A fact with no known id is rejected and counted. |
 | A reply that does not parse marks every episode consolidated, so the episodes are lost. | Such a reply ends the pass as `invalid_reply`. It marks nothing. The next pass reads the same episodes. |
@@ -169,7 +170,7 @@ The tests are in `autumn-harvest-agent/tests/episodes.rs` unless noted.
 | The pass tokens are in the ledger under the pass run | `the_pass_tokens_are_in_the_ledger_under_its_run` |
 | Erase removes episodes and facts, with matching counts | `a_memory_reset_removes_episodes_and_facts_and_counts_them`; `the_report_counts_the_erased_episodes_and_facts` in `autumn-harvest-cli/src/agents.rs`; `erase_also_erases_each_scheduled_pass_of_the_agent` in `autumn-harvest-cli/tests/integration/agents_cli.rs` |
 | `max_episodes = 2`: a third episode evicts the oldest, and the next pass counts it | `a_third_episode_evicts_the_oldest_and_the_next_pass_counts_it` |
-| The operator picks the pass model | `a_pass_runs_on_the_model_that_the_operator_names` |
+| The operator picks the pass model | `a_pass_runs_on_the_model_that_the_operator_names`, `a_pass_never_runs_on_a_model_that_the_mandate_forbids` |
 | Review fixes | `a_pass_across_a_reset_writes_no_fact`, `a_required_reset_with_no_store_fails` (unit, `consolidate.rs`); `a_mark_of_an_older_generation_changes_nothing`, `a_read_episode_evicted_during_the_pass_is_not_dropped` (unit, `episode.rs`); `a_failed_child_pass_waits_for_more_episodes_and_fails_the_op`, `episodes_with_no_episode_store_fail_the_op_with_a_named_error` |
 
 `formal/verus/src/agent_episodes.rs` proves the eviction and trigger

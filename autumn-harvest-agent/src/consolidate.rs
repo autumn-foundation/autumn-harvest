@@ -85,7 +85,8 @@ pub enum ConsolidationStop {
     BudgetExceeded,
     /// The reply did not parse. The episodes wait for the next pass.
     InvalidReply,
-    /// The kind keeps no episodes, or it has no store memory.
+    /// The kind keeps no episodes or no store memory, or its mandate
+    /// forbids the pass model. No model call ran.
     Disabled,
     /// A memory reset cleared the episodes during the pass. The pass wrote
     /// no fact after the reset and marked nothing.
@@ -639,6 +640,17 @@ pub(crate) async fn read_pass(
             "episodes need AgentMemory::Store",
         ));
     };
+    // A pass runs for the agent, so it takes the model rule of its mandate,
+    // as each op does.
+    let model = settings.model.clone().or_else(|| profile.model.clone());
+    if let Some(mandate) = &profile.mandate
+        && !mandate.allows_model(model.as_deref())
+    {
+        return Ok(ConsolidateRead::disabled(format!(
+            "the mandate forbids the pass model {:?}",
+            model.as_deref().unwrap_or(crate::DEFAULT_MODEL)
+        )));
+    }
     let store = harness.episode_store()?;
     let scope = episode_scope(agent);
     let log = harness
@@ -648,9 +660,7 @@ pub(crate) async fn read_pass(
     let episodes = log.pending(limit);
     let mut read = ConsolidateRead::new(settings, memory_scope, scope, episodes, log.dropped());
     read.generation = log.generation();
-    if read.model.is_none() {
-        read.model = profile.model;
-    }
+    read.model = model;
     Ok(read)
 }
 

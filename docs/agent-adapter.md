@@ -1346,7 +1346,8 @@ let harness = AgentHarness::new(model)
 - **Bound.** The log keeps `max_episodes`. The oldest goes first. The next
   pass reports each unconsolidated episode that an eviction dropped.
 - **Pass.** The workflow `agent_consolidate` reads at most
-  `max_pass_episodes` unconsolidated episodes. It checks the LLM budget,
+  `max_pass_episodes` unconsolidated episodes. A model that the profile
+  mandate forbids disables the pass. It checks the LLM budget,
   calls the model once, and records one cost ledger call under the pass
   run. Each valid fact becomes one entry of `facts_block`:
   `<subject> <relation> <object> [episodes: <id>, ...]`.
