@@ -1163,8 +1163,8 @@ app must clear those stores itself.
 
 1. The agent gets `pause`, `reset_memory` and `reset_workspace`, then a
    delete. The pause holds new work and stops the ticks, so nothing writes
-   the stores after the resets. The resets clear a `MemoryStore` scope and
-   every workspace snapshot, with the scratch files of stopped puts. See
+   the stores after the resets. The resets clear a `MemoryStore` scope, the
+   episode scope and every workspace snapshot, with the scratch files of stopped puts. See
    "Scratch files" and "A save after a reset" below for the two windows
    that stay. An agent that ended gets a new run for them,
    through `POST /workflows/agent/signal-with-start` on the queue of its
@@ -1176,11 +1176,17 @@ app must clear those stores itself.
    `filter=workflow_name = 'agent' AND workflow_id = '<id>'`.
 4. It erases each run. The erasure tombstones the payloads of history, the
    entity state and its projection, and deletes the stream chunks and the
-   cost ledger rows. It cascades to each child run of a fan-out.
-5. The report sums each count over every run and child:
+   cost ledger rows. It cascades to each child run of a fan-out, and to
+   each child consolidation pass (issue #2454).
+5. It lists each consolidation pass that a schedule started, with
+   `filter=workflow_name = 'agent_consolidate' AND
+   attrs.agent_consolidation_of = '<id>'`, and erases each one that ended.
+   A pass that still runs is a failure in the report.
+6. The report sums each count over every run and child:
    `events_scrubbed`, `stream_chunks_deleted`, `ledger_rows_deleted`,
-   `entity_states_scrubbed` and the rest. It lists each skipped child and
-   each failure.
+   `entity_states_scrubbed` and the rest. `episodes_erased` and
+   `facts_erased` come from the final state. It lists each skipped child
+   and each failure.
 
 The spend of an erased run leaves the LLM budget and mesh budget sums.
 
