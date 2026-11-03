@@ -12,6 +12,13 @@
 #      touching only docs/** or **/*.md doesn't run the compile/test matrix. A job
 #      skipped via `if:` still reports success to branch protection, so this is safe
 #      for required status checks (unlike paths-ignore, which reports nothing).
+#   4. No release-PR rerun — pull_request runs target trunk-dev only. The
+#      release PR from trunk-dev into trunk has the trunk-dev tip as its head,
+#      and the push run on trunk-dev already tested that commit. Its check
+#      runs report on the release PR. release-pr.yml checks that the merge
+#      equals the head, and runs the two gates that diff against trunk. A
+#      push run on trunk-dev decides docs-only against trunk, so a cancelled
+#      run cannot leave code untested (see the `changes` job).
 name: CI
 
 on:
@@ -24,7 +31,9 @@ on:
     # triggers a fresh run; the GitHub default [opened, synchronize, reopened]
     # does not include it. The other three keep normal PR pushes triggering.
     types: [opened, synchronize, reopened, ready_for_review]
-    branches: [trunk, trunk-dev]
+    # Not trunk: the push run on trunk-dev covers the release PR. See item 4
+    # of the header.
+    branches: [trunk-dev]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -74,9 +83,25 @@ jobs:
           fi
           echo "Comparing ${base}...${head}"
           echo "base_sha=${base}" >> "$GITHUB_OUTPUT"
+          # A push to trunk-dev decides docs-only against trunk, the last
+          # release, not against the last push. A newer push cancels the run
+          # of an older one. A diff against a docs-only newer push would skip
+          # the tests, and the code of the older push would never run. The
+          # release PR gets no ci.yml run, so this push run is its backstop.
+          # `base_sha` above stays per push, for the issue #794 gate.
+          diff_base="$base"
+          if [ "${{ github.event_name }}" = "push" ] \
+            && [ "${{ github.ref }}" = "refs/heads/trunk-dev" ]; then
+            if git fetch --no-tags origin trunk; then
+              diff_base="$(git rev-parse FETCH_HEAD)"
+              echo "trunk-dev push: deciding docs-only against trunk (${diff_base})"
+            else
+              echo "::warning::could not fetch trunk; deciding docs-only against ${base}"
+            fi
+          fi
           # --no-renames disables rename detection so a code->docs move surfaces
           # the deleted source path (setting code=true) instead of a docs-only add.
-          changed="$(git diff --name-only --no-renames "$base" "$head")"
+          changed="$(git diff --name-only --no-renames "$diff_base" "$head")"
           echo "Changed files:"
           echo "$changed"
           # Docs-only = every changed path matches docs/** or **/*.md. If any
@@ -714,14 +739,10 @@ jobs:
           python3 docs/audits/openapi-response-coverage.py --self-test
           python3 docs/audits/openapi-response-coverage.py
 
-      # Comment hygiene. A PR ratchets against its merge base, or against
-      # the commit that added this gate if the merge base predates it. Only
-      # the release PR (trunk-dev into trunk) hits the second case, and only
-      # while trunk is older than the gate. Its merge base is then the last
-      # release. That counts the legacy debt from before the gate as new.
-      # The gate commit still checks the whole release cumulatively. That
-      # matters because a push run on trunk-dev can be cancelled, and two
-      # clean PRs can merge into a new finding.
+      # Comment hygiene. A PR ratchets against its merge base. A push
+      # ratchets against the commit before the push. release-pr.yml ratchets
+      # the whole release against trunk, because a push run on trunk-dev can
+      # be cancelled, and two clean PRs can merge into a new finding.
       - name: Comment hygiene (docs/audits/comment-hygiene.py)
         env:
           BASE_REF: ${{ github.base_ref }}
@@ -730,14 +751,7 @@ jobs:
           BEFORE="${{ github.event.before }}"
           if [ -n "$BASE_REF" ]; then
             git fetch --no-tags origin "$BASE_REF"
-            BASE=FETCH_HEAD
-            GATE=$(git log --diff-filter=A --format=%H -1 -- docs/audits/comment-hygiene.py)
-            MB=$(git merge-base FETCH_HEAD HEAD || true)
-            if [ -n "$GATE" ] && [ -n "$MB" ] \
-              && ! git merge-base --is-ancestor "$GATE" "$MB"; then
-              BASE="$GATE"
-            fi
-            python3 docs/audits/comment-hygiene.py --base "$BASE"
+            python3 docs/audits/comment-hygiene.py --base FETCH_HEAD
           elif [ -n "$BEFORE" ] \
             && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
             # The whole push, not just its last commit. `HEAD~1` would let a

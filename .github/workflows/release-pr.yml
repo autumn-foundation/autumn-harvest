@@ -1,0 +1,129 @@
+# Checks for the release PR from trunk-dev into trunk.
+#
+# ci.yml runs on each push to trunk-dev and on each pull request into
+# trunk-dev. It does not run on the release PR. The head of the release PR
+# is the trunk-dev tip, and the push run already ran the full matrix on that
+# commit. Its check runs sit on the head commit, so the release PR shows
+# them. A second full run on the release PR tested the same tree twice.
+#
+# This workflow keeps what that second run gave, at a small cost:
+#
+# - `merge-equals-head` fails when the merge into trunk differs from the
+#   head. Then trunk holds a change that trunk-dev lacks, for example a
+#   hotfix, and no run tested the merge. Merge trunk into trunk-dev first.
+# - `comment-hygiene` ratchets the whole release against trunk. A push run on
+#   trunk-dev ratchets one push only, and a newer push can cancel it. Two
+#   clean PRs can also merge into a new finding.
+# - `schema-acknowledgement` checks each change of the schema contract since
+#   trunk against its acknowledgement, for the same reason.
+#
+# `release_pr_ci` in the core integration tests guards this file.
+name: Release PR
+
+on:
+  pull_request:
+    # The default types do not include ready_for_review. Without it, a draft
+    # that becomes ready gets no run until its next push.
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [trunk]
+
+concurrency:
+  group: release-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  merge-equals-head:
+    name: Release PR merge equals head
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # The default ref of a pull_request run is the merge commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Compare the merge tree with the head tree
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          merged="$(git rev-parse 'HEAD^{tree}')"
+          head="$(git rev-parse "${HEAD_SHA}^{tree}")"
+          if [ "$merged" != "$head" ]; then
+            echo "::error::The merge into trunk differs from the trunk-dev head." \
+                 "The push run on trunk-dev did not test it. Merge trunk into" \
+                 "trunk-dev, then push."
+            git diff --stat "$HEAD_SHA" HEAD
+            exit 1
+          fi
+          echo "The merge into trunk equals the trunk-dev head (tree ${head})."
+
+  comment-hygiene:
+    name: Release PR comment hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event.pull_request.draft == false
+    steps:
+      # Full history: the ratchet diffs against the merge base with trunk.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # The ratchet counts against the merge base, or against the commit that
+      # added the gate if the merge base predates it. While trunk is older
+      # than the gate, the merge base is the last release. That would count
+      # the legacy debt from before the gate as new.
+      - name: Comment hygiene over the whole release (docs/audits/comment-hygiene.py)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          python3 docs/audits/comment-hygiene.py --self-test
+          git fetch --no-tags origin "$BASE_REF"
+          BASE=FETCH_HEAD
+          GATE=$(git log --diff-filter=A --format=%H -1 -- docs/audits/comment-hygiene.py)
+          MB=$(git merge-base FETCH_HEAD HEAD || true)
+          if [ -n "$GATE" ] && [ -n "$MB" ] \
+            && ! git merge-base --is-ancestor "$GATE" "$MB"; then
+            BASE="$GATE"
+          fi
+          python3 docs/audits/comment-hygiene.py --base "$BASE"
+
+  schema-acknowledgement:
+    name: Release PR schema acknowledgement
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Step 2 of the issue #794 gate in ci.yml, with the release base. The
+      # push run already checked that the artifact is current, so this step
+      # checks only that each change since trunk is acknowledged.
+      - name: Check schema acknowledgements since trunk (issue #794)
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          ARTIFACT: docs/workflow-schema-contract.json
+        run: |
+          set -euo pipefail
+          cargo run --quiet -p autumn-harvest --no-default-features --features schema \
+            --example schema_workflow -- --emit-contract > "${RUNNER_TEMP}/schema-current.json"
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          if git cat-file -e "${BASE_SHA}:${ARTIFACT}" 2>/dev/null; then
+            git show "${BASE_SHA}:${ARTIFACT}" > "${RUNNER_TEMP}/schema-base.json"
+            cargo run --quiet -p autumn-harvest-cli --bin harvest -- \
+              schema check --baseline "${RUNNER_TEMP}/schema-base.json" \
+                           --current "${RUNNER_TEMP}/schema-current.json" \
+                           --acknowledged-in "$ARTIFACT"
+          else
+            echo "no artifact at ${BASE_SHA}: first introduction, nothing to compare"
+          fi
