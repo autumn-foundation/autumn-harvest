@@ -45,10 +45,23 @@ fn leaked(prefix: &str) -> &'static str {
     Box::leak(format!("{prefix}_{}", Uuid::new_v4().simple()).into_boxed_str())
 }
 
-/// Install the globals that the completion-trigger path reads, and restore
-/// them on drop.
+type Metadata = Option<HashMap<String, WorkflowMetadata>>;
+type Ceiling = Option<Duration>;
+
+/// Install the globals that the completion-trigger path reads. The drop
+/// restores the earlier values, so a test never clears the state of another.
 struct Globals {
+    previous: (Metadata, Option<Arc<RunDefaultsCache>>, Ceiling, Ceiling),
     _turn: tokio::sync::MutexGuard<'static, ()>,
+}
+
+/// Replace the value behind a lock and return the old one. A poisoned lock
+/// still works, because the value is plain data.
+fn swap<T>(lock: &std::sync::RwLock<T>, value: T) -> T {
+    let mut guard = lock
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::mem::replace(&mut *guard, value)
 }
 
 impl Globals {
@@ -73,33 +86,33 @@ impl Globals {
             retry_policy: None,
             quota: None,
         };
-        *GLOBAL_WORKFLOW_METADATA.write().expect("metadata lock") =
-            Some(HashMap::from([(target.to_string(), metadata)]));
         let cache = Arc::new(RunDefaultsCache::new());
         if let Some(fields) = overrides {
             cache.write_through(target, fields);
         }
-        *GLOBAL_RUN_DEFAULTS.write().expect("cache lock") = Some(cache);
-        *GLOBAL_MAX_WORKFLOW_EXECUTION_TIMEOUT
-            .write()
-            .expect("ceiling lock") = ceilings.0;
-        *GLOBAL_MAX_WORKFLOW_CHAIN_TIMEOUT
-            .write()
-            .expect("ceiling lock") = ceilings.1;
-        Self { _turn: turn }
+        let previous = (
+            swap(
+                &GLOBAL_WORKFLOW_METADATA,
+                Some(HashMap::from([(target.to_string(), metadata)])),
+            ),
+            swap(&GLOBAL_RUN_DEFAULTS, Some(cache)),
+            swap(&GLOBAL_MAX_WORKFLOW_EXECUTION_TIMEOUT, ceilings.0),
+            swap(&GLOBAL_MAX_WORKFLOW_CHAIN_TIMEOUT, ceilings.1),
+        );
+        Self {
+            previous,
+            _turn: turn,
+        }
     }
 }
 
 impl Drop for Globals {
     fn drop(&mut self) {
-        *GLOBAL_WORKFLOW_METADATA.write().expect("metadata lock") = None;
-        *GLOBAL_RUN_DEFAULTS.write().expect("cache lock") = None;
-        *GLOBAL_MAX_WORKFLOW_EXECUTION_TIMEOUT
-            .write()
-            .expect("ceiling lock") = None;
-        *GLOBAL_MAX_WORKFLOW_CHAIN_TIMEOUT
-            .write()
-            .expect("ceiling lock") = None;
+        let (metadata, cache, execution, chain) = std::mem::take(&mut self.previous);
+        swap(&GLOBAL_WORKFLOW_METADATA, metadata);
+        swap(&GLOBAL_RUN_DEFAULTS, cache);
+        swap(&GLOBAL_MAX_WORKFLOW_EXECUTION_TIMEOUT, execution);
+        swap(&GLOBAL_MAX_WORKFLOW_CHAIN_TIMEOUT, chain);
     }
 }
 

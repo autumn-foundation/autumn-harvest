@@ -204,3 +204,44 @@ fn the_scan_covers_the_completion_trigger_and_update_stub() {
         assert!(!ALLOWED_FILES.contains(&file), "{file} must not be exempt");
     }
 }
+
+/// Each allowed line matches once, so a copy of it is not exempt.
+#[test]
+fn each_allowed_line_matches_exactly_once() {
+    let root = repo_root();
+    for (file, text) in ALLOWED_LINES {
+        let source = std::fs::read_to_string(root.join(file)).expect("read source");
+        let hits = unwrapped_reads(&source)
+            .iter()
+            .filter(|(_, line)| line == text)
+            .count();
+        assert_eq!(hits, 1, "{file}: `{text}` must match once");
+    }
+}
+
+/// Issue #2511: the three completion-trigger start sites resolve their run
+/// defaults through `target_run_defaults`, and each one passes the chain
+/// ceiling. A DB test covers two sites. This test also covers the immediate
+/// relay (`DeferredTriggerStart::spawn`).
+#[test]
+fn every_completion_trigger_start_site_resolves_the_run_defaults() {
+    let source =
+        std::fs::read_to_string(repo_root().join("autumn-harvest/src/completion_trigger.rs"))
+            .expect("read completion_trigger.rs");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("production part");
+    assert_eq!(
+        production.matches("= target_run_defaults(").count(),
+        3,
+        "evaluate, spawn and the outbox sweep each resolve the run defaults"
+    );
+    assert_eq!(
+        production
+            .matches("max_workflow_chain_timeout_ceiling: run_defaults")
+            .count(),
+        3,
+        "each site passes the fleet chain ceiling"
+    );
+}

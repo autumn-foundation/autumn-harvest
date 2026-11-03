@@ -864,6 +864,17 @@ impl HandlerRegistry {
         if let Ok(mut lock) = crate::completion_trigger::GLOBAL_RUN_DEFAULTS.write() {
             *lock = Some(Arc::clone(&run_defaults));
         }
+        // The fleet ceilings reset with the other mirrors, so a registry built
+        // without the setters never inherits the ceilings of an earlier one.
+        // The setters run after the constructor and write the real values.
+        if let Ok(mut lock) =
+            crate::completion_trigger::GLOBAL_MAX_WORKFLOW_EXECUTION_TIMEOUT.write()
+        {
+            *lock = None;
+        }
+        if let Ok(mut lock) = crate::completion_trigger::GLOBAL_MAX_WORKFLOW_CHAIN_TIMEOUT.write() {
+            *lock = None;
+        }
         let mut activities: HashMap<String, ActivityInfo> = activities
             .into_iter()
             .map(|a| (a.name.to_string(), a))

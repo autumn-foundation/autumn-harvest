@@ -626,7 +626,7 @@ pub static GLOBAL_MAX_WORKFLOW_EXECUTION_TIMEOUT: std::sync::RwLock<Option<std::
 pub static GLOBAL_MAX_WORKFLOW_CHAIN_TIMEOUT: std::sync::RwLock<Option<std::time::Duration>> =
     std::sync::RwLock::new(None);
 
-/// The declared run defaults of a target type.
+/// The declared values that an operator override can replace.
 #[cfg(feature = "db")]
 #[derive(Debug, Clone, Copy, Default)]
 struct TargetDeclared {
@@ -703,8 +703,9 @@ fn resolve_target_run_defaults(
 /// The run defaults of a target type, read from the process globals at
 /// start time (issue #2511).
 ///
-/// A deferred start reads them when it fires, so an operator change reaches
-/// it with no stored copy.
+/// This path has no registry handle, and the outbox row has no timeout
+/// column. So a deferred start reads the globals when it fires. An operator
+/// change then reaches it with no stored copy.
 #[cfg(feature = "db")]
 fn target_run_defaults(workflow_name: &str) -> TargetRunDefaults {
     let declared = GLOBAL_WORKFLOW_METADATA
@@ -1442,7 +1443,9 @@ impl DeferredTriggerStart {
             // Provenance ref is the triggering (source) execution id (#740).
             let source_exec_id_str = self.source_exec_id.to_string();
             // Issue #2511: the relay resolves the timeouts and the chain cap
-            // when it fires. The SLA keeps the value from evaluation time.
+            // when it fires. The SLA keeps the value from evaluation time,
+            // because this struct already carries it. The outbox sweep
+            // resolves the SLA again, because its row stores none.
             let run_defaults = target_run_defaults(&self.target_workflow_name);
             let params = crate::execution::StartWorkflowParams {
                 execution_timeout: run_defaults.execution_timeout,

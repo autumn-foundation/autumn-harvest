@@ -81,7 +81,8 @@ The start clamps still apply after the override:
   default, as before. A child run of such a type stays uncapped.
 - A completion-trigger target start and a typed `update_with_start` run take
   the same three values and the same ceilings. A deferred completion-trigger
-  start resolves them when it fires.
+  start resolves them when it fires. The immediate relay of a cross-shard
+  start keeps the SLA of evaluation time.
 - A per-start `sla_secs` or `execution_timeout_secs` in the start request
   still wins over both.
 

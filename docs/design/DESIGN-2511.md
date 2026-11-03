@@ -45,21 +45,21 @@ payload. Option 4 changes the evaluation signatures of many callers.
 
 | Way to break it | Guard |
 |---|---|
-| One of the three sites keeps the old behavior. | One function, `target_run_defaults`, serves all three. A unit test checks it. A second test reads the source and counts the calls. |
-| The override skips the fleet ceiling. | The function returns the ceilings, and the start applies them as the other paths do. A unit test sets an override above each ceiling. |
-| A process never loaded the cache. | `apply` returns the code value. A unit test checks it. |
-| The declared `execution_timeout` now applies to targets that had none. | This is the intended fix. Every other start path applies it. The changelog states it. |
-| A ceiling global stays at an old value after a rebuild. | The registry setters write the global each time, as for the attempts ceiling. |
-| The stub reads `Self::info().chain_execution_timeout` and the guard skips it. | The stub binds `info`. The guard also learns the `info()` receiver. A guard self-test checks both. |
-| The macro fix lands in one of the two `impl` arms. | Both arms splice one `method_defs` block. A compile test uses both arms. |
+| One of the three sites keeps the old behavior. | One function, `target_run_defaults`, serves all three. Unit tests check the resolver. DB tests cover the inline start and the sweep. A source test counts the three calls. |
+| The override skips the fleet ceiling. | The function returns the ceilings, and the start applies them as the other paths do. DB tests set an override above each ceiling. |
+| A process never loaded the cache. | The resolver returns the declared value when the cache is missing. A unit test checks it. |
+| The declared `execution_timeout` now applies to targets that had none. | This is the intended fix. Every other start path applies it. The changelog lists it under Behavior change. |
+| A ceiling global stays at an old value after a rebuild. | The registry setters write the global each time, as for the attempts ceiling. The constructor resets both mirrors. |
+| The stub reads `Self::info().chain_execution_timeout` and the guard skips it. | The stub binds `info`. The guard also learns the `info()` receiver. A guard self-test checks the `Self::info()` read. |
+| The macro fix lands in one of the two `impl` arms. | Both arms splice one `method_defs` block, so one fix reaches both. |
 
 ## Six thinking hats
 
 - **White (facts).** Three sites build the start params. Two ceilings and
-  two caches exist. No `WorkflowEvent` changes.
+  one cache exist. No `WorkflowEvent` changes.
 - **Red (feeling).** Operators expect one override to reach every start. A
   silent gap is the worst result.
-- **Black (risks).** A new global can race between tests. A target now gets
+- **Black (risks).** A new global can race between tests. The two setters are no longer `const fn`. A target now gets
   a hard timeout that it lacked. A process-wide ceiling differs per registry
   when a process builds two.
 - **Yellow (benefits).** No migration and no lock. A change reaches the next
@@ -83,7 +83,11 @@ payload. Option 4 changes the evaluation signatures of many callers.
 - `update.rs` binds `info`. It resolves the three values through
   `client.apply_run_defaults` and `client.apply_chain_run_default`. It passes
   the client chain ceiling.
-- The guard also finds a read through `info()`.
+- The guard also finds a read through `info()`. It allows one line, the
+  metadata copy in `worker.rs`, and a test checks that the line matches once.
+- The immediate relay keeps the SLA of evaluation time, because
+  `DeferredTriggerStart` carries it. The outbox sweep resolves the SLA when it
+  fires, because its row stores none.
 
 ## Acceptance criteria
 
