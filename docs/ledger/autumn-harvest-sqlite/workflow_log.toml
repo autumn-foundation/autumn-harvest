@@ -34,3 +34,10 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_workflow_logs"]
 measured = "unmeasured"
+
+["append_commands"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = []
+tables = ["harvest_workflow_logs"]
+measured = "unmeasured"
