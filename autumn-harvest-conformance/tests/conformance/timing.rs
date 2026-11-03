@@ -7,6 +7,7 @@
 //! The Postgres worker seeds the jitter from random ids. A guard therefore
 //! checks a sample of seeds, not one run.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use autumn_harvest::policy::{RetryPolicy, compute_retry_delay};
@@ -15,6 +16,26 @@ use crate::corpus;
 
 /// The number of seeds that each guard checks.
 const SEEDS: u64 = 1_000;
+
+/// The corpus source. Each `#[activity]` in it must be in the guard list.
+const CORPUS: &str = include_str!("corpus.rs");
+
+/// The function name after each `#[activity(...)]` attribute of the corpus.
+fn declared_activities() -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut lines = CORPUS.lines();
+    while let Some(line) = lines.next() {
+        if !line.trim_start().starts_with("#[activity(") {
+            continue;
+        }
+        let name = lines
+            .find_map(|l| l.split_once("fn ").map(|(_, rest)| rest))
+            .and_then(|rest| rest.split('(').next())
+            .expect("a function follows each `#[activity]` attribute");
+        names.insert(name.trim().to_owned());
+    }
+    names
+}
 
 /// Spread sample `i` over the whole `u64` range.
 const fn seed(i: u64) -> u64 {
@@ -32,11 +53,29 @@ fn base_delay(policy: &RetryPolicy, attempt: u32) -> Duration {
 }
 
 #[test]
+fn every_corpus_activity_is_in_the_guard_list() {
+    let listed: BTreeSet<String> = corpus::all_activities()
+        .iter()
+        .map(|info| info.name.to_owned())
+        .collect();
+    assert_eq!(
+        declared_activities(),
+        listed,
+        "`corpus::all_activities` must name each `#[activity]` of `corpus.rs`"
+    );
+}
+
+#[test]
 fn every_corpus_retry_waits_its_base_delay_for_every_seed() {
     for info in corpus::all_activities() {
-        let Some(policy) = &info.default_retry_policy else {
-            continue;
-        };
+        // With no policy, Postgres jitters a one-second retry, and `SQLite`
+        // retries at once.
+        let policy = info.default_retry_policy.as_ref().unwrap_or_else(|| {
+            panic!(
+                "activity `{}` needs a retry policy. Without one, the backends differ",
+                info.name
+            )
+        });
         for attempt in 1..policy.max_attempts {
             let want = base_delay(policy, attempt);
             for i in 0..SEEDS {

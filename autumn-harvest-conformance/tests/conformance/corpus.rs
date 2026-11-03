@@ -39,8 +39,9 @@ fn err(e: impl std::fmt::Display) -> String {
 /// Turn off the jitter of `policy`, so each retry waits its exact delay.
 ///
 /// [`RetryPolicy::fixed`] draws each delay in `[0, interval]`. The Postgres
-/// worker applies that jitter, and `SQLite` does not (issue #2517). A
-/// positive backoff in the corpus must use this function.
+/// worker applies that jitter to an activity retry. `SQLite` waits the base
+/// delay (issue #2517). A positive backoff in the corpus must use this
+/// function.
 const fn exact(policy: RetryPolicy) -> RetryPolicy {
     policy.with_jitter(JitterPolicy::None)
 }
@@ -124,9 +125,11 @@ fn gated_activities() -> Vec<ActivityInfo> {
     all_activities()
 }
 
-/// Every activity of the corpus. Add each new activity here.
+/// Every activity of the corpus: `shared_activities` and `gated_retry`.
 ///
-/// The timing guard reads this list. It does not touch the gate.
+/// Add a new activity to `shared_activities`. The timing guard reads this
+/// list, and checks that it names each `#[activity]` of this file. It does
+/// not touch the gate.
 pub fn all_activities() -> Vec<ActivityInfo> {
     let mut all = shared_activities();
     all.push(gated_retry_info());

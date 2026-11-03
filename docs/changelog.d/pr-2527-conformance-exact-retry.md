@@ -11,7 +11,8 @@ delay. About one run in sixty drew a delay under the timer.
   `gated_retry`.
 - `corpus::all_activities` lists every corpus activity. `RACE_TIMER` names
   the timer of `race_timer_wins`.
-- `timing.rs` adds two guards that run without Docker. Each corpus retry
+- `timing.rs` adds guards that run without Docker. Each corpus activity
+  has a retry policy and is in `all_activities`. Each corpus retry
   waits its base delay for 1000 seeds. The race loser retries after the race
   timer, with one second to spare.
 
