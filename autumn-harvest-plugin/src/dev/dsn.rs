@@ -58,8 +58,8 @@ pub(super) fn is_uri_dsn(dsn: &str) -> bool {
 /// to blank out (issue #1322).
 ///
 /// `autumn-harvest-cli` solves the same problem for migration-target labels.
-/// See `is_connection_keyword` in `autumn-harvest-cli/src/lib.rs`. Keep this
-/// list in step with that one.
+/// See `is_connection_keyword` in `autumn-harvest-cli/src/lib.rs` (issue
+/// #2521). Keep this list in step with that one.
 pub(super) fn is_connection_keyword(key: &str) -> bool {
     const KEYWORDS: &[&str] = &[
         "application_name",
