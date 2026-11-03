@@ -1369,7 +1369,7 @@ async fn stored_start_input(
     if let WorkflowEvent::WorkflowStarted { input: field, .. } = &mut started {
         field.clone_from(input);
     }
-    let encoded = codecs.encode_event(&started)?;
+    let encoded = codecs.encode_event_owned(started)?;
     let mut only_input = serde_json::json!({
         "data": { "input": encoded.pointer("/data/input").cloned().unwrap_or(Value::Null) }
     });
