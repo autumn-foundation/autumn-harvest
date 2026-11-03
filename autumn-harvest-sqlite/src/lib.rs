@@ -782,6 +782,7 @@
 mod agent_policy_log;
 #[doc(hidden)]
 pub mod append_only;
+mod auth;
 mod composition;
 mod error;
 mod history_cap;
@@ -806,6 +807,9 @@ pub use autumn_harvest::{ExecutionId, WorkflowEvent};
 
 #[doc(hidden)]
 pub use crate::agent_policy_log::SqlitePolicyLog;
+pub use crate::auth::{
+    AuditFilter, AuditRow, MAX_AUDIT_PAGE, NewAuditRow, NewToken, SqliteAuthStore, StoredToken,
+};
 pub use crate::error::{SqliteError, SqliteResult};
 pub use crate::history_cap::HistoryCapReason;
 pub use crate::history_page::{

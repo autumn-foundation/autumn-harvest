@@ -57,11 +57,10 @@ use axum::extract::{FromRequest, Request, State};
 use axum::http::{Extensions, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use diesel_async::AsyncPgConnection;
 use uuid::Uuid;
 
 use autumn_harvest::audit::{
-    self, HEADER_TENANT, OP_AUTHZ_DENY, RouteClass, STATUS_FAILED, TARGET_ROUTE,
+    HEADER_TENANT, OP_AUTHZ_DENY, RouteClass, STATUS_FAILED, TARGET_ROUTE,
 };
 use autumn_harvest::models::{NewAuditRecord, WorkflowExecution};
 use autumn_harvest::shard::{ShardPlacement, ShardedDbPool};
@@ -69,10 +68,11 @@ use autumn_harvest::shard_fence::ShardFence;
 use autumn_harvest::types::ShardId;
 
 use crate::api::{
-    HarvestApiState, RouteMatchers, acquire_conn, audit_context, build_route_matchers,
-    classify_route, execution_id_in_path, is_form_urlencoded, match_route,
+    HarvestApiState, RouteMatchers, audit_context, build_route_matchers, classify_route,
+    execution_id_in_path, is_form_urlencoded, match_route,
 };
 use crate::api_token::{TokenPrincipal, TokenScope};
+use crate::auth_store::{AuthSession, AuthStore};
 
 /// Longest accepted [`HEADER_TENANT`] value, in bytes.
 pub const MAX_TENANT_KEY_LEN: usize = autumn_harvest::tenant::MAX_TENANT_LEN;
@@ -306,19 +306,38 @@ pub(crate) fn truncate(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-/// Write one `authz.deny` row to the control shard.
+/// Write one `authz.deny` row in `session`.
 ///
 /// Best effort: a failed write is logged. The caller returns the deny anyway.
-pub(crate) async fn audit_deny(conn: &mut AsyncPgConnection, deny: &DenyAudit<'_>) {
-    audit_route_event(conn, OP_AUTHZ_DENY, deny).await;
+pub(crate) async fn audit_deny(session: &mut AuthSession, deny: &DenyAudit<'_>) {
+    audit_route_event(session, OP_AUTHZ_DENY, deny).await;
 }
 
-/// Write one failed-request row for `operation` to the control shard.
+/// Write one `authz.deny` row to `store`, in a session of its own.
+pub(crate) async fn audit_deny_to(store: &AuthStore, deny: &DenyAudit<'_>) {
+    audit_route_event_to(store, OP_AUTHZ_DENY, deny).await;
+}
+
+/// Write one failed-request row for `operation` to `store`, in a session
+/// of its own. A store that cannot open a session is logged.
+pub(crate) async fn audit_route_event_to(store: &AuthStore, operation: &str, deny: &DenyAudit<'_>) {
+    match store.session().await {
+        Ok(mut session) => audit_route_event(&mut session, operation, deny).await,
+        Err(e) => tracing::error!(
+            error = %e,
+            path = %deny.path,
+            operation,
+            "harvest: no audit connection for route event"
+        ),
+    }
+}
+
+/// Write one failed-request row for `operation` to the control store.
 ///
 /// The API rate limiter (issue #1827) writes its sustained rows with this. The
 /// fields are cut to the same limits as an `authz.deny` row.
 pub(crate) async fn audit_route_event(
-    conn: &mut AsyncPgConnection,
+    session: &mut AuthSession,
     operation: &str,
     deny: &DenyAudit<'_>,
 ) {
@@ -342,7 +361,7 @@ pub(crate) async fn audit_route_event(
         shard_id: deny.shard.map(ShardId::as_i32),
         source: deny.source,
     };
-    if let Err(e) = audit::insert_audit(conn, &record).await {
+    if let Err(e) = session.insert_audit(&record).await {
         tracing::error!(
             error = %e,
             route = %route,
@@ -974,11 +993,9 @@ pub(crate) async fn enforce_authorizer(
             tenant.as_deref().unwrap_or("-"),
             shard.map_or_else(|| "-".to_string(), |s| s.as_i32().to_string()),
         );
-        if let Ok(pool) = api_state.storage_pool()
-            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
-        {
-            audit_deny(
-                &mut conn,
+        if let Some(store) = api_state.auth_store() {
+            audit_deny_to(
+                &store,
                 &DenyAudit {
                     actor: &actor,
                     method: &method,

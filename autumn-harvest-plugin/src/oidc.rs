@@ -678,12 +678,23 @@ pub(crate) fn login_router(login: OidcLogin) -> Router<()> {
 ///
 /// `router` already carries the admin-auth stack, the role layer included.
 pub(crate) fn apply_oidc(router: Router<()>, login: &OidcLogin, api_tokens: bool) -> Router<()> {
-    router
-        .layer(axum::middleware::from_fn_with_state(
-            (login.clone(), api_tokens),
-            require_oidc_session,
-        ))
-        .merge(login_router(login.clone()))
+    session_boundary(router, login, api_tokens).merge(login_router(login.clone()))
+}
+
+/// Wrap `router` in the session boundary only.
+///
+/// The SQLite router wraps its tenant routes inside their nest (issue
+/// #2469). The boundary then sees the core path, so a public route stays
+/// public on a tenant.
+pub(crate) fn session_boundary(
+    router: Router<()>,
+    login: &OidcLogin,
+    api_tokens: bool,
+) -> Router<()> {
+    router.layer(axum::middleware::from_fn_with_state(
+        (login.clone(), api_tokens),
+        require_oidc_session,
+    ))
 }
 
 // ── Session boundary ──────────────────────────────────────────────────────────
