@@ -45,7 +45,7 @@ fn workflow_chain_execution_timeout_attribute_parses(/* issue #617 */) {
     // The per-run and chain caps are independent.
     assert_eq!(
         info.execution_timeout,
-        Some(std::time::Duration::from_secs(1_800)),
+        Some(std::time::Duration::from_mins(30)),
         "execution_timeout = '30m'"
     );
     let chain = info
@@ -53,7 +53,7 @@ fn workflow_chain_execution_timeout_attribute_parses(/* issue #617 */) {
         .expect("chain_execution_timeout = '7d' must produce Some(...)");
     assert_eq!(
         chain,
-        std::time::Duration::from_secs(7 * 86_400),
+        std::time::Duration::from_hours(168),
         "7d = 604800 seconds"
     );
 }
@@ -101,7 +101,7 @@ fn workflow_execution_timeout_attribute_24h() {
         .expect("execution_timeout = '24h' must produce Some(...)");
     assert_eq!(
         timeout,
-        std::time::Duration::from_secs(86_400),
+        std::time::Duration::from_hours(24),
         "24h = 86400 seconds"
     );
 }
@@ -115,7 +115,7 @@ fn workflow_execution_timeout_attribute_30m() {
         .expect("execution_timeout = '30m' must produce Some(...)");
     assert_eq!(
         timeout,
-        std::time::Duration::from_secs(1_800),
+        std::time::Duration::from_mins(30),
         "30m = 1800 seconds"
     );
 }

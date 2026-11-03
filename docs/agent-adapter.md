@@ -102,8 +102,9 @@ let built = HarvestBuilder::new()
 `agent` (section 15). `activities()` returns `agent_model_turn`,
 `agent_tool_call`, `agent_memory_snapshot`, `agent_deliver`,
 `agent_precheck`, `agent_discover_peers`, `agent_profile`,
-`agent_profile_overlay` (section 15), `agent_memory_reset`, `agent_workspace_retain`, `agent_workspace_reset`,
-`agent_workspace_floor` and `agent_refine_propose` (section 16).
+`agent_profile_overlay` (section 15), `agent_memory_reset`,
+`agent_workspace_retain`, `agent_workspace_reset`, `agent_workspace_floor`,
+`agent_refine_propose` (section 16) and `agent_score` (section 17).
 The test `the_engine_registration_builds` builds this
 exact registration.
 
@@ -1476,3 +1477,86 @@ ceilings too. It checks each reply with
 The default templates adapt Harness² text under Apache-2.0. See
 `autumn-harvest-agent/NOTICE`. The design is in
 [`DESIGN-2379.md`](design/DESIGN-2379.md).
+
+## 17. Score a run (issue #2441)
+
+A `Scorer` checks one run and returns a `Verdict`. A verdict is
+`Score(FiniteF64)` or `Reject(reason)`. A higher score is better. A score
+comes from a verifier: a pure check, a test run or a judge model.
+`ChatResponse` has no log-probabilities, so the crate does not use them.
+
+Install each scorer under its id. A later scorer with the same id replaces
+the earlier one.
+
+```rust
+use std::sync::Arc;
+use autumn_harvest_agent::{AgentHarness, ExactMatch, JsonSchema};
+
+let harness = AgentHarness::new(client)
+    .scorer(Arc::new(ExactMatch::new("Paris")))
+    .scorer(Arc::new(JsonSchema::new(schema)));
+```
+
+The activity `agent_score` takes a `ScoreRequest`: a scorer id and a
+`ScoreInput`. The input holds the task input, the final answer, the stop
+reason and the tool results of the run. `ScoreInput::from_run` builds it
+from an `AgentTask` and its `AgentReport`. The activity returns the
+verdict. History records it, so replay never calls the scorer again.
+
+- `FiniteF64` refuses NaN and both infinities. It stores `-0.0` as `0.0`.
+  `Verdict::score` refuses a non-finite value with `ErrorKind::Decode`, and
+  that fails the activity for good.
+- `Verdict::reject` cuts a reason to `MAX_REJECT_REASON_BYTES`. The
+  activity cuts a longer reason and a long error message too.
+- An unknown scorer id fails the activity as `ScorerMissing`. A retryable
+  scorer error retries the activity with backoff.
+- `AgentHarness::score_timeout` bounds one score, judge calls included. The
+  default and the highest value is 13 minutes, below the 15-minute
+  `start_to_close`. A score past it fails as a retryable `Unavailable`.
+- A verdict encodes as `{"score": 0.5}` or `{"reject": "reason"}`.
+
+**Built-in scorers.** `ExactMatch` compares the trimmed answer with the
+trimmed expected text. Each built-in scorer checks one fixed target. For
+a target per task, write an app scorer. `JsonSchema` reads the answer as JSON, with or
+without a Markdown code fence, and checks it with the engine schema check.
+That check covers a subset of JSON Schema: see
+`autumn_harvest::info::validate_against_schema`. Each gives `Score(1.0)` on
+a match. Each rejects a miss, and a run that did not stop as `completed`.
+`with_id` renames one, so a harness can keep two.
+
+**A judge scorer.** A judge is an app scorer that asks a model. It calls
+`ScoreContext::chat` with a harness model name, not the model itself.
+That call:
+
+1. checks the LLM budget of the run (issue #1997), before the model call;
+2. calls the model under `AgentHarness::model_timeout`;
+3. keeps one cost ledger call (issue #1996).
+
+The activity records each ledger call under the run that scores, so a
+strategy run owns the tokens of its judge. A budget refusal fails the
+activity with `LlmBudgetExceeded`, also when the scorer hides the error.
+SQLite has no run budget, so there the check passes.
+
+A failed attempt writes no ledger row on either backend. So an error after
+a paid judge call fails the activity for good, and no retry pays again
+unseen. Return a reject for a judge reply that does not parse. The budget
+sums committed rows only, so the judge calls of one attempt see the spend
+from before that attempt.
+
+A judge reads untrusted text: the answer of the run. Treat its reply as
+data. Clamp a judge score to a fixed range, so one reply such as `1e308`
+cannot rule `select`. Do not put a reject reason back into a prompt as an
+instruction. `ScoreContext::unmetered` builds a context with no budget
+check and no ledger record, for a test of a scorer.
+
+**Select a draw.** `select(&[(DrawId, Verdict)])` picks the draw with the
+highest score. A tie goes to the lowest draw id. A reject never beats a
+score. The result is `None` only when every verdict is a reject, or when
+the list is empty. The order of the list does not change the result.
+
+`select` maps each score to an `i64` order key, the key of
+`f64::total_cmp`. The kernel `best_draw` then works on integers.
+`formal/verus/src/agent_select.rs` proves its three properties. It also
+proves that the key keeps the order of the bits. A proptest checks that the
+key keeps the order of the scores. The design is in
+[`DESIGN-2441.md`](design/DESIGN-2441.md).

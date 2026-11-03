@@ -41,13 +41,13 @@ use crate::shard_fanout::{self, FanoutStatus, ShardObservation, UnavailableShard
 /// pathologically large probe interval can never fail `try_build()`
 /// (issue #796, AC9). Realistic canary intervals are seconds-to-minutes; this
 /// clamp is purely defensive.
-const MAX_DERIVED_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
+const MAX_DERIVED_RETENTION: Duration = Duration::from_hours(87600);
 
 /// One hour — the floor for the aggressive self-cleaning retention window, and
 /// the fallback when the derived staleness-based value would be smaller
 /// (issue #796, AC9). The floor must exceed the staleness window so a
 /// `GET /admin/canary` read can always see the last recorded success.
-const RETENTION_FLOOR: Duration = Duration::from_secs(60 * 60);
+const RETENTION_FLOOR: Duration = Duration::from_hours(1);
 
 /// Minimum wall-clock a *healthy* probe needs to reach terminal completion:
 /// one dispatched activity, a full `ctx.timer("probe", 1)` (a whole-second

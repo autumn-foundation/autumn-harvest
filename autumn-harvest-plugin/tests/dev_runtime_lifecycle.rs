@@ -506,7 +506,9 @@ async fn a_durable_workflow_executes_and_is_observable() {
     };
 
     let base = runtime.api_url().to_owned();
-    let client = reqwest::Client::new();
+    let client = autumn_harvest_plugin::http::client_builder()
+        .build()
+        .expect("client");
 
     // AC1: migrations were applied automatically — no `diesel migration run`,
     // no `DATABASE_URL`, no compose file. If they had not been, the engine's

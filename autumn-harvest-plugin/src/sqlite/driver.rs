@@ -23,6 +23,7 @@
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_harvest::context::SharedState;
@@ -32,8 +33,10 @@ use autumn_harvest_sqlite::{
     AdmittedUpdate, SignalDelivery, SignalWithStart, SignalWithStartOutcome, SqliteError,
     SqliteResult, SqliteRuntime, StartOptions, StartOutcome,
 };
+use autumn_web::fleet_layout::FleetDbKey;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 /// The most commands the driver runs before each drive pass.
 ///
@@ -52,6 +55,8 @@ const COMMAND_BACKLOG: usize = 256;
 pub type QueryFuture = Pin<Box<dyn Future<Output = SqliteResult<Value>> + Send>>;
 
 /// What the driver registers before it opens the file.
+///
+/// The control driver and each tenant driver register from one registry.
 pub struct Registry {
     /// The `#[workflow]` definitions.
     pub workflows: Vec<WorkflowInfo>,
@@ -245,7 +250,7 @@ impl Driver {
     ///
     /// Returns the open error, such as a writer lock that another process
     /// holds, or the registration panic message.
-    pub(crate) fn open(path: &Path, registry: Registry) -> Result<SqliteRuntime, String> {
+    pub(crate) fn open(path: &Path, registry: &Registry) -> Result<SqliteRuntime, String> {
         let mut runtime = SqliteRuntime::open(path).map_err(|error| {
             format!(
                 "cannot open the Harvest SQLite database {}: {error}",
@@ -265,8 +270,9 @@ impl Driver {
     /// spawns, such as a fleet open, lives on the app's runtime too.
     pub(crate) fn start(runtime: SqliteRuntime, tick: Duration) -> Self {
         let (sender, receiver) = mpsc::channel(COMMAND_BACKLOG);
+        let stop = CancellationToken::new();
         let task = tokio::spawn(async move {
-            let reply = drive(runtime, receiver, tick).await;
+            let reply = drive(runtime, receiver, tick, &stop).await;
             // `drive` owned the runtime, so the lock is released by now.
             if let Some(reply) = reply {
                 let _ = reply.send(());
@@ -276,6 +282,34 @@ impl Driver {
             sender,
             task: Some(task),
         }
+    }
+
+    /// Start the drive loop of one fleet tenant (issue #2472).
+    ///
+    /// The loop runs with `key` as [`HarvestTenant::current`]. It stops when
+    /// `stop` fires, after the command or pass in flight. The caller hands
+    /// the task to the fleet, which waits for it before the tenant closes.
+    /// `on_exit` runs when the task ends or is aborted.
+    ///
+    /// [`HarvestTenant::current`]: super::HarvestTenant::current
+    pub(crate) fn spawn_tenant(
+        runtime: SqliteRuntime,
+        tick: Duration,
+        key: FleetDbKey,
+        stop: CancellationToken,
+        on_exit: Box<dyn FnOnce() + Send>,
+    ) -> (mpsc::Sender<Command>, tokio::task::JoinHandle<()>) {
+        let (sender, receiver) = mpsc::channel(COMMAND_BACKLOG);
+        let task = tokio::spawn(super::fleet::scoped(key, async move {
+            // Declared first, so it runs last: after the runtime drops, on a
+            // return and on an abort alike.
+            let _exit = OnExit(Some(on_exit));
+            let reply = drive(runtime, receiver, tick, &stop).await;
+            if let Some(reply) = reply {
+                let _ = reply.send(());
+            }
+        }));
+        (sender, task)
     }
 
     /// Stop the drive loop and wait for it.
@@ -293,7 +327,18 @@ impl Driver {
     }
 }
 
-fn register(runtime: &mut SqliteRuntime, registry: Registry) {
+/// Runs its closure when dropped.
+struct OnExit(Option<Box<dyn FnOnce() + Send>>);
+
+impl Drop for OnExit {
+    fn drop(&mut self) {
+        if let Some(on_exit) = self.0.take() {
+            on_exit();
+        }
+    }
+}
+
+fn register(runtime: &mut SqliteRuntime, registry: &Registry) {
     for workflow in &registry.workflows {
         runtime.register_workflow(workflow);
     }
@@ -306,18 +351,23 @@ fn register(runtime: &mut SqliteRuntime, registry: Registry) {
     for signal in &registry.signals {
         runtime.register_signal_handler(signal);
     }
-    runtime.set_shared_state(registry.state);
+    runtime.set_shared_state(Arc::clone(&registry.state));
 }
 
-/// The drive loop. It returns on [`Command::Shutdown`], with its reply, or
-/// when every sender is gone. It drops the runtime as it returns.
+/// The drive loop. It returns on [`Command::Shutdown`], with its reply, when
+/// every sender is gone, or when `stop` fires. It drops the runtime as it
+/// returns.
 async fn drive(
     mut runtime: SqliteRuntime,
     mut receiver: mpsc::Receiver<Command>,
     tick: Duration,
+    stop: &CancellationToken,
 ) -> Option<oneshot::Sender<()>> {
     let mut last_error: Option<String> = None;
     loop {
+        if stop.is_cancelled() {
+            return None;
+        }
         for _ in 0..COMMANDS_PER_PASS {
             match receiver.try_recv() {
                 Ok(Command::Shutdown { reply }) => return reply,
@@ -352,6 +402,7 @@ async fn drive(
             continue;
         }
         tokio::select! {
+            () = stop.cancelled() => return None,
             command = receiver.recv() => match command {
                 None => return None,
                 Some(Command::Shutdown { reply }) => return reply,
@@ -689,7 +740,7 @@ mod tests {
                     signals: Vec::new(),
                     state: autumn_harvest::context::empty_shared_state(),
                 };
-                let runtime = Driver::open(&path, registry).expect("open");
+                let runtime = Driver::open(&path, &registry).expect("open");
                 let driver = Driver::start(runtime, Duration::from_millis(250));
                 let (reply, started) = oneshot::channel();
                 driver

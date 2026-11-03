@@ -2499,7 +2499,7 @@ async fn a_reset_keeps_the_quota_key_of_its_source() {
 // ---------------------------------------------------------------------------
 
 /// The age past which the retention tests delete a run of their tenant.
-const RETENTION_AGE: Duration = Duration::from_secs(86_400);
+const RETENTION_AGE: Duration = Duration::from_hours(24);
 
 /// Put `exec` in `tenant` and make it older than [`RETENTION_AGE`].
 ///

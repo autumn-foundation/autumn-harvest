@@ -523,9 +523,7 @@ impl Default for HarvestApiState {
             max_workflow_chain_timeout: Arc::new(Mutex::new(None)),
             sse_keepalive_interval: Arc::new(Mutex::new(std::time::Duration::from_secs(15))),
             sse_buffer_depth: Arc::new(Mutex::new(1024)),
-            max_workflow_start_delay: Arc::new(Mutex::new(std::time::Duration::from_secs(
-                365 * 24 * 60 * 60,
-            ))),
+            max_workflow_start_delay: Arc::new(Mutex::new(std::time::Duration::from_hours(8760))),
             batch_start_max_items: Arc::new(Mutex::new(DEFAULT_BATCH_START_MAX_ITEMS)),
             batch_start_max_bytes: Arc::new(Mutex::new(DEFAULT_BATCH_START_MAX_BYTES)),
             gate_cache: Arc::new(autumn_harvest::AdmissionGateCache::new()),
@@ -18404,7 +18402,7 @@ pub(crate) async fn start_workflow(
                     macro_policy.map_or(std::time::Duration::from_secs(10), |p| p.max_wait)
                 };
 
-            if max_wait > std::time::Duration::from_secs(86400) {
+            if max_wait > std::time::Duration::from_hours(24) {
                 return Err((
                     axum::http::StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({
@@ -61827,8 +61825,8 @@ mod tests {
         let registry = HandlerRegistry::new(
             vec![deadline_info_fixture(
                 "deadline_wf",
-                Some(std::time::Duration::from_secs(4 * 3600)),
-                Some(std::time::Duration::from_secs(3 * 3600)),
+                Some(std::time::Duration::from_hours(4)),
+                Some(std::time::Duration::from_hours(3)),
             )],
             vec![],
         );
@@ -61848,7 +61846,7 @@ mod tests {
             vec![deadline_info_fixture(
                 "clamp_wf",
                 Some(std::time::Duration::from_secs(3600)),
-                Some(std::time::Duration::from_secs(10 * 3600)),
+                Some(std::time::Duration::from_hours(10)),
             )],
             vec![],
         );
@@ -61883,8 +61881,8 @@ mod tests {
         let registry = HandlerRegistry::new(
             vec![deadline_info_fixture(
                 "ceiling_wf",
-                Some(std::time::Duration::from_secs(10 * 3600)),
-                Some(std::time::Duration::from_secs(8 * 3600)),
+                Some(std::time::Duration::from_hours(10)),
+                Some(std::time::Duration::from_hours(8)),
             )],
             vec![],
         )
@@ -61904,7 +61902,7 @@ mod tests {
         let registry = HandlerRegistry::new(
             vec![deadline_info_fixture(
                 "small_wf",
-                Some(std::time::Duration::from_secs(1800)),
+                Some(std::time::Duration::from_mins(30)),
                 None,
             )],
             vec![],
@@ -61932,8 +61930,8 @@ mod tests {
         let registry = HandlerRegistry::new(
             vec![deadline_info_fixture(
                 "nightly_reconciliation",
-                Some(std::time::Duration::from_secs(4 * 3600)),
-                Some(std::time::Duration::from_secs(3 * 3600)),
+                Some(std::time::Duration::from_hours(4)),
+                Some(std::time::Duration::from_hours(3)),
             )],
             vec![],
         );

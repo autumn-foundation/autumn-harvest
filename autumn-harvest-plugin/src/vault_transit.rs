@@ -116,7 +116,7 @@ impl VaultTransit {
 
 /// The settings of the default client: no redirect.
 fn client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+    crate::http::client_builder().redirect(reqwest::redirect::Policy::none())
 }
 
 /// The time limit for one Vault request. With it, startup fails on a dead
@@ -565,7 +565,7 @@ mod tests {
             FakeServer::start(|request| vault(request, &Reply::Unwrap(KEY.to_vec()), true)).await;
         let server = redirect_to(&elsewhere.endpoint).await;
         // A caller client that follows redirects.
-        let following = reqwest::Client::builder().no_proxy().build().unwrap();
+        let following = crate::http::client_builder().no_proxy().build().unwrap();
         let err = provider(VaultTransit::new(&server.endpoint, TOKEN).with_client(following))
             .data_key(KEY_ID)
             .await

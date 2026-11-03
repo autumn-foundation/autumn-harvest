@@ -889,13 +889,10 @@ struct AgeRow {
 /// Seconds since the most recent dead-letter row on this shard (`NULL` when the
 /// DLQ is empty).
 async fn dlq_newest_age_secs(conn: &mut AsyncPgConnection) -> Result<Option<i64>, String> {
-    let row: AgeRow = diesel::sql_query(
-        "SELECT CEIL(EXTRACT(EPOCH FROM (NOW() - MAX(failed_at))))::BIGINT AS age \
-         FROM harvest_dead_letters",
-    )
-    .get_result(conn)
-    .await
-    .map_err(|e| e.to_string())?;
+    let row: AgeRow = diesel::sql_query(autumn_harvest::dlq::DLQ_NEWEST_AGE_SQL)
+        .get_result(conn)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(row.age.map(|age| age.max(0)))
 }
 

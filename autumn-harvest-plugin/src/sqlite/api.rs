@@ -15,6 +15,10 @@
 //! The #1802 mutation gate wraps the router, as on Postgres. Outside `dev`, a
 //! mutating call needs a declared auth boundary, an admin session or the
 //! explicit opt-out.
+//!
+//! With `sqlite_per_tenant`, `/tenants/{key}/..` serves the same routes on
+//! one fleet tenant (issue #2472). `{key}` is the app's routing key. The gate
+//! covers these routes too.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -38,8 +42,18 @@ use axum::routing::{any, get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{EPIC_ISSUE, HarvestSqlite, HarvestSqliteError, SignalWithStartParams, StopAck};
+use super::{
+    EPIC_ISSUE, HarvestFleet, HarvestSqlite, HarvestSqliteError, SignalWithStartParams, StopAck,
+};
 use crate::api::HarvestApiState;
+
+/// The issue that adds per-tenant Harvest.
+const TENANT_ISSUE: u32 = 2472;
+
+tokio::task_local! {
+    /// The tenant Harvest that serves the current tenant request.
+    static TENANT: HarvestSqlite;
+}
 
 /// How often a `/result` long poll reads the file. SQLite has no `LISTEN`.
 const RESULT_POLL: Duration = Duration::from_millis(100);
@@ -52,13 +66,19 @@ const READY_BUDGET: Duration = Duration::from_secs(1);
 pub struct ApiState {
     /// Filled by the startup hook. A request before it gets `503`.
     pub handle: Arc<OnceLock<HarvestSqlite>>,
+    /// Filled by the startup hook when `sqlite_per_tenant` is on.
+    pub fleet: Arc<OnceLock<HarvestFleet>>,
     /// The flags that the #1802 mutation gate reads.
-    pub api_state: HarvestApiState,
+    pub flags: HarvestApiState,
 }
 
 impl ApiState {
-    fn handle(&self) -> Result<&HarvestSqlite, AutumnError> {
-        self.handle.get().ok_or_else(|| {
+    /// The tenant Harvest of a tenant request, else the control Harvest.
+    fn handle(&self) -> Result<HarvestSqlite, AutumnError> {
+        if let Ok(handle) = TENANT.try_with(Clone::clone) {
+            return Ok(handle);
+        }
+        self.handle.get().cloned().ok_or_else(|| {
             AutumnError::service_unavailable_msg("the Harvest SQLite backend is not running yet")
         })
     }
@@ -67,9 +87,52 @@ impl ApiState {
 /// The SQLite management router, gated like the Postgres one.
 pub fn router(state: ApiState) -> Router<()> {
     let gate = middleware::from_fn_with_state(
-        state.api_state.clone(),
+        state.flags.clone(),
         crate::api::require_mutation_auth_by_method,
     );
+    let scope = middleware::from_fn_with_state(state.clone(), tenant_scope);
+    routes()
+        .nest("/tenants/{tenant}", routes().layer(scope))
+        .layer(gate)
+        .with_state(state)
+}
+
+/// The `{tenant}` segment of a tenant route. The other segments are ignored.
+#[derive(Deserialize)]
+struct TenantParams {
+    tenant: String,
+}
+
+/// Serve one request on the tenant that `{tenant}` routes to.
+///
+/// The tenant handle holds a lease, so the tenant stays open until the
+/// response is ready. Each handler reads it through [`ApiState::handle`].
+/// A tenant that does not exist is a `404`. The API never creates one.
+async fn tenant_scope(
+    State(state): State<ApiState>,
+    Path(TenantParams { tenant }): Path<TenantParams>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let Some(fleet) = state.fleet.get() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "per-tenant Harvest is off: call HarvestPlugin::sqlite_per_tenant",
+                "backend": "sqlite",
+                "issue": format!("https://github.com/autumn-foundation/autumn-harvest/issues/{TENANT_ISSUE}"),
+            })),
+        )
+            .into_response();
+    };
+    match fleet.open_existing_for(&tenant).await {
+        Ok(handle) => TENANT.scope(handle, next.run(request)).await,
+        Err(error) => map_error(error).into_response(),
+    }
+}
+
+/// The core routes, on the control Harvest or on one tenant.
+fn routes() -> Router<ApiState> {
     // A route that reads no query parameter refuses one. A Postgres client
     // may send `?after=` or `?event_type=` here. Answering it with the full,
     // unfiltered body would look like success (#2489).
@@ -139,8 +202,52 @@ pub fn router(state: ApiState) -> Router<()> {
         // `AppBuilder::nest` drops a nested fallback, so a catch-all route
         // stands in for it. A static or a parameter route still wins.
         .route("/{*rest}", any(not_ported))
-        .layer(gate)
-        .with_state(state)
+}
+
+// ── Path segments ────────────────────────────────────────────────────────────
+//
+// Each handler names its segments. A tenant route also carries `{tenant}`,
+// which a tuple extractor would count as one more segment.
+
+#[derive(Deserialize)]
+struct IdParams {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct NameParams {
+    workflow_name: String,
+}
+
+#[derive(Deserialize)]
+struct ByIdParams {
+    workflow_name: String,
+    workflow_id: String,
+}
+
+#[derive(Deserialize)]
+struct SignalParams {
+    id: String,
+    signal_name: String,
+}
+
+#[derive(Deserialize)]
+struct ByIdSignalParams {
+    workflow_name: String,
+    workflow_id: String,
+    signal_name: String,
+}
+
+#[derive(Deserialize)]
+struct QueryParams {
+    id: String,
+    query_name: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateParams {
+    id: String,
+    update_name: String,
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────
@@ -151,6 +258,12 @@ fn map_error(error: HarvestSqliteError) -> AutumnError {
         HarvestSqliteError::Sqlite(error) => error,
         HarvestSqliteError::InvalidInput(_) | HarvestSqliteError::InvalidSignal(_) => {
             return AutumnError::bad_request_msg(error.to_string());
+        }
+        // The fleet gives the status of a tenant key and an open. A bad key
+        // is `400`. A missing tenant is `404`. A tenant in a delete is `410`.
+        HarvestSqliteError::Fleet(error) => {
+            let status = error.http_status();
+            return AutumnError::service_unavailable_msg(error.to_string()).with_status(status);
         }
         other => return AutumnError::service_unavailable_msg(other.to_string()),
     };
@@ -554,10 +667,10 @@ async fn describe_json(handle: &HarvestSqlite, exec: ExecutionId) -> Result<Valu
 
 async fn get_workflow(
     State(state): State<ApiState>,
-    Path(id): Path<String>,
+    Path(IdParams { id }): Path<IdParams>,
 ) -> Result<Json<Value>, AutumnError> {
     let exec = parse_exec(&id)?;
-    Ok(Json(describe_json(state.handle()?, exec).await?))
+    Ok(Json(describe_json(&state.handle()?, exec).await?))
 }
 
 /// Set `X-Harvest-Execution-Id` to the run that a by-id route resolved, as
@@ -600,12 +713,15 @@ async fn resolve_key(
 
 async fn get_by_id(
     State(state): State<ApiState>,
-    Path((workflow_name, workflow_id)): Path<(String, String)>,
+    Path(ByIdParams {
+        workflow_name,
+        workflow_id,
+    }): Path<ByIdParams>,
 ) -> Result<Response, AutumnError> {
     let handle = state.handle()?;
-    let exec = resolve_key(handle, &workflow_name, &workflow_id).await?;
+    let exec = resolve_key(&handle, &workflow_name, &workflow_id).await?;
     Ok(by_id_response(
-        describe_json(handle, exec).await.map(Json),
+        describe_json(&handle, exec).await.map(Json),
         exec,
     ))
 }
@@ -632,7 +748,7 @@ async fn by_id_with_empty_id() -> AutumnError {
 /// `after`, `limit` and `event_type`. Like Postgres, it ignores other keys.
 async fn get_history(
     State(state): State<ApiState>,
-    Path(id): Path<String>,
+    Path(IdParams { id }): Path<IdParams>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, AutumnError> {
     let pairs = crate::strict_query::decode_or_autumn_error(raw.as_deref())?;
@@ -683,16 +799,16 @@ async fn get_history(
 /// because SQLite has no `LISTEN`.
 async fn get_result(
     State(state): State<ApiState>,
-    Path(id): Path<String>,
+    Path(IdParams { id }): Path<IdParams>,
     RawQuery(raw): RawQuery,
 ) -> Result<Response, AutumnError> {
     let pairs = crate::strict_query::decode_or_autumn_error(raw.as_deref())?;
     let exec = parse_exec(&id)?;
     let wait = crate::api::parse_workflow_result_wait_query(
         &pairs,
-        state.api_state.workflow_result_max_wait(),
+        state.flags.workflow_result_max_wait(),
     )?;
-    result_response(state.handle()?, exec, wait).await
+    result_response(&state.handle()?, exec, wait).await
 }
 
 async fn result_response(
@@ -724,19 +840,22 @@ async fn result_response(
 
 async fn get_result_by_id(
     State(state): State<ApiState>,
-    Path((workflow_name, workflow_id)): Path<(String, String)>,
+    Path(ByIdParams {
+        workflow_name,
+        workflow_id,
+    }): Path<ByIdParams>,
     RawQuery(raw): RawQuery,
 ) -> Result<Response, AutumnError> {
     // Only a bad encoding is a `400` before the lookup, as on Postgres. The
     // `wait` check runs after it, so its `400` carries the header.
     let pairs = crate::strict_query::decode_or_autumn_error(raw.as_deref())?;
     let handle = state.handle()?;
-    let exec = resolve_key(handle, &workflow_name, &workflow_id).await?;
+    let exec = resolve_key(&handle, &workflow_name, &workflow_id).await?;
     let answer = match crate::api::parse_workflow_result_wait_query(
         &pairs,
-        state.api_state.workflow_result_max_wait(),
+        state.flags.workflow_result_max_wait(),
     ) {
-        Ok(wait) => result_response(handle, exec, wait).await,
+        Ok(wait) => result_response(&handle, exec, wait).await,
         Err(error) => Err(error),
     };
     Ok(by_id_response(answer, exec))
@@ -842,7 +961,7 @@ async fn require_admin_for_policy(
     session: Option<Session>,
 ) -> Result<(), AutumnError> {
     if policy == Some("terminate_if_running")
-        && !crate::api::has_harvest_admin_access(&state.api_state, session).await
+        && !crate::api::has_harvest_admin_access(&state.flags, session).await
     {
         return Err(AutumnError::unauthorized_msg("authentication required"));
     }
@@ -862,7 +981,7 @@ fn signal_error(error: HarvestSqliteError) -> Response {
 
 async fn start(
     State(state): State<ApiState>,
-    Path(workflow_name): Path<String>,
+    Path(NameParams { workflow_name }): Path<NameParams>,
     session: Option<axum::Extension<Session>>,
     headers: axum::http::HeaderMap,
     body: Bytes,
@@ -939,7 +1058,7 @@ struct SignalWithStartBody {
 
 async fn signal_with_start(
     State(state): State<ApiState>,
-    Path(workflow_name): Path<String>,
+    Path(NameParams { workflow_name }): Path<NameParams>,
     session: Option<axum::Extension<Session>>,
     Json(body): Json<SignalWithStartBody>,
 ) -> Result<Response, AutumnError> {
@@ -1055,7 +1174,7 @@ fn raw_idempotency_key(
 
 async fn signal(
     State(state): State<ApiState>,
-    Path((id, signal_name)): Path<(String, String)>,
+    Path(SignalParams { id, signal_name }): Path<SignalParams>,
     RawQuery(raw): RawQuery,
     headers: axum::http::HeaderMap,
     body: Bytes,
@@ -1090,7 +1209,11 @@ async fn signal(
 
 async fn signal_by_id(
     State(state): State<ApiState>,
-    Path((workflow_name, workflow_id, signal_name)): Path<(String, String, String)>,
+    Path(ByIdSignalParams {
+        workflow_name,
+        workflow_id,
+        signal_name,
+    }): Path<ByIdSignalParams>,
     RawQuery(raw): RawQuery,
     headers: axum::http::HeaderMap,
     body: Bytes,
@@ -1157,7 +1280,7 @@ struct ReasonBody {
 /// as on Postgres.
 async fn cancel(
     State(state): State<ApiState>,
-    Path(id): Path<String>,
+    Path(IdParams { id }): Path<IdParams>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), AutumnError> {
     let exec = parse_exec(&id)?;
@@ -1179,7 +1302,7 @@ async fn cancel(
 /// on Postgres.
 async fn terminate(
     State(state): State<ApiState>,
-    Path(id): Path<String>,
+    Path(IdParams { id }): Path<IdParams>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), AutumnError> {
     let exec = parse_exec(&id)?;
@@ -1226,7 +1349,7 @@ fn stop_json(ack: &StopAck, newly_field: &str, deferred: Option<bool>) -> Value 
 
 async fn query_get(
     State(state): State<ApiState>,
-    Path((id, query_name)): Path<(String, String)>,
+    Path(QueryParams { id, query_name }): Path<QueryParams>,
 ) -> Result<Json<Value>, AutumnError> {
     let exec = parse_exec(&id)?;
     let answer = state
@@ -1245,7 +1368,7 @@ struct QueryBody {
 
 async fn query_post(
     State(state): State<ApiState>,
-    Path((id, query_name)): Path<(String, String)>,
+    Path(QueryParams { id, query_name }): Path<QueryParams>,
     body: Bytes,
 ) -> Result<Json<Value>, AutumnError> {
     let exec = parse_exec(&id)?;
@@ -1272,7 +1395,7 @@ struct UpdateBody {
 /// because there is nothing to wait for.
 async fn update(
     State(state): State<ApiState>,
-    Path((id, update_name)): Path<(String, String)>,
+    Path(UpdateParams { id, update_name }): Path<UpdateParams>,
     RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Result<Response, AutumnError> {

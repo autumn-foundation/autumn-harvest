@@ -523,3 +523,14 @@ async fn a_signal_that_breaks_its_schema_is_refused_before_it_is_staged() {
     let result = wait_completed(&client, &exec).await;
     assert_eq!(result["output"]["go"], json!({ "ok": true }));
 }
+
+/// Tenant routes need `sqlite_per_tenant` (issue #2472). Without it they are
+/// a `404` that names the option, never an empty `200`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_route_without_per_tenant_is_a_404() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = app(dir.path(), "dev");
+    let response = client.get("/harvest/tenants/acme/workflows").send().await;
+    response.assert_status(404);
+    assert!(response.text().contains("sqlite_per_tenant"));
+}

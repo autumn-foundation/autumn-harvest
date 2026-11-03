@@ -26,7 +26,7 @@
 //! oracle).
 
 use base64::Engine as _;
-use rand::RngCore as _;
+use rand::Rng as _;
 use sha2::{Digest as _, Sha256};
 
 /// The credential-namespace discriminator for a harvest-native token.
@@ -43,7 +43,7 @@ pub const TOKEN_PREFIX: &str = "hvst_";
 #[must_use]
 pub fn mint_secret() -> String {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut bytes);
     let body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
     format!("{TOKEN_PREFIX}{body}")
 }

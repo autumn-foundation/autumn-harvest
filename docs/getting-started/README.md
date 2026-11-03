@@ -59,10 +59,13 @@ Start with [Chapter 1 →](01-project-skeleton.md)
 - **Disaster recovery.** [`cross-region-dr.md`](../cross-region-dr.md) — per-shard
   cross-region replication, a fencing mechanism, a measured RPO, and the
   operator-initiated failover runbook.
-- **Upgrading.** [`upgrading/0.8.0.md`](../upgrading/0.8.0.md) is the current
-  0.7.0 → 0.8.0 upgrade guide — the `autumn-web` 0.9 bump, the `prod` profile's
-  strict config check and the new runtime defaults.
-  [`upgrading/0.7.0.md`](../upgrading/0.7.0.md) covers the previous
+- **Upgrading.** [`upgrading/0.9.0.md`](../upgrading/0.9.0.md) is the current
+  0.8.0 → 0.9.0 upgrade guide — the `schemars` 1.x bump, the split Diesel
+  tables, four index and table migrations and the fleet rules for the new
+  agent features. [`upgrading/0.8.0.md`](../upgrading/0.8.0.md) covers the
+  previous 0.7.0 → 0.8.0 hop: the `autumn-web` 0.9 bump, the `prod`
+  profile's strict config check and the 0.8.0 runtime defaults.
+  [`upgrading/0.7.0.md`](../upgrading/0.7.0.md) covers the
   0.6.0 → 0.7.0 hop: the `autumn-web` 0.8 bump, fail-closed mutations and the
   0.7.0 runtime defaults. [`upgrading/0.6.0.md`](../upgrading/0.6.0.md) covers
   the 0.5.0 → 0.6.0 hop: the `autumn-web` 0.7 bump and the move to
@@ -80,6 +83,11 @@ Start with [Chapter 1 →](01-project-skeleton.md)
   persistence backend for edge / local-first / single-server deployments (its
   runnable examples live in
   [`autumn-harvest-sqlite/examples/`](../../autumn-harvest-sqlite/examples/)).
+- **HarvestPlugin on SQLite.** [`sqlite-plugin.md`](../sqlite-plugin.md) runs
+  `HarvestPlugin` in an Autumn app on the SQLite lane, with the `sqlite`
+  feature of `autumn-harvest-plugin`. It lists what slice 1 refuses.
+- **Cost-aware deferral.** [`cost-deferral.md`](../cost-deferral.md) holds
+  named activity types while the autumn-web cost signal is high.
 - **Runbooks.**
   [`audit-trail.md`](../runbooks/audit-trail.md),
   [`external-activity-handoffs.md`](../runbooks/external-activity-handoffs.md),

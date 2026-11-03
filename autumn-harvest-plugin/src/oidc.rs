@@ -70,7 +70,7 @@ pub const SESSION_AUTH_AT_KEY: &str = "harvest_oidc_auth_at";
 pub const OIDC_ACTOR_PREFIX: &str = crate::roles::OIDC_ACTOR_PREFIX;
 
 /// The default longest session age.
-pub const DEFAULT_MAX_SESSION_AGE: Duration = Duration::from_secs(12 * 60 * 60);
+pub const DEFAULT_MAX_SESSION_AGE: Duration = Duration::from_hours(12);
 
 /// The shortest session age. The login time has a one-second resolution.
 const MIN_SESSION_AGE: Duration = Duration::from_secs(1);
@@ -449,7 +449,7 @@ pub async fn discover_provider(
         issuer.trim_end_matches('/')
     );
     let discovery = |e: reqwest::Error| OidcConfigError::Discovery(e.to_string());
-    let mut response = reqwest::Client::builder()
+    let mut response = crate::http::client_builder()
         .timeout(DISCOVERY_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()

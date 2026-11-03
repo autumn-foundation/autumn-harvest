@@ -66,7 +66,7 @@ use std::time::Duration;
 
 /// Default retention window within which a repeated `idempotency_key`
 /// deduplicates onto the same execution. After it elapses the key is reusable.
-pub const DEFAULT_START_IDEMPOTENCY_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+pub const DEFAULT_START_IDEMPOTENCY_WINDOW: Duration = Duration::from_hours(24);
 
 /// Maximum rows deleted per shard per expiry sweep tick, bounding the sweep's
 /// per-tick cost on a large backlog.

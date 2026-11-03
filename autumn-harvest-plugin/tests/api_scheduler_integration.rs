@@ -5890,8 +5890,8 @@ async fn backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling()
     // registers the DAG under in `registry.workflows`) declares a 10h hard
     // deadline and a 5h soft SLA. The 1h fleet-wide ceiling below must win.
     let deadline_info = WorkflowInfo {
-        execution_timeout: Some(std::time::Duration::from_secs(10 * 3600)),
-        sla: Some(std::time::Duration::from_secs(5 * 3600)),
+        execution_timeout: Some(std::time::Duration::from_hours(10)),
+        sla: Some(std::time::Duration::from_hours(5)),
         ..workflow_info_named(dag_name)
     };
     let registry = Arc::new(
@@ -6025,8 +6025,8 @@ async fn backfill_workflow_threads_declared_execution_timeout_sla_and_fleet_ceil
     // Same 10h declared / 5h sla / 1h fleet-wide ceiling values as the DAG
     // companion test above, exercising the identical clamp math.
     let deadline_info = WorkflowInfo {
-        execution_timeout: Some(std::time::Duration::from_secs(10 * 3600)),
-        sla: Some(std::time::Duration::from_secs(5 * 3600)),
+        execution_timeout: Some(std::time::Duration::from_hours(10)),
+        sla: Some(std::time::Duration::from_hours(5)),
         ..workflow_info_named(wf_name)
     };
     let registry = Arc::new(
@@ -8615,14 +8615,14 @@ async fn schedule_api_surfaces_effective_execution_timeout_and_sla() {
             workflow_info_named(plain_wf),
             deadline_workflow_info(
                 deadline_wf,
-                Some(Duration::from_secs(4 * 3600)),
-                Some(Duration::from_secs(3 * 3600)),
+                Some(Duration::from_hours(4)),
+                Some(Duration::from_hours(3)),
             ),
             // sla (10h) > execution_timeout (1h): must read back CLAMPED to 1h.
             deadline_workflow_info(
                 clamp_wf,
                 Some(Duration::from_secs(3600)),
-                Some(Duration::from_secs(10 * 3600)),
+                Some(Duration::from_hours(10)),
             ),
         ],
         vec![],

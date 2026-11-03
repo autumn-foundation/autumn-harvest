@@ -85,11 +85,11 @@ Statements: 1. Tables with no usable index: none.
 
 ## `redrive_delivery_at`
 
-Statements: 3. Tables with no usable index: `harvest_dead_letters`.
+Statements: 3. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `DELETE FROM "harvest_dead_letters" WHERE (("harvest_dead_letters"."original_task_id" = $1) AND ("...` | `harvest_dead_letters`: ModifyTable<br>`harvest_dead_letters`: no usable index |
+| 1 | `DELETE FROM "harvest_dead_letters" WHERE (("harvest_dead_letters"."original_task_id" = $1) AND ("...` | `harvest_dead_letters`: Index Scan on `idx_harvest_dl_original_task`<br>`harvest_dead_letters`: ModifyTable |
 | 2 | `SELECT "harvest_completion_deliveries"."state", "harvest_completion_deliveries"."max_attempts" FR...` | `harvest_completion_deliveries`: Index Scan on `idx_harvest_completion_deliveries_exec` |
 | 3 | `UPDATE "harvest_completion_deliveries" SET "state" = $1, "max_attempts" = $2, "next_attempt_at" =...` | `harvest_completion_deliveries`: Index Scan on `idx_harvest_completion_deliveries_exec`<br>`harvest_completion_deliveries`: ModifyTable |
 

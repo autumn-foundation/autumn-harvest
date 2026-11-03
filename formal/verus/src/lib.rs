@@ -13,4 +13,5 @@ mod agent_reset;
 mod agent_overlay;
 mod overlay_log;
 mod agent_propose;
+mod agent_select;
 mod agent_profile_read;

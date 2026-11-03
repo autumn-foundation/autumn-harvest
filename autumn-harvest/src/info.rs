@@ -2083,7 +2083,7 @@ mod tests {
             name: "billing_reconciliation",
             module: "my_app::workflows",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
-            execution_timeout: Some(std::time::Duration::from_secs(86_400)),
+            execution_timeout: Some(std::time::Duration::from_hours(24)),
             chain_execution_timeout: None,
             sla: None,
             concurrency: None,
@@ -2104,7 +2104,7 @@ mod tests {
         };
         assert_eq!(
             info.execution_timeout,
-            Some(std::time::Duration::from_secs(86_400))
+            Some(std::time::Duration::from_hours(24))
         );
     }
 
@@ -2972,7 +2972,7 @@ mod tests {
 
     #[test]
     fn dag_as_workflow_info_propagates_execution_timeout() {
-        let et = ::std::time::Duration::from_secs(4 * 3600);
+        let et = ::std::time::Duration::from_hours(4);
         let info = deadline_dag(Some(et), None)
             .as_workflow_info()
             .expect("workflow_handler is Some, so as_workflow_info must be Some");
@@ -2985,7 +2985,7 @@ mod tests {
 
     #[test]
     fn dag_as_workflow_info_propagates_sla() {
-        let sla = ::std::time::Duration::from_secs(3 * 3600);
+        let sla = ::std::time::Duration::from_hours(3);
         let info = deadline_dag(None, Some(sla))
             .as_workflow_info()
             .expect("workflow_handler is Some, so as_workflow_info must be Some");

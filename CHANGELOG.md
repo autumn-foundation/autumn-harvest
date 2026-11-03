@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-02
+
+### Changed
+
+- **Breaking and behavior changes.** The `schema` feature uses `schemars` 1.x, so a type that derives the 0.8 `JsonSchema` no longer builds, and a schema contract from 0.8.0 reports three schema-form deltas once (PR #2504); `harvest_workflow_executions`, `harvest_task_queue` and `harvest_schedules` split into a core and an `_ext` Diesel declaration, so a moved column changes its path and `WorkflowExecution` holds its rebalance columns in `rebalance` (issue #2492); `WorkerConfig`, `SqliteError` and the agent request, task, profile, report and evaluation types gain public fields or variants; `load_skill` is a reserved tool name (issue #2373); and `eval::Candidate::model` checks the model before the first call (issue #2375). Each has its own section and check in [`docs/upgrading/0.9.0.md`](docs/upgrading/0.9.0.md) §1. `autumn-web` stays at 0.9 and the MSRV stays at 1.88.0.
+
+- **Turn on the new agent features after the roll.** A 0.8.0 worker cannot replay the recorded overlay read, and it drops the skills, draw and context-reset fields. Install an overlay store, a proposer or a scorer, and set skills, draws or a context reset, only after every worker runs 0.9.0. See [`docs/upgrading/0.9.0.md`](docs/upgrading/0.9.0.md) §3.
+
+### Added
+
+- **Cost-aware deferral of activities (autumn#1720).** A worker can hold named activity types while the autumn-web `CostSignal` is high. One threshold and one runtime-config key now drive autumn jobs and Harvest activities. A held task stays `PENDING`, uses no attempt and no retry budget, and holds no slot. Set it with `WorkerConfig::with_cost_hold` or `HarvestPlugin::cost_deferrable_activities`. New gauge `harvest.cost.hold`. See [`docs/cost-deferral.md`](docs/cost-deferral.md).
+
+- **`HarvestPlugin` on SQLite, slice 1 (issue #2467, epic #2466).** The new `sqlite` feature of `autumn-harvest-plugin` boots the plugin in an Autumn app on the SQLite lane, a fleet app included. Harvest keeps its own file next to the app database. The core management routes keep their Postgres paths. Every other route answers `501` and names its issue. `HarvestSqlite` is an app-state handle and an axum extractor. See [`docs/sqlite-plugin.md`](docs/sqlite-plugin.md).
+
+- **Agent profile overlays under ceilings (issue #2370, epic #2369).** `agent::overlay` adds `ProfileOverlay`, `Ceilings`, `ModelRegistry` and the pure kernel `apply`. An overlay sets only the system prompt, guardrails, model, bounds and `read_only`. `apply` checks the merged result against the ceilings. A Verus proof covers the ceiling, read-only, model and idempotency properties.
+
+- **A versioned overlay store (issue #2371).** `ProfileOverlayStore` keeps each overlay version of an agent kind and one active pointer, moved by a compare-and-swap. A rollback activates an earlier version. In-memory, SQLite and Postgres stores ship. Migration `20261031200812_harvest_agent_overlays` adds the two tables, and triggers keep each version row immutable.
+
+- **A recorded overlay read for each op (issue #2372).** With `AgentHarness::overlay_store`, each op of a durable agent reads the active overlay once, through the activity `agent_profile_overlay`. History records the applied profile and its version, so replay never reads the store. An activation changes the next op only.
+
+- **Tool guidance and skills as overlay parts (issue #2373).** Tool guidance replaces the description of an app tool that the model sees. A skill lists a name and a summary in the system prompt, and the model reads the body with the built-in `load_skill` tool. History records each body.
+
+- **An evaluation candidate takes a whole overlay (issue #2375).** `eval::Candidate::overlay` replays a recorded run under a whole `ProfileOverlay`. A refused overlay fails before any model call. `Evaluation::overlay_digest` names the overlay.
+
+- **The overlay proposer contract (issue #2379).** The `refine` module turns evidence into a candidate overlay. `ModelProposer` implements `OverlayProposer` over any `AgentModel`, with default INV and DOM templates. The activity `agent_refine_propose` runs one stage, retries invalid replies within a bound, then keeps the current overlay.
+
+- **Draw identity (issue #2440).** `DrawId` reaches the model request and the response-cache key, so best-of-N with the cache on no longer collapses to one sample. `run_draws` runs each draw as a child `agent_loop` run with the run id `{root}:s{n}`.
+
+- **Scorer contract and selection kernel (issue #2441, epic #2438).** A `Scorer` returns a recorded `Verdict` for a run through the activity `agent_score`. A judge scorer calls the model under the run's LLM budget and cost ledger. `ExactMatch` and `JsonSchema` ship. `select` picks the best draw, and a Verus proof covers the pick.
+
+- **Progress notes and context reset in one agent run (issue #2453).** `ContextReset` is an opt-in operator setting. Near the cap, the model saves notes with `save_progress`, and the loop resets the window to the prompt, the task and the notes. A Verus proof bounds the reset.
+
+### Fixed
+
+- **The retention index migration no longer deadlocks (issue #2395).** In 0.8.0, `20261029034500_harvest_retention_candidates_index` built the new index and dropped the old one in one transaction. The drop could deadlock with a step transaction that waited behind the build, and the build rolled back. `20261029034500` now builds only. The new migration `20261101012649_harvest_retention_scan_index_drop` drops the old index in its own transaction. A database that applied the 0.8.0 form is already done. `migration_lock_safety` gains the `lock-upgrade` rule.
+
+- **`*_info()` doc examples name the real function.** `#[workflow]` and `#[activity]` printed the literal `#public_info_name()` in the generated doc example. The fence is now `text`, so `cargo test -- --ignored` in a downstream crate no longer fails once per `*_info()` function.
+
+### Performance
+
+- **Signal reads by execution use an index (issue #2367).** Migration `20261030182800_harvest_signals_exec_index` builds `idx_harvest_signals_exec`. The retry signal move falls from 4,480 to 529 buffers on 100,000 signals, and an execution delete from 4,150 to 149. Pending reads send `NOT consumed` as a literal, so a generic plan keeps the partial index. See [`docs/performance-signals-exec-index.md`](docs/performance-signals-exec-index.md).
+
+- **Dead-letter reads use an index (issue #2401).** Migration `20261102143438_harvest_dead_letter_indexes` builds three indexes on `harvest_dead_letters`. On 100,000 rows, a DLQ list page falls from 5,959 to 5 buffers, and the callback redrive delete from 5,884 to 5. See [`docs/performance-dead-letter-indexes.md`](docs/performance-dead-letter-indexes.md) for the trade-off.
+
+- **The schema contract diff borrows canonical schemas.** On 200 workflows and 400 activities the diff takes 13.5% fewer instructions and allocates 12.9% fewer bytes. See [`docs/performance-schema-contract-diff.md`](docs/performance-schema-contract-diff.md).
+
+### Documentation
+
+- **0.9.0 upgrade guide.** [`docs/upgrading/0.9.0.md`](docs/upgrading/0.9.0.md) is new. The 0.8.0 guide returns to the text that shipped with 0.8.0, and its §1.16 points at the 0.9.0 retention fix.
+
+- **Chapter 8 DAG snippets compile (PR #2495).** `scripts/check-dags-schedules-examples.sh` compiles 13 of the 15 Rust blocks of getting-started chapter 8 in the `lint` job.
+
+- **Assay 17 pre-registration (PR #2508).** It re-charters assay 16: the PG 12 and PG 14 engine tests, graded per test. Registered, not run.
+
+### Testing
+
+- **Conformance: gated signal order (PR #2509).** `signal_while_activity_retries` now opens its retry gate only after the history holds the signal. The flake rate fell from 3 in 80 to 0 in 100.
+
+- **The model-turn span test runs in its own binary (PR #2458).** A parallel test could cache the `agent_model_turn` tracing callsite as disabled. The test failed 2 times in 200, and passes 200 of 200 alone.
+
+### Internal
+
+- **Every Diesel table fits the default 32-column tier (issue #2492).** The workspace no longer turns on Diesel's `128-column-tables` feature, which Cargo unified into every embedder. `table_split` bridges each core and `_ext` declaration, and each statement renders the same SQL. `docs/audits/diesel-table-width.py` gates the width in the `lint` job.
+
+- **The workspace publishes again (PR #2459).** A versioned dev-dependency from `autumn-harvest` on `autumn-harvest-agent` made a cycle, so `cargo publish` could not order the crates. The edge is now path-only. PR CI runs the release gate's whole-workspace clippy, and the release gate frees the runner disk before its test build.
+
+- **Dependencies.** `schemars` 1.2.1 (PR #2504), `lru` 0.19.0 (PR #2502), and the `actions-minor-and-patch` group (PR #2500). `deny.toml` restores the `croner` 2.2 pin rehearsal from PR #2142 (PR #2506).
+
 ## [0.8.0] - 2026-10-28
 
 ### Upgraded
