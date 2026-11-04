@@ -15,7 +15,7 @@
 //! (default 1440, one day of a per-minute cron).
 
 use autumn_harvest::policy::Schedule;
-use autumn_harvest::schedule_plan::next_fire_after;
+use autumn_harvest::schedule_plan::SlotWalker;
 use chrono::{DateTime, Utc};
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -33,9 +33,10 @@ fn main() {
     let mut checksum = 0_i64;
     for i in 0..schedules {
         let schedule = Schedule::Cron(exprs[i % exprs.len()].to_string());
+        let walker = SlotWalker::new(&schedule);
         let mut cursor = start;
         for _ in 0..slots {
-            cursor = next_fire_after(&schedule, cursor).expect("next slot");
+            cursor = walker.next_after(cursor).expect("next slot");
         }
         checksum ^= cursor.timestamp();
     }
