@@ -62,6 +62,9 @@ diesel = { workspace = true }
 diesel-async = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+# Captures the `harvest.audit` event of a capped auto adoption (issue #2394).
+# Already in the lockfile.
+tracing-subscriber = "0.3"
 
 [[test]]
 name = "sqlite_loop"
@@ -184,12 +187,20 @@ name = "refine_propose"
 required-features = ["sqlite"]
 
 [[test]]
+name = "refine_policy"
+required-features = ["sqlite"]
+
+[[test]]
 name = "score"
 required-features = ["sqlite"]
 
 [[test]]
 name = "score_postgres"
 required-features = ["postgres"]
+
+[[test]]
+name = "episodes"
+required-features = ["sqlite"]
 
 [lints]
 workspace = true

@@ -280,7 +280,13 @@ fn the_engine_registration_builds() {
             "agent_workspace_floor",
             "agent_refine_propose",
             "agent_sampling_policy",
+            "agent_refine_policy",
             "agent_score",
+            "agent_consolidate_read",
+            "agent_consolidate_turn",
+            "agent_consolidate_write",
+            "agent_episode_append",
+            "agent_episode_reset",
         ]
     );
     let flows: Vec<&str> = workflows().iter().map(|w| w.name).collect();
@@ -291,6 +297,7 @@ fn the_engine_registration_builds() {
             autumn_harvest_agent::heartbeat::HEARTBEAT_WORKFLOW_NAME,
             autumn_harvest_agent::AGENT_WORKFLOW_NAME,
             autumn_harvest_agent::sampling::DRAWS_WORKFLOW_NAME,
+            autumn_harvest_agent::CONSOLIDATE_WORKFLOW_NAME,
         ]
     );
 }

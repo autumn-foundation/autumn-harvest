@@ -45,6 +45,9 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
+#[path = "support/wire_contract.rs"]
+mod wire_contract;
+
 fn init_sql() -> Vec<u8> {
     autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
@@ -283,6 +286,8 @@ async fn single_call_returns_every_line_in_emission_order() {
         first.get("truncation_marker").is_none(),
         "an ordinary line must omit truncation_marker entirely"
     );
+    // The shared shape check that the SQLite suite runs too (issue #2468).
+    wire_contract::logs_shape(&body);
 }
 
 #[tokio::test]

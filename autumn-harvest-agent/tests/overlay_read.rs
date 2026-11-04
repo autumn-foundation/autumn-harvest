@@ -251,3 +251,13 @@ async fn every_published_attribute_is_documented() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_policy_ceiling_reaches_the_op_read() {
+    overlay_read_suite::a_policy_ceiling_reaches_the_op_read(&mut Sqlite::new()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_after_an_auto_adoption_restores_v1() {
+    overlay_read_suite::a_rollback_after_an_auto_adoption_restores_v1(&mut Sqlite::new()).await;
+}

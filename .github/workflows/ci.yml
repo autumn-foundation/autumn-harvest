@@ -776,8 +776,10 @@ jobs:
             python3 docs/audits/comment-hygiene.py
           fi
 
-      # Folio corpus harness: test-db-linux per-shard weight drift report
-      # (see docs/audits/shard-weight-drift.py). Report-only (always exits
+      # Folio corpus harness: per-shard weight drift report for row-ordinal
+      # sharding (see docs/audits/shard-weight-drift.py). The coverage nightly
+      # shards that way. `test-db-linux` partitions by test hash now, so the
+      # report no longer describes it. Report-only (always exits
       # 0): the script's own docstring explains why gating now would redden
       # every open PR on a pre-existing collision this step cannot itself
       # fix. Pure Python stdlib, no deps, no network, no cargo build.
@@ -1334,18 +1336,77 @@ jobs:
             echo "no artifact at ${BASE_SHA} — first introduction, nothing to compare"
           fi
 
+  # Builds the test binaries of every `linux` and `linuxpart` manifest row once,
+  # into one cargo-nextest archive. Each `test-db-linux` shard downloads it and
+  # runs its slice. Before this job, every shard compiled its own rows. On
+  # shard 15 of a green trunk-dev run, that took 15.6 of the 22.4 minutes of
+  # its suite step, and each of the 21 shards repeated it.
+  #
+  # `run-suites.sh archive` explains the feature union and the debug-info
+  # setting. Without the debug-info setting the archive does not fit an
+  # artifact: one plugin test binary is about 1.4 GB.
+  #
+  # Same draft-skip and step-level docs-only gate as `test-db-linux`. A
+  # docs-only change runs no step here, so it uploads no archive, and the
+  # shards skip their download for the same reason.
+  test-db-archive:
+    name: Test DB (linux, build archive)
+    needs: [lint, changes]
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Its own key. The archive builds without debug info, so it shares
+          # no artifact with the jobs that build with it.
+          shared-key: test-db-archive
+      - name: Free runner disk before heavy plugin link (Linux)
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
+      # The shards install the same version. The archive format is internal
+      # to nextest, so the two ends must agree.
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        if: needs.changes.outputs.code == 'true'
+        with:
+          tool: cargo-nextest@0.9.111
+      - name: Build the live-DB test archive
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: bash .github/ci/run-suites.sh archive "$RUNNER_TEMP/nextest-db.tar.zst"
+      # The archive is zstd already, so the upload does not compress it again.
+      # One day of retention is enough: only this run reads it.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: needs.changes.outputs.code == 'true'
+        with:
+          name: nextest-db-archive
+          path: ${{ runner.temp }}/nextest-db.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
   # Split out of `test`'s `ubuntu-latest` leg (docs/rnd/2026-09-03-ci-health-semaphore.md):
   # the `linux`/`linuxpart` Docker-backed manifest rows used to run there as one
   # serial step, consistently ~55-58% of that leg's wall time across three
-  # sampled runs. Sharded across parallel jobs here instead, each processing
-  # row_ordinal % SEMAPHORE_SHARD_COUNT == SEMAPHORE_SHARD_INDEX of the
-  # matching manifest rows (see `run-suites.sh`'s header comment). Safe to
-  # shard freely: the few suites needing in-process serialization
-  # (`mutex_tests.rs`, `transactional_start_tests.rs` -- process-global state,
-  # not shared-database state) still get their own `--test-threads=1`
-  # regardless of which shard runs them; sharding only changes which manifest
-  # ROWS a given job processes, never the ordering of tests WITHIN one row's
-  # own `cargo test` invocation.
+  # sampled runs. Sharded across parallel jobs here instead.
+  #
+  # Each shard runs a slice of the tests from the `test-db-archive` archive.
+  # `run-suites.sh nextest` takes the slice with `--partition hash:<k>/<N>`, so
+  # a test lands on one shard by the hash of its name. A large suite spreads
+  # over all shards, and no shard compiles. The row-ordinal sharding that the
+  # comment above `matrix` analyses now runs only in the coverage nightly.
+  #
+  # Each test runs in its own process under nextest, and one at a time on a
+  # shard. The suites that serialize on process-global state (`mutex_tests.rs`,
+  # `transactional_start_tests.rs`) are therefore still serial, and isolated
+  # as well.
   #
   # A SEPARATE job, not a matrix dimension added to `test`: `test`'s
   # `ubuntu-latest` leg is a branch-protection required check BY NAME, and
@@ -1361,7 +1422,7 @@ jobs:
   # config change can do on its own.
   test-db-linux:
     name: Test DB (linux, shard ${{ matrix.shard }})
-    needs: [lint, changes]
+    needs: [lint, changes, test-db-archive]
     # Same draft-skip pattern as `test` (see its comment above): job-level
     # `if:` only gates draft-PR pushes, so every shard leg still spins up and
     # reports a conclusion; the step-level `needs.changes.outputs.code` guard
@@ -1374,6 +1435,14 @@ jobs:
       # SEMAPHORE_SHARD_COUNT below MUST equal this list's length -- GitHub
       # Actions matrix expressions can't derive one from the other, so keep
       # them in sync by hand when changing the shard count.
+      #
+      # This job no longer shards by row. It partitions tests by hash, so the
+      # row weights below do not set its balance. The `db` job of
+      # coverage-nightly.yml still shards by row ordinal, and
+      # `coverage_nightly_wiring.rs` holds it to this count. The analysis below
+      # therefore still applies there. Its references to a partitioned pass
+      # on shard 0 describe the layout before the archive. That pass is now
+      # partitioned over every shard.
       #
       # 21, not 11 (issue #1685 review; see also PR #1703's
       # `docs/audits/shard-weight-drift.py`, a report-only harness that
@@ -1519,32 +1588,47 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     runs-on: ubuntu-latest
-    # The shard count and index live here once. The pre-pull step and the
-    # suite step both read them, so a re-shard cannot leave the pre-pull
-    # asking about a different assignment than the suites run under. Keep
-    # the count equal to the `matrix.shard` list above. The partitioned pass
-    # at the end of this job overrides the count to run whole.
+    # The shard count and index live here once. The pre-pull step and both
+    # suite steps read them. Keep the count equal to the `matrix.shard` list
+    # above.
     env:
       SEMAPHORE_SHARD_COUNT: "21"
       SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # No rust-cache: a shard compiles nothing. It runs binaries from the
+      # archive. The toolchain stays, because `cargo nextest` runs through
+      # cargo.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # One cache shared across all shards (they all build against the
-          # same Cargo.lock) rather than rust-cache's default per-job-name
-          # key, so a shard that needs a binary another shard already built
-          # doesn't start cold.
-          shared-key: test-db-linux
-      - name: Free runner disk before heavy plugin link (Linux)
+      # The unpacked archive is large, and the Docker images need room too.
+      - name: Free runner disk before unpacking the test archive (Linux)
         if: needs.changes.outputs.code == 'true'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
+      # The same version as `test-db-archive`, which wrote the archive.
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        if: needs.changes.outputs.code == 'true'
+        with:
+          tool: cargo-nextest@0.9.111
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.changes.outputs.code == 'true'
+        with:
+          name: nextest-db-archive
+          path: ${{ runner.temp }}
+      # Unpacks into ./target, where the archive job built. A test that bakes
+      # a path in with `env!` then finds its file. Deletes the archive after,
+      # to give the disk back.
+      - name: Unpack the live-DB test archive
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          bash .github/ci/run-suites.sh extract "$RUNNER_TEMP/nextest-db.tar.zst"
+          rm -f "$RUNNER_TEMP/nextest-db.tar.zst"
           df -h /
       # The prune above guarantees every shard pulls its testcontainer images
       # from a cold cache. `testcontainers` itself retries nothing on a pull,
@@ -1559,6 +1643,10 @@ jobs:
       - name: Pre-pull Docker test images (retry transient pull failures)
         if: needs.changes.outputs.code == 'true'
         shell: bash
+        env:
+          # The hash partition sends tests of each emulator suite to many
+          # shards, so every shard pulls every emulator image.
+          PULL_EVERY_SUITE_IMAGE: "1"
         run: bash .github/ci/pull-test-images.sh
       - name: Run Linux Docker-backed manifest suites (shard)
         if: needs.changes.outputs.code == 'true'
@@ -1579,22 +1667,19 @@ jobs:
           # into a panic, so "the Redis suites stopped testing anything" is a
           # red build here rather than a silent green.
           HARVEST_TEST_REQUIRE_REDIS: "1"
-        run: bash .github/ci/run-suites.sh run linux
+        run: bash .github/ci/run-suites.sh nextest linux
       # Issue #958, AC2: re-run the store/replay/retention suites against the
       # opt-in PARTITIONED `harvest_events` layout. Same suites, same
       # assertions, `HARVEST_TEST_PARTITIONED=1` -- so "per-execution event
       # semantics are byte-identical between layouts" is asserted by the
       # existing tests rather than by a separate set that could drift from
-      # them. Only 10 rows (~6 minutes unsharded) -- not worth splitting, so it
-      # runs whole, once, on shard 0 only.
+      # them. The archive holds these binaries already, so the pass costs no
+      # build. It is partitioned like the step above, so it adds about one
+      # twenty-first of its run time to each shard, not all of it to shard 0.
       - name: Integration suites (partitioned harvest_events layout)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: needs.changes.outputs.code == 'true'
         shell: bash
-        env:
-          # Empty count: run-suites.sh treats it as unsharded, so this pass
-          # runs all its rows on this one shard.
-          SEMAPHORE_SHARD_COUNT: ""
-        run: bash .github/ci/run-suites.sh run linuxpart
+        run: bash .github/ci/run-suites.sh nextest linuxpart
 
   quickstart:
     name: Quickstart example builds and runs (clean-room, README steps)

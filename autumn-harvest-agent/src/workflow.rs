@@ -2891,7 +2891,7 @@ pub async fn agent_discover_peers(
 }
 
 /// The workflows to register on a `HarvestBuilder`: `agent_loop`,
-/// `agent_heartbeat` and the durable `agent`.
+/// `agent_heartbeat`, the durable `agent` and its pass `agent_consolidate`.
 #[must_use]
 pub fn workflows() -> Vec<WorkflowInfo> {
     vec![
@@ -2899,6 +2899,7 @@ pub fn workflows() -> Vec<WorkflowInfo> {
         agent_heartbeat_info(),
         agent_info(),
         crate::sampling::agent_draws_info(),
+        crate::consolidate::agent_consolidate_info(),
     ]
 }
 
@@ -2920,7 +2921,13 @@ pub fn activities() -> Vec<ActivityInfo> {
         agent_workspace_floor_info(),
         crate::refine::agent_refine_propose_info(),
         crate::sampling::agent_sampling_policy_info(),
+        crate::refine::agent_refine_policy_info(),
         crate::score::agent_score_info(),
+        crate::consolidate::agent_consolidate_read_info(),
+        crate::consolidate::agent_consolidate_turn_info(),
+        crate::consolidate::agent_consolidate_write_info(),
+        crate::consolidate::agent_episode_append_info(),
+        crate::consolidate::agent_episode_reset_info(),
     ]
 }
 

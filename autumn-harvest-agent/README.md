@@ -26,6 +26,10 @@ durable inbox, and it survives a crash. A message can queue, steer the running
 segment, or interrupt it (issue #2265). See section 15 of
 [`docs/agent-adapter.md`](../docs/agent-adapter.md).
 
+An opt-in episode log (issue #2454) records each op of a durable agent. The
+workflow `agent_consolidate` turns the episodes into facts in the agent
+memory, under the LLM budget and the cost ledger.
+
 A run can delegate a task to a peer agent. An inline peer runs as a sub-agent
 in the same workflow. A durable peer is an `Agent` with its own history, inbox
 and budget (issue #2269). A mandate bounds the delegation tree, and flow rules

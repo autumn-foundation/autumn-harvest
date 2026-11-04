@@ -39,7 +39,7 @@ measured = "unmeasured"
 driver = "setup"
 backend = ["sqlite"]
 kind = ["ddl", "read"]
-tables = ["harvest_agent_overlay_activations", "harvest_agent_overlay_heads", "harvest_agent_overlays"]
+tables = ["harvest_agent_overlay_activations", "harvest_agent_overlay_heads", "harvest_agent_overlays", "harvest_agent_refine_policies"]
 measured = "unmeasured"
 
 ["last_move"]
@@ -47,4 +47,32 @@ driver = "per_request"
 backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_agent_overlay_activations"]
+measured = "unmeasured"
+
+["SqliteOverlayLog::policy_log"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_agent_refine_policies"]
+measured = "unmeasured"
+
+["append_policy_in"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_agent_refine_policies"]
+measured = "unmeasured"
+
+["auto_adopt_in"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_agent_overlay_activations", "harvest_agent_overlay_heads", "harvest_agent_overlays"]
+measured = "unmeasured"
+
+["last_policy_in"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_agent_refine_policies"]
 measured = "unmeasured"

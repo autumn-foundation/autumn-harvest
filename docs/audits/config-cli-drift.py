@@ -16,7 +16,7 @@ Ground truth is extracted mechanically from two files, never hand-maintained:
   struct tree (what `autumn.toml`'s `[harvest]` section actually deserializes
   into) gives the TOML config-key paths; `env.var("...")` call sites give the
   `AUTUMN_*` env-var overrides.
-- `autumn-harvest-cli/src/lib.rs` — every `#[arg(...)]`-annotated field gives
+- `autumn-harvest-cli/src/**/*.rs` — every `#[arg(...)]`-annotated field gives
   a CLI flag (explicit `long = "..."` wins; otherwise the field name in
   kebab-case), and every `env = "..."` on one of those gives a CLI-level env
   var (`HARVEST_*`).
@@ -74,9 +74,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_RS = REPO_ROOT / "autumn-harvest-plugin/src/config.rs"
 CLI_RS = REPO_ROOT / "autumn-harvest-cli/src/lib.rs"
-# The CLI also declares flags in submodules, such as `agents.rs` (issue
-# #2439). Each `.rs` file in this directory is scanned.
-CLI_SRC = CLI_RS.parent
+# Every CLI source file. A subcommand module such as `agent_profile.rs`
+# (issue #2394) declares its own `#[arg(...)]` fields.
+CLI_SRC = REPO_ROOT / "autumn-harvest-cli/src"
 
 # `corpus-link-check.py` can't be `import`ed by its literal (hyphenated) name;
 # loaded by path instead so this script shares that one's process-artifact
@@ -170,25 +170,18 @@ def extract_cli_ground_truth():
     flags = set()
     env_vars = set()
     for path in sorted(CLI_SRC.rglob("*.rs")):
-        file_flags, file_env = extract_cli_file(path.read_text(encoding="utf-8"))
-        flags |= file_flags
-        env_vars |= file_env
-    # clap's derive `Parser`/`Subcommand` adds `--help` and `--version` to
-    # every level of the command tree, so they are always real.
-    flags.add("help")
-    flags.add("version")
+        _scan_cli_file(path.read_text(encoding="utf-8"), flags, env_vars)
+    _add_builtin_flags(flags)
     return flags, env_vars
 
 
-def extract_cli_file(text):
+def _scan_cli_file(text, flags, env_vars):
+    """Add the flags and env vars of one CLI source file."""
     lines = text.splitlines()
 
     # Join the whole file so a multi-line #[arg(...)] attribute is captured
     # as one block by ARG_ATTR_RE, then map each match back to a line number
     # so we can look at the field declaration on the lines right after it.
-    flags = set()
-    env_vars = set()
-
     for m in ARG_ATTR_RE.finditer(text):
         attr_body = m.group(1)
         if "long" not in attr_body:
@@ -217,6 +210,9 @@ def extract_cli_file(text):
         if env_m:
             env_vars.add(env_m.group(1))
 
+
+def _add_builtin_flags(flags):
+    """Add the flags that clap adds to each command."""
     # clap's derive `Parser`/`Subcommand` adds `--help` and `--version` to
     # every level of the command tree automatically — they're never
     # `#[arg(...)]` fields, so the loop above can't see them. Real unless
@@ -228,8 +224,6 @@ def extract_cli_file(text):
     # the CLI's own `the_real_binary_*` integration tests invoke it for real).
     flags.add("help")
     flags.add("version")
-
-    return flags, env_vars
 
 
 BLOCKQUOTE_PREFIX_RE = re.compile(r"^(>[ \t]*)")

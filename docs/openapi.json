@@ -6192,6 +6192,233 @@
         "x-harvest-route-class": "read_only"
       }
     },
+    "/agents/{kind}/profile/policy": {
+      "get": {
+        "description": "Show the refine policy of an agent kind (issue #2394), with its revision. A kind with no stored policy shows every default and revision null. custom is false when the last change was a reset.",
+        "operationId": "get_agents_by_kind_profile_policy",
+        "parameters": [
+          {
+            "description": "Agent kind: the name of an AgentProfile.",
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "custom": {},
+                    "kind": {},
+                    "policy": {},
+                    "revision": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "404": {
+            "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store)."
+          },
+          "500": {
+            "description": "Store or database error, or a stored policy that does not decode."
+          }
+        },
+        "summary": "Show the refine policy of an agent kind (issue #2394), with its revision.",
+        "tags": [
+          "agent"
+        ],
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
+      },
+      "put": {
+        "description": "Set the refine policy of an agent kind (issue #2394). The policy replaces the stored one. A key that it leaves out takes its default, and an unknown key or a value out of range is refused. Only the operator role sets it: the route is Mutating and not in ADMIN_SCOPE_ROUTES, so a read role gets 403. Audited under agent_profile.policy_set: error_summary holds the revision and each changed key with its old and new value. The store log keeps both whole bodies.",
+        "operationId": "put_agents_by_kind_profile_policy",
+        "parameters": [
+          {
+            "description": "Agent kind: the name of an AgentProfile.",
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "expected_revision": {
+                    "description": "The revision that the caller read, or null when the kind has no change. A different revision refuses the call."
+                  },
+                  "policy": {
+                    "description": "The whole refine policy: auto_adopt, approval_timeout, probe_effects, ceilings, proposal_attempts and lessons. See docs/agent-adapter.md section 18."
+                  }
+                },
+                "required": [
+                  "policy",
+                  "expected_revision"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "actor": {},
+                    "changes": {},
+                    "custom": {},
+                    "kind": {},
+                    "policy": {},
+                    "revision": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "Bad body: no expected_revision, an unknown key, a value out of range, an invalid operator id, or a kind over 200 bytes."
+          },
+          "404": {
+            "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store)."
+          },
+          "409": {
+            "description": "The policy is at another revision. Nothing changed."
+          },
+          "500": {
+            "description": "Store or database error. When the change committed but its audit row failed, the body holds committed true, kind and revision. Do not send the request again."
+          },
+          "503": {
+            "description": "The database is unavailable."
+          }
+        },
+        "summary": "Set the refine policy of an agent kind (issue #2394).",
+        "tags": [
+          "agent"
+        ],
+        "x-harvest-idempotency": "Compare-and-swap on expected_revision: a repeat of a succeeded call is a 409, because the revision moved.",
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
+      }
+    },
+    "/agents/{kind}/profile/policy/changes": {
+      "get": {
+        "description": "List each change of the refine policy of an agent kind, oldest first (issue #2394). Each change holds its revision, the operator id, the time, the old and the new policy (null for every default) and the keys that changed.",
+        "operationId": "get_agents_by_kind_profile_policy_changes",
+        "parameters": [
+          {
+            "description": "Agent kind: the name of an AgentProfile.",
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "changes": {},
+                    "kind": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "404": {
+            "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store)."
+          },
+          "500": {
+            "description": "Store or database error, or a stored policy that does not decode."
+          }
+        },
+        "summary": "List each change of the refine policy of an agent kind, oldest first (issue #2394).",
+        "tags": [
+          "agent"
+        ],
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
+      }
+    },
+    "/agents/{kind}/profile/policy/reset": {
+      "post": {
+        "description": "Restore every default of the refine policy of an agent kind (issue #2394). It needs no revision, because the result is the same from any state. Only the operator role resets it. Audited under agent_profile.policy_reset, with the same row form as a set.",
+        "operationId": "post_agents_by_kind_profile_policy_reset",
+        "parameters": [
+          {
+            "description": "Agent kind: the name of an AgentProfile.",
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "actor": {},
+                    "changes": {},
+                    "custom": {},
+                    "kind": {},
+                    "policy": {},
+                    "revision": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "The body is not an empty JSON object, the operator id is invalid, or the kind is over 200 bytes."
+          },
+          "404": {
+            "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store)."
+          },
+          "500": {
+            "description": "Store or database error. When the change committed but its audit row failed, the body holds committed true, kind and revision. Do not send the request again."
+          },
+          "503": {
+            "description": "The database is unavailable."
+          }
+        },
+        "summary": "Restore every default of the refine policy of an agent kind (issue #2394).",
+        "tags": [
+          "agent"
+        ],
+        "x-harvest-idempotency": "Idempotent in effect: each call leaves every default. Each call adds one change to the log.",
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
+      }
+    },
     "/agents/{kind}/profile/rollback": {
       "post": {
         "description": "Activate the version that was active before the current one (issue #2374). The store reads the last move from vN to vM, and activates vN over vM. The swap also needs that move to be the last one, so a pointer that moved after the read is a 409, also when it moved back. A second rollback undoes the first one. The routes are not in ADMIN_SCOPE_ROUTES, so the mutate scope (the harvest-operator role) is enough. Audited under agent_profile.rollback, with the same row form as activate.",

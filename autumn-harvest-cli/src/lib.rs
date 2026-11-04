@@ -661,7 +661,8 @@ pub enum ApiMethod {
     Patch,
     /// HTTP POST.
     Post,
-    /// HTTP PUT.
+    /// HTTP PUT. It replaces a whole value, such as a refine policy
+    /// (issue #2394).
     Put,
     /// HTTP DELETE.
     Delete,
@@ -884,6 +885,11 @@ pub enum CliError {
     /// version first, so it has no single request (issue #2374).
     #[error("`agents profile activate` with no --expected has no single API request")]
     AgentProfileActivateIsMultiStep,
+
+    /// `agents profile policy <kind> set` reads the policy first, so it has
+    /// no single request (issue #2394).
+    #[error("`agents profile policy set` has no single API request")]
+    AgentProfilePolicySetIsMultiStep,
 
     /// `--wait` timed out before the worker reached `Stopped`.
     #[error("timed out waiting for worker '{worker_id}' to stop (last status: {last_status})")]
@@ -3903,6 +3909,14 @@ impl ApiRequest {
             body,
         }
     }
+
+    fn put(path: impl Into<String>, body: Option<Value>) -> Self {
+        Self {
+            method: ApiMethod::Put,
+            path: path.into(),
+            body,
+        }
+    }
 }
 
 mod agent_profile;
@@ -4154,6 +4168,23 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     } = &cli.command
     {
         return agent_profile::run_profile_activate(&cli, kind, version).await;
+    }
+
+    // `agents profile policy <kind> set` reads the policy, changes the
+    // named keys, then sends them over the revision that it read (issue
+    // #2394).
+    if let Commands::Agents {
+        command:
+            agents::AgentCommand::Profile {
+                command:
+                    agent_profile::ProfileCommand::Policy {
+                        kind,
+                        action: agent_profile::PolicyAction::Set(set),
+                    },
+            },
+    } = &cli.command
+    {
+        return agent_profile::run_policy_set(&cli, kind, set).await;
     }
 
     // --wait mode: issue drain then poll until Stopped or timeout.

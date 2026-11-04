@@ -410,6 +410,9 @@ fn agents_profile_commands_are_covered() {
             "1",
         ][..],
         &["agents", "profile", "rollback", "support"][..],
+        &["agents", "profile", "policy", "support", "show"][..],
+        &["agents", "profile", "policy", "support", "reset"][..],
+        &["agents", "profile", "policy", "support", "history"][..],
     ] {
         assert_covered(args);
         assert_body_fields_documented(args);

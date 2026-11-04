@@ -66,6 +66,10 @@ pub struct Registry {
     pub updates: Vec<UpdateHandlerInfo>,
     /// The declarative `#[signal]` handlers, for their payload schemas.
     pub signals: Vec<autumn_harvest::SignalHandlerInfo>,
+    /// The declarative `#[query]` handlers (issue #2468).
+    pub queries: Vec<autumn_harvest::QueryHandlerInfo>,
+    /// The durable log sink policy. `None` stores no line (issue #2468).
+    pub log_policy: Option<autumn_harvest::context::WorkflowLogPolicy>,
     /// The `HarvestPlugin::state` values.
     pub state: SharedState,
 }
@@ -351,6 +355,10 @@ fn register(runtime: &mut SqliteRuntime, registry: &Registry) {
     for signal in &registry.signals {
         runtime.register_signal_handler(signal);
     }
+    for query in &registry.queries {
+        runtime.register_query(query);
+    }
+    runtime.set_workflow_log_policy(registry.log_policy);
     runtime.set_shared_state(Arc::clone(&registry.state));
 }
 
@@ -738,6 +746,8 @@ mod tests {
                     activities: Vec::new(),
                     updates: Vec::new(),
                     signals: Vec::new(),
+                    queries: Vec::new(),
+                    log_policy: None,
                     state: autumn_harvest::context::empty_shared_state(),
                 };
                 let runtime = Driver::open(&path, &registry).expect("open");

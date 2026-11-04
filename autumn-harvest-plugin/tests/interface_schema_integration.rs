@@ -58,6 +58,9 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
+#[path = "support/wire_contract.rs"]
+mod wire_contract;
+
 /// The full migration schema, mirroring every other plugin integration
 /// suite (e.g. `query_integration.rs`) — uses `test_init_sql()` so the
 /// test schema always tracks trunk and never hand-rolls a bundle (which the
@@ -656,6 +659,8 @@ async fn interface_lists_sorted_handlers_with_schemas() {
 
     let (status, body) = get(&app, "/workflows/registered/iface_wf/interface").await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
+    // The shared shape check that the SQLite suite runs too (issue #2468).
+    wire_contract::interface_shape(&body);
 
     // Signals: one entry `approve`, with an arg_schema + description, no response_schema.
     assert_eq!(names(&body["signals"]), vec!["approve"]);
@@ -781,6 +786,8 @@ async fn registered_schema_route_surfaces_declared_dependencies() {
         json!(["send_email", "charge_card"])
     );
     assert_eq!(body["declared_children"], json!(["generate_report"]));
+    // The shared shape check that the SQLite suite runs too (issue #2468).
+    wire_contract::registered_schema_shape(&body, "declaring_wf");
 
     let (status, body) = get(&app, "/workflows/registered/plain_wf/schema").await;
     assert_eq!(status, StatusCode::OK, "body: {body}");

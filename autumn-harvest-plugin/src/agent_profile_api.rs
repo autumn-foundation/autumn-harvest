@@ -9,19 +9,26 @@
 //! keeps `from v1 to v2` in `error_summary`. The move and its audit run in a
 //! task of their own, so a dropped client cannot stop the audit. The design is in
 //! `docs/design/DESIGN-2374.md`.
+//!
+//! The refine policy routes (issue #2394) read, set and reset the policy of
+//! one kind. A set and a reset are mutating, so only the operator role
+//! reaches them. Each one writes one audit row that names each changed key
+//! with its old and new value. The design is in
+//! `docs/design/DESIGN-2394.md`.
 
 use std::sync::Arc;
 
 use autumn_harvest::audit::{
-    self, OP_AGENT_PROFILE_ACTIVATE, OP_AGENT_PROFILE_ROLLBACK, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_AGENT_PROFILE,
+    self, OP_AGENT_PROFILE_ACTIVATE, OP_AGENT_PROFILE_POLICY_RESET, OP_AGENT_PROFILE_POLICY_SET,
+    OP_AGENT_PROFILE_ROLLBACK, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_AGENT_PROFILE,
 };
 use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::models::NewAuditRecord;
 use autumn_harvest_agent::agent::MAX_AGENT_NAME_BYTES;
+use autumn_harvest_agent::refine::policy::{PolicyChange, policy_changes};
 use autumn_harvest_agent::{
-    OverlayChange, OverlayStoreError, OverlayVersion, ProfileOverlay, ProfileOverlayStore,
-    Provenance, StoredOverlay, overlay_diff,
+    OverlayChange, OverlayStoreError, OverlayVersion, PolicyLogEntry, PolicyState, ProfileOverlay,
+    ProfileOverlayStore, Provenance, RefinePolicy, StoredOverlay, overlay_diff,
 };
 use autumn_web::AutumnError;
 use autumn_web::reexports::axum;
@@ -30,12 +37,15 @@ use axum::extract::{Extension, Json, Path, Query};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::api::{HarvestApiState, acquire_conn, audit_context, deserialize_tristate, map_error};
 use crate::authz::{MAX_AUDITED_SUMMARY_LEN, truncate};
 
 const ACTIVATE_ROUTE: &str = "POST /agents/{kind}/profile/activate";
 const ROLLBACK_ROUTE: &str = "POST /agents/{kind}/profile/rollback";
+const POLICY_SET_ROUTE: &str = "PUT /agents/{kind}/profile/policy";
+const POLICY_RESET_ROUTE: &str = "POST /agents/{kind}/profile/policy/reset";
 
 /// The message of every route when the embedder installed no store.
 pub const NO_OVERLAY_STORE: &str =
@@ -167,7 +177,9 @@ fn store_error(error: &OverlayStoreError) -> AutumnError {
         OverlayStoreError::UnknownVersion { .. } | OverlayStoreError::UnknownKind { .. } => {
             AutumnError::not_found_msg(message)
         }
-        OverlayStoreError::Conflict { .. } | OverlayStoreError::NoEarlierActivation => {
+        OverlayStoreError::Conflict { .. }
+        | OverlayStoreError::NoEarlierActivation
+        | OverlayStoreError::PolicyConflict { .. } => {
             AutumnError::bad_request_msg(message).with_status(StatusCode::CONFLICT)
         }
         OverlayStoreError::Overlay(_) => {
@@ -288,6 +300,14 @@ pub async fn diff_versions(
     }))
 }
 
+/// A change that the store committed: the answer, the keys that a failed
+/// audit names, and the audit summary.
+struct Committed {
+    body: Value,
+    ends: Value,
+    summary: String,
+}
+
 /// One write request: its audit context and its route.
 struct Write {
     api_state: HarvestApiState,
@@ -372,42 +392,63 @@ impl Write {
         self,
         outcome: Result<(Option<OverlayVersion>, OverlayVersion), AutumnError>,
     ) -> Response {
+        let outcome = outcome.map(|(from, to)| {
+            let summary = move_summary(from, to);
+            Committed {
+                body: serde_json::to_value(OverlayMove {
+                    kind: self.kind.clone(),
+                    from,
+                    to,
+                    actor: self.actor.clone(),
+                })
+                .unwrap_or_default(),
+                ends: serde_json::json!({"from": from, "to": to}),
+                summary,
+            }
+        });
+        self.finish_change(outcome).await
+    }
+
+    /// Audit the outcome of a request that changes the store, then answer
+    /// it.
+    ///
+    /// A failed request logs its audit error and keeps its own error. A
+    /// committed change whose audit row fails answers `500` with
+    /// `committed: true` and the keys of `ends`.
+    async fn finish_change(self, outcome: Result<Committed, AutumnError>) -> Response {
         match outcome {
-            Ok((from, to)) => {
-                let summary = move_summary(from, to);
+            Ok(committed) => {
+                let summary = committed.summary;
                 if let Err(error) = self.audit(Ok(&summary)).await {
                     tracing::error!(
                         error = %error,
                         kind = %truncate(&self.kind, MAX_AUDITED_SUMMARY_LEN),
                         summary,
-                        "an overlay move committed, but its audit row failed"
+                        "an agent profile change committed, but its audit row failed"
                     );
-                    let body = serde_json::json!({
+                    let mut body = serde_json::json!({
                         "error": format!(
-                            "the move {summary} committed, but its audit row failed. \
+                            "the change {summary} committed, but its audit row failed. \
                              Do not send the request again."
                         ),
                         "committed": true,
                         "kind": self.kind,
-                        "from": from,
-                        "to": to,
                     });
+                    if let (Some(body), Value::Object(ends)) =
+                        (body.as_object_mut(), committed.ends)
+                    {
+                        body.extend(ends);
+                    }
                     return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
                 }
-                Json(OverlayMove {
-                    kind: self.kind,
-                    from,
-                    to,
-                    actor: self.actor,
-                })
-                .into_response()
+                Json(committed.body).into_response()
             }
             Err(error) => {
                 if let Err(audit_error) = self.audit(Err(&error.to_string())).await {
                     tracing::warn!(
                         error = %audit_error,
                         kind = %truncate(&self.kind, MAX_AUDITED_SUMMARY_LEN),
-                        "audit insert failed for a refused overlay move"
+                        "audit insert failed for a refused agent profile change"
                     );
                 }
                 error.into_response()
@@ -546,9 +587,302 @@ pub async fn rollback(
     .await
 }
 
+/// The body of `GET /agents/{kind}/profile/policy`, and of a set or a
+/// reset.
+#[derive(Debug, Clone, Serialize)]
+pub struct PolicyView {
+    /// The agent kind.
+    pub kind: String,
+    /// The revision of the last change, or `null` when the kind has none.
+    pub revision: Option<u64>,
+    /// Whether the last change stored a policy. A reset stores none.
+    pub custom: bool,
+    /// The policy. With no stored policy, every default.
+    pub policy: RefinePolicy,
+    /// The operator who made the change. Only a set or a reset has it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// Each setting that the change changed. Only a set or a reset has it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes: Option<Vec<PolicyChange>>,
+}
+
+/// One change in `GET /agents/{kind}/profile/policy/changes`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PolicyChangeView {
+    /// The number of the change, from 1.
+    pub revision: u64,
+    /// The operator id.
+    pub actor: String,
+    /// The time of the change.
+    pub changed_at: DateTime<Utc>,
+    /// The policy before the change, or `null` for every default.
+    pub old: Option<RefinePolicy>,
+    /// The policy after the change, or `null` for every default.
+    pub new: Option<RefinePolicy>,
+    /// Each setting that differs.
+    pub changes: Vec<PolicyChange>,
+}
+
+/// The body of `GET /agents/{kind}/profile/policy/changes`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PolicyChangeList {
+    /// The agent kind.
+    pub kind: String,
+    /// Each change, oldest first.
+    pub changes: Vec<PolicyChangeView>,
+}
+
+/// The body of `PUT /agents/{kind}/profile/policy`.
+///
+/// Both keys are required. `expected_revision` is the revision that the
+/// client read, or `null` when the kind has no change.
+#[expect(
+    clippy::option_option,
+    reason = "serde tri-state: absent is an error, null is no revision"
+)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyRequest {
+    policy: RefinePolicy,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    expected_revision: Option<Option<u64>>,
+}
+
+/// The body of `POST /agents/{kind}/profile/policy/reset`. It has no field.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResetRequest {}
+
+fn policy_view(kind: &str, state: PolicyState) -> PolicyView {
+    PolicyView {
+        kind: kind.to_owned(),
+        revision: state.revision,
+        custom: state.custom,
+        policy: state.policy,
+        actor: None,
+        changes: None,
+    }
+}
+
+/// The settings that `entry` changed.
+fn entry_changes(entry: &PolicyLogEntry) -> Vec<PolicyChange> {
+    let old = entry.before().cloned().unwrap_or_default();
+    let new = entry.after().cloned().unwrap_or_default();
+    policy_changes(&old, &new)
+}
+
+/// The audit rank of a policy path. The settings that widen the gate come
+/// first, so a cut summary keeps them.
+fn audit_rank(path: &str) -> u8 {
+    match path {
+        _ if path.starts_with("auto_adopt.") => 0,
+        "probe_effects" => 1,
+        _ if path.starts_with("ceilings.max_") => 2,
+        "ceilings.models" => 3,
+        "approval_timeout" => 4,
+        _ => 5,
+    }
+}
+
+/// One change as audit text. A list shows the names that it adds and
+/// removes. Any other value shows `old -> new`.
+fn audit_change(change: &PolicyChange) -> String {
+    let names = |value: &Value| -> Option<Vec<String>> {
+        match value {
+            Value::Array(items) => Some(items.iter().map(Value::to_string).collect()),
+            _ => None,
+        }
+    };
+    match (names(&change.old), names(&change.new)) {
+        (Some(old), Some(new)) => {
+            let added: Vec<_> = new
+                .iter()
+                .filter(|name| !old.contains(name))
+                .cloned()
+                .collect();
+            let removed: Vec<_> = old
+                .iter()
+                .filter(|name| !new.contains(name))
+                .cloned()
+                .collect();
+            format!(
+                "{} +[{}] -[{}]",
+                change.path,
+                added.join(", "),
+                removed.join(", ")
+            )
+        }
+        _ => format!("{} {} -> {}", change.path, change.old, change.new),
+    }
+}
+
+/// `revision 2: auto_adopt.parts +["system"] -[]; ...`, or
+/// `revision 2: no change`.
+///
+/// The settings that widen the gate come first. A summary above the audit
+/// limit ends with a mark that names the revision. A reader then reads the
+/// whole change from the policy log.
+fn policy_summary(revision: u64, changes: &[PolicyChange]) -> String {
+    if changes.is_empty() {
+        return format!("revision {revision}: no change");
+    }
+    let mut ordered: Vec<&PolicyChange> = changes.iter().collect();
+    ordered.sort_by_key(|change| audit_rank(&change.path));
+    let parts: Vec<String> = ordered.into_iter().map(audit_change).collect();
+    let summary = format!("revision {revision}: {}", parts.join("; "));
+    if summary.len() <= MAX_AUDITED_SUMMARY_LEN {
+        return summary;
+    }
+    let mark = format!(" ... (cut: read revision {revision} at GET .../policy/changes)");
+    let mut end = MAX_AUDITED_SUMMARY_LEN.saturating_sub(mark.len());
+    while !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{mark}", &summary[..end])
+}
+
+/// The committed answer of a set or a reset.
+fn policy_committed(kind: &str, entry: &PolicyLogEntry, actor: &str) -> Committed {
+    let changes = entry_changes(entry);
+    let summary = policy_summary(entry.revision(), &changes);
+    let body = PolicyView {
+        kind: kind.to_owned(),
+        revision: Some(entry.revision()),
+        custom: entry.after().is_some(),
+        policy: entry.after().cloned().unwrap_or_default(),
+        actor: Some(actor.to_owned()),
+        changes: Some(changes),
+    };
+    Committed {
+        body: serde_json::to_value(body).unwrap_or_default(),
+        ends: serde_json::json!({"revision": entry.revision()}),
+        summary,
+    }
+}
+
+/// `GET /agents/{kind}/profile/policy`.
+pub async fn get_policy(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(kind): Path<String>,
+) -> Result<Json<PolicyView>, AutumnError> {
+    let state = store(&api_state)?
+        .policy(&kind)
+        .await
+        .map_err(|error| store_error(&error))?;
+    Ok(Json(policy_view(&kind, state)))
+}
+
+/// `GET /agents/{kind}/profile/policy/changes`.
+pub async fn list_policy_changes(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(kind): Path<String>,
+) -> Result<Json<PolicyChangeList>, AutumnError> {
+    let log = store(&api_state)?
+        .policy_log(&kind)
+        .await
+        .map_err(|error| store_error(&error))?;
+    let changes = log
+        .iter()
+        .map(|entry| PolicyChangeView {
+            revision: entry.revision(),
+            actor: entry.actor().author(),
+            changed_at: entry.changed_at(),
+            old: entry.before().cloned(),
+            new: entry.after().cloned(),
+            changes: entry_changes(entry),
+        })
+        .collect();
+    Ok(Json(PolicyChangeList { kind, changes }))
+}
+
+/// The change of a set request.
+async fn set_policy_change(
+    api_state: &HarvestApiState,
+    kind: &str,
+    request: Result<Json<PolicyRequest>, JsonRejection>,
+    actor: &str,
+) -> Result<Committed, AutumnError> {
+    check_kind(kind)?;
+    let Json(request) = request.map_err(|rejection| bad_body(&rejection))?;
+    let Some(expected) = request.expected_revision else {
+        return Err(AutumnError::bad_request_msg(
+            "expected_revision is required: send the revision that you read, or null",
+        ));
+    };
+    let entry = store(api_state)?
+        .set_policy(kind, &request.policy, expected, Provenance::operator(actor))
+        .await
+        .map_err(|error| store_error(&error))?;
+    Ok(policy_committed(kind, &entry, actor))
+}
+
+/// The change of a reset request. An empty body is a valid request.
+async fn reset_policy_change(
+    api_state: &HarvestApiState,
+    kind: &str,
+    request: Result<Json<ResetRequest>, JsonRejection>,
+    actor: &str,
+) -> Result<Committed, AutumnError> {
+    check_kind(kind)?;
+    match request {
+        Ok(Json(ResetRequest {})) | Err(JsonRejection::MissingJsonContentType(_)) => {}
+        Err(rejection) => return Err(bad_body(&rejection)),
+    }
+    let entry = store(api_state)?
+        .reset_policy(kind, Provenance::operator(actor))
+        .await
+        .map_err(|error| store_error(&error))?;
+    Ok(policy_committed(kind, &entry, actor))
+}
+
+/// `PUT /agents/{kind}/profile/policy`.
+pub async fn set_policy(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(kind): Path<String>,
+    headers: HeaderMap,
+    request: Result<Json<PolicyRequest>, JsonRejection>,
+) -> Response {
+    let write = Write::new(
+        api_state,
+        &headers,
+        kind,
+        OP_AGENT_PROFILE_POLICY_SET,
+        POLICY_SET_ROUTE,
+    );
+    detached(async move {
+        let outcome = set_policy_change(&write.api_state, &write.kind, request, &write.actor).await;
+        write.finish_change(outcome).await
+    })
+    .await
+}
+
+/// `POST /agents/{kind}/profile/policy/reset`.
+pub async fn reset_policy(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(kind): Path<String>,
+    headers: HeaderMap,
+    request: Result<Json<ResetRequest>, JsonRejection>,
+) -> Response {
+    let write = Write::new(
+        api_state,
+        &headers,
+        kind,
+        OP_AGENT_PROFILE_POLICY_RESET,
+        POLICY_RESET_ROUTE,
+    );
+    detached(async move {
+        let outcome =
+            reset_policy_change(&write.api_state, &write.kind, request, &write.actor).await;
+        write.finish_change(outcome).await
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn a_version_reads_with_or_without_its_prefix() {
@@ -557,6 +891,45 @@ mod tests {
         for bad in ["0", "v0", "-1", "two", "", "vv2"] {
             assert!(parse_version(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_policy_summary_puts_the_gate_first_and_marks_a_cut() {
+        let change = |path: &str, old: Value, new: Value| PolicyChange {
+            path: path.to_owned(),
+            old,
+            new,
+        };
+        let summary = policy_summary(
+            3,
+            &[
+                change("approval_timeout", json!("7d"), json!("1h")),
+                change("auto_adopt.parts", json!([]), json!(["system"])),
+                change("probe_effects", json!(["read_only"]), json!(["write"])),
+            ],
+        );
+        assert_eq!(
+            summary,
+            r#"revision 3: auto_adopt.parts +["system"] -[]; probe_effects +["write"] -["read_only"]; approval_timeout "7d" -> "1h""#
+        );
+        assert_eq!(policy_summary(4, &[]), "revision 4: no change");
+        let many: Vec<Value> = (0..64).map(|n| json!(format!("model-{n:03}"))).collect();
+        let long = policy_summary(
+            5,
+            &[
+                change("ceilings.models", Value::Null, Value::Array(many)),
+                change("probe_effects", json!(["read_only"]), json!(["external"])),
+            ],
+        );
+        assert!(long.len() <= MAX_AUDITED_SUMMARY_LEN, "{}", long.len());
+        assert!(
+            long.starts_with(r#"revision 5: probe_effects +["external"]"#),
+            "{long}"
+        );
+        assert!(
+            long.ends_with("read revision 5 at GET .../policy/changes)"),
+            "{long}"
+        );
     }
 
     #[test]

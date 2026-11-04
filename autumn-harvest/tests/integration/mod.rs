@@ -83,6 +83,7 @@ mod child_fanout_tests;
 mod child_policy_tests;
 #[cfg(feature = "db")]
 mod child_timeout_tests;
+mod ci_nextest_archive;
 mod ci_run_coverage;
 mod circuit_breaker_wiring_tests;
 #[cfg(feature = "db")]
@@ -346,6 +347,8 @@ mod run_defaults_chain_guard;
 mod run_defaults_chain_tests;
 #[cfg(feature = "db")]
 mod run_defaults_db_tests;
+#[cfg(feature = "db")]
+mod run_defaults_start_paths_tests;
 mod runtime_parameter_inventory_docs;
 mod safety_report_docs;
 mod saga_tests;

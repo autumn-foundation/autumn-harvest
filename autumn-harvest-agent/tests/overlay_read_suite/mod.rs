@@ -499,3 +499,94 @@ pub async fn a_rollback_restores_v1<B: Backend>(backend: &mut B) {
     assert!(prompts[1].contains(PROMPT_V1), "{prompts:?}");
     assert!(!prompts[1].contains(PROMPT_V2), "{prompts:?}");
 }
+
+/// Issue #2394: `ceilings.max_steps = 40`, over a profile of 20, lets an
+/// overlay with 30 steps run. The op reads the policy with the overlay.
+/// After a reset, the next op refuses that version and runs no model.
+pub async fn a_policy_ceiling_reaches_the_op_read<B: Backend>(backend: &mut B) {
+    use autumn_harvest_agent::RefinePolicy;
+
+    let kind = backend.kind();
+    let model = PromptModel::new();
+    let base = base_harness(&kind, model.clone());
+    let profile = base.agent_profile(&kind).unwrap().max_steps(20);
+    let (harness, store) = with_store(backend, base.agent(profile));
+    let wide: RefinePolicy =
+        serde_json::from_value(json!({"ceilings": {"max_steps": 40}})).unwrap();
+    store
+        .set_policy(&kind, &wide, None, Provenance::operator("ops"))
+        .await
+        .expect("set");
+    let overlay = ProfileOverlay {
+        max_steps: Some(30),
+        ..prompt(PROMPT_V1)
+    };
+    let v1 = adopt(store.as_ref(), &kind, &overlay, None).await;
+    backend.serve(harness).await;
+    let id = agent(&kind, "ceiling");
+
+    backend.send(&id, &AgentOp::message("one")).await;
+    let state = backend.settle(&id, &segments(1)).await;
+    assert_eq!(state.failures, 0, "{:?}", state.last_error);
+    assert_eq!(state.profile_version, Some(v1));
+    assert_all(&model.prompts(), PROMPT_V1);
+
+    store
+        .reset_policy(&kind, Provenance::operator("ops"))
+        .await
+        .expect("reset");
+    backend.send(&id, &AgentOp::message("two")).await;
+    let state = backend.settle(&id, &failures(1)).await;
+    let error = state.last_error.unwrap_or_default();
+    assert!(
+        error.contains(&format!("the overlay {v1}")) && error.contains("max_steps"),
+        "the error names the version and the bound: {error}"
+    );
+    assert_eq!(model.calls(), 1, "no model ran after the reset");
+}
+
+/// Issue #2394: `rollback` after an auto adoption restores the previous
+/// version, and the next op sees its prompt.
+pub async fn a_rollback_after_an_auto_adoption_restores_v1<B: Backend>(backend: &mut B) {
+    use autumn_harvest::ExecutionId;
+    use autumn_harvest_agent::{AutoAdoptOutcome, RefinePolicy};
+
+    let kind = backend.kind();
+    let model = PromptModel::new();
+    let (harness, store) = with_store(backend, base_harness(&kind, model.clone()));
+    let v1 = adopt(store.as_ref(), &kind, &prompt(PROMPT_V1), None).await;
+    let allow: RefinePolicy =
+        serde_json::from_value(json!({"auto_adopt": {"parts": ["system"]}})).unwrap();
+    store
+        .set_policy(&kind, &allow, None, Provenance::operator("ops"))
+        .await
+        .expect("set");
+    let run = ExecutionId::new();
+    let outcome = store
+        .auto_adopt(&kind, &prompt(PROMPT_V2), run, Some(v1), &allow)
+        .await
+        .expect("auto adopt");
+    let AutoAdoptOutcome::Adopted(v2) = outcome else {
+        panic!("want Adopted, got {outcome:?}");
+    };
+    backend.serve(harness).await;
+    let id = agent(&kind, "auto-rollback");
+
+    backend.send(&id, &AgentOp::message("one")).await;
+    let state = backend.settle(&id, &segments(1)).await;
+    assert_eq!(state.profile_version, Some(v2));
+
+    let back = store
+        .rollback(&kind, Provenance::operator("oncall"))
+        .await
+        .expect("rollback");
+    assert_eq!((back.from, back.to), (v2, v1));
+    backend.send(&id, &AgentOp::message("two")).await;
+    let state = backend.settle(&id, &segments(2)).await;
+    assert_eq!(state.failures, 0, "{:?}", state.last_error);
+    assert_eq!(state.profile_version, Some(v1));
+    let prompts = model.prompts();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains(PROMPT_V2), "{prompts:?}");
+    assert!(prompts[1].contains(PROMPT_V1), "{prompts:?}");
+}

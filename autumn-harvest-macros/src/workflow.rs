@@ -1149,8 +1149,8 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             &quote! { client.max_workflow_execution_timeout() },
         );
     // Shared by `start_with_options` and `signal_with_start` (issue #2406).
-    // `update.rs`'s `update_with_start` passes `None` for both. The operator
-    // override of the chain cap wins.
+    // `update.rs` resolves the same values for `update_with_start` (issue
+    // #2511). The operator override of the chain cap wins.
     let stub_chain_execution_timeout_tokens = crate::attr_util::optional_chrono_duration_tokens(
         "chain_execution_timeout",
         &quote! { client.apply_chain_run_default(info.name, info.chain_execution_timeout) },

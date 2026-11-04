@@ -1501,24 +1501,24 @@ struct WorkflowDetailsResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct WorkflowStackResponse {
-    exec_id: String,
-    workflow_id: String,
-    workflow_name: String,
-    state: String,
-    is_terminal: bool,
-    pending_activities: Vec<PendingActivity>,
-    pending_external_handoffs: Vec<ExternalHandoffResponse>,
-    pending_local_activities: Vec<PendingLocalActivity>,
-    pending_timers: Vec<PendingTimer>,
-    pending_signals: Vec<PendingSignal>,
-    buffered_signals: Vec<BufferedSignal>,
-    pending_child_workflows: Vec<PendingChildWorkflow>,
+pub(crate) struct WorkflowStackResponse {
+    pub(crate) exec_id: String,
+    pub(crate) workflow_id: String,
+    pub(crate) workflow_name: String,
+    pub(crate) state: String,
+    pub(crate) is_terminal: bool,
+    pub(crate) pending_activities: Vec<PendingActivity>,
+    pub(crate) pending_external_handoffs: Vec<ExternalHandoffResponse>,
+    pub(crate) pending_local_activities: Vec<PendingLocalActivity>,
+    pub(crate) pending_timers: Vec<PendingTimer>,
+    pub(crate) pending_signals: Vec<PendingSignal>,
+    pub(crate) buffered_signals: Vec<BufferedSignal>,
+    pub(crate) pending_child_workflows: Vec<PendingChildWorkflow>,
     /// `true` when one or more pending-activity heartbeat checkpoints were
     /// withheld because the cumulative per-response checkpoint budget was
     /// exhausted (#503 review). Affected entries carry
     /// `heartbeat_details_omitted_for_budget: true`.
-    checkpoints_truncated_for_budget: bool,
+    pub(crate) checkpoints_truncated_for_budget: bool,
     /// `true` when one or more decoded pending-activity inputs were withheld
     /// because the cumulative per-response input budget was exhausted
     /// (issue #608, mirroring the #503 checkpoint budget). Affected entries
@@ -1526,8 +1526,8 @@ struct WorkflowStackResponse {
     /// payload decoding was active for this request — omitted otherwise so
     /// flag-off responses stay byte-identical to pre-#608 builds.
     #[serde(skip_serializing_if = "Option::is_none")]
-    inputs_truncated_for_budget: Option<bool>,
-    last_event_id: i64,
+    pub(crate) inputs_truncated_for_budget: Option<bool>,
+    pub(crate) last_event_id: i64,
 }
 
 /// Coarse classification of why a workflow appears stalled (issue #486).
@@ -1609,33 +1609,33 @@ impl From<WorkflowExecution> for StalledWorkflowRow {
 /// round-trip. Omitted entirely when the activity has never failed (AC3), so a
 /// healthy-run stack response stays byte-identical to pre-#773 builds.
 #[derive(Debug, Clone, Serialize)]
-struct LastFailure {
+pub(crate) struct LastFailure {
     /// Low-cardinality error-type name. Defaults to `"Error"` for the
     /// task-row-sourced regular-activity path and for local activities (the
     /// `LocalActivityFailed` event carries no typed error-type).
-    error_type: String,
+    pub(crate) error_type: String,
     /// Human-readable failure message. Always present.
-    error: String,
+    pub(crate) error: String,
     /// Attempt number of this (the latest) recorded failure; consistent with
     /// the sibling `next_retry_at` countdown (AC4).
-    attempt: i32,
+    pub(crate) attempt: i32,
     /// `true` when the worker skipped retry and routed straight to DLQ. Always
     /// `false` for the regular-activity task-row path (a backing-off task is
     /// retryable by definition) and for local activities.
-    non_retryable: bool,
+    pub(crate) non_retryable: bool,
     /// When the failure was recorded. Populated from the
     /// `harvest_events.timestamp` of the originating `LocalActivityFailed`
     /// event; `None` (and omitted from the serialized form) for the regular
     /// task-row path, which has no failure timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
-    failed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) failed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Optional structured failure details (`ActivityFailure::with_details`).
     /// Always `None` today from both sources — the regular task-row path has no
     /// structured detail and `LocalActivityFailed` carries none — but the field
     /// is retained for forward-compat. Omitted from the serialized form when
     /// absent.
     #[serde(skip_serializing_if = "Option::is_none")]
-    details: Option<serde_json::Value>,
+    pub(crate) details: Option<serde_json::Value>,
 }
 
 /// Build a map of `activity_id` → most-recent [`LastFailure`] from a slice of
@@ -1654,7 +1654,7 @@ struct LastFailure {
 /// `LocalActivityFailed` carries only `activity_id` / `error` / `attempt`, so
 /// its `error_type` defaults to `"Error"`, `non_retryable` to `false`, and
 /// `details` to `None`; `failed_at` is the event timestamp.
-fn latest_failures_by_activity(
+pub(crate) fn latest_failures_by_activity(
     events: &[(i64, WorkflowEvent, chrono::DateTime<chrono::Utc>)],
 ) -> std::collections::HashMap<uuid::Uuid, LastFailure> {
     let mut map: std::collections::HashMap<uuid::Uuid, (i64, LastFailure)> =
@@ -1692,15 +1692,15 @@ fn latest_failures_by_activity(
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct PendingActivity {
-    activity_exec_id: String,
-    activity_name: String,
-    queue: String,
-    scheduled_at: chrono::DateTime<chrono::Utc>,
-    attempt: i32,
-    max_attempts: i32,
-    task_status: String,
-    claimed_by_worker_id: Option<String>,
+pub(crate) struct PendingActivity {
+    pub(crate) activity_exec_id: String,
+    pub(crate) activity_name: String,
+    pub(crate) queue: String,
+    pub(crate) scheduled_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) attempt: i32,
+    pub(crate) max_attempts: i32,
+    pub(crate) task_status: String,
+    pub(crate) claimed_by_worker_id: Option<String>,
     /// The pending task's input payload, tolerantly decoded (issue #608).
     /// Present **only** when read-path payload decoding is active for this
     /// request (deployment opt-in + harvest-admin access) — omitted
@@ -1711,7 +1711,7 @@ struct PendingActivity {
     /// cumulative per-response input budget — the same #503 policy that
     /// bounds heartbeat checkpoints.
     #[serde(skip_serializing_if = "Option::is_none")]
-    input: Option<serde_json::Value>,
+    pub(crate) input: Option<serde_json::Value>,
     /// `true` when the decoded input exceeded this activity's effective
     /// input-payload cap (#252, per-activity override raised against the
     /// global ceiling) and was withheld from the response; inspect
@@ -1720,20 +1720,20 @@ struct PendingActivity {
     /// responses omit the key and stay byte-identical to pre-#608 builds;
     /// populated whenever decoding is active for the request.
     #[serde(skip_serializing_if = "Option::is_none")]
-    input_truncated: Option<bool>,
+    pub(crate) input_truncated: Option<bool>,
     /// `true` when this input was within its own cap but was withheld because
     /// the cumulative per-response input budget was already exhausted by
     /// earlier activities (issue #608, mirroring the #503 checkpoint budget).
     /// `input_bytes` still reports its size. Present only when decoding is
     /// active for the request.
     #[serde(skip_serializing_if = "Option::is_none")]
-    input_omitted_for_budget: Option<bool>,
+    pub(crate) input_omitted_for_budget: Option<bool>,
     /// Observed serialized byte size of the decoded input. Present only when
     /// decoding is active for the request (and the row is a task-queue
     /// activity, not an external handoff).
     #[serde(skip_serializing_if = "Option::is_none")]
-    input_bytes: Option<u64>,
-    last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) input_bytes: Option<u64>,
+    pub(crate) last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Latest heartbeat checkpoint payload reported by the activity via
     /// `ctx.heartbeat(...)` — the current value of
     /// `harvest_task_queue.heartbeat_details` (issue #503). `null` when no
@@ -1741,29 +1741,29 @@ struct PendingActivity {
     /// the activity-result payload cap (see `heartbeat_details_truncated`).
     /// Read-only: surfacing this never mutates the column or affects
     /// retry-resume semantics.
-    heartbeat_details: Option<serde_json::Value>,
+    pub(crate) heartbeat_details: Option<serde_json::Value>,
     /// `true` when the stored heartbeat payload exceeded this activity's
     /// effective result-payload cap (#252) and was withheld from the response;
     /// inspect `heartbeat_details_bytes` for the size. This reflects the
     /// *individual* payload's own size only — see `heartbeat_details_omitted_for_budget`
     /// for the cross-activity response budget.
-    heartbeat_details_truncated: bool,
+    pub(crate) heartbeat_details_truncated: bool,
     /// `true` when this checkpoint was within its own cap but was withheld
     /// because the cumulative per-response checkpoint budget was already
     /// exhausted by earlier activities (#503 review). `heartbeat_details_bytes`
     /// still reports its size.
-    heartbeat_details_omitted_for_budget: bool,
+    pub(crate) heartbeat_details_omitted_for_budget: bool,
     /// Observed byte size of the stored heartbeat payload, when one exists.
-    heartbeat_details_bytes: Option<u64>,
-    next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
-    schedule_to_start_deadline: Option<chrono::DateTime<chrono::Utc>>,
-    start_to_close_deadline: Option<chrono::DateTime<chrono::Utc>>,
-    heartbeat_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) heartbeat_details_bytes: Option<u64>,
+    pub(crate) next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) schedule_to_start_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) start_to_close_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) heartbeat_deadline: Option<chrono::DateTime<chrono::Utc>>,
     /// The most recent recorded failure for this activity (issue #773),
     /// derived from the latest `ActivityFailed` event. Omitted when the
     /// activity has never failed (AC3). `None` for external-handoff rows.
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_failure: Option<LastFailure>,
+    pub(crate) last_failure: Option<LastFailure>,
 }
 
 /// A `std::io::Write` sink that counts bytes and discards them. Used to measure
@@ -1860,7 +1860,10 @@ pub(crate) fn checkpoint_budget_decisions(sizes: &[Option<u64>], budget: u64) ->
 /// `heartbeat_details = None` + `heartbeat_details_omitted_for_budget = true`,
 /// while their `heartbeat_details_bytes` size is still reported. Returns `true`
 /// when at least one checkpoint was withheld for budget.
-fn apply_checkpoint_response_budget(activities: &mut [PendingActivity], budget: u64) -> bool {
+pub(crate) fn apply_checkpoint_response_budget(
+    activities: &mut [PendingActivity],
+    budget: u64,
+) -> bool {
     // Only entries with an included payload participate in the budget; absent or
     // individually-truncated entries (`heartbeat_details == None`) map to `None`.
     let sizes: Vec<Option<u64>> = activities
@@ -1915,52 +1918,136 @@ fn apply_input_response_budget(activities: &mut [PendingActivity], budget: u64) 
     any_withheld
 }
 
+/// The local activities that a history schedules and does not finish (issue
+/// #773).
+///
+/// Each row is `(event_type, event_data, timestamp)`, in event order. The
+/// Postgres and the SQLite stack (issue #2468) both call it, so the two
+/// lists cannot drift.
+pub(crate) fn fold_pending_local_activities(
+    rows: impl IntoIterator<Item = (String, serde_json::Value, chrono::DateTime<chrono::Utc>)>,
+    failures_by_activity: &std::collections::HashMap<uuid::Uuid, LastFailure>,
+) -> Vec<PendingLocalActivity> {
+    rows.into_iter()
+        .fold(
+            std::collections::BTreeMap::<String, PendingLocalActivity>::new(),
+            |mut acc, (event_type, event_data, ts)| {
+                // `harvest_events.event_data` stores the full adjacently-tagged
+                // envelope `{"type": ..., "data": {...}}`, so the event's own
+                // fields live under `.data`, not at the top level (#773).
+                let activity_id = event_data
+                    .get("data")
+                    .and_then(|d| d.get("activity_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned);
+                match (event_type.as_str(), activity_id) {
+                    ("LocalActivityScheduled", Some(activity_exec_id)) => {
+                        let activity_name = event_data
+                            .get("data")
+                            .and_then(|d| d.get("name"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        // The local-activity id-space is the `activity_id`
+                        // string on the event, which is what
+                        // `LocalActivityFailed.activity_id` (and hence the
+                        // failure map key) also carries — parse it to look up
+                        // the most-recent failure (issue #773). Attach the RAW
+                        // (undecoded) failure here; decoding is deferred until
+                        // after the fold so an entry a later terminal event
+                        // removes is never decoded or audited, keeping the #608
+                        // read-path decode scoped to the local activities
+                        // actually surfaced (Codex P2, PR #1022).
+                        let last_failure = uuid::Uuid::parse_str(&activity_exec_id)
+                            .ok()
+                            .and_then(|aid| failures_by_activity.get(&aid).cloned());
+                        acc.insert(
+                            activity_exec_id.clone(),
+                            PendingLocalActivity {
+                                activity_exec_id,
+                                activity_name,
+                                scheduled_at: ts,
+                                attempt: 1,
+                                max_attempts: 1,
+                                task_status: "PENDING".to_string(),
+                                last_heartbeat_at: None,
+                                next_retry_at: None,
+                                start_to_close_deadline: None,
+                                heartbeat_deadline: None,
+                                last_failure,
+                            },
+                        );
+                    }
+                    // Both `LocalActivityCompleted` (success) and
+                    // `LocalActivityExhausted` (terminal retry-budget failure,
+                    // issue #773) close the local activity, so remove the
+                    // pending entry for either. A *bare* `LocalActivityFailed`
+                    // (mid-retry, no following `LocalActivityExhausted`) falls
+                    // through and correctly stays pending. Without this, a
+                    // workflow that catches a terminal local-activity failure
+                    // and keeps running would report the exhausted activity as
+                    // pending forever (Codex review, PR #1022).
+                    (
+                        "LocalActivityCompleted" | "LocalActivityExhausted",
+                        Some(activity_exec_id),
+                    ) => {
+                        acc.remove(&activity_exec_id);
+                    }
+                    _ => {}
+                }
+                acc
+            },
+        )
+        .into_values()
+        .collect()
+}
+
 #[derive(Debug, Serialize)]
-struct PendingLocalActivity {
-    activity_exec_id: String,
-    activity_name: String,
-    scheduled_at: chrono::DateTime<chrono::Utc>,
-    attempt: i32,
-    max_attempts: i32,
-    task_status: String,
-    last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
-    next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
-    start_to_close_deadline: Option<chrono::DateTime<chrono::Utc>>,
-    heartbeat_deadline: Option<chrono::DateTime<chrono::Utc>>,
+pub(crate) struct PendingLocalActivity {
+    pub(crate) activity_exec_id: String,
+    pub(crate) activity_name: String,
+    pub(crate) scheduled_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) attempt: i32,
+    pub(crate) max_attempts: i32,
+    pub(crate) task_status: String,
+    pub(crate) last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) start_to_close_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) heartbeat_deadline: Option<chrono::DateTime<chrono::Utc>>,
     /// The most recent recorded failure for this local activity (issue #773),
     /// derived from the latest `LocalActivityFailed` event. Omitted when the
     /// activity has never failed (AC3).
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_failure: Option<LastFailure>,
+    pub(crate) last_failure: Option<LastFailure>,
 }
 
 #[derive(Debug, Serialize)]
-struct PendingTimer {
-    timer_id: String,
-    name: Option<String>,
-    fires_at: chrono::DateTime<chrono::Utc>,
-    created_at: Option<chrono::DateTime<chrono::Utc>>,
+pub(crate) struct PendingTimer {
+    pub(crate) timer_id: String,
+    pub(crate) name: Option<String>,
+    pub(crate) fires_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize)]
-struct PendingSignal {
-    signal_name: String,
-    waiters: i64,
-    oldest_waiter_since: chrono::DateTime<chrono::Utc>,
+pub(crate) struct PendingSignal {
+    pub(crate) signal_name: String,
+    pub(crate) waiters: i64,
+    pub(crate) oldest_waiter_since: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Serialize)]
-struct BufferedSignal {
-    signal_name: String,
-    buffered: i64,
-    oldest_received_at: chrono::DateTime<chrono::Utc>,
+pub(crate) struct BufferedSignal {
+    pub(crate) signal_name: String,
+    pub(crate) buffered: i64,
+    pub(crate) oldest_received_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Serialize)]
-struct PendingChildWorkflow {
-    child_exec_id: String,
-    child_workflow_name: String,
-    state: String,
+pub(crate) struct PendingChildWorkflow {
+    pub(crate) child_exec_id: String,
+    pub(crate) child_workflow_name: String,
+    pub(crate) state: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1993,7 +2080,7 @@ struct ExternalHandoffShardCoverage {
 // definitions so the partial-availability shape is single-sourced.
 
 #[derive(Debug, Serialize)]
-struct ExternalHandoffResponse {
+pub(crate) struct ExternalHandoffResponse {
     token: String,
     workflow: ExternalHandoffWorkflow,
     activity: ExternalHandoffActivity,
@@ -3412,9 +3499,9 @@ pub(crate) const KNOWN_WORKFLOW_STATES: &[&str] = &[
 
 pub(crate) const DEFAULT_WORKFLOW_LIMIT: i64 = 50;
 pub(crate) const MAX_WORKFLOW_LIMIT: i64 = 200;
-const DEFAULT_WORKFLOW_CHILDREN_LIMIT: usize = 50;
-const MAX_WORKFLOW_CHILDREN_LIMIT: usize = 500;
-const MAX_WORKFLOW_CHILDREN_DEPTH: u8 = 5;
+pub(crate) const DEFAULT_WORKFLOW_CHILDREN_LIMIT: usize = 50;
+pub(crate) const MAX_WORKFLOW_CHILDREN_LIMIT: usize = 500;
+pub(crate) const MAX_WORKFLOW_CHILDREN_DEPTH: u8 = 5;
 const DEFAULT_EXTERNAL_HANDOFF_LIMIT: i64 = 100;
 const MAX_EXTERNAL_HANDOFF_LIMIT: i64 = 500;
 const DEFAULT_HISTORY_BATCH_EXPORT_LIMIT: usize = 100;
@@ -3552,9 +3639,9 @@ impl WorkflowFilters {
 }
 
 #[derive(Debug, Clone)]
-struct HistoryExportQuery {
-    payload_policy: HistoryPayloadPolicy,
-    max_bytes: usize,
+pub(crate) struct HistoryExportQuery {
+    pub(crate) payload_policy: HistoryPayloadPolicy,
+    pub(crate) max_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -3843,12 +3930,12 @@ impl HistoryBatchExportWork {
 }
 
 #[derive(Debug, Clone)]
-struct WorkflowChildrenFilters {
-    limit: usize,
-    statuses: Vec<String>,
-    workflow_name: Option<String>,
-    cursor: Option<WorkflowChildrenCursor>,
-    max_depth: u8,
+pub(crate) struct WorkflowChildrenFilters {
+    pub(crate) limit: usize,
+    pub(crate) statuses: Vec<String>,
+    pub(crate) workflow_name: Option<String>,
+    pub(crate) cursor: Option<WorkflowChildrenCursor>,
+    pub(crate) max_depth: u8,
 }
 
 impl Default for WorkflowChildrenFilters {
@@ -3864,15 +3951,15 @@ impl Default for WorkflowChildrenFilters {
 }
 
 #[derive(Debug, Clone)]
-struct WorkflowChildrenCursor {
-    started_at: chrono::DateTime<chrono::Utc>,
-    exec_id: uuid::Uuid,
+pub(crate) struct WorkflowChildrenCursor {
+    pub(crate) started_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) exec_id: uuid::Uuid,
 }
 
 #[derive(Debug, Serialize)]
-struct WorkflowChildrenResponse {
-    items: Vec<WorkflowChildResponse>,
-    next_cursor: Option<String>,
+pub(crate) struct WorkflowChildrenResponse {
+    pub(crate) items: Vec<WorkflowChildResponse>,
+    pub(crate) next_cursor: Option<String>,
     /// Cross-shard completeness of this page (issue #756 contract, extended to
     /// this endpoint by issue #956).
     ///
@@ -3886,22 +3973,22 @@ struct WorkflowChildrenResponse {
     /// `GET /workflows/{id}/tree` and the other #756 endpoints.
     ///
     /// Additive: always present, `complete` on the happy path.
-    status: FanoutStatus,
+    pub(crate) status: FanoutStatus,
     /// Shards that could not be queried, named with a reason. Empty when
     /// `status` is `complete`.
-    unavailable_shards: Vec<UnavailableShard>,
+    pub(crate) unavailable_shards: Vec<UnavailableShard>,
 }
 
 #[derive(Debug, Serialize)]
-struct WorkflowChildResponse {
-    exec_id: String,
-    workflow_name: String,
-    status: String,
-    started_at: chrono::DateTime<chrono::Utc>,
-    completed_at: Option<chrono::DateTime<chrono::Utc>>,
-    error_summary: Option<String>,
-    shard_id: i32,
-    depth: u8,
+pub(crate) struct WorkflowChildResponse {
+    pub(crate) exec_id: String,
+    pub(crate) workflow_name: String,
+    pub(crate) status: String,
+    pub(crate) started_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) error_summary: Option<String>,
+    pub(crate) shard_id: i32,
+    pub(crate) depth: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5442,6 +5529,22 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
         .route(
             "/agents/{kind}/profile/rollback",
             post(crate::agent_profile_api::rollback).route_layer(require_admin.clone()),
+        )
+        // The refine policy of an agent kind (issue #2394). The set and the
+        // reset are mutating, so only the operator role reaches them.
+        .route(
+            "/agents/{kind}/profile/policy",
+            get(crate::agent_profile_api::get_policy)
+                .put(crate::agent_profile_api::set_policy)
+                .route_layer(require_admin.clone()),
+        )
+        .route(
+            "/agents/{kind}/profile/policy/reset",
+            post(crate::agent_profile_api::reset_policy).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/agents/{kind}/profile/policy/changes",
+            get(crate::agent_profile_api::list_policy_changes).route_layer(require_admin.clone()),
         )
         .route(
             // The sampling policy of an agent kind (issue #2439).
@@ -7502,6 +7605,11 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/agents/{kind}/profile/diff"),
         ("POST", "/agents/{kind}/profile/activate"),
         ("POST", "/agents/{kind}/profile/rollback"),
+        // The refine policy of an agent kind (issue #2394).
+        ("GET", "/agents/{kind}/profile/policy"),
+        ("PUT", "/agents/{kind}/profile/policy"),
+        ("POST", "/agents/{kind}/profile/policy/reset"),
+        ("GET", "/agents/{kind}/profile/policy/changes"),
         ("GET", "/admin/retention"),
         ("POST", "/admin/retention/run-now"),
         ("POST", "/admin/workflows/replay-canary"),
@@ -7846,6 +7954,13 @@ pub const fn management_api_request_fields()
             Some(&["version", "expected_active"]),
         ),
         ("POST", "/agents/{kind}/profile/rollback", Some(&[])),
+        // The refine policy (issue #2394). A reset takes no field.
+        (
+            "PUT",
+            "/agents/{kind}/profile/policy",
+            Some(&["policy", "expected_revision"]),
+        ),
+        ("POST", "/agents/{kind}/profile/policy/reset", Some(&[])),
         // ── dead-letter queue ─────────────────────────────────────────────────
         (
             "POST",
@@ -9124,6 +9239,26 @@ pub const fn management_api_response_fields()
             "POST",
             "/agents/{kind}/profile/rollback",
             Some(&["kind", "from", "to", "actor"]),
+        ),
+        (
+            "GET",
+            "/agents/{kind}/profile/policy",
+            Some(&["kind", "revision", "custom", "policy"]),
+        ),
+        (
+            "PUT",
+            "/agents/{kind}/profile/policy",
+            Some(&["kind", "revision", "custom", "policy", "actor", "changes"]),
+        ),
+        (
+            "POST",
+            "/agents/{kind}/profile/policy/reset",
+            Some(&["kind", "revision", "custom", "policy", "actor", "changes"]),
+        ),
+        (
+            "GET",
+            "/agents/{kind}/profile/policy/changes",
+            Some(&["kind", "changes"]),
         ),
         ("GET", "/admin/retention", None), // RetentionStatus (external model)
         ("POST", "/admin/retention/run-now", Some(&["ok"])),
@@ -11050,20 +11185,20 @@ pub(crate) fn parse_summary_filters(
 #[derive(Debug, Serialize)]
 pub struct SummaryListItem {
     #[serde(flatten)]
-    summary: ExecutionSummary,
+    pub(crate) summary: ExecutionSummary,
     /// Always `true` — this row is a retention-demoted summary, not a live run.
-    summarized: bool,
+    pub(crate) summarized: bool,
     /// Always `false` — the full event history was deleted; only the summary
     /// remains.
-    history_available: bool,
+    pub(crate) history_available: bool,
 }
 
 /// Response envelope for `GET /workflows/summaries` (issue #752), mirroring the
 /// paginated `GET /workflows` shape `{ ..., next_cursor }`.
 #[derive(Debug, Serialize)]
 pub struct SummaryListPage {
-    summaries: Vec<SummaryListItem>,
-    next_cursor: Option<String>,
+    pub(crate) summaries: Vec<SummaryListItem>,
+    pub(crate) next_cursor: Option<String>,
 }
 
 /// `GET /workflows/summaries` — list retention-demoted execution summaries
@@ -11737,7 +11872,7 @@ pub(crate) fn parse_workflow_filters(
     Ok(filters.with_limit(limit))
 }
 
-fn parse_history_export_query(
+pub(crate) fn parse_history_export_query(
     pairs: &[(String, String)],
 ) -> Result<HistoryExportQuery, AutumnError> {
     let mut payload_policy = HistoryPayloadPolicy::Redacted;
@@ -13237,9 +13372,9 @@ async fn get_workflow_tree(
 }
 
 /// Parsed `GET /workflows/{id}/tree` query string.
-struct LineageQueryParams {
-    limits: LineageLimits,
-    summary: bool,
+pub(crate) struct LineageQueryParams {
+    pub(crate) limits: LineageLimits,
+    pub(crate) summary: bool,
 }
 
 /// Parse and validate `?max_depth=`, `?max_nodes=`, `?summary=`.
@@ -13247,7 +13382,9 @@ struct LineageQueryParams {
 /// An out-of-range or non-numeric bound is a `400` naming the offending
 /// parameter rather than a silent clamp — the response echoes the `limits` it
 /// applied, so clamping would make that echo lie.
-fn parse_lineage_query(pairs: &[(String, String)]) -> Result<LineageQueryParams, AutumnError> {
+pub(crate) fn parse_lineage_query(
+    pairs: &[(String, String)],
+) -> Result<LineageQueryParams, AutumnError> {
     let mut max_depth = None;
     let mut max_nodes = None;
     let mut summary = false;
@@ -13551,7 +13688,7 @@ fn workflow_children_store_filters(
     }
 }
 
-fn parse_workflow_children_filters(
+pub(crate) fn parse_workflow_children_filters(
     pairs: &[(String, String)],
 ) -> Result<WorkflowChildrenFilters, AutumnError> {
     let mut filters = WorkflowChildrenFilters::default();
@@ -13644,7 +13781,7 @@ fn parse_workflow_children_cursor(raw: &str) -> Result<WorkflowChildrenCursor, A
     })
 }
 
-fn workflow_child_matches_filters(
+pub(crate) fn workflow_child_matches_filters(
     row: &store::WorkflowChildRow,
     filters: &WorkflowChildrenFilters,
 ) -> bool {
@@ -13659,7 +13796,7 @@ fn workflow_child_matches_filters(
     true
 }
 
-fn workflow_child_is_after_cursor(
+pub(crate) fn workflow_child_is_after_cursor(
     row: &store::WorkflowChildRow,
     cursor: Option<&WorkflowChildrenCursor>,
 ) -> bool {
@@ -13671,7 +13808,7 @@ fn workflow_child_is_after_cursor(
         || (row.started_at == cursor.started_at && row.exec_id.as_uuid() < cursor.exec_id)
 }
 
-fn sort_workflow_child_rows(rows: &mut [store::WorkflowChildRow]) {
+pub(crate) fn sort_workflow_child_rows(rows: &mut [store::WorkflowChildRow]) {
     rows.sort_by(|left, right| {
         right
             .started_at
@@ -13680,7 +13817,7 @@ fn sort_workflow_child_rows(rows: &mut [store::WorkflowChildRow]) {
     });
 }
 
-fn encode_workflow_children_cursor(row: &store::WorkflowChildRow) -> String {
+pub(crate) fn encode_workflow_children_cursor(row: &store::WorkflowChildRow) -> String {
     format!(
         "{}|{}",
         row.started_at
@@ -14146,7 +14283,7 @@ type WorkflowLogsQueryParams = (
 /// An unknown `level=` value is rejected rather than silently ignored: a typo
 /// would otherwise answer "no lines" for a run that has plenty, which is the
 /// worst possible outcome for a triage endpoint.
-fn parse_workflow_logs_query(
+pub(crate) fn parse_workflow_logs_query(
     pairs: &[(String, String)],
 ) -> Result<WorkflowLogsQueryParams, AutumnError> {
     let mut limit = DEFAULT_WORKFLOW_LOG_PAGE;
@@ -14388,9 +14525,7 @@ pub(crate) async fn build_awaitables_report(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
 ) -> Result<WorkflowAwaitablesResponse, AutumnError> {
-    use autumn_harvest::awaitables::{
-        AWAITABLE_CATEGORY_CAP, AwaitableKind, WaitSetInput, project_awaitables,
-    };
+    use autumn_harvest::awaitables::{AWAITABLE_CATEGORY_CAP, WaitSetInput, project_awaitables};
 
     let runtime = api_state.runtime().map_err(map_error)?;
     let mut conn = db_conn_for_execution(api_state, exec_id).await?;
@@ -14632,82 +14767,7 @@ pub(crate) async fn build_awaitables_report(
             let outcome =
                 drive_query_replay_async(&ctx, workflow.handler, input, api_state.query_timeout())
                     .await;
-            match outcome {
-                // A deferred non-determinism error (an infallible primitive —
-                // `system_now`/`new_uuid`/`random_*` — absorbed a divergence
-                // and parked anyway) means the suspension point and its
-                // drained commands are NOT trustworthy: degrade to the
-                // history-only scan rather than serving a wait-set derived
-                // from diverged code (replay review). A broader
-                // unconsumed-history drift check is deliberately NOT applied:
-                // a delivered-but-not-yet-awaited signal legitimately leaves
-                // unconsumed history on a healthy parked run.
-                QueryReplayOutcome::Suspended if ctx.take_deferred_nd_error().is_some() => (
-                    "history_only",
-                    Some("replay_diverged"),
-                    project_awaitables(
-                        &rows,
-                        WaitSetInput::HistoryOnly {
-                            fire_eligible_timers: fire_eligible_timer_ids.as_ref(),
-                        },
-                        AWAITABLE_CATEGORY_CAP,
-                    ),
-                ),
-                QueryReplayOutcome::Suspended => {
-                    // The drained command buffer at the suspension point IS
-                    // the open wait-set — the six #615 categories.
-                    let commands = ctx.drain_commands();
-                    (
-                        "replayed",
-                        None,
-                        project_awaitables(
-                            &rows,
-                            WaitSetInput::Replayed {
-                                commands: &commands,
-                            },
-                            AWAITABLE_CATEGORY_CAP,
-                        ),
-                    )
-                }
-                // A NON-terminal execution whose replay reaches Poll::Ready
-                // is either about to complete (the worker has not persisted
-                // the terminal yet) or has diverged from its recorded
-                // history (code drift / nd-block). Either way the drained
-                // command set is not a trustworthy wait-set.
-                QueryReplayOutcome::ReachedTerminal => (
-                    "history_only",
-                    Some("replay_reached_terminal"),
-                    project_awaitables(
-                        &rows,
-                        WaitSetInput::HistoryOnly {
-                            fire_eligible_timers: fire_eligible_timer_ids.as_ref(),
-                        },
-                        AWAITABLE_CATEGORY_CAP,
-                    ),
-                ),
-                QueryReplayOutcome::TimedOut => (
-                    "history_only",
-                    Some("replay_timed_out"),
-                    project_awaitables(
-                        &rows,
-                        WaitSetInput::HistoryOnly {
-                            fire_eligible_timers: fire_eligible_timer_ids.as_ref(),
-                        },
-                        AWAITABLE_CATEGORY_CAP,
-                    ),
-                ),
-                QueryReplayOutcome::Panicked => (
-                    "history_only",
-                    Some("replay_panicked"),
-                    project_awaitables(
-                        &rows,
-                        WaitSetInput::HistoryOnly {
-                            fire_eligible_timers: fire_eligible_timer_ids.as_ref(),
-                        },
-                        AWAITABLE_CATEGORY_CAP,
-                    ),
-                ),
-            }
+            classify_replayed_wait_set(&ctx, outcome, &rows, fire_eligible_timer_ids.as_ref())
         }
     } else {
         let reason = if runtime.is_registered_dag(&execution.workflow_name) {
@@ -14728,19 +14788,7 @@ pub(crate) async fn build_awaitables_report(
         )
     };
 
-    // Enrich open activity awaitables with the task-row deadline where the
-    // projection derived none (timers/externals already carry theirs).
-    for awaitable in &mut projection.awaitables {
-        if awaitable.kind == AwaitableKind::Activity
-            && awaitable.deadline.is_none()
-            && let Some(deadline) = awaitable
-                .id
-                .as_ref()
-                .and_then(|id| activity_deadlines.get(id))
-        {
-            awaitable.deadline = Some(*deadline);
-        }
-    }
+    enrich_activity_deadlines(&mut projection, &activity_deadlines);
 
     Ok(WorkflowAwaitablesResponse {
         execution_id: exec_id.to_string(),
@@ -14755,6 +14803,119 @@ pub(crate) async fn build_awaitables_report(
         truncated_kinds: projection.truncated_kinds,
         category_cap: projection.category_cap,
     })
+}
+
+/// The wait-set of a replay that ran to `outcome` (issue #615).
+///
+/// A clean suspension serves the drained commands. Any other outcome
+/// degrades to the history-only scan, and the reason names why. The
+/// Postgres and the SQLite report (issue #2468) both call it.
+pub(crate) fn classify_replayed_wait_set(
+    ctx: &WorkflowContext,
+    outcome: QueryReplayOutcome,
+    rows: &[(chrono::DateTime<chrono::Utc>, WorkflowEvent)],
+    fire_eligible_timer_ids: Option<&std::collections::HashSet<String>>,
+) -> (
+    &'static str,
+    Option<&'static str>,
+    autumn_harvest::awaitables::AwaitablesProjection,
+) {
+    use autumn_harvest::awaitables::{AWAITABLE_CATEGORY_CAP, WaitSetInput, project_awaitables};
+    match outcome {
+        // A deferred non-determinism error (an infallible primitive —
+        // `system_now`/`new_uuid`/`random_*` — absorbed a divergence
+        // and parked anyway) means the suspension point and its
+        // drained commands are NOT trustworthy: degrade to the
+        // history-only scan rather than serving a wait-set derived
+        // from diverged code (replay review). A broader
+        // unconsumed-history drift check is deliberately NOT applied:
+        // a delivered-but-not-yet-awaited signal legitimately leaves
+        // unconsumed history on a healthy parked run.
+        QueryReplayOutcome::Suspended if ctx.take_deferred_nd_error().is_some() => (
+            "history_only",
+            Some("replay_diverged"),
+            project_awaitables(
+                rows,
+                WaitSetInput::HistoryOnly {
+                    fire_eligible_timers: fire_eligible_timer_ids,
+                },
+                AWAITABLE_CATEGORY_CAP,
+            ),
+        ),
+        QueryReplayOutcome::Suspended => {
+            // The drained command buffer at the suspension point IS
+            // the open wait-set — the six #615 categories.
+            let commands = ctx.drain_commands();
+            (
+                "replayed",
+                None,
+                project_awaitables(
+                    rows,
+                    WaitSetInput::Replayed {
+                        commands: &commands,
+                    },
+                    AWAITABLE_CATEGORY_CAP,
+                ),
+            )
+        }
+        // A NON-terminal execution whose replay reaches Poll::Ready
+        // is either about to complete (the worker has not persisted
+        // the terminal yet) or has diverged from its recorded
+        // history (code drift / nd-block). Either way the drained
+        // command set is not a trustworthy wait-set.
+        QueryReplayOutcome::ReachedTerminal => (
+            "history_only",
+            Some("replay_reached_terminal"),
+            project_awaitables(
+                rows,
+                WaitSetInput::HistoryOnly {
+                    fire_eligible_timers: fire_eligible_timer_ids,
+                },
+                AWAITABLE_CATEGORY_CAP,
+            ),
+        ),
+        QueryReplayOutcome::TimedOut => (
+            "history_only",
+            Some("replay_timed_out"),
+            project_awaitables(
+                rows,
+                WaitSetInput::HistoryOnly {
+                    fire_eligible_timers: fire_eligible_timer_ids,
+                },
+                AWAITABLE_CATEGORY_CAP,
+            ),
+        ),
+        QueryReplayOutcome::Panicked => (
+            "history_only",
+            Some("replay_panicked"),
+            project_awaitables(
+                rows,
+                WaitSetInput::HistoryOnly {
+                    fire_eligible_timers: fire_eligible_timer_ids,
+                },
+                AWAITABLE_CATEGORY_CAP,
+            ),
+        ),
+    }
+}
+
+/// Give each open activity awaitable its task deadline, when the projection
+/// derived none. Timers and handoffs carry their own.
+pub(crate) fn enrich_activity_deadlines(
+    projection: &mut autumn_harvest::awaitables::AwaitablesProjection,
+    activity_deadlines: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+) {
+    for awaitable in &mut projection.awaitables {
+        if awaitable.kind == autumn_harvest::awaitables::AwaitableKind::Activity
+            && awaitable.deadline.is_none()
+            && let Some(deadline) = awaitable
+                .id
+                .as_ref()
+                .and_then(|id| activity_deadlines.get(id))
+        {
+            awaitable.deadline = Some(*deadline);
+        }
+    }
 }
 
 /// `GET /workflows/{id}/awaitables` — enumerate what the execution is parked on.
@@ -16483,7 +16644,7 @@ async fn get_workflow_diagnose(
 /// Upper bound on the number of legacy `WorkflowContinuedAsNew` event hops the
 /// run-chain gather will walk forward (issue #701). Bounds the best-effort
 /// legacy path so a corrupt or unusually long chain can never spin.
-const MAX_RUN_CHAIN_HOPS: usize = 128;
+pub(crate) const MAX_RUN_CHAIN_HOPS: usize = 128;
 
 /// Upper bound on same-`workflow_id` candidate rows the legacy backward
 /// reconstruction (issue #701, Codex P2) will scan. A pre-feature chain queried
@@ -16491,7 +16652,7 @@ const MAX_RUN_CHAIN_HOPS: usize = 128;
 /// candidate's history to read its `WorkflowContinuedAsNew` linkage — bounded by
 /// this cap so a heavily id-reused `workflow_id` can never trigger an unbounded
 /// scan. Above the cap the chain is served best-effort with `head_unknown = true`.
-const MAX_LEGACY_CANDIDATES: usize = 256;
+pub(crate) const MAX_LEGACY_CANDIDATES: usize = 256;
 
 /// Outcome of legacy backward reconstruction (issue #701, Codex P2).
 enum LegacyReconstruction {
@@ -17143,7 +17304,7 @@ async fn get_workflow_stack(
     let inputs_truncated_for_budget = decoder
         .as_ref()
         .map(|_| apply_input_response_budget(&mut pending_activities, default_input_cap));
-    let mut pending_local_activities = harvest_events::table
+    let local_rows = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
         .filter(harvest_events::event_type.eq_any([
             "LocalActivityScheduled",
@@ -17160,78 +17321,9 @@ async fn get_workflow_stack(
         .load::<(String, serde_json::Value, chrono::DateTime<chrono::Utc>)>(&mut conn)
         .await
         .map_err(database_error)?
-        .into_iter()
-        .fold(
-            std::collections::BTreeMap::<String, PendingLocalActivity>::new(),
-            |mut acc, (event_type, event_data, ts)| {
-                // `harvest_events.event_data` stores the full adjacently-tagged
-                // envelope `{"type": ..., "data": {...}}`, so the event's own
-                // fields live under `.data`, not at the top level (#773).
-                let activity_id = event_data
-                    .get("data")
-                    .and_then(|d| d.get("activity_id"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned);
-                match (event_type.as_str(), activity_id) {
-                    ("LocalActivityScheduled", Some(activity_exec_id)) => {
-                        let activity_name = event_data
-                            .get("data")
-                            .and_then(|d| d.get("name"))
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        // The local-activity id-space is the `activity_id`
-                        // string on the event, which is what
-                        // `LocalActivityFailed.activity_id` (and hence the
-                        // failure map key) also carries — parse it to look up
-                        // the most-recent failure (issue #773). Attach the RAW
-                        // (undecoded) failure here; decoding is deferred until
-                        // after the fold so an entry a later terminal event
-                        // removes is never decoded or audited, keeping the #608
-                        // read-path decode scoped to the local activities
-                        // actually surfaced (Codex P2, PR #1022).
-                        let last_failure = uuid::Uuid::parse_str(&activity_exec_id)
-                            .ok()
-                            .and_then(|aid| failures_by_activity.get(&aid).cloned());
-                        acc.insert(
-                            activity_exec_id.clone(),
-                            PendingLocalActivity {
-                                activity_exec_id,
-                                activity_name,
-                                scheduled_at: ts,
-                                attempt: 1,
-                                max_attempts: 1,
-                                task_status: "PENDING".to_string(),
-                                last_heartbeat_at: None,
-                                next_retry_at: None,
-                                start_to_close_deadline: None,
-                                heartbeat_deadline: None,
-                                last_failure,
-                            },
-                        );
-                    }
-                    // Both `LocalActivityCompleted` (success) and
-                    // `LocalActivityExhausted` (terminal retry-budget failure,
-                    // issue #773) close the local activity, so remove the
-                    // pending entry for either. A *bare* `LocalActivityFailed`
-                    // (mid-retry, no following `LocalActivityExhausted`) falls
-                    // through and correctly stays pending. Without this, a
-                    // workflow that catches a terminal local-activity failure
-                    // and keeps running would report the exhausted activity as
-                    // pending forever (Codex review, PR #1022).
-                    (
-                        "LocalActivityCompleted" | "LocalActivityExhausted",
-                        Some(activity_exec_id),
-                    ) => {
-                        acc.remove(&activity_exec_id);
-                    }
-                    _ => {}
-                }
-                acc
-            },
-        )
-        .into_values()
-        .collect::<Vec<_>>();
+        .into_iter();
+    let mut pending_local_activities =
+        fold_pending_local_activities(local_rows, &failures_by_activity);
     // Decode each SURVIVING pending local activity's `last_failure` error inline
     // (issue #608), folding into `decode_outcome` for the audit row. Deferred to
     // here — rather than inside the fold's `LocalActivityScheduled` arm — so a
@@ -45966,7 +46058,7 @@ fn sort_history_export_candidates(candidates: &mut [HistoryExportCandidate]) {
     });
 }
 
-fn history_export_error_response(error: HistoryExportError) -> axum::response::Response {
+pub(crate) fn history_export_error_response(error: HistoryExportError) -> axum::response::Response {
     match error {
         HistoryExportError::SizeLimitExceeded {
             actual_bytes,

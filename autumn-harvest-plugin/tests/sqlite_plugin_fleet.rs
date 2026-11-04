@@ -390,6 +390,60 @@ async fn an_anonymous_tenant_mutation_outside_dev_is_refused() {
     fx.fleet.close_all().await;
 }
 
+/// The read routes and Vantage serve one tenant's file, and keep the admin
+/// gate on a tenant route (issue #2468).
+#[tokio::test(flavor = "multi_thread")]
+async fn tenant_read_routes_and_vantage_read_only_the_tenant_file() {
+    let fx = boot("dev");
+    provision(&fx.fleet, &["acme", "bee"]).await;
+    let acme = start(&fx.client, "acme", false).await;
+    completed(&fx.client, "acme", &acme).await;
+
+    let count: Value = fx
+        .client
+        .get("/harvest/tenants/acme/workflows/count")
+        .send()
+        .await
+        .json();
+    assert_eq!(count["total"], 1, "{count}");
+    let other: Value = fx
+        .client
+        .get("/harvest/tenants/bee/workflows/count")
+        .send()
+        .await
+        .json();
+    assert_eq!(other["total"], 0, "{other}");
+    fx.client
+        .get(&format!("/harvest/tenants/acme/workflows/{acme}/timeline"))
+        .send()
+        .await
+        .assert_ok();
+    fx.client
+        .get(&format!("/harvest/tenants/bee/workflows/{acme}/stack"))
+        .send()
+        .await
+        .assert_status(404);
+    let page = fx
+        .client
+        .get("/harvest/tenants/acme/ui/workflows")
+        .send()
+        .await;
+    page.assert_ok();
+    let page = String::from_utf8(page.body.clone()).unwrap();
+    assert!(page.contains(&format!("workflows/{acme}")), "{page}");
+    fx.fleet.close_all().await;
+
+    let fx = boot("test");
+    provision(&fx.fleet, &["acme"]).await;
+    let logs = fx
+        .client
+        .get(&format!("/harvest/tenants/acme/workflows/{acme}/logs"))
+        .send()
+        .await;
+    logs.assert_status(401);
+    fx.fleet.close_all().await;
+}
+
 /// The management API never creates a tenant, even when the fleet creates
 /// on demand. An unknown tenant is a `404` and leaves no file behind.
 #[tokio::test(flavor = "multi_thread")]
