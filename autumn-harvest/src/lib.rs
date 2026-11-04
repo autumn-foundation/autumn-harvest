@@ -387,6 +387,8 @@ pub mod handle_typed;
 #[doc(hidden)]
 pub mod heartbeat;
 pub mod history_export;
+/// History shape fingerprints — compare runs by event structure.
+pub mod history_shape;
 /// Hot code swap for workflow definitions via runtime modules (issue #967).
 ///
 /// R&D spike. Hosts a `#[workflow]` body as a runtime-loaded WebAssembly
