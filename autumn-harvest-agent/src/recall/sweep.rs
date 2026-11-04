@@ -126,8 +126,10 @@ fn run_nonce() -> String {
 }
 
 /// The agent name of `item` under `config`: the item id and a fingerprint
-/// of the item, the profile and the model id. A model with no id adds `run`
-/// in place of the id, so no other sweep reuses its agents.
+/// of the item, the profile and the id of each model that the profile
+/// runs. These are the model of each op and the model of each episode
+/// pass. A model with no id adds `run` in place of the id, so no other
+/// sweep reuses its agents.
 fn agent_name(
     harness: &AgentHarness,
     config: &str,
@@ -137,14 +139,24 @@ fn agent_name(
     let profile = harness
         .agent_profile(config)
         .ok_or_else(|| format!("the harness has no profile {config:?}"))?;
-    let model = harness.model(profile.model.as_deref())?;
-    let identity = model
-        .model_id()
-        .map_or_else(|| format!("unidentified:{run}"), |id| format!("id:{id}"));
+    // A pass with no model of its own runs on the profile model.
+    let pass = profile
+        .episodes
+        .as_ref()
+        .and_then(|settings| settings.model.as_deref())
+        .or(profile.model.as_deref());
+    let mut models = Vec::new();
+    for name in [profile.model.as_deref(), pass] {
+        let identity = harness
+            .model(name)?
+            .model_id()
+            .map_or_else(|| format!("unidentified:{run}"), |id| format!("id:{id}"));
+        models.push(identity);
+    }
     let inputs = serde_json::json!({
         "item": item,
         "profile": profile,
-        "model": identity,
+        "models": models,
     });
     let digest = Sha256::digest(inputs.to_string().as_bytes());
     let hex = digest.iter().take(FINGERPRINT_HEX / 2).fold(

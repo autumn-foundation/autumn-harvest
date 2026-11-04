@@ -310,6 +310,60 @@ async fn a_model_with_no_id_never_reuses_a_finished_item() {
     assert_eq!(report.score(WINDOW, OP1_ITEM), Some(0.0));
 }
 
+/// A model with a given id, which reads like `ReaderModel`.
+#[derive(Debug)]
+struct Named(&'static str, Arc<ReaderModel>);
+
+impl AgentModel for Named {
+    fn chat<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+    ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
+        self.1.chat(request)
+    }
+
+    fn model_id(&self) -> Option<&str> {
+        Some(self.0)
+    }
+}
+
+/// Run `episodes` with its passes on the harness model `pass`, which has the
+/// id `id`.
+async fn sweep_with_pass(db: &Path, id: &'static str, pass: &Arc<ReaderModel>) -> RecallReport {
+    let settings = autumn_harvest_agent::EpisodeSettings::default()
+        .every(1)
+        .model("pass");
+    let profile = recall::profiles(WINDOW_SIZE)
+        .into_iter()
+        .find(|profile| profile.kind == EPISODES)
+        .expect("the episodes profile")
+        .episodes(settings);
+    let harness = Arc::new(
+        harness(ReaderModel::new(), WINDOW_SIZE)
+            .model_named("pass", Arc::new(Named(id, pass.clone())))
+            .agent(profile),
+    );
+    let mut rt = SqliteRuntime::open(db).expect("the database opens");
+    sqlite::register(&mut rt, Arc::clone(&harness));
+    let configs = [EPISODES.to_owned()];
+    recall::sweep(&mut rt, &harness, &only(OP1_ITEM), &configs).await
+}
+
+/// A new pass model gets new agents, so a rerun never reports the facts of
+/// the old pass model.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rerun_with_another_pass_model_runs_again() {
+    let (_dir, db) = fresh_db();
+    let first = ReaderModel::new();
+    let report = sweep_with_pass(&db, "pass-a", &first).await;
+    assert!(first.calls() > 0, "the pass runs on the pass model");
+    assert_eq!(report.score(EPISODES, OP1_ITEM), Some(1.0));
+
+    let second = ReaderModel::new();
+    sweep_with_pass(&db, "pass-b", &second).await;
+    assert!(second.calls() > 0, "the new pass model runs its own agents");
+}
+
 /// A rerun with another window on the same database gets new agents, so it
 /// never reports the rows of the old window.
 #[tokio::test(flavor = "multi_thread")]
