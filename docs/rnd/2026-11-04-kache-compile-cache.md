@@ -77,6 +77,16 @@ read-only role for every other ref. The daemon reads AWS credentials from the
 standard chain, so `aws-actions/configure-aws-credentials` before the kache step
 works without key secrets.
 
+R2 has no OIDC trust policy, so it needs two R2 API tokens:
+
+- A token with **Object Read** on the bucket, as the repository secrets above.
+  Every job gets it, a PR job included.
+- A token with **Object Read & Write**, as secrets of a GitHub environment
+  whose deployment branch rule allows `trunk-dev` only. A push job names that
+  environment, so only a `trunk-dev` push can read the write token.
+
+A PR that edits the workflow then gets the read token only.
+
 ## 📊 Results so far
 
 ### Local, before the CI trial
