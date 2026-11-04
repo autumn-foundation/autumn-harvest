@@ -133,21 +133,30 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
             std::future::ready(Ok::<_, String>(h.discover_peers(&names)))
         })
     });
-    let h = Arc::clone(&harness);
+    register_refine(rt, &harness);
+    rt.register_activity_with_body(&agent_precheck_info(), move |input| {
+        call(input, |task| harness.precheck_tick(task))
+    });
+}
+
+/// Register the refine and score activities against `harness` (issues
+/// #2379, #2394 and #2441).
+fn register_refine(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
+    let h = Arc::clone(harness);
     rt.register_activity_with_body(&crate::refine::agent_refine_policy_info(), move |input| {
         call(input, |kind: String| {
             let h = Arc::clone(&h);
             async move { h.refine_policy(&kind).await }
         })
     });
-    let h = Arc::clone(&harness);
+    let h = Arc::clone(harness);
     rt.register_activity_with_body(&agent_refine_propose_info(), move |input| {
         call(input, |request| {
             let h = Arc::clone(&h);
             async move { run_stage(&h, request).await }
         })
     });
-    let h = Arc::clone(&harness);
+    let h = Arc::clone(harness);
     rt.register_activity_with_ledger(&agent_score_info(), move |input, _at| {
         call_with_ledger(input, |request| {
             let h = Arc::clone(&h);
@@ -158,9 +167,6 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
                 verdict.map(|verdict| (verdict, calls))
             }
         })
-    });
-    rt.register_activity_with_body(&agent_precheck_info(), move |input| {
-        call(input, |task| harness.precheck_tick(task))
     });
 }
 
