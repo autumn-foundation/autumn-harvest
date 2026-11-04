@@ -22,6 +22,7 @@ members = [
     "examples/billing-autumn-web",
     "examples/claude-agent-daemon",
     "examples/quickstart",
+    "examples/recall-eval",
     "examples/saga-choreography",
     "examples/standalone-runner",
     "examples/standalone-quickstart",
