@@ -83,9 +83,13 @@ fn reply(request: &ChatRequest) -> ChatResponse {
     if let Some((key, value)) = statement(&said) {
         let fact = format!("the {key} is {value}");
         let notes = last_notes(request);
+        // The notes hold the fact when the last value of the key is this
+        // value. An older equal value does not count, so a value that comes
+        // back is saved again.
         let saved = notes
             .as_deref()
-            .is_some_and(|notes| notes.lines().any(|line| line == fact));
+            .and_then(|notes| last_value(notes, &format!("{key} is ")))
+            .is_some_and(|last| last == value);
         if offers(request, SAVE_PROGRESS_TOOL) && !saved {
             let notes = notes.map_or_else(|| fact.clone(), |notes| format!("{notes}\n{fact}"));
             return save(&notes, request.messages.len());
@@ -352,6 +356,31 @@ mod tests {
             vec![tool],
         );
         assert_eq!(reply_text(&reply(&after)), "Noted: the code is 7.");
+    }
+
+    #[test]
+    fn a_value_that_comes_back_is_saved_again() {
+        let tool = ToolDefinition {
+            name: SAVE_PROGRESS_TOOL.to_owned(),
+            description: String::new(),
+            input_schema: json!({}),
+        };
+        let old = ChatMessage {
+            role: ChatRole::Assistant,
+            content: vec![ContentPart::ToolCall {
+                id: "s".into(),
+                name: SAVE_PROGRESS_TOOL.into(),
+                arguments: json!({"notes": "the code is 1\nthe code is 2"}),
+            }],
+        };
+        let said = request(vec![old, user("Remember: the code is 1.")], vec![tool]);
+        match reply(&said).content.as_slice() {
+            [ContentPart::ToolCall { arguments, .. }] => {
+                let notes = arguments["notes"].as_str().expect("notes");
+                assert_eq!(last_value(notes, "code is "), Some("1".into()));
+            }
+            other => panic!("expected a save call, got {other:?}"),
+        }
     }
 
     #[test]
