@@ -1,0 +1,50 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/operator.rs`. See `docs/ledger/README.md`.
+
+["children"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["count"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["parents_with_children"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"
+
+["buffered_signals"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_signals"]
+measured = "unmeasured"
+
+["pending_tasks"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_tasks"]
+measured = "unmeasured"
+
+["pending_timers"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_timers"]
+measured = "unmeasured"
+
+["timed_history"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_events", "harvest_executions"]
+measured = "unmeasured"

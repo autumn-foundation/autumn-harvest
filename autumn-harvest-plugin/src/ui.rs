@@ -99,7 +99,7 @@ const DLQ_SUMMARY_SAMPLES_PER_GROUP: u32 = 3;
 
 const KNOWN_STATES: &[&str] = KNOWN_WORKFLOW_STATES;
 
-const STYLE: &str = r#"
+pub(crate) const STYLE: &str = r#"
 *,*::before,*::after{box-sizing:border-box}
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#0f172a;color:#e2e8f0}
 a{color:#93c5fd;text-decoration:none}
@@ -7219,7 +7219,7 @@ fn render_blocked_on_panel(blocked_on: &BlockedOnData) -> Markup {
     }
 }
 
-fn kv(key: &str, value: &str, mono: bool) -> Markup {
+pub(crate) fn kv(key: &str, value: &str, mono: bool) -> Markup {
     html! {
         div.k { (key) }
         @if mono {
@@ -7230,7 +7230,7 @@ fn kv(key: &str, value: &str, mono: bool) -> Markup {
     }
 }
 
-fn json_card(title: &str, value: &Value) -> Markup {
+pub(crate) fn json_card(title: &str, value: &Value) -> Markup {
     html! {
         div.card {
             h3 { (title) }
@@ -7239,18 +7239,18 @@ fn json_card(title: &str, value: &Value) -> Markup {
     }
 }
 
-fn pretty_json(value: &Value) -> String {
+pub(crate) fn pretty_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
-fn format_timestamp(ts: Option<DateTime<Utc>>) -> String {
+pub(crate) fn format_timestamp(ts: Option<DateTime<Utc>>) -> String {
     ts.map_or_else(
         || "—".to_string(),
         |ts| ts.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
     )
 }
 
-fn state_badge(state: &str) -> Markup {
+pub(crate) fn state_badge(state: &str) -> Markup {
     let class = format!("badge {}", badge_class(state));
     let aria = format!("Status: {state}");
     html! {
@@ -7269,11 +7269,11 @@ fn badge_class(state: &str) -> &'static str {
     }
 }
 
-fn short_id(id: &str) -> String {
+pub(crate) fn short_id(id: &str) -> String {
     id.chars().take(8).collect::<String>() + "…"
 }
 
-fn url_encode(input: &str) -> String {
+pub(crate) fn url_encode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {

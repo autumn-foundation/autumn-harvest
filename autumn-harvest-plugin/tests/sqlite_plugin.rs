@@ -27,6 +27,9 @@ mod wire_contract;
 #[path = "sqlite_plugin/wire_parity.rs"]
 mod wire_parity;
 
+#[path = "sqlite_plugin/read_parity.rs"]
+mod read_parity;
+
 #[path = "support/token_contract.rs"]
 mod token_contract;
 
@@ -312,7 +315,7 @@ fn an_option_with_no_sqlite_port_fails_the_build_and_names_its_issue() {
         .cloned()
         .unwrap_or_default();
     assert!(
-        message.contains("decode_payloads_on_read (#2468)"),
+        message.contains("decode_payloads_on_read (#2466)"),
         "{message}"
     );
 }

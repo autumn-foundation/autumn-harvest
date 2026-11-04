@@ -49,6 +49,9 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
+#[path = "support/wire_contract.rs"]
+mod wire_contract;
+
 fn init_sql() -> Vec<u8> {
     autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
@@ -391,6 +394,8 @@ async fn run_chain_three_can_transitions_from_head_middle_and_tail() {
             runs[3]["continued_to_exec_id"].is_null(),
             "tail has no forward link ({label})"
         );
+        // The shared shape check that the SQLite suite runs too (issue #2468).
+        wire_contract::run_chain_shape(&body);
     }
 }
 
