@@ -1201,7 +1201,8 @@ enum Commands {
         command: ShardCommand,
     },
     /// List, describe, pause, resume and erase durable agents (issue #2267),
-    /// and operate their profile overlays (issue #2374).
+    /// and operate their profile overlays (issue #2374). Show, set and reset
+    /// the sampling policy of an agent kind (issue #2439).
     #[command(alias = "agent")]
     Agents {
         #[command(subcommand)]

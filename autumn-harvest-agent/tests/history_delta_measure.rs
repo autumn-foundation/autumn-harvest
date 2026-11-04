@@ -81,6 +81,7 @@ fn agent_loop_history(filler: Filler) -> Vec<WorkflowEvent> {
     for turn in 0..TURNS {
         let request = ModelTurnRequest {
             skills: false,
+            allowed_effects: None,
             tool_guidance: std::collections::BTreeMap::new(),
             run_id: "run-2009".into(),
             session_id: None,

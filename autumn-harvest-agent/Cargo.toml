@@ -159,6 +159,14 @@ name = "overlay_store_postgres"
 required-features = ["postgres"]
 
 [[test]]
+name = "sampling_policy_postgres"
+required-features = ["postgres"]
+
+[[test]]
+name = "sampling_policy"
+required-features = ["sqlite"]
+
+[[test]]
 name = "overlay_read"
 required-features = ["sqlite"]
 
@@ -190,6 +198,12 @@ required-features = ["sqlite"]
 name = "score_postgres"
 required-features = ["postgres"]
 
+# The `postgres` module on a real worker: the Postgres form of the SQLite
+# helpers.
+[[test]]
+name = "postgres_agents"
+required-features = ["postgres"]
+
 [[test]]
 name = "episodes"
 required-features = ["sqlite"]
@@ -200,6 +214,11 @@ workspace = true
 [[example]]
 name = "sqlite_agent"
 required-features = ["sqlite"]
+
+# The same story on Postgres, with a worker in the process.
+[[example]]
+name = "postgres_agent"
+required-features = ["postgres"]
 
 # A session as a durable agent (issues #1975, #2263). `test = true` runs its
 # embedded tests in the crate's own `cargo test` step.

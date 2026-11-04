@@ -22,6 +22,7 @@ use crate::message::{
 };
 use crate::policy::ToolDecision;
 use crate::skill::SkillText;
+use crate::tool::ToolEffect;
 use crate::workspace::{WorkspaceMount, WorkspaceRef};
 use serde::{Deserialize, Serialize};
 
@@ -38,8 +39,12 @@ pub const MAX_PARALLEL_CHILDREN: u32 = 16;
 /// The input of one agent run: the workflow input.
 // The flags are independent switches on a recorded payload. A flat bool per
 // switch keeps the wire shape plain, so the lint is allowed here.
+//
+// The derives are remote, so the trait impls below wrap them. The
+// `Deserialize` impl refuses each sampling policy field first (issue #2439).
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct AgentTask {
     /// The user message that starts this run.
     pub input: String,
@@ -190,11 +195,35 @@ pub struct AgentTask {
     /// `load_skill` tool. See [`skill`](crate::skill).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub skills: BTreeMap<String, SkillText>,
+    /// The tool effects that the run may run (issue #2439). `None` allows
+    /// each effect. It only narrows the run: `read_only` and the policy
+    /// still apply. A strategy draw sets it to the draw effects of its
+    /// policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_effects: Option<BTreeSet<ToolEffect>>,
     /// The draw of the run (issue #2440). Each model request carries its id.
     /// With a root, the run id is `{root}:s{n}`. A delegated child keeps the
     /// id. Use [`run_draws`](crate::run_draws) to start draws.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draw: Option<Draw>,
+}
+
+impl Serialize for AgentTask {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+/// The decode refuses each name in
+/// [`SAMPLING_POLICY_FIELDS`](crate::sampling::SAMPLING_POLICY_FIELDS), so a
+/// task never carries a policy. Any other unknown key still decodes, as
+/// before.
+impl<'de> Deserialize<'de> for AgentTask {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        crate::sampling::refuse_policy_fields::<D::Error>(&value, "an AgentTask")?;
+        Self::deserialize(value).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Where the run id of a task comes from.
@@ -247,6 +276,7 @@ impl AgentTask {
             context_reset: None,
             tool_guidance: BTreeMap::new(),
             skills: BTreeMap::new(),
+            allowed_effects: None,
             draw: None,
         }
     }
@@ -563,6 +593,11 @@ pub struct ModelTurnRequest {
     /// Offer the `load_skill` tool (issue #2373).
     #[serde(default, skip_serializing_if = "is_false")]
     pub skills: bool,
+    /// The tool effects that the run may run (issue #2439). The decision
+    /// phase denies a call to a tool of any other effect, and a call to an
+    /// unknown tool. `None` allows each effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_effects: Option<BTreeSet<ToolEffect>>,
     /// The draw of this turn (issue #2440). A recorded input with no field
     /// decodes as `None`, so a run in flight replays as it ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -702,6 +737,10 @@ pub struct ToolCallRequest {
     /// when the run has no skills, so the tool is unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill: Option<SkillLookup>,
+    /// Refuse a tool whose effect is not in the set, whatever the recorded
+    /// decision says (issue #2439). `None` allows each effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_effects: Option<BTreeSet<ToolEffect>>,
 }
 
 /// What a run holds for one `load_skill` call (issue #2373).

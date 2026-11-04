@@ -5547,6 +5547,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             get(crate::agent_profile_api::list_policy_changes).route_layer(require_admin.clone()),
         )
         .route(
+            // The sampling policy of an agent kind (issue #2439).
+            "/admin/agents/{kind}/sampling-policy",
+            get(crate::sampling_policy_api::get_sampling_policy)
+                .put(crate::sampling_policy_api::put_sampling_policy)
+                .delete(crate::sampling_policy_api::delete_sampling_policy)
+                .route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/retention",
             get(retention_status).route_layer(require_admin.clone()),
         )
@@ -7587,6 +7595,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
             "PATCH",
             "/admin/workflow-types/{workflow_name}/run-defaults",
         ),
+        ("GET", "/admin/agents/{kind}/sampling-policy"),
+        ("PUT", "/admin/agents/{kind}/sampling-policy"),
+        ("DELETE", "/admin/agents/{kind}/sampling-policy"),
         // Agent profile overlays (issue #2374).
         ("GET", "/agents/{kind}/profile"),
         ("GET", "/agents/{kind}/profile/versions"),
@@ -7929,6 +7940,13 @@ pub const fn management_api_request_fields()
                 "recompute_in_flight",
             ]),
         ),
+        // The sampling policy of an agent kind (issue #2439).
+        (
+            "PUT",
+            "/admin/agents/{kind}/sampling-policy",
+            Some(&["policy"]),
+        ),
+        ("DELETE", "/admin/agents/{kind}/sampling-policy", Some(&[])),
         // Agent profile overlays (issue #2374). A rollback takes no field.
         (
             "POST",
@@ -9158,6 +9176,22 @@ pub const fn management_api_response_fields()
             "PATCH",
             "/admin/workflow-types/{workflow_name}/run-defaults",
             Some(&["workflow_name", "code", "override", "effective"]),
+        ),
+        // Issue #2439.
+        (
+            "GET",
+            "/admin/agents/{kind}/sampling-policy",
+            Some(&["kind", "revision", "policy", "audit"]),
+        ),
+        (
+            "PUT",
+            "/admin/agents/{kind}/sampling-policy",
+            Some(&["kind", "revision", "old", "new"]),
+        ),
+        (
+            "DELETE",
+            "/admin/agents/{kind}/sampling-policy",
+            Some(&["kind", "revision", "old", "new"]),
         ),
         // Agent profile overlays (issue #2374).
         (

@@ -8,6 +8,15 @@
 #   UPDATE_VERUS_CONTRACTS=1 cargo test -p autumn-harvest --test integration \
 #     verus_proofs_coverage::every_verus_contract_matches_the_stored_list
 
+## formal/verus/src/agent_anonymise.rs
+pub open spec fn common(a: Seq < u8 >, b: Seq < u8 >) -> nat decreases a.len(), { if a.len() == 0 || b.len() == 0 || a [0] != b [0] { 0 } else { 1 + common(a.drop_first(), b.drop_first()) } }
+proof fn lemma_common(a: Seq < u8 >, b: Seq < u8 >) ensures common(a, b) <= a.len(), common(a, b) <= b.len(), forall | i: int | 0 <= i < common(a, b) ==> a [i] == b [i], common(a, b) < a.len() && common(a, b) < b.len() ==> a [common(a, b) as int] != b [common(a, b,) as int], decreases a.len(),
+pub fn shared_digits(a:& [u8], b:& [u8]) -> (r: usize) ensures r == common(a @, b @),
+pub open spec fn safe(shared: Seq < usize >, cap: int, r: int) -> bool { forall | i: int | 0 <= i < shared.len() && shared [i] < cap ==> shared [i] < r }
+pub fn id_width(shared:& [usize], floor: usize, cap: usize) -> (r: usize) requires floor <= cap, ensures floor <= r <= cap, safe(shared @, cap as int, r as int), r == floor || exists | i: int | 0 <= i < shared @.len() && #[trigger] shared @ [i] < cap && r == shared @ [i] + 1,
+pub proof fn theorem_the_width_is_the_least_safe_width(shared: Seq < usize >, floor: int, cap: int, r: int) requires floor <= r <= cap, safe(shared, cap, r), r == floor || exists | i: int | 0 <= i < shared.len() && #[trigger] shared [i] < cap && r == shared [i] + 1, ensures forall | w: int | floor <= w < r ==>! safe(shared, cap, w),
+pub proof fn theorem_a_width_above_the_shared_count_splits_a_pair(a: Seq < u8 >, b: Seq < u8 >, width: int) requires common(a, b) < width, width <= a.len(), width <= b.len(), ensures a.subrange(0, width) != b.subrange(0, width),
+
 ## formal/verus/src/agent_dedupe.rs
 pub open spec fn spec_is_new(floor: int, seq: int, in_above: bool) -> bool { seq > floor &&! in_above }
 pub open spec fn spec_next_floor(floor: int, next_in_above: bool) -> int { if next_in_above && floor < u64::MAX { floor + 1 } else { floor } }
@@ -120,6 +129,18 @@ pub proof fn theorem_a_zero_cap_never_resets(resets: int, max_resets: int, len: 
 pub open spec fn after(resets: int, max_resets: int, len: int, cap: int, percent: int) -> int { if due(resets, max_resets, len, cap, percent) { resets + 1 } else { resets } }
 pub open spec fn count(resets: int, max_resets: int, lens: Seq < int >, cap: int, percent: int) -> int decreases lens.len(), { if lens.len() == 0 { resets } else { count(after(resets, max_resets, lens [0], cap, percent), max_resets, lens.subrange(1, lens.len() as int), cap, percent,) } }
 pub proof fn theorem_resets_never_pass_the_cap(resets: int, max_resets: int, lens: Seq < int >, cap: int, percent: int,) requires 0 <= resets <= max_resets, ensures resets <= count(resets, max_resets, lens, cap, percent) <= max_resets, decreases lens.len(),
+
+## formal/verus/src/agent_sampling.rs
+pub const MAX_PARALLEL_CHILDREN: u32 = 16;
+pub enum DrawPlan { Run { draws: u32, concurrency: u32 }, NoDraws, TooManyDraws, TooManyConcurrent, }
+pub open spec fn spec_cap(max_concurrent: u32) -> int { if max_concurrent > MAX_PARALLEL_CHILDREN { MAX_PARALLEL_CHILDREN as int } else if max_concurrent == 0 { 1 } else { max_concurrent as int } }
+pub fn draw_plan(max_draws: u32, max_concurrent: u32, draws: u32, asked: u32) -> (r: DrawPlan) ensures draws == 0 <==> r is NoDraws, r is TooManyDraws <==> (draws > 0 && draws > max_draws), r is TooManyConcurrent <==> (draws > 0 && draws <= max_draws && asked > spec_cap(max_concurrent,)), r is Run ==> r -> Run_draws == draws, r is Run ==> 1 <= r -> Run_draws <= max_draws, r is Run ==> 1 <= r -> Run_concurrency, r is Run ==> r -> Run_concurrency <= r -> Run_draws, r is Run ==> r -> Run_concurrency <= MAX_PARALLEL_CHILDREN, r is Run ==> r -> Run_concurrency <= spec_cap(max_concurrent), r is Run && asked > 0 && asked <= draws ==> r -> Run_concurrency == asked,
+pub open spec fn spec_wave_end(draws: int, concurrency: int, start: int) -> int { let width = if concurrency == 0 { 1 } else { concurrency }; if start >= draws { draws } else if draws - start < width { draws } else { start + width } }
+pub fn wave_end(draws: u32, concurrency: u32, start: u32) -> (r: u32) ensures r == spec_wave_end(draws as int, concurrency as int, start as int), start < draws ==> start < r <= draws, start < draws && concurrency > 0 ==> r - start <= concurrency, start < draws && concurrency == 0 ==> r == start + 1, start >= draws ==> r == draws,
+pub open spec fn covered(draws: int, concurrency: int, start: int) -> int decreases draws - start, { if start >= draws || start < 0 { 0 } else { let end = spec_wave_end(draws, concurrency, start); if end <= start { 0 } else { (end - start) + covered(draws, concurrency, end) } } }
+pub proof fn theorem_the_waves_cover_each_draw_once(draws: int, concurrency: int, start: int) requires 0 <= start <= draws, concurrency >= 0, ensures covered(draws, concurrency, start) == draws - start, decreases draws - start,
+pub open spec fn spec_next_policy_revision(current: u64) -> Option < u64 > { if current < u64::MAX { Some((current + 1) as u64) } else { None } }
+pub fn next_policy_revision(current: u64) -> (r: Option < u64 >) ensures r == spec_next_policy_revision(current), r.is_some() ==> r.unwrap() == current + 1, r.is_some() ==> r.unwrap() >= 1, r.is_none() ==> current == u64::MAX,
 
 ## formal/verus/src/agent_select.rs
 pub open spec fn key(bits: i64) -> i64 { bits ^ ((((bits >> 63i64) as u64) >> 1u64) as i64) }

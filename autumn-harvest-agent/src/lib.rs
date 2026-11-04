@@ -28,6 +28,10 @@
 //! steer the running op, or interrupt it (issue #2265). See section 15 of
 //! `docs/agent-adapter.md`.
 //!
+//! The [`sampling`] module holds the operator sampling policy of each kind
+//! (issue #2439). [`sampling::agent_draws`] reads it once, then runs the
+//! draws of a strategy.
+//!
 //! The [`mesh`] module lets a run delegate a task to a [`Peer`]. A
 //! [`Mandate`] bounds the delegation tree. The [`flow`] module gates a
 //! dangerous sequence of tool calls with [`FlowRules`].
@@ -58,6 +62,9 @@
 //! ```
 //!
 //! # Use it on Postgres
+//!
+//! The `postgres` feature adds the `postgres` module. It has the calls of
+//! the `sqlite` module, for an app whose workers run on Postgres.
 //!
 //! Register the workflows and the activities, and install the harness as
 //! worker state:
@@ -101,8 +108,11 @@ pub mod mesh_control;
 pub mod message;
 pub mod model;
 pub mod policy;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod refine;
 pub mod response_cache;
+pub mod sampling;
 #[cfg(feature = "sandbox")]
 pub mod sandbox;
 pub mod score;

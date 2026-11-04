@@ -44,6 +44,9 @@ use crate::mesh_control::{MESH_ATTR, MeshPause, MeshSpend, Spend};
 use crate::model::BoxFuture;
 use crate::refine::agent_refine_propose_info;
 use crate::refine::propose::run_stage;
+use crate::sampling::{
+    DRAWS_WORKFLOW_NAME, DrawsInput, agent_draws_info, agent_sampling_policy_info,
+};
 use crate::score::{agent_score_info, run_score};
 use crate::types::{AgentTask, ModelTurnRequest};
 use crate::workflow::{
@@ -60,6 +63,7 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     rt.register_workflow(&agent_loop_info());
     rt.register_workflow(&agent_heartbeat_info());
     rt.register_workflow(&agent_info());
+    register_sampling(rt, &harness);
     rt.register_workflow(&agent_consolidate_info());
     register_episodes(rt, &harness);
     let h = Arc::clone(&harness);
@@ -79,24 +83,7 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     rt.register_activity_with_body(&agent_memory_reset_info(), move |input| {
         call(input, |scope| h.memory_reset(scope))
     });
-    let h = Arc::clone(&harness);
-    rt.register_activity_with_body(&agent_workspace_retain_info(), move |input| {
-        call(input, |mount| h.workspace_retain(mount))
-    });
-    let h = Arc::clone(&harness);
-    rt.register_activity_with_body(&agent_workspace_floor_info(), move |input| {
-        call(input, |scope: String| {
-            let h = Arc::clone(&h);
-            async move { h.workspace_floor(&scope).await }
-        })
-    });
-    let h = Arc::clone(&harness);
-    rt.register_activity_with_body(&agent_workspace_reset_info(), move |input| {
-        call(input, |mount: crate::workspace::WorkspaceMount| {
-            let h = Arc::clone(&h);
-            async move { h.workspace_reset(mount).await }
-        })
-    });
+    register_workspace(rt, &harness);
     let h = Arc::clone(&harness);
     rt.register_activity_with_ledger(&agent_model_turn_info(), move |input, at| {
         call_with_ledger(input, |request: ModelTurnRequest| async {
@@ -133,21 +120,42 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
             std::future::ready(Ok::<_, String>(h.discover_peers(&names)))
         })
     });
-    let h = Arc::clone(&harness);
+    register_refine(rt, &harness);
+    rt.register_activity_with_body(&agent_precheck_info(), move |input| {
+        call(input, |task| harness.precheck_tick(task))
+    });
+}
+
+/// Register the strategy run and its policy read (issue #2439).
+fn register_sampling(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
+    rt.register_workflow(&agent_draws_info());
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_sampling_policy_info(), move |input| {
+        call(input, |kind: String| {
+            let h = Arc::clone(&h);
+            async move { h.sampling_policy(&kind).await }
+        })
+    });
+}
+
+/// Register the refine and score activities against `harness` (issues
+/// #2379, #2394 and #2441).
+fn register_refine(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
+    let h = Arc::clone(harness);
     rt.register_activity_with_body(&crate::refine::agent_refine_policy_info(), move |input| {
         call(input, |kind: String| {
             let h = Arc::clone(&h);
             async move { h.refine_policy(&kind).await }
         })
     });
-    let h = Arc::clone(&harness);
+    let h = Arc::clone(harness);
     rt.register_activity_with_body(&agent_refine_propose_info(), move |input| {
         call(input, |request| {
             let h = Arc::clone(&h);
             async move { run_stage(&h, request).await }
         })
     });
-    let h = Arc::clone(&harness);
+    let h = Arc::clone(harness);
     rt.register_activity_with_ledger(&agent_score_info(), move |input, _at| {
         call_with_ledger(input, |request| {
             let h = Arc::clone(&h);
@@ -159,8 +167,29 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
             }
         })
     });
-    rt.register_activity_with_body(&agent_precheck_info(), move |input| {
-        call(input, |task| harness.precheck_tick(task))
+}
+
+/// Register the activities that retain, floor and reset a workspace.
+///
+/// `register` calls it so that function stays under the line limit.
+fn register_workspace(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_workspace_retain_info(), move |input| {
+        call(input, |mount| h.workspace_retain(mount))
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_workspace_floor_info(), move |input| {
+        call(input, |scope: String| {
+            let h = Arc::clone(&h);
+            async move { h.workspace_floor(&scope).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_workspace_reset_info(), move |input| {
+        call(input, |mount: crate::workspace::WorkspaceMount| {
+            let h = Arc::clone(&h);
+            async move { h.workspace_reset(mount).await }
+        })
     });
 }
 
@@ -230,6 +259,15 @@ pub fn consolidate(rt: &mut SqliteRuntime, id: &AgentId) -> SqliteResult<Executi
 /// Returns an error when the runtime cannot record the start.
 pub fn start(rt: &mut SqliteRuntime, task: &AgentTask) -> SqliteResult<ExecutionId> {
     rt.start_workflow(WORKFLOW_NAME, serde_json::to_value(task)?)
+}
+
+/// Start one strategy run (issue #2439). Returns its execution id.
+///
+/// # Errors
+///
+/// Returns an error when the runtime cannot record the start.
+pub fn start_draws(rt: &mut SqliteRuntime, input: &DrawsInput) -> SqliteResult<ExecutionId> {
+    rt.start_workflow(DRAWS_WORKFLOW_NAME, serde_json::to_value(input)?)
 }
 
 /// Start one heartbeat tick. Returns its execution id.

@@ -513,6 +513,186 @@
         "x-harvest-route-class": "mutating"
       }
     },
+    "/admin/agents/{kind}/sampling-policy": {
+      "delete": {
+        "description": "Reset the sampling policy of one agent kind to every default (issue #2439). The row stays, so the revision never goes back. new is null in the response. The store writes a harvest_agent_policy_audit row with the old policy. Each request also writes a harvest_audit_log row with the operation agent.sampling_policy.reset, a refused request included.",
+        "operationId": "delete_admin_agents_by_kind_sampling_policy",
+        "parameters": [
+          {
+            "description": "Agent kind: 1 to 64 characters from a-z, 0-9, _ and -.",
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "kind": {},
+                    "new": {},
+                    "old": {},
+                    "revision": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "The kind or the actor is not valid."
+          },
+          "403": {
+            "description": "The caller is not an operator. Nothing changes."
+          },
+          "409": {
+            "description": "The revision counter of the kind is full."
+          },
+          "500": {
+            "description": "A stored policy is corrupt."
+          },
+          "503": {
+            "description": "Database error."
+          }
+        },
+        "summary": "Reset the sampling policy of one agent kind to every default (issue #2439).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-idempotency": "Not idempotent: each reset adds 1 to the revision and writes an audit row.",
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
+      },
+      "get": {
+        "description": "Read the sampling policy of one agent kind (issue #2439). policy is the full SamplingPolicy, with each default filled in: strategies, max_draws, max_concurrent_draws, draw_effects, scorers, judge_models and max_answer_retries. revision is 0 when no operator ever set or reset the policy. audit holds the newest 20 changes, the newest first. Each audit row has revision, action (set or reset), actor, old, new and at.",
+        "operationId": "get_admin_agents_by_kind_sampling_policy",
+        "parameters": [
+          {
+            "description": "Agent kind: 1 to 64 characters from a-z, 0-9, _ and -.",
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "audit": {},
+                    "kind": {},
+                    "policy": {},
+                    "revision": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "The kind is not valid."
+          },
+          "500": {
+            "description": "A stored policy is corrupt."
+          },
+          "503": {
+            "description": "Database error."
+          }
+        },
+        "summary": "Read the sampling policy of one agent kind (issue #2439).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
+      },
+      "put": {
+        "description": "Replace the sampling policy of one agent kind (issue #2439). A key that the policy leaves out takes its default. An unknown key fails the request. The store writes the policy and a harvest_agent_policy_audit row with the old and new policy in one transaction. Each request also writes a harvest_audit_log row with the operation agent.sampling_policy.set, a refused request included. The next strategy run of every process reads the new policy. A run in flight keeps the policy that it read at its start.",
+        "operationId": "put_admin_agents_by_kind_sampling_policy",
+        "parameters": [
+          {
+            "description": "Agent kind: 1 to 64 characters from a-z, 0-9, _ and -.",
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "policy": {
+                    "additionalProperties": true,
+                    "description": "The SamplingPolicy. Keys: strategies (best_of_n, rejection, vote, cascade, beam), max_draws (1 to 256), max_concurrent_draws (1 to 16), draw_effects (read_only, internal, write, external), scorers (\"deterministic\" or {\"only\": [ids]}), judge_models and max_answer_retries (0 to 16).",
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "policy"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "kind": {},
+                    "new": {},
+                    "old": {},
+                    "revision": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "The body does not decode, has an unknown key, or a setting is out of bounds. The kind or the actor is not valid."
+          },
+          "403": {
+            "description": "The caller is not an operator. Nothing changes."
+          },
+          "409": {
+            "description": "The revision counter of the kind is full."
+          },
+          "500": {
+            "description": "A stored policy is corrupt."
+          },
+          "503": {
+            "description": "Database error."
+          }
+        },
+        "summary": "Replace the sampling policy of one agent kind (issue #2439).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-idempotency": "Not idempotent: each set adds 1 to the revision and writes an audit row.",
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
+      }
+    },
     "/admin/audit": {
       "get": {
         "description": "Browse the audit trail of management API mutations. Read-only — the audit log itself is never mutated through this surface.",

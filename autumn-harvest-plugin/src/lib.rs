@@ -81,6 +81,7 @@ mod run_defaults_api;
 pub mod runner;
 /// Cross-site request rejection for Vantage and DLQ mutations (issue #1278).
 pub mod same_origin;
+mod sampling_policy_api;
 pub mod schedule_runs;
 pub mod shard_fanout;
 pub mod shard_health;

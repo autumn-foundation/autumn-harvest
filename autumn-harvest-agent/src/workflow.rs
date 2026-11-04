@@ -436,6 +436,7 @@ fn next_request(
         model: task.model.clone(),
         tool_guidance: task.tool_guidance.clone(),
         skills: !task.skills.is_empty(),
+        allowed_effects: task.allowed_effects.clone(),
         draw: task.draw.as_ref().map(|draw| draw.id),
     }
 }
@@ -1865,6 +1866,7 @@ async fn run_tool(
         flow_labels,
         workspace: progress.workspace.clone(),
         skill: None,
+        allowed_effects: task.allowed_effects.clone(),
     };
     if wants_skill {
         request.skill = Some(skill::lookup(
@@ -2366,6 +2368,11 @@ async fn durable_peer(
     let Some(target) = target else {
         return Ok(refuse(agent, tree, Refusal::PeerUnavailable, &peer.name));
     };
+    // A durable peer runs its own op with its own effects. A mandate cannot
+    // carry an effect set, so a narrowed run never asks one (issue #2439).
+    if run.task.allowed_effects.is_some() {
+        return Ok(refuse(agent, tree, Refusal::NotPermitted, &peer.name));
+    }
     let target_id = target.as_str();
     if target_id == tree.outbox.self_id || tree.outbox.waiting.iter().any(|id| id == target_id) {
         return Ok(refuse(agent, tree, Refusal::Deadlock, &peer.name));
@@ -2596,6 +2603,8 @@ fn child_task(
         // parent do not apply to it (issue #2373).
         tool_guidance: std::collections::BTreeMap::new(),
         skills: std::collections::BTreeMap::new(),
+        // A child never runs a wider effect than its parent (issue #2439).
+        allowed_effects: task.allowed_effects.clone(),
         // A child is part of the draw of its parent, so its requests keep
         // the draw id. It has its own run id, so it drops the root.
         draw: task.draw.as_ref().map(Draw::inherited),
@@ -2889,6 +2898,7 @@ pub fn workflows() -> Vec<WorkflowInfo> {
         agent_loop_info(),
         agent_heartbeat_info(),
         agent_info(),
+        crate::sampling::agent_draws_info(),
         crate::consolidate::agent_consolidate_info(),
     ]
 }
@@ -2910,6 +2920,7 @@ pub fn activities() -> Vec<ActivityInfo> {
         agent_workspace_reset_info(),
         agent_workspace_floor_info(),
         crate::refine::agent_refine_propose_info(),
+        crate::sampling::agent_sampling_policy_info(),
         crate::refine::agent_refine_policy_info(),
         crate::score::agent_score_info(),
         crate::consolidate::agent_consolidate_read_info(),
