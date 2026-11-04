@@ -2633,6 +2633,11 @@ jobs:
         # check covered them. Nothing compiled them against the API.
         # See scripts/check-dags-schedules-examples.sh.
         run: ./scripts/check-dags-schedules-examples.sh
+      - name: Check activities page snippets compile
+        # activities.md shows 8 rust blocks a reader pastes verbatim.
+        # Nothing compiled them against the API.
+        # See scripts/check-activities-examples.sh.
+        run: ./scripts/check-activities-examples.sh
 
   # One check for branch protection to require in place of every leg above.
   # A skipped leg (a draft PR) counts as a pass, as a skipped job does
