@@ -1538,6 +1538,21 @@ The crate ships `InMemoryEpisodeStore`. A durable store implements
 `EpisodeStore` and calls the methods of `EpisodeLog`, so the rules are the
 same in every store.
 
+### Recall eval (issue #2455)
+
+The module `recall` measures what an agent forgets across ops. Each item
+of a fixture states a fact in an early op and asks for it in its last op.
+`recall::sweep` runs each item on its own agent of the config kind, one op
+per session, and scores the last answer with `ExactMatch`. The report has
+one row for each config and item. A failed item reads `error`, and the
+other rows keep their scores.
+
+`recall::profiles` gives four configs: `window`, `notes`, `memory` and
+`episodes`.
+`ReaderModel` answers only from its request, so CI proves that the eval sees
+a loss. The `recall-eval` example runs the eval on Claude. The results are
+in [`performance-agent-recall.md`](performance-agent-recall.md).
+
 ### Workspaces (issue #2274)
 
 A workspace is a set of files, for example a repository checkout and notes.
