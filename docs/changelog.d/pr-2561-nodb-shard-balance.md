@@ -1,4 +1,4 @@
-## CI: balance the no-db shards and merge five plugin lib-test builds
+## CI: balance the no-db shards and merge five plugin lib-test builds (PR #2561)
 
 The `Test (no-db, <os>, shard N)` jobs set the length of a CI run. On
 trunk-dev run 41757040952, Windows shard 3 took 110 minutes, and the
