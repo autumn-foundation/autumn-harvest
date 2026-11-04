@@ -15,6 +15,12 @@
 //! [`Evaluation::overlay_digest`] names the overlay. [`compare`] checks both
 //! overlays before the first model call.
 //!
+//! # A pool
+//!
+//! [`compare_anonymised`] runs any number of candidates on one source (issue
+//! #2376). It gives each one an opaque [`anon::AnonId`] in a seeded order. Its
+//! text names no model, overlay or label. See [`AnonymisedReport`].
+//!
 //! # How it runs
 //!
 //! The harness runs the real `agent_loop` body in the in-memory test engine.
@@ -127,6 +133,12 @@ use crate::policy::ToolDecision;
 use crate::types::{
     AgentReport, AgentTask, ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome,
 };
+mod anonymise;
+
+pub use anonymise::{
+    AnonymisedEvaluation, AnonymisedPool, AnonymisedReport, CandidateRef, compare_anonymised,
+};
+
 use crate::workflow::{
     WORKFLOW_NAME, agent_deliver_info, agent_discover_peers_info, agent_loop_info,
     agent_memory_snapshot_info, agent_model_turn_info, agent_tool_call_info,
@@ -174,6 +186,8 @@ pub struct Candidate {
     /// The model of every turn, from [`model`](Self::model).
     route: Option<String>,
     agent_models: BTreeMap<String, String>,
+    /// The operator label, from [`label`](Self::label).
+    label: Option<String>,
 }
 
 impl Candidate {
@@ -205,7 +219,55 @@ impl Candidate {
             max_turns: None,
             route: None,
             agent_models: BTreeMap::new(),
+            label: None,
         }
+    }
+
+    /// Name this candidate with an operator `label`, such as an overlay
+    /// version id (issue #2376).
+    ///
+    /// The label enters [`digest`](Self::digest). An anonymised report keeps
+    /// it in its key only, never in its text. It is not a flow label. An
+    /// overlay or a shorthand keeps it.
+    #[must_use]
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// The SHA-256 digest of what this candidate sets, as `sha256:<hex>`
+    /// (issue #2376).
+    ///
+    /// It reads the overlay digest, the label, the routes, the admitted
+    /// models, the ceilings and the turn cap. It cannot read the harness.
+    /// So two candidates that differ only in the harness have equal digests.
+    /// Give each one a [`label`](Self::label).
+    #[must_use]
+    pub fn digest(&self) -> String {
+        use sha2::{Digest as _, Sha256};
+
+        #[derive(Serialize)]
+        struct Identity<'a> {
+            overlay: String,
+            label: Option<&'a str>,
+            route: Option<&'a str>,
+            agent_models: &'a BTreeMap<String, String>,
+            admitted: &'a BTreeSet<String>,
+            ceilings: Option<&'a Ceilings>,
+            max_turns: Option<usize>,
+        }
+        let identity = Identity {
+            overlay: self.overlay.digest(),
+            label: self.label.as_deref(),
+            route: self.route.as_deref(),
+            agent_models: &self.agent_models,
+            admitted: &self.admitted,
+            ceilings: self.ceilings.as_ref(),
+            max_turns: self.max_turns,
+        };
+        // The identity holds strings, numbers and maps only, so it encodes.
+        let bytes = serde_json::to_vec(&identity).unwrap_or_default();
+        format!("sha256:{}", crate::transcript::hex(&Sha256::digest(&bytes)))
     }
 
     /// Run the source under `overlay` (issue #2375).
@@ -258,6 +320,37 @@ impl Candidate {
         self
     }
 
+    /// The names that identify this candidate in a failure text (issue
+    /// #2376): the label, both digests, each route and each model id.
+    ///
+    /// `asked` holds each route that a run of this candidate asked for. A
+    /// candidate can keep a route of the source, such as the model of a
+    /// recorded peer. So the routes that a run asks for count too.
+    fn identities(&self, asked: &BTreeSet<Option<String>>) -> Vec<String> {
+        let mut names = vec![self.digest(), self.overlay.digest()];
+        names.extend(self.label.clone());
+        let routes: BTreeSet<&String> = self
+            .overlay
+            .model
+            .iter()
+            .chain(&self.route)
+            .chain(&self.admitted)
+            .chain(self.agent_models.values())
+            .chain(asked.iter().flatten())
+            .collect();
+        let mut ids = vec![self.harness.model(None).ok()];
+        for route in routes {
+            names.push(route.clone());
+            ids.push(self.harness.model(Some(route)).ok());
+        }
+        names.extend(
+            ids.into_iter()
+                .flatten()
+                .filter_map(|model| model.model_id().map(str::to_owned)),
+        );
+        names
+    }
+
     /// The model name that this candidate sets for a turn of `agent`, if any.
     fn model_for(&self, agent: Option<&str>) -> Option<&String> {
         agent
@@ -299,6 +392,17 @@ impl Candidate {
             .unwrap_or_else(|| Ceilings::from_profile(&source));
         ceilings.models.extend(self.admitted.iter().cloned());
         let profile = overlay::apply(&source, &self.overlay, &ceilings, self.harness.as_ref())?;
+        // A route to a missing model would fail the run with an error that
+        // names the model. So it is refused first, as an overlay model is.
+        if let Some(model) = self
+            .agent_models
+            .values()
+            .find(|model| !self.harness.has_model(model))
+        {
+            return Err(OverlayError::UnknownModel {
+                model: model.clone(),
+            });
+        }
         let mut task = task.clone();
         task.system = profile.system;
         task.max_steps = profile.max_steps;
@@ -356,6 +460,16 @@ pub enum EvalError {
     /// or a tool that the harness does not hold (issue #2375).
     #[error("the candidate overlay is refused: {0}")]
     Overlay(#[from] OverlayError),
+    /// Two candidates of an anonymised pool have equal digests, so they
+    /// would get one id (issue #2376). The values are their input indices.
+    /// Give each one a [`Candidate::label`].
+    #[error("candidates {first} and {second} have equal digests; give each a label")]
+    DuplicateCandidate {
+        /// The input index of the first candidate.
+        first: usize,
+        /// The input index of the second candidate.
+        second: usize,
+    },
 }
 
 /// One side of a comparison.
@@ -558,6 +672,21 @@ async fn run(
     task: AgentTask,
     candidate: &Candidate,
 ) -> Result<Evaluation, EvalError> {
+    Ok(run_with_routes(recording, task, candidate).await?.0)
+}
+
+/// [`run`], with each model route that a candidate turn asked for. `None`
+/// is the default model. An anonymised pool redacts these routes (issue
+/// #2376).
+///
+/// # Errors
+///
+/// The errors of [`run`].
+async fn run_with_routes(
+    recording: &Recording,
+    task: AgentTask,
+    candidate: &Candidate,
+) -> Result<(Evaluation, BTreeSet<Option<String>>), EvalError> {
     let handle = multi_thread_handle()?;
 
     let input = serde_json::to_value(&task).map_err(|e| EvalError::Undecodable(e.to_string()))?;
@@ -578,6 +707,7 @@ async fn run(
         root: None,
         replayed: 0,
         stubbed: 0,
+        routes: BTreeSet::new(),
     }));
 
     let model = model_mock(&session, candidate, recording, handle);
@@ -631,28 +761,26 @@ async fn run(
     let outcome = env.run(agent_loop_info().handler, input).await;
 
     let candidate_turns = model_turns(outcome.events())?;
-    let (replayed, stubbed, cap_reached, root) = {
-        let session = lock(&session);
+    let (replayed, stubbed, cap_reached, root, routes) = {
+        let mut session = lock(&session);
         let root = session.root.clone();
-        (session.replayed, session.stubbed, session.cap_reached, root)
+        let routes = std::mem::take(&mut session.routes);
+        (
+            session.replayed,
+            session.stubbed,
+            session.cap_reached,
+            root,
+            routes,
+        )
     };
-    let candidate_end = match outcome.result {
-        Ok(output) => {
-            let mut report: AgentReport = decode(output).map_err(EvalError::Undecodable)?;
-            if let (Some(from), Some(to)) = (&root, &recording.run_id) {
-                rebase_run_ids(&mut report, from, to);
-            }
-            RunEnd::Completed(report)
-        }
-        Err(error) => RunEnd::Failed(error),
-    };
+    let candidate_end = run_end_of(outcome.result, root.as_deref(), recording)?;
 
     let turns = diff_turns(&recording.turns, &candidate_turns);
     let first_divergence = turns
         .iter()
         .position(|turn| matches!(turn.verdict, Verdict::Diverged(_)));
     let end_diverged = ends_differ(&recording.end, &candidate_end);
-    Ok(Evaluation {
+    let evaluation = Evaluation {
         turns,
         first_divergence,
         recorded: recording.end.clone(),
@@ -662,7 +790,8 @@ async fn run(
         stubbed_tool_calls: stubbed,
         turn_cap_reached: cap_reached,
         overlay_digest: candidate.overlay.digest(),
-    })
+    };
+    Ok((evaluation, routes))
 }
 
 /// Two candidates on one source, such as two models for one agent (issue
@@ -746,6 +875,29 @@ pub async fn compare(
         turns,
         first_divergence,
         end_diverged,
+    })
+}
+
+/// How the candidate run ended, from the engine `result`. The run ids of a
+/// report take the recorded root in place of the engine `root`.
+///
+/// # Errors
+///
+/// Returns [`EvalError::Undecodable`] for a report that does not decode.
+fn run_end_of(
+    result: Result<Value, String>,
+    root: Option<&str>,
+    recording: &Recording,
+) -> Result<RunEnd, EvalError> {
+    Ok(match result {
+        Ok(output) => {
+            let mut report: AgentReport = decode(output).map_err(EvalError::Undecodable)?;
+            if let (Some(from), Some(to)) = (root, &recording.run_id) {
+                rebase_run_ids(&mut report, from, to);
+            }
+            RunEnd::Completed(report)
+        }
+        Err(error) => RunEnd::Failed(error),
     })
 }
 
@@ -1185,6 +1337,9 @@ struct Session {
     root: Option<String>,
     replayed: u32,
     stubbed: u32,
+    /// Each model route that a candidate turn asked for. `None` is the
+    /// default model.
+    routes: BTreeSet<Option<String>>,
 }
 
 impl Session {
@@ -1287,7 +1442,9 @@ fn align_call_ids(
                 id.clone_from(&original.id);
             }
             _ => {
-                let base = format!("{EVAL_ID_PREFIX}{index}_{position}_{id}");
+                // The provider id stays out, because its form names the
+                // vendor (issue #2376).
+                let base = format!("{EVAL_ID_PREFIX}{index}_{position}");
                 let mut fresh = base.clone();
                 let mut suffix = 0_u32;
                 while taken.contains(&fresh) {
@@ -1348,6 +1505,7 @@ fn model_mock(
             session
                 .candidate_names
                 .insert(lane.clone(), request.agent.clone());
+            session.routes.insert(request.model.clone());
             // The test engine has its own ids. The policy sees the recorded
             // run id instead, with the lane of the same agent.
             if let Some(run_id) = &run_id {
@@ -1755,6 +1913,39 @@ mod tests {
     }
 
     #[test]
+    fn each_set_part_changes_the_candidate_digest() {
+        let base = || Candidate::new(lookup_harness());
+        let plain = base().digest();
+        assert!(plain.starts_with("sha256:"), "{plain}");
+        assert_eq!(
+            plain,
+            base().digest(),
+            "equal candidates have equal digests"
+        );
+        let named = lookup_harness().model_named("m", Arc::new(NoModel));
+        let variants = [
+            base().label("v7").digest(),
+            base().system_prompt("Be kind.").digest(),
+            Candidate::new(named).model("m").digest(),
+            base().agent_model("planner", "m").digest(),
+            base().max_turns(3).digest(),
+            base()
+                .ceilings(Ceilings::from_profile(&AgentProfile::new("x")))
+                .digest(),
+        ];
+        let distinct: BTreeSet<&String> = variants.iter().chain([&plain]).collect();
+        assert_eq!(distinct.len(), variants.len() + 1, "{variants:?}");
+        assert_eq!(
+            base()
+                .label("v7")
+                .overlay(ProfileOverlay::default())
+                .digest(),
+            base().label("v7").digest(),
+            "an overlay keeps the label"
+        );
+    }
+
+    #[test]
     fn only_the_root_and_its_lanes_take_the_recorded_run_id() {
         let mut report: AgentReport = serde_json::from_value(json!({
             "stop": "completed",
@@ -1888,18 +2079,17 @@ mod tests {
         let mut turn = turn_of(&[call("c1", "a", json!(1)), call("c2", "b", json!(3))]);
         align_call_ids(&mut turn.content, &recorded, &HashSet::new(), 4);
         let ids: Vec<String> = turn.calls().into_iter().map(|call| call.id).collect();
-        assert_eq!(ids, vec!["r1".to_owned(), "eval_4_1_c2".to_owned()]);
+        assert_eq!(ids, vec!["r1".to_owned(), "eval_4_1".to_owned()]);
     }
 
     #[test]
     fn a_new_id_never_equals_a_recorded_id() {
-        let recorded = vec![call("eval_0_0_c1", "a", json!(1))];
+        let recorded = vec![call("eval_0_0", "a", json!(1))];
         let taken: HashSet<String> = recorded.iter().map(|call| call.id.clone()).collect();
         let mut turn = turn_of(&[call("c1", "b", json!(2))]);
         align_call_ids(&mut turn.content, &recorded, &taken, 0);
         let id = turn.calls()[0].id.clone();
-        assert!(id.starts_with("eval_0_0_c1"), "{id}");
-        assert_ne!(id, "eval_0_0_c1");
+        assert_eq!(id, "eval_0_0_1", "the provider id stays out");
     }
 
     #[test]

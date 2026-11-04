@@ -8,6 +8,15 @@
 #   UPDATE_VERUS_CONTRACTS=1 cargo test -p autumn-harvest --test integration \
 #     verus_proofs_coverage::every_verus_contract_matches_the_stored_list
 
+## formal/verus/src/agent_anonymise.rs
+pub open spec fn common(a: Seq < u8 >, b: Seq < u8 >) -> nat decreases a.len(), { if a.len() == 0 || b.len() == 0 || a [0] != b [0] { 0 } else { 1 + common(a.drop_first(), b.drop_first()) } }
+proof fn lemma_common(a: Seq < u8 >, b: Seq < u8 >) ensures common(a, b) <= a.len(), common(a, b) <= b.len(), forall | i: int | 0 <= i < common(a, b) ==> a [i] == b [i], common(a, b) < a.len() && common(a, b) < b.len() ==> a [common(a, b) as int] != b [common(a, b,) as int], decreases a.len(),
+pub fn shared_digits(a:& [u8], b:& [u8]) -> (r: usize) ensures r == common(a @, b @),
+pub open spec fn safe(shared: Seq < usize >, cap: int, r: int) -> bool { forall | i: int | 0 <= i < shared.len() && shared [i] < cap ==> shared [i] < r }
+pub fn id_width(shared:& [usize], floor: usize, cap: usize) -> (r: usize) requires floor <= cap, ensures floor <= r <= cap, safe(shared @, cap as int, r as int), r == floor || exists | i: int | 0 <= i < shared @.len() && #[trigger] shared @ [i] < cap && r == shared @ [i] + 1,
+pub proof fn theorem_the_width_is_the_least_safe_width(shared: Seq < usize >, floor: int, cap: int, r: int) requires floor <= r <= cap, safe(shared, cap, r), r == floor || exists | i: int | 0 <= i < shared.len() && #[trigger] shared [i] < cap && r == shared [i] + 1, ensures forall | w: int | floor <= w < r ==>! safe(shared, cap, w),
+pub proof fn theorem_a_width_above_the_shared_count_splits_a_pair(a: Seq < u8 >, b: Seq < u8 >, width: int) requires common(a, b) < width, width <= a.len(), width <= b.len(), ensures a.subrange(0, width) != b.subrange(0, width),
+
 ## formal/verus/src/agent_dedupe.rs
 pub open spec fn spec_is_new(floor: int, seq: int, in_above: bool) -> bool { seq > floor &&! in_above }
 pub open spec fn spec_next_floor(floor: int, next_in_above: bool) -> int { if next_in_above && floor < u64::MAX { floor + 1 } else { floor } }
