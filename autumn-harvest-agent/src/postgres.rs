@@ -855,6 +855,70 @@ async fn signal_live(
     )))
 }
 
+/// A live probe forks on Postgres with live effects (issue #2378).
+///
+/// The read and the fork use the codecs of the target. The fork commits in
+/// one transaction and only inserts rows, so the source stays unchanged.
+#[cfg(feature = "eval")]
+impl crate::eval::LiveProbeHost for PostgresAgents {
+    fn source_run(
+        &self,
+        source: ExecutionId,
+    ) -> BoxFuture<'_, Result<crate::eval::SourceRun, crate::eval::EvalError>> {
+        Box::pin(async move {
+            let host = |err: HarvestError| crate::eval::EvalError::Fork(err.to_string());
+            let mut conn = self
+                .conn(self.shard_of(source).await.map_err(host)?)
+                .await
+                .map_err(host)?;
+            let run = load_execution(&mut conn, source).await.map_err(host)?;
+            let history =
+                autumn_harvest::store::load_history_with_codecs(&mut conn, source, &self.codecs)
+                    .await
+                    .map_err(host)?;
+            Ok(crate::eval::SourceRun {
+                workflow_name: run.workflow_name,
+                events: history.events,
+            })
+        })
+    }
+
+    fn fork_live(
+        &self,
+        source: ExecutionId,
+        input: Value,
+    ) -> BoxFuture<'_, Result<crate::eval::ProbeFork, crate::eval::EvalError>> {
+        use autumn_harvest::fork::{ForkEffects, WorkflowForkRequest};
+        Box::pin(async move {
+            let host = |err: HarvestError| crate::eval::EvalError::Fork(err.to_string());
+            let mut conn = self
+                .conn(self.shard_of(source).await.map_err(host)?)
+                .await
+                .map_err(host)?;
+            let request = WorkflowForkRequest {
+                reason: crate::eval::PROBE_FORK_REASON.to_owned(),
+                operator_id: crate::eval::PROBE_FORK_OPERATOR.to_owned(),
+                effects: ForkEffects::Live,
+                input: Some(input),
+                ..WorkflowForkRequest::default()
+            };
+            let fork = autumn_harvest::fork::fork_workflow_execution_with_codecs(
+                &mut conn,
+                source,
+                request,
+                &self.codecs,
+            )
+            .await
+            .map_err(|err| crate::eval::EvalError::Fork(err.to_string()))?;
+            Ok(crate::eval::ProbeFork {
+                exec_id: fork.new_exec_id,
+                workflow_id: fork.workflow_id,
+                forked_from_exec_id: fork.forked_from_exec_id,
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

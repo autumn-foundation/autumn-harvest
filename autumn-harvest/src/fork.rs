@@ -271,6 +271,31 @@ pub async fn fork_workflow_execution(
     .await
 }
 
+/// [`fork_workflow_execution`], with `codecs` and no handler registry
+/// (issue #2378).
+///
+/// A caller with no registry passes the payload codecs of its workers. With
+/// no registry, the fork does not check that the workflow type is
+/// registered, as for [`fork_workflow_execution`] with `None`.
+///
+/// # Errors
+///
+/// As [`fork_workflow_execution`].
+pub async fn fork_workflow_execution_with_codecs(
+    conn: &mut AsyncPgConnection,
+    source_id: ExecutionId,
+    request: WorkflowForkRequest,
+    codecs: &PayloadCodecs,
+) -> Result<ForkResult, WorkflowForkError> {
+    let request = request.normalized();
+    crate::dispatch::buffered_settled(Box::pin(
+        conn.transaction::<ForkResult, WorkflowForkError, _>(async |conn| {
+            fork_in_transaction(conn, source_id, &request, None, codecs).await
+        }),
+    ))
+    .await
+}
+
 /// [`fork_workflow_execution`], with its success audit row in the same
 /// transaction.
 ///

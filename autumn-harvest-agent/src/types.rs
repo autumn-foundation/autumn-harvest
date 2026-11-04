@@ -36,6 +36,22 @@ pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 3_600;
 /// this one.
 pub const MAX_PARALLEL_CHILDREN: u32 = 16;
 
+/// The error code of a tool call that a live probe refuses (issue #2378).
+pub const PROBE_EFFECT_REFUSED: &str = "probe_effect_refused";
+
+/// The mark of a live probe run (issue #2378).
+///
+/// A run with the mark runs a tool only when the tool effect is in
+/// [`effects`](Self::effects). The tool-call activity checks it, so a policy
+/// cannot change it. Each delegated child keeps the mark.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Probe {
+    /// The execution id of the source run.
+    pub source: String,
+    /// The tool effects that the probe may run.
+    pub effects: BTreeSet<ToolEffect>,
+}
+
 /// The input of one agent run: the workflow input.
 // The flags are independent switches on a recorded payload. A flat bool per
 // switch keeps the wire shape plain, so the lint is allowed here.
@@ -206,6 +222,10 @@ pub struct AgentTask {
     /// id. Use [`run_draws`](crate::run_draws) to start draws.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draw: Option<Draw>,
+    /// The probe mark of the run (issue #2378). `None` is a normal run. See
+    /// [`Probe`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<Probe>,
 }
 
 impl Serialize for AgentTask {
@@ -278,6 +298,7 @@ impl AgentTask {
             skills: BTreeMap::new(),
             allowed_effects: None,
             draw: None,
+            probe: None,
         }
     }
 
@@ -741,6 +762,11 @@ pub struct ToolCallRequest {
     /// decision says (issue #2439). `None` allows each effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_effects: Option<BTreeSet<ToolEffect>>,
+    /// The effects of a live probe (issue #2378). A tool of another effect
+    /// gets [`PROBE_EFFECT_REFUSED`] and does not run. `None` is a normal
+    /// run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_effects: Option<BTreeSet<ToolEffect>>,
 }
 
 /// What a run holds for one `load_skill` call (issue #2373).
@@ -792,6 +818,20 @@ impl ToolOutcome {
     pub fn error(message: &str) -> Self {
         Self {
             content: serde_json::json!({ "error": message }).to_string(),
+            is_error: true,
+            workspace: None,
+        }
+    }
+
+    /// The refusal of a live probe for a tool of `effect` (issue #2378).
+    #[must_use]
+    pub fn probe_refused(effect: ToolEffect) -> Self {
+        Self {
+            content: serde_json::json!({
+                "error": PROBE_EFFECT_REFUSED,
+                "effect": effect,
+            })
+            .to_string(),
             is_error: true,
             workspace: None,
         }
