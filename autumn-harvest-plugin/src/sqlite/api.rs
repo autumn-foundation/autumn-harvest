@@ -16,6 +16,11 @@
 //! mutating call needs a declared auth boundary, an admin session or the
 //! explicit opt-out.
 //!
+//! `GET`/`POST /admin/tokens`, `DELETE /admin/tokens/{id}` and
+//! `GET /admin/audit` are the Postgres handlers (issue #2469). They read
+//! the token and audit tables of the Harvest file. `sqlite::build` wraps
+//! this router in the admin-auth layer stack of `api.rs`, as on Postgres.
+//!
 //! With `sqlite_per_tenant`, `/tenants/{key}/..` serves the same routes on
 //! one fleet tenant (issue #2472). `{key}` is the app's routing key. The gate
 //! covers these routes too.
@@ -74,7 +79,7 @@ pub struct ApiState {
 
 impl ApiState {
     /// The tenant Harvest of a tenant request, else the control Harvest.
-    fn handle(&self) -> Result<HarvestSqlite, AutumnError> {
+    pub(super) fn handle(&self) -> Result<HarvestSqlite, AutumnError> {
         if let Ok(handle) = TENANT.try_with(Clone::clone) {
             return Ok(handle);
         }
@@ -85,16 +90,72 @@ impl ApiState {
 }
 
 /// The SQLite management router, gated like the Postgres one.
-pub fn router(state: ApiState) -> Router<()> {
+///
+/// `auth` wraps a router in the admin-auth layer stack. It wraps the control
+/// routes and the tenant routes apart, inside the tenant nest (issue #2469).
+/// Each layer then reads the path of a core route, such as `/workflows`,
+/// not `/tenants/{key}/workflows`. So a route keeps its class, its role
+/// grant and its authorizer fields on a tenant.
+// `{tenant}` is an axum path parameter, not a format argument.
+#[allow(clippy::literal_string_with_formatting_args)]
+pub fn router(state: ApiState, auth: &dyn Fn(Router<()>) -> Router<()>) -> Router<()> {
     let gate = middleware::from_fn_with_state(
         state.flags.clone(),
         crate::api::require_mutation_auth_by_method,
     );
     let scope = middleware::from_fn_with_state(state.clone(), tenant_scope);
-    routes()
-        .nest("/tenants/{tenant}", routes().layer(scope))
-        .layer(gate)
-        .with_state(state)
+    // The token and audit routes use the Harvest file of the control
+    // Harvest, so no tenant route serves them (issue #2469).
+    let admin = crate::api::auth_admin_routes(state.flags.clone());
+    // The gate runs inside the stack, after the token and role layers, as on
+    // Postgres. A verified token or role then counts as a credential.
+    let control = auth(
+        routes(&state.flags)
+            .with_state(state.clone())
+            .merge(admin)
+            .layer(gate.clone()),
+    );
+    let tenant = auth(
+        routes(&state.flags)
+            .layer(scope)
+            .with_state(state)
+            .layer(gate),
+    )
+    .layer(middleware::from_fn(bind_path_tenant));
+    // A layer of `control` does not reach the routes nested after it.
+    control.nest("/tenants/{tenant}", tenant)
+}
+
+/// Name the path tenant in the tenant header, for the authorizer (issue
+/// #2469).
+///
+/// The authorizer reads the tenant from `x-harvest-tenant`. On a tenant
+/// route the path picks the tenant, so the header must name the same one.
+/// A header that names another tenant is a `400`. With no header, the layer
+/// adds one.
+async fn bind_path_tenant(
+    Path(TenantParams { tenant }): Path<TenantParams>,
+    mut request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let header = autumn_harvest::audit::HEADER_TENANT;
+    let other = request
+        .headers()
+        .get_all(header)
+        .iter()
+        .any(|value| value.to_str().map(str::trim).ok() != Some(tenant.as_str()));
+    if other {
+        return AutumnError::bad_request_msg(format!(
+            "{header} names another tenant than the path"
+        ))
+        .into_response();
+    }
+    let Ok(value) = axum::http::HeaderValue::from_str(&tenant) else {
+        return AutumnError::bad_request_msg(format!("{header} cannot carry the path tenant"))
+            .into_response();
+    };
+    request.headers_mut().insert(header, value);
+    next.run(request).await
 }
 
 /// The `{tenant}` segment of a tenant route. The other segments are ignored.
@@ -132,7 +193,7 @@ async fn tenant_scope(
 }
 
 /// The core routes, on the control Harvest or on one tenant.
-fn routes() -> Router<ApiState> {
+fn routes(flags: &HarvestApiState) -> Router<ApiState> {
     // A route that reads no query parameter refuses one. A Postgres client
     // may send `?after=` or `?event_type=` here. Answering it with the full,
     // unfiltered body would look like success (#2489).
@@ -199,9 +260,69 @@ fn routes() -> Router<ApiState> {
             "/workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
             post(signal_by_id),
         )
+        .merge(read_routes(flags))
+        .merge(super::ui::routes())
         // `AppBuilder::nest` drops a nested fallback, so a catch-all route
         // stands in for it. A static or a parameter route still wins.
         .route("/{*rest}", any(not_ported))
+}
+
+/// The read routes of issue #2468. See [`super::reads`].
+///
+/// Summaries, logs and awaitables are admin routes on Postgres. The same
+/// gate guards them here. A route that reads no query key refuses one, as
+/// the core routes do.
+fn read_routes(flags: &HarvestApiState) -> Router<ApiState> {
+    use super::reads;
+    let no_query = middleware::from_fn(refuse_query_parameters);
+    let admin = middleware::from_fn_with_state(flags.clone(), crate::api::require_harvest_admin);
+    Router::new()
+        .route("/workflows/count", get(reads::count))
+        .route(
+            "/workflows/summaries",
+            get(reads::summaries).route_layer(admin.clone()),
+        )
+        .route(
+            "/workflows/registered/{name}/schema",
+            get(reads::registered_schema).route_layer(no_query.clone()),
+        )
+        .route(
+            "/workflows/registered/{name}/interface",
+            get(reads::registered_interface).route_layer(no_query.clone()),
+        )
+        .route("/workflows/{id}/children", get(reads::children))
+        .route(
+            "/workflows/by-id/{workflow_name}/{workflow_id}/children",
+            get(reads::children_by_id),
+        )
+        .route("/workflows/{id}/tree", get(reads::tree))
+        .route(
+            "/workflows/{id}/run-chain",
+            get(reads::run_chain_route).route_layer(no_query.clone()),
+        )
+        .route(
+            "/workflows/{id}/timeline",
+            get(reads::timeline).route_layer(no_query.clone()),
+        )
+        .route(
+            "/workflows/{id}/logs",
+            get(reads::logs).route_layer(admin.clone()),
+        )
+        .route(
+            "/workflows/{id}/awaitables",
+            get(reads::awaitables)
+                .route_layer(no_query.clone())
+                .route_layer(admin),
+        )
+        .route(
+            "/workflows/{id}/stack",
+            get(reads::stack).route_layer(no_query.clone()),
+        )
+        .route(
+            "/workflows/by-id/{workflow_name}/{workflow_id}/stack",
+            get(reads::stack_by_id).route_layer(no_query),
+        )
+        .route("/workflows/{id}/history/export", get(reads::history_export))
 }
 
 // ── Path segments ────────────────────────────────────────────────────────────
@@ -253,7 +374,7 @@ struct UpdateParams {
 // ── Errors ───────────────────────────────────────────────────────────────────
 
 /// The HTTP form of a backend error.
-fn map_error(error: HarvestSqliteError) -> AutumnError {
+pub(super) fn map_error(error: HarvestSqliteError) -> AutumnError {
     let error = match error {
         HarvestSqliteError::Sqlite(error) => error,
         HarvestSqliteError::InvalidInput(_) | HarvestSqliteError::InvalidSignal(_) => {
@@ -317,7 +438,7 @@ fn map_error(error: HarvestSqliteError) -> AutumnError {
     }
 }
 
-fn parse_exec(raw: &str) -> Result<ExecutionId, AutumnError> {
+pub(super) fn parse_exec(raw: &str) -> Result<ExecutionId, AutumnError> {
     crate::api::parse_execution_id(raw)
 }
 
@@ -346,7 +467,7 @@ fn refuse_unsupported(fields: &[(&str, bool)]) -> Result<(), AutumnError> {
 }
 
 /// Refuse a request that carries any query parameter.
-async fn refuse_query_parameters(
+pub(super) async fn refuse_query_parameters(
     request: axum::extract::Request,
     next: middleware::Next,
 ) -> Response {
@@ -677,7 +798,7 @@ async fn get_workflow(
 
 /// Set `X-Harvest-Execution-Id` to the run that a by-id route resolved, as
 /// on Postgres. It is set on an error too.
-fn with_execution_id(mut response: Response, exec: ExecutionId) -> Response {
+pub(super) fn with_execution_id(mut response: Response, exec: ExecutionId) -> Response {
     if let Ok(value) = axum::http::HeaderValue::from_str(&exec.to_string()) {
         response.headers_mut().insert(
             axum::http::HeaderName::from_static(crate::api::HEADER_EXECUTION_ID),
@@ -688,7 +809,10 @@ fn with_execution_id(mut response: Response, exec: ExecutionId) -> Response {
 }
 
 /// The response of a by-id route: the delegate's answer with the header.
-fn by_id_response<T: IntoResponse>(out: Result<T, AutumnError>, exec: ExecutionId) -> Response {
+pub(super) fn by_id_response<T: IntoResponse>(
+    out: Result<T, AutumnError>,
+    exec: ExecutionId,
+) -> Response {
     with_execution_id(
         out.map_or_else(IntoResponse::into_response, IntoResponse::into_response),
         exec,
@@ -697,7 +821,7 @@ fn by_id_response<T: IntoResponse>(out: Result<T, AutumnError>, exec: ExecutionI
 
 /// Resolve a business key for a by-id route. An empty id is the Postgres
 /// `400`, before any lookup (issue #1353).
-async fn resolve_key(
+pub(super) async fn resolve_key(
     handle: &HarvestSqlite,
     workflow_name: &str,
     workflow_id: &str,

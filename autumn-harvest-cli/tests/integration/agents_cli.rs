@@ -76,6 +76,9 @@ fn first_lines(requests: &[String]) -> Vec<&str> {
 
 const BY_ID: &str = "/api/harvest/workflows/by-id/agent/support%2Fada";
 
+/// The answer of a pass list with no scheduled pass (issue #2454).
+const NO_PASSES: &str = r#"{"workflows":[],"next_cursor":null}"#;
+
 /// Each line from `from` is an entity op signal with the body part in turn.
 fn assert_signals(lines: &[&str], requests: &[String], from: usize, bodies: &[&str]) {
     for (n, body) in bodies.iter().enumerate() {
@@ -101,6 +104,7 @@ async fn erase_pauses_resets_deletes_waits_and_erases_every_run() {
         format!(r#"{{"workflows":[{{"id":"{E0}"}},{{"id":"{E1}"}}],"next_cursor":null}}"#),
         r#"{"events_scrubbed":2,"ledger_rows_deleted":1}"#.to_owned(),
         r#"{"events_scrubbed":3,"stream_chunks_deleted":4}"#.to_owned(),
+        NO_PASSES.to_owned(),
     ];
     let (base_url, server) = scripted_server(script).await;
     let cli = Cli::try_parse_from([
@@ -167,6 +171,7 @@ async fn erase_of_an_ended_agent_restarts_it_to_reset_its_stores() {
         format!(r#"{{"workflows":[{{"id":"{E1}"}},{{"id":"{E2}"}}],"next_cursor":null}}"#),
         r#"{"events_scrubbed":1}"#.to_owned(),
         r#"{"events_scrubbed":1}"#.to_owned(),
+        NO_PASSES.to_owned(),
     ];
     let (base_url, server) = scripted_server(script).await;
     let cli = Cli::try_parse_from([
@@ -182,7 +187,7 @@ async fn erase_of_an_ended_agent_restarts_it_to_reset_its_stores() {
     run_cli(cli).await.expect("erase should succeed");
     let requests = server.await.expect("server task should finish");
     let lines = first_lines(&requests);
-    assert_eq!(requests.len(), 9, "{lines:?}");
+    assert_eq!(requests.len(), 10, "{lines:?}");
     assert!(
         lines[1].starts_with("POST /api/harvest/workflows/agent/signal-with-start "),
         "{lines:?}"
@@ -213,4 +218,64 @@ async fn erase_of_an_ended_agent_restarts_it_to_reset_its_stores() {
             "{lines:?}"
         );
     }
+}
+
+const E3: &str = "00000000-0000-0000-0000-0000000000e3";
+
+#[tokio::test]
+async fn erase_also_erases_each_scheduled_pass_of_the_agent() {
+    // Issue #2454: a pass that a schedule starts is no child of an agent
+    // run. Its history holds episode text, so erase finds it by its search
+    // attribute. A running pass is a failure in the report.
+    let script = vec![
+        run(E1, "RUNNING", ""),
+        "{}".to_owned(),
+        format!(r#"{{"execution_id":"{E1}","result":{{"failures":0}}}}"#),
+        "{}".to_owned(),
+        "{}".to_owned(),
+        "{}".to_owned(),
+        run(
+            E1,
+            "COMPLETED",
+            r#","output":{"failures":0,"episode_reset":{"episodes":3,"facts":2}}"#,
+        ),
+        format!(r#"{{"workflows":[{{"id":"{E1}"}}],"next_cursor":null}}"#),
+        r#"{"events_scrubbed":2}"#.to_owned(),
+        format!(
+            r#"{{"workflows":[{{"id":"{E2}","state":"COMPLETED"}},{{"id":"{E3}","state":"RUNNING"}}],"next_cursor":null}}"#
+        ),
+        r#"{"events_scrubbed":5}"#.to_owned(),
+    ];
+    let (base_url, server) = scripted_server(script).await;
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "--base-url",
+        &base_url,
+        "agents",
+        "erase",
+        "support/ada",
+    ])
+    .expect("CLI args should parse");
+
+    run_cli(cli).await.expect("erase should succeed");
+    let requests = server.await.expect("server task should finish");
+    let lines = first_lines(&requests);
+    assert_eq!(requests.len(), 11, "{lines:?}");
+    assert!(
+        lines[9].starts_with("GET /api/harvest/workflows?filter="),
+        "{lines:?}"
+    );
+    let filter = percent_encoding::percent_decode_str(lines[9])
+        .decode_utf8()
+        .unwrap()
+        .into_owned();
+    assert!(
+        filter.contains("workflow_name = 'agent_consolidate'")
+            && filter.contains("attrs.agent_consolidation_of = 'support/ada'"),
+        "{filter}"
+    );
+    assert!(
+        lines[10].starts_with(&format!("POST /api/harvest/workflows/{E2}/erase-payloads ")),
+        "{lines:?}"
+    );
 }

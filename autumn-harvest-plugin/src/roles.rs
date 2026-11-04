@@ -46,8 +46,8 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use crate::api::{
-    HarvestApiState, RouteMatchers, acquire_conn, audit_context, build_route_matchers,
-    classify_route, match_route, requires_admin_scope,
+    HarvestApiState, RouteMatchers, audit_context, build_route_matchers, classify_route,
+    match_route, requires_admin_scope,
 };
 use crate::api_token::TokenScope;
 
@@ -608,11 +608,9 @@ pub(crate) async fn audit_role_deny(
     );
     let (actor, source, request_id) = audit_context(headers, api_state);
     let summary = format!("roles {:?} do not allow this route", join_role_list(names));
-    if let Ok(pool) = api_state.storage_pool()
-        && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
-    {
-        crate::authz::audit_deny(
-            &mut conn,
+    if let Some(store) = api_state.auth_store() {
+        crate::authz::audit_deny_to(
+            &store,
             &crate::authz::DenyAudit {
                 actor: &actor,
                 method,

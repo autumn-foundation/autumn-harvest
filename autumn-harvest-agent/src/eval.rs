@@ -106,6 +106,9 @@
 //! async, so the harness blocks in place. Blocking in place needs a
 //! multi-thread Tokio runtime.
 
+pub mod anon;
+pub mod evidence;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -539,7 +542,7 @@ pub struct TurnDecision {
 }
 
 impl TurnDecision {
-    fn of(turn: &ModelTurn) -> Self {
+    pub(crate) fn of(turn: &ModelTurn) -> Self {
         let calls = turn
             .calls()
             .into_iter()
@@ -1233,7 +1236,7 @@ impl Effects {
 ///
 /// Returns [`EvalError::ErasedSource`] for an erased history, and
 /// [`EvalError::NotAnAgentRun`] for any history that is not an agent run.
-fn task_of(history: &[WorkflowEvent]) -> Result<AgentTask, EvalError> {
+pub(crate) fn task_of(history: &[WorkflowEvent]) -> Result<AgentTask, EvalError> {
     let Some(WorkflowEvent::WorkflowStarted { input, .. }) = history.first() else {
         return Err(EvalError::NotAnAgentRun(
             "the history does not start with WorkflowStarted".to_owned(),
@@ -1749,7 +1752,7 @@ fn deadline_signal(timer_id: &str) -> Option<&str> {
 }
 
 /// `true` when any payload of `event` holds an erasure tombstone.
-fn holds_tombstone(event: &WorkflowEvent) -> bool {
+pub(crate) fn holds_tombstone(event: &WorkflowEvent) -> bool {
     fn walk(value: &Value) -> bool {
         is_erasure_tombstone(value)
             || match value {
@@ -1773,7 +1776,7 @@ fn multi_thread_handle() -> Result<tokio::runtime::Handle, EvalError> {
     Ok(handle)
 }
 
-fn decode<T: DeserializeOwned>(value: Value) -> Result<T, String> {
+pub(crate) fn decode<T: DeserializeOwned>(value: Value) -> Result<T, String> {
     serde_json::from_value(value).map_err(|e| e.to_string())
 }
 

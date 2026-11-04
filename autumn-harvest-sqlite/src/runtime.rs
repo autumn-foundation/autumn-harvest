@@ -10,7 +10,8 @@ use autumn_harvest::builder::{
 };
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::context::{
-    DEFAULT_CURRENT_DETAILS_CAP_BYTES, LoserCancelReason, SharedState, empty_shared_state,
+    DEFAULT_CURRENT_DETAILS_CAP_BYTES, LoserCancelReason, SharedState, WorkflowLogPolicy,
+    empty_shared_state,
 };
 use autumn_harvest::executor::{
     QueryReplayOutcome, WorkflowExecuteSpanMeta, drive_query_replay_async,
@@ -22,9 +23,9 @@ use autumn_harvest::payload_depth::{
 };
 use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::{
-    ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, NoOpMetrics, SignalHandlerInfo,
-    TimerId, UpdateHandlerInfo, UpdateId, WorkflowCommand, WorkflowEvent, WorkflowHandlerFn,
-    WorkflowHistoryPolicy, WorkflowIdReusePolicy, WorkflowInfo, WorkflowOutcome,
+    ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, NoOpMetrics, QueryHandlerInfo,
+    SignalHandlerInfo, TimerId, UpdateHandlerInfo, UpdateId, WorkflowCommand, WorkflowEvent,
+    WorkflowHandlerFn, WorkflowHistoryPolicy, WorkflowIdReusePolicy, WorkflowInfo, WorkflowOutcome,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -39,7 +40,7 @@ use crate::schedule::{ScheduleOverride, ScheduleSummary};
 use crate::visibility::{ExecutionDescription, ExecutionFilter, ExecutionPage, ListCursor};
 use crate::{
     composition, llm_ledger, lock, mutex, queue, retention, schedule, schema, store, update,
-    visibility, worker,
+    visibility, worker, workflow_log,
 };
 
 /// A synchronous activity body, keyed by name.
@@ -406,6 +407,10 @@ pub struct SqliteRuntime {
     activities: HashMap<String, ActivitySpec>,
     /// Declarative `#[update]` handlers, keyed by workflow name (issue #2025).
     update_handlers: HashMap<String, Vec<UpdateHandlerInfo>>,
+    /// Declarative `#[query]` handlers, keyed by workflow name (issue #2468).
+    query_handlers: HashMap<String, Vec<QueryHandlerInfo>>,
+    /// The durable log sink policy (issue #2468). `None` stores no line.
+    log_policy: Option<WorkflowLogPolicy>,
     /// The time limit for one update handler (issue #2025).
     update_timeout: std::time::Duration,
     /// Consecutive contained-workflow-panic strike counter, keyed by execution
@@ -533,7 +538,16 @@ impl SqliteRuntime {
         Ok(())
     }
 
-    fn from_connection(conn: Connection, writer_lock: Option<WriterLock>) -> SqliteResult<Self> {
+    fn from_connection(
+        mut conn: Connection,
+        writer_lock: Option<WriterLock>,
+    ) -> SqliteResult<Self> {
+        // Each transaction takes the write lock when it begins (issue #2469).
+        // A second writer, such as the auth store, can share the file. A
+        // deferred transaction that reads and then writes would fail at once
+        // with `SQLITE_BUSY` or `SQLITE_BUSY_SNAPSHOT` after a write of that
+        // writer. An immediate one waits on the busy timeout instead.
+        conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
         // A failed setup builds no runtime, so `Drop` never runs. Release the
         // lock here, or an in-memory owner row would outlive the failed open.
         if let Err(err) = Self::prepare(&conn) {
@@ -548,6 +562,8 @@ impl SqliteRuntime {
             workflow_policies: HashMap::new(),
             activities: HashMap::new(),
             update_handlers: HashMap::new(),
+            query_handlers: HashMap::new(),
+            log_policy: None,
             update_timeout: UPDATE_TIMEOUT,
             workflow_panic_strikes: HashMap::new(),
             now_fn: std::sync::Arc::new(Utc::now),
@@ -917,6 +933,30 @@ impl SqliteRuntime {
         if !handlers.iter().any(|h| h.name == info.name) {
             handlers.push(info.clone());
         }
+    }
+
+    /// Register a declarative `#[query]` handler (issue #2468).
+    ///
+    /// The handler serves only runs of `info.workflow`. A query of that name
+    /// answers when the body registers no handler with the same name, as on
+    /// Postgres. The runtime keeps the first handler for a name.
+    pub fn register_query(&mut self, info: &QueryHandlerInfo) {
+        let handlers = self
+            .query_handlers
+            .entry(info.workflow.to_string())
+            .or_default();
+        if !handlers.iter().any(|h| h.name == info.name) {
+            handlers.push(info.clone());
+        }
+    }
+
+    /// Set the durable log sink policy (issue #2468).
+    ///
+    /// With a policy, each `ctx.log_*` line goes to `harvest_workflow_logs`.
+    /// The cap and the truncation marker follow Postgres (issue #790). `None`
+    /// is the default, and it stores no line.
+    pub const fn set_workflow_log_policy(&mut self, policy: Option<WorkflowLogPolicy>) {
+        self.log_policy = policy;
     }
 
     /// Start a fresh workflow execution, appending its `WorkflowStarted` event.
@@ -1686,6 +1726,7 @@ impl SqliteRuntime {
                 history: &history,
                 cycle: TerminalCycle::Completing,
                 now,
+                log_policy: self.log_policy,
             };
             persist_terminal_pending_commands(&tx, &drain, exec, batch.pending)?;
             // The seal writes one cascade event per detached child it closes.
@@ -2385,6 +2426,7 @@ impl SqliteRuntime {
         let loaded = QueryReplay::load(
             &self.conn,
             &self.workflows,
+            &self.query_handlers,
             self.history_policy,
             self.shared_state.clone(),
             exec,
@@ -2911,6 +2953,7 @@ impl SqliteRuntime {
             history: failure.history,
             cycle: TerminalCycle::Failing,
             now: clock.decided_at,
+            log_policy: self.log_policy,
         };
         persist_terminal_pending_commands(&tx, &drain, exec, pending.iter().copied())?;
         let cascade = if failure.retry.is_some() {
@@ -3177,6 +3220,7 @@ impl SqliteRuntime {
             history: &history,
             cycle: TerminalCycle::Completing,
             now,
+            log_policy: self.log_policy,
         };
         persist_terminal_pending_commands(
             &tx,
@@ -3371,6 +3415,12 @@ impl SqliteRuntime {
         (span_meta.execution_timeout, span_meta.deadline_at) = config.context_deadline();
         let declarative = self.declarative_updates(&workflow_name);
         let declarative: Vec<&UpdateHandlerInfo> = declarative.iter().collect();
+        let queries = self
+            .query_handlers
+            .get(&workflow_name)
+            .cloned()
+            .unwrap_or_default();
+        let queries: Vec<&QueryHandlerInfo> = queries.iter().collect();
         let (outcome, pending, _span, _resolved_router) =
             run_workflow_with_state_history_policy_and_caps(
                 exec,
@@ -3381,17 +3431,16 @@ impl SqliteRuntime {
                 // Issue #2023: the soft threshold for `should_continue_as_new`.
                 self.history_policy,
                 Some(&span_meta), // FIX: the sole seam carrying business workflow_id → ctx.info()
-                &[],              // declarative query handlers (none on this backend)
+                &queries,         // declarative query handlers (issue #2468)
                 &declarative,     // declarative update handlers (issue #2025)
                 &workflow_name,   // FIX C: the load-bearing name → ctx.info().workflow_type
                 DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
                 DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
                 DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
                 DEFAULT_CURRENT_DETAILS_CAP_BYTES,
-                // Issue #790: the durable per-execution log sink is a Postgres-only
-                // table this backend does not have, so it is always disabled here.
-                // `ctx.logger()` still emits to `tracing` exactly as before.
-                None,
+                // Issue #2468: the durable log sink. `None` keeps `ctx.logger()`
+                // tracing only.
+                self.log_policy,
                 std::collections::HashMap::new(), // context headers (none)
                 None,                             // payload offload threshold (none)
                 std::sync::Arc::new(NoOpMetrics),
@@ -3529,6 +3578,7 @@ impl SqliteRuntime {
                     history: &history,
                     cycle: TerminalCycle::Completing,
                     now: decided_at,
+                    log_policy: self.log_policy,
                 };
                 persist_terminal_pending_commands(&tx, &drain, exec, &pending)?;
                 let cascade = composition::cascade_event_count(&tx, exec)?;
@@ -3802,6 +3852,7 @@ impl SqliteRuntime {
     ) -> SqliteResult<Applied> {
         let now = clock.now;
         check_batch_shape(commands)?;
+        let log_policy = self.log_policy;
         let tx = self.conn.transaction()?;
         // A body that no longer awaits a key gives up its queue place.
         mutex::drop_stale_waits(&tx, exec, &acquired_keys(commands))?;
@@ -3889,13 +3940,9 @@ impl SqliteRuntime {
                 // `harvest_stream_chunks` table. A benign NO-OP here, as for
                 // `PublishProgress`.
                 | WorkflowCommand::PublishDurableProgress { .. }
-                // `RecordLog` (issue #790) is the OPT-IN durable per-execution
-                // log sink, backed by a Postgres-only `harvest_workflow_logs`
-                // table this backend does not have. A benign NO-OP here: the
-                // line still reaches `tracing` (the core emits that
-                // unconditionally), only the durable copy is skipped. It
-                // appends no event and gates no control flow, so dropping it
-                // cannot affect replay.
+                // `RecordLog` (issue #790) goes to `harvest_workflow_logs`
+                // after this loop, in the same transaction (issue #2468). It
+                // appends no event, so it cannot affect replay.
                 | WorkflowCommand::RecordLog { .. } => {}
                 // Bookkeeping commands that carry an event MUST be persisted, even
                 // when they ride in the same batch as a suspending command: a
@@ -4011,6 +4058,9 @@ impl SqliteRuntime {
                 other => return Err(SqliteError::Unsupported(command_name(other).to_string())),
             }
         }
+        // The lines of this cycle share its transaction. A rolled-back cycle
+        // stores none, and its re-drive offers the same seqs again.
+        workflow_log::append_commands(&tx, exec, commands, log_policy);
         if let Some(reason) = caps.reached(&tx, exec)? {
             return Ok(Applied::CapReached(reason));
         }
@@ -5593,6 +5643,8 @@ struct TerminalDrain<'a> {
     cycle: TerminalCycle,
     /// The clock of the cycle, in epoch milliseconds.
     now: i64,
+    /// The durable log sink policy (issue #2468).
+    log_policy: Option<WorkflowLogPolicy>,
 }
 
 /// Persist a terminal cycle's drained bookkeeping commands (issue #1068).
@@ -5618,7 +5670,8 @@ fn persist_terminal_pending_commands<'c>(
     exec: ExecutionId,
     pending: impl IntoIterator<Item = &'c WorkflowCommand>,
 ) -> SqliteResult<()> {
-    for cmd in pending {
+    let pending: Vec<&WorkflowCommand> = pending.into_iter().collect();
+    for cmd in pending.iter().copied() {
         match cmd {
             // A detached spawn in the terminal cycle starts its child before the
             // parent's terminal event, as on Postgres (issue #2026). The close
@@ -5721,8 +5774,8 @@ fn persist_terminal_pending_commands<'c>(
             | WorkflowCommand::PublishProgress { .. }
             // Durable streams (issue #1974): Postgres-only, a NO-OP here.
             | WorkflowCommand::PublishDurableProgress { .. }
-            // Durable workflow logs (issue #790) — Postgres-only sink; a benign
-            // NO-OP here for the same reason as `PublishProgress`.
+            // Durable workflow logs (issue #790). The lines go in after this
+            // loop (issue #2468).
             | WorkflowCommand::RecordLog { .. }
             // Issue #2029: the terminal state setter releases every lock and
             // queue place of the run, which covers each release. An acquire
@@ -5743,6 +5796,8 @@ fn persist_terminal_pending_commands<'c>(
             other => return Err(SqliteError::Unsupported(command_name(other).to_string())),
         }
     }
+    // The terminal cycle's lines share the terminal transaction (issue #2468).
+    workflow_log::append_commands(conn, exec, pending, drain.log_policy);
     Ok(())
 }
 
@@ -7048,5 +7103,34 @@ mod panic_strike_tests {
             rt.workflow_panic_strikes.is_empty(),
             "the cascade is forgotten"
         );
+    }
+}
+
+#[cfg(test)]
+mod transaction_behavior_tests {
+    use rusqlite::{Connection, ErrorCode};
+
+    use super::SqliteRuntime;
+
+    /// A runtime transaction takes the write lock when it begins (issue
+    /// #2469). A second writer on the file then waits for it, so the
+    /// runtime never meets `SQLITE_BUSY_SNAPSHOT` after a read.
+    #[test]
+    fn a_runtime_transaction_takes_the_write_lock_at_begin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.db");
+        let mut runtime = SqliteRuntime::open(&path).unwrap();
+        let other = Connection::open(&path).unwrap();
+        other.busy_timeout(std::time::Duration::ZERO).unwrap();
+
+        let tx = runtime.conn.transaction().unwrap();
+        let refused = other
+            .execute_batch("CREATE TABLE IF NOT EXISTS probe (x INTEGER)")
+            .unwrap_err();
+        assert_eq!(refused.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
+        tx.commit().unwrap();
+        other
+            .execute_batch("CREATE TABLE IF NOT EXISTS probe (x INTEGER)")
+            .unwrap();
     }
 }

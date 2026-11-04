@@ -206,6 +206,20 @@ activation. Each move of the pointer adds one row to
 A rollback reads that row, so never rewrite it. The trigger
 `harvest_agent_overlay_activations_immutable_trg` refuses each `UPDATE`.
 
+### The refine policy log is append-only (issue #2394)
+
+The refine policy of a kind is the last row of
+`harvest_agent_refine_policies`. Do not add code that updates a row. Set
+or reset the policy to add one. The trigger
+`harvest_agent_refine_policies_immutable_trg` refuses each `UPDATE`. Only
+an operator writes a row. Each store refuses another actor, and a `CHECK`
+refuses another author kind. So the refine loop cannot widen its own
+gate. `ProfileOverlay` and `AgentOp` refuse each policy key.
+`ProposeRequest` refuses each one except `ceilings`, which holds the
+resolved ceilings of the recorded read. Only `auto_adopt` writes an
+`auto` actor, and the store enforces the stricter of the run policy and
+its current policy. The SQLite store has the same guards.
+
 ### Decision owner fence (issue #2249)
 
 [ADR 0009](docs/adr/0009-decision-owner.md) defines owner mode. Issue #2251

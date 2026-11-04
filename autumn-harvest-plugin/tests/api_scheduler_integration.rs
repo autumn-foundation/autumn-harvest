@@ -54,6 +54,9 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tokio::sync::Barrier;
 use tower::ServiceExt;
 
+#[path = "support/wire_contract.rs"]
+mod wire_contract;
+
 fn init_sql() -> Vec<u8> {
     autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
@@ -2197,6 +2200,8 @@ async fn harvest_api_lists_direct_workflow_children_with_filters() {
     assert!(items[0]["started_at"].is_string());
     assert!(items[0]["completed_at"].is_string());
     assert!(body["next_cursor"].is_null());
+    // The shared shape check that the SQLite suite runs too (issue #2468).
+    wire_contract::children_shape(&body);
 }
 
 #[tokio::test]
@@ -2692,6 +2697,8 @@ async fn harvest_api_stack_endpoint_returns_shape() {
     assert!(payload["buffered_signals"].is_array());
     assert!(payload["pending_child_workflows"].is_array());
     assert!(payload["last_event_id"].is_number());
+    // The shared shape check that the SQLite suite runs too (issue #2468).
+    wire_contract::stack_shape(&payload);
 }
 
 #[tokio::test]
@@ -2766,6 +2773,8 @@ async fn harvest_api_stack_endpoint_surfaces_rate_limit_throttling() {
     );
     assert_eq!(pending[0]["heartbeat_details_truncated"], false);
     assert!(pending[0]["heartbeat_details_bytes"].is_null());
+    // The shared check also covers the fields of a pending activity.
+    wire_contract::stack_shape(&payload);
 }
 
 #[tokio::test]

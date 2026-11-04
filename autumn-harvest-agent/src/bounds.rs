@@ -153,9 +153,64 @@ pub const fn reset_due(resets: u32, max_resets: u32, len: u64, cap: u64, percent
     resets < max_resets && reaches_percent(len, cap, percent)
 }
 
+/// The episodes that one append evicts from a log of `len` episodes
+/// with the bound `max` (issue #2454).
+///
+/// A bound of 0 counts as 1, so the new episode always fits. After the
+/// append, the log holds at most the bound. An append to a log within the
+/// bound evicts at most one episode.
+/// `formal/verus/src/agent_episodes.rs` proves it for every input.
+#[must_use]
+pub const fn episode_evictions(len: u64, max: u64) -> u64 {
+    let max = if max == 0 { 1 } else { max };
+    if len < max { 0 } else { len - max + 1 }
+}
+
+/// Is a consolidation pass due after `appended` episodes since the last
+/// pass, with the trigger `every` (issue #2454)?
+///
+/// The count is of appends, not of pending episodes. A full log keeps its
+/// pending count, so only an append count moves the trigger. A trigger of
+/// 0 never fires.
+/// `formal/verus/src/agent_episodes.rs` proves it for every input.
+#[must_use]
+pub const fn consolidation_due(appended: u64, every: u32) -> bool {
+    every > 0 && appended >= every as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_append_keeps_the_log_in_its_bound() {
+        assert_eq!(episode_evictions(0, 2), 0);
+        assert_eq!(episode_evictions(1, 2), 0);
+        assert_eq!(episode_evictions(2, 2), 1);
+        // A bound of 0 counts as 1.
+        assert_eq!(episode_evictions(0, 0), 0);
+        assert_eq!(episode_evictions(1, 0), 1);
+        // A log over the bound shrinks to it.
+        assert_eq!(episode_evictions(5, 2), 4);
+    }
+
+    #[test]
+    fn a_pass_is_due_at_the_trigger() {
+        assert!(!consolidation_due(0, 3));
+        assert!(!consolidation_due(2, 3));
+        assert!(consolidation_due(3, 3));
+        assert!(consolidation_due(4, 3));
+        assert!(!consolidation_due(u64::MAX, 0));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn no_append_passes_the_bound(len in 0_u64..10_000, max in 0_u64..10_000) {
+            let evicted = episode_evictions(len, max);
+            proptest::prop_assert!(evicted <= len);
+            proptest::prop_assert!(len - evicted < max.max(1));
+        }
+    }
 
     #[test]
     fn the_threshold_is_a_percent_of_the_cap() {

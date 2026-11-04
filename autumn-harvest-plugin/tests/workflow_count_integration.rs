@@ -30,6 +30,9 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+#[path = "support/wire_contract.rs"]
+mod wire_contract;
+
 fn init_sql() -> Vec<u8> {
     autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
@@ -268,6 +271,12 @@ async fn group_by_state_and_workflow_name() {
         .unwrap();
     assert_eq!(onboarding["state"], "RUNNING");
     assert_eq!(onboarding["count"], 2);
+    // The shared shape check that the SQLite suite runs too (issue #2468).
+    wire_contract::count_shape(&body);
+    assert_eq!(
+        wire_contract::count_of(&body, Some("RUNNING"), Some("onboarding")),
+        2
+    );
 }
 
 #[tokio::test]

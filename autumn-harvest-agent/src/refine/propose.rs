@@ -19,6 +19,7 @@ use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::bundle::BundleManifest;
 use crate::agent::AgentProfile;
 use crate::agent::overlay::{self, Ceilings, ProfileOverlay};
 use crate::bounds::json_len;
@@ -72,15 +73,15 @@ impl fmt::Display for Dimension {
 }
 
 /// The evidence that a proposer reads.
-///
-/// Issue #2377 adds a bundle of workspace files. Until then, the evidence
-/// is plain text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Evidence {
     /// The evidence as one text.
     Text(String),
+    /// The evidence as workspace files (issue #2377). The proposer reads
+    /// the files of the snapshot that the manifest names.
+    Bundle(BundleManifest),
 }
 
 impl Evidence {
@@ -90,11 +91,13 @@ impl Evidence {
         Self::Text(text.into())
     }
 
-    /// The evidence as the text that a prompt holds.
+    /// The evidence as the text that a prompt holds. A bundle gives the
+    /// text of its `MISSION.md`, a short pointer to its files.
     #[must_use]
     pub fn render(&self) -> Cow<'_, str> {
         match self {
             Self::Text(text) => Cow::Borrowed(text),
+            Self::Bundle(manifest) => Cow::Owned(manifest.mission()),
         }
     }
 }
@@ -236,8 +239,10 @@ pub trait OverlayProposer: Send + Sync + fmt::Debug {
 ///
 /// The refine workflow (issue #2380) builds it from recorded reads. The
 /// `ceilings` and `attempts` come from the operator policy (issue #2394),
-/// never from the input of the refine run.
+/// never from the input of the refine run. An unknown key, such as a
+/// policy key, fails to decode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProposeRequest {
     /// The part of the setup to edit.
     pub dimension: Dimension,

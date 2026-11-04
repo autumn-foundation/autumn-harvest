@@ -1479,29 +1479,6 @@ impl HarvestPlugin {
             }
         };
         refuse(
-            self.api_tokens_enabled,
-            "HarvestPlugin::enable_api_tokens",
-            2469,
-        );
-        refuse(
-            self.role_auth_enabled,
-            "HarvestPlugin::api_with_role_auth",
-            2469,
-        );
-        refuse(
-            self.authorizer.is_some(),
-            "HarvestPlugin::with_authorizer",
-            2469,
-        );
-        refuse(self.roles.is_some(), "HarvestPlugin::with_roles", 2469);
-        refuse(
-            self.api_rate_limit.is_some(),
-            "HarvestPlugin::with_api_rate_limit",
-            2469,
-        );
-        #[cfg(feature = "oidc")]
-        refuse(self.oidc.is_some(), "HarvestPlugin::api_with_oidc", 2469);
-        refuse(
             self.mcp_tools_enabled || self.mcp_tasks_enabled,
             "HarvestPlugin::mcp_tools / mcp_tasks",
             2471,
@@ -1534,10 +1511,12 @@ impl HarvestPlugin {
             "HarvestPlugin::agent_overlay_store",
             2471,
         );
+        // This backend stores no codec envelope, so a read has nothing to
+        // decode. The option would only look like a protection.
         refuse(
             self.decode_payloads_on_read,
             "HarvestPlugin::decode_payloads_on_read",
-            2468,
+            crate::sqlite::EPIC_ISSUE,
         );
         // The SQLite worker reads no cost hold, so a held type would run
         // (autumn#1720).
@@ -1555,6 +1534,15 @@ impl HarvestPlugin {
                 allow_unauthenticated_mutations: self.allow_unauthenticated_mutations,
                 path: self.sqlite_path,
                 per_tenant: self.sqlite_per_tenant,
+                auth: crate::api::AdminAuthLayers {
+                    api_tokens: self.api_tokens_enabled,
+                    read_only_role: self.role_auth_enabled,
+                    authorizer: self.authorizer,
+                    rate_limit: self.api_rate_limit,
+                    roles: self.roles,
+                },
+                #[cfg(feature = "oidc")]
+                oidc: self.oidc,
                 refused,
             },
         )

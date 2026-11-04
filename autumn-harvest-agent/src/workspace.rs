@@ -488,14 +488,15 @@ impl DirWorkspaceBlobs {
     }
 }
 
-/// Durability calls, in order, and faults for them. Tests use both.
+/// Durability calls, in order, and faults for them. Tests use both. The
+/// evidence tests stop a put with them too (issue #2377).
 #[cfg(test)]
-mod sync_log {
+pub(crate) mod sync_log {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, PoisonError};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(super) enum Kind {
+    pub enum Kind {
         File,
         Rename,
         Dir,
@@ -533,7 +534,7 @@ mod sync_log {
     }
 
     /// Fail each call of `kind` on a path below `root`.
-    pub(super) fn fail(kind: Kind, root: &Path) {
+    pub fn fail(kind: Kind, root: &Path) {
         FAULTS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -549,7 +550,7 @@ mod sync_log {
     }
 
     /// Remove the faults on a path below `root`.
-    pub(super) fn heal(root: &Path) {
+    pub fn heal(root: &Path) {
         FAULTS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -557,7 +558,7 @@ mod sync_log {
     }
 
     /// Remove and return the calls on a path below `root`.
-    pub(super) fn take_below(root: &Path) -> Vec<Call> {
+    pub fn take_below(root: &Path) -> Vec<Call> {
         let mut log = LOG.lock().unwrap_or_else(PoisonError::into_inner);
         let (taken, kept) = log.drain(..).partition(|(_, p)| p.starts_with(root));
         *log = kept;

@@ -30,7 +30,7 @@ const THREE_HOURS: Option<Duration> = Some(Duration::from_hours(3));
 /// Serializes the tests on a shared database.
 ///
 /// They share one table, and one test renames it away for a moment.
-static SHARED_DB: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub static SHARED_DB: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Keeps a test database alive: its container, or the shared-database lock.
 struct Hold {
@@ -192,6 +192,7 @@ async fn a_patch_merges_and_the_last_field_deletes_the_row() {
         RunDefaultPatch {
             execution_timeout: Some(None),
             sla: Some(None),
+            ..RunDefaultPatch::default()
         },
     )
     .await;
@@ -320,4 +321,115 @@ async fn a_superseded_recompute_stops() {
         .await
         .expect("recompute");
     assert!(!code.superseded);
+}
+
+fn set_chain(secs: u64) -> RunDefaultPatch {
+    RunDefaultPatch {
+        chain_execution_timeout: Some(Some(Duration::from_secs(secs))),
+        ..RunDefaultPatch::default()
+    }
+}
+
+/// Issue #2406: an override can set the chain cap alone. A patch of another
+/// field keeps it, and clearing it deletes the row.
+#[tokio::test]
+async fn a_chain_only_override_is_stored_and_cleared() {
+    let (mut conn, _hold) = setup_db().await;
+    change(&mut conn, set_chain(7_200)).await;
+    let stored = get_run_default_override(&mut conn, WF)
+        .await
+        .expect("read")
+        .expect("a chain-only row is stored");
+    assert_eq!(
+        stored.fields.chain_execution_timeout,
+        Some(Duration::from_hours(2))
+    );
+    assert_eq!(stored.fields.sla, None);
+    assert_eq!(stored.fields.execution_timeout, None);
+
+    change(&mut conn, set_sla(300)).await;
+    change(
+        &mut conn,
+        RunDefaultPatch {
+            sla: Some(None),
+            ..RunDefaultPatch::default()
+        },
+    )
+    .await;
+    let stored = get_run_default_override(&mut conn, WF)
+        .await
+        .expect("read")
+        .expect("the chain field keeps the row");
+    assert_eq!(
+        stored.fields.chain_execution_timeout,
+        Some(Duration::from_hours(2))
+    );
+
+    let cache = RunDefaultsCache::new();
+    cache.refresh(&mut conn).await.expect("load");
+    assert_eq!(
+        cache.apply_chain(WF, Some(Duration::from_mins(1))),
+        Some(Duration::from_hours(2))
+    );
+
+    change(
+        &mut conn,
+        RunDefaultPatch {
+            chain_execution_timeout: Some(None),
+            ..RunDefaultPatch::default()
+        },
+    )
+    .await;
+    assert!(
+        get_run_default_override(&mut conn, WF)
+            .await
+            .expect("read")
+            .is_none()
+    );
+}
+
+/// Issue #2406: the chain cap takes the same bound as the other fields.
+#[tokio::test]
+async fn a_chain_duration_out_of_bounds_is_refused() {
+    let (mut conn, _hold) = setup_db().await;
+    for (secs, message) in [
+        (0, "at least one second"),
+        (MAX_RUN_DEFAULT.as_secs() + 1, "at most"),
+    ] {
+        let change = RunDefaultChange {
+            workflow_name: WF,
+            patch: set_chain(secs),
+            clear: false,
+            actor: "ops",
+            reason: None,
+        };
+        let error = update_run_default_override(&mut conn, &change)
+            .await
+            .expect_err("out of bounds is refused");
+        let error = error.to_string();
+        assert!(error.contains("chain_execution_timeout"), "{error}");
+        assert!(error.contains(message), "{error}");
+    }
+    assert!(
+        get_run_default_override(&mut conn, WF)
+            .await
+            .expect("read")
+            .is_none()
+    );
+}
+
+/// Issue #2406: the table refuses a zero chain cap, also from a writer that
+/// skips the bound check.
+#[tokio::test]
+async fn the_table_refuses_a_zero_chain_cap() {
+    let (mut conn, _hold) = setup_db().await;
+    let error = conn
+        .batch_execute(
+            "INSERT INTO harvest_run_default_overrides \
+                 (workflow_name, chain_execution_timeout_secs, updated_by) \
+             VALUES ('run_defaults_db_wf', 0, 'ops')",
+        )
+        .await
+        .expect_err("a zero chain cap is refused");
+    assert!(error.to_string().contains("check"), "{error}");
 }

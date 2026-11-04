@@ -383,7 +383,7 @@ pub fn render_snapshot(blocks: &[MemoryBlock]) -> String {
 
 /// One line with no markup: `&`, `<`, `>` and `"` become entities, and each
 /// line break becomes a space.
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
@@ -402,7 +402,7 @@ fn escape(text: &str) -> String {
 ///
 /// A store applies each key once, and keeps a failure as well. A retried call
 /// then changes nothing, even when another run edited the scope in between.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EditKey(String);
 
