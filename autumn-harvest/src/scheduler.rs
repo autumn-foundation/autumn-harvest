@@ -220,7 +220,9 @@ pub fn plan_backfill_timestamps(
             // Find the first cron occurrence at or after `from` by searching from 1 ms before
             // it (cron fires on whole-second boundaries; 1 ms is a safe undercut).
             let reference = from - chrono::Duration::milliseconds(1);
-            let Some(mut cursor) = next_run_after(schedule, reference) else {
+            let walker = slot_walker(schedule);
+            let next_slot = |at| walker.as_ref().and_then(|w| w.next_after(at));
+            let Some(mut cursor) = next_slot(reference) else {
                 return Ok(vec![]);
             };
             let mut timestamps = Vec::new();
@@ -232,7 +234,7 @@ pub fn plan_backfill_timestamps(
                     return Err(BackfillPlanError::LimitExceeded { limit: max_count });
                 }
                 timestamps.push(cursor);
-                let Some(next) = next_run_after(schedule, cursor) else {
+                let Some(next) = next_slot(cursor) else {
                     break;
                 };
                 cursor = next;
@@ -5676,6 +5678,11 @@ fn schedule_expr(schedule: Option<&Schedule>) -> Option<String> {
     }
 }
 
+/// Prepare `schedule` for a walk of many slots. `None` never fires.
+fn slot_walker(schedule: Option<&Schedule>) -> Option<crate::schedule_plan::SlotWalker> {
+    schedule.map(crate::schedule_plan::SlotWalker::new)
+}
+
 fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
     schedule.and_then(|schedule| crate::schedule_plan::next_fire_after(schedule, reference))
 }
@@ -6421,13 +6428,14 @@ fn due_run_plan(
 
     let mut created = Vec::with_capacity(1);
     let mut cursor = first_due;
+    let walker = slot_walker(schedule);
 
     loop {
         if cursor > now {
             return (created, Some(cursor));
         }
         created.push(cursor);
-        let Some(next) = next_run_after(schedule, cursor) else {
+        let Some(next) = walker.as_ref().and_then(|w| w.next_after(cursor)) else {
             return (created, None);
         };
         cursor = next;
@@ -6621,6 +6629,7 @@ fn eligible_slot_summary(
     let mut cursor = first_due;
     let mut count: u64 = 0;
     let mut last_eligible = None;
+    let walker = slot_walker(schedule);
     loop {
         if cursor > now {
             return EligibleSummary {
@@ -6633,7 +6642,7 @@ fn eligible_slot_summary(
             count += 1;
             last_eligible = Some(cursor);
         }
-        let Some(next) = next_run_after(schedule, cursor) else {
+        let Some(next) = walker.as_ref().and_then(|w| w.next_after(cursor)) else {
             return EligibleSummary {
                 eligible_count: count,
                 last_eligible,
@@ -6686,8 +6695,12 @@ fn window_eligible_slots(
     // Codex #3069); the in-window set itself is bounded by the operator-chosen
     // window, so collecting it is intentional. Using `cutoff - 1ns` makes the
     // jump inclusive of an occurrence landing exactly on the cutoff.
+    let walker = slot_walker(schedule);
     let mut cursor = if cutoff > first_due {
-        next_run_after(schedule, cutoff - chrono::Duration::nanoseconds(1)).unwrap_or(first_due)
+        walker
+            .as_ref()
+            .and_then(|w| w.next_after(cutoff - chrono::Duration::nanoseconds(1)))
+            .unwrap_or(first_due)
     } else {
         first_due
     };
@@ -6699,7 +6712,7 @@ fn window_eligible_slots(
         if cursor >= cutoff && end_at.is_none_or(|e| cursor < e) {
             slots.push(cursor);
         }
-        let Some(next) = next_run_after(schedule, cursor) else {
+        let Some(next) = walker.as_ref().and_then(|w| w.next_after(cursor)) else {
             return slots;
         };
         cursor = next;

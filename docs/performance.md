@@ -2809,6 +2809,12 @@ standalone note rather than part of the claim-path attribution table above:
   the entity checkpoint continues the run near op 288. The transcript digest
   is 34.4% of the replay at 200 ops, and the entity snapshot work 27.0%.
   Baseline only.
+* [`docs/performance-agent-recall.md`](performance-agent-recall.md)
+  — the long-horizon recall eval of a durable `agent` (issue #2455). It
+  scores what each memory config keeps across ops: the window only,
+  progress notes, store memory and episodes. The scripted CI check scores
+  0.17, 1.00, 0.17 and 1.00, with notes and episodes at 1.00 by
+  construction. Real-model runs go on that page.
 * [`docs/performance-analyzer-large-payload.md`](performance-analyzer-large-payload.md)
   — `LargePayloadRule` in `HistoryAnalyzer::analyze`. It counts payload bytes
   without building the JSON text. Instructions fall from 1.32G to 298M, and
