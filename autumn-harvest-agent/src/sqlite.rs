@@ -62,41 +62,7 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     rt.register_workflow(&agent_info());
     rt.register_workflow(&agent_consolidate_info());
     register_episodes(rt, &harness);
-    let h = Arc::clone(&harness);
-    rt.register_activity_with_body(&agent_profile_info(), move |input| {
-        call(input, |kind: String| {
-            std::future::ready(Ok::<_, String>(h.profile_read(&kind)))
-        })
-    });
-    let h = Arc::clone(&harness);
-    rt.register_activity_with_body(&agent_profile_overlay_info(), move |input| {
-        call(input, |request: crate::agent::profile_read::OverlayRead| {
-            let h = Arc::clone(&h);
-            async move { h.overlaid_profile(&request).await }
-        })
-    });
-    let h = Arc::clone(&harness);
-    rt.register_activity_with_body(&agent_memory_reset_info(), move |input| {
-        call(input, |scope| h.memory_reset(scope))
-    });
-    let h = Arc::clone(&harness);
-    rt.register_activity_with_body(&agent_workspace_retain_info(), move |input| {
-        call(input, |mount| h.workspace_retain(mount))
-    });
-    let h = Arc::clone(&harness);
-    rt.register_activity_with_body(&agent_workspace_floor_info(), move |input| {
-        call(input, |scope: String| {
-            let h = Arc::clone(&h);
-            async move { h.workspace_floor(&scope).await }
-        })
-    });
-    let h = Arc::clone(&harness);
-    rt.register_activity_with_body(&agent_workspace_reset_info(), move |input| {
-        call(input, |mount: crate::workspace::WorkspaceMount| {
-            let h = Arc::clone(&h);
-            async move { h.workspace_reset(mount).await }
-        })
-    });
+    register_profile_and_workspace(rt, &harness);
     let h = Arc::clone(&harness);
     rt.register_activity_with_ledger(&agent_model_turn_info(), move |input, at| {
         call_with_ledger(input, |request: ModelTurnRequest| async {
@@ -161,6 +127,45 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     });
     rt.register_activity_with_body(&agent_precheck_info(), move |input| {
         call(input, |task| harness.precheck_tick(task))
+    });
+}
+
+/// Register the profile, memory-reset and workspace activities.
+fn register_profile_and_workspace(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_profile_info(), move |input| {
+        call(input, |kind: String| {
+            std::future::ready(Ok::<_, String>(h.profile_read(&kind)))
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_profile_overlay_info(), move |input| {
+        call(input, |request: crate::agent::profile_read::OverlayRead| {
+            let h = Arc::clone(&h);
+            async move { h.overlaid_profile(&request).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_memory_reset_info(), move |input| {
+        call(input, |scope| h.memory_reset(scope))
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_workspace_retain_info(), move |input| {
+        call(input, |mount| h.workspace_retain(mount))
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_workspace_floor_info(), move |input| {
+        call(input, |scope: String| {
+            let h = Arc::clone(&h);
+            async move { h.workspace_floor(&scope).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_workspace_reset_info(), move |input| {
+        call(input, |mount: crate::workspace::WorkspaceMount| {
+            let h = Arc::clone(&h);
+            async move { h.workspace_reset(mount).await }
+        })
     });
 }
 
