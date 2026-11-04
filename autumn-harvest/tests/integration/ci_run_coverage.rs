@@ -1205,10 +1205,15 @@ fn core_required_features_reads_mod_cfg_and_file_cfg() {
 fn ci_yaml_invokes_the_runner_against_the_manifest() {
     // Without this, deleting a runner step (but keeping the manifest) would make
     // the guard read a manifest CI never executes → green-but-not-run.
+    // The live-DB rows run from one nextest archive, so CI must build it,
+    // unpack it, and run both live-DB classes from it.
     for needle in [
         "run-suites.sh compile",
         "run-suites.sh run allos",
-        "run-suites.sh run linux",
+        "run-suites.sh archive",
+        "run-suites.sh extract",
+        "run-suites.sh nextest linux",
+        "run-suites.sh nextest linuxpart",
     ] {
         assert!(
             CI_YAML.contains(needle),
