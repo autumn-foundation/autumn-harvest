@@ -39,7 +39,7 @@ labels or order. Parent: #2369. It builds on the overlay candidates of
   and `id_width` in `eval/anon.rs`. It proves that the width is the least
   safe width from the floor, and that two prefixes of that width differ.
 - **Tests.** The change adds fifteen integration tests to
-  `autumn-harvest-agent/tests/eval.rs` and twelve unit tests. One unit
+  `autumn-harvest-agent/tests/eval.rs` and ten unit tests. One unit
   test is a proptest. It checks that any input order gives each candidate
   the same id and rank.
 - No new `WorkflowEvent` variant. No migration.
