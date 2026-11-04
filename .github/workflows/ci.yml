@@ -875,10 +875,16 @@ jobs:
   #     manifest rows. See run-suites.sh's header comment for why a filtered,
   #     already-sorted row list still batches correctly.
   #   * The ~30 individual steps carried over from `test` have no such
-  #     mechanism (each is its own crate/example, not a manifest row), so they
-  #     are round-robin assigned to one shard each via `matrix.shard == N` --
-  #     by COUNT, not by measured per-step time (no such measurement exists for
-  #     macOS/Windows), so the four shards are approximately, not exactly, even.
+  #     mechanism (each is its own crate/example, not a manifest row). Each
+  #     one runs on one shard, through `matrix.shard == N`.
+  #     The assignment balances the measured step times of trunk-dev run
+  #     41757040952 on all three OSes. Windows weighs most, because it was the
+  #     long pole at 110 minutes.
+  #     The manifest steps above set a different base load on each shard, so
+  #     balance the totals, not the step counts.
+  #     Two steps share a shard on purpose. `Run all-features lib tests` runs
+  #     on shard 0 after `Compile db-backed tests`, which builds the same lib
+  #     test binary. On another shard, it builds that binary again.
   #
   # A SEPARATE job, not a matrix dimension added to `test`, for the same reason
   # `test-db-linux` is one: `test`'s three legs are branch-protection required
@@ -953,8 +959,8 @@ jobs:
           SEMAPHORE_SHARD_COUNT: "4"
           SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
         run: bash .github/ci/run-suites.sh run allos
-      # ── Individual crate/example steps carried over from `test`, round-robin
-      # assigned one shard each (see the job comment above) ─────────────────
+      # ── Individual crate/example steps carried over from `test`, one shard
+      # each, balanced by measured time (see the job comment above) ─────────
       # The lib test target needs about 8 GB to compile, and `integration`
       # needs about 11 GB. One `--tests` build compiles both at the same time.
       # That fills the 16 GB runner, and the runner shuts down (issue #2259).
@@ -1011,11 +1017,15 @@ jobs:
       # here is that the bench still compiles, not that it runs. No
       # `--features`: `autumn-harvest-plugin` unconditionally depends on
       # `autumn-harvest` with `db`/`testing` already enabled.
+      # One shard is enough for a compile check. With no shard condition, all
+      # four Linux shards built it, at about 11 minutes each.
       - name: Compile diagnose benchmark (issue #1194)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo bench -p autumn-harvest-plugin --bench diagnose_bench --no-run
+      # Shard 0, after `Compile db-backed tests`: that step already built this
+      # lib test binary, so this step only runs it.
       - name: Run all-features lib tests
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --all-features --lib
       - name: Run plugin lib tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
@@ -1023,9 +1033,32 @@ jobs:
       - name: Run plugin lib tests (webhooks feature, issue #618 outbound-delegate gating)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-plugin --features webhooks --lib
-      - name: Run plugin connector tests (issue #944)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
-        run: cargo test -p autumn-harvest-plugin --features connectors --lib connector
+      # Five feature-gated lib suites, each picked by a name filter, in one
+      # build. One step per feature rebuilt the plugin crate five times. Each
+      # rebuild took 3-5 minutes on Windows and ran seconds of tests.
+      # The features are additive, and no test that a filter selects is gated
+      # off by another feature in the list. So the one build runs every test
+      # that the five steps ran.
+      # - `connector` (issue #944): the connector unit tests. The doc example
+      #   check in `scripts/check-broker-connector-cutover-example.sh` relies
+      #   on this filter.
+      # - `aws_kms` (issue #1825): the AWS KMS binding of the AEAD codec key
+      #   provider, against a local fake KMS endpoint. It needs no AWS account.
+      # - `object_store` (issue #1983): the S3 and GCS adapters, against an
+      #   in-memory backend and a local fake GCS server. They need no cloud
+      #   account and no Docker.
+      # - `vault_transit` (issue #1981): the Vault Transit binding runs the
+      #   KMS conformance suite of AWS, against a local fake Vault server.
+      # - `oidc` (issue #1978): the OIDC unit tests and the `api_with_oidc`
+      #   builder test compile only with the feature. The MCP tool gate test
+      #   also needs `mcp`. The round-trip suite runs from the manifest
+      #   (`oidc_login`).
+      - name: Run plugin feature lib tests (connectors, KMS, object store, OIDC; issues 944, 1825, 1983, 1981, 1978)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        run: >-
+          cargo test -p autumn-harvest-plugin
+          --features connectors,aws-kms,s3,gcs,vault-transit,oidc,mcp,unified-dag-execution
+          --lib -- connector aws_kms object_store vault_transit oidc
       # Issue #1287 review: the manifest's `dev_runtime_tests` row (features
       # `dev-runtime`) and `dev_runtime_managed` row (`compileonly`, so
       # `--no-run` only) never exercise this crate's `--lib` target, so the
@@ -1045,27 +1078,6 @@ jobs:
       - name: Run plugin lib tests (redis feature, issue #1312)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-plugin --features redis --lib
-      # Issue #1825. The AWS KMS binding for the AEAD codec key provider runs
-      # against a local fake KMS endpoint, so it needs no AWS account.
-      - name: Run plugin lib tests (aws-kms feature, issue #1825)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
-        run: cargo test -p autumn-harvest-plugin --features aws-kms --lib aws_kms
-      # Issue #1983. The adapter unit tests use an in-memory backend and a
-      # local fake GCS server, so they need no cloud account and no Docker.
-      - name: Run plugin lib tests (s3 and gcs features, issue #1983)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
-        run: cargo test -p autumn-harvest-plugin --features s3,gcs --lib object_store
-      # Issue #1981. The Vault Transit binding runs the same KMS conformance
-      # suite as AWS, against a local fake Vault server.
-      - name: Run plugin lib tests (vault-transit feature, issue #1981)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
-        run: cargo test -p autumn-harvest-plugin --features vault-transit --lib vault_transit
-      # Issue #1978. The OIDC unit tests and the `api_with_oidc` builder test
-      # compile only with the feature. The MCP tool gate test also needs
-      # `mcp`. The round-trip suite runs from the manifest (`oidc_login`).
-      - name: Run plugin lib tests (oidc and mcp features, issue #1978)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
-        run: cargo test -p autumn-harvest-plugin --features oidc,mcp,unified-dag-execution --lib oidc
       # No CI step ran the plugin's doctests, so a broken `///` example landed
       # silently (issue #944 review found exactly that). These are compile-only
       # (`no_run`), so they cost seconds and need no database.
@@ -1078,8 +1090,10 @@ jobs:
       - name: Run plugin metrics scrape tests (issue #355)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-plugin --features metrics --lib --test metrics_scrape_http_tests
+      # Shard 1, beside the metrics scrape tests: both build the plugin with
+      # `metrics`, so the example reuses most of that build.
       - name: Compile plugin metrics scrape example
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo build -p autumn-harvest-plugin --example metrics_scrape_quickstart --features metrics
       # `aws-sdk-sqs` is pure Rust, so the SQS example builds on every OS.
       - name: Compile plugin SQS connector example (issue #944)
@@ -1089,7 +1103,7 @@ jobs:
       # (see tests/connector_example_budget.rs), so it must keep compiling.
       # Linux-only for the same librdkafka reason as the broker suite.
       - name: Compile plugin Kafka connector example (issue #944, Linux)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: |
           (sudo apt-get update || echo "::warning::apt-get update failed for a mirror; installing from the lists it fetched") && sudo apt-get install -y libcurl4-openssl-dev
           cargo build -p autumn-harvest-plugin --example kafka_connector_quickstart --features kafka
@@ -1097,7 +1111,7 @@ jobs:
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-macros
       - name: Run CLI tests (issue #753)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-cli
       - name: Run autumn-harvest-sqlite tests (issue #1068)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
@@ -1106,7 +1120,7 @@ jobs:
       # crash test runs its own binary as a child process. Issue #2001 adds
       # the `eval` suite.
       - name: Run autumn-harvest-agent tests (issues #1973, #2001)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox
       # Sandboxed code activities. The tests need no KVM: a fake VMM, fake
       # `firecracker` and `jailer` scripts and a fake API server stand in. The
@@ -1277,7 +1291,7 @@ jobs:
       # which drags in wasmtime — a multi-minute build not worth paying on three
       # legs, and the macOS/Windows legs never build core examples at all.
       - name: Run wasm_activity example (issue #965)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo run -p autumn-harvest --features wasm-activities --example wasm_activity
       # Issue #794: the schema-contract gate, end to end. Generates the
       # currently-published schemas from the example registry, then diffs them
