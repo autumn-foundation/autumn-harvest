@@ -356,6 +356,40 @@ async fn a_patch_keeps_the_time_zone_and_refuses_override_fields() {
     }
 }
 
+/// Two overlapping `PATCH` requests of an API schedule both apply. The
+/// driver reads and merges each one in its own turn, so the later one keeps
+/// the field that the earlier one changed.
+#[tokio::test(flavor = "multi_thread")]
+async fn overlapping_patches_of_an_api_schedule_both_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = boot(dir.path(), "dev", base());
+    let created: Value = client
+        .post("/harvest/admin/schedules/workflow")
+        .json(&json!({ "workflow_name": "tick", "schedule_expr": "interval:3600", "input": 1 }))
+        .send()
+        .await
+        .json();
+    let path = format!(
+        "/harvest/admin/schedules/{}",
+        created["id"].as_str().unwrap()
+    );
+
+    for round in 0..10 {
+        let (input, runs) = tokio::join!(
+            client.patch(&path).json(&json!({ "input": round })).send(),
+            client
+                .patch(&path)
+                .json(&json!({ "max_active_runs": round + 1 }))
+                .send(),
+        );
+        input.assert_ok();
+        runs.assert_ok();
+        let one: Value = client.get(&path).send().await.json();
+        assert_eq!(one["workflow_input"], round, "round {round}: {one}");
+        assert_eq!(one["max_active_runs"], round + 1, "round {round}: {one}");
+    }
+}
+
 /// Outside `dev`, an anonymous schedule write is refused, as on Postgres.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_anonymous_schedule_write_outside_dev_is_refused() {

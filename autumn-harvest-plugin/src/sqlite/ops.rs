@@ -612,28 +612,51 @@ async fn patch_inner(
     let name = stored.workflow_name.clone();
     let is_code = is_code_schedule(&handle, &name);
     request.check_override_fields(is_code, schedule_id(&name))?;
-    let schedule = request.schedule(&stored.schedule)?;
     let overlap = request
         .overlap_policy
         .as_deref()
         .map(parse_overlap)
         .transpose()?;
     if is_code {
+        let schedule = request.schedule(&stored.schedule)?;
         let actor = state.flags.extract_actor(headers);
         override_code(&handle, &name, &request, schedule, overlap, actor).await?;
     } else {
-        let mut code = WorkflowSchedule::new(name.clone(), schedule.unwrap_or(stored.schedule))
-            .with_input(request.input.clone().unwrap_or(stored.input))
-            .with_paused(stored.paused);
-        code.max_active_runs = request.max_active_runs.unwrap_or(stored.max_active_runs);
-        code.overlap_policy = overlap.unwrap_or(stored.overlap_policy);
+        let job_name = name.clone();
         handle
-            .run(move |runtime| runtime.upsert_schedule(&code))
+            .run(move |runtime| edit_in_place(runtime, &job_name, &request, overlap))
             .await
-            .map_err(schedule_error)?
-            .map_err(|error| schedule_error(error.into()))?;
+            .map_err(schedule_error)??;
     }
     entry_of(&handle, &name).await
+}
+
+/// Edit an API schedule in place, on the driver task.
+///
+/// The read, the merge and the upsert run in one job. Two overlapping
+/// `PATCH` requests then apply one after the other, so the second keeps
+/// the fields that the first changed.
+fn edit_in_place(
+    runtime: &mut autumn_harvest_sqlite::SqliteRuntime,
+    name: &str,
+    request: &PatchBody,
+    overlap: Option<OverlapPolicy>,
+) -> Result<(), AutumnError> {
+    let stored = runtime
+        .list_schedules()
+        .map_err(|error| schedule_error(error.into()))?
+        .into_iter()
+        .find(|row| row.workflow_name == name)
+        .ok_or_else(|| AutumnError::not_found_msg(format!("schedule {}", schedule_id(name))))?;
+    let schedule = request.schedule(&stored.schedule)?;
+    let mut code = WorkflowSchedule::new(name.to_owned(), schedule.unwrap_or(stored.schedule))
+        .with_input(request.input.clone().unwrap_or(stored.input))
+        .with_paused(stored.paused);
+    code.max_active_runs = request.max_active_runs.unwrap_or(stored.max_active_runs);
+    code.overlap_policy = overlap.unwrap_or(stored.overlap_policy);
+    runtime
+        .upsert_schedule(&code)
+        .map_err(|error| schedule_error(error.into()))
 }
 
 /// Set or clear the operator override of a code schedule (issue #2390).
