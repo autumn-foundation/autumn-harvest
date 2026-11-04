@@ -609,12 +609,27 @@ fn apply_driver_check(
     explicit: Option<bool>,
     role: autumn_web::config::ProcessRole,
 ) -> autumn_web::AutumnResult<()> {
-    match driver_check(explicit, role) {
+    let check = driver_check(explicit, role);
+    if check != DriverCheck::Refuse {
+        let source = if explicit.is_some() {
+            "explicit"
+        } else {
+            "sqlite"
+        };
+        tracing::info!(
+            role = %role.as_str(),
+            worker_enabled = true,
+            worker_source = %source,
+            "harvest SQLite driver runs on every process role"
+        );
+    }
+    match check {
         DriverCheck::Run => Ok(()),
         DriverCheck::RunAgainstRole => {
             tracing::warn!(
                 "the Autumn process role `web` does not turn off the Harvest SQLite driver: \
-                 the app process is the only writer, so it always runs the driver"
+                 the app process is the only writer, so it always runs the driver. Set \
+                 harvest.worker_enabled = true to remove this warning"
             );
             Ok(())
         }
@@ -659,8 +674,36 @@ mod tests {
         );
         assert_eq!(driver_check(None, ProcessRole::Worker), DriverCheck::Run);
         assert_eq!(driver_check(None, ProcessRole::Combined), DriverCheck::Run);
-        assert!(apply_driver_check(None, ProcessRole::Web).is_ok());
         assert!(apply_driver_check(Some(false), ProcessRole::Worker).is_err());
+    }
+
+    /// Issue #2477: a `web` SQLite app warns that its driver still runs, and
+    /// names the fix. Each start logs the value and its source.
+    #[test]
+    fn the_sqlite_web_role_warns_that_the_driver_still_runs() {
+        use autumn_web::config::ProcessRole;
+
+        use crate::process_role::capture_logs;
+
+        let run = |explicit, role| {
+            capture_logs(tracing::Level::INFO, || {
+                assert!(apply_driver_check(explicit, role).is_ok());
+            })
+        };
+        let out = run(None, ProcessRole::Web);
+        let warn = out
+            .lines()
+            .find(|line| line.contains(" WARN "))
+            .unwrap_or_else(|| panic!("no warning: {out}"));
+        assert!(warn.contains("role `web`"), "{warn}");
+        assert!(warn.contains("harvest.worker_enabled = true"), "{warn}");
+        assert!(out.contains("role=web"), "{out}");
+        assert!(out.contains("worker_source=sqlite"), "{out}");
+
+        let out = run(Some(true), ProcessRole::Web);
+        assert!(!out.contains(" WARN "), "{out}");
+        assert!(out.contains("worker_source=explicit"), "{out}");
+        assert!(!run(None, ProcessRole::Worker).contains(" WARN "));
     }
 
     #[test]

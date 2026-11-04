@@ -1,7 +1,8 @@
 //! The worker and scheduler switches follow the process role (issue #2477).
 //!
 //! `HarvestRunner::start` resolves both switches from the Autumn role. The
-//! copies below prove the table for every input. A `web` role with no
+//! copies below prove the table for every input. `resolve_switch` proves that
+//! the runtime joins the kernels with the right arguments. A `web` role with no
 //! explicit value runs no worker and no scheduler. No role keeps the old
 //! default, `true`. An explicit value always wins. The startup warning fires
 //! exactly when the resolved value differs from the role default.
@@ -16,6 +17,18 @@ pub enum ProcessRole {
     Web,
     Worker,
 }
+
+// The engine type is `Copy`. The guard bans `#[derive]`, so these impls say so.
+impl Clone for ProcessRole {
+    fn clone(&self) -> (r: Self)
+        ensures
+            r == *self,
+    {
+        *self
+    }
+}
+
+impl Copy for ProcessRole {}
 
 /// The switch value that a role gives when no value is set.
 pub open spec fn spec_role_default(role: Option<ProcessRole>) -> bool {
@@ -74,6 +87,16 @@ pub fn contradicts_role(explicit: Option<bool>, role: Option<ProcessRole>) -> (r
     }
 }
 
+// mirror: autumn-harvest-plugin/src/process_role.rs resolve_switch
+pub fn resolve_switch(explicit: Option<bool>, role: Option<ProcessRole>) -> (r: (bool, bool))
+    ensures
+        r.0 == spec_switch_value(explicit, spec_role_default(role)),
+        r.1 == spec_contradicts(explicit, role),
+{
+    let enabled = switch_value(explicit, role_default(role));
+    (enabled, contradicts_role(explicit, role))
+}
+
 /// A `web` role with no explicit value runs no worker and no scheduler.
 pub proof fn theorem_a_web_role_runs_nothing_by_default()
     ensures
@@ -118,7 +141,6 @@ pub proof fn theorem_a_warning_marks_each_override(
             spec_role_default(role),
         ) != spec_role_default(role)),
         role.is_none() ==> !spec_contradicts(explicit, role),
-        explicit.is_none() ==> !spec_contradicts(explicit, role),
 {
 }
 

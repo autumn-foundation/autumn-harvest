@@ -757,6 +757,39 @@ impl DeferredAuditExportInstall {
     }
 }
 
+/// The background tasks that one runtime spawns (issue #2477).
+///
+/// `HarvestRunner::start` reads every spawn decision from here, so a test of
+/// the plan covers the wiring of the switches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpawnPlan {
+    /// The local worker and its poll loops.
+    worker: bool,
+    /// The local scheduler.
+    scheduler: bool,
+}
+
+impl SpawnPlan {
+    const fn for_switches(switches: crate::process_role::ProcessSwitches) -> Self {
+        Self {
+            worker: switches.worker.enabled,
+            scheduler: switches.scheduler.enabled,
+        }
+    }
+
+    /// The batch executor. Only the worker process runs it, so executors do
+    /// not compete for the same job rows.
+    const fn batch(self) -> bool {
+        self.worker
+    }
+
+    /// The codec refresh loop. A worker refreshes its key in its own timeout
+    /// checker, so only a process with no worker needs this loop.
+    const fn codec_refresh(self) -> bool {
+        !self.worker
+    }
+}
+
 impl PreparedHarvestRuntime {
     fn build(
         built: BuiltHarvest,
@@ -1125,8 +1158,9 @@ impl HarvestRunner {
         // runner with no app state has no role and keeps both switches on.
         let switches = config.process_switches(resources.process_role());
         switches.log();
-        let worker_enabled = switches.worker.enabled;
-        let scheduler_enabled = switches.scheduler.enabled;
+        let plan = SpawnPlan::for_switches(switches);
+        let worker_enabled = plan.worker;
+        let scheduler_enabled = plan.scheduler;
 
         let completion_triggers = built.completion_triggers().to_vec();
         let mut prepared = PreparedHarvestRuntime::build(built, resources, worker_enabled)?;
@@ -1420,7 +1454,7 @@ impl HarvestRunner {
         // rows to completion in the background. Only the worker-owning
         // process spawns it so we don't run multiple competing executors
         // against the same job rows.
-        let batch = if worker_enabled {
+        let batch = if plan.batch() {
             Some(BatchRuntime::spawn(
                 prepared.storage_pool.sharded_pool().clone(),
                 BatchExecutorConfig {
@@ -1436,14 +1470,14 @@ impl HarvestRunner {
         // Issue #1244: a worker-enabled process already refreshes its
         // active codec key through its own timeout-checker loop. Only a
         // process with no local worker needs this independent one.
-        let codec_refresh = if worker_enabled {
-            None
-        } else {
+        let codec_refresh = if plan.codec_refresh() {
             Some(CodecRefreshRuntime::spawn(
                 prepared.storage_pool.sharded_pool().clone(),
                 registry.payload_codecs().clone(),
                 prepared.worker_runtime_config.poll_interval,
             ))
+        } else {
+            None
         };
         let mut api_runtime = HarvestApiRuntime::new(
             registry,
@@ -3014,6 +3048,41 @@ mod tests {
         assert!(
             registered.contains("unified_dag"),
             "a registered unified DAG's name must count as registered",
+        );
+    }
+
+    /// Issue #2477: each role gives its spawn plan. A `web` replica spawns
+    /// no worker, scheduler or batch executor, but keeps its codec key fresh.
+    #[test]
+    fn each_role_gives_its_spawn_plan() {
+        use autumn_web::config::ProcessRole;
+
+        use super::SpawnPlan;
+        use crate::process_role::ProcessSwitches;
+
+        // (worker, scheduler, batch, codec refresh) for each input.
+        let plan = |worker, scheduler, role| {
+            let plan = SpawnPlan::for_switches(ProcessSwitches::resolve(worker, scheduler, role));
+            (
+                plan.worker,
+                plan.scheduler,
+                plan.batch(),
+                plan.codec_refresh(),
+            )
+        };
+        let web = (false, false, false, true);
+        let full = (true, true, true, false);
+        assert_eq!(plan(None, None, Some(ProcessRole::Web)), web);
+        assert_eq!(plan(None, None, Some(ProcessRole::Worker)), full);
+        assert_eq!(plan(None, None, Some(ProcessRole::Combined)), full);
+        assert_eq!(plan(None, None, None), full);
+        assert_eq!(
+            plan(Some(true), None, Some(ProcessRole::Web)),
+            (true, false, true, false)
+        );
+        assert_eq!(
+            plan(Some(false), Some(true), Some(ProcessRole::Worker)),
+            (false, true, false, true)
         );
     }
 

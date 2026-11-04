@@ -1419,8 +1419,8 @@ Harvest configuration lives under the `[harvest]` section of `autumn.toml`, dese
 ```toml
 [harvest]
 mode = "embedded"            # "embedded" | "split" | "external" — default: embedded
-worker_enabled = true        # default: unset, which follows AUTUMN_ROLE (issue #2477)
-scheduler_enabled = true     # default: unset, which follows AUTUMN_ROLE (issue #2477)
+# worker_enabled = true      # default: unset, which follows AUTUMN_ROLE (issue #2477)
+# scheduler_enabled = true   # default: unset, which follows AUTUMN_ROLE (issue #2477)
 
 [harvest.database]
 url = "postgres://..."       # required when mode is "split" or "external"; unused for "embedded"

@@ -22,14 +22,18 @@ replicas do that work.
 - An explicit value against the role logs one `warn!` per switch. The
   warning names the switch, its value and the role.
 - At startup, Harvest logs one line with each value and its source:
-  `explicit`, `role` or `default`.
+  `explicit`, `role` or `default`. The SQLite backend logs the source
+  `sqlite`.
 - A runtime with no Autumn `AppState` has no role. A standalone
   `HarvestRunner` is one example. Both switches then stay on.
 - The SQLite backend always runs its driver. The `web` role does not stop
-  it, and Harvest logs a warning. See [`docs/sqlite-plugin.md`](../sqlite-plugin.md).
+  it, and Harvest logs a warning. Set `harvest.worker_enabled = true` to
+  remove the warning. The SQLite backend has no schedules, so it ignores
+  `harvest.scheduler_enabled`. See [`docs/sqlite-plugin.md`](../sqlite-plugin.md).
 
-A split role needs a jobs backend that both process groups share. Autumn
-refuses the boot otherwise. Set it once in the shared `autumn.toml`:
+A split role needs a jobs backend that both process groups share, such as
+`postgres` or `redis`. Autumn refuses the boot otherwise. Set it once in the
+shared `autumn.toml`:
 
 ```toml
 [jobs]
@@ -38,8 +42,11 @@ backend = "postgres"
 
 ## Fly.io
 
-Each process group runs the same image. Only `AUTUMN_ROLE` differs. Fly
-sets no environment per process group, so the command sets it.
+Each process group runs the same image. Only `AUTUMN_ROLE` differs in the
+app config. A `fly.toml` has no `[env]` table per process group, so each
+command sets `AUTUMN_ROLE`. A command in `[processes]` replaces the image
+`CMD`, not its `ENTRYPOINT`. Use an image with no `ENTRYPOINT`, or one that
+runs its arguments.
 
 ```toml
 # fly.toml
@@ -58,6 +65,14 @@ method = "GET"
 path = "/api/harvest/health/ready"
 interval = "10s"
 timeout = "2s"
+
+[checks.worker_ready]
+type = "http"
+port = 3000
+path = "/ready"
+interval = "10s"
+timeout = "2s"
+processes = ["worker"]
 
 [[vm]]
 processes = ["web"]
@@ -79,7 +94,8 @@ entry script that exports `AUTUMN_ROLE` and then runs the app.
 
 ## Kubernetes
 
-Two Deployments run the same image. Only `AUTUMN_ROLE` differs.
+Two Deployments run the same image. Only `AUTUMN_ROLE` differs in the app
+config.
 
 ```yaml
 apiVersion: apps/v1
@@ -119,7 +135,8 @@ spec:
     metadata:
       labels: { app: orders, role: worker }
     spec:
-      # A worker finishes its in-flight activities before it stops.
+      # A worker drains in-flight tasks for up to its shutdown timeout.
+      # Keep this period longer. See kubernetes-probes.md.
       terminationGracePeriodSeconds: 60
       containers:
         - name: orders
@@ -167,4 +184,10 @@ Do one of these before the upgrade:
   logs a warning for each override.
 
 A fleet that sets `AUTUMN_HARVEST__WORKER_ENABLED=false` on its API
-replicas keeps working. Replace that variable with `AUTUMN_ROLE=web`.
+replicas, with no `AUTUMN_ROLE`, keeps working. Its role is `combined`, so
+Harvest now logs a warning for that override. To remove the warning, set
+`AUTUMN_ROLE=web` and remove the variable. Read these effects first:
+
+- The Harvest scheduler also stops on those replicas.
+- Autumn's own `#[job]` workers and cron tasks stop on those replicas too.
+- Autumn refuses the boot with no shared jobs backend. See [Rules](#rules).

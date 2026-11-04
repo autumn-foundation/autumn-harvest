@@ -8,7 +8,7 @@ Issue #2477. Parent epic #2476.
 on every replica. An `AUTUMN_ROLE=web` replica then claims tasks and runs
 the scheduler. The operator must also set
 `AUTUMN_HARVEST__WORKER_ENABLED=false`. `AppState::role()` gives the role
-since autumn-web 0.7, so Harvest can follow it.
+since autumn-web 0.7 (autumn#1726), so Harvest can follow it.
 
 ## 2. Facts
 
@@ -35,6 +35,7 @@ The chosen option is in bold.
 | What an explicit value against the role does | refuse the boot · **win, with one `warn!` per switch** |
 | Where the resolve logic lives | inline in the runner · **one pure module, `process_role.rs`, with a Verus proof** |
 | What SQLite does on `web` | refuse the boot · **keep the driver on, and warn** |
+| How the spawn wiring is tested | a DB test with a `web` state · **a pure `SpawnPlan`, because autumn-web gives no way to set the role of a test state** |
 
 ## 4. Reverse brainstorming
 
@@ -46,10 +47,11 @@ The chosen option is in bold.
 | An embedder writes `worker_enabled: true`. The meaning changes with no notice. | The type changes to `Option<bool>`, so that code fails to compile. |
 | A standalone runner loses its worker. | No role means the old default, `true`. A test proves it. |
 | An explicit `false` on a `combined` replica goes quiet. | The contradiction `warn!` names the switch, its value and the role. |
+| The warning tells an old API replica to unset its switch. That turns the worker back on. | The warning also names the `AUTUMN_ROLE` fix. |
 | The log does not say why a switch is off. | One `info!` names each value and its source. |
 | A `web` SQLite app stops booting. | SQLite ignores the role default and warns. An explicit `false` is still refused. |
 | The env variable stops working. | `AUTUMN_HARVEST__WORKER_ENABLED` still sets the explicit value. A test proves it. |
-| The resolve table drifts from its contract. | Verus proves the table. The mirror guard keeps the copy equal to the source. |
+| The resolve table drifts from its contract. | Verus proves the table and `resolve_switch`, which joins the kernels. The mirror guard keeps each copy equal to its source. |
 
 ## 5. Six thinking hats
 

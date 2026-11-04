@@ -17,6 +17,7 @@ use autumn_web::config::ProcessRole;
 
 /// Where a resolved switch value comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SwitchSource {
     /// The operator set the value in config or in the environment.
     Explicit,
@@ -54,10 +55,11 @@ impl ProcessSwitch {
             (None, Some(role)) => SwitchSource::Role(role),
             (None, None) => SwitchSource::Default,
         };
+        let (enabled, contradicts_role) = resolve_switch(explicit, role);
         Self {
-            enabled: switch_value(explicit, role_default(role)),
+            enabled,
             source,
-            contradicts_role: contradicts_role(explicit, role),
+            contradicts_role,
         }
     }
 }
@@ -109,10 +111,11 @@ impl ProcessSwitches {
             if switch.contradicts_role {
                 tracing::warn!(
                     "harvest.{name} = {} contradicts the Autumn process role `{role}`, whose \
-                     default is {}. The explicit value wins. Unset harvest.{name} to follow \
-                     the role",
+                     default is {}. The explicit value wins. To remove this warning, set \
+                     AUTUMN_ROLE to the role that gives {}, or unset harvest.{name}",
                     switch.enabled,
                     role_default(self.role),
+                    switch.enabled,
                 );
             }
         }
@@ -123,7 +126,7 @@ impl ProcessSwitches {
 ///
 /// `formal/verus/src/process_role.rs` proves the function for every input.
 #[must_use]
-pub const fn role_default(role: Option<ProcessRole>) -> bool {
+pub(crate) const fn role_default(role: Option<ProcessRole>) -> bool {
     match role {
         Some(ProcessRole::Web) => false,
         Some(ProcessRole::Combined | ProcessRole::Worker) | None => true,
@@ -134,7 +137,7 @@ pub const fn role_default(role: Option<ProcessRole>) -> bool {
 ///
 /// `formal/verus/src/process_role.rs` proves the function for every input.
 #[must_use]
-pub const fn switch_value(explicit: Option<bool>, default: bool) -> bool {
+pub(crate) const fn switch_value(explicit: Option<bool>, default: bool) -> bool {
     match explicit {
         Some(value) => value,
         None => default,
@@ -145,17 +148,56 @@ pub const fn switch_value(explicit: Option<bool>, default: bool) -> bool {
 ///
 /// `formal/verus/src/process_role.rs` proves the function for every input.
 #[must_use]
-pub const fn contradicts_role(explicit: Option<bool>, role: Option<ProcessRole>) -> bool {
+pub(crate) const fn contradicts_role(explicit: Option<bool>, role: Option<ProcessRole>) -> bool {
     match (explicit, role) {
         (Some(value), Some(named)) => value != role_default(Some(named)),
         _ => false,
     }
 }
 
+/// The resolved value of one switch, and whether it contradicts the role.
+///
+/// `formal/verus/src/process_role.rs` proves the function for every input.
+const fn resolve_switch(explicit: Option<bool>, role: Option<ProcessRole>) -> (bool, bool) {
+    let enabled = switch_value(explicit, role_default(role));
+    (enabled, contradicts_role(explicit, role))
+}
+
+/// Run `f` and return its log output at `level` and above.
 #[cfg(test)]
-mod tests {
+pub(crate) fn capture_logs(level: tracing::Level, f: impl FnOnce()) -> String {
     use std::sync::{Arc, Mutex};
 
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+    let buf = Buf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_max_level(level)
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let bytes = buf.0.lock().unwrap().clone();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
     use autumn_web::config::ProcessRole;
 
     use super::{ProcessSwitches, SwitchSource};
@@ -165,39 +207,18 @@ mod tests {
 
     const ROLES: [ProcessRole; 3] = [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker];
 
-    /// Run `f` and return its log output at `level` and above.
-    fn capture(level: tracing::Level, f: impl FnOnce()) -> String {
-        #[derive(Clone, Default)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
-            type Writer = Self;
-            fn make_writer(&'a self) -> Self {
-                self.clone()
-            }
-        }
-        let buf = Buf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_max_level(level)
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let bytes = buf.0.lock().unwrap().clone();
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
-
+    /// The warning lines of one `log` call.
+    ///
+    /// The INFO line must also be there. So an empty result means "no
+    /// warning", never "the capture failed".
     fn warnings(switches: ProcessSwitches) -> Vec<String> {
-        capture(tracing::Level::WARN, || switches.log())
-            .lines()
+        let out = super::capture_logs(tracing::Level::INFO, || switches.log());
+        assert!(
+            out.contains(" INFO "),
+            "the capture lost the INFO line: {out}"
+        );
+        out.lines()
+            .filter(|line| line.contains(" WARN "))
             .map(str::to_owned)
             .collect()
     }
@@ -247,6 +268,7 @@ mod tests {
             assert_eq!(switches.worker.enabled, value);
             assert_eq!(switches.scheduler.enabled, value);
             assert_eq!(switches.worker.source, SwitchSource::Explicit);
+            assert_eq!(switches.scheduler.source, SwitchSource::Explicit);
             assert_eq!(warnings(switches), NO_LINES, "{value}");
         }
     }
@@ -293,6 +315,7 @@ mod tests {
                         line.contains(&format!("default is {role_default}")),
                         "{line}"
                     );
+                    assert!(line.contains("set AUTUMN_ROLE"), "{line}");
                 }
             }
         }
@@ -319,11 +342,46 @@ mod tests {
         assert!(lines[0].contains("role `web`"), "{lines:?}");
     }
 
+    /// An explicit `false` on a `worker` replica warns for the worker only.
+    #[test]
+    fn an_explicit_worker_off_on_a_worker_replica_warns_once() {
+        let switches = ProcessSwitches::resolve(Some(false), None, Some(ProcessRole::Worker));
+        assert!(!switches.worker.enabled);
+        assert!(switches.scheduler.enabled);
+        assert_eq!(
+            switches.scheduler.source,
+            SwitchSource::Role(ProcessRole::Worker)
+        );
+        let lines = warnings(switches);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("harvest.worker_enabled = false"),
+            "{lines:?}"
+        );
+    }
+
+    /// The old API-only replica sets `false` with no `AUTUMN_ROLE`, so its
+    /// role is `combined`. The warning must not tell it to unset the switch
+    /// only, because that turns the worker back on.
+    #[test]
+    fn the_legacy_api_only_warning_names_the_role_fix() {
+        let switches =
+            ProcessSwitches::resolve(Some(false), Some(false), Some(ProcessRole::Combined));
+        let lines = warnings(switches);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for line in &lines {
+            assert!(
+                line.contains("set AUTUMN_ROLE to the role that gives false"),
+                "{line}"
+            );
+        }
+    }
+
     /// The startup line names each value and its source.
     #[test]
     fn the_startup_line_names_each_value_and_source() {
         let switches = ProcessSwitches::resolve(Some(true), None, Some(ProcessRole::Web));
-        let out = capture(tracing::Level::INFO, || switches.log());
+        let out = super::capture_logs(tracing::Level::INFO, || switches.log());
         let info = out
             .lines()
             .find(|line| line.contains(" INFO "))
@@ -338,11 +396,24 @@ mod tests {
             assert!(info.contains(field), "{field} missing: {info}");
         }
 
-        let standalone = capture(tracing::Level::INFO, || {
+        let standalone = super::capture_logs(tracing::Level::INFO, || {
             ProcessSwitches::resolve(None, None, None).log();
         });
         assert!(standalone.contains("role=none"), "{standalone}");
         assert!(standalone.contains("worker_source=default"), "{standalone}");
+        assert!(
+            standalone.contains("scheduler_source=default"),
+            "{standalone}"
+        );
+
+        for role in [ProcessRole::Worker, ProcessRole::Combined] {
+            let out = super::capture_logs(tracing::Level::INFO, || {
+                ProcessSwitches::resolve(None, Some(false), Some(role)).log();
+            });
+            assert!(out.contains(&format!("role={}", role.as_str())), "{out}");
+            assert!(out.contains("worker_source=role"), "{out}");
+            assert!(out.contains("scheduler_source=explicit"), "{out}");
+        }
     }
 
     #[test]
