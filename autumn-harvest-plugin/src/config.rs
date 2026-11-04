@@ -170,8 +170,11 @@ impl HarvestStartupConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarvestRuntimeConfig {
     pub mode: HarvestMode,
-    pub worker_enabled: bool,
-    pub scheduler_enabled: bool,
+    /// Run the local worker. `None` follows the process role (issue #2477).
+    /// See [`crate::process_role`].
+    pub worker_enabled: Option<bool>,
+    /// Run the local scheduler. `None` follows the process role (issue #2477).
+    pub scheduler_enabled: Option<bool>,
     pub database: HarvestDatabaseConfig,
     pub outbox: HarvestOutboxConfig,
     pub batch: HarvestBatchConfig,
@@ -209,15 +212,30 @@ impl HarvestRuntimeConfig {
         Ok(config)
     }
 
+    /// Resolve the worker and scheduler switches for `role` (issue #2477).
+    ///
+    /// `role` is the Autumn process role, or `None` with no `AppState`.
+    #[must_use]
+    pub const fn process_switches(
+        &self,
+        role: Option<autumn_web::config::ProcessRole>,
+    ) -> crate::process_role::ProcessSwitches {
+        crate::process_role::ProcessSwitches::resolve(
+            self.worker_enabled,
+            self.scheduler_enabled,
+            role,
+        )
+    }
+
     fn apply_partial(&mut self, partial: PartialHarvestRuntimeConfig) {
         if let Some(mode) = partial.mode {
             self.mode = mode;
         }
         if let Some(worker_enabled) = partial.worker_enabled {
-            self.worker_enabled = worker_enabled;
+            self.worker_enabled = Some(worker_enabled);
         }
         if let Some(scheduler_enabled) = partial.scheduler_enabled {
-            self.scheduler_enabled = scheduler_enabled;
+            self.scheduler_enabled = Some(scheduler_enabled);
         }
         if let Some(url) = partial.database.url {
             self.database.url = Some(url);
@@ -282,12 +300,17 @@ impl HarvestRuntimeConfig {
         }
 
         if let Ok(worker_enabled) = env.var("AUTUMN_HARVEST__WORKER_ENABLED") {
-            self.worker_enabled = parse_bool("AUTUMN_HARVEST__WORKER_ENABLED", &worker_enabled)?;
+            self.worker_enabled = Some(parse_bool(
+                "AUTUMN_HARVEST__WORKER_ENABLED",
+                &worker_enabled,
+            )?);
         }
 
         if let Ok(scheduler_enabled) = env.var("AUTUMN_HARVEST__SCHEDULER_ENABLED") {
-            self.scheduler_enabled =
-                parse_bool("AUTUMN_HARVEST__SCHEDULER_ENABLED", &scheduler_enabled)?;
+            self.scheduler_enabled = Some(parse_bool(
+                "AUTUMN_HARVEST__SCHEDULER_ENABLED",
+                &scheduler_enabled,
+            )?);
         }
 
         if let Ok(url) = env.var("AUTUMN_HARVEST_DATABASE__URL") {
@@ -578,8 +601,8 @@ impl Default for HarvestRuntimeConfig {
     fn default() -> Self {
         Self {
             mode: HarvestMode::Embedded,
-            worker_enabled: true,
-            scheduler_enabled: true,
+            worker_enabled: None,
+            scheduler_enabled: None,
             database: HarvestDatabaseConfig::default(),
             outbox: HarvestOutboxConfig::default(),
             batch: HarvestBatchConfig::default(),
@@ -1101,9 +1124,40 @@ mod tests {
         let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
 
         assert_eq!(config.mode, HarvestMode::Embedded);
-        assert!(config.worker_enabled);
-        assert!(config.scheduler_enabled);
+        // Unset means "follow the process role" (issue #2477).
+        assert_eq!(config.worker_enabled, None);
+        assert_eq!(config.scheduler_enabled, None);
         assert_eq!(config.database.url, None);
+    }
+
+    /// `AUTUMN_HARVEST__WORKER_ENABLED` stays the explicit override (issue
+    /// #2477). Each env value and each TOML value is kept as explicit.
+    #[test]
+    fn an_env_or_toml_switch_is_kept_as_an_explicit_value() {
+        for value in [true, false] {
+            let env = MockEnv::new()
+                .with("AUTUMN_HARVEST__WORKER_ENABLED", &value.to_string())
+                .with("AUTUMN_HARVEST__SCHEDULER_ENABLED", &value.to_string());
+            let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+            assert_eq!(config.worker_enabled, Some(value));
+            assert_eq!(config.scheduler_enabled, Some(value));
+        }
+
+        let dir = unique_temp_dir("harvest-config-switch-true");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest]\nworker_enabled = true\n",
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.worker_enabled, Some(true));
+        assert_eq!(config.scheduler_enabled, None);
+
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST__WORKER_ENABLED", "false");
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.worker_enabled, Some(false), "the env beats the file");
     }
 
     /// The `prod` profile turns on `strict_config` (since autumn-web 0.9).
@@ -1206,8 +1260,8 @@ url = "postgres://harvest:harvest@localhost:5432/harvest"
             HarvestRuntimeConfig::load_with_env(&env).expect("external config should load");
 
         assert_eq!(config.mode, HarvestMode::External);
-        assert!(!config.worker_enabled);
-        assert!(!config.scheduler_enabled);
+        assert_eq!(config.worker_enabled, Some(false));
+        assert_eq!(config.scheduler_enabled, Some(false));
         assert_eq!(
             config.database.url.as_deref(),
             Some("postgres://harvest:harvest@localhost:5432/harvest")
@@ -1239,8 +1293,8 @@ mode = "embedded"
             HarvestRuntimeConfig::load_with_env(&env).expect("env override config should load");
 
         assert_eq!(config.mode, HarvestMode::External);
-        assert!(!config.worker_enabled);
-        assert!(!config.scheduler_enabled);
+        assert_eq!(config.worker_enabled, Some(false));
+        assert_eq!(config.scheduler_enabled, Some(false));
         assert_eq!(
             config.database.url.as_deref(),
             Some("postgres://harvest:harvest@localhost:5432/env_override")

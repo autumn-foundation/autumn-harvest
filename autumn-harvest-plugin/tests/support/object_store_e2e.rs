@@ -112,8 +112,8 @@ pub async fn retention_archive_reads_back_through_api_and_vantage<B: ObjectBacke
         builder.build(),
         &HarvestRuntimeConfig {
             mode: HarvestMode::External,
-            worker_enabled: false,
-            scheduler_enabled: false,
+            worker_enabled: Some(false),
+            scheduler_enabled: Some(false),
             database: autumn_harvest_plugin::HarvestDatabaseConfig {
                 url: Some(url.clone()),
             },

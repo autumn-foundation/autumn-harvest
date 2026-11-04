@@ -72,6 +72,8 @@ mod overrides_api;
 pub mod plugin;
 pub mod preflight;
 pub mod prelude;
+/// Worker and scheduler switches from the Autumn process role (issue #2477).
+pub mod process_role;
 /// Fleet-wide task-queue coverage read model (issue #774).
 pub mod queue_coverage;
 pub mod replay_diagnosis;

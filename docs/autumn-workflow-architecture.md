@@ -1419,8 +1419,8 @@ Harvest configuration lives under the `[harvest]` section of `autumn.toml`, dese
 ```toml
 [harvest]
 mode = "embedded"            # "embedded" | "split" | "external" — default: embedded
-worker_enabled = true        # default: true
-scheduler_enabled = true     # default: true
+worker_enabled = true        # default: unset, which follows AUTUMN_ROLE (issue #2477)
+scheduler_enabled = true     # default: unset, which follows AUTUMN_ROLE (issue #2477)
 
 [harvest.database]
 url = "postgres://..."       # required when mode is "split" or "external"; unused for "embedded"
@@ -1451,6 +1451,8 @@ visibility_timeout_ms = 60000     # default: 60000 — how long a delivered refe
 poll_interval_ms = 20             # default: 20 — blocking read wait when the channel is idle
 reconcile_interval_ms = 1000      # default: 1000 — interval of the reconcile sweep over due PENDING rows
 ```
+
+An unset `worker_enabled` or `scheduler_enabled` follows the Autumn process role. A `web` role turns both off. A `worker` or `combined` role, or no role, turns both on. An explicit value wins and logs a warning when it contradicts the role. See [`docs/operations/process-roles.md`](operations/process-roles.md).
 
 Setting `harvest.redis.url` needs the `redis` cargo feature of `autumn-harvest-plugin`. A build without that feature carries no channel implementation, so it rejects the URL at load rather than ignoring it. Validation also rejects an empty `key_prefix` or `consumer_group`, a `poll_interval_ms` outside 1 to 5000, and a `visibility_timeout_ms` below 1000. See [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md).
 

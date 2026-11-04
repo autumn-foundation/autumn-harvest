@@ -4092,8 +4092,8 @@ mod tests {
             built,
             &HarvestRuntimeConfig {
                 mode: HarvestMode::External,
-                worker_enabled: false,
-                scheduler_enabled: false,
+                worker_enabled: Some(false),
+                scheduler_enabled: Some(false),
                 database: HarvestDatabaseConfig {
                     url: Some("postgres://harvest:harvest@localhost:5432/harvest".to_string()),
                 },
@@ -4219,8 +4219,8 @@ mod tests {
         let state = AppState::for_test().with_pool(app_pool);
         let config = HarvestRuntimeConfig {
             mode: HarvestMode::External,
-            worker_enabled: false,
-            scheduler_enabled: false,
+            worker_enabled: Some(false),
+            scheduler_enabled: Some(false),
             database: HarvestDatabaseConfig {
                 url: Some("postgres://harvest:harvest@localhost:5432/harvest".to_owned()),
             },

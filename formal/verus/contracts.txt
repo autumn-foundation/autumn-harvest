@@ -319,6 +319,20 @@ pub proof fn theorem_a_batch_fences_only_its_locked_rows(epochs: Seq < int >, lo
 pub open spec fn skip_locked(wanted: Set < int >, takeable: Set < int >, busy: Set < int >) -> Set < int > { wanted.intersect(takeable).difference(busy) }
 pub proof fn theorem_a_batch_keeps_each_epoch_under_a_commit(epochs: Seq < int >, wanted: Set < int >, takeable: Set < int >, busy: Set < int >, p: int, pinned: int, holder_matches: bool,) requires 0 <= p < epochs.len(), ensures busy.contains(p) ==> batch(epochs, skip_locked(wanted, takeable, busy)) [p] == epochs [p], busy.contains(p) && holder_matches && pinned == epochs [p] ==> (holder_matches && pinned == batch(epochs, skip_locked(wanted, takeable, busy)) [p]), batch(epochs, skip_locked(wanted, takeable, busy)) [p] != epochs [p] ==> (wanted.contains(p) && takeable.contains(p) &&! busy.contains(p)),
 
+## formal/verus/src/process_role.rs
+pub enum ProcessRole { Combined, Web, Worker, }
+pub open spec fn spec_role_default(role: Option < ProcessRole >) -> bool { match role { Some(ProcessRole::Web) => false, _ => true, } }
+pub open spec fn spec_switch_value(explicit: Option < bool >, default: bool) -> bool { match explicit { Some(value) => value, None => default, } }
+pub open spec fn spec_contradicts(explicit: Option < bool >, role: Option < ProcessRole >) -> bool { match explicit { Some(value) => role.is_some() && value != spec_role_default(role), None => false, } }
+pub fn role_default(role: Option < ProcessRole >) -> (r: bool) ensures r == spec_role_default(role),
+pub fn switch_value(explicit: Option < bool >, default: bool) -> (r: bool) ensures r == spec_switch_value(explicit, default),
+pub fn contradicts_role(explicit: Option < bool >, role: Option < ProcessRole >) -> (r: bool) ensures r == spec_contradicts(explicit, role),
+pub proof fn theorem_a_web_role_runs_nothing_by_default() ensures ! spec_switch_value(None, spec_role_default(Some(ProcessRole::Web))),
+pub proof fn theorem_a_worker_or_combined_role_runs_both_by_default(role: ProcessRole) requires role != ProcessRole::Web, ensures spec_switch_value(None, spec_role_default(Some(role))),
+pub proof fn theorem_no_role_keeps_the_old_default() ensures spec_switch_value(None, spec_role_default(None)),
+pub proof fn theorem_an_explicit_value_wins(value: bool, role: Option < ProcessRole >) ensures spec_switch_value(Some(value), spec_role_default(role)) == value,
+pub proof fn theorem_a_warning_marks_each_override(explicit: Option < bool >, role: Option < ProcessRole >,) ensures role.is_some() ==> (spec_contradicts(explicit, role) <==> spec_switch_value(explicit, spec_role_default(role),) != spec_role_default(role)), role.is_none() ==>! spec_contradicts(explicit, role), explicit.is_none() ==>! spec_contradicts(explicit, role),
+
 ## formal/verus/src/refine_policy.rs
 pub enum AdoptDecision { Adopt, Unchanged, NeedsApproval, CapReached, }
 pub open spec fn spec_parts_allowed(changed: u8, allowed: u8) -> bool { changed &! allowed == 0 }

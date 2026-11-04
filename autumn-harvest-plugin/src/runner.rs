@@ -80,6 +80,14 @@ impl HarvestRunnerResources {
         self
     }
 
+    /// The Autumn process role of the injected app state (issue #2477).
+    ///
+    /// `None` when no app state is set, as in a standalone runner.
+    #[must_use]
+    pub fn process_role(&self) -> Option<autumn_web::config::ProcessRole> {
+        self.app_state.as_ref().map(AppState::role)
+    }
+
     /// Inject the application/business database role for workflow code that
     /// touches app tables directly.
     #[must_use]
@@ -1113,8 +1121,15 @@ impl HarvestRunner {
             run_startup_orphan_gate(config.startup.orphaned_workflows, &built, &resources).await?;
         }
 
+        // Issue #2477: an unset switch follows the role of the app state. A
+        // runner with no app state has no role and keeps both switches on.
+        let switches = config.process_switches(resources.process_role());
+        switches.log();
+        let worker_enabled = switches.worker.enabled;
+        let scheduler_enabled = switches.scheduler.enabled;
+
         let completion_triggers = built.completion_triggers().to_vec();
-        let mut prepared = PreparedHarvestRuntime::build(built, resources, config.worker_enabled)?;
+        let mut prepared = PreparedHarvestRuntime::build(built, resources, worker_enabled)?;
         let registry = Arc::clone(&prepared.registry);
         let dag_catalog = Arc::clone(&prepared.dag_catalog);
         let workflow_schedules = Arc::clone(&prepared.workflow_schedules);
@@ -1128,7 +1143,7 @@ impl HarvestRunner {
             autumn_harvest::notify::register_pool(shard_pool);
         }
 
-        if !config.worker_enabled && !config.scheduler_enabled {
+        if !worker_enabled && !scheduler_enabled {
             tracing::info!(
                 mode = ?config.mode,
                 "harvest runtime started without local worker or scheduler ownership"
@@ -1266,7 +1281,7 @@ impl HarvestRunner {
             )
         };
 
-        let worker = if config.worker_enabled {
+        let worker = if worker_enabled {
             // Pass the exact generations this call's own install stamped,
             // when it went through the multi-shard per-shard-channel path
             // (Codex review, issue #1429 follow-up). A second, overlapping
@@ -1365,7 +1380,7 @@ impl HarvestRunner {
                 worker.run(&pool).await;
             })
         });
-        let scheduler = if config.scheduler_enabled {
+        let scheduler = if scheduler_enabled {
             Some(SchedulerRuntime::spawn_sharded(
                 prepared.storage_pool.sharded_pool().clone(),
                 shard_router.clone(),
@@ -1405,7 +1420,7 @@ impl HarvestRunner {
         // rows to completion in the background. Only the worker-owning
         // process spawns it so we don't run multiple competing executors
         // against the same job rows.
-        let batch = if config.worker_enabled {
+        let batch = if worker_enabled {
             Some(BatchRuntime::spawn(
                 prepared.storage_pool.sharded_pool().clone(),
                 BatchExecutorConfig {
@@ -1421,7 +1436,7 @@ impl HarvestRunner {
         // Issue #1244: a worker-enabled process already refreshes its
         // active codec key through its own timeout-checker loop. Only a
         // process with no local worker needs this independent one.
-        let codec_refresh = if config.worker_enabled {
+        let codec_refresh = if worker_enabled {
             None
         } else {
             Some(CodecRefreshRuntime::spawn(
@@ -2999,6 +3014,23 @@ mod tests {
         assert!(
             registered.contains("unified_dag"),
             "a registered unified DAG's name must count as registered",
+        );
+    }
+
+    /// Issue #2477: the runner reads the role from its app state. With no
+    /// app state it has no role, so both switches keep their old default.
+    #[test]
+    fn the_resources_give_the_role_of_their_app_state() {
+        let bare = HarvestRunnerResources::new(tagged_pool(1));
+        assert_eq!(bare.process_role(), None);
+        let switches =
+            crate::config::HarvestRuntimeConfig::default().process_switches(bare.process_role());
+        assert!(switches.worker.enabled && switches.scheduler.enabled);
+
+        let with_state = bare.with_app_state(autumn_web::AppState::for_test());
+        assert_eq!(
+            with_state.process_role(),
+            Some(autumn_web::config::ProcessRole::Combined)
         );
     }
 
