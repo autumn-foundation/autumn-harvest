@@ -334,6 +334,28 @@ pub(crate) fn tool_records(messages: &[ChatMessage]) -> Vec<ToolRecord> {
         .collect()
 }
 
+/// The judge calls that one score may make (issue #2442).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeLimit {
+    /// No judge call.
+    NoCall,
+    /// Calls to this harness model only.
+    Model(String),
+}
+
+impl JudgeLimit {
+    /// Whether a judge call to `model` may run. `None` is the default
+    /// model.
+    #[must_use]
+    pub fn allows(&self, model: Option<&str>) -> bool {
+        match self {
+            Self::NoCall => false,
+            Self::Model(allowed) => model == Some(allowed.as_str()),
+        }
+    }
+}
+
 /// The input of the `agent_score` activity: a scorer id and what it reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -342,6 +364,10 @@ pub struct ScoreRequest {
     pub scorer: String,
     /// What the scorer reads.
     pub input: ScoreInput,
+    /// The judge calls that the score may make. `None` allows a call to
+    /// each harness model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge: Option<JudgeLimit>,
 }
 
 impl ScoreRequest {
@@ -351,7 +377,15 @@ impl ScoreRequest {
         Self {
             scorer: scorer.into(),
             input,
+            judge: None,
         }
+    }
+
+    /// Let the score make only the judge calls that `limit` allows.
+    #[must_use]
+    pub fn judge(mut self, limit: JudgeLimit) -> Self {
+        self.judge = Some(limit);
+        self
     }
 }
 
@@ -366,6 +400,10 @@ pub struct ScoreContext<'a> {
     check: BudgetCheck<'a>,
     calls: Mutex<Vec<LlmCall>>,
     refusal: Mutex<Option<String>>,
+    /// The judge calls that the request allows. `None` allows each model.
+    limit: Option<JudgeLimit>,
+    /// A judge call that the limit refused.
+    limited: Mutex<Option<String>>,
     /// The judge calls that hold a ledger slot: done, or still in flight.
     slots: AtomicUsize,
 }
@@ -414,8 +452,16 @@ impl<'a> ScoreContext<'a> {
             check,
             calls: Mutex::new(Vec::new()),
             refusal: Mutex::new(None),
+            limit: None,
+            limited: Mutex::new(None),
             slots: AtomicUsize::new(0),
         }
+    }
+
+    /// Allow only the judge calls of `limit` (issue #2442).
+    pub(crate) fn limited(mut self, limit: Option<JudgeLimit>) -> Self {
+        self.limit = limit;
+        self
     }
 
     /// Send one judge request to a harness model.
@@ -444,6 +490,19 @@ impl<'a> ScoreContext<'a> {
                 ErrorKind::Budget,
                 "the LLM budget refused an earlier judge call",
             ));
+        }
+        if let Some(limit) = &self.limit
+            && !limit.allows(model)
+        {
+            let message = match limit {
+                JudgeLimit::NoCall => "the answer check allows no judge call".to_owned(),
+                JudgeLimit::Model(allowed) => format!(
+                    "the answer check allows judge calls to {:?} only",
+                    cut_bytes(allowed.clone(), crate::mesh::MAX_ITEM_LEN)
+                ),
+            };
+            *self.limited.lock().unwrap_or_else(PoisonError::into_inner) = Some(message.clone());
+            return Err(AgentError::new(ErrorKind::Config, message));
         }
         let client = self.harness.model(model).map_err(|_| {
             AgentError::new(
@@ -508,6 +567,14 @@ impl<'a> ScoreContext<'a> {
         }
     }
 
+    /// The message of a judge call that the limit refused, if any.
+    fn limited_call(&self) -> Option<String> {
+        self.limited
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// The refusal payload of a judge call, if the budget refused one.
     fn refused(&self) -> Option<String> {
         self.refusal
@@ -568,7 +635,7 @@ pub(crate) async fn run_score<'a>(
         );
         return (Err(failure.into_error_payload()), Vec::new());
     };
-    let cx = ScoreContext::checked(harness, check);
+    let cx = ScoreContext::checked(harness, check).limited(request.judge.clone());
     let budget = harness.score_budget();
     let outcome = tokio::time::timeout(budget, scorer.score(&request.input, &cx))
         .await
@@ -579,6 +646,12 @@ pub(crate) async fn run_score<'a>(
             ))
         });
     let calls = cx.ledger_calls();
+    // A judge call outside the limit fails the score, also when the scorer
+    // handled the error. No call ran, so nothing was paid.
+    if let Some(message) = cx.limited_call() {
+        let failure = ActivityFailure::non_retryable("JudgeNotAllowed", message);
+        return (Err(failure.into_error_payload()), calls);
+    }
     // A refusal wins, also when the scorer handled the error.
     if let Some(refusal) = cx.refused() {
         return (

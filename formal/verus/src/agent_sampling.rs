@@ -16,8 +16,11 @@
 //!   each draw once. So no more than `concurrency` draws run at one time.
 //! - A revision moves up by one and never wraps.
 //! - An answer check never has more retries than the policy cap or
-//!   `MAX_ANSWER_RETRIES`. With every answer rejected, a run with the cap
-//!   `c` asks for exactly `c + 1` answers.
+//!   `MAX_ANSWER_RETRIES`.
+//! - In `spec_answers`, a spec model of the loop, a run with the cap `c`
+//!   asks for exactly `c + 1` answers when each answer is rejected. The
+//!   proptest `the_answers_of_a_run_never_pass_the_cap` links the model to
+//!   the engine kernels.
 
 use vstd::prelude::*;
 

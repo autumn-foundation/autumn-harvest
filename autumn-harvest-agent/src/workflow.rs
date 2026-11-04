@@ -132,7 +132,7 @@ pub(crate) struct Progress {
     /// never drops a message from a person.
     pub(crate) steers: Vec<ChatMessage>,
     /// The admitted answer check of the run (issue #2442).
-    pub(crate) check: Option<answer_check::Admitted>,
+    pub(crate) check: Option<answer_check::ActiveCheck>,
     /// The reason of each answer that the check rejected, follow-ups
     /// included.
     pub(crate) rejections: Vec<String>,
@@ -893,18 +893,31 @@ async fn answer_turn(
     if save_reply(progress, turn, over_budget) {
         return Ok(None);
     }
+    let narration = progress.last_text.clone();
     progress.push_assistant(turn);
     let answer = turn.text();
-    let mut stop = answer_stop(turn, over_budget);
-    if stop == AgentStop::Completed {
-        stop = match answer_check::check(ctx, task, progress, &answer).await? {
-            Checked::Passed => stop,
-            Checked::Retry => return Ok(None),
-            Checked::Stop(stop) => stop,
-        };
+    let stop = answer_stop(turn, over_budget);
+    if stop != AgentStop::Completed {
+        progress.answer = Some(answer);
+        return Ok(Some(stop));
     }
-    progress.answer = Some(answer);
-    Ok(Some(stop))
+    match answer_check::check(ctx, task, progress, &answer).await? {
+        Checked::Passed => {
+            progress.answer = Some(answer);
+            Ok(Some(stop))
+        }
+        // The report keeps the last answer. No answer is delivered.
+        Checked::Stop(AgentStop::AnswerRejected) => Ok(Some(AgentStop::AnswerRejected)),
+        // A rejected or unchecked answer is not the text of the report.
+        Checked::Retry => {
+            progress.last_text = narration;
+            Ok(None)
+        }
+        Checked::Stop(stop) => {
+            progress.last_text = narration;
+            Ok(Some(stop))
+        }
+    }
 }
 
 /// How a segment ends on `turn`, a turn with no calls.
@@ -2988,6 +3001,7 @@ pub fn activities() -> Vec<ActivityInfo> {
         crate::sampling::agent_sampling_policy_info(),
         crate::refine::agent_refine_policy_info(),
         crate::score::agent_score_info(),
+        crate::answer_check::agent_answer_check_info(),
         crate::consolidate::agent_consolidate_read_info(),
         crate::consolidate::agent_consolidate_turn_info(),
         crate::consolidate::agent_consolidate_write_info(),

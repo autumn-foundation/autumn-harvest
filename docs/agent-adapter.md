@@ -2058,52 +2058,97 @@ let task = AgentTask::new("Give the order as JSON.")
 
 The check names three things:
 
-- `kind`: the agent kind whose `SamplingPolicy` (section 19) caps the check.
+- `kind`: an agent kind with a registered `AgentProfile`. Its
+  `SamplingPolicy` (section 19) caps the check.
 - `scorer`: a `ScorerRef` (section 17). A judge names its model.
 - `retries`: the rejected answers after which the model may answer again.
   0 by default.
 
-The run does this:
+### Admission
 
-1. Before the first model call, it reads the policy of the kind once, in
-   the recorded activity `agent_sampling_policy`. `retries` must be at most
-   `max_answer_retries`. The scorer and a judge model must pass the policy.
-   Otherwise the run fails with `sampling refused (<code>)`, and no model
-   call runs. The codes are `too_many_answer_retries`,
-   `scorer_not_allowed` and `judge_model_not_allowed`. With
-   `report_failure`, the run ends as `failed`.
-2. Each answer that ends a segment as `completed` goes to the recorded
-   activity `agent_score`. The score input holds the task input, the answer
-   and the tool results of the run.
+Before the first model call, the recorded activity `agent_answer_check`
+admits the check. The checks go in this order:
+
+1. The kind is a valid name (`invalid_kind`).
+2. The kind has a profile (`unknown_kind`).
+3. A profile with a tenant belongs to the tenant of the run
+   (`other_tenant`). The tenant that the engine verified wins over
+   `AgentTask::tenant`. SQLite keeps no run tenant, so there the task
+   tenant applies.
+4. `retries` is at most `max_answer_retries` (`too_many_answer_retries`).
+5. The policy allows the scorer and its judge model
+   (`scorer_not_allowed`, `judge_model_not_allowed`).
+6. The harness has the scorer (`unknown_scorer`).
+
+A refused check fails the run with `sampling refused (<code>)`. No model
+call runs. With `report_failure`, the run ends as `failed`. Replay reads
+the recorded admission, so a policy change during a run does not reach it.
+
+A task can name each kind of its own tenant. The kind sets the cap, the
+scorers and the judge models, not the profile of the run.
+
+### The loop
+
+1. The loop scores each answer that ends a segment as `completed`, in the
+   recorded activity `agent_score`. It does not score an answer that ends
+   as `tokens_exhausted` or `output_capped`.
+2. The score input holds `AgentTask::input`, the answer and the tool
+   results of the run. In a follow-up segment, the input is still the task
+   input.
 3. A score ends the segment as `completed`.
 4. A reject adds its reason to `AgentReport.answer_rejections`. While the
    rejections are at most `retries`, the loop adds a user message with the
-   reason and asks the model again in the same run.
+   reason. Then it asks the model again in the same run.
 5. After `retries + 1` rejected answers, the run ends as `answer_rejected`.
-   `AgentReport.text` holds the last answer.
 
-A retry is one more model call of the same run. It counts against
-`max_total_tokens` and the LLM budgets, so a retry past a bound ends the
-run under that bound. An answer that ends as `tokens_exhausted` or
-`output_capped` is not scored. A judge call that the LLM budget refuses
-ends the run as `budget_exceeded`.
+The cap counts each rejection of the run, follow-ups included. A context
+reset keeps the retry messages of the segment. A delegated child has no check. Each
+draw of `run_draws` with a check admits and checks its own answers.
 
-The model turn and the verdict are recorded activities. A crash in a retry
-replays from history, and no completed model call or score runs again. A
-policy change during a run does not reach it.
+### Bounds and cost
+
+A retry is one more model call of the same run. A retry is not a tool
+round, so `max_steps` does not count it. `max_total_tokens` and the LLM
+budgets count it. A retry past a bound ends the run under that bound.
+
+A judge call goes to the cost ledger and the LLM budget (section 17).
+`max_total_tokens` and `AgentReport.usage` do not count judge tokens. A
+judge call that the LLM budget refuses ends the run as `budget_exceeded`.
+
+The admitted judge model is in each score request. `ScoreContext::chat`
+refuses a call to any other model. With no judge model, it refuses each
+call. The score then fails as `JudgeNotAllowed`, also when the scorer
+handles the error.
+
+### What the report and the delivery hold
+
+- Under `answer_rejected`, `AgentReport.text` holds the last rejected
+  answer. The delivery sends only the notice "The agent stopped early:
+  answer_rejected.".
+- A bound that ends the run after a retry does not report the rejected
+  answer as the text.
+- The transcript keeps each rejected answer and each retry message.
+
+### Safety and size
+
+The retry message puts the reason between `<reason>` tags. The loop
+replaces each `<` and `>` of the reason, so the reason cannot close the
+tag. A reason from a judge can still quote the answer. Keep a reason short
+and plain.
 
 A score request over the request cap drops its tool results. A request
-that is still too large ends the run as `transcript_full`. The retry
-message puts the reason between `<reason>` tags and calls it data. A
-reason from a judge can still hold text from the answer, so keep a judge
-reason short and plain.
+that is still too large ends the run as `transcript_full`.
 
-The cap counts each rejection of the run, follow-ups included. A
-delegated child has no check. `AgentTask.answer_check` is not written when
-it is `None`. A task recorded before the field decodes with no check, and
-its run replays unchanged. `AnswerCheck` denies unknown keys. So upgrade
-every worker before a task sets the field.
+### Compatibility
 
-`formal/verus/src/agent_sampling.rs` proves the cap. With every answer
-rejected, a run with `retries = c` asks for exactly `c + 1` answers. The
-design is in [`DESIGN-2442.md`](design/DESIGN-2442.md).
+`AgentTask` does not write `answer_check` when it is `None`. A task from
+before the field decodes with no check. Its run records no new event, so
+it replays unchanged. A worker from before this release ignores the field
+and runs with no check. Upgrade every worker before a task sets it. A
+decoder from before this release cannot read the stop `answer_rejected`.
+
+`formal/verus/src/agent_sampling.rs` proves the integer kernels and a spec
+model of the loop. With every answer rejected, a run with `retries = c`
+asks for exactly `c + 1` answers. The proptest
+`the_answers_of_a_run_never_pass_the_cap` links the model to the engine
+kernels. The design is in [`DESIGN-2442.md`](design/DESIGN-2442.md).

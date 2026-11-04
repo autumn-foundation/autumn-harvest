@@ -282,6 +282,7 @@ fn the_engine_registration_builds() {
             "agent_sampling_policy",
             "agent_refine_policy",
             "agent_score",
+            "agent_answer_check",
             "agent_consolidate_read",
             "agent_consolidate_turn",
             "agent_consolidate_write",

@@ -149,7 +149,9 @@ pub use agent::{
     agent_workspace_floor_info, agent_workspace_reset, agent_workspace_reset_info,
     agent_workspace_retain, agent_workspace_retain_info,
 };
-pub use answer_check::AnswerCheck;
+pub use answer_check::{
+    AnswerCheck, CheckAdmission, CheckRequest, agent_answer_check, agent_answer_check_info,
+};
 pub use approval::Approval;
 pub use consolidate::{
     CONSOLIDATE_WORKFLOW_NAME, ConsolidateTask, ConsolidationReport, ConsolidationStop,
@@ -197,8 +199,9 @@ pub use response_cache::{
     CacheIndex, CacheKey, CacheScope, InMemoryCacheIndex, KeyTenant, ResponseCache,
 };
 pub use score::{
-    ExactMatch, FiniteF64, JsonSchema, MAX_REJECT_REASON_BYTES, NonFinite, ScoreContext,
-    ScoreInput, ScoreRequest, Scorer, ToolRecord, Verdict, agent_score, agent_score_info, select,
+    ExactMatch, FiniteF64, JsonSchema, JudgeLimit, MAX_REJECT_REASON_BYTES, NonFinite,
+    ScoreContext, ScoreInput, ScoreRequest, Scorer, ToolRecord, Verdict, agent_score,
+    agent_score_info, select,
 };
 pub use skill::{LOAD_SKILL_TOOL, SkillText};
 pub use tool::{FnTool, Tool, ToolContext, ToolEffect};

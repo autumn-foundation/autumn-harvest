@@ -18,7 +18,8 @@ use crate::answer_check::AnswerCheck;
 use crate::tool::ToolEffect;
 use crate::types::MAX_PARALLEL_CHILDREN;
 
-/// Why a strategy run is refused before its first model call.
+/// Why a strategy run or an answer check is refused before its first model
+/// call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "refusal", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -62,6 +63,14 @@ pub enum Refusal {
         /// The cap of the policy.
         max: u32,
     },
+    /// The harness has no scorer with the id of the answer check (issue
+    /// #2442).
+    UnknownScorer {
+        /// The scorer id.
+        scorer: ScorerId,
+    },
+    /// The profile of the kind belongs to another tenant (issue #2442).
+    OtherTenant,
     /// The kind is not a valid agent kind.
     InvalidKind,
     /// No agent profile has the kind, so no task can be built.
@@ -83,6 +92,8 @@ impl Refusal {
             Self::ScorerNotAllowed { .. } => "scorer_not_allowed",
             Self::JudgeModelNotAllowed { .. } => "judge_model_not_allowed",
             Self::TooManyAnswerRetries { .. } => "too_many_answer_retries",
+            Self::UnknownScorer { .. } => "unknown_scorer",
+            Self::OtherTenant => "other_tenant",
             Self::InvalidKind => "invalid_kind",
             Self::UnknownKind => "unknown_kind",
         }
@@ -125,6 +136,8 @@ impl std::fmt::Display for Refusal {
                 f,
                 "the run asks for {asked} answer retries; the policy allows {max}"
             ),
+            Self::UnknownScorer { scorer } => write!(f, "the harness has no scorer {scorer}"),
+            Self::OtherTenant => f.write_str("the profile of the kind belongs to another tenant"),
             Self::InvalidKind => f.write_str("the kind is not a valid agent kind"),
             Self::UnknownKind => f.write_str("no agent profile has the kind"),
         }

@@ -12,8 +12,8 @@ mod common;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::IntoActivityErrorString as _;
@@ -22,13 +22,13 @@ use autumn_harvest::quota::QuotaResource;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer, WorkflowTestEnv};
 use autumn_harvest_agent::model::BoxFuture;
 use autumn_harvest_agent::sampling::{
-    InMemorySamplingPolicyStore, MAX_ANSWER_RETRIES, PolicyRead, SamplingPolicy,
-    SamplingPolicyStore, ScorerRef,
+    InMemorySamplingPolicyStore, MAX_ANSWER_RETRIES, SamplingPolicy, SamplingPolicyStore, ScorerRef,
 };
 use autumn_harvest_agent::{
-    AgentError, AgentHarness, AgentModel, AgentReport, AgentStop, AgentTask, AnswerCheck,
-    ChatRequest, ChatResponse, ContentPart, ModelTurn, ScoreContext, ScoreInput, Scorer,
-    StopReason, TokenUsage, Verdict, agent_loop_info, sqlite,
+    AgentError, AgentHarness, AgentModel, AgentProfile, AgentReport, AgentStop, AgentTask,
+    AnswerCheck, ChatMessage, ChatRequest, ChatResponse, ChatRole, ContentPart, Delivery,
+    ModelTurn, Report, ScoreContext, ScoreInput, Scorer, StopReason, TokenUsage, Verdict,
+    agent_loop_info, sqlite,
 };
 use autumn_harvest_sqlite::{ExecutionId, RunState, SqliteRuntime};
 use common::{Reply, ScriptedModel, answer, report, runtime};
@@ -118,9 +118,11 @@ fn task(retries: u32) -> AgentTask {
     AgentTask::new("Give the result as a JSON object.").answer_check(check(retries))
 }
 
-/// A harness with the scorer and a policy that allows `cap` retries.
+/// A harness with a profile of [`KIND`], the scorer, and a policy that
+/// allows `cap` retries.
 fn harness(model: Arc<dyn AgentModel>, scorer: &Arc<JsonObject>, cap: u32) -> AgentHarness {
     AgentHarness::new(model)
+        .agent(AgentProfile::new(KIND))
         .scorer(Arc::clone(scorer) as Arc<dyn Scorer>)
         .sampling_policies(store_with(cap))
 }
@@ -138,17 +140,19 @@ fn last_user(request: &ChatRequest) -> String {
         .iter()
         .rev()
         .find(|message| message.role == autumn_harvest_agent::ChatRole::User)
-        .map(|message| {
-            message
-                .content
-                .iter()
-                .filter_map(|part| match part {
-                    ContentPart::Text(text) => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect()
-        })
+        .map(text_of)
         .unwrap_or_default()
+}
+
+fn text_of(message: &ChatMessage) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Replay the history of `exec` and expect no nondeterminism.
@@ -205,6 +209,10 @@ async fn a_rejected_answer_is_retried_with_the_reason() {
         last_user(second)
     );
     // The rejected answer stays in the transcript, before the reason.
+    let messages = &second.messages;
+    let rejected = &messages[messages.len() - 2];
+    assert_eq!(rejected.role, ChatRole::Assistant);
+    assert_eq!(text_of(rejected), "not json");
     assert_eq!(report.usage.total(), 10, "the retry is in the usage");
     replays(rt.load_history(exec).unwrap(), exec).await;
 }
@@ -243,7 +251,9 @@ async fn with_no_retries_one_reject_ends_the_run() {
     let model = ScriptedModel::new(vec![answer("a", 1), answer("{}", 1)]);
     let scorer = Arc::new(JsonObject::default());
     // No store: every default, so the cap is 0.
-    let harness = AgentHarness::new(model.clone()).scorer(Arc::clone(&scorer) as Arc<dyn Scorer>);
+    let harness = AgentHarness::new(model.clone())
+        .agent(AgentProfile::new(KIND))
+        .scorer(Arc::clone(&scorer) as Arc<dyn Scorer>);
     let mut rt = runtime(&db, harness);
     let (_exec, state) = drive(&mut rt, &task(0)).await;
     let report = report(state);
@@ -384,7 +394,7 @@ async fn a_retry_past_the_token_limit_ends_as_tokens_exhausted() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_retry_at_the_token_limit_sends_no_call() {
+async fn an_answer_past_the_token_limit_is_not_scored() {
     let (_dir, db) = fresh_db();
     let model = ScriptedModel::new(vec![answer("a", 10), answer("{}", 1)]);
     let scorer = Arc::new(JsonObject::default());
@@ -421,21 +431,14 @@ fn budget_refusal() -> String {
     .into_error_payload()
 }
 
-fn policy_read(max_answer_retries: u32) -> Value {
-    serde_json::to_value(PolicyRead {
-        policy: SamplingPolicy {
-            max_answer_retries,
-            ..SamplingPolicy::default()
-        },
-        revision: 1,
-    })
-    .unwrap()
+fn admitted(cap: u32) -> Value {
+    json!({"admission": "admitted", "cap": cap, "revision": 1})
 }
 
 #[tokio::test]
 async fn a_retry_refused_by_the_llm_budget_ends_as_budget_exceeded() {
     let outcome = WorkflowTestEnv::new()
-        .mock_activity_retries("agent_sampling_policy", vec![Ok(policy_read(3))])
+        .mock_activity_retries("agent_answer_check", vec![Ok(admitted(3))])
         .mock_activity_retries("agent_model_turn", vec![Ok(turn("not json"))])
         .mock_activity_retries("agent_model_turn", vec![Err(budget_refusal())])
         .mock_activity_retries("agent_score", vec![Ok(json!({"reject": "not JSON"}))])
@@ -447,12 +450,16 @@ async fn a_retry_refused_by_the_llm_budget_ends_as_budget_exceeded() {
     let report: AgentReport = serde_json::from_value(outcome.result.unwrap()).unwrap();
     assert_eq!(report.stop, AgentStop::BudgetExceeded);
     assert_eq!(report.answer_rejections, ["not JSON"]);
+    assert_eq!(
+        report.text, "",
+        "a bound after a retry does not report the rejected answer"
+    );
 }
 
 #[tokio::test]
 async fn a_judge_refused_by_the_llm_budget_ends_as_budget_exceeded() {
     let outcome = WorkflowTestEnv::new()
-        .mock_activity_retries("agent_sampling_policy", vec![Ok(policy_read(3))])
+        .mock_activity_retries("agent_answer_check", vec![Ok(admitted(3))])
         .mock_activity_retries("agent_model_turn", vec![Ok(turn("{}"))])
         .mock_activity_retries("agent_score", vec![Err(budget_refusal())])
         .run(
@@ -596,4 +603,150 @@ fn the_task_cannot_carry_the_policy_cap() {
     );
     let back: AgentTask = serde_json::from_value(value).unwrap();
     assert_eq!(back.answer_check, Some(check(1)));
+}
+
+// ── Review findings: admission, judges, delivery ────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_scorer_fails_before_any_model_call() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![answer("{}", 1)]);
+    let harness = AgentHarness::new(model.clone())
+        .agent(AgentProfile::new(KIND))
+        .sampling_policies(store_with(2));
+    let mut rt = runtime(&db, harness);
+    let (_exec, state) = drive(&mut rt, &task(1)).await;
+    refused(&state, "unknown_scorer");
+    assert_eq!(model.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kind_with_no_profile_fails_before_any_model_call() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![answer("{}", 1)]);
+    let scorer = Arc::new(JsonObject::default());
+    let mut rt = runtime(&db, harness(model.clone(), &scorer, 2));
+    let other = AnswerCheck::new("nobody", ScorerRef::deterministic(SCORER).unwrap());
+    let (_exec, state) = drive(&mut rt, &AgentTask::new("x").answer_check(other)).await;
+    refused(&state, "unknown_kind");
+    let bad = AnswerCheck::new("Not A Kind", ScorerRef::deterministic(SCORER).unwrap());
+    let (_exec, state) = drive(&mut rt, &AgentTask::new("x").answer_check(bad)).await;
+    refused(&state, "invalid_kind");
+    assert_eq!(model.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kind_of_another_tenant_fails_before_any_model_call() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![answer("{}", 1), answer("{}", 1)]);
+    let scorer = Arc::new(JsonObject::default());
+    let harness = AgentHarness::new(model.clone())
+        .agent(AgentProfile::new(KIND).tenant("acme"))
+        .scorer(Arc::clone(&scorer) as Arc<dyn Scorer>)
+        .sampling_policies(store_with(2));
+    let mut rt = runtime(&db, harness);
+    let (_exec, state) = drive(&mut rt, &task(1).tenant("globex")).await;
+    refused(&state, "other_tenant");
+    let (_exec, state) = drive(&mut rt, &task(1)).await;
+    refused(&state, "other_tenant");
+    assert_eq!(model.calls(), 0);
+    let (_exec, state) = drive(&mut rt, &task(1).tenant("acme")).await;
+    assert_eq!(report(state).stop, AgentStop::Completed);
+}
+
+/// A scorer that asks the judge model `big`, whatever the check says.
+#[derive(Debug)]
+struct Sneaky;
+
+impl Scorer for Sneaky {
+    fn id(&self) -> &str {
+        SCORER
+    }
+
+    fn score<'a>(
+        &'a self,
+        _input: &'a ScoreInput,
+        cx: &'a ScoreContext<'_>,
+    ) -> BoxFuture<'a, Result<Verdict, AgentError>> {
+        Box::pin(async move {
+            let request = ChatRequest {
+                messages: Vec::new(),
+                tools: Vec::new(),
+                max_tokens: None,
+                temperature: None,
+                draw: None,
+            };
+            // The scorer hides the error, so only the activity can stop it.
+            match cx.chat(Some("big"), &request).await {
+                Ok(_) => Verdict::score(1.0),
+                Err(_) => Verdict::score(0.5),
+            }
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scorer_cannot_call_a_judge_that_the_check_did_not_admit() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![answer("{}", 1)]);
+    let big = ScriptedModel::new(vec![answer("1.0", 1)]);
+    let harness = AgentHarness::new(model.clone())
+        .model_named("big", big.clone())
+        .agent(AgentProfile::new(KIND))
+        .scorer(Arc::new(Sneaky))
+        .sampling_policies(store_with(2));
+    let mut rt = runtime(&db, harness);
+    let (_exec, state) = drive(&mut rt, &task(0)).await;
+    refused(&state, "the answer check allows no judge call");
+    assert_eq!(big.calls(), 0, "the judge model is never called");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_output_capped_answer_is_not_scored() {
+    let (_dir, db) = fresh_db();
+    let capped = Ok(ChatResponse {
+        content: vec![ContentPart::Text("{\"cut".to_owned())],
+        stop_reason: StopReason::MaxTokens,
+        usage: TokenUsage::new(1, 0),
+    });
+    let model = ScriptedModel::new(vec![capped]);
+    let scorer = Arc::new(JsonObject::default());
+    let mut rt = runtime(&db, harness(model.clone(), &scorer, 2));
+    let (_exec, state) = drive(&mut rt, &task(2)).await;
+    assert_eq!(report(state).stop, AgentStop::OutputCapped);
+    assert_eq!(scorer.calls(), 0);
+}
+
+/// A delivery that keeps each report.
+#[derive(Debug, Default)]
+struct Kept(Mutex<Vec<Report>>);
+
+impl Delivery for Kept {
+    fn deliver<'a>(&'a self, report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
+        self.0.lock().unwrap().push(report.clone());
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_answer_is_never_delivered() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![answer("secret one", 1), answer("secret two", 1)]);
+    let scorer = Arc::new(JsonObject::default());
+    let kept = Arc::new(Kept::default());
+    let harness =
+        harness(model.clone(), &scorer, 1).delivery(Arc::clone(&kept) as Arc<dyn Delivery>);
+    let mut rt = runtime(&db, harness);
+    let mut task = task(1);
+    task.deliver = true;
+    let (_exec, state) = drive(&mut rt, &task).await;
+    let report = report(state);
+    assert_eq!(report.stop, AgentStop::AnswerRejected);
+    assert_eq!(
+        report.text, "secret two",
+        "the app still reads the last answer"
+    );
+    let sent = kept.0.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].text, "The agent stopped early: answer_rejected.");
 }
