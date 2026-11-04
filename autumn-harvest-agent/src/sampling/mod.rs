@@ -12,6 +12,7 @@
 //!   first model call.
 //! - [`agent_draws`] reads the policy once, admits the request and runs the
 //!   draws.
+//! - [`admit_answer_check`] caps the answer check of a run (issue #2442).
 //!
 //! A run never carries a policy field. [`AgentTask`](crate::AgentTask),
 //! [`AgentOp`](crate::AgentOp) and [`DrawsInput`] refuse each name in
@@ -23,7 +24,10 @@ mod draws;
 mod policy;
 mod store;
 
-pub use admit::{Admission, Ask, DrawPlan, REFUSED_PREFIX, Refusal, admit, draw_plan, wave_end};
+pub use admit::{
+    Admission, Ask, DrawPlan, REFUSED_PREFIX, Refusal, admit, admit_answer_check, answer_retry_cap,
+    draw_plan, retry_after_reject, wave_end,
+};
 pub use draws::{
     DRAWS_WORKFLOW_NAME, DrawsInput, DrawsReport, agent_draws, agent_draws_info,
     agent_sampling_policy, agent_sampling_policy_info,

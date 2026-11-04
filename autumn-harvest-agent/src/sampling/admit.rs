@@ -5,13 +5,16 @@
 //! the policy allows gets a named [`Refusal`].
 //!
 //! [`draw_plan`] and [`wave_end`] hold the integer part.
+//! [`admit_answer_check`] admits the answer check of a run (issue #2442).
+//! [`answer_retry_cap`] and [`retry_after_reject`] hold its integer part.
 //! `formal/verus/src/agent_sampling.rs` proves them.
 
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use super::policy::{SamplingPolicy, ScorerId, ScorerRef, Scorers, Strategy};
+use super::policy::{MAX_ANSWER_RETRIES, SamplingPolicy, ScorerId, ScorerRef, Scorers, Strategy};
+use crate::answer_check::AnswerCheck;
 use crate::tool::ToolEffect;
 use crate::types::MAX_PARALLEL_CHILDREN;
 
@@ -51,6 +54,14 @@ pub enum Refusal {
         /// The model that the judge names.
         model: String,
     },
+    /// The answer check asks for more retries than the policy allows
+    /// (issue #2442).
+    TooManyAnswerRetries {
+        /// The retries that the check asked for.
+        asked: u32,
+        /// The cap of the policy.
+        max: u32,
+    },
     /// The kind is not a valid agent kind.
     InvalidKind,
     /// No agent profile has the kind, so no task can be built.
@@ -71,6 +82,7 @@ impl Refusal {
             Self::TooManyConcurrentDraws { .. } => "too_many_concurrent_draws",
             Self::ScorerNotAllowed { .. } => "scorer_not_allowed",
             Self::JudgeModelNotAllowed { .. } => "judge_model_not_allowed",
+            Self::TooManyAnswerRetries { .. } => "too_many_answer_retries",
             Self::InvalidKind => "invalid_kind",
             Self::UnknownKind => "unknown_kind",
         }
@@ -109,6 +121,10 @@ impl std::fmt::Display for Refusal {
                     "the policy of this kind does not allow the judge model {model:?}"
                 )
             }
+            Self::TooManyAnswerRetries { asked, max } => write!(
+                f,
+                "the run asks for {asked} answer retries; the policy allows {max}"
+            ),
             Self::InvalidKind => f.write_str("the kind is not a valid agent kind"),
             Self::UnknownKind => f.write_str("no agent profile has the kind"),
         }
@@ -204,6 +220,51 @@ pub const fn wave_end(draws: u32, concurrency: u32, start: u32) -> u32 {
     let width = if concurrency == 0 { 1 } else { concurrency };
     let left = draws - start;
     if left < width { draws } else { start + width }
+}
+
+/// The retry cap of an answer check: `asked`, or `None` when `asked` is
+/// over `policy_max` or over [`MAX_ANSWER_RETRIES`].
+///
+/// `formal/verus/src/agent_sampling.rs` proves it.
+#[must_use]
+pub const fn answer_retry_cap(policy_max: u32, asked: u32) -> Option<u32> {
+    let mut cap = policy_max;
+    if cap > MAX_ANSWER_RETRIES {
+        cap = MAX_ANSWER_RETRIES;
+    }
+    if asked > cap {
+        return None;
+    }
+    Some(asked)
+}
+
+/// Whether the model may answer again after `rejections` rejected answers,
+/// under the retry cap `cap`.
+///
+/// With every answer rejected, a run asks for `cap + 1` answers.
+/// `formal/verus/src/agent_sampling.rs` proves it.
+#[must_use]
+pub const fn retry_after_reject(rejections: u32, cap: u32) -> bool {
+    rejections <= cap
+}
+
+/// Compare the answer check `check` with `policy` (issue #2442). Returns
+/// the retry cap of the run.
+///
+/// The checks go in order: the retries, the scorer, then the judge model.
+///
+/// # Errors
+///
+/// Returns the first [`Refusal`].
+pub fn admit_answer_check(policy: &SamplingPolicy, check: &AnswerCheck) -> Result<u32, Refusal> {
+    let Some(cap) = answer_retry_cap(policy.max_answer_retries, check.retries) else {
+        return Err(Refusal::TooManyAnswerRetries {
+            asked: check.retries,
+            max: policy.max_answer_retries.min(MAX_ANSWER_RETRIES),
+        });
+    };
+    check_scorer(policy, &check.scorer)?;
+    Ok(cap)
 }
 
 /// Compare `ask` with `policy`.
@@ -422,6 +483,60 @@ mod tests {
         );
     }
 
+    fn check(retries: u32) -> AnswerCheck {
+        AnswerCheck::new("k", ScorerRef::deterministic("exact_match").unwrap()).retries(retries)
+    }
+
+    #[test]
+    fn the_retry_cap_is_the_ask_within_the_policy() {
+        assert_eq!(answer_retry_cap(0, 0), Some(0));
+        assert_eq!(answer_retry_cap(2, 1), Some(1));
+        assert_eq!(answer_retry_cap(2, 2), Some(2));
+        assert_eq!(answer_retry_cap(2, 3), None);
+        assert_eq!(
+            answer_retry_cap(u32::MAX, MAX_ANSWER_RETRIES + 1),
+            None,
+            "the engine bound holds over a bad policy"
+        );
+    }
+
+    #[test]
+    fn a_cap_of_two_allows_three_answers() {
+        assert!(retry_after_reject(1, 2));
+        assert!(retry_after_reject(2, 2));
+        assert!(!retry_after_reject(3, 2));
+        assert!(!retry_after_reject(1, 0), "a cap of 0 allows one answer");
+    }
+
+    #[test]
+    fn an_answer_check_needs_its_retries_and_its_scorer_in_the_policy() {
+        let mut policy = SamplingPolicy::default();
+        assert_eq!(admit_answer_check(&policy, &check(0)), Ok(0));
+        assert_eq!(
+            admit_answer_check(&policy, &check(1)),
+            Err(Refusal::TooManyAnswerRetries { asked: 1, max: 0 })
+        );
+        policy.max_answer_retries = 3;
+        assert_eq!(admit_answer_check(&policy, &check(2)), Ok(2));
+        let judge = AnswerCheck::new("k", ScorerRef::judge("judge", "big").unwrap());
+        assert_eq!(
+            admit_answer_check(&policy, &judge).unwrap_err().code(),
+            "scorer_not_allowed"
+        );
+        policy.scorers = Scorers::Only(BTreeSet::from([judge.scorer.id.clone()]));
+        assert_eq!(
+            admit_answer_check(&policy, &judge).unwrap_err().code(),
+            "judge_model_not_allowed"
+        );
+        policy.judge_models.insert("big".to_owned());
+        assert_eq!(admit_answer_check(&policy, &judge), Ok(0));
+        let text = Refusal::TooManyAnswerRetries { asked: 4, max: 3 }.error_text();
+        assert_eq!(
+            text,
+            "sampling refused (too_many_answer_retries): the run asks for 4 answer retries; the policy allows 3"
+        );
+    }
+
     proptest! {
         #[test]
         fn an_admission_never_passes_a_cap(
@@ -447,6 +562,24 @@ mod tests {
                     start = end;
                 }
                 prop_assert_eq!(seen, run);
+            }
+        }
+
+        #[test]
+        fn the_answers_of_a_run_never_pass_the_cap(
+            policy_max in 0_u32..=40,
+            asked in 0_u32..=40,
+        ) {
+            if let Some(cap) = answer_retry_cap(policy_max, asked) {
+                prop_assert!(cap <= policy_max && cap <= MAX_ANSWER_RETRIES);
+                // Count the answers of a run whose every answer is rejected.
+                let mut answers = 1_u32;
+                while retry_after_reject(answers, cap) {
+                    answers += 1;
+                }
+                prop_assert_eq!(answers, cap + 1);
+            } else {
+                prop_assert!(asked > policy_max.min(MAX_ANSWER_RETRIES));
             }
         }
     }

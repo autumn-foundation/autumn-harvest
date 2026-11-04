@@ -32,6 +32,7 @@ use crate::agent::{
     agent_info, agent_memory_reset_info, agent_profile_info, agent_profile_overlay_info,
     agent_workspace_floor_info, agent_workspace_reset_info, agent_workspace_retain_info,
 };
+use crate::answer_check::{self, Checked};
 use crate::approval::{Approval, Decision, approval_signal, await_decision, decode_decision};
 use crate::bounds::{RoundBudget, json_len, reaches_percent, reset_due, sibling_cap};
 use crate::context_reset::{self, ProgressNotes, SAVE_PROGRESS_TOOL};
@@ -130,6 +131,11 @@ pub(crate) struct Progress {
     /// The steer messages of this segment. A reset keeps them, so a reset
     /// never drops a message from a person.
     pub(crate) steers: Vec<ChatMessage>,
+    /// The admitted answer check of the run (issue #2442).
+    pub(crate) check: Option<answer_check::Admitted>,
+    /// The reason of each answer that the check rejected, follow-ups
+    /// included.
+    pub(crate) rejections: Vec<String>,
 }
 
 /// The notes and the context resets of one run (issue #2453).
@@ -212,6 +218,8 @@ impl Progress {
             workspace: None,
             reset: ResetState::default(),
             steers: Vec::new(),
+            check: None,
+            rejections: Vec::new(),
         }
     }
 
@@ -256,6 +264,7 @@ impl Progress {
             workspace: self.workspace.as_ref().and_then(|mount| mount.head.clone()),
             error: None,
             resets: self.reset.count,
+            answer_rejections: self.rejections.clone(),
         }
     }
 
@@ -510,6 +519,9 @@ pub(crate) async fn drive(
     }
     let mut tree = root_tree(ctx, task, &progress.run_id);
     let agent = root_member(ctx, task).await?;
+    if let Some(failed) = Box::pin(admit_check(ctx, task, &mut progress, &tree)).await? {
+        return Ok((failed, 0));
+    }
     let mut input = task.input.as_str();
     let mut delivered = 0_u32;
     loop {
@@ -789,12 +801,10 @@ pub(crate) async fn run_segment(
         let calls = turn.calls();
 
         if calls.is_empty() {
-            if save_reply(progress, &turn, over_budget) {
-                continue;
+            match Box::pin(answer_turn(ctx, task, progress, &turn, over_budget)).await? {
+                Some(stop) => return Ok(stop),
+                None => continue,
             }
-            progress.push_assistant(&turn);
-            progress.answer = Some(turn.text());
-            return Ok(answer_stop(&turn, over_budget));
         }
         // A turn with calls that ends here is NOT added to the transcript. A
         // tool call with no result would make the transcript invalid for the
@@ -842,6 +852,59 @@ pub(crate) async fn run_segment(
             }
         }
     }
+}
+
+/// Read the policy of the answer check of `task` and admit the check
+/// (issue #2442). It runs before the first model call.
+///
+/// Returns the failed report of a refused check under `report_failure`.
+///
+/// # Errors
+///
+/// Returns the refusal, or the error of the policy read.
+async fn admit_check(
+    ctx: &WorkflowContext,
+    task: &AgentTask,
+    progress: &mut Progress,
+    tree: &Tree,
+) -> Result<Option<AgentReport>, String> {
+    match answer_check::admit(ctx, task).await {
+        Ok(check) => {
+            progress.check = check;
+            Ok(None)
+        }
+        Err(error) if task.report_failure => Ok(Some(progress.failure(error, tree))),
+        Err(error) => Err(error),
+    }
+}
+
+/// End the segment on `turn`, a turn with no calls, and return its stop.
+///
+/// `None` asks the model again. That is the reply to a save turn (issue
+/// #2453), or an answer that the check rejected within its cap (issue
+/// #2442). Only an answer that completes is checked.
+async fn answer_turn(
+    ctx: &WorkflowContext,
+    task: &AgentTask,
+    progress: &mut Progress,
+    turn: &ModelTurn,
+    over_budget: bool,
+) -> Result<Option<AgentStop>, String> {
+    if save_reply(progress, turn, over_budget) {
+        return Ok(None);
+    }
+    progress.push_assistant(turn);
+    let answer = turn.text();
+    let mut stop = answer_stop(turn, over_budget);
+    if stop == AgentStop::Completed {
+        stop = match answer_check::check(ctx, task, progress, &answer).await? {
+            Checked::Passed => stop,
+            Checked::Retry => return Ok(None),
+            Checked::Stop(stop) => stop,
+        };
+    }
+    progress.answer = Some(answer);
+    Ok(Some(stop))
 }
 
 /// How a segment ends on `turn`, a turn with no calls.
@@ -2608,6 +2671,8 @@ fn child_task(
         // A child is part of the draw of its parent, so its requests keep
         // the draw id. It has its own run id, so it drops the root.
         draw: task.draw.as_ref().map(Draw::inherited),
+        // Only the answer of the root run is checked (issue #2442).
+        answer_check: None,
     }
 }
 

@@ -355,6 +355,7 @@ A bound is a normal end, not an error. `AgentReport.stop` names it:
 | `budget_exceeded` | A run or tenant LLM budget refused the next model call. The call was not sent. See [LLM budgets](#llm-budgets-issue-1997). |
 | `loop_detected` | The loop guard saw the same call, with the same result, too many times. |
 | `failed` | The run failed. `AgentReport.error` holds the error. Only a fan-out child ends so, because a parent keeps its usage and labels (issue #2328). |
+| `answer_rejected` | The answer check rejected more answers than its cap allows. `AgentReport.answer_rejections` holds each reason. See [Answer check](#20-answer-check-issue-2442). |
 
 A turn that ends the run before its tool calls run is left out of
 `AgentReport.messages`. Its text is not the answer either. A round that ends
@@ -1952,7 +1953,7 @@ is the safe value.
 | `draw_effects` | The `ToolEffect`s that a draw may run | `[read_only]` |
 | `scorers` | The scorer ids that the kind may use: `deterministic`, or `{"only": [ids]}` | `deterministic`: each scorer that calls no model |
 | `judge_models` | The models that a judge scorer may call | none |
-| `max_answer_retries` | The cap of the in-loop answer check (#2442). 0 to 16. | 0 |
+| `max_answer_retries` | The cap of the answer check (section 20). 0 to 16. | 0 |
 
 An unknown key fails the decode. So an older worker never drops a setting
 that a newer worker recorded. The run of that older worker fails closed,
@@ -2039,3 +2040,70 @@ refine policy key (section 18). Any other unknown key of `AgentTask` and
 policy.
 
 The design is in [`DESIGN-2439.md`](design/DESIGN-2439.md).
+
+## 20. Answer check (issue #2442)
+
+An `AnswerCheck` scores each final answer of a run in the same run. A bad
+answer does not need a second run, so the run does not pay for its
+transcript again.
+
+```rust
+use autumn_harvest_agent::{AgentTask, AnswerCheck};
+use autumn_harvest_agent::sampling::ScorerRef;
+
+let scorer = ScorerRef::deterministic("json_schema").expect("a valid id");
+let task = AgentTask::new("Give the order as JSON.")
+    .answer_check(AnswerCheck::new("support", scorer).retries(2));
+```
+
+The check names three things:
+
+- `kind`: the agent kind whose `SamplingPolicy` (section 19) caps the check.
+- `scorer`: a `ScorerRef` (section 17). A judge names its model.
+- `retries`: the rejected answers after which the model may answer again.
+  0 by default.
+
+The run does this:
+
+1. Before the first model call, it reads the policy of the kind once, in
+   the recorded activity `agent_sampling_policy`. `retries` must be at most
+   `max_answer_retries`. The scorer and a judge model must pass the policy.
+   Otherwise the run fails with `sampling refused (<code>)`, and no model
+   call runs. The codes are `too_many_answer_retries`,
+   `scorer_not_allowed` and `judge_model_not_allowed`. With
+   `report_failure`, the run ends as `failed`.
+2. Each answer that ends a segment as `completed` goes to the recorded
+   activity `agent_score`. The score input holds the task input, the answer
+   and the tool results of the run.
+3. A score ends the segment as `completed`.
+4. A reject adds its reason to `AgentReport.answer_rejections`. While the
+   rejections are at most `retries`, the loop adds a user message with the
+   reason and asks the model again in the same run.
+5. After `retries + 1` rejected answers, the run ends as `answer_rejected`.
+   `AgentReport.text` holds the last answer.
+
+A retry is one more model call of the same run. It counts against
+`max_total_tokens` and the LLM budgets, so a retry past a bound ends the
+run under that bound. An answer that ends as `tokens_exhausted` or
+`output_capped` is not scored. A judge call that the LLM budget refuses
+ends the run as `budget_exceeded`.
+
+The model turn and the verdict are recorded activities. A crash in a retry
+replays from history, and no completed model call or score runs again. A
+policy change during a run does not reach it.
+
+A score request over the request cap drops its tool results. A request
+that is still too large ends the run as `transcript_full`. The retry
+message puts the reason between `<reason>` tags and calls it data. A
+reason from a judge can still hold text from the answer, so keep a judge
+reason short and plain.
+
+The cap counts each rejection of the run, follow-ups included. A
+delegated child has no check. `AgentTask.answer_check` is not written when
+it is `None`. A task recorded before the field decodes with no check, and
+its run replays unchanged. `AnswerCheck` denies unknown keys. So upgrade
+every worker before a task sets the field.
+
+`formal/verus/src/agent_sampling.rs` proves the cap. With every answer
+rejected, a run with `retries = c` asks for exactly `c + 1` answers. The
+design is in [`DESIGN-2442.md`](design/DESIGN-2442.md).

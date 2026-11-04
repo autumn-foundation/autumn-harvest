@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::draw::DrawId;
 use crate::error::{AgentError, ErrorKind};
 use crate::harness::{AgentHarness, cut_bytes, model_failure};
-use crate::message::ContentPart;
+use crate::message::{ChatMessage, ContentPart};
 use crate::model::{BoxFuture, ChatRequest, ChatResponse};
 use crate::refine::model_proposer::unfenced;
 use crate::types::{AgentReport, AgentStop, AgentTask};
@@ -299,34 +299,39 @@ impl ScoreInput {
     /// activity input.
     #[must_use]
     pub fn from_run(task: &AgentTask, report: &AgentReport) -> Self {
-        let parts = || report.messages.iter().flat_map(|m| m.content.iter());
-        let names: std::collections::HashMap<&str, &str> = parts()
-            .filter_map(|part| match part {
-                ContentPart::ToolCall { id, name, .. } => Some((id.as_str(), name.as_str())),
-                _ => None,
-            })
-            .collect();
-        let tools = parts()
-            .filter_map(|part| match part {
-                ContentPart::ToolResult {
-                    tool_call_id,
-                    content,
-                } => Some(ToolRecord {
-                    name: names
-                        .get(tool_call_id.as_str())
-                        .map_or_else(String::new, |name| (*name).to_owned()),
-                    content: content.clone(),
-                }),
-                _ => None,
-            })
-            .collect();
         Self {
             task: task.input.clone(),
             answer: report.text.clone(),
             stop: report.stop,
-            tools,
+            tools: tool_records(&report.messages),
         }
     }
+}
+
+/// The tool results of `messages`, in order, each with the name of its
+/// call.
+pub(crate) fn tool_records(messages: &[ChatMessage]) -> Vec<ToolRecord> {
+    let parts = || messages.iter().flat_map(|m| m.content.iter());
+    let names: std::collections::HashMap<&str, &str> = parts()
+        .filter_map(|part| match part {
+            ContentPart::ToolCall { id, name, .. } => Some((id.as_str(), name.as_str())),
+            _ => None,
+        })
+        .collect();
+    parts()
+        .filter_map(|part| match part {
+            ContentPart::ToolResult {
+                tool_call_id,
+                content,
+            } => Some(ToolRecord {
+                name: names
+                    .get(tool_call_id.as_str())
+                    .map_or_else(String::new, |name| (*name).to_owned()),
+                content: content.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The input of the `agent_score` activity: a scorer id and what it reads.
@@ -1079,6 +1084,7 @@ mod tests {
             workspace: None,
             error: None,
             resets: 0,
+            answer_rejections: Vec::new(),
         };
         let input = ScoreInput::from_run(&task, &report);
         assert_eq!(

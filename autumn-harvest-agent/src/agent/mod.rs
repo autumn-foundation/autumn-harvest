@@ -1303,6 +1303,9 @@ impl Agent {
 /// [`AgentRun::handle`]. harvest-verify reads a future type that names a
 /// lifetime, as `AgentRun<'_>` does, as one that can write through its
 /// fields. The future also stays unboxed, so harvest-verify can follow it.
+// The engine keeps the workflow future on the heap, so the inline op future
+// costs no stack. A box here would hide the op from harvest-verify.
+#[allow(clippy::large_futures)]
 async fn handle_op(
     run: &AgentRun<'_>,
     state: AgentState,

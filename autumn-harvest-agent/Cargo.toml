@@ -75,6 +75,10 @@ name = "crash_resume"
 required-features = ["sqlite"]
 
 [[test]]
+name = "answer_check"
+required-features = ["sqlite"]
+
+[[test]]
 name = "always_on"
 required-features = ["sqlite"]
 
