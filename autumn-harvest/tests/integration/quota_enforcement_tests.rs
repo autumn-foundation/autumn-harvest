@@ -127,6 +127,8 @@ fn wf_meta(quota: QuotaPolicy) -> WorkflowMetadata {
         runbook_url: None,
         severity: None,
         input_schema: None,
+        execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         retry_policy: None,
         quota: Some(quota),

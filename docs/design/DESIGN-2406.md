@@ -34,7 +34,7 @@ cap needs a deploy.
   the ceiling would reach a child uncapped.
 - A completion-trigger start sets no chain timeout and no execution timeout.
   Its outbox row has no column for them. This change leaves that path as it
-  is. Issue #2511 tracks it.
+  is. Issue #2511 fixes it (see `DESIGN-2511.md`).
 - The cache of #2387 holds one `RunDefaultFields` per type. A start reads it
   from memory.
 
