@@ -51,6 +51,25 @@ const COMMANDS_PER_PASS: usize = 32;
 /// starts from growing memory while one long activity runs.
 const COMMAND_BACKLOG: usize = 256;
 
+tokio::task_local! {
+    /// Set on a driver task. An activity and a workflow run on that task.
+    static DRIVER_TASK: ();
+}
+
+/// Whether the caller runs on a driver task, as an activity or a workflow
+/// does (issue #2470).
+///
+/// A call there that waits for the driver would wait for itself.
+pub fn on_driver() -> bool {
+    DRIVER_TASK.try_with(|()| ()).is_ok()
+}
+
+/// Run `future` as if on a driver task, for a test of [`on_driver`].
+#[cfg(test)]
+pub async fn scope_as_driver<F: Future>(future: F) -> F::Output {
+    DRIVER_TASK.scope((), future).await
+}
+
 /// A query replay, ready to run off the driver task.
 pub type QueryFuture = Pin<Box<dyn Future<Output = SqliteResult<Value>> + Send>>;
 
@@ -283,7 +302,9 @@ impl Driver {
         let (sender, receiver) = mpsc::channel(COMMAND_BACKLOG);
         let stop = CancellationToken::new();
         let task = tokio::spawn(async move {
-            let reply = drive(runtime, receiver, tick, &stop).await;
+            let reply = DRIVER_TASK
+                .scope((), drive(runtime, receiver, tick, &stop))
+                .await;
             // `drive` owned the runtime, so the lock is released by now.
             if let Some(reply) = reply {
                 let _ = reply.send(());
@@ -315,7 +336,9 @@ impl Driver {
             // Declared first, so it runs last: after the runtime drops, on a
             // return and on an abort alike.
             let _exit = OnExit(Some(on_exit));
-            let reply = drive(runtime, receiver, tick, &stop).await;
+            let reply = DRIVER_TASK
+                .scope((), drive(runtime, receiver, tick, &stop))
+                .await;
             if let Some(reply) = reply {
                 let _ = reply.send(());
             }
@@ -615,16 +638,7 @@ fn start_once(
     else {
         return Err(SqliteError::BlankWorkflowId);
     };
-    let key = autumn_harvest_sqlite::ExecutionFilter::new()
-        .workflow_name(workflow_name.to_owned())
-        .workflow_id(workflow_id)
-        .limit(1);
-    let prior = runtime
-        .list_executions(&key)?
-        .executions
-        .first()
-        .and_then(autumn_harvest_sqlite::ExecutionSummary::execution_id);
-    if let Some(exec_id) = prior {
+    if let Some(exec_id) = runtime.newest_run_of_key(workflow_name, &workflow_id)? {
         return Ok(StartOutcome {
             exec_id,
             created: false,

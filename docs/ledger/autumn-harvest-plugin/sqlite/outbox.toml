@@ -33,6 +33,13 @@ measured = "unmeasured"
 ["ensure_schema"]
 driver = "setup"
 backend = ["postgres", "sqlite"]
-kind = ["ddl"]
+kind = ["ddl", "read", "write"]
+tables = ["harvest_workflow_outbox"]
+measured = "unmeasured"
+
+["undelivered_rows"]
+driver = "setup"
+backend = ["postgres", "sqlite"]
+kind = ["read"]
 tables = ["harvest_workflow_outbox"]
 measured = "unmeasured"

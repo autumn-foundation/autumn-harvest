@@ -19,7 +19,12 @@
 //!   key, in any state, before it starts one. A crash after the start and
 //!   before the mark therefore costs no second run.
 //! - One drain runs at a time in a process. One process holds the writer
-//!   lock on the Harvest file, so the table needs no claim column.
+//!   lock on the Harvest file, so the table needs no claim column. Two apps
+//!   with two Harvest files must not share one app database.
+//!
+//! A row whose key has a run from another path, such as an API start, counts
+//! as delivered to that run. A sealed run counts too. This is stricter than
+//! the Postgres reuse policy, which starts a fresh run over a sealed one.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,17 +64,43 @@ CREATE TABLE IF NOT EXISTS harvest_workflow_outbox (
     created_at             INTEGER NOT NULL,
     UNIQUE (workflow_name, workflow_id)
 );
-CREATE INDEX IF NOT EXISTS idx_harvest_workflow_outbox_due
-    ON harvest_workflow_outbox (next_attempt_at, id)
+CREATE INDEX IF NOT EXISTS idx_harvest_workflow_outbox_pending
+    ON harvest_workflow_outbox (id)
     WHERE delivered_at IS NULL;";
+
+/// The insert of the writer. A duplicate key is a no-op.
+const INSERT_SQL: &str = "INSERT INTO harvest_workflow_outbox \
+     (workflow_name, workflow_id, queue_name, input, memo, search_attrs, next_attempt_at, \
+     created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+     ON CONFLICT (workflow_name, workflow_id) DO NOTHING";
+
+/// The due rows, oldest first. The partial index on `id` answers it, so a
+/// poll reads the undelivered rows only.
+const DUE_SQL: &str = "SELECT id, workflow_name, workflow_id, input, memo, search_attrs, \
+     delivery_attempts FROM harvest_workflow_outbox \
+     WHERE delivered_at IS NULL AND next_attempt_at <= ? ORDER BY id LIMIT ?";
+
+/// The mark of a delivered row. It counts once, so a repeat mark is a no-op.
+const DELIVERED_SQL: &str = "UPDATE harvest_workflow_outbox \
+     SET delivery_attempts = delivery_attempts + 1, last_error = NULL, \
+     delivered_execution_id = ?, delivered_at = ? WHERE id = ? AND delivered_at IS NULL";
+
+/// The mark of a failed start.
+const FAILED_SQL: &str = "UPDATE harvest_workflow_outbox \
+     SET delivery_attempts = delivery_attempts + 1, last_error = ?, next_attempt_at = ? \
+     WHERE id = ? AND delivered_at IS NULL";
 
 /// The one queue of the SQLite backend.
 const QUEUE: &str = "default";
 
 /// The refusal of a write to a database with no outbox table.
 const NO_TABLE: &str = "this database has no harvest_workflow_outbox table. Write the start on \
-     the app's primary database. HarvestPlugin creates the table there at boot \
-     (autumn-harvest#2470)";
+     the app's primary database. HarvestPlugin creates the table there at boot, in \
+     harvest.mode = \"embedded\" (autumn-harvest#2470)";
+
+/// The refusal of a flush on the driver task.
+const ON_DRIVER: &str = "the outbox cannot flush inside an activity or a workflow: the driver \
+     task that runs it would wait for itself. The relay delivers the row (autumn-harvest#2470)";
 
 /// Persist a workflow start in the outbox of a SQLite app database.
 ///
@@ -90,12 +121,15 @@ const NO_TABLE: &str = "this database has no harvest_workflow_outbox table. Writ
 /// Returns a Diesel error when the insert fails. A request that this backend
 /// cannot honour is a `QueryBuilderError`, and the query never runs:
 ///
-/// - an empty `workflow_id`, as on Postgres;
+/// - an empty or blank `workflow_id`;
 /// - a `queue_name` other than `"default"`;
 /// - a `search_attrs` that is not an object of JSON primitives.
 ///
 /// A database with no outbox table, such as a fleet tenant database, is a
-/// `QueryBuilderError` that names this issue.
+/// `QueryBuilderError` that names autumn-harvest#2470.
+///
+/// The relay retries a row that fails to start, with a backoff, as on
+/// Postgres. An unknown workflow or an input over the cap fails that way.
 pub async fn enqueue_workflow_start_outbox(
     conn: &mut RuntimeConnection,
     request: &WorkflowStartRequest,
@@ -103,29 +137,25 @@ pub async fn enqueue_workflow_start_outbox(
     check_request(request)
         .map_err(|message| diesel::result::Error::QueryBuilderError(message.into()))?;
     let now = now_ms();
-    diesel::sql_query(
-        "INSERT INTO harvest_workflow_outbox \
-         (workflow_name, workflow_id, queue_name, input, memo, search_attrs, next_attempt_at, \
-         created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT (workflow_name, workflow_id) DO NOTHING",
-    )
-    .bind::<Text, _>(request.workflow_name.clone())
-    .bind::<Text, _>(request.workflow_id.clone())
-    .bind::<Text, _>(request.queue_name.clone())
-    .bind::<Text, _>(request.input.to_string())
-    .bind::<Nullable<Text>, _>(request.memo.as_ref().map(Value::to_string))
-    .bind::<Nullable<Text>, _>(search_attrs_text(request.search_attrs.as_ref()))
-    .bind::<BigInt, _>(now)
-    .bind::<BigInt, _>(now)
-    .execute(conn)
-    .await
-    .map(|_| ())
-    .map_err(name_missing_table)
+    diesel::sql_query(INSERT_SQL)
+        .bind::<Text, _>(request.workflow_name.clone())
+        .bind::<Text, _>(request.workflow_id.clone())
+        .bind::<Text, _>(request.queue_name.clone())
+        .bind::<Text, _>(request.input.to_string())
+        .bind::<Nullable<Text>, _>(request.memo.as_ref().map(Value::to_string))
+        .bind::<Nullable<Text>, _>(search_attrs_text(request.search_attrs.as_ref()))
+        .bind::<BigInt, _>(now)
+        .bind::<BigInt, _>(now)
+        .execute(conn)
+        .await
+        .map(|_| ())
+        .map_err(name_missing_table)
 }
 
 /// The refusal of a request that this backend cannot honour, or `Ok`.
 fn check_request(request: &WorkflowStartRequest) -> Result<(), String> {
-    if request.workflow_id.is_empty() {
+    // The driver refuses a blank id. Such a row could never start.
+    if request.workflow_id.trim().is_empty() {
         return Err("workflow_id must not be empty".to_owned());
     }
     if request.queue_name != QUEUE {
@@ -154,7 +184,7 @@ fn search_attrs_text(attrs: Option<&Value>) -> Option<String> {
     attrs.filter(|attrs| !attrs.is_null()).map(Value::to_string)
 }
 
-/// A missing table as the refusal that names this issue.
+/// A missing table as the refusal that names autumn-harvest#2470.
 fn name_missing_table(error: diesel::result::Error) -> diesel::result::Error {
     match &error {
         diesel::result::Error::DatabaseError(_, info)
@@ -173,11 +203,17 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// Create the outbox table on the app's primary database.
+/// Create the outbox table on the app's primary database, and check its
+/// shape.
+///
+/// A table that exists keeps its shape, so the check compiles each statement
+/// of the writer and the relay with `EXPLAIN`. A missing column or unique
+/// key then fails the boot, not each write.
 ///
 /// # Errors
 ///
-/// Returns a message when no connection is available or the DDL fails.
+/// Returns a message when no connection is available, the DDL fails, or the
+/// table has another shape.
 pub async fn ensure_schema(pool: &Pool<RuntimeConnection>) -> Result<(), String> {
     let mut conn = pool
         .get()
@@ -185,7 +221,53 @@ pub async fn ensure_schema(pool: &Pool<RuntimeConnection>) -> Result<(), String>
         .map_err(|error| format!("outbox schema: no connection: {error}"))?;
     conn.batch_execute(SCHEMA_SQL)
         .await
-        .map_err(|error| format!("outbox schema: {error}"))
+        .map_err(|error| format!("outbox schema: {error}"))?;
+    let probe = [INSERT_SQL, DUE_SQL, DELIVERED_SQL, FAILED_SQL]
+        .map(|sql| format!("EXPLAIN {sql};"))
+        .join("\n");
+    conn.batch_execute(&probe).await.map_err(|error| {
+        format!(
+            "harvest_workflow_outbox does not have the shape that HarvestPlugin needs: {error}. \
+             Drop it, or make it match OUTBOX_SCHEMA_SQL (autumn-harvest#2470)"
+        )
+    })
+}
+
+/// The undelivered rows of an outbox that no relay drains (issue #2470).
+///
+/// Split and external mode run no SQLite relay. A row left from embedded
+/// mode then waits. `None` when the table does not exist.
+pub async fn undelivered_rows(pool: &Pool<RuntimeConnection>) -> Option<i64> {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    let mut conn = pool.get().await.ok()?;
+    diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_workflow_outbox WHERE delivered_at IS NULL",
+    )
+    .get_result::<Count>(&mut *conn)
+    .await
+    .ok()
+    .map(|count| count.n)
+}
+
+/// Warn when the app database holds starts that no relay drains.
+///
+/// The Postgres path of a SQLite app calls it at boot, in split and external
+/// mode. A silent wait would let an app believe that the starts run.
+pub async fn warn_if_stranded(state: &autumn_web::AppState) {
+    let Some(pool) = state.pool() else {
+        return;
+    };
+    if let Some(rows) = undelivered_rows(pool).await.filter(|rows| *rows > 0) {
+        tracing::warn!(
+            rows,
+            "harvest_workflow_outbox holds undelivered starts, and no relay runs outside \
+             harvest.mode = \"embedded\". Boot in embedded mode to run them (autumn-harvest#2470)"
+        );
+    }
 }
 
 /// One due row.
@@ -253,6 +335,7 @@ struct Inner {
 }
 
 impl SqliteOutbox {
+    /// A relay of the outbox in `pool` to the control Harvest `harvest`.
     pub fn new(
         pool: Pool<RuntimeConnection>,
         harvest: HarvestSqlite,
@@ -273,8 +356,10 @@ impl SqliteOutbox {
     /// # Errors
     ///
     /// Returns an error when the driver has stopped or the app database
-    /// fails.
+    /// fails. A call on the driver task, from an activity or a workflow, is
+    /// refused: the start would wait for that task.
     pub async fn flush(&self) -> Result<usize, AutumnError> {
+        refuse_on_driver()?;
         Ok(self.flush_inner().await?)
     }
 
@@ -285,6 +370,7 @@ impl SqliteOutbox {
     ///
     /// See [`flush`](Self::flush).
     pub async fn drain_once(&self, limit: i64) -> Result<usize, AutumnError> {
+        refuse_on_driver()?;
         if !self.inner.config.enabled {
             return Ok(0);
         }
@@ -342,16 +428,12 @@ impl SqliteOutbox {
 
     async fn due_rows(&self, limit: i64) -> Result<Vec<DueRow>, DrainError> {
         let mut conn = self.connection().await?;
-        diesel::sql_query(
-            "SELECT id, workflow_name, workflow_id, input, memo, search_attrs, \
-             delivery_attempts FROM harvest_workflow_outbox \
-             WHERE delivered_at IS NULL AND next_attempt_at <= ? ORDER BY id LIMIT ?",
-        )
-        .bind::<BigInt, _>(now_ms())
-        .bind::<BigInt, _>(limit)
-        .load(&mut *conn)
-        .await
-        .map_err(|error| database(&error))
+        diesel::sql_query(DUE_SQL)
+            .bind::<BigInt, _>(now_ms())
+            .bind::<BigInt, _>(limit)
+            .load(&mut *conn)
+            .await
+            .map_err(|error| database(&error))
     }
 
     /// Start the run of `row` once.
@@ -370,17 +452,13 @@ impl SqliteOutbox {
     /// and 0 when an earlier mark did.
     async fn mark_delivered(&self, id: i64, exec: &str) -> Result<usize, DrainError> {
         let mut conn = self.connection().await?;
-        diesel::sql_query(
-            "UPDATE harvest_workflow_outbox SET delivery_attempts = delivery_attempts + 1, \
-             last_error = NULL, delivered_execution_id = ?, delivered_at = ? \
-             WHERE id = ? AND delivered_at IS NULL",
-        )
-        .bind::<Text, _>(exec.to_owned())
-        .bind::<BigInt, _>(now_ms())
-        .bind::<BigInt, _>(id)
-        .execute(&mut *conn)
-        .await
-        .map_err(|error| database(&error))
+        diesel::sql_query(DELIVERED_SQL)
+            .bind::<Text, _>(exec.to_owned())
+            .bind::<BigInt, _>(now_ms())
+            .bind::<BigInt, _>(id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| database(&error))
     }
 
     /// Keep `error` on the row, and back off its next attempt.
@@ -388,30 +466,24 @@ impl SqliteOutbox {
         let delay = retry_delay_for_attempts(&self.inner.config, row.delivery_attempts);
         let next = now_ms().saturating_add(i64::try_from(delay).unwrap_or(i64::MAX));
         let mut conn = self.connection().await?;
-        diesel::sql_query(
-            "UPDATE harvest_workflow_outbox SET delivery_attempts = delivery_attempts + 1, \
-             last_error = ?, next_attempt_at = ? WHERE id = ? AND delivered_at IS NULL",
-        )
-        .bind::<Text, _>(error.to_owned())
-        .bind::<BigInt, _>(next)
-        .bind::<BigInt, _>(row.id)
-        .execute(&mut *conn)
-        .await
-        .map(|_| ())
-        .map_err(|error| database(&error))
+        diesel::sql_query(FAILED_SQL)
+            .bind::<Text, _>(error.to_owned())
+            .bind::<BigInt, _>(next)
+            .bind::<BigInt, _>(row.id)
+            .execute(&mut *conn)
+            .await
+            .map(|_| ())
+            .map_err(|error| database(&error))
     }
 
     /// Run the relay until `stop` fires or the driver stops.
     ///
-    /// A drain that `stop` interrupts loses nothing. A row that started and
-    /// has no mark goes to the driver again at the next boot, and
-    /// `StartOnce` returns the run that exists.
+    /// The caller spawns it only when `harvest.outbox.enabled` is true. A
+    /// drain that `stop` interrupts loses nothing. A row that started and has
+    /// no mark goes to the driver again, and `StartOnce` returns the run that
+    /// exists.
     pub fn spawn(self, stop: CancellationToken) -> JoinHandle<()> {
         tokio::spawn(async move {
-            if !self.inner.config.enabled {
-                tracing::debug!("the Harvest SQLite outbox relay is disabled");
-                return;
-            }
             let mut interval =
                 tokio::time::interval(Duration::from_millis(self.inner.config.poll_interval_ms));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -436,9 +508,14 @@ impl SqliteOutbox {
                         }
                     }
                     Err(DrainError::Stopped) => {
-                        tracing::debug!(
-                            "the Harvest SQLite driver stopped, so the outbox relay stops"
-                        );
+                        // A stop that the shutdown hook did not ask for leaves
+                        // the rows waiting until the next boot.
+                        if !stop.is_cancelled() {
+                            tracing::warn!(
+                                "the Harvest SQLite driver stopped, so the outbox relay stops. \
+                                 Undelivered starts wait for the next boot"
+                            );
+                        }
                         return;
                     }
                     Err(DrainError::Database(error)) => {
@@ -452,6 +529,14 @@ impl SqliteOutbox {
             }
         })
     }
+}
+
+/// Refuse a flush on the driver task. See [`ON_DRIVER`].
+fn refuse_on_driver() -> Result<(), AutumnError> {
+    if super::driver::on_driver() {
+        return Err(AutumnError::service_unavailable_msg(ON_DRIVER));
+    }
+    Ok(())
 }
 
 fn database(error: &diesel::result::Error) -> DrainError {
@@ -571,8 +656,11 @@ mod tests {
         not_object.search_attrs = Some(json!(["web"]));
         let mut nested = request("o-n");
         nested.search_attrs = Some(json!({ "tags": ["a"] }));
+        // The driver refuses a blank id, so such a row could never start.
+        let blank = request("  ");
         for (request, want) in [
             (empty, "workflow_id must not be empty"),
+            (blank, "workflow_id must not be empty"),
             (queue, "queue_name \"fast\""),
             (not_object, "search_attrs must be a JSON object"),
             (nested, "search attribute \"tags\""),
@@ -608,6 +696,54 @@ mod tests {
         assert!(message.contains("primary database"), "{message}");
     }
 
+    /// A table with another shape fails the boot, not each write.
+    #[tokio::test]
+    async fn a_table_of_another_shape_fails_the_schema_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("app.db").display());
+        let bad_pool = pool(&url);
+        {
+            let mut conn = bad_pool.get().await.unwrap();
+            // No unique key, so the writer's `ON CONFLICT` cannot compile.
+            conn.batch_execute(
+                "CREATE TABLE harvest_workflow_outbox (id INTEGER PRIMARY KEY, \
+                 workflow_name TEXT, workflow_id TEXT, queue_name TEXT, input TEXT, memo TEXT, \
+                 search_attrs TEXT, delivery_attempts INTEGER, last_error TEXT, \
+                 delivered_execution_id TEXT, delivered_at INTEGER, next_attempt_at INTEGER, \
+                 created_at INTEGER)",
+            )
+            .await
+            .unwrap();
+        }
+        let error = ensure_schema(&bad_pool).await.unwrap_err();
+        assert!(error.contains("autumn-harvest#2470"), "{error}");
+
+        let fresh = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", fresh.path().join("app.db").display());
+        let fresh_pool = pool(&url);
+        ensure_schema(&fresh_pool).await.unwrap();
+        ensure_schema(&fresh_pool)
+            .await
+            .expect("a second boot passes");
+    }
+
+    /// Split mode warns about rows that no relay drains.
+    #[tokio::test]
+    async fn undelivered_rows_counts_what_no_relay_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("app.db").display());
+        let pool = pool(&url);
+        assert_eq!(undelivered_rows(&pool).await, None, "no table");
+        ensure_schema(&pool).await.unwrap();
+        assert_eq!(undelivered_rows(&pool).await, Some(0));
+        let mut conn = pool.get().await.unwrap();
+        enqueue_workflow_start_outbox(&mut conn, &request("o-1"))
+            .await
+            .unwrap();
+        drop(conn);
+        assert_eq!(undelivered_rows(&pool).await, Some(1));
+    }
+
     #[test]
     fn a_stored_row_gives_the_start_options() {
         let row = DueRow {
@@ -641,5 +777,261 @@ mod tests {
             ..bare
         };
         assert!(options_of(&broken).is_err());
+    }
+
+    // ── The relay, driven directly ───────────────────────────────────────
+    //
+    // These tests build the relay with no background task, so each count
+    // is exact. `tests/sqlite_plugin/outbox.rs` runs it in a booted app.
+
+    use super::super::driver::{Driver, Registry};
+    use super::super::handle::Catalog;
+    use autumn_harvest::prelude::*;
+    use autumn_harvest_sqlite::ExecutionFilter;
+
+    /// Completes at once.
+    #[workflow]
+    async fn ship(_ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
+        Ok(input)
+    }
+
+    /// Waits for a signal that never comes, so a terminate seals it.
+    #[workflow]
+    async fn hold(ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
+        ctx.wait_for_signal("never")
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(input)
+    }
+
+    fn pool(url: &str) -> Pool<RuntimeConnection> {
+        let mut config = autumn_web::config::DatabaseConfig::default();
+        config.url = Some(url.to_owned());
+        autumn_web::db::create_pool(&config)
+            .expect("a pool")
+            .expect("a SQLite URL")
+    }
+
+    /// A relay on a fresh app database and Harvest file.
+    struct Relay {
+        _dir: tempfile::TempDir,
+        outbox: SqliteOutbox,
+        harvest: HarvestSqlite,
+        driver: Driver,
+        pool: Pool<RuntimeConnection>,
+    }
+
+    async fn relay(enabled: bool) -> Relay {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry {
+            workflows: vec![ship_info(), hold_info()],
+            activities: Vec::new(),
+            updates: Vec::new(),
+            signals: Vec::new(),
+            queries: Vec::new(),
+            log_policy: None,
+            state: autumn_harvest::context::empty_shared_state(),
+        };
+        let path = dir.path().join("app.harvest.db");
+        let runtime = Driver::open(&path, &registry).unwrap();
+        let driver = Driver::start(runtime, Duration::from_millis(20));
+        let reader = autumn_harvest_sqlite::SqliteReader::open(&path).unwrap();
+        let harvest = HarvestSqlite::new(
+            driver.sender.clone(),
+            reader,
+            path,
+            Arc::new(Catalog::of(&registry)),
+        );
+        let pool = pool(&format!("sqlite://{}", dir.path().join("app.db").display()));
+        ensure_schema(&pool).await.unwrap();
+        let config = HarvestOutboxConfig {
+            enabled,
+            poll_interval_ms: 10,
+            ..HarvestOutboxConfig::default()
+        };
+        let outbox = SqliteOutbox::new(pool.clone(), harvest.clone(), config);
+        Relay {
+            _dir: dir,
+            outbox,
+            harvest,
+            driver,
+            pool,
+        }
+    }
+
+    impl Relay {
+        async fn enqueue(&self, workflow_id: &str) {
+            self.enqueue_as("ship", workflow_id).await;
+        }
+
+        async fn enqueue_as(&self, workflow_name: &str, workflow_id: &str) {
+            let mut conn = self.pool.get().await.unwrap();
+            let mut start = request(workflow_id);
+            start.workflow_name = workflow_name.to_owned();
+            start.input = json!(workflow_id);
+            enqueue_workflow_start_outbox(&mut conn, &start)
+                .await
+                .unwrap();
+        }
+
+        async fn runs(&self, workflow_id: &str) -> Vec<String> {
+            self.runs_of("ship", workflow_id).await
+        }
+
+        async fn runs_of(&self, workflow_name: &str, workflow_id: &str) -> Vec<String> {
+            let filter = ExecutionFilter::new()
+                .workflow_name(workflow_name.to_owned())
+                .workflow_id(workflow_id.to_owned());
+            self.harvest
+                .list(filter)
+                .await
+                .unwrap()
+                .executions
+                .iter()
+                .filter_map(|run| run.execution_id().map(|exec| exec.to_string()))
+                .collect()
+        }
+
+        /// `(delivery_attempts, delivered_execution_id)` of the row.
+        async fn row(&self, workflow_id: &str) -> (i64, Option<String>) {
+            #[derive(diesel::QueryableByName)]
+            struct Row {
+                #[diesel(sql_type = BigInt)]
+                delivery_attempts: i64,
+                #[diesel(sql_type = Nullable<Text>)]
+                delivered_execution_id: Option<String>,
+            }
+            let mut conn = self.pool.get().await.unwrap();
+            let row: Row = diesel::sql_query(
+                "SELECT delivery_attempts, delivered_execution_id \
+                 FROM harvest_workflow_outbox WHERE workflow_id = ?",
+            )
+            .bind::<Text, _>(workflow_id.to_owned())
+            .get_result(&mut *conn)
+            .await
+            .unwrap();
+            (row.delivery_attempts, row.delivered_execution_id)
+        }
+
+        async fn sql(&self, sql: &str) {
+            let mut conn = self.pool.get().await.unwrap();
+            conn.batch_execute(sql).await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drain_once_respects_its_limit() {
+        let relay = relay(true).await;
+        for key in ["o-1", "o-2", "o-3"] {
+            relay.enqueue(key).await;
+        }
+        assert_eq!(relay.outbox.drain_once(2).await.unwrap(), 2);
+        assert_eq!(relay.outbox.drain_once(2).await.unwrap(), 1);
+        assert_eq!(relay.outbox.drain_once(0).await.unwrap(), 0);
+        for key in ["o-1", "o-2", "o-3"] {
+            assert_eq!(relay.runs(key).await.len(), 1, "{key}");
+        }
+        relay.driver.shutdown().await;
+    }
+
+    /// Two drains never dispatch one row, and each delivery counts once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_flushes_start_each_row_once() {
+        let relay = relay(true).await;
+        let keys: Vec<String> = (0..20).map(|n| format!("o-{n}")).collect();
+        for key in &keys {
+            relay.enqueue(key).await;
+        }
+        let (a, b, c, d) = tokio::join!(
+            relay.outbox.flush(),
+            relay.outbox.flush(),
+            relay.outbox.flush(),
+            relay.outbox.flush(),
+        );
+        let total = a.unwrap() + b.unwrap() + c.unwrap() + d.unwrap();
+        assert_eq!(total, keys.len());
+        for key in &keys {
+            assert_eq!(relay.runs(key).await.len(), 1, "{key}");
+            assert_eq!(relay.row(key).await.0, 1, "{key}");
+        }
+        relay.driver.shutdown().await;
+    }
+
+    /// A disabled relay delivers nothing. The rows wait, as on Postgres.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_disabled_outbox_delivers_nothing() {
+        let relay = relay(false).await;
+        relay.enqueue("o-off").await;
+        assert_eq!(relay.outbox.flush().await.unwrap(), 0);
+        assert_eq!(relay.outbox.drain_once(10).await.unwrap(), 0);
+        assert_eq!(relay.row("o-off").await, (0, None));
+        assert!(relay.runs("o-off").await.is_empty());
+        relay.driver.shutdown().await;
+    }
+
+    /// The relay ends when the driver stops. It marks no failure, so the
+    /// next boot delivers the row on its first attempt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_relay_stops_when_the_driver_stops() {
+        let relay = relay(true).await;
+        let stop = CancellationToken::new();
+        relay.harvest.shutdown().await.unwrap();
+        relay.enqueue("o-stop").await;
+        let task = relay.outbox.clone().spawn(stop.clone());
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the relay ends")
+            .expect("the relay does not panic");
+        assert!(!stop.is_cancelled());
+        assert_eq!(relay.row("o-stop").await, (0, None));
+        assert!(matches!(
+            relay.outbox.flush().await,
+            Err(error) if error.to_string().contains("stopped")
+        ));
+    }
+
+    /// An activity or a workflow runs on the driver task. A flush there
+    /// would wait for itself, so it is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flush_on_the_driver_task_is_refused() {
+        let relay = relay(true).await;
+        relay.enqueue("o-driver").await;
+        let refused = super::super::driver::scope_as_driver(relay.outbox.flush()).await;
+        let error = refused.unwrap_err().to_string();
+        assert!(error.contains("autumn-harvest#2470"), "{error}");
+        let refused = super::super::driver::scope_as_driver(relay.outbox.drain_once(1)).await;
+        assert!(refused.is_err());
+        assert_eq!(relay.row("o-driver").await, (0, None));
+        relay.driver.shutdown().await;
+    }
+
+    /// AC2 through the real relay: the start commits, the mark fails, and
+    /// the run is terminated before the redelivery. A plain start would run
+    /// the key again over the terminated run. `StartOnce` marks the row with
+    /// the first run instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_mark_redelivers_to_the_same_run() {
+        let relay = relay(true).await;
+        relay.enqueue_as("hold", "o-mark").await;
+        relay
+            .sql(
+                "CREATE TRIGGER fail_mark BEFORE UPDATE ON harvest_workflow_outbox \
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            )
+            .await;
+        let error = relay.outbox.flush().await.unwrap_err().to_string();
+        assert!(error.contains("injected"), "{error}");
+        let first = relay.runs_of("hold", "o-mark").await;
+        assert_eq!(first.len(), 1, "the start committed before the mark");
+        assert_eq!(relay.row("o-mark").await, (0, None));
+
+        let exec = first[0].parse().unwrap();
+        let ack = relay.harvest.terminate(exec, "operator").await.unwrap();
+        assert_eq!(ack.state, "TERMINATED");
+        relay.sql("DROP TRIGGER fail_mark").await;
+        assert_eq!(relay.outbox.flush().await.unwrap(), 1);
+        assert_eq!(relay.row("o-mark").await, (1, Some(first[0].clone())));
+        assert_eq!(relay.runs_of("hold", "o-mark").await, first);
+        relay.driver.shutdown().await;
     }
 }

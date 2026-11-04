@@ -74,9 +74,15 @@ app code.
 | F5 | Two drains in one process dispatch one row. | A mutex serializes drains. The mark guard counts it once. |
 | F6 | App code writes the row in a fleet tenant database. | That database has no table, so the write fails. |
 | F7 | A row that can never start blocks the queue. | It retries with a capped backoff and `last_error`, as on Postgres. Rows behind it still drain. |
-| F8 | A queue name or search attribute that SQLite cannot honour. | The writer refuses it, so the row never waits for a retry that cannot pass. |
+| F8 | A blank id, a queue name or a search attribute that SQLite cannot honour. | The writer refuses it, so the row never waits for a retry that cannot pass. An unknown workflow or an oversized input fails at start, and retries as on Postgres (F7). |
 | F9 | Shutdown drops the writer lock while the relay dispatches. | The shutdown hook stops the relay before the driver. A `Stopped` reply ends the drain. |
 | F10 | The relay spins on a broken table. | It logs once per change, and waits for the next tick. |
+| F11 | An activity flushes the outbox, and waits for its own driver task. | A flush on a driver task is refused. |
+| F12 | `StartOnce` scans every run of the store for a new key. | `newest_run_of_key` uses the key index. |
+| F13 | The due query reads every delivered row on each poll. | A partial index on `id` holds the undelivered rows only. |
+| F14 | An existing table of another shape fails each write. | The boot compiles each statement with `EXPLAIN`, and fails on a mismatch. |
+| F15 | Split mode leaves rows from embedded mode with no relay. | The boot warns when undelivered rows wait. |
+| F16 | The driver stops outside shutdown, and the relay ends with it. | The relay logs a warning. The rows wait for the next boot. |
 
 ### 0.5 Six thinking hats
 
@@ -101,9 +107,10 @@ app code.
 
 ### 1.1 Table
 
-`sqlite::outbox::SCHEMA_SQL` creates `harvest_workflow_outbox` in the app's
+`sqlite::OUTBOX_SCHEMA_SQL` creates `harvest_workflow_outbox` in the app's
 primary database at boot. The columns follow Postgres. Times are epoch
-milliseconds. There is no claim column (R3).
+milliseconds. There is no claim column (R3). The boot checks the shape of
+a table that exists (F14).
 
 ### 1.2 Writer
 
@@ -111,10 +118,11 @@ milliseconds. There is no claim column (R3).
 the caller's connection. A duplicate `(workflow_name, workflow_id)` is a
 no-op, as on Postgres. It refuses:
 
-- an empty `workflow_id`, as on Postgres;
+- an empty or blank `workflow_id`;
 - a `queue_name` other than `default`: SQLite has one queue;
 - a `search_attrs` that is not an object of JSON primitives;
-- a database with no outbox table, with a message that names this issue.
+- a database with no outbox table, with a message that names
+  autumn-harvest#2470.
 
 ### 1.3 Relay
 
@@ -124,8 +132,15 @@ The startup hook creates the table, then spawns the relay. Each tick of
 row delivered with its execution id. A failure sets `last_error` and the
 next attempt time. `claim_ttl_ms` has no effect on SQLite.
 
+`StartOnce` matches a run of the key in any state, from any start path. It
+is stricter than the Postgres reuse policy, which starts a fresh run over a
+sealed one. A row whose key already ran from the API is marked with that
+run. Two apps with two Harvest files must not share one app database: each
+relay would start the row in its own file.
+
 `flush_workflow_start_outbox` and `drain_workflow_start_outbox_once` drain
-the SQLite outbox when the app runs Harvest on SQLite.
+the SQLite outbox when the app runs Harvest on SQLite. An activity or a
+workflow cannot call them (F11).
 
 ### 1.4 Shutdown
 

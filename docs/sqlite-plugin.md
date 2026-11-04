@@ -338,23 +338,33 @@ conn.transaction(async |conn| {
   app's primary database. In a fleet app, that is the control database.
   A fleet tenant database has no outbox table, so a write there fails.
   `OUTBOX_SCHEMA_SQL` holds the DDL, for an app that applies it before the
-  deploy.
+  deploy. A table of another shape fails the boot.
 - **The relay.** It drains the due rows every
   `harvest.outbox.poll_interval_ms`, in batches of `batch_size`. The control
   Harvest runs each start. A failed start keeps `last_error`, and backs off
   with `base_retry_delay_ms` and `max_retry_delay_ms`. `claim_ttl_ms` has no
   effect: one process holds the Harvest file, so one relay runs.
-  `harvest.outbox.enabled = false` stops the relay, and the rows wait.
+  `harvest.outbox.enabled = false` stops the relay, and the rows wait. Two
+  apps with two Harvest files must not share one app database.
 - **Exactly once.** A rolled-back write leaves no row. A committed row runs
   once, across a crash before the relay and a crash between the start and
   the mark. The relay starts a row only when its
-  `(workflow_name, workflow_id)` has no run, in any state.
+  `(workflow_name, workflow_id)` has no run, in any state. This is stricter
+  than Postgres: a key that an API start already used, or that an operator
+  terminated, is marked with that run and does not run again.
 - **Flush.** `flush_workflow_start_outbox(&state)` and
   `drain_workflow_start_outbox_once` drain the SQLite outbox, as on
+  Postgres. An activity or a workflow cannot call them: they run on the
+  driver task, and the start would wait for that task.
+- **Refusals.** The writer refuses an empty or blank `workflow_id`, a
+  `queue_name` other than `"default"`, and `search_attrs` that is not an
+  object of JSON primitives. A duplicate key is a no-op. An unknown workflow
+  or an input over the cap fails at start, and the relay retries it, as on
   Postgres.
-- **Refusals.** The writer refuses an empty `workflow_id`, a `queue_name`
-  other than `"default"`, and `search_attrs` that is not an object of JSON
-  primitives. A duplicate key is a no-op.
+- **Split and external mode.** No SQLite relay runs. The boot warns when
+  the app database holds undelivered starts from embedded mode.
+- **In-memory app database.** Its pool has one connection. A flush then
+  waits while the caller holds that connection. Use a file.
 
 ## The management API
 
@@ -585,8 +595,8 @@ no-op would let an app believe a protection or a feature is on.
 
 These options do nothing on SQLite, because they tune Postgres machinery that
 this backend does not have: `worker(..)`, `load_shed`, `ramp_guard`,
-`start_idempotency_window`, the durable-route limits and the status
-thresholds.
+`start_idempotency_window`, the durable-route limits, the status
+thresholds and `harvest.outbox.claim_ttl_ms`.
 
 ## Tests
 

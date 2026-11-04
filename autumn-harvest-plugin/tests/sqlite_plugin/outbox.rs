@@ -15,7 +15,10 @@ use autumn_harvest::prelude::*;
 use autumn_harvest_plugin::sqlite::{
     ExecutionFilter, HarvestSqlite, StartOptions, enqueue_workflow_start_outbox,
 };
-use autumn_harvest_plugin::{HarvestPlugin, WorkflowStartRequest, flush_workflow_start_outbox};
+use autumn_harvest_plugin::{
+    HarvestPlugin, WorkflowStartRequest, drain_workflow_start_outbox_once,
+    flush_workflow_start_outbox,
+};
 use autumn_web::AppState;
 use autumn_web::db::RuntimeConnection;
 use autumn_web::test::{TestApp, TestClient};
@@ -202,9 +205,10 @@ async fn a_start_in_a_rolled_back_transaction_never_runs() {
     assert_eq!(runs(&client, "o-rolled-back").await, Vec::<String>::new());
 
     place_order(state, "o-committed", true).await;
-    // An explicit flush and the background relay race. One of them
-    // delivers the row, so the flush reports zero or one.
-    assert!(flush_workflow_start_outbox(state).await.unwrap() <= 1);
+    // The top-level drain reaches the SQLite outbox. It races the
+    // background relay, so either one can deliver the row. The exact counts
+    // are in the unit tests of `sqlite::outbox`, which run no relay.
+    drain_workflow_start_outbox_once(state, 10).await.unwrap();
     let exec = wait_delivered_and_completed(&client, "o-committed").await;
     assert_eq!(count(state, "SELECT COUNT(*) AS n FROM orders").await, 1);
     assert_eq!(
@@ -358,4 +362,27 @@ async fn a_failed_start_backs_off_and_keeps_its_error() {
     }
     assert_eq!(flush_workflow_start_outbox(state).await.unwrap(), 0);
     assert_eq!(runs(&client, "o-once").await, [exec]);
+}
+
+/// An app with no database has no outbox. A flush says what it needs, so
+/// the app does not believe that its starts run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_without_an_app_database_names_what_it_needs() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = TestApp::new()
+        .config(super::config(dir.path()))
+        .profile("dev")
+        .plugin(
+            HarvestPlugin::new()
+                .workflows(workflows![ship])
+                .activities(activities![pack])
+                .api("/harvest"),
+        )
+        .build();
+    let error = flush_workflow_start_outbox(client.state())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("embedded"), "{error}");
+    assert!(error.contains("#2470"), "{error}");
 }

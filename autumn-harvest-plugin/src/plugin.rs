@@ -1582,6 +1582,11 @@ impl HarvestPlugin {
             "harvest runs on Postgres; a SQLite app runs the transactional outbox in embedded \
              mode only (autumn-harvest#2470)"
         );
+        // Rows left from embedded mode wait with no relay. Say so at boot.
+        let app = app.on_startup(|state| async move {
+            crate::sqlite::warn_if_stranded(&state).await;
+            Ok(())
+        });
         self.build_postgres(app)
     }
 

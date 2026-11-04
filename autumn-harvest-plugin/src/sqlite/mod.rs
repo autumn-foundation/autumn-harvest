@@ -44,8 +44,8 @@ use tokio_util::sync::CancellationToken;
 pub use driver::{RoutedSignal, RoutedUpdate, SignalWithStartParams, StopAck};
 pub use fleet::{HarvestFleet, HarvestTenant, tenant_harvest_file};
 pub use handle::{HarvestSqlite, HarvestSqliteError};
-pub(crate) use outbox::SqliteOutbox;
 pub use outbox::{SCHEMA_SQL as OUTBOX_SCHEMA_SQL, enqueue_workflow_start_outbox};
+pub(crate) use outbox::{SqliteOutbox, warn_if_stranded};
 
 /// The `autumn-harvest-sqlite` types that [`HarvestSqlite`] takes and returns.
 pub use autumn_harvest_sqlite::{

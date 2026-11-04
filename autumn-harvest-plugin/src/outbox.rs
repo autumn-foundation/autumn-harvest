@@ -108,6 +108,8 @@ impl HarvestWorkflowOutboxRow {
 /// Persist a workflow-start request in the application database outbox.
 ///
 /// Duplicate `(workflow_name, workflow_id)` requests are ignored so callers can retry safely.
+/// This writer takes a Postgres connection. On a SQLite app, use
+/// `sqlite::enqueue_workflow_start_outbox` (issue #2470).
 ///
 /// # Errors
 ///
@@ -155,7 +157,8 @@ pub async fn enqueue_workflow_start_outbox(
 /// # Errors
 ///
 /// Returns an [`AutumnError`] when the app database pool is unavailable or row claiming/updating
-/// fails.
+/// fails. On SQLite, it also fails when the driver has stopped, or when an activity or a
+/// workflow calls it.
 pub async fn drain_workflow_start_outbox_once(
     state: &AppState,
     limit: i64,
@@ -507,7 +510,8 @@ async fn flush_outbox_marks_or_err(
 ///
 /// # Errors
 ///
-/// Returns an [`AutumnError`] when claiming or marking any outbox row fails.
+/// Returns an [`AutumnError`] when claiming or marking any outbox row fails. On SQLite, it
+/// also fails when the driver has stopped, or when an activity or a workflow calls it.
 pub async fn flush_workflow_start_outbox(state: &AppState) -> Result<usize, AutumnError> {
     // A SQLite app in embedded mode drains its own outbox (issue #2470).
     #[cfg(feature = "sqlite")]
