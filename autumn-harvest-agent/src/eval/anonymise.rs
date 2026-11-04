@@ -2,18 +2,18 @@
 //!
 //! A model that reads a comparison to pick a candidate is biased by labels
 //! and by order. [`compare_anonymised`] removes both. It gives each candidate
-//! an opaque [`CandidateId`] and lists the candidates in a seeded order. The
+//! an opaque [`AnonId`] and lists the candidates in a seeded order. The
 //! text holds no model name, no overlay digest and no label. The key that
 //! maps each id back to its candidate is a separate field.
 //!
 //! # The ids
 //!
-//! The sort key of a candidate is the SHA-256 of the seed, the source run id
-//! and [`Candidate::digest`]. The pool sorts by that key. So the input order
-//! changes neither the ids nor the text. The id is `c-` and a hex prefix of
-//! the key. The prefix has at least [`MIN_ID_DIGITS`] digits. It grows until
-//! no two ids are equal. `formal/verus/src/agent_anonymise.rs` proves the
-//! width rule.
+//! [`anon::assign`] gives the ids, as for an evidence bundle (issue #2377).
+//! Its key of a candidate is [`Candidate::digest`]. The id is `c-` and a hex
+//! prefix of the SHA-256 of the seed, the source run id and that digest.
+//! The prefix has at least [`MIN_ANON_HEX`](anon::MIN_ANON_HEX) digits. It
+//! grows until no two ids are equal. The pool lists the ids in order, so the
+//! input order changes neither the ids nor the text.
 //!
 //! The source run id is the run id of the first recorded model request. It
 //! is the execution id of the source, unless its task names another run id
@@ -43,44 +43,15 @@ use std::fmt::{self, Write as _};
 
 use autumn_harvest::event::WorkflowEvent;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
+use super::anon::{self, AnonId, CandidateKey};
 use super::{
     Candidate, Divergence, EvalError, Evaluation, Recording, RunEnd, Side, TurnDecision, TurnDiff,
     Verdict, run_with_routes,
 };
-use crate::transcript::hex;
-
-/// The least number of hex digits in an id.
-pub const MIN_ID_DIGITS: usize = 12;
-
-/// The number of hex digits in a sort key: the length of a SHA-256 in hex.
-const KEY_DIGITS: usize = 64;
-
-/// The domain tag of a sort key. A change of the key layout changes it.
-const KEY_DOMAIN: &[u8] = b"autumn-harvest/eval/anonymised/v1\0";
 
 /// The text that replaces an identity in a failure text.
 pub const REDACTED: &str = "[redacted]";
-
-/// The opaque id of one candidate in a pool, such as `c-3f9a1b2c4d5e`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct CandidateId(String);
-
-impl CandidateId {
-    /// The id as text.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for CandidateId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 /// What an id resolves to. Never give it to the reader of the text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,7 +74,7 @@ pub struct CandidateRef {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnonymisedEvaluation {
     /// The opaque id of the candidate.
-    pub id: CandidateId,
+    pub id: AnonId,
     /// One comparison per model turn, as in [`Evaluation::turns`].
     pub turns: Vec<TurnDiff>,
     /// The index of the first divergent turn.
@@ -142,7 +113,7 @@ pub struct AnonymisedReport {
     /// The structured pool.
     pub pool: AnonymisedPool,
     /// Each id and its candidate.
-    pub key: BTreeMap<CandidateId, CandidateRef>,
+    pub key: BTreeMap<AnonId, CandidateRef>,
 }
 
 impl fmt::Debug for AnonymisedReport {
@@ -158,7 +129,7 @@ impl fmt::Debug for AnonymisedReport {
 impl AnonymisedReport {
     /// The candidate of `id`, or `None` for an id outside the pool.
     #[must_use]
-    pub fn resolve(&self, id: &CandidateId) -> Option<&CandidateRef> {
+    pub fn resolve(&self, id: &AnonId) -> Option<&CandidateRef> {
         self.key.get(id)
     }
 }
@@ -267,7 +238,7 @@ fn identities(candidates: &[Candidate], asked: &BTreeSet<Option<String>>) -> Vec
 
 /// `evaluation` under `id`, with every identity field left out, and with
 /// the run end scrubbed.
-fn anonymise(evaluation: Evaluation, id: CandidateId, scrub: &Scrub) -> AnonymisedEvaluation {
+fn anonymise(evaluation: Evaluation, id: AnonId, scrub: &Scrub) -> AnonymisedEvaluation {
     // An exhaustive destructure. A new field of `Evaluation` fails the build
     // here until this function keeps it or names it an identity.
     let Evaluation {
@@ -344,84 +315,32 @@ fn redact_one(text: &str, name: &str) -> String {
 /// # Errors
 ///
 /// Returns [`EvalError::DuplicateCandidate`] for the first pair of equal
-/// sort keys, in input order. Only equal digests give equal keys.
+/// digests, in input order. Equal digests would get one id.
 fn pool_slots(
     seed: u64,
     source: &str,
     digests: &[String],
-) -> Result<Vec<(usize, CandidateId)>, EvalError> {
-    let keys: Vec<String> = digests
-        .iter()
-        .map(|digest| sort_key(seed, source, digest))
-        .collect();
-    let mut shared = Vec::new();
-    for (first, a) in keys.iter().enumerate() {
-        for (second, b) in keys.iter().enumerate().skip(first + 1) {
-            let count = shared_digits(a.as_bytes(), b.as_bytes());
-            if count >= KEY_DIGITS {
-                return Err(EvalError::DuplicateCandidate { first, second });
-            }
-            shared.push(count);
+) -> Result<Vec<(usize, AnonId)>, EvalError> {
+    for (first, a) in digests.iter().enumerate() {
+        if let Some(second) = (first + 1..digests.len()).find(|&at| digests[at] == *a) {
+            return Err(EvalError::DuplicateCandidate { first, second });
         }
     }
-    let width = id_width(&shared, MIN_ID_DIGITS, KEY_DIGITS);
-    let mut order: Vec<usize> = (0..keys.len()).collect();
-    order.sort_by(|a, b| keys[*a].cmp(&keys[*b]));
-    let mut ranks = vec![0; keys.len()];
+    let keys: Vec<CandidateKey<'_>> = digests
+        .iter()
+        .map(|digest| CandidateKey {
+            digest,
+            occurrence: 0,
+        })
+        .collect();
+    let ids = anon::assign(seed, source, &keys);
+    let mut order: Vec<usize> = (0..ids.len()).collect();
+    order.sort_by(|a, b| ids[*a].cmp(&ids[*b]));
+    let mut ranks = vec![0; ids.len()];
     for (rank, index) in order.into_iter().enumerate() {
         ranks[index] = rank;
     }
-    Ok(keys
-        .iter()
-        .zip(ranks)
-        .map(|(key, rank)| {
-            let prefix = key.get(..width).unwrap_or(key);
-            (rank, CandidateId(format!("c-{prefix}")))
-        })
-        .collect())
-}
-
-/// The sort key of the candidate `digest`, as 64 hex digits.
-///
-/// Each part has a length prefix, so two part lists never give one input.
-fn sort_key(seed: u64, source: &str, digest: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(KEY_DOMAIN);
-    hasher.update(seed.to_be_bytes());
-    for part in [source, digest] {
-        let len = u64::try_from(part.len()).unwrap_or(u64::MAX);
-        hasher.update(len.to_be_bytes());
-        hasher.update(part.as_bytes());
-    }
-    hex(&hasher.finalize())
-}
-
-/// The number of leading digits that `a` and `b` share.
-///
-/// `formal/verus/src/agent_anonymise.rs` proves it.
-const fn shared_digits(a: &[u8], b: &[u8]) -> usize {
-    let mut i = 0;
-    while i < a.len() && i < b.len() && a[i] == b[i] {
-        i += 1;
-    }
-    i
-}
-
-/// The id width: the least width from `floor` that is above each shared
-/// count below `cap`.
-///
-/// `formal/verus/src/agent_anonymise.rs` proves that no smaller width from
-/// the floor is above each count. Two prefixes of this width then differ.
-const fn id_width(shared: &[usize], floor: usize, cap: usize) -> usize {
-    let mut width = floor;
-    let mut i = 0;
-    while i < shared.len() {
-        if shared[i] >= width && shared[i] < cap {
-            width = shared[i] + 1;
-        }
-        i += 1;
-    }
-    width
+    Ok(ranks.into_iter().zip(ids).collect())
 }
 
 impl AnonymisedPool {
@@ -537,7 +456,7 @@ mod tests {
     }
 
     /// The input indices in pool order.
-    fn order(slots: &[(usize, CandidateId)]) -> Vec<usize> {
+    fn order(slots: &[(usize, AnonId)]) -> Vec<usize> {
         let mut indices: Vec<usize> = (0..slots.len()).collect();
         indices.sort_by_key(|index| slots[*index].0);
         indices
@@ -546,8 +465,9 @@ mod tests {
     #[test]
     fn two_seeds_order_a_pair_apart() {
         let pair = digests(&["sha256:aa", "sha256:bb"]);
-        let one = pool_slots(1, "exec-1", &pair).unwrap();
-        let two = pool_slots(2, "exec-1", &pair).unwrap();
+        // Seed 0 orders `aa` first and seed 1 orders `bb` first.
+        let one = pool_slots(0, "exec-1", &pair).unwrap();
+        let two = pool_slots(1, "exec-1", &pair).unwrap();
         assert_ne!(order(&one), order(&two), "{one:?} {two:?}");
         assert_ne!(one[0].1, two[0].1, "the seed changes the id");
     }
@@ -571,7 +491,7 @@ mod tests {
         let slots = pool_slots(0, "exec-1", &digests(&["x", "y"])).unwrap();
         for (_, id) in &slots {
             let digits = id.as_str().strip_prefix("c-").unwrap();
-            assert_eq!(digits.len(), MIN_ID_DIGITS, "{id}");
+            assert_eq!(digits.len(), anon::MIN_ANON_HEX, "{id}");
             assert!(digits.bytes().all(|b| b.is_ascii_hexdigit()), "{id}");
         }
     }
@@ -590,29 +510,6 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(pool_slots(0, "exec-1", &[]).unwrap(), Vec::new());
-    }
-
-    #[test]
-    fn a_shared_prefix_widens_every_id() {
-        assert_eq!(id_width(&[], 12, 64), 12);
-        assert_eq!(id_width(&[3, 11], 12, 64), 12);
-        assert_eq!(id_width(&[12], 12, 64), 13);
-        assert_eq!(id_width(&[3, 20, 13], 12, 64), 21);
-        assert_eq!(id_width(&[64], 12, 64), 12, "an equal pair is not fixable");
-    }
-
-    #[test]
-    fn shared_digits_counts_the_common_prefix() {
-        assert_eq!(shared_digits(b"abc", b"abd"), 2);
-        assert_eq!(shared_digits(b"ab", b"ab"), 2);
-        assert_eq!(shared_digits(b"", b"a"), 0);
-        assert_eq!(shared_digits(b"x", b"y"), 0);
-    }
-
-    #[test]
-    fn a_key_parts_list_gives_one_input_only() {
-        assert_ne!(sort_key(0, "ab", "c"), sort_key(0, "a", "bc"));
-        assert_eq!(sort_key(0, "a", "b").len(), KEY_DIGITS);
     }
 
     #[test]
@@ -663,13 +560,13 @@ mod tests {
     }
 
     /// The pool slot of each digest, by digest.
-    fn slots_by_digest(seed: u64, digests: &[String]) -> BTreeMap<String, (usize, CandidateId)> {
+    fn slots_by_digest(seed: u64, digests: &[String]) -> BTreeMap<String, (usize, AnonId)> {
         let slots = pool_slots(seed, "exec-1", digests).unwrap();
         digests.iter().cloned().zip(slots).collect()
     }
 
     /// The number of distinct ids in `slots`.
-    fn distinct_ids(slots: &BTreeMap<String, (usize, CandidateId)>) -> usize {
+    fn distinct_ids(slots: &BTreeMap<String, (usize, AnonId)>) -> usize {
         slots
             .values()
             .map(|slot| &slot.1)

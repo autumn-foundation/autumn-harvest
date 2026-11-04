@@ -988,14 +988,14 @@ let pool = [
     Candidate::new(harness_b).overlay(v8).label("triage@v8"),
 ];
 let report = compare_anonymised(&history, &pool, seed).await?;
-let pick = ask_a_model(&report.text).await?;          // a CandidateId
+let pick = ask_a_model(&report.text).await?;          // an AnonId
 let chosen = &pool[report.resolve(&pick).ok_or("not in the pool")?.index];
 ```
 
 | Part | In an anonymised report |
 |---|---|
-| `CandidateId` | `c-` and a hex prefix of `SHA-256(seed, source run id, Candidate::digest)`. The prefix has at least 12 digits. It grows until no two ids are equal. `formal/verus/src/agent_anonymise.rs` proves the width rule. |
-| The order | The pool sorts by that hash. The input order changes no id and no text. The candidates also run in pool order. |
+| `AnonId` | `eval::anon::assign` gives the ids, as for an evidence bundle. The key of a candidate is `Candidate::digest`. An id is `c-` and a hex prefix of `SHA-256(seed, source run id, Candidate::digest)`. The prefix has at least 12 digits. It grows until no two ids are equal. `formal/verus/src/agent_anonymise.rs` proves the width rule. |
+| The order | The pool lists the ids in order. The input order changes no id and no text. The candidates also run in pool order. |
 | `text` | `AnonymisedPool::render`: the source end, then per id the counts, the end, each turn verdict, and each turn decision as JSON. It holds no model name, overlay digest, label or input index. |
 | `pool` | The same content as JSON. Each `AnonymisedEvaluation` keeps every field of `Evaluation` except `overlay_digest`. The recorded end is in the pool once. |
 | `key` | Each id with its `CandidateRef`: the input index, the candidate digest, the overlay digest and the label. Keep it from the reader. `AnonymisedReport` does not implement `Serialize`, and its `Debug` form hides the key. |

@@ -18,7 +18,7 @@
 //! # A pool
 //!
 //! [`compare_anonymised`] runs any number of candidates on one source (issue
-//! #2376). It gives each one an opaque [`CandidateId`] in a seeded order. Its
+//! #2376). It gives each one an opaque [`anon::AnonId`] in a seeded order. Its
 //! text names no model, overlay or label. See [`AnonymisedReport`].
 //!
 //! # How it runs
@@ -136,8 +136,7 @@ use crate::types::{
 mod anonymise;
 
 pub use anonymise::{
-    AnonymisedEvaluation, AnonymisedPool, AnonymisedReport, CandidateId, CandidateRef,
-    compare_anonymised,
+    AnonymisedEvaluation, AnonymisedPool, AnonymisedReport, CandidateRef, compare_anonymised,
 };
 
 use crate::workflow::{

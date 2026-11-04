@@ -76,7 +76,7 @@ Each answer gives a rule.
 ## 5. Decision
 
 ```rust
-pub struct CandidateId(String);                 // "c-<hex>"
+// `AnonId` is `eval::anon::AnonId` of issue #2377: "c-<hex>".
 impl Candidate {
     pub fn label(self, label: impl Into<String>) -> Self;
     pub fn digest(&self) -> String;              // "sha256:<hex>"
@@ -89,17 +89,19 @@ pub async fn compare_anonymised(
 pub struct AnonymisedReport {
     pub text: String,                            // pool.render()
     pub pool: AnonymisedPool,                    // no identity
-    pub key: BTreeMap<CandidateId, CandidateRef>,
+    pub key: BTreeMap<AnonId, CandidateRef>,
 }
 ```
 
 1. The harness reads the source and applies every overlay. A refusal costs
    no model call.
-2. Each candidate gets a sort key: `SHA-256` of a domain tag, the seed, the
-   source run id and the candidate digest, each length-prefixed.
-3. The pool sorts by key. The id width is the least width of at least 12
-   hex digits that is above the shared prefix of every pair. A pair with
-   equal keys gives `DuplicateCandidate`.
+2. Two equal candidate digests give `DuplicateCandidate`.
+3. `eval::anon::assign` gives the ids, as for an evidence bundle (issue
+   #2377). Its key of a candidate is the candidate digest. It hashes a
+   domain tag, the seed, the source run id and that key, each
+   length-prefixed. The id width is the least width of at least 12 hex
+   digits that is above the shared prefix of every pair. The pool lists
+   the ids in order.
 4. The candidates run in pool order. Each `Evaluation` becomes an
    `AnonymisedEvaluation`, which keeps every field except `overlay_digest`.
 5. `AnonymisedPool::render` writes the text. It holds the ids and the
@@ -119,7 +121,7 @@ All tests are in `autumn-harvest-agent/tests/eval.rs` unless named.
 | Two seeds order a pair apart | `two_seeds_order_a_pair_apart`, a unit test in `eval/anonymise.rs` with fixed seeds and a fixed run id. `the_seed_reorders_the_pool` checks a recorded source. Its run id changes on each run, so that test tries seeds until the order changes. |
 | The map resolves every id, and no id repeats | `the_key_resolves_every_id_once` |
 | The report keeps every non-identity field of `Evaluation` | `the_report_keeps_every_field_that_is_not_an_identity`, and `anonymise` destructures `Evaluation` exhaustively |
-| The id width rule | `formal/verus/src/agent_anonymise.rs`, and the unit test `a_shared_prefix_widens_every_id` |
+| The id width rule | `formal/verus/src/agent_anonymise.rs`, and the unit test `a_shared_prefix_widens_every_id` in `eval/anon.rs` |
 | Duplicates and bad overlays cost no model call | `equal_candidates_are_refused_before_any_model_call`, `a_bad_overlay_in_the_pool_is_refused_before_any_model_call`, `an_unknown_agent_route_is_refused_before_any_model_call` |
 | Failure texts name no candidate | `a_failure_text_names_no_candidate`, `a_failed_source_end_names_no_candidate`, `an_inherited_route_and_its_model_id_are_redacted`, `a_recorded_peer_route_and_its_model_id_are_redacted`, and the unit test `only_a_whole_name_is_redacted` |
 | The run order is the pool order | `the_candidates_run_in_pool_order` |

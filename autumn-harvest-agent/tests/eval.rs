@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest_agent::eval::anon::AnonId;
 use autumn_harvest_agent::eval::{
-    AnonymisedReport, Candidate, CandidateId, DEFAULT_EXTRA_TURNS, Divergence, EvalError,
-    Evaluation, RunEnd, Side, Verdict, compare, compare_anonymised, evaluate,
+    AnonymisedReport, Candidate, DEFAULT_EXTRA_TURNS, Divergence, EvalError, Evaluation, RunEnd,
+    Side, Verdict, compare, compare_anonymised, evaluate,
 };
 use autumn_harvest_agent::followup::FOLLOWUP_TOOL;
 use autumn_harvest_agent::memory::{MEMORY_TOOL, MemoryStore};
@@ -2355,7 +2356,7 @@ fn pool_of(members: &[Member]) -> (Vec<Candidate>, Vec<Arc<ScriptedModel>>) {
 }
 
 /// The id of the candidate at input `index`.
-fn id_of(report: &AnonymisedReport, index: usize) -> CandidateId {
+fn id_of(report: &AnonymisedReport, index: usize) -> AnonId {
     report
         .key
         .iter()
@@ -2460,7 +2461,7 @@ async fn the_key_resolves_every_id_once() {
     let report = compare_anonymised(&source, &candidates, 3).await.unwrap();
 
     assert_eq!(report.key.len(), 3, "no id repeats");
-    let pool_ids: std::collections::BTreeSet<&CandidateId> = report
+    let pool_ids: std::collections::BTreeSet<&AnonId> = report
         .pool
         .candidates
         .iter()

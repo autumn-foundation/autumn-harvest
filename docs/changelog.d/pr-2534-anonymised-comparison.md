@@ -31,9 +31,13 @@ labels or order. Parent: #2369. It builds on the overlay candidates of
 - **Kept fields.** `AnonymisedEvaluation` keeps every field of `Evaluation`
   except `overlay_digest`. An exhaustive destructure fails the build when
   `Evaluation` gains a field.
+- **One id scheme.** The ids come from `eval::anon::assign` of #2377, so a
+  report and an evidence bundle share one scheme. `assign` now picks the
+  id width with the proven `shared_digits` and `id_width` kernel. The width
+  rule is unchanged for distinct keys.
 - **Proof.** `formal/verus/src/agent_anonymise.rs` mirrors `shared_digits`
-  and `id_width`. It proves that the width is the least safe width from
-  the floor, and that two prefixes of that width differ.
+  and `id_width` in `eval/anon.rs`. It proves that the width is the least
+  safe width from the floor, and that two prefixes of that width differ.
 - **Tests.** The change adds fifteen integration tests to
   `autumn-harvest-agent/tests/eval.rs` and twelve unit tests. One unit
   test is a proptest. It checks that any input order gives each candidate

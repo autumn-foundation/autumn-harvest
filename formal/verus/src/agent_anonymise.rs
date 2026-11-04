@@ -1,6 +1,6 @@
 //! The id width of an anonymised pool (issue #2376).
 //!
-//! `eval::compare_anonymised` gives each candidate the id `c-<prefix>`. The
+//! `eval::anon::assign` gives each candidate the id `c-<prefix>`. The
 //! prefix is the first `width` hex digits of the sort key of the candidate.
 //! The copy `shared_digits` counts the leading digits that two keys share.
 //! The copy `id_width` picks the width from the shared count of every pair.
@@ -47,7 +47,7 @@ proof fn lemma_common(a: Seq<u8>, b: Seq<u8>)
     }
 }
 
-// mirror: autumn-harvest-agent/src/eval/anonymise.rs shared_digits
+// mirror: autumn-harvest-agent/src/eval/anon.rs shared_digits
 pub fn shared_digits(a: &[u8], b: &[u8]) -> (r: usize)
     ensures
         r == common(a@, b@),
@@ -89,7 +89,7 @@ pub open spec fn safe(shared: Seq<usize>, cap: int, r: int) -> bool {
     forall|i: int| 0 <= i < shared.len() && shared[i] < cap ==> shared[i] < r
 }
 
-// mirror: autumn-harvest-agent/src/eval/anonymise.rs id_width
+// mirror: autumn-harvest-agent/src/eval/anon.rs id_width
 pub fn id_width(shared: &[usize], floor: usize, cap: usize) -> (r: usize)
     requires
         floor <= cap,
