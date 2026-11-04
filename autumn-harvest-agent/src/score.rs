@@ -365,6 +365,8 @@ pub struct ScoreContext<'a> {
     slots: AtomicUsize,
     /// The sum of the usage of each judge reply.
     usage: Mutex<TokenUsage>,
+    /// The model name of each judge call. `None` is the default model.
+    routes: Mutex<std::collections::BTreeSet<Option<String>>>,
 }
 
 /// One reserved ledger slot. A drop before [`Slot::keep`] frees it, so a
@@ -413,6 +415,7 @@ impl<'a> ScoreContext<'a> {
             refusal: Mutex::new(None),
             slots: AtomicUsize::new(0),
             usage: Mutex::new(TokenUsage::default()),
+            routes: Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -449,6 +452,10 @@ impl<'a> ScoreContext<'a> {
                 "the harness has no such judge model; add it with AgentHarness::model_named",
             )
         })?;
+        self.routes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(model.map(str::to_owned));
         // Reserve the slot before the call, so concurrent calls never pass
         // the ledger cap together.
         let slot = self.reserve().ok_or_else(|| {
@@ -525,6 +532,16 @@ impl<'a> ScoreContext<'a> {
     #[must_use]
     pub fn usage(&self) -> TokenUsage {
         *self.usage.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The model name of each judge call so far. `None` is the default
+    /// model. An anonymised pool redacts these names (issue #2447).
+    #[must_use]
+    pub fn routes(&self) -> std::collections::BTreeSet<Option<String>> {
+        self.routes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The cost ledger calls of the judge calls so far.

@@ -2869,25 +2869,20 @@ async fn a_recorded_peer_route_and_its_model_id_are_redacted() {
 
 // ── Scored evaluations (issue #2447) ────────────────────────────────────────
 
-/// The golden JSON of an evaluation with no scorer. It holds the shape from
-/// before issue #2447. Set `UPDATE_GOLDEN=1` to write it again.
+/// The golden JSON of an evaluation with no scorer. The code from before
+/// issue #2447 wrote it. Set `UPDATE_GOLDEN=1` to write it again.
 const NO_SCORER_GOLDEN: &str = "tests/fixtures/eval_no_scorer.json";
 
-/// `value` with each `run_id` string replaced. A source run on SQLite gets a
-/// new run id each time.
-fn without_run_ids(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for (key, field) in map.iter_mut() {
-                if key == "run_id" && field.is_string() {
-                    *field = json!("<run>");
-                } else {
-                    without_run_ids(field);
-                }
-            }
+/// The run id in the golden JSON. A source run on SQLite gets a new run id
+/// each time.
+const GOLDEN_RUN_ID: &str = "<run>";
+
+/// Replace the run id of each report in `value` with `run_id`.
+fn with_run_id(value: &mut Value, run_id: &str) {
+    for end in ["/recorded/detail/run_id", "/candidate/detail/run_id"] {
+        if let Some(field) = value.pointer_mut(end) {
+            *field = json!(run_id);
         }
-        Value::Array(items) => items.iter_mut().for_each(without_run_ids),
-        _ => {}
     }
 }
 
@@ -2906,14 +2901,23 @@ async fn with_no_scorer_the_report_keeps_its_json() {
     assert_eq!(evaluation.candidate_verdict, None);
     assert_eq!(evaluation.scorer_usage, None);
     let mut value = serde_json::to_value(&evaluation).unwrap();
-    without_run_ids(&mut value);
+    let run_id = value
+        .pointer("/recorded/detail/run_id")
+        .and_then(Value::as_str)
+        .expect("the source report has a run id")
+        .to_owned();
+    with_run_id(&mut value, GOLDEN_RUN_ID);
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(NO_SCORER_GOLDEN);
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
         let text = serde_json::to_string_pretty(&value).unwrap();
         std::fs::write(&path, text + "\n").unwrap();
     }
-    let golden: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let mut golden: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(value, golden, "the JSON of a report with no scorer changed");
+    // The JSON from before issue #2447 decodes to the same report.
+    with_run_id(&mut golden, &run_id);
+    let decoded: Evaluation = serde_json::from_value(golden).unwrap();
+    assert_eq!(decoded, evaluation);
 }
 
 /// A source run that answers `text` with no tool call.
@@ -2970,11 +2974,26 @@ impl Scorer for Counted {
     }
 }
 
-/// A judge model that answers `0.5` with a fixed usage.
+/// A judge model that answers `reply` with a fixed usage.
 #[derive(Debug)]
 struct Judge {
+    reply: &'static str,
     usage: TokenUsage,
     calls: AtomicUsize,
+}
+
+impl Judge {
+    fn new(reply: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            reply,
+            usage: TokenUsage::new(120, 3),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
 }
 
 impl AgentModel for Judge {
@@ -2983,10 +3002,10 @@ impl AgentModel for Judge {
         _request: &'a ChatRequest,
     ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let usage = self.usage;
+        let (usage, reply) = (self.usage, self.reply);
         Box::pin(async move {
             Ok(ChatResponse {
-                content: vec![ContentPart::Text("0.5".into())],
+                content: vec![ContentPart::Text(reply.into())],
                 stop_reason: StopReason::EndTurn,
                 usage,
             })
@@ -3141,10 +3160,7 @@ async fn a_failed_source_end_has_no_verdict() {
 #[tokio::test(flavor = "multi_thread")]
 async fn judge_tokens_go_to_scorer_usage_not_to_the_candidate() {
     let source = answers("41").await;
-    let judge = Arc::new(Judge {
-        usage: TokenUsage::new(120, 3),
-        calls: AtomicUsize::new(0),
-    });
+    let judge = Judge::new("0.5");
     let (plain, _) = answering("42");
     let harness = AgentHarness::new(ScriptedModel::new(vec![answer("42", 9)]))
         .model_named("judge", judge.clone());
@@ -3153,7 +3169,7 @@ async fn judge_tokens_go_to_scorer_usage_not_to_the_candidate() {
     let with_judge = evaluate(&source, &judged).await.unwrap();
     let without = evaluate(&source, &plain).await.unwrap();
 
-    assert_eq!(judge.calls.load(Ordering::SeqCst), 2, "one call per end");
+    assert_eq!(judge.calls(), 2, "one call per end");
     assert_eq!(with_judge.scorer_usage, Some(TokenUsage::new(240, 6)));
     assert_eq!(with_judge.recorded_verdict, Some(scored(0.5)));
     assert_eq!(with_judge.candidate_verdict, Some(scored(0.5)));
@@ -3202,12 +3218,9 @@ async fn compare_with_a_scorer_gives_both_verdicts_per_side() {
         "{:?}",
         comparison.second.candidate_verdict
     );
+    assert_eq!(comparison.first_verdict(), Some(&scored(1.0)));
     assert_eq!(
-        comparison.verdict(Side::Recorded),
-        comparison.first.candidate_verdict.as_ref()
-    );
-    assert_eq!(
-        comparison.verdict(Side::Candidate),
+        comparison.second_verdict(),
         comparison.second.candidate_verdict.as_ref()
     );
     assert_eq!(scorer.calls(), 3, "the source is scored once");
@@ -3251,7 +3264,7 @@ async fn a_scorer_error_on_the_source_costs_no_candidate_call() {
     )
     .await;
 
-    let Err(EvalError::Scorer { side, error }) = result else {
+    let Err(EvalError::Scorer { side, error, .. }) = result else {
         panic!("the scorer error fails the evaluation: {result:?}");
     };
     assert_eq!(side, Side::Recorded);
@@ -3302,17 +3315,142 @@ async fn a_scorer_past_its_timeout_fails_the_evaluation() {
         }
     }
     let source = answers("41").await;
-    let harness = AgentHarness::new(ScriptedModel::new(vec![answer("42", 9)]))
-        .score_timeout(Duration::from_millis(50));
+    let model = ScriptedModel::new(vec![answer("42", 9)]);
+    let harness = AgentHarness::new(model.clone()).score_timeout(Duration::from_millis(50));
     let candidate = Candidate::new(harness).scorer(Arc::new(Slow));
 
     let result = evaluate(&source, &candidate).await;
 
-    let Err(EvalError::Scorer { side, error }) = result else {
+    let Err(EvalError::Scorer { side, error, .. }) = result else {
         panic!("the timeout fails the evaluation: {result:?}");
     };
     assert_eq!(side, Side::Recorded);
     assert_eq!(error.kind(), ErrorKind::Unavailable);
+    assert_eq!(
+        model.calls(),
+        0,
+        "the timeout fires before the candidate run"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_evaluation_holds_the_tokens_of_a_shared_source_score() {
+    let source = answers("41").await;
+    let judge = Judge::new("0.5");
+    let harness = Arc::new(
+        AgentHarness::new(ScriptedModel::new(Vec::new()))
+            .model_named("judge", judge.clone())
+            .model_named("a", ScriptedModel::new(vec![answer("42", 9)]))
+            .model_named("b", ScriptedModel::new(vec![answer("40", 9)])),
+    );
+    let scorer: Arc<dyn Scorer> = Arc::new(JudgeScorer);
+    let first = Candidate::shared(Arc::clone(&harness))
+        .model("a")
+        .scorer(Arc::clone(&scorer));
+    let second = Candidate::shared(harness).model("b").scorer(scorer);
+
+    let comparison = compare(&source, &first, &second).await.unwrap();
+
+    assert_eq!(judge.calls(), 3, "one source call and one per candidate");
+    assert_eq!(
+        comparison.first.scorer_usage,
+        Some(TokenUsage::new(240, 6)),
+        "the first holds the source score and its own"
+    );
+    assert_eq!(
+        comparison.second.scorer_usage,
+        Some(TokenUsage::new(120, 3))
+    );
+    assert_eq!(comparison.second.recorded_verdict, Some(scored(0.5)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_verdict_is_shared_only_with_the_same_scorer_and_harness() {
+    let source = answers("41").await;
+    let harness_of = || {
+        Arc::new(
+            AgentHarness::new(ScriptedModel::new(Vec::new()))
+                .model_named("a", ScriptedModel::new(vec![answer("42", 9)]))
+                .model_named("b", ScriptedModel::new(vec![answer("42", 9)])),
+        )
+    };
+
+    // The same scorer on two harnesses.
+    let scorer = Counted::new("41");
+    let shared: Arc<dyn Scorer> = scorer.clone();
+    let first = Candidate::shared(harness_of())
+        .model("a")
+        .scorer(Arc::clone(&shared));
+    let second = Candidate::shared(harness_of()).model("b").scorer(shared);
+    compare(&source, &first, &second).await.unwrap();
+    assert_eq!(scorer.calls(), 4, "each harness scores the source");
+
+    // Two scorers on one harness.
+    let harness = harness_of();
+    let (one, two) = (Counted::new("41"), Counted::new("41"));
+    let first = Candidate::shared(Arc::clone(&harness))
+        .model("a")
+        .scorer(one.clone());
+    let second = Candidate::shared(harness).model("b").scorer(two.clone());
+    compare(&source, &first, &second).await.unwrap();
+    assert_eq!(
+        (one.calls(), two.calls()),
+        (2, 2),
+        "each scorer scores the source"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_judge_that_gives_nan_fails_with_decode() {
+    let source = answers("41").await;
+    let harness = AgentHarness::new(ScriptedModel::new(vec![answer("42", 9)]))
+        .model_named("judge", Judge::new("NaN"));
+    let candidate = Candidate::new(harness).scorer(Arc::new(JudgeScorer));
+
+    let result = evaluate(&source, &candidate).await;
+
+    let Err(EvalError::Scorer { side, error, .. }) = result else {
+        panic!("a NaN score fails the evaluation: {result:?}");
+    };
+    assert_eq!(side, Side::Recorded);
+    assert_eq!(error.kind(), ErrorKind::Decode);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_reject_reason_is_cut() {
+    #[derive(Debug)]
+    struct Verbose;
+    impl Scorer for Verbose {
+        fn id(&self) -> &'static str {
+            "verbose"
+        }
+        fn score<'a>(
+            &'a self,
+            _input: &'a ScoreInput,
+            _cx: &'a ScoreContext<'_>,
+        ) -> BoxFuture<'a, Result<score::Verdict, AgentError>> {
+            // The variant itself, so the scorer skips the cut of `reject`.
+            let reason = "x".repeat(score::MAX_REJECT_REASON_BYTES * 2);
+            Box::pin(async move { Ok(score::Verdict::Reject(reason)) })
+        }
+    }
+    let source = answers("41").await;
+    let (candidate, _) = answering("42");
+
+    let evaluation = evaluate(&source, &candidate.scorer(Arc::new(Verbose)))
+        .await
+        .unwrap();
+
+    for verdict in [&evaluation.recorded_verdict, &evaluation.candidate_verdict] {
+        let Some(score::Verdict::Reject(reason)) = verdict else {
+            panic!("a reject: {verdict:?}");
+        };
+        assert!(
+            reason.len() <= score::MAX_REJECT_REASON_BYTES,
+            "{}",
+            reason.len()
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3356,5 +3494,175 @@ async fn a_pool_keeps_the_verdicts_and_redacts_each_reject_reason() {
     for identity in ["model-secret-one-7a", "model-secret-two-9c"] {
         assert!(!report.text.contains(identity), "{}", report.text);
         assert!(!pool_json.contains(identity), "{pool_json}");
+    }
+}
+
+/// A judge scorer that pays for one judge call, then fails.
+#[derive(Debug)]
+struct JudgeThenFail;
+
+impl Scorer for JudgeThenFail {
+    fn id(&self) -> &'static str {
+        "judge_then_fail"
+    }
+
+    fn score<'a>(
+        &'a self,
+        input: &'a ScoreInput,
+        cx: &'a ScoreContext<'_>,
+    ) -> BoxFuture<'a, Result<score::Verdict, AgentError>> {
+        Box::pin(async move {
+            let request = ChatRequest {
+                messages: vec![ChatMessage::text(ChatRole::User, input.answer.clone())],
+                tools: Vec::new(),
+                max_tokens: Some(8),
+                temperature: None,
+                draw: None,
+            };
+            cx.chat(Some("judge"), &request).await?;
+            Err(AgentError::new(
+                ErrorKind::Decode,
+                "the judge reply does not parse",
+            ))
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scorer_error_keeps_the_judge_spend() {
+    let source = answers("41").await;
+    let harness = AgentHarness::new(ScriptedModel::new(vec![answer("42", 9)]))
+        .model_named("judge", Judge::new("0.5"));
+    let candidate = Candidate::new(harness).scorer(Arc::new(JudgeThenFail));
+
+    let result = evaluate(&source, &candidate).await;
+
+    let Err(EvalError::Scorer { side, usage, .. }) = result else {
+        panic!("the scorer error fails the evaluation: {result:?}");
+    };
+    assert_eq!(side, Side::Recorded);
+    assert_eq!(usage, TokenUsage::new(120, 3), "the paid judge call shows");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_candidate_scorer_error_keeps_the_source_spend_too() {
+    // A judge scorer that fails only on the candidate answer.
+    #[derive(Debug)]
+    struct FailsOnBoom;
+    impl Scorer for FailsOnBoom {
+        fn id(&self) -> &'static str {
+            "fails_on_boom"
+        }
+        fn score<'a>(
+            &'a self,
+            input: &'a ScoreInput,
+            cx: &'a ScoreContext<'_>,
+        ) -> BoxFuture<'a, Result<score::Verdict, AgentError>> {
+            Box::pin(async move {
+                let verdict = JudgeScorer.score(input, cx).await?;
+                if input.answer == "boom" {
+                    return Err(AgentError::new(ErrorKind::Provider, "down"));
+                }
+                Ok(verdict)
+            })
+        }
+    }
+    let source = answers("41").await;
+    let judge = Judge::new("0.5");
+    let harness = AgentHarness::new(ScriptedModel::new(vec![answer("boom", 9)]))
+        .model_named("judge", judge.clone());
+
+    let result = evaluate(
+        &source,
+        &Candidate::new(harness).scorer(Arc::new(FailsOnBoom)),
+    )
+    .await;
+
+    let Err(EvalError::Scorer { side, usage, .. }) = result else {
+        panic!("the scorer error fails the evaluation: {result:?}");
+    };
+    assert_eq!(side, Side::Candidate);
+    assert_eq!(judge.calls(), 2);
+    assert_eq!(usage, TokenUsage::new(240, 6), "both judge calls show");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pool_redacts_the_judge_model_in_a_reject_reason() {
+    /// A judge model that names itself in its reply.
+    #[derive(Debug)]
+    struct NamedJudge(&'static str);
+    impl AgentModel for NamedJudge {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
+            let text = format!("{} says no", self.0);
+            Box::pin(async move {
+                Ok(ChatResponse {
+                    content: vec![ContentPart::Text(text)],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::new(1, 1),
+                })
+            })
+        }
+
+        fn model_id(&self) -> Option<&str> {
+            Some(self.0)
+        }
+    }
+    /// A judge scorer that rejects with the judge reply as its reason.
+    #[derive(Debug)]
+    struct Quoting;
+    impl Scorer for Quoting {
+        fn id(&self) -> &'static str {
+            "quoting"
+        }
+        fn score<'a>(
+            &'a self,
+            input: &'a ScoreInput,
+            cx: &'a ScoreContext<'_>,
+        ) -> BoxFuture<'a, Result<score::Verdict, AgentError>> {
+            Box::pin(async move {
+                let request = ChatRequest {
+                    messages: vec![ChatMessage::text(ChatRole::User, input.answer.clone())],
+                    tools: Vec::new(),
+                    max_tokens: Some(8),
+                    temperature: None,
+                    draw: None,
+                };
+                let reply = cx.chat(Some("grader"), &request).await?;
+                let text = match reply.content.first() {
+                    Some(ContentPart::Text(text)) => text.clone(),
+                    _ => String::new(),
+                };
+                Ok(score::Verdict::reject(text))
+            })
+        }
+    }
+    let source = answers("41").await;
+    let member = |judge: &'static str, label: &str| {
+        let harness = AgentHarness::new(ScriptedModel::new(vec![answer("42", 9)]))
+            .model_named("grader", Arc::new(NamedJudge(judge)));
+        Candidate::new(harness)
+            .label(label)
+            .scorer(Arc::new(Quoting))
+    };
+    let pool = [
+        member("judge-secret-one-5e", "label-one-6f"),
+        member("judge-secret-two-7a", "label-two-8b"),
+    ];
+
+    let report = compare_anonymised(&source, &pool, 4).await.unwrap();
+
+    let pool_json = serde_json::to_string(&report.pool).unwrap();
+    for identity in ["judge-secret-one-5e", "judge-secret-two-7a", "grader"] {
+        assert!(!report.text.contains(identity), "{}", report.text);
+        assert!(!pool_json.contains(identity), "{pool_json}");
+    }
+    for entry in &report.pool.candidates {
+        assert_eq!(
+            entry.candidate_verdict,
+            Some(score::Verdict::reject("[redacted] says no"))
+        );
     }
 }

@@ -28,8 +28,9 @@
 //! as the model of a recorded peer. An identity is a label,
 //! a digest, a route or a model id. Only a whole name is replaced. A name
 //! ends at a character that is not a letter, a digit, `-` or `_`. So a
-//! short route, such as `a`, also replaces that word. Each reject reason of
-//! a scorer gets the same treatment (issue #2447).
+//! short route, such as `a`, also replaces that word. The same rule redacts
+//! each reject reason of a scorer (issue #2447). Each judge route of a
+//! scorer counts as a route, with the model id behind it.
 //!
 //! # Limits
 //!
@@ -38,6 +39,11 @@
 //! family. A harness setting, such as a policy timeout, can show in a policy
 //! reason. Keep the seed from the reader, because the seed and the digests
 //! give the ids.
+//!
+//! Two candidates with the same scorer and harness share one source verdict
+//! (issue #2447). Only the first of them in pool order holds its tokens. So
+//! the source verdicts and the scorer usage can show which ids share a
+//! scorer or a harness.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
@@ -153,8 +159,8 @@ impl AnonymisedReport {
 ///
 /// Each overlay passes [`overlay::apply`](crate::agent::overlay::apply)
 /// before the first model call. The pool also checks the ids for a
-/// duplicate first. With a [`Candidate::scorer`], the source is scored next,
-/// in pool order (issue #2447). The candidates then run one after the
+/// duplicate first. With a [`Candidate::scorer`], the pool then scores the
+/// source, in pool order (issue #2447). The candidates then run one after the
 /// other, in pool order. An empty slice gives an empty pool.
 ///
 /// # Errors
@@ -298,8 +304,10 @@ fn anonymise(evaluation: Evaluation, id: AnonId, scrub: &Scrub) -> AnonymisedEva
 /// A judge reason can name a model.
 fn scrub_verdict(verdict: score::Verdict, scrub: &Scrub) -> score::Verdict {
     match verdict {
+        // Redact the whole reason first, then cut it. A cut then never
+        // splits a name, and a longer reason still fits the cap.
         score::Verdict::Reject(reason) => {
-            score::Verdict::Reject(redact(&reason, &scrub.identities))
+            score::Verdict::reject(redact(&reason, &scrub.identities))
         }
         verdict @ score::Verdict::Score(_) => verdict,
     }
