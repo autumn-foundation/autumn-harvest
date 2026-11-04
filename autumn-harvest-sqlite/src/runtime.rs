@@ -2254,8 +2254,23 @@ impl SqliteRuntime {
     /// Returns [`SqliteError::ScheduleNotFound`] when no schedule exists.
     /// Returns [`SqliteError::Sqlite`] if the write fails.
     pub fn pause_schedule(&mut self, workflow_name: &str) -> SqliteResult<()> {
+        self.pause_schedule_with_reason(workflow_name, None)
+    }
+
+    /// Pause the schedule of `workflow_name`, and store `reason` until the
+    /// resume (issue #2471). `ScheduleSummary::pause_reason` reads it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ScheduleNotFound`] when no schedule exists.
+    /// Returns [`SqliteError::Sqlite`] if the write fails.
+    pub fn pause_schedule_with_reason(
+        &mut self,
+        workflow_name: &str,
+        reason: Option<&str>,
+    ) -> SqliteResult<()> {
         let now = (self.now_fn)().timestamp_millis();
-        schedule::set_paused(&self.conn, workflow_name, true, now)
+        schedule::set_paused(&self.conn, workflow_name, true, reason, now)
     }
 
     /// Resume the schedule of `workflow_name` (issue #2031). The next slot
@@ -2268,7 +2283,7 @@ impl SqliteRuntime {
     /// and [`SqliteError::Sqlite`] if the write fails.
     pub fn resume_schedule(&mut self, workflow_name: &str) -> SqliteResult<()> {
         let now = (self.now_fn)().timestamp_millis();
-        schedule::set_paused(&self.conn, workflow_name, false, now)
+        schedule::set_paused(&self.conn, workflow_name, false, None, now)
     }
 
     /// Set or change the operator override of the schedule of

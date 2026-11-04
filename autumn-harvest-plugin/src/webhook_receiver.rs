@@ -970,6 +970,47 @@ async fn write_dispatch_audit(
 mod tests {
     use super::*;
 
+    /// Before startup a SQLite app answers `503`, which releases the replay
+    /// key. A delivery never reaches the Postgres start path (issue #2471).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_sqlite_delivery_before_startup_is_a_503() {
+        let api_state = HarvestApiState::new();
+        api_state.set_sqlite_backend();
+        let response = sqlite_dispatch(
+            &api_state,
+            WebhookTarget::Starts { workflow: "orders" },
+            "/hooks/orders",
+            &WorkflowId::new("o-1"),
+            Some("dlv-1"),
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("a SQLite app answers on its own path");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(
+            api_state.trigger_metrics().is_err(),
+            "no metrics before startup"
+        );
+        // A Postgres app takes its own path.
+        let postgres = HarvestApiState::new();
+        assert!(
+            sqlite_dispatch(
+                &postgres,
+                WebhookTarget::Starts { workflow: "orders" },
+                "/hooks/orders",
+                &WorkflowId::new("o-1"),
+                None,
+                &serde_json::json!({}),
+            )
+            .await
+            .is_none()
+        );
+    }
+
     #[derive(Default)]
     struct RecordingMetrics {
         received: std::sync::Mutex<Vec<(String, WebhookOutcome)>>,

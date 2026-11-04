@@ -26,6 +26,7 @@
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -108,38 +109,60 @@ impl Registry {
 /// (issue #2471). The admin routes send one for each schedule change.
 pub type Job = Box<dyn FnOnce(&mut SqliteRuntime) + Send>;
 
+/// The batches of one retention step. The driver yields between steps, so
+/// a large backlog never holds the task for long (issue #2471).
+const RETENTION_STEP_BATCHES: u32 = 8;
+
 /// The retention of one Harvest file (issue #2471).
 ///
-/// The driver runs it on its interval. `POST /admin/retention/run-now` runs
-/// it through a [`Job`]. `GET /admin/retention` reads its status.
+/// The driver runs a pass on its interval, one step at a time. Each step
+/// removes at most [`RETENTION_STEP_BATCHES`] batches. `POST
+/// /admin/retention/run-now` queues a pass, as on Postgres. `GET
+/// /admin/retention` reads the status of the last finished pass.
 pub struct Retention {
     config: RetentionConfig,
     /// `None` when no age is set. A pass then removes nothing.
     policy: Option<PurgePolicy>,
     every: Duration,
     status: Mutex<RetentionStatus>,
+    /// The pass in progress, if any.
+    pass: Mutex<Option<(Instant, RetentionTickResult)>>,
+    /// Set by run-now. The driver takes it on its next turn.
+    requested: AtomicBool,
 }
 
 impl Retention {
     pub fn new(config: &RetentionConfig) -> Self {
         Self {
             config: config.clone(),
-            policy: purge_policy(config),
+            policy: purge_policy(config).map(|policy| policy.batch_limit(RETENTION_STEP_BATCHES)),
             every: Duration::from_secs(config.tick_interval_secs.max(1)),
             status: Mutex::new(RetentionStatus {
                 config: config.clone(),
                 // One file is one shard.
                 per_shard: vec![RetentionTickResult::default()],
             }),
+            pass: Mutex::new(None),
+            requested: AtomicBool::new(false),
         }
     }
 
-    /// The status of the last pass, in the Postgres shape.
+    /// The status of the last finished pass, in the Postgres shape.
     pub fn status(&self) -> RetentionStatus {
         self.status
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Queue a pass. The driver runs it on its next turn.
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    /// Take a queued pass.
+    fn take_request(&self) -> bool {
+        self.requested.swap(false, Ordering::AcqRel)
     }
 
     /// The retention age of `workflow_name`, as on Postgres. An MCP task
@@ -156,34 +179,55 @@ impl Retention {
         self.policy.is_some()
     }
 
-    /// Run one pass, and record it.
-    pub fn run(&self, runtime: &mut SqliteRuntime) {
-        let started = Instant::now();
-        let mut tick = RetentionTickResult {
-            ran_at: Some(chrono::Utc::now()),
-            ..RetentionTickResult::default()
-        };
-        if let Some(policy) = &self.policy {
-            match runtime.purge_with(policy) {
+    /// Run one step of the pass. Returns `true` while more remains.
+    ///
+    /// The counts add up over the steps of one pass. A dry run counts the
+    /// would-be deletes in `deleted_count`, as on Postgres. A dry run takes one
+    /// step only, so its count is a lower bound on a large backlog.
+    fn step(&self, runtime: &mut SqliteRuntime) -> bool {
+        let (started, mut tick) = self
+            .pass
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .unwrap_or_else(|| {
+                (
+                    Instant::now(),
+                    RetentionTickResult {
+                        ran_at: Some(chrono::Utc::now()),
+                        ..RetentionTickResult::default()
+                    },
+                )
+            });
+        let more = match &self.policy {
+            None => false,
+            Some(policy) => match runtime.purge_with(policy) {
                 Ok(report) => {
-                    tick.candidate_count = usize::try_from(report.removed).unwrap_or(usize::MAX);
-                    if !report.dry_run {
-                        tick.deleted_count = tick.candidate_count;
+                    let removed = usize::try_from(report.removed).unwrap_or(usize::MAX);
+                    tick.candidate_count = tick.candidate_count.saturating_add(removed);
+                    tick.deleted_count = tick.deleted_count.saturating_add(removed);
+                    for (workflow, count) in report.by_workflow {
+                        *tick.deleted_by_workflow.entry(workflow).or_default() += count;
                     }
-                    tick.deleted_by_workflow = report.by_workflow;
+                    !report.complete && !report.dry_run
                 }
                 Err(error) => {
                     tracing::warn!(%error, "harvest-sqlite retention pass failed");
                     tick.last_error = Some(error.to_string());
+                    false
                 }
-            }
-        }
-        tick.duration_ms = started.elapsed().as_millis();
-        let mut status = self.status.lock().unwrap_or_else(PoisonError::into_inner);
-        *status = RetentionStatus {
-            config: self.config.clone(),
-            per_shard: vec![tick],
+            },
         };
+        tick.duration_ms = started.elapsed().as_millis();
+        if more {
+            *self.pass.lock().unwrap_or_else(PoisonError::into_inner) = Some((started, tick));
+        } else {
+            *self.status.lock().unwrap_or_else(PoisonError::into_inner) = RetentionStatus {
+                config: self.config.clone(),
+                per_shard: vec![tick],
+            };
+        }
+        more
     }
 }
 
@@ -538,10 +582,16 @@ async fn drive(
 ) -> Option<oneshot::Sender<()>> {
     let mut last_error: Option<String> = None;
     let mut next_purge = retention.periodic().then(Instant::now);
+    let mut purging = false;
     loop {
-        if next_purge.is_some_and(|at| Instant::now() >= at) {
-            retention.run(&mut runtime);
-            next_purge = Some(Instant::now() + retention.every);
+        if purging || next_purge.is_some_and(|at| Instant::now() >= at) || retention.take_request()
+        {
+            purging = retention.step(&mut runtime);
+            if !purging {
+                next_purge = retention
+                    .periodic()
+                    .then(|| Instant::now() + retention.every);
+            }
         }
         if stop.is_cancelled() {
             return None;
@@ -570,7 +620,8 @@ async fn drive(
                 false
             }
         };
-        if progressed {
+        // A retention pass in progress takes its next step after a yield.
+        if progressed || purging {
             // A pass can finish without awaiting anything: the store is
             // synchronous SQLite. A chain of such passes, such as a workflow
             // that keeps continuing as new, would then hold the executor. On
@@ -684,9 +735,20 @@ async fn handle(runtime: &mut SqliteRuntime, command: Command) {
             };
             let _ = reply.send(routed);
         }
-        Command::Run(job) => job(runtime),
+        Command::Run(job) => run_job(runtime, job),
         // `drive` takes a shutdown before it calls `handle`.
         Command::Shutdown { .. } => {}
+    }
+}
+
+/// Run one job. A panic in it must not end the driver. The job's reply
+/// drops, so its caller gets `Stopped` for that call only.
+fn run_job(runtime: &mut SqliteRuntime, job: Job) {
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(runtime))) {
+        tracing::error!(
+            panic = %autumn_harvest::error::panic_message(panic),
+            "a harvest-sqlite driver job panicked"
+        );
     }
 }
 

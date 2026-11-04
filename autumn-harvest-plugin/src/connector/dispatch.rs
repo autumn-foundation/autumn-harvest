@@ -298,6 +298,33 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// Before startup a SQLite app has no handle. A dispatch is then a
+    /// transient refusal, so the message waits. It never reaches the
+    /// Postgres start path (issue #2471).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_sqlite_dispatch_before_startup_is_transient() {
+        let api_state = HarvestApiState::new();
+        api_state.set_sqlite_backend();
+        let outcome = dispatch(
+            &api_state,
+            DispatchRequest {
+                target: ConnectorTarget::Starts { workflow: "orders" },
+                workflow_id: WorkflowId::new("o-1"),
+                payload: serde_json::json!({}),
+                queue: None,
+                idempotency_key: "conn:orders",
+                idempotency_mode: IdempotencyMode::WorkflowId,
+                coordinates: "orders:0:1",
+            },
+        )
+        .await;
+        assert!(
+            matches!(&outcome, DispatchOutcome::Transient(detail) if detail.contains("503")),
+            "{outcome:?}"
+        );
+    }
+
     fn ids(
         execution_id: Option<&str>,
         signal_delivered: Option<bool>,

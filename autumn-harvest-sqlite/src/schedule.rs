@@ -48,6 +48,8 @@ pub struct ScheduleSummary {
     pub overlap_policy: OverlapPolicy,
     /// `true` while the schedule is paused.
     pub paused: bool,
+    /// The reason of the pause, while paused (issue #2471).
+    pub pause_reason: Option<String>,
     /// The next slot. `None` never fires.
     pub next_run_at: Option<DateTime<Utc>>,
     /// The slot of the last started run.
@@ -398,11 +400,13 @@ pub fn delete(conn: &Connection, workflow_name: &str) -> SqliteResult<()> {
 /// Pause or resume the schedule of `workflow_name`.
 ///
 /// A resume counts the next slot from `now`, so the slots missed while
-/// paused do not fire. A resume of a running schedule changes nothing.
+/// paused do not fire. A resume of a running schedule changes nothing. A
+/// pause stores `reason`, and a resume clears it (issue #2471).
 pub fn set_paused(
     conn: &Connection,
     workflow_name: &str,
     paused: bool,
+    reason: Option<&str>,
     now: i64,
 ) -> SqliteResult<()> {
     let tx = conn.unchecked_transaction()?;
@@ -418,13 +422,14 @@ pub fn set_paused(
     };
     if paused {
         tx.execute(
-            "UPDATE harvest_schedules SET paused = 1 WHERE workflow_name = ?1",
-            [workflow_name],
+            "UPDATE harvest_schedules SET paused = 1, pause_reason = ?2 WHERE workflow_name = ?1",
+            params![workflow_name, reason],
         )?;
     } else if was_paused {
         let next = first_slot(&parse_spec(&spec)?, now);
         tx.execute(
-            "UPDATE harvest_schedules SET paused = 0, next_run_at = ?2 WHERE workflow_name = ?1",
+            "UPDATE harvest_schedules SET paused = 0, next_run_at = ?2, pause_reason = NULL \
+             WHERE workflow_name = ?1",
             params![workflow_name, next],
         )?;
     }
@@ -436,7 +441,7 @@ pub fn set_paused(
 pub fn list(conn: &Connection) -> SqliteResult<Vec<ScheduleSummary>> {
     let mut stmt = conn.prepare(
         "SELECT workflow_name, schedule_json, paused, next_run_at, last_run_at, \
-           max_active_runs, input_json, overlap_policy \
+           max_active_runs, input_json, overlap_policy, pause_reason \
          FROM harvest_schedules ORDER BY workflow_name",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -452,12 +457,14 @@ pub fn list(conn: &Connection) -> SqliteResult<Vec<ScheduleSummary>> {
                 row.get::<_, i64>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ),
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let ((workflow_name, spec, paused, next), (last, max_active_runs, input, overlap)) = row?;
+        let ((workflow_name, spec, paused, next), (last, max_active_runs, input, overlap, reason)) =
+            row?;
         out.push(ScheduleSummary {
             workflow_name,
             schedule: parse_spec(&spec)?,
@@ -467,6 +474,7 @@ pub fn list(conn: &Connection) -> SqliteResult<Vec<ScheduleSummary>> {
                 .map_err(|_| SqliteError::corrupt("harvest_schedules.input_json"))?,
             overlap_policy: OverlapPolicy::from_db(&overlap),
             paused,
+            pause_reason: reason.filter(|_| paused),
             next_run_at: next.and_then(DateTime::from_timestamp_millis),
             last_run_at: last.and_then(DateTime::from_timestamp_millis),
         });
@@ -628,7 +636,7 @@ pub fn check_trigger_policy(policy: OverlapPolicy) -> SqliteResult<()> {
         return Ok(());
     }
     Err(SqliteError::Unsupported(format!(
-        "overlap_policy {} — the sqlite backend supports skip and allow_all (issue #2471)",
+        "overlap_policy {} — the sqlite backend supports skip and allow_all (issue #2466)",
         policy.as_str()
     )))
 }

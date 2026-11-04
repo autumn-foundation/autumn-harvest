@@ -20,7 +20,7 @@ use crate::error::SqliteResult;
 
 /// The runs that one transaction removes. A batch keeps each write short, so
 /// a large purge does not hold the write lock for long.
-const PURGE_BATCH: u32 = 256;
+pub const PURGE_BATCH: u32 = 256;
 
 /// The tables that hold rows of a run. Each has an index that leads with
 /// `exec_id`. The execution row goes last.
@@ -66,6 +66,9 @@ pub struct PurgePolicy {
     pub overrides: BTreeMap<String, Duration>,
     /// `true` counts the runs and removes none.
     pub dry_run: bool,
+    /// The most batches of one call. `None` has no bound. A bound keeps one
+    /// call short, so a caller can yield between calls.
+    pub max_batches: Option<u32>,
 }
 
 impl PurgePolicy {
@@ -95,6 +98,17 @@ impl PurgePolicy {
         self.dry_run = dry_run;
         self
     }
+
+    /// Stop each call after `batches` batches of [`PURGE_BATCH`] runs.
+    ///
+    /// A real purge resumes on the next call, because a removed run does not
+    /// come back. A dry run starts again from the oldest run, so its count is
+    /// a lower bound when [`PurgeReport::complete`] is `false`.
+    #[must_use]
+    pub const fn batch_limit(mut self, batches: u32) -> Self {
+        self.max_batches = Some(batches);
+        self
+    }
 }
 
 /// What one retention pass removed, or would remove in a dry run.
@@ -107,6 +121,8 @@ pub struct PurgeReport {
     pub by_workflow: BTreeMap<String, u64>,
     /// `true` when the pass removed nothing on purpose.
     pub dry_run: bool,
+    /// `false` when the batch limit stopped the call before its end.
+    pub complete: bool,
 }
 
 /// The runs of one scoped pass.
@@ -130,7 +146,7 @@ pub fn purge_terminal(conn: &mut Connection, cutoff_micros: i64) -> SqliteResult
         dry_run: false,
     };
     let mut tally = BTreeMap::new();
-    purge_scope(conn, cutoff_micros, &scope, &mut tally)
+    purge_scope(conn, cutoff_micros, &scope, &mut tally, &mut None)
 }
 
 /// Apply `policy` with each window counted back from `now_micros`.
@@ -148,15 +164,27 @@ pub fn purge_with(
     };
     let mut report = PurgeReport {
         dry_run: policy.dry_run,
+        complete: true,
         ..PurgeReport::default()
     };
+    let mut budget = policy.max_batches;
     for (workflow_name, age) in &policy.overrides {
         let scope = Scope {
             only: Some(workflow_name),
             except: "[]".to_owned(),
             dry_run: policy.dry_run,
         };
-        report.removed += purge_scope(conn, cutoff(*age), &scope, &mut report.by_workflow)?;
+        report.removed += purge_scope(
+            conn,
+            cutoff(*age),
+            &scope,
+            &mut report.by_workflow,
+            &mut budget,
+        )?;
+        if budget == Some(0) {
+            report.complete = false;
+            return Ok(report);
+        }
     }
     if let Some(age) = policy.max_age {
         let names: Vec<&str> = policy.overrides.keys().map(String::as_str).collect();
@@ -165,21 +193,35 @@ pub fn purge_with(
             except: serde_json::to_string(&names)?,
             dry_run: policy.dry_run,
         };
-        report.removed += purge_scope(conn, cutoff(age), &scope, &mut report.by_workflow)?;
+        report.removed += purge_scope(
+            conn,
+            cutoff(age),
+            &scope,
+            &mut report.by_workflow,
+            &mut budget,
+        )?;
+        report.complete = budget != Some(0);
     }
     Ok(report)
 }
 
 /// One scoped pass in batches. It adds each removed run to `tally`, by type.
+///
+/// `budget` counts down one per full batch. At zero the pass stops, and the
+/// caller reads the zero as "more may remain".
 fn purge_scope(
     conn: &mut Connection,
     cutoff_micros: i64,
     scope: &Scope<'_>,
     tally: &mut BTreeMap<String, u64>,
+    budget: &mut Option<u32>,
 ) -> SqliteResult<u64> {
     let mut removed = 0;
     let mut cursor = (i64::MIN, Value::Text(String::new()));
     loop {
+        if *budget == Some(0) {
+            return Ok(removed);
+        }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let rows: Vec<(i64, Value, Value)> = tx
             .prepare(CANDIDATES)?
@@ -220,6 +262,9 @@ fn purge_scope(
         removed += count as u64;
         if rows.len() < PURGE_BATCH as usize {
             return Ok(removed);
+        }
+        if let Some(left) = budget {
+            *left -= 1;
         }
         cursor = last;
     }

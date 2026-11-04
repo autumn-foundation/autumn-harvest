@@ -141,11 +141,16 @@ async fn an_api_schedule_round_trips_through_the_admin_routes() {
     assert_eq!(edited["max_active_runs"], 2);
     assert_eq!(edited["workflow_input"], 3);
 
-    let paused = client.post(&at("/pause")).send().await;
+    let paused = client
+        .post(&at("/pause"))
+        .json(&json!({ "reason": "maintenance" }))
+        .send()
+        .await;
     paused.assert_ok();
     assert_eq!(paused.json::<Value>(), json!({ "ok": true }));
     let one: Value = client.get(&at("")).send().await.json();
     assert_eq!(one["is_paused"], true);
+    assert_eq!(one["pause_reason"], "maintenance", "the reason is stored");
 
     client.post(&at("/trigger")).send().await.assert_status(409);
     let fired = client.post(&at("/trigger?force=true")).send().await;
@@ -169,6 +174,19 @@ async fn an_api_schedule_round_trips_through_the_admin_routes() {
     client.post(&at("/resume")).send().await.assert_ok();
     let one: Value = client.get(&at("")).send().await.json();
     assert_eq!(one["is_paused"], false);
+    assert_eq!(
+        one["pause_reason"],
+        Value::Null,
+        "a resume clears the reason"
+    );
+
+    // `GET` shows these values, so a read-modify-write client can send them.
+    client
+        .patch(&at(""))
+        .json(&json!({ "catchup": false, "jitter_secs": 0, "queue_name": "default" }))
+        .send()
+        .await
+        .assert_ok();
 
     client.delete(&at("")).send().await.assert_ok();
     client.get(&at("")).send().await.assert_status(404);
@@ -268,6 +286,18 @@ async fn a_patch_of_a_code_schedule_is_an_override() {
     refused.assert_status(400);
     refused.assert_body_contains("input");
 
+    // A clear stands alone, as on Postgres. A refused clear writes nothing.
+    let combined = client
+        .patch(&path)
+        .json(&json!({ "clear_override": true, "max_active_runs": 3 }))
+        .send()
+        .await;
+    combined.assert_status(400);
+    combined.assert_body_contains("clear_override");
+    let kept: Value = client.get(&path).send().await.json();
+    assert_eq!(kept["schedule_expr"], "interval:7200", "the override stays");
+    assert_eq!(kept["max_active_runs"], 1);
+
     let cleared = client
         .patch(&path)
         .json(&json!({ "clear_override": true }))
@@ -275,6 +305,55 @@ async fn a_patch_of_a_code_schedule_is_an_override() {
         .await;
     cleared.assert_ok();
     assert_eq!(cleared.json::<Value>()["schedule_expr"], "interval:3600");
+
+    // The next boot would upsert it again, so a delete is refused, as on
+    // Postgres.
+    let deleted = client.delete(&path).send().await;
+    deleted.assert_status(400);
+    deleted.assert_body_contains("workflow_schedule");
+    client.get(&path).send().await.assert_ok();
+}
+
+/// A `PATCH` of the expression alone keeps the stored time zone, as on
+/// Postgres. An API schedule has no override to clear or to explain.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_patch_keeps_the_time_zone_and_refuses_override_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = boot(dir.path(), "dev", base());
+    let created: Value = client
+        .post("/harvest/admin/schedules/workflow")
+        .json(&json!({
+            "workflow_name": "tick",
+            "schedule_expr": "cron:0 9 * * *",
+            "timezone": "Europe/London",
+        }))
+        .send()
+        .await
+        .json();
+    assert_eq!(created["timezone"], "Europe/London");
+    let path = format!(
+        "/harvest/admin/schedules/{}",
+        created["id"].as_str().unwrap()
+    );
+
+    let patched = client
+        .patch(&path)
+        .json(&json!({ "schedule_expr": "cron:0 10 * * *" }))
+        .send()
+        .await;
+    patched.assert_ok();
+    let patched: Value = patched.json();
+    assert_eq!(patched["timezone"], "Europe/London");
+    assert_eq!(patched["schedule_expr"], "cron_tz:Europe/London:0 10 * * *");
+
+    for body in [
+        json!({ "clear_override": true }),
+        json!({ "reason": "why" }),
+    ] {
+        let refused = client.patch(&path).json(&body).send().await;
+        refused.assert_status(400);
+        refused.assert_body_contains("not declared in code");
+    }
 }
 
 /// Outside `dev`, an anonymous schedule write is refused, as on Postgres.
@@ -304,7 +383,7 @@ fn retention(max_age_secs: u64, tick_interval_secs: u64) -> RetentionConfig {
 }
 
 /// `HarvestPlugin::retention(..)` purges an old terminal run on its tick.
-/// `GET /admin/retention` reports the pass.
+/// `GET /admin/retention` reports the passes.
 #[tokio::test(flavor = "multi_thread")]
 async fn retention_purges_an_old_run_on_its_tick() {
     let dir = tempfile::tempdir().unwrap();
@@ -317,18 +396,19 @@ async fn retention_purges_an_old_run_on_its_tick() {
     )
     .await;
 
-    let status = eventually(&client, "/harvest/admin/retention", |status, body| {
-        status == 200 && body["per_shard"][0]["deleted_count"].as_u64() >= Some(1)
-    })
-    .await;
+    // The status holds the last pass only. A later pass removes nothing, so
+    // this checks the shape, not the count. `run_now_queues_a_pass` checks it.
+    let status: Value = client.get("/harvest/admin/retention").send().await.json();
     assert_eq!(status["config"]["max_age_secs"], 1);
     assert_eq!(status["per_shard"][0]["shard"], 0);
-    assert_eq!(status["per_shard"][0]["deleted_by_workflow"]["tick"], 1);
+    assert!(status["per_shard"][0]["ran_at"].is_string(), "{status}");
+    assert_eq!(status["per_shard"][0]["last_error"], Value::Null);
 }
 
-/// `POST /admin/retention/run-now` runs a pass before it answers.
+/// `POST /admin/retention/run-now` queues a pass, as on Postgres. With a
+/// one-hour tick, no other pass runs, so the status keeps its counts.
 #[tokio::test(flavor = "multi_thread")]
-async fn run_now_purges_before_it_answers() {
+async fn run_now_queues_a_pass() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = retention(1, 3600);
     config.overrides = BTreeMap::from([("tick".to_owned(), 1)]);
@@ -340,16 +420,23 @@ async fn run_now_purges_before_it_answers() {
         |status, body| status == 200 && body["execution"]["state"] == "COMPLETED",
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // The age counts on the real clock, from the close of the run.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
 
     let response = client.post("/harvest/admin/retention/run-now").send().await;
     response.assert_ok();
     assert_eq!(response.json::<Value>(), json!({ "ok": true }));
-    client
-        .get(&format!("/harvest/workflows/{exec}"))
-        .send()
-        .await
-        .assert_status(404);
+    eventually(
+        &client,
+        &format!("/harvest/workflows/{exec}"),
+        |status, _| status == 404,
+    )
+    .await;
+    let status = eventually(&client, "/harvest/admin/retention", |status, body| {
+        status == 200 && body["per_shard"][0]["deleted_count"] == 1
+    })
+    .await;
+    assert_eq!(status["per_shard"][0]["deleted_by_workflow"]["tick"], 1);
 }
 
 /// A retention field with no SQLite store fails the build and names it.

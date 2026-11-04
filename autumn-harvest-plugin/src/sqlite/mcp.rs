@@ -110,6 +110,13 @@ impl Run {
     }
 }
 
+/// The HTTP status and the text of a refused call, as the SQLite routes
+/// answer it. An MCP task maps a `4xx` to `INVALID_PARAMS`, as on Postgres.
+pub fn refusal(error: HarvestSqliteError) -> (u16, String) {
+    let text = error.to_string();
+    (map_error(error).status().as_u16(), text)
+}
+
 /// Read `exec`, or `None` when it does not exist.
 pub async fn read_run(
     handle: &HarvestSqlite,

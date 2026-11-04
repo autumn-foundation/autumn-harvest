@@ -2,8 +2,9 @@
 
 A `HarvestPlugin` app on `autumn-web/sqlite` now builds with workflow
 schedules, `retention`, `mcp_tools`, `mcp_tasks`, `webhooks` and
-`connector`. Slice 1 refused each one at build. The Postgres default build
-does not change. The design record is `docs/design/DESIGN-2471.md`.
+`connector`. Slice 1 refused each one at build. On Postgres, the one change
+is the new `HarvestPlugin::workflow_schedule`. The design record is
+`docs/design/DESIGN-2471.md`.
 
 - **Schedules.** `HarvestPlugin::workflow_schedule` adds a code schedule on
   both backends. The SQLite driver upserts it at boot.
@@ -14,8 +15,10 @@ does not change. The design record is `docs/design/DESIGN-2471.md`.
 - **Retention.** `RetentionConfig` maps to the new
   `autumn_harvest_sqlite::PurgePolicy`: the global age, the per-type
   `overrides` and `dry_run`. The driver runs a pass every
-  `tick_interval_secs`, between drive passes. `tenant_overrides`, `summary`
-  and `payload_orphan_grace_secs` are refused at build.
+  `tick_interval_secs`, between drive passes, in steps of eight batches with
+  a yield between steps (`PurgePolicy::batch_limit`). `run-now` queues a
+  pass, as on Postgres. `tenant_overrides`, `summary` and
+  `payload_orphan_grace_secs` are refused at build.
 - **Admin routes.** `GET`/`POST`/`PATCH`/`DELETE` of `/admin/schedules`,
   `/pause`, `/resume`, `/trigger`, `GET /admin/retention` and
   `POST /admin/retention/run-now` serve on SQLite, with the Postgres paths
@@ -34,7 +37,9 @@ does not change. The design record is `docs/design/DESIGN-2471.md`.
 - **Refactors.** `validate_connectors` and `build_mcp_routes` moved out of
   `build_postgres`, so both backends run one copy.
 - **No new `WorkflowEvent` variant, no Postgres migration.** The SQLite
-  auth store adds one table, `harvest_connector_dead_letters`.
+  auth store adds one table, `harvest_connector_dead_letters`. The SQLite
+  `harvest_schedules` table gains `pause_reason`. An old file gets the
+  column on open.
 - **Tests.** `autumn-harvest-sqlite`: `schedule_admin` and
   `retention_policy`. Plugin: `ops_parity` and `trigger_parity` in
   `tests/sqlite_plugin.rs`. CI's `sqlite-plugin` job turns on `mcp`,

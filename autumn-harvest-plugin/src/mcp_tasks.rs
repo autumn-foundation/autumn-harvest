@@ -2025,15 +2025,19 @@ mod sqlite_tasks {
             | Err(HarvestSqliteError::Sqlite(
                 SqliteError::WorkflowNotRunning { .. } | SqliteError::ExecutionNotFound(_),
             )) => Ok(()),
-            Err(error @ HarvestSqliteError::InvalidSignal(_)) => {
-                let mut err = RpcError::new(
-                    INVALID_PARAMS,
-                    format!("the run refused the answer to {}", wait.key),
-                );
-                err.data = Some(json!({ "error": error.to_string() }));
-                Err(err)
-            }
-            Err(error) => Err(internal(&error)),
+            // A schema refusal is `InvalidSignal`. Each other `4xx`, such as
+            // an oversized payload, is a refusal too, as on Postgres.
+            Err(error) => match crate::sqlite::mcp::refusal(error) {
+                (status, text) if (400..500).contains(&status) => {
+                    let mut err = RpcError::new(
+                        INVALID_PARAMS,
+                        format!("the run refused the answer to {}", wait.key),
+                    );
+                    err.data = Some(json!({ "error": text, "status": status }));
+                    Err(err)
+                }
+                (_, text) => Err(RpcError::new(INTERNAL_ERROR, text)),
+            },
         }
     }
 

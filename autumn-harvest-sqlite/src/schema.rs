@@ -340,10 +340,12 @@ CREATE TABLE IF NOT EXISTS harvest_schedules (
                                            -- NULL = never fires.
     last_run_at     INTEGER,               -- the slot of the last started run in
                                            -- epoch milliseconds
-    code_json       TEXT                   -- the code `WorkflowSchedule` as JSON
+    code_json       TEXT,                  -- the code `WorkflowSchedule` as JSON
                                            -- (issue #2390). The row holds the
                                            -- effective value; an override
                                            -- merges over this one.
+    pause_reason    TEXT                   -- the reason of the pause, while
+                                           -- paused (issue #2471)
 );
 
 CREATE TABLE IF NOT EXISTS harvest_schedule_overrides (
@@ -659,6 +661,13 @@ fn add_schedule_code(conn: &Connection) -> SqliteResult<()> {
             "harvest_schedules",
             "code_json",
             "ALTER TABLE harvest_schedules ADD COLUMN code_json TEXT",
+        )?;
+        // Issue #2471: the reason of a pause, as on Postgres.
+        add_column_if_absent(
+            conn,
+            "harvest_schedules",
+            "pause_reason",
+            "ALTER TABLE harvest_schedules ADD COLUMN pause_reason TEXT",
         )?;
     }
     Ok(())

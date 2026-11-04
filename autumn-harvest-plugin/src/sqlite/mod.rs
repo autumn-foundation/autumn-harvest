@@ -933,7 +933,7 @@ mod tests {
             ..RetentionConfig::default()
         };
         let builder = HarvestBuilder::default().retention(config.clone());
-        assert!(builder_refusals(&builder).is_empty());
+        assert_eq!(builder_refusals(&builder), []);
 
         let storeless = RetentionConfig {
             tenant_overrides: [("acme".to_owned(), 30)].into(),

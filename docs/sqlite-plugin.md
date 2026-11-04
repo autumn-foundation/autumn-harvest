@@ -414,14 +414,24 @@ HarvestPlugin::new()
   stable for that name. `POST /admin/schedules/workflow` creates or replaces
   an API schedule. A `PATCH` of an API schedule edits it in place. A `PATCH`
   of a code schedule sets an operator override (#2390), and
-  `clear_override` returns it to code. Each write adds one audit row.
+  `clear_override` returns it to code. A clear stands alone, as on Postgres.
+  A `DELETE` of a code schedule is a `400`, because the next boot upserts it
+  again. Each write adds one audit row. A tenant row names its tenant in
+  `route_or_command`.
+- **Pause.** `POST /admin/schedules/{id}/pause` stores its `reason` as
+  `pause_reason`. A resume clears it.
 - **Trigger.** `POST /admin/schedules/{id}/trigger` starts one run now with
   the stored input. Under `skip`, a schedule at its run limit answers
-  `outcome: "skipped_overlap"`. The run counts against the next slot.
+  `outcome: "skipped_overlap"`. The run counts against the next slot. Its
+  `workflow_id` is `manual-<workflow name>-<millis>-<nonce>`. Postgres puts
+  the schedule id where this backend puts the workflow name.
 - **Supported fields.** A cron or interval expression with its time zone,
   `input`, `paused`, `max_active_runs`, and the `skip` and `allow_all`
-  overlap policies. Each other field is a `400` that names it. Catch-up is
-  always off. Jitter is ignored, because one writer has no fleet to spread.
+  overlap policies. Each other field is a `400` that names it, unless it has
+  the value that `GET` shows, such as `catchup: false` or `jitter_secs: 0`.
+  Catch-up is always off. The engine ignores the jitter of a code schedule,
+  because one writer has no fleet to spread. The admin routes refuse a
+  `jitter_secs` above zero.
 - **Not ported.** Backfill, `/runs`, `/decisions` and `/preview` answer
   `501`.
 
@@ -435,7 +445,7 @@ control Harvest gets the code schedules.
 | `RetentionConfig` field | On SQLite |
 | --- | --- |
 | `max_age_secs`, `overrides` | honoured: a type override wins, and a type with neither stays |
-| `dry_run` | honoured: a pass counts and removes nothing |
+| `dry_run` | honoured: a pass counts and removes nothing. It counts at most 2,048 runs |
 | `tick_interval_secs` | the interval of the pass. The first pass runs at boot |
 | `audit_retention_days` | honoured by the token and audit store |
 | `tenant_overrides`, `summary`, `payload_orphan_grace_secs` | refused at build: SQLite has no run tenant, no summary table and no payload store |
@@ -443,14 +453,17 @@ control Harvest gets the code schedules.
 The other fields tune Postgres machinery, such as partitions and the
 task-queue janitor. They change nothing here.
 
-- **One writer.** The pass runs between drive passes, in batches of 256 runs.
-  A pass removes the events, tasks, timers, signals, attempts, ledger rows,
-  logs and row of each run.
+- **One writer.** The pass runs on the driver in steps of eight batches of
+  256 runs. The driver yields between steps, so a large backlog never holds
+  it for long. A pass removes the events, tasks, timers, signals, attempts,
+  ledger rows, logs and row of each run.
 - **`GET /admin/retention`** answers the Postgres `RetentionStatus`, with
   one shard: `deleted_count`, `candidate_count`, `deleted_by_workflow` and
-  `last_error` of the last pass.
-- **`POST /admin/retention/run-now`** runs a pass before it answers.
-  Postgres only queues one.
+  `last_error` of the last finished pass. A dry run counts its would-be
+  deletes in `deleted_count`, as on Postgres. `oldest_age_secs_skipped` is
+  always `null`.
+- **`POST /admin/retention/run-now`** queues a pass, as on Postgres. The
+  driver runs it on its next turn.
 - Each tenant file runs the same policy, with its own status.
 
 ## MCP, webhooks and connectors
@@ -463,7 +476,9 @@ ones.
 - **MCP tools.** `start_`, `{wf}_status`, `signal_`, `{wf}_update_` and
   `{wf}_watch` call the SQLite management handlers. `status` and `watch`
   follow the retry and continue-as-new chain. `watch` polls the file every
-  100 ms, because SQLite has no `LISTEN`.
+  100 ms, because SQLite has no `LISTEN`. It sends a progress frame on each
+  change of state. This backend stores no `current_details`, so a frame
+  names the state, and `status` reads `current_details: null`.
 - **MCP tasks.** A task reads its live run and its open signal waits from
   the file. An answer is delivered with its input key as the signal key, so
   a retried answer is a no-op. A start key in `Idempotency-Key` or the task
@@ -499,8 +514,8 @@ route serves it under `{path}/tenants/{key}/ui`:
   routes.
 
 The pages link only to SQLite pages. The Postgres pages for DAGs, workers,
-schedules and dead letters read tables that this backend does not have, so
-they stay off. The pages hold no form that writes.
+schedules and dead letters read the Postgres shape of those tables, so they
+stay off. The pages hold no form that writes.
 
 ### Where the contract differs
 
@@ -660,8 +675,9 @@ cargo test -p autumn-harvest-plugin --features sqlite,oidc,mcp,webhooks,connecto
 cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin_fleet
 ```
 
-CI runs both in the `sqlite-plugin` job, with the `oidc` feature on. Its
-last steps also turn on `mcp`, `webhooks` and `connectors`. The
+CI runs both in the `sqlite-plugin` job, with `oidc`, `mcp`, `webhooks` and
+`connectors` on. One clippy step turns on `sqlite` alone, for the code that
+those features turn off. The
 `ops_parity` module covers schedules and retention. The `trigger_parity`
 module covers MCP, webhooks and connectors, and runs only with those
 features. The

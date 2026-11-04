@@ -4,7 +4,7 @@ Issue #2471. Parent epic #2466. Follows #2467.
 
 ## Problem
 
-Slice 1 refuses these options at build on SQLite and names this issue:
+Slice 1 refused these options at build on SQLite and named this issue:
 workflow schedules, `retention`, `mcp_tools`, `mcp_tasks`, `webhooks` and
 `connector`. The issue asks for these items:
 
@@ -136,6 +136,31 @@ workflow schedules, `retention`, `mcp_tools`, `mcp_tasks`, `webhooks` and
   descriptors and auth layers. Each tool and task call reads and writes
   through the handle. `watch` polls the reader, because SQLite has no
   `LISTEN`.
+
+## Review outcome
+
+Four review agents and Codex found these issues. Each is fixed:
+
+- **A long purge held the driver.** A pass ran in one call, so a large
+  backlog stalled every request. The pass now runs in steps of eight
+  batches, with a yield between steps. A dry run takes one step.
+- **Run-now reported a failed pass as a success.** It now queues a pass, as
+  on Postgres. `GET /admin/retention` shows the result.
+- **A panic in a driver job ended the driver.** The driver now catches it.
+- **The time zone reset to UTC.** A `PATCH` of the expression alone now
+  keeps the stored zone.
+- **A refused clear still wrote.** `check_override_fields` now runs before
+  any write, as on Postgres. A reason on an API schedule is a `400`.
+- **A code schedule could be deleted.** The next boot upserts it again, so
+  the `DELETE` is now a `400`, as on Postgres.
+- **A tenant schedule of a code name took the override path.** Only the
+  control Harvest has code schedules now. A tenant audit row names its
+  tenant.
+- **The pause reason was dropped.** `harvest_schedules.pause_reason` now
+  stores it.
+- **A `PATCH` refused the values that `GET` shows.** They now pass.
+- **An MCP task answer refusal was an internal error.** Each `4xx` is now
+  `INVALID_PARAMS`, as on Postgres.
 
 ## Out of scope
 

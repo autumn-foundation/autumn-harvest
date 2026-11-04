@@ -144,3 +144,35 @@ async fn a_run_inside_the_window_stays() {
     assert_eq!(report.removed, 0);
     assert!(!gone(&rt, run));
 }
+
+/// A batch limit stops a call early. A real purge resumes on the next call,
+/// so a caller can yield between calls and still remove every run.
+#[tokio::test]
+async fn a_batch_limit_splits_a_purge_into_short_calls() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&short_info());
+    let total = u64::from(autumn_harvest_sqlite::PURGE_BATCH) * 2 + 10;
+    for n in 0..total {
+        rt.start_workflow("short", json!(n)).unwrap();
+    }
+    rt.run_until_idle().await.unwrap();
+
+    let policy = PurgePolicy::new().max_age(HOUR).batch_limit(1);
+    let first = rt.purge_with_as_of(two_hours_on(), &policy).unwrap();
+    assert_eq!(first.removed, u64::from(autumn_harvest_sqlite::PURGE_BATCH));
+    assert!(!first.complete, "the limit stops the call");
+    let mut removed = first.removed;
+    for _ in 0..5 {
+        let next = rt.purge_with_as_of(two_hours_on(), &policy).unwrap();
+        removed += next.removed;
+        if next.complete {
+            break;
+        }
+    }
+    assert_eq!(removed, total, "the calls remove every run");
+    let unbounded = rt
+        .purge_with_as_of(two_hours_on(), &PurgePolicy::new().max_age(HOUR))
+        .unwrap();
+    assert_eq!(unbounded.removed, 0);
+    assert!(unbounded.complete);
+}

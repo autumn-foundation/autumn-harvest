@@ -240,3 +240,22 @@ async fn the_reader_lists_schedules_with_input_and_policy() {
     );
     assert!(reader.schedule_override("tick").unwrap().is_none());
 }
+
+/// A pause keeps its reason until the resume, as on Postgres.
+#[tokio::test]
+async fn a_pause_keeps_its_reason_until_the_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(AtomicI64::new(T0));
+    let mut rt = runtime_at(&dir.path().join("reason.db"), &clock);
+    rt.upsert_schedule(&every_minute("tick")).unwrap();
+    rt.pause_schedule_with_reason("tick", Some("maintenance"))
+        .unwrap();
+    let paused = &rt.list_schedules().unwrap()[0];
+    assert!(paused.paused);
+    assert_eq!(paused.pause_reason.as_deref(), Some("maintenance"));
+
+    rt.resume_schedule("tick").unwrap();
+    let resumed = &rt.list_schedules().unwrap()[0];
+    assert!(!resumed.paused);
+    assert_eq!(resumed.pause_reason, None);
+}

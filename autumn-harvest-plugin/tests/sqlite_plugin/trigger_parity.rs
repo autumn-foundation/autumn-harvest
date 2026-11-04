@@ -196,10 +196,12 @@ async fn a_webhook_starts_a_run_once_on_sqlite() {
     assert_eq!(runs_of(&client, "order_flow").await.len(), 1);
 
     let audit: Value = client.get("/harvest/admin/audit").send().await.json();
-    assert!(
-        audit.to_string().contains("webhook.trigger"),
-        "a dispatch writes an audit row: {audit}"
-    );
+    let rows = audit.as_array().map_or(0, |rows| {
+        rows.iter()
+            .filter(|row| row["operation"] == "webhook.trigger")
+            .count()
+    });
+    assert_eq!(rows, 2, "each dispatch writes one audit row: {audit}");
 }
 
 /// A signal-with-start webhook dedupes a redelivery on its delivery id.
@@ -362,6 +364,19 @@ async fn a_connector_signal_with_start_dedupes_a_redelivery() {
         .json();
     let signals = history.to_string().matches("SignalReceived").count();
     assert_eq!(signals, 1, "one signal for two deliveries: {history}");
+}
+
+/// A connector `queue` has no SQLite meaning, so the build refuses it.
+#[test]
+fn a_connector_queue_fails_the_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = Arc::new(MockSource::new("orders"));
+    let binding = SourceBinding::starts("orders", "orders", "order_flow")
+        .map_raw(order_mapper)
+        .idempotency_mode(IdempotencyMode::WorkflowId)
+        .queue("fast");
+    let message = build_panic(base().connector(binding, source as _), dir.path());
+    assert!(message.contains("SourceBinding::queue"), "{message}");
 }
 
 /// A `Starts` binding in `BrokerCoordinates` mode, the default, needs a

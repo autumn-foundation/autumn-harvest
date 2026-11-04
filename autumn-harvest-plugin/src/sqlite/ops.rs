@@ -96,6 +96,7 @@ struct Entry {
     schedule_expr: String,
     timezone: String,
     is_paused: bool,
+    pause_reason: Option<String>,
     next_run_at: Option<DateTime<Utc>>,
     last_run_at: Option<DateTime<Utc>>,
     max_active_runs: u32,
@@ -116,6 +117,7 @@ impl Entry {
             schedule_expr,
             timezone,
             is_paused: row.paused,
+            pause_reason: row.pause_reason.clone(),
             next_run_at: row.next_run_at,
             last_run_at: row.last_run_at,
             max_active_runs: row.max_active_runs,
@@ -216,14 +218,19 @@ struct PatchBody {
 }
 
 impl PatchBody {
+    /// Refuse each field that this backend cannot honour. A value that `GET`
+    /// shows, such as `catchup: false`, changes nothing, so it passes. A
+    /// read-modify-write client can then send the body back.
     fn refuse_unsupported(&self) -> Result<(), AutumnError> {
+        let set_to =
+            |field: &Option<Value>, keep: &Value| field.as_ref().is_some_and(|v| v != keep);
         unsupported(&[
-            ("catchup", self.catchup.is_some()),
-            ("queue_name", self.queue_name.is_some()),
-            ("jitter_secs", self.jitter_secs.is_some()),
+            ("catchup", set_to(&self.catchup, &json!(false))),
+            ("queue_name", set_to(&self.queue_name, &json!("default"))),
+            ("jitter_secs", set_to(&self.jitter_secs, &json!(0))),
             ("buffer_all_max", self.buffer_all_max.is_some()),
             ("calendar", self.calendar.is_some()),
-            ("skip_policy", self.skip_policy.is_some()),
+            ("skip_policy", set_to(&self.skip_policy, &json!("skip"))),
             (
                 "consecutive_failure_limit",
                 self.consecutive_failure_limit.is_some(),
@@ -236,10 +243,54 @@ impl PatchBody {
         ])
     }
 
+    /// Whether the body edits a field, beyond `clear_override` and `reason`.
+    /// The other Postgres fields are refused before this check.
+    const fn has_edit_fields(&self) -> bool {
+        self.schedule_expr.is_some()
+            || self.timezone.is_some()
+            || self.input.is_some()
+            || self.max_active_runs.is_some()
+            || self.overlap_policy.is_some()
+    }
+
+    /// The Postgres `check_override_fields`, before any write.
+    ///
+    /// A code schedule takes its input from code. A clear stands alone,
+    /// because the other fields resolve against the stored override. An API
+    /// schedule has no override, so a clear or a reason is a mistake.
+    fn check_override_fields(&self, code: bool, id: uuid::Uuid) -> Result<(), AutumnError> {
+        let refusal = if code && self.input.is_some() {
+            Some(format!(
+                "schedule {id} is declared in code; its input is set in code and an override \
+                 cannot change it"
+            ))
+        } else if code && self.clear_override && self.has_edit_fields() {
+            Some(format!(
+                "schedule {id}: clear_override cannot be combined with other fields; clear \
+                 first, then send the new values"
+            ))
+        } else if !code && (self.clear_override || self.reason.is_some()) {
+            Some(format!(
+                "schedule {id} is not declared in code, so it has no override; clear_override \
+                 and reason apply to a code-declared schedule only"
+            ))
+        } else {
+            None
+        };
+        refusal.map_or(Ok(()), |message| Err(AutumnError::bad_request_msg(message)))
+    }
+
     /// The new cadence, or `None` when the body keeps it.
+    ///
+    /// An expression with no `timezone` keeps the stored time zone, as on
+    /// Postgres. A `cron_tz:` expression names its own.
     fn schedule(&self, stored: &Schedule) -> Result<Option<Schedule>, AutumnError> {
+        let stored_tz = match stored {
+            Schedule::CronInTimezone { tz, .. } => tz.as_str(),
+            _ => "UTC",
+        };
         match (&self.schedule_expr, &self.timezone) {
-            (Some(expr), tz) => parse_expr(expr, tz.as_deref().unwrap_or("UTC")).map(Some),
+            (Some(expr), tz) => parse_expr(expr, tz.as_deref().unwrap_or(stored_tz)).map(Some),
             // A time zone alone re-anchors a stored cron, as on Postgres.
             (None, Some(tz)) => Ok(match stored {
                 Schedule::Cron(expr) | Schedule::CronInTimezone { expr, .. } => {
@@ -361,28 +412,48 @@ struct Audit<'a> {
     route: &'a str,
 }
 
+/// `POST /admin/x` on tenant `acme` gives `POST /tenants/acme/admin/x`.
+fn tenant_route(route: &str, tenant: Option<&str>) -> String {
+    match (tenant, route.split_once(' ')) {
+        (Some(tenant), Some((method, path))) => format!("{method} /tenants/{tenant}{path}"),
+        _ => route.to_owned(),
+    }
+}
+
+/// Whether `workflow_name` is a code schedule of this Harvest.
+///
+/// Only the control Harvest upserts the code schedules. A tenant schedule of
+/// the same name is an API schedule.
+fn is_code_schedule(handle: &HarvestSqlite, workflow_name: &str) -> bool {
+    handle.tenant().is_none() && handle.catalog().code_schedules.contains(workflow_name)
+}
+
 /// The error text of a failed route, for its audit row.
 fn failure<T>(outcome: &Result<T, AutumnError>) -> Option<String> {
     outcome.as_ref().err().map(ToString::to_string)
 }
 
 /// Write one audit row, best effort, as the Postgres schedule routes do.
-async fn audit(
-    flags: &HarvestApiState,
-    headers: &HeaderMap,
-    row: &Audit<'_>,
-    error: Option<String>,
-) {
+///
+/// All rows go to the control store. A tenant route names its tenant in
+/// the route, because a schedule id is the same in every tenant.
+async fn audit(state: &ApiState, headers: &HeaderMap, row: &Audit<'_>, error: Option<String>) {
+    let flags = &state.flags;
     let Some(store) = flags.auth_store() else {
         return;
     };
     let (actor, source, request_id) = crate::api::audit_context(headers, flags);
+    let tenant = state
+        .handle()
+        .ok()
+        .and_then(|handle| handle.tenant().map(ToString::to_string));
+    let route = tenant_route(row.route, tenant.as_deref());
     let record = NewAuditRecord {
         actor: &actor,
         operation: row.operation,
         target_type: row.target_type,
         target_id: row.target_id,
-        route_or_command: row.route,
+        route_or_command: &route,
         request_id: request_id.as_deref(),
         idempotency_key: None,
         status: if error.is_some() {
@@ -435,7 +506,7 @@ async fn create(
         target_id: target.as_deref(),
         route: "POST /admin/schedules/workflow",
     };
-    audit(&state.flags, &headers, &row, failure(&outcome)).await;
+    audit(&state, &headers, &row, failure(&outcome)).await;
     let (_, entry) = outcome?;
     Ok((StatusCode::CREATED, entry).into_response())
 }
@@ -519,7 +590,7 @@ async fn patch(
         target_id: Some(&id),
         route: "PATCH /admin/schedules/{id}",
     };
-    audit(&state.flags, &headers, &row, failure(&outcome)).await;
+    audit(&state, &headers, &row, failure(&outcome)).await;
     outcome
 }
 
@@ -539,21 +610,18 @@ async fn patch_inner(
     let handle = state.handle()?;
     let stored = load_one(&handle, id).await?;
     let name = stored.workflow_name.clone();
+    let is_code = is_code_schedule(&handle, &name);
+    request.check_override_fields(is_code, schedule_id(&name))?;
     let schedule = request.schedule(&stored.schedule)?;
     let overlap = request
         .overlap_policy
         .as_deref()
         .map(parse_overlap)
         .transpose()?;
-    if handle.catalog().code_schedules.contains(&name) {
+    if is_code {
         let actor = state.flags.extract_actor(headers);
         override_code(&handle, &name, &request, schedule, overlap, actor).await?;
     } else {
-        if request.clear_override {
-            return Err(AutumnError::bad_request_msg(
-                "clear_override applies to a schedule declared in code; this one has no code value",
-            ));
-        }
         let mut code = WorkflowSchedule::new(name.clone(), schedule.unwrap_or(stored.schedule))
             .with_input(request.input.clone().unwrap_or(stored.input))
             .with_paused(stored.paused);
@@ -570,8 +638,8 @@ async fn patch_inner(
 
 /// Set or clear the operator override of a code schedule (issue #2390).
 ///
-/// `clear_override` goes first, then the other fields, as on Postgres. The
-/// engine refuses a field it cannot override, such as `input`, by name.
+/// The caller has run `check_override_fields`, so a clear comes alone. The
+/// engine refuses a field it cannot override by name, before any write.
 async fn override_code(
     handle: &HarvestSqlite,
     name: &str,
@@ -625,8 +693,8 @@ async fn resume(
     set_paused(&state, &id, &headers, &body, false).await
 }
 
-/// Pause or resume. The optional `reason` goes to the audit row. This
-/// backend stores no pause reason on the schedule.
+/// Pause or resume. A pause stores its optional `reason`, as on Postgres.
+/// A resume clears it.
 async fn set_paused(
     state: &ApiState,
     id: &str,
@@ -638,18 +706,18 @@ async fn set_paused(
         let request: ReasonBody = optional_body(body)?;
         let handle = state.handle()?;
         let name = load_one(&handle, id).await?.workflow_name;
+        let reason = request.reason;
         handle
             .run(move |runtime| {
                 if paused {
-                    runtime.pause_schedule(&name)
+                    runtime.pause_schedule_with_reason(&name, reason.as_deref())
                 } else {
                     runtime.resume_schedule(&name)
                 }
             })
             .await
             .map_err(schedule_error)?
-            .map_err(|error| schedule_error(error.into()))?;
-        Ok::<_, AutumnError>(request.reason)
+            .map_err(|error| schedule_error(error.into()))
     }
     .await;
     let (operation, route) = if paused {
@@ -663,8 +731,8 @@ async fn set_paused(
         target_id: Some(id),
         route,
     };
-    audit(&state.flags, headers, &row, failure(&outcome)).await;
-    outcome.map(|_| Json(json!({ "ok": true })))
+    audit(state, headers, &row, failure(&outcome)).await;
+    outcome.map(|()| Json(json!({ "ok": true })))
 }
 
 async fn delete(
@@ -675,6 +743,13 @@ async fn delete(
     let outcome = async {
         let handle = state.handle()?;
         let name = load_one(&handle, &id).await?.workflow_name;
+        // The next boot would upsert it again, as on Postgres, which refuses.
+        if is_code_schedule(&handle, &name) {
+            return Err(AutumnError::bad_request_msg(format!(
+                "schedule {id} is managed by the in-process workflow schedule catalog \
+                 (HarvestPlugin::workflow_schedule); remove it from code, or pause it"
+            )));
+        }
         handle
             .run(move |runtime| runtime.delete_schedule(&name))
             .await
@@ -688,7 +763,7 @@ async fn delete(
         target_id: Some(&id),
         route: "DELETE /admin/schedules/{id}",
     };
-    audit(&state.flags, &headers, &row, failure(&outcome)).await;
+    audit(&state, &headers, &row, failure(&outcome)).await;
     outcome.map(|()| Json(json!({ "ok": true })))
 }
 
@@ -708,7 +783,7 @@ async fn trigger(
         target_id: Some(&id),
         route: "POST /admin/schedules/{id}/trigger",
     };
-    audit(&state.flags, &headers, &row, failure(&outcome)).await;
+    audit(&state, &headers, &row, failure(&outcome)).await;
     outcome
 }
 
@@ -796,28 +871,20 @@ async fn retention_status(State(state): State<ApiState>) -> Result<Response, Aut
     Ok(Json(handle.retention().status()).into_response())
 }
 
-/// `POST /admin/retention/run-now`. The pass runs on the driver before the
-/// answer. Postgres only queues it.
+/// `POST /admin/retention/run-now`. It queues a pass, as on Postgres. The
+/// driver runs it on its next turn. `GET /admin/retention` shows the result.
 async fn run_now(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, AutumnError> {
-    let outcome = async {
-        let handle = state.handle()?;
-        let retention = std::sync::Arc::clone(handle.retention());
-        handle
-            .run(move |runtime| retention.run(runtime))
-            .await
-            .map_err(map_error)
-    }
-    .await;
+    let outcome = state.handle().map(|handle| handle.retention().request());
     let row = Audit {
         operation: OP_RETENTION_RUN_NOW,
         target_type: TARGET_RETENTION,
         target_id: None,
         route: "POST /admin/retention/run-now",
     };
-    audit(&state.flags, &headers, &row, failure(&outcome)).await;
+    audit(&state, &headers, &row, failure(&outcome)).await;
     outcome.map(|()| Json(json!({ "ok": true })))
 }
 
