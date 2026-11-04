@@ -7950,7 +7950,8 @@ pub const fn management_api_request_fields()
                 "reason",
             ]),
         ),
-        // Run-default overrides of a workflow type (issues #2387 and #2406).
+        // Run-default overrides of a workflow type (issues #2387, #2406 and
+        // #2407).
         (
             "PATCH",
             "/admin/workflow-types/{workflow_name}/run-defaults",
@@ -7958,6 +7959,7 @@ pub const fn management_api_request_fields()
                 "sla_secs",
                 "execution_timeout_secs",
                 "chain_execution_timeout_secs",
+                "concurrency_limit",
                 "clear_override",
                 "reason",
                 "recompute_in_flight",
