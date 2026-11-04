@@ -1121,3 +1121,27 @@ async fn outcome_of_a_failed_only_replaced_prior_is_terminal_not_running() {
         other => panic!("expected Terminated for a sealed FAILED-replaced prior, got {other:?}"),
     }
 }
+
+/// `newest_run_of_key` returns the newest run of a key in any state. A
+/// sealed run counts, so the outbox relay never starts a key twice (issue
+/// #2470).
+#[test]
+fn newest_run_of_key_returns_a_sealed_run_too() {
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&wait_wf_info());
+    assert_eq!(rt.newest_run_of_key("wait_wf", "k").unwrap(), None);
+
+    let first = rt.start_workflow_with_id("wait_wf", "k", json!(1)).unwrap();
+    assert_eq!(rt.newest_run_of_key("wait_wf", "k").unwrap(), Some(first));
+
+    rt.terminate(first, "operator").unwrap();
+    assert_eq!(rt.newest_run_of_key("wait_wf", "k").unwrap(), Some(first));
+
+    // A start over the sealed run takes the key. It is now the newest.
+    let second = rt.start_workflow_with_id("wait_wf", "k", json!(2)).unwrap();
+    assert_ne!(second, first);
+    assert_eq!(rt.newest_run_of_key("wait_wf", "k").unwrap(), Some(second));
+    assert_eq!(rt.newest_run_of_key("wait_wf", "other").unwrap(), None);
+    assert_eq!(rt.newest_run_of_key("echo_wf", "k").unwrap(), None);
+}

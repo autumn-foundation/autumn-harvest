@@ -783,3 +783,57 @@ async fn a_disabled_scheduler_fires_no_code_schedule() {
         .json();
     assert_eq!(runs, json!([]), "no slot fires");
 }
+
+/// The outbox of a fleet app lives in the control database, and the control
+/// Harvest runs each start. A tenant database has no outbox table, so a
+/// write there fails rather than wait for a relay (issue #2470).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_outbox_runs_on_the_control_harvest_and_refuses_a_tenant_database() {
+    use autumn_harvest_plugin::WorkflowStartRequest;
+    use autumn_harvest_plugin::sqlite::{HarvestSqlite, enqueue_workflow_start_outbox};
+
+    let fixture = boot_with("dev", "tenant", &["acme"]);
+    let state = fixture.client.state();
+    let start = WorkflowStartRequest {
+        workflow_name: "tenant_flow".to_owned(),
+        workflow_id: "o-fleet".to_owned(),
+        queue_name: "default".to_owned(),
+        input: json!(false),
+        memo: None,
+        search_attrs: None,
+    };
+
+    let tenant = fixture.fleet.open_for("acme").await.expect("open acme");
+    let mut conn = tenant.pool().get().await.expect("a tenant connection");
+    let refused = enqueue_workflow_start_outbox(&mut conn, &start)
+        .await
+        .expect_err("a tenant database has no outbox");
+    assert!(refused.to_string().contains("#2470"), "{refused}");
+    drop(conn);
+
+    let mut conn = state.pool().unwrap().get().await.unwrap();
+    enqueue_workflow_start_outbox(&mut conn, &start)
+        .await
+        .unwrap();
+    drop(conn);
+    autumn_harvest_plugin::flush_workflow_start_outbox(state)
+        .await
+        .unwrap();
+    let control = state.extension::<HarvestSqlite>().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let filter = autumn_harvest_plugin::sqlite::ExecutionFilter::new()
+            .workflow_name("tenant_flow")
+            .workflow_id("o-fleet".to_owned())
+            .state("COMPLETED");
+        let page = control.list(filter).await.unwrap();
+        if let Some(run) = page.executions.first() {
+            let exec = run.execution_id().unwrap();
+            let result = control.result(exec).await.unwrap();
+            assert_eq!(result.output, Some(json!({ "who": "control" })));
+            break;
+        }
+        assert!(Instant::now() < deadline, "the start did not run");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

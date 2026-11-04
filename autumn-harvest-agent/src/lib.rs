@@ -15,9 +15,10 @@
 //! [`ResponseCache`] serves an identical model call across runs. The
 //! [`draw`] module gives each sample of a run its own identity, so the cache
 //! keeps the samples apart. The [`episode`] log records each op, and
-//! [`consolidate`] turns the episodes into facts (issue #2454). The `eval`
-//! feature adds the `eval` module. That
-//! module re-drives a recorded run with a candidate model or prompt. The
+//! [`consolidate`] turns the episodes into facts (issue #2454). The
+//! [`recall`] module measures what an agent forgets across ops (issue
+//! #2455). The `eval` feature adds the `eval` module. That module re-drives
+//! a recorded run with a candidate model or prompt. The
 //! `sandbox` feature adds the `sandbox` module. Its `SandboxTool` runs agent
 //! code in a sandbox.
 //!
@@ -110,6 +111,7 @@ pub mod model;
 pub mod policy;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod recall;
 pub mod refine;
 pub mod response_cache;
 pub mod sampling;

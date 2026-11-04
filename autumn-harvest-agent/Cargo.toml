@@ -208,6 +208,10 @@ required-features = ["postgres"]
 name = "episodes"
 required-features = ["sqlite"]
 
+[[test]]
+name = "recall"
+required-features = ["sqlite"]
+
 [lints]
 workspace = true
 

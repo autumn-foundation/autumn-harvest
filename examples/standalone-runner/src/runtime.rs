@@ -10,8 +10,8 @@ use crate::{activities, workflows};
 pub fn standalone_runtime_config(database_url: String) -> HarvestRuntimeConfig {
     HarvestRuntimeConfig {
         mode: HarvestMode::External,
-        worker_enabled: true,
-        scheduler_enabled: true,
+        // The switches stay unset. This runner has no Autumn role, so both
+        // resolve to `true` (issue #2477).
         database: HarvestDatabaseConfig {
             url: Some(database_url),
         },

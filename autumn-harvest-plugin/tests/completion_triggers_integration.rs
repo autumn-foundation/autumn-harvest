@@ -2585,8 +2585,8 @@ async fn test_runner_startup_fails_on_sync_failure() {
         built,
         &HarvestRuntimeConfig {
             mode: HarvestMode::External,
-            worker_enabled: false,
-            scheduler_enabled: false,
+            worker_enabled: Some(false),
+            scheduler_enabled: Some(false),
             database: autumn_harvest_plugin::HarvestDatabaseConfig {
                 url: Some("postgres://postgres:postgres@localhost:12345/non_existent".to_string()),
             },

@@ -1,0 +1,45 @@
+# Ledger profiles for `autumn-harvest-plugin/src/sqlite/outbox.rs`. See `docs/ledger/README.md`.
+# Each query is diesel on a SQLite app database (issue #2470). The scan reads
+# diesel as Postgres, so `backend` lists both.
+
+["SqliteOutbox::due_rows"]
+driver = "per_tick"
+backend = ["postgres", "sqlite"]
+kind = ["read"]
+tables = ["harvest_workflow_outbox"]
+measured = "unmeasured"
+
+["SqliteOutbox::mark_delivered"]
+driver = "per_tick"
+backend = ["postgres", "sqlite"]
+kind = ["write"]
+tables = ["harvest_workflow_outbox"]
+measured = "unmeasured"
+
+["SqliteOutbox::mark_failed"]
+driver = "per_tick"
+backend = ["postgres", "sqlite"]
+kind = ["write"]
+tables = ["harvest_workflow_outbox"]
+measured = "unmeasured"
+
+["enqueue_workflow_start_outbox"]
+driver = "per_request"
+backend = ["postgres", "sqlite"]
+kind = ["write"]
+tables = ["harvest_workflow_outbox"]
+measured = "unmeasured"
+
+["ensure_schema"]
+driver = "setup"
+backend = ["postgres", "sqlite"]
+kind = ["ddl", "read", "write"]
+tables = ["harvest_workflow_outbox"]
+measured = "unmeasured"
+
+["undelivered_rows"]
+driver = "setup"
+backend = ["postgres", "sqlite"]
+kind = ["read"]
+tables = ["harvest_workflow_outbox"]
+measured = "unmeasured"

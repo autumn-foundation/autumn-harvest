@@ -2165,6 +2165,23 @@ impl SqliteRuntime {
         }
     }
 
+    /// The newest run of the key `(workflow_name, workflow_id)`, in any state,
+    /// or `None` (issue #2470).
+    ///
+    /// A terminated or continued run counts too. Unlike a filtered listing,
+    /// the key index answers it, so it costs one seek.
+    ///
+    /// # Errors
+    ///
+    /// Returns a persistence error if the read fails.
+    pub fn newest_run_of_key(
+        &self,
+        workflow_name: &str,
+        workflow_id: &str,
+    ) -> SqliteResult<Option<ExecutionId>> {
+        store::newest_execution_by_key(&self.conn, workflow_name, workflow_id)
+    }
+
     /// One page of executions, newest first, with no payloads (issue #2027).
     ///
     /// [`SqliteReader`](crate::SqliteReader) has the same read without the

@@ -1,0 +1,183 @@
+{
+  "candidate": {
+    "detail": {
+      "followup_dropped": false,
+      "followups": 0,
+      "messages": [
+        {
+          "content": [
+            {
+              "text": "look it up"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "content": [
+            {
+              "tool_call": {
+                "arguments": {
+                  "q": "y"
+                },
+                "id": "eval_0_0",
+                "name": "lookup"
+              }
+            }
+          ],
+          "role": "assistant"
+        },
+        {
+          "content": [
+            {
+              "tool_result": {
+                "content": "{\"error\":\"not run: the evaluation has no recorded output for this call, and it runs no tool\"}",
+                "tool_call_id": "eval_0_0"
+              }
+            }
+          ],
+          "role": "tool"
+        },
+        {
+          "content": [
+            {
+              "text": "other"
+            }
+          ],
+          "role": "assistant"
+        }
+      ],
+      "run_id": "<run>",
+      "steps_used": 1,
+      "stop": "completed",
+      "text": "other",
+      "tool_calls": 1,
+      "usage": {
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "input_tokens": 12,
+        "output_tokens": 0
+      }
+    },
+    "end": "completed"
+  },
+  "end_diverged": false,
+  "first_divergence": 0,
+  "overlay_digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+  "recorded": {
+    "detail": {
+      "followup_dropped": false,
+      "followups": 0,
+      "messages": [
+        {
+          "content": [
+            {
+              "text": "look it up"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "content": [
+            {
+              "tool_call": {
+                "arguments": {
+                  "q": "x"
+                },
+                "id": "c1",
+                "name": "lookup"
+              }
+            }
+          ],
+          "role": "assistant"
+        },
+        {
+          "content": [
+            {
+              "tool_result": {
+                "content": "{\"echo\":{\"q\":\"x\"}}",
+                "tool_call_id": "c1"
+              }
+            }
+          ],
+          "role": "tool"
+        },
+        {
+          "content": [
+            {
+              "text": "done"
+            }
+          ],
+          "role": "assistant"
+        }
+      ],
+      "run_id": "<run>",
+      "steps_used": 1,
+      "stop": "completed",
+      "text": "done",
+      "tool_calls": 1,
+      "usage": {
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "input_tokens": 10,
+        "output_tokens": 0
+      }
+    },
+    "end": "completed"
+  },
+  "replayed_tool_calls": 0,
+  "stubbed_tool_calls": 1,
+  "turn_cap_reached": false,
+  "turns": [
+    {
+      "candidate": {
+        "calls": [
+          {
+            "arguments": {
+              "q": "y"
+            },
+            "decision": "allow",
+            "name": "lookup"
+          }
+        ],
+        "stop": "tool_use",
+        "text": ""
+      },
+      "recorded": {
+        "calls": [
+          {
+            "arguments": {
+              "q": "x"
+            },
+            "decision": "allow",
+            "name": "lookup"
+          }
+        ],
+        "stop": "tool_use",
+        "text": ""
+      },
+      "turn": 0,
+      "verdict": {
+        "divergence": {
+          "kind": "calls"
+        },
+        "verdict": "diverged"
+      }
+    },
+    {
+      "candidate": {
+        "calls": [],
+        "stop": "end_turn",
+        "text": "other"
+      },
+      "recorded": {
+        "calls": [],
+        "stop": "end_turn",
+        "text": "done"
+      },
+      "turn": 1,
+      "verdict": {
+        "verdict": "reworded"
+      }
+    }
+  ]
+}

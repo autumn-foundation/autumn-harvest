@@ -8,6 +8,76 @@ use chrono::{DateTime, Utc};
 
 use crate::policy::{Schedule, parse_cron};
 
+/// A schedule prepared for repeated slot lookups.
+///
+/// A catch-up walk asks for many slots of one schedule. Building this value
+/// once parses the cron expression and the zone once, not once per slot.
+pub struct SlotWalker {
+    kind: WalkerKind,
+}
+
+enum WalkerKind {
+    Cron(croner::Cron),
+    CronInTimezone(croner::Cron, chrono_tz::Tz),
+    Interval(chrono::Duration),
+    Never,
+}
+
+impl SlotWalker {
+    /// Prepare `schedule`. A spec that does not parse never fires.
+    #[must_use]
+    pub fn new(schedule: &Schedule) -> Self {
+        let kind = match schedule {
+            Schedule::Cron(expr) => parse_cron(expr).ok().map(WalkerKind::Cron),
+            Schedule::CronInTimezone { expr, tz } => {
+                // An unknown zone never fires. Validation rejects it earlier.
+                tz.parse::<chrono_tz::Tz>().ok().and_then(|tz| {
+                    parse_cron(expr)
+                        .ok()
+                        .map(|cron| WalkerKind::CronInTimezone(cron, tz))
+                })
+            }
+            Schedule::Interval(interval) => chrono::Duration::from_std(*interval)
+                .ok()
+                // A zero period returns `reference` again. A catch-up walk then
+                // loops forever (issue #484). So a period that does not advance
+                // has no next slot. `validate_schedule` also rejects it.
+                .filter(|duration| *duration > chrono::Duration::zero())
+                .map(WalkerKind::Interval),
+            Schedule::Manual => None,
+        };
+        Self {
+            kind: kind.unwrap_or(WalkerKind::Never),
+        }
+    }
+
+    /// The first slot strictly after `reference`.
+    #[must_use]
+    pub fn next_after(&self, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        match &self.kind {
+            WalkerKind::Cron(cron) => cron.find_next_occurrence(&reference, false).ok(),
+            WalkerKind::CronInTimezone(cron, tz) => {
+                let local_ref = reference.with_timezone(tz);
+                let candidate = cron.find_next_occurrence(&local_ref, false).ok()?;
+                // Spring forward: a match in the skipped hour, such as 02:30,
+                // resolves to the first valid second after the gap. That instant
+                // does not match the pattern. A second search that includes the
+                // candidate moves to the real next match. On a normal match it
+                // returns the same instant.
+                //
+                // Fall back: the strict first search already moves past the first
+                // occurrence of the repeated hour, so the hour fires once.
+                let local_next = cron.find_next_occurrence(&candidate, true).ok()?;
+                Some(local_next.with_timezone(&Utc))
+            }
+            // A sum past the last date that chrono holds also means no next
+            // run (issue #2048).
+            WalkerKind::Interval(duration) => reference.checked_add_signed(*duration),
+            WalkerKind::Never => None,
+        }
+    }
+}
+
 /// The first slot of `schedule` strictly after `reference`.
 ///
 /// Returns `None` for [`Schedule::Manual`] and for a spec that does not
@@ -15,38 +85,7 @@ use crate::policy::{Schedule, parse_cron};
 /// passes the last date that `chrono` holds.
 #[must_use]
 pub fn next_fire_after(schedule: &Schedule, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    match schedule {
-        Schedule::Cron(expr) => parse_cron(expr)
-            .ok()
-            .and_then(|cron| cron.find_next_occurrence(&reference, false).ok()),
-        Schedule::CronInTimezone { expr, tz } => {
-            // An unknown zone never fires. Validation rejects it earlier.
-            let tz: chrono_tz::Tz = tz.parse().ok()?;
-            let cron = parse_cron(expr).ok()?;
-            let local_ref = reference.with_timezone(&tz);
-            let candidate = cron.find_next_occurrence(&local_ref, false).ok()?;
-            // Spring forward: a match in the skipped hour, such as 02:30,
-            // resolves to the first valid second after the gap. That instant
-            // does not match the pattern. A second search that includes the
-            // candidate moves to the real next match. On a normal match it
-            // returns the same instant.
-            //
-            // Fall back: the strict first search already moves past the first
-            // occurrence of the repeated hour, so the hour fires once.
-            let local_next = cron.find_next_occurrence(&candidate, true).ok()?;
-            Some(local_next.with_timezone(&Utc))
-        }
-        Schedule::Interval(interval) => chrono::Duration::from_std(*interval)
-            .ok()
-            // A zero period returns `reference` again. A catch-up walk then
-            // loops forever (issue #484). So a period that does not advance
-            // has no next slot. `validate_schedule` also rejects it.
-            .filter(|duration| *duration > chrono::Duration::zero())
-            // A sum past the last date that chrono holds also means no next
-            // run (issue #2048).
-            .and_then(|duration| reference.checked_add_signed(duration)),
-        Schedule::Manual => None,
-    }
+    SlotWalker::new(schedule).next_after(reference)
 }
 
 /// The slot after a fire of `fired`, with catch-up off.

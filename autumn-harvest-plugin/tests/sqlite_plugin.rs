@@ -52,6 +52,9 @@ mod ops_parity;
 #[path = "sqlite_plugin/trigger_parity.rs"]
 mod trigger_parity;
 
+#[path = "sqlite_plugin/outbox.rs"]
+mod outbox;
+
 /// A value given to `HarvestPlugin::state`. The activity reads it back.
 #[derive(Debug)]
 struct Prefix(&'static str);

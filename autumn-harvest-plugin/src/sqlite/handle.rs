@@ -343,6 +343,29 @@ impl HarvestSqlite {
             .await??)
     }
 
+    /// Return the newest run of the key in `options`, in any state, or else
+    /// start one. The outbox relay starts each row with this (issue #2470).
+    ///
+    /// The runtime checks the input schema of a fresh run only. A row whose
+    /// run already exists is marked delivered, whatever its input.
+    pub(crate) async fn start_once(
+        &self,
+        workflow_name: &str,
+        input: Value,
+        options: StartOptions,
+    ) -> Result<StartOutcome, HarvestSqliteError> {
+        let workflow_name = workflow_name.to_owned();
+        Self::lift(
+            self.call(|reply| Command::StartOnce {
+                workflow_name,
+                input,
+                options,
+                reply,
+            })
+            .await?,
+        )
+    }
+
     /// Start a run and signal it, or signal the run that exists, in one
     /// transaction.
     ///

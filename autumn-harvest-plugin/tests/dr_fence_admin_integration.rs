@@ -429,8 +429,8 @@ async fn an_unpinned_process_admits_admin_writes() {
 
 fn api_only_config() -> autumn_harvest_plugin::config::HarvestRuntimeConfig {
     autumn_harvest_plugin::config::HarvestRuntimeConfig {
-        worker_enabled: false,
-        scheduler_enabled: false,
+        worker_enabled: Some(false),
+        scheduler_enabled: Some(false),
         ..autumn_harvest_plugin::config::HarvestRuntimeConfig::default()
     }
 }

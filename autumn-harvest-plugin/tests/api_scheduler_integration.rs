@@ -3042,8 +3042,8 @@ async fn external_runner_processes_workflows_started_via_management_api() {
             .build(),
         &HarvestRuntimeConfig {
             mode: HarvestMode::External,
-            worker_enabled: false,
-            scheduler_enabled: false,
+            worker_enabled: Some(false),
+            scheduler_enabled: Some(false),
             database: autumn_harvest_plugin::HarvestDatabaseConfig {
                 url: Some(database_url.clone()),
             },
@@ -3090,8 +3090,8 @@ async fn external_runner_processes_workflows_started_via_management_api() {
             .build(),
         &HarvestRuntimeConfig {
             mode: HarvestMode::External,
-            worker_enabled: true,
-            scheduler_enabled: false,
+            worker_enabled: Some(true),
+            scheduler_enabled: Some(false),
             database: autumn_harvest_plugin::HarvestDatabaseConfig {
                 url: Some(database_url.clone()),
             },
@@ -3750,8 +3750,8 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
             .build(),
         &HarvestRuntimeConfig {
             mode: HarvestMode::External,
-            worker_enabled: false,
-            scheduler_enabled: false,
+            worker_enabled: Some(false),
+            scheduler_enabled: Some(false),
             database: autumn_harvest_plugin::HarvestDatabaseConfig {
                 url: Some(database_url.clone()),
             },
