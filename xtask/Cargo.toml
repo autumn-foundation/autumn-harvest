@@ -1,0 +1,25 @@
+[package]
+name = "xtask"
+description = "Workspace automation: CI gates, doc guards and perf evidence. Run it with `cargo xtask`."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+smop = { version = "0.3.2", default-features = false, features = ["sh", "fs", "path", "env", "cli", "json", "toml", "glob", "time"] }
+regex = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+toml = { workspace = true }
+walkdir = "2"
+
+[lints]
+workspace = true

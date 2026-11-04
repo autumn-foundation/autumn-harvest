@@ -495,3 +495,4 @@ mod workflow_task_timeout_tests;
 mod workflow_test_env_mid_run_tests;
 #[cfg(feature = "testing")]
 mod workflow_test_env_tests;
+mod xtask_bin;
