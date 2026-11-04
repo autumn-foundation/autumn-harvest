@@ -16,7 +16,22 @@ use super::ci_run_coverage::{
 
 const NIGHTLY: &str = ".github/workflows/coverage-nightly.yml";
 const BASELINE: &str = ".github/ci/coverage-baseline.json";
-const SCRIPT: &str = ".github/ci/coverage.py";
+
+/// The coverage command, without the program that runs it.
+///
+/// A step runs it as `cargo xtask ci coverage` or, after the coverage
+/// environment is set, as the prebuilt `./target/debug/xtask ci coverage`.
+const COVERAGE: &str = "xtask ci coverage";
+
+/// The `cargo xtask` form of [`COVERAGE`].
+const CARGO_COVERAGE: &str = "cargo xtask ci coverage";
+
+/// The `db` step that builds `xtask` before the coverage environment.
+///
+/// `show-env` instruments each later build. A `cargo xtask` call after it
+/// would build an instrumented `xtask`, and its profile data would join the
+/// report. So the steps after it run the prebuilt binary.
+const BUILD_XTASK: &str = "cargo build --quiet --package xtask";
 
 /// The critical modules that issue #1818 names.
 const CRITICAL: &[&str] = &[
@@ -44,7 +59,7 @@ const DB_RUN: &[&str] = &[
     "coverage_env=\"$(cargo llvm-cov show-env --sh --branch)\"",
     "eval \"$coverage_env\"",
     "cargo llvm-cov clean --workspace",
-    "bash .github/ci/run-suites.sh run linux",
+    "./target/debug/xtask ci run-suites run linux",
 ];
 
 /// The `if` of a step that also runs after a failed test, but not after a
@@ -104,13 +119,13 @@ fn uses_the_coverage_toolchain(job: &serde_yaml::Value) -> bool {
 /// failed test.
 ///
 /// The LCOV exporter of LLVM 23 crashes on `worker.rs`, so the job exports
-/// JSON and the script converts it.
+/// JSON and `cargo xtask ci coverage convert` converts it.
 fn exports_lcov_after_a_failure(job: &serde_yaml::Value) -> bool {
     let steps = steps(job);
     let export = steps.iter().position(|s| {
         let run = str_at(s, &["run"]);
         run.contains("cargo llvm-cov report --branch --json")
-            && run.contains(&format!("{SCRIPT} convert"))
+            && run.contains(&format!("{COVERAGE} convert"))
             && if_is(s, UNLESS_CANCELLED)
     });
     let upload = steps.iter().position(|s| {
@@ -146,6 +161,26 @@ fn runs_the_linux_rows_instrumented(job: &serde_yaml::Value) -> bool {
         .any(|s| ungated(s) && script_lines(str_at(s, &["run"])) == DB_RUN)
 }
 
+/// True when one ungated step builds `xtask` before the [`DB_RUN`] step.
+///
+/// The steps from the [`DB_RUN`] step on must not run `cargo xtask`. Each one
+/// sees the coverage environment, or follows a step that set it.
+fn builds_xtask_first(job: &serde_yaml::Value) -> bool {
+    let steps = steps(job);
+    let build = steps
+        .iter()
+        .position(|s| ungated(s) && str_at(s, &["run"]).trim() == BUILD_XTASK);
+    let suites = steps
+        .iter()
+        .position(|s| script_lines(str_at(s, &["run"])) == DB_RUN);
+    let later_cargo_xtask = suites.is_some_and(|from| {
+        steps[from..]
+            .iter()
+            .any(|s| str_at(s, &["run"]).contains("cargo xtask"))
+    });
+    matches!((build, suites), (Some(b), Some(r)) if b < r) && !later_cargo_xtask
+}
+
 /// The number at `path`, written as a YAML number or a string.
 fn number_at(node: &serde_yaml::Value, path: &[&str]) -> Option<u64> {
     let mut cur = node;
@@ -157,8 +192,8 @@ fn number_at(node: &serde_yaml::Value, path: &[&str]) -> Option<u64> {
 
 /// True when the `db` matrix is exactly `0..SEMAPHORE_SHARD_COUNT`.
 ///
-/// `run-suites.sh` keeps a row when `ordinal % count == index`. A missing
-/// index drops its rows in silence.
+/// `cargo xtask ci run-suites` keeps a row when `ordinal % count == index`.
+/// A missing index drops its rows in silence.
 fn shards_cover_every_row(db: &serde_yaml::Value) -> bool {
     let shards: Option<Vec<u64>> = db["strategy"]["matrix"]["shard"]
         .as_sequence()
@@ -171,13 +206,13 @@ fn shards_cover_every_row(db: &serde_yaml::Value) -> bool {
 
 /// True when the ratchet step gates the run.
 ///
-/// It is one plain `coverage.py ratchet` command against the committed
-/// baseline. `--update` rewrites the baseline and always passes, so it is
-/// rejected.
+/// It is one plain `cargo xtask ci coverage ratchet` command against the
+/// committed baseline. `--update` rewrites the baseline and always passes, so
+/// it is rejected.
 fn ratchets(step: &serde_yaml::Value) -> bool {
     let run = str_at(step, &["run"]).trim();
     let tokens: Vec<&str> = run.split_whitespace().collect();
-    run.starts_with(&format!("python3 {SCRIPT} ratchet "))
+    run.starts_with(&format!("{CARGO_COVERAGE} ratchet "))
         && plain(run)
         && has_pair(&tokens, ["--baseline", BASELINE])
         && !tokens.contains(&"--update")
@@ -230,7 +265,7 @@ fn test_jobs_use_a_dated_nightly_with_branch_coverage() {
         );
         assert!(
             exports_lcov_after_a_failure(job),
-            "the `{name}` job must export JSON, convert it with {SCRIPT} and upload a \
+            "the `{name}` job must export JSON, convert it with `{COVERAGE} convert` and upload a \
              `{LCOV_PREFIX}*` artifact, each with `if: {UNLESS_CANCELLED}`"
         );
     }
@@ -248,6 +283,11 @@ fn db_shards_run_every_linux_row_under_coverage() {
     assert!(
         runs_the_linux_rows_instrumented(db),
         "one ungated `db` step must run exactly these lines: {DB_RUN:?}"
+    );
+    assert!(
+        builds_xtask_first(db),
+        "an ungated `db` step must run `{BUILD_XTASK}` before the coverage environment, and \
+         no later step may run `cargo xtask`"
     );
     assert!(
         shards_cover_every_row(db),
@@ -281,10 +321,14 @@ fn report_job_publishes_and_ratchets() {
         str_at(s, &["uses"]).starts_with("actions/download-artifact@")
             && str_at(s, &["with", "pattern"]) == format!("{LCOV_PREFIX}*")
     });
+    let toolchain = position(&|s| {
+        str_at(s, &["uses"]).starts_with("dtolnay/rust-toolchain@")
+            && compact(str_at(s, &["with", "toolchain"])) == "${{env.RUSTUP_TOOLCHAIN}}"
+    });
     let summary = position(&|s| {
         let run = str_at(s, &["run"]);
-        run.contains(&format!("{SCRIPT} merge"))
-            && run.contains(&format!("{SCRIPT} summary"))
+        run.contains(&format!("{CARGO_COVERAGE} merge"))
+            && run.contains(&format!("{CARGO_COVERAGE} summary"))
             && run.contains(&format!("--baseline {BASELINE}"))
             && run.contains("$GITHUB_STEP_SUMMARY")
     });
@@ -294,6 +338,10 @@ fn report_job_publishes_and_ratchets() {
             && if_is(s, UNLESS_CANCELLED)
     });
     let ratchet = position(&|s| ratchets(s));
+    assert!(
+        matches!(toolchain, Some(t) if summary.is_some_and(|s| t < s)),
+        "the `report` job must install `env.RUSTUP_TOOLCHAIN` before `{CARGO_COVERAGE}` runs"
+    );
     assert!(
         matches!((download, summary, upload, ratchet), (Some(d), Some(s), Some(u), Some(r)) if d < s && s < u && s < r),
         "the `report` job must download the {LCOV_PREFIX}* artifacts, merge and summarize \
@@ -305,7 +353,7 @@ fn report_job_publishes_and_ratchets() {
 /// Self-test: each way to soften the ratchet fails the check.
 #[test]
 fn ratchet_check_rejects_a_soft_gate() {
-    let run = "python3 .github/ci/coverage.py ratchet --baseline .github/ci/coverage-baseline.json --summary s.json";
+    let run = "cargo xtask ci coverage ratchet --baseline .github/ci/coverage-baseline.json --summary s.json";
     let step = |run: &str, condition: &str, extra: &str| {
         let text = format!("run: '{run}'\nif: \"{condition}\"\n{extra}");
         ratchets(&parse_workflow_text(&text).expect("synthetic step must parse"))
@@ -447,7 +495,7 @@ fn baseline_lists_the_critical_modules_with_recorded_floors() {
 #[test]
 fn lint_runs_the_script_self_test_and_prs_run_the_pipeline() {
     let ci = parse_workflow(".github/workflows/ci.yml");
-    let self_test = format!("python3 {SCRIPT} --self-test");
+    let self_test = format!("{CARGO_COVERAGE} --self-test");
     let lint = steps(&ci["jobs"]["lint"])
         .iter()
         .any(|s| str_at(s, &["run"]) == self_test && ungated(s));

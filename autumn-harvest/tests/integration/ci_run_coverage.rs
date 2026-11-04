@@ -16,7 +16,7 @@
 //! bundle is complete.
 //!
 //! Source of truth: the per-suite CI runs are now DATA in the manifest
-//! `.github/ci/integration-suites.txt` (executed by `.github/ci/run-suites.sh`,
+//! `.github/ci/integration-suites.txt` (executed by `cargo xtask ci run-suites`,
 //! which the `test` job invokes), not copy-pasted `cargo test` steps in
 //! `ci.yml`. This guard parses that structured manifest instead of scraping
 //! `run:` lines — the columns are already split, so the old `--test-threads=1`
@@ -55,10 +55,6 @@ const CI_YAML: &str = include_str!("../../../.github/workflows/ci.yml");
 
 /// The manifest: the single source of truth for which per-suite runs CI does.
 const MANIFEST: &str = include_str!("../../../.github/ci/integration-suites.txt");
-
-/// The runner script, so we can assert it actually reads the manifest (closing
-/// the "runner step present but pointed elsewhere" gap).
-const RUN_SCRIPT: &str = include_str!("../../../.github/ci/run-suites.sh");
 
 /// The integration submodule declarations (source of truth for which core
 /// suites exist and their cfg gates).
@@ -1208,25 +1204,77 @@ fn ci_yaml_invokes_the_runner_against_the_manifest() {
     // The live-DB rows run from one nextest archive, so CI must build it,
     // unpack it, and run both live-DB classes from it.
     for needle in [
-        "run-suites.sh compile",
-        "run-suites.sh run allos",
-        "run-suites.sh archive",
-        "run-suites.sh extract",
-        "run-suites.sh nextest linux",
-        "run-suites.sh nextest linuxpart",
+        "cargo xtask ci run-suites compile",
+        "cargo xtask ci run-suites run allos",
+        "cargo xtask ci run-suites archive",
+        "cargo xtask ci run-suites extract",
+        "cargo xtask ci run-suites nextest linux",
+        "cargo xtask ci run-suites nextest linuxpart",
     ] {
         assert!(
             CI_YAML.contains(needle),
-            "ci.yml must invoke `bash .github/ci/{needle}` — the manifest is executed by the \
-             runner script, and a missing invocation would silently stop running suites while \
-             this guard stayed green"
+            "ci.yml must invoke `{needle}` — the manifest is executed by the runner, and a \
+             missing invocation would silently stop running suites while this guard stayed green"
         );
     }
+}
+
+/// The rows of `class`, in manifest order, as the runner prints them.
+///
+/// It runs `cargo xtask ci run-suites run <class>` with `DRY_RUN=1` and no
+/// `SUITES_MANIFEST`, so the runner reads its default manifest.
+fn runner_dry_run(class: &str) -> Vec<String> {
+    let out = crate::xtask_bin::xtask()
+        .args(["ci", "run-suites", "run", class])
+        .env("DRY_RUN", "1")
+        .env_remove("SUITES_MANIFEST")
+        .env_remove("SEMAPHORE_SHARD_COUNT")
+        .env_remove("SEMAPHORE_SHARD_INDEX")
+        .output()
+        .expect("start the xtask runner");
     assert!(
-        RUN_SCRIPT.contains("integration-suites.txt"),
-        "the runner script (.github/ci/run-suites.sh) must reference the manifest \
-         `integration-suites.txt`, else it would execute some other list"
+        out.status.success(),
+        "the runner failed: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("+ "))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn the_runner_executes_the_committed_manifest() {
+    // The runner must read `integration-suites.txt`, or it would execute some
+    // other list while this guard reads this one. So each row of a class must
+    // give one command, in manifest order, for its own crate, target and
+    // filter.
+    let rows = parse_manifest();
+    for class in ["linux", "allos"] {
+        let want: Vec<&SuiteRow> = rows.iter().filter(|r| r.osclass == class).collect();
+        let got = runner_dry_run(class);
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "`run {class}` must print one command for each `{class}` manifest row"
+        );
+        for (row, command) in want.iter().zip(&got) {
+            let tokens: Vec<&str> = command.split_whitespace().collect();
+            let pair = |a: &str, b: &str| tokens.windows(2).any(|w| w[0] == a && w[1] == b);
+            assert!(
+                pair("-p", &row.krate) && pair("--test", &row.target),
+                "`run {class}` must build `{}` `--test {}`: {command}",
+                row.krate,
+                row.target
+            );
+            assert!(
+                row.filter == "-" || tokens.contains(&row.filter.as_str()),
+                "`run {class}` must pass the filter `{}`: {command}",
+                row.filter
+            );
+        }
+    }
 }
 
 // ── The `merge=union` manifest must stay sorted + unique ─────────────────────

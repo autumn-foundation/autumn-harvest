@@ -3,7 +3,8 @@
 # - `unit`: the autumn-harvest lib tests, under `cargo llvm-cov`.
 # - `db`: every `linux` row of `.github/ci/integration-suites.txt`, in the
 #   shard layout of `test-db-linux`. `show-env` instruments the plain
-#   `cargo test` calls of `run-suites.sh`.
+#   `cargo test` calls of `cargo xtask ci run-suites`. The job builds `xtask`
+#   before `show-env`, so the coverage data holds no `xtask` code.
 # - Each test job exports `llvm-cov` JSON and converts it into LCOV. The
 #   LCOV exporter of LLVM 23 crashes on this crate (a SIGSEGV in
 #   `CoverageExporterLcov::renderRoot` on `worker.rs`).
@@ -19,7 +20,7 @@
 # context.
 #
 # A PR runs this workflow only when it changes this file. The `lint` job
-# runs the self-test of `coverage.py` on each PR. A floor-raise PR can start
+# runs the self-test of `cargo xtask ci coverage` on each PR. A floor-raise PR can start
 # a run by hand.
 #
 # `autumn-harvest/tests/integration/coverage_nightly_wiring.rs` guards this
@@ -85,7 +86,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           cargo llvm-cov report --branch --json --output-path unit.json
-          python3 .github/ci/coverage.py convert unit.json --root "$GITHUB_WORKSPACE" --output unit.lcov
+          cargo xtask ci coverage convert unit.json --root "$GITHUB_WORKSPACE" --output unit.lcov
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
@@ -127,8 +128,13 @@ jobs:
           df -h /
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked --version "$CARGO_LLVM_COV_VERSION"
+      # `show-env` below instruments each later build. The steps after it run
+      # this binary directly. A `cargo xtask` call there would build an
+      # instrumented `xtask`, and its profile data would join the report.
+      - name: Build xtask before the coverage environment
+        run: cargo build --quiet --package xtask
       - name: Pre-pull Docker test images
-        run: bash .github/ci/pull-test-images.sh
+        run: cargo xtask ci pull-test-images
       - name: Run the Linux manifest suites under coverage
         env:
           HARVEST_DEV_REQUIRE_POSTGRES: "1"
@@ -139,14 +145,14 @@ jobs:
           coverage_env="$(cargo llvm-cov show-env --sh --branch)"
           eval "$coverage_env"
           cargo llvm-cov clean --workspace
-          bash .github/ci/run-suites.sh run linux
+          ./target/debug/xtask ci run-suites run linux
       - name: Export coverage
         if: ${{ !cancelled() }}
         run: |
           coverage_env="$(cargo llvm-cov show-env --sh --branch)"
           eval "$coverage_env"
           cargo llvm-cov report --branch --json --output-path db.json
-          python3 .github/ci/coverage.py convert db.json --root "$GITHUB_WORKSPACE" \
+          ./target/debug/xtask ci coverage convert db.json --root "$GITHUB_WORKSPACE" \
             --output "db-${SEMAPHORE_SHARD_INDEX}.lcov"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
@@ -166,6 +172,15 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # `cargo xtask` merges and ratchets the coverage, so the job needs the
+      # pinned toolchain. Only the nightly saves the cache.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: coverage-report
+          save-if: ${{ github.event_name == 'schedule' }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: coverage-lcov-*
@@ -187,8 +202,8 @@ jobs:
             partial=(--partial)
           fi
           mkdir -p coverage-report
-          python3 .github/ci/coverage.py merge --output coverage-report/coverage.lcov "${files[@]}"
-          python3 .github/ci/coverage.py summary coverage-report/coverage.lcov "${partial[@]}" \
+          cargo xtask ci coverage merge --output coverage-report/coverage.lcov "${files[@]}"
+          cargo xtask ci coverage summary coverage-report/coverage.lcov "${partial[@]}" \
             --baseline .github/ci/coverage-baseline.json \
             --json coverage-report/summary.json --markdown coverage-report/summary.md
           cat coverage-report/summary.md >> "$GITHUB_STEP_SUMMARY"
@@ -202,7 +217,7 @@ jobs:
         # A failed test cuts coverage short, so a drop then is noise. The
         # failed test job already fails the run.
         if: needs.unit.result == 'success' && needs.db.result == 'success'
-        run: python3 .github/ci/coverage.py ratchet --baseline .github/ci/coverage-baseline.json --summary coverage-report/summary.json
+        run: cargo xtask ci coverage ratchet --baseline .github/ci/coverage-baseline.json --summary coverage-report/summary.json
 
   alert:
     name: Report a failed nightly
