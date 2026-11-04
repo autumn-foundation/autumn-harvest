@@ -617,18 +617,35 @@ async fn patch_inner(
         .as_deref()
         .map(parse_overlap)
         .transpose()?;
+    // Each field that derives from the stored row resolves inside the driver
+    // job. Two overlapping requests then apply one after the other.
+    let job_name = name.clone();
     if is_code {
-        let schedule = request.schedule(&stored.schedule)?;
         let actor = state.flags.extract_actor(headers);
-        override_code(&handle, &name, &request, schedule, overlap, actor).await?;
+        handle
+            .run(move |runtime| override_code(runtime, &job_name, &request, overlap, &actor))
+            .await
+            .map_err(schedule_error)??;
     } else {
-        let job_name = name.clone();
         handle
             .run(move |runtime| edit_in_place(runtime, &job_name, &request, overlap))
             .await
             .map_err(schedule_error)??;
     }
     entry_of(&handle, &name).await
+}
+
+/// The stored row of `name`, read on the driver task.
+fn stored_row(
+    runtime: &autumn_harvest_sqlite::SqliteRuntime,
+    name: &str,
+) -> Result<ScheduleSummary, AutumnError> {
+    runtime
+        .list_schedules()
+        .map_err(|error| schedule_error(error.into()))?
+        .into_iter()
+        .find(|row| row.workflow_name == name)
+        .ok_or_else(|| AutumnError::not_found_msg(format!("schedule {}", schedule_id(name))))
 }
 
 /// Edit an API schedule in place, on the driver task.
@@ -642,12 +659,7 @@ fn edit_in_place(
     request: &PatchBody,
     overlap: Option<OverlapPolicy>,
 ) -> Result<(), AutumnError> {
-    let stored = runtime
-        .list_schedules()
-        .map_err(|error| schedule_error(error.into()))?
-        .into_iter()
-        .find(|row| row.workflow_name == name)
-        .ok_or_else(|| AutumnError::not_found_msg(format!("schedule {}", schedule_id(name))))?;
+    let stored = stored_row(runtime, name)?;
     let schedule = request.schedule(&stored.schedule)?;
     let mut code = WorkflowSchedule::new(name.to_owned(), schedule.unwrap_or(stored.schedule))
         .with_input(request.input.clone().unwrap_or(stored.input))
@@ -659,43 +671,38 @@ fn edit_in_place(
         .map_err(|error| schedule_error(error.into()))
 }
 
-/// Set or clear the operator override of a code schedule (issue #2390).
+/// Set or clear the operator override of a code schedule (issue #2390), on
+/// the driver task.
 ///
 /// The caller has run `check_override_fields`, so a clear comes alone. The
-/// engine refuses a field it cannot override by name, before any write.
-async fn override_code(
-    handle: &HarvestSqlite,
+/// cadence resolves against the row of this turn, as `edit_in_place` does.
+/// The engine refuses a field it cannot override by name, before any write.
+fn override_code(
+    runtime: &mut autumn_harvest_sqlite::SqliteRuntime,
     name: &str,
     request: &PatchBody,
-    schedule: Option<Schedule>,
     overlap: Option<OverlapPolicy>,
-    actor: String,
+    actor: &str,
 ) -> Result<(), AutumnError> {
+    let to_http = |error: SqliteError| schedule_error(error.into());
+    if request.clear_override {
+        runtime.clear_schedule_override(name).map_err(to_http)?;
+    }
+    let stored = stored_row(runtime, name)?;
     let patch = WorkflowSchedulePatch {
-        schedule,
+        schedule: request.schedule(&stored.schedule)?,
         input: request.input.clone(),
         max_active_runs: request.max_active_runs,
         overlap_policy: overlap,
         ..WorkflowSchedulePatch::default()
     };
-    let clear = request.clear_override;
-    let reason = request.reason.clone();
-    let name = name.to_owned();
-    handle
-        .run(move |runtime| {
-            if clear {
-                runtime.clear_schedule_override(&name)?;
-            }
-            if autumn_harvest::schedule_patch::workflow_fields_are_empty(&patch) {
-                return Ok(());
-            }
-            runtime
-                .set_schedule_override(&name, &patch, &actor, reason.as_deref())
-                .map(|_| ())
-        })
-        .await
-        .map_err(schedule_error)?
-        .map_err(|error: SqliteError| schedule_error(error.into()))
+    if autumn_harvest::schedule_patch::workflow_fields_are_empty(&patch) {
+        return Ok(());
+    }
+    runtime
+        .set_schedule_override(name, &patch, actor, request.reason.as_deref())
+        .map(|_| ())
+        .map_err(to_http)
 }
 
 async fn pause(

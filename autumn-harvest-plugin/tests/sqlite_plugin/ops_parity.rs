@@ -390,6 +390,51 @@ async fn overlapping_patches_of_an_api_schedule_both_apply() {
     }
 }
 
+/// Two overlapping cadence edits of a code schedule both apply. One changes
+/// the expression and keeps the zone. The other changes the zone and keeps
+/// the expression. In either order, the result has both.
+#[tokio::test(flavor = "multi_thread")]
+async fn overlapping_cadence_overrides_of_a_code_schedule_both_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let schedule = WorkflowSchedule::new("tick", Schedule::Cron("0 3 * * *".to_owned()));
+    let client = boot(dir.path(), "dev", base().workflow_schedule(schedule));
+    let id = eventually(&client, "/harvest/admin/schedules", |status, body| {
+        status == 200 && body.as_array().is_some_and(|rows| rows.len() == 1)
+    })
+    .await[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let path = format!("/harvest/admin/schedules/{id}");
+
+    for (round, zone) in ["Europe/London", "Europe/Paris"]
+        .iter()
+        .cycle()
+        .take(10)
+        .enumerate()
+    {
+        let expr = format!("cron:0 {} * * *", round + 1);
+        let (cadence, timezone) = tokio::join!(
+            client
+                .patch(&path)
+                .json(&json!({ "schedule_expr": expr }))
+                .send(),
+            client
+                .patch(&path)
+                .json(&json!({ "timezone": zone }))
+                .send(),
+        );
+        cadence.assert_ok();
+        timezone.assert_ok();
+        let one: Value = client.get(&path).send().await.json();
+        assert_eq!(
+            one["schedule_expr"],
+            format!("cron_tz:{zone}:0 {} * * *", round + 1),
+            "round {round}: {one}"
+        );
+    }
+}
+
 /// Outside `dev`, an anonymous schedule write is refused, as on Postgres.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_anonymous_schedule_write_outside_dev_is_refused() {
