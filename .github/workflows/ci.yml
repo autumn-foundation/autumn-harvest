@@ -1164,6 +1164,11 @@ jobs:
       - name: "Run agent-loop-hit-rate example tests (issue #2007)"
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p agent-loop-hit-rate --bins
+      # Issue #2455. `--bins` runs the scripted sweep. A real-model run costs
+      # money and runs by hand (see the crate README).
+      - name: "Run recall-eval example tests (issue #2455)"
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p recall-eval --bins
       # Issue #2257. The unit tests and the SQLite tests run offline. The
       # Postgres target runs from its `linux` manifest row, and the
       # measurement runs by hand (see the crate README).
@@ -2479,6 +2484,10 @@ jobs:
       # daemon above: it uses `autumn-harvest` with no default features.
       - name: Clippy autoresearch example
         run: cargo clippy -p autoresearch --all-targets --no-deps -- -D warnings
+      # The recall eval (issue #2455). `--no-deps` for the same reason as
+      # autoresearch, which it depends on.
+      - name: "Clippy recall-eval example (issue #2455)"
+        run: cargo clippy -p recall-eval --all-targets --no-deps -- -D warnings
       # The agent-mesh capstone (issue #2276). `--no-deps` for the same
       # reason as the autoresearch step.
       - name: "Clippy agent-mesh example (issue #2276)"

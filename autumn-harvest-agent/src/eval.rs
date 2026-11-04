@@ -107,6 +107,19 @@
 //! evaluation grows with the square of the run length. Evaluate long runs
 //! offline, not on a request path.
 //!
+//! # Scores
+//!
+//! [`Candidate::scorer`] adds a [`Scorer`] (issue #2447). The scorer checks
+//! the final answer of each completed end. A failed end gets no verdict. The
+//! harness scores the source before the first candidate model call. So a
+//! scorer that fails on the source costs no candidate call. The source run
+//! had no scorer, so the harness scores the recorded report. It does not
+//! read a verdict from history. See [`Evaluation::recorded_verdict`].
+//!
+//! A judge scorer calls the models of the candidate harness. These calls are
+//! live, as the candidate model is. Their tokens go to
+//! [`Evaluation::scorer_usage`], apart from the candidate usage.
+//!
 //! # Runtime
 //!
 //! The test engine resolves activities synchronously. The model call is
@@ -139,11 +152,13 @@ use serde_json::Value;
 
 use crate::agent::AgentProfile;
 use crate::agent::overlay::{self, Ceilings, OverlayError, ProfileOverlay};
+use crate::error::{AgentError, ErrorKind};
 use crate::harness::{AgentHarness, fit_turn};
 use crate::memory::MemorySnapshot;
 use crate::mesh::Peer;
-use crate::message::{ContentPart, StopReason, ToolCall};
+use crate::message::{ContentPart, StopReason, TokenUsage, ToolCall};
 use crate::policy::ToolDecision;
+use crate::score::{self, ScoreContext, ScoreInput, Scorer};
 pub use crate::types::PROBE_EFFECT_REFUSED;
 use crate::types::{
     AgentReport, AgentTask, ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome,
@@ -203,6 +218,8 @@ pub struct Candidate {
     agent_models: BTreeMap<String, String>,
     /// The operator label, from [`label`](Self::label).
     label: Option<String>,
+    /// The scorer of each run end, from [`scorer`](Self::scorer).
+    scorer: Option<Arc<dyn Scorer>>,
 }
 
 impl Candidate {
@@ -235,6 +252,7 @@ impl Candidate {
             route: None,
             agent_models: BTreeMap::new(),
             label: None,
+            scorer: None,
         }
     }
 
@@ -247,6 +265,19 @@ impl Candidate {
     #[must_use]
     pub fn label(mut self, label: impl Into<String>) -> Self {
         self.label = Some(label.into());
+        self
+    }
+
+    /// Score each completed run end with `scorer` (issue #2447).
+    ///
+    /// The report then holds [`Evaluation::recorded_verdict`],
+    /// [`Evaluation::candidate_verdict`] and [`Evaluation::scorer_usage`]. A
+    /// judge scorer calls the models of this harness. The scorer judges the
+    /// candidate. It is not a part of it, so it does not enter
+    /// [`digest`](Self::digest).
+    #[must_use]
+    pub fn scorer(mut self, scorer: Arc<dyn Scorer>) -> Self {
+        self.scorer = Some(scorer);
         self
     }
 
@@ -510,6 +541,25 @@ pub enum EvalError {
     /// #2378). The source stays unchanged.
     #[error("the live probe fork failed: {0}")]
     Fork(String),
+    /// The scorer failed, or did not end within
+    /// [`AgentHarness::score_timeout`] (issue #2447). A scorer error is not
+    /// a reject, so the evaluation fails. [`Side::Recorded`] is the source
+    /// end. [`Side::Candidate`] is the end of the candidate that ran.
+    ///
+    /// The report of a candidate end is lost, and so is the report of an
+    /// earlier candidate of a comparison.
+    #[error("the scorer failed on the {} end: {error}", .side.word())]
+    Scorer {
+        /// The run end that the scorer failed on.
+        side: Side,
+        /// The scorer error.
+        #[source]
+        error: AgentError,
+        /// The tokens of the judge calls of this evaluation before the
+        /// error. The evaluation writes no ledger row, so only this field
+        /// shows that spend.
+        usage: TokenUsage,
+    },
 }
 
 /// One side of a comparison.
@@ -520,6 +570,16 @@ pub enum Side {
     Recorded,
     /// The candidate run.
     Candidate,
+}
+
+impl Side {
+    /// The side in one word.
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::Candidate => "candidate",
+        }
+    }
 }
 
 /// How two decisions of one turn differ.
@@ -666,6 +726,24 @@ pub struct Evaluation {
     /// the empty string.
     #[serde(default)]
     pub overlay_digest: String,
+    /// The verdict of the scorer on the recorded end (issue #2447).
+    ///
+    /// The harness scores the recorded report. It does not read a verdict
+    /// from history. It is `None` with no scorer, and for a failed end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_verdict: Option<score::Verdict>,
+    /// The verdict of the scorer on the candidate end (issue #2447). It is
+    /// `None` with no scorer, and for a failed end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_verdict: Option<score::Verdict>,
+    /// The tokens of the judge calls of the scorer (issue #2447). They are
+    /// not in the candidate usage. It is `None` with no scorer, and zero for
+    /// a scorer that calls no judge.
+    ///
+    /// In a comparison, the first evaluation that scores the source holds
+    /// the tokens of that score. See [`compare`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorer_usage: Option<TokenUsage>,
 }
 
 impl Evaluation {
@@ -698,11 +776,15 @@ pub async fn evaluate(
 ) -> Result<Evaluation, EvalError> {
     let recording = Recording::read(history)?;
     let task = candidate.task_under_overlay(&recording.task)?;
-    run(&recording, task, candidate).await
+    let source = SourceScores::default().of(&recording, candidate).await?;
+    // The run future is large. A box keeps it out of the future of each
+    // caller, so a caller passes `clippy::large_futures`.
+    Box::pin(run(&recording, task, candidate, source)).await
 }
 
 /// Run `candidate` on `task`, the recorded task under its overlay, and
-/// compare the run with `recording`.
+/// compare the run with `recording`. `source` is the score of the recorded
+/// end, or `None` with no scorer.
 ///
 /// # Errors
 ///
@@ -711,8 +793,142 @@ async fn run(
     recording: &Recording,
     task: AgentTask,
     candidate: &Candidate,
+    source: Option<Scored>,
 ) -> Result<Evaluation, EvalError> {
-    Ok(run_with_routes(recording, task, candidate).await?.0)
+    let mut evaluation = run_with_routes(recording, task, candidate, source).await?.0;
+    evaluation.recorded_verdict = evaluation.recorded_verdict.map(cut_reason);
+    evaluation.candidate_verdict = evaluation.candidate_verdict.map(cut_reason);
+    Ok(evaluation)
+}
+
+/// `verdict` with its reject reason cut to
+/// [`MAX_REJECT_REASON_BYTES`](score::MAX_REJECT_REASON_BYTES), as
+/// `agent_score` does. An anonymised pool cuts after it redacts, so a cut
+/// never splits a name that it redacts.
+pub(crate) fn cut_reason(verdict: score::Verdict) -> score::Verdict {
+    match verdict {
+        score::Verdict::Reject(reason) => score::Verdict::reject(reason),
+        verdict @ score::Verdict::Score(_) => verdict,
+    }
+}
+
+/// A verdict of a scorer, the tokens of its judge calls and their models.
+#[derive(Debug, Clone, Default)]
+struct Scored {
+    /// The verdict, or `None` for a failed end.
+    verdict: Option<score::Verdict>,
+    /// The tokens of the judge calls of this score.
+    usage: TokenUsage,
+    /// The model name of each judge call. `None` is the default model.
+    routes: BTreeSet<Option<String>>,
+}
+
+/// The verdict of `scorer` on `end`, a run of `task`.
+///
+/// A failed end gets no verdict and costs no call. A judge calls the models
+/// of `harness`. [`AgentHarness::score_timeout`] bounds the score.
+///
+/// # Errors
+///
+/// Returns [`EvalError::Scorer`] with `side` when the scorer fails or does
+/// not end in time. Its usage holds the judge calls of this score.
+async fn score_end(
+    scorer: &dyn Scorer,
+    harness: &AgentHarness,
+    task: &AgentTask,
+    end: &RunEnd,
+    side: Side,
+) -> Result<Scored, EvalError> {
+    let RunEnd::Completed(report) = end else {
+        return Ok(Scored::default());
+    };
+    let input = ScoreInput::from_run(task, report);
+    let cx = ScoreContext::unmetered(harness);
+    let budget = harness.score_budget();
+    let verdict = tokio::time::timeout(budget, scorer.score(&input, &cx))
+        .await
+        .unwrap_or_else(|_| {
+            Err(AgentError::new(
+                ErrorKind::Unavailable,
+                format!("the scorer did not end within {budget:?}"),
+            ))
+        })
+        .map_err(|error| EvalError::Scorer {
+            side,
+            error,
+            usage: cx.usage(),
+        })?;
+    // The reason stays whole here. `run` cuts it, and a pool cuts it after
+    // it redacts.
+    Ok(Scored {
+        verdict: Some(verdict),
+        usage: cx.usage(),
+        routes: cx.routes(),
+    })
+}
+
+/// Each source verdict so far. [`SourceScores::of`] scores the source once
+/// for each scorer and harness.
+///
+/// A judge scorer calls the models of the candidate harness. So two
+/// candidates share a source verdict only when they share the scorer and the
+/// harness, as the same `Arc` values.
+#[derive(Default)]
+struct SourceScores(Vec<SourceScore>);
+
+/// One source verdict and what made it.
+struct SourceScore {
+    scorer: Arc<dyn Scorer>,
+    harness: Arc<AgentHarness>,
+    verdict: Option<score::Verdict>,
+}
+
+impl SourceScores {
+    /// The score of the recorded end for `candidate`, or `None` with no
+    /// scorer.
+    ///
+    /// A shared verdict has zero usage, because the first candidate that
+    /// scored it holds its tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvalError::MultiThreadRuntimeRequired`] before any judge
+    /// call, and [`EvalError::Scorer`] with [`Side::Recorded`].
+    async fn of(
+        &mut self,
+        recording: &Recording,
+        candidate: &Candidate,
+    ) -> Result<Option<Scored>, EvalError> {
+        let Some(scorer) = &candidate.scorer else {
+            return Ok(None);
+        };
+        if let Some(seen) = self.0.iter().find(|seen| {
+            std::ptr::addr_eq(Arc::as_ptr(&seen.scorer), Arc::as_ptr(scorer))
+                && Arc::ptr_eq(&seen.harness, &candidate.harness)
+        }) {
+            return Ok(Some(Scored {
+                verdict: seen.verdict.clone(),
+                ..Scored::default()
+            }));
+        }
+        // The candidate run needs this runtime. Check it first, so a wrong
+        // runtime costs no judge call.
+        multi_thread_handle()?;
+        let fresh = score_end(
+            scorer.as_ref(),
+            &candidate.harness,
+            &recording.task,
+            &recording.end,
+            Side::Recorded,
+        )
+        .await?;
+        self.0.push(SourceScore {
+            scorer: Arc::clone(scorer),
+            harness: Arc::clone(&candidate.harness),
+            verdict: fresh.verdict.clone(),
+        });
+        Ok(Some(fresh))
+    }
 }
 
 /// [`run`], with each model route that a candidate turn asked for. `None`
@@ -726,6 +942,7 @@ async fn run_with_routes(
     recording: &Recording,
     task: AgentTask,
     candidate: &Candidate,
+    source: Option<Scored>,
 ) -> Result<(Evaluation, BTreeSet<Option<String>>), EvalError> {
     let handle = multi_thread_handle()?;
 
@@ -734,21 +951,7 @@ async fn run_with_routes(
         .max_turns
         .unwrap_or_else(|| recording.turns.len().saturating_add(DEFAULT_EXTRA_TURNS));
 
-    let session = Arc::new(Mutex::new(Session {
-        recorded_calls: recording.turns.iter().map(ModelTurn::calls).collect(),
-        recorded_agents: recording.turn_agents.clone(),
-        candidate_names: HashMap::new(),
-        turn: 0,
-        max_turns,
-        cap_reached: false,
-        tools: recording.tools.clone(),
-        snapshots: recording.snapshots.iter().cloned().collect(),
-        peers: recording.peers.clone(),
-        root: None,
-        replayed: 0,
-        stubbed: 0,
-        routes: BTreeSet::new(),
-    }));
+    let session = Arc::new(Mutex::new(Session::new(recording, max_turns)));
 
     let model = model_mock(&session, candidate, recording, handle);
     let tool = {
@@ -801,7 +1004,7 @@ async fn run_with_routes(
     let outcome = env.run(agent_loop_info().handler, input).await;
 
     let candidate_turns = model_turns(outcome.events())?;
-    let (replayed, stubbed, cap_reached, root, routes) = {
+    let (replayed, stubbed, cap_reached, root, mut routes) = {
         let mut session = lock(&session);
         let root = session.root.clone();
         let routes = std::mem::take(&mut session.routes);
@@ -820,6 +1023,9 @@ async fn run_with_routes(
         .iter()
         .position(|turn| matches!(turn.verdict, Verdict::Diverged(_)));
     let end_diverged = ends_differ(&recording.end, &candidate_end);
+    let verdicts = verdicts(source, candidate, &task, &candidate_end).await?;
+    // A judge route counts as a route, so a pool redacts its names too.
+    routes.extend(verdicts.routes);
     let evaluation = Evaluation {
         turns,
         first_divergence,
@@ -830,8 +1036,66 @@ async fn run_with_routes(
         stubbed_tool_calls: stubbed,
         turn_cap_reached: cap_reached,
         overlay_digest: candidate.overlay.digest(),
+        recorded_verdict: verdicts.recorded,
+        candidate_verdict: verdicts.candidate,
+        scorer_usage: verdicts.usage,
     };
     Ok((evaluation, routes))
+}
+
+/// The score fields of one [`Evaluation`]. Each is `None` with no scorer.
+#[derive(Debug, Default)]
+struct Verdicts {
+    recorded: Option<score::Verdict>,
+    candidate: Option<score::Verdict>,
+    usage: Option<TokenUsage>,
+    /// The model name of each judge call of both scores.
+    routes: BTreeSet<Option<String>>,
+}
+
+/// The score fields of a run of `candidate` on `task` that ended as `end`.
+/// `source` is the score of the recorded end.
+///
+/// # Errors
+///
+/// Returns [`EvalError::Scorer`] with [`Side::Candidate`]. Its usage also
+/// holds the tokens of the source score.
+async fn verdicts(
+    source: Option<Scored>,
+    candidate: &Candidate,
+    task: &AgentTask,
+    end: &RunEnd,
+) -> Result<Verdicts, EvalError> {
+    let (Some(source), Some(scorer)) = (source, &candidate.scorer) else {
+        return Ok(Verdicts::default());
+    };
+    let own = match score_end(
+        scorer.as_ref(),
+        &candidate.harness,
+        task,
+        end,
+        Side::Candidate,
+    )
+    .await
+    {
+        Ok(own) => own,
+        Err(EvalError::Scorer { side, error, usage }) => {
+            return Err(EvalError::Scorer {
+                side,
+                error,
+                usage: source.usage.saturating_add(usage),
+            });
+        }
+        Err(other) => return Err(other),
+    };
+    let mut routes = source.routes;
+    routes.extend(own.routes);
+    Ok(Verdicts {
+        recorded: source.verdict,
+        candidate: own.verdict,
+        usage: Some(source.usage.saturating_add(own.usage)),
+        routes,
+    })
 }
 
 /// Two candidates on one source, such as two models for one agent (issue
@@ -861,6 +1125,22 @@ impl Comparison {
     pub const fn diverged(&self) -> bool {
         self.first_divergence.is_some() || self.end_diverged
     }
+
+    /// The verdict of the scorer on the end of the first candidate (issue
+    /// #2447). It is `None` with no scorer, and for a failed end.
+    ///
+    /// Each evaluation also holds the verdict on the source.
+    #[must_use]
+    pub const fn first_verdict(&self) -> Option<&score::Verdict> {
+        self.first.candidate_verdict.as_ref()
+    }
+
+    /// The verdict of the scorer on the end of the second candidate (issue
+    /// #2447). It is `None` with no scorer, and for a failed end.
+    #[must_use]
+    pub const fn second_verdict(&self) -> Option<&score::Verdict> {
+        self.second.candidate_verdict.as_ref()
+    }
 }
 
 /// Evaluate `first` and `second` against one recorded `history`, then
@@ -872,6 +1152,11 @@ impl Comparison {
 ///
 /// Both overlays pass [`overlay::apply`] before the first model call
 /// (issue #2375).
+///
+/// With a [`Candidate::scorer`], each evaluation holds both verdicts (issue
+/// #2447). `compare` scores the source before the first model call. Two
+/// candidates with the same scorer and harness share one source verdict.
+/// The first evaluation then holds the tokens of that score.
 ///
 /// # Errors
 ///
@@ -885,8 +1170,11 @@ pub async fn compare(
     let recording = Recording::read(history)?;
     let first_task = first.task_under_overlay(&recording.task)?;
     let second_task = second.task_under_overlay(&recording.task)?;
-    let first = run(&recording, first_task, first).await?;
-    let second = run(&recording, second_task, second).await?;
+    let mut sources = SourceScores::default();
+    let first_source = sources.of(&recording, first).await?;
+    let second_source = sources.of(&recording, second).await?;
+    let first = Box::pin(run(&recording, first_task, first, first_source)).await?;
+    let second = Box::pin(run(&recording, second_task, second, second_source)).await?;
     let decision = |evaluation: &Evaluation, turn: usize| {
         evaluation
             .turns
@@ -1383,6 +1671,25 @@ struct Session {
 }
 
 impl Session {
+    /// A session over `recording` that allows `max_turns` live turns.
+    fn new(recording: &Recording, max_turns: usize) -> Self {
+        Self {
+            recorded_calls: recording.turns.iter().map(ModelTurn::calls).collect(),
+            recorded_agents: recording.turn_agents.clone(),
+            candidate_names: HashMap::new(),
+            turn: 0,
+            max_turns,
+            cap_reached: false,
+            tools: recording.tools.clone(),
+            snapshots: recording.snapshots.iter().cloned().collect(),
+            peers: recording.peers.clone(),
+            root: None,
+            replayed: 0,
+            stubbed: 0,
+            routes: BTreeSet::new(),
+        }
+    }
+
     /// Claim the next candidate turn, of `agent`. Returns its index and the
     /// recorded calls of the same turn.
     ///

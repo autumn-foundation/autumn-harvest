@@ -5,10 +5,14 @@
 //! row. A routing change moves the schedule row to a new owner. Before #2389
 //! the override stayed behind, so the new owner reconciled to the code value.
 //!
+//! Issue #2405: two shards on one pool share one schedule table. The shard
+//! that does not own a DAG must not delete the row of the shard that does.
+//!
 //! Execution: honours `HARVEST_TEST_DATABASE_URL` for the admin connection
 //! and creates one fresh database per shard off it. Otherwise it boots a
 //! testcontainers Postgres 16 and does the same. Separate databases are
-//! load-bearing: a shard is the pool that it reads.
+//! load-bearing: a shard is the pool that it reads. The colocated tests
+//! share one database on purpose.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -184,6 +188,16 @@ fn lowered(dag: &RegisteredDag) -> WorkflowSchedule {
 }
 
 async fn tick(pool: &ShardedDbPool, router: ShardRouter, dag: &RegisteredDag) {
+    tick_with(pool, router, dag, lowered(dag)).await;
+}
+
+/// One tick with the schedule `ws` for `dag`.
+async fn tick_with(
+    pool: &ShardedDbPool,
+    router: ShardRouter,
+    dag: &RegisteredDag,
+    ws: WorkflowSchedule,
+) {
     let mut catalog = DagCatalog::new();
     catalog.insert(dag.name.clone(), dag.clone());
     tick_once_sharded(
@@ -191,7 +205,7 @@ async fn tick(pool: &ShardedDbPool, router: ShardRouter, dag: &RegisteredDag) {
         router,
         Arc::new(HandlerRegistry::new(vec![], vec![])),
         Arc::new(catalog),
-        Arc::new(vec![lowered(dag)]),
+        Arc::new(vec![ws]),
         SchedulerMonitor::offline(),
     )
     .await
@@ -372,8 +386,7 @@ async fn an_override_on_the_new_owner_is_kept() {
 #[tokio::test]
 async fn colocated_shards_keep_the_override() {
     let shards = setup_shards().await;
-    let shared = build_pool(&shards.urls[&OLD]);
-    let pool = ShardedDbPool::from_map(BTreeMap::from([(OLD, shared.clone()), (NEW, shared)]), OLD);
+    let pool = colocated_pool(&shards);
     let dag = code_dag(&moving_dag_name());
     let mut old = shards.conn(OLD).await;
     update_dag_override(&mut old, &dag, &every_minute(), "ops", None)
@@ -384,6 +397,171 @@ async fn colocated_shards_keep_the_override() {
     tick(&pool, router_after(), &dag).await;
 
     assert_eq!(override_schedule(&mut old, &dag.name).await, MINUTELY);
+}
+
+/// The id and the next fire time of the schedule row of a DAG.
+async fn schedule_row(
+    conn: &mut AsyncPgConnection,
+    dag_name: &str,
+) -> Option<(uuid::Uuid, Option<chrono::DateTime<chrono::Utc>>)> {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    dsl::harvest_schedules
+        .filter(dsl::dag_name.eq(dag_name))
+        .select((dsl::id, dsl::next_run_at))
+        .first(conn)
+        .await
+        .optional()
+        .expect("read schedule row")
+}
+
+/// A pool that two shards share.
+fn colocated_pool(shards: &Shards) -> ShardedDbPool {
+    let shared = build_pool(&shards.urls[&OLD]);
+    ShardedDbPool::from_map(BTreeMap::from([(OLD, shared.clone()), (NEW, shared)]), OLD)
+}
+
+/// Two ticks under `router` keep one row with one id and one fire time.
+async fn assert_row_is_stable(
+    shards: &Shards,
+    pool: &ShardedDbPool,
+    router: &ShardRouter,
+    dag: &RegisteredDag,
+) {
+    let mut conn = shards.conn(OLD).await;
+    tick(pool, router.clone(), dag).await;
+    let first = schedule_row(&mut conn, &dag.name).await;
+    assert!(first.is_some(), "the DAG has a schedule row after one tick");
+    tick(pool, router.clone(), dag).await;
+    assert_eq!(
+        schedule_row(&mut conn, &dag.name).await,
+        first,
+        "a second tick does not delete and insert the row again"
+    );
+}
+
+/// Issue #2405, AC1: the owner is first in shard order.
+///
+/// Before the fix, the shard after the owner deleted the row each tick.
+#[tokio::test]
+async fn colocated_shards_keep_the_schedule_row_of_an_earlier_owner() {
+    let shards = setup_shards().await;
+    let pool = colocated_pool(&shards);
+    let dag = code_dag(&moving_dag_name());
+
+    assert_row_is_stable(&shards, &pool, &router_before(), &dag).await;
+}
+
+/// Issue #2405, AC1: the owner is last in shard order.
+///
+/// Before the fix, the shard before the owner deleted the row each tick. The
+/// owner then inserted it again with a new fire time.
+#[tokio::test]
+async fn colocated_shards_keep_the_schedule_row_of_a_later_owner() {
+    let shards = setup_shards().await;
+    let pool = colocated_pool(&shards);
+    let only_new = ShardRouter::new(vec![OLD, NEW], vec![NEW], OLD);
+    let dag = code_dag(&moving_dag_name());
+
+    assert_row_is_stable(&shards, &pool, &only_new, &dag).await;
+}
+
+/// Issue #2405, AC1: a DAG on every writable shard keeps its row.
+///
+/// The read-only shard of the pool does not own the DAG. Before the fix, it
+/// deleted the row of the writable owner.
+#[tokio::test]
+async fn colocated_shards_keep_the_row_of_a_dag_on_every_writable_shard() {
+    let shards = setup_shards().await;
+    let pool = colocated_pool(&shards);
+    let dag = code_dag(&moving_dag_name());
+    let ws = lowered(&dag).with_all_writable_shards();
+    let mut conn = shards.conn(OLD).await;
+
+    tick_with(&pool, router_before(), &dag, ws.clone()).await;
+    let first = schedule_row(&mut conn, &dag.name).await;
+    assert!(first.is_some(), "the DAG has a schedule row after one tick");
+    tick_with(&pool, router_before(), &dag, ws).await;
+    assert_eq!(schedule_row(&mut conn, &dag.name).await, first);
+}
+
+/// Issue #2405: the owner fires its DAG, not the pool peer before it.
+///
+/// Both shards read the due row from one table. A fire mints an execution id
+/// for the firing shard. The run must carry the shard id of the owner.
+#[tokio::test]
+async fn the_owner_fires_a_due_dag_on_a_colocated_pool() {
+    use autumn_harvest::schema::harvest_workflow_executions::dsl as exec;
+    let shards = setup_shards().await;
+    let pool = colocated_pool(&shards);
+    let only_new = ShardRouter::new(vec![OLD, NEW], vec![NEW], OLD);
+    let dag = code_dag(&moving_dag_name());
+    let mut conn = shards.conn(OLD).await;
+    tick(&pool, only_new.clone(), &dag).await;
+    conn.batch_execute("UPDATE harvest_schedules SET next_run_at = now() - interval '1 minute'")
+        .await
+        .expect("make the row due");
+
+    tick(&pool, only_new, &dag).await;
+
+    let fired: Vec<i32> = exec::harvest_workflow_executions
+        .select(exec::shard_id)
+        .load(&mut conn)
+        .await
+        .expect("read executions");
+    assert_eq!(fired, vec![NEW.as_i32()], "one run, on the owner shard");
+}
+
+/// Issue #2405, AC2: a shard with its own pool still deletes a stale row.
+#[tokio::test]
+async fn a_shard_with_its_own_pool_collects_a_stale_schedule_row() {
+    let shards = setup_shards().await;
+    let pool = shards.pool();
+    let dag = code_dag(&moving_dag_name());
+    tick(&pool, router_before(), &dag).await;
+    let mut old = shards.conn(OLD).await;
+    assert!(schedule_row(&mut old, &dag.name).await.is_some());
+
+    tick(&pool, router_after(), &dag).await;
+
+    assert_eq!(
+        schedule_row(&mut old, &dag.name).await,
+        None,
+        "the old shard deletes the row that it no longer owns"
+    );
+    let mut new = shards.conn(NEW).await;
+    assert!(schedule_row(&mut new, &dag.name).await.is_some());
+}
+
+/// Issue #2405, AC2: two shards of one pool still delete a row when no shard
+/// of that pool owns the DAG.
+#[tokio::test]
+async fn colocated_shards_collect_a_row_that_moved_to_another_pool() {
+    const OTHER: ShardId = ShardId::new(2);
+    let shards = setup_shards().await;
+    let shared = build_pool(&shards.urls[&OLD]);
+    let pool = ShardedDbPool::from_map(
+        BTreeMap::from([
+            (OLD, shared.clone()),
+            (NEW, shared),
+            (OTHER, build_pool(&shards.urls[&NEW])),
+        ]),
+        OLD,
+    );
+    let all = vec![OLD, NEW, OTHER];
+    let dag = code_dag(&moving_dag_name());
+    tick(&pool, ShardRouter::new(all.clone(), vec![OLD], OLD), &dag).await;
+    let mut shared_conn = shards.conn(OLD).await;
+    assert!(schedule_row(&mut shared_conn, &dag.name).await.is_some());
+
+    tick(&pool, ShardRouter::new(all, vec![OTHER], OLD), &dag).await;
+
+    assert_eq!(
+        schedule_row(&mut shared_conn, &dag.name).await,
+        None,
+        "the shared pool deletes the row that moved off it"
+    );
+    let mut other = shards.conn(NEW).await;
+    assert!(schedule_row(&mut other, &dag.name).await.is_some());
 }
 
 /// Make one statement kind on the override table fail on this shard.
