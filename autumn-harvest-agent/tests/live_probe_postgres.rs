@@ -478,8 +478,7 @@ async fn the_default_probe_runs_only_read_only_tools() {
     };
     let task: AgentTask = serde_json::from_value(input.clone()).unwrap();
     let mark = task.probe.expect("the input marks the probe");
-    assert_eq!(mark.source, source.to_string());
-    assert_eq!(mark.effects, BTreeSet::from([ToolEffect::ReadOnly]));
+    assert_eq!(mark.effects(), BTreeSet::from([ToolEffect::ReadOnly]));
     assert_eq!(task.system.as_deref(), Some(CALL_TOOLS));
     // The spend of the probe is under its own run id.
     assert!(fx.ledger_rows(probe).await > 0, "the probe has ledger rows");
@@ -567,7 +566,7 @@ async fn a_fan_out_child_of_a_probe_refuses_a_write() {
     assert_eq!(children.len(), 2, "the probe ran two child runs");
     for child in &children {
         let mark = child.probe.as_ref().expect("a child is a probe");
-        assert_eq!(mark.effects, BTreeSet::from([ToolEffect::ReadOnly]));
+        assert_eq!(mark.effects(), BTreeSet::from([ToolEffect::ReadOnly]));
     }
     assert_eq!(fx.ledger_rows(source).await, source_ledger);
 }

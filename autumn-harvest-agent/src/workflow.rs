@@ -1869,7 +1869,7 @@ async fn run_tool(
         workspace: progress.workspace.clone(),
         skill: None,
         allowed_effects: task.allowed_effects.clone(),
-        probe_effects: task.probe.as_ref().map(|probe| probe.effects.clone()),
+        probe_effects: task.probe.map(crate::types::Probe::effects),
     };
     if wants_skill {
         request.skill = Some(skill::lookup(
@@ -2613,7 +2613,7 @@ fn child_task(
         // the draw id. It has its own run id, so it drops the root.
         draw: task.draw.as_ref().map(Draw::inherited),
         // A child of a probe is a probe with the same effects (issue #2378).
-        probe: task.probe.clone(),
+        probe: task.probe,
     }
 }
 

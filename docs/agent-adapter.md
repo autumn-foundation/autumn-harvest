@@ -1025,7 +1025,8 @@ let state = postgres::wait_run(&pg, probe.exec_id, Duration::from_secs(300)).awa
 
 The fork starts at event 0 with `ForkEffects::Live`. Its input is the
 source task under the overlay, with the source ceilings. The input holds
-`AgentTask::probe`: the source id and the allowed effects. A worker that
+`AgentTask::probe`: the allowed effects. The `WorkflowForked` event of the
+fork names the source. A worker that
 holds the same tools runs it.
 
 | Part | In a live probe |

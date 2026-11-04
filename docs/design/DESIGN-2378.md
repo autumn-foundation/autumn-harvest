@@ -17,7 +17,7 @@ input is the source task under the overlay, with a `probe` mark.
 
 | Part | Rule |
 |---|---|
-| Mark | `AgentTask::probe` holds the source id and the `allowed` set. The fork records it in `WorkflowStarted`. |
+| Mark | `AgentTask::probe` holds the `allowed` set, as a one-byte mask. The fork records it in `WorkflowStarted`. The `WorkflowForked` event names the source. |
 | Gate | `AgentHarness::tool_call` reads `ToolCallRequest::probe_effects`. A tool with an effect outside the set gets `probe_effect_refused`. `Tool::execute` does not run. |
 | Policy | The gate is in the activity body. The policy cannot change it. A permissive policy cannot bypass it. |
 | Tools seen | The model sees every tool, as in the source. A refusal is an outcome, so the probe records the plan of the candidate. |

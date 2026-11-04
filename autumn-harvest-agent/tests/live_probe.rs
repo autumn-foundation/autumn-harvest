@@ -147,10 +147,7 @@ impl Delivery for CountingDelivery {
 }
 
 fn mark() -> Probe {
-    Probe {
-        source: "source-1".to_owned(),
-        effects: BTreeSet::from([ToolEffect::ReadOnly]),
-    }
+    Probe::new([ToolEffect::ReadOnly])
 }
 
 #[tokio::test(flavor = "multi_thread")]

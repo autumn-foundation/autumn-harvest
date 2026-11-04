@@ -37,11 +37,11 @@ use crate::workflow::WORKFLOW_NAME;
 
 /// The audit reason of a probe fork.
 #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
-pub(crate) const PROBE_FORK_REASON: &str = "live probe (issue #2378)";
+pub const PROBE_FORK_REASON: &str = "live probe (issue #2378)";
 
 /// The audit operator of a probe fork.
 #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
-pub(crate) const PROBE_FORK_OPERATOR: &str = "autumn_harvest_agent::eval::live_probe";
+pub const PROBE_FORK_OPERATOR: &str = "autumn_harvest_agent::eval::live_probe";
 
 /// The recorded source of a probe.
 #[derive(Debug, Clone)]
@@ -125,6 +125,9 @@ pub struct LiveProbe {
 /// - [`EvalError::Fork`]: the read or the fork failed.
 ///
 /// A refusal writes nothing.
+// The future is `Send` when `H` is `Sync`, as `PostgresAgents` is.
+// `SqliteRuntime` is not `Sync`, so the bound would refuse its host.
+#[allow(clippy::future_not_send)]
 pub async fn live_probe<H: LiveProbeHost + ?Sized>(
     host: &H,
     harness: &AgentHarness,
@@ -140,7 +143,7 @@ pub async fn live_probe<H: LiveProbeHost + ?Sized>(
         )));
     }
     let effects: BTreeSet<ToolEffect> = allowed.iter().copied().collect();
-    let task = probe_task(&task_of(&run.events)?, harness, overlay, source, &effects)?;
+    let task = probe_task(&task_of(&run.events)?, harness, overlay, &effects)?;
     let input = serde_json::to_value(&task).map_err(|e| EvalError::Undecodable(e.to_string()))?;
     let fork = host.fork_live(source, input).await?;
     Ok(LiveProbe {
@@ -161,15 +164,11 @@ fn probe_task(
     task: &AgentTask,
     harness: &AgentHarness,
     overlay: &ProfileOverlay,
-    source: ExecutionId,
     effects: &BTreeSet<ToolEffect>,
 ) -> Result<AgentTask, EvalError> {
     let ceilings = Ceilings::from_profile(&source_profile(task));
     let mut task = task_with_overlay(task, overlay, &ceilings, harness)?;
-    task.probe = Some(Probe {
-        source: source.to_string(),
-        effects: effects.clone(),
-    });
+    task.probe = Some(Probe::new(effects.iter().copied()));
     task.followups = None;
     task.draw = None;
     Ok(task)
@@ -290,13 +289,7 @@ mod tests {
         let [input] = host.forks().try_into().unwrap();
         let forked: AgentTask = serde_json::from_value(input).unwrap();
         assert_eq!(forked.system.as_deref(), Some("new"));
-        assert_eq!(
-            forked.probe,
-            Some(Probe {
-                source: source.to_string(),
-                effects,
-            })
-        );
+        assert_eq!(forked.probe, Some(Probe::new(effects)));
         assert_eq!(forked.followups, None, "a probe books no follow-up");
         assert_eq!(forked.draw, None, "a probe has its own run id");
         assert_eq!(forked.input, task.input);
@@ -314,7 +307,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(probe.effects.is_empty());
+        assert_eq!(probe.effects, BTreeSet::new());
         let [input] = host.forks().try_into().unwrap();
         assert_eq!(input["probe"]["effects"], json!([]));
     }
@@ -336,7 +329,7 @@ mod tests {
         )
         .await;
         assert!(matches!(refused, Err(EvalError::Overlay(_))), "{refused:?}");
-        assert!(host.forks().is_empty(), "a refusal forks nothing");
+        assert_eq!(host.forks(), Vec::<Value>::new(), "a refusal forks nothing");
     }
 
     #[tokio::test]
@@ -355,7 +348,7 @@ mod tests {
             matches!(refused, Err(EvalError::NotAnAgentRun(_))),
             "{refused:?}"
         );
-        assert!(host.forks().is_empty());
+        assert_eq!(host.forks(), Vec::<Value>::new());
     }
 
     #[tokio::test]
@@ -377,7 +370,28 @@ mod tests {
             matches!(refused, Err(EvalError::ErasedSource)),
             "{refused:?}"
         );
-        assert!(host.forks().is_empty());
+        assert_eq!(host.forks(), Vec::<Value>::new());
+    }
+
+    #[test]
+    fn the_mark_keeps_its_wire_shape() {
+        for effects in [
+            BTreeSet::new(),
+            BTreeSet::from([ToolEffect::ReadOnly]),
+            BTreeSet::from(ToolEffect::ALL),
+        ] {
+            let mark = Probe::new(effects.iter().copied());
+            assert_eq!(mark.effects(), effects);
+            let wire = serde_json::to_value(mark).unwrap();
+            assert_eq!(wire, json!({ "effects": effects }));
+            assert_eq!(serde_json::from_value::<Probe>(wire).unwrap(), mark);
+            for effect in ToolEffect::ALL {
+                assert_eq!(mark.allows(effect), effects.contains(&effect));
+            }
+        }
+        // An unknown key fails, so no part of the mark drops in silence.
+        let unknown = json!({ "effects": [], "source": "x" });
+        assert!(serde_json::from_value::<Probe>(unknown).is_err());
     }
 
     #[test]

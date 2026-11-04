@@ -3,7 +3,8 @@
 `eval::live_probe(host, harness, source, overlay, allowed)` forks a recorded
 `agent_loop` run at event 0 with `ForkEffects::Live`. The fork input is the
 source task under the overlay, with the source ceilings, and a new
-`AgentTask::probe` mark: the source id and the allowed `ToolEffect`s. Pass
+`AgentTask::probe` mark: the allowed `ToolEffect`s, as a one-byte mask, so
+`AgentTask` does not grow. Pass
 `RefinePolicy::probe_effects` as `allowed`. Its default is `[read_only]`.
 
 - `agent_tool_call` reads the new `ToolCallRequest::probe_effects`. A tool

@@ -43,13 +43,74 @@ pub const PROBE_EFFECT_REFUSED: &str = "probe_effect_refused";
 ///
 /// A run with the mark runs a tool only when the tool effect is in
 /// [`effects`](Self::effects). The tool-call activity checks it, so a policy
-/// cannot change it. Each delegated child keeps the mark.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// cannot change it. Each delegated child keeps the mark. The fork event of
+/// the run names the source.
+///
+/// The mark is one byte in memory, so `AgentTask` does not grow. A future
+/// that holds a task is close to the `large_futures` threshold. The wire
+/// shape is `{"effects": ["read_only"]}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ProbeWire", into = "ProbeWire")]
 pub struct Probe {
-    /// The execution id of the source run.
-    pub source: String,
+    /// One bit for each effect, in the order of [`ToolEffect::ALL`].
+    mask: u8,
+}
+
+impl Probe {
+    /// A probe that may run the tools of `effects`.
+    #[must_use]
+    pub fn new(effects: impl IntoIterator<Item = ToolEffect>) -> Self {
+        let mask = effects
+            .into_iter()
+            .fold(0, |mask, effect| mask | Self::bit(effect));
+        Self { mask }
+    }
+
+    /// Whether the probe may run a tool of `effect`.
+    #[must_use]
+    pub const fn allows(self, effect: ToolEffect) -> bool {
+        self.mask & Self::bit(effect) != 0
+    }
+
     /// The tool effects that the probe may run.
-    pub effects: BTreeSet<ToolEffect>,
+    #[must_use]
+    pub fn effects(self) -> BTreeSet<ToolEffect> {
+        ToolEffect::ALL
+            .into_iter()
+            .filter(|effect| self.allows(*effect))
+            .collect()
+    }
+
+    const fn bit(effect: ToolEffect) -> u8 {
+        match effect {
+            ToolEffect::ReadOnly => 1,
+            ToolEffect::Internal => 2,
+            ToolEffect::Write => 4,
+            ToolEffect::External => 8,
+        }
+    }
+}
+
+/// The wire shape of a [`Probe`]. An unknown key fails to decode, so an
+/// old worker never drops a part of the mark.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeWire {
+    effects: BTreeSet<ToolEffect>,
+}
+
+impl From<ProbeWire> for Probe {
+    fn from(wire: ProbeWire) -> Self {
+        Self::new(wire.effects)
+    }
+}
+
+impl From<Probe> for ProbeWire {
+    fn from(probe: Probe) -> Self {
+        Self {
+            effects: probe.effects(),
+        }
+    }
 }
 
 /// The input of one agent run: the workflow input.
