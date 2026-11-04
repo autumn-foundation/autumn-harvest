@@ -22,7 +22,7 @@ holds the policy log of each kind. A missing policy means every default.
 | `auto_adopt.parts` | `[]`, so every overlay waits | `ProfileOverlayStore::auto_adopt`, through `refine::adopt` (#2381) | Yes, in the store |
 | `auto_adopt.max_per_day` | `1` | `ProfileOverlayStore::auto_adopt` (#2381) | Yes, in the store |
 | `approval_timeout` | `7d` | `RefinePolicy::gate_state` (#2381) | No. The gate of #2381 will call it. |
-| `probe_effects` | `[read_only]` | `RefinePolicy::probe_rules` (#2378) | No. The probe of #2378 will install it. |
+| `probe_effects` | `[read_only]` | `eval::live_probe` (#2378) | Yes, in the tool-call activity of the probe. `agent_refine` (#2380) will pass it. |
 | `ceilings` | the profile values and model | the store validator and the op read (#2370, #2372) | Yes |
 | `proposal_attempts` | `2` | `ProposeRequest::attempts` (#2379) | No. The workflow of #2380 will copy it. |
 | `lessons.max_entries` | `64` | the lesson library (#2382) | No. #2382 will read it. |
@@ -116,8 +116,9 @@ cap. The activation log records each auto move with the actor
 ### The probe rules
 
 `RefinePolicy::probe_rules()` returns `ToolRules`. A listed effect runs. A
-tool with another effect, or an unknown tool, is denied. A probe (#2378)
-puts the rules on top of the app policy with `Strictest`.
+tool with another effect, or an unknown tool, is denied. The probe of
+#2378 checks the same set in its tool-call activity instead, so a policy
+cannot bypass it. See [DESIGN-2378](DESIGN-2378.md).
 
 ### Storage
 
@@ -267,7 +268,7 @@ the kernels:
   `proposal_attempts` into each `ProposeRequest`.
 - #2381 will call `refine::adopt`, and `RefinePolicy::gate_state` for
   `timed_out`.
-- #2378 will install `probe_rules` on top of the app policy.
+- #2378 checks `probe_effects` in the tool-call activity of the probe.
 - #2382 will read `lessons.max_entries`.
 
 The AC names an `agent_refine` input. #2380 builds it. `ProposeRequest`
