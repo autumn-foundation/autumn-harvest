@@ -166,7 +166,7 @@ Six checks hold the chain together:
    serves anything else.
 4. The `lint` job validates both copies with `openapi-spec-validator`, and it
    runs on documentation-only pull requests too.
-5. `docs/audits/openapi-response-coverage.py`, also in `lint`, reads the
+5. `cargo xtask audit openapi-response-coverage`, also in `lint`, reads the
    handlers: every status a handler returns must be declared, every
    request-body field that is mandatory on the wire must be marked required,
    and every query key a hand-rolled parser matches must be documented.
