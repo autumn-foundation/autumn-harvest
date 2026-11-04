@@ -259,6 +259,12 @@ pub open spec fn rollback_swap(h: Heads, plan: RollbackPlan, read_seq: u64) -> H
 pub proof fn theorem_a_stale_rollback_changes_nothing(h: Heads, plan: RollbackPlan, read_seq: u64) requires h.moves.len() <= u64::MAX, last_seq(h) != Some(read_seq), ensures rollback_swap(h, plan, read_seq) == h,
 pub proof fn theorem_a_fresh_rollback_swap_is_the_rollback(h: Heads) requires chained(h), h.moves.len() > 0, h.moves.len() <= u64::MAX, h.moves.last().from.is_some(), ensures rollback_swap(h, spec_rollback_target(h.moves.last().from, h.moves.last().to).unwrap(), h.moves.len() as u64,) == rollback(h),
 pub proof fn theorem_a_move_away_and_back_fails_a_stale_rollback(h: Heads) requires chained(h), h.stored >= 3, h.moves.len() > 0, h.moves.len() < 1000, h.active == Some(2u64), h.moves.last().from == Some(1u64), ensures rollback_swap(activate_logged(activate_logged(h, 3, Some(2u64)), 2, Some(3u64)), RollbackPlan { target: 1, expected: 2 }, h.moves.len() as u64,) == activate_logged(activate_logged(h, 3, Some(2u64)), 2, Some(3u64)), activate_logged(activate_logged(h, 3, Some(2u64)), 2, Some(3u64)).active == Some(2u64),
+pub enum AutoMoveDecision { Move, Conflict, CapReached, }
+pub open spec fn spec_decide_auto_move(expected: Option < u64 >, actual: Option < u64 >, used: u64, cap: Option < u32 >,) -> AutoMoveDecision { if expected != actual { AutoMoveDecision::Conflict } else { match cap { Some(limit) => if used >= limit as u64 { AutoMoveDecision::CapReached } else { AutoMoveDecision::Move }, None => AutoMoveDecision::Move, } } }
+pub fn decide_auto_move(expected: Option < u64 >, actual: Option < u64 >, used: u64, cap: Option < u32 >) -> (r: AutoMoveDecision) ensures r == spec_decide_auto_move(expected, actual, used, cap), r is Move ==> expected == actual, r is Move && cap is Some ==> used < cap -> 0 as u64,
+pub open spec fn spec_auto_day(cap: Option < u32 >, used: u64, attempts: nat) -> u64 decreases attempts, { if attempts == 0 { used } else { let next = if spec_decide_auto_move(None, None, used, cap) is Move { (used + 1) as u64 } else { used }; spec_auto_day(cap, next, (attempts - 1) as nat) } }
+pub proof fn theorem_an_auto_day_never_passes_the_cap(limit: u32, used: u64, attempts: nat) requires used <= limit as u64, ensures spec_auto_day(Some(limit), used, attempts) <= limit as u64, decreases attempts,
+pub proof fn theorem_a_stale_auto_move_conflicts(expected: Option < u64 >, actual: Option < u64 >, used: u64, cap: Option < u32 >,) requires expected != actual, ensures spec_decide_auto_move(expected, actual, used, cap) is Conflict,
 
 ## formal/verus/src/owner_fence.rs
 pub fn next_epoch(epoch: i64) -> (r: Option < i64 >) ensures epoch < i64::MAX ==> r == Some((epoch + 1) as i64), epoch == i64::MAX ==> r == None::< i64 >,
@@ -276,6 +282,24 @@ pub proof fn theorem_a_batch_is_one_acquisition_per_locked_row(epochs: Seq < int
 pub proof fn theorem_a_batch_fences_only_its_locked_rows(epochs: Seq < int >, locked: Set < int >, p: int, holder_matches: bool,) requires 0 <= p < epochs.len(), ensures locked.contains(p) ==>! (holder_matches && epochs [p] == batch(epochs, locked) [p]), ! locked.contains(p) ==> epochs [p] == batch(epochs, locked) [p],
 pub open spec fn skip_locked(wanted: Set < int >, takeable: Set < int >, busy: Set < int >) -> Set < int > { wanted.intersect(takeable).difference(busy) }
 pub proof fn theorem_a_batch_keeps_each_epoch_under_a_commit(epochs: Seq < int >, wanted: Set < int >, takeable: Set < int >, busy: Set < int >, p: int, pinned: int, holder_matches: bool,) requires 0 <= p < epochs.len(), ensures busy.contains(p) ==> batch(epochs, skip_locked(wanted, takeable, busy)) [p] == epochs [p], busy.contains(p) && holder_matches && pinned == epochs [p] ==> (holder_matches && pinned == batch(epochs, skip_locked(wanted, takeable, busy)) [p]), batch(epochs, skip_locked(wanted, takeable, busy)) [p] != epochs [p] ==> (wanted.contains(p) && takeable.contains(p) &&! busy.contains(p)),
+
+## formal/verus/src/refine_policy.rs
+pub enum AdoptDecision { Adopt, Unchanged, NeedsApproval, CapReached, }
+pub open spec fn spec_parts_allowed(changed: u8, allowed: u8) -> bool { changed &! allowed == 0 }
+pub fn parts_allowed(changed: u8, allowed: u8) -> (r: bool) ensures r == spec_parts_allowed(changed, allowed),
+pub open spec fn spec_decide_adoption(allowed: u8, changed: u8, used_today: u32, cap: Option < u32 >,) -> AdoptDecision { if changed == 0 { AdoptDecision::Unchanged } else if ! spec_parts_allowed(changed, allowed) { AdoptDecision::NeedsApproval } else { match cap { Some(limit) => if used_today < limit { AdoptDecision::Adopt } else { AdoptDecision::CapReached }, None => AdoptDecision::Adopt, } } }
+pub fn decide_adoption(allowed: u8, changed: u8, used_today: u32, cap: Option < u32 >) -> (r: AdoptDecision) ensures r == spec_decide_adoption(allowed, changed, used_today, cap), r is Adopt ==> changed != 0, r is Adopt ==> spec_parts_allowed(changed, allowed), r is Adopt && cap is Some ==> used_today < cap -> 0,
+proof fn lemma_nothing_allowed(changed: u8) by (bit_vector) requires changed != 0, ensures changed &! 0u8 != 0,
+proof fn lemma_superset_allows(changed: u8, allowed: u8, wider: u8) by (bit_vector) requires changed &! allowed == 0, allowed &! wider == 0, ensures changed &! wider == 0,
+pub proof fn theorem_the_default_never_adopts(changed: u8, used_today: u32, cap: Option < u32 >) ensures ! (spec_decide_adoption(0, changed, used_today, cap) is Adopt),
+pub proof fn theorem_an_empty_change_is_unchanged(allowed: u8, used_today: u32, cap: Option < u32 >) ensures spec_decide_adoption(allowed, 0, used_today, cap) is Unchanged,
+pub proof fn theorem_a_wider_policy_keeps_an_adoption(allowed: u8, wider: u8, changed: u8, used_today: u32, cap: Option < u32 >,) requires allowed &! wider == 0, spec_decide_adoption(allowed, changed, used_today, cap) is Adopt, ensures spec_decide_adoption(wider, changed, used_today, cap) is Adopt,
+pub open spec fn spec_day(allowed: u8, cap: Option < u32 >, used: u32, changes: Seq < u8 >,) -> u32 decreases changes.len(), { if changes.len() == 0 { used } else { let next = if spec_decide_adoption(allowed, changes [0], used, cap) is Adopt { (used + 1) as u32 } else { used }; spec_day(allowed, cap, next, changes.subrange(1, changes.len() as int)) } }
+pub proof fn theorem_a_day_never_passes_the_cap(allowed: u8, limit: u32, used: u32, changes: Seq < u8 >,) requires used <= limit, ensures spec_day(allowed, Some(limit), used, changes) <= limit, decreases changes.len(),
+pub proof fn theorem_a_full_day_adopts_nothing(allowed: u8, limit: u32, used: u32, changed: u8) requires used >= limit, ensures ! (spec_decide_adoption(allowed, changed, used, Some(limit)) is Adopt),
+pub open spec fn spec_gate_timed_out(requested_ms: u64, now_ms: u64, timeout_ms: u64) -> bool { now_ms as int >= requested_ms as int + timeout_ms as int }
+pub fn gate_timed_out(requested_ms: u64, now_ms: u64, timeout_ms: u64) -> (r: bool) ensures r == spec_gate_timed_out(requested_ms, now_ms, timeout_ms),
+pub proof fn theorem_a_timeout_is_final(requested_ms: u64, now_ms: u64, later_ms: u64, timeout_ms: u64,) requires spec_gate_timed_out(requested_ms, now_ms, timeout_ms), later_ms >= now_ms, ensures spec_gate_timed_out(requested_ms, later_ms, timeout_ms),
 
 ## formal/verus/src/scan_skip.rs
 pub open spec fn skips(next: Seq < usize >, dead: Set < int >, k: int) -> bool { forall | m: int | k <= m < next [k] ==> #[trigger] dead.contains(m) }

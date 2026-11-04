@@ -494,8 +494,14 @@ pub struct PeerReply {
 ///
 /// The wire form is internally tagged by `type`. A tick op does not decode
 /// from a signal: only the agent itself makes one.
+///
+/// An op that holds a key of the refine policy fails to decode (issue
+/// #2394). So no op can carry a policy into the refine loop. See
+/// [`policy_key`](crate::refine::policy::policy_key). The decoder reads
+/// the op as JSON first, so an op decodes only from a self-describing
+/// format. Each op is JSON on the wire and in history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", remote = "Self")]
 #[non_exhaustive]
 // `PeerMessage` holds its envelope inline for harvest-verify. See there.
 #[allow(clippy::large_enum_variant)]
@@ -520,6 +526,25 @@ pub enum AgentOp {
     /// hook makes it.
     #[serde(skip_deserializing)]
     Unpark,
+}
+
+impl Serialize for AgentOp {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentOp {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(key) = crate::refine::policy::policy_key(&value) {
+            return Err(D::Error::custom(format!(
+                "an agent op never carries the refine policy key {key:?}"
+            )));
+        }
+        Self::deserialize(value).map_err(D::Error::custom)
+    }
 }
 
 impl AgentOp {

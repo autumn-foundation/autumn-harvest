@@ -212,7 +212,7 @@ collector:
 | `occurred_at` | `timeUnixNano` / `timeObservedUnixNano` |
 | `operation` | `body` (or `event.name`) |
 | `status` | `severityText` — `"succeeded"` → `INFO`, `"failed"` → `ERROR`. **Lowercase on the wire**: these are the audit table's own values (`audit::STATUS_SUCCEEDED` / `STATUS_FAILED`), passed through verbatim. A receiver matching `"FAILED"` will silently classify every failed privileged action as `INFO`. |
-| `error_summary` | `attributes["exception.message"]`. A few succeeded rows also use it as a summary: the ramp guard row (#1814) and the agent profile rows (#2374), such as `from v1 to v2`. Map it by `status`. |
+| `error_summary` | `attributes["exception.message"]`. A few succeeded rows also use it as a summary: the ramp guard row (#1814) and the agent profile rows (#2374), such as `from v1 to v2`, and the refine policy rows (#2394), such as `revision 2: auto_adopt.parts +["system"] -[]`. A policy row lists the settings that widen the gate first, and marks a cut summary with its revision. Map it by `status`. |
 | `shard_id` | `attributes["harvest.shard.id"]` — the shard the **operation acted on**, and the one a correlation should key off |
 | `shard` | `attributes["harvest.audit.source_shard"]` — the shard whose **database this record was read from**. Together with `seq` it is the dedup and gap-detection key, *not* an operation attribute |
 | `seq` | `attributes["harvest.audit.seq"]` |

@@ -1654,3 +1654,92 @@ the list is empty. The order of the list does not change the result.
 proves that the key keeps the order of the bits. A proptest checks that the
 key keeps the order of the scores. The design is in
 [`DESIGN-2441.md`](design/DESIGN-2441.md).
+
+## 18. The refine policy (issue #2394)
+
+An operator decides what the refine loop may do. Each agent kind has a
+`RefinePolicy`. The overlay store holds it, next to the overlay versions.
+A kind with no stored policy uses every default. The defaults never let
+an overlay go live without a person. A change takes effect at the next
+read, with no restart: the next op, or the next refine run.
+
+Today the store enforces `ceilings`, `auto_adopt.parts` and
+`auto_adopt.max_per_day`. The other settings are kernels for open issues:
+the probe of #2378, the refine workflow of #2380, the adoption gate of
+#2381 and the lesson library of #2382. Those issues will read them.
+
+| Setting | Meaning | Default | Range |
+|---|---|---|---|
+| `auto_adopt.parts` | The overlay parts that may go live without a person: `system`, `guardrails`, `tool_guidance`, `skills`, `model`, `bounds` (the three `max_*` fields), `read_only`. | `[]`, so every overlay waits | Any subset |
+| `auto_adopt.max_per_day` | The cap of auto adoptions in one UTC day. | `1` | `0` to `1000`, or `"unlimited"` |
+| `approval_timeout` | How long the adoption gate waits. | `"7d"` | `"1m"` to `"90d"`, as `<n><s\|m\|h\|d>` |
+| `probe_effects` | The `ToolEffect`s that a live probe may run. | `["read_only"]` | Any subset of `read_only`, `internal`, `write`, `external` |
+| `ceilings.max_steps`, `ceilings.max_total_tokens`, `ceilings.max_output_tokens` | The highest bound that an overlay may set. `null` is the profile value. | `null` each, so an overlay can only narrow | `1` or more |
+| `ceilings.models` | The models that an overlay may name. `null` is the profile model. | `null` | 1 to 64 names |
+| `proposal_attempts` | The attempts of each proposer stage before it inherits. | `2` | `1` to `8` |
+| `lessons.max_entries` | The size of the lesson library. | `64` | `1` to `4096` |
+
+```sh
+harvest agents profile policy support show
+harvest agents profile policy support set --auto-adopt-parts system --max-per-day 3
+harvest agents profile policy support set --max-steps 40 --probe-effects read_only,internal
+harvest agents profile policy support history
+harvest agents profile policy support reset
+```
+
+- **Who sets it.** Only an operator. The store refuses a refine or an
+  auto actor. `PUT /agents/{kind}/profile/policy` and
+  `POST .../policy/reset` are `Mutating`, so a read role gets `403`.
+- **Compare-and-swap.** A set sends `expected_revision`. A stale one is a
+  `409`. `set` with flags reads the policy, changes only the named keys
+  and sends the revision that it read.
+- **Audit.** Each set and reset adds one row to the store log, with the
+  old and the new policy. `GET .../policy/changes` lists them. Each one
+  also writes an `agent_profile.policy_set` or
+  `agent_profile.policy_reset` audit row. `error_summary` names each
+  changed key with its old and new value. The settings that widen the gate
+  come first. A list shows the names that it adds and removes. A summary
+  over 512 bytes ends with a mark that names its revision.
+- **No self-widening.** A `ProfileOverlay` and an `AgentOp` refuse each
+  policy key when they decode. A `ProposeRequest` refuses each one except
+  `ceilings`, which holds the resolved ceilings of the recorded read. An
+  unknown key in a policy also fails, so an old worker never drops a new
+  setting.
+- **One read per run.** A refine run calls `read_refine_policy` once. The
+  activity `agent_refine_policy` records the policy. A replay reads the
+  record. A change during the run never widens that run. A narrowing
+  reaches its adoption at once, because the store also checks its current
+  policy.
+- **Ceilings.** The store validator and the op read of #2372 apply each
+  overlay under `policy.ceilings.resolve(profile)`. The op read takes the
+  policy in the same recorded activity. A raised ceiling lets an overlay
+  pass the profile bound. A lowered one fails the next op of a version
+  that no longer fits, and no model runs.
+- **Auto adoption.** `ProfileOverlayStore::auto_adopt` enforces the
+  gate. A candidate goes live only when each changed part is in
+  `auto_adopt.parts` of the run policy and of the current stored policy,
+  and the stricter daily cap allows it. One transaction puts the version
+  as `auto:<run>`, counts the auto moves of the UTC day of the store clock
+  and moves the pointer. Set the clock with `with_clock`. `put`,
+  `activate` and `rollback` refuse an `auto` actor. `refine::adopt` wraps
+  the call. Otherwise the candidate is put as `refine:<run>` and waits. A
+  wait on the cap writes a `harvest.audit` tracing event that names the
+  cap. An unchanged candidate stores nothing.
+
+| `refine_status` | Meaning |
+|---|---|
+| `auto_adopted` | The candidate went live without a person. |
+| `awaiting_approval` | The candidate waits, with the reason. |
+| `unchanged` | The candidate changes no part. |
+| `timed_out` | The gate of #2381 waited for `approval_timeout`. It will use `RefinePolicy::gate_state`. |
+
+- **Probes.** `RefinePolicy::probe_rules()` returns `ToolRules`. The probe
+  of #2378 will put them on top of the app policy with `Strictest`. An
+  unknown tool is denied.
+- **Rollback.** `rollback` after an auto adoption restores the version
+  before it, as after any activation.
+
+`formal/verus/src/refine_policy.rs` proves that the default never adopts
+and that an empty change never adopts. `formal/verus/src/overlay_log.rs`
+proves that the auto moves of a day never pass the cap. The design is in [`DESIGN-2394.md`](design/DESIGN-2394.md). The rule is in
+[ADR 0014](adr/0014-operator-refine-policy.md).
