@@ -142,7 +142,7 @@ fn register_sampling(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
     rt.register_activity_with_body(&agent_answer_check_info(), move |input| {
         call(input, |request: CheckRequest| {
             let h = Arc::clone(&h);
-            async move { admission(&h, &request, None).await }
+            async move { admission(&h, &request, request.tenant.as_deref()).await }
         })
     });
 }

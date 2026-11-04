@@ -41,7 +41,7 @@ gives a rule.
 | A task asks for 100 retries. | `sampling::answer_retry_cap` refuses an ask over the policy cap or over `MAX_ANSWER_RETRIES`. The run fails with `too_many_answer_retries` before any model call. |
 | A task names a judge with an expensive model. | `sampling::admit_answer_check` checks the scorer and the judge model against the policy. |
 | A scorer calls a judge model that the check did not name. | Each score request holds a `JudgeLimit`. `ScoreContext::chat` refuses any other model, and the score fails as `JudgeNotAllowed`. |
-| A task names a kind of another tenant to borrow its policy. | The kind needs a profile. A profile with a tenant admits only a run of that tenant. The verified tenant wins over the task field. |
+| A task names a kind of another tenant to borrow its policy. | The kind needs a profile. A profile with a tenant admits only a run of that tenant. On Postgres, the run tenant of the engine applies, not the task field. |
 | A task names a scorer that the harness does not have. | The admission refuses it as `unknown_scorer`. No model call runs. |
 | A crash between the answer and the verdict calls the model again. | The model turn and the verdict are recorded activities. Replay reads both. |
 | A policy change during a run moves its cap. | The run reads the policy once, in the admission. Replay reads the record. |
@@ -68,7 +68,8 @@ gives a rule.
   a bound. A reason sent back to the model is an injection path. A scorer
   can call any harness model unless the score stops it.
 - **Yellow (benefits).** One run, one transcript and one cost ledger. The
-  model sees its own answer and the reason, so a retry is cheap.
+  model sees its own answer and the reason, so a retry is cheap. After a
+  context reset, it sees the reason only.
 - **Green (ideas).** A durable agent profile can carry a check later, with
   its kind as the policy key. A score can return its judge usage later, so
   `max_total_tokens` counts it.

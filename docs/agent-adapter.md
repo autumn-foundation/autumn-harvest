@@ -2072,9 +2072,10 @@ admits the check. The checks go in this order:
 1. The kind is a valid name (`invalid_kind`).
 2. The kind has a profile (`unknown_kind`).
 3. A profile with a tenant belongs to the tenant of the run
-   (`other_tenant`). The tenant that the engine verified wins over
-   `AgentTask::tenant`. SQLite keeps no run tenant, so there the task
-   tenant applies.
+   (`other_tenant`). On Postgres, the run tenant that the engine keeps
+   applies, not `AgentTask::tenant`. So a run with no tenant cannot use a
+   profile with a tenant. SQLite keeps no run tenant, so there
+   `AgentTask::tenant` applies.
 4. `retries` is at most `max_answer_retries` (`too_many_answer_retries`).
 5. The policy allows the scorer and its judge model
    (`scorer_not_allowed`, `judge_model_not_allowed`).
@@ -2102,7 +2103,8 @@ scorers and the judge models, not the profile of the run.
 5. After `retries + 1` rejected answers, the run ends as `answer_rejected`.
 
 The cap counts each rejection of the run, follow-ups included. A context
-reset keeps the retry messages of the segment. A delegated child has no check. Each
+reset keeps the retry messages of the segment, but not the rejected
+answers. A delegated child has no check. Each
 draw of `run_draws` with a check admits and checks its own answers.
 
 ### Bounds and cost

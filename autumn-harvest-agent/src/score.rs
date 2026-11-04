@@ -346,12 +346,12 @@ pub enum JudgeLimit {
 
 impl JudgeLimit {
     /// Whether a judge call to `model` may run. `None` is the default
-    /// model.
+    /// model, as [`AgentHarness::model`] reads it.
     #[must_use]
     pub fn allows(&self, model: Option<&str>) -> bool {
         match self {
             Self::NoCall => false,
-            Self::Model(allowed) => model == Some(allowed.as_str()),
+            Self::Model(allowed) => model.unwrap_or(crate::DEFAULT_MODEL) == allowed,
         }
     }
 }

@@ -86,7 +86,8 @@ impl AnswerCheck {
 pub struct CheckRequest {
     /// The check of the task.
     pub check: AnswerCheck,
-    /// The tenant that the task declares.
+    /// The tenant that the task declares. Only SQLite reads it, because it
+    /// keeps no run tenant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
 }
@@ -115,9 +116,7 @@ pub enum CheckAdmission {
 ///
 /// 1. The kind is a valid name.
 /// 2. The kind has an agent profile.
-/// 3. A profile with a tenant belongs to the tenant of the run. `verified`
-///    is the tenant of the run, when the engine knows it. It wins over the
-///    tenant that the task declares.
+/// 3. A profile with a tenant belongs to `tenant`, the tenant of the run.
 /// 4. The policy of the kind allows the retries, the scorer and the judge
 ///    model.
 /// 5. The harness has the scorer.
@@ -128,7 +127,7 @@ pub enum CheckAdmission {
 pub(crate) async fn admission(
     harness: &AgentHarness,
     request: &CheckRequest,
-    verified: Option<&str>,
+    tenant: Option<&str>,
 ) -> Result<CheckAdmission, String> {
     let check = &request.check;
     if !valid_name(&check.kind) {
@@ -137,7 +136,6 @@ pub(crate) async fn admission(
     let Some(profile) = harness.agent_profile(&check.kind) else {
         return Ok(refused(Refusal::UnknownKind));
     };
-    let tenant = verified.or(request.tenant.as_deref());
     if profile
         .tenant
         .as_deref()
@@ -168,7 +166,8 @@ const fn refused(refusal: Refusal) -> CheckAdmission {
 /// The admission of one answer check, as an activity.
 ///
 /// History records the result, so replay never reads the profile or the
-/// policy again.
+/// policy again. The run tenant that the engine keeps applies, not the task
+/// field. So a run with no tenant cannot use a profile with a tenant.
 ///
 /// # Errors
 ///
@@ -184,8 +183,8 @@ pub async fn agent_answer_check(
 ) -> Result<CheckAdmission, String> {
     let harness = crate::workflow::harness(ctx)?;
     // A failed tenant read fails closed. A retry reads it again.
-    let verified = ctx.run_tenant().await.map_err(|err| err.to_string())?;
-    admission(harness, &request, verified.as_deref()).await
+    let tenant = ctx.run_tenant().await.map_err(|err| err.to_string())?;
+    admission(harness, &request, tenant.as_deref()).await
 }
 
 /// The check of a run after its admission.
@@ -353,6 +352,9 @@ mod tests {
         assert!(cheap.allows(Some("cheap")));
         assert!(!cheap.allows(Some("big")));
         assert!(!cheap.allows(None), "the default model is another model");
+        let default = JudgeLimit::Model(crate::DEFAULT_MODEL.to_owned());
+        assert!(default.allows(None), "None is the default model");
+        assert!(default.allows(Some(crate::DEFAULT_MODEL)));
         assert!(!JudgeLimit::NoCall.allows(None));
     }
 
