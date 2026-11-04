@@ -44,6 +44,10 @@ impl ReaderModel {
     /// The answer when the request holds no value for the key.
     pub const UNKNOWN: &'static str = "unknown";
 
+    /// The model id. The model is deterministic, so a sweep may reuse its
+    /// finished agents.
+    pub const ID: &'static str = "recall-reader-v1";
+
     /// A new model with no calls.
     #[must_use]
     pub fn new() -> Arc<Self> {
@@ -63,6 +67,10 @@ impl AgentModel for ReaderModel {
     ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(std::future::ready(Ok(reply(request))))
+    }
+
+    fn model_id(&self) -> Option<&str> {
+        Some(Self::ID)
     }
 }
 

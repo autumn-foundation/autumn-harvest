@@ -281,6 +281,35 @@ async fn a_rerun_after_the_sweep_calls_no_model() {
     assert_eq!(second, first);
 }
 
+/// A model with no id, which reads like `ReaderModel`.
+#[derive(Debug)]
+struct Unnamed(Arc<ReaderModel>);
+
+impl AgentModel for Unnamed {
+    fn chat<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+    ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
+        self.0.chat(request)
+    }
+}
+
+/// A model with no id has no stable identity. A rerun on the same database
+/// gets new agents, so it never reports the rows of another model.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_with_no_id_never_reuses_a_finished_item() {
+    let (_dir, db) = fresh_db();
+    let fixture = only(OP1_ITEM);
+    let first = Arc::new(Unnamed(ReaderModel::new()));
+    sweep_on(&db, first, WINDOW_SIZE, &fixture, &[WINDOW]).await;
+
+    let second = ReaderModel::new();
+    let unnamed = Arc::new(Unnamed(second.clone()));
+    let report = sweep_on(&db, unnamed, WINDOW_SIZE, &fixture, &[WINDOW]).await;
+    assert!(second.calls() > 0, "the second model runs its own agents");
+    assert_eq!(report.score(WINDOW, OP1_ITEM), Some(0.0));
+}
+
 /// A rerun with another window on the same database gets new agents, so it
 /// never reports the rows of the old window.
 #[tokio::test(flavor = "multi_thread")]

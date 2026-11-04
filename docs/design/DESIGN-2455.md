@@ -54,6 +54,7 @@ The chosen option is in bold.
 | `episodes` also gives the model the `memory` tool, so a real model saves the fact itself. The column then credits episodes. | The `memory` config has store memory and no episodes. Compare `episodes` with `memory`. |
 | A real model answers `Teal` for `teal`, and the miss hides recall. | Each value is a number. The docs say that `ExactMatch` trims spaces only. |
 | A rerun on the same file with another model or window prints old rows under a new heading. | The agent name holds a hash of the item, the profile and the model id. |
+| Two models with no `model_id` hash the same, so the second reuses the rows of the first. | A model with no id hashes the start time of the sweep in place of the id. `ReaderModel` has an id. |
 | A crash loses the in-memory stores of `memory` and `episodes`. | The docs say to rerun those configs on a new file. |
 | One config fails and the report loses the other rows. | The driver catches each error per item. The row of a failed item holds the error. |
 | A rerun after a crash calls the model again. | Each op has the key `recall:<agent name>:<n>`. A rerun drives only ops that did not run. |
@@ -133,4 +134,5 @@ The tests are in `autumn-harvest-agent/tests/recall.rs`.
 | Support: an op on a retry timer fails its item | `an_op_that_waits_for_a_retry_fails_its_item` |
 | Support: a rerun calls no model | `a_rerun_after_the_sweep_calls_no_model` |
 | Support: a rerun with another window runs again | `a_rerun_with_another_window_runs_again` |
+| Support: a model with no id never reuses a finished item | `a_model_with_no_id_never_reuses_a_finished_item` |
 | AC 5: the first real-model table is under `docs/` | `docs/performance-agent-recall.md` §3. Not met: no API key in CI. |

@@ -17,7 +17,8 @@ forgets across ops.
   on a retry timer, fails its item.
 - The agent name holds a fingerprint of the item, the profile and the model.
   A rerun with the same inputs on the same file calls no model for a
-  finished item. A changed input gets new agents.
+  finished item. A changed input, or a model with no `model_id`, gets new
+  agents.
 - `ReaderModel` answers only from its request. CI uses it to prove that the
   eval sees a loss.
 - The new example crate `recall-eval` runs the eval on Claude and prints the
@@ -27,10 +28,11 @@ The sweep is a plain driver, not the `agent_sweep` workflow of #2448, which
 is still open. It adds no migration, no `WorkflowEvent` variant and no
 query. It writes `harvest_events` only through the existing agent workflow.
 
-Test evidence: `autumn-harvest-agent/tests/recall.rs` runs eleven tests.
+Test evidence: `autumn-harvest-agent/tests/recall.rs` runs twelve tests.
 With the window only, a fact of op 1 scores 0. With notes or episodes, it
 scores 1. A failed config, a config with no profile, and an op on a retry
 timer each fail alone. A control item scores 1 with the window only. A rerun
-calls no model, and a rerun with another window runs again. Unit tests cover
+calls no model. A rerun with another window, or with a model with no id,
+runs again. Unit tests cover
 the fixture checks, the model replies and the report table, with a property
 test. `cargo test -p recall-eval --bins` checks the printed section.

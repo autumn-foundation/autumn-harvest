@@ -78,7 +78,8 @@ On a rerun with the same `--db` file:
 - The same item, profile and model reuse their agents. A finished item calls
   no model.
 - A changed item, window or model gets new agents, so old rows never show
-  under a new heading.
+  under a new heading. A model with no `model_id` gets new agents on each
+  run.
 - A failed item stays failed. Use a new file to run it again.
 - `memory` and `episodes` keep their stores in memory. After a crash, run
   them again on a new file.

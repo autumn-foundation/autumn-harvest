@@ -28,6 +28,9 @@ const FINGERPRINT_HEX: usize = 12;
 /// inputs on the same database therefore calls no model for a finished
 /// item. A changed item, profile or model gets new agents.
 ///
+/// A model with no `model_id` has no stable identity. Its fingerprint also
+/// hashes the start time of the sweep, so each sweep gets new agents.
+///
 /// A failure ends its item only. The row holds the error, and the sweep goes
 /// on, so the report always has one row for each config and item. A failed
 /// item stays failed on that database.
@@ -37,10 +40,11 @@ pub async fn sweep(
     fixture: &RecallFixture,
     configs: &[String],
 ) -> RecallReport {
+    let run = run_nonce();
     let mut rows = Vec::with_capacity(configs.len() * fixture.items.len());
     for config in configs {
         for item in &fixture.items {
-            let outcome = run_item(rt, harness, config, item)
+            let outcome = run_item(rt, harness, config, item, &run)
                 .await
                 .unwrap_or_else(|error| RecallOutcome::Failed { error });
             tracing::info!(
@@ -70,9 +74,10 @@ async fn run_item(
     harness: &AgentHarness,
     config: &str,
     item: &RecallItem,
+    run: &str,
 ) -> Result<RecallOutcome, String> {
     let question = item.ops.last().ok_or("the item has no op")?;
-    let name = agent_name(harness, config, item)?;
+    let name = agent_name(harness, config, item, run)?;
     let id = AgentId::new(config, &name).map_err(|err| err.to_string())?;
     for (n, op) in item.ops.iter().enumerate() {
         let key = format!("recall:{name}:{n}");
@@ -112,17 +117,34 @@ async fn run_item(
     Ok(RecallOutcome::Scored { answer, verdict })
 }
 
+/// A text that differs for each sweep: the start time in nanoseconds.
+fn run_nonce() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos())
+        .to_string()
+}
+
 /// The agent name of `item` under `config`: the item id and a fingerprint
-/// of the item, the profile and the model id.
-fn agent_name(harness: &AgentHarness, config: &str, item: &RecallItem) -> Result<String, String> {
+/// of the item, the profile and the model id. A model with no id adds `run`
+/// in place of the id, so no other sweep reuses its agents.
+fn agent_name(
+    harness: &AgentHarness,
+    config: &str,
+    item: &RecallItem,
+    run: &str,
+) -> Result<String, String> {
     let profile = harness
         .agent_profile(config)
         .ok_or_else(|| format!("the harness has no profile {config:?}"))?;
     let model = harness.model(profile.model.as_deref())?;
+    let identity = model
+        .model_id()
+        .map_or_else(|| format!("unidentified:{run}"), |id| format!("id:{id}"));
     let inputs = serde_json::json!({
         "item": item,
         "profile": profile,
-        "model": model.model_id(),
+        "model": identity,
     });
     let digest = Sha256::digest(inputs.to_string().as_bytes());
     let hex = digest.iter().take(FINGERPRINT_HEX / 2).fold(
