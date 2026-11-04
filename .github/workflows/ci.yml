@@ -72,8 +72,8 @@ env:
   CARGO_INCREMENTAL: 0
   # kache turns off free-space recovery in CI by default. The store reflinks
   # each output, and it keeps the blocks after cargo replaces that file.
-  # A macOS no-db shard grew its store to 48 GiB and ran out of disk. Below
-  # this floor, kache evicts store entries to free disk.
+  # A macOS no-db shard grew its store to 48 GiB of a 96 GiB disk, and cargo
+  # then hit a disk I/O error. Below this floor, kache evicts store entries.
   KACHE_AUTO_RECOVER_MIN_FREE_BYTES: 20GiB
 
 jobs:
@@ -861,11 +861,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
+      # kache executable caching broke uplifted binaries on macOS:
+      # `target/debug/harvest` and a build-script copy failed with "cannot
+      # execute binary file". Test binaries in `deps/` ran. The CLI caches
+      # executables by default on macOS, so this turns it off before the
+      # action can start the daemon.
+      - name: Turn off kache executable caching (macOS)
+        if: runner.os == 'macOS'
+        run: echo "KACHE_CACHE_EXECUTABLES=0" >> "$GITHUB_ENV"
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
           github-cache: false
-          cache-executables: true
+          cache-executables: ${{ runner.os != 'macOS' }}
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
           s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
@@ -980,11 +988,19 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      # kache executable caching broke uplifted binaries on macOS:
+      # `target/debug/harvest` and a build-script copy failed with "cannot
+      # execute binary file". Test binaries in `deps/` ran. The CLI caches
+      # executables by default on macOS, so this turns it off before the
+      # action can start the daemon.
+      - name: Turn off kache executable caching (macOS)
+        if: runner.os == 'macOS'
+        run: echo "KACHE_CACHE_EXECUTABLES=0" >> "$GITHUB_ENV"
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
           github-cache: false
-          cache-executables: true
+          cache-executables: ${{ runner.os != 'macOS' }}
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
           s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}

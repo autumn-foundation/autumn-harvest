@@ -26,6 +26,16 @@ workflow `env` block gives the reasons. In short:
   Each workspace crate then misses, as a local test showed.
 - The kache step runs after any step that deletes `$AGENT_TOOLSDIRECTORY`,
   because the action installs kache there.
+- On macOS, kache does not cache executables. With it on, a no-db shard
+  failed twice with "cannot execute binary file". The first time it was a
+  build-script copy, the second time `target/debug/harvest`. Both are copies
+  that cargo uplifts out of `deps/`. Test binaries, which run from `deps/`,
+  passed. Linux has no reflink on the runner disk, and every Linux leg passed.
+  The kache CLI caches executables by default on macOS, so the job sets
+  `KACHE_CACHE_EXECUTABLES=0` before the action starts.
+- `KACHE_AUTO_RECOVER_MIN_FREE_BYTES=20GiB` turns on free-space recovery.
+  kache turns it off in CI by default. One macOS store grew to 48 GiB with a
+  0% hit rate in a PR job.
 - The backend is S3. The GitHub Actions cache is off. The trial measured why;
   see "Results" below.
 
