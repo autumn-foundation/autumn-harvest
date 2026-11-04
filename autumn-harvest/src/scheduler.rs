@@ -1135,19 +1135,30 @@ fn pool_peer_owns(
 ///
 /// Their rows are in the shared table of `shard`. The firing pass of `shard`
 /// skips them, so the owner fires each one with its own shard id.
+///
+/// The catalog is also read. A DAG with no schedule can still have a due row
+/// until its owner registers it again.
 fn peer_owned_dags(
     schedules: &[WorkflowSchedule],
+    dags: &DagCatalog,
     router: &ShardRouter,
     shard: ShardId,
     pool_peers: &[ShardId],
 ) -> BTreeSet<String> {
-    schedules
+    let from_schedules = schedules
         .iter()
         .filter(|ws| {
             !schedule_targets_shard(ws, router, shard) && pool_peer_owns(ws, router, pool_peers)
         })
-        .filter_map(|ws| ws.dag_name.clone())
-        .collect()
+        .filter_map(|ws| ws.dag_name.clone());
+    let from_catalog = dags
+        .keys()
+        .filter(|name| {
+            let owner = router.pick_for_dag(name);
+            owner != shard && pool_peers.contains(&owner)
+        })
+        .cloned();
+    from_schedules.chain(from_catalog).collect()
 }
 
 /// Whether the firing pass skips a row of `dag_name` (issue #2405).
@@ -1784,7 +1795,13 @@ async fn register_shard_pass<'a>(
             peer_dags: BTreeSet::new(),
         });
     }
-    let peer_dags = peer_owned_dags(workflow_schedules.as_ref(), router, shard, pool_peers);
+    let peer_dags = peer_owned_dags(
+        workflow_schedules.as_ref(),
+        dags.as_ref(),
+        router,
+        shard,
+        pool_peers,
+    );
     Ok(ShardPass {
         dags: Some(dags),
         misplaced,
@@ -9872,10 +9889,22 @@ mod tests {
             dag_schedule("nightly"),
             WorkflowSchedule::new("report", Schedule::Interval(Duration::from_secs(60))),
         ];
-        let on_s1 = peer_owned_dags(&schedules, &router, s1, &[s0]);
+        let none = DagCatalog::new();
+        let on_s1 = peer_owned_dags(&schedules, &none, &router, s1, &[s0]);
         assert_eq!(on_s1, BTreeSet::from(["nightly".to_string()]));
-        assert!(peer_owned_dags(&schedules, &router, s0, &[s1]).is_empty());
-        assert!(peer_owned_dags(&schedules, &router, s1, &[]).is_empty());
+        assert!(peer_owned_dags(&schedules, &none, &router, s0, &[s1]).is_empty());
+        assert!(peer_owned_dags(&schedules, &none, &router, s1, &[]).is_empty());
+    }
+
+    #[test]
+    fn peer_owned_dags_reads_a_catalog_dag_with_no_schedule() {
+        let (s0, s1) = (ShardId::new(0), ShardId::new(1));
+        let router = ShardRouter::new(vec![s0, s1], vec![s0], s0);
+        let mut dags = DagCatalog::new();
+        dags.insert("manual".to_string(), dag_with_schedule("manual", None));
+        let on_s1 = peer_owned_dags(&[], &dags, &router, s1, &[s0]);
+        assert_eq!(on_s1, BTreeSet::from(["manual".to_string()]));
+        assert!(peer_owned_dags(&[], &dags, &router, s0, &[s1]).is_empty());
     }
 
     #[test]
