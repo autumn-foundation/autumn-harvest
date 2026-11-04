@@ -70,6 +70,11 @@ env:
   # incremental build gives path crates another codegen-units value, so the
   # cache keys would differ between jobs and runs.
   CARGO_INCREMENTAL: 0
+  # kache turns off free-space recovery in CI by default. The store reflinks
+  # each output, and it keeps the blocks after cargo replaces that file.
+  # A macOS no-db shard grew its store to 48 GiB and ran out of disk. Below
+  # this floor, kache evicts store entries to free disk.
+  KACHE_AUTO_RECOVER_MIN_FREE_BYTES: 20GiB
 
 jobs:
   # Detects whether any non-docs file changed, so the build/test jobs below can
