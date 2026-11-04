@@ -737,7 +737,9 @@ pub async fn evaluate(
     let recording = Recording::read(history)?;
     let task = candidate.task_under_overlay(&recording.task)?;
     let source = SourceScores::default().of(&recording, candidate).await?;
-    run(&recording, task, candidate, source).await
+    // The run future is large. A box keeps it out of the future of each
+    // caller, so a caller passes `clippy::large_futures`.
+    Box::pin(run(&recording, task, candidate, source)).await
 }
 
 /// Run `candidate` on `task`, the recorded task under its overlay, and
@@ -1131,8 +1133,8 @@ pub async fn compare(
     let mut sources = SourceScores::default();
     let first_source = sources.of(&recording, first).await?;
     let second_source = sources.of(&recording, second).await?;
-    let first = run(&recording, first_task, first, first_source).await?;
-    let second = run(&recording, second_task, second, second_source).await?;
+    let first = Box::pin(run(&recording, first_task, first, first_source)).await?;
+    let second = Box::pin(run(&recording, second_task, second, second_source)).await?;
     let decision = |evaluation: &Evaluation, turn: usize| {
         evaluation
             .turns
