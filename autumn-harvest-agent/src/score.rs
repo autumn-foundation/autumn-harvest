@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::draw::DrawId;
 use crate::error::{AgentError, ErrorKind};
 use crate::harness::{AgentHarness, cut_bytes, model_failure};
-use crate::message::ContentPart;
+use crate::message::{ContentPart, TokenUsage};
 use crate::model::{BoxFuture, ChatRequest, ChatResponse};
 use crate::refine::model_proposer::unfenced;
 use crate::types::{AgentReport, AgentStop, AgentTask};
@@ -363,6 +363,8 @@ pub struct ScoreContext<'a> {
     refusal: Mutex<Option<String>>,
     /// The judge calls that hold a ledger slot: done, or still in flight.
     slots: AtomicUsize,
+    /// The sum of the usage of each judge reply.
+    usage: Mutex<TokenUsage>,
 }
 
 /// One reserved ledger slot. A drop before [`Slot::keep`] frees it, so a
@@ -410,6 +412,7 @@ impl<'a> ScoreContext<'a> {
             calls: Mutex::new(Vec::new()),
             refusal: Mutex::new(None),
             slots: AtomicUsize::new(0),
+            usage: Mutex::new(TokenUsage::default()),
         }
     }
 
@@ -475,6 +478,9 @@ impl<'a> ScoreContext<'a> {
             .harness
             .ledger_call(model, &response.usage, started.elapsed());
         self.lock_calls().push(call);
+        let mut usage = self.usage.lock().unwrap_or_else(PoisonError::into_inner);
+        *usage = usage.saturating_add(response.usage);
+        drop(usage);
         slot.keep();
         Ok(response)
     }
@@ -513,6 +519,12 @@ impl<'a> ScoreContext<'a> {
 
     fn lock_calls(&self) -> std::sync::MutexGuard<'_, Vec<LlmCall>> {
         self.calls.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The sum of the token usage of the judge replies so far (issue #2447).
+    #[must_use]
+    pub fn usage(&self) -> TokenUsage {
+        *self.usage.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The cost ledger calls of the judge calls so far.
