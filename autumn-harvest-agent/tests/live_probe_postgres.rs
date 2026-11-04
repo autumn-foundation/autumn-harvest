@@ -625,16 +625,20 @@ impl Drop for TriggerRow {
     }
 }
 
-/// The number of runs of the workflow type `name`.
-async fn runs_of(fx: &Fixture, name: &str) -> usize {
+/// The number of runs that a completion trigger started for `source`.
+///
+/// A trigger start records its source in `start_source_ref`. So another
+/// run of the shared database cannot add to the count. A fork row names its
+/// source there too, so the filter also reads `start_source`.
+async fn trigger_starts(fx: &Fixture, source: ExecutionId) -> usize {
     let rows = diesel::sql_query(
         "SELECT count(*)::text AS text FROM harvest_workflow_executions \
-         WHERE workflow_name = $1",
+         WHERE start_source = 'completion_trigger' AND start_source_ref = $1",
     )
-    .bind::<Text, _>(name);
+    .bind::<Text, _>(source.to_string());
     let rows: Vec<TextRow> = diesel_async::RunQueryDsl::load(rows, &mut fx.conn().await)
         .await
-        .expect("count the runs");
+        .expect("count the trigger starts");
     rows.into_iter()
         .next()
         .map_or(0, |row| row.text.parse().unwrap())
@@ -648,7 +652,6 @@ async fn a_probe_fires_no_completion_trigger() {
     // A registered target, so the terminal path can route its start. Its
     // run fails on the report input, and the test only counts the starts.
     let target = autumn_harvest_agent::heartbeat::HEARTBEAT_WORKFLOW_NAME.to_owned();
-    let started = runs_of(&fx, &target).await;
     let id = uuid_text();
     let insert = diesel::sql_query(
         "INSERT INTO harvest_completion_triggers \
@@ -657,7 +660,7 @@ async fn a_probe_fires_no_completion_trigger() {
                  '{\"type\":\"Passthrough\"}'::jsonb)",
     )
     .bind::<Text, _>(id.clone())
-    .bind::<Text, _>(target.clone());
+    .bind::<Text, _>(target);
     diesel_async::RunQueryDsl::execute(insert, &mut fx.conn().await)
         .await
         .expect("insert the trigger");
@@ -668,18 +671,15 @@ async fn a_probe_fires_no_completion_trigger() {
 
     let source = fx.source(&source_task()).await;
     assert_eq!(
-        runs_of(&fx, &target).await,
+        trigger_starts(&fx, source).await,
         1,
         "the source fires the trigger"
     );
 
     let (probe, _report) = fx.probe(source, CALL_TOOLS, &[ToolEffect::ReadOnly]).await;
 
-    assert_eq!(
-        runs_of(&fx, &target).await,
-        started + 1,
-        "the probe fires none"
-    );
+    assert_eq!(trigger_starts(&fx, probe).await, 0, "the probe fires none");
+    assert_eq!(trigger_starts(&fx, source).await, 1);
     let mut conn = fx.conn().await;
     for (exec, quiet) in [(source, false), (probe, true)] {
         let row = autumn_harvest::execution::load_execution(&mut conn, exec)
