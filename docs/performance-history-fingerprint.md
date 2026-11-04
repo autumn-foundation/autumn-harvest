@@ -190,7 +190,7 @@ more post-fix to bound noise: `451,624,503` and `451,624,503` — a
   (0.1.94) predates a `clippy::unused_async_trait_impl` reference already in
   `context.rs` (unrelated pre-existing code, not touched by this change) and
   fails on `unknown-lints` before reaching this diff.
-* `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` — see PR.
+* `cargo xtask audit comment-hygiene --base origin/trunk-dev` — see PR.
 
 ## 🔬 Reproduce
 

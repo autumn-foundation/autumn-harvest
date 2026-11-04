@@ -642,7 +642,7 @@ jobs:
         run: python3 docs/audits/doc-snippet-syntax.py
 
       # Comment hygiene across the Rust sources (see
-      # docs/audits/comment-hygiene.py). Two tiers, and the split is the
+      # xtask/src/audit/comment_hygiene/mod.rs). Two tiers, and the split is the
       # point: Tier A (commented-out code, an unreferenced TODO, a narrative
       # aside, a blank comment line at a block edge) is at zero and must stay
       # there; Tier B (review-round archaeology, contractions, sentences over
@@ -755,25 +755,25 @@ jobs:
       # ratchets against the commit before the push. release-pr.yml ratchets
       # the whole release against trunk, because a push run on trunk-dev can
       # be cancelled, and two clean PRs can merge into a new finding.
-      - name: Comment hygiene (docs/audits/comment-hygiene.py)
+      - name: Comment hygiene (cargo xtask audit comment-hygiene)
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
-          python3 docs/audits/comment-hygiene.py --self-test
+          cargo xtask audit comment-hygiene --self-test
           BEFORE="${{ github.event.before }}"
           if [ -n "$BASE_REF" ]; then
             git fetch --no-tags origin "$BASE_REF"
-            python3 docs/audits/comment-hygiene.py --base FETCH_HEAD
+            cargo xtask audit comment-hygiene --base FETCH_HEAD
           elif [ -n "$BEFORE" ] \
             && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
             # The whole push, not just its last commit. `HEAD~1` would let a
             # violation introduced by an earlier commit of a multi-commit push
             # through, in any file the final commit did not also touch.
-            python3 docs/audits/comment-hygiene.py --base "$BEFORE"
+            cargo xtask audit comment-hygiene --base "$BEFORE"
           else
             # A branch's first push has no before-SHA to diff against. Tier A
             # still gates; Tier B reports.
-            python3 docs/audits/comment-hygiene.py
+            cargo xtask audit comment-hygiene
           fi
 
       # Folio corpus harness: per-shard weight drift report for row-ordinal
