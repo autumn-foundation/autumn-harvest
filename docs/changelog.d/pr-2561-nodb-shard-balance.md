@@ -18,14 +18,17 @@ Four changes, all in `ci.yml`:
 - `Compile diagnose benchmark` had no shard condition, so all four Linux
   shards compiled it, for about 11 minutes each. It now runs on shard 3.
 - Five steps move to balance the measured totals: the CLI tests, the
-  agent tests, the metrics scrape example, and the Kafka and WASM examples.
+  saga-choreography tests, the metrics scrape example, and the Kafka and
+  WASM examples.
 
 The `redis`, `webhooks`, `dev-runtime-managed` and default plugin lib-test
 steps stay apart. Each runs the whole lib under its own feature set, and a
 merge would change what they test.
 
-The modelled long poles are about 79 minutes on Windows, 74 on macOS and
-56 on Linux. The model uses the step times of one run, so the real numbers
-will differ.
+On the first PR run, the long poles were 96.5 minutes on Windows (from
+109.8) and 58.8 on Linux (from 69.7). macOS rose from 82.2 to 91.2. Shard
+0 was the long pole on Windows and macOS. Its two compile steps took 5-12 minutes
+longer than on the trunk-dev run, so the agent tests moved back to shard
+3, and the saga-choreography tests moved to shard 1.
 
 No engine change, no migration, no new `WorkflowEvent` variant.

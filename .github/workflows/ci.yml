@@ -878,10 +878,13 @@ jobs:
   #     mechanism (each is its own crate/example, not a manifest row). Each
   #     one runs on one shard, through `matrix.shard == N`.
   #     The assignment balances the measured step times of trunk-dev run
-  #     41757040952 on all three OSes. Windows weighs most, because it was the
-  #     long pole at 110 minutes.
+  #     41757040952 and PR run 41909196917 on all three OSes. Windows weighs
+  #     most, because it was the long pole at 110 minutes.
   #     The manifest steps above set a different base load on each shard, so
   #     balance the totals, not the step counts.
+  #     Shard 0 also runs `Compile db-backed tests`. That step and the
+  #     manifest compile vary by 5-12 minutes between runs, so keep shard 0
+  #     lighter than the others.
   #     Two steps share a shard on purpose. `Run all-features lib tests` runs
   #     on shard 0 after `Compile db-backed tests`, which builds the same lib
   #     test binary. On another shard, it builds that binary again.
@@ -1120,7 +1123,7 @@ jobs:
       # crash test runs its own binary as a child process. Issue #2001 adds
       # the `eval` suite.
       - name: Run autumn-harvest-agent tests (issues #1973, #2001)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox
       # Sandboxed code activities. The tests need no KVM: a fake VMM, fake
       # `firecracker` and `jailer` scripts and a fake API server stand in. The
@@ -1158,7 +1161,7 @@ jobs:
       # none of which touch the crates' own assertions. None need a live
       # database, so they run here rather than on `test-db-linux`.
       - name: Run saga-choreography example tests
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p saga-choreography
       - name: Run billing-autumn-web example tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
