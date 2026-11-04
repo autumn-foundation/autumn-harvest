@@ -47,8 +47,10 @@ env:
   # kache caches each rustc invocation by content, workspace crates and test
   # binaries included, so an untouched crate is a cache hit on an empty target.
   # The action keys its GitHub cache by `Cargo.lock` alone, with no job name.
-  # So each job and matrix leg passes `kache-<job>-<job-index>` as its prefix.
-  # Without it, the first leg to save wins and the rest restore a wrong store.
+  # So each job and matrix leg passes `kache-g<N>-<job>-<job-index>` as its
+  # prefix. Without it, the first leg to save wins and the rest restore a
+  # wrong store. A failed job still saves its store, and an entry is never
+  # replaced. Bump `g<N>` in every prefix to drop a bad or empty store.
   # Four jobs keep rust-cache: kani, fuzz-smoke and both harvest-verify jobs.
   # They cache files that are not rustc outputs (MIR, `cargo install`, `fuzz/`).
   # The action installs kache into the runner tool cache. A job that frees
@@ -180,7 +182,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       - name: Check default-run for multi-binary packages
@@ -840,7 +842,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       - name: Run no-db tests
@@ -953,7 +955,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       # ── Manifest-driven, self-sharded (every shard runs both, each on its
@@ -1393,7 +1395,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       # The shards install the same version. The archive format is internal
@@ -1740,7 +1742,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       - name: Build quickstart
@@ -1902,7 +1904,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       # One package per command. The chapter runs each with `cargo run -p`,
@@ -1965,7 +1967,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       # See docs/upgrading/README.md, "How CI proves the contract".
@@ -2012,7 +2014,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -2126,7 +2128,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       - name: Scaffold a project with `harvest new`
@@ -2212,7 +2214,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       - name: Clippy autumn-harvest
@@ -2243,7 +2245,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       - name: Clippy autumn-harvest-plugin
@@ -2276,7 +2278,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       # issue #525. Both tiers are linted: `dev-runtime-managed` compiles the
@@ -2315,7 +2317,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       - name: Clippy autumn-harvest-plugin (sqs feature)
@@ -2348,7 +2350,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       # The `sqlite` feature flips `autumn-web` to SQLite for the whole build.
@@ -2389,7 +2391,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       # `testcontainers` retries no pull, so a registry blip would fail the
@@ -2416,7 +2418,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       - name: Clippy autumn-harvest-macros
@@ -2485,7 +2487,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       - name: Clippy --workspace (same command as release.yml validate)
@@ -2506,7 +2508,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       # Same issue #962 rule as every other crate on this page: a workspace
@@ -2565,7 +2567,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       - name: Check signals chapter's clean await_condition example
@@ -2743,7 +2745,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       - name: Check MSRV compiles
@@ -2793,7 +2795,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       - name: Run loom models
@@ -2820,7 +2822,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
       - name: Run Shuttle models (random and PCT schedulers)
