@@ -2117,9 +2117,7 @@ wider effects than a single run of its kind.
   id `n`, so N draws are N samples, not one cached answer.
 
 `agent_draws` returns each draw report. An engine failure of a draw fails
-the run. The score (section 17) and the selection (#2443) build on it.
-The request says whether a scorer is a judge. A `Scorer` does not say it,
-so #2443 must check the model of each judge call against `judge_models`.
+the run. `agent_sample` (section 20) scores the draws and selects one.
 
 ### Upgrade every worker first
 
@@ -2137,3 +2135,87 @@ refine policy key (section 18). Any other unknown key of `AgentTask` and
 policy.
 
 The design is in [`DESIGN-2439.md`](design/DESIGN-2439.md).
+
+## 20. Best-of-N and rejection sampling (issue #2443)
+
+`agent_sample` runs a task many times, scores each draw and keeps the
+best. Each draw is a child `agent_loop` run with the run id `{root}:s{n}`.
+History records the end of each draw and each verdict. So a crash costs
+only the draws in flight, and replay never calls a scorer again.
+
+```rust
+use autumn_harvest_agent::ExactMatch;
+use autumn_harvest_agent::sampling::{SampleInput, SampleStrategy, ScorerRef};
+
+// The policy of `researcher` must list `best_of_n`, with `max_draws >= 3`.
+
+let input = SampleInput::new(
+    "researcher",
+    "Name a prime.",
+    SampleStrategy::best_of_n(3),
+    ScorerRef::deterministic(ExactMatch::ID).unwrap(),
+)
+.max_total_tokens(20_000);
+// SQLite: autumn_harvest_agent::sqlite::start_sample(&mut rt, &input)
+```
+
+| Strategy | What it does |
+|---|---|
+| `best_of_n { n }` | Runs `n` draws, scores each, and selects with `select` (section 17). A tie goes to the lowest draw id. |
+| `rejection { max_attempts, threshold }` | Runs draws until one scores at or above `threshold`, up to `max_attempts` draws. It runs one draw at a time unless the input asks for more. It stops after the wave that holds the pass. |
+
+The run reads the profile and the sampling policy of the kind once each,
+as `agent_draws` does (section 19). The policy admits the strategy, the
+draw count (`n` or `max_attempts`), the concurrency and the scorer. Each
+draw gets `draw_effects`, so with the default `[read_only]` a draw that
+calls a `write` tool gets a refusal, and the tool body never runs.
+
+### The budget
+
+The draws share one token budget: the `max_total_tokens` of the profile,
+narrowed by the `max_total_tokens` of the input. The run starts each wave
+with the tokens that are left. `sample_step` keeps a wave no wider than
+the tokens left, and draw `i` gets the cap `sibling_cap(left, width, i)`.
+The spend of each draw and of its judge calls counts.
+
+The run starts no more draws when no token is left, when a draw ends
+`budget_exceeded`, or when the LLM budget refuses a judge call. It then
+selects among the draws that it has, and sets `stopped` to
+`budget_exceeded`. The loop checks a token cap between model calls. So
+each draw of the last wave can pass its share by one call.
+
+A failed score does not fail the run. The draw gets a reject that names
+the error, the run starts no more draws, and `stopped` is
+`score_failed`.
+
+### Scores and judges
+
+The `agent_sample_score` activity scores each draw. It is `agent_score`,
+but it also returns the tokens and the cost of the judge calls. A draw
+that failed, or that a budget stopped, gets a reject and no score call.
+The run cuts each tool result of a score input to 16 KiB.
+
+A judge call may name only the judge model of the input `ScorerRef`,
+which the policy admitted. So the scorer must name that model, and `None`
+fails. A call to any other model fails with `ErrorKind::Config`, and the
+model is not called.
+
+### The report
+
+`SampleReport` holds:
+
+- `outcome`: `selected { draw }`, or `no_accepted_draw` when no draw
+  passed;
+- `selected`: the `AgentReport` of the selected draw;
+- `stopped`: `completed`, `accepted` (a rejection run found a pass),
+  `budget_exceeded` or `score_failed`;
+- `attempts`: the draws that ran;
+- `draws`: for each draw, its stop, verdict, usage and cost. The usage and
+  the cost include the judge calls of the draw;
+- `usage` and `cost_usd_micros`: the totals. They equal the cost ledger
+  rows of the run tree.
+
+Each `ModelTurn` carries the cost that the ledger recorded for it, and
+`AgentReport::cost_usd_micros` sums it, as `usage` sums the tokens.
+
+The design is in [`DESIGN-2443.md`](design/DESIGN-2443.md).

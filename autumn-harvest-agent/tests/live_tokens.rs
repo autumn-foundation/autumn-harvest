@@ -375,6 +375,7 @@ fn turn(text: &str, call: bool) -> ModelTurn {
         decisions.push(autumn_harvest_agent::ToolDecision::Allow);
     }
     ModelTurn {
+        cost_usd_micros: None,
         content,
         stop: if call {
             StopReason::ToolUse

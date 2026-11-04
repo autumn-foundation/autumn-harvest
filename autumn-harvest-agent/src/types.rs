@@ -724,6 +724,11 @@ pub struct ModelTurn {
     /// Empty unless the request set `interruptible`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interruptible: Vec<bool>,
+    /// The cost of the call in millionths of a US dollar, as the cost
+    /// ledger records it (issue #2443). `None` for a cache hit, an unpriced
+    /// call, and a turn recorded before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd_micros: Option<u64>,
 }
 
 impl ModelTurn {
@@ -743,6 +748,7 @@ impl ModelTurn {
             releases: Vec::new(),
             oversized: true,
             interruptible: Vec::new(),
+            cost_usd_micros: self.cost_usd_micros,
         }
     }
 
@@ -949,6 +955,11 @@ pub struct AgentReport {
     pub tool_calls: u32,
     /// Provider-reported tokens for the whole run, follow-ups included.
     pub usage: TokenUsage,
+    /// The priced cost of the same calls, in millionths of a US dollar
+    /// (issue #2443). It is the sum of the cost ledger rows of the run. An
+    /// unpriced call adds 0.
+    #[serde(default, skip_serializing_if = "crate::agent::is_zero")]
+    pub cost_usd_micros: u64,
     /// The transcript without the system prompt. Pass it as the history of the
     /// next run to continue the conversation.
     pub messages: Vec<ChatMessage>,
@@ -1114,6 +1125,7 @@ mod tests {
     #[test]
     fn turn_text_joins_only_text_parts() {
         let turn = ModelTurn {
+            cost_usd_micros: None,
             content: vec![
                 ContentPart::Text("a".into()),
                 ContentPart::ToolCall {

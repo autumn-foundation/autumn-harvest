@@ -51,6 +51,25 @@ const COMMANDS_PER_PASS: usize = 32;
 /// starts from growing memory while one long activity runs.
 const COMMAND_BACKLOG: usize = 256;
 
+tokio::task_local! {
+    /// Set on a driver task. An activity and a workflow run on that task.
+    static DRIVER_TASK: ();
+}
+
+/// Whether the caller runs on a driver task, as an activity or a workflow
+/// does (issue #2470).
+///
+/// A call there that waits for the driver would wait for itself.
+pub fn on_driver() -> bool {
+    DRIVER_TASK.try_with(|()| ()).is_ok()
+}
+
+/// Run `future` as if on a driver task, for a test of [`on_driver`].
+#[cfg(test)]
+pub async fn scope_as_driver<F: Future>(future: F) -> F::Output {
+    DRIVER_TASK.scope((), future).await
+}
+
 /// A query replay, ready to run off the driver task.
 pub type QueryFuture = Pin<Box<dyn Future<Output = SqliteResult<Value>> + Send>>;
 
@@ -191,6 +210,13 @@ pub enum Command {
         options: StartOptions,
         reply: oneshot::Sender<SqliteResult<Started<StartOutcome>>>,
     },
+    /// Return any run of the key, or else start one (issue #2470).
+    StartOnce {
+        workflow_name: String,
+        input: Value,
+        options: StartOptions,
+        reply: oneshot::Sender<SqliteResult<StartOutcome>>,
+    },
     SignalWithStart {
         request: SignalWithStartParams,
         reply: oneshot::Sender<SqliteResult<Started<SignalWithStartOutcome>>>,
@@ -276,7 +302,9 @@ impl Driver {
         let (sender, receiver) = mpsc::channel(COMMAND_BACKLOG);
         let stop = CancellationToken::new();
         let task = tokio::spawn(async move {
-            let reply = drive(runtime, receiver, tick, &stop).await;
+            let reply = DRIVER_TASK
+                .scope((), drive(runtime, receiver, tick, &stop))
+                .await;
             // `drive` owned the runtime, so the lock is released by now.
             if let Some(reply) = reply {
                 let _ = reply.send(());
@@ -308,7 +336,9 @@ impl Driver {
             // Declared first, so it runs last: after the runtime drops, on a
             // return and on an abort alike.
             let _exit = OnExit(Some(on_exit));
-            let reply = drive(runtime, receiver, tick, &stop).await;
+            let reply = DRIVER_TASK
+                .scope((), drive(runtime, receiver, tick, &stop))
+                .await;
             if let Some(reply) = reply {
                 let _ = reply.send(());
             }
@@ -435,6 +465,14 @@ async fn handle(runtime: &mut SqliteRuntime, command: Command) {
                 .map(|outcome| Started::read(runtime, outcome.exec_id, outcome));
             let _ = reply.send(started);
         }
+        Command::StartOnce {
+            workflow_name,
+            input,
+            options,
+            reply,
+        } => {
+            let _ = reply.send(start_once(runtime, &workflow_name, input, options));
+        }
         Command::SignalWithStart { request, reply } => {
             let _ = reply.send(signal_with_start(runtime, request));
         }
@@ -445,11 +483,7 @@ async fn handle(runtime: &mut SqliteRuntime, command: Command) {
             idempotency_key,
             reply,
         } => {
-            let routed = live_attempt(runtime, exec).and_then(|exec| {
-                runtime
-                    .send_signal_idempotent(exec, &name, payload, idempotency_key.as_deref())
-                    .map(|delivered| RoutedSignal { exec, delivered })
-            });
+            let routed = signal(runtime, exec, &name, payload, idempotency_key.as_deref());
             let _ = reply.send(routed);
         }
         Command::SignalByWorkflowId {
@@ -519,6 +553,20 @@ async fn handle(runtime: &mut SqliteRuntime, command: Command) {
     }
 }
 
+/// Signal the live attempt of `exec`.
+fn signal(
+    runtime: &mut SqliteRuntime,
+    exec: ExecutionId,
+    name: &str,
+    payload: Value,
+    idempotency_key: Option<&str>,
+) -> SqliteResult<RoutedSignal> {
+    let exec = live_attempt(runtime, exec)?;
+    runtime
+        .send_signal_idempotent(exec, name, payload, idempotency_key)
+        .map(|delivered| RoutedSignal { exec, delivered })
+}
+
 /// The stored state of `exec`.
 fn state_of(runtime: &SqliteRuntime, exec: ExecutionId) -> SqliteResult<String> {
     Ok(runtime
@@ -563,6 +611,40 @@ fn live_attempt(runtime: &SqliteRuntime, exec: ExecutionId) -> SqliteResult<Exec
         });
     }
     Ok(current)
+}
+
+/// Return the newest run of the key in `options`, in any state, or else
+/// start one (issue #2470).
+///
+/// The outbox relay starts each row with this. A sealed prior, such as a
+/// terminated run, counts too. A redelivery after a crash therefore never
+/// runs a start twice. The driver runs one command at a time, so no write
+/// comes between the check and the start.
+///
+/// # Errors
+///
+/// Returns [`SqliteError::BlankWorkflowId`] when the key has no id. A start
+/// with no id would run again on each redelivery.
+fn start_once(
+    runtime: &mut SqliteRuntime,
+    workflow_name: &str,
+    input: Value,
+    options: StartOptions,
+) -> SqliteResult<StartOutcome> {
+    let Some(workflow_id) = options
+        .workflow_id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+    else {
+        return Err(SqliteError::BlankWorkflowId);
+    };
+    if let Some(exec_id) = runtime.newest_run_of_key(workflow_name, &workflow_id)? {
+        return Ok(StartOutcome {
+            exec_id,
+            created: false,
+        });
+    }
+    runtime.start_workflow_with_options(workflow_name, input, options)
 }
 
 /// Run a signal-with-start, and read the state that it left.
@@ -725,6 +807,49 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         Ok(n)
+    }
+
+    /// Waits for a signal that never comes, so a run stays `RUNNING`.
+    #[workflow]
+    async fn parked(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+        ctx.wait_for_signal("never")
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(n)
+    }
+
+    /// `StartOnce` returns any run of the key, a sealed one too. It starts
+    /// a run only for a key with none (issue #2470).
+    #[test]
+    fn start_once_returns_any_run_of_the_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = SqliteRuntime::open(&dir.path().join("h.db")).expect("open");
+        runtime.register_workflow(&parked_info());
+        let key = |id: &str| StartOptions::new().workflow_id(id);
+
+        let first = start_once(&mut runtime, "parked", serde_json::json!(1), key("k")).unwrap();
+        assert!(first.created);
+        let again = start_once(&mut runtime, "parked", serde_json::json!(2), key("k")).unwrap();
+        assert_eq!(again.exec_id, first.exec_id);
+        assert!(!again.created);
+
+        // The default reuse policy starts over a terminated run. This must not.
+        runtime.terminate(first.exec_id, "operator").unwrap();
+        let sealed = start_once(&mut runtime, "parked", serde_json::json!(3), key("k")).unwrap();
+        assert_eq!(sealed.exec_id, first.exec_id);
+        assert!(!sealed.created);
+
+        // Another key starts its own run.
+        let other = start_once(&mut runtime, "parked", serde_json::json!(4), key("j")).unwrap();
+        assert!(other.created);
+        assert_ne!(other.exec_id, first.exec_id);
+
+        for blank in [StartOptions::new(), key("  ")] {
+            assert!(matches!(
+                start_once(&mut runtime, "parked", serde_json::json!(5), blank),
+                Err(SqliteError::BlankWorkflowId)
+            ));
+        }
     }
 
     /// On a current-thread runtime, a chain of passes that never awaits

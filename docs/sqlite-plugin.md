@@ -17,6 +17,9 @@ API tokens, roles, OIDC and the audit log. The design records are
 [#2468](https://github.com/autumn-foundation/autumn-harvest/issues/2468)
 ports the read routes, Vantage and declarative queries. Its design record
 is [`DESIGN-2468.md`](design/DESIGN-2468.md).
+[#2470](https://github.com/autumn-foundation/autumn-harvest/issues/2470)
+adds the [transactional outbox](#the-transactional-outbox). Its design
+record is [`DESIGN-2470.md`](design/DESIGN-2470.md).
 
 ## Turn it on
 
@@ -82,7 +85,8 @@ history out, and the reverse.
 
 The plugin registers no migration set on a SQLite app. The Postgres sets would
 fail on SQLite. `autumn-harvest-sqlite` applies its own schema when it opens
-its file.
+its file. The one Harvest table in the app database is the
+[outbox](#the-transactional-outbox). The startup hook creates it.
 
 ## Split and external mode
 
@@ -114,8 +118,8 @@ not `HarvestSqlite`.
 - **The app pool stays SQLite.** No Postgres migration set goes to the app
   database. The transactional outbox relay does not run, and activities get
   no `AppDbPool`. An activity reads the SQLite app pool through
-  `ctx.state::<AppState>()`. The SQLite outbox is
-  [#2470](https://github.com/autumn-foundation/autumn-harvest/issues/2470).
+  `ctx.state::<AppState>()`. The SQLite outbox runs in embedded mode only
+  ([#2470](https://github.com/autumn-foundation/autumn-harvest/issues/2470)).
 - **Loud conflicts.** `harvest.sqlite.path` and `sqlite_per_tenant()` have
   no effect in this mode, so the build refuses them.
   `HarvestPlugin::sqlite_path` is a default for embedded mode. It only logs
@@ -303,6 +307,64 @@ The handle has `start`, `signal_with_start`, `signal`,
 
 A violation is `HarvestSqliteError::InvalidInput` or `InvalidSignal`. Over
 HTTP it is the Postgres `400` with `violations`.
+
+## The transactional outbox
+
+A start from the handle commits in the Harvest file, not in your business
+transaction. To start a run only when your rows commit, write the start to
+the outbox on the connection of that transaction (issue #2470):
+
+```rust,ignore
+use autumn_harvest_plugin::WorkflowStartRequest;
+use autumn_harvest_plugin::sqlite::enqueue_workflow_start_outbox;
+use diesel_async::AsyncConnection as _;
+
+conn.transaction(async |conn| {
+    insert_order(conn, &order).await?;
+    enqueue_workflow_start_outbox(conn, &WorkflowStartRequest {
+        workflow_name: "process_order".to_owned(),
+        workflow_id: order.id.clone(),
+        queue_name: "default".to_owned(),
+        input: json!(order),
+        memo: None,
+        search_attrs: None,
+    })
+    .await
+})
+.await?;
+```
+
+- **The table.** The startup hook creates `harvest_workflow_outbox` in the
+  app's primary database. In a fleet app, that is the control database.
+  A fleet tenant database has no outbox table, so a write there fails.
+  `OUTBOX_SCHEMA_SQL` holds the DDL, for an app that applies it before the
+  deploy. A table of another shape fails the boot.
+- **The relay.** It drains the due rows every
+  `harvest.outbox.poll_interval_ms`, in batches of `batch_size`. The control
+  Harvest runs each start. A failed start keeps `last_error`, and backs off
+  with `base_retry_delay_ms` and `max_retry_delay_ms`. `claim_ttl_ms` has no
+  effect: one process holds the Harvest file, so one relay runs.
+  `harvest.outbox.enabled = false` stops the relay, and the rows wait. Two
+  apps with two Harvest files must not share one app database.
+- **Exactly once.** A rolled-back write leaves no row. A committed row runs
+  once, across a crash before the relay and a crash between the start and
+  the mark. The relay starts a row only when its
+  `(workflow_name, workflow_id)` has no run, in any state. This is stricter
+  than Postgres: a key that an API start already used, or that an operator
+  terminated, is marked with that run and does not run again.
+- **Flush.** `flush_workflow_start_outbox(&state)` and
+  `drain_workflow_start_outbox_once` drain the SQLite outbox, as on
+  Postgres. An activity or a workflow cannot call them: they run on the
+  driver task, and the start would wait for that task.
+- **Refusals.** The writer refuses an empty or blank `workflow_id`, a
+  `queue_name` other than `"default"`, and `search_attrs` that is not an
+  object of JSON primitives. A duplicate key is a no-op. An unknown workflow
+  or an input over the cap fails at start, and the relay retries it, as on
+  Postgres.
+- **Split and external mode.** No SQLite relay runs. The boot warns when
+  the app database holds undelivered starts from embedded mode.
+- **In-memory app database.** Its pool has one connection. A flush then
+  waits while the caller holds that connection. Use a file.
 
 ## The management API
 
@@ -524,18 +586,17 @@ no-op would let an app believe a protection or a feature is on.
 | Option or mode | Issue |
 | --- | --- |
 | `decode_payloads_on_read`: this backend stores no codec envelope, so a read has nothing to decode | the epic |
-| The transactional outbox | [#2470](https://github.com/autumn-foundation/autumn-harvest/issues/2470) |
 | Workflow schedules, `retention`, `mcp_tools`, `mcp_tasks`, `webhooks`, `connector`, `synthetic_canary`, `agent_overlay_store` | [#2471](https://github.com/autumn-foundation/autumn-harvest/issues/2471) |
 | `harvest.sqlite.path` or `sqlite_per_tenant()` with `harvest.mode = "split"` / `"external"` | [#2472](https://github.com/autumn-foundation/autumn-harvest/issues/2472): no effect in that mode |
 | `sqlite_per_tenant()` in an app with no `[database.fleet]` | [#2472](https://github.com/autumn-foundation/autumn-harvest/issues/2472) |
-| `harvest.worker_enabled = false` | not planned: the app process is the only writer |
+| `harvest.worker_enabled = false` | not planned: the app process is the only writer. The `web` role does not stop the driver either ([#2477](https://github.com/autumn-foundation/autumn-harvest/issues/2477)) |
 | DAGs | an engine non-goal of the SQLite backend (#2019) |
 | `with_metrics_scrape` | the epic |
 
 These options do nothing on SQLite, because they tune Postgres machinery that
 this backend does not have: `worker(..)`, `load_shed`, `ramp_guard`,
-`start_idempotency_window`, the durable-route limits and the status
-thresholds.
+`start_idempotency_window`, the durable-route limits, the status
+thresholds and `harvest.outbox.claim_ttl_ms`.
 
 ## Tests
 

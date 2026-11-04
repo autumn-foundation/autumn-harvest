@@ -16,6 +16,8 @@
 //! - API tokens, roles, OIDC, the authorizer and the rate limiter run the
 //!   admin-auth layer stack of the Postgres path (issue #2469). Tokens and
 //!   audit rows live in the Harvest file.
+//! - The transactional outbox lives in the app database. A relay hands each
+//!   committed start to the driver. See [`outbox`] (issue #2470).
 //!
 //! Every builder option and mode that this slice cannot honour fails the
 //! build or the boot, and names the issue that ports it. A silent no-op would
@@ -25,6 +27,7 @@ mod api;
 mod driver;
 mod fleet;
 mod handle;
+mod outbox;
 mod reads;
 mod ui;
 
@@ -36,10 +39,13 @@ use autumn_harvest::builder::HarvestBuilder;
 use autumn_web::AppState;
 use autumn_web::app::AppBuilder;
 use autumn_web::error::AutumnError;
+use tokio_util::sync::CancellationToken;
 
 pub use driver::{RoutedSignal, RoutedUpdate, SignalWithStartParams, StopAck};
 pub use fleet::{HarvestFleet, HarvestTenant, tenant_harvest_file};
 pub use handle::{HarvestSqlite, HarvestSqliteError};
+pub use outbox::{SCHEMA_SQL as OUTBOX_SCHEMA_SQL, enqueue_workflow_start_outbox};
+pub(crate) use outbox::{SqliteOutbox, warn_if_stranded};
 
 /// The `autumn-harvest-sqlite` types that [`HarvestSqlite`] takes and returns.
 pub use autumn_harvest_sqlite::{
@@ -85,6 +91,8 @@ struct Slot {
     per_tenant: bool,
     /// The per-tenant Harvests. The shutdown hook releases them.
     fleet: Option<HarvestFleet>,
+    /// The outbox relay and its stop token (issue #2470).
+    relay: Option<Relay>,
 }
 
 struct StartParts {
@@ -172,6 +180,7 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         code_path,
         per_tenant,
         fleet: None,
+        relay: None,
     }));
     let startup_slot = Arc::clone(&slot);
     let startup_handles = handles.clone();
@@ -186,10 +195,18 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         .on_shutdown(move || {
             let slot = Arc::clone(&slot);
             async move {
-                let (driver, fleet) = {
+                let (driver, fleet, relay) = {
                     let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
-                    (slot.driver.take(), slot.fleet.take())
+                    (slot.driver.take(), slot.fleet.take(), slot.relay.take())
                 };
+                // The relay stops first. It must not send a start to a driver
+                // that is stopping.
+                if let Some((stop, task)) = relay {
+                    stop.cancel();
+                    if task.await.is_err() {
+                        tracing::warn!("the harvest-sqlite outbox relay did not stop cleanly");
+                    }
+                }
                 if let Some(fleet) = fleet {
                     fleet.release();
                 }
@@ -460,14 +477,7 @@ async fn start(
             runtime_config.mode
         )));
     }
-    if !runtime_config.worker_enabled {
-        // One process holds the writer lock. A process with no driver could
-        // not write at all, so an API-only replica is not a SQLite topology.
-        return Err(AutumnError::service_unavailable_msg(
-            "harvest.worker_enabled = false is not supported on the SQLite backend: the app \
-             process is the only writer, so it always runs the driver",
-        ));
-    }
+    apply_driver_check(runtime_config.worker_enabled, state.role())?;
     let sqlite_config = HarvestSqliteConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     let app_config = state.config();
@@ -535,7 +545,7 @@ async fn start(
     };
     api_state.install_sqlite_auth_store(Arc::new(auth_store));
     let handle = HarvestSqlite::new(driver.sender.clone(), reader, path.clone(), catalog);
-    slot.lock().unwrap_or_else(PoisonError::into_inner).driver = Some(driver);
+    keep_control(state, slot, driver, &handle, runtime_config.outbox).await?;
     state.insert_extension(handle.clone());
     let _ = handles.control.set(handle);
     tracing::info!(path = %path.display(), "harvest is running on SQLite");
@@ -549,6 +559,71 @@ async fn start(
         tracing::info!("harvest runs one SQLite file per open fleet tenant");
     }
     Ok(())
+}
+
+/// The relay of the outbox and its stop token.
+type Relay = (CancellationToken, tokio::task::JoinHandle<()>);
+
+/// Start the outbox, then keep the driver and the relay for the shutdown
+/// hook.
+///
+/// # Errors
+///
+/// Returns the outbox error. The driver stops first, so the writer lock is
+/// free.
+async fn keep_control(
+    state: &AppState,
+    slot: &Mutex<Slot>,
+    driver: Driver,
+    handle: &HarvestSqlite,
+    config: crate::config::HarvestOutboxConfig,
+) -> autumn_web::AutumnResult<()> {
+    let relay = match start_outbox(state, handle, config).await {
+        Ok(relay) => relay,
+        Err(error) => {
+            driver.shutdown().await;
+            return Err(AutumnError::service_unavailable_msg(error));
+        }
+    };
+    {
+        let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.driver = Some(driver);
+        slot.relay = relay;
+    }
+    Ok(())
+}
+
+/// Create the outbox table and start its relay (issue #2470).
+///
+/// The table goes to the app's primary database. In a fleet app, that is the
+/// control database, so the control Harvest runs each start. An app with no
+/// database has no outbox. A disabled relay still gets the table, so app code
+/// can write starts that a later boot runs, as on Postgres.
+///
+/// # Errors
+///
+/// Returns a message when the table cannot be created.
+async fn start_outbox(
+    state: &AppState,
+    harvest: &HarvestSqlite,
+    config: crate::config::HarvestOutboxConfig,
+) -> Result<Option<Relay>, String> {
+    let Some(pool) = state.pool() else {
+        return Ok(None);
+    };
+    outbox::ensure_schema(pool).await?;
+    let enabled = config.enabled;
+    let relay = SqliteOutbox::new(pool.clone(), harvest.clone(), config);
+    state.insert_extension(relay.clone());
+    if !enabled {
+        tracing::info!(
+            "the Harvest SQLite outbox relay is disabled: harvest.outbox.enabled = false"
+        );
+        return Ok(None);
+    }
+    let stop = CancellationToken::new();
+    let task = relay.spawn(stop.clone());
+    Ok(Some((stop, task)))
 }
 
 /// The app's SQLite fleet, for `sqlite_per_tenant` (issue #2472).
@@ -600,9 +675,118 @@ fn warn_if_open(profile: &str, api_state: &HarvestApiState) {
     );
 }
 
+/// What the SQLite path does with `harvest.worker_enabled` (issue #2477).
+#[derive(Debug, PartialEq, Eq)]
+enum DriverCheck {
+    /// Run the driver.
+    Run,
+    /// Run the driver, and warn that the `web` role does not stop it.
+    RunAgainstRole,
+    /// Refuse the boot.
+    Refuse,
+}
+
+/// Warn or refuse the boot after [`driver_check`].
+fn apply_driver_check(
+    explicit: Option<bool>,
+    role: autumn_web::config::ProcessRole,
+) -> autumn_web::AutumnResult<()> {
+    let check = driver_check(explicit, role);
+    if check != DriverCheck::Refuse {
+        let source = if explicit.is_some() {
+            "explicit"
+        } else {
+            "sqlite"
+        };
+        tracing::info!(
+            role = %role.as_str(),
+            worker_enabled = true,
+            worker_source = %source,
+            "harvest SQLite driver runs on every process role"
+        );
+    }
+    match check {
+        DriverCheck::Run => Ok(()),
+        DriverCheck::RunAgainstRole => {
+            tracing::warn!(
+                "the Autumn process role `web` does not turn off the Harvest SQLite driver: \
+                 the app process is the only writer, so it always runs the driver. Set \
+                 harvest.worker_enabled = true to remove this warning"
+            );
+            Ok(())
+        }
+        DriverCheck::Refuse => Err(AutumnError::service_unavailable_msg(
+            "harvest.worker_enabled = false is not supported on the SQLite backend: the app \
+             process is the only writer, so it always runs the driver",
+        )),
+    }
+}
+
+/// The SQLite backend always runs its driver.
+///
+/// One process holds the writer lock. A process with no driver could not
+/// write at all, so an API-only replica is not a SQLite topology. An
+/// explicit `false` is refused. The `web` role default does not apply.
+fn driver_check(explicit: Option<bool>, role: autumn_web::config::ProcessRole) -> DriverCheck {
+    match explicit {
+        Some(false) => DriverCheck::Refuse,
+        None if role == autumn_web::config::ProcessRole::Web => DriverCheck::RunAgainstRole,
+        Some(true) | None => DriverCheck::Run,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sqlite_driver_ignores_the_web_role_default() {
+        use autumn_web::config::ProcessRole;
+        for role in [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker] {
+            assert_eq!(
+                driver_check(Some(false), role),
+                DriverCheck::Refuse,
+                "{role:?}"
+            );
+            assert_eq!(driver_check(Some(true), role), DriverCheck::Run, "{role:?}");
+        }
+        assert_eq!(
+            driver_check(None, ProcessRole::Web),
+            DriverCheck::RunAgainstRole
+        );
+        assert_eq!(driver_check(None, ProcessRole::Worker), DriverCheck::Run);
+        assert_eq!(driver_check(None, ProcessRole::Combined), DriverCheck::Run);
+        assert!(apply_driver_check(Some(false), ProcessRole::Worker).is_err());
+    }
+
+    /// Issue #2477: a `web` SQLite app warns that its driver still runs, and
+    /// names the fix. Each start logs the value and its source.
+    #[test]
+    fn the_sqlite_web_role_warns_that_the_driver_still_runs() {
+        use autumn_web::config::ProcessRole;
+
+        use crate::process_role::capture_logs;
+
+        let run = |explicit, role| {
+            capture_logs(tracing::Level::INFO, || {
+                assert!(apply_driver_check(explicit, role).is_ok());
+            })
+        };
+        let out = run(None, ProcessRole::Web);
+        let warn = out
+            .lines()
+            .find(|line| line.contains(" WARN "))
+            .unwrap_or_else(|| panic!("no warning: {out}"));
+        assert!(warn.contains("role `web`"), "{warn}");
+        assert!(warn.contains("harvest.worker_enabled = true"), "{warn}");
+        assert!(out.contains("role=web"), "{out}");
+        assert!(out.contains("worker_source=sqlite"), "{out}");
+
+        let out = run(Some(true), ProcessRole::Web);
+        assert!(!out.contains(" WARN "), "{out}");
+        assert!(out.contains("worker_source=explicit"), "{out}");
+        assert!(!run(None, ProcessRole::Worker).contains(" WARN "));
+    }
 
     #[test]
     fn a_configured_path_wins_then_the_code_path() {

@@ -317,8 +317,13 @@ fn every_verus_mirror_matches_its_engine_source() {
 /// The source crates that a Verus proof may mirror.
 ///
 /// The agent crate holds pure kernels of the durable agent (issue #2262).
-/// A proof of one names its Verus file as an engine function does.
-const MIRRORED_CRATES: &[&str] = &["autumn-harvest/src", "autumn-harvest-agent/src"];
+/// A proof of one names its Verus file as an engine function does. The
+/// plugin crate holds the process role kernels (issue #2477).
+const MIRRORED_CRATES: &[&str] = &[
+    "autumn-harvest/src",
+    "autumn-harvest-agent/src",
+    "autumn-harvest-plugin/src",
+];
 
 /// The `.rs` files under each of [`MIRRORED_CRATES`], relative to the repo
 /// root.

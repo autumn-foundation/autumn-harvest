@@ -314,6 +314,7 @@ linux        autumn-harvest-agent   live_probe_postgres              eval,postgr
 linux        autumn-harvest-agent   overlay_read_postgres            postgres                   -
 linux        autumn-harvest-agent   overlay_store_postgres           postgres                   -
 linux        autumn-harvest-agent   postgres_agents                  postgres                   -
+linux        autumn-harvest-agent   sample_postgres                  postgres                   -
 linux        autumn-harvest-agent   sampling_policy_postgres         postgres                   -
 linux        autumn-harvest-agent   score_postgres                   postgres                   -
 linux        autumn-harvest-conformance  conformance                  -                          -

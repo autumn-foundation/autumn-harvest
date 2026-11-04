@@ -20,3 +20,4 @@ mod agent_anonymise;
 mod agent_episodes;
 mod refine_policy;
 mod evidence_parts;
+mod process_role;
