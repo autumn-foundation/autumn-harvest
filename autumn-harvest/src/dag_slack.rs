@@ -214,7 +214,7 @@ mod tests {
     fn empty_dag_has_no_tasks_and_no_makespan() {
         let report = DagSlackAnalyzer::new(DagBuilder::new().build().unwrap()).analyze();
         assert_eq!(report.makespan, Duration::ZERO);
-        assert!(report.tasks.is_empty());
+        assert_eq!(report.tasks, [] as [TaskSlack; 0]);
         assert!(report.most_flexible().is_none());
     }
 
