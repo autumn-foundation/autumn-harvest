@@ -51,6 +51,8 @@ env:
   # Without it, the first leg to save wins and the rest restore a wrong store.
   # Four jobs keep rust-cache: kani, fuzz-smoke and both harvest-verify jobs.
   # They cache files that are not rustc outputs (MIR, `cargo install`, `fuzz/`).
+  # The action installs kache into the runner tool cache. A job that frees
+  # disk with `rm -rf "$AGENT_TOOLSDIRECTORY"` must run that step first.
   # rust-cache used to set CARGO_INCREMENTAL=0 itself. kache does not, and an
   # incremental build gives path crates another codegen-units value, so the
   # cache keys would differ between jobs and runs.
@@ -937,12 +939,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
-        with:
-          version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
-          cache-executables: true
-          pr-comment: false
       # Same disk-pressure guard as the pre-split `test` job carried
       # immediately before this step; every shard on Linux gets its own runner,
       # so it's cheap (a few seconds) to run per shard rather than build a
@@ -954,6 +950,12 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       # ── Manifest-driven, self-sharded (every shard runs both, each on its
       # own slice of the matching rows) ───────────────────────────────────
       - name: Compile plugin integration test suites (manifest, all OSes)
@@ -1381,12 +1383,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
-        with:
-          version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
-          cache-executables: true
-          pr-comment: false
       - name: Free runner disk before heavy plugin link (Linux)
         if: needs.changes.outputs.code == 'true'
         run: |
@@ -1394,6 +1390,12 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       # The shards install the same version. The archive format is internal
       # to nextest, so the two ends must agree.
       - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
@@ -1953,12 +1955,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
-        with:
-          version: v2.0.0
-          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
-          cache-executables: true
-          pr-comment: false
       # Two trees build here, so free the disk as the `test` job does.
       - name: Free runner disk before two builds
         run: |
@@ -1966,6 +1962,12 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       # See docs/upgrading/README.md, "How CI proves the contract".
       - name: Run the previous release and this tree on one database
         env:
