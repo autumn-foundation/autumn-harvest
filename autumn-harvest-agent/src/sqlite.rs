@@ -63,14 +63,7 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     rt.register_workflow(&agent_loop_info());
     rt.register_workflow(&agent_heartbeat_info());
     rt.register_workflow(&agent_info());
-    rt.register_workflow(&agent_draws_info());
-    let h = Arc::clone(&harness);
-    rt.register_activity_with_body(&agent_sampling_policy_info(), move |input| {
-        call(input, |kind: String| {
-            let h = Arc::clone(&h);
-            async move { h.sampling_policy(&kind).await }
-        })
-    });
+    register_sampling(rt, &harness);
     rt.register_workflow(&agent_consolidate_info());
     register_episodes(rt, &harness);
     let h = Arc::clone(&harness);
@@ -144,20 +137,7 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
             std::future::ready(Ok::<_, String>(h.discover_peers(&names)))
         })
     });
-    let h = Arc::clone(&harness);
-    rt.register_activity_with_body(&crate::refine::agent_refine_policy_info(), move |input| {
-        call(input, |kind: String| {
-            let h = Arc::clone(&h);
-            async move { h.refine_policy(&kind).await }
-        })
-    });
-    let h = Arc::clone(&harness);
-    rt.register_activity_with_body(&agent_refine_propose_info(), move |input| {
-        call(input, |request| {
-            let h = Arc::clone(&h);
-            async move { run_stage(&h, request).await }
-        })
-    });
+    register_refine(rt, &harness);
     let h = Arc::clone(&harness);
     rt.register_activity_with_ledger(&agent_score_info(), move |input, _at| {
         call_with_ledger(input, |request| {
@@ -172,6 +152,37 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     });
     rt.register_activity_with_body(&agent_precheck_info(), move |input| {
         call(input, |task| harness.precheck_tick(task))
+    });
+}
+
+/// Register the refine policy read (issue #2394) and the proposer stage
+/// (issue #2379).
+fn register_refine(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&crate::refine::agent_refine_policy_info(), move |input| {
+        call(input, |kind: String| {
+            let h = Arc::clone(&h);
+            async move { h.refine_policy(&kind).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_refine_propose_info(), move |input| {
+        call(input, |request| {
+            let h = Arc::clone(&h);
+            async move { run_stage(&h, request).await }
+        })
+    });
+}
+
+/// Register the strategy run and its policy read (issue #2439).
+fn register_sampling(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
+    rt.register_workflow(&agent_draws_info());
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_sampling_policy_info(), move |input| {
+        call(input, |kind: String| {
+            let h = Arc::clone(&h);
+            async move { h.sampling_policy(&kind).await }
+        })
     });
 }
 

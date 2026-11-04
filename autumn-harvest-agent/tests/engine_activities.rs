@@ -260,7 +260,7 @@ fn the_engine_registration_builds() {
         .activities(activities())
         .state(AgentHarness::new(ScriptedModel::new(Vec::new())))
         .build();
-    assert_eq!(built.workflow_count(), 4);
+    assert_eq!(built.workflow_count(), 5);
     assert!(built.state::<AgentHarness>().is_some());
     let names: Vec<&str> = activities().iter().map(|a| a.name).collect();
     assert_eq!(
