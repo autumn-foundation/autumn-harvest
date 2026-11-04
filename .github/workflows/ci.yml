@@ -51,8 +51,9 @@ env:
   # The action installs kache into the runner tool cache. A job that frees
   # disk with `rm -rf "$AGENT_TOOLSDIRECTORY"` must run that step first.
   #
-  # Backend: an S3 bucket, when the repository has the `KACHE_S3_BUCKET`
-  # variable and the `KACHE_S3_ACCESS_KEY_ID` secret. kache writes to it only
+  # Backend: an S3 bucket, when the repository has `KACHE_S3_BUCKET` (as a
+  # variable or a secret) and the `KACHE_S3_ACCESS_KEY_ID` secret. The same
+  # goes for `KACHE_S3_REGION` and `KACHE_S3_ENDPOINT`. kache writes to it only
   # from a push to a protected branch, so trunk-dev must have a ruleset. Pull
   # requests read what trunk-dev published, so every PR shares one store.
   # Each entry is written on its own, so the store follows trunk-dev.
@@ -195,9 +196,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -861,9 +862,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -980,9 +981,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -1426,9 +1427,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -1779,9 +1780,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -1947,9 +1948,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -2016,9 +2017,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -2069,9 +2070,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -2189,9 +2190,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -2281,9 +2282,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -2318,9 +2319,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -2357,9 +2358,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -2402,9 +2403,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -2441,9 +2442,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -2488,9 +2489,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -2521,9 +2522,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -2596,9 +2597,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -2623,9 +2624,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -2688,9 +2689,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -2872,9 +2873,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -2928,9 +2929,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
@@ -2961,9 +2962,9 @@ jobs:
           github-cache: false
           cache-executables: true
           pr-comment: false
-          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
-          s3-region: ${{ vars.KACHE_S3_REGION }}
-          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}

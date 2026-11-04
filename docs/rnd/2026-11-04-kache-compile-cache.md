@@ -43,7 +43,7 @@ freezes at the first save for each `Cargo.lock`.
    `s3:GetObject` and `s3:PutObject` on AWS, or an R2 token with object read
    and write on that bucket.
 3. **Add repository variables** (Settings → Secrets and variables → Actions →
-   Variables):
+   Variables). A repository secret with the same name works too:
    - `KACHE_S3_BUCKET`: the bucket name.
    - `KACHE_S3_REGION`: optional. The default is `us-east-1`. R2 uses `auto`.
    - `KACHE_S3_ENDPOINT`: only for a store that is not AWS. For R2, it is
