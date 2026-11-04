@@ -4307,8 +4307,9 @@ while True:
         // jail exists, so the launch usually stops there. The link task can
         // end before its first poll, and then one poll runs the whole
         // launch. That attempt leaves no jail, and the test tries again.
+        // A busy runner can end many attempts that way, so the bound is wide.
         let mut caught = None;
-        for _ in 0..20 {
+        for _ in 0..200 {
             let mut launch = launcher.launch();
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut pending = true;
