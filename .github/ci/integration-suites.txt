@@ -313,6 +313,7 @@ linux        autumn-harvest         integration                      wasm-activi
 linux        autumn-harvest-agent   overlay_read_postgres            postgres                   -
 linux        autumn-harvest-agent   overlay_store_postgres           postgres                   -
 linux        autumn-harvest-agent   postgres_agents                  postgres                   -
+linux        autumn-harvest-agent   sampling_policy_postgres         postgres                   -
 linux        autumn-harvest-agent   score_postgres                   postgres                   -
 linux        autumn-harvest-conformance  conformance                  -                          -
 linux        autumn-harvest-plugin  activity_info_api_integration    -                          -
@@ -385,6 +386,7 @@ linux        autumn-harvest-plugin  retry_chain_routing_integration  -          
 linux        autumn-harvest-plugin  run_chain_integration            -                          -
 linux        autumn-harvest-plugin  run_defaults_integration         -                          -
 linux        autumn-harvest-plugin  runner_orphan_gate_integration   -                          -
+linux        autumn-harvest-plugin  sampling_policy_integration      -                          -
 linux        autumn-harvest-plugin  scaling_api_tests                -                          -
 linux        autumn-harvest-plugin  schedule_bulk_audit_perf         -                          -
 linux        autumn-harvest-plugin  schedule_overdue_aux_perf        -                          -

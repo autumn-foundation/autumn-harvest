@@ -420,6 +420,27 @@ fn agents_profile_commands_are_covered() {
 }
 
 #[test]
+fn agents_sampling_policy_is_covered() {
+    // Issue #2439.
+    for args in [
+        &["agents", "sampling", "policy", "researcher", "show"][..],
+        &[
+            "agents",
+            "sampling",
+            "policy",
+            "researcher",
+            "set",
+            "--max-draws",
+            "4",
+        ][..],
+        &["agents", "sampling", "policy", "researcher", "reset"][..],
+    ] {
+        assert_covered(args);
+        assert_body_fields_documented(args);
+    }
+}
+
+#[test]
 fn workflow_start_is_covered() {
     assert_covered(&["workflow", "start", "my_workflow"]);
 }

@@ -218,6 +218,7 @@ async fn a_retry_starts_the_live_text_again() {
 fn request(stream: bool) -> ModelTurnRequest {
     ModelTurnRequest {
         skills: false,
+        allowed_effects: None,
         tool_guidance: std::collections::BTreeMap::new(),
         run_id: "run-1".into(),
         session_id: None,

@@ -44,6 +44,9 @@ use crate::mesh_control::{MESH_ATTR, MeshPause, MeshSpend, Spend};
 use crate::model::BoxFuture;
 use crate::refine::agent_refine_propose_info;
 use crate::refine::propose::run_stage;
+use crate::sampling::{
+    DRAWS_WORKFLOW_NAME, DrawsInput, agent_draws_info, agent_sampling_policy_info,
+};
 use crate::score::{agent_score_info, run_score};
 use crate::types::{AgentTask, ModelTurnRequest};
 use crate::workflow::{
@@ -60,6 +63,7 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     rt.register_workflow(&agent_loop_info());
     rt.register_workflow(&agent_heartbeat_info());
     rt.register_workflow(&agent_info());
+    register_sampling(rt, &harness);
     rt.register_workflow(&agent_consolidate_info());
     register_episodes(rt, &harness);
     let h = Arc::clone(&harness);
@@ -119,6 +123,18 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     register_refine(rt, &harness);
     rt.register_activity_with_body(&agent_precheck_info(), move |input| {
         call(input, |task| harness.precheck_tick(task))
+    });
+}
+
+/// Register the strategy run and its policy read (issue #2439).
+fn register_sampling(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
+    rt.register_workflow(&agent_draws_info());
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_sampling_policy_info(), move |input| {
+        call(input, |kind: String| {
+            let h = Arc::clone(&h);
+            async move { h.sampling_policy(&kind).await }
+        })
     });
 }
 
@@ -243,6 +259,15 @@ pub fn consolidate(rt: &mut SqliteRuntime, id: &AgentId) -> SqliteResult<Executi
 /// Returns an error when the runtime cannot record the start.
 pub fn start(rt: &mut SqliteRuntime, task: &AgentTask) -> SqliteResult<ExecutionId> {
     rt.start_workflow(WORKFLOW_NAME, serde_json::to_value(task)?)
+}
+
+/// Start one strategy run (issue #2439). Returns its execution id.
+///
+/// # Errors
+///
+/// Returns an error when the runtime cannot record the start.
+pub fn start_draws(rt: &mut SqliteRuntime, input: &DrawsInput) -> SqliteResult<ExecutionId> {
+    rt.start_workflow(DRAWS_WORKFLOW_NAME, serde_json::to_value(input)?)
 }
 
 /// Start one heartbeat tick. Returns its execution id.

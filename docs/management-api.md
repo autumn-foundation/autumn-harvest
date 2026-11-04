@@ -36,6 +36,7 @@ New route families added in **0.5.0** (all in the contract; each has a CLI verb)
 - `GET /admin/workflow-types/reachability` — safe-handler-removal pre-flight (#520).
 - `GET` / `PATCH /admin/workflow-types/{workflow_name}/run-defaults` — runtime SLA, execution-timeout and chain-cap override (#2387, #2406).
 - `GET /admin/overrides` — every schedule and run-default override, with actor, reason and time (#2388).
+- `GET` / `PUT` / `DELETE /admin/agents/{kind}/sampling-policy` — the sampling policy of an agent kind. Only an operator sets or resets it (#2439).
 - `GET /agents/{kind}/profile`, `.../versions`, `.../versions/{version}`, `.../diff` and `POST .../activate`, `.../rollback` — agent profile overlays (#2374).
 - `GET` and `PUT /agents/{kind}/profile/policy`, `POST .../policy/reset` and `GET .../policy/changes` — the refine policy of an agent kind (#2394).
 - `GET /dags/{dag_name}/runs/{run_exec_id}` — DAG run graph view (#690).

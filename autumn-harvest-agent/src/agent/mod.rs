@@ -508,9 +508,11 @@ pub struct PeerReply {
 ///
 /// An op that holds a key of the refine policy fails to decode (issue
 /// #2394). So no op can carry a policy into the refine loop. See
-/// [`policy_key`](crate::refine::policy::policy_key). The decoder reads
-/// the op as JSON first, so an op decodes only from a self-describing
-/// format. Each op is JSON on the wire and in history.
+/// [`policy_key`](crate::refine::policy::policy_key). An op that holds a
+/// name of [`SAMPLING_POLICY_FIELDS`](crate::sampling::SAMPLING_POLICY_FIELDS)
+/// fails too (issue #2439). The decoder reads the op as JSON first, so an
+/// op decodes only from a self-describing format. Each op is JSON on the
+/// wire and in history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", remote = "Self")]
 #[non_exhaustive]
@@ -545,10 +547,13 @@ impl Serialize for AgentOp {
     }
 }
 
+/// The wire form is internally tagged, so the fields of each variant are at
+/// the top level. A signal therefore never carries a policy.
 impl<'de> Deserialize<'de> for AgentOp {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error as _;
         let value = serde_json::Value::deserialize(deserializer)?;
+        crate::sampling::refuse_policy_fields::<D::Error>(&value, "an AgentOp")?;
         if let Some(key) = crate::refine::policy::policy_key(&value) {
             return Err(D::Error::custom(format!(
                 "an agent op never carries the refine policy key {key:?}"

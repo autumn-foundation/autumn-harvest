@@ -159,6 +159,14 @@ name = "overlay_store_postgres"
 required-features = ["postgres"]
 
 [[test]]
+name = "sampling_policy_postgres"
+required-features = ["postgres"]
+
+[[test]]
+name = "sampling_policy"
+required-features = ["sqlite"]
+
+[[test]]
 name = "overlay_read"
 required-features = ["sqlite"]
 
