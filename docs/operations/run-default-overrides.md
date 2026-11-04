@@ -194,10 +194,17 @@ a policy, adds a `concurrency_raise` report:
 The raise updates 500 rows per transaction. It skips a row that another
 transaction holds, for example a row that a worker claims at that moment.
 Another process stores the old limit on a start until its cache reloads,
-within about 6 seconds. So the route raises the rows again 10 seconds later.
-That second raise also lifts a row that the first one skipped. Each raise
-runs in its own task, so a client that disconnects stops neither one. A
-shard that the second raise cannot reach goes to the log as a warning.
+within about 6 seconds. So the route raises the rows again 10 seconds, 1
+minute and 5 minutes later. A later raise also lifts a row that an earlier
+one skipped, or a start that a caller transaction held uncommitted. Each
+raise runs in its own task, so a client that disconnects stops none of them.
+A shard that a later raise cannot reach goes to the log as a warning. A start
+that stays uncommitted past the last raise keeps the old cap. Send the same
+request again to raise it.
+
+On a shard other than the default one, each batch of a raise holds the type
+lock of the default shard until it commits. A change of the override takes
+the same lock. So a newer, lower limit never meets a stale raise.
 
 `GET /admin/concurrency` reports `code_limit`, `override_limit` and
 `effective_limit` for each workflow type with a concurrency policy in a

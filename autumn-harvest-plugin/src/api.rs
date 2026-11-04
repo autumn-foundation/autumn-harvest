@@ -421,7 +421,7 @@ pub struct HarvestApiState {
     /// Server-side ceiling on the chain-scoped lifetime cap AND fleet-wide chain
     /// default (issue #617). `None` = no chain cap applied fleet-wide.
     max_workflow_chain_timeout: Arc<Mutex<Option<std::time::Duration>>>,
-    /// The wait before the second raise of the waiting starts (issue #2407).
+    /// The base wait before the settle raises of the live rows (issue #2407).
     concurrency_raise_settle_delay: Arc<Mutex<std::time::Duration>>,
     /// SSE keepalive comment interval (issue #324). Default 15 s.
     sse_keepalive_interval: Arc<Mutex<std::time::Duration>>,
@@ -646,7 +646,7 @@ impl HarvestApiState {
             .unwrap_or_else(PoisonError::into_inner) = ceiling;
     }
 
-    /// Set the wait before the second raise of the waiting starts (issue
+    /// Set the base wait before the settle raises of the live rows (issue
     /// #2407). A test sets a short wait.
     pub fn set_concurrency_raise_settle_delay(&self, delay: std::time::Duration) {
         *self
@@ -655,7 +655,7 @@ impl HarvestApiState {
             .unwrap_or_else(PoisonError::into_inner) = delay;
     }
 
-    /// The wait before the second raise of the waiting starts (issue #2407).
+    /// The base wait before the settle raises of the live rows (issue #2407).
     #[must_use]
     pub fn concurrency_raise_settle_delay(&self) -> std::time::Duration {
         *self

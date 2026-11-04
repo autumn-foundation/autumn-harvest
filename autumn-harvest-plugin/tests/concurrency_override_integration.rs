@@ -538,33 +538,47 @@ async fn the_route_refuses_a_limit_that_cannot_apply() {
     );
 }
 
-/// AC2: the settle pass raises a start that a process stored with the old cap
-/// after the first pass, for example before its cache reloaded.
+/// AC2: the settle passes raise a start that a process stored with the old
+/// cap after the first raise, for example before its cache reloaded. A later
+/// pass raises a row that an earlier pass missed.
 #[tokio::test]
-async fn the_settle_pass_raises_a_late_start() {
+async fn the_settle_passes_raise_a_late_start() {
     let (url, _db) = setup_database().await;
-    let app = build_app_with_settle(&build_pool(&url), Duration::from_millis(300));
+    // The passes run 0.1 s, 0.6 s and 3 s after the change.
+    let app = build_app_with_settle(&build_pool(&url), Duration::from_millis(100));
     let (status, body) = patch(&app, DEFER_WF, json!({ "concurrency_limit": 5 })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
     // A start from a process with a stale cache stores the code limit.
     let late = start(&app, DEFER_WF, json!({ "tenant": "acme" })).await;
-    let mut conn = connect(&url).await;
+    store_cap(&url, late, 2).await;
+    wait_for_cap(&url, late, 5, "the first settle pass").await;
+
+    // A row that the earlier passes missed is raised by a later one.
+    store_cap(&url, late, 2).await;
+    wait_for_cap(&url, late, 5, "a later settle pass").await;
+}
+
+async fn store_cap(url: &str, exec_id: Uuid, cap: i32) {
+    let mut conn = connect(url).await;
     diesel::sql_query(
-        "UPDATE harvest_task_queue SET concurrency_cap = 2 WHERE workflow_exec_id = $1",
+        "UPDATE harvest_task_queue SET concurrency_cap = $2 WHERE workflow_exec_id = $1",
     )
-    .bind::<SqlUuid, _>(late)
+    .bind::<SqlUuid, _>(exec_id)
+    .bind::<Integer, _>(cap)
     .execute(&mut conn)
     .await
     .expect("store the old cap");
+}
 
+async fn wait_for_cap(url: &str, exec_id: Uuid, cap: i32, what: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while task(&url, late).await.0 != Some(5) {
+    while task(url, exec_id).await.0 != Some(cap) {
         assert!(
             std::time::Instant::now() < deadline,
-            "the settle pass must raise the late start"
+            "{what} must raise the late start"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

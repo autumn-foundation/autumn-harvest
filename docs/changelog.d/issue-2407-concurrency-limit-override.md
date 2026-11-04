@@ -10,8 +10,8 @@ of the other run-default fields. `GET` shows it in `code`, `override` and
 applies to the next start. A run in flight keeps its task and its cap, and a
 lower limit cancels no run. A higher limit raises the stored cap of each live
 task row of the type on every shard, so the next claim admits the waiting
-starts. A second raise 10 seconds later lifts the starts that a process with
-a stale cache stored. The response reports `concurrency_raise.raised_tasks`.
+starts. Further raises 10 seconds, 1 minute and 5 minutes later lift the
+starts that a process with a stale cache stored. The response reports `concurrency_raise.raised_tasks`.
 Clearing the override restores the code value. The route refuses a limit for
 a type with no concurrency policy, for a latest-wins type
 (`cancel_running`), and a limit of zero or above 2147483647. A later drop of

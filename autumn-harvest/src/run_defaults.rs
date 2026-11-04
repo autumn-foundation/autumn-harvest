@@ -782,12 +782,17 @@ mod db {
     /// The pass only raises. It never lowers a cap. So a lower limit applies
     /// to the next start only.
     ///
-    /// The update runs in batches of [`RECOMPUTE_BATCH`] rows. Each batch is
-    /// one transaction under the lock of the type, and it skips a row that
-    /// another transaction holds. Under that lock it reads the stored override
-    /// from `store`, the default shard. `None` means that `conn` is the
-    /// default shard. If the effective limit of `code` is no longer `limit`, a
-    /// newer change replaced it, and the pass stops.
+    /// The update runs in batches of [`RECOMPUTE_BATCH`] rows, and it skips a
+    /// row that another transaction holds. Each batch takes the lock of the
+    /// type on the default shard, then reads the stored override there. If
+    /// the effective limit of `code` is no longer `limit`, a newer change
+    /// replaced it, and the pass stops.
+    ///
+    /// `store` is the default shard. `None` means that `conn` is the default
+    /// shard, and one transaction holds the lock and the update. Otherwise a
+    /// transaction on `store` holds the lock until the batch on `conn`
+    /// commits. A change of the override takes the same lock. So a newer,
+    /// lower limit cannot commit between the check and the update.
     ///
     /// # Errors
     ///
@@ -827,33 +832,51 @@ mod db {
             WHERE t.id = batch.id";
 
         let cap = i32::try_from(limit).unwrap_or(i32::MAX);
+        let effective = |stored: Option<RunDefaultOverride>| {
+            stored
+                .map_or(Some(code), |stored| {
+                    stored.fields.apply_concurrency(Some(code))
+                })
+                .map(|policy| policy.limit)
+        };
+        let update = async |conn: &mut AsyncPgConnection| {
+            diesel::sql_query(RAISE_SQL)
+                .bind::<Text, _>(workflow_name)
+                .bind::<Integer, _>(cap)
+                .bind::<BigInt, _>(RECOMPUTE_BATCH)
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)
+        };
         let mut raised = 0_u64;
         loop {
-            let store = store.as_deref_mut();
-            let batch = Box::pin(conn.transaction(async |conn| {
-                lock_type(conn, workflow_name).await?;
-                let stored = match store {
-                    Some(store) => get_run_default_override(store, workflow_name).await?,
-                    None => get_run_default_override(conn, workflow_name).await?,
-                };
-                let current = stored
-                    .map_or(Some(code), |stored| {
-                        stored.fields.apply_concurrency(Some(code))
-                    })
-                    .map(|policy| policy.limit);
-                if current != Some(limit) {
-                    return Ok(None);
+            let batch = match store.as_deref_mut() {
+                None => {
+                    Box::pin(conn.transaction(async |conn| {
+                        lock_type(conn, workflow_name).await?;
+                        let stored = get_run_default_override(conn, workflow_name).await?;
+                        if effective(stored) != Some(limit) {
+                            return Ok(None);
+                        }
+                        update(conn).await.map(Some)
+                    }))
+                    .await?
                 }
-                diesel::sql_query(RAISE_SQL)
-                    .bind::<Text, _>(workflow_name)
-                    .bind::<Integer, _>(cap)
-                    .bind::<BigInt, _>(RECOMPUTE_BATCH)
-                    .execute(conn)
-                    .await
-                    .map(Some)
-                    .map_err(crate::error::database_error)
-            }))
-            .await?;
+                Some(store) => {
+                    let conn = &mut *conn;
+                    Box::pin(store.transaction(async |store| {
+                        lock_type(store, workflow_name).await?;
+                        let stored = get_run_default_override(store, workflow_name).await?;
+                        if effective(stored) != Some(limit) {
+                            return Ok(None);
+                        }
+                        Box::pin(conn.transaction(async |conn| update(conn).await))
+                            .await
+                            .map(Some)
+                    }))
+                    .await?
+                }
+            };
             let Some(updated) = batch else {
                 return Ok(CapRaise {
                     raised,

@@ -37,6 +37,12 @@ struct Hold {
 }
 
 async fn setup_db() -> (AsyncPgConnection, Hold) {
+    let (conn, hold, _) = setup_db_with_url().await;
+    (conn, hold)
+}
+
+/// Also returns the URL, so a test can open more connections.
+async fn setup_db_with_url() -> (AsyncPgConnection, Hold, String) {
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         let shared = crate::run_defaults_db_tests::SHARED_DB.lock().await;
         let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
@@ -47,7 +53,7 @@ async fn setup_db() -> (AsyncPgConnection, Hold) {
             _container: None,
             _shared: Some(shared),
         };
-        return (conn, hold);
+        return (conn, hold, url);
     }
     let container = Postgres::default()
         .with_tag("16")
@@ -65,7 +71,26 @@ async fn setup_db() -> (AsyncPgConnection, Hold) {
         _container: Some(container),
         _shared: None,
     };
-    (conn, hold)
+    (conn, hold, url)
+}
+
+/// A fresh, migrated database on the same server. It stands in for a shard
+/// that is not the default shard.
+async fn other_shard(url: &str) -> AsyncPgConnection {
+    let name = format!("conc_ovr_shard_{}", Uuid::new_v4().simple());
+    let mut admin = AsyncPgConnection::establish(url).await.expect("connect");
+    admin
+        .batch_execute(&format!("CREATE DATABASE \"{name}\""))
+        .await
+        .expect("create the shard database");
+    let (server, _) = url.rsplit_once('/').expect("a database in the URL");
+    let mut conn = AsyncPgConnection::establish(&format!("{server}/{name}"))
+        .await
+        .expect("connect to the shard");
+    conn.batch_execute(&autumn_harvest::test_init_sql())
+        .await
+        .expect("migrate the shard");
+    conn
 }
 
 /// A unique type name, so rows of another test never match.
@@ -423,4 +448,52 @@ async fn the_raise_pass_crosses_a_batch_boundary() {
 
     assert_eq!(raise.raised, u64::try_from(rows).expect("fits"));
     assert!(!raise.superseded);
+}
+
+/// A raise on another shard holds the type lock of the default shard while it
+/// updates. A change of the override takes that lock. So a newer, lower limit
+/// cannot commit between the check of the limit and the update. The stale
+/// raise then never lifts the rows that the lower limit stored.
+#[tokio::test]
+async fn a_raise_on_another_shard_waits_for_the_override_lock() {
+    let (mut default_shard, _hold, url) = setup_db_with_url().await;
+    let wf = type_name("raise_remote");
+    change(&mut default_shard, &wf, set_limit(4))
+        .await
+        .expect("set");
+    let mut shard = other_shard(&url).await;
+    let waiting = seed(&mut shard, &wf, Some(1)).await;
+
+    // A change of the override holds this lock, as in `update_run_default_override`.
+    let mut writer = AsyncPgConnection::establish(&url).await.expect("connect");
+    writer
+        .batch_execute(&format!(
+            "BEGIN; SELECT pg_advisory_xact_lock(hashtext('harvest:run_defaults:{wf}')::int8)"
+        ))
+        .await
+        .expect("hold the type lock");
+
+    let name = wf.clone();
+    let raise = tokio::spawn(async move {
+        let outcome =
+            raise_waiting_concurrency_caps(&mut shard, Some(&mut default_shard), &name, CODE, 4)
+                .await;
+        (outcome, shard)
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !raise.is_finished(),
+        "the raise must wait for the type lock of the default shard"
+    );
+
+    writer.batch_execute("COMMIT").await.expect("release");
+    let (outcome, mut shard) = raise.await.expect("join");
+    assert_eq!(
+        outcome.expect("raise"),
+        CapRaise {
+            raised: 1,
+            superseded: false
+        }
+    );
+    assert_eq!(cap(&mut shard, waiting).await, Some(4));
 }

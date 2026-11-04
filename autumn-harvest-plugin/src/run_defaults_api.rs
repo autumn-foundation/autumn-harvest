@@ -462,22 +462,30 @@ async fn on_every_shard(pool: &HarvestDbPool, workflow_name: &str, job: ShardJob
     pass
 }
 
-/// The wait before the second raise of the waiting starts (issue #2407).
+/// The base wait before the settle raises of the live rows (issue #2407).
 ///
 /// Another process applies the new limit only after its cache reloads,
 /// within [`RUN_DEFAULTS_TTL`] plus one refresh period. A start that it
-/// stores before then takes the old cap. The second raise lifts that start.
-/// It also lifts a row that the first raise skipped, because another
+/// stores before then takes the old cap. A settle raise lifts that start. It
+/// also lifts a row that an earlier raise skipped, because another
 /// transaction held it.
 pub const CONCURRENCY_RAISE_SETTLE_DELAY: Duration =
     Duration::from_secs(2 * RUN_DEFAULTS_TTL.as_secs());
 
-/// Raise the stored cap of the live rows of a type on every shard, now and
-/// again after the settle delay (issue #2407).
+/// The settle raises run at these multiples of the base wait: 10 seconds,
+/// 1 minute and 5 minutes with [`CONCURRENCY_RAISE_SETTLE_DELAY`].
 ///
-/// Each raise runs in its own task, so a client that disconnects stops
-/// neither one. The response reports the first raise. The second one logs a
-/// shard that it could not reach.
+/// A later raise lifts a row that an earlier one missed. For example, a
+/// caller transaction can hold an uncommitted start through the first one.
+const SETTLE_MULTIPLES: [u32; 3] = [1, 6, 30];
+
+/// Raise the stored cap of the live rows of a type on every shard, now and
+/// again at each settle wait (issue #2407).
+///
+/// Each raise runs in its own task, so a client that disconnects stops none
+/// of them. The response reports the first raise. A settle raise logs a
+/// shard that it could not reach. A settle raise stops when a newer change
+/// replaced the limit.
 async fn raise_on_every_shard(
     api_state: &HarvestApiState,
     pool: &HarvestDbPool,
@@ -491,12 +499,19 @@ async fn raise_on_every_shard(
         let workflow_name = workflow_name.to_string();
         tokio::spawn(async move { on_every_shard(&pool, &workflow_name, job).await })
     };
-    let delay = api_state.concurrency_raise_settle_delay();
+    let base = api_state.concurrency_raise_settle_delay();
     let pool = pool.clone();
     let name = workflow_name.to_string();
     tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        on_every_shard(&pool, &name, job).await;
+        let mut waited = Duration::ZERO;
+        for multiple in SETTLE_MULTIPLES {
+            let at = base * multiple;
+            tokio::time::sleep(at.saturating_sub(waited)).await;
+            waited = at;
+            if on_every_shard(&pool, &name, job).await.superseded {
+                break;
+            }
+        }
     });
     let pass = first.await.map_err(|error| {
         AutumnError::internal_server_error_msg(format!("concurrency raise failed: {error}"))

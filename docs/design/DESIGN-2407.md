@@ -46,7 +46,7 @@ shows the cap, but only a deploy changes it.
 8. Let a latest-wins type take an override, and make the supersede respect
    the caps of the runs that it cancels.
 
-Decision: 1, 4 and 5, plus a second raise after the cache TTL. Option 2
+Decision: 1, 4 and 5, plus settle raises after the cache TTL. Option 2
 duplicates the cache and the route. Option 3 needs the override on every
 shard and changes the hot claim query. Option 6 adds a write to the start
 path. Option 7 slows the runs in flight. Option 8 changes the supersede and
@@ -61,9 +61,9 @@ its lock order for a type that gains nothing from an override.
 | A latest-wins type cancels runs after the override drops. | The route refuses every override for a latest-wins type. The resolver also ignores a stored one. |
 | A lower limit stops a run in flight. | No pass lowers a stored cap. A successor or a retry takes the larger of its stored cap and the current limit. |
 | A raise leaves a waiting start or a parked run behind its old cap. | The `PATCH` raises each PENDING or RUNNING workflow task row of the type, on every shard. |
-| A process with a stale cache stores the old cap after the raise. | A second raise runs after twice the cache TTL. It also lifts a row that the first raise skipped. |
+| A process with a stale cache stores the old cap after the raise. | Settle raises run at 10 seconds, 1 minute and 5 minutes. They also lift a row that an earlier raise skipped, or a start that a caller transaction held. |
 | A client disconnects and the raise stops. | Each raise runs in its own task. |
-| Two changes race, and an old raise runs after a newer lower limit. | Each raise batch takes the type lock and reads the stored override. It stops when the effective limit changed. |
+| Two changes race, and an old raise runs after a newer lower limit. | Each raise batch takes the type lock of the default shard and reads the stored override there. It holds that lock until its update commits, on every shard. It stops when the effective limit changed. |
 | A raise holds many row locks on the hot task table. | It updates 500 rows per transaction, with `SKIP LOCKED`. |
 | A limit of zero, or one past the `INTEGER` column. | The write refuses both. The table `CHECK` refuses zero. |
 | An override on a type with no policy, or on a DAG. | The route refuses it. A start of such a type has no key. |
@@ -109,8 +109,8 @@ its lock order for a type that gains nothing from an override.
   for a type with no policy and for a latest-wins type. `code`, `override`
   and `effective` report it.
 - A `PATCH` that names `concurrency_limit` or `clear_override` runs
-  `raise_waiting_concurrency_caps` on every shard, now and again after
-  `CONCURRENCY_RAISE_SETTLE_DELAY`. The response reports the first raise as
+  `raise_waiting_concurrency_caps` on every shard, now and again at 1, 6
+  and 30 times `CONCURRENCY_RAISE_SETTLE_DELAY`. The response reports the first raise as
   `concurrency_raise.raised_tasks`, `unavailable_shards` and `superseded`.
 - `GET /admin/concurrency` adds `code_limit`, `override_limit` and
   `effective_limit` to each workflow type with a policy in a `workflow`
