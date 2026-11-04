@@ -59,12 +59,11 @@ env:
   # `manifest-key` names each job and leg, so prefetch stays per workload.
   # `docs/rnd/2026-11-04-kache-compile-cache.md` lists the setup.
   #
-  # Fallback: the GitHub Actions cache, for a fork PR or a repository with no
-  # bucket. The action keys that cache by `Cargo.lock` alone, with no job
-  # name. So each job and matrix leg passes `kache-g<N>-<job>-<job-index>` as
-  # its prefix. Without it, the first leg to save wins. An entry is never
-  # replaced, so this store freezes at its first save for each `Cargo.lock`.
-  # A failed job still saves its store. Bump `g<N>` to drop a bad store.
+  # No fallback: without the bucket, a job builds from an empty local store
+  # and saves nothing. The GitHub Actions cache is off (`github-cache: false`).
+  # One run saved 0.4 to 0.5 GB per job leg there, over 35 legs. That passed
+  # the repository quota, so GitHub evicted the oldest kache stores in the
+  # same run, and the rust-cache entries of other branches.
   #
   # rust-cache used to set CARGO_INCREMENTAL=0 itself. kache does not, and an
   # incremental build gives path crates another codegen-units value, so the
@@ -193,7 +192,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -859,7 +858,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -978,7 +977,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -1424,7 +1423,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -1777,7 +1776,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -1945,7 +1944,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -2014,7 +2013,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -2067,7 +2066,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -2187,7 +2186,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -2279,7 +2278,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -2316,7 +2315,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -2355,7 +2354,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -2400,7 +2399,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -2439,7 +2438,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -2486,7 +2485,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -2519,7 +2518,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -2594,7 +2593,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -2621,7 +2620,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -2686,7 +2685,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -2870,7 +2869,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -2926,7 +2925,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
@@ -2959,7 +2958,7 @@ jobs:
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
-          cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
+          github-cache: false
           cache-executables: true
           pr-comment: false
           s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}

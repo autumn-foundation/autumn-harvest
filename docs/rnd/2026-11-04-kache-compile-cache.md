@@ -2,7 +2,7 @@
 
 > **Status: trial in progress on PR #2551.** CI uses kache through
 > `kunobi-ninja/kache-action`. The S3 backend waits for the setup below.
-> Until then, each job falls back to the GitHub Actions cache.
+> Until then, each job builds from an empty local store.
 
 Started 2026-11-04 on `trunk-dev` `429cd9a`.
 
@@ -26,8 +26,8 @@ workflow `env` block gives the reasons. In short:
   Each workspace crate then misses, as a local test showed.
 - The kache step runs after any step that deletes `$AGENT_TOOLSDIRECTORY`,
   because the action installs kache there.
-- With a bucket configured, the backend is S3. Without one, it is the GitHub
-  Actions cache, keyed per job and matrix leg.
+- The backend is S3. The GitHub Actions cache is off. The trial measured why;
+  see "Results" below.
 
 ## 🪣 S3 setup
 
@@ -50,7 +50,7 @@ freezes at the first save for each `Cargo.lock`.
      `https://<account-id>.r2.cloudflarestorage.com`.
 4. **Add repository secrets**: `KACHE_S3_ACCESS_KEY_ID` and
    `KACHE_S3_SECRET_ACCESS_KEY`. A job uses the bucket only when the key secret
-   is set. A fork PR gets no secrets, so it falls back to the GitHub cache.
+   is set. A fork PR gets no secrets, so it builds with no cache.
 5. **Protect `trunk-dev`.** On GitHub Actions, kache writes only from a push to
    a branch that GitHub reports as protected (`GITHUB_REF_PROTECTED=true`).
    `KACHE_REMOTE_READONLY=0` does not override that. On 2026-11-04,
@@ -97,10 +97,24 @@ little more than rust-cache.
 
 ### CI, GitHub Actions cache backend
 
-The baseline is the per-job median of 8 recent rust-cache runs. Only
-successful jobs count. One runner can take twice as long as another for the
-same job, so the table shows the range too.
+These runs used the GitHub Actions cache, before the switch to S3. The
+baseline is the per-job median of 8 recent rust-cache runs. Only successful
+jobs count. One runner can take twice as long as another for the same job,
+so a single run is not a fair comparison.
 
-Cold run (empty kache store), first 17 jobs to finish: 134 job-minutes, against
-a baseline median of 124 (+8%). Every job except
-`Clippy (whole workspace)` (+47%) fell inside its baseline range.
+| Set of jobs | rust-cache median | kache cold | kache warm |
+|---|---|---|---|
+| 17 jobs that finished in both kache runs | 126 job-min | 147 (+17%) | 68 (−45%) |
+| The 10 of them whose warm run restored a store | 91 job-min | 99 (+8%) | 30 (−67%) |
+
+The cold run had an empty store, and the warm run changed no Rust source. So
+the warm column is the best case. It matches a PR that touches no workspace
+crate. A PR that edits `autumn-harvest` misses for that crate and for every
+crate and test binary above it.
+
+**The GitHub cache cannot hold the stores.** One run saved 0.4 to 0.5 GB per
+job leg, compressed, over 35 legs. That passes the repository quota. GitHub
+evicts the least recently used entry first. In the warm run, the 7 jobs whose
+stores were saved first all missed, and every job saved later hit. The same
+eviction removes the rust-cache entries of other branches. So the workflow no
+longer uses the GitHub cache, and the store moves to S3.
