@@ -1034,6 +1034,38 @@ let comparison = compare(&history, &first, &second).await?;
 assert_ne!(comparison.first.overlay_digest, comparison.second.overlay_digest);
 ```
 
+### Score a comparison
+
+Divergence is not quality. `Candidate::scorer` adds a `score::Scorer`
+(issues #2441 and #2447). The report then holds a verdict for each run end.
+
+```rust,ignore
+use autumn_harvest_agent::eval::{Candidate, compare};
+use autumn_harvest_agent::score::{ExactMatch, Scorer, Verdict};
+
+let scorer: Arc<dyn Scorer> = Arc::new(ExactMatch::new("42"));
+let harness = Arc::new(AgentHarness::new(fallback).model_named("a", a).model_named("b", b));
+let first = Candidate::shared(Arc::clone(&harness)).model("a").scorer(Arc::clone(&scorer));
+let second = Candidate::shared(harness).model("b").scorer(scorer);
+let comparison = compare(&history, &first, &second).await?;
+// The source answered "41", the first candidate "42", the second "40".
+assert!(comparison.first.recorded_verdict.as_ref().is_some_and(Verdict::is_reject));
+assert_eq!(comparison.first_verdict(), Some(&Verdict::score(1.0)?));
+assert!(comparison.second_verdict().is_some_and(Verdict::is_reject));
+```
+
+| Part | In a scored evaluation |
+|---|---|
+| `recorded_verdict` | The verdict on the source end. The source run had no scorer, so the harness scores the recorded report. It does not read a verdict from history. |
+| `candidate_verdict` | The verdict on the candidate end. |
+| A failed end | No verdict. The scorer never sees it. |
+| `scorer_usage` | The tokens of the judge calls. They are not in the candidate usage. It is zero for a scorer that calls no judge. |
+| A judge | A live call to a model of the candidate harness, through `ScoreContext::chat`, as the candidate model is. The evaluation writes no ledger row. |
+| The order | The harness scores the source before the first candidate model call. So a scorer that fails on the source costs no candidate call. A scorer that fails only on the candidate end fails after the candidate run. |
+| A scorer error | `EvalError::Scorer` with the side: `Recorded` for the source end, `Candidate` for the candidate end. Its `usage` holds the tokens of each judge call before the error. The report of the candidate run is lost. An error is not a reject. `AgentHarness::score_timeout` bounds each score. |
+| `compare` | Each evaluation holds both verdicts. `Comparison::first_verdict` and `second_verdict` give the verdict of each candidate. Two candidates with the same scorer and harness share one source verdict. The first evaluation holds its tokens. |
+| No scorer | Each field is `None`, and the JSON has no new key. |
+
 Each candidate turn is a live model call. `Candidate::max_turns` caps them.
 The default cap is the recorded turn count plus `DEFAULT_EXTRA_TURNS`. The
 report sets `turn_cap_reached` when the cap stops the candidate. Each engine
@@ -1071,13 +1103,14 @@ let chosen = &pool[report.resolve(&pick).ok_or("not in the pool")?.index];
 |---|---|
 | `AnonId` | `eval::anon::assign` gives the ids, as for an evidence bundle. The key of a candidate is `Candidate::digest`. An id is `c-` and a hex prefix of `SHA-256(seed, source run id, Candidate::digest)`. The prefix has at least 12 digits. It grows until no two ids are equal. `formal/verus/src/agent_anonymise.rs` proves the width rule. |
 | The order | The pool lists the ids in order. The input order changes no id and no text. The candidates also run in pool order. |
-| `text` | `AnonymisedPool::render`: the source end, then per id the counts, the end, each turn verdict, and each turn decision as JSON. It holds no model name, overlay digest, label or input index. |
+| `text` | `AnonymisedPool::render`: the source end, then per id the counts, the end, each scorer verdict, each turn verdict, and each turn decision as JSON. It holds no model name, overlay digest, label or input index. |
 | `pool` | The same content as JSON. Each `AnonymisedEvaluation` keeps every field of `Evaluation` except `overlay_digest`. The recorded end is in the pool once. |
 | `key` | Each id with its `CandidateRef`: the input index, the candidate digest, the overlay digest and the label. Keep it from the reader. `AnonymisedReport` does not implement `Serialize`, and its `Debug` form hides the key. |
-| A failure text | Each run end error and report error replaces each label, digest, route and model id of the pool with `[redacted]`. The source end gets the same treatment. Each route that a run asks for counts, with the model id behind it in each harness. So a route that a candidate keeps from the source, such as the model of a recorded peer, counts too. Only a whole name is replaced, so a short route such as `a` also replaces that word. |
+| A failure text | Each run end error, report error and scorer reject reason replaces each label, digest, route and model id of the pool with `[redacted]`. A judge route of a scorer counts as a route. The source end gets the same treatment. Each route that a run asks for counts, with the model id behind it in each harness. So a route that a candidate keeps from the source, such as the model of a recorded peer, counts too. Only a whole name is replaced, so a short route such as `a` also replaces that word. |
 | `Candidate::label` | An operator name, such as an overlay version id. It enters the digest, never the text. |
 | `Candidate::digest` | The SHA-256 of the overlay digest, the label, the routes, the admitted models, the ceilings and the turn cap. It cannot read the harness. |
-| Equal digests | `EvalError::DuplicateCandidate` with both input indices, before any model call. Give each candidate a label. |
+| Equal digests | `EvalError::DuplicateCandidate` with both input indices, before any model call. Give each candidate a label. The scorer is not in the digest, so two candidates that differ only in the scorer need labels too. |
+| Scores | Each entry keeps its verdicts and `scorer_usage`. Each reject reason is redacted. Two candidates with the same scorer and harness share one source verdict, and only the first in pool order holds its tokens. So the scores can show which ids share a scorer or a harness. |
 
 The text renders each model reply as written, so a reply can name its own
 model. The pool keeps the token usage, and a tokenizer can show a model
