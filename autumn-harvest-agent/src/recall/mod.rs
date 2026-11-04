@@ -389,9 +389,49 @@ mod tests {
         }
     }
 
+    /// The table has one line per item and one cell per config. A mean
+    /// reads only scored rows, so a failed row never moves it. Each cell is
+    /// a hit, a miss, or a failure.
+    fn check_table(cells: &[Vec<Option<bool>>]) {
+        let configs: Vec<String> = (0..cells.len()).map(|c| format!("c{c}")).collect();
+        let width = cells.iter().map(Vec::len).min().unwrap_or(1);
+        let items: Vec<String> = (0..width).map(|i| format!("i{i}")).collect();
+        let mut rows = Vec::new();
+        for (config, column) in configs.iter().zip(cells) {
+            for (item, outcome) in items.iter().zip(column) {
+                rows.push(row(config, item, *outcome));
+            }
+        }
+        let report = RecallReport {
+            configs: configs.clone(),
+            items: items.clone(),
+            rows,
+        };
+        let table = report.to_markdown();
+        assert_eq!(table.lines().count(), items.len() + 3);
+        for line in table.lines() {
+            assert_eq!(line.matches('|').count(), configs.len() + 2);
+        }
+        assert!(!table.contains("missing"));
+        for (config, column) in configs.iter().zip(cells) {
+            let scored: Vec<f64> = column[..width]
+                .iter()
+                .filter_map(|cell| cell.map(|hit| if hit { 1.0 } else { 0.0 }))
+                .collect();
+            let want = if scored.is_empty() {
+                None
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                Some(scored.iter().sum::<f64>() / scored.len() as f64)
+            };
+            assert_eq!(report.mean(config), want);
+        }
+    }
+
+    // The macro body names no type. `cargo harvest-verify` reads the type
+    // names in a macro call that it cannot expand, and counts each one as
+    // writable (issue #2455).
     proptest! {
-        /// The table has one line per item and one cell per config. A mean
-        /// reads only scored rows, so a failed row never moves it.
         #[test]
         fn the_table_lists_every_cell_and_the_mean_skips_failures(
             cells in proptest::collection::vec(
@@ -399,35 +439,7 @@ mod tests {
                 1..4,
             )
         ) {
-            let configs: Vec<String> = (0..cells.len()).map(|c| format!("c{c}")).collect();
-            let width = cells.iter().map(Vec::len).min().unwrap_or(1);
-            let items: Vec<String> = (0..width).map(|i| format!("i{i}")).collect();
-            let mut rows = Vec::new();
-            for (config, column) in configs.iter().zip(&cells) {
-                for (item, outcome) in items.iter().zip(column) {
-                    rows.push(row(config, item, *outcome));
-                }
-            }
-            let report = RecallReport { configs: configs.clone(), items: items.clone(), rows };
-            let table = report.to_markdown();
-            prop_assert_eq!(table.lines().count(), items.len() + 3);
-            for line in table.lines() {
-                prop_assert_eq!(line.matches('|').count(), configs.len() + 2);
-            }
-            prop_assert!(!table.contains("missing"));
-            for (config, column) in configs.iter().zip(&cells) {
-                let scored: Vec<f64> = column[..width]
-                    .iter()
-                    .filter_map(|cell| cell.map(|hit| if hit { 1.0 } else { 0.0 }))
-                    .collect();
-                let want = if scored.is_empty() {
-                    None
-                } else {
-                    #[allow(clippy::cast_precision_loss)]
-                    Some(scored.iter().sum::<f64>() / scored.len() as f64)
-                };
-                prop_assert_eq!(report.mean(config), want);
-            }
+            check_table(&cells);
         }
     }
 }
