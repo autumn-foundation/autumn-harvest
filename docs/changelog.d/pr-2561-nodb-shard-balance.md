@@ -12,7 +12,9 @@ Four changes, all in `ci.yml`:
 - Five plugin lib-test steps become one. Each one selected its tests by a
   name filter: `connector`, `aws_kms`, `object_store`, `vault_transit` and
   `oidc`. Each step rebuilt the plugin crate under its own feature set. One
-  build with the union of the features runs the same tests.
+  build with the union of the features runs the same tests. Locally, the
+  five filters select 272 tests, and the union build selects the same 272.
+  All of them pass.
 - `Compile diagnose benchmark` had no shard condition, so all four Linux
   shards compiled it, for about 11 minutes each. It now runs on shard 3.
 - Five steps move to balance the measured totals: the CLI tests, the
