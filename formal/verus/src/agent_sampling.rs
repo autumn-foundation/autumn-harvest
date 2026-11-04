@@ -13,7 +13,14 @@
 //! - Each wave holds from 1 to `concurrency` draws, and the waves cover
 //!   each draw once. So no more than `concurrency` draws run at one time.
 //! - A revision moves up by one and never wraps.
+//!
+//! `sample_step` gives the next wave of an `agent_sample` run (issue
+//! #2443). A wave holds from 1 to `concurrency` draws, and never passes
+//! the planned draws. It never holds more draws than tokens are left. So
+//! each draw of a wave gets at least one token, and the shares sum to the
+//! tokens left.
 
+use vstd::arithmetic::div_mod::*;
 use vstd::prelude::*;
 
 verus! {
@@ -143,6 +150,58 @@ pub proof fn theorem_the_waves_cover_each_draw_once(draws: int, concurrency: int
         assert(start < end <= draws);
         theorem_the_waves_cover_each_draw_once(draws, concurrency, end);
     }
+}
+
+/// The next step of a sample run.
+pub enum SampleStep {
+    Wave { width: u32 },
+    Done,
+    BudgetExceeded,
+}
+
+// mirror: autumn-harvest-agent/src/sampling/admit.rs sample_step
+pub fn sample_step(draws: u32, started: u32, concurrency: u32, budgeted: bool, tokens_left: u32) -> (r: SampleStep)
+    ensures
+        r is Done <==> started >= draws,
+        r is BudgetExceeded <==> (started < draws && budgeted && tokens_left == 0),
+        r is Wave ==> 1 <= r->Wave_width,
+        r is Wave ==> started + r->Wave_width <= draws,
+        r is Wave && concurrency > 0 ==> r->Wave_width <= concurrency,
+        r is Wave && concurrency == 0 ==> r->Wave_width == 1,
+        r is Wave && budgeted ==> r->Wave_width <= tokens_left,
+{
+    if started >= draws {
+        return SampleStep::Done;
+    }
+    if budgeted && tokens_left == 0 {
+        return SampleStep::BudgetExceeded;
+    }
+    let mut width = wave_end(draws, concurrency, started) - started;
+    if budgeted && width > tokens_left {
+        width = tokens_left;
+    }
+    SampleStep::Wave { width }
+}
+
+/// Each draw of a wave gets at least one token. A wave never holds more
+/// draws than tokens are left, so the base share is at least 1.
+pub proof fn theorem_each_draw_of_a_wave_gets_a_token(left: int, width: int, index: int)
+    requires
+        1 <= width <= left,
+    ensures
+        crate::agent_siblings::share(left, width, index) >= 1,
+        crate::agent_siblings::total(left, width, width) == left,
+{
+    lemma_fundamental_div_mod(left, width);
+    lemma_mod_pos_bound(left, width);
+    let q = left / width;
+    assert(q >= 1) by (nonlinear_arith)
+        requires
+            left == width * q + left % width,
+            0 <= left % width < width,
+            width <= left,
+    ;
+    crate::agent_siblings::theorem_the_shares_sum_to_the_remainder(left, width);
 }
 
 /// `next_policy_revision` as a spec.

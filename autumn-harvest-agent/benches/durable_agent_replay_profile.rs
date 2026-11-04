@@ -210,6 +210,7 @@ fn op_of(run_id: &str) -> Result<u64, String> {
 
 fn turn(content: Vec<ContentPart>, stop: StopReason, calls: usize) -> ModelTurn {
     ModelTurn {
+        cost_usd_micros: None,
         content,
         stop,
         usage: TokenUsage::new(900, 40),

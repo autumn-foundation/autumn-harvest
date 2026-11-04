@@ -985,7 +985,12 @@ impl AgentHarness {
             };
             let mut content = response.content;
             prepare(&mut content);
+            // A hit calls no model, so it costs nothing.
+            let cost_usd_micros = (!cache_hit)
+                .then(|| priced(client.as_ref(), &response.usage))
+                .flatten();
             let mut turn = ModelTurn {
+                cost_usd_micros,
                 content,
                 stop: response.stop_reason,
                 usage: response.usage,
@@ -1084,18 +1089,7 @@ impl AgentHarness {
             );
             model = UNKNOWN_MODEL_ID;
         }
-        let cost = client.cost_usd_micros(usage).filter(|&cost| {
-            let check = LlmCall::new(UNKNOWN_MODEL_ID, 0, 0)
-                .with_cost_usd_micros(cost)
-                .validate();
-            if let Err(err) = &check {
-                tracing::warn!(
-                    error = %err,
-                    "the agent cost ledger refused the cost; recording the turn as unpriced"
-                );
-            }
-            check.is_ok()
-        });
+        let cost = priced(client.as_ref(), usage);
         let mut call = LlmCall::new(
             model,
             u64::from(usage.input_tokens),
@@ -1984,6 +1978,27 @@ pub(crate) fn cut_bytes(text: String, max: usize) -> String {
 /// the model why. A turn with many calls then stays small.
 const REASON_CUT_BYTES: usize = 256;
 
+/// The cost of one call of `client`, as the cost ledger records it.
+///
+/// A cost that the ledger refuses is `None`, so the call is unpriced. The
+/// turn and the ledger row read this one function, so they agree.
+pub(crate) fn priced(client: &dyn AgentModel, usage: &TokenUsage) -> Option<u64> {
+    use autumn_harvest::llm_ledger::LlmCall;
+
+    client.cost_usd_micros(usage).filter(|&cost| {
+        let check = LlmCall::new(UNKNOWN_MODEL_ID, 0, 0)
+            .with_cost_usd_micros(cost)
+            .validate();
+        if let Err(err) = &check {
+            tracing::warn!(
+                error = %err,
+                "the agent cost ledger refused the cost; recording the turn as unpriced"
+            );
+        }
+        check.is_ok()
+    })
+}
+
 /// Make `turn` fit the result cap, or replace it with a typed outcome.
 ///
 /// A turn that exceeds the cap would fail the activity with a `PayloadTooLarge`
@@ -2086,6 +2101,7 @@ mod tests {
     /// A turn with `content` and `decisions`, and fixed usage for checks.
     fn turn_of(content: Vec<ContentPart>, decisions: Vec<ToolDecision>) -> ModelTurn {
         ModelTurn {
+            cost_usd_micros: None,
             content,
             stop: crate::message::StopReason::EndTurn,
             usage: TokenUsage::new(7, 3),

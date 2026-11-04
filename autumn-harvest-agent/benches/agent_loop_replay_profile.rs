@@ -142,6 +142,7 @@ fn tool_result(step: u32, bytes: usize) -> String {
 /// The model turn of tool round `step`: a short narration and one call.
 fn tool_turn(step: u32) -> ModelTurn {
     ModelTurn {
+        cost_usd_micros: None,
         content: vec![
             ContentPart::Text(format!(
                 "Page {step} of the order history can hold the refund. I read it next."
@@ -170,6 +171,7 @@ fn tool_turn(step: u32) -> ModelTurn {
 /// The last model turn: the answer, with no call.
 fn final_turn(rounds: u32) -> ModelTurn {
     ModelTurn {
+        cost_usd_micros: None,
         content: vec![ContentPart::Text(format!(
             "I read {rounds} pages. The refund of the last order waits for review."
         ))],

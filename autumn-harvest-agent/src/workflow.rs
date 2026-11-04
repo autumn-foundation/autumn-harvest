@@ -83,6 +83,8 @@ pub(crate) struct Progress {
     pub(crate) messages: Vec<ChatMessage>,
     /// Tokens of the whole run, earlier segments and delegations included.
     pub(crate) usage: TokenUsage,
+    /// The priced cost of the same calls, in millionths of a US dollar.
+    pub(crate) cost_usd_micros: u64,
     /// Tool rounds of this segment. `max_steps` bounds it.
     pub(crate) steps: u32,
     /// Tool rounds of the earlier segments. Tool steps add it, so they never
@@ -192,6 +194,7 @@ impl Progress {
             run_id,
             messages,
             usage: TokenUsage::default(),
+            cost_usd_micros: 0,
             steps: 0,
             step_base: 0,
             tool_calls: 0,
@@ -247,6 +250,7 @@ impl Progress {
                 .saturating_add(self.delegated_steps),
             tool_calls: self.tool_calls.saturating_add(self.delegated_tool_calls),
             usage: self.usage,
+            cost_usd_micros: self.cost_usd_micros,
             messages: without_system(&self.messages),
             followups: self.chain,
             followup_dropped: false,
@@ -257,6 +261,11 @@ impl Progress {
             error: None,
             resets: self.reset.count,
         }
+    }
+
+    /// Add the cost of a call or of a child run.
+    pub(crate) const fn add_cost(&mut self, cost_usd_micros: u64) {
+        self.cost_usd_micros = self.cost_usd_micros.saturating_add(cost_usd_micros);
     }
 
     /// The report of a run that failed with `error`. It keeps what the run
@@ -777,6 +786,7 @@ pub(crate) async fn run_segment(
         };
 
         progress.usage = progress.usage.saturating_add(turn.usage);
+        progress.add_cost(turn.cost_usd_micros.unwrap_or(0));
         publish_turn_text(ctx, run, progress, &turn)?;
         // The activity drops a reply that does not fit the result cap. The
         // turn then holds no text and no calls, so the segment ends here.
@@ -2075,6 +2085,7 @@ async fn delegate(
     // A failed child paid for its turns, so the parent counts them.
     if ended.is_err() {
         progress.usage = progress.usage.saturating_add(child.usage);
+        progress.add_cost(child.cost_usd_micros);
     }
     let stop = ended?;
     // An interrupt that ended the child ends the round of the parent too.
@@ -2085,6 +2096,7 @@ async fn delegate(
     let steps = child.steps.saturating_add(child.delegated_steps);
     let tool_calls = child.tool_calls.saturating_add(child.delegated_tool_calls);
     progress.usage = progress.usage.saturating_add(child.usage);
+    progress.add_cost(child.cost_usd_micros);
     progress.delegated_steps = progress.delegated_steps.saturating_add(steps);
     progress.delegated_tool_calls = progress.delegated_tool_calls.saturating_add(tool_calls);
     tree.records.push(DelegationRecord {
@@ -2310,6 +2322,7 @@ fn merge_child(
     report: &AgentReport,
 ) -> ToolOutcome {
     progress.usage = progress.usage.saturating_add(report.usage);
+    progress.add_cost(report.cost_usd_micros);
     progress.delegated_steps = progress.delegated_steps.saturating_add(report.steps_used);
     progress.delegated_tool_calls = progress
         .delegated_tool_calls
@@ -2891,7 +2904,8 @@ pub async fn agent_discover_peers(
 }
 
 /// The workflows to register on a `HarvestBuilder`: `agent_loop`,
-/// `agent_heartbeat`, the durable `agent` and its pass `agent_consolidate`.
+/// `agent_heartbeat`, the durable `agent`, the strategy runs `agent_draws`
+/// and `agent_sample`, and the pass `agent_consolidate`.
 #[must_use]
 pub fn workflows() -> Vec<WorkflowInfo> {
     vec![
@@ -2899,6 +2913,7 @@ pub fn workflows() -> Vec<WorkflowInfo> {
         agent_heartbeat_info(),
         agent_info(),
         crate::sampling::agent_draws_info(),
+        crate::sampling::agent_sample_info(),
         crate::consolidate::agent_consolidate_info(),
     ]
 }
@@ -2923,6 +2938,7 @@ pub fn activities() -> Vec<ActivityInfo> {
         crate::sampling::agent_sampling_policy_info(),
         crate::refine::agent_refine_policy_info(),
         crate::score::agent_score_info(),
+        crate::score::agent_sample_score_info(),
         crate::consolidate::agent_consolidate_read_info(),
         crate::consolidate::agent_consolidate_turn_info(),
         crate::consolidate::agent_consolidate_write_info(),
@@ -2958,6 +2974,7 @@ mod tests {
             reason: "no".into(),
         };
         let turn = ModelTurn {
+            cost_usd_micros: None,
             content: Vec::new(),
             stop: StopReason::ToolUse,
             usage: TokenUsage::default(),

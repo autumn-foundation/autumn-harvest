@@ -1821,6 +1821,7 @@ mod tests {
 
     fn turn_of(calls: &[ToolCall]) -> ModelTurn {
         ModelTurn {
+            cost_usd_micros: None,
             content: calls
                 .iter()
                 .map(|call| ContentPart::ToolCall {
@@ -2184,6 +2185,7 @@ mod tests {
         assert!(!ends_differ(&failed, &RunEnd::Failed("y".into())));
         let report = |stop| {
             RunEnd::Completed(AgentReport {
+                cost_usd_micros: 0,
                 stop,
                 text: String::new(),
                 steps_used: 0,

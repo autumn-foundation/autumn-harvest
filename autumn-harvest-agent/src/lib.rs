@@ -30,7 +30,8 @@
 //!
 //! The [`sampling`] module holds the operator sampling policy of each kind
 //! (issue #2439). [`sampling::agent_draws`] reads it once, then runs the
-//! draws of a strategy.
+//! draws of a strategy. [`sampling::agent_sample`] also scores the draws
+//! and selects one (issue #2443).
 //!
 //! The [`mesh`] module lets a run delegate a task to a [`Peer`]. A
 //! [`Mandate`] bounds the delegation tree. The [`flow`] module gates a
@@ -195,8 +196,9 @@ pub use response_cache::{
     CacheIndex, CacheKey, CacheScope, InMemoryCacheIndex, KeyTenant, ResponseCache,
 };
 pub use score::{
-    ExactMatch, FiniteF64, JsonSchema, MAX_REJECT_REASON_BYTES, NonFinite, ScoreContext,
-    ScoreInput, ScoreRequest, Scorer, ToolRecord, Verdict, agent_score, agent_score_info, select,
+    ExactMatch, FiniteF64, JsonSchema, MAX_REJECT_REASON_BYTES, NonFinite, SampleScore,
+    ScoreContext, ScoreInput, ScoreRequest, Scorer, ToolRecord, Verdict, agent_sample_score,
+    agent_sample_score_info, agent_score, agent_score_info, select,
 };
 pub use skill::{LOAD_SKILL_TOOL, SkillText};
 pub use tool::{FnTool, Tool, ToolContext, ToolEffect};

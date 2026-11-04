@@ -168,6 +168,7 @@ async fn a_turn_over_the_cap_with_its_decisions_is_not_cached() {
     let (_dir, db) = fresh_db();
     let tool_call = calls(&[("c1", "lookup", json!({}))], 1);
     let bare = ModelTurn {
+        cost_usd_micros: None,
         content: tool_call.clone().unwrap().content,
         stop: StopReason::ToolUse,
         usage: TokenUsage::default(),
