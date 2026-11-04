@@ -146,6 +146,13 @@ Both replicas tick at the same interval. For most schedule rows, only one replic
 
 Expected steady-state: `lost_race / claimed ≈ 0` for fast schedules (< tick interval), `lost_race / claimed ≈ replica_count - 1` at the exact slot boundary.
 
+### Split Web and Worker Replicas
+
+Set `AUTUMN_ROLE=web` or `AUTUMN_ROLE=worker` on each replica. A `web`
+replica runs no Harvest worker and no scheduler tick. Only the `worker`
+replicas tick and claim, so the contract above holds among them. See
+[`docs/operations/process-roles.md`](../operations/process-roles.md).
+
 ### Multi-Shard
 
 Each shard has its own connection pool. Claims are shard-local — `fire_claim_token` on shard A is independent of shard B. The contract holds per-shard.
