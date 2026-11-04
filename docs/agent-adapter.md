@@ -1183,7 +1183,7 @@ so a list of the agents due to wake reads only those agents.
 | `harvest agents describe <kind>/<name>` | `GET /workflows/by-id/agent/{id}/query/harvest.entity.state` |
 | `harvest agents pause <id> --reason <text>` | `POST /workflows/by-id/agent/{id}/signal/harvest.entity.op` |
 | `harvest agents resume <id>` | the same route, with `resume` |
-| `harvest agents erase <id>` | the signal route, then `POST /workflows/{exec}/erase-payloads` for each run |
+| `harvest agents erase <id>` | the signal route, then `POST /workflows/{exec}/erase-payloads` for each run and each scheduled pass |
 | `harvest agents profile list <kind>` | `GET /agents/{kind}/profile/versions` |
 | `harvest agents profile show <kind> [--version v]` | `GET /agents/{kind}/profile`, or `GET /agents/{kind}/profile/versions/{v}` |
 | `harvest agents profile diff <kind> <a> <b>` | `GET /agents/{kind}/profile/diff?a=&b=` |
@@ -1225,8 +1225,8 @@ app must clear those stores itself.
 
 1. The agent gets `pause`, `reset_memory` and `reset_workspace`, then a
    delete. The pause holds new work and stops the ticks, so nothing writes
-   the stores after the resets. The resets clear a `MemoryStore` scope and
-   every workspace snapshot, with the scratch files of stopped puts. See
+   the stores after the resets. The resets clear a `MemoryStore` scope, the
+   episode scope and every workspace snapshot, with the scratch files of stopped puts. See
    "Scratch files" and "A save after a reset" below for the two windows
    that stay. An agent that ended gets a new run for them,
    through `POST /workflows/agent/signal-with-start` on the queue of its
@@ -1238,11 +1238,17 @@ app must clear those stores itself.
    `filter=workflow_name = 'agent' AND workflow_id = '<id>'`.
 4. It erases each run. The erasure tombstones the payloads of history, the
    entity state and its projection, and deletes the stream chunks and the
-   cost ledger rows. It cascades to each child run of a fan-out.
-5. The report sums each count over every run and child:
+   cost ledger rows. It cascades to each child run of a fan-out, and to
+   each child consolidation pass (issue #2454).
+5. It lists each consolidation pass that a schedule started, with
+   `filter=workflow_name = 'agent_consolidate' AND
+   attrs.agent_consolidation_of = '<id>'`, and erases each one that ended.
+   A pass that still runs is a failure in the report.
+6. The report sums each count over every run and child:
    `events_scrubbed`, `stream_chunks_deleted`, `ledger_rows_deleted`,
-   `entity_states_scrubbed` and the rest. It lists each skipped child and
-   each failure.
+   `entity_states_scrubbed` and the rest. `episodes_erased` and
+   `facts_erased` come from the final state. It lists each skipped child
+   and each failure.
 
 The spend of an erased run leaves the LLM budget and mesh budget sums.
 
@@ -1311,6 +1317,70 @@ as an agent.
 - A silent tick or a failed op keeps no transcript, so it changes no notes
   either.
 - `Control::ClearTranscript` clears the notes too.
+
+### Episodes and consolidation (issue #2454)
+
+`AgentProfile::episodes` keeps an episode log for each agent of a kind. It
+is off by default. It needs `AgentMemory::Store` and
+`AgentHarness::episodes`. The design is in `docs/design/DESIGN-2454.md`.
+
+```rust
+let profile = AgentProfile::new("support")
+    .memory(AgentMemory::Store)
+    .episodes(EpisodeSettings::default().every(10).max_episodes(200).model("cheap"));
+let harness = AgentHarness::new(model)
+    .memory(memory_store)
+    .episodes(episode_store)
+    .model_named("cheap", cheap_model)
+    .agent(profile);
+```
+
+- **Episode.** At the end of an op, the activity `agent_episode_append`
+  appends one episode to the scope `agent:<id>:episodes`. It holds the run
+  id, the answer cut to `max_text_bytes`, the stop, the recorded time and
+  the flow labels of the agent. The key is `episode:<run id>`, so a retry
+  or a crash appends once.
+- **Which ops.** Only a segment that keeps its transcript and may write
+  memory appends, as for progress notes. A silent tick, a failed op and a
+  read-only op append nothing.
+- **Bound.** The log keeps `max_episodes`. The oldest goes first. The next
+  pass reports each unconsolidated episode that an eviction dropped.
+- **Pass.** The workflow `agent_consolidate` reads at most
+  `max_pass_episodes` unconsolidated episodes. A model that the profile
+  mandate forbids disables the pass. It checks the LLM budget and the
+  budget of the agent mesh (issue #2272). It then calls the model once, and records one cost ledger call under the pass
+  run. Each valid fact becomes one entry of `facts_block`:
+  `<subject> <relation> <object> [episodes: <id>, ...]`.
+- **Labels.** A fact takes the labels of every episode of its pass. A
+  memory store that cannot keep labels refuses a labelled fact, and the
+  report counts it under `facts_refused`. The sources of a refused fact
+  stay unconsolidated.
+- **Trigger.** `EpisodeSettings::every(n)` runs a child pass at the `n`-th
+  append since the last pass. The op waits for it. A failed pass therefore
+  waits for `n` more appends, also when the log is full. A pass that
+  does not write all its facts fails the op with a named error. With the
+  default `ConsolidationTrigger::Schedule`, an engine schedule starts each
+  pass: register `consolidate::schedule(when, &agent_id)`. The engine keys
+  a schedule by its workflow name, so this serves one agent per
+  deployment. A second schedule replaces the first. For many agents, use
+  `every(n)`, or start each pass from the app. Issue #2540 tracks a
+  dispatcher. On SQLite, `sqlite::consolidate` starts one pass.
+- **Report.** A pass returns a `ConsolidationReport`. Its `stop` is
+  `completed`, `nothing_to_do`, `budget_exceeded`, `invalid_reply`,
+  `disabled` or `reset`. A refused budget and a reply that does not parse
+  write no fact and mark no episode. SQLite has no run budget, so a pass
+  there always passes the budget check.
+- **Erase.** `Control::ResetMemory` clears the episode scope first, then the
+  memory scope. `AgentState::episode_reset` counts the episodes and the
+  derived facts. `harvest agents erase` reports them as `episodes_erased`
+  and `facts_erased`. It also erases each pass that a schedule started, by
+  the search attribute `agent_consolidation_of`. A pass that runs across
+  the reset writes no fact after it and ends as `reset`. A pass that still
+  runs is a failure in the report, so erase again after it ends.
+
+The crate ships `InMemoryEpisodeStore`. A durable store implements
+`EpisodeStore` and calls the methods of `EpisodeLog`, so the rules are the
+same in every store.
 
 ### Workspaces (issue #2274)
 

@@ -190,6 +190,10 @@ required-features = ["sqlite"]
 name = "score_postgres"
 required-features = ["postgres"]
 
+[[test]]
+name = "episodes"
+required-features = ["sqlite"]
+
 [lints]
 workspace = true
 

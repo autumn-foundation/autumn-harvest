@@ -15,6 +15,7 @@ use crate::agent::AgentProfile;
 use crate::agent::overlay_store::ProfileOverlayStore;
 use crate::bounds::{exceeds_bytes, json_len};
 use crate::delivery::{Delivery, LogDelivery, Report};
+use crate::episode::EpisodeStore;
 use crate::error::{AgentError, ErrorKind};
 use crate::flow::{FlowRules, Released, call_labels};
 use crate::followup::FOLLOWUP_TOOL;
@@ -124,6 +125,7 @@ pub struct AgentHarness {
     cache_timeout: Duration,
     budget_timeout: Duration,
     memory: Option<Arc<dyn MemoryStore>>,
+    episodes: Option<Arc<dyn EpisodeStore>>,
     delivery: Arc<dyn Delivery>,
     precheck: Option<Arc<dyn Precheck>>,
     cache: Option<ResponseCache>,
@@ -171,6 +173,7 @@ impl AgentHarness {
             cache_timeout: DEFAULT_CACHE_TIMEOUT,
             budget_timeout: DEFAULT_BUDGET_TIMEOUT,
             memory: None,
+            episodes: None,
             delivery: Arc::new(LogDelivery),
             precheck: None,
             cache: None,
@@ -370,6 +373,60 @@ impl AgentHarness {
         self
     }
 
+    /// Set the episode store (issue #2454). A kind with
+    /// [`AgentProfile::episodes`] keeps its episode log in it.
+    #[must_use]
+    pub fn episodes(mut self, store: Arc<dyn EpisodeStore>) -> Self {
+        self.episodes = Some(store);
+        self
+    }
+
+    /// The memory store, or a non-retryable error that names the fix.
+    pub(crate) fn memory_store(&self) -> Result<&Arc<dyn MemoryStore>, String> {
+        self.memory.as_ref().ok_or_else(|| {
+            ActivityFailure::non_retryable(
+                "MemoryStoreMissing",
+                "the agent writes facts, but no memory store is installed: call AgentHarness::memory",
+            )
+            .into_error_payload()
+        })
+    }
+
+    /// The episode store, or a non-retryable error that names the fix.
+    pub(crate) fn episode_store(&self) -> Result<&Arc<dyn EpisodeStore>, String> {
+        self.episodes.as_ref().ok_or_else(|| {
+            ActivityFailure::non_retryable(
+                "EpisodeStoreMissing",
+                "the kind keeps episodes, but no episode store is installed: call AgentHarness::episodes",
+            )
+            .into_error_payload()
+        })
+    }
+
+    /// Run one store call of `what` under the hook timeout. A timeout is a
+    /// retryable failure. The store result comes back as it is.
+    pub(crate) async fn hooked_agent<T>(
+        &self,
+        what: &str,
+        call: impl std::future::Future<Output = Result<T, AgentError>>,
+    ) -> Result<Result<T, AgentError>, String> {
+        tokio::time::timeout(self.hook_timeout, call)
+            .await
+            .map_err(|_| self.hook_timed_out("StoreTimeout", what))
+    }
+
+    /// Run one store call of `what` under the hook timeout, as an activity
+    /// error payload.
+    pub(crate) async fn hooked<T>(
+        &self,
+        what: &str,
+        call: impl std::future::Future<Output = Result<T, AgentError>>,
+    ) -> Result<T, String> {
+        self.hooked_agent(what, call)
+            .await?
+            .map_err(|err| model_failure(&err))
+    }
+
     /// Set where reports go. The default is [`LogDelivery`].
     #[must_use]
     pub fn delivery(mut self, delivery: Arc<dyn Delivery>) -> Self {
@@ -491,7 +548,7 @@ impl AgentHarness {
     /// Returns a non-retryable [`MESH_BUDGET_EXCEEDED`] payload with the
     /// period end. A budget with no spend source fails closed as a config
     /// error. A failed read is retryable.
-    async fn check_mesh_budget(
+    pub(crate) async fn check_mesh_budget(
         &self,
         mesh: Option<&str>,
         now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,

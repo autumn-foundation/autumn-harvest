@@ -32,6 +32,11 @@ use crate::agent::{
     agent_workspace_floor_info, agent_workspace_reset_info, agent_workspace_retain_info,
 };
 use crate::approval::Approval;
+use crate::consolidate::{
+    CONSOLIDATE_WORKFLOW_NAME, ConsolidateTask, agent_consolidate_info,
+    agent_consolidate_read_info, agent_consolidate_turn_info, agent_consolidate_write_info,
+    agent_episode_append_info, agent_episode_reset_info,
+};
 use crate::error::{AgentError, ErrorKind};
 use crate::harness::{AgentHarness, CacheTenant};
 use crate::heartbeat::{HEARTBEAT_WORKFLOW_NAME, HeartbeatTask, agent_heartbeat_info};
@@ -55,6 +60,8 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     rt.register_workflow(&agent_loop_info());
     rt.register_workflow(&agent_heartbeat_info());
     rt.register_workflow(&agent_info());
+    rt.register_workflow(&agent_consolidate_info());
+    register_episodes(rt, &harness);
     let h = Arc::clone(&harness);
     rt.register_activity_with_body(&agent_profile_info(), move |input| {
         call(input, |kind: String| {
@@ -155,6 +162,65 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     rt.register_activity_with_body(&agent_precheck_info(), move |input| {
         call(input, |task| harness.precheck_tick(task))
     });
+}
+
+/// Register the activities of the episode log and of its pass (issue
+/// #2454). The model turn records its ledger call with the completion.
+fn register_episodes(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_episode_append_info(), move |input| {
+        call(input, |append| {
+            let h = Arc::clone(&h);
+            async move { crate::consolidate::append_episode(&h, append).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_episode_reset_info(), move |input| {
+        call(input, |erase| {
+            let h = Arc::clone(&h);
+            async move { crate::consolidate::erase_episodes(&h, erase).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_consolidate_read_info(), move |input| {
+        call(input, |agent: AgentId| {
+            let h = Arc::clone(&h);
+            async move { crate::consolidate::read_pass(&h, &agent).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_consolidate_write_info(), move |input| {
+        call(input, |write| {
+            let h = Arc::clone(&h);
+            async move { crate::consolidate::write_facts(&h, write).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_ledger(&agent_consolidate_turn_info(), move |input, at| {
+        call_with_ledger(input, |turn| {
+            let h = Arc::clone(&h);
+            async move {
+                // SQLite has no run budget, so the turn passes the check.
+                let pass = Box::new(|| Box::pin(async { Ok(()) }) as BoxFuture<'_, _>);
+                let (facts, calls) = crate::consolidate::run_turn(&h, turn, pass, at).await;
+                facts.map(|facts| (facts, calls))
+            }
+        })
+    });
+}
+
+/// Start one consolidation pass of the agent `id` (issue #2454). Returns
+/// its execution id. Drive it with `SqliteRuntime::run_until_blocked`.
+///
+/// Use it with `ConsolidationTrigger::Schedule`, or pass
+/// `consolidate::schedule` to `SqliteRuntime::upsert_schedule`.
+///
+/// # Errors
+///
+/// Returns an error when the runtime cannot record the start.
+pub fn consolidate(rt: &mut SqliteRuntime, id: &AgentId) -> SqliteResult<ExecutionId> {
+    let task = ConsolidateTask { agent: id.clone() };
+    rt.start_workflow(CONSOLIDATE_WORKFLOW_NAME, serde_json::to_value(task)?)
 }
 
 /// Start one agent run. Returns its execution id.

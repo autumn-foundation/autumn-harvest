@@ -26,6 +26,21 @@ proof fn lemma_apply_all_is_the_union(floor: int, above: Set < int >, applied: S
 pub proof fn theorem_each_number_applies_once(seqs: Seq < int >, i: int) requires forall | j: int | 0 <= j < seqs.len() ==> 1 <= #[trigger] seqs [j], 0 <= i < seqs.len(), ensures ({ let before = apply_all(0, Set::empty(), seqs.take(i)); spec_is_new(before.0, seqs [i], before.1.contains(seqs [i])) ==! seqs.take(i).contains(seqs [i],) }), encodes(apply_all(0, Set::empty(), seqs).0, apply_all(0, Set::empty(), seqs).1, seqs.to_set(),),
 pub proof fn theorem_the_bound_makes_no_false_duplicate(floor: int, above: Set < int >, applied: Set < int >, seq: int, forgot: int,) requires sound(floor, above, applied), 1 <= seq, ensures ! spec_is_new(floor, seq, above.contains(seq)) ==> applied.contains(seq), sound(apply(floor, above, seq).0, apply(floor, above, seq).1, applied.insert(seq)), sound(floor, above.remove(forgot), applied),
 
+## formal/verus/src/agent_episodes.rs
+pub open spec fn bound(max: int) -> int { if max == 0 { 1 } else { max } }
+pub open spec fn evicted(len: int, max: int) -> int { if len < bound(max) { 0 } else { len - bound(max) + 1 } }
+pub open spec fn after(len: int, max: int) -> int { len - evicted(len, max) + 1 }
+pub fn episode_evictions(len: u64, max: u64) -> (r: u64) ensures r == evicted(len as int, max as int),
+pub open spec fn due(appended: int, every: int) -> bool { every > 0 && appended >= every }
+pub fn consolidation_due(appended: u64, every: u32) -> (r: bool) ensures r == due(appended as int, every as int),
+pub proof fn theorem_an_append_keeps_the_bound(len: int, max: int) requires 0 <= len, 0 <= max, ensures 0 <= evicted(len, max) <= len, 1 <= after(len, max) <= bound(max),
+pub proof fn theorem_a_log_in_its_bound_evicts_at_most_one(len: int, max: int) requires 0 <= len <= bound(max), 0 <= max, ensures evicted(len, max) <= 1, len < bound(max) ==> evicted(len, max) == 0,
+pub open spec fn run(len: int, max: int, n: nat) -> int decreases n, { if n == 0 { len } else { run(after(len, max), max, (n - 1) as nat) } }
+pub proof fn theorem_no_sequence_passes_the_bound(len: int, max: int, n: nat) requires 0 <= len <= bound(max), 0 <= max, ensures 0 <= run(len, max, n) <= bound(max), decreases n,
+pub proof fn theorem_a_zero_trigger_never_fires(appended: int) ensures ! due(appended, 0),
+pub proof fn theorem_no_pass_is_due_under_the_trigger(appended: int, every: int) requires 0 <= appended < every, ensures ! due(appended, every),
+pub proof fn theorem_the_trigger_is_monotone(small: int, large: int, every: int) requires small <= large, due(small, every), ensures due(large, every),
+
 ## formal/verus/src/agent_inbox.rs
 pub enum InboxStatus { Open, Paused, Parked, }
 pub enum OpClass { Work, Control, Tick, }
