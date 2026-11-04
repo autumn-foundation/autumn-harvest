@@ -576,7 +576,8 @@ mod tests {
 
     // `harvest-verify` reads each bare type name in the tokens of a macro
     // with no local definition as a type that can write through. So the
-    // body below names no type. The helpers above hold the types.
+    // body below names no type. The helpers above hold the types. Issue
+    // #2545 tracks the fix in the analyzer.
     proptest! {
         /// Any order of the input gives each digest the same id and rank.
         #[test]
