@@ -79,7 +79,10 @@ The start clamps still apply after the override:
 - The fleet chain ceiling `max_workflow_chain_timeout` still caps the chain
   cap. A root run of a type with no chain cap takes the ceiling as its
   default, as before. A child run of such a type stays uncapped.
-- A completion-trigger start sets no chain cap. Issue #2511 tracks it.
+- A completion-trigger target start and a typed `update_with_start` run take
+  the same three values and the same ceilings. A deferred completion-trigger
+  start resolves them when it fires. The immediate relay of a cross-shard
+  start keeps the SLA of evaluation time.
 - A per-start `sla_secs` or `execution_timeout_secs` in the start request
   still wins over both.
 

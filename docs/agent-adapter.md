@@ -956,7 +956,8 @@ A recorded outcome answers a call with the same step, tool name and
 arguments. A candidate call that equals the recorded call at the same turn
 and position, of the same agent, takes the recorded call id. Approval signal names hold the call
 id, so the recorded approvals stay valid. Any other call gets a new `eval_`
-id, so no recorded approval can release it. The harness sends again only an
+id, so no recorded approval can release it. That id holds the turn and the
+position, not the provider id. The harness sends again only an
 approval for a wait that the source opened, when it arrived before the
 deadline. An approval sent before its wait opened leaves no deadline timer,
 so the harness drops it, and the candidate times out at that wait.
@@ -999,7 +1000,7 @@ println!("{}", evaluation.overlay_digest);
 | `skills` | The skill list in the system prompt and the `load_skill` tool. A `load_skill` call is a tool call like any other: a recorded outcome answers it, or it gets the stub. |
 | `Candidate::system_prompt` | A one-part overlay that sets `system`. |
 | `Candidate::model` | A one-part overlay that sets `model`. The ceilings admit the model, because the operator names it. The harness and the source mandate must still hold it, or the evaluation fails before any call. Every turn asks it. |
-| `Candidate::agent_model` | A route for one agent. It is not an overlay part. |
+| `Candidate::agent_model` | A route for one agent. It is not an overlay part. A route to a model that the harness does not hold gives `OverlayError::UnknownModel` before any call (issue #2376). |
 | `Candidate::overlay` | Replaces the parts and the route that a shorthand set before it. It keeps the ceilings and the agent routes. |
 | `Evaluation::overlay_digest` | `ProfileOverlay::digest`: the SHA-256 of the JSON of the overlay. Equal overlays have equal digests. The digest leaves out the ceilings and the agent routes. |
 
@@ -1047,6 +1048,41 @@ run the evaluation on a multi-thread Tokio runtime.
 
 The evaluation is an in-memory fork at the first event. The database fork of
 issue #2000 is a separate feature.
+
+### Anonymise a pool
+
+`eval::compare_anonymised` runs any number of candidates on one source
+(issue #2376). A model that reads the report to pick a candidate then sees
+no label and no input order. Harness² does the same before selection.
+
+```rust,ignore
+use autumn_harvest_agent::eval::{Candidate, compare_anonymised};
+
+let pool = [
+    Candidate::new(harness_a).overlay(v7).label("triage@v7"),
+    Candidate::new(harness_b).overlay(v8).label("triage@v8"),
+];
+let report = compare_anonymised(&history, &pool, seed).await?;
+let pick = ask_a_model(&report.text).await?;          // an AnonId
+let chosen = &pool[report.resolve(&pick).ok_or("not in the pool")?.index];
+```
+
+| Part | In an anonymised report |
+|---|---|
+| `AnonId` | `eval::anon::assign` gives the ids, as for an evidence bundle. The key of a candidate is `Candidate::digest`. An id is `c-` and a hex prefix of `SHA-256(seed, source run id, Candidate::digest)`. The prefix has at least 12 digits. It grows until no two ids are equal. `formal/verus/src/agent_anonymise.rs` proves the width rule. |
+| The order | The pool lists the ids in order. The input order changes no id and no text. The candidates also run in pool order. |
+| `text` | `AnonymisedPool::render`: the source end, then per id the counts, the end, each turn verdict, and each turn decision as JSON. It holds no model name, overlay digest, label or input index. |
+| `pool` | The same content as JSON. Each `AnonymisedEvaluation` keeps every field of `Evaluation` except `overlay_digest`. The recorded end is in the pool once. |
+| `key` | Each id with its `CandidateRef`: the input index, the candidate digest, the overlay digest and the label. Keep it from the reader. `AnonymisedReport` does not implement `Serialize`, and its `Debug` form hides the key. |
+| A failure text | Each run end error and report error replaces each label, digest, route and model id of the pool with `[redacted]`. The source end gets the same treatment. Each route that a run asks for counts, with the model id behind it in each harness. So a route that a candidate keeps from the source, such as the model of a recorded peer, counts too. Only a whole name is replaced, so a short route such as `a` also replaces that word. |
+| `Candidate::label` | An operator name, such as an overlay version id. It enters the digest, never the text. |
+| `Candidate::digest` | The SHA-256 of the overlay digest, the label, the routes, the admitted models, the ceilings and the turn cap. It cannot read the harness. |
+| Equal digests | `EvalError::DuplicateCandidate` with both input indices, before any model call. Give each candidate a label. |
+
+The text renders each model reply as written, so a reply can name its own
+model. The pool keeps the token usage, and a tokenizer can show a model
+family. A policy reason can show a harness setting, such as a timeout. Keep
+the seed from the reader, because the seed and the digests give the ids.
 
 ### Write an evidence bundle
 
@@ -1270,7 +1306,7 @@ so a list of the agents due to wake reads only those agents.
 | `harvest agents describe <kind>/<name>` | `GET /workflows/by-id/agent/{id}/query/harvest.entity.state` |
 | `harvest agents pause <id> --reason <text>` | `POST /workflows/by-id/agent/{id}/signal/harvest.entity.op` |
 | `harvest agents resume <id>` | the same route, with `resume` |
-| `harvest agents erase <id>` | the signal route, then `POST /workflows/{exec}/erase-payloads` for each run |
+| `harvest agents erase <id>` | the signal route, then `POST /workflows/{exec}/erase-payloads` for each run and each scheduled pass |
 | `harvest agents profile list <kind>` | `GET /agents/{kind}/profile/versions` |
 | `harvest agents profile show <kind> [--version v]` | `GET /agents/{kind}/profile`, or `GET /agents/{kind}/profile/versions/{v}` |
 | `harvest agents profile diff <kind> <a> <b>` | `GET /agents/{kind}/profile/diff?a=&b=` |
@@ -1312,8 +1348,8 @@ app must clear those stores itself.
 
 1. The agent gets `pause`, `reset_memory` and `reset_workspace`, then a
    delete. The pause holds new work and stops the ticks, so nothing writes
-   the stores after the resets. The resets clear a `MemoryStore` scope and
-   every workspace snapshot, with the scratch files of stopped puts. See
+   the stores after the resets. The resets clear a `MemoryStore` scope, the
+   episode scope and every workspace snapshot, with the scratch files of stopped puts. See
    "Scratch files" and "A save after a reset" below for the two windows
    that stay. An agent that ended gets a new run for them,
    through `POST /workflows/agent/signal-with-start` on the queue of its
@@ -1325,11 +1361,17 @@ app must clear those stores itself.
    `filter=workflow_name = 'agent' AND workflow_id = '<id>'`.
 4. It erases each run. The erasure tombstones the payloads of history, the
    entity state and its projection, and deletes the stream chunks and the
-   cost ledger rows. It cascades to each child run of a fan-out.
-5. The report sums each count over every run and child:
+   cost ledger rows. It cascades to each child run of a fan-out, and to
+   each child consolidation pass (issue #2454).
+5. It lists each consolidation pass that a schedule started, with
+   `filter=workflow_name = 'agent_consolidate' AND
+   attrs.agent_consolidation_of = '<id>'`, and erases each one that ended.
+   A pass that still runs is a failure in the report.
+6. The report sums each count over every run and child:
    `events_scrubbed`, `stream_chunks_deleted`, `ledger_rows_deleted`,
-   `entity_states_scrubbed` and the rest. It lists each skipped child and
-   each failure.
+   `entity_states_scrubbed` and the rest. `episodes_erased` and
+   `facts_erased` come from the final state. It lists each skipped child
+   and each failure.
 
 The spend of an erased run leaves the LLM budget and mesh budget sums.
 
@@ -1398,6 +1440,70 @@ as an agent.
 - A silent tick or a failed op keeps no transcript, so it changes no notes
   either.
 - `Control::ClearTranscript` clears the notes too.
+
+### Episodes and consolidation (issue #2454)
+
+`AgentProfile::episodes` keeps an episode log for each agent of a kind. It
+is off by default. It needs `AgentMemory::Store` and
+`AgentHarness::episodes`. The design is in `docs/design/DESIGN-2454.md`.
+
+```rust
+let profile = AgentProfile::new("support")
+    .memory(AgentMemory::Store)
+    .episodes(EpisodeSettings::default().every(10).max_episodes(200).model("cheap"));
+let harness = AgentHarness::new(model)
+    .memory(memory_store)
+    .episodes(episode_store)
+    .model_named("cheap", cheap_model)
+    .agent(profile);
+```
+
+- **Episode.** At the end of an op, the activity `agent_episode_append`
+  appends one episode to the scope `agent:<id>:episodes`. It holds the run
+  id, the answer cut to `max_text_bytes`, the stop, the recorded time and
+  the flow labels of the agent. The key is `episode:<run id>`, so a retry
+  or a crash appends once.
+- **Which ops.** Only a segment that keeps its transcript and may write
+  memory appends, as for progress notes. A silent tick, a failed op and a
+  read-only op append nothing.
+- **Bound.** The log keeps `max_episodes`. The oldest goes first. The next
+  pass reports each unconsolidated episode that an eviction dropped.
+- **Pass.** The workflow `agent_consolidate` reads at most
+  `max_pass_episodes` unconsolidated episodes. A model that the profile
+  mandate forbids disables the pass. It checks the LLM budget and the
+  budget of the agent mesh (issue #2272). It then calls the model once, and records one cost ledger call under the pass
+  run. Each valid fact becomes one entry of `facts_block`:
+  `<subject> <relation> <object> [episodes: <id>, ...]`.
+- **Labels.** A fact takes the labels of every episode of its pass. A
+  memory store that cannot keep labels refuses a labelled fact, and the
+  report counts it under `facts_refused`. The sources of a refused fact
+  stay unconsolidated.
+- **Trigger.** `EpisodeSettings::every(n)` runs a child pass at the `n`-th
+  append since the last pass. The op waits for it. A failed pass therefore
+  waits for `n` more appends, also when the log is full. A pass that
+  does not write all its facts fails the op with a named error. With the
+  default `ConsolidationTrigger::Schedule`, an engine schedule starts each
+  pass: register `consolidate::schedule(when, &agent_id)`. The engine keys
+  a schedule by its workflow name, so this serves one agent per
+  deployment. A second schedule replaces the first. For many agents, use
+  `every(n)`, or start each pass from the app. Issue #2540 tracks a
+  dispatcher. On SQLite, `sqlite::consolidate` starts one pass.
+- **Report.** A pass returns a `ConsolidationReport`. Its `stop` is
+  `completed`, `nothing_to_do`, `budget_exceeded`, `invalid_reply`,
+  `disabled` or `reset`. A refused budget and a reply that does not parse
+  write no fact and mark no episode. SQLite has no run budget, so a pass
+  there always passes the budget check.
+- **Erase.** `Control::ResetMemory` clears the episode scope first, then the
+  memory scope. `AgentState::episode_reset` counts the episodes and the
+  derived facts. `harvest agents erase` reports them as `episodes_erased`
+  and `facts_erased`. It also erases each pass that a schedule started, by
+  the search attribute `agent_consolidation_of`. A pass that runs across
+  the reset writes no fact after it and ends as `reset`. A pass that still
+  runs is a failure in the report, so erase again after it ends.
+
+The crate ships `InMemoryEpisodeStore`. A durable store implements
+`EpisodeStore` and calls the methods of `EpisodeLog`, so the rules are the
+same in every store.
 
 ### Workspaces (issue #2274)
 
@@ -1741,3 +1847,92 @@ the list is empty. The order of the list does not change the result.
 proves that the key keeps the order of the bits. A proptest checks that the
 key keeps the order of the scores. The design is in
 [`DESIGN-2441.md`](design/DESIGN-2441.md).
+
+## 18. The refine policy (issue #2394)
+
+An operator decides what the refine loop may do. Each agent kind has a
+`RefinePolicy`. The overlay store holds it, next to the overlay versions.
+A kind with no stored policy uses every default. The defaults never let
+an overlay go live without a person. A change takes effect at the next
+read, with no restart: the next op, or the next refine run.
+
+Today the store enforces `ceilings`, `auto_adopt.parts` and
+`auto_adopt.max_per_day`. The other settings are kernels for open issues:
+the probe of #2378, the refine workflow of #2380, the adoption gate of
+#2381 and the lesson library of #2382. Those issues will read them.
+
+| Setting | Meaning | Default | Range |
+|---|---|---|---|
+| `auto_adopt.parts` | The overlay parts that may go live without a person: `system`, `guardrails`, `tool_guidance`, `skills`, `model`, `bounds` (the three `max_*` fields), `read_only`. | `[]`, so every overlay waits | Any subset |
+| `auto_adopt.max_per_day` | The cap of auto adoptions in one UTC day. | `1` | `0` to `1000`, or `"unlimited"` |
+| `approval_timeout` | How long the adoption gate waits. | `"7d"` | `"1m"` to `"90d"`, as `<n><s\|m\|h\|d>` |
+| `probe_effects` | The `ToolEffect`s that a live probe may run. | `["read_only"]` | Any subset of `read_only`, `internal`, `write`, `external` |
+| `ceilings.max_steps`, `ceilings.max_total_tokens`, `ceilings.max_output_tokens` | The highest bound that an overlay may set. `null` is the profile value. | `null` each, so an overlay can only narrow | `1` or more |
+| `ceilings.models` | The models that an overlay may name. `null` is the profile model. | `null` | 1 to 64 names |
+| `proposal_attempts` | The attempts of each proposer stage before it inherits. | `2` | `1` to `8` |
+| `lessons.max_entries` | The size of the lesson library. | `64` | `1` to `4096` |
+
+```sh
+harvest agents profile policy support show
+harvest agents profile policy support set --auto-adopt-parts system --max-per-day 3
+harvest agents profile policy support set --max-steps 40 --probe-effects read_only,internal
+harvest agents profile policy support history
+harvest agents profile policy support reset
+```
+
+- **Who sets it.** Only an operator. The store refuses a refine or an
+  auto actor. `PUT /agents/{kind}/profile/policy` and
+  `POST .../policy/reset` are `Mutating`, so a read role gets `403`.
+- **Compare-and-swap.** A set sends `expected_revision`. A stale one is a
+  `409`. `set` with flags reads the policy, changes only the named keys
+  and sends the revision that it read.
+- **Audit.** Each set and reset adds one row to the store log, with the
+  old and the new policy. `GET .../policy/changes` lists them. Each one
+  also writes an `agent_profile.policy_set` or
+  `agent_profile.policy_reset` audit row. `error_summary` names each
+  changed key with its old and new value. The settings that widen the gate
+  come first. A list shows the names that it adds and removes. A summary
+  over 512 bytes ends with a mark that names its revision.
+- **No self-widening.** A `ProfileOverlay` and an `AgentOp` refuse each
+  policy key when they decode. A `ProposeRequest` refuses each one except
+  `ceilings`, which holds the resolved ceilings of the recorded read. An
+  unknown key in a policy also fails, so an old worker never drops a new
+  setting.
+- **One read per run.** A refine run calls `read_refine_policy` once. The
+  activity `agent_refine_policy` records the policy. A replay reads the
+  record. A change during the run never widens that run. A narrowing
+  reaches its adoption at once, because the store also checks its current
+  policy.
+- **Ceilings.** The store validator and the op read of #2372 apply each
+  overlay under `policy.ceilings.resolve(profile)`. The op read takes the
+  policy in the same recorded activity. A raised ceiling lets an overlay
+  pass the profile bound. A lowered one fails the next op of a version
+  that no longer fits, and no model runs.
+- **Auto adoption.** `ProfileOverlayStore::auto_adopt` enforces the
+  gate. A candidate goes live only when each changed part is in
+  `auto_adopt.parts` of the run policy and of the current stored policy,
+  and the stricter daily cap allows it. One transaction puts the version
+  as `auto:<run>`, counts the auto moves of the UTC day of the store clock
+  and moves the pointer. Set the clock with `with_clock`. `put`,
+  `activate` and `rollback` refuse an `auto` actor. `refine::adopt` wraps
+  the call. Otherwise the candidate is put as `refine:<run>` and waits. A
+  wait on the cap writes a `harvest.audit` tracing event that names the
+  cap. An unchanged candidate stores nothing.
+
+| `refine_status` | Meaning |
+|---|---|
+| `auto_adopted` | The candidate went live without a person. |
+| `awaiting_approval` | The candidate waits, with the reason. |
+| `unchanged` | The candidate changes no part. |
+| `timed_out` | The gate of #2381 waited for `approval_timeout`. It will use `RefinePolicy::gate_state`. |
+
+- **Probes.** `RefinePolicy::probe_rules()` returns `ToolRules`. The probe
+  of #2378 will put them on top of the app policy with `Strictest`. An
+  unknown tool is denied.
+- **Rollback.** `rollback` after an auto adoption restores the version
+  before it, as after any activation.
+
+`formal/verus/src/refine_policy.rs` proves that the default never adopts
+and that an empty change never adopts. `formal/verus/src/overlay_log.rs`
+proves that the auto moves of a day never pass the cap. The design is in [`DESIGN-2394.md`](design/DESIGN-2394.md). The rule is in
+[ADR 0014](adr/0014-operator-refine-policy.md).

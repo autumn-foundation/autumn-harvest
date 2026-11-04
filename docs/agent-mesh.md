@@ -481,6 +481,7 @@ let task = AgentTask::new("triage this")
   model of a durable peer, so the receiver checks it.
 - `eval::compare` runs two candidates on one recorded run.
   `Candidate::agent_model` sets the model of one agent of the tree.
+  `eval::compare_anonymised` runs a pool under opaque ids (issue #2376).
 
 ## 15. Concurrent children (issue #2270)
 

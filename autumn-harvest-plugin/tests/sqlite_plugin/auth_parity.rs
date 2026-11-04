@@ -262,9 +262,9 @@ impl RoleBackend for Apps {
         client.into_router()
     }
 
-    /// Vantage is #2468.
+    /// The SQLite path serves Vantage (issue #2468).
     fn serves_vantage(&self) -> bool {
-        false
+        true
     }
 
     fn bare(&self) -> axum::Router {
@@ -328,9 +328,9 @@ mod oidc {
             self.oidc_app(login, true)
         }
 
-        /// Vantage is #2468.
+        /// The SQLite path serves Vantage (issue #2468).
         fn serves_vantage(&self) -> bool {
-            false
+            true
         }
 
         /// The Harvest file holds the tokens.

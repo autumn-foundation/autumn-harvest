@@ -29,6 +29,11 @@
 #
 # With arguments, the script pulls only those images and skips the shard
 # plan. `dst-nightly.yml` passes `postgres:16` (issue #2280).
+#
+# With PULL_EVERY_SUITE_IMAGE=1, the script pulls each emulator on every
+# shard and skips the shard plan. `test-db-linux` sets it. That job runs
+# from the nextest archive and partitions by test hash, so the tests of
+# one suite reach many shards. The row plan above cannot name them.
 set -euo pipefail
 
 if [ "$#" -gt 0 ]; then
@@ -45,7 +50,12 @@ else
   # The dry run prints this shard's cargo invocations without running
   # them, so no shard number is hardcoded here. It is captured first:
   # `grep -q` closing a pipe early would trip `pipefail`.
-  plan="$(DRY_RUN=1 bash .github/ci/run-suites.sh run linux)"
+  if [ "${PULL_EVERY_SUITE_IMAGE:-}" = "1" ]; then
+    # Each `--test` pattern below then matches.
+    plan="--test connector_sqs_broker --test object_store_s3_minio --test object_store_gcs_emulator"
+  else
+    plan="$(DRY_RUN=1 bash .github/ci/run-suites.sh run linux)"
+  fi
   if grep -q -- '--test connector_sqs_broker' <<<"$plan"; then
     images="$images softwaremill/elasticmq:1.5.2"
   fi

@@ -169,3 +169,107 @@ async fn a_stale_activate_fails_with_the_active_version() {
     assert_ne!(error.exit_code(), 0);
     assert!(error.to_string().contains("v3"), "{error}");
 }
+
+/// Issue #2394: `policy set` reads the policy, changes only the named keys,
+/// then sends a `PUT` over the revision that it read.
+#[tokio::test]
+async fn policy_set_reads_then_sends_the_changed_keys() {
+    let (base_url, task) = scripted_server(vec![
+        (
+            "200 OK",
+            r#"{"kind":"support","revision":3,"custom":true,"policy":{"auto_adopt":{"parts":[],"max_per_day":1},"approval_timeout":"7d"}}"#
+                .to_owned(),
+        ),
+        (
+            "200 OK",
+            r#"{"kind":"support","revision":4,"custom":true,"policy":{}}"#.to_owned(),
+        ),
+    ])
+    .await;
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "--base-url",
+        &base_url,
+        "agents",
+        "profile",
+        "policy",
+        "support",
+        "set",
+        "--auto-adopt-parts",
+        "system",
+        "--max-per-day",
+        "unlimited",
+    ])
+    .expect("parse");
+    run_cli(cli).await.expect("set");
+    let requests = task.await.expect("server");
+    assert_eq!(
+        first_line(&requests[0]),
+        "GET /api/harvest/agents/support/profile/policy HTTP/1.1"
+    );
+    assert_eq!(
+        first_line(&requests[1]),
+        "PUT /api/harvest/agents/support/profile/policy HTTP/1.1"
+    );
+    assert_eq!(
+        body(&requests[1]),
+        serde_json::json!({
+            "policy": {
+                "auto_adopt": {"parts": ["system"], "max_per_day": "unlimited"},
+                "approval_timeout": "7d"
+            },
+            "expected_revision": 3
+        })
+    );
+}
+
+/// A policy set that loses a race exits non-zero with the message of the
+/// server. `show`, `reset` and `history` send one request each.
+#[tokio::test]
+async fn policy_actions_send_their_requests() {
+    let conflict = r#"{"error":"the refine policy is at revision 5, not the expected one"}"#;
+    let (base_url, task) = scripted_server(vec![
+        (
+            "200 OK",
+            r#"{"kind":"support","revision":null,"custom":false,"policy":{}}"#.to_owned(),
+        ),
+        ("409 Conflict", conflict.to_owned()),
+        ("200 OK", r#"{"kind":"support","revision":6}"#.to_owned()),
+        ("200 OK", r#"{"kind":"support","changes":[]}"#.to_owned()),
+    ])
+    .await;
+    let run = |args: &[&str]| {
+        let mut argv = vec![
+            "harvest",
+            "--base-url",
+            &base_url,
+            "agents",
+            "profile",
+            "policy",
+        ];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).expect("parse")
+    };
+    let error = run_cli(run(&["support", "set", "--proposal-attempts", "3"]))
+        .await
+        .expect_err("a 409 fails");
+    assert_ne!(error.exit_code(), 0);
+    assert!(error.to_string().contains("revision 5"), "{error}");
+    run_cli(run(&["support", "reset"])).await.expect("reset");
+    run_cli(run(&["support", "history"]))
+        .await
+        .expect("history");
+    let requests = task.await.expect("server");
+    assert_eq!(
+        body(&requests[1]),
+        serde_json::json!({"policy": {"proposal_attempts": 3}, "expected_revision": null})
+    );
+    assert_eq!(
+        first_line(&requests[2]),
+        "POST /api/harvest/agents/support/profile/policy/reset HTTP/1.1"
+    );
+    assert_eq!(
+        first_line(&requests[3]),
+        "GET /api/harvest/agents/support/profile/policy/changes HTTP/1.1"
+    );
+}

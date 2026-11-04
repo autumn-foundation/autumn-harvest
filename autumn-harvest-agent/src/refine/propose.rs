@@ -239,8 +239,10 @@ pub trait OverlayProposer: Send + Sync + fmt::Debug {
 ///
 /// The refine workflow (issue #2380) builds it from recorded reads. The
 /// `ceilings` and `attempts` come from the operator policy (issue #2394),
-/// never from the input of the refine run.
+/// never from the input of the refine run. An unknown key, such as a
+/// policy key, fails to decode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProposeRequest {
     /// The part of the setup to edit.
     pub dimension: Dimension,

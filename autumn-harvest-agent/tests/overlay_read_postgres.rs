@@ -409,3 +409,13 @@ async fn a_narrowed_deploy_fails_safe() {
 async fn a_rollback_restores_v1() {
     overlay_read_suite::a_rollback_restores_v1(&mut Pg::new().await).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_policy_ceiling_reaches_the_op_read() {
+    overlay_read_suite::a_policy_ceiling_reaches_the_op_read(&mut Pg::new().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rollback_after_an_auto_adoption_restores_v1() {
+    overlay_read_suite::a_rollback_after_an_auto_adoption_restores_v1(&mut Pg::new().await).await;
+}

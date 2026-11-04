@@ -85,6 +85,16 @@ pub const OP_AGENT_PROFILE_ACTIVATE: &str = "agent_profile.activate";
 ///
 /// The row has the same form as [`OP_AGENT_PROFILE_ACTIVATE`].
 pub const OP_AGENT_PROFILE_ROLLBACK: &str = "agent_profile.rollback";
+/// Audit operation: Set the refine policy of an agent kind (issue #2394).
+///
+/// The target id is the agent kind. A succeeded row keeps the revision and
+/// each changed key with its old and new value in `error_summary`.
+pub const OP_AGENT_PROFILE_POLICY_SET: &str = "agent_profile.policy_set";
+/// Audit operation: Reset the refine policy of an agent kind to every
+/// default (issue #2394).
+///
+/// The row has the same form as [`OP_AGENT_PROFILE_POLICY_SET`].
+pub const OP_AGENT_PROFILE_POLICY_RESET: &str = "agent_profile.policy_reset";
 /// Audit operation: Created a new workflow schedule.
 pub const OP_SCHEDULE_CREATE: &str = "schedule.create";
 /// Audit operation: Edited an existing workflow schedule in place (issue #771).
@@ -579,6 +589,18 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /agents/{kind}/profile/diff", RouteClass::ReadOnly),
     ("POST /agents/{kind}/profile/activate", RouteClass::Mutating),
     ("POST /agents/{kind}/profile/rollback", RouteClass::Mutating),
+    // The refine policy of an agent kind (issue #2394). Only the operator
+    // role sets or resets it.
+    ("GET /agents/{kind}/profile/policy", RouteClass::ReadOnly),
+    ("PUT /agents/{kind}/profile/policy", RouteClass::Mutating),
+    (
+        "POST /agents/{kind}/profile/policy/reset",
+        RouteClass::Mutating,
+    ),
+    (
+        "GET /agents/{kind}/profile/policy/changes",
+        RouteClass::ReadOnly,
+    ),
     ("GET /admin/history/exports", RouteClass::ReadOnly),
     ("GET /admin/history/export-sample", RouteClass::ReadOnly),
     ("GET /admin/external-handoffs", RouteClass::ReadOnly),
@@ -964,6 +986,8 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_WORKFLOW_TYPE_RUN_DEFAULTS,
     OP_AGENT_PROFILE_ACTIVATE,
     OP_AGENT_PROFILE_ROLLBACK,
+    OP_AGENT_PROFILE_POLICY_SET,
+    OP_AGENT_PROFILE_POLICY_RESET,
     OP_SCHEDULE_CREATE,
     OP_SCHEDULE_UPDATE,
     OP_SCHEDULE_PAUSE,
@@ -1343,6 +1367,17 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         "POST /agents/{kind}/profile/rollback",
         Some(OP_AGENT_PROFILE_ROLLBACK),
     ),
+    // The refine policy of an agent kind (issue #2394).
+    ("GET /agents/{kind}/profile/policy", None),
+    (
+        "PUT /agents/{kind}/profile/policy",
+        Some(OP_AGENT_PROFILE_POLICY_SET),
+    ),
+    (
+        "POST /agents/{kind}/profile/policy/reset",
+        Some(OP_AGENT_PROFILE_POLICY_RESET),
+    ),
+    ("GET /agents/{kind}/profile/policy/changes", None),
     ("GET /admin/history/exports", None),
     ("GET /admin/history/export-sample", None),
     ("GET /admin/external-handoffs", None),

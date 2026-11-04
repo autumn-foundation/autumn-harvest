@@ -577,6 +577,12 @@ pub struct WorkflowMetadata {
     pub runbook_url: Option<String>,
     pub severity: Option<String>,
     pub input_schema: Option<fn() -> serde_json::Value>,
+    /// Declared hard execution timeout (issue #2511). A start resolves it
+    /// with any operator override, then applies the fleet ceiling.
+    pub execution_timeout: Option<std::time::Duration>,
+    /// Declared chain cap (issues #617 and #2511). A start resolves it with
+    /// any operator override, then applies the fleet chain ceiling.
+    pub chain_execution_timeout: Option<std::time::Duration>,
     /// Declared soft-SLA default (issue #487), resolved at completion-trigger
     /// start time into a fresh `sla_deadline_at`.
     pub sla: Option<std::time::Duration>,
@@ -606,22 +612,124 @@ pub static GLOBAL_RUN_DEFAULTS: std::sync::RwLock<
     Option<std::sync::Arc<crate::run_defaults::RunDefaultsCache>>,
 > = std::sync::RwLock::new(None);
 
-/// The effective SLA of a target type: its declared SLA with any operator
-/// override (issue #2387).
+/// The fleet ceiling on `execution_timeout` (issue #2511).
+///
+/// The registry setter writes it. The completion-trigger path has no
+/// registry, so it reads this mirror.
 #[cfg(feature = "db")]
-fn effective_target_sla(
-    workflow_name: &str,
+pub static GLOBAL_MAX_WORKFLOW_EXECUTION_TIMEOUT: std::sync::RwLock<Option<std::time::Duration>> =
+    std::sync::RwLock::new(None);
+
+/// The fleet ceiling on the chain cap (issue #2511). See
+/// [`GLOBAL_MAX_WORKFLOW_EXECUTION_TIMEOUT`].
+#[cfg(feature = "db")]
+pub static GLOBAL_MAX_WORKFLOW_CHAIN_TIMEOUT: std::sync::RwLock<Option<std::time::Duration>> =
+    std::sync::RwLock::new(None);
+
+/// The declared values that an operator override can replace.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, Default)]
+struct TargetDeclared {
+    execution_timeout: Option<std::time::Duration>,
+    chain_execution_timeout: Option<std::time::Duration>,
     sla: Option<std::time::Duration>,
-) -> Option<std::time::Duration> {
-    GLOBAL_RUN_DEFAULTS
+}
+
+#[cfg(feature = "db")]
+impl TargetDeclared {
+    /// Copy the declared values. [`resolve_target_run_defaults`] applies the
+    /// operator override to them.
+    const fn from_metadata(m: &WorkflowMetadata) -> Self {
+        Self {
+            execution_timeout: m.execution_timeout,
+            chain_execution_timeout: m.chain_execution_timeout,
+            sla: m.sla,
+        }
+    }
+}
+
+/// The fleet ceilings that a start applies.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, Default)]
+struct Ceilings {
+    execution_timeout: Option<std::time::Duration>,
+    chain_timeout: Option<std::time::Duration>,
+}
+
+/// The run defaults that a completion-trigger target start takes (issue
+/// #2511).
+///
+/// Each field goes into the same field of `StartWorkflowParams`. The start
+/// applies the ceilings and its other clamps.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TargetRunDefaults {
+    execution_timeout: Option<chrono::Duration>,
+    chain_execution_timeout: Option<chrono::Duration>,
+    sla: Option<chrono::Duration>,
+    max_execution_timeout_ceiling: Option<chrono::Duration>,
+    max_workflow_chain_timeout_ceiling: Option<chrono::Duration>,
+}
+
+/// Resolve the run defaults of one target type.
+///
+/// An operator override in `cache` wins over each declared value (issues
+/// #2387 and #2406). A value past the `chrono` range drops out. A missing
+/// cache returns the declared values.
+#[cfg(feature = "db")]
+fn resolve_target_run_defaults(
+    workflow_name: &str,
+    declared: TargetDeclared,
+    cache: Option<&crate::run_defaults::RunDefaultsCache>,
+    ceilings: Ceilings,
+) -> TargetRunDefaults {
+    let (execution_timeout, sla) = cache.map_or((declared.execution_timeout, declared.sla), |c| {
+        c.apply(workflow_name, declared.execution_timeout, declared.sla)
+    });
+    let chain = cache.map_or(declared.chain_execution_timeout, |c| {
+        c.apply_chain(workflow_name, declared.chain_execution_timeout)
+    });
+    let to_chrono =
+        |d: Option<std::time::Duration>| d.and_then(|d| chrono::Duration::from_std(d).ok());
+    TargetRunDefaults {
+        execution_timeout: to_chrono(execution_timeout),
+        chain_execution_timeout: to_chrono(chain),
+        sla: to_chrono(sla),
+        max_execution_timeout_ceiling: to_chrono(ceilings.execution_timeout),
+        max_workflow_chain_timeout_ceiling: to_chrono(ceilings.chain_timeout),
+    }
+}
+
+/// The run defaults of a target type, read from the process globals at
+/// start time (issue #2511).
+///
+/// This path has no registry handle, and the outbox row has no timeout
+/// column. So a deferred start reads the globals when it fires. An operator
+/// change then reaches it with no stored copy.
+#[cfg(feature = "db")]
+fn target_run_defaults(workflow_name: &str) -> TargetRunDefaults {
+    let declared = GLOBAL_WORKFLOW_METADATA
         .read()
         .ok()
         .and_then(|guard| {
             guard
                 .as_ref()
-                .map(|cache| cache.apply(workflow_name, None, sla).1)
+                .and_then(|map| map.get(workflow_name))
+                .map(TargetDeclared::from_metadata)
         })
-        .unwrap_or(sla)
+        .unwrap_or_default();
+    let ceilings = Ceilings {
+        execution_timeout: GLOBAL_MAX_WORKFLOW_EXECUTION_TIMEOUT
+            .read()
+            .ok()
+            .and_then(|g| *g),
+        chain_timeout: GLOBAL_MAX_WORKFLOW_CHAIN_TIMEOUT
+            .read()
+            .ok()
+            .and_then(|g| *g),
+    };
+    let cache = GLOBAL_RUN_DEFAULTS.read().ok().and_then(|g| g.clone());
+    resolve_target_run_defaults(workflow_name, declared, cache.as_deref(), ceilings)
 }
 
 #[cfg(feature = "db")]
@@ -1334,7 +1442,16 @@ impl DeferredTriggerStart {
 
             // Provenance ref is the triggering (source) execution id (#740).
             let source_exec_id_str = self.source_exec_id.to_string();
+            // Issue #2511: the relay resolves the timeouts and the chain cap
+            // when it fires. The SLA keeps the value from evaluation time,
+            // because this struct already carries it. The outbox sweep
+            // resolves the SLA again, because its row stores none.
+            let run_defaults = target_run_defaults(&self.target_workflow_name);
             let params = crate::execution::StartWorkflowParams {
+                execution_timeout: run_defaults.execution_timeout,
+                max_execution_timeout_ceiling: run_defaults.max_execution_timeout_ceiling,
+                chain_execution_timeout: run_defaults.chain_execution_timeout,
+                max_workflow_chain_timeout_ceiling: run_defaults.max_workflow_chain_timeout_ceiling,
                 concurrency_key: self.concurrency_key,
                 concurrency_limit: self.concurrency_limit,
                 concurrency_on_conflict: self.concurrency_on_conflict,
@@ -1774,23 +1891,24 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
             let source_shard = crate::types::ShardId::new(execution.shard_id);
 
             // Resolve target metadata (owner, runbook_url, severity, sla, retry_policy)
-            let (target_owner, target_runbook_url, target_severity, target_sla, target_retry_policy) = {
+            let (target_owner, target_runbook_url, target_severity, target_retry_policy) = {
                 let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
                 lock.as_ref()
                     .and_then(|guard| guard.as_ref())
                     .and_then(|meta_map| meta_map.get(&trigger_db.target_workflow_name))
-                    .map_or((None, None, None, None, None), |meta| {
+                    .map_or((None, None, None, None), |meta| {
                         (
                             meta.owner.clone(),
                             meta.runbook_url.clone(),
                             meta.severity.clone(),
-                            meta.sla,
                             meta.retry_policy.clone(),
                         )
                     })
             };
-            // Issue #2387: an operator SLA override of the target type wins.
-            let target_sla = effective_target_sla(&trigger_db.target_workflow_name, target_sla);
+            // Issues #2387, #2406 and #2511: the target takes its declared
+            // run defaults, any operator override and the fleet ceilings.
+            let run_defaults = target_run_defaults(&trigger_db.target_workflow_name);
+            let target_sla = run_defaults.sla.and_then(|d| d.to_std().ok());
 
             // issue #618: completion triggers are an in-process start producer
             // and MUST honour an active admission gate. This runs INSIDE the
@@ -2009,7 +2127,12 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                         owner: target_owner.as_deref(),
                         runbook_url: target_runbook_url.as_deref(),
                         severity: target_severity.as_deref(),
-                        sla: target_sla.and_then(|d| chrono::Duration::from_std(d).ok()),
+                        sla: run_defaults.sla,
+                        execution_timeout: run_defaults.execution_timeout,
+                        max_execution_timeout_ceiling: run_defaults.max_execution_timeout_ceiling,
+                        chain_execution_timeout: run_defaults.chain_execution_timeout,
+                        max_workflow_chain_timeout_ceiling: run_defaults
+                            .max_workflow_chain_timeout_ceiling,
                         workflow_retry_policy: target_retry_policy.clone(),
                         max_workflow_attempts_ceiling,
                         start_source: crate::types::StartSource::CompletionTrigger,
@@ -2608,23 +2731,23 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
 
         let priority: Priority = serde_json::from_value(task.priority).unwrap_or_default();
 
-        let (target_owner, target_runbook_url, target_severity, target_sla, target_retry_policy) = {
+        let (target_owner, target_runbook_url, target_severity, target_retry_policy) = {
             let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
             lock.as_ref()
                 .and_then(|guard| guard.as_ref())
                 .and_then(|meta_map| meta_map.get(&task.target_workflow_name))
-                .map_or((None, None, None, None, None), |meta| {
+                .map_or((None, None, None, None), |meta| {
                     (
                         meta.owner.clone(),
                         meta.runbook_url.clone(),
                         meta.severity.clone(),
-                        meta.sla,
                         meta.retry_policy.clone(),
                     )
                 })
         };
-        // Issue #2387: an operator SLA override of the target type wins.
-        let target_sla = effective_target_sla(&task.target_workflow_name, target_sla);
+        // Issues #2387, #2406 and #2511: the sweep resolves the run defaults
+        // when it fires, so an operator change reaches a stored row.
+        let run_defaults = target_run_defaults(&task.target_workflow_name);
         let max_workflow_attempts_ceiling = GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING
             .read()
             .ok()
@@ -2662,7 +2785,11 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
             owner: target_owner.as_deref(),
             runbook_url: target_runbook_url.as_deref(),
             severity: target_severity.as_deref(),
-            sla: target_sla.and_then(|d| chrono::Duration::from_std(d).ok()),
+            sla: run_defaults.sla,
+            execution_timeout: run_defaults.execution_timeout,
+            max_execution_timeout_ceiling: run_defaults.max_execution_timeout_ceiling,
+            chain_execution_timeout: run_defaults.chain_execution_timeout,
+            max_workflow_chain_timeout_ceiling: run_defaults.max_workflow_chain_timeout_ceiling,
             workflow_retry_policy: target_retry_policy,
             max_workflow_attempts_ceiling,
             start_source: crate::types::StartSource::CompletionTrigger,
@@ -3887,5 +4014,108 @@ mod tests {
              Postgres's own clock_timestamp(), not a host-computed \
              chrono::Utc::now(): {sql}"
         );
+    }
+
+    /// Issue #2511: the declared values of a target type, with no override.
+    #[cfg(feature = "db")]
+    fn declared(
+        execution_timeout: Option<u64>,
+        chain: Option<u64>,
+        sla: Option<u64>,
+    ) -> TargetDeclared {
+        TargetDeclared {
+            execution_timeout: execution_timeout.map(std::time::Duration::from_secs),
+            chain_execution_timeout: chain.map(std::time::Duration::from_secs),
+            sla: sla.map(std::time::Duration::from_secs),
+        }
+    }
+
+    #[cfg(feature = "db")]
+    fn secs(s: i64) -> chrono::Duration {
+        chrono::Duration::seconds(s)
+    }
+
+    /// With no override, a target takes its declared values.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_target_takes_its_declared_run_defaults() {
+        let got = resolve_target_run_defaults(
+            "wf",
+            declared(Some(60), Some(600), Some(30)),
+            None,
+            Ceilings::default(),
+        );
+        assert_eq!(got.execution_timeout, Some(secs(60)));
+        assert_eq!(got.chain_execution_timeout, Some(secs(600)));
+        assert_eq!(got.sla, Some(secs(30)));
+    }
+
+    /// An override wins over each declared value (issues #2387, #2406).
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_target_takes_the_run_default_override() {
+        let cache = crate::run_defaults::RunDefaultsCache::new();
+        cache.write_through(
+            "wf",
+            crate::run_defaults::RunDefaultFields {
+                execution_timeout: Some(std::time::Duration::from_secs(90)),
+                sla: Some(std::time::Duration::from_secs(45)),
+                chain_execution_timeout: Some(std::time::Duration::from_mins(15)),
+            },
+        );
+        let got = resolve_target_run_defaults(
+            "wf",
+            declared(Some(60), Some(600), Some(30)),
+            Some(&cache),
+            Ceilings::default(),
+        );
+        assert_eq!(got.execution_timeout, Some(secs(90)));
+        assert_eq!(got.chain_execution_timeout, Some(secs(900)));
+        assert_eq!(got.sla, Some(secs(45)));
+        let other = resolve_target_run_defaults(
+            "other",
+            declared(Some(60), Some(600), Some(30)),
+            Some(&cache),
+            Ceilings::default(),
+        );
+        assert_eq!(
+            other.chain_execution_timeout,
+            Some(secs(600)),
+            "another type"
+        );
+    }
+
+    /// The result carries both fleet ceilings, so the start can cap the
+    /// override as every other start path does.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_target_carries_the_fleet_ceilings() {
+        let ceilings = Ceilings {
+            execution_timeout: Some(std::time::Duration::from_secs(120)),
+            chain_timeout: Some(std::time::Duration::from_mins(20)),
+        };
+        let got = resolve_target_run_defaults("wf", declared(None, None, None), None, ceilings);
+        assert_eq!(got.max_execution_timeout_ceiling, Some(secs(120)));
+        assert_eq!(got.max_workflow_chain_timeout_ceiling, Some(secs(1200)));
+        assert_eq!(
+            got.chain_execution_timeout, None,
+            "a ceiling sets no cap here"
+        );
+    }
+
+    /// A value past the `chrono` range drops out and never panics.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_target_drops_a_value_past_the_chrono_range() {
+        let got = resolve_target_run_defaults(
+            "wf",
+            TargetDeclared {
+                chain_execution_timeout: Some(std::time::Duration::MAX),
+                ..TargetDeclared::default()
+            },
+            None,
+            Ceilings::default(),
+        );
+        assert_eq!(got.chain_execution_timeout, None);
     }
 }

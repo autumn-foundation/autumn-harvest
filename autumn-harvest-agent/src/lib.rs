@@ -14,7 +14,9 @@
 //! recorded [`Verdict`], and [`select`] picks the best draw (issue #2441).
 //! [`ResponseCache`] serves an identical model call across runs. The
 //! [`draw`] module gives each sample of a run its own identity, so the cache
-//! keeps the samples apart. The `eval` feature adds the `eval` module. That
+//! keeps the samples apart. The [`episode`] log records each op, and
+//! [`consolidate`] turns the episodes into facts (issue #2454). The `eval`
+//! feature adds the `eval` module. That
 //! module re-drives a recorded run with a candidate model or prompt. The
 //! `sandbox` feature adds the `sandbox` module. Its `SandboxTool` runs agent
 //! code in a sandbox.
@@ -82,9 +84,11 @@
 pub mod agent;
 pub mod approval;
 pub mod bounds;
+pub mod consolidate;
 pub mod context_reset;
 pub mod delivery;
 pub mod draw;
+pub mod episode;
 pub mod error;
 #[cfg(feature = "eval")]
 pub mod eval;
@@ -125,8 +129,9 @@ pub use agent::overlay_store::PostgresOverlayStore;
 #[cfg(feature = "sqlite")]
 pub use agent::overlay_store::SqliteOverlayStore;
 pub use agent::overlay_store::{
-    Activation, InMemoryOverlayStore, MAX_AUTHOR_LEN, OverlayStoreError, OverlayValidator,
-    OverlayVersion, ProfileOverlayStore, Provenance, Rollback, StoredOverlay,
+    Activation, AutoAdoptOutcome, InMemoryOverlayStore, MAX_AUTHOR_LEN, OverlayStoreError,
+    OverlayValidator, OverlayVersion, PolicyLogEntry, PolicyState, ProfileOverlayStore, Provenance,
+    Rollback, StoreClock, StoredOverlay,
 };
 pub use agent::profile_read::{OverlayRead, ProfileRead};
 pub use agent::{
@@ -139,9 +144,17 @@ pub use agent::{
     agent_workspace_retain, agent_workspace_retain_info,
 };
 pub use approval::Approval;
+pub use consolidate::{
+    CONSOLIDATE_WORKFLOW_NAME, ConsolidateTask, ConsolidationReport, ConsolidationStop,
+    agent_consolidate, agent_consolidate_info,
+};
 pub use context_reset::{ContextReset, ProgressNotes};
 pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
 pub use draw::{Draw, DrawId, run_draws};
+pub use episode::{
+    Appended, Cleared, ConsolidationTrigger, Episode, EpisodeLog, EpisodeReset, EpisodeSettings,
+    EpisodeStore, InMemoryEpisodeStore, PassMark,
+};
 pub use error::{AgentError, ErrorKind};
 pub use flow::{FlowRule, FlowRules, Recheck, Released};
 pub use followup::Followups;
@@ -161,6 +174,11 @@ pub use message::{
 };
 pub use model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
 pub use policy::{AllowAll, Rule, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
+pub use refine::{
+    AdoptDecision, Adoption, ApprovalTimeout, AutoAdopt, DailyCap, GateState, OverlayPart,
+    PolicyCeilings, RefinePolicy, RefineStatus, WaitReason, adopt, agent_refine_policy,
+    agent_refine_policy_info, read_refine_policy,
+};
 pub use refine::{
     BundleFile, BundleManifest, DEFAULT_PROPOSAL_ATTEMPTS, DEFAULT_PROPOSER_OUTPUT_TOKENS,
     DEFAULT_PROPOSER_TIMEOUT, Dimension, Evidence, KEEP_BASE, MAX_PROPOSAL_ATTEMPTS, ModelProposer,

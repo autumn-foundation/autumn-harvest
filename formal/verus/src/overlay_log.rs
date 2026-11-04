@@ -24,6 +24,11 @@
 //! models the pointer of one kind and its log of moves. Each move records
 //! the pointer before it and the version after it. A rollback activates the
 //! pointer before the last move, over the pointer after it.
+//!
+//! Issue #2394 adds `decide_auto_move`, the kernel of an auto adoption
+//! under the head lock. It refuses a stale pointer, then a full daily cap.
+//! The spec `spec_auto_day` shows that the auto moves of one day never pass
+//! the cap.
 
 use vstd::prelude::*;
 
@@ -589,6 +594,109 @@ pub proof fn theorem_a_move_away_and_back_fails_a_stale_rollback(h: Heads)
     assert(away.moves.len() == h.moves.len() + 1);
     assert(back.moves.len() == h.moves.len() + 2);
     theorem_a_stale_rollback_changes_nothing(back, RollbackPlan { target: 1, expected: 2 }, h.moves.len() as u64);
+}
+
+
+/// The three outcomes of an auto adoption under the head lock (issue #2394).
+pub enum AutoMoveDecision {
+    Move,
+    Conflict,
+    CapReached,
+}
+
+/// `decide_auto_move` as a spec.
+pub open spec fn spec_decide_auto_move(
+    expected: Option<u64>,
+    actual: Option<u64>,
+    used: u64,
+    cap: Option<u32>,
+) -> AutoMoveDecision {
+    if expected != actual {
+        AutoMoveDecision::Conflict
+    } else {
+        match cap {
+            Some(limit) => if used >= limit as u64 {
+                AutoMoveDecision::CapReached
+            } else {
+                AutoMoveDecision::Move
+            },
+            None => AutoMoveDecision::Move,
+        }
+    }
+}
+
+// mirror: autumn-harvest/src/overlay_log.rs decide_auto_move
+pub fn decide_auto_move(expected: Option<u64>, actual: Option<u64>, used: u64, cap: Option<u32>) -> (r:
+    AutoMoveDecision)
+    ensures
+        r == spec_decide_auto_move(expected, actual, used, cap),
+        r is Move ==> expected == actual,
+        r is Move && cap is Some ==> used < cap->0 as u64,
+{
+    let same = match (expected, actual) {
+        (None, None) => true,
+        (Some(want), Some(have)) => want == have,
+        _ => false,
+    };
+    if !same {
+        return AutoMoveDecision::Conflict;
+    }
+    match cap {
+        Some(limit) if used >= limit as u64 => AutoMoveDecision::CapReached,
+        _ => AutoMoveDecision::Move,
+    }
+}
+
+/// The auto moves of one UTC day, from the count `used`, after a sequence
+/// of attempts. Each attempt reads the pointer that it expects, so only the
+/// cap can refuse it. Each move adds one.
+pub open spec fn spec_auto_day(cap: Option<u32>, used: u64, attempts: nat) -> u64
+    decreases attempts,
+{
+    if attempts == 0 {
+        used
+    } else {
+        let next = if spec_decide_auto_move(None, None, used, cap) is Move {
+            (used + 1) as u64
+        } else {
+            used
+        };
+        spec_auto_day(cap, next, (attempts - 1) as nat)
+    }
+}
+
+/// With a cap of `limit`, a day that starts at or under the cap ends at or
+/// under it, after any number of attempts. The store counts under the head
+/// lock, so the attempts of one kind run one after another.
+pub proof fn theorem_an_auto_day_never_passes_the_cap(limit: u32, used: u64, attempts: nat)
+    requires
+        used <= limit as u64,
+    ensures
+        spec_auto_day(Some(limit), used, attempts) <= limit as u64,
+    decreases attempts,
+{
+    if attempts > 0 {
+        let next = if spec_decide_auto_move(None, None, used, Some(limit)) is Move {
+            (used + 1) as u64
+        } else {
+            used
+        };
+        theorem_an_auto_day_never_passes_the_cap(limit, next, (attempts - 1) as nat);
+    }
+}
+
+/// A stale pointer never moves, whatever the cap.
+pub proof fn theorem_a_stale_auto_move_conflicts(
+    expected: Option<u64>,
+    actual: Option<u64>,
+    used: u64,
+    cap: Option<u32>,
+)
+    requires
+        expected != actual,
+    ensures
+        spec_decide_auto_move(expected, actual, used, cap) is Conflict,
+{
 }
 
 } // verus!
