@@ -1,116 +1,106 @@
-# Spike: does the kache compiler cache cut our compile times?
+# Trial: kache in place of rust-cache in CI
 
-> **Status: measured, not adopted.** One machine, one workload, one sample per
-> cell except where noted. The note records what was run so that a later trial
-> starts from these numbers instead of repeating them.
+> **Status: trial in progress on PR #2551.** CI uses kache through
+> `kunobi-ninja/kache-action`. The S3 backend waits for the setup below.
+> Until then, each job falls back to the GitHub Actions cache.
 
-Measured 2026-11-04 on `trunk-dev` `429cd9a`.
+Started 2026-11-04 on `trunk-dev` `429cd9a`.
 
 ## 🎯 Question
 
-[kache](https://github.com/kunobi-ninja/kache) is a `RUSTC_WRAPPER` compiler
-cache with a GitHub Actions integration,
-[kache-action](https://github.com/kunobi-ninja/kache-action). Does it make
-local builds or CI builds of this workspace faster?
+Does [kache](https://github.com/kunobi-ninja/kache) make CI jobs faster than
+`Swatinem/rust-cache`? rust-cache saves a target that holds the dependencies
+only. Every run then compiles the workspace crates again. kache caches each
+`rustc` invocation by content, so an unchanged workspace crate or test binary
+is a cache hit.
 
-## 🧪 Setup
+## ⚙️ What the workflow does
 
-- kache 2.0.0 and kache-engine 2.0.0, from `cargo install kache --locked --version 2.0.0`.
-- Rust 1.99.1, from `rust-toolchain.toml`. Debug profile.
-- 4 vCPU, 15 GiB RAM, Linux 6.18, ext4. No reflink support, so restores copy.
-- Workload: the first step of the CI `test` job, without running the tests:
+`.github/workflows/ci.yml` runs kache-action in 22 jobs. The comment in the
+workflow `env` block gives the reasons. In short:
 
-  ```sh
-  cargo test -p autumn-harvest --no-default-features --no-run --locked
-  ```
+- `kani`, `fuzz-smoke` and both `harvest-verify` jobs keep rust-cache. They
+  cache files that are not `rustc` outputs.
+- `CARGO_INCREMENTAL=0` is set for the whole workflow. rust-cache used to set
+  it. An incremental build gives path crates another `codegen-units` value.
+  Each workspace crate then misses, as a local test showed.
+- The kache step runs after any step that deletes `$AGENT_TOOLSDIRECTORY`,
+  because the action installs kache there.
+- With a bucket configured, the backend is S3. Without one, it is the GitHub
+  Actions cache, keyed per job and matrix leg.
 
-  It builds 316 units. The workspace members in it are `autumn-harvest`,
-  `autumn-harvest-agent` and `autumn-harvest-macros`.
-- The wrapper was set per run with `RUSTC_WRAPPER`, not with `kache init`.
-  `kache init` writes `~/.cargo/config.toml`, which would also wrap the
-  baseline.
-- Each run had its own `CARGO_TARGET_DIR`. Sources were fetched before timing.
-  The page cache was not flushed.
-- An "edit" appends a unique comment line to `autumn-harvest/src/lib.rs`. A
-  plain `touch` is not used: kache keys on content, so a `touch` is a free hit
-  for kache and a recompile for cargo.
+## 🪣 S3 setup
 
-## 📊 Results
+The S3 backend gives one store that every PR reads. Each push to `trunk-dev`
+adds the crates that it compiled, so the store follows `trunk-dev`. The GitHub
+Actions cache cannot do that. Its entries are never replaced, so its store
+freezes at the first save for each `Cargo.lock`.
 
-### Local development
+1. **Make a bucket.** AWS S3, or an S3-compatible store. Cloudflare R2 has no
+   egress fee, and GitHub-hosted runners do not run in AWS. kache writes under
+   the `artifacts/` prefix.
+2. **Make a credential** that can read and write `artifacts/*` in that bucket:
+   `s3:GetObject` and `s3:PutObject` on AWS, or an R2 token with object read
+   and write on that bucket.
+3. **Add repository variables** (Settings → Secrets and variables → Actions →
+   Variables):
+   - `KACHE_S3_BUCKET`: the bucket name.
+   - `KACHE_S3_REGION`: optional. The default is `us-east-1`. R2 uses `auto`.
+   - `KACHE_S3_ENDPOINT`: only for a store that is not AWS. For R2, it is
+     `https://<account-id>.r2.cloudflarestorage.com`.
+4. **Add repository secrets**: `KACHE_S3_ACCESS_KEY_ID` and
+   `KACHE_S3_SECRET_ACCESS_KEY`. A job uses the bucket only when the key secret
+   is set. A fork PR gets no secrets, so it falls back to the GitHub cache.
+5. **Protect `trunk-dev`.** On GitHub Actions, kache writes only from a push to
+   a branch that GitHub reports as protected (`GITHUB_REF_PROTECTED=true`).
+   `KACHE_REMOTE_READONLY=0` does not override that. On 2026-11-04,
+   `trunk-dev` had no branch protection and no ruleset, so nothing would be
+   written. A branch ruleset that targets `trunk-dev` with only "Restrict
+   deletions" and "Block force pushes" is enough, and it does not block an
+   ordinary push.
+6. **Check the first push run.** After a merge to `trunk-dev`, each kache job
+   summary shows the uploads. A job that does not publish says why in the
+   `Remote writes` row of `kache doctor`.
 
-| Scenario | Plain cargo | kache | Change |
-|---|---|---|---|
-| Cold build, empty target, empty store | 124.1 s, 123.8 s | 129.8 s | +5% |
-| Empty target, warm store (new worktree, `cargo clean`) | 124 s (a cold build) | **10.1 s** | −92% |
-| No-op rebuild | 0.5 s | 0.4 s | none |
-| 1st edit of `lib.rs` after a restore | 23.4 s | **95.1 s** | +306% |
-| 2nd and 3rd edits | 19.7 s, 20.9 s | 27.9 s, 21.7 s | about even |
+Pull request jobs stay read-only. They read what `trunk-dev` published, and
+they compile their own changes on each push. kache can give pull requests a
+second, writable prefix (`pull_request_prefix`), but the action has no input
+for it. Then any PR author can affect the cached artifacts of another PR.
 
-The warm row ran with `KACHE_SEED_NEW_TARGETS=0`, so every unit came through
-the cache. A cold build left a 5.3 GiB store and a 5.4 GiB target. The plain
-target was 7.7 GiB, because kache strips the incremental directory.
+### Hardening to consider
 
-The first-edit penalty is kache's adaptive incremental mode. A restored
-target has no incremental state. So the first edit of a crate compiles it in
-full: about 47 s for the `autumn-harvest` lib, plus its test binaries. Later
-edits compile incrementally, like plain cargo.
+kache's read-only rule is not a security boundary. The bucket policy is.
+Same-repository PR jobs get the same secret as `trunk-dev` pushes, so a PR that
+edits the workflow can write to the bucket. On AWS, two OIDC roles close that
+gap: a write role whose trust policy matches `ref:refs/heads/trunk-dev`, and a
+read-only role for every other ref. The daemon reads AWS credentials from the
+standard chain, so `aws-actions/configure-aws-credentials` before the kache step
+works without key secrets.
 
-### CI shape
+## 📊 Results so far
 
-CI already caches with `Swatinem/rust-cache`. That action saves a target
-that holds the dependencies only. It removes the workspace-member artifacts
-and sets `CARGO_INCREMENTAL=0`. So the fair comparison is kache against that
-target, not against a cold build. All rows use `CARGO_INCREMENTAL=0`.
+### Local, before the CI trial
 
-| Pull request shape | rust-cache target | kache, empty target, warm store | Change |
-|---|---|---|---|
-| Does not touch the three members above | 70.5 s | **5.3 s** | −92% |
-| Edits `autumn-harvest/src/lib.rs` | 71.3 s | 81.2 s | +14% |
+4 vCPU, the CI `test` job's build
+(`cargo test -p autumn-harvest --no-default-features --no-run`), one sample
+each.
 
-One kache run is not in the table: 75.7 s on an untouched PR. Its store came
-from the local builds. Cargo gives path crates other `codegen-units` when
-incremental is on, so every member key missed. A CI store must come from
-builds with the same flags as the job that reads it.
+| Case | Plain cargo or rust-cache target | kache |
+|---|---|---|
+| Empty target, empty store | 124 s | 130 s |
+| Empty target, warm store, nothing changed | 70.5 s (rust-cache target) | 5.3 s |
+| Empty target, warm store, `autumn-harvest/src/lib.rs` edited | 71.3 s (rust-cache target) | 81.2 s |
 
-38 of the last 50 commits on `trunk-dev` change the source, manifest or
-migrations of one of the three members, or change `Cargo.lock`. This clone
-holds only 50 commits. On that mix, the expected gain for this job is about
-8 s a run. The common case gets slower, and the rare case gets much faster.
+An edit to the core crate misses for that crate and every test binary on top
+of it. kache then also hashes and stores each large output, so it costs a
+little more than rust-cache.
 
-## 🧱 Costs that the timings do not show
+### CI, GitHub Actions cache backend
 
-- **Cache quota.** One job's store is about 5 GiB before compression. `ci.yml`
-  already has 27 `rust-cache` steps, and a matrix job saves one entry per leg. GitHub
-  evicts by LRU at the repository quota. More large entries would evict the
-  current entries, and the existing jobs would get slower.
-- **The kache-action cache key has no job name.** `buildCacheKey` in the
-  action builds `kache-<version>-<os>-<arch>-<Cargo.lock hash>`. Every job
-  needs its own `cache-key-prefix`. Otherwise the first job to save wins, and
-  the other jobs restore a store for another workload.
-- **Remote writes need a protected-branch push.** With an S3 remote, kache
-  refuses writes from pull requests. A PR then rebuilds its own changes on
-  each push, unless a separate `pull_request_prefix` is set up with its own
-  bucket policy.
-- **A new binary in the build path.** kache 2.0.0 ships two binaries and a
-  daemon. A cache bug changes the build output. `cargo` alone has no such
-  risk.
+The baseline is the per-job median of 8 recent rust-cache runs. Only
+successful jobs count. One runner can take twice as long as another for the
+same job, so the table shows the range too.
 
-## ✅ Outcome
-
-- **CI: do not adopt now.** Most PRs edit the core crate. For those, kache
-  is 14% slower than the current `rust-cache` setup. The gain on the other
-  PRs does not pay for the quota and the extra moving parts.
-- **Local: optional, per developer.** kache helps a developer who often makes
-  new worktrees or runs `cargo clean`: 10 s instead of 124 s. It does not help
-  the edit-rebuild loop, and the first edit after a restore is slower. It is a
-  per-machine choice (`kache init`). It needs no change in the repository.
-
-## 🔁 Reopen when
-
-- A trial moves the jobs that do not build `autumn-harvest` (examples, the
-  clients, `autumn-harvest-plugin` shards) to a shared S3 store with
-  per-job manifest keys. Those jobs are the untouched-PR case.
-- kache can restore incremental state into a CI target, so that the
-  first-edit penalty goes away.
-- The GitHub Actions cache quota is raised enough to hold a store per job.
+Cold run (empty kache store), first 17 jobs to finish: 134 job-minutes, against
+a baseline median of 124 (+8%). Every job except
+`Clippy (whole workspace)` (+47%) fell inside its baseline range.

@@ -46,15 +46,26 @@ env:
   # Swatinem/rust-cache in every job that builds the root workspace.
   # kache caches each rustc invocation by content, workspace crates and test
   # binaries included, so an untouched crate is a cache hit on an empty target.
-  # The action keys its GitHub cache by `Cargo.lock` alone, with no job name.
-  # So each job and matrix leg passes `kache-g<N>-<job>-<job-index>` as its
-  # prefix. Without it, the first leg to save wins and the rest restore a
-  # wrong store. A failed job still saves its store, and an entry is never
-  # replaced. Bump `g<N>` in every prefix to drop a bad or empty store.
   # Four jobs keep rust-cache: kani, fuzz-smoke and both harvest-verify jobs.
   # They cache files that are not rustc outputs (MIR, `cargo install`, `fuzz/`).
   # The action installs kache into the runner tool cache. A job that frees
   # disk with `rm -rf "$AGENT_TOOLSDIRECTORY"` must run that step first.
+  #
+  # Backend: an S3 bucket, when the repository has the `KACHE_S3_BUCKET`
+  # variable and the `KACHE_S3_ACCESS_KEY_ID` secret. kache writes to it only
+  # from a push to a protected branch, so trunk-dev must have a ruleset. Pull
+  # requests read what trunk-dev published, so every PR shares one store.
+  # Each entry is written on its own, so the store follows trunk-dev.
+  # `manifest-key` names each job and leg, so prefetch stays per workload.
+  # `docs/rnd/2026-11-04-kache-compile-cache.md` lists the setup.
+  #
+  # Fallback: the GitHub Actions cache, for a fork PR or a repository with no
+  # bucket. The action keys that cache by `Cargo.lock` alone, with no job
+  # name. So each job and matrix leg passes `kache-g<N>-<job>-<job-index>` as
+  # its prefix. Without it, the first leg to save wins. An entry is never
+  # replaced, so this store freezes at its first save for each `Cargo.lock`.
+  # A failed job still saves its store. Bump `g<N>` to drop a bad store.
+  #
   # rust-cache used to set CARGO_INCREMENTAL=0 itself. kache does not, and an
   # incremental build gives path crates another codegen-units value, so the
   # cache keys would differ between jobs and runs.
@@ -185,6 +196,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Check default-run for multi-binary packages
         # Guards the defect class that silently broke `cargo run -p
         # quickstart` and `cargo run -p autumn-harvest-cli -- ...` (the
@@ -845,6 +862,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Run no-db tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features
@@ -958,6 +981,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # ── Manifest-driven, self-sharded (every shard runs both, each on its
       # own slice of the matching rows) ───────────────────────────────────
       - name: Compile plugin integration test suites (manifest, all OSes)
@@ -1398,6 +1427,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # The shards install the same version. The archive format is internal
       # to nextest, so the two ends must agree.
       - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
@@ -1745,6 +1780,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Build quickstart
         run: cargo build -p quickstart
       - name: Run the exact README quickstart command and assert a workflow reaches COMPLETED
@@ -1907,6 +1948,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # One package per command. The chapter runs each with `cargo run -p`,
       # and a joint build resolves other features, so it would not be reused.
       - name: Build the chapter's crate and the CLI
@@ -1970,6 +2017,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # See docs/upgrading/README.md, "How CI proves the contract".
       - name: Run the previous release and this tree on one database
         env:
@@ -2017,6 +2070,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
@@ -2131,6 +2190,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Scaffold a project with `harvest new`
         run: cargo run -p autumn-harvest-cli --bin harvest -- new demo_app --path "${RUNNER_TEMP}/scaffold"
       - name: Build the scaffolded project against the release candidates
@@ -2217,6 +2282,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Clippy autumn-harvest
         run: cargo clippy -p autumn-harvest --all-features --tests -- -D warnings
       # The deterministic profiles of the 0.8.0 fork, owner and entity paths.
@@ -2248,6 +2319,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Clippy autumn-harvest-plugin
         run: cargo clippy -p autumn-harvest-plugin --all-targets -- -D warnings
       - name: Clippy autumn-harvest-plugin (mcp feature)
@@ -2281,6 +2358,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # issue #525. Both tiers are linted: `dev-runtime-managed` compiles the
       # archive-download path, which `dev-runtime` alone `cfg`s out entirely.
       - name: Clippy autumn-harvest-plugin (dev-runtime feature)
@@ -2320,6 +2403,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Clippy autumn-harvest-plugin (sqs feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
       - name: Clippy autumn-harvest-plugin (aws-kms feature, issue #1825)
@@ -2353,6 +2442,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # The `sqlite` feature flips `autumn-web` to SQLite for the whole build.
       # The Postgres test binaries of this crate need a Postgres app pool, so
       # the lane builds the library and the SQLite suite only. No Postgres and
@@ -2394,6 +2489,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # `testcontainers` retries no pull, so a registry blip would fail the
       # suite. The script retries it.
       - name: Pre-pull the Postgres image
@@ -2421,6 +2522,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Clippy autumn-harvest-macros
         run: cargo clippy -p autumn-harvest-macros -- -D warnings
       - name: Clippy autumn-harvest-cli
@@ -2490,6 +2597,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Clippy --workspace (same command as release.yml validate)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -2511,6 +2624,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # Same issue #962 rule as every other crate on this page: a workspace
       # member gets NO clippy coverage without its own step, and these three
       # standalone example crates (each its own `examples/*/Cargo.toml`
@@ -2570,6 +2689,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Check signals chapter's clean await_condition example
         # Guards two real, reproduced-live compile failures an Onramp
         # clean-room pass found in chapter 4's "Clean Declarative
@@ -2748,6 +2873,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Check MSRV compiles
         run: cargo check --workspace
       # `cargo check --workspace` builds default features only, so the
@@ -2798,6 +2929,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Run loom models
         run: cargo test -p autumn-harvest --no-default-features --test loom_models --release
 
@@ -2825,6 +2962,12 @@ jobs:
           cache-key-prefix: kache-g2-${{ github.job }}-${{ strategy.job-index }}
           cache-executables: true
           pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && vars.KACHE_S3_BUCKET || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Run Shuttle models (random and PCT schedulers)
         run: cargo test -p autumn-harvest --no-default-features --test shuttle_models --release
 
