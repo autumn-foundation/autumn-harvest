@@ -21,7 +21,7 @@ use autumn_harvest::llm_ledger::LlmCall;
 use autumn_harvest::payload_depth::{
     MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE, nests_past_cap,
 };
-use autumn_harvest::policy::WorkflowSchedule;
+use autumn_harvest::policy::{OverlapPolicy, WorkflowSchedule};
 use autumn_harvest::{
     ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, NoOpMetrics, QueryHandlerInfo,
     SignalHandlerInfo, TimerId, UpdateHandlerInfo, UpdateId, WorkflowCommand, WorkflowEvent,
@@ -36,7 +36,8 @@ use crate::history_cap::{CapCheck, HistoryCapReason};
 use crate::llm_ledger::LlmLedgerRow;
 use crate::lock::WriterLock;
 use crate::query::{DEFAULT_QUERY_TIMEOUT, QueryReplay};
-use crate::schedule::{ScheduleOverride, ScheduleSummary};
+use crate::retention::{PurgePolicy, PurgeReport};
+use crate::schedule::{ScheduleOverride, ScheduleSummary, ScheduleTrigger};
 use crate::visibility::{ExecutionDescription, ExecutionFilter, ExecutionPage, ListCursor};
 use crate::{
     composition, llm_ledger, lock, mutex, queue, retention, schedule, schema, store, update,
@@ -449,6 +450,9 @@ pub struct SqliteRuntime {
     /// The declarative `#[signal]` handlers that carry an `arg_schema`, by
     /// `(workflow, signal)` (issue #2467).
     signal_handlers: HashMap<(String, String), SignalHandlerInfo>,
+    /// `false` fires no schedule (issue #2471). The plugin sets it from
+    /// `harvest.scheduler_enabled`.
+    schedules_enabled: bool,
 }
 
 impl Drop for SqliteRuntime {
@@ -574,6 +578,7 @@ impl SqliteRuntime {
             shared_state: empty_shared_state(),
             workflow_infos: HashMap::new(),
             signal_handlers: HashMap::new(),
+            schedules_enabled: true,
         })
     }
 
@@ -588,6 +593,17 @@ impl SqliteRuntime {
     #[doc(hidden)]
     pub fn set_clock(&mut self, now_fn: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) {
         self.now_fn = std::sync::Arc::new(now_fn);
+    }
+
+    /// Turn the firing of schedules on or off (issue #2471). It is on by
+    /// default.
+    ///
+    /// While it is off, no drive fires a due slot. The rows stay, and a due
+    /// slot stays due. So the next drive after a switch on fires it once.
+    /// The schedule admin calls still work, and a trigger still starts a run.
+    /// The SQLite plugin sets it from `harvest.scheduler_enabled`.
+    pub const fn set_schedules_enabled(&mut self, enabled: bool) {
+        self.schedules_enabled = enabled;
     }
 
     /// Set the app state that `ctx.state::<T>()` returns (issue #2467).
@@ -2327,6 +2343,107 @@ impl SqliteRuntime {
         schedule::list(&self.conn)
     }
 
+    /// Start one run of the schedule of `workflow_name` now (issue #2471).
+    ///
+    /// The run takes the stored input. It counts as a run of the schedule,
+    /// so `skip` counts it against the next slot. The slot does not move.
+    ///
+    /// - A paused schedule starts no run, unless `force` is `true`. A force
+    ///   keeps the pause.
+    /// - `overlap` overrides the stored policy for this call. Under `skip`, a
+    ///   schedule at its run limit starts no run.
+    ///
+    /// # Errors
+    ///
+    /// - [`SqliteError::ScheduleNotFound`]: no schedule exists.
+    /// - [`SqliteError::Unsupported`]: `overlap` is not `Skip` or `AllowAll`.
+    ///   Nothing is written.
+    /// - [`SqliteError::UnknownWorkflow`]: the workflow is not registered.
+    /// - [`SqliteError::Corrupt`] or [`SqliteError::Sqlite`]: a stored value
+    ///   does not parse, or the write fails.
+    pub fn trigger_schedule(
+        &mut self,
+        workflow_name: &str,
+        force: bool,
+        overlap: Option<OverlapPolicy>,
+    ) -> SqliteResult<ScheduleTrigger> {
+        if let Some(policy) = overlap {
+            schedule::check_trigger_policy(policy)?;
+        }
+        let now = (self.now_fn)().timestamp_millis();
+        let config = self.start_config(workflow_name, now)?;
+        let tx = self.conn.transaction()?;
+        let Some(manual) = schedule::load_manual(&tx, workflow_name)? else {
+            return Err(SqliteError::ScheduleNotFound(workflow_name.to_string()));
+        };
+        if manual.paused && !force {
+            return Ok(ScheduleTrigger::Paused);
+        }
+        let workflow_id = schedule::manual_workflow_id(workflow_name, now);
+        let policy = overlap.unwrap_or(manual.overlap_policy);
+        if policy != OverlapPolicy::AllowAll
+            && schedule::active_runs(&tx, workflow_name, now)? >= manual.max_active_runs
+        {
+            return Ok(ScheduleTrigger::SkippedOverlap { workflow_id });
+        }
+        // A field borrow, not `check_start`, because `tx` borrows `conn`.
+        if !self.workflows.contains_key(workflow_name) {
+            return Err(SqliteError::UnknownWorkflow(workflow_name.to_string()));
+        }
+        check_input_cap(&manual.input)?;
+        let fresh = FreshRun {
+            config: &config,
+            started_at: now,
+            fields: RunFields::default(),
+            input_check: None,
+        };
+        let outcome = start_in_tx(
+            &tx,
+            workflow_name,
+            Some(&workflow_id),
+            manual.input,
+            WorkflowIdReusePolicy::RejectDuplicate,
+            StartMatrix::Plain,
+            fresh,
+        )?;
+        store::set_schedule_name(&tx, outcome.exec_id, workflow_name)?;
+        tx.commit()?;
+        Ok(ScheduleTrigger::Fired {
+            exec_id: outcome.exec_id,
+            workflow_id,
+        })
+    }
+
+    /// Remove each terminal run past the age that `policy` gives its type
+    /// (issue #2471).
+    ///
+    /// The rule is the Postgres one. A type override wins over the global
+    /// age. A type with neither stays. A dry run counts the runs and removes
+    /// none. The window counts on the real clock, as
+    /// [`purge_terminal`](Self::purge_terminal) does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if a read or a delete fails.
+    pub fn purge_with(&mut self, policy: &PurgePolicy) -> SqliteResult<PurgeReport> {
+        self.purge_with_as_of(Utc::now(), policy)
+    }
+
+    /// Like [`purge_with`](Self::purge_with), with each window counted back
+    /// from `now`. A test seam that ages runs without a sleep.
+    ///
+    /// # Errors
+    ///
+    /// See [`purge_with`](Self::purge_with).
+    #[doc(hidden)]
+    pub fn purge_with_as_of(
+        &mut self,
+        now: DateTime<Utc>,
+        policy: &PurgePolicy,
+    ) -> SqliteResult<PurgeReport> {
+        retention::purge_with(&mut self.conn, now.timestamp_micros(), policy)
+    }
+
     /// Remove each terminal run closed more than `older_than` ago (issue
     /// #2031). Returns the number of runs removed.
     ///
@@ -2697,6 +2814,7 @@ impl SqliteRuntime {
         let failure_now = move || now_fn().timestamp_millis();
         let mut first_error = None;
         let now = (self.now_fn)().timestamp_millis();
+        let fire = fire && self.schedules_enabled;
         let mut progress = fire && self.fire_due_schedules(now, &mut first_error)?;
         for exec in store::running_executions(&self.conn)? {
             if skip.contains(&exec) {
@@ -2736,7 +2854,8 @@ impl SqliteRuntime {
         // `_as_of` simulation: `failure_now() == now` (deterministic, sleep-free).
         let failure_now = move || now;
         let mut first_error = None;
-        let mut progress = self.fire_due_schedules(now, &mut first_error)?;
+        let mut progress =
+            self.schedules_enabled && self.fire_due_schedules(now, &mut first_error)?;
         for exec in store::running_executions(&self.conn)? {
             match self.drive_one_cycle(exec, now, &failure_now).await {
                 Ok(

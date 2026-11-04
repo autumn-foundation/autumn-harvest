@@ -19,19 +19,24 @@
 //! Exactly one command or one pass runs at a time. That is the single-writer
 //! contract of `autumn-harvest-sqlite`. A long activity body therefore delays
 //! the next command. Reads do not wait: they use a read-only connection.
+//!
+//! The retention pass runs between drive passes, on its own interval (issue
+//! #2471). So it is one more writer turn, never a second writer.
 
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use autumn_harvest::context::SharedState;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
+use autumn_harvest::policy::WorkflowSchedule;
+use autumn_harvest::retention::{RetentionConfig, RetentionStatus, RetentionTickResult};
 use autumn_harvest::{ExecutionId, UpdateHandlerInfo};
 use autumn_harvest_sqlite::{
-    AdmittedUpdate, SignalDelivery, SignalWithStart, SignalWithStartOutcome, SqliteError,
-    SqliteResult, SqliteRuntime, StartOptions, StartOutcome,
+    AdmittedUpdate, PurgePolicy, SignalDelivery, SignalWithStart, SignalWithStartOutcome,
+    SqliteError, SqliteResult, SqliteRuntime, StartOptions, StartOutcome,
 };
 use autumn_web::fleet_layout::FleetDbKey;
 use serde_json::Value;
@@ -72,6 +77,132 @@ pub struct Registry {
     pub log_policy: Option<autumn_harvest::context::WorkflowLogPolicy>,
     /// The `HarvestPlugin::state` values.
     pub state: SharedState,
+    /// The code schedules (issue #2471). Only the control Harvest gets them.
+    pub schedules: Vec<WorkflowSchedule>,
+    /// `harvest.scheduler_enabled`. `false` fires no schedule.
+    pub scheduler_enabled: bool,
+    /// `HarvestPlugin::retention`. Each driver runs it on its own file.
+    pub retention: RetentionConfig,
+}
+
+impl Registry {
+    /// A registry with no definition, for a test.
+    #[cfg(test)]
+    pub fn empty() -> Self {
+        Self {
+            workflows: Vec::new(),
+            activities: Vec::new(),
+            updates: Vec::new(),
+            signals: Vec::new(),
+            queries: Vec::new(),
+            log_policy: None,
+            state: autumn_harvest::context::empty_shared_state(),
+            schedules: Vec::new(),
+            scheduler_enabled: true,
+            retention: RetentionConfig::default(),
+        }
+    }
+}
+
+/// A write that runs on the driver task, in turn with every other write
+/// (issue #2471). The admin routes send one for each schedule change.
+pub type Job = Box<dyn FnOnce(&mut SqliteRuntime) + Send>;
+
+/// The retention of one Harvest file (issue #2471).
+///
+/// The driver runs it on its interval. `POST /admin/retention/run-now` runs
+/// it through a [`Job`]. `GET /admin/retention` reads its status.
+pub struct Retention {
+    config: RetentionConfig,
+    /// `None` when no age is set. A pass then removes nothing.
+    policy: Option<PurgePolicy>,
+    every: Duration,
+    status: Mutex<RetentionStatus>,
+}
+
+impl Retention {
+    pub fn new(config: &RetentionConfig) -> Self {
+        Self {
+            config: config.clone(),
+            policy: purge_policy(config),
+            every: Duration::from_secs(config.tick_interval_secs.max(1)),
+            status: Mutex::new(RetentionStatus {
+                config: config.clone(),
+                // One file is one shard.
+                per_shard: vec![RetentionTickResult::default()],
+            }),
+        }
+    }
+
+    /// The status of the last pass, in the Postgres shape.
+    pub fn status(&self) -> RetentionStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The retention age of `workflow_name`, as on Postgres. An MCP task
+    /// reports it as its TTL.
+    #[cfg(feature = "mcp")]
+    pub fn effective_max_age(&self, workflow_name: &str) -> Option<Duration> {
+        self.policy
+            .as_ref()
+            .and_then(|_| self.config.effective_max_age(workflow_name))
+    }
+
+    /// Whether the driver runs a pass on its own.
+    const fn periodic(&self) -> bool {
+        self.policy.is_some()
+    }
+
+    /// Run one pass, and record it.
+    pub fn run(&self, runtime: &mut SqliteRuntime) {
+        let started = Instant::now();
+        let mut tick = RetentionTickResult {
+            ran_at: Some(chrono::Utc::now()),
+            ..RetentionTickResult::default()
+        };
+        if let Some(policy) = &self.policy {
+            match runtime.purge_with(policy) {
+                Ok(report) => {
+                    tick.candidate_count = usize::try_from(report.removed).unwrap_or(usize::MAX);
+                    if !report.dry_run {
+                        tick.deleted_count = tick.candidate_count;
+                    }
+                    tick.deleted_by_workflow = report.by_workflow;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "harvest-sqlite retention pass failed");
+                    tick.last_error = Some(error.to_string());
+                }
+            }
+        }
+        tick.duration_ms = started.elapsed().as_millis();
+        let mut status = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+        *status = RetentionStatus {
+            config: self.config.clone(),
+            per_shard: vec![tick],
+        };
+    }
+}
+
+/// The purge policy of `config`, or `None` when it sets no age.
+///
+/// The ages are the Postgres ones: `max_age_secs` and the per-type
+/// `overrides`. The build refuses the fields that SQLite cannot honour.
+pub fn purge_policy(config: &RetentionConfig) -> Option<PurgePolicy> {
+    if config.max_age_secs.is_none() && config.overrides.is_empty() {
+        return None;
+    }
+    let mut policy = PurgePolicy::new().dry_run(config.dry_run);
+    if let Some(secs) = config.max_age_secs {
+        policy = policy.max_age(Duration::from_secs(secs));
+    }
+    for (workflow, secs) in &config.overrides {
+        policy = policy.override_age(workflow.clone(), Duration::from_secs(*secs));
+    }
+    Some(policy)
 }
 
 /// An owned signal-with-start request. See [`SignalWithStart`].
@@ -232,6 +363,8 @@ pub enum Command {
         input: Value,
         reply: oneshot::Sender<SqliteResult<RoutedUpdate>>,
     },
+    /// Run a [`Job`] on the runtime (issue #2471).
+    Run(Job),
     /// Stop the loop. `reply` fires once the runtime is dropped, so the
     /// writer lock is free.
     Shutdown { reply: Option<oneshot::Sender<()>> },
@@ -265,18 +398,46 @@ impl Driver {
             register(&mut runtime, registry);
         }))
         .map_err(autumn_harvest::error::panic_message)?;
+        runtime.set_schedules_enabled(registry.scheduler_enabled);
         Ok(runtime)
+    }
+
+    /// Upsert each code schedule of `registry` (issue #2471).
+    ///
+    /// The control Harvest calls it once at open. A disabled scheduler
+    /// upserts none, as on Postgres, where the scheduler upserts them.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message that names the schedule and the refusal, such as an
+    /// unknown workflow or a field that this backend cannot honour.
+    pub(crate) fn upsert_code_schedules(
+        runtime: &mut SqliteRuntime,
+        registry: &Registry,
+    ) -> Result<(), String> {
+        if !registry.scheduler_enabled {
+            return Ok(());
+        }
+        for schedule in &registry.schedules {
+            runtime.upsert_schedule(schedule).map_err(|error| {
+                format!(
+                    "cannot register the schedule of {} on SQLite: {error}",
+                    schedule.workflow_name
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// Start the drive loop as a task on the app's runtime.
     ///
     /// An activity then runs where the rest of the app runs. A task that it
     /// spawns, such as a fleet open, lives on the app's runtime too.
-    pub(crate) fn start(runtime: SqliteRuntime, tick: Duration) -> Self {
+    pub(crate) fn start(runtime: SqliteRuntime, tick: Duration, retention: Arc<Retention>) -> Self {
         let (sender, receiver) = mpsc::channel(COMMAND_BACKLOG);
         let stop = CancellationToken::new();
         let task = tokio::spawn(async move {
-            let reply = drive(runtime, receiver, tick, &stop).await;
+            let reply = drive(runtime, receiver, tick, &stop, &retention).await;
             // `drive` owned the runtime, so the lock is released by now.
             if let Some(reply) = reply {
                 let _ = reply.send(());
@@ -299,6 +460,7 @@ impl Driver {
     pub(crate) fn spawn_tenant(
         runtime: SqliteRuntime,
         tick: Duration,
+        retention: Arc<Retention>,
         key: FleetDbKey,
         stop: CancellationToken,
         on_exit: Box<dyn FnOnce() + Send>,
@@ -308,7 +470,7 @@ impl Driver {
             // Declared first, so it runs last: after the runtime drops, on a
             // return and on an abort alike.
             let _exit = OnExit(Some(on_exit));
-            let reply = drive(runtime, receiver, tick, &stop).await;
+            let reply = drive(runtime, receiver, tick, &stop, &retention).await;
             if let Some(reply) = reply {
                 let _ = reply.send(());
             }
@@ -365,14 +527,22 @@ fn register(runtime: &mut SqliteRuntime, registry: &Registry) {
 /// The drive loop. It returns on [`Command::Shutdown`], with its reply, when
 /// every sender is gone, or when `stop` fires. It drops the runtime as it
 /// returns.
+///
+/// A periodic retention runs its first pass at once, then on its interval.
 async fn drive(
     mut runtime: SqliteRuntime,
     mut receiver: mpsc::Receiver<Command>,
     tick: Duration,
     stop: &CancellationToken,
+    retention: &Retention,
 ) -> Option<oneshot::Sender<()>> {
     let mut last_error: Option<String> = None;
+    let mut next_purge = retention.periodic().then(Instant::now);
     loop {
+        if next_purge.is_some_and(|at| Instant::now() >= at) {
+            retention.run(&mut runtime);
+            next_purge = Some(Instant::now() + retention.every);
+        }
         if stop.is_cancelled() {
             return None;
         }
@@ -514,6 +684,7 @@ async fn handle(runtime: &mut SqliteRuntime, command: Command) {
             };
             let _ = reply.send(routed);
         }
+        Command::Run(job) => job(runtime),
         // `drive` takes a shutdown before it calls `handle`.
         Command::Shutdown { .. } => {}
     }
@@ -743,15 +914,11 @@ mod tests {
             tokio.block_on(async move {
                 let registry = Registry {
                     workflows: vec![forever_info()],
-                    activities: Vec::new(),
-                    updates: Vec::new(),
-                    signals: Vec::new(),
-                    queries: Vec::new(),
-                    log_policy: None,
-                    state: autumn_harvest::context::empty_shared_state(),
+                    ..Registry::empty()
                 };
                 let runtime = Driver::open(&path, &registry).expect("open");
-                let driver = Driver::start(runtime, Duration::from_millis(250));
+                let retention = Arc::new(Retention::new(&registry.retention));
+                let driver = Driver::start(runtime, Duration::from_millis(250), retention);
                 let (reply, started) = oneshot::channel();
                 driver
                     .sender
@@ -774,5 +941,68 @@ mod tests {
             done_rx.recv_timeout(Duration::from_secs(30)).is_ok(),
             "the drive loop starved the current-thread runtime"
         );
+    }
+
+    #[workflow]
+    async fn once(_ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+        Ok(n)
+    }
+
+    fn every_second() -> WorkflowSchedule {
+        WorkflowSchedule::new(
+            "once",
+            autumn_harvest::policy::Schedule::Interval(Duration::from_secs(1)),
+        )
+    }
+
+    /// `harvest.scheduler_enabled = false` upserts no code schedule, and a
+    /// stored schedule does not fire (issue #2471).
+    #[tokio::test]
+    async fn a_disabled_scheduler_upserts_and_fires_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("h.db");
+        let on = Registry {
+            workflows: vec![once_info()],
+            schedules: vec![every_second()],
+            ..Registry::empty()
+        };
+        let mut runtime = Driver::open(&path, &on).expect("open");
+        Driver::upsert_code_schedules(&mut runtime, &on).expect("upsert");
+        assert_eq!(runtime.list_schedules().expect("list").len(), 1);
+        drop(runtime);
+
+        let off = Registry {
+            scheduler_enabled: false,
+            schedules: vec![every_second()],
+            ..on
+        };
+        let mut runtime = Driver::open(&path, &off).expect("reopen");
+        runtime.delete_schedule("once").expect("delete");
+        Driver::upsert_code_schedules(&mut runtime, &off).expect("no upsert");
+        assert!(runtime.list_schedules().expect("list").is_empty());
+
+        // A schedule from the admin API stays, and does not fire.
+        runtime
+            .upsert_schedule(&every_second())
+            .expect("admin upsert");
+        let later = chrono::Utc::now() + chrono::Duration::seconds(5);
+        runtime.poll_once_as_of(later).await.expect("poll");
+        let runs = runtime
+            .list_executions(&autumn_harvest_sqlite::ExecutionFilter::new())
+            .expect("runs");
+        assert!(runs.executions.is_empty(), "no slot fires");
+    }
+
+    /// An unknown workflow in a code schedule fails the open, and names it.
+    #[test]
+    fn a_code_schedule_of_an_unknown_workflow_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let registry = Registry {
+            schedules: vec![every_second()],
+            ..Registry::empty()
+        };
+        let mut runtime = Driver::open(&dir.path().join("h.db"), &registry).expect("open");
+        let error = Driver::upsert_code_schedules(&mut runtime, &registry).unwrap_err();
+        assert!(error.contains("once"), "{error}");
     }
 }

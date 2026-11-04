@@ -60,6 +60,17 @@ pub async fn dispatch(
     let workflow = request.target.workflow();
     let workflow_id = request.workflow_id.as_str().to_string();
 
+    // A SQLite app starts and signals through its handle (issue #2471).
+    #[cfg(feature = "sqlite")]
+    if let Some(handle) = api_state.sqlite_handle() {
+        let response = match handle {
+            Ok(handle) => sqlite_dispatch(&handle, request, workflow_id.clone()).await,
+            // `503` is transient, so the message waits for the boot.
+            Err(error) => axum::response::IntoResponse::into_response(error),
+        };
+        return classify_response(response, workflow_id).await;
+    }
+
     let response = match request.target {
         ConnectorTarget::Starts { .. } => {
             // Strip any inbound `Idempotency-Key`: the connector owns start
@@ -114,6 +125,39 @@ pub async fn dispatch(
     };
 
     classify_response(response, workflow_id).await
+}
+
+/// Dispatch one message through the SQLite handle (issue #2471).
+///
+/// The build refuses a `queue` and a `Starts` binding in `BrokerCoordinates`
+/// mode on SQLite, so neither reaches here. A `Starts` binding dedupes on
+/// the mapped `workflow_id`. A `SignalsWithStart` binding dedupes on the
+/// derived key. SQLite stores no start provenance, so the coordinates stay
+/// in the dead-letter record only.
+#[cfg(feature = "sqlite")]
+async fn sqlite_dispatch(
+    handle: &crate::sqlite::HarvestSqlite,
+    request: DispatchRequest<'_>,
+    workflow_id: String,
+) -> axum::response::Response {
+    let workflow = request.target.workflow();
+    match request.target {
+        ConnectorTarget::Starts { .. } => {
+            crate::sqlite::triggers::start(handle, workflow, Some(workflow_id), request.payload)
+                .await
+        }
+        ConnectorTarget::SignalsWithStart { signal_name, .. } => {
+            crate::sqlite::triggers::signal_with_start(
+                handle,
+                workflow,
+                workflow_id,
+                signal_name.to_string(),
+                request.payload,
+                Some(request.idempotency_key.to_string()),
+            )
+            .await
+        }
+    }
 }
 
 /// Classify the delegate's HTTP response into a [`DispatchOutcome`].

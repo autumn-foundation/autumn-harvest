@@ -42,6 +42,10 @@ pub struct ScheduleSummary {
     pub schedule: Schedule,
     /// The run limit of `skip` (issue #2390).
     pub max_active_runs: u32,
+    /// The input of each run (issue #2471).
+    pub input: Value,
+    /// The overlap policy: `Skip` or `AllowAll` (issue #2471).
+    pub overlap_policy: OverlapPolicy,
     /// `true` while the schedule is paused.
     pub paused: bool,
     /// The next slot. `None` never fires.
@@ -432,27 +436,36 @@ pub fn set_paused(
 pub fn list(conn: &Connection) -> SqliteResult<Vec<ScheduleSummary>> {
     let mut stmt = conn.prepare(
         "SELECT workflow_name, schedule_json, paused, next_run_at, last_run_at, \
-           max_active_runs \
+           max_active_runs, input_json, overlap_policy \
          FROM harvest_schedules ORDER BY workflow_name",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, bool>(2)?,
-            row.get::<_, Option<i64>>(3)?,
-            row.get::<_, Option<i64>>(4)?,
-            row.get::<_, i64>(5)?,
+            (
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ),
+            (
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ),
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (workflow_name, spec, paused, next, last, max_active_runs) = row?;
+        let ((workflow_name, spec, paused, next), (last, max_active_runs, input, overlap)) = row?;
         out.push(ScheduleSummary {
             workflow_name,
             schedule: parse_spec(&spec)?,
             max_active_runs: u32::try_from(max_active_runs)
                 .map_err(|_| SqliteError::corrupt("harvest_schedules.max_active_runs"))?,
+            input: serde_json::from_str(&input)
+                .map_err(|_| SqliteError::corrupt("harvest_schedules.input_json"))?,
+            overlap_policy: OverlapPolicy::from_db(&overlap),
             paused,
             next_run_at: next.and_then(DateTime::from_timestamp_millis),
             last_run_at: last.and_then(DateTime::from_timestamp_millis),
@@ -534,6 +547,90 @@ pub fn advance(conn: &Connection, due: &Due, now: i64, dispatched: bool) -> Sqli
         params![due.workflow_name, next, dispatched, due.slot],
     )?;
     Ok(())
+}
+
+/// What a trigger of a schedule did (issue #2471).
+///
+/// It is `non_exhaustive`, so a later outcome is not a breaking change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScheduleTrigger {
+    /// The trigger started a run.
+    Fired {
+        /// The new run.
+        exec_id: autumn_harvest::ExecutionId,
+        /// Its business id: `manual-<workflow>-<millis>-<nonce>`.
+        workflow_id: String,
+    },
+    /// The schedule is at its run limit under `skip`. No run started.
+    SkippedOverlap {
+        /// The business id that the run would have had, as on Postgres.
+        workflow_id: String,
+    },
+    /// The schedule is paused and the call did not force it. No run started.
+    Paused,
+}
+
+/// A schedule as a trigger reads it.
+pub struct Manual {
+    /// The input of the run.
+    pub input: Value,
+    /// The stored overlap policy.
+    pub overlap_policy: OverlapPolicy,
+    /// The run limit of `skip`.
+    pub max_active_runs: i64,
+    /// `true` while the schedule is paused.
+    pub paused: bool,
+}
+
+/// The schedule `workflow_name` for a trigger, whatever its slot.
+pub fn load_manual(conn: &Connection, workflow_name: &str) -> SqliteResult<Option<Manual>> {
+    let row = conn
+        .query_row(
+            "SELECT input_json, overlap_policy, max_active_runs, paused \
+             FROM harvest_schedules WHERE workflow_name = ?1",
+            [workflow_name],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((input, overlap, max_active_runs, paused)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(Manual {
+        input: serde_json::from_str(&input)
+            .map_err(|_| SqliteError::corrupt("harvest_schedules.input_json"))?,
+        overlap_policy: OverlapPolicy::from_db(&overlap),
+        max_active_runs,
+        paused,
+    }))
+}
+
+/// The `workflow_id` of a triggered run. It mirrors the Postgres form
+/// `manual-<schedule id>-<millis>-<nonce>`. The workflow name stands for the
+/// schedule id. The nonce keeps two triggers in one millisecond apart.
+pub fn manual_workflow_id(workflow_name: &str, now: i64) -> String {
+    format!(
+        "manual-{workflow_name}-{now}-{}",
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// Refuse a trigger overlap policy that this backend cannot honor.
+pub fn check_trigger_policy(policy: OverlapPolicy) -> SqliteResult<()> {
+    if matches!(policy, OverlapPolicy::Skip | OverlapPolicy::AllowAll) {
+        return Ok(());
+    }
+    Err(SqliteError::Unsupported(format!(
+        "overlap_policy {} — the sqlite backend supports skip and allow_all (issue #2471)",
+        policy.as_str()
+    )))
 }
 
 /// The `workflow_id` of the run of one slot. It mirrors the Postgres form

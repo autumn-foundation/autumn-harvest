@@ -1316,7 +1316,7 @@ so a list of the agents due to wake reads only those agents.
 **Profile overlays (issue #2374).** The `profile` commands use the routes
 of the overlay store. Install the store with
 `HarvestPlugin::agent_overlay_store`. Without it, each route is `404`. The
-SQLite plugin does not serve these routes yet (#2471).
+SQLite plugin does not serve these routes yet (epic #2466).
 
 - `list` shows each version with its provenance and created time. The
   active version has `active: true`.

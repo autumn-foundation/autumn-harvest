@@ -810,7 +810,8 @@ pub use autumn_harvest::{ExecutionId, WorkflowEvent};
 #[doc(hidden)]
 pub use crate::agent_policy_log::SqlitePolicyLog;
 pub use crate::auth::{
-    AuditFilter, AuditRow, MAX_AUDIT_PAGE, NewAuditRow, NewToken, SqliteAuthStore, StoredToken,
+    AuditFilter, AuditRow, MAX_AUDIT_PAGE, NewAuditRow, NewDeadLetter, NewToken, SqliteAuthStore,
+    StoredToken,
 };
 pub use crate::error::{SqliteError, SqliteResult};
 pub use crate::history_cap::HistoryCapReason;
@@ -831,7 +832,8 @@ pub use crate::runtime::{
     StartOutcome, UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
 // The depth cap is shared with the Postgres backend (issue #2225).
-pub use crate::schedule::{ScheduleOverride, ScheduleSummary};
+pub use crate::retention::{PurgePolicy, PurgeReport};
+pub use crate::schedule::{ScheduleOverride, ScheduleSummary, ScheduleTrigger};
 pub use crate::store::ActivityAttempt;
 pub use crate::visibility::{
     DEFAULT_LIST_LIMIT, ExecutionDescription, ExecutionFilter, ExecutionPage, ExecutionSummary,
