@@ -1019,6 +1019,10 @@ pub enum ForkEffects {
     Recorded,
     /// An activity runs for real. The caller must ask for this mode.
     Live,
+    /// An activity runs for real, as in [`Live`](Self::Live). The fork sends
+    /// no completion callback and fires no completion trigger (issue #2378).
+    /// A live probe of an agent uses it.
+    LiveQuiet,
 }
 
 impl ForkEffects {
@@ -1028,7 +1032,21 @@ impl ForkEffects {
         match self {
             Self::Recorded => "recorded",
             Self::Live => "live",
+            Self::LiveQuiet => "live_quiet",
         }
+    }
+
+    /// Whether an activity runs for real.
+    #[must_use]
+    pub const fn is_live(self) -> bool {
+        matches!(self, Self::Live | Self::LiveQuiet)
+    }
+
+    /// Whether the terminal path sends completion callbacks and fires
+    /// completion triggers. Only [`Live`](Self::Live) does.
+    #[must_use]
+    pub const fn notifies_completion(self) -> bool {
+        matches!(self, Self::Live)
     }
 }
 

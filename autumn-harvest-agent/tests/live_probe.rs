@@ -220,3 +220,35 @@ async fn a_probe_never_delegates_to_a_durable_peer() {
         "the desk never woke"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_probe_never_writes_the_memory_of_the_source() {
+    let store = Arc::new(autumn_harvest_agent::InMemoryMemoryStore::default());
+    let harness = AgentHarness::new(ScriptedModel::new(Vec::new()))
+        .memory(Arc::clone(&store) as Arc<dyn autumn_harvest_agent::MemoryStore>);
+    let scope = autumn_harvest_agent::MemoryScope::new("user-1");
+    let mut call = request(
+        "memory",
+        false,
+        Some(&[ToolEffect::ReadOnly, ToolEffect::Internal]),
+    );
+    call.memory_scope = Some(scope.clone());
+    call.call.arguments = json!({"command": "append", "block": "notes", "text": "probe note"});
+
+    let refused = harness.tool_call(call.clone()).await.unwrap();
+
+    assert_eq!(error_code(&refused.content), PROBE_EFFECT_REFUSED);
+    let snapshot = harness.memory_snapshot(scope).await.unwrap();
+    assert!(
+        !format!("{snapshot:?}").contains("probe note"),
+        "the store holds no probe note: {snapshot:?}"
+    );
+    // The same call with no mark reaches the memory tool.
+    call.probe_effects = None;
+    let plain = harness.tool_call(call).await.unwrap();
+    assert_ne!(
+        error_code(&plain.content),
+        PROBE_EFFECT_REFUSED,
+        "{plain:?}"
+    );
+}

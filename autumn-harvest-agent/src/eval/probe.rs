@@ -14,9 +14,18 @@
 //!   durable peer is refused.
 //! - The run never moves the workspace head.
 //!
-//! The probe input has no follow-ups and no draw. A follow-up waits on a
-//! durable timer, so the probe would not end. A draw root sets the run id,
-//! and the probe needs its own run id for the cost ledger.
+//! The probe input also changes these fields of the source task:
+//!
+//! - No follow-ups. A follow-up waits on a durable timer, so the probe would
+//!   not end.
+//! - No draw. A draw root sets the run id, and the probe needs its own.
+//! - `deliver` is off. An older worker ignores the mark, but not this flag.
+//! - `parallel_children` is zero, so each delegation runs inline. A fan-out
+//!   child is a separate run, and its end would notify outside systems.
+//! - The approval wait is [`PROBE_APPROVAL_TIMEOUT_SECS`]. Nobody answers it.
+//!
+//! The fork uses `ForkEffects::LiveQuiet`, so its end sends no completion
+//! callback and fires no completion trigger.
 //!
 //! Only Postgres has a fork. The SQLite host returns
 //! [`EvalError::Unsupported`].
@@ -34,6 +43,10 @@ use crate::model::BoxFuture;
 use crate::tool::ToolEffect;
 use crate::types::{AgentTask, Probe};
 use crate::workflow::WORKFLOW_NAME;
+
+/// The approval wait of a probe, in seconds. A gated call times out to a
+/// deny.
+pub const PROBE_APPROVAL_TIMEOUT_SECS: u64 = 1;
 
 /// The audit reason of a probe fork.
 #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
@@ -65,7 +78,7 @@ pub struct ProbeFork {
 
 /// A backend that can fork a run for a live probe.
 ///
-/// `PostgresAgents` forks with `ForkEffects::Live`. `SqliteRuntime` returns
+/// `PostgresAgents` forks with `ForkEffects::LiveQuiet`. `SqliteRuntime` returns
 /// [`EvalError::Unsupported`] from each method.
 pub trait LiveProbeHost {
     /// Read the workflow type and the decoded history of `source`.
@@ -171,6 +184,14 @@ fn probe_task(
     task.probe = Some(Probe::new(effects.iter().copied()));
     task.followups = None;
     task.draw = None;
+    // An older worker ignores the mark, but it reads this flag. So no report
+    // leaves the probe on any worker.
+    task.deliver = false;
+    // A fan-out child is a separate run. Its end would send completion
+    // callbacks and fire completion triggers. An inline child sends none.
+    task.parallel_children = 0;
+    // Nobody answers the approval of a probe, so a gated call fails fast.
+    task.approval_timeout_secs = PROBE_APPROVAL_TIMEOUT_SECS;
     Ok(task)
 }
 
@@ -266,7 +287,10 @@ mod tests {
 
     #[tokio::test]
     async fn the_probe_input_holds_the_overlay_and_the_mark() {
-        let mut task = AgentTask::new("Check the account.").system("old");
+        let mut task = AgentTask::new("Check the account.")
+            .system("old")
+            .parallel_children(4);
+        task.deliver = true;
         task.followups = Some(Followups::new(std::time::Duration::from_secs(60)));
         task.draw = Some(Draw::rooted("draws-1".to_owned(), DrawId::new(2)));
         let host = FakeHost::new(serde_json::to_value(&task).unwrap());
@@ -292,6 +316,9 @@ mod tests {
         assert_eq!(forked.probe, Some(Probe::new(effects)));
         assert_eq!(forked.followups, None, "a probe books no follow-up");
         assert_eq!(forked.draw, None, "a probe has its own run id");
+        assert!(!forked.deliver, "an older worker delivers nothing either");
+        assert_eq!(forked.parallel_children, 0, "each child runs inline");
+        assert_eq!(forked.approval_timeout_secs, PROBE_APPROVAL_TIMEOUT_SECS);
         assert_eq!(forked.input, task.input);
     }
 

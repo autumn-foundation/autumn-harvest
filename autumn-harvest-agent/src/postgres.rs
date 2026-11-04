@@ -85,6 +85,8 @@ pub struct PostgresAgents {
     sharded: Option<ShardedDbPool>,
     router: ShardRouter,
     codecs: PayloadCodecs,
+    /// The payload offloader of the workers, if any (issue #2378).
+    offloader: Option<std::sync::Arc<autumn_harvest::payload_store::PayloadOffloader>>,
     queue: String,
 }
 
@@ -116,6 +118,7 @@ impl PostgresAgents {
             sharded: None,
             router: ShardRouter::single(),
             codecs: PayloadCodecs::default(),
+            offloader: None,
             queue: DEFAULT_QUEUE.to_owned(),
         }
     }
@@ -138,6 +141,7 @@ impl PostgresAgents {
             sharded: Some(pools.clone()),
             router,
             codecs: PayloadCodecs::default(),
+            offloader: None,
             queue: DEFAULT_QUEUE.to_owned(),
         }
     }
@@ -147,6 +151,18 @@ impl PostgresAgents {
     #[must_use]
     pub fn with_codecs(mut self, codecs: PayloadCodecs) -> Self {
         self.codecs = codecs;
+        self
+    }
+
+    /// Read and write offloaded payloads with `offloader` (issue #2378). Pass
+    /// the offloader of the workers. A live probe then reads a source whose
+    /// input the store holds, and offloads a large probe input.
+    #[must_use]
+    pub fn with_payload_offloader(
+        mut self,
+        offloader: std::sync::Arc<autumn_harvest::payload_store::PayloadOffloader>,
+    ) -> Self {
+        self.offloader = Some(offloader);
         self
     }
 
@@ -855,9 +871,9 @@ async fn signal_live(
     )))
 }
 
-/// A live probe forks on Postgres with live effects (issue #2378).
+/// A live probe forks on Postgres with quiet live effects (issue #2378).
 ///
-/// The read and the fork use the codecs of the target. The fork commits in
+/// The read and the fork use the codecs and the offloader of the target. The fork commits in
 /// one transaction and only inserts rows, so the source stays unchanged.
 #[cfg(feature = "eval")]
 impl crate::eval::LiveProbeHost for PostgresAgents {
@@ -872,10 +888,14 @@ impl crate::eval::LiveProbeHost for PostgresAgents {
                 .await
                 .map_err(host)?;
             let run = load_execution(&mut conn, source).await.map_err(host)?;
-            let history =
-                autumn_harvest::store::load_history_with_codecs(&mut conn, source, &self.codecs)
-                    .await
-                    .map_err(host)?;
+            let history = autumn_harvest::store::load_history_inflated(
+                &mut conn,
+                source,
+                &self.codecs,
+                self.offloader.as_deref(),
+            )
+            .await
+            .map_err(host)?;
             Ok(crate::eval::SourceRun {
                 workflow_name: run.workflow_name,
                 events: history.events,
@@ -888,7 +908,7 @@ impl crate::eval::LiveProbeHost for PostgresAgents {
         source: ExecutionId,
         input: Value,
     ) -> BoxFuture<'_, Result<crate::eval::ProbeFork, crate::eval::EvalError>> {
-        use autumn_harvest::fork::{ForkEffects, WorkflowForkRequest};
+        use autumn_harvest::fork::{ForkEffects, WorkflowForkError, WorkflowForkRequest};
         Box::pin(async move {
             let host = |err: HarvestError| crate::eval::EvalError::Fork(err.to_string());
             let mut conn = self
@@ -898,7 +918,7 @@ impl crate::eval::LiveProbeHost for PostgresAgents {
             let request = WorkflowForkRequest {
                 reason: crate::eval::PROBE_FORK_REASON.to_owned(),
                 operator_id: crate::eval::PROBE_FORK_OPERATOR.to_owned(),
-                effects: ForkEffects::Live,
+                effects: ForkEffects::LiveQuiet,
                 input: Some(input),
                 ..WorkflowForkRequest::default()
             };
@@ -907,9 +927,13 @@ impl crate::eval::LiveProbeHost for PostgresAgents {
                 source,
                 request,
                 &self.codecs,
+                self.offloader.as_deref(),
             )
             .await
-            .map_err(|err| crate::eval::EvalError::Fork(err.to_string()))?;
+            .map_err(|err| match err {
+                WorkflowForkError::ErasedSource { .. } => crate::eval::EvalError::ErasedSource,
+                other => crate::eval::EvalError::Fork(other.to_string()),
+            })?;
             Ok(crate::eval::ProbeFork {
                 exec_id: fork.new_exec_id,
                 workflow_id: fork.workflow_id,

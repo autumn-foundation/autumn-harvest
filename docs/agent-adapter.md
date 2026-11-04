@@ -1023,26 +1023,31 @@ let probe = live_probe(&pg, &harness, source, &overlay, &allowed).await?;
 let state = postgres::wait_run(&pg, probe.exec_id, Duration::from_secs(300)).await?;
 ```
 
-The fork starts at event 0 with `ForkEffects::Live`. Its input is the
+The fork starts at event 0 with `ForkEffects::LiveQuiet`. Its input is the
 source task under the overlay, with the source ceilings. The input holds
 `AgentTask::probe`: the allowed effects. The `WorkflowForked` event of the
-fork names the source. A worker that
-holds the same tools runs it.
+fork names the source. A worker that holds the same tools runs the fork.
 
 | Part | In a live probe |
 |---|---|
 | `agent_tool_call` | Runs a tool only when its effect is in the set. Any other tool gets `{"error": "probe_effect_refused", "effect": ...}`, and `Tool::execute` does not run. The check is in the activity, so a permissive policy cannot bypass it. |
-| The policy | Runs as in the source. A gated call waits for a person. Nobody answers, so it times out to a deny. Bound the wait of the caller. |
-| `agent_deliver` | Never runs. |
-| A delegated child | A probe with the same set, inline or as a fan-out child run. |
+| The `memory` tool | Refused. A note would show in each later run of the scope. |
+| The policy | Runs as in the source. Nobody answers a probe, so the approval wait is one second. A gated call times out to a deny. |
+| `agent_deliver` | Never runs. The probe input also sets `deliver` to `false`. |
+| A delegated child | Runs inline, as a probe with the same set. A fan-out child would be a separate run that notifies on its end. |
 | A durable peer | The delegation is refused. The peer runs its own effects. |
 | The workspace | A probe reads it and never moves its head. |
 | Follow-ups and the draw | The probe input has neither. A follow-up would wait on a timer, and a draw root would give the probe the run id of the source. |
+| The end of the run | `LiveQuiet` sends no completion callback and fires no completion trigger. |
 | The cost ledger | The model turns record rows under the fork execution id. |
 | The source | A fork only inserts rows, so the source history stays the same. |
 
-Start a probe only after the whole fleet runs this release. An older
-worker drops the mark and runs each tool.
+An older worker cannot decode `live_quiet`, so it cannot run a probe. Start
+a probe only after every worker runs this release.
+
+Pass `PostgresAgents::with_payload_offloader` when the workers offload
+payloads. The probe then reads an offloaded source input, and offloads a
+large probe input.
 
 The default of `RefinePolicy::probe_effects` is `[read_only]`. An empty set
 refuses each tool. SQLite has no fork, so its host returns

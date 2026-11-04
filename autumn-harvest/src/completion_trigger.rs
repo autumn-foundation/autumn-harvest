@@ -1690,10 +1690,10 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
         // (`completion_callback::GLOBAL_CALLBACK_CONFIG` is `None`) or when
         // no target matches this terminal state.
         // Issue #2000: a recorded fork must not notify an outside system or
-        // start a run, so it skips callbacks and triggers. It still releases
-        // its mutexes below.
-        let recorded_fork = crate::fork::is_recorded_fork(conn, &execution).await?;
-        if !recorded_fork {
+        // start a run, so it skips callbacks and triggers. A quiet live fork
+        // skips them too (issue #2378). It still releases its mutexes below.
+        let quiet_fork = crate::fork::skips_completion_effects(conn, &execution).await?;
+        if !quiet_fork {
             crate::completion_callback::enqueue_completion_deliveries(
                 conn, &execution, exec_id, state, codecs,
             )
@@ -1710,7 +1710,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
         // non-terminal nd-block path (issue #603) deliberately does NOT reach
         // this function, so a blocked holder keeps its locks.
         crate::mutex::sweep_terminal_holder_and_wake(conn, exec_id).await?;
-        if recorded_fork {
+        if quiet_fork {
             return Ok(deferred_starts);
         }
 

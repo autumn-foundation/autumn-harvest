@@ -25,6 +25,7 @@ use autumn_harvest::{ExecutionId, HarvestBuilder, ShardId, WorkerConfig, migrate
 use autumn_harvest_agent::eval::{PROBE_EFFECT_REFUSED, live_probe};
 use autumn_harvest_agent::mesh::DELEGATE_TOOL;
 use autumn_harvest_agent::postgres::{self, PostgresAgents, RunState};
+use autumn_harvest_agent::refine::RefinePolicy;
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentModel, AgentReport, AgentTask, AllowAll, BoxFuture, ChatRequest,
     ChatResponse, ChatRole, ContentPart, Delivery, FnTool, Mandate, Peer, ProfileOverlay, Report,
@@ -450,11 +451,16 @@ async fn the_default_probe_runs_only_read_only_tools() {
     .await;
     let source = fx.source(&source_task()).await;
     let before = fx.event_digest(source).await;
+    assert!(!before.is_empty(), "the digest covers the source rows");
     let source_ledger = fx.ledger_rows(source).await;
+    assert!(source_ledger > 0, "the source has ledger rows");
     let delivered = fx.delivery.count();
     assert_eq!(delivered, 1, "the source delivers its report");
 
-    let (probe, report) = fx.probe(source, CALL_TOOLS, &[ToolEffect::ReadOnly]).await;
+    // The real default of the operator setting, not a copy of it.
+    let allowed: Vec<ToolEffect> = RefinePolicy::default().probe_effects.into_iter().collect();
+    assert_eq!(allowed, [ToolEffect::ReadOnly]);
+    let (probe, report) = fx.probe(source, CALL_TOOLS, &allowed).await;
 
     assert_eq!(Counters::get(&fx.counters.write), 0, "no write ran");
     assert_eq!(Counters::get(&fx.counters.external), 0, "no external ran");
@@ -472,7 +478,10 @@ async fn the_default_probe_runs_only_read_only_tools() {
     assert_eq!(fx.event_digest(source).await, before);
     // The fork names its source and marks itself as a probe.
     let history = fx.history(probe).await;
-    assert_eq!(fork_marker(&history), Some((source, ForkEffects::Live)));
+    assert_eq!(
+        fork_marker(&history),
+        Some((source, ForkEffects::LiveQuiet))
+    );
     let Some(WorkflowEvent::WorkflowStarted { input, .. }) = history.first() else {
         panic!("the probe history starts with WorkflowStarted");
     };
@@ -480,7 +489,8 @@ async fn the_default_probe_runs_only_read_only_tools() {
     let mark = task.probe.expect("the input marks the probe");
     assert_eq!(mark.effects(), BTreeSet::from([ToolEffect::ReadOnly]));
     assert_eq!(task.system.as_deref(), Some(CALL_TOOLS));
-    // The spend of the probe is under its own run id.
+    // The ledger keys each row on its execution. The probe rows key on the
+    // fork, and the source keeps its own count.
     assert!(fx.ledger_rows(probe).await > 0, "the probe has ledger rows");
     assert_eq!(
         fx.ledger_rows(source).await,
@@ -537,7 +547,7 @@ fn child_results(model: &ProbeModel) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_fan_out_child_of_a_probe_refuses_a_write() {
+async fn a_fan_out_source_probes_its_children_inline() {
     let fx = Fixture::new(Arc::new(AllowAll)).await;
     let task = source_task()
         .mandate(Mandate::new("planner").peers(["helper"]))
@@ -551,23 +561,21 @@ async fn a_fan_out_child_of_a_probe_refuses_a_write() {
     assert_eq!(Counters::get(&fx.counters.write), 0, "no child wrote");
     let refused = refusals(&child_results(&fx.model));
     assert_eq!(refused.len(), 2, "each child got a refusal: {refused:?}");
-    // Each child run is a probe with the same set.
-    let children: Vec<AgentTask> = fx
-        .history(probe)
-        .await
-        .into_iter()
-        .filter_map(|event| match event {
-            WorkflowEvent::ChildWorkflowStarted { input, .. } => {
-                Some(serde_json::from_value(input).unwrap())
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(children.len(), 2, "the probe ran two child runs");
-    for child in &children {
-        let mark = child.probe.as_ref().expect("a child is a probe");
-        assert_eq!(mark.effects(), BTreeSet::from([ToolEffect::ReadOnly]));
-    }
+    assert!(refused.iter().all(|value| value["effect"] == "write"));
+    // A fan-out child is a separate run, which could notify on its end. So
+    // the probe runs each child inline and starts no child run.
+    let history = fx.history(probe).await;
+    assert!(
+        !history
+            .iter()
+            .any(|event| matches!(event, WorkflowEvent::ChildWorkflowStarted { .. })),
+        "the probe started no child run"
+    );
+    let Some(WorkflowEvent::WorkflowStarted { input, .. }) = history.first() else {
+        panic!("the probe history starts with WorkflowStarted");
+    };
+    let input: AgentTask = serde_json::from_value(input.clone()).unwrap();
+    assert_eq!(input.parallel_children, 0);
     assert_eq!(fx.ledger_rows(source).await, source_ledger);
 }
 
@@ -581,5 +589,113 @@ async fn an_inline_child_of_a_probe_refuses_a_write() {
 
     assert_eq!(report.text, "probe done");
     assert_eq!(Counters::get(&fx.counters.write), 0, "no child wrote");
-    assert_eq!(refusals(&child_results(&fx.model)).len(), 2);
+    let refused = refusals(&child_results(&fx.model));
+    assert_eq!(refused.len(), 2, "{refused:?}");
+    assert!(refused.iter().all(|value| value["effect"] == "write"));
+}
+
+/// Removes the completion trigger of a test, also on a panic.
+struct TriggerRow {
+    url: String,
+    id: String,
+}
+
+impl Drop for TriggerRow {
+    fn drop(&mut self) {
+        let (url, id) = (self.url.clone(), self.id.clone());
+        // A drop cannot await, so a scoped thread runs the delete.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime");
+                runtime.block_on(async {
+                    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+                    let delete = diesel::sql_query(
+                        "DELETE FROM harvest_completion_triggers WHERE id = $1::uuid",
+                    )
+                    .bind::<Text, _>(id);
+                    diesel_async::RunQueryDsl::execute(delete, &mut conn)
+                        .await
+                        .expect("delete the trigger");
+                });
+            });
+        });
+    }
+}
+
+/// The number of runs of the workflow type `name`.
+async fn runs_of(fx: &Fixture, name: &str) -> usize {
+    let rows = diesel::sql_query(
+        "SELECT count(*)::text AS text FROM harvest_workflow_executions \
+         WHERE workflow_name = $1",
+    )
+    .bind::<Text, _>(name);
+    let rows: Vec<TextRow> = diesel_async::RunQueryDsl::load(rows, &mut fx.conn().await)
+        .await
+        .expect("count the runs");
+    rows.into_iter()
+        .next()
+        .map_or(0, |row| row.text.parse().unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_probe_fires_no_completion_trigger() {
+    // A trigger start routes through the global router, as in a worker app.
+    autumn_harvest::shard::install_global_router(autumn_harvest::shard::ShardRouter::single());
+    let fx = Fixture::new(Arc::new(AllowAll)).await;
+    // A registered target, so the terminal path can route its start. Its
+    // run fails on the report input, and the test only counts the starts.
+    let target = autumn_harvest_agent::heartbeat::HEARTBEAT_WORKFLOW_NAME.to_owned();
+    let started = runs_of(&fx, &target).await;
+    let id = uuid_text();
+    let insert = diesel::sql_query(
+        "INSERT INTO harvest_completion_triggers \
+            (id, source_workflow_name, terminal_states, target_workflow_name, input_mapping) \
+         VALUES ($1::uuid, 'agent_loop', '[\"Completed\"]'::jsonb, $2, \
+                 '{\"type\":\"Passthrough\"}'::jsonb)",
+    )
+    .bind::<Text, _>(id.clone())
+    .bind::<Text, _>(target.clone());
+    diesel_async::RunQueryDsl::execute(insert, &mut fx.conn().await)
+        .await
+        .expect("insert the trigger");
+    let _row = TriggerRow {
+        url: fx.url.clone(),
+        id,
+    };
+
+    let source = fx.source(&source_task()).await;
+    assert_eq!(
+        runs_of(&fx, &target).await,
+        1,
+        "the source fires the trigger"
+    );
+
+    let (probe, _report) = fx.probe(source, CALL_TOOLS, &[ToolEffect::ReadOnly]).await;
+
+    assert_eq!(
+        runs_of(&fx, &target).await,
+        started + 1,
+        "the probe fires none"
+    );
+    let mut conn = fx.conn().await;
+    for (exec, quiet) in [(source, false), (probe, true)] {
+        let row = autumn_harvest::execution::load_execution(&mut conn, exec)
+            .await
+            .unwrap();
+        assert_eq!(
+            autumn_harvest::fork::skips_completion_effects(&mut conn, &row)
+                .await
+                .unwrap(),
+            quiet,
+            "{exec}"
+        );
+    }
+}
+
+/// A new UUID as text, from the clock and a counter.
+fn uuid_text() -> String {
+    ExecutionId::new().to_string()
 }

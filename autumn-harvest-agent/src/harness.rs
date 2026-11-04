@@ -1378,8 +1378,11 @@ impl AgentHarness {
         // A live probe runs only its effects (issue #2378). The check is in
         // the activity, so no policy decision can change it.
         if let Some(effects) = &request.probe_effects
-            && !effects.contains(&tool.effect())
+            && (!effects.contains(&tool.effect()) || tool.name() == MEMORY_TOOL)
         {
+            // The memory of the scope belongs to the source. A note would
+            // show in the prompt of each later run, so a probe never writes
+            // one, as for the workspace head.
             return Ok(ToolOutcome::probe_refused(tool.effect()));
         }
         // A second check of the read-only rule. The decision and the call can
