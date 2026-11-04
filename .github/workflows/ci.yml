@@ -42,6 +42,19 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Compiler cache: kache (kunobi-ninja/kache-action) replaces
+  # Swatinem/rust-cache in every job that builds the root workspace.
+  # kache caches each rustc invocation by content, workspace crates and test
+  # binaries included, so an untouched crate is a cache hit on an empty target.
+  # The action keys its GitHub cache by `Cargo.lock` alone, with no job name.
+  # So each job and matrix leg passes `kache-<job>-<job-index>` as its prefix.
+  # Without it, the first leg to save wins and the rest restore a wrong store.
+  # Four jobs keep rust-cache: kani, fuzz-smoke and both harvest-verify jobs.
+  # They cache files that are not rustc outputs (MIR, `cargo install`, `fuzz/`).
+  # rust-cache used to set CARGO_INCREMENTAL=0 itself. kache does not, and an
+  # incremental build gives path crates another codegen-units value, so the
+  # cache keys would differ between jobs and runs.
+  CARGO_INCREMENTAL: 0
 
 jobs:
   # Detects whether any non-docs file changed, so the build/test jobs below can
@@ -162,7 +175,12 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       - name: Check default-run for multi-binary packages
         # Guards the defect class that silently broke `cargo run -p
         # quickstart` and `cargo run -p autumn-harvest-cli -- ...` (the
@@ -817,7 +835,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       - name: Run no-db tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features
@@ -914,13 +937,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # Shared across a given OS's 4 shards (they build the same
-          # Cargo.lock), so a shard needing a binary another shard already
-          # built doesn't start cold -- same reasoning as `test-db-linux`'s
-          # `shared-key`, but per-OS since these three OSes don't share a cache.
-          shared-key: test-nodb-${{ matrix.os }}
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       # Same disk-pressure guard as the pre-split `test` job carried
       # immediately before this step; every shard on Linux gets its own runner,
       # so it's cheap (a few seconds) to run per shard rather than build a
@@ -1359,11 +1381,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # Its own key. The archive builds without debug info, so it shares
-          # no artifact with the jobs that build with it.
-          shared-key: test-db-archive
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       - name: Free runner disk before heavy plugin link (Linux)
         if: needs.changes.outputs.code == 'true'
         run: |
@@ -1712,7 +1735,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       - name: Build quickstart
         run: cargo build -p quickstart
       - name: Run the exact README quickstart command and assert a workflow reaches COMPLETED
@@ -1869,7 +1897,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       # One package per command. The chapter runs each with `cargo run -p`,
       # and a joint build resolves other features, so it would not be reused.
       - name: Build the chapter's crate and the CLI
@@ -1920,7 +1953,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       # Two trees build here, so free the disk as the `test` job does.
       - name: Free runner disk before two builds
         run: |
@@ -1969,7 +2007,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
@@ -2078,7 +2121,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       - name: Scaffold a project with `harvest new`
         run: cargo run -p autumn-harvest-cli --bin harvest -- new demo_app --path "${RUNNER_TEMP}/scaffold"
       - name: Build the scaffolded project against the release candidates
@@ -2159,11 +2207,12 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       - name: Clippy autumn-harvest
         run: cargo clippy -p autumn-harvest --all-features --tests -- -D warnings
       # The deterministic profiles of the 0.8.0 fork, owner and entity paths.
@@ -2189,11 +2238,12 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       - name: Clippy autumn-harvest-plugin
         run: cargo clippy -p autumn-harvest-plugin --all-targets -- -D warnings
       - name: Clippy autumn-harvest-plugin (mcp feature)
@@ -2221,11 +2271,12 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       # issue #525. Both tiers are linted: `dev-runtime-managed` compiles the
       # archive-download path, which `dev-runtime` alone `cfg`s out entirely.
       - name: Clippy autumn-harvest-plugin (dev-runtime feature)
@@ -2259,11 +2310,12 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       - name: Clippy autumn-harvest-plugin (sqs feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
       - name: Clippy autumn-harvest-plugin (aws-kms feature, issue #1825)
@@ -2291,9 +2343,12 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          cache-on-failure: true
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       # The `sqlite` feature flips `autumn-web` to SQLite for the whole build.
       # The Postgres test binaries of this crate need a Postgres app pool, so
       # the lane builds the library and the SQLite suite only. No Postgres and
@@ -2329,9 +2384,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          cache-on-failure: true
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       # `testcontainers` retries no pull, so a registry blip would fail the
       # suite. The script retries it.
       - name: Pre-pull the Postgres image
@@ -2353,11 +2411,12 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       - name: Clippy autumn-harvest-macros
         run: cargo clippy -p autumn-harvest-macros -- -D warnings
       - name: Clippy autumn-harvest-cli
@@ -2421,9 +2480,12 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          cache-on-failure: true
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       - name: Clippy --workspace (same command as release.yml validate)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -2439,11 +2501,12 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       # Same issue #962 rule as every other crate on this page: a workspace
       # member gets NO clippy coverage without its own step, and these three
       # standalone example crates (each its own `examples/*/Cargo.toml`
@@ -2497,11 +2560,12 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       - name: Check signals chapter's clean await_condition example
         # Guards two real, reproduced-live compile failures an Onramp
         # clean-room pass found in chapter 4's "Clean Declarative
@@ -2674,7 +2738,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.97.0"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       - name: Check MSRV compiles
         run: cargo check --workspace
       # `cargo check --workspace` builds default features only, so the
@@ -2719,7 +2788,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       - name: Run loom models
         run: cargo test -p autumn-harvest --no-default-features --test loom_models --release
 
@@ -2741,7 +2815,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          cache-key-prefix: kache-${{ github.job }}-${{ strategy.job-index }}
+          cache-executables: true
+          pr-comment: false
       - name: Run Shuttle models (random and PCT schedulers)
         run: cargo test -p autumn-harvest --no-default-features --test shuttle_models --release
 
