@@ -1180,8 +1180,9 @@ pub struct AgentState {
     pub appends_since_pass: u32,
 }
 
+/// Whether `value` is 0. A serde skip predicate.
 #[allow(clippy::trivially_copy_pass_by_ref)]
-const fn is_zero(value: &u64) -> bool {
+pub(crate) const fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
@@ -1303,6 +1304,9 @@ impl Agent {
 /// [`AgentRun::handle`]. harvest-verify reads a future type that names a
 /// lifetime, as `AgentRun<'_>` does, as one that can write through its
 /// fields. The future also stays unboxed, so harvest-verify can follow it.
+// The engine keeps the workflow future on the heap, so the size of this
+// inline future costs no stack.
+#[allow(clippy::large_futures)]
 async fn handle_op(
     run: &AgentRun<'_>,
     state: AgentState,

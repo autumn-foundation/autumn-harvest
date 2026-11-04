@@ -15,8 +15,8 @@
 //! `allowed_effects` set to the draw effects of the policy, met with the
 //! effects of the profile. So a draw never gets more than a single run.
 //!
-//! #2440 adds draw identity. #2441 and #2443 score the draws and select
-//! one.
+//! #2440 adds draw identity. `agent_sample` (#2443) scores the draws and
+//! selects one.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
@@ -152,7 +152,10 @@ pub async fn agent_draws(ctx: &WorkflowContext, input: DrawsInput) -> Result<Dra
 /// The profile of `kind`, as a durable agent reads it for one op (issue
 /// #2372). With an overlay store, the active overlay applies. `None` means
 /// that no profile has the kind.
-async fn read_profile(ctx: &WorkflowContext, kind: &str) -> Result<Option<AgentProfile>, String> {
+pub(super) async fn read_profile(
+    ctx: &WorkflowContext,
+    kind: &str,
+) -> Result<Option<AgentProfile>, String> {
     let read: Option<ProfileRead> = ctx
         .execute_activity(&agent_profile_info(), kind.to_owned())
         .await
@@ -213,7 +216,7 @@ pub async fn run_admitted(
 /// The task that `profile` gives for `input`, as a durable agent builds
 /// it. It has no memory, no workspace, no follow-ups and no delivery,
 /// because a draw is not the answer that reaches a person.
-fn profile_task(profile: &AgentProfile, input: &str) -> AgentTask {
+pub(super) fn profile_task(profile: &AgentProfile, input: &str) -> AgentTask {
     let mandate_read_only = profile
         .mandate
         .as_ref()
@@ -253,7 +256,7 @@ fn profile_task(profile: &AgentProfile, input: &str) -> AgentTask {
 ///   one store (issue #2274).
 /// - `run_draws` gives it a draw id, so its cache key differs from the key
 ///   of each other draw (issue #2440).
-fn draw_task(task: &AgentTask, draw_effects: &BTreeSet<ToolEffect>) -> AgentTask {
+pub(super) fn draw_task(task: &AgentTask, draw_effects: &BTreeSet<ToolEffect>) -> AgentTask {
     let allowed_effects: BTreeSet<ToolEffect> = task.allowed_effects.as_ref().map_or_else(
         || draw_effects.clone(),
         |own| own.intersection(draw_effects).copied().collect(),
