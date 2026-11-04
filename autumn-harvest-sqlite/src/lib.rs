@@ -779,6 +779,7 @@
 //! deterministic primitive is **never** silently dropped, and a history written
 //! here always replays byte-identically on the core `WorkflowReplayer`.
 
+mod agent_policy_log;
 #[doc(hidden)]
 pub mod append_only;
 mod auth;
@@ -806,6 +807,8 @@ mod workflow_log;
 pub use autumn_harvest::llm_ledger::LlmCall;
 pub use autumn_harvest::{ExecutionId, WorkflowEvent};
 
+#[doc(hidden)]
+pub use crate::agent_policy_log::SqlitePolicyLog;
 pub use crate::auth::{
     AuditFilter, AuditRow, MAX_AUDIT_PAGE, NewAuditRow, NewToken, SqliteAuthStore, StoredToken,
 };

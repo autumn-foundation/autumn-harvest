@@ -58,7 +58,7 @@ const WIRE_KEYS: [&str; 8] = [
 
 /// Whether `item` is a valid tool name or flow label: 1 to
 /// [`MAX_ITEM_LEN`] bytes with no control character.
-fn valid_item(item: &str) -> bool {
+pub(crate) fn valid_item(item: &str) -> bool {
     !item.is_empty() && item.len() <= MAX_ITEM_LEN && !item.chars().any(char::is_control)
 }
 

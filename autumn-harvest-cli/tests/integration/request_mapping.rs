@@ -3773,3 +3773,141 @@ fn dlq_redrive_rejects_a_spread_over_one_hour() {
     ]);
     assert!(parsed.is_err(), "--spread-secs is capped at 3600");
 }
+
+/// Issue #2439: `agents sampling policy <kind>` maps `show`, `set` and
+/// `reset` to `GET`, `PUT` and `DELETE` on one route.
+#[test]
+fn agents_sampling_policy_maps_to_get_put_and_delete() {
+    let request = |args: &[&str]| {
+        let all: Vec<&str> = ["harvest", "agents", "sampling", "policy"]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        Cli::try_parse_from(all)
+            .expect("sampling policy args should parse")
+            .api_request()
+            .expect("sampling policy request should build")
+    };
+
+    let show = request(&["researcher", "show"]);
+    assert_eq!(show.method, ApiMethod::Get);
+    assert_eq!(show.path, "/admin/agents/researcher/sampling-policy");
+    assert_eq!(show.body, None);
+
+    let reset = request(&["researcher", "reset"]);
+    assert_eq!(reset.method, ApiMethod::Delete);
+    assert_eq!(reset.path, "/admin/agents/researcher/sampling-policy");
+    assert_eq!(reset.body, None);
+
+    let set = request(&[
+        "researcher",
+        "set",
+        "--strategies",
+        "best_of_n,vote",
+        "--max-draws",
+        "4",
+        "--max-concurrent-draws",
+        "2",
+        "--draw-effects",
+        "read_only,write",
+        "--scorers",
+        "exact_match,judge",
+        "--judge-models",
+        "small,large",
+        "--max-answer-retries",
+        "3",
+    ]);
+    assert_eq!(set.method, ApiMethod::Put);
+    assert_eq!(set.path, "/admin/agents/researcher/sampling-policy");
+    assert_eq!(
+        set.body,
+        Some(json!({"policy": {
+            "strategies": ["best_of_n", "vote"],
+            "max_draws": 4,
+            "max_concurrent_draws": 2,
+            "draw_effects": ["read_only", "write"],
+            "scorers": {"only": ["exact_match", "judge"]},
+            "judge_models": ["small", "large"],
+            "max_answer_retries": 3,
+        }}))
+    );
+}
+
+/// Issue #2439: `set` sends only the given settings, so the server fills in
+/// each default. An empty list flag sends an empty list.
+#[test]
+fn agents_sampling_policy_set_sends_only_the_given_settings() {
+    let body = |args: &[&str]| {
+        let all: Vec<&str> = ["harvest", "agents", "sampling", "policy", "coder", "set"]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        Cli::try_parse_from(all)
+            .expect("set args should parse")
+            .api_request()
+            .expect("set request should build")
+            .body
+    };
+
+    assert_eq!(
+        body(&["--json", "{}"]),
+        Some(json!({"policy": {}})),
+        "an explicit empty policy is the only way to send no setting"
+    );
+    assert_eq!(
+        body(&["--max-draws", "8", "--scorers", "deterministic"]),
+        Some(json!({"policy": {"max_draws": 8, "scorers": "deterministic"}}))
+    );
+    assert_eq!(
+        body(&["--strategies", "", "--draw-effects", ""]),
+        Some(json!({"policy": {"strategies": [], "draw_effects": []}}))
+    );
+    assert_eq!(
+        body(&["--json", r#"{"max_draws": 2, "strategies": ["beam"]}"#]),
+        Some(json!({"policy": {"max_draws": 2, "strategies": ["beam"]}}))
+    );
+}
+
+/// Issue #2439: a bare `set` would restore every default as a `set`. The CLI
+/// refuses it, so `reset` is the one way to do that.
+#[test]
+fn agents_sampling_policy_set_needs_a_setting() {
+    let bare = Cli::try_parse_from(["harvest", "agents", "sampling", "policy", "coder", "set"]);
+    assert!(bare.is_err(), "a bare set is refused");
+}
+
+/// Issue #2439: `--json` replaces every other flag, and must be an object.
+#[test]
+fn agents_sampling_policy_set_refuses_a_bad_json_policy() {
+    let both = Cli::try_parse_from([
+        "harvest",
+        "agents",
+        "sampling",
+        "policy",
+        "coder",
+        "set",
+        "--json",
+        "{}",
+        "--max-draws",
+        "2",
+    ]);
+    assert!(both.is_err(), "--json conflicts with each other flag");
+
+    for raw in ["[1]", "not json"] {
+        let cli = Cli::try_parse_from([
+            "harvest", "agents", "sampling", "policy", "coder", "set", "--json", raw,
+        ])
+        .expect("set args should parse");
+        assert!(cli.api_request().is_err(), "{raw} must be refused");
+    }
+}
+
+/// Issue #2439: the kind is one path segment, so a slash cannot reach
+/// another route.
+#[test]
+fn agents_sampling_policy_encodes_the_kind() {
+    let cli = Cli::try_parse_from(["harvest", "agents", "sampling", "policy", "a/b", "show"])
+        .expect("show args should parse");
+    let request = cli.api_request().expect("show request should build");
+    assert_eq!(request.path, "/admin/agents/a%2Fb/sampling-policy");
+}

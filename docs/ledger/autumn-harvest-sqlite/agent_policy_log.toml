@@ -1,0 +1,29 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/agent_policy_log.rs`. See `docs/ledger/README.md`.
+
+["SqlitePolicyLog::prepare"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["ddl", "read"]
+tables = ["harvest_agent_policies", "harvest_agent_policy_audit"]
+measured = "unmeasured"
+
+["audit_in"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_agent_policy_audit"]
+measured = "unmeasured"
+
+["read_in"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_agent_policies"]
+measured = "unmeasured"
+
+["write_in"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_agent_policies", "harvest_agent_policy_audit"]
+measured = "unmeasured"

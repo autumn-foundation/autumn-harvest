@@ -4,7 +4,7 @@
 //! records the answer with the reply. Replay reads the record, so the policy
 //! is never asked twice about one call.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -113,6 +113,20 @@ impl ToolRules {
             .unknown(Rule::Deny("this run may only call known tools".to_owned()))
     }
 
+    /// Rules for a run with an effect set (issue #2439). A tool whose effect
+    /// is not in `allowed` is refused. A tool that is not known is refused
+    /// too.
+    #[must_use]
+    pub fn only_effects(allowed: &BTreeSet<ToolEffect>) -> Self {
+        ToolEffect::ALL
+            .into_iter()
+            .filter(|effect| !allowed.contains(effect))
+            .fold(Self::new(), |rules, effect| {
+                rules.effect(effect, Rule::Deny(effect_refusal(effect)))
+            })
+            .unknown(Rule::Deny("this run may only call known tools".to_owned()))
+    }
+
     /// Ask a person before any write or external call.
     #[must_use]
     pub fn ask_before_acting() -> Self {
@@ -173,6 +187,11 @@ impl ToolPolicy for ToolRules {
     }
 }
 
+/// The reason that a run with an effect set gives for a refused tool.
+pub(crate) fn effect_refusal(effect: ToolEffect) -> String {
+    format!("this run may not run a tool of effect {effect}")
+}
+
 /// Combines policies and keeps the strictest answer. Any
 /// [`ToolDecision::Deny`] wins, then any [`ToolDecision::RequireApproval`],
 /// else [`ToolDecision::Allow`].
@@ -231,6 +250,33 @@ mod tests {
 
     fn tool(name: &str, effect: ToolEffect) -> FnTool {
         FnTool::new(name, "t", json!({}), |_| async { Ok(json!(null)) }).effect(effect)
+    }
+
+    #[test]
+    fn only_effects_refuses_every_other_effect_and_unknown_tools() {
+        let rules = ToolRules::only_effects(&BTreeSet::from([ToolEffect::ReadOnly]));
+        let read = tool("read", ToolEffect::ReadOnly);
+        assert_eq!(
+            rules.decide_now(&call("read"), Some(&read)),
+            ToolDecision::Allow
+        );
+        for effect in [
+            ToolEffect::Internal,
+            ToolEffect::Write,
+            ToolEffect::External,
+        ] {
+            let other = tool("other", effect);
+            assert_eq!(
+                rules.decide_now(&call("other"), Some(&other)),
+                ToolDecision::Deny {
+                    reason: effect_refusal(effect)
+                }
+            );
+        }
+        assert!(matches!(
+            rules.decide_now(&call("ghost"), None),
+            ToolDecision::Deny { .. }
+        ));
     }
 
     #[test]

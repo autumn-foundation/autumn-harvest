@@ -43,14 +43,18 @@ An app implements `AgentModel` for its provider.
 ```sh
 cargo run -p autumn-harvest-agent --features sqlite --example sqlite_agent
 cargo run -p autumn-harvest-agent --features sqlite --example agent_session_entity
+DATABASE_URL=postgres://localhost/harvest \
+  cargo run -p autumn-harvest-agent --features postgres --example postgres_agent
 ```
 
 The first example runs the agent loop once. The second runs a chat session
-as a durable `Agent`.
+as a durable `Agent`. The third runs both on Postgres, with a worker in the
+process.
 
 | Feature | Contents |
 |---|---|
 | `sqlite` | `sqlite::register`, `start`, `start_heartbeat` and `decide` for the embedded backend |
+| `postgres` | The same calls in `postgres`, for Postgres workers, and `PostgresOverlayStore` |
 | `eval` | `eval::evaluate`: re-drive a recorded run with a candidate model or prompt, and diff the decisions (issue #2001) |
 | `sandbox` | A tool that runs agent code in a sandbox. See [`docs/sandbox-activities.md`](../docs/sandbox-activities.md) |
 

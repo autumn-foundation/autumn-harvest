@@ -544,6 +544,7 @@ async fn the_tool_call_activity_checks_the_mandate_again() {
     let outcome = harness
         .tool_call(ToolCallRequest {
             skill: None,
+            allowed_effects: None,
             run_id: "r:d1".into(),
             session_id: None,
             step: 0,
@@ -1081,6 +1082,7 @@ async fn a_turn_records_labels_only_with_flow_rules() {
     ]);
     let request = ModelTurnRequest {
         skills: false,
+        allowed_effects: None,
         tool_guidance: std::collections::BTreeMap::new(),
         run_id: "r".into(),
         session_id: None,
@@ -1386,6 +1388,7 @@ async fn an_unknown_tool_is_denied_under_flow_rules() {
 fn turn_request() -> ModelTurnRequest {
     ModelTurnRequest {
         skills: false,
+        allowed_effects: None,
         tool_guidance: std::collections::BTreeMap::new(),
         run_id: "r".into(),
         session_id: None,
@@ -1950,6 +1953,7 @@ async fn the_tool_call_activity_refuses_a_tool_whose_labels_grew() {
     ));
     let request = |labels: &[&str]| ToolCallRequest {
         skill: None,
+        allowed_effects: None,
         run_id: "r".into(),
         session_id: None,
         step: 0,

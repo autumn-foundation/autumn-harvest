@@ -6114,6 +6114,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "recall-eval"
+version = "0.9.0"
+dependencies = [
+ "autoresearch",
+ "autumn-harvest-agent",
+ "autumn-harvest-sqlite",
+ "chrono",
+ "clap",
+ "tempfile",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "redis"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
