@@ -1703,7 +1703,11 @@ async fn start_child_on_target(
                 params = params.with_decision_partition(&child_workflow_id);
                 params.required_build_id = spec.assigned_build_id.clone();
                 params.concurrency_key = spec.concurrency_key.clone();
-                params.max_concurrent = spec.max_concurrent;
+                // Issue #2407: the limit of the type when the relay fires.
+                params.max_concurrent = crate::completion_trigger::fire_time_concurrency_limit(
+                    &workflow_name,
+                    spec.max_concurrent,
+                );
                 // A spec from before issue #1976 has no fairness key. It then
                 // takes the child's quota key, as a local child does.
                 params.fairness_key = crate::queue_fairness::fairness_key_for(

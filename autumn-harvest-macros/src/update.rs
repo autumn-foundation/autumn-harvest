@@ -293,10 +293,12 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let max_execution_timeout_ceiling = #update_with_start_max_execution_timeout_ceiling_tokens;
             let chain_execution_timeout = #update_with_start_chain_execution_timeout_tokens;
             let max_workflow_chain_timeout_ceiling = #update_with_start_max_workflow_chain_timeout_ceiling_tokens;
-            let concurrency_key = Self::info().concurrency.and_then(|p|
+            // Issue #2407: an operator override wins over the declared limit.
+            let concurrency_policy = client.apply_concurrency_run_default(info.name, info.concurrency);
+            let concurrency_key = concurrency_policy.and_then(|p|
                 ::autumn_harvest::concurrency::resolve_concurrency_key(p.key_expr, &start_input)
             );
-            let concurrency_limit = Self::info().concurrency.map(|p| p.limit);
+            let concurrency_limit = concurrency_policy.map(|p| p.limit);
             let params = ::autumn_harvest::UpdateWithStartParams {
                 workflow_name: #workflow_simple_name,
                 workflow_id: &workflow_id,
@@ -317,8 +319,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 max_workflow_chain_timeout_ceiling,
                 concurrency_key,
                 concurrency_limit,
-                concurrency_on_conflict: Self::info()
-                    .concurrency
+                concurrency_on_conflict: concurrency_policy
                     .map_or(
                         ::autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                         |p| p.on_conflict,

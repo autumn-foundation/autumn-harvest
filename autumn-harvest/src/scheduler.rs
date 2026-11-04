@@ -5171,8 +5171,9 @@ async fn tick_one_workflow_schedule(
             None => serde_json::Value::Null,
         };
         let wf_info = registry.workflows.get(wf_name);
+        // Issue #2407: an operator override wins over the declared limit.
         let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
-            wf_info.and_then(|info| info.concurrency.as_ref()).map_or(
+            registry.concurrency_policy(wf_name).map_or(
                 (None, None, crate::concurrency::ConcurrencyOnConflict::Defer),
                 |policy| {
                     let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
@@ -7138,8 +7139,9 @@ async fn drain_claimed_buffered_schedule(
             None => serde_json::Value::Null,
         };
         let wf_info = registry.workflows.get(wf_name);
+        // Issue #2407: an operator override wins over the declared limit.
         let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
-            wf_info.and_then(|info| info.concurrency.as_ref()).map_or(
+            registry.concurrency_policy(wf_name).map_or(
                 (None, None, crate::concurrency::ConcurrencyOnConflict::Defer),
                 |policy| {
                     let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);

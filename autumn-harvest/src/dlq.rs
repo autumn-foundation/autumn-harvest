@@ -956,8 +956,7 @@ pub async fn replay_dead_letter_at(
                     if task_type == TaskType::Workflow
                         && decoded
                         && let Some(reg) = registry
-                        && let Some(info) = reg.workflows.get(&workflow_name)
-                        && let Some(policy) = &info.concurrency
+                        && let Some(policy) = reg.concurrency_policy(&workflow_name)
                     {
                         params.concurrency_key = crate::concurrency::resolve_concurrency_key(
                             policy.key_expr,
@@ -1600,8 +1599,7 @@ pub async fn redrive_dead_letter_at(
                 if task_type == TaskType::Workflow
                     && decoded
                     && let Some(reg) = registry
-                    && let Some(info) = reg.workflows.get(&workflow_name)
-                    && let Some(policy) = &info.concurrency
+                    && let Some(policy) = reg.concurrency_policy(&workflow_name)
                 {
                     params.concurrency_key =
                         crate::concurrency::resolve_concurrency_key(policy.key_expr, &params.input);

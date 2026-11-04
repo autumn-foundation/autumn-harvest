@@ -1,4 +1,4 @@
-# Runtime SLA, execution-timeout and chain-cap overrides
+# Runtime SLA, execution-timeout, chain-cap and concurrency-limit overrides
 
 A workflow type declares three durations in code: its soft `sla`, its hard
 `execution_timeout` and its chain cap `chain_execution_timeout`. It declares
@@ -9,6 +9,11 @@ A DAG declares `sla` and `execution_timeout` through `#[dag(...)]` or
 same name. A DAG declares no chain cap. An operator override changes these
 values at runtime, with no restart and no deploy (issues #2387 and #2406,
 epic #2384).
+
+A workflow type can also declare a concurrency policy through
+`#[workflow(concurrency(key = ..., limit = ...))]`. An operator override
+changes its `limit` at runtime (issue #2407). The key and `on_conflict` stay
+as declared.
 
 ## Quick reference
 
@@ -39,6 +44,16 @@ curl -X PATCH https://<host>/api/harvest/admin/workflow-types/nightly_etl/run-de
      -H 'Content-Type: application/json' \
      -d '{"clear_override": true}'
 
+# Shed load from a downstream: let at most 2 runs of a key run at once.
+curl -X PATCH https://<host>/api/harvest/admin/workflow-types/tenant_sync/run-defaults \
+     -H 'Content-Type: application/json' \
+     -d '{"concurrency_limit": 2, "reason": "INC-4823"}'
+
+# Return the concurrency limit to its code value.
+curl -X PATCH https://<host>/api/harvest/admin/workflow-types/tenant_sync/run-defaults \
+     -H 'Content-Type: application/json' \
+     -d '{"concurrency_limit": null}'
+
 # Read the code value, the override and the effective value.
 curl https://<host>/api/harvest/admin/workflow-types/nightly_etl/run-defaults
 ```
@@ -53,11 +68,12 @@ Both routes need the admin role. Each `PATCH` writes one
 | `sla_secs` | The soft SLA in whole seconds, from 1 to 3153600000 (100 years). A breach is reported. It never ends a run. |
 | `execution_timeout_secs` | The hard execution timeout in whole seconds, from 1 to 3153600000 (100 years). A run past it is ended. |
 | `chain_execution_timeout_secs` | The cap of a new continue-as-new chain in whole seconds, from 1 to 3153600000 (100 years). A chain past it is ended. Refused for a DAG. |
+| `concurrency_limit` | The concurrency limit of a new start, from 1 to 2147483647. Refused for a type with no concurrency policy, a DAG included, and for a latest-wins type. |
 | `clear_override` | `true` deletes the stored override before the other fields merge. |
 | `reason` | Free text stored with the override. |
 | `recompute_in_flight` | `true` moves the SLA deadline of the runs in flight. Default `false`. |
 
-Each duration is tri-state:
+Each duration and `concurrency_limit` is tri-state:
 
 - An absent key keeps the stored override.
 - `null` returns the field to its code value.
@@ -140,10 +156,68 @@ true`. So two recomputes of one type never undo each other: the newer change
 decides the SLA of the runs in flight. To move them, set
 `recompute_in_flight: true` on that newer change.
 
+## Concurrency limit
+
+A start stores its concurrency limit on its workflow task row. The claim
+admits a row only while the count of running rows of its key is below that
+stored cap. A run in flight keeps one task row for its life. So:
+
+- **A lower limit** applies to the next start. A run in flight keeps its task
+  and its cap, and a lower limit cancels no run. The new starts wait until
+  the running count of their key drops below the new limit. A start that
+  waits from before the change keeps its higher cap. A continue-as-new
+  successor or a retry of a run in flight also keeps its higher cap.
+- **A higher limit** applies to the next start. The `PATCH` also raises the
+  stored cap of each live task row of the type, on every shard: a waiting
+  start, and the row of a run in flight. So the next claim admits the
+  waiting starts. It never lowers a stored cap.
+- **A latest-wins type** (`on_conflict = cancel_running`) cancels the oldest
+  runs of a key to keep its limit. Any later drop of an override, a clear
+  included, would cancel runs in flight. So the route refuses a limit for
+  such a type, and a start of such a type ignores a stored one.
+- **`{"concurrency_limit": null}`** clears only the limit and restores the
+  code limit. `clear_override` also clears the other fields. Either `PATCH`
+  raises the live rows to the code limit, if it is higher.
+
+A deferred start takes the limit that holds when it fires: a debounce, a
+throttle, an event batch, a completion trigger and a cross-shard child.
+
+A `PATCH` that names `concurrency_limit` or `clear_override`, for a type with
+a policy, adds a `concurrency_raise` report:
+
+| Field | Meaning |
+|-------|---------|
+| `raised_tasks` | The number of task rows whose cap went up. |
+| `unavailable_shards` | The shards that the raise could not reach. Their rows keep the old cap. Send the same request again to retry them. |
+| `superseded` | `true` when a newer change to the limit stopped this raise. That change then decides the cap. |
+
+The raise updates 500 rows per transaction. It skips a row that another
+transaction holds, for example a row that a worker claims at that moment.
+Another process stores the old limit on a start until its cache reloads,
+within about 6 seconds. So the route raises the rows again 10 seconds later.
+That second raise also lifts a row that the first one skipped. Each raise
+runs in its own task, so a client that disconnects stops neither one. A
+shard that the second raise cannot reach goes to the log as a warning.
+
+`GET /admin/concurrency` reports `code_limit`, `override_limit` and
+`effective_limit` for each workflow type with a concurrency policy in a
+`workflow` group. It reads the stored override, not a cache.
+`max_concurrent` is the largest cap that a live row of the key stores. So it
+can differ from `effective_limit` until the older rows finish.
+
+## Mixed versions
+
+Set a limit only after every process runs this release. An older process
+refuses `concurrency_limit` with a 400, and it starts runs with the code
+limit. Do not send a `PATCH` to an older process once a limit is stored. If
+it clears the last other field of the row, it deletes the row, the limit
+included.
+
 ## Grants
 
 The runtime role needs `SELECT`, `INSERT`, `UPDATE` and `DELETE` on
-`harvest_run_default_overrides`. `GET /admin/preflight` reports a missing
+`harvest_run_default_overrides`. The concurrency raise also needs `UPDATE` on
+`harvest_task_queue`, which the runtime role already has. `GET /admin/preflight` reports a missing
 grant.
 
 ## See also

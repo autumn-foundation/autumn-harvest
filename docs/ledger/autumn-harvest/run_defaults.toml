@@ -15,6 +15,13 @@ kind = ["read"]
 tables = []
 measured = "unmeasured"
 
+["db::raise_waiting_concurrency_caps"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_run_default_overrides", "harvest_task_queue", "harvest_workflow_executions"]
+measured = "unmeasured"
+
 ["db::recompute_in_flight_sla"]
 driver = "per_request"
 backend = ["postgres"]

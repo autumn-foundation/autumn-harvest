@@ -421,6 +421,8 @@ pub struct HarvestApiState {
     /// Server-side ceiling on the chain-scoped lifetime cap AND fleet-wide chain
     /// default (issue #617). `None` = no chain cap applied fleet-wide.
     max_workflow_chain_timeout: Arc<Mutex<Option<std::time::Duration>>>,
+    /// The wait before the second raise of the waiting starts (issue #2407).
+    concurrency_raise_settle_delay: Arc<Mutex<std::time::Duration>>,
     /// SSE keepalive comment interval (issue #324). Default 15 s.
     sse_keepalive_interval: Arc<Mutex<std::time::Duration>>,
     /// Maximum SSE event buffer depth per stream (issue #324). Default 1024.
@@ -529,6 +531,9 @@ impl Default for HarvestApiState {
             query_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(5))),
             max_workflow_execution_timeout: Arc::new(Mutex::new(None)),
             max_workflow_chain_timeout: Arc::new(Mutex::new(None)),
+            concurrency_raise_settle_delay: Arc::new(Mutex::new(
+                crate::run_defaults_api::CONCURRENCY_RAISE_SETTLE_DELAY,
+            )),
             sse_keepalive_interval: Arc::new(Mutex::new(std::time::Duration::from_secs(15))),
             sse_buffer_depth: Arc::new(Mutex::new(1024)),
             max_workflow_start_delay: Arc::new(Mutex::new(std::time::Duration::from_hours(8760))),
@@ -639,6 +644,24 @@ impl HarvestApiState {
             .max_workflow_chain_timeout
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = ceiling;
+    }
+
+    /// Set the wait before the second raise of the waiting starts (issue
+    /// #2407). A test sets a short wait.
+    pub fn set_concurrency_raise_settle_delay(&self, delay: std::time::Duration) {
+        *self
+            .concurrency_raise_settle_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = delay;
+    }
+
+    /// The wait before the second raise of the waiting starts (issue #2407).
+    #[must_use]
+    pub fn concurrency_raise_settle_delay(&self) -> std::time::Duration {
+        *self
+            .concurrency_raise_settle_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Current server-side ceiling for workflow chain timeouts.
@@ -19180,12 +19203,8 @@ pub(crate) async fn start_workflow(
         });
 
     // Resolve per-key concurrency policy from WorkflowInfo (issue #247).
-    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .and_then(|info| info.concurrency.as_ref())
-        .map_or(
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
+        runtime.registry.concurrency_policy(&workflow_name).map_or(
             (
                 None,
                 None,
@@ -21631,9 +21650,7 @@ async fn batch_start_workflows(
 
             let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
                 .registry
-                .workflows
-                .get(&item.workflow_name)
-                .and_then(|info| info.concurrency.as_ref())
+                .concurrency_policy(&item.workflow_name)
                 .map_or(
                     (
                         None,
@@ -23087,12 +23104,8 @@ pub(crate) async fn signal_with_start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .and_then(|info| info.concurrency.as_ref())
-        .map_or(
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
+        runtime.registry.concurrency_policy(&workflow_name).map_or(
             (
                 None,
                 None,
@@ -23848,12 +23861,8 @@ async fn update_with_start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .and_then(|info| info.concurrency.as_ref())
-        .map_or(
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
+        runtime.registry.concurrency_policy(&workflow_name).map_or(
             (
                 None,
                 None,
@@ -24972,9 +24981,7 @@ async fn rerun_workflow(
     // Per-key concurrency (issue #247), resolved against the EFFECTIVE input.
     let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
-        .workflows
-        .get(&source.workflow_name)
-        .and_then(|info| info.concurrency.as_ref())
+        .concurrency_policy(&source.workflow_name)
         .map_or(
             (
                 None,
@@ -31568,12 +31575,8 @@ async fn trigger_schedule_now(
         .registry
         .chain_execution_timeout(&workflow_name)
         .and_then(|d| chrono::Duration::from_std(d).ok());
-    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .and_then(|info| info.concurrency.as_ref())
-        .map_or(
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
+        runtime.registry.concurrency_policy(&workflow_name).map_or(
             (
                 None,
                 None,
@@ -36352,6 +36355,18 @@ async fn concurrency_status(
     let mut merged: std::collections::HashMap<(String, String), ConcurrencyKeyStats> =
         std::collections::HashMap::new();
 
+    // The stored limit overrides (issue #2407). The read takes the table, not
+    // the cache, so this view never shows a stale override.
+    let overrides: std::collections::HashMap<String, u32> = {
+        let mut conn = acquire_conn(pool.default_pool()).await?;
+        autumn_harvest::run_defaults::load_run_default_overrides(&mut conn)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .filter_map(|o| Some((o.workflow_name, o.fields.concurrency_limit?)))
+            .collect()
+    };
+
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
         let stats = queue::concurrency_key_stats(&mut conn, &runtime.queues)
@@ -36399,20 +36414,23 @@ async fn concurrency_status(
             {
                 continue;
             }
-            let declared = runtime
+            let code = runtime
                 .registry
                 .workflows
                 .get(&attribution.workflow_name)
-                .and_then(|info| info.concurrency)
-                .map_or_else(
-                    autumn_harvest::concurrency::ConcurrencyOnConflict::default,
-                    |policy| policy.on_conflict,
-                );
-            // Activity concurrency groups always defer (issue #811, Codex round 1).
+                .and_then(|info| info.concurrency);
+            let declared = code.map_or_else(
+                autumn_harvest::concurrency::ConcurrencyOnConflict::default,
+                |policy| policy.on_conflict,
+            );
+            // Activity concurrency groups always defer (issue #811).
             let on_conflict = effective_admin_on_conflict(&attribution.task_type, declared);
+            let override_limit = overrides.get(&attribution.workflow_name).copied();
+            let limits = admin_concurrency_limits(&attribution.task_type, code, override_limit);
             entry.workflows.push(queue::ConcurrencyWorkflowStrategy {
                 workflow_name: attribution.workflow_name,
                 on_conflict,
+                limits,
             });
         }
     }
@@ -36425,6 +36443,33 @@ async fn concurrency_status(
     }
     result.sort_by(|a, b| a.key.cmp(&b.key).then(a.task_type.cmp(&b.task_type)));
     Ok(Json(result))
+}
+
+/// The limits to report for one workflow type of an `/admin/concurrency` row
+/// (issue #2407).
+///
+/// Only a `workflow` group reports them, because the workflow limit caps only
+/// workflow tasks. A type with no code policy reports none. The effective
+/// limit follows the same rule as a start.
+fn admin_concurrency_limits(
+    task_type: &str,
+    code: Option<autumn_harvest::concurrency::ConcurrencyPolicy>,
+    override_limit: Option<u32>,
+) -> Option<queue::ConcurrencyLimitView> {
+    if task_type != "workflow" {
+        return None;
+    }
+    let code = code?;
+    let fields = autumn_harvest::run_defaults::RunDefaultFields {
+        concurrency_limit: override_limit,
+        ..autumn_harvest::run_defaults::RunDefaultFields::default()
+    };
+    let effective = fields.apply_concurrency(Some(code))?;
+    Some(queue::ConcurrencyLimitView {
+        code_limit: code.limit,
+        override_limit,
+        effective_limit: effective.limit,
+    })
 }
 
 /// Effective `on_conflict` to report for one `/admin/concurrency` row (issue #811).
@@ -53767,6 +53812,28 @@ mod tests {
     /// purely at claim time and always defers, so reporting its owning
     /// workflow's declared `cancel_running` on the `task_type = "activity"`
     /// admin row advertises a strategy nothing enforces.
+    /// Issue #2407: only a `workflow` group of a type with a policy reports
+    /// limits. A latest-wins type reports its code limit as effective.
+    #[test]
+    fn admin_reports_limits_for_workflow_rows_with_a_policy_only() {
+        use autumn_harvest::concurrency::{ConcurrencyOnConflict, ConcurrencyPolicy};
+
+        let defer = Some(ConcurrencyPolicy::new("input.k", 2));
+        let view = admin_concurrency_limits("workflow", defer, Some(5)).expect("limits");
+        assert_eq!(
+            (view.code_limit, view.override_limit, view.effective_limit),
+            (2, Some(5), 5)
+        );
+        assert_eq!(admin_concurrency_limits("activity", defer, Some(5)), None);
+        assert_eq!(admin_concurrency_limits("workflow", None, Some(5)), None);
+        let latest = Some(
+            ConcurrencyPolicy::new("input.k", 2)
+                .with_on_conflict(ConcurrencyOnConflict::CancelRunning),
+        );
+        let view = admin_concurrency_limits("workflow", latest, Some(5)).expect("limits");
+        assert_eq!(view.effective_limit, 2);
+    }
+
     #[test]
     fn admin_reports_defer_for_activity_rows_regardless_of_workflow_policy() {
         use autumn_harvest::concurrency::ConcurrencyOnConflict;

@@ -4534,6 +4534,22 @@ pub struct ConcurrencyWorkflowStrategy {
     /// A workflow whose registered `WorkflowInfo` declares no concurrency
     /// policy reports `defer`, matching what the start path resolves.
     pub on_conflict: crate::concurrency::ConcurrencyOnConflict,
+    /// The code limit, the operator override and the effective limit of the
+    /// type (issue #2407). Present on a `workflow` group of a type with a
+    /// policy. Serde flattens these fields into this object.
+    #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ConcurrencyLimitView>,
+}
+
+/// The concurrency limit of one workflow type (issue #2407).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConcurrencyLimitView {
+    /// The limit declared in code.
+    pub code_limit: u32,
+    /// The operator override, or `null` when there is none.
+    pub override_limit: Option<u32>,
+    /// The limit that a new start takes.
+    pub effective_limit: u32,
 }
 
 /// A `(concurrency_key, task_type)` group and one workflow type observed on it.
@@ -11527,10 +11543,16 @@ mod tests {
                 ConcurrencyWorkflowStrategy {
                     workflow_name: "doc_index".to_string(),
                     on_conflict: crate::concurrency::ConcurrencyOnConflict::CancelRunning,
+                    limits: None,
                 },
                 ConcurrencyWorkflowStrategy {
                     workflow_name: "doc_report".to_string(),
                     on_conflict: crate::concurrency::ConcurrencyOnConflict::Defer,
+                    limits: Some(ConcurrencyLimitView {
+                        code_limit: 2,
+                        override_limit: None,
+                        effective_limit: 2,
+                    }),
                 },
             ],
             ..sampler_shaped
@@ -11540,7 +11562,13 @@ mod tests {
             json["workflows"],
             serde_json::json!([
                 {"workflow_name": "doc_index", "on_conflict": "cancel_running"},
-                {"workflow_name": "doc_report", "on_conflict": "defer"},
+                {
+                    "workflow_name": "doc_report",
+                    "on_conflict": "defer",
+                    "code_limit": 2,
+                    "override_limit": null,
+                    "effective_limit": 2,
+                },
             ]),
             "the admin read must surface each workflow's effective strategy \
              using the same snake_case wire values the macro attribute accepts"
