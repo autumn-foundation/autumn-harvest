@@ -114,7 +114,8 @@ fn register_plugin_migrations(app: AppBuilder, require_embedded: bool) -> AppBui
 /// Whether the outbox set goes to the app database.
 ///
 /// The set is Postgres SQL. Under `sqlite` the app database is SQLite, so
-/// the set never goes there (issue #2472). The SQLite outbox is #2470.
+/// the set never goes there (issue #2472). The SQLite path creates its own
+/// table at boot (issue #2470).
 const fn app_outbox_set_applies() -> bool {
     !cfg!(feature = "sqlite")
 }
@@ -1578,9 +1579,14 @@ impl HarvestPlugin {
         }
         tracing::info!(
             ?mode,
-            "harvest runs on Postgres; the transactional outbox is off on a SQLite app \
-             (autumn-harvest#2470)"
+            "harvest runs on Postgres; a SQLite app runs the transactional outbox in embedded \
+             mode only (autumn-harvest#2470)"
         );
+        // Rows left from embedded mode wait with no relay. Say so at boot.
+        let app = app.on_startup(|state| async move {
+            crate::sqlite::warn_if_stranded(&state).await;
+            Ok(())
+        });
         self.build_postgres(app)
     }
 

@@ -391,6 +391,29 @@ pub fn find_active_execution_by_key(
     }
 }
 
+/// The newest execution of a `(workflow_name, workflow_id)` key, in any state
+/// (issue #2470).
+///
+/// A sealed run counts too. The outbox relay of `autumn-harvest-plugin` uses
+/// it to start a key at most once. The plain compare lets
+/// `idx_harvest_executions_key` answer it.
+pub fn newest_execution_by_key(
+    conn: &Connection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> SqliteResult<Option<ExecutionId>> {
+    conn.query_row(
+        "SELECT exec_id FROM harvest_executions \
+         WHERE workflow_name = ?1 AND workflow_id = ?2 \
+         ORDER BY rowid DESC LIMIT 1",
+        params![workflow_name, workflow_id],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|exec| exec.parse().map_err(|_| SqliteError::corrupt("exec_id")))
+    .transpose()
+}
+
 /// EVERY ACTIVE (non-sealed) execution for a `(workflow_name, workflow_id)` key,
 /// newest-first — the `TerminateIfRunning` reconciliation lookup (Codex #1080 P2).
 ///

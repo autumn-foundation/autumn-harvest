@@ -311,3 +311,10 @@ kind = ["read"]
 tables = ["harvest_executions"]
 measured = "docs/performance-sqlite-runtime-drive.md"
 plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
+["newest_execution_by_key"]
+driver = "per_tick"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "unmeasured"

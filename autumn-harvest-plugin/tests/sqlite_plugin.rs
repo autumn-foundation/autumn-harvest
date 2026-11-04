@@ -43,6 +43,9 @@ mod oidc_contract;
 #[path = "sqlite_plugin/auth_parity.rs"]
 mod auth_parity;
 
+#[path = "sqlite_plugin/outbox.rs"]
+mod outbox;
+
 /// A value given to `HarvestPlugin::state`. The activity reads it back.
 #[derive(Debug)]
 struct Prefix(&'static str);
