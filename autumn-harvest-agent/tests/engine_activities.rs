@@ -277,6 +277,7 @@ fn the_engine_registration_builds() {
             "agent_workspace_reset",
             "agent_workspace_floor",
             "agent_refine_propose",
+            "agent_refine_policy",
             "agent_score",
             "agent_consolidate_read",
             "agent_consolidate_turn",

@@ -13,6 +13,9 @@
 //!   the app's pooled file.
 //! - One driver task owns the runtime. See [`driver`].
 //! - The management API serves the core routes. See [`api`].
+//! - API tokens, roles, OIDC, the authorizer and the rate limiter run the
+//!   admin-auth layer stack of the Postgres path (issue #2469). Tokens and
+//!   audit rows live in the Harvest file.
 //!
 //! Every builder option and mode that this slice cannot honour fails the
 //! build or the boot, and names the issue that ports it. A silent no-op would
@@ -22,6 +25,8 @@ mod api;
 mod driver;
 mod fleet;
 mod handle;
+mod reads;
+mod ui;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -60,6 +65,11 @@ pub(crate) struct SqliteParts {
     pub path: Option<PathBuf>,
     /// One Harvest per open fleet tenant (issue #2472).
     pub per_tenant: bool,
+    /// The admin-auth layers (issue #2469). They run as on Postgres.
+    pub auth: crate::api::AdminAuthLayers,
+    /// The OIDC login (issue #2469).
+    #[cfg(feature = "oidc")]
+    pub oidc: Option<crate::oidc::OidcLogin>,
     /// Each option that was set but has no SQLite port: its name and issue.
     pub refused: Vec<(&'static str, u32)>,
 }
@@ -83,6 +93,12 @@ struct StartParts {
     updates: Vec<autumn_harvest::UpdateHandlerInfo>,
     /// The declarative `#[signal]` handlers, for their payload schemas.
     signals: Vec<autumn_harvest::SignalHandlerInfo>,
+    /// The declarative `#[query]` handlers (issue #2468).
+    queries: Vec<autumn_harvest::QueryHandlerInfo>,
+    /// The durable log sink policy (issue #2468).
+    log_policy: Option<autumn_harvest::context::WorkflowLogPolicy>,
+    /// The days to keep an audit row, as on Postgres. Zero keeps it.
+    audit_retention_days: i64,
     /// The `HarvestPlugin::state` values. The startup hook adds `AppState`.
     state: autumn_harvest::context::SharedStateMap,
 }
@@ -102,6 +118,9 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         allow_unauthenticated_mutations,
         path: code_path,
         per_tenant,
+        auth,
+        #[cfg(feature = "oidc")]
+        oidc,
         mut refused,
     } = parts;
 
@@ -120,12 +139,31 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         activities: builder.take_activities(),
         updates: builder.update_handlers().to_vec(),
         signals: builder.signal_handlers().to_vec(),
+        queries: builder.query_handlers().to_vec(),
+        log_policy: builder.workflow_log_policy(),
         state: builder.take_state(),
+        audit_retention_days: audit_retention_days(builder.retention_config()),
     };
 
     let api_state = HarvestApiState::new();
     api_state.set_allow_unauthenticated_mutations(allow_unauthenticated_mutations);
-    api_state.set_admin_auth_boundary(api_middleware.is_some());
+    // A login declares the boundary, as on Postgres.
+    #[cfg(feature = "oidc")]
+    let boundary = api_middleware.is_some() || oidc.is_some();
+    #[cfg(not(feature = "oidc"))]
+    let boundary = api_middleware.is_some();
+    api_state.set_admin_auth_boundary(boundary);
+    // The SQLite store keeps no run tenant, so tenant binding fails closed.
+    api_state.set_no_run_tenants();
+    // The roles of a login replace those of `with_roles`, as on Postgres.
+    #[cfg(feature = "oidc")]
+    let auth = crate::api::AdminAuthLayers {
+        roles: oidc
+            .as_ref()
+            .map(|login| login.roles().clone())
+            .or(auth.roles),
+        ..auth
+    };
     let handles = Handles::default();
 
     let slot = Arc::new(Mutex::new(Slot {
@@ -164,16 +202,65 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
     let Some(path) = api_path else {
         return app;
     };
-    let mut router = api::router(api::ApiState {
-        handle: handles.control,
-        fleet: handles.fleet,
-        flags: api_state,
-    });
+    let router = api_router(
+        handles,
+        &api_state,
+        &auth,
+        api_middleware,
+        #[cfg(feature = "oidc")]
+        oidc.as_ref(),
+    );
+    // `AppBuilder::nest` takes a `Router<AppState>`. No handler reads it.
+    app.nest(&path, router.with_state(()))
+}
+
+/// The management router with its auth (issue #2469).
+///
+/// The one layer stack of both backends wraps the routes, and the OIDC
+/// session boundary wraps the stack, as on Postgres. Host auth runs outside
+/// them. A login and host auth are alternatives, so one of them is `None`.
+fn api_router(
+    handles: Handles,
+    api_state: &HarvestApiState,
+    auth: &crate::api::AdminAuthLayers,
+    api_middleware: Option<crate::plugin::ApiMiddlewareFn>,
+    #[cfg(feature = "oidc")] oidc: Option<&crate::oidc::OidcLogin>,
+) -> autumn_web::reexports::axum::Router<()> {
+    // One limiter for the control and the tenant routes, so a client gets
+    // one budget.
+    let limiter = auth
+        .rate_limit
+        .clone()
+        .map(crate::api_rate_limit::ApiRateLimiter::new);
+    // The OIDC session boundary joins the stack, inside the tenant nest too.
+    // It then sees the core path, so a tenant health route stays public.
+    let stack = |router| {
+        let router =
+            crate::api::apply_admin_auth_layers_with(router, api_state, auth, limiter.clone());
+        #[cfg(feature = "oidc")]
+        let router = match oidc {
+            Some(login) => crate::oidc::session_boundary(router, login, auth.api_tokens),
+            None => router,
+        };
+        router
+    };
+    let mut router = api::router(
+        api::ApiState {
+            handle: handles.control,
+            fleet: handles.fleet,
+            flags: api_state.clone(),
+        },
+        &stack,
+    );
     if let Some(middleware) = api_middleware {
         router = middleware(router);
     }
-    // `AppBuilder::nest` takes a `Router<AppState>`. No handler reads it.
-    app.nest(&path, router.with_state(()))
+    // The login routes sit once, at the top, outside the boundary.
+    #[cfg(feature = "oidc")]
+    if let Some(login) = oidc {
+        router = router.merge(crate::oidc::login_router(login.clone()));
+    }
+    router
 }
 
 /// The options set on the builder that have no SQLite port.
@@ -183,18 +270,13 @@ fn builder_refusals(builder: &HarvestBuilder) -> Vec<(&'static str, u32)> {
         // DAGs are an engine non-goal of the SQLite backend (#2019).
         refused.push(("HarvestPlugin::dags", 2019));
     }
-    // The SQLite replay passes no declarative query handler, so a call to one
-    // would answer `QueryNotFound`. A query that the workflow body registers
-    // with `ctx.register_query` works.
-    if !builder.query_handlers().is_empty() {
-        refused.push(("HarvestPlugin::queries", 2468));
-    }
     if !builder.workflow_schedules().is_empty() {
         refused.push(("workflow schedules", 2471));
     }
     // Only a run purge counts. The default config also runs the audit and
-    // schedule janitors, which this backend has no tables for, so `enabled`
-    // is true for every plugin.
+    // schedule janitors, so `enabled` is true for every plugin. The audit
+    // store honours `audit_retention_days` (issue #2469). This backend has no
+    // schedule tables.
     if purges_runs(builder.retention_config()) {
         refused.push(("HarvestPlugin::retention", 2471));
     }
@@ -204,6 +286,15 @@ fn builder_refusals(builder: &HarvestBuilder) -> Vec<(&'static str, u32)> {
         refused.push(("WorkerConfig::with_cost_hold", EPIC_ISSUE));
     }
     refused
+}
+
+/// The days to keep an audit row. A dry run keeps every row.
+const fn audit_retention_days(config: &autumn_harvest::retention::RetentionConfig) -> i64 {
+    if config.dry_run {
+        0
+    } else {
+        config.audit_retention_days
+    }
 }
 
 /// Whether `config` asks to purge terminal runs by age.
@@ -399,21 +490,38 @@ async fn start(
         app_config.database.effective_primary_url(),
     )
     .map_err(AutumnError::service_unavailable_msg)?;
-    let infos = parts.workflows.clone();
     let registry = Arc::new(Registry {
         workflows: parts.workflows,
         activities: parts.activities,
         updates: parts.updates,
         signals: parts.signals,
+        queries: parts.queries,
+        log_policy: parts.log_policy,
         state: Arc::new(with_app_state(parts.state, state)),
     });
+    let catalog = Arc::new(handle::Catalog::of(&registry));
     let tick = Duration::from_millis(sqlite_config.tick_ms);
     let open_path = path.clone();
     let open_registry = Arc::clone(&registry);
-    let runtime = tokio::task::spawn_blocking(move || Driver::open(&open_path, &open_registry))
-        .await
-        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?
-        .map_err(AutumnError::service_unavailable_msg)?;
+    let audit_retention_days = parts.audit_retention_days;
+    let (runtime, auth_store) = tokio::task::spawn_blocking(move || {
+        let runtime = Driver::open(&open_path, &open_registry)?;
+        // Tokens and audit rows live in the Harvest file (issue #2469). The
+        // store opens before the driver starts, so its schema step never
+        // meets a driver write.
+        let auth_store = autumn_harvest_sqlite::SqliteAuthStore::open(&open_path)
+            .and_then(|store| store.with_audit_retention_days(audit_retention_days))
+            .map_err(|error| {
+                format!(
+                    "cannot open the token and audit store on {}: {error}",
+                    open_path.display()
+                )
+            })?;
+        Ok::<_, String>((runtime, auth_store))
+    })
+    .await
+    .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?
+    .map_err(AutumnError::service_unavailable_msg)?;
     let driver = Driver::start(runtime, tick);
     let reader = match autumn_harvest_sqlite::SqliteReader::open(&path) {
         Ok(reader) => reader,
@@ -425,14 +533,15 @@ async fn start(
             )));
         }
     };
-    let handle = HarvestSqlite::new(driver.sender.clone(), reader, path.clone(), infos.clone());
+    api_state.install_sqlite_auth_store(Arc::new(auth_store));
+    let handle = HarvestSqlite::new(driver.sender.clone(), reader, path.clone(), catalog);
     slot.lock().unwrap_or_else(PoisonError::into_inner).driver = Some(driver);
     state.insert_extension(handle.clone());
     let _ = handles.control.set(handle);
     tracing::info!(path = %path.display(), "harvest is running on SQLite");
 
     if let Some(fleet) = fleet {
-        let tenants = HarvestFleet::new(fleet, registry, infos, tick);
+        let tenants = HarvestFleet::new(fleet, registry, tick);
         tenants.install().await;
         state.insert_extension(tenants.clone());
         slot.lock().unwrap_or_else(PoisonError::into_inner).fleet = Some(tenants.clone());
@@ -597,8 +706,10 @@ mod tests {
         );
     }
 
+    /// The SQLite replay serves declarative queries (issue #2468), so the
+    /// build no longer refuses them.
     #[test]
-    fn a_declarative_query_is_refused_with_its_issue() {
+    fn a_declarative_query_is_not_refused() {
         fn answer(
             _ctx: &autumn_harvest::context::WorkflowContext,
             _args: serde_json::Value,
@@ -617,10 +728,7 @@ mod tests {
             response_schema: None,
         };
         let builder = HarvestBuilder::default().queries(vec![query]);
-        assert_eq!(
-            builder_refusals(&builder),
-            vec![("HarvestPlugin::queries", 2468)]
-        );
+        assert!(builder_refusals(&builder).is_empty());
     }
 
     #[test]

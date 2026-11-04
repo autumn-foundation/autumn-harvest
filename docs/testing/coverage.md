@@ -8,7 +8,10 @@ modules from dropping.
 
 - **`unit`** runs the `autumn-harvest` lib tests with `--all-features`.
 - **`db`** runs every `linux` row of `.github/ci/integration-suites.txt`.
-  It uses the shard layout of `test-db-linux`.
+  It shards by row ordinal, with the shard count of `test-db-linux`.
+  That CI job itself runs the rows from one nextest archive and
+  partitions them by test hash. See
+  [`ci-db-archive.md`](ci-db-archive.md).
 - **`report`** merges the LCOV file of each job. It publishes the
   `coverage-report` artifact and the run summary.
 

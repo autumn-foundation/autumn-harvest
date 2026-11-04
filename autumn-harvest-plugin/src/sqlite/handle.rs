@@ -107,6 +107,8 @@ struct Inner {
     workflows: Vec<String>,
     /// The registered definitions, for their input schemas.
     infos: HashMap<String, WorkflowInfo>,
+    /// The registered definitions that the read routes need (issue #2468).
+    catalog: Arc<Catalog>,
     /// The fleet tenant of this Harvest. `None` for the control Harvest.
     tenant: Option<FleetDbKey>,
 }
@@ -125,14 +127,19 @@ impl HarvestSqlite {
         sender: mpsc::Sender<Command>,
         reader: SqliteReader,
         path: PathBuf,
-        infos: Vec<WorkflowInfo>,
+        catalog: Arc<Catalog>,
     ) -> Self {
-        let mut workflows: Vec<String> = infos.iter().map(|info| info.name.to_owned()).collect();
+        let mut workflows: Vec<String> = catalog
+            .workflows
+            .iter()
+            .map(|info| info.name.to_owned())
+            .collect();
         workflows.sort();
         workflows.dedup();
-        let infos = infos
-            .into_iter()
-            .map(|info| (info.name.to_owned(), info))
+        let infos = catalog
+            .workflows
+            .iter()
+            .map(|info| (info.name.to_owned(), info.clone()))
             .collect();
         Self {
             inner: Arc::new(Inner {
@@ -141,6 +148,7 @@ impl HarvestSqlite {
                 path,
                 workflows,
                 infos,
+                catalog,
                 tenant: None,
             }),
             lease: None,
@@ -230,7 +238,13 @@ impl HarvestSqlite {
         })
     }
 
-    async fn read<T: Send + 'static>(
+    /// The registered definitions that the read routes need.
+    pub(crate) fn catalog(&self) -> &Catalog {
+        &self.inner.catalog
+    }
+
+    /// Run `read` on the read-only connection, off the async runtime.
+    pub(crate) async fn read<T: Send + 'static>(
         &self,
         read: impl FnOnce(&SqliteReader) -> Result<T, SqliteError> + Send + 'static,
     ) -> Result<T, HarvestSqliteError> {
@@ -704,6 +718,67 @@ impl HarvestSqlite {
         .map_err(|error| HarvestSqliteError::Read(error.to_string()))?
         .map(|_| ())
         .map_err(HarvestSqliteError::from)
+    }
+}
+
+/// The registered definitions that the read routes need (issue #2468).
+///
+/// The interface route lists the handlers. The awaitables route replays a
+/// run with them, as the drive does.
+pub struct Catalog {
+    /// The `#[workflow]` definitions.
+    pub workflows: Vec<WorkflowInfo>,
+    /// The declared attempt cap of each `#[activity]`, by name.
+    attempt_caps: HashMap<String, u32>,
+    /// The declarative `#[signal]` handlers.
+    pub signals: Vec<autumn_harvest::SignalHandlerInfo>,
+    /// The declarative `#[query]` handlers.
+    pub queries: Vec<autumn_harvest::QueryHandlerInfo>,
+    /// The declarative `#[update]` handlers.
+    pub updates: Vec<autumn_harvest::UpdateHandlerInfo>,
+    /// The app state of a replay.
+    ///
+    /// The state holds `AppState`, and `AppState` holds this handle. A weak
+    /// link breaks that cycle. The driver's runtime holds the strong link,
+    /// so a replay after a shutdown gets an empty state.
+    state: std::sync::Weak<autumn_harvest::context::SharedStateMap>,
+}
+
+impl Catalog {
+    /// The catalog of the definitions in `registry`.
+    pub fn of(registry: &super::driver::Registry) -> Self {
+        Self {
+            workflows: registry.workflows.clone(),
+            attempt_caps: registry
+                .activities
+                .iter()
+                .map(|info| {
+                    let cap = info
+                        .default_retry_policy
+                        .as_ref()
+                        .map_or(1, |policy| policy.max_attempts.max(1));
+                    (info.name.to_owned(), cap)
+                })
+                .collect(),
+            signals: registry.signals.clone(),
+            queries: registry.queries.clone(),
+            updates: registry.updates.clone(),
+            state: Arc::downgrade(&registry.state),
+        }
+    }
+
+    /// The attempt cap that a claim gives the activity `name`, as the
+    /// worker resolves it. An unknown activity gets one attempt.
+    pub fn max_attempts(&self, name: &str) -> i32 {
+        let max = self.attempt_caps.get(name).copied().unwrap_or(1);
+        i32::try_from(max).unwrap_or(i32::MAX)
+    }
+
+    /// The app state of a replay, or an empty one once the driver stopped.
+    pub fn state(&self) -> autumn_harvest::context::SharedState {
+        self.state
+            .upgrade()
+            .unwrap_or_else(autumn_harvest::context::empty_shared_state)
     }
 }
 

@@ -134,6 +134,13 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
         })
     });
     let h = Arc::clone(&harness);
+    rt.register_activity_with_body(&crate::refine::agent_refine_policy_info(), move |input| {
+        call(input, |kind: String| {
+            let h = Arc::clone(&h);
+            async move { h.refine_policy(&kind).await }
+        })
+    });
+    let h = Arc::clone(&harness);
     rt.register_activity_with_body(&agent_refine_propose_info(), move |input| {
         call(input, |request| {
             let h = Arc::clone(&h);

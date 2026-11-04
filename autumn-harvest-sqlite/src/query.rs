@@ -16,7 +16,7 @@ use autumn_harvest::executor::{
     history_reached_terminal_seal,
 };
 use autumn_harvest::{
-    ExecutionId, HarvestError, WorkflowCommand, WorkflowEvent, WorkflowHandlerFn,
+    ExecutionId, HarvestError, QueryHandlerInfo, WorkflowCommand, WorkflowEvent, WorkflowHandlerFn,
     WorkflowHistoryPolicy,
 };
 use rusqlite::Connection;
@@ -28,28 +28,139 @@ use crate::store;
 /// The default query timeout. It matches the Postgres builder default.
 pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The rows one query replays. It owns them, so the query future borrows no
-/// connection.
-pub struct QueryReplay {
+/// The rows that a replay of one run reads (issue #2468).
+///
+/// It owns them, so a replay future borrows no connection. A query replay
+/// and the awaitables report both build their context from it. The context
+/// then matches the drive's context.
+pub struct ReplayInput {
     exec: ExecutionId,
-    handler: WorkflowHandlerFn,
     history: Vec<WorkflowEvent>,
     input: Value,
     workflow_name: String,
     workflow_id: String,
     terminal: bool,
-    history_policy: WorkflowHistoryPolicy,
     pending_cancel: Option<String>,
     parent: Option<ExecutionId>,
-    /// The runtime's app state, so `ctx.state::<T>()` matches the drive
-    /// (issue #2467).
-    shared_state: SharedState,
     /// The drive's timeout and deadline, so `ctx.deadline()` matches (issue
     /// #2029).
     deadline: (
         Option<chrono::Duration>,
         Option<chrono::DateTime<chrono::Utc>>,
     ),
+}
+
+impl ReplayInput {
+    /// Read the rows of `exec`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
+    /// a persistence error if a row cannot be read.
+    pub fn load(conn: &Connection, exec: ExecutionId) -> SqliteResult<Self> {
+        // The state read goes first. It is the read that rejects an unknown id.
+        let state = store::execution_state(conn, exec)?;
+        let terminal = autumn_harvest::erase::is_terminal_state(&state);
+        // A cancel request is pending only while the run is live (issue
+        // #2021). The next drive sees it, so the replay sees it too.
+        let pending_cancel = if terminal {
+            None
+        } else {
+            store::cancel_request(conn, exec)?.map(|(reason, _)| reason)
+        };
+        Ok(Self {
+            exec,
+            history: store::load_history(conn, exec)?,
+            input: store::execution_input(conn, exec)?,
+            workflow_name: store::workflow_name_of(conn, exec)?,
+            workflow_id: store::workflow_id_of(conn, exec)?,
+            terminal,
+            pending_cancel,
+            // A child sees its parent here, as on a drive (issue #2026).
+            parent: store::parent_link(conn, exec)?.map(|(parent, _)| parent),
+            deadline: store::run_config(conn, exec)?.context_deadline(),
+        })
+    }
+
+    /// The workflow name of the run.
+    #[must_use]
+    pub fn workflow_name(&self) -> &str {
+        &self.workflow_name
+    }
+
+    /// Whether the run is in a terminal state.
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
+    /// The stored history of the run.
+    #[must_use]
+    pub fn history(&self) -> &[WorkflowEvent] {
+        &self.history
+    }
+
+    /// The stored history of the run, owned.
+    #[must_use]
+    pub fn into_history(self) -> Vec<WorkflowEvent> {
+        self.history
+    }
+
+    /// The parent run, for a child run.
+    #[must_use]
+    pub const fn parent(&self) -> Option<ExecutionId> {
+        self.parent
+    }
+
+    /// The declared execution timeout and the deadline of the run.
+    #[must_use]
+    pub const fn deadline(
+        &self,
+    ) -> (
+        Option<chrono::Duration>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        self.deadline
+    }
+
+    /// A replay context and the run input.
+    ///
+    /// The drive builds its context with the same name, id, parent, history
+    /// policy, pending cancel and deadline. A handler that reads them then
+    /// replays the same path.
+    #[must_use]
+    pub fn into_context(
+        self,
+        shared_state: SharedState,
+        history_policy: WorkflowHistoryPolicy,
+    ) -> (WorkflowContext, Value) {
+        let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+            self.exec,
+            self.history,
+            shared_state,
+            history_policy,
+        )
+        .with_workflow_name(self.workflow_name)
+        .with_workflow_id(self.workflow_id)
+        .with_parent_execution_id(self.parent)
+        .with_pending_cancellation(self.pending_cancel)
+        .with_execution_timeout(self.deadline.0)
+        .with_deadline(self.deadline.1);
+        (ctx, self.input)
+    }
+}
+
+/// The rows one query replays, with the handler of the run's workflow.
+pub struct QueryReplay {
+    rows: ReplayInput,
+    handler: WorkflowHandlerFn,
+    history_policy: WorkflowHistoryPolicy,
+    /// The runtime's app state, so `ctx.state::<T>()` matches the drive
+    /// (issue #2467).
+    shared_state: SharedState,
+    /// The declarative `#[query]` handlers of the run's workflow (issue
+    /// #2468).
+    queries: Vec<QueryHandlerInfo>,
 }
 
 impl QueryReplay {
@@ -63,38 +174,25 @@ impl QueryReplay {
     pub fn load(
         conn: &Connection,
         workflows: &HashMap<String, WorkflowHandlerFn>,
+        queries: &HashMap<String, Vec<QueryHandlerInfo>>,
         history_policy: WorkflowHistoryPolicy,
         shared_state: SharedState,
         exec: ExecutionId,
     ) -> SqliteResult<Self> {
-        // The state read goes first. It is the read that rejects an unknown id.
-        let state = store::execution_state(conn, exec)?;
-        let workflow_name = store::workflow_name_of(conn, exec)?;
+        let rows = ReplayInput::load(conn, exec)?;
         let handler = *workflows
-            .get(&workflow_name)
-            .ok_or_else(|| SqliteError::UnknownWorkflow(workflow_name.clone()))?;
-        let terminal = autumn_harvest::erase::is_terminal_state(&state);
-        // A cancel request is pending only while the run is live (issue
-        // #2021). The next drive sees it, so the query replay sees it too.
-        let pending_cancel = if terminal {
-            None
-        } else {
-            store::cancel_request(conn, exec)?.map(|(reason, _)| reason)
-        };
+            .get(&rows.workflow_name)
+            .ok_or_else(|| SqliteError::UnknownWorkflow(rows.workflow_name.clone()))?;
+        let queries = queries
+            .get(&rows.workflow_name)
+            .cloned()
+            .unwrap_or_default();
         Ok(Self {
-            exec,
+            rows,
             handler,
-            history: store::load_history(conn, exec)?,
-            input: store::execution_input(conn, exec)?,
-            workflow_id: store::workflow_id_of(conn, exec)?,
-            workflow_name,
-            terminal,
             history_policy,
-            pending_cancel,
-            // A child sees its parent here, as on a drive (issue #2026).
-            parent: store::parent_link(conn, exec)?.map(|(parent, _)| parent),
-            deadline: store::run_config(conn, exec)?.context_deadline(),
             shared_state,
+            queries,
         })
     }
 
@@ -106,26 +204,20 @@ impl QueryReplay {
     /// [`SqliteError::QueryPanicked`], [`SqliteError::QueryTimedOut`] or
     /// [`SqliteError::QueryUnavailable`].
     pub async fn run(self, name: String, args: Value, timeout: Duration) -> SqliteResult<Value> {
-        let exec = self.exec;
-        let sealed = self.terminal && history_reached_terminal_seal(&self.history);
-        // The drive builds its context with the same name, id, parent, history
-        // policy and pending cancel. A handler that reads them then replays
-        // the same path.
-        let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
-            exec,
-            self.history,
-            self.shared_state,
-            self.history_policy,
-        )
-        .with_workflow_name(self.workflow_name)
-        .with_workflow_id(self.workflow_id)
-        .with_parent_execution_id(self.parent)
-        .with_pending_cancellation(self.pending_cancel)
-        .with_execution_timeout(self.deadline.0)
-        .with_deadline(self.deadline.1);
+        let exec = self.rows.exec;
+        let terminal = self.rows.terminal;
+        let sealed = terminal && history_reached_terminal_seal(&self.rows.history);
+        let (ctx, input) = self
+            .rows
+            .into_context(self.shared_state, self.history_policy);
+        // A declarative handler answers when no imperative one has the name,
+        // as on Postgres (issue #2468).
+        for query in &self.queries {
+            ctx.register_declarative_query_handler(query);
+        }
 
-        let outcome = drive_query_replay_async(&ctx, self.handler, self.input, timeout).await;
-        let refusal = if self.terminal {
+        let outcome = drive_query_replay_async(&ctx, self.handler, input, timeout).await;
+        let refusal = if terminal {
             terminal_refusal(&ctx, outcome, sealed)
         } else {
             running_refusal(&ctx, outcome)
@@ -265,8 +357,7 @@ fn handler_result(
         Ok(Err(HarvestError::QueryHandlerNotFound(_))) => {
             Err(SqliteError::QueryNotFound { execution_id, name })
         }
-        // Only a declarative handler gives this. This backend seeds none, so
-        // the arm is a guard for a later core change.
+        // Only a declarative handler gives this (issue #2468).
         Ok(Err(HarvestError::QueryHandlerPanicked(details))) => Err(SqliteError::QueryPanicked {
             execution_id,
             name,

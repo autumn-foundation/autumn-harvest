@@ -407,6 +407,19 @@ CREATE TABLE IF NOT EXISTS harvest_llm_ledger (
 -- A usage report reads the ledger in a window of `recorded_at`.
 CREATE INDEX IF NOT EXISTS idx_harvest_llm_ledger_recorded_at
     ON harvest_llm_ledger (recorded_at);
+
+-- The durable workflow log lines (issue #2468), as on Postgres (issue #790).
+-- `seq` is the call ordinal of a line, so a re-driven cycle stores it once.
+-- `seq = i64::MAX` is the truncation marker. The table is new, so
+-- `CREATE TABLE IF NOT EXISTS` adds it to an older file.
+CREATE TABLE IF NOT EXISTS harvest_workflow_logs (
+    exec_id     TEXT    NOT NULL,
+    seq         INTEGER NOT NULL,
+    level       TEXT    NOT NULL,
+    message     TEXT    NOT NULL,
+    occurred_at INTEGER NOT NULL,          -- epoch microseconds
+    PRIMARY KEY (exec_id, seq)
+);
 ";
 
 /// The append-only guard on `harvest_events` (issue #2031), the analog of

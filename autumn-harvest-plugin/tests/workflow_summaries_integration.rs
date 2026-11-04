@@ -38,6 +38,9 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
+#[path = "support/wire_contract.rs"]
+mod wire_contract;
+
 type HarvestApiApp = axum::Router;
 
 fn init_sql() -> Vec<u8> {
@@ -222,6 +225,8 @@ async fn list_returns_summaries_with_flags() {
     assert_eq!(items[1]["workflow_id"], json!("sum-1"));
     assert_eq!(items[1]["result"], json!({"ok": true}));
     assert!(body["next_cursor"].is_null(), "no further page: {body}");
+    // The shared shape check that the SQLite suite runs too (issue #2468).
+    wire_contract::summaries_shape(&body);
 }
 
 // AC4: filters by workflow_name / state / completed range / search_attr.

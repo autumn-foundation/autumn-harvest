@@ -83,6 +83,7 @@ mod child_fanout_tests;
 mod child_policy_tests;
 #[cfg(feature = "db")]
 mod child_timeout_tests;
+mod ci_nextest_archive;
 mod ci_run_coverage;
 mod circuit_breaker_wiring_tests;
 #[cfg(feature = "db")]
