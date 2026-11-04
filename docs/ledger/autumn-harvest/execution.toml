@@ -79,6 +79,13 @@ tables = ["harvest_workflow_executions"]
 measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest/execution.md"
 
+["list_running_with_search_attrs"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_workflow_executions"]
+measured = "unmeasured"
+
 ["list_schedule_runs"]
 driver = "per_request"
 backend = ["postgres"]
