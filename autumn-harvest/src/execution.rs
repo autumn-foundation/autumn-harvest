@@ -7118,6 +7118,57 @@ pub async fn resolve_execution_id_by_workflow_id(
     }))
 }
 
+/// The largest page that [`list_running_with_search_attrs`] returns.
+pub const MAX_SEARCH_ATTR_PAGE: u32 = 1000;
+
+/// List the running executions of `workflow_name` whose search attributes
+/// contain `attrs`, in execution id order, on ONE shard.
+///
+/// `after` is the last execution id of the previous page, or `None` for the
+/// first page. A page holds at most `limit` rows, capped at
+/// [`MAX_SEARCH_ATTR_PAGE`]. The test is JSON containment, so
+/// `{"agent_mesh": "desk"}` matches each run that carries that pair. The GIN
+/// index `idx_harvest_we_search` serves the containment test.
+///
+/// The agent crate pauses a mesh with this scan. It returns the workflow id
+/// of each run too, because the agent id is the workflow id.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when the query fails.
+pub async fn list_running_with_search_attrs(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    attrs: &serde_json::Value,
+    after: Option<ExecutionId>,
+    limit: u32,
+) -> HarvestResult<Vec<(ExecutionId, String)>> {
+    use diesel::PgJsonbExpressionMethods as _;
+
+    let mut query = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .filter(harvest_workflow_executions::search_attrs.contains(attrs.clone()))
+        .order(harvest_workflow_executions::id.asc())
+        .limit(i64::from(limit.min(MAX_SEARCH_ATTR_PAGE)))
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::workflow_id,
+        ))
+        .into_boxed();
+    if let Some(after) = after {
+        query = query.filter(harvest_workflow_executions::id.gt(after.as_uuid()));
+    }
+    let rows = query
+        .load::<(Uuid, String)>(conn)
+        .await
+        .map_err(database_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, workflow_id)| (ExecutionId::from_uuid(id), workflow_id))
+        .collect())
+}
+
 /// Returns `true` when `err` reports that a target resolved by
 /// [`resolve_execution_id_by_workflow_id`] raced to `CONTINUED_AS_NEW`
 /// between resolution and a delivery/cancel attempt on it (issue #751).

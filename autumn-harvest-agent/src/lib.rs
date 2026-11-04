@@ -63,6 +63,9 @@
 //!
 //! # Use it on Postgres
 //!
+//! The `postgres` feature adds the `postgres` module. It has the calls of
+//! the `sqlite` module, for an app whose workers run on Postgres.
+//!
 //! Register the workflows and the activities, and install the harness as
 //! worker state:
 //!
@@ -105,6 +108,8 @@ pub mod mesh_control;
 pub mod message;
 pub mod model;
 pub mod policy;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod refine;
 pub mod response_cache;
 pub mod sampling;

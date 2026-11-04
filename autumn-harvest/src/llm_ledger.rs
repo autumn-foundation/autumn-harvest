@@ -345,6 +345,76 @@ pub(crate) async fn insert_ledger_rows(
     Ok(())
 }
 
+/// The summed spend of a set of runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LedgerTotal {
+    /// Input and output tokens.
+    pub tokens: u64,
+    /// The cost in micro-dollars. A row with no cost adds zero.
+    pub cost_usd_micros: u64,
+}
+
+/// The sum over each ledger row of a run whose search attributes contain
+/// `attrs`. Only rows recorded at or after `since` count.
+///
+/// A shard rebalance copies a run and its ledger rows to the target. The
+/// source keeps a `MIGRATED` seal, and the target holds a `MIGRATING` copy
+/// until the cutover. Neither copy is the live run, so the sum skips both. A
+/// moved run then counts once, on its current shard.
+///
+/// The SUM is numeric in Postgres. `LEAST` caps it at the largest `bigint`
+/// before the cast, so a huge total saturates and does not fail the read.
+#[cfg(feature = "db")]
+const SPEND_FOR_SEARCH_ATTRS_SQL: &str = "\
+    SELECT LEAST(COALESCE(SUM(l.input_tokens + l.output_tokens), 0), \
+                 9223372036854775807)::bigint AS tokens, \
+           LEAST(COALESCE(SUM(l.cost_usd_micros), 0), 9223372036854775807)::bigint \
+               AS cost_usd_micros \
+      FROM harvest_llm_ledger l \
+      JOIN harvest_workflow_executions e ON e.id = l.workflow_exec_id \
+     WHERE e.search_attrs @> $1 AND l.recorded_at >= $2 \
+       AND e.state NOT IN ('MIGRATED', 'MIGRATING')";
+
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct LedgerTotalRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    tokens: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    cost_usd_micros: i64,
+}
+
+/// Sum the ledger rows of every run whose search attributes contain
+/// `attrs`, from `since` on, on ONE shard.
+///
+/// The agent crate reads the spend of a mesh with it, with
+/// `{"agent_mesh": "<mesh>"}` as `attrs`. Child runs that carry the pair
+/// count too. The read has no upper time bound, as the `SQLite` reader has
+/// none.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the read fails.
+#[cfg(feature = "db")]
+pub async fn spend_for_search_attrs(
+    conn: &mut diesel_async::AsyncPgConnection,
+    attrs: &serde_json::Value,
+    since: chrono::DateTime<chrono::Utc>,
+) -> crate::error::HarvestResult<LedgerTotal> {
+    use diesel_async::RunQueryDsl as _;
+
+    let row = diesel::sql_query(SPEND_FOR_SEARCH_ATTRS_SQL)
+        .bind::<diesel::sql_types::Jsonb, _>(attrs)
+        .bind::<diesel::sql_types::Timestamptz, _>(since)
+        .get_result::<LedgerTotalRow>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(LedgerTotal {
+        tokens: u64::try_from(row.tokens).unwrap_or(0),
+        cost_usd_micros: u64::try_from(row.cost_usd_micros).unwrap_or(0),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

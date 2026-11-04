@@ -28,9 +28,11 @@
 //!
 //! # Send an op
 //!
-//! On SQLite, call [`crate::sqlite::send`]. On Postgres, send a
-//! signal-with-start to the workflow `agent`. Use the agent id as the
-//! workflow id, `{}` as the input, and [`Agent::payload`] as the payload.
+//! On SQLite, call `sqlite::send`. On Postgres, call `postgres::send`. Each
+//! one sends a signal-with-start to the workflow `agent`. It uses the agent
+//! id as the workflow id, `{}` as the input, and [`Agent::payload`] as the
+//! payload. Each link is plain text, because each module is behind its own
+//! feature.
 
 pub mod dedupe;
 pub mod inbox;

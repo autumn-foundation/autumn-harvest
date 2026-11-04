@@ -138,25 +138,25 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
         })
     });
     register_refine(rt, &harness);
-    let h = Arc::clone(&harness);
-    rt.register_activity_with_ledger(&agent_score_info(), move |input, _at| {
-        call_with_ledger(input, |request| {
-            let h = Arc::clone(&h);
-            async move {
-                // SQLite has no run budget, so a judge call passes the check.
-                let pass = Box::new(|| Box::pin(async { Ok(()) }) as BoxFuture<'_, _>);
-                let (verdict, calls) = run_score(&h, request, pass).await;
-                verdict.map(|verdict| (verdict, calls))
-            }
-        })
-    });
     rt.register_activity_with_body(&agent_precheck_info(), move |input| {
         call(input, |task| harness.precheck_tick(task))
     });
 }
 
-/// Register the refine policy read (issue #2394) and the proposer stage
-/// (issue #2379).
+/// Register the strategy run and its policy read (issue #2439).
+fn register_sampling(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
+    rt.register_workflow(&agent_draws_info());
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_sampling_policy_info(), move |input| {
+        call(input, |kind: String| {
+            let h = Arc::clone(&h);
+            async move { h.sampling_policy(&kind).await }
+        })
+    });
+}
+
+/// Register the refine and score activities against `harness` (issues
+/// #2379, #2394 and #2441).
 fn register_refine(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
     let h = Arc::clone(harness);
     rt.register_activity_with_body(&crate::refine::agent_refine_policy_info(), move |input| {
@@ -172,16 +172,16 @@ fn register_refine(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
             async move { run_stage(&h, request).await }
         })
     });
-}
-
-/// Register the strategy run and its policy read (issue #2439).
-fn register_sampling(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
-    rt.register_workflow(&agent_draws_info());
     let h = Arc::clone(harness);
-    rt.register_activity_with_body(&agent_sampling_policy_info(), move |input| {
-        call(input, |kind: String| {
+    rt.register_activity_with_ledger(&agent_score_info(), move |input, _at| {
+        call_with_ledger(input, |request| {
             let h = Arc::clone(&h);
-            async move { h.sampling_policy(&kind).await }
+            async move {
+                // SQLite has no run budget, so a judge call passes the check.
+                let pass = Box::new(|| Box::pin(async { Ok(()) }) as BoxFuture<'_, _>);
+                let (verdict, calls) = run_score(&h, request, pass).await;
+                verdict.map(|verdict| (verdict, calls))
+            }
         })
     });
 }

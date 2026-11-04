@@ -108,9 +108,84 @@ let built = HarvestBuilder::new()
 The test `the_engine_registration_builds` builds this
 exact registration.
 
-Start a run under the name `agent_loop` with an `AgentTask` as input. To
-decide on a gated call, send a signal to the run, with a serialised
-`Approval` as the payload. Read the signal name from the wait: the
+### The `postgres` module
+
+The `postgres` feature adds the module `postgres`. It mirrors `sqlite`
+function by function: `register`, `start`, `start_heartbeat`, `decide`,
+`send`, `delete`, `current_run`, `state`, `LedgerSpend` and `pause_mesh`. A
+worker drives each run, so a function records a start or a signal and
+returns. It does not drive the run. `wait_run` and `wait_for` take the place
+of `sqlite::drive`.
+
+The example needs a database that it may migrate, and no API key. It runs a
+worker in the process. The first worker stops at the approval wait, as a
+crashed process does. A second worker takes the approval and finishes:
+
+```sh
+export DATABASE_URL=postgres://postgres:postgres@localhost:5432/harvest
+cargo run -p autumn-harvest-agent --features postgres --example postgres_agent
+```
+
+```text
+waiting on tool_approval:0:1:write_1 for call Some("write_1")
+  write_note ran with {"text":"remember the milk"}
+stop:   Completed
+answer: The note is saved.
+model calls: 1 before the restart, 1 after it
+agent support/acct-42: 2 ops, 26 tokens, last answer Some("Your order ships tomorrow.")
+```
+
+The core of it:
+
+```rust
+use autumn_harvest_agent::postgres::{self, PostgresAgents, RunState};
+use autumn_harvest_agent::{AgentTask, Approval};
+
+// On each worker:
+let builder = postgres::register(HarvestBuilder::new(), harness);
+
+// In the app:
+let pg = PostgresAgents::single(pool);
+let exec = postgres::start(&pg, &AgentTask::new("Save a note.")).await?;
+if let RunState::WaitingSignal(signal) = postgres::wait_run(&pg, exec, limit).await? {
+    // Show the call to a person, then send the decision.
+    postgres::decide(&pg, exec, &signal, &Approval::Approve).await?;
+}
+let state = postgres::wait_run(&pg, exec, limit).await?;
+```
+
+| Function | What it does |
+|---|---|
+| `PostgresAgents::single(pool)` | Targets one database. Each run lands on shard 0. |
+| `PostgresAgents::sharded(&pools, router)` | Targets a sharded fleet. Pass the pools and the router of the workers. |
+| `with_codecs`, `with_queue` | Use the payload codecs and the queue of the workers. The default queue is `default`. |
+| `run_state`, `wait_run` | Where one run stands: `Completed`, `Failed`, `WaitingSignal`, `Ended` or `Running`. |
+| `pending_approvals` | The approval signals that one run waits for now. |
+| `wait_for` | Waits until the state of a durable agent passes a test. |
+
+- `pending_approvals` reads the history of the run. Each approval wait has
+  a deadline timer, `__signal_timeout:<seq>:<signal name>`. A wait is open
+  until its timer fires or is cancelled, or its signal arrives. A decision
+  that is queued but not yet read also closes it. The queued signals are
+  read before the history, so a decision that a worker consumes between the
+  reads still closes the wait. It reads that run only, not its child runs.
+- `state` reads the entity projection, so it usually replays nothing. A
+  snapshot in the payload store, or one past the side-effect cap, has no
+  readable state in the row. `state` then replays the live run, as the query
+  route does. It returns `None` before the first op commits, after a delete,
+  and after an erasure.
+- A lookup by agent id reads each physical database once. A first send goes
+  to the shard that the router picks for the id.
+- A shard rebalance moves a run and keeps its execution id. A sharded target
+  follows the forwarding chain for each call by execution id. A lookup by
+  agent id skips the `MIGRATED` seal and the `MIGRATING` copy, and so does
+  `LedgerSpend`, so a moved run counts once.
+- A steer or an interrupt that races a continue-as-new resolves the
+  successor run and goes again.
+
+To start a run without the module, start the name `agent_loop` with an
+`AgentTask` as input. To decide on a gated call, send a signal to the run,
+with a serialised `Approval` as the payload. Read the signal name from the wait: the
 deadline timer of the wait is `__signal_timeout:<seq>:<signal name>`. On
 SQLite, `RunState::WaitingSignal` holds the name. For a run with no
 delegation, `approval::approval_signal(step, position, call_id)` also builds
@@ -478,7 +553,7 @@ it does in a plain run.
 
 | Primitive | Engine primitive | Turn it on |
 |---|---|---|
-| Heartbeat | Workflow `agent_heartbeat`: one tick per run | `heartbeat::schedule` (Postgres), `sqlite::start_heartbeat` |
+| Heartbeat | Workflow `agent_heartbeat`: one tick per run | `heartbeat::schedule`, `postgres::start_heartbeat`, `sqlite::start_heartbeat` |
 | Follow-up | A durable timer, then a new segment in the same workflow | `AgentTask::followups` |
 | Delivery | Activity `agent_deliver` | `AgentTask::deliver`, `AgentHarness::delivery` |
 | Memory | Activity `agent_memory_snapshot`, once per segment | `AgentTask::memory`, `AgentHarness::memory` |
@@ -552,7 +627,7 @@ let built = HarvestBuilder::new()
 
 On SQLite, pass the same `heartbeat::schedule` to
 `SqliteRuntime::upsert_schedule` (issue #2031). An app can also call
-`sqlite::start_heartbeat` on each tick.
+`sqlite::start_heartbeat` or `postgres::start_heartbeat` on each tick.
 
 The engine keeps one schedule per workflow name, so a deployment has one
 heartbeat schedule. For one heartbeat per agent, use a durable `Agent`
@@ -881,7 +956,8 @@ A recorded outcome answers a call with the same step, tool name and
 arguments. A candidate call that equals the recorded call at the same turn
 and position, of the same agent, takes the recorded call id. Approval signal names hold the call
 id, so the recorded approvals stay valid. Any other call gets a new `eval_`
-id, so no recorded approval can release it. The harness sends again only an
+id, so no recorded approval can release it. That id holds the turn and the
+position, not the provider id. The harness sends again only an
 approval for a wait that the source opened, when it arrived before the
 deadline. An approval sent before its wait opened leaves no deadline timer,
 so the harness drops it, and the candidate times out at that wait.
@@ -924,7 +1000,7 @@ println!("{}", evaluation.overlay_digest);
 | `skills` | The skill list in the system prompt and the `load_skill` tool. A `load_skill` call is a tool call like any other: a recorded outcome answers it, or it gets the stub. |
 | `Candidate::system_prompt` | A one-part overlay that sets `system`. |
 | `Candidate::model` | A one-part overlay that sets `model`. The ceilings admit the model, because the operator names it. The harness and the source mandate must still hold it, or the evaluation fails before any call. Every turn asks it. |
-| `Candidate::agent_model` | A route for one agent. It is not an overlay part. |
+| `Candidate::agent_model` | A route for one agent. It is not an overlay part. A route to a model that the harness does not hold gives `OverlayError::UnknownModel` before any call (issue #2376). |
 | `Candidate::overlay` | Replaces the parts and the route that a shorthand set before it. It keeps the ceilings and the agent routes. |
 | `Evaluation::overlay_digest` | `ProfileOverlay::digest`: the SHA-256 of the JSON of the overlay. Equal overlays have equal digests. The digest leaves out the ceilings and the agent routes. |
 
@@ -972,6 +1048,41 @@ run the evaluation on a multi-thread Tokio runtime.
 
 The evaluation is an in-memory fork at the first event. The database fork of
 issue #2000 is a separate feature.
+
+### Anonymise a pool
+
+`eval::compare_anonymised` runs any number of candidates on one source
+(issue #2376). A model that reads the report to pick a candidate then sees
+no label and no input order. Harness² does the same before selection.
+
+```rust,ignore
+use autumn_harvest_agent::eval::{Candidate, compare_anonymised};
+
+let pool = [
+    Candidate::new(harness_a).overlay(v7).label("triage@v7"),
+    Candidate::new(harness_b).overlay(v8).label("triage@v8"),
+];
+let report = compare_anonymised(&history, &pool, seed).await?;
+let pick = ask_a_model(&report.text).await?;          // an AnonId
+let chosen = &pool[report.resolve(&pick).ok_or("not in the pool")?.index];
+```
+
+| Part | In an anonymised report |
+|---|---|
+| `AnonId` | `eval::anon::assign` gives the ids, as for an evidence bundle. The key of a candidate is `Candidate::digest`. An id is `c-` and a hex prefix of `SHA-256(seed, source run id, Candidate::digest)`. The prefix has at least 12 digits. It grows until no two ids are equal. `formal/verus/src/agent_anonymise.rs` proves the width rule. |
+| The order | The pool lists the ids in order. The input order changes no id and no text. The candidates also run in pool order. |
+| `text` | `AnonymisedPool::render`: the source end, then per id the counts, the end, each turn verdict, and each turn decision as JSON. It holds no model name, overlay digest, label or input index. |
+| `pool` | The same content as JSON. Each `AnonymisedEvaluation` keeps every field of `Evaluation` except `overlay_digest`. The recorded end is in the pool once. |
+| `key` | Each id with its `CandidateRef`: the input index, the candidate digest, the overlay digest and the label. Keep it from the reader. `AnonymisedReport` does not implement `Serialize`, and its `Debug` form hides the key. |
+| A failure text | Each run end error and report error replaces each label, digest, route and model id of the pool with `[redacted]`. The source end gets the same treatment. Each route that a run asks for counts, with the model id behind it in each harness. So a route that a candidate keeps from the source, such as the model of a recorded peer, counts too. Only a whole name is replaced, so a short route such as `a` also replaces that word. |
+| `Candidate::label` | An operator name, such as an overlay version id. It enters the digest, never the text. |
+| `Candidate::digest` | The SHA-256 of the overlay digest, the label, the routes, the admitted models, the ceilings and the turn cap. It cannot read the harness. |
+| Equal digests | `EvalError::DuplicateCandidate` with both input indices, before any model call. Give each candidate a label. |
+
+The text renders each model reply as written, so a reply can name its own
+model. The pool keeps the token usage, and a tokenizer can show a model
+family. A policy reason can show a harness setting, such as a timeout. Keep
+the seed from the reader, because the seed and the digests give the ids.
 
 ### Write an evidence bundle
 
@@ -1090,9 +1201,21 @@ sqlite::drive(&mut rt, &id).await?;
 let state = sqlite::state(&rt, &id).await?;
 ```
 
-On Postgres, send a signal-with-start to the workflow `agent`. Use the agent
-id as the workflow id, `{}` as the start input, and `Agent::payload(&op)` as
-the signal payload. Pass the message id as the idempotency key.
+On Postgres, the `postgres` module has the same calls. A worker runs the
+op, so wait on the state instead of a drive:
+
+```rust
+use autumn_harvest_agent::postgres::{self, PostgresAgents};
+
+let pg = PostgresAgents::single(pool);
+postgres::send(&pg, &id, &AgentOp::message_with_id("Where is my order?", "m-1"), Some("m-1")).await?;
+let state = postgres::wait_for(&pg, &id, limit, |state| state.segments >= 1).await?;
+```
+
+`postgres::send` sends a signal-with-start to the workflow `agent`. It
+uses the agent id as the workflow id, `{}` as the start input, and
+`Agent::payload(&op)` as the signal payload. The message id is the
+idempotency key. An app without the module sends the same signal.
 
 ### The inbox
 
@@ -1254,9 +1377,9 @@ The spend of an erased run leaves the LLM budget and mesh budget sums.
 
 ### Mid-turn messages (issue #2265)
 
-A message carries an `Urgency`. `sqlite::send` sends the extra signal first,
-then the op. On Postgres, send the signal of `Agent::urgency_signal(&op)` to
-the running run, then the op.
+A message carries an `Urgency`. `sqlite::send` and `postgres::send` send the
+extra signal first, then the op. Without the module, send the signal of
+`Agent::urgency_signal(&op)` to the running run, then the op.
 
 | Urgency | Signal | Effect |
 |---|---|---|

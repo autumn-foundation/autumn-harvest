@@ -9,6 +9,7 @@
 //!   occurrence.
 //! - All ids of one call use the same number of digits: the fewest, but at
 //!   least [`MIN_ANON_HEX`], that keep the ids distinct.
+//!   `formal/verus/src/agent_anonymise.rs` proves that width rule.
 //! - A list in id order does not show the input order. A new seed gives a
 //!   new order.
 //!
@@ -64,19 +65,46 @@ pub struct CandidateKey<'a> {
 #[must_use]
 pub fn assign(seed: u64, source: &str, keys: &[CandidateKey<'_>]) -> Vec<AnonId> {
     let full: Vec<String> = keys.iter().map(|key| digest(seed, source, key)).collect();
-    let width = (MIN_ANON_HEX..=full.first().map_or(MIN_ANON_HEX, String::len))
-        .find(|&width| distinct(&full, width))
-        .unwrap_or(MIN_ANON_HEX);
+    let mut shared = Vec::new();
+    for (at, a) in full.iter().enumerate() {
+        for b in full.iter().skip(at + 1) {
+            shared.push(shared_digits(a.as_bytes(), b.as_bytes()));
+        }
+    }
+    let cap = full.first().map_or(MIN_ANON_HEX, String::len);
+    let width = id_width(&shared, MIN_ANON_HEX, cap.max(MIN_ANON_HEX));
     full.iter()
         .map(|hex| AnonId(format!("{ANON_PREFIX}{}", &hex[..width.min(hex.len())])))
         .collect()
 }
 
-/// `true` when the first `width` digits of each digest differ.
-fn distinct(full: &[String], width: usize) -> bool {
-    let mut seen = std::collections::HashSet::new();
-    full.iter()
-        .all(|hex| seen.insert(&hex[..width.min(hex.len())]))
+/// The number of leading digits that `a` and `b` share.
+///
+/// `formal/verus/src/agent_anonymise.rs` proves it.
+const fn shared_digits(a: &[u8], b: &[u8]) -> usize {
+    let mut i = 0;
+    while i < a.len() && i < b.len() && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+/// The id width: the least width from `floor` that is above each shared
+/// count below `cap`. An equal pair shares `cap` digits, and no width
+/// splits it.
+///
+/// `formal/verus/src/agent_anonymise.rs` proves that no smaller width from
+/// the floor is above each count. Two prefixes of this width then differ.
+const fn id_width(shared: &[usize], floor: usize, cap: usize) -> usize {
+    let mut width = floor;
+    let mut i = 0;
+    while i < shared.len() {
+        if shared[i] >= width && shared[i] < cap {
+            width = shared[i] + 1;
+        }
+        i += 1;
+    }
+    width
 }
 
 /// The SHA-256 digest of one key, as hex. Each field has a length prefix,
@@ -171,6 +199,23 @@ mod tests {
         ];
         let ids = assign(1, "run-1", &twice);
         assert_ne!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn a_shared_prefix_widens_every_id() {
+        assert_eq!(id_width(&[], 12, 64), 12);
+        assert_eq!(id_width(&[3, 11], 12, 64), 12);
+        assert_eq!(id_width(&[12], 12, 64), 13);
+        assert_eq!(id_width(&[3, 20, 13], 12, 64), 21);
+        assert_eq!(id_width(&[64], 12, 64), 12, "an equal pair is not fixable");
+    }
+
+    #[test]
+    fn shared_digits_counts_the_common_prefix() {
+        assert_eq!(shared_digits(b"abc", b"abd"), 2);
+        assert_eq!(shared_digits(b"ab", b"ab"), 2);
+        assert_eq!(shared_digits(b"", b"a"), 0);
+        assert_eq!(shared_digits(b"x", b"y"), 0);
     }
 
     #[test]
