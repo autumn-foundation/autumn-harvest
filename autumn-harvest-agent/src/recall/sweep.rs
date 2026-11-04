@@ -125,11 +125,12 @@ fn run_nonce() -> String {
         .to_string()
 }
 
-/// The agent name of `item` under `config`: the item id and a fingerprint
-/// of the item, the profile and the id of each model that the profile
-/// runs. These are the model of each op and the model of each episode
-/// pass. A model with no id adds `run` in place of the id, so no other
-/// sweep reuses its agents.
+/// The agent name of `item` under `config`: the item id and a fingerprint.
+///
+/// The fingerprint hashes the item, the profile and the id of each model
+/// that the profile runs. These are the model of each op and the model of
+/// each episode pass. A model with no id adds `run` in place of the id, so
+/// no other sweep reuses its agents.
 fn agent_name(
     harness: &AgentHarness,
     config: &str,
