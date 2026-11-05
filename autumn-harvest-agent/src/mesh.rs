@@ -749,6 +749,46 @@ pub struct DelegationRecord {
     /// The context resets of the child itself (issue #2453).
     #[serde(default, skip_serializing_if = "crate::types::is_zero")]
     pub resets: u32,
+    /// Why the delegation ran alone, when the task allowed a fan-out (issue
+    /// #2483). `None` when the delegation ran in a batch, or when the bound
+    /// is under 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<SerialReason>,
+}
+
+/// Why a delegation ran alone, when [`AgentTask::parallel_children`] is 2 or
+/// more (issue #2483).
+///
+/// [`AgentTask::parallel_children`]: crate::AgentTask::parallel_children()
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SerialReason {
+    /// No other call of the turn could join a batch.
+    SingleCall,
+    /// Another call of the turn could join a batch, but no neighbour of this
+    /// call could.
+    NotConsecutive,
+    /// The policy gated the call, so it waited for a person.
+    Gated,
+    /// The call delegates to a durable peer.
+    DurablePeer,
+    /// The batch before the call holds `parallel_children` calls.
+    BoundReached,
+}
+
+impl SerialReason {
+    /// The stable code of the reason.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::SingleCall => "single_call",
+            Self::NotConsecutive => "not_consecutive",
+            Self::Gated => "gated",
+            Self::DurablePeer => "durable_peer",
+            Self::BoundReached => "bound_reached",
+        }
+    }
 }
 
 #[cfg(test)]

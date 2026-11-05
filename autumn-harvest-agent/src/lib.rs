@@ -98,6 +98,7 @@ pub mod episode;
 pub mod error;
 #[cfg(feature = "eval")]
 pub mod eval;
+mod fan_out_plan;
 pub mod flow;
 pub mod followup;
 pub mod harness;
@@ -174,7 +175,7 @@ pub use heartbeat::{
 pub use live::{LiveEvent, LiveSink, TurnText};
 pub use loop_guard::LoopGuard;
 pub use memory::{EditKey, InMemoryMemoryStore, MemoryBlock, MemoryScope, MemoryStore};
-pub use mesh::{DelegationRecord, MANDATE_META_KEY, Mandate, Peer, Refusal};
+pub use mesh::{DelegationRecord, MANDATE_META_KEY, Mandate, Peer, Refusal, SerialReason};
 pub use mesh_control::{BudgetPeriod, MeshBudget, MeshPause, MeshSpend, Spend};
 pub use message::{
     ChatMessage, ChatRole, ContentPart, RunId, SessionId, StopReason, TokenUsage, ToolCall,

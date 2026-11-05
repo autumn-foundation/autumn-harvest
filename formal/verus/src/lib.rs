@@ -7,6 +7,7 @@ mod agent_inbox;
 mod agent_dedupe;
 mod agent_wake;
 mod agent_siblings;
+mod agent_fan_out;
 mod scan_skip;
 mod depth_cap;
 mod agent_reset;

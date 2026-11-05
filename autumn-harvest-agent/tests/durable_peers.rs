@@ -1341,3 +1341,25 @@ async fn a_read_only_receiver_keeps_the_next_durable_hop_read_only() {
     });
     assert!(refused, "the critic reads the refusal");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delegation_to_a_durable_peer_names_why_it_ran_alone() {
+    // Issue #2483: a durable peer never joins a batch. The record says so.
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, mesh_harness(mesh_model()));
+    start(&mut rt, &research()).await;
+    let task = AgentTask::new("what is it?")
+        .mandate(Mandate::new("triage").peers(["researcher"]))
+        .parallel_children(2);
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    let report = common::report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert!(report.text.contains("The answer is 42."), "{}", report.text);
+    let serials: Vec<_> = report.delegations.iter().map(|r| r.serial).collect();
+    assert_eq!(
+        serials,
+        [Some(autumn_harvest_agent::SerialReason::DurablePeer)]
+    );
+}

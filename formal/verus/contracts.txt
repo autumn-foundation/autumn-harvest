@@ -50,6 +50,31 @@ pub proof fn theorem_a_zero_trigger_never_fires(appended: int) ensures ! due(app
 pub proof fn theorem_no_pass_is_due_under_the_trigger(appended: int, every: int) requires 0 <= appended < every, ensures ! due(appended, every),
 pub proof fn theorem_the_trigger_is_monotone(small: int, large: int, every: int) requires small <= large, due(small, every), ensures due(large, every),
 
+## formal/verus/src/agent_fan_out.rs
+pub enum SerialReason { SingleCall, NotConsecutive, Gated, DurablePeer, BoundReached, }
+pub enum Fit { Batchable, Gated, Durable, Other, }
+pub enum Step { Lead(usize), Member, Alone(SerialReason), Skip, }
+pub open spec fn joins(fit: Fit) -> bool { fit is Batchable }
+pub open spec fn count(fits: Seq < Fit >, n: int) -> int decreases n, { if n <= 0 { 0 } else { count(fits, n - 1) + if joins(fits [n - 1]) { 1int } else { 0int } } }
+pub open spec fn others(fits: Seq < Fit >, i: int) -> bool { exists | j: int | 0 <= j < fits.len() && j != i && #[trigger] joins(fits [j]) }
+pub open spec fn left(fits: Seq < Fit >, i: int) -> bool { 0 < i && joins(fits [i - 1]) }
+pub open spec fn right(fits: Seq < Fit >, i: int) -> bool { i + 1 < fits.len() && joins(fits [i + 1]) }
+pub open spec fn reason_ok(fits: Seq < Fit >, i: int, reason: SerialReason) -> bool { match reason { SerialReason::Gated => fits [i] is Gated, SerialReason::DurablePeer => fits [i] is Durable, SerialReason::BoundReached => joins(fits [i]) && left(fits, i) &&! right(fits, i), SerialReason::NotConsecutive => joins(fits [i]) &&! left(fits, i) &&! right(fits, i) && others(fits, i), SerialReason::SingleCall => joins(fits [i]) &&! others(fits, i), } }
+pub open spec fn step_ok(fits: Seq < Fit >, bound: int, steps: Seq < Step >, i: int) -> bool { if bound < 2 { steps [i] is Skip } else { match steps [i] { Step::Skip => fits [i] is Other, Step::Lead(n) => 2 <= n <= bound && i + n <= steps.len() && (forall | j: int | i <= j < i + n ==> #[trigger] joins(fits [j])) && (forall | j: int | i < j < i + n ==> #[trigger] steps [j] is Member), Step::Member => joins(fits [i]) && exists | k: int | 0 <= k < i && #[trigger] steps [k] is Lead && i < k + steps [k] -> Lead_0, Step::Alone(reason) => reason_ok(fits, i, reason), } } }
+proof fn lemma_count_bounds(fits: Seq < Fit >, n: int) requires 0 <= n, ensures 0 <= count(fits, n) <= n, decreases n,
+proof fn lemma_a_lone_call_counts_one(fits: Seq < Fit >, n: int, i: int) requires 0 <= i < n <= fits.len(), joins(fits [i]), forall | j: int | 0 <= j < n && j != i ==>! #[trigger] joins(fits [j]), ensures count(fits, n) == 1, decreases n,
+proof fn lemma_none_counts_zero(fits: Seq < Fit >, n: int) requires 0 <= n <= fits.len(), forall | j: int | 0 <= j < n ==>! #[trigger] joins(fits [j]), ensures count(fits, n) == 0, decreases n,
+proof fn lemma_two_calls_count_two(fits: Seq < Fit >, n: int, i: int, j: int) requires 0 <= i < j < n <= fits.len(), joins(fits [i]), joins(fits [j]), ensures count(fits, n) >= 2, decreases n,
+proof fn lemma_one_call_counts_one(fits: Seq < Fit >, n: int, i: int) requires 0 <= i < n <= fits.len(), joins(fits [i]), ensures count(fits, n) >= 1, decreases n,
+proof fn lemma_the_count_names_the_others(fits: Seq < Fit >, i: int) requires 0 <= i < fits.len(), joins(fits [i]), ensures count(fits, fits.len() as int) > 1 <==> others(fits, i),
+pub open spec fn prefix_ok(fits: Seq < Fit >, bound: int, steps: Seq < Step >, n: int) -> bool { forall | i: int | 0 <= i < n ==> #[trigger] step_ok(fits, bound, steps, i) }
+proof fn lemma_push(fits: Seq < Fit >, bound: int, steps: Seq < Step >, step: Step, n: int) requires 0 <= n <= steps.len(), prefix_ok(fits, bound, steps, n), ensures prefix_ok(fits, bound, steps.push(step), n),
+proof fn lemma_push_member(fits: Seq < Fit >, bound: int, steps: Seq < Step >, at: int, len: usize) requires 2 <= bound, len <= bound, 0 <= at < steps.len() < at + len <= fits.len(), steps [at] == Step::Lead(len), prefix_ok(fits, bound, steps, at), forall | j: int | at <= j < at + len ==> #[trigger] joins(fits [j]), forall | j: int | at < j < steps.len() ==> #[trigger] steps [j] is Member, forall | j: int | at < j < steps.len() ==> #[trigger] step_ok(fits, bound, steps, j), ensures prefix_ok(fits, bound, steps.push(Step::Member), at), forall | j: int | at < j <= steps.len() ==> #[trigger] steps.push(Step::Member) [j] is Member, forall | j: int | at < j <= steps.len() ==> #[trigger] step_ok(fits, bound, steps.push(Step::Member), j),
+pub fn can_join(fit:& Fit) -> (r: bool) ensures r == joins(* fit),
+pub fn fan_out_plan(fits:& [Fit], bound: usize) -> (steps: Vec < Step >) ensures steps.len() == fits.len(), prefix_ok(fits @, bound as int, steps @, fits.len() as int),
+pub proof fn theorem_no_fallback_is_silent(fits: Seq < Fit >, bound: int, steps: Seq < Step >, i: int) requires 2 <= bound, 0 <= i < fits.len(), prefix_ok(fits, bound, steps, fits.len() as int), ! (fits [i] is Other), ensures ! (steps [i] is Skip),
+pub proof fn theorem_an_off_fan_out_names_no_reason(fits: Seq < Fit >, bound: int, steps: Seq < Step >, i: int,) requires bound < 2, 0 <= i < fits.len(), prefix_ok(fits, bound, steps, fits.len() as int), ensures steps [i] is Skip,
+
 ## formal/verus/src/agent_inbox.rs
 pub enum InboxStatus { Open, Paused, Parked, }
 pub enum OpClass { Work, Control, Tick, }
