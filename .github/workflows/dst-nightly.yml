@@ -164,7 +164,7 @@ jobs:
       # the `world` job (issue #2280). This step pulls with retries.
       - name: Pull the Postgres image
         timeout-minutes: 10
-        run: bash .github/ci/pull-test-images.sh postgres:16
+        run: cargo xtask ci pull-test-images postgres:16
       - name: Replay oracle runs on Postgres
         # The test owns a Postgres container (testcontainers), so the
         # runner needs only Docker.
@@ -219,7 +219,7 @@ jobs:
         run: cargo test -p autumn-harvest --test integration --no-run
       - name: Pull the Postgres image
         timeout-minutes: 10
-        run: bash .github/ci/pull-test-images.sh postgres:16
+        run: cargo xtask ci pull-test-images postgres:16
       - name: Run the worker loop under the seeded world
         # The test owns a Postgres container (testcontainers), so the
         # runner needs only Docker. Each run clones a fresh database.

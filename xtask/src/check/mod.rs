@@ -29,6 +29,8 @@ pub mod readme_upgrade_guide_current;
 pub mod search_attr_query_syntax;
 pub mod signals_clean_approval_example_determinism;
 pub mod sqlite_outcome_match_example;
+/// Helpers that several commands of this group share.
+mod support;
 pub mod underscore_input_snippets;
 pub mod verus_proofs;
 pub mod webhooks_feature_example;

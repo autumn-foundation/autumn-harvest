@@ -153,7 +153,7 @@ To roll back, replace the N processes with N-1 processes. Keep the schema.
 ## How CI proves the contract
 
 The `mixed-version-smoke` job in `.github/workflows/ci.yml` runs
-`scripts/run-mixed-version-smoke.sh`. The script does these steps:
+`cargo xtask dev run-mixed-version-smoke`. The command does these steps:
 
 1. It finds N-1: the highest `vX.Y.Z` tag of an earlier minor version.
 2. It builds the smoke worker in `scripts/mixed-version-smoke` against this
@@ -181,10 +181,10 @@ Run it on your machine:
 ```sh
 git fetch --tags
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/mvsmoke \
-  ./scripts/run-mixed-version-smoke.sh
+  cargo xtask dev run-mixed-version-smoke
 ```
 
-The script drops and recreates the `public` schema of that database. Set
+The command drops and recreates the `public` schema of that database. Set
 `MV_SMOKE_PREVIOUS` to test against another tag.
 
 When the API of N-1 differs from this tree, a cargo feature in
@@ -196,5 +196,6 @@ the codec envelope. It does not cover signals, child workflows, schedules,
 erasure, retention or key rotation. A change to one of those needs its own
 mixed-version reasoning in review.
 
-`docs/audits/mixed-version-contract.py` runs in the `lint` job. It fails
-when this page loses a section, or when the job or the script goes missing.
+`cargo xtask audit mixed-version-contract` runs in the `lint` job. It fails
+when this page loses a section, or when the job or the smoke command goes
+missing.

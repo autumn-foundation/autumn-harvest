@@ -29,7 +29,7 @@ pub fn read_repo_file(path: impl AsRef<Path>) -> Result<String> {
 }
 
 /// Maps a pass or fail outcome to the process exit code of a gate.
-pub fn gate_exit(passed: bool) -> std::process::ExitCode {
+pub const fn gate_exit(passed: bool) -> std::process::ExitCode {
     if passed {
         std::process::ExitCode::SUCCESS
     } else {

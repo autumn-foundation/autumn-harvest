@@ -10,8 +10,8 @@
 //! reports each statement when it starts to run.
 //!
 //! For each statement, the hook writes one JSON line with the SQL text and the
-//! source frames of the call stack. `docs/audits/ledger-census.py` maps the
-//! frames to profiles. The hook samples a few stacks for each distinct
+//! source frames of the call stack. `cargo xtask audit ledger-census` maps
+//! the frames to profiles. The hook samples a few stacks for each distinct
 //! statement, because symbol resolution is slow.
 //!
 //! The module exists only with the `ledger-census` feature, which no release

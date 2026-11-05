@@ -12,7 +12,7 @@
 //! Evidence is `pg_stat_statements` calls and buffers, never wall-clock.
 //! Run once per label (`PERF_LABEL=before` / `after`) and diff the
 //! `*-state.txt` artifacts for result equivalence. See
-//! `autumn-harvest/scripts/broken_session_scan_perf_repro.sh`.
+//! `cargo xtask perf broken-session-scan`.
 
 #![allow(clippy::too_many_lines)]
 
@@ -723,7 +723,7 @@ async fn wal_lsn(conn: &mut AsyncPgConnection) -> i64 {
 
 /// Evidence generator, not a CI assertion.
 #[tokio::test]
-#[ignore = "evidence generator -- see scripts/broken_session_scan_perf_repro.sh"]
+#[ignore = "evidence generator -- see cargo xtask perf broken-session-scan"]
 async fn zz_capture_broken_session_scan_perf_evidence() {
     let (admin, _guard) = setup_server().await;
     let label = std::env::var("PERF_LABEL").unwrap_or_else(|_| "unlabeled".to_string());

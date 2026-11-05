@@ -39,7 +39,7 @@ real Postgres 16 with `pg_stat_statements` preloaded. Reproduce with:
 
 ```bash
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-  ./autumn-harvest/scripts/build_reachability_fanout_perf_repro.sh
+  cargo xtask perf build-reachability-fanout
 ```
 
 ## 📈 Profile
@@ -158,5 +158,5 @@ performs a write.
 
 ```bash
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-  ./autumn-harvest/scripts/build_reachability_fanout_perf_repro.sh
+  cargo xtask perf build-reachability-fanout
 ```

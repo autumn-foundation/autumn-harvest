@@ -5,8 +5,8 @@
 
 //! Transform the management API contract into an OpenAPI 3.1 document (issue #694).
 //!
-//! Prints the document to stdout. `scripts/regenerate-openapi.sh` runs it twice
-//! to write the two checked-in copies:
+//! Prints the document to stdout. `cargo xtask dev regenerate-openapi` runs it
+//! twice to write the two checked-in copies:
 //!
 //! ```sh
 //! emit_openapi docs/api-contract.json           > docs/openapi.json

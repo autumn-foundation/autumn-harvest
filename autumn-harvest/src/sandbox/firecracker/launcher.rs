@@ -2173,8 +2173,8 @@ const IMAGE_LOCK_POLL: Duration = Duration::from_millis(10);
 /// operation. The locks go when the returned files close.
 ///
 /// A pin takes shared locks. A publish takes an exclusive lock while it
-/// renames files, as `publish-image.sh` does. So a pin never links the
-/// files of a publish in progress.
+/// renames files, as `cargo xtask sandbox publish-image` does. So a pin
+/// never links the files of a publish in progress.
 ///
 /// # Errors
 ///
@@ -5174,8 +5174,8 @@ while True:
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Replace `path` by a rename, as `publish-image.sh` does, and return
-    /// the old bytes.
+    /// Replace `path` by a rename, as `cargo xtask sandbox publish-image`
+    /// does, and return the old bytes.
     fn publish_over(path: &Path, bytes: &[u8]) -> Vec<u8> {
         let old = std::fs::read(path).unwrap();
         let next = path.with_extension("next");

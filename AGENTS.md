@@ -23,4 +23,4 @@
 
 - Never write a design record, plan or note at the repository root.
 - A design record (`DESIGN-<issue>.md`) goes in `docs/design/`. See `docs/design/README.md` for the other homes.
-- `docs/audits/root-files.py` fails CI on a root file that is not in its allow list.
+- `cargo xtask audit root-files` fails CI on a root file that is not in its allow list.

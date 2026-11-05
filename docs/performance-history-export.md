@@ -166,7 +166,7 @@ result above.
 * `cargo test -p autumn-harvest --test integration --no-default-features
   --features testing -- parent_aware_child` — **4 passed, 0 failed**
   (the `export_history`-round-trip replayer tests).
-* `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` — OK, no
+* `cargo xtask audit comment-hygiene --base origin/trunk-dev` — OK, no
   Tier A findings, no Tier B regressions.
 
 ## 🔬 Reproduce

@@ -179,7 +179,7 @@ One command, against the committed four-shard Postgres topology in
 [`benchmarks/docker-compose.yml`](../benchmarks/docker-compose.yml):
 
 ```bash
-./benchmarks/run.sh
+cargo xtask bench run
 ```
 
 It brings the topology up, runs all twelve cells, writes the report to
@@ -189,7 +189,7 @@ roughly 20–40 minutes on a four-core machine.
 To check a fresh run against the published numbers rather than just reading it:
 
 ```bash
-HARVEST_BENCH_CHECK=1 ./benchmarks/run.sh
+HARVEST_BENCH_CHECK=1 cargo xtask bench run
 ```
 
 That prints a per-number verdict against the published baselines at the stated
@@ -200,7 +200,7 @@ tolerance (below). Nothing about it is a CI gate — see [scope](#scope).
 Reproducing one headline should not cost forty minutes:
 
 ```bash
-HARVEST_BENCH_SCENARIOS=signal_roundtrip HARVEST_BENCH_SHARDS=1 ./benchmarks/run.sh
+HARVEST_BENCH_SCENARIOS=signal_roundtrip HARVEST_BENCH_SHARDS=1 cargo xtask bench run
 ```
 
 | variable | effect |
@@ -224,7 +224,7 @@ published percentiles always rest on the same sample count.
 The harness resolves its shards in this order:
 
 1. `HARVEST_BENCH_SHARD_URLS` — one **admin** Postgres URL per shard, comma
-   separated. This is what `run.sh` sets, and the only mode that gives
+   separated. This is what `cargo xtask bench run` sets, and the only mode that gives
    independent servers per shard.
 2. `HARVEST_TEST_DATABASE_URL` — a single admin URL; one database per shard is
    created on it. Cheap, but every "shard" then shares one server's buffer
@@ -428,7 +428,7 @@ re-measure keeps pointing at the last release that did.
 
 To publish a fresh set:
 
-1. Run the suite on an idle reference machine: `./benchmarks/run.sh`. It writes
+1. Run the suite on an idle reference machine: `cargo xtask bench run`. It writes
    to `benchmarks/results/<timestamp>.md` (gitignored working output — not to be
    confused with `docs/benchmarks/`, which is the published, permanent copy).
 2. Check the run's **noise control** section first. If the replay spread across
@@ -447,6 +447,6 @@ To publish a fresh set:
 | Harness | `autumn-harvest/tests/integration/e2e_bench_support.rs` |
 | Runner | `autumn-harvest/benches/e2e_bench.rs` |
 | Topology | `benchmarks/docker-compose.yml` |
-| One command | `benchmarks/run.sh` |
+| One command | `cargo xtask bench run` |
 | Docs guard | `autumn-harvest/tests/integration/benchmarks_docs.rs` |
 | Planning record | `docs/plans/2026-09-01-e2e-benchmark-suite.md` |

@@ -67,7 +67,7 @@ already uses. The adapter ships no HTTP client.
 
 ## Consequences
 
-- `scripts/check-agent-adapter-deps.sh` fails CI if the adapter depends on
+- `cargo xtask check agent-adapter-deps` fails CI if the adapter depends on
   any Autumn crate outside the engine.
 - The policy runs inside the model-turn activity. Its decision is recorded
   with the reply, so replay never asks the policy again.

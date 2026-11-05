@@ -78,17 +78,28 @@ fn the_published_doc_covers_every_shard_count() {
 fn the_documented_command_is_the_committed_runner() {
     let doc = benchmarks_doc();
     assert!(
-        doc.contains("./benchmarks/run.sh"),
+        doc.contains("cargo xtask bench run"),
         "docs/benchmarks.md must document the one command issue #941 AC3 promises"
     );
-    let runner = read("benchmarks/run.sh");
+    let help = crate::xtask_bin::xtask()
+        .args(["bench", "run", "--help"])
+        .output()
+        .expect("run cargo xtask bench run --help");
     assert!(
-        runner.contains("docker-compose.yml") && runner.contains("--bench e2e_bench"),
-        "benchmarks/run.sh must bring up the committed topology and run the suite"
+        help.status.success(),
+        "`cargo xtask bench run` must exist: {}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let runner = read("xtask/src/bench/run.rs");
+    assert!(
+        runner.contains("docker-compose.yml")
+            && runner.contains("\"--bench\"")
+            && runner.contains("\"e2e_bench\""),
+        "xtask/src/bench/run.rs must bring up the committed topology and run the suite"
     );
     assert!(
-        runner.contains("HARVEST_BENCH_SHARD_URLS"),
-        "the runner must hand the shard URLs to the harness"
+        runner.contains(&format!("\"{SHARD_URLS_ENV_VAR}\"")),
+        "the runner must hand the shard URLs to the harness in {SHARD_URLS_ENV_VAR}"
     );
 }
 

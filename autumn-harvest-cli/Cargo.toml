@@ -14,7 +14,7 @@ categories = ["command-line-utilities", "asynchronous"]
 # and docs/runbooks/ all invoke this package as plain `cargo run -p
 # autumn-harvest-cli -- ...` — no `--bin`. Without default-run, the
 # harvest-replay [[bin]] below makes every one of those commands ambiguous
-# and fatal (see scripts/check-default-run.sh).
+# and fatal (see `cargo xtask check default-run`).
 default-run = "harvest"
 
 [dependencies]

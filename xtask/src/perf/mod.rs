@@ -24,6 +24,8 @@ pub mod quota_history_bytes;
 pub mod quota_reconcile_candidate_scan;
 pub mod schedule_to_close_claim;
 pub mod sticky_routing_claim;
+/// Helpers that several commands of this group share.
+pub mod support;
 pub mod usage_report_activity_lookback;
 pub mod worker_session_claim;
 
