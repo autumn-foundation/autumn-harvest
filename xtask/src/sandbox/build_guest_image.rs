@@ -413,6 +413,9 @@ fn pipe_into(from: &mut Command, into: &mut Command) -> Result<()> {
     let mut source = spawn(from.stdout(Stdio::piped()))?;
     let stdout = source.stdout.take().context("no pipe from docker export")?;
     let sink = spawn(into.stdin(stdout));
+    // The command still holds the read end of the pipe. Drop it, so a sink
+    // that exits first leaves no reader, and the source gets a broken pipe.
+    into.stdin(Stdio::null());
     let sink_status = match sink {
         Ok(mut sink) => sink.wait().context("cannot wait for a step")?,
         Err(err) => {
@@ -481,6 +484,23 @@ fn shell_code(status: ExitStatus) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sink that exits first must not leave the source blocked on a full
+    /// pipe. The shell pipeline ends with a broken pipe there, so the port
+    /// must too.
+    #[cfg(unix)]
+    #[test]
+    fn a_sink_that_exits_first_does_not_hang_the_pipe() {
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = pipe_into(&mut Command::new("yes"), &mut Command::new("false"));
+            let _ = done.send(result.is_err());
+        });
+        let failed = outcome
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("pipe_into must return when the sink exits first");
+        assert!(failed, "a failed sink must fail the pipe");
+    }
 
     #[test]
     fn the_default_kernel_is_pinned_by_digest() {
