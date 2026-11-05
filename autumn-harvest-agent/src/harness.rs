@@ -2407,6 +2407,12 @@ mod tests {
         assert_eq!(truncate_flagged(&text, 14), (text, false));
     }
 
+    /// The first `n` characters of `text`. It is outside `proptest!` for
+    /// the reason above `no_content`.
+    fn first_chars(text: &str, n: usize) -> String {
+        text.chars().take(n).collect()
+    }
+
     proptest::proptest! {
         // Issue #2481: the flag is set exactly when characters drop.
         #[test]
@@ -2417,7 +2423,7 @@ mod tests {
             let (shown, cut) = truncate_flagged(&text, limit);
             proptest::prop_assert_eq!(cut, text.chars().count() > limit);
             let want = if cut {
-                format!("{}{TRUNCATED}", text.chars().take(limit).collect::<String>())
+                format!("{}{TRUNCATED}", first_chars(&text, limit))
             } else {
                 text.clone()
             };
