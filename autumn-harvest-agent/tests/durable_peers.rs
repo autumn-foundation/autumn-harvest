@@ -1365,9 +1365,9 @@ async fn a_delegation_to_a_durable_peer_names_why_it_ran_alone() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_gated_delegation_to_a_durable_peer_names_the_durable_peer() {
-    // Issue #2483: a durable peer never joins a batch, gated or not. The
-    // reason names the peer kind first.
+async fn a_gated_delegation_to_a_durable_peer_names_gated() {
+    // Issue #2483: a person can edit the target of a gated call, so the
+    // reason names the gate, not the peer.
     use autumn_harvest_agent::{Approval, Rule, ToolRules};
 
     let (_dir, db) = fresh_db();
@@ -1389,8 +1389,5 @@ async fn a_gated_delegation_to_a_durable_peer_names_the_durable_peer() {
 
     assert!(report.text.contains("The answer is 42."), "{}", report.text);
     let serials: Vec<_> = report.delegations.iter().map(|r| r.serial).collect();
-    assert_eq!(
-        serials,
-        [Some(autumn_harvest_agent::SerialReason::DurablePeer)]
-    );
+    assert_eq!(serials, [Some(autumn_harvest_agent::SerialReason::Gated)]);
 }

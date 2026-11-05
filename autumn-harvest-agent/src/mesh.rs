@@ -773,9 +773,10 @@ pub enum SerialReason {
     /// Another call of the turn could join a batch, but no neighbour of this
     /// call could.
     NotConsecutive,
-    /// The policy gated a call to an inline peer, so it waited for a person.
+    /// The policy gated the call, so it waited for a person. The person can
+    /// edit its target, so the peer does not count.
     Gated,
-    /// The call delegates to a durable peer, gated or not.
+    /// The policy allowed a call to a durable peer.
     DurablePeer,
     /// The call is the last of a run. The batch before it is full.
     BoundReached,

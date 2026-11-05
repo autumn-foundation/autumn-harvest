@@ -523,8 +523,8 @@ does not run, so it has no record.
 |---|---|
 | `single_call` | No other call of the turn meets 2 to 4. |
 | `not_consecutive` | Another call meets 2 to 4, but no neighbour does. |
-| `gated` | The policy gated a call to an inline peer. |
-| `durable_peer` | The peer is durable, gated or not. |
+| `gated` | The policy gated the call. A person can edit its target, so the peer does not count. |
+| `durable_peer` | The policy allowed a call to a durable peer. |
 | `bound_reached` | The call is the last of a run. The batch before it is full. |
 
 | Rule | What happens |

@@ -1129,6 +1129,32 @@ async fn a_gated_delegation_names_gated() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_edited_gated_call_names_gated() {
+    // The model names a peer that the roster does not hold. A person edits
+    // the call to an inline peer, so it runs and names the gate.
+    use autumn_harvest_agent::Approval;
+    use autumn_harvest_sqlite::RunState;
+
+    let (_dir, db) = fresh_db();
+    let model = root_calls(vec![delegate("d1", "airline", "find flights")]);
+    let harness = trip_harness(model).policy(Arc::new(GateOne("airline")));
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &trip_task(3)).unwrap();
+    let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the call waits for a person");
+    };
+    let edit = Approval::Edit {
+        arguments: json!({"agent": "flights", "task": "find flights"}),
+    };
+    sqlite::decide(&mut rt, exec, &signal, &edit).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.delegations.len(), 1);
+    assert_eq!(report.delegations[0].chain, ["planner", "flights"]);
+    assert_eq!(serials(&report), [Some(SerialReason::Gated)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_nested_lone_delegation_names_its_reason() {
     // The flights child of a batch delegates to rail alone. Its record
     // reaches the root through the report of the child run.

@@ -1613,22 +1613,26 @@ fn round_plan(
 }
 
 /// What one call is to a fan-out. A call to a peer that the roster does not
-/// name is refused, so the plan does not touch it. A durable peer comes
-/// before the decision, so a gated call to it is `Durable`.
+/// name is refused, so the plan does not touch it. A person can edit the
+/// target of a gated call, so a gated call is `Gated` whatever peer it names.
 fn fit(call: &ToolCall, decision: Option<&ToolDecision>, agent: &Member) -> Fit {
     if call.name != DELEGATE_TOOL {
         return Fit::Other;
+    }
+    match decision {
+        None | Some(ToolDecision::Deny { .. }) => return Fit::Other,
+        Some(ToolDecision::RequireApproval { .. }) => return Fit::Gated,
+        Some(ToolDecision::Allow) => {}
     }
     let Some(peer) = delegate_args(&call.arguments)
         .and_then(|args| agent.peers.iter().find(|peer| peer.name == args.agent))
     else {
         return Fit::Other;
     };
-    match decision {
-        None | Some(ToolDecision::Deny { .. }) => Fit::Other,
-        Some(_) if peer.agent.is_some() => Fit::Durable,
-        Some(ToolDecision::Allow) => Fit::Batchable,
-        Some(ToolDecision::RequireApproval { .. }) => Fit::Gated,
+    if peer.agent.is_some() {
+        Fit::Durable
+    } else {
+        Fit::Batchable
     }
 }
 
