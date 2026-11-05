@@ -34,7 +34,13 @@ const GUARDS: &[&str] = &["fixed", "pre-fix"];
 const OPS: &[&str] = &["init", "write", "start", "heartbeat"];
 
 /// The trace runner.
-const RUNNER: &str = "scripts/check-formal-traces.sh";
+const RUNNER: &str = "cargo xtask check formal-traces";
+
+/// The source of the model runner. It holds the TLC pin.
+const MODEL_RUNNER_SRC: &str = "xtask/src/check/formal_models.rs";
+
+/// The source of the trace runner.
+const TRACE_RUNNER_SRC: &str = "xtask/src/check/formal_traces.rs";
 
 /// The variable that names the chaos trace directory.
 const TRACE_DIR_VAR: &str = "HARVEST_TLA_TRACE_DIR";
@@ -213,26 +219,33 @@ fn each_trace_spec_extends_its_model() {
     }
 }
 
-/// Both runners must pin the same TLC release.
+/// Both runners must use the same TLC release.
+///
+/// The model runner holds the one pin. The trace runner must fetch the jar
+/// through it and must hold no pin of its own.
 #[test]
 fn trace_runner_pins_the_same_tlc_as_the_model_runner() {
     let pins = |text: &str| -> Vec<String> {
         text.lines()
             .map(str::trim)
-            .filter(|l| l.starts_with("tlc_version=") || l.starts_with("tlc_sha256="))
+            .filter(|l| l.contains("TLC_VERSION: &str") || l.contains("TLC_SHA256: &str"))
             .map(str::to_string)
             .collect()
     };
-    let models = pins(&read("scripts/check-formal-models.sh"));
-    assert_eq!(models.len(), 2, "check-formal-models.sh must pin TLC");
-    assert_eq!(
-        pins(&read(RUNNER)),
-        models,
-        "{RUNNER} must pin the same TLC"
+    let models = read(MODEL_RUNNER_SRC);
+    assert_eq!(pins(&models).len(), 2, "{MODEL_RUNNER_SRC} must pin TLC");
+    assert!(
+        models.contains("sha256sum"),
+        "{MODEL_RUNNER_SRC} must check the jar"
+    );
+    let traces = read(TRACE_RUNNER_SRC);
+    assert!(
+        pins(&traces).is_empty() && !traces.contains("tla2tools.jar\""),
+        "{TRACE_RUNNER_SRC} must not pin a TLC of its own"
     );
     assert!(
-        read(RUNNER).contains("sha256sum"),
-        "{RUNNER} must check the jar"
+        traces.contains("tla2tools_jar(work.path())"),
+        "{TRACE_RUNNER_SRC} must fetch the jar that {MODEL_RUNNER_SRC} pins"
     );
 }
 

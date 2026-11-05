@@ -56,6 +56,13 @@ tables = ["harvest_schedules"]
 measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest-sqlite/schedule.md"
 
+["load_manual"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_schedules"]
+measured = "unmeasured"
+
 ["load_due"]
 driver = "per_tick"
 backend = ["sqlite"]

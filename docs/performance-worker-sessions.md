@@ -515,7 +515,7 @@ only) -- this pass did not separately measure CPU cost.
 - `docs/perf-artifacts/worker-session-claim-predicate/` -- the committed
   `EXPLAIN` captures, `pg_stat_statements` snapshots, and a
   `fixture-summary.txt` for both data states at all three depths.
-- `autumn-harvest/scripts/worker_session_claim_perf_repro.sh` -- a
+- `cargo xtask perf worker-session-claim` -- a
   reproduction script that re-runs the capture test.
 - This doc.
 
@@ -525,13 +525,13 @@ only) -- this pass did not separately measure CPU cost.
 
 ```bash
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-  ./autumn-harvest/scripts/worker_session_claim_perf_repro.sh
+  cargo xtask perf worker-session-claim
 ```
 
 or, with only a reachable Docker daemon and no external Postgres:
 
 ```bash
-./autumn-harvest/scripts/worker_session_claim_perf_repro.sh
+cargo xtask perf worker-session-claim
 ```
 
 Both regenerate the `EXPLAIN` captures, `pg_stat_statements` snapshots, and

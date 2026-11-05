@@ -15,9 +15,11 @@
 //! [`ResponseCache`] serves an identical model call across runs. The
 //! [`draw`] module gives each sample of a run its own identity, so the cache
 //! keeps the samples apart. The [`episode`] log records each op, and
-//! [`consolidate`] turns the episodes into facts (issue #2454). The `eval`
-//! feature adds the `eval` module. That
-//! module re-drives a recorded run with a candidate model or prompt. The
+//! [`consolidate`] turns the episodes into facts (issue #2454).
+//! [`consolidate_all`] starts the passes of many agents from one schedule
+//! (issue #2540). The [`recall`] module measures what an agent forgets across ops (issue
+//! #2455). The `eval` feature adds the `eval` module. That module re-drives
+//! a recorded run with a candidate model or prompt. The
 //! `sandbox` feature adds the `sandbox` module. Its `SandboxTool` runs agent
 //! code in a sandbox.
 //!
@@ -27,6 +29,11 @@
 //! time from a durable inbox, and it survives a crash. A message can queue,
 //! steer the running op, or interrupt it (issue #2265). See section 15 of
 //! `docs/agent-adapter.md`.
+//!
+//! The [`sampling`] module holds the operator sampling policy of each kind
+//! (issue #2439). [`sampling::agent_draws`] reads it once, then runs the
+//! draws of a strategy. [`sampling::agent_sample`] also scores the draws
+//! and selects one (issue #2443).
 //!
 //! The [`mesh`] module lets a run delegate a task to a [`Peer`]. A
 //! [`Mandate`] bounds the delegation tree. The [`flow`] module gates a
@@ -59,6 +66,9 @@
 //!
 //! # Use it on Postgres
 //!
+//! The `postgres` feature adds the `postgres` module. It has the calls of
+//! the `sqlite` module, for an app whose workers run on Postgres.
+//!
 //! Register the workflows and the activities, and install the harness as
 //! worker state:
 //!
@@ -79,9 +89,11 @@
 //! See `docs/agent-adapter.md` for the whole pattern.
 
 pub mod agent;
+pub mod answer_check;
 pub mod approval;
 pub mod bounds;
 pub mod consolidate;
+pub mod consolidate_all;
 pub mod context_reset;
 pub mod delivery;
 pub mod draw;
@@ -89,6 +101,7 @@ pub mod episode;
 pub mod error;
 #[cfg(feature = "eval")]
 pub mod eval;
+mod fan_out_plan;
 pub mod flow;
 pub mod followup;
 pub mod harness;
@@ -101,8 +114,12 @@ pub mod mesh_control;
 pub mod message;
 pub mod model;
 pub mod policy;
+#[cfg(feature = "postgres")]
+pub mod postgres;
+pub mod recall;
 pub mod refine;
 pub mod response_cache;
+pub mod sampling;
 #[cfg(feature = "sandbox")]
 pub mod sandbox;
 pub mod score;
@@ -138,10 +155,17 @@ pub use agent::{
     agent_workspace_floor_info, agent_workspace_reset, agent_workspace_reset_info,
     agent_workspace_retain, agent_workspace_retain_info,
 };
+pub use answer_check::{
+    AnswerCheck, CheckAdmission, CheckRequest, agent_answer_check, agent_answer_check_info,
+};
 pub use approval::Approval;
 pub use consolidate::{
     CONSOLIDATE_WORKFLOW_NAME, ConsolidateTask, ConsolidationReport, ConsolidationStop,
     agent_consolidate, agent_consolidate_info,
+};
+pub use consolidate_all::{
+    AgentDirectory, CONSOLIDATE_ALL_WORKFLOW_NAME, ConsolidateAll, DispatchReport, LastPass,
+    agent_consolidate_all, agent_consolidate_all_info,
 };
 pub use context_reset::{ContextReset, ProgressNotes};
 pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
@@ -161,7 +185,7 @@ pub use heartbeat::{
 pub use live::{LiveEvent, LiveSink, TurnText};
 pub use loop_guard::LoopGuard;
 pub use memory::{EditKey, InMemoryMemoryStore, MemoryBlock, MemoryScope, MemoryStore};
-pub use mesh::{DelegationRecord, MANDATE_META_KEY, Mandate, Peer, Refusal};
+pub use mesh::{DelegationRecord, MANDATE_META_KEY, Mandate, Peer, Refusal, SerialReason};
 pub use mesh_control::{BudgetPeriod, MeshBudget, MeshPause, MeshSpend, Spend};
 pub use message::{
     ChatMessage, ChatRole, ContentPart, RunId, SessionId, StopReason, TokenUsage, ToolCall,
@@ -185,15 +209,16 @@ pub use response_cache::{
     CacheIndex, CacheKey, CacheScope, InMemoryCacheIndex, KeyTenant, ResponseCache,
 };
 pub use score::{
-    ExactMatch, FiniteF64, JsonSchema, MAX_REJECT_REASON_BYTES, NonFinite, ScoreContext,
-    ScoreInput, ScoreRequest, Scorer, ToolRecord, Verdict, agent_score, agent_score_info, select,
+    ExactMatch, FiniteF64, JsonSchema, MAX_REJECT_REASON_BYTES, NonFinite, SampleScore,
+    ScoreContext, ScoreInput, ScoreRequest, Scorer, ToolRecord, Verdict, agent_sample_score,
+    agent_sample_score_info, agent_score, agent_score_info, select,
 };
 pub use skill::{LOAD_SKILL_TOOL, SkillText};
 pub use tool::{FnTool, Tool, ToolContext, ToolEffect};
 pub use transcript::{InMemoryTranscriptStore, PrefixRef, TranscriptStore};
 pub use types::{
     AgentReport, AgentStop, AgentTask, MAX_PARALLEL_CHILDREN, ModelTurn, ModelTurnRequest,
-    RunIdSource, ToolCallRequest, ToolOutcome,
+    PROBE_EFFECT_REFUSED, Probe, RunIdSource, ToolCallRequest, ToolOutcome,
 };
 pub use workflow::{
     WORKFLOW_NAME, activities, agent_deliver, agent_deliver_info, agent_discover_peers,
@@ -205,3 +230,25 @@ pub use workspace::{
     DirWorkspaceBlobs, InMemoryWorkspaceBlobs, Workspace, WorkspaceBlobs, WorkspaceFile,
     WorkspaceHandle, WorkspaceMount, WorkspaceRef, WorkspaceStore,
 };
+
+/// Compiles each Rust fence in the two agent guides as a doctest (issue #2482).
+///
+/// A fence that drifts from the public API fails `cargo test --doc`. Each
+/// fence must compile, so a reader can copy it as written. The guard suite
+/// `tests/guide_snippets.rs` refuses a fence that rustdoc skips. A failure
+/// names the guide and the line of the fence. The `doc-snippets` job in CI
+/// runs these doctests, also on a docs-only change.
+#[cfg(all(
+    doctest,
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "eval",
+    feature = "sandbox"
+))]
+mod guide_snippets {
+    #[doc = include_str!("../../docs/agent-adapter.md")]
+    struct AgentAdapterGuide;
+
+    #[doc = include_str!("../../docs/agent-mesh.md")]
+    struct AgentMeshGuide;
+}

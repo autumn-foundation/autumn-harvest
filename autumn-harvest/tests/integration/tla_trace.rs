@@ -6,7 +6,7 @@
 //! steps only.
 //!
 //! [`export`] turns the log into one NDJSON trace per task row. Each line is
-//! one transaction. `scripts/check-formal-traces.sh` checks each trace with
+//! one transaction. `cargo xtask check formal-traces` checks each trace with
 //! TLC against `formal/tla/trace/<spec>Trace.tla`. See
 //! `docs/testing/formal-methods.md`.
 //!

@@ -158,7 +158,7 @@ reported to show they did not regress.
   **2,393 passed, 0 failed**, including all `critical_path::tests::*` and
   `dag_export::tests::test_export_mermaid_with_critical_path`, unchanged in
   expectation.
-* `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` — OK, no
+* `cargo xtask audit comment-hygiene --base origin/trunk-dev` — OK, no
   Tier A findings, no Tier B regressions.
 
 ## 🔬 Reproduce

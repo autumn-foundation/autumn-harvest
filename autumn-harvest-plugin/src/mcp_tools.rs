@@ -983,6 +983,8 @@ fn build_tool_route(
         // Generated API routes carry no SEO meta (since autumn-web 0.7): EMPTY is
         // what a route attribute without `seo(...)` produces.
         seo: autumn_web::SeoRouteDefaults::EMPTY,
+        // The group of the plugin that registers the route (since autumn-web 0.10).
+        group: None,
     }
 }
 
@@ -1102,6 +1104,16 @@ pub(crate) async fn start_tool(
     headers: axum::http::HeaderMap,
     body: serde_json::Value,
 ) -> axum::response::Response {
+    // A SQLite app starts through its handle (issue #2471).
+    #[cfg(feature = "sqlite")]
+    if let Some(sqlite) = api_state.sqlite_handle() {
+        return match sqlite {
+            Ok(handle) => {
+                crate::sqlite::mcp::start_tool(handle, &api_state, workflow, headers, body).await
+            }
+            Err(error) => axum::response::IntoResponse::into_response(error),
+        };
+    }
     Box::pin(crate::api::start_workflow(
         Extension(api_state),
         Path(workflow.to_string()),
@@ -1202,6 +1214,13 @@ async fn status_tool(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
+    #[cfg(feature = "sqlite")]
+    if let Some(sqlite) = api_state.sqlite_handle() {
+        return match sqlite {
+            Ok(handle_) => crate::sqlite::mcp::status_tool(handle_, workflow, handle).await,
+            Err(error) => axum::response::IntoResponse::into_response(error),
+        };
+    }
     let execution = match load_owned_execution(&api_state, workflow, handle).await {
         Ok(execution) => execution,
         Err(response) => return response,
@@ -1243,6 +1262,24 @@ async fn signal_tool(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
+    #[cfg(feature = "sqlite")]
+    if let Some(sqlite) = api_state.sqlite_handle() {
+        return match sqlite {
+            Ok(handle_) => {
+                crate::sqlite::mcp::signal_tool(
+                    handle_,
+                    &api_state,
+                    workflow,
+                    &handle,
+                    signal_name,
+                    headers,
+                    payload,
+                )
+                .await
+            }
+            Err(error) => axum::response::IntoResponse::into_response(error),
+        };
+    }
     let execution = match load_owned_execution(&api_state, workflow, &handle).await {
         Ok(execution) => execution,
         Err(response) => return response,
@@ -1276,6 +1313,18 @@ async fn update_tool(
     handle: String,
     body: serde_json::Value,
 ) -> axum::response::Response {
+    #[cfg(feature = "sqlite")]
+    if let Some(sqlite) = api_state.sqlite_handle() {
+        return match sqlite {
+            Ok(handle_) => {
+                crate::sqlite::mcp::update_tool(
+                    handle_, &api_state, workflow, update, &handle, body,
+                )
+                .await
+            }
+            Err(error) => axum::response::IntoResponse::into_response(error),
+        };
+    }
     let execution = match load_owned_execution(&api_state, workflow, &handle).await {
         Ok(execution) => execution,
         Err(response) => return response,
@@ -1326,6 +1375,24 @@ async fn watch_tool(
     use axum::response::IntoResponse as _;
     use axum::response::sse::{Event, KeepAlive, Sse};
     use futures::SinkExt as _;
+
+    // SQLite has no `LISTEN`, so its watch polls the file (issue #2471).
+    #[cfg(feature = "sqlite")]
+    if let Some(sqlite) = api_state.sqlite_handle() {
+        return match sqlite {
+            Ok(handle_) => {
+                crate::sqlite::mcp::watch_tool(
+                    handle_,
+                    workflow,
+                    handle,
+                    api_state.sse_keepalive_interval(),
+                    api_state.sse_buffer_depth(),
+                )
+                .await
+            }
+            Err(error) => axum::response::IntoResponse::into_response(error),
+        };
+    }
 
     let exec_id = match crate::api::parse_execution_id(handle) {
         Ok(id) => id,

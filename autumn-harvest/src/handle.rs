@@ -661,6 +661,22 @@ impl WorkflowHandleClient {
             .map_or(declared, |cache| cache.apply_chain(workflow_name, declared))
     }
 
+    /// The effective concurrency policy of a type (issue #2407).
+    ///
+    /// An operator override in the shared cache wins over the declared limit.
+    /// A client with no cache returns `declared`. The generated typed stubs
+    /// call this.
+    #[must_use]
+    pub fn apply_concurrency_run_default(
+        &self,
+        workflow_name: &str,
+        declared: Option<crate::concurrency::ConcurrencyPolicy>,
+    ) -> Option<crate::concurrency::ConcurrencyPolicy> {
+        self.inner.run_defaults.as_ref().map_or(declared, |cache| {
+            cache.apply_concurrency(workflow_name, declared)
+        })
+    }
+
     /// Get the chain-scoped lifetime cap ceiling (issue #617). Doubles as the
     /// fleet-wide chain default.
     #[must_use]
@@ -1300,13 +1316,13 @@ impl WorkflowHandleClient {
         info: &crate::info::WorkflowInfo,
         input: &Value,
     ) -> ResolvedStartDefaults {
-        let concurrency_key = info
-            .concurrency
+        // Issue #2407: an operator override wins over the declared limit.
+        let policy = self.apply_concurrency_run_default(info.name, info.concurrency);
+        let concurrency_key = policy
             .as_ref()
             .and_then(|policy| crate::concurrency::resolve_concurrency_key(policy.key_expr, input));
-        let concurrency_limit = info.concurrency.as_ref().map(|policy| policy.limit);
-        let concurrency_on_conflict = info
-            .concurrency
+        let concurrency_limit = policy.as_ref().map(|policy| policy.limit);
+        let concurrency_on_conflict = policy
             .as_ref()
             .map_or(crate::concurrency::ConcurrencyOnConflict::Defer, |policy| {
                 policy.on_conflict
@@ -2870,6 +2886,8 @@ mod tests {
                 execution_timeout: Some(2 * hour),
                 sla: Some(hour / 2),
                 chain_execution_timeout: Some(3 * hour),
+                concurrency_limit: None,
+                quota: crate::quota::QuotaLimits::default(),
             },
         );
         let client = residency_client().with_run_defaults(cache);
@@ -2886,6 +2904,32 @@ mod tests {
             Some(hour),
             "another type keeps its declared value"
         );
+    }
+
+    /// Issue #2407: the typed stubs and the transactional start resolve the
+    /// concurrency policy through the client. A client with no cache keeps
+    /// the declared policy.
+    #[test]
+    fn the_client_applies_the_concurrency_limit_override() {
+        let declared = Some(crate::concurrency::ConcurrencyPolicy::new("input.k", 2));
+        assert_eq!(
+            residency_client().apply_concurrency_run_default("wf", declared),
+            declared
+        );
+        let cache = Arc::new(crate::run_defaults::RunDefaultsCache::new());
+        cache.write_through(
+            "wf",
+            crate::run_defaults::RunDefaultFields {
+                concurrency_limit: Some(6),
+                ..crate::run_defaults::RunDefaultFields::default()
+            },
+        );
+        let client = residency_client().with_run_defaults(cache);
+        let policy = client
+            .apply_concurrency_run_default("wf", declared)
+            .expect("policy");
+        assert_eq!((policy.key_expr, policy.limit), ("input.k", 6));
+        assert_eq!(client.apply_concurrency_run_default("wf", None), None);
     }
 
     /// AC1b/AC5 on the **handle** surface: the SDK's placement resolver reads

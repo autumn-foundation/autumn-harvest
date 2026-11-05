@@ -25,8 +25,8 @@ use autumn_harvest_agent::workflow::agent_loop_info;
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentModel, AgentReport, AgentStop, AgentTask, BoxFuture,
     ChatRequest, ChatResponse, ChatRole, ContentPart, ErrorKind, FlowRules, FnTool, Mandate,
-    ModelTurn, ModelTurnRequest, Peer, Rule, StopReason, TokenUsage, ToolDecision, ToolEffect,
-    sqlite,
+    ModelTurn, ModelTurnRequest, Peer, Rule, SerialReason, StopReason, TokenUsage, ToolDecision,
+    ToolEffect, sqlite,
 };
 use autumn_harvest_sqlite::SqliteRuntime;
 use common::{TryFnModel, report, runtime};
@@ -430,6 +430,7 @@ fn sim_turn(content: Vec<ContentPart>, stop: StopReason) -> ModelTurn {
         .map(|_| ToolDecision::Allow)
         .collect();
     ModelTurn {
+        cost_usd_micros: None,
         content,
         stop,
         usage: TokenUsage::new(1, 1),
@@ -448,6 +449,7 @@ fn child_report(input: &Value) -> Value {
     let mut labels = BTreeSet::new();
     labels.insert(task.input.replace(' ', "_"));
     json!(AgentReport {
+        cost_usd_micros: 0,
         stop: AgentStop::Completed,
         text: format!("done: {}", task.input),
         steps_used: 1,
@@ -462,6 +464,7 @@ fn child_report(input: &Value) -> Value {
         workspace: None,
         error: None,
         resets: 0,
+        answer_rejections: Vec::new(),
     })
 }
 
@@ -897,4 +900,419 @@ async fn a_nested_failure_keeps_the_usage_of_the_whole_subtree() {
     assert!(error.contains("rail refused"), "{error}");
     // Root 1, flights 2, rail 2 (the paid turn), hotels 2, visas 2.
     assert_eq!(state.tokens_used, 1 + 2 + 2 + 2 + 2, "the subtree is paid");
+}
+
+/// A child answer of 9 000 characters. It ends with the child input, so a
+/// cut shows.
+fn long_answer(input: &str) -> String {
+    format!("{}{input}", "x".repeat(9_000))
+}
+
+/// The root fans out to three peers. Each peer answers with a long text.
+fn long_trip_model() -> Arc<FnModel> {
+    FnModel::new(|request| {
+        let input = first_user(request);
+        if input == ROOT_INPUT {
+            return if results(request).is_empty() {
+                three_delegations(3)
+            } else {
+                text("trip planned", 3)
+            };
+        }
+        text(&long_answer(&input), 2)
+    })
+}
+
+/// The delegation results that the root read last.
+fn delegation_results(model: &FnModel) -> Vec<Value> {
+    let last = model
+        .requests()
+        .into_iter()
+        .rfind(|request| first_user(request) == ROOT_INPUT)
+        .unwrap();
+    results(&last)
+        .iter()
+        .map(|result| serde_json::from_str(result).unwrap())
+        .collect()
+}
+
+// Issue #2481: `tool_output_limit` governs a fan-out answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_harness_limit_governs_a_fan_out_answer() {
+    let (_dir, db) = fresh_db();
+    let model = long_trip_model();
+    let harness = trip_harness(model.clone()).tool_output_limit(20_000);
+    let mut rt = runtime(&db, harness);
+    let (exec, report) = run(&mut rt, &trip_task(3)).await;
+
+    assert_eq!(children_started(&rt, exec).len(), 3, "the children fan out");
+    let found = delegation_results(&model);
+    assert_eq!(found.len(), 3);
+    for (result, input) in found
+        .iter()
+        .zip(["find flights", "find hotels", "check visas"])
+    {
+        let answer = result["answer"].as_str().unwrap_or_default();
+        assert!(
+            answer == long_answer(input),
+            "{input}: {} characters, whole: {}",
+            answer.chars().count(),
+            answer.ends_with(input)
+        );
+        assert_eq!(result["truncated"], false);
+    }
+    assert_eq!(report.delegations.len(), 3);
+    assert!(report.delegations.iter().all(|r| !r.answer_truncated));
+}
+
+// Issue #2481: a cut fan-out answer is marked for the model and the report.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_fan_out_answer_is_marked() {
+    let (_dir, db) = fresh_db();
+    let model = long_trip_model();
+    let harness = trip_harness(model.clone()).tool_output_limit(100);
+    let mut rt = runtime(&db, harness);
+    let (exec, report) = run(&mut rt, &trip_task(3)).await;
+
+    assert_eq!(children_started(&rt, exec).len(), 3, "the children fan out");
+    for result in delegation_results(&model) {
+        assert_eq!(result["answer"], format!("{}…[truncated]", "x".repeat(100)));
+        assert_eq!(result["truncated"], true);
+    }
+    assert_eq!(report.delegations.len(), 3);
+    assert!(report.delegations.iter().all(|r| r.answer_truncated));
+}
+
+// ---------------------------------------------------------------------------
+// A delegation that runs alone names why (issue #2483).
+// ---------------------------------------------------------------------------
+
+/// The reason on each record of the run, in order.
+fn serials(report: &AgentReport) -> Vec<Option<SerialReason>> {
+    report
+        .delegations
+        .iter()
+        .map(|record| record.serial)
+        .collect()
+}
+
+/// A model whose root turn makes `calls`, and whose children answer.
+fn root_calls(calls: Vec<(&'static str, &'static str, Value)>) -> Arc<FnModel> {
+    FnModel::new(move |request| {
+        let input = first_user(request);
+        if input == ROOT_INPUT {
+            return if results(request).is_empty() {
+                tool_calls(&calls, 1)
+            } else {
+                text("trip planned", 1)
+            };
+        }
+        text(&format!("done: {input}"), 1)
+    })
+}
+
+fn delegate(id: &'static str, agent: &str, task: &str) -> (&'static str, &'static str, Value) {
+    (id, DELEGATE_TOOL, json!({"agent": agent, "task": task}))
+}
+
+fn note() -> Arc<dyn autumn_harvest_agent::Tool> {
+    FnTool::new("note", "Notes.", json!({"type": "object"}), |_| async {
+        Ok(json!("noted"))
+    })
+    .effect(ToolEffect::ReadOnly)
+    .shared()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_call_past_the_bound_names_why_it_ran_alone() {
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, trip_harness(trip_model()));
+    let (exec, report) = run(&mut rt, &trip_task(2)).await;
+
+    // The batch ends first, then the visas child runs inline.
+    assert_eq!(
+        serials(&report),
+        [None, None, Some(SerialReason::BoundReached)]
+    );
+    assert_eq!(report.delegations[2].chain, ["planner", "visas"]);
+    assert_eq!(children_started(&rt, exec).len(), 2, "one batch of two");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lone_call_after_a_batch_and_another_call_is_not_consecutive() {
+    let (_dir, db) = fresh_db();
+    let model = root_calls(vec![
+        delegate("d1", "flights", "find flights"),
+        delegate("d2", "hotels", "find hotels"),
+        ("n1", "note", json!({})),
+        delegate("d3", "visas", "check visas"),
+    ]);
+    let mut rt = runtime(&db, trip_harness(model).tool(note()));
+    let (exec, report) = run(&mut rt, &trip_task(3)).await;
+
+    assert_eq!(children_started(&rt, exec).len(), 2);
+    assert_eq!(
+        serials(&report),
+        [None, None, Some(SerialReason::NotConsecutive)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bound_of_one_names_no_reason() {
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, trip_harness(trip_model()));
+    let (exec, report) = run(&mut rt, &trip_task(1)).await;
+
+    assert!(children_started(&rt, exec).is_empty(), "each ran inline");
+    assert_eq!(serials(&report), [None, None, None]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_lone_delegation_keeps_no_reason() {
+    // The mandate allows one delegation. The second call is refused, so it
+    // did not run, and its record names the refusal only.
+    let (_dir, db) = fresh_db();
+    let model = root_calls(vec![
+        delegate("d1", "flights", "find flights"),
+        ("n1", "note", json!({})),
+        delegate("d2", "hotels", "find hotels"),
+    ]);
+    let mut rt = runtime(&db, trip_harness(model).tool(note()));
+    let task = AgentTask::new(ROOT_INPUT)
+        .mandate(
+            Mandate::new("planner")
+                .peers(["flights", "hotels", "visas"])
+                .max_delegations(1),
+        )
+        .parallel_children(3);
+    let (_exec, report) = run(&mut rt, &task).await;
+
+    assert_eq!(
+        report.delegations[1].refusal,
+        Some(autumn_harvest_agent::Refusal::FanOutExhausted)
+    );
+    assert_eq!(serials(&report), [Some(SerialReason::NotConsecutive), None]);
+}
+
+/// A policy that gates each delegation to one peer and allows each other
+/// call.
+#[derive(Debug)]
+struct GateOne(&'static str);
+
+impl autumn_harvest_agent::ToolPolicy for GateOne {
+    fn decide<'a>(
+        &'a self,
+        call: &'a autumn_harvest_agent::ToolCall,
+        _tool: Option<&'a dyn autumn_harvest_agent::Tool>,
+        _info: &'a autumn_harvest_agent::RunInfo,
+    ) -> BoxFuture<'a, ToolDecision> {
+        let gated = call.name == DELEGATE_TOOL && call.arguments["agent"] == self.0;
+        Box::pin(async move {
+            if gated {
+                ToolDecision::RequireApproval {
+                    reason: "check".into(),
+                }
+            } else {
+                ToolDecision::Allow
+            }
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_gated_call_leaves_the_earlier_record_alone() {
+    use autumn_harvest_agent::Approval;
+    use autumn_harvest_sqlite::RunState;
+
+    let (_dir, db) = fresh_db();
+    let model = root_calls(vec![
+        delegate("d1", "flights", "find flights"),
+        delegate("d2", "hotels", "find hotels"),
+    ]);
+    let harness = trip_harness(model).policy(Arc::new(GateOne("hotels")));
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &trip_task(3)).unwrap();
+    let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the hotels call waits for a person");
+    };
+    let reject = Approval::Reject {
+        reason: "no".into(),
+    };
+    sqlite::decide(&mut rt, exec, &signal, &reject).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.delegations.len(), 1, "a rejected call has no record");
+    assert_eq!(report.delegations[0].chain, ["planner", "flights"]);
+    assert_eq!(serials(&report), [Some(SerialReason::SingleCall)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lone_delegation_names_a_single_call() {
+    let (_dir, db) = fresh_db();
+    let model = root_calls(vec![delegate("d1", "flights", "find flights")]);
+    let mut rt = runtime(&db, trip_harness(model));
+    let (exec, report) = run(&mut rt, &trip_task(3)).await;
+
+    assert_eq!(report.text, "trip planned");
+    assert_eq!(serials(&report), [Some(SerialReason::SingleCall)]);
+    // The reason is a pure function of the recorded turn, so replay holds.
+    let replay = WorkflowReplayer::new()
+        .register(vec![agent_loop_info()])
+        .with_execution_id(exec)
+        .replay_from_events(rt.load_history(exec).unwrap())
+        .await;
+    assert!(
+        matches!(replay.status, ReplayStatus::ReplaySucceeded),
+        "{replay}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delegations_split_by_another_call_name_not_consecutive() {
+    let (_dir, db) = fresh_db();
+    let model = root_calls(vec![
+        delegate("d1", "flights", "find flights"),
+        ("n1", "note", json!({})),
+        delegate("d2", "hotels", "find hotels"),
+    ]);
+    let mut rt = runtime(&db, trip_harness(model).tool(note()));
+    let (exec, report) = run(&mut rt, &trip_task(3)).await;
+
+    assert!(children_started(&rt, exec).is_empty(), "both ran inline");
+    assert_eq!(
+        serials(&report),
+        [
+            Some(SerialReason::NotConsecutive),
+            Some(SerialReason::NotConsecutive),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gated_delegation_names_gated() {
+    use autumn_harvest_agent::{Approval, ToolRules};
+    use autumn_harvest_sqlite::RunState;
+
+    let (_dir, db) = fresh_db();
+    let harness = trip_harness(trip_model())
+        .policy(Arc::new(ToolRules::new().tool(DELEGATE_TOOL, Rule::Ask)));
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &trip_task(3)).unwrap();
+    let mut state = rt.run_until_blocked(exec).await.unwrap();
+    while let RunState::WaitingSignal(signal) = state {
+        sqlite::decide(&mut rt, exec, &signal, &Approval::Approve).unwrap();
+        state = rt.run_until_blocked(exec).await.unwrap();
+    }
+    let report = report(state);
+
+    assert_eq!(report.text, "trip planned");
+    assert!(children_started(&rt, exec).is_empty(), "each ran inline");
+    assert_eq!(serials(&report), [Some(SerialReason::Gated); 3]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edited_gated_call_names_gated() {
+    // The model names a peer that the roster does not hold. A person edits
+    // the call to an inline peer, so it runs and names the gate.
+    use autumn_harvest_agent::Approval;
+    use autumn_harvest_sqlite::RunState;
+
+    let (_dir, db) = fresh_db();
+    let model = root_calls(vec![delegate("d1", "airline", "find flights")]);
+    let harness = trip_harness(model).policy(Arc::new(GateOne("airline")));
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &trip_task(3)).unwrap();
+    let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the call waits for a person");
+    };
+    let edit = Approval::Edit {
+        arguments: json!({"agent": "flights", "task": "find flights"}),
+    };
+    sqlite::decide(&mut rt, exec, &signal, &edit).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.delegations.len(), 1);
+    assert_eq!(report.delegations[0].chain, ["planner", "flights"]);
+    assert_eq!(serials(&report), [Some(SerialReason::Gated)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nested_lone_delegation_names_its_reason() {
+    // The flights child of a batch delegates to rail alone. Its record
+    // reaches the root through the report of the child run.
+    let (_dir, db) = fresh_db();
+    let model = FnModel::new(|request| {
+        let input = first_user(request);
+        let answered = !results(request).is_empty();
+        match input.as_str() {
+            ROOT_INPUT if answered => text("trip planned", 1),
+            ROOT_INPUT => three_delegations(1),
+            "find flights" if !answered => tool_calls(
+                &[(
+                    "r1",
+                    DELEGATE_TOOL,
+                    json!({"agent": "rail", "task": "check rail"}),
+                )],
+                1,
+            ),
+            _ => text("answered", 1),
+        }
+    });
+    let harness = AgentHarness::new(model)
+        .peer(Peer::new("flights", "Finds flights.").peers(["rail"]))
+        .peer(Peer::new("hotels", "Finds hotels."))
+        .peer(Peer::new("visas", "Checks visas."))
+        .peer(Peer::new("rail", "Checks rail."));
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new(ROOT_INPUT)
+        .mandate(Mandate::new("planner").peers(["flights", "hotels", "visas", "rail"]))
+        .parallel_children(3);
+    let (_exec, report) = run(&mut rt, &task).await;
+
+    let rail = report
+        .delegations
+        .iter()
+        .find(|record| record.chain.last().map(String::as_str) == Some("rail"))
+        .expect("the rail record reaches the root");
+    assert_eq!(rail.serial, Some(SerialReason::SingleCall));
+    let batched = report
+        .delegations
+        .iter()
+        .filter(|record| record.chain.len() == 2)
+        .all(|record| record.serial.is_none());
+    assert!(batched, "{:?}", report.delegations);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_bound_no_record_names_a_reason() {
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, trip_harness(trip_model()));
+    let (_exec, report) = run(&mut rt, &trip_task(0)).await;
+
+    assert_eq!(serials(&report), [None, None, None]);
+    // A record with no reason writes no field, so an old report decodes
+    // and a new one reads the same as before.
+    let encoded = serde_json::to_value(&report.delegations).unwrap();
+    assert!(
+        encoded
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record.get("serial").is_none()),
+        "{encoded}"
+    );
+}
+
+#[test]
+fn a_reason_has_a_stable_code_and_wire_form() {
+    for (reason, code) in [
+        (SerialReason::SingleCall, "single_call"),
+        (SerialReason::NotConsecutive, "not_consecutive"),
+        (SerialReason::Gated, "gated"),
+        (SerialReason::DurablePeer, "durable_peer"),
+        (SerialReason::BoundReached, "bound_reached"),
+    ] {
+        assert_eq!(reason.code(), code);
+        assert_eq!(serde_json::to_value(reason).unwrap(), json!(code));
+    }
 }

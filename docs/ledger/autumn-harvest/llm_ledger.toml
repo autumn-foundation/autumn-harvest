@@ -7,3 +7,10 @@ kind = ["write"]
 tables = ["harvest_llm_ledger"]
 measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest/llm_ledger.md"
+
+["spend_for_search_attrs"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_llm_ledger", "harvest_workflow_executions"]
+measured = "unmeasured"

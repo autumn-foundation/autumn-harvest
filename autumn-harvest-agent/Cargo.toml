@@ -75,6 +75,10 @@ name = "crash_resume"
 required-features = ["sqlite"]
 
 [[test]]
+name = "answer_check"
+required-features = ["sqlite"]
+
+[[test]]
 name = "always_on"
 required-features = ["sqlite"]
 
@@ -123,11 +127,19 @@ name = "fan_out"
 required-features = ["sqlite"]
 
 [[test]]
+name = "fan_out_trace"
+required-features = ["sqlite"]
+
+[[test]]
 name = "draws"
 required-features = ["sqlite"]
 
 [[test]]
 name = "evidence"
+required-features = ["eval", "sqlite"]
+
+[[test]]
+name = "refine_run"
 required-features = ["eval", "sqlite"]
 
 [[test]]
@@ -157,6 +169,14 @@ required-features = ["sqlite"]
 [[test]]
 name = "overlay_store_postgres"
 required-features = ["postgres"]
+
+[[test]]
+name = "sampling_policy_postgres"
+required-features = ["postgres"]
+
+[[test]]
+name = "sampling_policy"
+required-features = ["sqlite"]
 
 [[test]]
 name = "overlay_read"
@@ -191,7 +211,41 @@ name = "score_postgres"
 required-features = ["postgres"]
 
 [[test]]
+name = "live_probe"
+required-features = ["eval", "sqlite"]
+
+[[test]]
+name = "live_probe_postgres"
+required-features = ["eval", "postgres"]
+
+[[test]]
+name = "sample"
+required-features = ["sqlite"]
+
+[[test]]
+name = "sample_crash"
+required-features = ["sqlite"]
+
+[[test]]
+name = "sample_postgres"
+required-features = ["postgres"]
+
+# The `postgres` module on a real worker: the Postgres form of the SQLite
+# helpers.
+[[test]]
+name = "postgres_agents"
+required-features = ["postgres"]
+
+[[test]]
 name = "episodes"
+required-features = ["sqlite"]
+
+[[test]]
+name = "consolidate_all"
+required-features = ["sqlite"]
+
+[[test]]
+name = "recall"
 required-features = ["sqlite"]
 
 [lints]
@@ -200,6 +254,11 @@ workspace = true
 [[example]]
 name = "sqlite_agent"
 required-features = ["sqlite"]
+
+# The same story on Postgres, with a worker in the process.
+[[example]]
+name = "postgres_agent"
+required-features = ["postgres"]
 
 # A session as a durable agent (issues #1975, #2263). `test = true` runs its
 # embedded tests in the crate's own `cargo test` step.

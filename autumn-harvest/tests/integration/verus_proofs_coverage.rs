@@ -306,7 +306,7 @@ fn every_verus_mirror_matches_its_engine_source() {
             normalize(&body),
             m.verus_body,
             "{} copies `{}` in {}, but the bodies differ. Port the change to \
-             the Verus copy, then run scripts/check-verus-proofs.sh",
+             the Verus copy, then run `cargo xtask check verus-proofs`",
             m.verus_file,
             m.source_fn,
             m.source_file
@@ -317,8 +317,13 @@ fn every_verus_mirror_matches_its_engine_source() {
 /// The source crates that a Verus proof may mirror.
 ///
 /// The agent crate holds pure kernels of the durable agent (issue #2262).
-/// A proof of one names its Verus file as an engine function does.
-const MIRRORED_CRATES: &[&str] = &["autumn-harvest/src", "autumn-harvest-agent/src"];
+/// A proof of one names its Verus file as an engine function does. The
+/// plugin crate holds the process role kernels (issue #2477).
+const MIRRORED_CRATES: &[&str] = &[
+    "autumn-harvest/src",
+    "autumn-harvest-agent/src",
+    "autumn-harvest-plugin/src",
+];
 
 /// The `.rs` files under each of [`MIRRORED_CRATES`], relative to the repo
 /// root.
@@ -974,13 +979,13 @@ fn every_verus_module_is_in_the_crate_root() {
 #[test]
 fn ci_runs_the_verus_proofs() {
     let ci = parse_workflow(".github/workflows/ci.yml");
-    if let Some(defect) = formal_job_defect(&ci, "verus", "scripts/check-verus-proofs.sh") {
+    if let Some(defect) = formal_job_defect(&ci, "verus", "cargo xtask check verus-proofs") {
         panic!("{defect}");
     }
-    let script = read("scripts/check-verus-proofs.sh");
+    let script = read("xtask/src/check/verus_proofs.rs");
     assert!(script.contains("formal/verus/src/lib.rs"));
     assert!(
-        script.contains("sha256sum"),
+        script.contains("verify_sha256(&zip, VERUS_SHA256)"),
         "the Verus download must be pinned"
     );
     assert!(script.contains("verified, 0 errors"));

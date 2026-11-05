@@ -154,7 +154,7 @@ count above; dhat here only confirms it carries no allocation cost.
   model-row drift (`source:fetch_add@Atomic`, this sandbox's installed
   `rustc 1.94.1` versus the `Atomic<T>` spelling a newer rustc prints),
   unrelated to `split_top`.
-* `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` — OK, no
+* `cargo xtask audit comment-hygiene --base origin/trunk-dev` — OK, no
   Tier A findings, no Tier B regressions.
 
 ## 🔬 Reproduce

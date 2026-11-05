@@ -1,9 +1,12 @@
-//! Operator overrides for per-type run defaults (issues #2387 and #2406).
+//! Operator overrides for per-type run defaults (issues #2387, #2406, #2407
+//! and #2408).
 //!
 //! [`WorkflowInfo::sla`](crate::info::WorkflowInfo::sla),
-//! [`WorkflowInfo::execution_timeout`](crate::info::WorkflowInfo::execution_timeout)
-//! and
+//! [`WorkflowInfo::execution_timeout`](crate::info::WorkflowInfo::execution_timeout),
 //! [`WorkflowInfo::chain_execution_timeout`](crate::info::WorkflowInfo::chain_execution_timeout)
+//! the `limit` of
+//! [`WorkflowInfo::concurrency`](crate::info::WorkflowInfo::concurrency) and
+//! the admission caps of [`WorkflowInfo::quota`](crate::info::WorkflowInfo::quota)
 //! are declared in code. A DAG lowers to a shadow workflow type of the same
 //! name, so its `DagInfo` values arrive here too. Each start path resolves the
 //! deadlines of a new run from them, so a change needed a restart.
@@ -40,18 +43,51 @@
 //! runs of a type that have not breached yet. It never changes a hard
 //! `deadline_at`, because a shorter one could end a run at once.
 //!
+//! ## Concurrency limit
+//!
+//! An override of the concurrency limit keeps the declared key and
+//! `on_conflict`. Each start stores its limit on its task row, and the claim
+//! compares the running count of the key to that stored cap. So a lower limit
+//! applies to the next start, and a run in flight keeps its cap.
+//! [`raise_waiting_concurrency_caps`] lifts the stored cap of the live rows
+//! after a raise, so the next claim admits the waiting starts.
+//!
+//! A latest-wins policy (`cancel_running`) keeps its code limit. Its start
+//! cancels runs down to the limit, so any later drop of an override would
+//! cancel runs in flight.
+//!
+//! ## Quota limits
+//!
+//! An override of the quota caps (issue #2408) keeps the declared key and the
+//! LLM caps. No row stores a quota cap. Each admission reads the caps again
+//! through [`current_quota_policy`], inside `enforce_quota_admission`. So a
+//! lower cap refuses the next admission over it, and a higher cap admits the
+//! next one. Only admission reads a cap, so a cap never ends a run in flight.
+//! A parent whose child spawn a cap refuses waits with a backoff, and its own
+//! `execution_timeout` still applies. A type with no admission cap keeps its
+//! code policy. See [`QuotaLimits::apply`].
+//!
+//! Admission has no registry, so it reads the cache through
+//! `GLOBAL_RUN_DEFAULTS`. The last `HandlerRegistry` built sets that global.
+//! A process that admits starts with no registry, or with no refresh loop,
+//! admits under the code caps.
+//!
 //! ## Failure mode
 //!
 //! A refresh that fails keeps the last snapshot, and the next tick retries.
-//! A process that never loaded the table uses the code values. This is the
-//! same posture as a missed SLA: an SLA only reports a breach, and it never
-//! ends a run.
+//! A process that never loaded the table uses the code values. For an SLA
+//! this is harmless, because an SLA only reports a breach. For a concurrency
+//! limit or a quota cap, such a process admits under the code value until a
+//! refresh succeeds. Each failed refresh logs a warning.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+
+use crate::concurrency::ConcurrencyPolicy;
+use crate::quota::{QuotaLimits, QuotaLimitsPatch, QuotaPolicy};
 
 /// The maximum age of a loaded snapshot before a refresh loop reloads it.
 pub const RUN_DEFAULTS_TTL: Duration = Duration::from_secs(5);
@@ -62,6 +98,17 @@ pub const RUN_DEFAULTS_TTL: Duration = Duration::from_secs(5);
 /// `chrono` panics, and a larger value fails its conversion and drops the
 /// deadline. So the write refuses a value above this bound.
 pub const MAX_RUN_DEFAULT: Duration = Duration::from_hours(876_000);
+
+/// The largest concurrency limit that an override can set.
+///
+/// A task row stores its cap in an `INTEGER` column, so a larger value does
+/// not fit.
+pub const MAX_CONCURRENCY_LIMIT: u32 = i32::MAX.unsigned_abs();
+
+/// The largest `max_history_bytes` that an override can set (issue #2408).
+///
+/// The override column is a `BIGINT`, so a larger value does not fit.
+pub const MAX_QUOTA_HISTORY_BYTES: u64 = i64::MAX.unsigned_abs();
 
 /// The run-default fields that an override can set.
 ///
@@ -74,6 +121,10 @@ pub struct RunDefaultFields {
     pub sla: Option<Duration>,
     /// The cap of a new continue-as-new chain (issue #2406).
     pub chain_execution_timeout: Option<Duration>,
+    /// The concurrency limit of a new start (issue #2407).
+    pub concurrency_limit: Option<u32>,
+    /// The quota admission caps of a new admission (issue #2408).
+    pub quota: QuotaLimits,
 }
 
 impl RunDefaultFields {
@@ -83,6 +134,40 @@ impl RunDefaultFields {
         self.execution_timeout.is_none()
             && self.sla.is_none()
             && self.chain_execution_timeout.is_none()
+            && self.concurrency_limit.is_none()
+            && self.quota.is_empty()
+    }
+
+    /// Apply this override to the code quota policy of one type (issue
+    /// #2408).
+    ///
+    /// A type with no code policy gets none. See [`QuotaLimits::apply`].
+    #[must_use]
+    pub const fn apply_quota(&self, policy: Option<QuotaPolicy>) -> Option<QuotaPolicy> {
+        match policy {
+            Some(policy) => Some(self.quota.apply(policy)),
+            None => None,
+        }
+    }
+
+    /// Apply this override to the code concurrency policy of one type
+    /// (issue #2407).
+    ///
+    /// The result keeps the code key and `on_conflict`. A type with no code
+    /// policy gets none. A latest-wins policy keeps its code limit, because a
+    /// later drop of the override would cancel runs in flight.
+    #[must_use]
+    pub fn apply_concurrency(
+        &self,
+        policy: Option<ConcurrencyPolicy>,
+    ) -> Option<ConcurrencyPolicy> {
+        let mut policy = policy?;
+        if let Some(limit) = self.concurrency_limit
+            && !policy.on_conflict.is_cancel_running()
+        {
+            policy.limit = limit;
+        }
+        Some(policy)
     }
 
     /// Apply this override to the code chain cap of one type.
@@ -120,6 +205,10 @@ pub struct RunDefaultPatch {
     pub sla: Option<Option<Duration>>,
     /// The chain cap.
     pub chain_execution_timeout: Option<Option<Duration>>,
+    /// The concurrency limit (issue #2407).
+    pub concurrency_limit: Option<Option<u32>>,
+    /// The quota admission caps (issue #2408).
+    pub quota: QuotaLimitsPatch,
 }
 
 impl RunDefaultPatch {
@@ -132,6 +221,8 @@ impl RunDefaultPatch {
             chain_execution_timeout: self
                 .chain_execution_timeout
                 .unwrap_or(stored.chain_execution_timeout),
+            concurrency_limit: self.concurrency_limit.unwrap_or(stored.concurrency_limit),
+            quota: self.quota.merge(stored.quota),
         }
     }
 }
@@ -218,6 +309,44 @@ impl RunDefaultsCache {
             })
     }
 
+    /// The effective concurrency policy of one type (issue #2407).
+    ///
+    /// `policy` is the code policy. A poisoned lock returns it unchanged. See
+    /// [`RunDefaultFields::apply_concurrency`].
+    #[must_use]
+    pub fn apply_concurrency(
+        &self,
+        workflow_name: &str,
+        policy: Option<ConcurrencyPolicy>,
+    ) -> Option<ConcurrencyPolicy> {
+        let Ok(snapshot) = self.snapshot.read() else {
+            return policy;
+        };
+        snapshot
+            .overrides
+            .get(workflow_name)
+            .map_or(policy, |fields| fields.apply_concurrency(policy))
+    }
+
+    /// The effective quota policy of one type (issue #2408).
+    ///
+    /// `policy` is the code policy. A poisoned lock returns it unchanged. See
+    /// [`RunDefaultFields::apply_quota`].
+    #[must_use]
+    pub fn apply_quota(
+        &self,
+        workflow_name: &str,
+        policy: Option<QuotaPolicy>,
+    ) -> Option<QuotaPolicy> {
+        let Ok(snapshot) = self.snapshot.read() else {
+            return policy;
+        };
+        snapshot
+            .overrides
+            .get(workflow_name)
+            .map_or(policy, |fields| fields.apply_quota(policy))
+    }
+
     /// The override of one type in the current snapshot, if any.
     #[must_use]
     pub fn get(&self, workflow_name: &str) -> Option<RunDefaultFields> {
@@ -275,8 +404,9 @@ pub use db::*;
 #[cfg(feature = "db")]
 mod db {
     use super::{
-        MAX_RUN_DEFAULT, RUN_DEFAULTS_TTL, RunDefaultFields, RunDefaultOverride, RunDefaultPatch,
-        RunDefaultsCache,
+        ConcurrencyPolicy, MAX_CONCURRENCY_LIMIT, MAX_QUOTA_HISTORY_BYTES, MAX_RUN_DEFAULT,
+        QuotaLimits, QuotaLimitsPatch, QuotaPolicy, RUN_DEFAULTS_TTL, RunDefaultFields,
+        RunDefaultOverride, RunDefaultPatch, RunDefaultsCache,
     };
     use std::time::Duration;
 
@@ -300,6 +430,10 @@ mod db {
         sla_secs: Option<i64>,
         execution_timeout_secs: Option<i64>,
         chain_execution_timeout_secs: Option<i64>,
+        concurrency_limit: Option<i32>,
+        quota_max_active_executions: Option<i64>,
+        quota_max_history_bytes: Option<i64>,
+        quota_max_dead_letters: Option<i64>,
         reason: Option<String>,
         updated_by: String,
         created_at: DateTime<Utc>,
@@ -321,6 +455,38 @@ mod db {
                     })
                     .transpose()
             };
+            let unreadable = |field: &str, n: i64| {
+                HarvestError::Config(format!(
+                    "run-default override for '{}' holds an unreadable {field} ({n})",
+                    self.workflow_name
+                ))
+            };
+            let count = |field: &str, value: Option<i64>| -> HarvestResult<Option<u32>> {
+                value
+                    .map(|n| {
+                        u32::try_from(n)
+                            .ok()
+                            .filter(|n| *n > 0)
+                            .ok_or_else(|| unreadable(field, n))
+                    })
+                    .transpose()
+            };
+            let quota = QuotaLimits {
+                max_active_executions: count(
+                    "quota_max_active_executions",
+                    self.quota_max_active_executions,
+                )?,
+                max_history_bytes: self
+                    .quota_max_history_bytes
+                    .map(|n| {
+                        u64::try_from(n)
+                            .ok()
+                            .filter(|n| *n > 0)
+                            .ok_or_else(|| unreadable("quota_max_history_bytes", n))
+                    })
+                    .transpose()?,
+                max_dead_letters: count("quota_max_dead_letters", self.quota_max_dead_letters)?,
+            };
             let fields = RunDefaultFields {
                 execution_timeout: secs("execution_timeout_secs", self.execution_timeout_secs)?,
                 sla: secs("sla_secs", self.sla_secs)?,
@@ -328,6 +494,19 @@ mod db {
                     "chain_execution_timeout_secs",
                     self.chain_execution_timeout_secs,
                 )?,
+                concurrency_limit: self
+                    .concurrency_limit
+                    .map(|n| {
+                        u32::try_from(n).ok().filter(|n| *n > 0).ok_or_else(|| {
+                            HarvestError::Config(format!(
+                                "run-default override for '{}' holds an unreadable \
+                                 concurrency_limit ({n})",
+                                self.workflow_name
+                            ))
+                        })
+                    })
+                    .transpose()?,
+                quota,
             };
             Ok(RunDefaultOverride {
                 workflow_name: self.workflow_name,
@@ -414,12 +593,14 @@ mod db {
     /// shard.
     ///
     /// A zero duration is rejected, because a zero SLA breaches at once and a
-    /// zero timeout ends the run or the chain at once. A merge that sets no field deletes
-    /// the row. Returns the stored override after the change.
+    /// zero timeout ends the run or the chain at once. The write also refuses
+    /// a zero concurrency limit or quota cap, because no start can then run.
+    /// A merge that sets no field deletes the row. Returns the stored override
+    /// after the change.
     ///
     /// # Errors
     ///
-    /// Returns [`HarvestError::Config`] for a zero duration, and
+    /// Returns [`HarvestError::Config`] for a zero or out-of-range value, and
     /// [`HarvestError::Database`] when a read or write fails.
     pub async fn update_run_default_override(
         conn: &mut AsyncPgConnection,
@@ -428,26 +609,7 @@ mod db {
         use crate::schema::harvest_run_default_overrides::dsl;
         use diesel_async::AsyncConnection;
 
-        for (field, value) in [
-            ("execution_timeout", change.patch.execution_timeout),
-            ("sla", change.patch.sla),
-            (
-                "chain_execution_timeout",
-                change.patch.chain_execution_timeout,
-            ),
-        ] {
-            if value.flatten().is_some_and(|d| d.as_secs() == 0) {
-                return Err(HarvestError::Config(format!(
-                    "{field} must be at least one second"
-                )));
-            }
-            if value.flatten().is_some_and(|d| d > MAX_RUN_DEFAULT) {
-                return Err(HarvestError::Config(format!(
-                    "{field} must be at most {} seconds (100 years)",
-                    MAX_RUN_DEFAULT.as_secs()
-                )));
-            }
-        }
+        check_patch(&change.patch)?;
         let change = *change;
         Box::pin(conn.transaction(async |conn| {
             // A first override has no row for FOR UPDATE to lock. This lock
@@ -472,12 +634,25 @@ mod db {
             let sla_secs = merged.sla.map(to_secs);
             let execution_timeout_secs = merged.execution_timeout.map(to_secs);
             let chain_execution_timeout_secs = merged.chain_execution_timeout.map(to_secs);
+            let concurrency_limit = merged
+                .concurrency_limit
+                .map(|n| i32::try_from(n).unwrap_or(i32::MAX));
+            let quota_max_active_executions = merged.quota.max_active_executions.map(i64::from);
+            let quota_max_history_bytes = merged
+                .quota
+                .max_history_bytes
+                .map(|n| i64::try_from(n).unwrap_or(i64::MAX));
+            let quota_max_dead_letters = merged.quota.max_dead_letters.map(i64::from);
             diesel::insert_into(dsl::harvest_run_default_overrides)
                 .values((
                     dsl::workflow_name.eq(change.workflow_name),
                     dsl::sla_secs.eq(sla_secs),
                     dsl::execution_timeout_secs.eq(execution_timeout_secs),
                     dsl::chain_execution_timeout_secs.eq(chain_execution_timeout_secs),
+                    dsl::concurrency_limit.eq(concurrency_limit),
+                    dsl::quota_max_active_executions.eq(quota_max_active_executions),
+                    dsl::quota_max_history_bytes.eq(quota_max_history_bytes),
+                    dsl::quota_max_dead_letters.eq(quota_max_dead_letters),
                     dsl::reason.eq(change.reason),
                     dsl::updated_by.eq(change.actor),
                     dsl::created_at.eq(now),
@@ -489,6 +664,10 @@ mod db {
                     dsl::sla_secs.eq(sla_secs),
                     dsl::execution_timeout_secs.eq(execution_timeout_secs),
                     dsl::chain_execution_timeout_secs.eq(chain_execution_timeout_secs),
+                    dsl::concurrency_limit.eq(concurrency_limit),
+                    dsl::quota_max_active_executions.eq(quota_max_active_executions),
+                    dsl::quota_max_history_bytes.eq(quota_max_history_bytes),
+                    dsl::quota_max_dead_letters.eq(quota_max_dead_letters),
                     dsl::reason.eq(change.reason),
                     dsl::updated_by.eq(change.actor),
                     dsl::updated_at.eq(now),
@@ -499,6 +678,96 @@ mod db {
             select_override(conn, change.workflow_name, false).await
         }))
         .await
+    }
+
+    /// Refuse a value that no start can use.
+    ///
+    /// A zero duration is refused, because a zero SLA breaches at once and a
+    /// zero timeout ends the run or the chain at once. A zero concurrency
+    /// limit or quota cap is refused, because no start can then run.
+    fn check_patch(patch: &RunDefaultPatch) -> HarvestResult<()> {
+        for (field, value) in [
+            ("execution_timeout", patch.execution_timeout),
+            ("sla", patch.sla),
+            ("chain_execution_timeout", patch.chain_execution_timeout),
+        ] {
+            if value.flatten().is_some_and(|d| d.as_secs() == 0) {
+                return Err(HarvestError::Config(format!(
+                    "{field} must be at least one second"
+                )));
+            }
+            if value.flatten().is_some_and(|d| d > MAX_RUN_DEFAULT) {
+                return Err(HarvestError::Config(format!(
+                    "{field} must be at most {} seconds (100 years)",
+                    MAX_RUN_DEFAULT.as_secs()
+                )));
+            }
+        }
+        match patch.concurrency_limit.flatten() {
+            Some(0) => {
+                return Err(HarvestError::Config(
+                    "concurrency_limit must be at least 1".to_string(),
+                ));
+            }
+            Some(limit) if limit > MAX_CONCURRENCY_LIMIT => {
+                return Err(HarvestError::Config(format!(
+                    "concurrency_limit must be at most {MAX_CONCURRENCY_LIMIT}"
+                )));
+            }
+            _ => {}
+        }
+        check_quota_patch(&patch.quota)
+    }
+
+    /// Refuse a quota cap of zero, or one past its column (issue #2408).
+    ///
+    /// A zero cap refuses every admission of the type. A pause does that
+    /// already, so the write refuses it, as for the concurrency limit.
+    fn check_quota_patch(quota: &QuotaLimitsPatch) -> HarvestResult<()> {
+        for (field, value) in [
+            (
+                "quota_max_active_executions",
+                quota.max_active_executions.flatten().map(u64::from),
+            ),
+            ("quota_max_history_bytes", quota.max_history_bytes.flatten()),
+            (
+                "quota_max_dead_letters",
+                quota.max_dead_letters.flatten().map(u64::from),
+            ),
+        ] {
+            if value == Some(0) {
+                return Err(HarvestError::Config(format!("{field} must be at least 1")));
+            }
+        }
+        if quota
+            .max_history_bytes
+            .flatten()
+            .is_some_and(|n| n > MAX_QUOTA_HISTORY_BYTES)
+        {
+            return Err(HarvestError::Config(format!(
+                "quota_max_history_bytes must be at most {MAX_QUOTA_HISTORY_BYTES}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The effective quota policy of one type, from the process cache (issue
+    /// #2408).
+    ///
+    /// `policy` is the code policy, or the caps that a cross-shard child spec
+    /// carries. The cache is [`GLOBAL_RUN_DEFAULTS`](crate::completion_trigger::GLOBAL_RUN_DEFAULTS),
+    /// because admission code has no registry. With no cache, `policy` comes
+    /// back unchanged. Each admission calls this, so a change reaches the next
+    /// admission within the cache TTL.
+    #[must_use]
+    pub fn current_quota_policy(workflow_name: &str, policy: QuotaPolicy) -> QuotaPolicy {
+        let cache = crate::completion_trigger::GLOBAL_RUN_DEFAULTS
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone());
+        cache
+            .and_then(|cache| cache.apply_quota(workflow_name, Some(policy)))
+            .unwrap_or(policy)
     }
 
     impl RunDefaultsCache {
@@ -659,6 +928,138 @@ mod db {
             }
         }
     }
+    /// The result of [`raise_waiting_concurrency_caps`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CapRaise {
+        /// The number of task rows whose cap went up.
+        pub raised: u64,
+        /// Whether a newer change replaced the limit, so the pass stopped.
+        pub superseded: bool,
+    }
+
+    /// Raise the stored cap of the live workflow task rows of one type to
+    /// `limit` (issue #2407). Call it on every shard.
+    ///
+    /// The claim compares the running count of a key to the cap stored on
+    /// each task row. A waiting start keeps the cap of the start that wrote
+    /// it. A run in flight keeps one task row for its life. The row is parked
+    /// between decisions, and a wake sets it back to PENDING with its cap. So
+    /// this pass lifts each PENDING or RUNNING workflow task row of the type
+    /// whose cap is below `limit`. The next claim then admits it.
+    ///
+    /// The pass only raises. It never lowers a cap. So a lower limit applies
+    /// to the next start only.
+    ///
+    /// The update runs in batches of [`RECOMPUTE_BATCH`] rows, and it skips a
+    /// row that another transaction holds. Each batch takes the lock of the
+    /// type on the default shard, then reads the stored override there. If
+    /// the effective limit of `code` is no longer `limit`, a newer change
+    /// replaced it, and the pass stops.
+    ///
+    /// `store` is the default shard. `None` means that `conn` is the default
+    /// shard, and one transaction holds the lock and the update. Otherwise a
+    /// transaction on `store` holds the lock until the batch on `conn`
+    /// commits. A change of the override takes the same lock. So a newer,
+    /// lower limit cannot commit between the check and the update.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] when a read or an update fails, and
+    /// [`HarvestError::Config`] when the stored override does not decode.
+    pub async fn raise_waiting_concurrency_caps(
+        conn: &mut AsyncPgConnection,
+        mut store: Option<&mut AsyncPgConnection>,
+        workflow_name: &str,
+        code: ConcurrencyPolicy,
+        limit: u32,
+    ) -> HarvestResult<CapRaise> {
+        use diesel::sql_types::{BigInt, Integer, Text};
+        use diesel_async::AsyncConnection;
+
+        // A run in a terminal state has no live task row, so the filter skips
+        // it.
+        const RAISE_SQL: &str = "\
+            WITH batch AS ( \
+                SELECT t.id \
+                FROM harvest_workflow_executions e \
+                JOIN harvest_task_queue t ON t.workflow_exec_id = e.id \
+                WHERE e.workflow_name = $1 \
+                  AND e.state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT', \
+                                      'CONTINUED_AS_NEW', 'TERMINATED') \
+                  AND t.task_type = 'workflow' \
+                  AND t.state IN ('PENDING', 'RUNNING') \
+                  AND t.concurrency_key IS NOT NULL \
+                  AND t.concurrency_cap < $2 \
+                ORDER BY t.id \
+                LIMIT $3 \
+                FOR UPDATE OF t SKIP LOCKED \
+            ) \
+            UPDATE harvest_task_queue AS t \
+            SET concurrency_cap = $2 \
+            FROM batch \
+            WHERE t.id = batch.id";
+
+        let cap = i32::try_from(limit).unwrap_or(i32::MAX);
+        let effective = |stored: Option<RunDefaultOverride>| {
+            stored
+                .map_or(Some(code), |stored| {
+                    stored.fields.apply_concurrency(Some(code))
+                })
+                .map(|policy| policy.limit)
+        };
+        let update = async |conn: &mut AsyncPgConnection| {
+            diesel::sql_query(RAISE_SQL)
+                .bind::<Text, _>(workflow_name)
+                .bind::<Integer, _>(cap)
+                .bind::<BigInt, _>(RECOMPUTE_BATCH)
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)
+        };
+        let mut raised = 0_u64;
+        loop {
+            let batch = match store.as_deref_mut() {
+                None => {
+                    Box::pin(conn.transaction(async |conn| {
+                        lock_type(conn, workflow_name).await?;
+                        let stored = get_run_default_override(conn, workflow_name).await?;
+                        if effective(stored) != Some(limit) {
+                            return Ok(None);
+                        }
+                        update(conn).await.map(Some)
+                    }))
+                    .await?
+                }
+                Some(store) => {
+                    let conn = &mut *conn;
+                    Box::pin(store.transaction(async |store| {
+                        lock_type(store, workflow_name).await?;
+                        let stored = get_run_default_override(store, workflow_name).await?;
+                        if effective(stored) != Some(limit) {
+                            return Ok(None);
+                        }
+                        Box::pin(conn.transaction(async |conn| update(conn).await))
+                            .await
+                            .map(Some)
+                    }))
+                    .await?
+                }
+            };
+            let Some(updated) = batch else {
+                return Ok(CapRaise {
+                    raised,
+                    superseded: true,
+                });
+            };
+            raised += u64::try_from(updated).unwrap_or(0);
+            if i64::try_from(updated).unwrap_or(i64::MAX) < RECOMPUTE_BATCH {
+                return Ok(CapRaise {
+                    raised,
+                    superseded: false,
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -793,6 +1194,8 @@ mod tests {
             execution_timeout: Some(mins(60)),
             sla: Some(mins(5)),
             chain_execution_timeout: Some(mins(600)),
+            concurrency_limit: None,
+            quota: QuotaLimits::default(),
         };
         let clear_sla = RunDefaultPatch {
             sla: Some(None),
@@ -813,6 +1216,193 @@ mod tests {
                 ..base
             }
         );
+    }
+
+    fn limit_only(limit: u32) -> RunDefaultFields {
+        RunDefaultFields {
+            concurrency_limit: Some(limit),
+            ..RunDefaultFields::default()
+        }
+    }
+
+    const DEFER: ConcurrencyPolicy = ConcurrencyPolicy::new("input.tenant", 5);
+    const LATEST_WINS: ConcurrencyPolicy = ConcurrencyPolicy::new("input.tenant", 5)
+        .with_on_conflict(crate::concurrency::ConcurrencyOnConflict::CancelRunning);
+
+    #[test]
+    fn a_concurrency_override_replaces_the_code_limit() {
+        let cache = RunDefaultsCache::new();
+        cache.replace([stored("etl", limit_only(2))]);
+        let lower = cache.apply_concurrency("etl", Some(DEFER)).expect("policy");
+        assert_eq!(lower.limit, 2, "a lower limit applies");
+        assert_eq!(lower.key_expr, DEFER.key_expr, "the key stays the code key");
+        assert_eq!(lower.on_conflict, DEFER.on_conflict);
+        cache.write_through("etl", limit_only(9));
+        assert_eq!(
+            cache.apply_concurrency("etl", Some(DEFER)).map(|p| p.limit),
+            Some(9),
+            "a higher limit applies"
+        );
+        assert_eq!(
+            cache.apply_concurrency("other", Some(DEFER)),
+            Some(DEFER),
+            "another type keeps its code limit"
+        );
+    }
+
+    /// A latest-wins start cancels runs down to its limit. Any later drop of
+    /// an override, a clear included, would cancel runs in flight. So a
+    /// latest-wins policy always keeps its code limit.
+    #[test]
+    fn a_latest_wins_policy_keeps_its_code_limit() {
+        let cache = RunDefaultsCache::new();
+        for limit in [1, 5, 8] {
+            cache.write_through("etl", limit_only(limit));
+            assert_eq!(
+                cache.apply_concurrency("etl", Some(LATEST_WINS)),
+                Some(LATEST_WINS),
+                "an override of {limit} is ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn a_concurrency_override_needs_a_code_policy() {
+        let cache = RunDefaultsCache::new();
+        cache.replace([stored("etl", limit_only(3))]);
+        assert_eq!(cache.apply_concurrency("etl", None), None);
+    }
+
+    #[test]
+    fn a_never_loaded_cache_returns_the_code_policy() {
+        let cache = RunDefaultsCache::new();
+        assert_eq!(cache.apply_concurrency("etl", Some(DEFER)), Some(DEFER));
+    }
+
+    #[test]
+    fn a_concurrency_only_override_is_not_empty_and_leaves_the_durations() {
+        let fields = limit_only(4);
+        assert!(!fields.is_empty());
+        let cache = RunDefaultsCache::new();
+        cache.write_through("etl", fields);
+        assert_eq!(cache.get("etl"), Some(fields));
+        assert_eq!(
+            cache.apply("etl", Some(mins(30)), Some(mins(10))),
+            (Some(mins(30)), Some(mins(10)))
+        );
+        assert_eq!(cache.apply_chain("etl", Some(mins(60))), Some(mins(60)));
+    }
+
+    #[test]
+    fn patch_merge_keeps_the_concurrency_field_it_does_not_name() {
+        let base = RunDefaultFields {
+            sla: Some(mins(5)),
+            concurrency_limit: Some(7),
+            ..RunDefaultFields::default()
+        };
+        let clear_sla = RunDefaultPatch {
+            sla: Some(None),
+            ..RunDefaultPatch::default()
+        };
+        assert_eq!(clear_sla.merge(base).concurrency_limit, Some(7));
+        let clear_limit = RunDefaultPatch {
+            concurrency_limit: Some(None),
+            ..RunDefaultPatch::default()
+        };
+        assert_eq!(
+            clear_limit.merge(base),
+            RunDefaultFields {
+                concurrency_limit: None,
+                ..base
+            }
+        );
+    }
+
+    const QUOTA: QuotaPolicy = QuotaPolicy::new("input.tenant")
+        .with_max_active_executions(10)
+        .with_max_history_bytes(1_000);
+
+    fn quota_only(max_active_executions: u32) -> RunDefaultFields {
+        RunDefaultFields {
+            quota: QuotaLimits {
+                max_active_executions: Some(max_active_executions),
+                ..QuotaLimits::default()
+            },
+            ..RunDefaultFields::default()
+        }
+    }
+
+    #[test]
+    fn a_quota_override_replaces_the_code_caps() {
+        let cache = RunDefaultsCache::new();
+        cache.replace([stored("etl", quota_only(2))]);
+        let effective = cache.apply_quota("etl", Some(QUOTA)).expect("policy");
+        assert_eq!(effective.max_active_executions, Some(2));
+        assert_eq!(effective.max_history_bytes, Some(1_000), "unset inherits");
+        assert_eq!(effective.key_expr, QUOTA.key_expr);
+        assert_eq!(
+            cache.apply_quota("other", Some(QUOTA)),
+            Some(QUOTA),
+            "another type keeps its code caps"
+        );
+        assert_eq!(cache.apply_quota("etl", None), None, "no code policy");
+    }
+
+    #[test]
+    fn a_never_loaded_cache_returns_the_code_quota() {
+        let cache = RunDefaultsCache::new();
+        assert_eq!(cache.apply_quota("etl", Some(QUOTA)), Some(QUOTA));
+    }
+
+    #[test]
+    fn a_quota_only_override_is_not_empty_and_leaves_the_other_fields() {
+        let fields = quota_only(3);
+        assert!(!fields.is_empty());
+        let cache = RunDefaultsCache::new();
+        cache.write_through("etl", fields);
+        assert_eq!(cache.get("etl"), Some(fields));
+        assert_eq!(
+            cache.apply("etl", Some(mins(30)), Some(mins(10))),
+            (Some(mins(30)), Some(mins(10)))
+        );
+        assert_eq!(cache.apply_concurrency("etl", Some(DEFER)), Some(DEFER));
+    }
+
+    #[test]
+    fn patch_merge_keeps_the_quota_caps_it_does_not_name() {
+        let base = RunDefaultFields {
+            sla: Some(mins(5)),
+            ..quota_only(7)
+        };
+        let clear_sla = RunDefaultPatch {
+            sla: Some(None),
+            ..RunDefaultPatch::default()
+        };
+        assert_eq!(clear_sla.merge(base).quota, base.quota);
+        let clear_quota = RunDefaultPatch {
+            quota: QuotaLimitsPatch {
+                max_active_executions: Some(None),
+                ..QuotaLimitsPatch::default()
+            },
+            ..RunDefaultPatch::default()
+        };
+        assert_eq!(
+            clear_quota.merge(base),
+            RunDefaultFields {
+                quota: QuotaLimits::default(),
+                ..base
+            }
+        );
+    }
+
+    #[test]
+    fn the_history_bytes_bound_fits_the_bigint_column() {
+        assert_eq!(i64::try_from(MAX_QUOTA_HISTORY_BYTES).ok(), Some(i64::MAX));
+    }
+
+    #[test]
+    fn the_limit_bound_fits_the_cap_column() {
+        assert_eq!(i64::from(MAX_CONCURRENCY_LIMIT), i64::from(i32::MAX));
     }
 
     #[test]

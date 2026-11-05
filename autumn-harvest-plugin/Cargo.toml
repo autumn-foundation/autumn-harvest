@@ -102,9 +102,11 @@ sqlite = ["autumn-web/sqlite", "dep:autumn-harvest-sqlite"]
 [dependencies]
 autumn-harvest = { version = "0.9.0", path = "../autumn-harvest", features = ["db", "testing"] }
 # The agent profile overlay routes (issue #2374) use the store trait and the
-# overlay diff. The crate builds on the core crate only, so no cycle forms.
-autumn-harvest-agent = { version = "0.9.0", path = "../autumn-harvest-agent" }
-autumn-web = "0.9"
+# overlay diff. The sampling policy routes (issue #2439) call the Postgres
+# policy store. The agent crate never depends on this crate.
+# `cargo xtask check agent-adapter-deps` checks that direction.
+autumn-harvest-agent = { version = "0.9.0", path = "../autumn-harvest-agent", features = ["postgres"] }
+autumn-web = "0.10"
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
@@ -208,7 +210,7 @@ path = "src/bin/harvest_dev.rs"
 required-features = ["dev-runtime"]
 
 [dev-dependencies]
-autumn-web = { version = "0.9", features = ["test-support", "mcp"] }
+autumn-web = { version = "0.10", features = ["test-support", "mcp"] }
 # The dev-runtime lifecycle test drives the running dev runtime over real HTTP
 # (start a workflow, poll its status, fetch the Vantage page). The crate already
 # depends on reqwest for the callback deliverer; the test needs `json` on top.

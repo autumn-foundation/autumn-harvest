@@ -4,20 +4,20 @@
 //! fired, and no alert told anyone. The watchdog workflow is a separate file,
 //! so a defect in `chaos.yml` cannot also stop the alert.
 //!
-//! The behaviour tests run `.github/ci/chaos-watchdog.sh` with a stub `gh` on
-//! `PATH`. The stub records each call and returns canned JSON. The script reads
-//! that JSON with the real `jq`, so the tests also check its filters. These
-//! tests run on Linux only. The script uses GNU `date` and `jq`, which the
+//! The behaviour tests run `cargo xtask ci chaos-watchdog` with a stub `gh` on
+//! `PATH`. The stub records each call and returns canned JSON. The command
+//! reads that JSON itself, so the tests also check its filters. These tests
+//! run on Linux only. The fallback of the report step uses `jq`, which the
 //! `ubuntu-latest` runner has.
 
-#[cfg(target_os = "linux")]
-use super::ci_run_coverage::repo_root;
 use super::ci_run_coverage::{parse_workflow, workflow_crons, workflow_run_commands};
 
 const WATCHDOG_WORKFLOW: &str = ".github/workflows/chaos-watchdog.yml";
-const WATCHDOG_SCRIPT: &str = ".github/ci/chaos-watchdog.sh";
+/// The command that the watchdog step runs.
+const WATCHDOG_COMMAND: &str = "cargo xtask ci chaos-watchdog";
 
-/// The alert issue title. The script finds its open alert by this exact title.
+/// The alert issue title. The watchdog finds its open alert by this exact
+/// title.
 #[cfg(target_os = "linux")]
 const ALERT_TITLE: &str = "Chaos nightly: no successful scheduled run in 48 h";
 
@@ -25,10 +25,10 @@ const ALERT_TITLE: &str = "Chaos nightly: no successful scheduled run in 48 h";
 #[cfg(target_os = "linux")]
 const WATCHDOG_FAILED_TITLE: &str = "Chaos watchdog: a watchdog run failed";
 
-/// The watchdog must fire on its own cron and run the script with the
-/// permissions that the script needs.
+/// The watchdog must fire on its own cron and run the command with the
+/// permissions that the command needs.
 #[test]
-fn watchdog_workflow_runs_the_script_daily() {
+fn watchdog_workflow_runs_the_command_daily() {
     let doc = parse_workflow(WATCHDOG_WORKFLOW);
     assert!(
         !workflow_crons(&doc).is_empty(),
@@ -40,13 +40,54 @@ fn watchdog_workflow_runs_the_script_daily() {
             .and_then(|p| p.get(key))
             .and_then(serde_yaml::Value::as_str)
     };
-    assert_eq!(perm("actions"), Some("read"), "the script lists runs");
-    assert_eq!(perm("issues"), Some("write"), "the script opens issues");
+    assert_eq!(perm("actions"), Some("read"), "the command lists runs");
+    assert_eq!(perm("issues"), Some("write"), "the command opens issues");
 
     let runs = workflow_run_commands(&doc);
     assert!(
-        runs.iter().any(|run| run.contains(WATCHDOG_SCRIPT)),
-        "{WATCHDOG_WORKFLOW} must run {WATCHDOG_SCRIPT}; found {runs:?}"
+        runs.iter().any(|run| run.trim() == WATCHDOG_COMMAND),
+        "{WATCHDOG_WORKFLOW} must run {WATCHDOG_COMMAND}; found {runs:?}"
+    );
+}
+
+/// A failed build leaves no xtask binary, so the report step cannot run it.
+/// The build must be its own step, before the watchdog, so that failure is a
+/// red run. The report step then takes its fallback.
+#[test]
+fn watchdog_workflow_builds_xtask_before_the_check() {
+    let doc = parse_workflow(WATCHDOG_WORKFLOW);
+    let steps: Vec<&serde_yaml::Value> = doc
+        .get("jobs")
+        .and_then(serde_yaml::Value::as_mapping)
+        .into_iter()
+        .flat_map(|jobs| jobs.values())
+        .filter_map(|job| job.get("steps").and_then(serde_yaml::Value::as_sequence))
+        .flatten()
+        .collect();
+    let run_of = |step: &serde_yaml::Value| {
+        step.get("run")
+            .and_then(serde_yaml::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let build = steps
+        .iter()
+        .position(|s| run_of(s).contains("cargo build") && run_of(s).contains("-p xtask"))
+        .unwrap_or_else(|| panic!("{WATCHDOG_WORKFLOW} must build xtask in its own step"));
+    let check = steps
+        .iter()
+        .position(|s| run_of(s) == WATCHDOG_COMMAND)
+        .unwrap_or_else(|| panic!("{WATCHDOG_WORKFLOW} must run {WATCHDOG_COMMAND}"));
+    assert!(build < check, "the build step must come before the check");
+    let toolchain = steps.iter().position(|s| {
+        s.get("uses")
+            .and_then(serde_yaml::Value::as_str)
+            .is_some_and(|u| u.starts_with("dtolnay/rust-toolchain@"))
+    });
+    assert!(
+        toolchain.is_some_and(|at| at < build),
+        "{WATCHDOG_WORKFLOW} must install a toolchain before it builds xtask"
     );
 }
 
@@ -106,12 +147,12 @@ fn watchdog_workflow_reports_its_own_failure() {
                 .is_some_and(|cond| cond.contains("failure()") && !cond.contains('!'));
             let run = step.get("run").and_then(serde_yaml::Value::as_str);
             on_failure
-                && run.is_some_and(|r| r.contains(WATCHDOG_SCRIPT) && r.contains("self-failed"))
+                && run.is_some_and(|r| r.contains(&format!("{WATCHDOG_COMMAND} self-failed")))
         });
     assert!(
         reports,
         "{WATCHDOG_WORKFLOW} must have an `if: failure()` step that runs \
-         `{WATCHDOG_SCRIPT} self-failed`"
+         `{WATCHDOG_COMMAND} self-failed`"
     );
 }
 
@@ -122,7 +163,7 @@ struct Stub {
     runs: Option<&'static str>,
     /// JSON body of the issue query, or `None` to fail as an API error does.
     issues: Option<String>,
-    /// The script argument, if any.
+    /// The command argument, if any.
     arg: Option<&'static str>,
 }
 
@@ -163,7 +204,7 @@ impl Outcome {
         self.calls.iter().any(|c| c.starts_with(prefix))
     }
 
-    /// True when the script wrote to an issue (create, comment or close).
+    /// True when the command wrote to an issue (create, comment or close).
     fn wrote_an_issue(&self) -> bool {
         ["issue create", "issue comment", "issue close"]
             .iter()
@@ -171,11 +212,11 @@ impl Outcome {
     }
 }
 
-/// Runs the watchdog script with a stub `gh` first on `PATH`.
+/// Runs the watchdog command with a stub `gh` first on `PATH`.
 #[cfg(target_os = "linux")]
 fn run_watchdog(stub: &Stub) -> Outcome {
-    let mut cmd = std::process::Command::new("bash");
-    cmd.arg(repo_root().join(WATCHDOG_SCRIPT));
+    let mut cmd = crate::xtask_bin::xtask();
+    cmd.args(["ci", "chaos-watchdog"]);
     if let Some(arg) = stub.arg {
         cmd.arg(arg);
     }
@@ -233,7 +274,7 @@ if [ "$1 $2" = "issue list" ]; then echo "[]"; fi
             if stub.issues.is_none() { "1" } else { "0" },
         )
         .output()
-        .expect("run bash");
+        .expect("run the watchdog");
     let calls = std::fs::read_to_string(&log)
         .unwrap_or_default()
         .lines()
@@ -378,7 +419,7 @@ fn watchdog_fails_closed_when_the_issue_query_fails() {
     assert!(!out.wrote_an_issue(), "calls: {:?}", out.calls);
 }
 
-/// In `self-failed` mode the script reports the red watchdog run on its own
+/// In `self-failed` mode the command reports the red watchdog run on its own
 /// issue. It does not query runs, because that query can be the part that
 /// failed. It must not use the nightly alert title, because the nightly can
 /// be green.
@@ -477,11 +518,12 @@ fn report_step_run() -> String {
 }
 
 /// Runs the report step in an empty directory, as after a failed checkout.
+/// The shell options are the ones that GitHub Actions gives a `run:` step.
 #[cfg(target_os = "linux")]
 fn run_report_step_without_checkout(issues: String) -> Outcome {
     let empty = tempfile::tempdir().expect("tempdir");
     let mut cmd = std::process::Command::new("bash");
-    cmd.arg("-c")
+    cmd.args(["--noprofile", "--norc", "-eo", "pipefail", "-c"])
         .arg(report_step_run())
         .current_dir(empty.path());
     run_stubbed(
@@ -494,8 +536,8 @@ fn run_report_step_without_checkout(issues: String) -> Outcome {
     )
 }
 
-/// When `actions/checkout` fails, the script is not on disk. The report step
-/// must still open the watchdog-failure issue.
+/// When `actions/checkout` or the xtask build fails, there is no binary to
+/// run. The report step must still open the watchdog-failure issue.
 #[cfg(target_os = "linux")]
 #[test]
 fn watchdog_report_step_works_without_checkout() {

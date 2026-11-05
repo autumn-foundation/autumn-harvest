@@ -15,7 +15,7 @@
     }
   },
   "info": {
-    "description": "Generated from `docs/api-contract.json` (contract version 2). Do not edit by hand. Regenerate with `scripts/regenerate-openapi.sh`.\n\nEvery path is relative to the prefix the embedder passes to `HarvestPlugin::api`, `/api/harvest` by convention.\n\nAuth: Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate. The optional API rate limiter (issue #1827) can answer 429 with a Retry-After header in whole seconds on any route that is not PublicSafe. Its body is {\"error\": \"rate limited\", \"route_class\", \"retry_after_secs\"}. See docs/security-posture.md#api-rate-limiting.",
+    "description": "Generated from `docs/api-contract.json` (contract version 2). Do not edit by hand. Regenerate with `cargo xtask dev regenerate-openapi`.\n\nEvery path is relative to the prefix the embedder passes to `HarvestPlugin::api`, `/api/harvest` by convention.\n\nAuth: Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate. The optional API rate limiter (issue #1827) can answer 429 with a Retry-After header in whole seconds on any route that is not PublicSafe. Its body is {\"error\": \"rate limited\", \"route_class\", \"retry_after_secs\"}. See docs/security-posture.md#api-rate-limiting.",
     "summary": "Control-plane HTTP API for autumn-harvest durable workflows.",
     "title": "Harvest management API",
     "version": "0.9.0",
@@ -509,6 +509,186 @@
           "admin"
         ],
         "x-harvest-idempotency": "Resuming an activity that is not paused returns 200 with `newly_resumed: false`.",
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
+      }
+    },
+    "/admin/agents/{kind}/sampling-policy": {
+      "delete": {
+        "description": "Reset the sampling policy of one agent kind to every default (issue #2439). The row stays, so the revision never goes back. new is null in the response. The store writes a harvest_agent_policy_audit row with the old policy. Each request also writes a harvest_audit_log row with the operation agent.sampling_policy.reset, a refused request included.",
+        "operationId": "delete_admin_agents_by_kind_sampling_policy",
+        "parameters": [
+          {
+            "description": "Agent kind: 1 to 64 characters from a-z, 0-9, _ and -.",
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "kind": {},
+                    "new": {},
+                    "old": {},
+                    "revision": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "The kind or the actor is not valid."
+          },
+          "403": {
+            "description": "The caller is not an operator. Nothing changes."
+          },
+          "409": {
+            "description": "The revision counter of the kind is full."
+          },
+          "500": {
+            "description": "A stored policy is corrupt."
+          },
+          "503": {
+            "description": "Database error."
+          }
+        },
+        "summary": "Reset the sampling policy of one agent kind to every default (issue #2439).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-idempotency": "Not idempotent: each reset adds 1 to the revision and writes an audit row.",
+        "x-harvest-read-only": false,
+        "x-harvest-route-class": "mutating"
+      },
+      "get": {
+        "description": "Read the sampling policy of one agent kind (issue #2439). policy is the full SamplingPolicy, with each default filled in: strategies, max_draws, max_concurrent_draws, draw_effects, scorers, judge_models and max_answer_retries. revision is 0 when no operator ever set or reset the policy. audit holds the newest 20 changes, the newest first. Each audit row has revision, action (set or reset), actor, old, new and at.",
+        "operationId": "get_admin_agents_by_kind_sampling_policy",
+        "parameters": [
+          {
+            "description": "Agent kind: 1 to 64 characters from a-z, 0-9, _ and -.",
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "audit": {},
+                    "kind": {},
+                    "policy": {},
+                    "revision": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "The kind is not valid."
+          },
+          "500": {
+            "description": "A stored policy is corrupt."
+          },
+          "503": {
+            "description": "Database error."
+          }
+        },
+        "summary": "Read the sampling policy of one agent kind (issue #2439).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
+      },
+      "put": {
+        "description": "Replace the sampling policy of one agent kind (issue #2439). A key that the policy leaves out takes its default. An unknown key fails the request. The store writes the policy and a harvest_agent_policy_audit row with the old and new policy in one transaction. Each request also writes a harvest_audit_log row with the operation agent.sampling_policy.set, a refused request included. The next strategy run of every process reads the new policy. A run in flight keeps the policy that it read at its start.",
+        "operationId": "put_admin_agents_by_kind_sampling_policy",
+        "parameters": [
+          {
+            "description": "Agent kind: 1 to 64 characters from a-z, 0-9, _ and -.",
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "policy": {
+                    "additionalProperties": true,
+                    "description": "The SamplingPolicy. Keys: strategies (best_of_n, rejection, vote, cascade, beam), max_draws (1 to 256), max_concurrent_draws (1 to 16), draw_effects (read_only, internal, write, external), scorers (\"deterministic\" or {\"only\": [ids]}), judge_models and max_answer_retries (0 to 16).",
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "policy"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "kind": {},
+                    "new": {},
+                    "old": {},
+                    "revision": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "The body does not decode, has an unknown key, or a setting is out of bounds. The kind or the actor is not valid."
+          },
+          "403": {
+            "description": "The caller is not an operator. Nothing changes."
+          },
+          "409": {
+            "description": "The revision counter of the kind is full."
+          },
+          "500": {
+            "description": "A stored policy is corrupt."
+          },
+          "503": {
+            "description": "Database error."
+          }
+        },
+        "summary": "Replace the sampling policy of one agent kind (issue #2439).",
+        "tags": [
+          "admin"
+        ],
+        "x-harvest-idempotency": "Not idempotent: each set adds 1 to the revision and writes an audit row.",
         "x-harvest-read-only": false,
         "x-harvest-route-class": "mutating"
       }
@@ -1741,7 +1921,7 @@
     },
     "/admin/concurrency": {
       "get": {
-        "description": "Return live per-key concurrency statistics, grouped by (concurrency_key, task_type) and summed across shards: configured cap (max_concurrent), currently in-flight, and queued (pending) counts. Each row also carries a workflows array attributing the key to the workflow type(s) observed on it, each with the effective on_conflict overflow strategy their registered policy declares (\"defer\" = wait for a slot, \"cancel_running\" = latest-wins, issue #811). A workflow declaring no concurrency policy reports \"defer\". The workflows array is omitted when empty. Latest-wins supersede is shard-local; see docs/sharding.md.",
+        "description": "Return live per-key concurrency statistics, grouped by (concurrency_key, task_type) and summed across shards: configured cap (max_concurrent), currently in-flight, and queued (pending) counts. Each row also carries a workflows array attributing the key to the workflow type(s) observed on it, each with the effective on_conflict overflow strategy their registered policy declares (\"defer\" = wait for a slot, \"cancel_running\" = latest-wins, issue #811). A workflow declaring no concurrency policy reports \"defer\". On a workflow row, each workflow type with a policy also reports code_limit, override_limit (the stored operator override, or null) and effective_limit (issue #2407). max_concurrent is the largest cap that a live row of the key stores, so it can differ from effective_limit until older rows finish. The workflows array is omitted when empty. Latest-wins supersede is shard-local; see docs/sharding.md.",
         "operationId": "get_admin_concurrency",
         "responses": {
           "200": {
@@ -2423,7 +2603,7 @@
     },
     "/admin/overrides": {
       "get": {
-        "description": "List every operator override (issue #2388). schedule_overrides holds each DAG and workflow schedule override (issues #2385 and #2386), read from every shard pool: kind, name, fields (the stored override fields by their PATCH names), reason, updated_by, created_at, updated_at and shard_ids. run_default_overrides holds each run-default override (issue #2387) from the default shard: workflow_name, sla_secs, execution_timeout_secs, reason, updated_by and updated_at. unavailable_shards names each shard that could not be read; its overrides are absent from the list.",
+        "description": "List every operator override (issue #2388). schedule_overrides holds each DAG and workflow schedule override (issues #2385 and #2386), read from every shard pool: kind, name, fields (the stored override fields by their PATCH names), reason, updated_by, created_at, updated_at and shard_ids. run_default_overrides holds each run-default override (issues #2387, #2406, #2407 and #2408) from the default shard: workflow_name, sla_secs, execution_timeout_secs, chain_execution_timeout_secs, concurrency_limit, quota_max_active_executions, quota_max_history_bytes, quota_max_dead_letters, reason, updated_by and updated_at. unavailable_shards names each shard that could not be read; its overrides are absent from the list.",
         "operationId": "get_admin_overrides",
         "responses": {
           "200": {
@@ -2488,7 +2668,7 @@
     },
     "/admin/queue-coverage": {
       "get": {
-        "description": "Fleet-wide task-queue coverage (issue #774): report task queues with >=1 PENDING task and zero live workers polling them, fanned out across every readable shard. A worker is live for coverage purposes when its heartbeat is fresh and its status is Active or Draining (only Stopped/stale workers fail to cover) -- coverage means a poller exists, not that capacity is available (a saturated queue is #531/#742's job, not this endpoint's, and worker build_id is never consulted -- that is #171's build-id reachability). A queue currently paused via the queue-pause primitive is excluded from items/uncovered (already covered by harvest_queue_paused_too_long), but a queue that is both paused AND pollerless AND has real pending work is still named in excluded_paused_queues, since the pause alert alone fires on pause duration and can miss that combination for its full grace window; a paused queue that already has a live poller is absent from excluded_paused_queues (nothing to report). Each uncovered item[] carries pending_count, a bounded (5) set of representative sample_task_ids/sample_execution_ids for drill-down, and a per-shard shard_breakdown. An unreachable shard is named in shards[] (never silently dropped) and degrades status to partial/unavailable; uncovered is authoritative only when status == complete. No new WorkflowEvent variant, no migration -- read path only.",
+        "description": "Fleet-wide task-queue coverage (issue #774): report task queues with >=1 PENDING task and zero live workers polling them, fanned out across every readable shard. A worker is live for coverage purposes when its heartbeat is fresh and its status is Active or Draining (only Stopped/stale workers fail to cover) -- coverage means a poller exists, not that capacity is available (a saturated queue is #531/#742's job, not this endpoint's, and worker build_id is never consulted -- that is #171's build-id reachability). A queue currently paused via the queue-pause primitive is excluded from items/uncovered (already covered by harvest_queue_paused_too_long), but a queue that is both paused AND pollerless AND has real pending work is still named in excluded_paused_queues, since the pause alert alone fires on pause duration and can miss that combination for its full grace window; a paused queue that already has a live poller is absent from excluded_paused_queues (nothing to report). Each uncovered item[] carries pending_count, a bounded (5) set of representative sample_task_ids/sample_execution_ids for drill-down, and a per-shard shard_breakdown. An unreachable shard is named in shards[] (never silently dropped) and degrades status to partial/unavailable; uncovered is authoritative only when status == complete. unpolled_declared_queues (issue #2479) names each declared queue that no live worker polls on a writable shard, with or without pending work. A drained shard takes no new run, so it does not count. The declared list is the code list of the process that serves the request. Config or the role pin can narrow each worker to a subset, so a name there has no worker tier. It is null when unknown: no runtime is installed, or a writable shard gave no answer. It does not change uncovered. No new WorkflowEvent variant, no migration -- read path only.",
         "operationId": "get_admin_queue_coverage",
         "parameters": [
           {
@@ -2514,7 +2694,8 @@
                     "shards": {},
                     "status": {},
                     "total_uncovered_queues": {},
-                    "uncovered": {}
+                    "uncovered": {},
+                    "unpolled_declared_queues": {}
                   },
                   "type": "object"
                 }
@@ -3126,7 +3307,7 @@
     },
     "/admin/quotas": {
       "get": {
-        "description": "List usage-vs-limit for every resolved `(workflow_name, quota_key)` pair with declared per-tenant resource quotas (issue #946). Each entry reports the current active-execution count, aggregate history bytes, and dead-letter count for the key against the workflow type's currently-registered `QuotaPolicy` limits. Admin-gated: like `/admin/concurrency`, `/admin/debounce`, and `/admin/start-throttle`, the quota_key resolves from user/tenant-derived input fields, so an unauthenticated caller could otherwise enumerate tenant identifiers across the fleet.",
+        "description": "List usage-vs-limit for every resolved `(workflow_name, quota_key)` pair with declared per-tenant resource quotas (issue #946). Each entry reports the current active-execution count, aggregate history bytes, and dead-letter count for the key against the workflow type's effective limits: the operator override of issue #2408, then the currently-registered `QuotaPolicy` limits. Admin-gated: like `/admin/concurrency`, `/admin/debounce`, and `/admin/start-throttle`, the quota_key resolves from user/tenant-derived input fields, so an unauthenticated caller could otherwise enumerate tenant identifiers across the fleet.",
         "operationId": "get_admin_quotas",
         "responses": {
           "200": {
@@ -3134,15 +3315,17 @@
               "application/json": {
                 "schema": {
                   "properties": {
+                    "override_source": {},
                     "quotas": {},
                     "status": {},
-                    "unavailable_shards": {}
+                    "unavailable_shards": {},
+                    "workflow_types": {}
                   },
                   "type": "object"
                 }
               }
             },
-            "description": "Quota enforcement is shard-local by design (issue #946 AC8): the same (workflow_name, quota_key) pair can carry independent usage on every shard a tenant's traffic happens to land on, since shard routing hashes on workflow_id, not the quota key -- so the effective cap across the whole fleet is per-shard-limit multiplied by shards touched. Each entry in `quotas` therefore reports both a fleet-wide `usage` object (active_executions, history_bytes, dead_letters, summed across shards for convenience) AND a `shards` array of per-shard objects {shard_id, active_executions, history_bytes, dead_letters} so an operator can see exactly which shard(s) a tenant is actually capped on. `limits` reports the workflow type's CURRENTLY registered QuotaPolicy caps (max_active_executions, max_history_bytes, max_dead_letters; each null when uncapped or the workflow type declares no quota policy at all) -- resolved live against the registry, not persisted with the usage rows, so an edited policy is reflected immediately rather than against a stale snapshot. An unreachable shard degrades the response to `status: \"partial\"` (naming it in `unavailable_shards`) rather than failing the whole read; usage totals then reflect only the reachable shards and are a lower bound."
+            "description": "Quota enforcement is shard-local by design (issue #946 AC8): the same (workflow_name, quota_key) pair can carry independent usage on every shard a tenant's traffic happens to land on, since shard routing hashes on workflow_id, not the quota key -- so the effective cap across the whole fleet is per-shard-limit multiplied by shards touched. Each entry in `quotas` therefore reports both a fleet-wide `usage` object (active_executions, history_bytes, dead_letters, summed across shards for convenience) AND a `shards` array of per-shard objects {shard_id, active_executions, history_bytes, dead_letters} so an operator can see exactly which shard(s) a tenant is actually capped on. `limits` reports the EFFECTIVE caps (max_active_executions, max_history_bytes, max_dead_letters; each null when uncapped or the workflow type declares no quota policy at all): the operator override of issue #2408, then the CURRENTLY registered QuotaPolicy caps -- resolved live against the registry, not persisted with the usage rows. `code_limits` holds the registered caps. `override` names the stored override (max_active_executions, max_history_bytes, max_dead_letters, reason, updated_by, updated_at, applies), or null; applies is false when the type has no admission cap, so the override changes nothing. `override_source` is \"table\" when the overrides were read from the default shard, or \"cache\" when that read failed and the cache of the serving process was used, then with null reason, updated_by and updated_at. `workflow_types` lists workflow_name, limits, code_limits and override for each registered type with an admission cap, so an override shows before its type has usage. An unreachable shard degrades the response to `status: \"partial\"` (naming it in `unavailable_shards`) rather than failing the whole read; usage totals then reflect only the reachable shards and are a lower bound."
           },
           "503": {
             "description": "Harvest storage pool is not configured."
@@ -5620,7 +5803,7 @@
     },
     "/admin/workflow-types/{workflow_name}/run-defaults": {
       "get": {
-        "description": "Read the run defaults of one workflow type (issues #2387 and #2406). code holds the sla_secs, execution_timeout_secs and chain_execution_timeout_secs declared in code. override holds the stored operator override (sla_secs, execution_timeout_secs, chain_execution_timeout_secs, reason, updated_by, updated_at), or null. effective holds the values a new run takes: the override, then code. The start clamps still apply after it: sla is clamped to execution_timeout, the fleet ceiling caps execution_timeout, and the fleet chain ceiling caps chain_execution_timeout.",
+        "description": "Read the run defaults of one workflow type (issues #2387, #2406, #2407 and #2408). code holds the sla_secs, execution_timeout_secs, chain_execution_timeout_secs, concurrency_limit, quota_max_active_executions, quota_max_history_bytes and quota_max_dead_letters declared in code. override holds the stored operator override (the same seven fields, reason, updated_by, updated_at), or null. effective holds the values a new run takes: the override, then code. The start clamps still apply after it: sla is clamped to execution_timeout, the fleet ceiling caps execution_timeout, and the fleet chain ceiling caps chain_execution_timeout. A latest-wins type keeps its code concurrency_limit. A type with no quota admission cap keeps its code quota caps.",
         "operationId": "get_admin_workflow_types_by_workflow_name_run_defaults",
         "parameters": [
           {
@@ -5657,7 +5840,7 @@
             "description": "Database error."
           }
         },
-        "summary": "Read the run defaults of one workflow type (issues #2387 and #2406).",
+        "summary": "Read the run defaults of one workflow type (issues #2387, #2406, #2407 and #2408).",
         "tags": [
           "admin"
         ],
@@ -5665,7 +5848,7 @@
         "x-harvest-route-class": "read_only"
       },
       "patch": {
-        "description": "Set, change or clear the run-default override of one workflow type (issues #2387 and #2406). The override wins over the code value for every new run and survives a restart. It reaches this process at once and every other process within its refresh period (about 5 seconds). Each duration is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. With recompute_in_flight, the SLA deadline of each RUNNING, SUSPENDED or PAUSED run of the type that has not breached moves to the new effective SLA, on every shard, and the response gains recompute (moved_runs, unavailable_shards, superseded). A recompute stops when a newer change to the type replaces its SLA, and then reports superseded true. A hard deadline_at never changes. A chain_deadline_at never changes either: a chain in flight keeps its stored cap, and the override applies to the next chain that starts. A DAG declares no chain cap, so chain_execution_timeout_secs on a DAG is a 400. The response has the same shape as GET.",
+        "description": "Set, change or clear the run-default override of one workflow type (issues #2387, #2406, #2407 and #2408). The override wins over the code value for every new run and survives a restart. It reaches this process at once and every other process within its refresh period (about 5 seconds). Each duration is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. With recompute_in_flight, the SLA deadline of each RUNNING, SUSPENDED or PAUSED run of the type that has not breached moves to the new effective SLA, on every shard, and the response gains recompute (moved_runs, unavailable_shards, superseded). A recompute stops when a newer change to the type replaces its SLA, and then reports superseded true. A hard deadline_at never changes. A chain_deadline_at never changes either: a chain in flight keeps its stored cap, and the override applies to the next chain that starts. A DAG declares no chain cap, so chain_execution_timeout_secs on a DAG is a 400. concurrency_limit applies to the next start and never lowers the cap of a run in flight. A PATCH that names concurrency_limit or clear_override, for a type with a concurrency policy, also raises the stored cap of each PENDING or RUNNING workflow task row of the type to the new effective limit, on every shard, and the response gains concurrency_raise (raised_tasks, unavailable_shards, superseded). Further raises run 10 seconds, 1 minute and 5 minutes later, for the starts that a process with a stale cache stored. No raise lowers a stored cap. Each quota_max_* field applies to the next admission of a key in every process: a lower cap refuses new work for a tenant over it with the 429 of issue #946, and never ends a run in flight. A parent whose child spawn a lower cap refuses waits with a backoff, and its own execution_timeout still applies. No row stores a quota cap, so no pass runs. The response has the same shape as GET.",
         "operationId": "patch_admin_workflow_types_by_workflow_name_run_defaults",
         "parameters": [
           {
@@ -5689,8 +5872,20 @@
                   "clear_override": {
                     "description": "true deletes the stored override before the other fields merge."
                   },
+                  "concurrency_limit": {
+                    "description": "Override the concurrency limit of a new start, from 1 to 2147483647. The key and on_conflict stay as declared. null returns to code. Refused for a type with no concurrency policy, a DAG included, and for a latest-wins (cancel_running) type."
+                  },
                   "execution_timeout_secs": {
                     "description": "Override hard execution timeout in whole seconds, from 1 to 3153600000 (100 years). null returns to code."
+                  },
+                  "quota_max_active_executions": {
+                    "description": "Override the quota cap on the active runs of one key, from 1 to 4294967295. The quota key and the LLM caps stay as declared. null returns to code and is accepted on any type. A value is refused for a type with no quota admission cap, a DAG included."
+                  },
+                  "quota_max_dead_letters": {
+                    "description": "Override the quota cap on the dead letters of one key, from 1 to 4294967295. null returns to code and is accepted on any type. A value is refused for a type with no quota admission cap, a DAG included."
+                  },
+                  "quota_max_history_bytes": {
+                    "description": "Override the quota cap on the history bytes of the active runs of one key, from 1 to 9223372036854775807. null returns to code and is accepted on any type. A value is refused for a type with no quota admission cap, a DAG included."
                   },
                   "reason": {
                     "description": "Operator reason stored with the override."
@@ -5726,7 +5921,7 @@
             "description": "Success."
           },
           "400": {
-            "description": "Empty patch, unknown field, a duration of zero or past 100 years, or chain_execution_timeout_secs for a DAG."
+            "description": "Empty patch, unknown field, a duration of zero or past 100 years, chain_execution_timeout_secs for a DAG, a concurrency_limit of zero, past 2147483647, for a type with no policy, or for a latest-wins type, or a quota_max_* cap of zero, past its bound, or for a type with no quota admission cap."
           },
           "404": {
             "description": "Workflow type not registered in this process."
@@ -5735,7 +5930,7 @@
             "description": "Database error."
           }
         },
-        "summary": "Set, change or clear the run-default override of one workflow type (issues #2387 and #2406).",
+        "summary": "Set, change or clear the run-default override of one workflow type (issues #2387, #2406, #2407 and #2408).",
         "tags": [
           "admin"
         ],

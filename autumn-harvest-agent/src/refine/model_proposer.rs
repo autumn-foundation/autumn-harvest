@@ -7,13 +7,14 @@
 
 use std::sync::Arc;
 
+use super::meter::Charge;
 use super::prompts::{DOM_TEMPLATE, INV_TEMPLATE};
 use super::propose::{Dimension, Evidence, OverlayProposer, ProposeContext, ProposerReply};
 use crate::agent::overlay::ProfileOverlay;
 use sha2::{Digest as _, Sha256};
 
 use crate::error::{AgentError, ErrorKind};
-use crate::harness::DEFAULT_MODEL;
+use crate::harness::{DEFAULT_MODEL, priced};
 use crate::message::{ChatMessage, ChatRole, ContentPart, StopReason};
 use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
 use crate::response_cache::hex;
@@ -226,6 +227,13 @@ impl OverlayProposer for ModelProposer {
             }
             let request = self.request(context);
             let response = self.model.chat(&request).await?;
+            // The provider bills the call, so the stage charges it before any
+            // check.
+            context.charge(Charge {
+                model_id: self.model.model_id().map(str::to_owned),
+                usage: response.usage,
+                cost_usd_micros: priced(self.model.as_ref(), &response.usage),
+            });
             if response.stop_reason == StopReason::MaxTokens {
                 return Err(AgentError::new(
                     ErrorKind::Decode,
@@ -590,6 +598,8 @@ mod tests {
             profile,
             current: ProfileOverlay::default(),
             attempts: ProposalAttempts::default(),
+            sample: 1,
+            others: Vec::new(),
         };
         let stage = run_stage(&harness, request).await.unwrap();
         assert_eq!(

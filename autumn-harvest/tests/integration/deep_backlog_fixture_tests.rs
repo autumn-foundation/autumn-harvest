@@ -4,7 +4,7 @@
 //! database. The DB tests seed a small fixture of the same shape. The
 //! `#[ignore]`d `zz_capture_deep_backlog_ledger_evidence` test seeds the full
 //! fixture and writes the Ledger artifacts. Run it with
-//! `autumn-harvest/scripts/deep_backlog_ledger_repro.sh`.
+//! `cargo xtask perf deep-backlog-ledger`.
 
 use crate::deep_backlog_support::{
     self as fixture, FixtureServer, FixtureSpec, LEDGER_LIVE_ROWS, WorkloadConfig, head_share,
@@ -678,7 +678,7 @@ async fn a_counter_reset_leaves_setup_traffic_out_of_the_snapshot() {
 /// The test runs a shallow and a deep fixture on one seed. Both get the same
 /// claim workload, so the per-call buffers compare directly.
 #[tokio::test]
-#[ignore = "Ledger evidence capture: seeds 1M rows; run deep_backlog_ledger_repro.sh"]
+#[ignore = "Ledger evidence capture: seeds 1M rows; run cargo xtask perf deep-backlog-ledger"]
 async fn zz_capture_deep_backlog_ledger_evidence() {
     let Some(server) = server().await else { return };
     let out_dir = fixture::artifact_dir();

@@ -1,13 +1,13 @@
 //! Mixed-version smoke worker (issue #1828).
 //!
-//! `scripts/run-mixed-version-smoke.sh` builds this binary twice: once from
-//! the current tree and once from the previous release. Both binaries then
+//! `cargo xtask dev run-mixed-version-smoke` builds this binary twice: once
+//! from the current tree and once from the previous release. Both binaries then
 //! share one database. The contract that they prove is in
 //! `docs/upgrading/README.md`.
 //!
 //! The `mv_smoke` workflow runs one activity, waits on a durable timer, and
 //! runs a second activity. Each activity returns the label of the binary that
-//! ran it. The script stops one version during the timer and starts the
+//! ran it. The command stops one version during the timer and starts the
 //! other. The output then shows which version ran each step.
 //!
 //! With `MV_SMOKE_CODEC=1`, the worker installs a test payload codec. The
@@ -34,7 +34,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The queue for the workflow and its activities.
 const QUEUE: &str = "mixed-version-smoke";
-/// The time between the two activities. The script stops a worker in it.
+/// The time between the two activities. The smoke stops a worker in it.
 /// It must exceed the spread of the first steps plus the drain, on a slow
 /// runner too.
 const GAP_SECS: u64 = 30;
@@ -155,8 +155,9 @@ async fn worker(url: String) -> Result<(), BoxError> {
     let pool = Pool::builder(manager).max_size(8).build()?;
     let config = HarvestRuntimeConfig {
         mode: HarvestMode::External,
-        worker_enabled: true,
-        scheduler_enabled: true,
+        // The switches stay at their default. That is `true` before issue
+        // #2477 and "no role, so `true`" after it, so one source builds on
+        // both trees.
         database: HarvestDatabaseConfig { url: Some(url) },
         outbox: HarvestOutboxConfig {
             enabled: false,

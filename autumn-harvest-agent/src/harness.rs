@@ -14,6 +14,7 @@ use tracing::Instrument;
 use crate::agent::AgentProfile;
 use crate::agent::overlay_store::ProfileOverlayStore;
 use crate::bounds::{exceeds_bytes, json_len};
+use crate::consolidate_all::AgentDirectory;
 use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::episode::EpisodeStore;
 use crate::error::{AgentError, ErrorKind};
@@ -26,9 +27,12 @@ use crate::mesh::{DELEGATE_TOOL, Peer, delegate_definition, valid_name};
 use crate::mesh_control::{MESH_BUDGET_EXCEEDED, MeshBudget, MeshBudgetExceeded, MeshSpend};
 use crate::message::{ChatMessage, ContentPart, RunId, TokenUsage, ToolDefinition};
 use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MODEL_ID};
-use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
+use crate::policy::{
+    AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules, effect_refusal,
+};
 use crate::refine::{DEFAULT_PROPOSER_TIMEOUT, OverlayProposer};
 use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
+use crate::sampling::{PolicyRead, PolicyStoreError, SamplingPolicy, SamplingPolicyStore};
 use crate::score::Scorer;
 use crate::skill::{LOAD_SKILL_TOOL, SkillTool};
 use crate::tool::{Tool, ToolContext, ToolEffect};
@@ -39,7 +43,8 @@ use crate::transcript::{InMemoryTranscriptStore, PREFIX_MISSING, TranscriptStore
 use crate::types::{ModelTurn, ModelTurnRequest, SkillLookup, ToolCallRequest, ToolOutcome};
 use crate::workspace::{WorkspaceHandle, WorkspaceMount, WorkspaceRef, WorkspaceStore};
 
-/// The default cap on one tool result, in characters.
+/// The default cap on one tool result and on one delegation answer, in
+/// characters. [`AgentHarness::tool_output_limit`] changes it.
 pub const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 8_000;
 
 /// The name of the model that [`AgentHarness::new`] takes (issue #2271).
@@ -103,7 +108,7 @@ pub const DEFAULT_BUDGET_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTCOME_ENVELOPE_BYTES: u64 = 64;
 
 /// The mark at the end of a cut result.
-const TRUNCATED: &str = "…[truncated]";
+pub(crate) const TRUNCATED: &str = "…[truncated]";
 
 /// The model, the tools, and the policy behind the two agent activities.
 ///
@@ -126,6 +131,7 @@ pub struct AgentHarness {
     budget_timeout: Duration,
     memory: Option<Arc<dyn MemoryStore>>,
     episodes: Option<Arc<dyn EpisodeStore>>,
+    directory: Option<Arc<dyn AgentDirectory>>,
     delivery: Arc<dyn Delivery>,
     precheck: Option<Arc<dyn Precheck>>,
     cache: Option<ResponseCache>,
@@ -139,6 +145,12 @@ pub struct AgentHarness {
     workspace: Option<WorkspaceStore>,
     proposer: Option<Arc<dyn OverlayProposer>>,
     proposer_timeout: Duration,
+    refine_sources: Option<Arc<dyn crate::refine::RefineSources>>,
+    #[cfg(feature = "eval")]
+    composer: Option<Arc<dyn crate::refine::OverlayComposer>>,
+    #[cfg(feature = "eval")]
+    selector: Option<Arc<dyn crate::refine::OverlaySelector>>,
+    sampling: Option<Arc<dyn SamplingPolicyStore>>,
     scorers: BTreeMap<String, Arc<dyn Scorer>>,
     score_timeout: Duration,
     overlays: Option<Arc<dyn ProfileOverlayStore>>,
@@ -158,6 +170,12 @@ impl AgentHarness {
             workspace: None,
             proposer: None,
             proposer_timeout: DEFAULT_PROPOSER_TIMEOUT,
+            refine_sources: None,
+            #[cfg(feature = "eval")]
+            composer: None,
+            #[cfg(feature = "eval")]
+            selector: None,
+            sampling: None,
             scorers: BTreeMap::new(),
             score_timeout: DEFAULT_SCORE_TIMEOUT,
             overlays: None,
@@ -174,6 +192,7 @@ impl AgentHarness {
             budget_timeout: DEFAULT_BUDGET_TIMEOUT,
             memory: None,
             episodes: None,
+            directory: None,
             delivery: Arc::new(LogDelivery),
             precheck: None,
             cache: None,
@@ -217,7 +236,12 @@ impl AgentHarness {
         self
     }
 
-    /// Set the cap on one tool result, in characters.
+    /// Set the cap on one tool result and on one delegation answer, in
+    /// characters.
+    ///
+    /// [`Peer::answer_limit`] overrides it for one peer. The delegation
+    /// result marks a cut answer with `"truncated": true` (issue #2481). A
+    /// byte share of the request cap also cuts a delegation answer.
     #[must_use]
     pub const fn tool_output_limit(mut self, limit: usize) -> Self {
         self.tool_output_limit = limit;
@@ -253,6 +277,48 @@ impl AgentHarness {
         self
     }
 
+    /// Read the source runs of a refine run from `sources` (issue #2380).
+    #[must_use]
+    pub fn refine_sources(mut self, sources: Arc<dyn crate::refine::RefineSources>) -> Self {
+        self.refine_sources = Some(sources);
+        self
+    }
+
+    /// The source reader of a refine run, if one is installed.
+    #[cfg(feature = "eval")]
+    pub(crate) fn sources(&self) -> Option<&Arc<dyn crate::refine::RefineSources>> {
+        self.refine_sources.as_ref()
+    }
+
+    /// Set the overlay composer of a refine run (issue #2380).
+    #[cfg(feature = "eval")]
+    #[must_use]
+    pub fn composer(mut self, composer: Arc<dyn crate::refine::OverlayComposer>) -> Self {
+        self.composer = Some(composer);
+        self
+    }
+
+    /// The overlay composer, if one is installed.
+    #[cfg(feature = "eval")]
+    pub(crate) fn overlay_composer(&self) -> Option<&Arc<dyn crate::refine::OverlayComposer>> {
+        self.composer.as_ref()
+    }
+
+    /// Set the selector of a refine run (issue #2380). With none, the run
+    /// picks by the probe results and asks no model.
+    #[cfg(feature = "eval")]
+    #[must_use]
+    pub fn selector(mut self, selector: Arc<dyn crate::refine::OverlaySelector>) -> Self {
+        self.selector = Some(selector);
+        self
+    }
+
+    /// The selector, if one is installed.
+    #[cfg(feature = "eval")]
+    pub(crate) fn overlay_selector(&self) -> Option<&Arc<dyn crate::refine::OverlaySelector>> {
+        self.selector.as_ref()
+    }
+
     /// Set the time budget of one proposer call.
     ///
     /// The budget is at most [`DEFAULT_PROPOSER_TIMEOUT`], so every stage
@@ -266,6 +332,49 @@ impl AgentHarness {
             timeout.min(DEFAULT_PROPOSER_TIMEOUT)
         };
         self
+    }
+
+    /// Set the store of the sampling policies (issue #2439).
+    ///
+    /// Without a store, each strategy run reads every default, so it is
+    /// refused.
+    #[must_use]
+    pub fn sampling_policies(mut self, store: Arc<dyn SamplingPolicyStore>) -> Self {
+        self.sampling = Some(store);
+        self
+    }
+
+    /// The sampling policy of `kind`, for the `agent_sampling_policy`
+    /// activity.
+    ///
+    /// A harness with no store reads every default.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable error for a kind that is not valid or a
+    /// stored policy that does not decode. Returns a retryable error when
+    /// the store fails. The model reads neither.
+    pub async fn sampling_policy(&self, kind: &str) -> Result<PolicyRead, String> {
+        let Some(store) = &self.sampling else {
+            return Ok(PolicyRead {
+                policy: SamplingPolicy::default(),
+                revision: 0,
+            });
+        };
+        match tokio::time::timeout(self.hook_timeout, store.read(kind)).await {
+            Ok(Ok(read)) => Ok(read),
+            Ok(Err(
+                err @ (PolicyStoreError::InvalidKind { .. } | PolicyStoreError::Corrupt { .. }),
+            )) => Err(
+                ActivityFailure::non_retryable("SamplingPolicyInvalid", err.to_string())
+                    .into_error_payload(),
+            ),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_) => Err(format!(
+                "the sampling policy store did not answer within {:?}",
+                self.hook_timeout
+            )),
+        }
     }
 
     /// Read the active overlay of each kind from `store` (issue #2372).
@@ -379,6 +488,22 @@ impl AgentHarness {
     pub fn episodes(mut self, store: Arc<dyn EpisodeStore>) -> Self {
         self.episodes = Some(store);
         self
+    }
+
+    /// Set the agent directory (issue #2540). The dispatcher
+    /// `agent_consolidate_all` lists the agents of each scheduled kind with
+    /// it.
+    #[must_use]
+    pub fn directory(mut self, directory: Arc<dyn AgentDirectory>) -> Self {
+        self.directory = Some(directory);
+        self
+    }
+
+    /// The agent directory, or a non-retryable error that names the fix.
+    pub(crate) fn agent_directory(&self) -> Result<&Arc<dyn AgentDirectory>, String> {
+        self.directory
+            .as_ref()
+            .ok_or_else(crate::consolidate_all::directory_missing)
     }
 
     /// The memory store, or a non-retryable error that names the fix.
@@ -673,6 +798,11 @@ impl AgentHarness {
             .cloned()
     }
 
+    /// Every profile, in the order of [`agent`](Self::agent).
+    pub(crate) fn agent_profiles(&self) -> &[AgentProfile] {
+        &self.profiles
+    }
+
     /// Install flow rules. They gate each tool call against the labels that
     /// the run tree has exercised.
     #[must_use]
@@ -694,7 +824,11 @@ impl AgentHarness {
             .filter(|peer| wanted.contains(&peer.name))
         {
             if valid_name(&peer.name) {
-                found.insert(peer.name.clone(), peer.clone());
+                // History records the resolved limit, so replay cuts each
+                // answer as the live run did (issue #2481).
+                let mut peer = peer.clone();
+                peer.answer_limit.get_or_insert(self.tool_output_limit);
+                found.insert(peer.name.clone(), peer);
             } else {
                 tracing::warn!(peer = %peer.name, "a peer with an invalid name is left out");
             }
@@ -937,7 +1071,12 @@ impl AgentHarness {
             };
             let mut content = response.content;
             prepare(&mut content);
+            // A hit calls no model, so it costs nothing.
+            let cost_usd_micros = (!cache_hit)
+                .then(|| priced(client.as_ref(), &response.usage))
+                .flatten();
             let mut turn = ModelTurn {
+                cost_usd_micros,
                 content,
                 stop: response.stop_reason,
                 usage: response.usage,
@@ -964,6 +1103,7 @@ impl AgentHarness {
                     allowed,
                     exercised: &request.flow_labels,
                     released: &request.flow_released,
+                    allowed_effects: request.allowed_effects.as_ref(),
                 },
                 &mut policy_budget,
             )
@@ -1035,18 +1175,7 @@ impl AgentHarness {
             );
             model = UNKNOWN_MODEL_ID;
         }
-        let cost = client.cost_usd_micros(usage).filter(|&cost| {
-            let check = LlmCall::new(UNKNOWN_MODEL_ID, 0, 0)
-                .with_cost_usd_micros(cost)
-                .validate();
-            if let Err(err) = &check {
-                tracing::warn!(
-                    error = %err,
-                    "the agent cost ledger refused the cost; recording the turn as unpriced"
-                );
-            }
-            check.is_ok()
-        });
+        let cost = priced(client.as_ref(), usage);
         let mut call = LlmCall::new(
             model,
             u64::from(usage.input_tokens),
@@ -1078,20 +1207,27 @@ impl AgentHarness {
             allowed,
             exercised,
             released,
+            allowed_effects,
         } = scope;
         let started = tokio::time::Instant::now();
         let deadline = started + *budget;
-        let read_only_policy: Arc<dyn ToolPolicy>;
-        let policy: &dyn ToolPolicy = if read_only {
-            // The read-only rules go first. Their deny ends the decision, so
-            // the app policy is not asked about a call that cannot run.
-            read_only_policy = Arc::new(Strictest::new(vec![
-                Arc::new(ToolRules::read_only()),
-                Arc::clone(&self.policy),
-            ]));
-            read_only_policy.as_ref()
-        } else {
+        // The effect rules and the read-only rules go first. Their deny ends
+        // the decision, so the app policy is not asked about a call that
+        // cannot run.
+        let mut layers: Vec<Arc<dyn ToolPolicy>> = Vec::new();
+        if let Some(effects) = allowed_effects {
+            layers.push(Arc::new(ToolRules::only_effects(effects)));
+        }
+        if read_only {
+            layers.push(Arc::new(ToolRules::read_only()));
+        }
+        let layered: Arc<dyn ToolPolicy>;
+        let policy: &dyn ToolPolicy = if layers.is_empty() {
             self.policy.as_ref()
+        } else {
+            layers.push(Arc::clone(&self.policy));
+            layered = Arc::new(Strictest::new(layers));
+            layered.as_ref()
         };
         // Each call that is not denied may run. Its labels count for the
         // calls after it in this turn before it runs, so the check fails
@@ -1319,10 +1455,26 @@ impl AgentHarness {
         else {
             return Ok(self.error_outcome(&format!("unknown tool {:?}", call.name)));
         };
+        // A live probe runs only its effects (issue #2378). The check is in
+        // the activity, so no policy decision can change it.
+        if let Some(effects) = &request.probe_effects
+            && (!effects.contains(&tool.effect()) || tool.name() == MEMORY_TOOL)
+        {
+            // The memory of the scope belongs to the source. A note would
+            // show in the prompt of each later run, so a probe never writes
+            // one, as for the workspace head.
+            return Ok(ToolOutcome::probe_refused(tool.effect()));
+        }
         // A second check of the read-only rule. The decision and the call can
         // run on workers with different tool lists, for example in a deploy.
         if request.read_only && tool.effect() >= ToolEffect::Write {
             return Ok(self.error_outcome("this run may only read data"));
+        }
+        // The same reason applies to the effect set of a draw (issue #2439).
+        if let Some(effects) = &request.allowed_effects
+            && !effects.contains(&tool.effect())
+        {
+            return Ok(self.error_outcome(&effect_refusal(tool.effect())));
         }
         // The same reason applies to the flow labels. A tool that gained a
         // label after the decision did not pass the flow rules with it.
@@ -1336,8 +1488,10 @@ impl AgentHarness {
         if let Some(lookup) = request.skill.filter(|_| tool.name() == LOAD_SKILL_TOOL) {
             return Ok(self.skill_outcome(lookup, &call.arguments));
         }
-        // A read-only run can read the files but never moves the head.
-        let keep_files = !request.read_only;
+        // A read-only run can read the files but never moves the head. A
+        // probe never moves it either, because the head belongs to the
+        // source scope (issue #2378).
+        let keep_files = !request.read_only && request.probe_effects.is_none();
         // Only a tool that opts in loads the workspace (issue #2274).
         let mount = request.workspace.filter(|_| tool.uses_workspace());
         let handle = match &mount {
@@ -1377,6 +1531,12 @@ impl AgentHarness {
                 )),
             },
         )
+    }
+
+    /// The workspace store, if one is installed.
+    #[cfg(feature = "eval")]
+    pub(crate) const fn workspace_store_opt(&self) -> Option<&WorkspaceStore> {
+        self.workspace.as_ref()
     }
 
     /// The workspace store, or a non-retryable error.
@@ -1676,6 +1836,8 @@ struct Scope<'a> {
     exercised: &'a BTreeSet<String>,
     /// The flow rules that a person released before the turn.
     released: &'a Released,
+    /// The tool effects that the run may run. `None` allows each effect.
+    allowed_effects: Option<&'a BTreeSet<ToolEffect>>,
 }
 
 /// The definition of `tool` that the model sees. Guidance replaces the
@@ -1920,6 +2082,27 @@ pub(crate) fn cut_bytes(text: String, max: usize) -> String {
 /// the model why. A turn with many calls then stays small.
 const REASON_CUT_BYTES: usize = 256;
 
+/// The cost of one call of `client`, as the cost ledger records it.
+///
+/// A cost that the ledger refuses is `None`, so the call is unpriced. The
+/// turn and the ledger row read this one function, so they agree.
+pub(crate) fn priced(client: &dyn AgentModel, usage: &TokenUsage) -> Option<u64> {
+    use autumn_harvest::llm_ledger::LlmCall;
+
+    client.cost_usd_micros(usage).filter(|&cost| {
+        let check = LlmCall::new(UNKNOWN_MODEL_ID, 0, 0)
+            .with_cost_usd_micros(cost)
+            .validate();
+        if let Err(err) = &check {
+            tracing::warn!(
+                error = %err,
+                "the agent cost ledger refused the cost; recording the turn as unpriced"
+            );
+        }
+        check.is_ok()
+    })
+}
+
 /// Make `turn` fit the result cap, or replace it with a typed outcome.
 ///
 /// A turn that exceeds the cap would fail the activity with a `PayloadTooLarge`
@@ -1954,9 +2137,15 @@ pub(crate) fn fit_turn(mut turn: ModelTurn, cap: u64) -> ModelTurn {
 
 /// Cut `text` to `limit` characters and mark the cut.
 pub(crate) fn truncate(text: &str, limit: usize) -> String {
+    truncate_flagged(text, limit).0
+}
+
+/// Cut `text` to `limit` characters and mark the cut. The flag is `true`
+/// when the cut drops a character (issue #2481).
+pub(crate) fn truncate_flagged(text: &str, limit: usize) -> (String, bool) {
     match text.char_indices().nth(limit) {
-        None => text.to_owned(),
-        Some((end, _)) => format!("{}{TRUNCATED}", &text[..end]),
+        None => (text.to_owned(), false),
+        Some((end, _)) => (format!("{}{TRUNCATED}", &text[..end]), true),
     }
 }
 
@@ -2022,6 +2211,7 @@ mod tests {
     /// A turn with `content` and `decisions`, and fixed usage for checks.
     fn turn_of(content: Vec<ContentPart>, decisions: Vec<ToolDecision>) -> ModelTurn {
         ModelTurn {
+            cost_usd_micros: None,
             content,
             stop: crate::message::StopReason::EndTurn,
             usage: TokenUsage::new(7, 3),
@@ -2301,5 +2491,38 @@ mod tests {
         assert_eq!(truncate("abc", 3), "abc");
         assert_eq!(truncate("ééé", 2), "éé…[truncated]");
         assert_eq!(truncate("", 0), "");
+    }
+
+    // Issue #2481: the flag counts characters. It does not compare text.
+    #[test]
+    fn a_text_that_ends_with_the_mark_still_reads_as_cut() {
+        let text = format!("ab{TRUNCATED}");
+        assert_eq!(truncate_flagged(&text, 2), (text.clone(), true));
+        assert_eq!(truncate_flagged(&text, 14), (text, false));
+    }
+
+    /// The first `n` characters of `text`. It is outside `proptest!` for
+    /// the reason above `no_content`.
+    fn first_chars(text: &str, n: usize) -> String {
+        text.chars().take(n).collect()
+    }
+
+    proptest::proptest! {
+        // Issue #2481: the flag is set exactly when characters drop.
+        #[test]
+        fn the_cut_flag_matches_the_character_count(
+            text in "\\PC{0,64}",
+            limit in 0_usize..80,
+        ) {
+            let (shown, cut) = truncate_flagged(&text, limit);
+            proptest::prop_assert_eq!(cut, text.chars().count() > limit);
+            let want = if cut {
+                format!("{}{TRUNCATED}", first_chars(&text, limit))
+            } else {
+                text.clone()
+            };
+            proptest::prop_assert_eq!(&shown, &want);
+            proptest::prop_assert_eq!(shown, truncate(&text, limit));
+        }
     }
 }

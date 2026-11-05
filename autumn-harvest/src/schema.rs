@@ -208,7 +208,7 @@ diesel::table! {
 /// table splits over a core and an extension declaration, as
 /// [`crate::table_split`] explains. Together they hold 61 columns. These four
 /// columns stay out of both, so the extension keeps room for a new column.
-/// `docs/audits/diesel-table-width.py` enforces the width.
+/// `cargo xtask audit diesel-table-width` enforces the width.
 ///
 /// The physical columns stay in Postgres. Only the shard rebalance writes them,
 /// and it writes them with raw SQL. Reads go through the typed SQL fragments
@@ -461,6 +461,10 @@ diesel::table! {
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
         chain_execution_timeout_secs -> Nullable<Int8>,
+        concurrency_limit -> Nullable<Int4>,
+        quota_max_active_executions -> Nullable<Int8>,
+        quota_max_history_bytes -> Nullable<Int8>,
+        quota_max_dead_letters -> Nullable<Int8>,
     }
 }
 

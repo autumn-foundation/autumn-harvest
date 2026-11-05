@@ -72,6 +72,8 @@ mod overrides_api;
 pub mod plugin;
 pub mod preflight;
 pub mod prelude;
+/// Worker and scheduler switches from the Autumn process role (issue #2477).
+pub mod process_role;
 /// Fleet-wide task-queue coverage read model (issue #774).
 pub mod queue_coverage;
 pub mod replay_diagnosis;
@@ -81,6 +83,7 @@ mod run_defaults_api;
 pub mod runner;
 /// Cross-site request rejection for Vantage and DLQ mutations (issue #1278).
 pub mod same_origin;
+mod sampling_policy_api;
 pub mod schedule_runs;
 pub mod shard_fanout;
 pub mod shard_health;
@@ -104,6 +107,7 @@ pub mod version_gate_retirement;
 pub mod version_usage;
 /// The `filter` grammar of `GET /workflows` (issue #1982).
 mod visibility_query;
+pub mod worker_queues;
 pub mod workflow_count;
 pub mod workflow_reachability;
 
@@ -154,8 +158,8 @@ pub use api::{
 };
 pub use config::{
     HarvestBatchConfig, HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig,
-    HarvestReadinessConfig, HarvestRedisConfig, HarvestRuntimeConfig, HarvestStartupConfig,
-    OrphanStartupAction,
+    HarvestReadinessConfig, HarvestRedisConfig, HarvestRetentionConfig, HarvestRuntimeConfig,
+    HarvestStartupConfig, HarvestWorkerConfig, OrphanStartupAction, RetentionRunOn,
 };
 pub use embedding::{HarvestEmbedding, HarvestEmbeddingRuntime};
 pub use outbox::{

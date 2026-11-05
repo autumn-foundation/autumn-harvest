@@ -99,9 +99,12 @@ fn release_pr_ratchets_comment_hygiene_over_the_whole_release() {
     let doc = parse_workflow(RELEASE_PR);
     let runs = job_runs(&doc, "comment-hygiene");
     for needle in [
-        "comment-hygiene.py --self-test",
-        "comment-hygiene.py --base \"$BASE\"",
+        "cargo xtask audit comment-hygiene --self-test",
+        "cargo xtask audit comment-hygiene --base \"$BASE\"",
         "git merge-base --is-ancestor",
+        // The commit that added the gate. The gate first landed at this
+        // path, and `git log` still finds that commit after the port.
+        "--diff-filter=A --format=%H -1 -- docs/audits/comment-hygiene.py",
     ] {
         assert!(
             runs.contains(needle),

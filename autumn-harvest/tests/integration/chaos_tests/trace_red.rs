@@ -10,7 +10,7 @@
 //! such as a malformed trace, therefore fails the check.
 //!
 //! These tests always record. `chaos.yml` runs
-//! `scripts/check-formal-traces.sh` on the exported traces, so a check that
+//! `cargo xtask check formal-traces` on the exported traces, so a check that
 //! accepts an injected violation fails CI.
 
 use std::sync::Arc;

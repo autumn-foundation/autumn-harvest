@@ -10,6 +10,10 @@ They work on Postgres and on SQLite. The research behind them is in
 [`rnd/2026-10-13-agent-mesh-primitives.md`](rnd/2026-10-13-agent-mesh-primitives.md).
 The plan is in [`docs/design/DESIGN-agent-mesh.md`](design/DESIGN-agent-mesh.md).
 
+Each Rust example compiles as written, and CI checks this (issue #2482). An
+example takes each value from your app as a function parameter. The type of
+the parameter shows what to pass.
+
 ## 1. The primitives
 
 | Primitive | Type | What it does |
@@ -27,23 +31,34 @@ The plan is in [`docs/design/DESIGN-agent-mesh.md`](design/DESIGN-agent-mesh.md)
 ## 2. Delegate to a peer
 
 ```rust
-use autumn_harvest_agent::{AgentHarness, AgentTask, Mandate, Peer};
+use std::sync::Arc;
+use autumn_harvest_agent::{AgentHarness, AgentModel, AgentTask, Mandate, Peer, Tool};
 
-let harness = AgentHarness::new(model)
-    .tool(web_search)
-    .tool(write_file)
-    .peer(
-        Peer::new("researcher", "Finds facts on the web.")
-            .system("You research. Cite each source.")
-            .tools(["web_search"])
-            .max_steps(6)
-            .max_total_tokens(40_000),
-    );
+fn planner(
+    model: Arc<dyn AgentModel>,
+    web_search: Arc<dyn Tool>,
+    write_file: Arc<dyn Tool>,
+) -> (AgentHarness, AgentTask) {
+    let harness = AgentHarness::new(model)
+        .tool(web_search)
+        .tool(write_file)
+        .peer(
+            Peer::new("researcher", "Finds facts on the web.")
+                .system("You research. Cite each source.")
+                .tools(["web_search"])
+                .max_steps(6)
+                .max_total_tokens(40_000),
+        );
 
-let task = AgentTask::new("Plan a trip to Lisbon.")
-    .max_total_tokens(100_000)
-    .mandate(Mandate::new("planner").peers(["researcher"]));
+    let task = AgentTask::new("Plan a trip to Lisbon.")
+        .max_total_tokens(100_000)
+        .mandate(Mandate::new("planner").peers(["researcher"]));
+    (harness, task)
+}
 ```
+
+A harness takes each tool as an `Arc<dyn Tool>`. `FnTool::new` wraps an async
+function, and `shared` returns it as an `Arc<dyn Tool>`. Section 7 shows both.
 
 The planner sees one more tool, `delegate`. Its input is `agent`, one of the
 peer names, and `task`, the text for the peer. The tool description lists
@@ -56,11 +71,13 @@ tool allowlist or flow rules.
 The result of a delegation is JSON:
 
 ```json
-{"agent": "researcher", "stop": "completed", "answer": "The ferry leaves at 9."}
+{"agent": "researcher", "answer": "The ferry leaves at 9.", "stop": "completed", "truncated": false}
 ```
 
-The `stop` field tells the parent model how the child ended. The parent
-model reads it and decides what to do.
+The `stop` field tells the parent model how the child ended. The
+`truncated` field is `true` when the harness cuts the answer (section 3).
+The parent model reads both and decides what to do. A durable peer result
+also has `error`.
 
 ## 3. What the child gets
 
@@ -81,7 +98,19 @@ the task.
 | Memory, follow-ups, delivery | Off |
 | Session, tenant, output cap, unattended flag | As the parent |
 | Loop guard, approval timeout, request cap | As the parent |
-| Answer | Cut to 8 000 characters. `AgentHarness::tool_output_limit` does not apply. |
+| Answer | Cut to `Peer::answer_limit`, else to `AgentHarness::tool_output_limit` (default 8 000 characters). |
+
+The same limit applies to an inline child, a fan-out child (section 15) and
+a durable peer (section 13). The answer is also cut to a sixth of the
+request cap of the parent, as a tool result is under its result cap. So a
+large limit cannot drop a whole answer. The request cap bounds bytes, not
+tokens. Keep the limit inside the context window of your model.
+
+A cut answer ends with `…[truncated]`. The result also has
+`"truncated": true`, the report sets `DelegationRecord::answer_truncated`,
+and the worker logs a warning. The peer lookup records the limit, so replay
+cuts each answer as the live run did. A run recorded before issue #2481
+keeps its old cut of 8 000 characters and has no `truncated` field.
 
 Tools key idempotency on `(run_id, step, call_id)`. A child has its own run
 id, so its keys never collide with the parent keys. A child of a run whose
@@ -189,7 +218,8 @@ order each ended:
 | `usage` | Tokens of the child and of every agent under it |
 | `steps_used`, `tool_calls` | The rounds and calls of the child and of every agent under it |
 
-`AgentReport::usage`, `steps_used` and `tool_calls` cover the whole tree.
+`AgentReport::usage`, `cost_usd_micros`, `steps_used` and `tool_calls`
+cover the whole tree.
 Each agent still has its own step bound, so a child round never counts
 against the `max_steps` of its parent.
 
@@ -202,19 +232,27 @@ inbox can exfiltrate the data. Flow rules stop that sequence.
 Give each tool its labels:
 
 ```rust
+use std::sync::Arc;
 use autumn_harvest_agent::flow::labels;
-use autumn_harvest_agent::{AgentHarness, FlowRules, FnTool, ToolEffect};
+use autumn_harvest_agent::{AgentError, AgentHarness, AgentModel, FlowRules, FnTool, Tool, ToolEffect};
+use serde_json::{Value, json};
 
-let inbox = FnTool::new("inbox", "Read mail.", schema, read_mail)
-    .effect(ToolEffect::ReadOnly)
-    .label(labels::UNTRUSTED_INPUT)
-    .label(labels::PRIVATE_DATA)
-    .shared();
+fn mail_agent(model: Arc<dyn AgentModel>, send_mail: Arc<dyn Tool>) -> AgentHarness {
+    let inbox = FnTool::new("inbox", "Read mail.", json!({"type": "object"}), read_mail)
+        .effect(ToolEffect::ReadOnly)
+        .label(labels::UNTRUSTED_INPUT)
+        .label(labels::PRIVATE_DATA)
+        .shared();
 
-let harness = AgentHarness::new(model)
-    .tool(inbox)
-    .tool(send_mail)
-    .flow_rules(FlowRules::rule_of_two());
+    AgentHarness::new(model)
+        .tool(inbox)
+        .tool(send_mail)
+        .flow_rules(FlowRules::rule_of_two())
+}
+
+async fn read_mail(_input: Value) -> Result<Value, AgentError> {
+    Ok(json!({"messages": []}))
+}
 ```
 
 Each call also carries the label of its effect: `effect:read_only`,
@@ -241,6 +279,8 @@ Set it on one rule with `forbid_with(labels, rule, recheck)`, or on every rule
 with `with_recheck(recheck)`:
 
 ```rust
+use autumn_harvest_agent::{FlowRules, Recheck};
+
 let rules = FlowRules::rule_of_two().with_recheck(Recheck::UntilApproved);
 ```
 
@@ -301,9 +341,13 @@ when the harness has flow rules. Install the same flow rules on every worker.
 A run that continues a conversation must continue its labels too:
 
 ```rust
-let next = AgentTask::new("Now reply to the sender.")
-    .history(report.messages.clone())
-    .flow_labels(report.flow_labels.clone());
+use autumn_harvest_agent::{AgentReport, AgentTask};
+
+fn reply(report: &AgentReport) -> AgentTask {
+    AgentTask::new("Now reply to the sender.")
+        .history(report.messages.clone())
+        .flow_labels(report.flow_labels.clone())
+}
 ```
 
 `HeartbeatTask::flow_labels` does the same for a heartbeat tick. The next run
@@ -417,13 +461,19 @@ and memory. A `delegate` call to it sends a message and waits for the reply.
 Inline delegation stays for short, bounded sub-tasks.
 
 ```rust
-use autumn_harvest_agent::{AgentHarness, AgentId, AgentProfile, Mandate, Peer};
+use std::sync::Arc;
+use autumn_harvest_agent::{
+    AgentHarness, AgentId, AgentIdError, AgentModel, AgentProfile, Mandate, Peer,
+};
 
-let researcher = AgentId::new("research", "r1")?;
-let harness = AgentHarness::new(model)
-    .peer(Peer::agent("researcher", "Finds facts.", &researcher))
-    .agent(AgentProfile::new("triage").mandate(Mandate::new("triage").peers(["researcher"])))
-    .agent(AgentProfile::new("research").mandate(Mandate::new("researcher")));
+fn mesh(model: Arc<dyn AgentModel>) -> Result<AgentHarness, AgentIdError> {
+    let researcher = AgentId::new("research", "r1")?;
+    let triage = Mandate::new("triage").peers(["researcher"]);
+    Ok(AgentHarness::new(model)
+        .peer(Peer::agent("researcher", "Finds facts.", &researcher))
+        .agent(AgentProfile::new("triage").mandate(triage))
+        .agent(AgentProfile::new("research").mandate(Mandate::new("researcher"))))
+}
 ```
 
 | Step | What happens |
@@ -453,13 +503,17 @@ The harness holds named models. A task, a peer, a profile or a heartbeat
 names its model. A cheap triage model can front a strong planner.
 
 ```rust
-use autumn_harvest_agent::{AgentHarness, AgentTask, DEFAULT_MODEL, Mandate, Peer};
+use std::sync::Arc;
+use autumn_harvest_agent::{AgentHarness, AgentModel, AgentTask, DEFAULT_MODEL, Mandate, Peer};
 
-let harness = AgentHarness::new(cheap)
-    .model_named("strong", strong)
-    .peer(Peer::new("planner", "Plans.").model("strong"));
-let task = AgentTask::new("triage this")
-    .mandate(Mandate::new("triage").peers(["planner"]).models([DEFAULT_MODEL, "strong"]));
+fn triage(cheap: Arc<dyn AgentModel>, strong: Arc<dyn AgentModel>) -> (AgentHarness, AgentTask) {
+    let harness = AgentHarness::new(cheap)
+        .model_named("strong", strong)
+        .peer(Peer::new("planner", "Plans.").model("strong"));
+    let mandate = Mandate::new("triage").peers(["planner"]).models([DEFAULT_MODEL, "strong"]);
+    let task = AgentTask::new("triage this").mandate(mandate);
+    (harness, task)
+}
 ```
 
 | Setter | Scope |
@@ -481,6 +535,7 @@ let task = AgentTask::new("triage this")
   model of a durable peer, so the receiver checks it.
 - `eval::compare` runs two candidates on one recorded run.
   `Candidate::agent_model` sets the model of one agent of the tree.
+  `eval::compare_anonymised` runs a pool under opaque ids (issue #2376).
 
 ## 15. Concurrent children (issue #2270)
 
@@ -497,9 +552,37 @@ let task = AgentTask::new("plan the trip")
     .parallel_children(3);
 ```
 
+The default is 0, so the fan-out is off until you set `n`. A call joins a
+batch only when each of these is true. Otherwise it runs inline, one after
+another, as with no bound.
+
+1. `n` is 2 or more. `MAX_PARALLEL_CHILDREN` caps it.
+2. The call is a `delegate` call.
+3. The policy allows the call. A gated call waits for a person.
+4. The peer is inline. A durable peer runs on its own worker.
+5. The call is next to another call that meets 2 to 4.
+
+A run of such calls splits into batches of at most `n`, in call order. A
+call left over at the end runs alone.
+
+A delegation that runs alone names why. Its `DelegationRecord::serial`
+holds the reason (issue #2483). A `debug` event logs it once, with the
+message `a delegation ran alone` and the fields `call_id`, `chain` and
+`reason`. A bound under 2 names no reason. A refused delegation names its
+refusal instead. A call that the policy denies, or that a person rejects,
+does not run, so it has no record.
+
+| `serial` | Why the call ran alone |
+|---|---|
+| `single_call` | No other call of the turn meets 2 to 4. |
+| `not_consecutive` | Another call meets 2 to 4, but no neighbour does. |
+| `gated` | The policy gated the call. A person can edit its target, so the peer does not count. |
+| `durable_peer` | The policy allowed a call to a durable peer. |
+| `bound_reached` | The call is the last of a run. The batch before it is full. |
+
 | Rule | What happens |
 |---|---|
-| Batch | Two or more `delegate` calls in a row, each allowed by the policy, each to an inline peer. At most `n` calls, and at most `MAX_PARALLEL_CHILDREN`. |
+| Batch | See the list above. |
 | Child | Each call of a batch runs as a child `agent_loop` run, with its own history. |
 | Tokens | The siblings split the token remainder of the tree with `sibling_cap`. The caps of a batch sum to the remainder. |
 | Delegations | The siblings split the delegation remainder. Each child run counts its own delegations from zero. |
@@ -517,7 +600,7 @@ let task = AgentTask::new("plan the trip")
 - A child run starts with no released flow rules.
 - A durable agent takes an interrupt only after the batch ends.
 - A single delegation, a gated one, or one to a durable peer runs inline,
-  as before.
+  as before. Its record names why.
 - `eval::evaluate` answers each child run with the recorded report of the
   child with the same delegation chain and task text. With no match, the
   candidate fails.
@@ -528,26 +611,35 @@ A mesh is a set of durable agents that share an id. A long-lived mesh needs
 controls that span time and agents.
 
 ```rust
-use autumn_harvest_agent::{AgentHarness, AgentProfile, MeshBudget, sqlite};
+use std::path::Path;
+use std::sync::Arc;
+use autumn_harvest_agent::{AgentHarness, AgentModel, AgentProfile, MeshBudget, sqlite};
 
-let harness = AgentHarness::new(model)
-    .agent(AgentProfile::new("triage").mesh("support"))
-    .agent(AgentProfile::new("research").mesh("support"))
-    .mesh_budget(MeshBudget::daily("support").max_tokens(2_000_000))
-    .mesh_spend(Arc::new(sqlite::LedgerSpend::open(&db)));
+fn support_mesh(model: Arc<dyn AgentModel>, db: &Path) -> AgentHarness {
+    AgentHarness::new(model)
+        .agent(AgentProfile::new("triage").mesh("support"))
+        .agent(AgentProfile::new("research").mesh("support"))
+        .mesh_budget(MeshBudget::daily("support").max_tokens(2_000_000))
+        .mesh_spend(Arc::new(sqlite::LedgerSpend::open(db)))
+}
 ```
+
+On Postgres, use `postgres::LedgerSpend::new(pg)` and
+`postgres::pause_mesh(&pg, mesh, reason)`. They do the same, over every
+database of `pg`.
 
 | Control | What happens |
 |---|---|
 | Mesh id | `AgentProfile::mesh` names it. Each run, model turn and peer message carries it. A run publishes it as the search attribute `agent_mesh`. |
 | Period budget | `MeshBudget` caps tokens or cost for each day, month or fixed window, in UTC. The model-turn activity sums the spend of the mesh with a `MeshSpend` source before the call. A spent budget refuses the turn with `MeshBudgetExceeded`. |
 | Parking | A refused durable agent parks until the period ends. Its work waits, first the refused message, and its ticks are skipped. A wake at the period end opens it. |
-| Kill switch | `sqlite::pause_mesh(rt, mesh, reason)` sends an interrupt and `Control::Pause` to every running agent of the mesh. It returns a `MeshPause` audit record and logs it to the target `harvest.audit`. |
+| Kill switch | `sqlite::pause_mesh(rt, mesh, reason)` or `postgres::pause_mesh(&pg, mesh, reason)` sends an interrupt and `Control::Pause` to every running agent of the mesh. It returns a `MeshPause` audit record and logs it to the target `harvest.audit`. |
 | Labelled memory | A memory entry keeps the flow labels of the run that wrote it. A run that reads the entry takes the labels. |
 
 - `sqlite::LedgerSpend` sums the cost ledger of every run with the mesh
-  attribute, child runs included. On Postgres, implement `MeshSpend` over
-  `harvest_llm_ledger`.
+  attribute, child runs included. `postgres::LedgerSpend` sums
+  `harvest_llm_ledger` the same way, with one read for each database. The
+  GIN index on `search_attrs` and the `recorded_at` index serve the read.
 - The budget is a soft cap, as the run budgets are. Turns that start before
   any of them records can all pass the check.
 - A refused message runs again only when no tool ran in its op. Any other

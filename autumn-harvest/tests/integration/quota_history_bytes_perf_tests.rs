@@ -55,7 +55,7 @@
 //!
 //! The evidence-capture test below is ignored by default: a one-shot tool,
 //! not a repeatable CI assertion. Run via
-//! `autumn-harvest/scripts/quota_history_bytes_perf_repro.sh`. Full writeup:
+//! `cargo xtask perf quota-history-bytes`. Full writeup:
 //! `docs/performance-quota-history-bytes.md`.
 
 #![cfg(feature = "db")]
@@ -308,7 +308,7 @@ async fn explain_lateral_variant(conn: &mut diesel_async::AsyncPgConnection) -> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "evidence generator, not a CI assertion -- run via \
-            autumn-harvest/scripts/quota_history_bytes_perf_repro.sh"]
+            cargo xtask perf quota-history-bytes"]
 #[allow(clippy::too_many_lines)] // one-shot evidence capture, not control flow
 async fn zz_capture_quota_history_bytes_evidence() {
     let Some(bench) = bench_db_or_skip().await else {

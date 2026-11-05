@@ -4,8 +4,9 @@
 //! corpus artifact before the run and upload it after the run, also after a
 //! crash. A
 //! failed scheduled run must open an issue. The target lists in
-//! `fuzz/Cargo.toml`, `fuzz/smoke.sh` and the workflow must agree, and so
-//! must the nightly toolchain that the two files pin.
+//! `fuzz/Cargo.toml`, `cargo xtask dev fuzz-smoke` and the workflow must
+//! agree. So must the nightly toolchain that the smoke run and the workflow
+//! pin. `xtask/src/dev/fuzz_smoke.rs` holds the list and the pin of the smoke run.
 
 use std::collections::BTreeSet;
 
@@ -15,7 +16,7 @@ use super::ci_run_coverage::{
 };
 
 const FUZZ_CARGO_TOML: &str = include_str!("../../../fuzz/Cargo.toml");
-const FUZZ_SMOKE_SH: &str = include_str!("../../../fuzz/smoke.sh");
+const FUZZ_SMOKE_RS: &str = include_str!("../../../xtask/src/dev/fuzz_smoke.rs");
 const NIGHTLY: &str = ".github/workflows/fuzz-nightly.yml";
 
 /// The path that the upload step must name.
@@ -43,21 +44,31 @@ fn cargo_targets(toml: &str) -> BTreeSet<String> {
     out
 }
 
-/// The entries of the `TARGETS=( ... )` array in `fuzz/smoke.sh`.
-fn smoke_targets(script: &str) -> BTreeSet<String> {
-    let start = script.find("TARGETS=(").expect("smoke.sh declares TARGETS");
-    let body = &script[start + "TARGETS=(".len()..];
-    let end = body.find(')').expect("the TARGETS array closes");
-    body[..end].split_whitespace().map(str::to_string).collect()
+/// The entries of the `TARGETS` array in `xtask/src/dev/fuzz_smoke.rs`.
+fn smoke_targets(source: &str) -> BTreeSet<String> {
+    let start = source
+        .find("pub const TARGETS")
+        .expect("fuzz_smoke.rs declares TARGETS");
+    let body = &source[start..];
+    let open = body.find("= [").expect("TARGETS is an array") + "= [".len();
+    let end = body[open..].find(']').expect("the TARGETS array closes");
+    body[open..open + end]
+        .split(',')
+        .map(|entry| entry.trim().trim_matches('"'))
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
-/// The default of `TOOLCHAIN="${FUZZ_TOOLCHAIN:-<pin>}"` in `fuzz/smoke.sh`.
-fn smoke_toolchain(script: &str) -> &str {
-    let start = script
-        .find("${FUZZ_TOOLCHAIN:-")
-        .expect("smoke.sh defaults FUZZ_TOOLCHAIN");
-    let rest = &script[start + "${FUZZ_TOOLCHAIN:-".len()..];
-    &rest[..rest.find('}').expect("the default closes")]
+/// The `DEFAULT_TOOLCHAIN` of `xtask/src/dev/fuzz_smoke.rs`, which
+/// `FUZZ_TOOLCHAIN` overrides.
+fn smoke_toolchain(source: &str) -> &str {
+    let marker = "pub const DEFAULT_TOOLCHAIN: &str = \"";
+    let start = source
+        .find(marker)
+        .expect("fuzz_smoke.rs defaults FUZZ_TOOLCHAIN");
+    let rest = &source[start + marker.len()..];
+    &rest[..rest.find('"').expect("the default closes")]
 }
 
 /// The `matrix.target` list of a job.
@@ -154,9 +165,9 @@ fn fuzz_target_lists_agree() {
         "fuzz/Cargo.toml must declare the `fuzz_replay` target; found {cargo:?}"
     );
     assert_eq!(
-        smoke_targets(FUZZ_SMOKE_SH),
+        smoke_targets(FUZZ_SMOKE_RS),
         cargo,
-        "fuzz/smoke.sh TARGETS must list every fuzz/Cargo.toml [[bin]]"
+        "xtask/src/dev/fuzz_smoke.rs TARGETS must list every fuzz/Cargo.toml [[bin]]"
     );
     let doc = parse_workflow(NIGHTLY);
     assert_eq!(
@@ -166,7 +177,7 @@ fn fuzz_target_lists_agree() {
     );
 }
 
-/// The workflow and `smoke.sh` fuzz with one dated nightly. A newer nightly
+/// The workflow and the smoke run fuzz with one dated nightly. A newer nightly
 /// can fail to compile the crate, so the pin must be a date.
 #[test]
 fn fuzz_toolchain_pins_agree() {
@@ -177,9 +188,9 @@ fn fuzz_toolchain_pins_agree() {
         "{NIGHTLY} must pin `env.FUZZ_TOOLCHAIN: nightly-YYYY-MM-DD`; found {pinned:?}"
     );
     assert_eq!(
-        smoke_toolchain(FUZZ_SMOKE_SH),
+        smoke_toolchain(FUZZ_SMOKE_RS),
         pinned,
-        "fuzz/smoke.sh must default to the nightly that {NIGHTLY} pins"
+        "xtask/src/dev/fuzz_smoke.rs must default to the nightly that {NIGHTLY} pins"
     );
     let installs = steps(&doc["jobs"]["fuzz"]).iter().any(|s| {
         str_at(s, &["uses"]).starts_with("dtolnay/rust-toolchain@")
@@ -385,10 +396,11 @@ fn target_parsers_read_the_file_shapes() {
         cargo_targets(toml),
         BTreeSet::from(["a".to_string(), "b".to_string()])
     );
-    let script = "TARGETS=(\n  a\n  b\n)\nTOOLCHAIN=\"${FUZZ_TOOLCHAIN:-nightly-2026-01-02}\"\n";
-    assert_eq!(smoke_toolchain(script), "nightly-2026-01-02");
+    let source = "pub const TARGETS: [&str; 2] = [\n    \"a\",\n    \"b\",\n];\n\
+                  pub const DEFAULT_TOOLCHAIN: &str = \"nightly-2026-01-02\";\n";
+    assert_eq!(smoke_toolchain(source), "nightly-2026-01-02");
     assert_eq!(
-        smoke_targets(script),
+        smoke_targets(source),
         BTreeSet::from(["a".to_string(), "b".to_string()])
     );
 }

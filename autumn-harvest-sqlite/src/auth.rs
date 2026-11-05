@@ -7,6 +7,9 @@
 //! - `harvest_audit_log` holds one row per audited management call (issue
 //!   #158). A trigger refuses each `UPDATE`, so a row cannot change after
 //!   its write.
+//! - `harvest_connector_dead_letters` holds one row per poison broker
+//!   message (issues #944 and #2471). Its idempotency key is unique, so a
+//!   redelivery adds no second row.
 //!
 //! [`SqliteAuthStore`] opens its own connections. It can share the file of
 //! a [`SqliteRuntime`](crate::SqliteRuntime):
@@ -75,6 +78,19 @@ CREATE TRIGGER IF NOT EXISTS harvest_audit_log_immutable_upd
 BEGIN
     SELECT RAISE(ABORT, 'harvest_audit_log rows do not change (issue #2469)');
 END;
+CREATE TABLE IF NOT EXISTS harvest_connector_dead_letters (
+    id              TEXT    PRIMARY KEY,
+    binding         TEXT    NOT NULL,
+    stream          TEXT    NOT NULL,
+    coordinates     TEXT    NOT NULL,
+    idempotency_key TEXT    NOT NULL UNIQUE,
+    workflow_name   TEXT    NOT NULL,
+    reason          TEXT    NOT NULL,
+    detail          TEXT    NOT NULL,
+    attempts        INTEGER NOT NULL,
+    payload         BLOB    NOT NULL,
+    failed_at_us    INTEGER NOT NULL
+);
 ";
 
 /// The columns of one token row, in the order [`read_token`] reads them.
@@ -91,6 +107,32 @@ pub const MAX_AUDIT_PAGE: i64 = 500;
 
 /// The store deletes the expired audit rows after this many audit writes.
 pub const PURGE_EVERY: u64 = 256;
+
+/// One poison broker message to store (issue #2471). The fields are the
+/// Postgres `harvest_connector_dead_letters` columns.
+#[derive(Debug, Clone)]
+pub struct NewDeadLetter<'a> {
+    /// The binding that the message arrived on.
+    pub binding: &'a str,
+    /// The topic or queue.
+    pub stream: &'a str,
+    /// The rendered broker coordinates.
+    pub coordinates: &'a str,
+    /// The derived idempotency key. It is unique.
+    pub idempotency_key: &'a str,
+    /// The target workflow type.
+    pub workflow_name: &'a str,
+    /// The poison class.
+    pub reason: &'a str,
+    /// The detail of the failure.
+    pub detail: &'a str,
+    /// The strikes at the dead letter.
+    pub attempts: i32,
+    /// The raw message body.
+    pub payload: &'a [u8],
+    /// When the message was dead-lettered.
+    pub failed_at: DateTime<Utc>,
+}
 
 /// A token to store.
 #[derive(Clone)]
@@ -492,6 +534,56 @@ impl SqliteAuthStore {
         Ok(id)
     }
 
+    /// Record one poison broker message (issue #2471). Returns `false` when
+    /// a row with its idempotency key exists, so a redelivery adds none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] when the insert fails.
+    pub fn insert_dead_letter(&self, row: &NewDeadLetter<'_>) -> SqliteResult<bool> {
+        self.with_conn(|conn| {
+            let inserted = conn.execute(
+                "INSERT INTO harvest_connector_dead_letters \
+                   (id, binding, stream, coordinates, idempotency_key, workflow_name, reason, \
+                    detail, attempts, payload, failed_at_us) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT (idempotency_key) DO NOTHING",
+                params![
+                    Uuid::new_v4().to_string(),
+                    row.binding,
+                    row.stream,
+                    row.coordinates,
+                    row.idempotency_key,
+                    row.workflow_name,
+                    row.reason,
+                    row.detail,
+                    row.attempts,
+                    row.payload,
+                    row.failed_at.timestamp_micros(),
+                ],
+            )?;
+            Ok(inserted > 0)
+        })
+    }
+
+    /// The idempotency keys of the stored dead letters, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] when the query fails.
+    pub fn dead_letter_keys(&self) -> SqliteResult<Vec<String>> {
+        self.with_reader(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT idempotency_key FROM harvest_connector_dead_letters \
+                 ORDER BY failed_at_us, id",
+            )?;
+            let keys = stmt
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            Ok(keys)
+        })
+    }
+
     /// The audit rows that match `filter`, newest first.
     ///
     /// The order is `(occurred_at, id)`, descending. `before` with
@@ -688,6 +780,31 @@ mod tests {
         assert_eq!(stored.tenant.as_deref(), Some("acme"));
         assert_eq!(store.token_by_hash("h1").unwrap(), Some(stored));
         assert_eq!(store.token_by_hash("other").unwrap(), None);
+    }
+
+    /// A dead letter is idempotent by its key, so a redelivery adds no row
+    /// (issue #2471).
+    #[test]
+    fn a_dead_letter_is_stored_once_per_key() {
+        let store = store();
+        let row = NewDeadLetter {
+            binding: "orders",
+            stream: "orders",
+            coordinates: "orders:0:7",
+            idempotency_key: "conn:orders:-:orders:0:7",
+            workflow_name: "process_order",
+            reason: "mapping_failed",
+            detail: "bad json",
+            attempts: 3,
+            payload: b"{",
+            failed_at: at(0),
+        };
+        assert!(store.insert_dead_letter(&row).unwrap());
+        assert!(!store.insert_dead_letter(&row).unwrap(), "a redelivery");
+        assert_eq!(
+            store.dead_letter_keys().unwrap(),
+            ["conn:orders:-:orders:0:7"]
+        );
     }
 
     #[test]

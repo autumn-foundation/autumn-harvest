@@ -207,6 +207,8 @@ pub mod adaptive_limit;
 pub mod admission_gate;
 /// AES-256-GCM payload codec and data-key providers (issue #1825).
 pub mod aead_codec;
+/// The operator policies of agent kinds (issue #2439).
+pub mod agent_policy_log;
 /// History analyzer and linter.
 pub mod analyzer;
 /// Pure token-secret helpers shared by the mint route and the CLI (issue #942).
@@ -388,6 +390,8 @@ pub mod handle_typed;
 #[doc(hidden)]
 pub mod heartbeat;
 pub mod history_export;
+/// History shape fingerprints — compare runs by event structure.
+pub mod history_shape;
 /// Hot code swap for workflow definitions via runtime modules (issue #967).
 ///
 /// R&D spike. Hosts a `#[workflow]` body as a runtime-loaded WebAssembly

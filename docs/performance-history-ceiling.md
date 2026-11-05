@@ -33,7 +33,7 @@ over-represent hung/looping workflows. Reproduce with:
 
 ```bash
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-  ./autumn-harvest/scripts/history_ceiling_claim_perf_repro.sh
+  cargo xtask perf history-ceiling-claim
 ```
 
 ## 📈 Profile
@@ -260,7 +260,7 @@ cargo test -p autumn-harvest --features db --lib timeout::tests::workflow_histor
 
 # Full evidence capture (seeds ~4M rows; several minutes):
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-  ./autumn-harvest/scripts/history_ceiling_claim_perf_repro.sh
+  cargo xtask perf history-ceiling-claim
 ```
 
 ## Known limitation: `pg_stat_statements` capture came back empty
@@ -288,7 +288,7 @@ useful.
   query this page measures.
 * `tests/integration/history_ceiling_claim_tests.rs` -- the harness and
   evidence-capture test.
-* `autumn-harvest/scripts/history_ceiling_claim_perf_repro.sh` -- regenerates
+* `cargo xtask perf history-ceiling-claim` -- regenerates
   the committed artifacts from a clean checkout.
 * `docs/perf-artifacts/history-ceiling-scanner/` -- committed before/after
   `EXPLAIN` and result-set evidence.

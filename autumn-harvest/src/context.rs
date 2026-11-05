@@ -24175,22 +24175,28 @@ mod tests {
             })
             .collect();
         let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", holidays);
-        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
-        let start = std::time::Instant::now();
-        let out = ctx.business_days_from_now("d", crate::calendar::MAX_BUSINESS_DAYS, "biz");
-        let elapsed = start.elapsed();
-        // Assert the outcome, not just the timing: discarding the Result would
-        // let the scan bail out immediately with an error and still "pass".
-        // With no declared coverage horizon the resolution must SUCCEED, and it
-        // must land past the 400-day holiday span.
-        let deadline = out.expect("MAX_BUSINESS_DAYS must resolve, not reject");
+        // A shared CI runner can preempt one scan for longer than the budget.
+        // Preemption only adds time, so the fastest of several scans measures
+        // the scan cost. Each scan gets a fresh context and its own outcome check.
+        let mut fastest = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals.clone());
+            let start = std::time::Instant::now();
+            let out = ctx.business_days_from_now("d", crate::calendar::MAX_BUSINESS_DAYS, "biz");
+            fastest = fastest.min(start.elapsed());
+            // Assert the outcome, not just the timing: discarding the Result would
+            // let the scan bail out immediately with an error and still "pass".
+            // With no declared coverage horizon the resolution must SUCCEED, and it
+            // must land past the 400-day holiday span.
+            let deadline = out.expect("MAX_BUSINESS_DAYS must resolve, not reject");
+            assert!(
+                deadline > bd_utc("2027-02-05T00:00:00Z"),
+                "MAX_BUSINESS_DAYS (~14 years) must land far in the future, got {deadline}"
+            );
+        }
         assert!(
-            deadline > bd_utc("2027-02-05T00:00:00Z"),
-            "MAX_BUSINESS_DAYS (~14 years) must land far in the future, got {deadline}"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_millis(50),
-            "the bounded scan must stay far under 50 ms, took {elapsed:?}"
+            fastest < std::time::Duration::from_millis(50),
+            "the bounded scan must stay far under 50 ms, the fastest of 5 took {fastest:?}"
         );
     }
 

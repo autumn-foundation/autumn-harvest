@@ -12,6 +12,7 @@
 //! [`select`] picks the best draw. A tie goes to the lowest draw id, and a
 //! reject never beats a score. See `docs/design/DESIGN-2441.md`.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -26,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::draw::DrawId;
 use crate::error::{AgentError, ErrorKind};
 use crate::harness::{AgentHarness, cut_bytes, model_failure};
-use crate::message::ContentPart;
+use crate::message::{ChatMessage, ContentPart, TokenUsage};
 use crate::model::{BoxFuture, ChatRequest, ChatResponse};
 use crate::refine::model_proposer::unfenced;
 use crate::types::{AgentReport, AgentStop, AgentTask};
@@ -299,34 +300,39 @@ impl ScoreInput {
     /// activity input.
     #[must_use]
     pub fn from_run(task: &AgentTask, report: &AgentReport) -> Self {
-        let parts = || report.messages.iter().flat_map(|m| m.content.iter());
-        let names: std::collections::HashMap<&str, &str> = parts()
-            .filter_map(|part| match part {
-                ContentPart::ToolCall { id, name, .. } => Some((id.as_str(), name.as_str())),
-                _ => None,
-            })
-            .collect();
-        let tools = parts()
-            .filter_map(|part| match part {
-                ContentPart::ToolResult {
-                    tool_call_id,
-                    content,
-                } => Some(ToolRecord {
-                    name: names
-                        .get(tool_call_id.as_str())
-                        .map_or_else(String::new, |name| (*name).to_owned()),
-                    content: content.clone(),
-                }),
-                _ => None,
-            })
-            .collect();
         Self {
             task: task.input.clone(),
             answer: report.text.clone(),
             stop: report.stop,
-            tools,
+            tools: tool_records(&report.messages),
         }
     }
+}
+
+/// The tool results of `messages`, in order, each with the name of its
+/// call.
+pub(crate) fn tool_records(messages: &[ChatMessage]) -> Vec<ToolRecord> {
+    let parts = || messages.iter().flat_map(|m| m.content.iter());
+    let names: std::collections::BTreeMap<&str, &str> = parts()
+        .filter_map(|part| match part {
+            ContentPart::ToolCall { id, name, .. } => Some((id.as_str(), name.as_str())),
+            _ => None,
+        })
+        .collect();
+    parts()
+        .filter_map(|part| match part {
+            ContentPart::ToolResult {
+                tool_call_id,
+                content,
+            } => Some(ToolRecord {
+                name: names
+                    .get(tool_call_id.as_str())
+                    .map_or_else(String::new, |name| (*name).to_owned()),
+                content: content.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The input of the `agent_score` activity: a scorer id and what it reads.
@@ -337,6 +343,11 @@ pub struct ScoreRequest {
     pub scorer: String,
     /// What the scorer reads.
     pub input: ScoreInput,
+    /// The only models that a judge call may name (issue #2443). `None`
+    /// allows each harness model. A sample run sets the judge model that
+    /// its policy admitted, or no model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_judges: Option<BTreeSet<String>>,
 }
 
 impl ScoreRequest {
@@ -346,7 +357,15 @@ impl ScoreRequest {
         Self {
             scorer: scorer.into(),
             input,
+            admitted_judges: None,
         }
+    }
+
+    /// Let a judge call name only the models in `models`.
+    #[must_use]
+    pub fn admitted_judges(mut self, models: impl IntoIterator<Item = String>) -> Self {
+        self.admitted_judges = Some(models.into_iter().collect());
+        self
     }
 }
 
@@ -363,6 +382,12 @@ pub struct ScoreContext<'a> {
     refusal: Mutex<Option<String>>,
     /// The judge calls that hold a ledger slot: done, or still in flight.
     slots: AtomicUsize,
+    /// The only models that a judge call may name. `None` allows each.
+    judges: Option<BTreeSet<String>>,
+    /// The sum of the usage of each judge reply.
+    usage: Mutex<TokenUsage>,
+    /// The model name of each judge call. `None` is the default model.
+    routes: Mutex<std::collections::BTreeSet<Option<String>>>,
 }
 
 /// One reserved ledger slot. A drop before [`Slot::keep`] frees it, so a
@@ -410,19 +435,32 @@ impl<'a> ScoreContext<'a> {
             calls: Mutex::new(Vec::new()),
             refusal: Mutex::new(None),
             slots: AtomicUsize::new(0),
+            judges: None,
+            usage: Mutex::new(TokenUsage::default()),
+            routes: Mutex::new(std::collections::BTreeSet::new()),
         }
+    }
+
+    /// Let a judge call name only the models in `judges`. `None` allows
+    /// each harness model.
+    #[must_use]
+    pub(crate) fn only_judges(mut self, judges: Option<BTreeSet<String>>) -> Self {
+        self.judges = judges;
+        self
     }
 
     /// Send one judge request to a harness model.
     ///
     /// `model` names a model of [`AgentHarness::model_named`]. `None` is the
-    /// default model. The call checks the LLM budget of the run first. It
+    /// default model. A sample run pins its admitted judge, so its scorer
+    /// must name that model, and `None` fails. The call checks the LLM budget of the run first. It
     /// then calls the model under the model timeout of the harness, and it
     /// keeps one cost ledger call.
     ///
     /// # Errors
     ///
-    /// - [`ErrorKind::Config`] for an unknown model.
+    /// - [`ErrorKind::Config`] for an unknown model, and for a model that
+    ///   the run did not admit as a judge.
     /// - [`ErrorKind::Budget`] when the budget refuses the call. The
     ///   activity then fails with the refusal, even when the scorer handles
     ///   the error.
@@ -440,12 +478,35 @@ impl<'a> ScoreContext<'a> {
                 "the LLM budget refused an earlier judge call",
             ));
         }
+        if let Some(judges) = &self.judges
+            && !model.is_some_and(|model| judges.contains(model))
+        {
+            let named = model.map_or_else(
+                || "the default model".to_owned(),
+                |model| {
+                    format!(
+                        "{:?}",
+                        cut_bytes(model.to_owned(), crate::mesh::MAX_NAME_LEN)
+                    )
+                },
+            );
+            return Err(AgentError::new(
+                ErrorKind::Config,
+                format!(
+                    "the run did not admit the judge model {named}; call the judge model of the ScorerRef"
+                ),
+            ));
+        }
         let client = self.harness.model(model).map_err(|_| {
             AgentError::new(
                 ErrorKind::Config,
                 "the harness has no such judge model; add it with AgentHarness::model_named",
             )
         })?;
+        self.routes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(model.map(str::to_owned));
         // Reserve the slot before the call, so concurrent calls never pass
         // the ledger cap together.
         let slot = self.reserve().ok_or_else(|| {
@@ -475,6 +536,9 @@ impl<'a> ScoreContext<'a> {
             .harness
             .ledger_call(model, &response.usage, started.elapsed());
         self.lock_calls().push(call);
+        let mut usage = self.usage.lock().unwrap_or_else(PoisonError::into_inner);
+        *usage = usage.saturating_add(response.usage);
+        drop(usage);
         slot.keep();
         Ok(response)
     }
@@ -513,6 +577,22 @@ impl<'a> ScoreContext<'a> {
 
     fn lock_calls(&self) -> std::sync::MutexGuard<'_, Vec<LlmCall>> {
         self.calls.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The sum of the token usage of the judge replies so far (issue #2447).
+    #[must_use]
+    pub fn usage(&self) -> TokenUsage {
+        *self.usage.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The model name of each judge call so far. `None` is the default
+    /// model. An anonymised pool redacts these names (issue #2447).
+    #[must_use]
+    pub fn routes(&self) -> std::collections::BTreeSet<Option<String>> {
+        self.routes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The cost ledger calls of the judge calls so far.
@@ -563,7 +643,7 @@ pub(crate) async fn run_score<'a>(
         );
         return (Err(failure.into_error_payload()), Vec::new());
     };
-    let cx = ScoreContext::checked(harness, check);
+    let cx = ScoreContext::checked(harness, check).only_judges(request.admitted_judges);
     let budget = harness.score_budget();
     let outcome = tokio::time::timeout(budget, scorer.score(&request.input, &cx))
         .await
@@ -651,6 +731,75 @@ pub async fn agent_score(ctx: &ActivityContext, request: ScoreRequest) -> Result
         }
     }
     verdict
+}
+
+/// The verdict of one draw, and the spend of its judge calls (issue
+/// #2443).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SampleScore {
+    /// The verdict.
+    pub verdict: Verdict,
+    /// The tokens of the judge calls.
+    #[serde(default)]
+    pub usage: TokenUsage,
+    /// The priced cost of the judge calls, in millionths of a US dollar.
+    #[serde(default)]
+    pub cost_usd_micros: u64,
+}
+
+impl SampleScore {
+    /// `verdict`, with the spend of `calls`.
+    pub(crate) fn new(verdict: Verdict, calls: &[LlmCall]) -> Self {
+        let wide = |tokens: u64| u32::try_from(tokens).unwrap_or(u32::MAX);
+        let usage = calls.iter().fold(TokenUsage::default(), |usage, call| {
+            usage.saturating_add(TokenUsage::new(
+                wide(call.input_tokens()),
+                wide(call.output_tokens()),
+            ))
+        });
+        let cost_usd_micros = calls
+            .iter()
+            .filter_map(LlmCall::cost_usd_micros)
+            .fold(0_u64, u64::saturating_add);
+        Self {
+            verdict,
+            usage,
+            cost_usd_micros,
+        }
+    }
+}
+
+/// One score of a draw, as an activity (issue #2443).
+///
+/// It is [`agent_score`], but it also returns the tokens and the cost of
+/// the judge calls. A sample run adds them to the draw that they scored.
+///
+/// # Errors
+///
+/// Returns the errors of [`agent_score`].
+#[activity(
+    start_to_close = "15m",
+    retry = RetryPolicy::exponential(4, Duration::from_secs(2))
+)]
+pub async fn agent_sample_score(
+    ctx: &ActivityContext,
+    request: ScoreRequest,
+) -> Result<SampleScore, String> {
+    let harness = crate::workflow::harness(ctx)?;
+    let (verdict, calls) = run_score(
+        harness,
+        request,
+        Box::new(|| Box::pin(ctx.check_llm_budget())),
+    )
+    .await;
+    let scored = verdict.map(|verdict| SampleScore::new(verdict, &calls));
+    for call in calls {
+        if let Err(err) = ctx.record_llm_call(call) {
+            tracing::warn!(error = %err, "the agent cost ledger refused a judge call");
+        }
+    }
+    scored
 }
 
 /// A scorer that accepts an answer equal to the expected text.
@@ -1041,6 +1190,7 @@ mod tests {
     fn an_input_from_a_run_holds_the_task_answer_stop_and_tools() {
         let task = AgentTask::new("What is 2 + 2?");
         let report = AgentReport {
+            cost_usd_micros: 0,
             stop: AgentStop::Completed,
             text: "4".into(),
             steps_used: 1,
@@ -1079,6 +1229,7 @@ mod tests {
             workspace: None,
             error: None,
             resets: 0,
+            answer_rejections: Vec::new(),
         };
         let input = ScoreInput::from_run(&task, &report);
         assert_eq!(

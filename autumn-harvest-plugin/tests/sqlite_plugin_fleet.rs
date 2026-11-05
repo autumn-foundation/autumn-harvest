@@ -735,3 +735,105 @@ async fn an_oidc_login_keeps_tenant_health_public() {
     assert_ne!(login_route.status.as_u16(), 404, "the login route exists");
     fx.fleet.close_all().await;
 }
+
+#[workflow]
+async fn every_second(_ctx: &WorkflowContext, _n: Value) -> Result<(), String> {
+    Ok(())
+}
+
+/// `harvest.scheduler_enabled = false` on a SQLite app (issue #2471): the
+/// boot upserts no code schedule and no slot fires.
+///
+/// The flag is a process environment variable. This binary holds the test
+/// because no other test in it uses a schedule, so the flag changes nothing
+/// else here. `tests/sqlite_plugin.rs` proves that the same schedule fires
+/// with the flag on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_disabled_scheduler_fires_no_code_schedule() {
+    // SAFETY: no other test in this binary reads the variable concurrently
+    // for a schedule. Each one tolerates either value.
+    unsafe { std::env::set_var("AUTUMN_HARVEST__SCHEDULER_ENABLED", "false") };
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = AutumnConfig::default();
+    config.database.url = Some(format!("sqlite://{}", dir.path().join("app.db").display()));
+    let client = TestApp::new()
+        .config(config)
+        .profile("dev")
+        .plugin(
+            HarvestPlugin::new()
+                .workflows(workflows![every_second])
+                .workflow_schedule(autumn_harvest::policy::WorkflowSchedule::new(
+                    "every_second",
+                    autumn_harvest::policy::Schedule::Interval(Duration::from_secs(1)),
+                ))
+                .api("/harvest"),
+        )
+        .build();
+    // SAFETY: as above. The boot read the variable already.
+    unsafe { std::env::remove_var("AUTUMN_HARVEST__SCHEDULER_ENABLED") };
+
+    // Three slots pass. With the scheduler on, each one starts a run.
+    tokio::time::sleep(Duration::from_millis(3200)).await;
+    let schedules: Value = client.get("/harvest/admin/schedules").send().await.json();
+    assert_eq!(schedules, json!([]), "no code schedule is upserted");
+    let runs: Value = client
+        .get("/harvest/workflows?workflow_name=every_second")
+        .send()
+        .await
+        .json();
+    assert_eq!(runs, json!([]), "no slot fires");
+}
+
+/// The outbox of a fleet app lives in the control database, and the control
+/// Harvest runs each start. A tenant database has no outbox table, so a
+/// write there fails rather than wait for a relay (issue #2470).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_outbox_runs_on_the_control_harvest_and_refuses_a_tenant_database() {
+    use autumn_harvest_plugin::WorkflowStartRequest;
+    use autumn_harvest_plugin::sqlite::{HarvestSqlite, enqueue_workflow_start_outbox};
+
+    let fixture = boot_with("dev", "tenant", &["acme"]);
+    let state = fixture.client.state();
+    let start = WorkflowStartRequest {
+        workflow_name: "tenant_flow".to_owned(),
+        workflow_id: "o-fleet".to_owned(),
+        queue_name: "default".to_owned(),
+        input: json!(false),
+        memo: None,
+        search_attrs: None,
+    };
+
+    let tenant = fixture.fleet.open_for("acme").await.expect("open acme");
+    let mut conn = tenant.pool().get().await.expect("a tenant connection");
+    let refused = enqueue_workflow_start_outbox(&mut conn, &start)
+        .await
+        .expect_err("a tenant database has no outbox");
+    assert!(refused.to_string().contains("#2470"), "{refused}");
+    drop(conn);
+
+    let mut conn = state.pool().unwrap().get().await.unwrap();
+    enqueue_workflow_start_outbox(&mut conn, &start)
+        .await
+        .unwrap();
+    drop(conn);
+    autumn_harvest_plugin::flush_workflow_start_outbox(state)
+        .await
+        .unwrap();
+    let control = state.extension::<HarvestSqlite>().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let filter = autumn_harvest_plugin::sqlite::ExecutionFilter::new()
+            .workflow_name("tenant_flow")
+            .workflow_id("o-fleet".to_owned())
+            .state("COMPLETED");
+        let page = control.list(filter).await.unwrap();
+        if let Some(run) = page.executions.first() {
+            let exec = run.execution_id().unwrap();
+            let result = control.result(exec).await.unwrap();
+            assert_eq!(result.output, Some(json!({ "who": "control" })));
+            break;
+        }
+        assert!(Instant::now() < deadline, "the start did not run");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

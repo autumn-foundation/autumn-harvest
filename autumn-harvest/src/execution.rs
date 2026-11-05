@@ -1153,6 +1153,9 @@ pub(crate) async fn enforce_quota_admission(
     let Some(key) = quota_key else {
         return Ok(Vec::new());
     };
+    // The operator override of the caps applies here (issue #2408). Every
+    // admission path calls this function, so none can skip the override.
+    let policy = crate::run_defaults::current_quota_policy(workflow_name, policy);
 
     // Serialize check-then-admit for this key under a transaction-scoped
     // advisory lock (auto-released at commit or rollback) so concurrent
@@ -7116,6 +7119,92 @@ pub async fn resolve_execution_id_by_workflow_id(
         state,
         started_at,
     }))
+}
+
+/// The largest page that [`list_running_with_search_attrs`] returns.
+pub const MAX_SEARCH_ATTR_PAGE: u32 = 1000;
+
+/// List the running executions of `workflow_name` whose search attributes
+/// contain `attrs`, in execution id order, on ONE shard.
+///
+/// `after` is the last execution id of the previous page, or `None` for the
+/// first page. A page holds at most `limit` rows, capped at
+/// [`MAX_SEARCH_ATTR_PAGE`]. The test is JSON containment, so
+/// `{"agent_mesh": "desk"}` matches each run that carries that pair. The GIN
+/// index `idx_harvest_we_search` serves the containment test.
+///
+/// The agent crate pauses a mesh with this scan. It returns the workflow id
+/// of each run too, because the agent id is the workflow id.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when the query fails.
+pub async fn list_running_with_search_attrs(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    attrs: &serde_json::Value,
+    after: Option<ExecutionId>,
+    limit: u32,
+) -> HarvestResult<Vec<(ExecutionId, String)>> {
+    use diesel::PgJsonbExpressionMethods as _;
+
+    let mut query = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .filter(harvest_workflow_executions::search_attrs.contains(attrs.clone()))
+        .order(harvest_workflow_executions::id.asc())
+        .limit(i64::from(limit.min(MAX_SEARCH_ATTR_PAGE)))
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::workflow_id,
+        ))
+        .into_boxed();
+    if let Some(after) = after {
+        query = query.filter(harvest_workflow_executions::id.gt(after.as_uuid()));
+    }
+    let rows = query
+        .load::<(Uuid, String)>(conn)
+        .await
+        .map_err(database_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, workflow_id)| (ExecutionId::from_uuid(id), workflow_id))
+        .collect())
+}
+
+/// The state and start time of the newest execution of `workflow_name`
+/// whose search attributes contain `attrs`, on ONE shard (issue #2540).
+///
+/// A running execution comes first, so the state reads `RUNNING` when any
+/// match still runs. Else the newest start wins. The test is JSON
+/// containment, as in [`list_running_with_search_attrs`]. The agent crate
+/// reads the last consolidation pass of an agent with it.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when the query fails.
+pub async fn latest_with_search_attrs(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    attrs: &serde_json::Value,
+) -> HarvestResult<Option<(String, chrono::DateTime<Utc>)>> {
+    use diesel::PgJsonbExpressionMethods as _;
+
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::search_attrs.contains(attrs.clone()))
+        .order((
+            harvest_workflow_executions::state.eq("RUNNING").desc(),
+            harvest_workflow_executions::started_at.desc(),
+        ))
+        .select((
+            harvest_workflow_executions::state,
+            harvest_workflow_executions::started_at,
+        ))
+        .first::<(String, chrono::DateTime<Utc>)>(conn)
+        .await
+        .optional()
+        .map_err(database_error)
 }
 
 /// Returns `true` when `err` reports that a target resolved by

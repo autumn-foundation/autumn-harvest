@@ -17,7 +17,7 @@
 (***************************************************************************)
 EXTENDS ActivityClaim, Sequences
 
-CONSTANT Log  \* The trace. scripts/formal_traces.py writes it.
+CONSTANT Log  \* The trace. xtask/src/dev/formal_traces.rs writes it.
 
 VARIABLE cursor  \* The index of the next line to match.
 

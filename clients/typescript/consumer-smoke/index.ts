@@ -1,6 +1,6 @@
-// A consumer of the packed tarball. `build-typescript-client.sh` installs the
-// tarball next to this file and type-checks it, so a broken `exports` or
-// `types` entry fails the build.
+// A consumer of the packed tarball. `cargo xtask dev build-typescript-client`
+// installs the tarball next to this file and type-checks it, so a broken
+// `exports` or `types` entry fails the build.
 import { DEFAULT_BASE_URL, createHarvestClient, isStarted } from "autumn-harvest-client";
 import type { HealthResponse, WorkflowStatus } from "autumn-harvest-client";
 

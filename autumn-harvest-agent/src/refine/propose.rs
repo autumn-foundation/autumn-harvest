@@ -20,12 +20,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::bundle::BundleManifest;
+use super::meter::{Charge, Meter, total};
 use crate::agent::AgentProfile;
 use crate::agent::overlay::{self, Ceilings, ProfileOverlay};
 use crate::bounds::json_len;
 use crate::error::{AgentError, ErrorKind};
-use crate::harness::{AgentHarness, DEFAULT_MODEL, model_failure, truncate};
+use crate::harness::{AgentHarness, DEFAULT_MODEL, truncate};
+use crate::message::TokenUsage;
 use crate::model::BoxFuture;
+use autumn_harvest::llm_ledger::LlmCall;
 
 /// The most attempts of one stage.
 ///
@@ -178,9 +181,25 @@ pub struct ProposeContext<'a> {
     pub attempt: u32,
     /// Why the stage refused the reply of the last attempt.
     pub rejection: Option<&'a str>,
+    /// The sample number of the stage, from 1 (issue #2380). A refine run
+    /// asks k stages of one dimension from one base. Each one has its own
+    /// sample, so a proposer can vary its answer.
+    pub sample: u32,
+    /// Where [`charge`](Self::charge) records a model call. An app cannot
+    /// read it, so a proposer cannot take back its own charges.
+    pub(crate) meter: Option<&'a Meter>,
 }
 
 impl<'a> ProposeContext<'a> {
+    /// Record one model call of the proposer (issue #2380). The stage
+    /// writes a cost ledger row for it, and a refine run counts it in its
+    /// budget. Outside a stage, it does nothing.
+    pub fn charge(&self, charge: Charge) {
+        if let Some(meter) = self.meter {
+            meter.charge(charge);
+        }
+    }
+
     /// The context of attempt 1, with no rejection.
     #[must_use]
     pub const fn new(
@@ -198,6 +217,8 @@ impl<'a> ProposeContext<'a> {
             current,
             attempt: 1,
             rejection: None,
+            sample: 1,
+            meter: None,
         }
     }
 }
@@ -257,6 +278,24 @@ pub struct ProposeRequest {
     /// The number of attempts.
     #[serde(default)]
     pub attempts: ProposalAttempts,
+    /// The sample number of the stage, from 1 (issue #2380).
+    #[serde(default = "first_sample", skip_serializing_if = "is_first_sample")]
+    pub sample: u32,
+    /// The profiles of the other sources of a refine run, and the profile of
+    /// the kind (issue #2380). A valid reply applies to each of them too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub others: Vec<AgentProfile>,
+}
+
+/// The sample of a request that names none.
+const fn first_sample() -> u32 {
+    1
+}
+
+/// Whether `sample` is the first, so the request leaves it out.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_first_sample(sample: &u32) -> bool {
+    *sample == 1
 }
 
 /// The result of one stage.
@@ -284,6 +323,24 @@ pub struct Stage {
     pub attempts: u32,
     /// The result.
     pub outcome: StageOutcome,
+    /// The tokens of the proposer calls that the proposer charged (issue
+    /// #2380).
+    #[serde(default, skip_serializing_if = "is_no_usage")]
+    pub usage: TokenUsage,
+    /// The cost of those calls, in millionths of a US dollar.
+    #[serde(default, skip_serializing_if = "is_zero_cost")]
+    pub cost_usd_micros: u64,
+}
+
+/// Whether `usage` is empty, so the stage leaves it out.
+fn is_no_usage(usage: &TokenUsage) -> bool {
+    *usage == TokenUsage::default()
+}
+
+/// Whether `cost` is zero, so the stage leaves it out.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero_cost(cost: &u64) -> bool {
+    *cost == 0
 }
 
 impl Stage {
@@ -344,6 +401,80 @@ pub(crate) const fn next_step(attempt: u32, max: u32, verdict: Verdict) -> Step 
     }
 }
 
+/// One editor of a stage: a proposer, or a composer (issue #2380).
+pub(crate) trait Ask: Send + Sync {
+    /// Ask for attempt `attempt`. `rejection` is why the stage refused the
+    /// last reply. The editor charges its calls to `meter`.
+    fn ask<'a>(
+        &'a self,
+        attempt: u32,
+        rejection: Option<&'a str>,
+        meter: &'a Meter,
+    ) -> BoxFuture<'a, Result<ProposerReply, AgentError>>;
+}
+
+/// What one stage edits.
+pub(crate) struct Edit<'a> {
+    /// The base profile.
+    pub profile: &'a AgentProfile,
+    /// The overlay that the stage edits.
+    pub current: &'a ProfileOverlay,
+    /// The ceilings of the run.
+    pub ceilings: &'a Ceilings,
+    /// The number of attempts.
+    pub attempts: ProposalAttempts,
+    /// The profiles of the other sources of the run, and the profile of the
+    /// kind. A reply must apply to each of them too.
+    pub others: &'a [AgentProfile],
+}
+
+/// The end of one stage.
+pub(crate) struct Edited {
+    /// The result.
+    pub outcome: StageOutcome,
+    /// The editor calls.
+    pub attempts: u32,
+    /// The model calls that the editor charged.
+    pub charges: Vec<Charge>,
+}
+
+/// The proposer of one stage and what it reads.
+struct ProposeAsk<'a> {
+    proposer: &'a dyn OverlayProposer,
+    dimension: Dimension,
+    evidence: &'a Evidence,
+    profile: &'a AgentProfile,
+    ceilings: &'a Ceilings,
+    current: &'a ProfileOverlay,
+    sample: u32,
+}
+
+impl Ask for ProposeAsk<'_> {
+    fn ask<'a>(
+        &'a self,
+        attempt: u32,
+        rejection: Option<&'a str>,
+        meter: &'a Meter,
+    ) -> BoxFuture<'a, Result<ProposerReply, AgentError>> {
+        Box::pin(async move {
+            let context = ProposeContext {
+                attempt,
+                rejection,
+                sample: self.sample,
+                meter: Some(meter),
+                ..ProposeContext::new(
+                    self.dimension,
+                    self.evidence,
+                    self.profile,
+                    self.ceilings,
+                    self.current,
+                )
+            };
+            self.proposer.propose(&context).await
+        })
+    }
+}
+
 /// Runs one stage on `harness`.
 ///
 /// # Errors
@@ -352,10 +483,25 @@ pub(crate) const fn next_step(attempt: u32, max: u32, verdict: Verdict) -> Step 
 /// installed, `current` does not apply under the ceilings, or the proposer
 /// fails with a configuration kind. Returns a retryable payload when the
 /// proposer fails with a retryable kind.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn run_stage(
     harness: &AgentHarness,
     request: ProposeRequest,
 ) -> Result<Stage, String> {
+    run_stage_metered(harness, request)
+        .await
+        .map(|(stage, _calls)| stage)
+}
+
+/// [`run_stage`], with the cost ledger call of each charged model call.
+///
+/// # Errors
+///
+/// The errors of [`run_stage`].
+pub(crate) async fn run_stage_metered(
+    harness: &AgentHarness,
+    request: ProposeRequest,
+) -> Result<(Stage, Vec<LlmCall>), String> {
     let proposer = harness.overlay_proposer().ok_or_else(|| {
         ActivityFailure::non_retryable(
             PROPOSER_MISSING,
@@ -370,41 +516,87 @@ pub(crate) async fn run_stage(
         current,
         ceilings,
         attempts,
+        sample,
+        others,
     } = request;
-    // A fallback hands `current` on, so `current` must apply.
-    let base = overlay::apply(&profile, &current, &ceilings, harness).map_err(|err| {
-        ActivityFailure::non_retryable(
-            CURRENT_REFUSED,
-            format!("the current overlay does not apply under the ceilings of the run: {err}"),
-        )
-        .into_error_payload()
-    })?;
-    let cap = harness.result_cap();
-    let check = Check {
+    let ask = ProposeAsk {
+        proposer: proposer.as_ref(),
+        dimension,
+        evidence: &evidence,
         profile: &profile,
         ceilings: &ceilings,
+        current: &current,
+        sample,
+    };
+    let edit = Edit {
+        profile: &profile,
+        current: &current,
+        ceilings: &ceilings,
+        attempts,
+        others: &others,
+    };
+    let edited = edit_stage(harness, &edit, &ask).await?;
+    let (usage, cost_usd_micros) = total(&edited.charges);
+    let calls = edited.charges.iter().map(Charge::ledger_call).collect();
+    Ok((
+        Stage {
+            dimension,
+            attempts: edited.attempts,
+            outcome: edited.outcome,
+            usage,
+            cost_usd_micros,
+        },
+        calls,
+    ))
+}
+
+/// Runs the attempts of one stage with `ask`.
+///
+/// # Errors
+///
+/// Returns a non-retryable payload when `current` does not apply under the
+/// ceilings, or when the editor fails with a configuration kind. Returns a
+/// retryable payload when the editor fails with a retryable kind.
+pub(crate) async fn edit_stage(
+    harness: &AgentHarness,
+    edit: &Edit<'_>,
+    ask: &dyn Ask,
+) -> Result<Edited, String> {
+    // A fallback hands `current` on, so `current` must apply.
+    let base =
+        overlay::apply(edit.profile, edit.current, edit.ceilings, harness).map_err(|err| {
+            ActivityFailure::non_retryable(
+                CURRENT_REFUSED,
+                format!("the current overlay does not apply under the ceilings of the run: {err}"),
+            )
+            .into_error_payload()
+        })?;
+    let cap = harness.result_cap();
+    let check = Check {
+        profile: edit.profile,
+        others: edit.others,
+        ceilings: edit.ceilings,
         registry: harness,
         base: with_named_model(base),
         cap,
     };
     let limit = rejection_chars(cap);
     let budget = harness.proposer_budget();
-    let max = attempts.get();
+    let max = edit.attempts.get();
+    let meter = Meter::default();
     let mut rejection: Option<String> = None;
     let mut attempt = 1;
     loop {
-        let context = ProposeContext {
-            attempt,
-            rejection: rejection.as_deref(),
-            ..ProposeContext::new(dimension, &evidence, &profile, &ceilings, &current)
-        };
-        let reply = tokio::time::timeout(budget, proposer.propose(&context)).await;
+        let reply =
+            tokio::time::timeout(budget, ask.ask(attempt, rejection.as_deref(), &meter)).await;
         let checked = match reply {
             Err(_) => Err(format!(
                 "the proposer did not answer within {} ms",
                 budget.as_millis()
             )),
-            Ok(Err(err)) if fails_the_stage(err.kind()) => return Err(model_failure(&err)),
+            Ok(Err(err)) if fails_the_stage(err.kind()) => {
+                return Err(spent_failure(&err, &meter.take()));
+            }
             Ok(Err(err)) => Err(format!("the proposer failed: {err}")),
             Ok(Ok(reply)) => check.reply(reply),
         }
@@ -426,12 +618,44 @@ pub(crate) async fn run_stage(
             Ok(None) => StageOutcome::KeptBase,
             Err(error) => StageOutcome::FellBack { error },
         };
-        return Ok(Stage {
-            dimension,
-            attempts: attempt,
+        return Ok(Edited {
             outcome,
+            attempts: attempt,
+            charges: meter.take(),
         });
     }
+}
+
+/// The spend that a failed step reports in its failure details (issue
+/// #2380). The engine keeps no ledger row of a failed attempt, so the
+/// refine run reads the spend of the last attempt from here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpentDetails {
+    /// The tokens that the editor charged before the error.
+    pub usage: TokenUsage,
+    /// The cost that the editor charged before the error.
+    pub cost_usd_micros: u64,
+}
+
+/// The failure payload of the editor error `err`, with the spend of
+/// `charges` in its details. A retryable kind stays retryable.
+pub(crate) fn spent_failure(err: &AgentError, charges: &[Charge]) -> String {
+    let kind = format!("{:?}", err.kind());
+    let message = err.to_string();
+    let failure = if err.kind().is_retryable() {
+        ActivityFailure::retryable(kind, message)
+    } else {
+        ActivityFailure::non_retryable(kind, message)
+    };
+    let (usage, cost_usd_micros) = total(charges);
+    let details = SpentDetails {
+        usage,
+        cost_usd_micros,
+    };
+    failure
+        .with_details(serde_json::to_value(details).unwrap_or_default())
+        .into_error_payload()
 }
 
 /// Whether a proposer error of `kind` fails the activity.
@@ -472,6 +696,8 @@ fn with_named_model(mut profile: AgentProfile) -> AgentProfile {
 /// The inputs that check one reply.
 struct Check<'a> {
     profile: &'a AgentProfile,
+    /// The profiles of the other sources of the run.
+    others: &'a [AgentProfile],
     ceilings: &'a Ceilings,
     registry: &'a AgentHarness,
     /// The profile under `current`, with its model named.
@@ -491,6 +717,11 @@ impl Check<'_> {
         };
         let applied = overlay::apply(self.profile, &overlay, self.ceilings, self.registry)
             .map_err(|err| format!("the overlay is refused: {err}"))?;
+        for other in self.others {
+            overlay::apply(other, &overlay, self.ceilings, self.registry).map_err(|err| {
+                format!("the overlay is refused for another source of the run or the kind: {err}")
+            })?;
+        }
         if with_named_model(applied) == self.base {
             return Ok(None);
         }
@@ -530,7 +761,20 @@ pub async fn agent_refine_propose(
     ctx: &ActivityContext,
     request: ProposeRequest,
 ) -> Result<Stage, String> {
-    run_stage(crate::workflow::harness(ctx)?, request).await
+    let (stage, calls) = run_stage_metered(crate::workflow::harness(ctx)?, request).await?;
+    record_calls(ctx, calls);
+    Ok(stage)
+}
+
+/// Write `calls` to the cost ledger of the activity (issue #2380). A
+/// refusal does not fail the stage, because the provider already billed the
+/// calls.
+pub(crate) fn record_calls(ctx: &ActivityContext, calls: Vec<LlmCall>) {
+    for call in calls {
+        if let Err(err) = ctx.record_llm_call(call) {
+            tracing::warn!(error = %err, "the agent cost ledger refused a refine call");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -634,6 +878,8 @@ mod tests {
             profile,
             current,
             attempts: ProposalAttempts::new(attempts).unwrap(),
+            sample: 1,
+            others: Vec::new(),
         }
     }
 
@@ -1049,6 +1295,8 @@ mod tests {
             outcome: StageOutcome::FellBack {
                 error: "no".to_owned(),
             },
+            usage: TokenUsage::default(),
+            cost_usd_micros: 0,
         };
         let value = serde_json::to_value(&stage).unwrap();
         assert_eq!(

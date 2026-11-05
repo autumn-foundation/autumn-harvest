@@ -9,7 +9,7 @@
 //!
 //! `docs/api-contract.json` is the single source. [`document_from_contract`]
 //! transforms it. Two checked-in files hold the result, and
-//! `scripts/regenerate-openapi.sh` writes both:
+//! `cargo xtask dev regenerate-openapi` writes both:
 //!
 //! * `autumn-harvest-plugin/openapi.json` — compact, compiled in below, and
 //!   served verbatim. It lives inside the crate because a published crate can
@@ -82,7 +82,7 @@ pub struct OpenApiError(String);
 
 /// The generated document, compiled in and served verbatim.
 ///
-/// Written by `scripts/regenerate-openapi.sh`. Never edit it by hand.
+/// Written by `cargo xtask dev regenerate-openapi`. Never edit it by hand.
 const OPENAPI_JSON: &str = include_str!("../openapi.json");
 
 #[expect(clippy::expect_used, reason = "a unit test parses the generated file")]
@@ -193,7 +193,7 @@ fn info(contract: &Value) -> Value {
         "description": format!(
             "Generated from `docs/api-contract.json` (contract version {contract_version}). \
              Do not edit by hand. Regenerate with \
-             `scripts/regenerate-openapi.sh`.\n\n\
+             `cargo xtask dev regenerate-openapi`.\n\n\
              Every path is relative to the prefix the embedder passes to \
              `HarvestPlugin::api`, `{CONVENTIONAL_MOUNT_PATH}` by convention.\n\n\
              Auth: {auth_note}"

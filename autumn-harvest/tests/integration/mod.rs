@@ -110,6 +110,9 @@ mod completion_callback_tests;
 mod completion_trigger_outbox_queue_perf;
 mod concurrency_key_tests;
 mod concurrency_model_ci;
+#[cfg(feature = "db")]
+mod concurrency_override_db_tests;
+mod concurrency_override_guard;
 mod concurrency_supersede_tests;
 mod contention_adaptive_atomicity_docs;
 mod context_headers_tests;
@@ -298,6 +301,9 @@ mod queue_pause_tests;
 mod quota_enforcement_tests;
 mod quota_history_bytes_perf_tests;
 mod quota_lock_ordering_tests;
+#[cfg(feature = "db")]
+mod quota_override_db_tests;
+mod quota_override_guard;
 mod quota_reconcile_candidate_bound_tests;
 mod quota_reconcile_candidate_scan_perf_tests;
 mod quota_reconcile_tests;
@@ -495,3 +501,4 @@ mod workflow_task_timeout_tests;
 mod workflow_test_env_mid_run_tests;
 #[cfg(feature = "testing")]
 mod workflow_test_env_tests;
+mod xtask_bin;

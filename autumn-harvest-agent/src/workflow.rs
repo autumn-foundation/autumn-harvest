@@ -32,14 +32,20 @@ use crate::agent::{
     agent_info, agent_memory_reset_info, agent_profile_info, agent_profile_overlay_info,
     agent_workspace_floor_info, agent_workspace_reset_info, agent_workspace_retain_info,
 };
+use crate::answer_check::{self, Checked};
 use crate::approval::{Approval, Decision, approval_signal, await_decision, decode_decision};
-use crate::bounds::{RoundBudget, json_len, reaches_percent, reset_due, sibling_cap};
+use crate::bounds::{
+    RoundBudget, full_round_resets, json_len, reaches_percent, reset_due, sibling_cap,
+};
 use crate::context_reset::{self, ProgressNotes, SAVE_PROGRESS_TOOL};
 use crate::delivery::{Report, ReportSource, report_text};
 use crate::draw::Draw;
+use crate::fan_out_plan::{Fit, Step, fan_out_plan};
 use crate::flow::Released;
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
-use crate::harness::{AgentHarness, CacheTenant, DEFAULT_TOOL_OUTPUT_LIMIT, truncate};
+use crate::harness::{
+    AgentHarness, CacheTenant, TRUNCATED, max_tool_result_bytes, truncate, truncate_flagged,
+};
 use crate::heartbeat::{HeartbeatTask, agent_heartbeat_info};
 use crate::loop_guard::{LoopTracker, LoopVerdict, warning_note};
 use crate::memory::{
@@ -48,7 +54,7 @@ use crate::memory::{
 };
 use crate::mesh::{
     DELEGATE_TOOL, DelegateArgs, DelegationRecord, INVALID_NAME, Mandate, Peer, Refusal,
-    delegate_definition, valid_name,
+    SerialReason, delegate_definition, valid_name,
 };
 use crate::mesh_control::{MESH_ATTR, MESH_BUDGET_EXCEEDED, MeshBudgetExceeded};
 use crate::message::{
@@ -73,6 +79,19 @@ const FINAL_TURN_PATCH: &str = "agent_final_turn_rules";
 /// with the old input.
 const CHILD_FAILURE_REPORT_PATCH: &str = "agent_child_failure_report";
 
+/// The cut of a delegation answer in a history from before issue #2481.
+///
+/// Such a history recorded its peer lookup with no `answer_limit`. Its run
+/// replays with this cut and with no `truncated` key. A new lookup always
+/// holds a limit, so a new run never reads this value.
+const LEGACY_ANSWER_LIMIT: usize = 8_000;
+
+/// The gate of the rules for a tool round over the cap (issue #2461). The
+/// loop asks it only where a new rule changes the branch: a round that
+/// resets, and a stopped save round. A history recorded before the gate
+/// holds no marker there, so it replays as it ran.
+const RESET_ON_FULL_PATCH: &str = "agent_reset_on_full_round";
+
 /// The registered workflow name.
 pub const WORKFLOW_NAME: &str = "agent_loop";
 
@@ -83,6 +102,8 @@ pub(crate) struct Progress {
     pub(crate) messages: Vec<ChatMessage>,
     /// Tokens of the whole run, earlier segments and delegations included.
     pub(crate) usage: TokenUsage,
+    /// The priced cost of the same calls, in millionths of a US dollar.
+    pub(crate) cost_usd_micros: u64,
     /// Tool rounds of this segment. `max_steps` bounds it.
     pub(crate) steps: u32,
     /// Tool rounds of the earlier segments. Tool steps add it, so they never
@@ -130,6 +151,11 @@ pub(crate) struct Progress {
     /// The steer messages of this segment. A reset keeps them, so a reset
     /// never drops a message from a person.
     pub(crate) steers: Vec<ChatMessage>,
+    /// The admitted answer check of the run (issue #2442).
+    pub(crate) check: Option<answer_check::ActiveCheck>,
+    /// The reason of each answer that the check rejected, follow-ups
+    /// included.
+    pub(crate) rejections: Vec<String>,
 }
 
 /// The notes and the context resets of one run (issue #2453).
@@ -148,6 +174,10 @@ pub(crate) struct ResetState {
     /// The booking that woke this segment, with its result. Each reset of
     /// the segment keeps it, because the wake message points at it.
     pub(crate) woken_by: Option<[ChatMessage; 2]>,
+    /// The tool round over the cap that made the next reset due, with its
+    /// answers (issue #2461). The reset window keeps it, so the model sees
+    /// which calls ran. The reset clears it.
+    pub(crate) kept: Option<[ChatMessage; 2]>,
 }
 
 /// The steer messages of a durable agent (issue #2265).
@@ -192,6 +222,7 @@ impl Progress {
             run_id,
             messages,
             usage: TokenUsage::default(),
+            cost_usd_micros: 0,
             steps: 0,
             step_base: 0,
             tool_calls: 0,
@@ -212,6 +243,8 @@ impl Progress {
             workspace: None,
             reset: ResetState::default(),
             steers: Vec::new(),
+            check: None,
+            rejections: Vec::new(),
         }
     }
 
@@ -247,6 +280,7 @@ impl Progress {
                 .saturating_add(self.delegated_steps),
             tool_calls: self.tool_calls.saturating_add(self.delegated_tool_calls),
             usage: self.usage,
+            cost_usd_micros: self.cost_usd_micros,
             messages: without_system(&self.messages),
             followups: self.chain,
             followup_dropped: false,
@@ -256,7 +290,13 @@ impl Progress {
             workspace: self.workspace.as_ref().and_then(|mount| mount.head.clone()),
             error: None,
             resets: self.reset.count,
+            answer_rejections: self.rejections.clone(),
         }
+    }
+
+    /// Add the cost of a call or of a child run.
+    pub(crate) const fn add_cost(&mut self, cost_usd_micros: u64) {
+        self.cost_usd_micros = self.cost_usd_micros.saturating_add(cost_usd_micros);
     }
 
     /// The report of a run that failed with `error`. It keeps what the run
@@ -436,6 +476,7 @@ fn next_request(
         model: task.model.clone(),
         tool_guidance: task.tool_guidance.clone(),
         skills: !task.skills.is_empty(),
+        allowed_effects: task.allowed_effects.clone(),
         draw: task.draw.as_ref().map(|draw| draw.id),
     }
 }
@@ -509,6 +550,9 @@ pub(crate) async fn drive(
     }
     let mut tree = root_tree(ctx, task, &progress.run_id);
     let agent = root_member(ctx, task).await?;
+    if let Some(failed) = Box::pin(admit_check(ctx, task, &mut progress, &tree)).await? {
+        return Ok((failed, 0));
+    }
     let mut input = task.input.as_str();
     let mut delivered = 0_u32;
     loop {
@@ -543,7 +587,9 @@ pub(crate) async fn drive(
             Err(error) => return Err(error),
         };
         let mut report = progress.report(stop, &tree);
-        if task.deliver {
+        // A probe sends no report (issue #2378). Its answer is for the
+        // operator, not for a person.
+        if task.deliver && task.probe.is_none() {
             let source = if woken {
                 ReportSource::Followup
             } else {
@@ -681,6 +727,7 @@ async fn open_segment(
     progress.steers.clear();
     // A save turn that ended its segment has no reset to run.
     progress.reset.pending = false;
+    progress.reset.kept = None;
     if progress
         .sent
         .as_ref()
@@ -776,7 +823,12 @@ pub(crate) async fn run_segment(
         };
 
         progress.usage = progress.usage.saturating_add(turn.usage);
-        publish_turn_text(ctx, run, progress, &turn)?;
+        progress.add_cost(turn.cost_usd_micros.unwrap_or(0));
+        // A run with an answer check publishes a final answer only after the
+        // check (issue #2442). A run with no check publishes each turn here.
+        if progress.check.is_none() || !turn.calls().is_empty() {
+            publish_turn_text(ctx, run, progress, &turn)?;
+        }
         // The activity drops a reply that does not fit the result cap. The
         // turn then holds no text and no calls, so the segment ends here.
         if turn.oversized {
@@ -788,12 +840,10 @@ pub(crate) async fn run_segment(
         let calls = turn.calls();
 
         if calls.is_empty() {
-            if save_reply(progress, &turn, over_budget) {
-                continue;
+            match Box::pin(answer_turn(ctx, run, progress, &turn, over_budget)).await? {
+                Some(stop) => return Ok(stop),
+                None => continue,
             }
-            progress.push_assistant(&turn);
-            progress.answer = Some(turn.text());
-            return Ok(answer_stop(&turn, over_budget));
         }
         // A turn with calls that ends here is NOT added to the transcript. A
         // tool call with no result would make the transcript invalid for the
@@ -825,13 +875,10 @@ pub(crate) async fn run_segment(
 
         match Box::pin(run_round(ctx, run, progress, tree, slot, &turn, calls)).await? {
             RoundEnd::Continue => {}
-            // The reset of a save round runs next, with the notes it has.
-            RoundEnd::Full if progress.reset.pending => {}
-            RoundEnd::Full => {
-                // Not every call ran, so the text of the turn is no answer.
-                // It can claim work that never ran.
-                progress.last_text = narration;
-                return Ok(AgentStop::TranscriptFull);
+            RoundEnd::Full { stopped } => {
+                if !full_round_goes_on(ctx, run, progress, tree, input, stopped, narration) {
+                    return Ok(AgentStop::TranscriptFull);
+                }
             }
             RoundEnd::Loop => return Ok(AgentStop::LoopDetected),
             RoundEnd::Interrupted => {
@@ -839,6 +886,85 @@ pub(crate) async fn run_segment(
                 progress.last_text = narration;
                 return Ok(AgentStop::Interrupted);
             }
+        }
+    }
+}
+
+/// Read the policy of the answer check of `task` and admit the check
+/// (issue #2442). It runs before the first model call.
+///
+/// Returns the failed report of a refused check under `report_failure`.
+///
+/// # Errors
+///
+/// Returns the refusal, or the error of the policy read.
+async fn admit_check(
+    ctx: &WorkflowContext,
+    task: &AgentTask,
+    progress: &mut Progress,
+    tree: &Tree,
+) -> Result<Option<AgentReport>, String> {
+    match answer_check::admit(ctx, task).await {
+        Ok(check) => {
+            progress.check = check;
+            Ok(None)
+        }
+        Err(error) if task.report_failure => Ok(Some(progress.failure(error, tree))),
+        Err(error) => Err(error),
+    }
+}
+
+/// End the segment on `turn`, a turn with no calls, and return its stop.
+///
+/// `None` asks the model again. That is the reply to a save turn (issue
+/// #2453), or an answer that the check rejected within its cap (issue
+/// #2442). Only an answer that completes is checked.
+///
+/// With a check, the loop publishes the durable text of the turn here. A
+/// rejected or unchecked answer then never reaches the durable stream.
+async fn answer_turn(
+    ctx: &WorkflowContext,
+    run: Run<'_>,
+    progress: &mut Progress,
+    turn: &ModelTurn,
+    over_budget: bool,
+) -> Result<Option<AgentStop>, String> {
+    let checked = progress.check.is_some();
+    if save_reply(progress, turn, over_budget) {
+        if checked {
+            publish_turn_text(ctx, run, progress, turn)?;
+        }
+        return Ok(None);
+    }
+    let narration = progress.last_text.clone();
+    progress.push_assistant(turn);
+    let answer = turn.text();
+    let stop = answer_stop(turn, over_budget);
+    if stop != AgentStop::Completed {
+        if checked {
+            publish_turn_text(ctx, run, progress, turn)?;
+        }
+        progress.answer = Some(answer);
+        return Ok(Some(stop));
+    }
+    match answer_check::check(ctx, run.task, progress, &answer).await? {
+        Checked::Passed => {
+            if checked {
+                publish_turn_text(ctx, run, progress, turn)?;
+            }
+            progress.answer = Some(answer);
+            Ok(Some(stop))
+        }
+        // The report keeps the last answer. No answer is delivered.
+        Checked::Stop(AgentStop::AnswerRejected) => Ok(Some(AgentStop::AnswerRejected)),
+        // A rejected or unchecked answer is not the text of the report.
+        Checked::Retry => {
+            progress.last_text = narration;
+            Ok(None)
+        }
+        Checked::Stop(stop) => {
+            progress.last_text = narration;
+            Ok(Some(stop))
         }
     }
 }
@@ -859,6 +985,81 @@ fn answer_stop(turn: &ModelTurn, over_budget: bool) -> AgentStop {
 /// before the next request. A bound that ends the run still ends it.
 fn save_reply(progress: &Progress, turn: &ModelTurn, over_budget: bool) -> bool {
     progress.reset.pending && !over_budget && turn.stop != StopReason::MaxTokens
+}
+
+/// Whether a segment goes on after a tool round over the cap.
+///
+/// The reset of a save round runs next, with the notes it has. Any other
+/// round goes on only when [`reset_on_full_round`] resets it. A round that
+/// the loop guard or an interrupt also stopped never goes on, so the stop
+/// holds. A save round before that rule went on, so the gate keeps that
+/// history (issue #2461).
+///
+/// Not every call ran, so the text of the turn is no answer. It can claim
+/// work that never ran. So `narration`, the text before the turn, comes back
+/// unless the save round goes on.
+fn full_round_goes_on(
+    ctx: &WorkflowContext,
+    run: Run<'_>,
+    progress: &mut Progress,
+    tree: &Tree,
+    input: &str,
+    stopped: bool,
+    narration: String,
+) -> bool {
+    let save_round = progress.reset.pending;
+    if save_round && !(stopped && ctx.patched(RESET_ON_FULL_PATCH)) {
+        return true;
+    }
+    progress.last_text = narration;
+    !save_round && !stopped && reset_on_full_round(ctx, run, progress, tree, input)
+}
+
+/// Whether a tool round over the cap resets, and does not end the run
+/// (issue #2461).
+///
+/// The reset keeps the round with its answers. A call that ran shows its
+/// result or `DROPPED_FULL`, and a call that did not run shows
+/// `NOT_RUN_FULL`. So the model does not run a call with an effect again.
+///
+/// The round resets when a reset is left and the window after the reset,
+/// with the notes of that time, falls under the threshold. Then the next
+/// request takes the reset, with a save turn first when one fits. The check
+/// reads only recorded data, so replay takes the same branch.
+fn reset_on_full_round(
+    ctx: &WorkflowContext,
+    run: Run<'_>,
+    progress: &mut Progress,
+    tree: &Tree,
+    input: &str,
+) -> bool {
+    let Some(setting) = run.task.context_reset else {
+        return false;
+    };
+    // The round pushed its assistant turn, then its tool message.
+    let [.., call, answers] = progress.messages.as_slice() else {
+        return false;
+    };
+    progress.reset.kept = Some([call.clone(), answers.clone()]);
+    let after = reset_window(run.task, progress, input);
+    let after_len = json_len(&next_request(
+        run,
+        progress,
+        tree,
+        &run.extra_tools(),
+        after,
+    ));
+    let resets = full_round_resets(
+        progress.reset.count,
+        setting.max_resets,
+        after_len,
+        run.task.request_cap(),
+        setting.reset_at_percent,
+    ) && ctx.patched(RESET_ON_FULL_PATCH);
+    if !resets {
+        progress.reset.kept = None;
+    }
+    resets
 }
 
 /// The next request and its size, after a context reset when one is due
@@ -901,6 +1102,9 @@ fn sized_request(
 /// Without room, the reset runs at once. A reset whose window, with the
 /// notes of that time, still reaches the threshold frees no room. So it does
 /// not run, because it would only spend the next reset.
+///
+/// A round over the cap that kept its answers makes the reset due at once
+/// (issue #2461). [`reset_on_full_round`] already checked its room.
 fn plan_reset(
     run: Run<'_>,
     progress: &mut Progress,
@@ -914,19 +1118,21 @@ fn plan_reset(
     if std::mem::take(&mut progress.reset.pending) {
         return Some(reset_now(run.task, progress, input));
     }
-    if !reset_due(
-        progress.reset.count,
-        setting.max_resets,
-        len,
-        cap,
-        setting.reset_at_percent,
-    ) {
-        return None;
-    }
-    let after = reset_window(run.task, progress, input);
-    let after_len = json_len(&next_request(run, progress, tree, extra_tools, after));
-    if reaches_percent(after_len, cap, setting.reset_at_percent) {
-        return None;
+    if progress.reset.kept.is_none() {
+        if !reset_due(
+            progress.reset.count,
+            setting.max_resets,
+            len,
+            cap,
+            setting.reset_at_percent,
+        ) {
+            return None;
+        }
+        let after = reset_window(run.task, progress, input);
+        let after_len = json_len(&next_request(run, progress, tree, extra_tools, after));
+        if reaches_percent(after_len, cap, setting.reset_at_percent) {
+            return None;
+        }
     }
     let mut noticed = progress.messages.clone();
     noticed.push(ChatMessage::text(
@@ -952,7 +1158,10 @@ fn plan_reset(
 fn reset_now(task: &AgentTask, progress: &mut Progress, input: &str) -> Vec<ChatMessage> {
     progress.reset.count = progress.reset.count.saturating_add(1);
     progress.sent = None;
-    reset_window(task, progress, input)
+    let window = reset_window(task, progress, input);
+    // A later reset drops the kept round like any other turn.
+    progress.reset.kept = None;
+    window
 }
 
 /// The window after a reset (issue #2453).
@@ -960,7 +1169,11 @@ fn reset_now(task: &AgentTask, progress: &mut Progress, input: &str) -> Vec<Chat
 /// It holds the system prompt and the task. In a segment that a follow-up
 /// woke, the booking that woke it follows. The wake message points at that
 /// booking, so the wake message comes next. The booking that this segment
-/// made follows that. Then the notes follow, and last the steers.
+/// made follows that. A kept round over the cap follows (issue #2461). Then
+/// the notes follow, and last the steers.
+///
+/// The kept round can hold the booking of the segment. Then the booking
+/// shows only in the round, so no call id comes twice.
 fn reset_window(task: &AgentTask, progress: &Progress, input: &str) -> Vec<ChatMessage> {
     let messages = &progress.messages;
     let mut window = Vec::with_capacity(10 + progress.steers.len());
@@ -985,9 +1198,13 @@ fn reset_window(task: &AgentTask, progress: &Progress, input: &str) -> Vec<ChatM
     if input != task.input {
         window.push(ChatMessage::text(ChatRole::User, input));
     }
+    let kept = progress.reset.kept.as_ref();
     if progress.followup.is_some() {
-        window.extend(booking(&messages[start..]).into_iter().flatten());
+        let own = booking(&messages[start..])
+            .filter(|[call, _]| !kept.is_some_and(|[round, _]| holds_calls_of(round, call)));
+        window.extend(own.into_iter().flatten());
     }
+    window.extend(kept.into_iter().flatten().cloned());
     if let Some(notes) = &progress.reset.notes {
         window.extend(context_reset::restored(&notes.text));
     }
@@ -1024,6 +1241,14 @@ fn booking(messages: &[ChatMessage]) -> Option<[ChatMessage; 2]> {
             content: vec![result.clone()],
         },
     ])
+}
+
+/// Whether `message` holds every call part of `calls`.
+fn holds_calls_of(message: &ChatMessage, calls: &ChatMessage) -> bool {
+    calls
+        .content
+        .iter()
+        .all(|part| message.content.contains(part))
 }
 
 /// The result part of the call `id` in `messages`.
@@ -1254,8 +1479,9 @@ async fn system_prompt(
 enum RoundEnd {
     /// Every call has an answer. Ask the model again.
     Continue,
-    /// The next request would exceed the request cap.
-    Full,
+    /// The next request would exceed the request cap. `stopped` is true when
+    /// the loop guard or an interrupt also stopped the round.
+    Full { stopped: bool },
     /// The loop guard stopped the run.
     Loop,
     /// An interrupt ended the round (issue #2265).
@@ -1366,9 +1592,11 @@ fn flow_after(tree: &Tree, turn: &ModelTurn) -> (BTreeSet<String>, Released) {
 /// each call does not fit, no call runs. The model could not read a result.
 ///
 /// The round drops a result that does not fit, and runs no more calls. The
-/// run then ends, so the model never reads a later result. No more calls run
-/// after the loop guard stops the run either. Each call still gets an answer,
-/// so the transcript stays valid and shows what ran.
+/// run then ends, so the model never reads a later result. With a reset left
+/// and room in the reset window, the run resets instead (issue #2461). A
+/// round that the loop guard or an interrupt also stopped never resets. No
+/// more calls run after the loop guard stops the run either. Each call still
+/// gets an answer, so the transcript stays valid and shows what ran.
 async fn run_round(
     ctx: &WorkflowContext,
     run: Run<'_>,
@@ -1380,7 +1608,7 @@ async fn run_round(
 ) -> Result<RoundEnd, String> {
     let task = run.task;
     let mut budget = round_budget(run, progress, tree, turn, &calls);
-    let batches = fan_out_batches(&calls, &turn.decisions, run.agent, task.parallel_children);
+    let plan = round_plan(&calls, &turn.decisions, run.agent, task.parallel_children);
     let mut results = Vec::with_capacity(calls.len());
     let mut full = false;
     let mut looped = false;
@@ -1427,10 +1655,10 @@ async fn run_round(
             *guard.full = true;
             ToolOutcome::error(NOT_RUN_FULL).content
         } else {
-            let batch = batches
-                .iter()
-                .find(|(start, _)| *start == position)
-                .map(|&(start, len)| start..start + len);
+            let batch = match plan.get(position) {
+                Some(&Step::Lead(len)) => Some(position..position + len),
+                _ => None,
+            };
             let span = batch.clone().unwrap_or(position..position + 1);
             // With flow rules, the turn decided each call against the labels
             // before the round. A delegation can add the labels of its child.
@@ -1441,10 +1669,14 @@ async fn run_round(
                     .cloned()
                     .collect::<BTreeSet<_>>()
             });
+            let before = tree.records.len();
             let (outcome, rest) = act(
                 ctx, run, progress, tree, slot, turn, &calls, position, batch,
             )
             .await?;
+            if let Some(&Step::Alone(reason)) = plan.get(position) {
+                note_serial(ctx, tree, before, call, reason);
+            }
             fanned = rest;
             stale = expected.is_some_and(|expected| !tree.exercised.is_subset(&expected));
             let mut guard = Settle {
@@ -1465,7 +1697,9 @@ async fn run_round(
         content: results,
     });
     Ok(if full {
-        RoundEnd::Full
+        RoundEnd::Full {
+            stopped: looped || progress.interrupted,
+        }
     } else if looped {
         RoundEnd::Loop
     } else if progress.interrupted {
@@ -1572,50 +1806,85 @@ impl Settle<'_, '_> {
     }
 }
 
-/// The fan-out batches of one round (issue #2270). Returns `(start, len)`
-/// pairs.
+/// The fan-out plan of one round (issues #2270 and #2483).
 ///
 /// A batch is two or more calls in a row. The policy allows each call, and
 /// each call delegates to an inline peer. A batch holds at most `bound`
-/// calls.
-///
-/// A gated delegation, or one to a durable peer, runs alone, as before.
-fn fan_out_batches(
+/// calls. A gated delegation, or one to a durable peer, runs alone, as
+/// before. The step of each delegation that runs alone names why.
+fn round_plan(
     calls: &[ToolCall],
     decisions: &[ToolDecision],
     agent: Option<&Member>,
     bound: u32,
-) -> Vec<(usize, usize)> {
+) -> Vec<Step> {
     let bound = usize::try_from(bound.min(MAX_PARALLEL_CHILDREN)).unwrap_or(1);
-    // A bound under 2 never extends a batch past one call.
     let Some(agent) = agent else {
-        return Vec::new();
+        return vec![Step::Skip; calls.len()];
     };
-    let batchable = |position: usize| {
-        let call = &calls[position];
-        call.name == DELEGATE_TOOL
-            && matches!(decisions.get(position), Some(ToolDecision::Allow))
-            && delegate_args(&call.arguments)
-                .and_then(|args| agent.peers.iter().find(|peer| peer.name == args.agent))
-                .is_some_and(|peer| peer.agent.is_none())
-    };
-    let mut batches = Vec::new();
-    let mut start = 0;
-    while start < calls.len() {
-        if !batchable(start) {
-            start += 1;
-            continue;
-        }
-        let mut end = start + 1;
-        while end < calls.len() && end - start < bound && batchable(end) {
-            end += 1;
-        }
-        if end - start >= 2 {
-            batches.push((start, end - start));
-        }
-        start = end;
+    let fits: Vec<Fit> = calls
+        .iter()
+        .enumerate()
+        .map(|(position, call)| fit(call, decisions.get(position), agent))
+        .collect();
+    fan_out_plan(&fits, bound)
+}
+
+/// What one call is to a fan-out. A call to a peer that the roster does not
+/// name is refused, so the plan does not touch it. A person can edit the
+/// target of a gated call, so a gated call is `Gated` whatever peer it names.
+fn fit(call: &ToolCall, decision: Option<&ToolDecision>, agent: &Member) -> Fit {
+    if call.name != DELEGATE_TOOL {
+        return Fit::Other;
     }
-    batches
+    match decision {
+        None | Some(ToolDecision::Deny { .. }) => return Fit::Other,
+        Some(ToolDecision::RequireApproval { .. }) => return Fit::Gated,
+        Some(ToolDecision::Allow) => {}
+    }
+    let Some(peer) = delegate_args(&call.arguments)
+        .and_then(|args| agent.peers.iter().find(|peer| peer.name == args.agent))
+    else {
+        return Fit::Other;
+    };
+    if peer.agent.is_some() {
+        Fit::Durable
+    } else {
+        Fit::Batchable
+    }
+}
+
+/// Write `reason` on the record of a delegation that ran alone (issue
+/// #2483).
+///
+/// The call pushes its own record last, after the records of its subtree.
+/// A refused delegation did not run, so its record keeps no reason. This
+/// includes a durable peer that refuses the message. A person can also
+/// reject a gated call. It then pushes no record.
+fn note_serial(
+    ctx: &WorkflowContext,
+    tree: &mut Tree,
+    before: usize,
+    call: &ToolCall,
+    reason: SerialReason,
+) {
+    let Some(record) = tree.records.get_mut(before..).and_then(<[_]>::last_mut) else {
+        return;
+    };
+    if record.refusal.is_some() {
+        return;
+    }
+    record.serial = Some(reason);
+    // Replay runs this code again. The record is the durable trace, so the
+    // log line fires only once.
+    if !ctx.is_replaying() {
+        tracing::debug!(
+            call_id = %call.id,
+            chain = ?record.chain,
+            reason = reason.code(),
+            "a delegation ran alone"
+        );
+    }
 }
 
 /// The longest answer that the round writes for a call with no result.
@@ -1865,6 +2134,8 @@ async fn run_tool(
         flow_labels,
         workspace: progress.workspace.clone(),
         skill: None,
+        allowed_effects: task.allowed_effects.clone(),
+        probe_effects: task.probe.map(crate::types::Probe::effects),
     };
     if wants_skill {
         request.skill = Some(skill::lookup(
@@ -2073,6 +2344,7 @@ async fn delegate(
     // A failed child paid for its turns, so the parent counts them.
     if ended.is_err() {
         progress.usage = progress.usage.saturating_add(child.usage);
+        progress.add_cost(child.cost_usd_micros);
     }
     let stop = ended?;
     // An interrupt that ended the child ends the round of the parent too.
@@ -2083,6 +2355,7 @@ async fn delegate(
     let steps = child.steps.saturating_add(child.delegated_steps);
     let tool_calls = child.tool_calls.saturating_add(child.delegated_tool_calls);
     progress.usage = progress.usage.saturating_add(child.usage);
+    progress.add_cost(child.cost_usd_micros);
     progress.delegated_steps = progress.delegated_steps.saturating_add(steps);
     progress.delegated_tool_calls = progress.delegated_tool_calls.saturating_add(tool_calls);
     tree.records.push(DelegationRecord {
@@ -2094,18 +2367,127 @@ async fn delegate(
         steps_used: steps,
         tool_calls,
         resets: child.reset.count,
+        answer_truncated: false,
+        serial: None,
     });
-    let outcome = serde_json::json!({
+    let mut outcome = serde_json::json!({
         "agent": peer.name,
         "stop": stop,
-        "answer": truncate(&child.last_text, DEFAULT_TOOL_OUTPUT_LIMIT),
-    })
-    .to_string();
+    });
+    AnswerRoom::of(ctx, task).put(tree, peer, &mut outcome, &child.last_text);
+    let outcome = outcome.to_string();
     Ok(ToolOutcome {
         content: outcome,
         is_error: stop != AgentStop::Completed,
         workspace: None,
     })
+}
+
+/// The room for one delegation answer in the next request of the parent
+/// (issue #2481).
+#[derive(Clone, Copy)]
+struct AnswerRoom<'a> {
+    ctx: &'a WorkflowContext,
+    /// The byte share of one result under the request cap of the parent.
+    max_bytes: usize,
+}
+
+impl<'a> AnswerRoom<'a> {
+    /// The room under the request cap of `task`.
+    ///
+    /// A tool result gets the same share of its result cap. Without this
+    /// cut, an answer over the cap drops whole, and the run ends as
+    /// `transcript_full`.
+    fn of(ctx: &'a WorkflowContext, task: &AgentTask) -> Self {
+        Self {
+            ctx,
+            max_bytes: max_tool_result_bytes(task.request_cap()),
+        }
+    }
+
+    /// Put the answer of `peer` into `result`, and report a cut.
+    ///
+    /// A cut sets `answer_truncated` on the last record of `tree`, which
+    /// is the record of this delegation. The operator also gets a warning.
+    fn put(self, tree: &mut Tree, peer: &Peer, result: &mut serde_json::Value, answer: &str) {
+        if !put_answer(result, peer, answer, self.max_bytes) {
+            return;
+        }
+        if let Some(record) = tree.records.last_mut() {
+            record.answer_truncated = true;
+        }
+        self.ctx.log_warn(&format!(
+            "the answer of the peer {:?} is cut: it has {} characters, and the limit is {} characters or {} bytes",
+            peer.name,
+            answer.chars().count(),
+            peer.answer_limit.unwrap_or(usize::MAX),
+            self.max_bytes,
+        ));
+    }
+}
+
+/// Put the answer of `peer` into a delegation result (issue #2481).
+///
+/// It cuts the answer to the character limit of the peer. It also cuts the
+/// encoded result to `max_bytes`, as a tool result is cut. The encoded size
+/// counts each escape, so the request escape stays inside the share. The
+/// `truncated` key tells the parent model whether text dropped. It returns
+/// `true` on a cut.
+///
+/// Put every other key into `result` first, so the cut measures them.
+///
+/// A peer lookup from before issue #2481 has no limit. Then the result
+/// keeps the old cut and the old shape, and the function returns `false`.
+/// So that run replays as it ran.
+fn put_answer(result: &mut serde_json::Value, peer: &Peer, answer: &str, max_bytes: usize) -> bool {
+    let Some(limit) = peer.answer_limit else {
+        result["answer"] = truncate(answer, LEGACY_ANSWER_LIMIT).into();
+        return false;
+    };
+    // `false` is the longer flag, so the frame holds for either value.
+    result["answer"] = "".into();
+    result["truncated"] = false.into();
+    let frame = result.to_string().len();
+    let (shown, mut cut) = truncate_flagged(answer, limit);
+    let shown = if frame.saturating_add(escaped_len(&shown)) <= max_bytes {
+        shown
+    } else {
+        cut = true;
+        let room = max_bytes
+            .saturating_sub(frame)
+            .saturating_sub(escaped_len(TRUNCATED));
+        format!("{}{TRUNCATED}", escaped_prefix(answer, limit, room))
+    };
+    result["answer"] = shown.into();
+    result["truncated"] = cut.into();
+    cut
+}
+
+/// The longest prefix of the first `limit` characters of `text` whose JSON
+/// escape fits `room` bytes.
+fn escaped_prefix(text: &str, limit: usize, room: usize) -> &str {
+    let mut used = 0_usize;
+    for (taken, (index, c)) in text.char_indices().enumerate() {
+        used = used.saturating_add(escaped_char_len(c));
+        if taken >= limit || used > room {
+            return &text[..index];
+        }
+    }
+    text
+}
+
+/// The bytes of `text` inside a JSON string, without the quotes.
+fn escaped_len(text: &str) -> usize {
+    text.chars().map(escaped_char_len).sum()
+}
+
+/// The bytes of `c` inside a JSON string, as `serde_json` writes it.
+const fn escaped_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+        '\0'..='\u{1f}' => 6,
+        _ => c.len_utf8(),
+    }
 }
 
 /// Record a refused delegation and answer the model.
@@ -2128,6 +2510,8 @@ fn refuse_delegation(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &s
         steps_used: 0,
         tool_calls: 0,
         resets: 0,
+        answer_truncated: false,
+        serial: None,
     });
     refused(refusal, name)
 }
@@ -2246,8 +2630,9 @@ async fn fan_out(
     // Each sibling ended, so every report joins the parent. The first
     // failure in input order fails the batch.
     let mut failed = None;
+    let room = AnswerRoom::of(ctx, task);
     for ((position, peer, child), output) in children.into_iter().zip(ended) {
-        match merge_ended(progress, tree, peer, child, output) {
+        match merge_ended(room, progress, tree, peer, child, output) {
             Ok(outcome) => outcomes[position] = Some(outcome),
             Err(err) => {
                 failed.get_or_insert(err);
@@ -2268,6 +2653,7 @@ async fn fan_out(
 /// A child that reported its failure still joins the parent. Then it counts
 /// as a failure like any other (issue #2328).
 fn merge_ended(
+    room: AnswerRoom<'_>,
     progress: &mut Progress,
     tree: &mut Tree,
     peer: &Peer,
@@ -2277,7 +2663,7 @@ fn merge_ended(
     let report = output.and_then(|value| {
         serde_json::from_value::<AgentReport>(value).map_err(|err| err.to_string())
     })?;
-    let outcome = merge_child(progress, tree, peer, child, &report);
+    let outcome = merge_child(room, progress, tree, peer, child, &report);
     if report.stop == AgentStop::Failed {
         return Err(report
             .error
@@ -2301,6 +2687,7 @@ fn sibling<'a>(agent: &'a Member, used: u32, name: &str) -> Result<(Mandate, &'a
 
 /// Add the report of one child run to the parent, and answer the model.
 fn merge_child(
+    room: AnswerRoom<'_>,
     progress: &mut Progress,
     tree: &mut Tree,
     peer: &Peer,
@@ -2308,6 +2695,7 @@ fn merge_child(
     report: &AgentReport,
 ) -> ToolOutcome {
     progress.usage = progress.usage.saturating_add(report.usage);
+    progress.add_cost(report.cost_usd_micros);
     progress.delegated_steps = progress.delegated_steps.saturating_add(report.steps_used);
     progress.delegated_tool_calls = progress
         .delegated_tool_calls
@@ -2334,13 +2722,15 @@ fn merge_child(
         steps_used: report.steps_used,
         tool_calls: report.tool_calls,
         resets: report.resets,
+        answer_truncated: false,
+        serial: None,
     });
-    let outcome = serde_json::json!({
+    let mut outcome = serde_json::json!({
         "agent": peer.name,
         "stop": report.stop,
-        "answer": truncate(&report.text, DEFAULT_TOOL_OUTPUT_LIMIT),
-    })
-    .to_string();
+    });
+    room.put(tree, peer, &mut outcome, &report.text);
+    let outcome = outcome.to_string();
     ToolOutcome {
         content: outcome,
         is_error: report.stop != AgentStop::Completed,
@@ -2366,6 +2756,12 @@ async fn durable_peer(
     let Some(target) = target else {
         return Ok(refuse(agent, tree, Refusal::PeerUnavailable, &peer.name));
     };
+    // A durable peer runs its own op with its own effects. A mandate cannot
+    // carry an effect set, so a narrowed run never asks one (issue #2439).
+    // A probe never asks one for the same reason (issue #2378).
+    if run.task.allowed_effects.is_some() || run.task.probe.is_some() {
+        return Ok(refuse(agent, tree, Refusal::NotPermitted, &peer.name));
+    }
     let target_id = target.as_str();
     if target_id == tree.outbox.self_id || tree.outbox.waiting.iter().any(|id| id == target_id) {
         return Ok(refuse(agent, tree, Refusal::Deadlock, &peer.name));
@@ -2422,11 +2818,13 @@ async fn durable_peer(
     if chain.last().is_none_or(|last| *last != peer.name) {
         chain.push(peer.name.clone());
     }
-    Ok(peer_outcome(tree, peer, target_id, chain, outcome))
+    let room = AnswerRoom::of(ctx, run.task);
+    Ok(peer_outcome(room, tree, peer, target_id, chain, outcome))
 }
 
 /// Record one exchange with a durable peer and answer the model.
 fn peer_outcome(
+    room: AnswerRoom<'_>,
     tree: &mut Tree,
     peer: &Peer,
     target_id: &str,
@@ -2446,17 +2844,24 @@ fn peer_outcome(
                 steps_used: 0,
                 tool_calls: 0,
                 resets: 0,
+                answer_truncated: false,
+                serial: None,
             });
             if let Some(refusal) = reply.refusal {
                 refused(refusal, &peer.name)
             } else {
-                let content = serde_json::json!({
+                // The keys keep their old order, also under the
+                // `preserve_order` feature of `serde_json`.
+                // The answer key comes first, then `error`, so the cut
+                // measures the error too.
+                let mut content = serde_json::json!({
                     "agent": peer.name,
                     "stop": reply.stop,
-                    "answer": truncate(&reply.answer, DEFAULT_TOOL_OUTPUT_LIMIT),
-                    "error": reply.error,
-                })
-                .to_string();
+                });
+                content["answer"] = "".into();
+                content["error"] = serde_json::json!(reply.error);
+                room.put(tree, peer, &mut content, &reply.answer);
+                let content = content.to_string();
                 ToolOutcome {
                     content,
                     is_error: reply.stop != Some(AgentStop::Completed),
@@ -2474,6 +2879,8 @@ fn peer_outcome(
                 steps_used: 0,
                 tool_calls: 0,
                 resets: 0,
+                answer_truncated: false,
+                serial: None,
             });
             ToolOutcome::error(&format!(
                 "the durable agent {:?} gave no answer: {error}",
@@ -2538,6 +2945,8 @@ fn refuse(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &str) -> Tool
         steps_used: 0,
         tool_calls: 0,
         resets: 0,
+        answer_truncated: false,
+        serial: None,
     });
     refused(refusal, name)
 }
@@ -2596,9 +3005,17 @@ fn child_task(
         // parent do not apply to it (issue #2373).
         tool_guidance: std::collections::BTreeMap::new(),
         skills: std::collections::BTreeMap::new(),
+        // A child never runs a wider effect than its parent (issue #2439).
+        allowed_effects: task.allowed_effects.clone(),
         // A child is part of the draw of its parent, so its requests keep
         // the draw id. It has its own run id, so it drops the root.
         draw: task.draw.as_ref().map(Draw::inherited),
+        // Only the answer of the root run is checked (issue #2442).
+        answer_check: None,
+        // A child of a probe is a probe with the same effects (issue #2378).
+        probe: task.probe,
+        // A peer is another agent, so it is not of the kind of the parent.
+        kind: None,
     }
 }
 
@@ -2882,21 +3299,33 @@ pub async fn agent_discover_peers(
 }
 
 /// The workflows to register on a `HarvestBuilder`: `agent_loop`,
-/// `agent_heartbeat`, the durable `agent` and its pass `agent_consolidate`.
+/// `agent_heartbeat`, the durable `agent`, the strategy runs `agent_draws`
+/// and `agent_sample`, and the pass `agent_consolidate`.
+///
+/// With the `eval` feature, it also holds the refine run `agent_refine`
+/// (issue #2380).
 #[must_use]
 pub fn workflows() -> Vec<WorkflowInfo> {
-    vec![
+    #[allow(unused_mut)]
+    let mut list = vec![
         agent_loop_info(),
         agent_heartbeat_info(),
         agent_info(),
+        crate::sampling::agent_draws_info(),
+        crate::sampling::agent_sample_info(),
         crate::consolidate::agent_consolidate_info(),
-    ]
+        crate::consolidate_all::agent_consolidate_all_info(),
+    ];
+    #[cfg(feature = "eval")]
+    list.push(crate::refine::agent_refine_info());
+    list
 }
 
 /// The activities to register on a `HarvestBuilder`.
 #[must_use]
 pub fn activities() -> Vec<ActivityInfo> {
-    vec![
+    #[allow(unused_mut)]
+    let mut list = vec![
         agent_model_turn_info(),
         agent_tool_call_info(),
         agent_memory_snapshot_info(),
@@ -2910,19 +3339,260 @@ pub fn activities() -> Vec<ActivityInfo> {
         agent_workspace_reset_info(),
         agent_workspace_floor_info(),
         crate::refine::agent_refine_propose_info(),
+        crate::sampling::agent_sampling_policy_info(),
         crate::refine::agent_refine_policy_info(),
         crate::score::agent_score_info(),
+        crate::answer_check::agent_answer_check_info(),
+        crate::score::agent_sample_score_info(),
         crate::consolidate::agent_consolidate_read_info(),
         crate::consolidate::agent_consolidate_turn_info(),
         crate::consolidate::agent_consolidate_write_info(),
+        crate::consolidate_all::agent_consolidate_due_info(),
         crate::consolidate::agent_episode_append_info(),
         crate::consolidate::agent_episode_reset_info(),
-    ]
+    ];
+    #[cfg(feature = "eval")]
+    list.extend([
+        crate::refine::agent_refine_start_info(),
+        crate::refine::agent_refine_probe_info(),
+        crate::refine::agent_refine_compose_info(),
+        crate::refine::agent_refine_select_info(),
+    ]);
+    list
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    /// The batching of one round before issue #2483, at the `ToolCall`
+    /// level. Returns `(start, len)` pairs.
+    fn old_batches(
+        calls: &[ToolCall],
+        decisions: &[ToolDecision],
+        agent: Option<&Member>,
+        bound: u32,
+    ) -> Vec<(usize, usize)> {
+        let bound = usize::try_from(bound.min(MAX_PARALLEL_CHILDREN)).unwrap_or(1);
+        let Some(agent) = agent else {
+            return Vec::new();
+        };
+        let batchable = |position: usize| {
+            let call = &calls[position];
+            call.name == DELEGATE_TOOL
+                && matches!(decisions.get(position), Some(ToolDecision::Allow))
+                && delegate_args(&call.arguments)
+                    .and_then(|args| agent.peers.iter().find(|peer| peer.name == args.agent))
+                    .is_some_and(|peer| peer.agent.is_none())
+        };
+        let mut batches = Vec::new();
+        let mut start = 0;
+        while start < calls.len() {
+            if !batchable(start) {
+                start += 1;
+                continue;
+            }
+            let mut end = start + 1;
+            while end < calls.len() && end - start < bound && batchable(end) {
+                end += 1;
+            }
+            if end - start >= 2 {
+                batches.push((start, end - start));
+            }
+            start = end;
+        }
+        batches
+    }
+
+    /// A call of a round: a delegation to an inline, a durable or an
+    /// unknown peer, a delegation with bad arguments, or another tool.
+    fn call() -> impl Strategy<Value = ToolCall> {
+        let delegate = |agent: &str| ToolCall {
+            id: "c".into(),
+            name: DELEGATE_TOOL.into(),
+            arguments: json!({"agent": agent, "task": "t"}),
+        };
+        prop_oneof![
+            Just(delegate("inline")),
+            Just(delegate("durable")),
+            Just(delegate("unknown")),
+            Just(ToolCall {
+                id: "c".into(),
+                name: DELEGATE_TOOL.into(),
+                arguments: json!({"agent": "inline"}),
+            }),
+            Just(ToolCall {
+                id: "c".into(),
+                name: "note".into(),
+                arguments: json!({}),
+            }),
+        ]
+    }
+
+    fn decision() -> impl Strategy<Value = ToolDecision> {
+        prop_oneof![
+            Just(ToolDecision::Allow),
+            Just(ToolDecision::RequireApproval { reason: "r".into() }),
+            Just(ToolDecision::Deny { reason: "d".into() }),
+        ]
+    }
+
+    proptest! {
+        /// The plan batches each round exactly as the code before issue
+        /// #2483 did, so a recorded run replays the same. A round may hold
+        /// fewer decisions than calls.
+        #[test]
+        fn a_round_plan_batches_as_before(
+            calls in prop::collection::vec(call(), 0..12),
+            decisions in prop::collection::vec(decision(), 0..12),
+            bound in 0u32..20,
+            mandated in any::<bool>(),
+        ) {
+            let id = crate::agent::AgentId::new("peer", "p1").unwrap();
+            let agent = Member {
+                mandate: Mandate::new("root"),
+                peers: vec![
+                    Peer::new("inline", "Inline."),
+                    Peer::agent("durable", "Durable.", &id),
+                ],
+            };
+            let agent = mandated.then_some(&agent);
+            let plan = round_plan(&calls, &decisions, agent, bound);
+            let leads: Vec<(usize, usize)> = plan
+                .iter()
+                .enumerate()
+                .filter_map(|(at, step)| match step {
+                    Step::Lead(len) => Some((at, *len)),
+                    _ => None,
+                })
+                .collect();
+            prop_assert_eq!(plan.len(), calls.len());
+            prop_assert_eq!(leads, old_batches(&calls, &decisions, agent, bound));
+        }
+    }
+
+    // Issue #2481: a peer lookup recorded before the limit has no
+    // `answer_limit`. Its run replays with the old cut and the old shape.
+    #[test]
+    fn a_legacy_lookup_keeps_the_old_cut_and_shape() {
+        let peer: Peer = serde_json::from_value(serde_json::json!({
+            "name": "researcher",
+            "description": "R.",
+            "max_steps": 8,
+        }))
+        .unwrap();
+        assert_eq!(peer.answer_limit, None);
+        assert_eq!(LEGACY_ANSWER_LIMIT, 8_000, "old histories pin this value");
+        let mut result = serde_json::json!({"agent": "researcher", "stop": "completed"});
+        let cut = put_answer(&mut result, &peer, &"x".repeat(8_050), 10);
+        assert!(!cut, "a legacy run sets no record flag");
+        let want = serde_json::json!({
+            "agent": "researcher",
+            "stop": "completed",
+            "answer": format!("{}…[truncated]", "x".repeat(8_000)),
+        });
+        assert_eq!(result, want);
+    }
+
+    // Issue #2481: a resolved lookup cuts at its limit and marks the cut.
+    #[test]
+    fn a_resolved_lookup_marks_the_cut() {
+        let peer = Peer::new("researcher", "R.").answer_limit(3);
+        let mut result = serde_json::json!({"agent": "researcher"});
+        assert!(put_answer(&mut result, &peer, "abcd", usize::MAX));
+        assert_eq!(result["answer"], "abc…[truncated]");
+        assert_eq!(result["truncated"], true);
+        let mut result = serde_json::json!({"agent": "researcher"});
+        assert!(!put_answer(&mut result, &peer, "abc", usize::MAX));
+        assert_eq!(result["answer"], "abc");
+        assert_eq!(result["truncated"], false);
+    }
+
+    // Issue #2481: the byte share also cuts, on a char boundary.
+    #[test]
+    fn a_resolved_lookup_cuts_to_the_byte_share() {
+        let peer = Peer::new("researcher", "R.").answer_limit(usize::MAX);
+        let mut result = serde_json::json!({"agent": "a"});
+        // The frame `{"agent":"a","answer":"","truncated":false}` is 43
+        // bytes. One "é" (2 bytes) and the mark (14 bytes) fill 59 bytes.
+        assert!(put_answer(&mut result, &peer, &"é".repeat(20), 59));
+        assert_eq!(result["answer"], "é…[truncated]");
+        assert_eq!(result["truncated"], true);
+        assert!(result.to_string().len() <= 59);
+        let mut result = serde_json::json!({"agent": "a"});
+        assert!(!put_answer(&mut result, &peer, "éééé", 100));
+        assert_eq!(result["answer"], "éééé");
+        assert_eq!(result["truncated"], false);
+    }
+
+    // Issue #2481: the cut measures the encoded result, so an escaped
+    // character counts with its escape.
+    #[test]
+    fn an_escaped_answer_cuts_to_the_encoded_size() {
+        let peer = Peer::new("researcher", "R.").answer_limit(usize::MAX);
+        let mut result = serde_json::json!({"agent": "a"});
+        assert!(put_answer(&mut result, &peer, &"\0".repeat(100), 100));
+        assert!(result.to_string().len() <= 100, "{result}");
+        assert!(result["answer"].as_str().unwrap().ends_with("…[truncated]"));
+    }
+
+    // The escape length matches `serde_json` for each ASCII character and a
+    // few wider ones.
+    #[test]
+    fn the_escape_length_matches_serde_json() {
+        let wide = ['é', '漢', '🎉', '\u{7f}', '\u{2028}'];
+        for c in (0_u8..=0x7f).map(char::from).chain(wide) {
+            let encoded = serde_json::to_string(&c.to_string()).unwrap();
+            assert_eq!(escaped_char_len(c), encoded.len() - 2, "{c:?}");
+        }
+    }
+
+    // A fixed list of answers with each kind of escape, for the bound below.
+    fn escape_cases() -> Vec<String> {
+        let all: String = (0_u8..=0x7f).map(char::from).collect();
+        vec![
+            all.repeat(3),
+            "\"\\\n\t\0é漢🎉".repeat(20),
+            "plain text ".repeat(40),
+            String::new(),
+        ]
+    }
+
+    // Issue #2481: each encoded result fits a share that can hold the frame
+    // and the mark. A kept answer is a prefix of the original.
+    #[test]
+    fn each_encoded_result_fits_its_share() {
+        let peer = Peer::new("researcher", "R.").answer_limit(usize::MAX);
+        // The frame `{"agent":"a","answer":"","stop":"completed","truncated":false}`
+        // is 62 bytes. The mark adds 14.
+        for answer in escape_cases() {
+            for max_bytes in [76, 77, 81, 100, 257, 1_000] {
+                let mut result = serde_json::json!({"agent": "a", "stop": "completed"});
+                let cut = put_answer(&mut result, &peer, &answer, max_bytes);
+                assert!(
+                    result.to_string().len() <= max_bytes,
+                    "{max_bytes}: {result}"
+                );
+                let shown = result["answer"].as_str().unwrap();
+                let kept = shown.strip_suffix("…[truncated]").unwrap_or(shown);
+                assert!(answer.starts_with(kept), "{max_bytes}");
+                assert_eq!(cut, kept.len() < answer.len(), "{max_bytes}");
+            }
+        }
+    }
+
+    // A share too small for the frame and the mark keeps the mark only. The
+    // parent model still sees the cut.
+    #[test]
+    fn a_tiny_share_keeps_the_mark_only() {
+        let peer = Peer::new("researcher", "R.").answer_limit(usize::MAX);
+        let mut result = serde_json::json!({"agent": "a"});
+        assert!(put_answer(&mut result, &peer, "abc", 10));
+        assert_eq!(result["answer"], "…[truncated]");
+        assert_eq!(result["truncated"], true);
+    }
 
     #[test]
     fn the_flow_state_after_a_turn_skips_denied_calls() {
@@ -2947,6 +3617,7 @@ mod tests {
             reason: "no".into(),
         };
         let turn = ModelTurn {
+            cost_usd_micros: None,
             content: Vec::new(),
             stop: StopReason::ToolUse,
             usage: TokenUsage::default(),
@@ -3102,6 +3773,68 @@ mod tests {
         progress.reset.count = 1;
         assert!(plan(&task, &mut progress, len).is_none(), "no reset left");
         assert!(!progress.reset.pending);
+    }
+
+    #[test]
+    fn a_kept_round_makes_the_reset_due_under_the_threshold() {
+        let (mut task, mut progress, len) = reset_fixture();
+        task.max_request_bytes = Some(len * 3);
+        let round = [
+            assistant(vec![followup_call("h1")]),
+            tool(vec![result("h1", "dropped")]),
+        ];
+        progress.reset.kept = Some(round.clone());
+        let noticed = plan(&task, &mut progress, len).expect("a save turn");
+        assert!(
+            progress.reset.pending,
+            "under 50 %, the kept round asks a save turn"
+        );
+        assert_eq!(noticed.len(), progress.messages.len() + 1);
+        let window = plan(&task, &mut progress, len).expect("the reset");
+        assert_eq!(progress.reset.count, 1);
+        assert!(progress.reset.kept.is_none(), "the reset clears the round");
+        let mut expected = vec![ChatMessage::text(ChatRole::User, "audit")];
+        expected.extend(round);
+        assert_eq!(window, expected);
+    }
+
+    #[test]
+    fn a_booking_in_the_kept_round_shows_once() {
+        let booked = r#"{"in_minutes":1,"scheduled":true}"#;
+        let task = AgentTask::new("audit");
+        let round = [
+            assistant(vec![followup_call("f1"), followup_call("h1")]),
+            tool(vec![result("f1", booked), result("h1", "dropped")]),
+        ];
+        let mut messages = vec![ChatMessage::text(ChatRole::User, "audit")];
+        messages.extend(round.clone());
+        let mut progress = Progress::new("r".into(), messages);
+        progress.followup = Some(Planned { delay_secs: 60 });
+        progress.reset.kept = Some(round.clone());
+        let window = reset_window(&task, &progress, "audit");
+        let mut expected = vec![ChatMessage::text(ChatRole::User, "audit")];
+        expected.extend(round);
+        assert_eq!(window, expected);
+        // A round with no booking keeps the booking of the segment apart.
+        progress.reset.kept = Some([
+            assistant(vec![followup_call("h2")]),
+            tool(vec![result("h2", "dropped")]),
+        ]);
+        let ids: Vec<String> = reset_window(&task, &progress, "audit")
+            .iter()
+            .map(|message| match &message.content[0] {
+                ContentPart::Text(text) => text.clone(),
+                ContentPart::ToolCall { id, .. }
+                | ContentPart::ToolResult {
+                    tool_call_id: id, ..
+                } => id.clone(),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            ["audit", "f1", "f1", "h2", "h2"],
+            "the booking comes first"
+        );
     }
 
     fn followup_call(id: &str) -> ContentPart {

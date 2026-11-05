@@ -3,8 +3,10 @@
 //! Each test boots a real app through `TestApp`, with the app database and
 //! the Harvest file in a temp directory. No Postgres and no Docker run.
 //!
-//! Run it with `cargo test -p autumn-harvest-plugin --features sqlite,oidc
-//! --test sqlite_plugin`. Without `oidc`, the OIDC checks do not run.
+//! Run it with `cargo test -p autumn-harvest-plugin --features
+//! sqlite,oidc,mcp,webhooks,connectors --test sqlite_plugin`. Without `oidc`,
+//! the OIDC checks do not run. Without the trigger features, the MCP, webhook
+//! and connector checks do not run (issue #2471).
 
 #![cfg(feature = "sqlite")]
 // The `#[workflow]` and `#[activity]` macros need an `async fn`.
@@ -42,6 +44,16 @@ mod oidc_contract;
 
 #[path = "sqlite_plugin/auth_parity.rs"]
 mod auth_parity;
+
+#[path = "sqlite_plugin/ops_parity.rs"]
+mod ops_parity;
+
+#[cfg(all(feature = "mcp", feature = "webhooks", feature = "connectors"))]
+#[path = "sqlite_plugin/trigger_parity.rs"]
+mod trigger_parity;
+
+#[path = "sqlite_plugin/outbox.rs"]
+mod outbox;
 
 /// A value given to `HarvestPlugin::state`. The activity reads it back.
 #[derive(Debug)]

@@ -16,7 +16,7 @@ This page records commit throughput for N concurrent writers in three modes:
 ## Run it
 
 ```sh
-HARVEST_NOTIFY_BENCH_WRITERS=1,4,16,32,64 ./benchmarks/notify-commit.sh
+HARVEST_NOTIFY_BENCH_WRITERS=1,4,16,32,64 cargo xtask bench notify-commit
 ```
 
 The script starts a throwaway `postgres:16` container, runs

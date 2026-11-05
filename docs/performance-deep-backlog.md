@@ -47,7 +47,7 @@ No engine code, query, index or migration changes here. See
 
 ```bash
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-  autumn-harvest/scripts/deep_backlog_ledger_repro.sh
+  cargo xtask perf deep-backlog-ledger
 ```
 
 The script seeds a shallow (4k) and a deep (1M) fixture on seed 1956. On each it

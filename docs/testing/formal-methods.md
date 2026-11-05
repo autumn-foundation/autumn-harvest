@@ -27,10 +27,10 @@ and Shuttle, which check in-process concurrency.
 The runner needs Java 11 or later.
 
 ```bash
-scripts/check-formal-models.sh
+cargo xtask check formal-models
 ```
 
-The script downloads `tla2tools.jar` 1.7.4 and checks its SHA-256. To use a
+The command downloads `tla2tools.jar` 1.7.4 and checks its SHA-256. To use a
 local jar, set `TLA2TOOLS_JAR=/path/to/tla2tools.jar`. A full run takes about
 3 minutes on 4 cores. The `OwnerLease` design config takes about 2 minutes
 of it.
@@ -45,7 +45,7 @@ java -cp "$TLA2TOOLS_JAR" tlc2.TLC -metadir /tmp/tlc \
 
 `-metadir` keeps TLC's `states/` directory out of the tree.
 
-The `formal-models` job in `.github/workflows/ci.yml` runs the script. Like
+The `formal-models` job in `.github/workflows/ci.yml` runs the command. Like
 `msrv`, it skips draft PRs and docs-only changes.
 
 ### The manifest
@@ -560,12 +560,12 @@ Issue #2003 checks that the running engine follows `ActivityClaim` and
 history of a task row is a behavior of the spec.
 
 ```bash
-scripts/check-formal-traces.sh formal/tla/trace/fixtures
+cargo xtask check formal-traces formal/tla/trace/fixtures
 ```
 
-`scripts/check-formal-traces.sh` needs Java 11 or later and Python 3. It
-pins the same `tla2tools.jar` as `scripts/check-formal-models.sh`, and it
-reads `TLA2TOOLS_JAR` in the same way. The fixtures take about 10 seconds.
+`cargo xtask check formal-traces` needs Java 11 or later. It uses the
+`tla2tools.jar` pin of `cargo xtask check formal-models`, and it reads
+`TLA2TOOLS_JAR` in the same way. The fixtures take about 10 seconds.
 
 ### Record a trace
 
@@ -622,7 +622,7 @@ its pooled connections serve many claims.
 
 ### Check a trace
 
-`scripts/formal_traces.py` writes a TLA+ module for each check. The module
+`xtask/src/dev/formal_traces.rs` writes a TLA+ module for each check. The module
 holds the trace as the constant `Log`. TLC then checks `ActivityClaimTrace`
 or `WorkflowTaskClaimTrace`, in `formal/tla/trace/`. Each extends its model
 with a line cursor:
@@ -680,7 +680,7 @@ The sources are:
 ### In CI
 
 `chaos.yml` sets `HARVEST_TLA_TRACE_DIR`. After the chaos suite, it runs
-`scripts/check-formal-traces.sh "$HARVEST_TLA_TRACE_DIR"`. The runner checks
+`cargo xtask check formal-traces "$HARVEST_TLA_TRACE_DIR"`. The runner checks
 every trace from the reproducers, the convergence sweep and the
 infrastructure faults. TLC must reject each red trace.
 
@@ -697,7 +697,7 @@ export HARVEST_TLA_TRACE_DIR=/tmp/harvest-traces
 rm -rf "$HARVEST_TLA_TRACE_DIR"
 cargo test -p autumn-harvest --features chaos --test integration chaos_tests:: \
   -- --test-threads=1
-scripts/check-formal-traces.sh "$HARVEST_TLA_TRACE_DIR"
+cargo xtask check formal-traces "$HARVEST_TLA_TRACE_DIR"
 ```
 
 `formal_trace_coverage.rs` fails in these cases:
@@ -705,7 +705,7 @@ scripts/check-formal-traces.sh "$HARVEST_TLA_TRACE_DIR"
 - A fixture is malformed.
 - A spec has no clean fixture, or no red fixture that only the fence rejects.
 - A trace spec does not extend its model.
-- The two runners pin different TLC releases.
+- The trace runner pins its own TLC release.
 - `ci.yml` or `chaos.yml` does not run the runner.
 - The chaos suite does not install the recorder or export its traces.
 - This page does not name a part of the trace check.
@@ -743,21 +743,21 @@ cargo kani setup
 Run every proof:
 
 ```bash
-scripts/check-kani-proofs.sh
+cargo xtask check kani-proofs
 ```
 
-The script runs
+The command runs
 `cargo kani -p autumn-harvest --no-default-features --features chaos -Z stubbing`.
 `chaos` turns on the chaos controller, which holds a proof. `-Z stubbing`
 enables `#[kani::stub]`.
 
 `cargo kani` exits 0 when it finds no proof, and when a `kani::cover!` is
-unsatisfiable. The script fails in both cases. It also fails when Kani
+unsatisfiable. The command fails in both cases. It also fails when Kani
 verifies fewer proofs than the source holds.
 
 To run one proof, call `cargo kani` with the same flags and
 `--harness <name>`. The `kani` job in `.github/workflows/ci.yml` runs the
-script. It skips draft PRs and docs-only changes, like `msrv`. The compile
+command. It skips draft PRs and docs-only changes, like `msrv`. The compile
 takes most of the time. The proofs take about 1 minute together.
 
 ### The proofs
@@ -838,7 +838,7 @@ Three kernels have no Kani proof. Issue #1819 names the first two:
 3. Add `#[kani::unwind(N)]` to a proof with a loop. Kani reports an
    unwinding failure when `N` is too small.
 4. Add `kani::cover!` for an interesting case. A proof whose assumptions
-   exclude every input passes for the wrong reason. The script fails on an
+   exclude every input passes for the wrong reason. The command fails on an
    unsatisfied cover.
 5. Run the proof alone. Keep it under one minute. A slow proof usually
    relates a multiply to a divide, or builds a `Vec` or a `String`. Stub or
@@ -855,25 +855,25 @@ integer kernels that make CBMC time out: a 64-bit multiply, a 128-bit
 product, and a mixer that must be shown to be one to one.
 
 ```bash
-scripts/check-verus-proofs.sh
+cargo xtask check verus-proofs
 ```
 
-The script downloads the pinned Verus release and checks its SHA-256. The pin
+The command downloads the pinned Verus release and checks its SHA-256. The pin
 is a weekly release, because Verus deletes the assets of older rolling builds. To
 use a local binary, set `VERUS=/path/to/verus`. The release names the Rust
-toolchain that it links against, and the script installs that toolchain
+toolchain that it links against, and the command installs that toolchain
 with rustup. The proofs take about 2 seconds. The `verus` job in
-`.github/workflows/ci.yml` runs the script. It skips draft PRs and
+`.github/workflows/ci.yml` runs the command. It skips draft PRs and
 docs-only changes, like `msrv`.
 
-The script fails when Verus reports an error, or when it verifies nothing.
+The command fails when Verus reports an error, or when it verifies nothing.
 
 ### Mirrors
 
 Verus cannot compile the engine crate, so each proof checks a copy of an
 engine function in `formal/verus/src/`. A `// mirror: <path> <fn>` line
-marks each copy. A mirror can copy a function of `autumn-harvest/src` or
-of `autumn-harvest-agent/src`. The guard suite
+marks each copy. A mirror can copy a function of `autumn-harvest/src`,
+`autumn-harvest-agent/src` or `autumn-harvest-plugin/src`. The guard suite
 `autumn-harvest/tests/integration/verus_proofs_coverage.rs` removes
 comments, whitespace and `proof { }` blocks from both bodies. The bodies
 must then be equal. A `proof { }` block is ghost code. Verus erases it, so
@@ -909,7 +909,7 @@ The guard suite fails in these cases:
 - A Verus file sits below `formal/verus/src`, or a proof file loads
   another file with `mod <name>;` or `include!`. No guard would read that
   file.
-- `ci.yml` does not run the script on every PR.
+- `ci.yml` does not run the command on every PR.
 - This page does not name a Verus file or a mirrored function.
 
 A Verus loop states its `invariant`, `invariant_except_break`, `ensures`
@@ -922,7 +922,7 @@ cannot hide code behind it. An engine body that holds a clause keyword
 fails the guard, so the drop changes only the Verus copy.
 
 A change to a mirrored function therefore fails the no-DB suite until the
-copy matches. Port the change, then run the script.
+copy matches. Port the change, then run `cargo xtask check verus-proofs`.
 
 ### The proofs
 
@@ -937,16 +937,23 @@ copy matches. Port the change, then run the script.
 | `agent_dedupe.rs` | `is_new` and `next_floor` in `agent/dedupe.rs` of the agent crate | The floor and the set above it hold exactly the applied numbers. An apply and its fold equal the plain set insert, in any order and with any repeats. So the receiver takes no new message for a duplicate. The floor never moves over a gap, and the bound on the set forgets only an applied number (issue #2269). |
 | `agent_wake.rs` | `next_heartbeat` in `agent/wake.rs` of the agent crate | With no heartbeat, the function books nothing. A tick books the next tick strictly after the time that it ran, so a tick never runs in a loop. Any other op keeps the booked tick, so messages never starve the heartbeat (issue #2266). |
 | `agent_siblings.rs` | `sibling_cap` in `bounds.rs` of the agent crate | No step overflows. Each share is the base share or one more. The shares of all siblings sum to the remaining tokens, so concurrent children never pass the cap of the parent (issue #2270). |
-| `agent_reset.rs` | `reaches_percent` and `reset_due` in `bounds.rs` of the agent crate | No step overflows. A zero cap never resets. A request over the cap reaches the threshold for every percent, so the check before a request finds a reset due while one is left. A request under the threshold fits the cap. A tool round that passes the cap ends the run before that check. No sequence of requests takes the reset count past `max_resets` (issue #2453). |
+| `agent_fan_out.rs` | `can_join` and `fan_out_plan` in `fan_out_plan.rs` of the agent crate | No step overflows. A bound under 2 names no reason. With a bound of 2 or more, each delegation that can run leads a batch, joins one, or names why it ran alone. Each reason is true of the turn. A batch holds from 2 to `bound` calls that can join, and each member follows its lead. A batch stops short of `bound` only at the end of a run, so `BoundReached` follows a full batch. The proptests `the_plan_batches_as_before` and `a_round_plan_batches_as_before` check that the batches did not change (issue #2483). |
+| `agent_reset.rs` | `reaches_percent`, `reset_due` and `full_round_resets` in `bounds.rs` of the agent crate | No step overflows. A zero cap never resets. A request over the cap reaches the threshold for every percent, so the check before a request finds a reset due while one is left. A request under the threshold fits the cap. A tool round that passes the cap ends the run before that check. No sequence of requests takes the reset count past `max_resets` (issue #2453). |
 | `agent_episodes.rs` | `episode_evictions` and `consolidation_due` in `bounds.rs` of the agent crate | No step overflows. An append never passes `max_episodes`, and it evicts only stored episodes. A log in its bound loses at most one episode per append. No sequence of appends takes the log past the bound. A pass is due only at or over the trigger, a due pass stays due as appends grow, and a trigger of 0 never fires (issue #2454). |
+| `agent_dispatch.rs` | `dispatch_passes` in `bounds.rs` of the agent crate | No step overflows. The bound of a firing is 1 to 256. A firing never starts more passes than the bound or the due agents. A firing with a due agent starts at least one pass. When the due agents fit the bound, none waits. With no new due agent, the queue drains within the firings that the bound gives (issue #2540). |
 | `agent_overlay.rs` | `merged_bound` and `merged_read_only` in `agent/overlay.rs` of the agent crate | A spec of `apply` uses the two kernels. No result bound is above its ceiling. A result clears `read_only` only when the ceilings allow it. Its model is in the ceilings. The registry and the profile mandate hold an overlay model. Under `Ceilings::from_profile`, no bound rises, `read_only` stays set and the model does not change. A second apply changes no modelled field. `apply` refuses exactly when a rule fails. The model carries each field that an overlay cannot name unchanged, and leaves out the system prompt. The proptests in `overlay.rs` check both on the engine `apply` (issue #2370). `apply` refuses exactly when a merged guidance key names no registered tool. Guidance changes only the description of an app tool, so its name and effect stay, and a built-in keeps its text. That spec has no mirror. `tests/skills.rs` checks the engine (issue #2373). |
 | `overlay_log.rs` | `next_overlay_version` and `decide_activate` in `overlay_log.rs` | A spec `Log` models the versions and the active pointer of one kind. A put returns a version above each stored version, and keeps each stored body. The pointer is unset or names a stored version. No sequence of calls rewrites a stored body. A refused activation changes nothing. Of two activations that read the same pointer, exactly one moves it. The shared overlay store suite checks the SQL of each store (issue #2371). Issue #2374 adds `logs_activation`, `rollback_target` and `decide_rollback`. A spec `Heads` models the pointer and its log of moves. An activation and a rollback keep the chain of moves. A rollback with no earlier activation changes nothing. A rollback restores the version before the current one, and a second rollback undoes it. Of two rollbacks that read the same move, only the first moves the pointer. A rollback swap over a stale read changes nothing, also when the pointer moved away and back. Issue #2394 adds `decide_auto_move`, the cap check that the stores run under the head lock. A stale pointer always conflicts. A spec `spec_auto_day` folds the kernel over the attempts of one UTC day, and the count of auto moves never passes the cap. |
 | `agent_propose.rs` | `next_step` in `refine/propose.rs` of the agent crate | A spec `run` drives the stage loop over any sequence of verdicts. A stage uses from 1 to `max` attempts and never ends on a retry. It falls back exactly when each of its `max` attempts is invalid. A stage that does not fall back ends at its first valid reply, so the proposer is never asked after a valid reply. A `Same` reply keeps the base, and a `Differs` reply proposes. The proptest `a_stage_is_bounded_and_stops_at_the_first_valid_reply` checks the engine loop (issue #2379). |
+| `agent_refine.rs` | `identity_holds` in `refine/ledger.rs` of the agent crate | A spec `count` runs one refine plan over any sequence of stage outcomes. Both modes plan 3k stages for each source. Each plan meets the identity: 3k sessions, and one probe for each session that is not a skip. One probe fewer or one more breaks it. A run one session short breaks it. The run plays one plan for each source, so the proof covers each source count. The proptest `each_plan_meets_the_identity` checks the same counts on a model of the plan (issue #2380). |
+| `agent_sampling.rs` | `draw_plan`, `wave_end`, `sample_step`, `answer_retry_cap` and `retry_after_reject` in `sampling/admit.rs` of the agent crate, and `next_policy_revision` in `agent_policy_log.rs` | An admitted strategy run has from 1 to `max_draws` draws. Its concurrency is from 1 to the cap of the policy, to `MAX_PARALLEL_CHILDREN` and to the draw count. Each wave holds from 1 to `concurrency` draws, and the waves cover each draw once, so no more than `concurrency` draws run at one time. A policy revision moves up by one and never wraps. The proptest `an_admission_never_passes_a_cap` checks the engine kernels (issue #2439). A sample wave holds from 1 to `concurrency` draws, never passes the planned draws, and never holds more draws than tokens are left. So each draw gets a share of at least one token, and the shares sum to the tokens left. With no token left and draws left, the step is `BudgetExceeded`. The proptest `a_sample_step_never_passes_a_bound` checks the engine kernel (issue #2443). An answer check never has more retries than the policy cap or `MAX_ANSWER_RETRIES`. In a spec model of the loop, a run with the cap `c` asks for exactly `c + 1` answers when each answer is rejected. The proptest `the_answers_of_a_run_never_pass_the_cap` links the model to the engine kernels (issue #2442). |
 | `agent_select.rs` | `pick`, `best_draw` and `key_of_bits` in `score.rs` of the agent crate | The order key keeps the sign-magnitude order of the bits of an `f64`, so equal keys mean equal bits. A spec `chosen` folds `pick` over a sequence of entries, each a draw id and an order key or a reject. The winner is an entry, has the top key, and has the lowest draw id on a tie. The result is `None` exactly when each entry is a reject, so a reject never wins while a key exists. Two inputs with the same entries give the same result, so a permutation does not change it. IEEE 754 orders finite floats by those bits, except `-0.0`, which `FiniteF64` never holds. The proptest `the_order_key_matches_the_float_order` checks that step. `select_does_not_depend_on_the_order` checks the engine with floats (issue #2441). |
 | `evidence_parts.rs` | `part_end` in `eval/evidence.rs` of the agent crate | A spec `tile` runs the split of an evidence file over any choice of cuts. A text that fits the cap is one part. There is no part of an empty text. Each part is not empty and holds at most the cap. Each part starts where the last one ended, and the last part ends at the end of the text. So the parts joined in order are the whole text, and the split cuts nothing. The proptest `the_parts_join_to_the_text_and_fit_the_cap` checks the engine split (issue #2377). |
 | `agent_profile_read.rs` | `op_profile` in `agent/profile_read.rs` of the agent crate | With no active version, an op runs on the base profile with no version. With an active version that applies, it runs on the applied profile and records that version. With an active version that does not apply, it fails and names the version. So an active version never yields the base profile. The proptest `the_kernel_never_runs_bare_under_a_version` checks the engine kernel, and `tests/overlay_read_suite` checks the op read on SQLite and Postgres (issue #2372). |
+| `agent_anonymise.rs` | `shared_digits` and `id_width` in `eval/anon.rs` of the agent crate | `shared_digits` returns the common prefix length of two keys. `id_width` returns a width from the floor that is above each shared count below the cap. No smaller width from the floor is above each count. Two keys that share fewer digits than the width have different prefixes of that width, so no anonymous id repeats. The proptests `distinct_keys_give_distinct_ids` and `the_input_order_changes_no_slot` check the ids (issues #2376 and #2377). |
 | `refine_policy.rs` | `parts_allowed`, `decide_adoption` and `gate_timed_out` in `refine/policy.rs` of the agent crate | Each overlay part is one bit. An adoption needs a change, each changed part allowed, and room under the daily cap. The default policy allows no part, so it never adopts. An empty change is `Unchanged`. A larger allowed set keeps each adoption. A spec `spec_day` folds the kernel over the changes of one UTC day, and the count never passes the cap. The stores enforce the cap with `decide_auto_move`, which `overlay_log.rs` proves. A gate times out exactly when `now` reaches `requested + timeout`, and a timeout is final. The proptest `the_kernel_matches_the_oracle` checks the engine kernel, and the store suite checks the cap under the lock on each backend (issue #2394). |
 | `scan_skip.rs` | `first_live` in `activity_scan_index.rs` | The query returns the first live entry at or after its start, or the end slot. It never skips a live entry. Each call keeps the skip links sound. A new list, an added entry and more dead entries keep them sound too. So a skip-list query finds the same entry as a plain walk of that list (issue #2330). The proptest `the_indexed_scan_matches_the_oracle` checks the role of each event. |
+| `process_role.rs` | `role_default`, `switch_value`, `contradicts_role`, `resolve_switch`, `retention_placed` and `runs_retention` in `process_role.rs` of the plugin crate | A `web` role with no explicit value runs no worker and no scheduler. A `worker` or `combined` role runs both. No role keeps the old default, `true`, so a standalone runner keeps both. An explicit value always wins. The startup warning fires exactly when the resolved value differs from the default of a known role. With no role, nothing warns. `resolve_switch` joins the kernels with the right arguments. The unit tests in `process_role.rs` check the engine log lines (issue #2477). With `run_on = "scheduler"`, retention runs exactly where the resolved scheduler runs, so a `web` role with no explicit value runs none. Each other role, and no role, runs it. An explicit scheduler value moves retention with it. With `run_on = "all"`, enabled retention runs on each process. Retention that is off never runs. The DB test `retention_follows_the_scheduler_placement` checks the sweep on each placement (issue #2478). |
+| `worker_queues.rs` | `queue_source` and `pin_misses` in `worker_queues.rs` of the plugin crate | An explicit queue list always wins. A role pin applies only with no explicit list, and only when it names a declared queue. Otherwise the worker polls each declared queue, as before. The warning for a pin fires only when the pin changes nothing, and never with no pin or with an explicit list. The proptests in `worker_queues.rs` check that a resolved list is a non-empty subset of the declared list, in code order (issue #2479). |
 | `depth_cap.rs` | `add_bounded_depth` in `queue.rs` | Each call is one `step`, stays at or below the cap and never overflows. The sampler adds one bounded depth per shard. The fold over any number of shards equals the capped sum of the true counts. So the `harvest.queue.depth` gauge is exact below the cap and reads the cap at or above it (issue #2356). The DB test `bounded_depths_match_the_exact_count_up_to_the_cap` checks that the SQL returns `min(count, cap)` per shard. |
 
 **The mixer inverse.** Each step of the `SplitMix64` finalizer has an
@@ -996,7 +1003,7 @@ that no step overflows. The unit test
 3. Write the property as an `ensures` clause. Put proof hints in
    `proof { }` blocks, or in separate lemmas.
 4. Name the Verus file in a comment on the engine function.
-5. Run the script, then the guard suite.
+5. Run `cargo xtask check verus-proofs`, then the guard suite.
 6. Add a row to the table above.
 
 ## Not modelled yet

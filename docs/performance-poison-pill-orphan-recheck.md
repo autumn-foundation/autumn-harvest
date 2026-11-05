@@ -343,7 +343,7 @@ page.
 ## Verification
 
 - `cargo fmt --all` — clean.
-- `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` — no
+- `cargo xtask audit comment-hygiene --base origin/trunk-dev` — no
   Tier A findings, no Tier B regressions in either changed file.
 - `cargo clippy -p autumn-harvest --lib --test integration --features
   db,testing -- -D warnings` — clean.

@@ -378,7 +378,7 @@ async fn observe_migration_shard(
 /// This function is a sibling of `shard_health.rs`'s `required_migration_versions`.
 /// Both copies form one clone class (issue #2358).
 /// The two bodies must stay byte-identical.
-/// `docs/audits/required-migration-versions-sync.py` fails CI when they differ.
+/// `cargo xtask audit required-migration-versions-sync` fails CI when they differ.
 /// A fix here must land in both files in the same change.
 fn required_migration_versions() -> Result<Vec<String>, String> {
     let migrations = <diesel_migrations::EmbeddedMigrations as MigrationSource<Pg>>::migrations(
@@ -433,6 +433,11 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         "harvest_run_default_overrides",
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
+    // The sampling policy routes read and write the policy of an agent kind
+    // (issue #2439). A set or reset upserts the row and inserts its audit
+    // row. A reset keeps the row, so no DELETE is needed.
+    ("harvest_agent_policies", &["SELECT", "INSERT", "UPDATE"]),
+    ("harvest_agent_policy_audit", &["SELECT", "INSERT"]),
     ("harvest_signals", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_timers", &["SELECT", "INSERT", "UPDATE", "DELETE"]),
     ("harvest_dead_letters", &["SELECT", "INSERT", "DELETE"]),
@@ -537,8 +542,12 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     ),
 ];
 
-const HARVEST_SEQUENCE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] =
-    &[("harvest_events_id_seq", &["USAGE"])];
+// The audit insert of a sampling policy change takes its id from a
+// sequence (issue #2439).
+const HARVEST_SEQUENCE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
+    ("harvest_events_id_seq", &["USAGE"]),
+    ("harvest_agent_policy_audit_id_seq", &["USAGE"]),
+];
 
 #[derive(diesel::QueryableByName, Debug, Clone)]
 struct TablePrivilegeRow {

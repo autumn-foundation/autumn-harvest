@@ -34,5 +34,6 @@ pub mod wf_metrics_with_ambient_label;
 pub mod wf_recursive_helper;
 pub mod wf_saga_step;
 pub mod wf_sorted_keys;
+pub mod wf_test_macro_names_type;
 pub mod wf_trimmed_param_receiver;
 pub mod wf_try_on_clean_result;

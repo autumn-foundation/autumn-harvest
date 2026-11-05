@@ -60,6 +60,17 @@ pub async fn dispatch(
     let workflow = request.target.workflow();
     let workflow_id = request.workflow_id.as_str().to_string();
 
+    // A SQLite app starts and signals through its handle (issue #2471).
+    #[cfg(feature = "sqlite")]
+    if let Some(handle) = api_state.sqlite_handle() {
+        let response = match handle {
+            Ok(handle) => sqlite_dispatch(&handle, request, workflow_id.clone()).await,
+            // `503` is transient, so the message waits for the boot.
+            Err(error) => axum::response::IntoResponse::into_response(error),
+        };
+        return classify_response(response, workflow_id).await;
+    }
+
     let response = match request.target {
         ConnectorTarget::Starts { .. } => {
             // Strip any inbound `Idempotency-Key`: the connector owns start
@@ -114,6 +125,39 @@ pub async fn dispatch(
     };
 
     classify_response(response, workflow_id).await
+}
+
+/// Dispatch one message through the SQLite handle (issue #2471).
+///
+/// The build refuses a `queue` and a `Starts` binding in `BrokerCoordinates`
+/// mode on SQLite, so neither reaches here. A `Starts` binding dedupes on
+/// the mapped `workflow_id`. A `SignalsWithStart` binding dedupes on the
+/// derived key. SQLite stores no start provenance, so the coordinates stay
+/// in the dead-letter record only.
+#[cfg(feature = "sqlite")]
+async fn sqlite_dispatch(
+    handle: &crate::sqlite::HarvestSqlite,
+    request: DispatchRequest<'_>,
+    workflow_id: String,
+) -> axum::response::Response {
+    let workflow = request.target.workflow();
+    match request.target {
+        ConnectorTarget::Starts { .. } => {
+            crate::sqlite::triggers::start(handle, workflow, Some(workflow_id), request.payload)
+                .await
+        }
+        ConnectorTarget::SignalsWithStart { signal_name, .. } => {
+            crate::sqlite::triggers::signal_with_start(
+                handle,
+                workflow,
+                workflow_id,
+                signal_name.to_string(),
+                request.payload,
+                Some(request.idempotency_key.to_string()),
+            )
+            .await
+        }
+    }
 }
 
 /// Classify the delegate's HTTP response into a [`DispatchOutcome`].
@@ -253,6 +297,33 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Before startup a SQLite app has no handle. A dispatch is then a
+    /// transient refusal, so the message waits. It never reaches the
+    /// Postgres start path (issue #2471).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_sqlite_dispatch_before_startup_is_transient() {
+        let api_state = HarvestApiState::new();
+        api_state.set_sqlite_backend();
+        let outcome = dispatch(
+            &api_state,
+            DispatchRequest {
+                target: ConnectorTarget::Starts { workflow: "orders" },
+                workflow_id: WorkflowId::new("o-1"),
+                payload: serde_json::json!({}),
+                queue: None,
+                idempotency_key: "conn:orders",
+                idempotency_mode: IdempotencyMode::WorkflowId,
+                coordinates: "orders:0:1",
+            },
+        )
+        .await;
+        assert!(
+            matches!(&outcome, DispatchOutcome::Transient(detail) if detail.contains("503")),
+            "{outcome:?}"
+        );
+    }
 
     fn ids(
         execution_id: Option<&str>,

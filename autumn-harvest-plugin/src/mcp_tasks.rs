@@ -944,6 +944,8 @@ pub fn build_mcp_task_route(
         // The class that a route macro sets when it names none (since autumn-web 0.9).
         criticality: autumn_web::Criticality::Default,
         seo: autumn_web::SeoRouteDefaults::EMPTY,
+        // The group of the plugin that registers the route (since autumn-web 0.10).
+        group: None,
     }
 }
 
@@ -1405,6 +1407,11 @@ async fn tasks_update(
         }
         // The input key is the delivery key. A header key wins over the
         // query key, so the header from the request must not ride along.
+        #[cfg(feature = "sqlite")]
+        if let Some(handle) = sqlite_handle(api_state)? {
+            sqlite_tasks::answer(&handle, snapshot.run_id, wait, payload).await?;
+            continue;
+        }
         let mut headers = headers.clone();
         headers.remove(autumn_harvest::audit::HEADER_IDEMPOTENCY_KEY);
         let response = crate::api::signal_workflow(
@@ -1447,6 +1454,10 @@ async fn wait_still_open(
     use diesel::{ExpressionMethods as _, QueryDsl as _};
     use diesel_async::RunQueryDsl as _;
 
+    #[cfg(feature = "sqlite")]
+    if let Some(handle) = sqlite_handle(api_state)? {
+        return sqlite_tasks::wait_still_open(&handle, run, wait).await;
+    }
     let head = history_head(api_state, run).await?;
     if head.map(|(position, _)| position) != Some(wait.position) {
         return Ok(false);
@@ -1494,6 +1505,10 @@ async fn tasks_cancel(
     if !live_served {
         return Err(outside_catalog());
     }
+    #[cfg(feature = "sqlite")]
+    if let Some(handle) = sqlite_handle(api_state)? {
+        return sqlite_tasks::cancel(&handle, snapshot.run_id).await;
+    }
     let outcome = crate::api::cancel_workflow(
         Extension(api_state.clone()),
         Path(snapshot.run_id.to_string()),
@@ -1524,6 +1539,11 @@ async fn load_task(
     task_id: &str,
     decode: Option<(&PayloadCodecs, &HeaderMap)>,
 ) -> Result<(TaskSnapshot, bool), RpcError> {
+    // A SQLite app reads its own file (issue #2471).
+    #[cfg(feature = "sqlite")]
+    if let Some(handle) = sqlite_handle(api_state)? {
+        return sqlite_tasks::load_task(api_state, &handle, catalog, task_id).await;
+    }
     let exec_id = crate::api::parse_execution_id(task_id).map_err(|_| RpcError::not_found())?;
     // The shard that hosts the run now, which a rebalance can change.
     let (mut conn, shard) = crate::api::db_conn_for_execution_with_shard(api_state, exec_id)
@@ -1842,6 +1862,198 @@ async fn open_signal_waits(
         return Ok((Vec::new(), Some(last_updated_at)));
     }
     Ok((waits, Some(last_updated_at)))
+}
+
+/// The control Harvest of a SQLite app, or `None` on Postgres (issue
+/// #2471). Before startup it is an error, so the call fails closed.
+#[cfg(feature = "sqlite")]
+fn sqlite_handle(
+    api_state: &HarvestApiState,
+) -> Result<Option<crate::sqlite::HarvestSqlite>, RpcError> {
+    api_state
+        .sqlite_handle()
+        .transpose()
+        .map_err(|error| RpcError::new(INTERNAL_ERROR, error.to_string()))
+}
+
+/// The task reads and writes of a SQLite app (issue #2471).
+///
+/// They give the Postgres snapshot from the Harvest file. SQLite has no
+/// operator rerun and no reset, so no seal hides an end here.
+#[cfg(feature = "sqlite")]
+mod sqlite_tasks {
+    use super::{
+        HarvestApiState, INTERNAL_ERROR, INVALID_PARAMS, RpcError, RpcResult, SignalWait,
+        TaskCatalog, TaskSnapshot, input_request_key, live_run_guards_start_row, ttl_ms,
+    };
+    use crate::sqlite::mcp::{history_head, live_run, open_waits, queued_signals, read_run};
+    use crate::sqlite::{HarvestSqlite, HarvestSqliteError};
+    use autumn_harvest_sqlite::SqliteError;
+    use serde_json::{Value, json};
+
+    fn internal(error: &HarvestSqliteError) -> RpcError {
+        RpcError::new(INTERNAL_ERROR, error.to_string())
+    }
+
+    /// Load the task: the start row, its live run and the open waits.
+    ///
+    /// A malformed id, an unknown id and a run outside the catalog all get
+    /// the same error, so the route is no existence oracle.
+    pub(super) async fn load_task(
+        flags: &HarvestApiState,
+        handle: &HarvestSqlite,
+        catalog: &TaskCatalog,
+        task_id: &str,
+    ) -> Result<(TaskSnapshot, bool), RpcError> {
+        let exec = crate::api::parse_execution_id(task_id).map_err(|_| RpcError::not_found())?;
+        let origin = read_run(handle, exec)
+            .await
+            .map_err(|e| internal(&e))?
+            .ok_or_else(RpcError::not_found)?;
+        if !catalog.serves(&origin.workflow_name) {
+            return Err(RpcError::not_found());
+        }
+        let live = live_run(handle, origin.clone())
+            .await
+            .map_err(|e| internal(&e))?;
+        let live_served = catalog.serves(&live.workflow_name);
+        let (ttl_completed_at, ttl_workflow) = if live_run_guards_start_row(
+            (&origin.workflow_name, &origin.workflow_id),
+            (&live.workflow_name, &live.workflow_id),
+        ) {
+            (live.completed_at, live.workflow_name.clone())
+        } else {
+            (
+                live.completed_at.or(origin.completed_at),
+                origin.workflow_name.clone(),
+            )
+        };
+        let retention = handle.retention().effective_max_age(&ttl_workflow);
+        let (waits, last_event_at) = if crate::api::is_terminal_state(&live.state) {
+            (Vec::new(), None)
+        } else {
+            waits_of(flags, handle, live.exec).await?
+        };
+        let snapshot = TaskSnapshot {
+            task_id: task_id.to_string(),
+            run_id: live.exec.as_uuid(),
+            created_at: origin.started_at,
+            last_updated_at: live
+                .completed_at
+                .or(last_event_at)
+                .unwrap_or(live.started_at),
+            ttl_ms: ttl_ms(origin.started_at, ttl_completed_at, retention),
+            state: live.state,
+            current_details: None,
+            output: live.output,
+            error: live.error,
+            waits,
+        };
+        Ok((snapshot, live_served))
+    }
+
+    /// The open waits of a live run, and the time it last changed. A wait
+    /// whose signal is staged is left out, because the run is about to wake.
+    async fn waits_of(
+        flags: &HarvestApiState,
+        handle: &HarvestSqlite,
+        exec: autumn_harvest::ExecutionId,
+    ) -> Result<(Vec<SignalWait>, Option<chrono::DateTime<chrono::Utc>>), RpcError> {
+        let read = open_waits(handle, flags, exec)
+            .await
+            .map_err(|e| internal(&e))?;
+        let Some((position, last_event_at)) = read.head else {
+            return Ok((Vec::new(), None));
+        };
+        let mut last_updated_at = last_event_at;
+        let mut waits = Vec::new();
+        for name in read.names {
+            if let Some((_, queued_at)) = read.queued.iter().find(|(queued, _)| *queued == name) {
+                last_updated_at = last_updated_at.max(*queued_at);
+            } else {
+                waits.push(SignalWait {
+                    key: input_request_key(exec.as_uuid(), &name, position),
+                    signal_name: name,
+                    position,
+                });
+            }
+        }
+        // A wake that lands after the read ends the waits. Report none.
+        if !waits.is_empty()
+            && history_head(handle, exec)
+                .await
+                .map_err(|e| internal(&e))?
+                .map(|(at, _)| at)
+                != Some(position)
+        {
+            return Ok((Vec::new(), Some(last_updated_at)));
+        }
+        Ok((waits, Some(last_updated_at)))
+    }
+
+    /// `true` when the run is still parked on `wait`: no new event, and no
+    /// staged signal of that name.
+    pub(super) async fn wait_still_open(
+        handle: &HarvestSqlite,
+        run: uuid::Uuid,
+        wait: &SignalWait,
+    ) -> Result<bool, RpcError> {
+        let exec = autumn_harvest::ExecutionId::from_uuid(run);
+        let head = history_head(handle, exec).await.map_err(|e| internal(&e))?;
+        if head.map(|(position, _)| position) != Some(wait.position) {
+            return Ok(false);
+        }
+        let queued = queued_signals(handle, exec)
+            .await
+            .map_err(|e| internal(&e))?;
+        Ok(!queued.iter().any(|(name, _)| *name == wait.signal_name))
+    }
+
+    /// Deliver one accepted answer as its signal. The input key is the
+    /// signal key, so a retried answer is a no-op. A run that ended after the
+    /// read is still an ack, as on Postgres.
+    pub(super) async fn answer(
+        handle: &HarvestSqlite,
+        run: uuid::Uuid,
+        wait: &SignalWait,
+        payload: Value,
+    ) -> Result<(), RpcError> {
+        let exec = autumn_harvest::ExecutionId::from_uuid(run);
+        match handle
+            .signal_routed(exec, &wait.signal_name, payload, Some(wait.key.clone()))
+            .await
+        {
+            Ok(_)
+            | Err(HarvestSqliteError::Sqlite(
+                SqliteError::WorkflowNotRunning { .. } | SqliteError::ExecutionNotFound(_),
+            )) => Ok(()),
+            // A schema refusal is `InvalidSignal`. Each other `4xx`, such as
+            // an oversized payload, is a refusal too, as on Postgres.
+            Err(error) => match crate::sqlite::mcp::refusal(error) {
+                (status, text) if (400..500).contains(&status) => {
+                    let mut err = RpcError::new(
+                        INVALID_PARAMS,
+                        format!("the run refused the answer to {}", wait.key),
+                    );
+                    err.data = Some(json!({ "error": text, "status": status }));
+                    Err(err)
+                }
+                (_, text) => Err(RpcError::new(INTERNAL_ERROR, text)),
+            },
+        }
+    }
+
+    /// Cancel the live run. A run that has ended is an ack too.
+    pub(super) async fn cancel(handle: &HarvestSqlite, run: uuid::Uuid) -> RpcResult {
+        let exec = autumn_harvest::ExecutionId::from_uuid(run);
+        match handle.cancel(exec, "cancelled by MCP tasks/cancel").await {
+            Ok(_)
+            | Err(HarvestSqliteError::Sqlite(
+                SqliteError::WorkflowNotRunning { .. } | SqliteError::ExecutionNotFound(_),
+            )) => Ok(json!({"resultType": "complete"})),
+            Err(error) => Err(internal(&error)),
+        }
+    }
 }
 
 #[cfg(test)]

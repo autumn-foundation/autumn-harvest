@@ -28,7 +28,7 @@ and how to reproduce any number here.
 
 **Container caveat.** These figures come from native Postgres clusters. The
 machine they were measured on had no Docker daemon, so the compose path — the
-one `./benchmarks/run.sh` runs — was **not** measured here. The delta between
+one `cargo xtask bench run` runs — was **not** measured here. The delta between
 the two is unquantified and this page does not claim to know its sign.
 
 ## Headline numbers

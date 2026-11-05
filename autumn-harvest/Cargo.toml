@@ -46,7 +46,7 @@ fuzzing = ["testing", "dep:arbitrary", "chrono/arbitrary", "uuid/arbitrary"]
 # migration, no engine-runtime change. Depends on `testing` for `HistorySnapshot`
 # and the `WorkflowReplayer` handler-registration surface.
 debugger = ["testing"]
-metrics-rs = ["dep:metrics", "dep:foldhash"]
+metrics-rs = ["dep:metrics"]
 # Enables `WorkflowInfo::with_schemas::<I, O, E>()` for automatic JSON Schema
 # generation from types that derive `schemars::JsonSchema` (issue #373).
 schema = ["dep:schemars"]
@@ -104,9 +104,8 @@ serde_json = { workspace = true }
 base64 = "0.23"
 sha2 = "0.11"
 hmac = "0.13"
-# AES-256-GCM payload codec (issue #1825). `autumn-web` 0.9 keeps its own 0.10.3 in
-# the lockfile. No default features: the codec reads nonces from `rand`'s
-# `SysRng`, so `aead/getrandom` is not needed.
+# AES-256-GCM payload codec (issue #1825). No default features: the codec reads
+# nonces from `rand`'s `SysRng`, so `aead/getrandom` is not needed.
 aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc", "zeroize"] }
 # `aes-gcm`'s own `zeroize` feature clears only a temporary key. These turn on
 # `ZeroizeOnDrop` for the AES round keys and the GHASH state. All three crates
@@ -157,8 +156,9 @@ tokio-postgres-rustls = { version = "0.14", optional = true }
 # reason as tokio-postgres above (a downstream lockfile shouldn't be able to
 # freshly resolve the yanked 0.24.5).
 metrics = { version = "0.24.6", optional = true }
-# Hashes the `metrics-rs` label interner. SipHash cost more than the copy it saves.
-foldhash = { version = "0.2", optional = true }
+# Hashes the `metrics-rs` label interner and the awaitables history index.
+# SipHash cost more than the work it guards.
+foldhash = "0.2"
 schemars = { version = "1.2", optional = true }
 # wasmtime 50's own minimum Rust is 1.97, which sets the workspace MSRV.
 # 48.0.3 is the first 48.x release with the RUSTSEC-2026-0316 fix (46.x has no
@@ -372,7 +372,6 @@ required-features = ["debugger"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
-criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trybuild = "1"
 tempfile = "3"
@@ -407,16 +406,25 @@ serde_yaml = "0.9"
 # (`tests/loom_models.rs`) never uses testcontainers, so gate it to non-loom
 # builds; the Docker-backed integration tests that DO use it always run under a
 # normal build where `cfg(not(loom))` is true, so this is transparent to them.
-[target.'cfg(not(loom))'.dev-dependencies]
+# The light test path (`harvest_light`, below) also skips it.
+[target.'cfg(not(any(loom, harvest_light)))'.dev-dependencies]
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+
+# The light test path (issue #2487) sets `--cfg harvest_light`. The `sandbox-test`
+# alias sets it. The cfg skips the heavy dev-dependencies, so the build has no
+# Docker client, no benchmark harness and no model checker. Each heavy
+# dev-dependency sits in a table that excludes `harvest_light`. The `tests/`,
+# `benches/` and `examples/` targets need the full set.
+[target.'cfg(not(harvest_light))'.dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 
 # Runs the real `agent_loop` on a Postgres worker to measure the resident hit
 # rate (issue #2013). The loom and shuttle models never use it.
 # Keep this dependency path-only, with no `version`. The agent crate depends on
 # this crate, so a versioned edge makes a cycle. Cargo then cannot order a
 # workspace `cargo publish`. A path-only dev-dependency is stripped on publish.
-[target.'cfg(not(any(loom, shuttle)))'.dev-dependencies]
+[target.'cfg(not(any(loom, shuttle, harvest_light)))'.dev-dependencies]
 autumn-harvest-agent = { path = "../autumn-harvest-agent" }
 # Explores every interleaving of the DST oracles within a bound (the
 # `stateright` test target). Dev-only, so it never ships. The loom and Shuttle
@@ -829,4 +837,10 @@ harness = false
 # See `benches/schema_contract_diff_profile.rs`.
 [[bench]]
 name = "schema_contract_diff_profile"
+harness = false
+
+# Deterministic instruction/allocation harness for `schedule_plan::next_fire_after`
+# over a catch-up walk. Drive it under `valgrind --tool=callgrind` / `--tool=dhat`.
+[[bench]]
+name = "schedule_slot_walk_profile"
 harness = false

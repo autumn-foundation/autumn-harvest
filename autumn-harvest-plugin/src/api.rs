@@ -163,6 +163,9 @@ pub struct HarvestRetentionRuntime {
     config: RetentionConfig,
     monitor: Option<RetentionMonitor>,
     trigger: Option<tokio::sync::mpsc::Sender<()>>,
+    /// Retention is on, but `run_on` places it on other processes (issue
+    /// #2478). The status says so, and `run-now` names the fix.
+    placed_elsewhere: bool,
 }
 
 impl HarvestRetentionRuntime {
@@ -176,12 +179,26 @@ impl HarvestRetentionRuntime {
             config,
             monitor,
             trigger,
+            placed_elsewhere: false,
         }
     }
 
     #[must_use]
     pub const fn disabled(config: RetentionConfig) -> Self {
         Self::new(config, None, None)
+    }
+
+    /// Retention is on, but this process does not run it (issue #2478).
+    ///
+    /// `harvest.retention.run_on = "scheduler"` places the janitor on the
+    /// processes that run the scheduler. `GET /admin/retention` then reports
+    /// `placed_elsewhere: true`. `run-now` returns a 503 that names
+    /// `run_on = "all"`.
+    #[must_use]
+    pub const fn placed_elsewhere(config: RetentionConfig) -> Self {
+        let mut runtime = Self::new(config, None, None);
+        runtime.placed_elsewhere = true;
+        runtime
     }
 }
 
@@ -421,6 +438,8 @@ pub struct HarvestApiState {
     /// Server-side ceiling on the chain-scoped lifetime cap AND fleet-wide chain
     /// default (issue #617). `None` = no chain cap applied fleet-wide.
     max_workflow_chain_timeout: Arc<Mutex<Option<std::time::Duration>>>,
+    /// The base wait before the settle raises of the live rows (issue #2407).
+    concurrency_raise_settle_delay: Arc<Mutex<std::time::Duration>>,
     /// SSE keepalive comment interval (issue #324). Default 15 s.
     sse_keepalive_interval: Arc<Mutex<std::time::Duration>>,
     /// Maximum SSE event buffer depth per stream (issue #324). Default 1024.
@@ -501,8 +520,23 @@ pub struct HarvestApiState {
     /// The token and audit store of a SQLite app (issue #2469).
     #[cfg(feature = "sqlite")]
     sqlite_auth_store: Arc<Mutex<Option<Arc<autumn_harvest_sqlite::SqliteAuthStore>>>>,
+    /// The control Harvest of a SQLite app (issue #2471). MCP, webhook and
+    /// connector starts go through it, not the Postgres start path.
+    #[cfg(feature = "sqlite")]
+    sqlite_backend: Arc<SqliteBackendSlot>,
     /// Set on a SQLite app, whose store keeps no run tenant (issue #2469).
     no_run_tenants: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The SQLite handle of a [`HarvestApiState`] (issue #2471).
+///
+/// `on` is set at build. The handle is set at startup. A request between
+/// the two gets `503`, never the Postgres path.
+#[cfg(feature = "sqlite")]
+#[derive(Default)]
+struct SqliteBackendSlot {
+    on: std::sync::atomic::AtomicBool,
+    handle: std::sync::OnceLock<crate::sqlite::HarvestSqlite>,
 }
 
 impl Default for HarvestApiState {
@@ -529,6 +563,9 @@ impl Default for HarvestApiState {
             query_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(5))),
             max_workflow_execution_timeout: Arc::new(Mutex::new(None)),
             max_workflow_chain_timeout: Arc::new(Mutex::new(None)),
+            concurrency_raise_settle_delay: Arc::new(Mutex::new(
+                crate::run_defaults_api::CONCURRENCY_RAISE_SETTLE_DELAY,
+            )),
             sse_keepalive_interval: Arc::new(Mutex::new(std::time::Duration::from_secs(15))),
             sse_buffer_depth: Arc::new(Mutex::new(1024)),
             max_workflow_start_delay: Arc::new(Mutex::new(std::time::Duration::from_hours(8760))),
@@ -565,6 +602,8 @@ impl Default for HarvestApiState {
             require_embedded_harvest_mode: Arc::new(Mutex::new(false)),
             #[cfg(feature = "sqlite")]
             sqlite_auth_store: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "sqlite")]
+            sqlite_backend: Arc::default(),
             no_run_tenants: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -639,6 +678,24 @@ impl HarvestApiState {
             .max_workflow_chain_timeout
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = ceiling;
+    }
+
+    /// Set the base wait before the settle raises of the live rows (issue
+    /// #2407). A test sets a short wait.
+    pub fn set_concurrency_raise_settle_delay(&self, delay: std::time::Duration) {
+        *self
+            .concurrency_raise_settle_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = delay;
+    }
+
+    /// The base wait before the settle raises of the live rows (issue #2407).
+    #[must_use]
+    pub fn concurrency_raise_settle_delay(&self) -> std::time::Duration {
+        *self
+            .concurrency_raise_settle_delay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Current server-side ceiling for workflow chain timeouts.
@@ -1388,6 +1445,33 @@ impl HarvestApiState {
             .ok_or_else(|| HarvestError::Config("harvest runtime is not started".to_string()))
     }
 
+    /// The metrics recorder of the webhook receivers.
+    ///
+    /// A SQLite app has no telemetry registry, so it records nothing (issue
+    /// #2471). Before startup, both backends return an error, which the
+    /// caller answers with `503`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the backend is not running yet.
+    #[cfg(feature = "webhooks")]
+    pub(crate) fn trigger_metrics(
+        &self,
+    ) -> Result<Arc<dyn autumn_harvest::telemetry::MetricsRecorder>, String> {
+        #[cfg(feature = "sqlite")]
+        if let Some(handle) = self.sqlite_handle() {
+            return handle
+                .map(|_| {
+                    Arc::new(autumn_harvest::NoOpMetrics)
+                        as Arc<dyn autumn_harvest::telemetry::MetricsRecorder>
+                })
+                .map_err(|error| error.to_string());
+        }
+        self.runtime()
+            .map(|runtime| runtime.registry().telemetry().metrics.clone())
+            .map_err(|error| error.to_string())
+    }
+
     /// The store of tokens and audit rows, or `None` before startup.
     ///
     /// A SQLite app uses its Harvest file (issue #2469). Every other app
@@ -1419,6 +1503,42 @@ impl HarvestApiState {
             .sqlite_auth_store
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(store);
+    }
+
+    /// Mark this state as the state of a SQLite app (issue #2471).
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn set_sqlite_backend(&self) {
+        self.sqlite_backend
+            .on
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Install the control Harvest of a SQLite app (issue #2471).
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn install_sqlite_handle(&self, handle: crate::sqlite::HarvestSqlite) {
+        let _ = self.sqlite_backend.handle.set(handle);
+    }
+
+    /// The control Harvest of a SQLite app (issue #2471).
+    ///
+    /// `None` on Postgres. `Some(Err)` is a `503` before startup.
+    #[cfg(all(
+        feature = "sqlite",
+        any(feature = "mcp", feature = "webhooks", feature = "connectors")
+    ))]
+    pub(crate) fn sqlite_handle(
+        &self,
+    ) -> Option<Result<crate::sqlite::HarvestSqlite, AutumnError>> {
+        // Fully qualified: diesel's `RunQueryDsl::load` would win.
+        if !std::sync::atomic::AtomicBool::load(
+            &self.sqlite_backend.on,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            return None;
+        }
+        Some(self.sqlite_backend.handle.get().cloned().ok_or_else(|| {
+            AutumnError::service_unavailable_msg("the Harvest SQLite backend is not running yet")
+        }))
     }
 
     /// Mark a store that keeps no run tenant, as on SQLite (issue #2469).
@@ -5547,6 +5667,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             get(crate::agent_profile_api::list_policy_changes).route_layer(require_admin.clone()),
         )
         .route(
+            // The sampling policy of an agent kind (issue #2439).
+            "/admin/agents/{kind}/sampling-policy",
+            get(crate::sampling_policy_api::get_sampling_policy)
+                .put(crate::sampling_policy_api::put_sampling_policy)
+                .delete(crate::sampling_policy_api::delete_sampling_policy)
+                .route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/retention",
             get(retention_status).route_layer(require_admin.clone()),
         )
@@ -7587,6 +7715,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
             "PATCH",
             "/admin/workflow-types/{workflow_name}/run-defaults",
         ),
+        ("GET", "/admin/agents/{kind}/sampling-policy"),
+        ("PUT", "/admin/agents/{kind}/sampling-policy"),
+        ("DELETE", "/admin/agents/{kind}/sampling-policy"),
         // Agent profile overlays (issue #2374).
         ("GET", "/agents/{kind}/profile"),
         ("GET", "/agents/{kind}/profile/versions"),
@@ -7916,7 +8047,8 @@ pub const fn management_api_request_fields()
                 "reason",
             ]),
         ),
-        // Run-default overrides of a workflow type (issues #2387 and #2406).
+        // Run-default overrides of a workflow type (issues #2387, #2406,
+        // #2407 and #2408).
         (
             "PATCH",
             "/admin/workflow-types/{workflow_name}/run-defaults",
@@ -7924,11 +8056,22 @@ pub const fn management_api_request_fields()
                 "sla_secs",
                 "execution_timeout_secs",
                 "chain_execution_timeout_secs",
+                "concurrency_limit",
+                "quota_max_active_executions",
+                "quota_max_history_bytes",
+                "quota_max_dead_letters",
                 "clear_override",
                 "reason",
                 "recompute_in_flight",
             ]),
         ),
+        // The sampling policy of an agent kind (issue #2439).
+        (
+            "PUT",
+            "/admin/agents/{kind}/sampling-policy",
+            Some(&["policy"]),
+        ),
+        ("DELETE", "/admin/agents/{kind}/sampling-policy", Some(&[])),
         // Agent profile overlays (issue #2374). A rollback takes no field.
         (
             "POST",
@@ -9070,6 +9213,7 @@ pub const fn management_api_response_fields()
                 "items",
                 "shards",
                 "excluded_paused_queues",
+                "unpolled_declared_queues",
             ]),
         ),
         (
@@ -9158,6 +9302,22 @@ pub const fn management_api_response_fields()
             "PATCH",
             "/admin/workflow-types/{workflow_name}/run-defaults",
             Some(&["workflow_name", "code", "override", "effective"]),
+        ),
+        // Issue #2439.
+        (
+            "GET",
+            "/admin/agents/{kind}/sampling-policy",
+            Some(&["kind", "revision", "policy", "audit"]),
+        ),
+        (
+            "PUT",
+            "/admin/agents/{kind}/sampling-policy",
+            Some(&["kind", "revision", "old", "new"]),
+        ),
+        (
+            "DELETE",
+            "/admin/agents/{kind}/sampling-policy",
+            Some(&["kind", "revision", "old", "new"]),
         ),
         // Agent profile overlays (issue #2374).
         (
@@ -9260,7 +9420,13 @@ pub const fn management_api_response_fields()
         (
             "GET",
             "/admin/quotas",
-            Some(&["quotas", "status", "unavailable_shards"]),
+            Some(&[
+                "quotas",
+                "workflow_types",
+                "override_source",
+                "status",
+                "unavailable_shards",
+            ]),
         ),
         (
             "GET",
@@ -19146,12 +19312,8 @@ pub(crate) async fn start_workflow(
         });
 
     // Resolve per-key concurrency policy from WorkflowInfo (issue #247).
-    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .and_then(|info| info.concurrency.as_ref())
-        .map_or(
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
+        runtime.registry.concurrency_policy(&workflow_name).map_or(
             (
                 None,
                 None,
@@ -21597,9 +21759,7 @@ async fn batch_start_workflows(
 
             let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
                 .registry
-                .workflows
-                .get(&item.workflow_name)
-                .and_then(|info| info.concurrency.as_ref())
+                .concurrency_policy(&item.workflow_name)
                 .map_or(
                     (
                         None,
@@ -23053,12 +23213,8 @@ pub(crate) async fn signal_with_start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .and_then(|info| info.concurrency.as_ref())
-        .map_or(
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
+        runtime.registry.concurrency_policy(&workflow_name).map_or(
             (
                 None,
                 None,
@@ -23814,12 +23970,8 @@ async fn update_with_start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .and_then(|info| info.concurrency.as_ref())
-        .map_or(
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
+        runtime.registry.concurrency_policy(&workflow_name).map_or(
             (
                 None,
                 None,
@@ -24938,9 +25090,7 @@ async fn rerun_workflow(
     // Per-key concurrency (issue #247), resolved against the EFFECTIVE input.
     let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
-        .workflows
-        .get(&source.workflow_name)
-        .and_then(|info| info.concurrency.as_ref())
+        .concurrency_policy(&source.workflow_name)
         .map_or(
             (
                 None,
@@ -31534,12 +31684,8 @@ async fn trigger_schedule_now(
         .registry
         .chain_execution_timeout(&workflow_name)
         .and_then(|d| chrono::Duration::from_std(d).ok());
-    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .and_then(|info| info.concurrency.as_ref())
-        .map_or(
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
+        runtime.registry.concurrency_policy(&workflow_name).map_or(
             (
                 None,
                 None,
@@ -34073,7 +34219,7 @@ async fn load_schedule_by_id_with_shard(
     resolve_schedule_with_shard(api_state, schedule_id).await
 }
 
-fn parse_schedule_expr_with_tz(
+pub(crate) fn parse_schedule_expr_with_tz(
     expr: &str,
     timezone: &str,
 ) -> Result<autumn_harvest::policy::Schedule, String> {
@@ -35731,9 +35877,23 @@ async fn bulk_discard_dead_letters_for_selector(
     Ok(result)
 }
 
+/// The body of `GET /admin/retention`.
+///
+/// `placed_elsewhere` is in the body only when it is `true` (issue #2478).
+/// So every other body is the plain `RetentionStatus`, as before.
+#[derive(serde::Serialize)]
+struct RetentionStatusBody {
+    #[serde(flatten)]
+    status: RetentionStatus,
+    /// Retention is on, but this process does not run the janitor. An
+    /// empty `per_shard` then means "not here", not "idle".
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    placed_elsewhere: bool,
+}
+
 async fn retention_status(
     Extension(api_state): Extension<HarvestApiState>,
-) -> Result<Json<RetentionStatus>, AutumnError> {
+) -> Result<Json<RetentionStatusBody>, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let status = runtime.retention.monitor.as_ref().map_or_else(
         || RetentionStatus {
@@ -35742,8 +35902,17 @@ async fn retention_status(
         },
         RetentionMonitor::snapshot,
     );
-    Ok(Json(status))
+    Ok(Json(RetentionStatusBody {
+        status,
+        placed_elsewhere: runtime.retention.placed_elsewhere,
+    }))
 }
+
+/// The 503 of `run-now` on a process with no placed janitor (issue #2478).
+const RETENTION_PLACED_ELSEWHERE_MESSAGE: &str = "retention run-now unavailable: \
+     harvest.retention.run_on = \"scheduler\" runs retention only on processes that run the \
+     scheduler, and this process runs none. Set harvest.retention.run_on = \"all\" to run \
+     retention here";
 
 async fn retention_run_now(
     Extension(api_state): Extension<HarvestApiState>,
@@ -35754,6 +35923,17 @@ async fn retention_run_now(
 
     let runtime = api_state.runtime().map_err(map_error)?;
     let Some(trigger) = runtime.retention.trigger.as_ref() else {
+        let (summary, message) = if runtime.retention.placed_elsewhere {
+            (
+                "retention not placed on this process",
+                RETENTION_PLACED_ELSEWHERE_MESSAGE,
+            )
+        } else {
+            (
+                "no local retention runtime owner",
+                "retention run-now unavailable: no local retention runtime owner",
+            )
+        };
         if let Ok(pool) = api_state.storage_pool()
             && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
         {
@@ -35766,15 +35946,13 @@ async fn retention_run_now(
                 request_id: request_id.as_deref(),
                 idempotency_key: None,
                 status: STATUS_FAILED,
-                error_summary: Some("no local retention runtime owner"),
+                error_summary: Some(summary),
                 shard_id: None,
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
         }
-        return Err(AutumnError::service_unavailable_msg(
-            "retention run-now unavailable: no local retention runtime owner",
-        ));
+        return Err(AutumnError::service_unavailable_msg(message));
     };
 
     let send_result = trigger.try_send(());
@@ -36318,6 +36496,18 @@ async fn concurrency_status(
     let mut merged: std::collections::HashMap<(String, String), ConcurrencyKeyStats> =
         std::collections::HashMap::new();
 
+    // The stored limit overrides (issue #2407). The read takes the table, not
+    // the cache, so this view never shows a stale override.
+    let overrides: std::collections::HashMap<String, u32> = {
+        let mut conn = acquire_conn(pool.default_pool()).await?;
+        autumn_harvest::run_defaults::load_run_default_overrides(&mut conn)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .filter_map(|o| Some((o.workflow_name, o.fields.concurrency_limit?)))
+            .collect()
+    };
+
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
         let stats = queue::concurrency_key_stats(&mut conn, &runtime.queues)
@@ -36365,20 +36555,23 @@ async fn concurrency_status(
             {
                 continue;
             }
-            let declared = runtime
+            let code = runtime
                 .registry
                 .workflows
                 .get(&attribution.workflow_name)
-                .and_then(|info| info.concurrency)
-                .map_or_else(
-                    autumn_harvest::concurrency::ConcurrencyOnConflict::default,
-                    |policy| policy.on_conflict,
-                );
-            // Activity concurrency groups always defer (issue #811, Codex round 1).
+                .and_then(|info| info.concurrency);
+            let declared = code.map_or_else(
+                autumn_harvest::concurrency::ConcurrencyOnConflict::default,
+                |policy| policy.on_conflict,
+            );
+            // Activity concurrency groups always defer (issue #811).
             let on_conflict = effective_admin_on_conflict(&attribution.task_type, declared);
+            let override_limit = overrides.get(&attribution.workflow_name).copied();
+            let limits = admin_concurrency_limits(&attribution.task_type, code, override_limit);
             entry.workflows.push(queue::ConcurrencyWorkflowStrategy {
                 workflow_name: attribution.workflow_name,
                 on_conflict,
+                limits,
             });
         }
     }
@@ -36391,6 +36584,33 @@ async fn concurrency_status(
     }
     result.sort_by(|a, b| a.key.cmp(&b.key).then(a.task_type.cmp(&b.task_type)));
     Ok(Json(result))
+}
+
+/// The limits to report for one workflow type of an `/admin/concurrency` row
+/// (issue #2407).
+///
+/// Only a `workflow` group reports them, because the workflow limit caps only
+/// workflow tasks. A type with no code policy reports none. The effective
+/// limit follows the same rule as a start.
+fn admin_concurrency_limits(
+    task_type: &str,
+    code: Option<autumn_harvest::concurrency::ConcurrencyPolicy>,
+    override_limit: Option<u32>,
+) -> Option<queue::ConcurrencyLimitView> {
+    if task_type != "workflow" {
+        return None;
+    }
+    let code = code?;
+    let fields = autumn_harvest::run_defaults::RunDefaultFields {
+        concurrency_limit: override_limit,
+        ..autumn_harvest::run_defaults::RunDefaultFields::default()
+    };
+    let effective = fields.apply_concurrency(Some(code))?;
+    Some(queue::ConcurrencyLimitView {
+        code_limit: code.limit,
+        override_limit,
+        effective_limit: effective.limit,
+    })
 }
 
 /// Effective `on_conflict` to report for one `/admin/concurrency` row (issue #811).
@@ -40559,6 +40779,11 @@ fn merge_paused_queue_rows(
 /// `/admin/concurrency`'s cross-shard sum) but always also lists the full
 /// per-shard breakdown, so an operator can see exactly which shard(s) a
 /// tenant is actually capped on.
+///
+/// `limits` holds the effective caps, after the operator override of issue
+/// #2408. `code_limits` and `override` show where each cap comes from.
+/// `workflow_types` lists each type with an admission cap, so an override
+/// shows before its type has usage.
 async fn list_quotas_handler(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<Value>, AutumnError> {
@@ -40577,12 +40802,172 @@ async fn list_quotas_handler(
     .await?;
 
     let collected = shard_fanout::collect_fanout_rows(observations);
+    let default_shard = api_state
+        .storage_pool()
+        .map_err(map_error)?
+        .default_shard()
+        .as_i32();
+    let default_down = collected
+        .unavailable_shards
+        .iter()
+        .any(|shard| shard.shard_id == default_shard);
+    let (overrides, source) =
+        load_quota_overrides(&api_state, &runtime.registry, default_down).await;
 
     Ok(Json(serde_json::json!({
-        "quotas": merge_quota_rows(collected.rows, &runtime.registry),
+        "quotas": merge_quota_rows(collected.rows, &runtime.registry, &overrides),
+        "workflow_types": quota_workflow_types(&runtime.registry, &overrides),
+        "override_source": source,
         "status": collected.status,
         "unavailable_shards": collected.unavailable_shards,
     })))
+}
+
+/// The stored quota override of one type, as `GET /admin/quotas` names it
+/// (issue #2408).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuotaOverrideView {
+    limits: ::autumn_harvest::quota::QuotaLimits,
+    reason: Option<String>,
+    updated_by: Option<String>,
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The stored quota overrides, by type, and their source (issue #2408).
+///
+/// The read takes the table on the default shard, so the view never shows a
+/// stale override. The source is then `table`. When that read fails, the
+/// view takes the cache of this process, which is what this process
+/// enforces. The source is then `cache`, and the cache holds no reason,
+/// actor or time. `default_down` skips the read when the usage fan-out could
+/// not reach the default shard, so the request waits for it only once.
+async fn load_quota_overrides(
+    api_state: &HarvestApiState,
+    registry: &HandlerRegistry,
+    default_down: bool,
+) -> (
+    std::collections::HashMap<String, QuotaOverrideView>,
+    &'static str,
+) {
+    let stored = async {
+        if default_down {
+            return Err("the default shard is unavailable".to_string());
+        }
+        let pool = api_state.storage_pool().map_err(|e| e.to_string())?;
+        let mut conn = acquire_conn(pool.default_pool())
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        ::autumn_harvest::run_defaults::load_run_default_overrides(&mut conn)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    .await;
+    match stored {
+        Ok(rows) => {
+            let overrides = rows
+                .into_iter()
+                .filter(|row| !row.fields.quota.is_empty())
+                .map(|row| {
+                    let view = QuotaOverrideView {
+                        limits: row.fields.quota,
+                        reason: row.reason,
+                        updated_by: Some(row.updated_by),
+                        updated_at: Some(row.updated_at),
+                    };
+                    (row.workflow_name, view)
+                })
+                .collect();
+            (overrides, "table")
+        }
+        Err(reason) => {
+            tracing::warn!(
+                reason,
+                "GET /admin/quotas could not read the stored overrides; it shows the cache"
+            );
+            (cached_quota_overrides(registry), "cache")
+        }
+    }
+}
+
+/// The quota overrides in the cache of this process, by registered type
+/// (issue #2408). The cache holds no reason, actor or time.
+fn cached_quota_overrides(
+    registry: &HandlerRegistry,
+) -> std::collections::HashMap<String, QuotaOverrideView> {
+    registry
+        .workflows
+        .keys()
+        .filter_map(|name| {
+            let fields = registry.run_defaults().get(name)?;
+            (!fields.quota.is_empty()).then(|| {
+                let view = QuotaOverrideView {
+                    limits: fields.quota,
+                    reason: None,
+                    updated_by: None,
+                    updated_at: None,
+                };
+                (name.clone(), view)
+            })
+        })
+        .collect()
+}
+
+/// The `limits`, `code_limits` and `override` of one type (issues #946 and
+/// #2408).
+///
+/// `limits` follows the same rule as admission. Each cap of the override
+/// replaces the code cap. A type with no admission cap keeps its code caps.
+/// A type with no quota policy reports null caps. `override.applies` is
+/// `false` when the type has no admission cap, so the override changes
+/// nothing.
+fn quota_limit_fields(
+    policy: Option<::autumn_harvest::quota::QuotaPolicy>,
+    stored: Option<&QuotaOverrideView>,
+) -> serde_json::Map<String, Value> {
+    use ::autumn_harvest::quota::QuotaLimits;
+    let caps = |limits: QuotaLimits| serde_json::to_value(limits).unwrap_or(Value::Null);
+    let code = policy.map(|p| QuotaLimits::of(&p)).unwrap_or_default();
+    let effective = match (policy, stored) {
+        (Some(policy), Some(stored)) => QuotaLimits::of(&stored.limits.apply(policy)),
+        _ => code,
+    };
+    let applies = policy.is_some_and(|p| p.has_any_cap());
+    let named = stored.map_or(Value::Null, |stored| {
+        let mut view = caps(stored.limits);
+        view["applies"] = serde_json::json!(applies);
+        view["reason"] = serde_json::json!(stored.reason);
+        view["updated_by"] = serde_json::json!(stored.updated_by);
+        view["updated_at"] = serde_json::json!(stored.updated_at);
+        view
+    });
+    let mut fields = serde_json::Map::new();
+    fields.insert("limits".to_string(), caps(effective));
+    fields.insert("code_limits".to_string(), caps(code));
+    fields.insert("override".to_string(), named);
+    fields
+}
+
+/// Each registered type with a quota admission cap, by name (issue #2408).
+fn quota_workflow_types(
+    registry: &HandlerRegistry,
+    overrides: &std::collections::HashMap<String, QuotaOverrideView>,
+) -> Vec<Value> {
+    let mut names: Vec<&String> = registry
+        .workflows
+        .iter()
+        .filter(|(_, info)| info.quota.is_some_and(|p| p.has_any_cap()))
+        .map(|(name, _)| name)
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let policy = registry.workflows.get(name).and_then(|info| info.quota);
+            let mut entry = quota_limit_fields(policy, overrides.get(name));
+            entry.insert("workflow_name".to_string(), serde_json::json!(name));
+            Value::Object(entry)
+        })
+        .collect()
 }
 
 /// Merge per-shard quota usage rows into one entry per `(workflow_name,
@@ -40592,10 +40977,12 @@ async fn list_quotas_handler(
 /// The declared `limits` are resolved from the CURRENT registered
 /// `WorkflowInfo.quota` for `workflow_name` (never persisted with the usage
 /// rows themselves), so a policy edited after a key accrued usage is reported
-/// against the live policy, not a stale snapshot.
+/// against the live policy, not a stale snapshot. The operator override of
+/// issue #2408 then applies, as at admission.
 fn merge_quota_rows(
     rows: Vec<(i32, ::autumn_harvest::quota::QuotaKeyUsage)>,
     registry: &HandlerRegistry,
+    overrides: &std::collections::HashMap<String, QuotaOverrideView>,
 ) -> Vec<Value> {
     let mut by_key: std::collections::BTreeMap<
         (String, String),
@@ -40626,29 +41013,37 @@ fn merge_quota_rows(
                 .get(&workflow_name)
                 .and_then(|info| info.quota);
 
-            serde_json::json!({
-                "workflow_name": workflow_name,
-                "quota_key": quota_key,
-                "usage": {
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "workflow_name".to_string(),
+                serde_json::json!(workflow_name),
+            );
+            entry.insert("quota_key".to_string(), serde_json::json!(quota_key));
+            entry.insert(
+                "usage".to_string(),
+                serde_json::json!({
                     "active_executions": total_active,
                     "history_bytes": total_history_bytes,
                     "dead_letters": total_dead_letters,
-                },
-                "limits": {
-                    "max_active_executions": policy.and_then(|p| p.max_active_executions),
-                    "max_history_bytes": policy.and_then(|p| p.max_history_bytes),
-                    "max_dead_letters": policy.and_then(|p| p.max_dead_letters),
-                },
-                "shards": shard_rows
+                }),
+            );
+            entry.extend(quota_limit_fields(policy, overrides.get(&workflow_name)));
+            entry.insert(
+                "shards".to_string(),
+                shard_rows
                     .iter()
-                    .map(|(shard_id, row)| serde_json::json!({
-                        "shard_id": shard_id,
-                        "active_executions": row.active_executions,
-                        "history_bytes": row.history_bytes,
-                        "dead_letters": row.dead_letters,
-                    }))
-                    .collect::<Vec<_>>(),
-            })
+                    .map(|(shard_id, row)| {
+                        serde_json::json!({
+                            "shard_id": shard_id,
+                            "active_executions": row.active_executions,
+                            "history_bytes": row.history_bytes,
+                            "dead_letters": row.dead_letters,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+            Value::Object(entry)
         })
         .collect()
 }
@@ -43623,19 +44018,19 @@ async fn db_conn_for_dag(
 /// Postgres cannot know the threshold is already satisfied until it has
 /// counted every single matching row, so a workflow with 500,000 recorded
 /// events pays to have all 500,000 counted merely to answer "yes, that's
-/// `>= 10,000`". Profiled on a 5.3M-row `harvest_events` fixture (5,000
-/// ordinary executions plus 15 long-running ones with 50k-450k events each;
-/// `autumn-harvest-plugin/scripts/history_bloat_perf_repro.sh`, artifacts
-/// committed under `docs/perf-artifacts/history-bloat-filter/`):
+/// `>= 10,000`". The profile uses a 5.3M-row `harvest_events` fixture. It
+/// holds 5,000 ordinary executions plus 15 long-running ones with 50k-450k
+/// events each. `cargo xtask perf history-bloat` builds it, and the
+/// artifacts are under `docs/perf-artifacts/history-bloat-filter/`. There,
 /// `(SELECT COUNT(*) ...) >= 10000` against a 448,175-event execution reads
-/// 3,976 total buffers (`pg_stat_statements.total_buffers`, corroborated by
-/// `EXPLAIN (ANALYZE, BUFFERS)` showing `shared hit=6 read=3970`) via a
-/// Parallel Index Only Scan in this fixture's current state, but the access
-/// path Postgres picks for the unbounded scan is sensitive to whether the
-/// table's visibility map is fresh -- see
-/// `docs/performance-history-bloat-filter.md#the-problem` for a fixture state
-/// in which the identical query instead read 158,593 buffers via a Parallel
-/// Seq Scan. What is *not* sensitive to that: `COUNT(*)` has no early exit
+/// 3,976 total buffers via a Parallel Index Only Scan. That figure is
+/// `pg_stat_statements.total_buffers`. `EXPLAIN (ANALYZE, BUFFERS)` agrees
+/// with `shared hit=6 read=3970`. This holds in the current state of the
+/// fixture. The access path that Postgres picks for the unbounded scan
+/// depends on whether the visibility map of the table is fresh.
+/// `docs/performance-history-bloat-filter.md#the-problem` shows a fixture
+/// state in which the identical query read 158,593 buffers via a Parallel
+/// Seq Scan instead. What is *not* sensitive to that: `COUNT(*)` has no early exit
 /// regardless of which access path answers it, so every one of the 448,175
 /// matching rows still has to be visited to confirm the threshold.
 ///
@@ -53724,6 +54119,39 @@ mod tests {
         );
     }
 
+    /// Issue #2408: `limits` takes the override only for a type with an
+    /// admission cap. `override.applies` says whether it changes anything.
+    #[test]
+    fn quota_limit_fields_report_effective_code_and_override() {
+        use autumn_harvest::quota::{QuotaLimits, QuotaPolicy};
+
+        let stored = QuotaOverrideView {
+            limits: QuotaLimits {
+                max_active_executions: Some(1),
+                ..QuotaLimits::default()
+            },
+            reason: Some("INC-1".to_string()),
+            updated_by: Some("ops".to_string()),
+            updated_at: None,
+        };
+        let code = QuotaPolicy::new("tenant").with_max_active_executions(5);
+        let fields = quota_limit_fields(Some(code), Some(&stored));
+        assert_eq!(fields["limits"]["max_active_executions"], 1);
+        assert_eq!(fields["code_limits"]["max_active_executions"], 5);
+        assert_eq!(fields["override"]["max_active_executions"], 1);
+        assert_eq!(fields["override"]["reason"], "INC-1");
+        assert_eq!(fields["override"]["applies"], true);
+
+        let capless = QuotaPolicy::new("tenant");
+        let fields = quota_limit_fields(Some(capless), Some(&stored));
+        assert_eq!(fields["limits"]["max_active_executions"], Value::Null);
+        assert_eq!(fields["override"]["applies"], false);
+
+        let fields = quota_limit_fields(Some(code), None);
+        assert_eq!(fields["limits"], fields["code_limits"]);
+        assert_eq!(fields["override"], Value::Null);
+    }
+
     // ── issue #811 (Codex round 1, P2): activity concurrency groups always defer
     // ───────────────────────────────────────────────────────────────────────
 
@@ -53733,6 +54161,28 @@ mod tests {
     /// purely at claim time and always defers, so reporting its owning
     /// workflow's declared `cancel_running` on the `task_type = "activity"`
     /// admin row advertises a strategy nothing enforces.
+    /// Issue #2407: only a `workflow` group of a type with a policy reports
+    /// limits. A latest-wins type reports its code limit as effective.
+    #[test]
+    fn admin_reports_limits_for_workflow_rows_with_a_policy_only() {
+        use autumn_harvest::concurrency::{ConcurrencyOnConflict, ConcurrencyPolicy};
+
+        let defer = Some(ConcurrencyPolicy::new("input.k", 2));
+        let view = admin_concurrency_limits("workflow", defer, Some(5)).expect("limits");
+        assert_eq!(
+            (view.code_limit, view.override_limit, view.effective_limit),
+            (2, Some(5), 5)
+        );
+        assert_eq!(admin_concurrency_limits("activity", defer, Some(5)), None);
+        assert_eq!(admin_concurrency_limits("workflow", None, Some(5)), None);
+        let latest = Some(
+            ConcurrencyPolicy::new("input.k", 2)
+                .with_on_conflict(ConcurrencyOnConflict::CancelRunning),
+        );
+        let view = admin_concurrency_limits("workflow", latest, Some(5)).expect("limits");
+        assert_eq!(view.effective_limit, 2);
+    }
+
     #[test]
     fn admin_reports_defer_for_activity_rows_regardless_of_workflow_policy() {
         use autumn_harvest::concurrency::ConcurrencyOnConflict;

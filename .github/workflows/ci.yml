@@ -42,6 +42,39 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Compiler cache: kache (kunobi-ninja/kache-action) replaces
+  # Swatinem/rust-cache in every job that builds the root workspace.
+  # kache caches each rustc invocation by content, workspace crates and test
+  # binaries included, so an untouched crate is a cache hit on an empty target.
+  # Four jobs keep rust-cache: kani, fuzz-smoke and both harvest-verify jobs.
+  # They cache files that are not rustc outputs (MIR, `cargo install`, `fuzz/`).
+  # The action installs kache into the runner tool cache. A job that frees
+  # disk with `rm -rf "$AGENT_TOOLSDIRECTORY"` must run that step first.
+  #
+  # Backend: an S3 bucket, when the repository has `KACHE_S3_BUCKET` (as a
+  # variable or a secret) and the `KACHE_S3_ACCESS_KEY_ID` secret. The same
+  # goes for `KACHE_S3_REGION` and `KACHE_S3_ENDPOINT`. kache writes to it only
+  # from a push to a protected branch, so trunk-dev must have a ruleset. Pull
+  # requests read what trunk-dev published, so every PR shares one store.
+  # Each entry is written on its own, so the store follows trunk-dev.
+  # `manifest-key` names each job and leg, so prefetch stays per workload.
+  # `docs/rnd/2026-11-04-kache-compile-cache.md` lists the setup.
+  #
+  # No fallback: without the bucket, a job builds from an empty local store
+  # and saves nothing. The GitHub Actions cache is off (`github-cache: false`).
+  # One run saved 0.4 to 0.5 GB per job leg there, over 35 legs. That passed
+  # the repository quota, so GitHub evicted the oldest kache stores in the
+  # same run, and the rust-cache entries of other branches.
+  #
+  # rust-cache used to set CARGO_INCREMENTAL=0 itself. kache does not, and an
+  # incremental build gives path crates another codegen-units value, so the
+  # cache keys would differ between jobs and runs.
+  CARGO_INCREMENTAL: 0
+  # kache turns off free-space recovery in CI by default. The store reflinks
+  # each output, and it keeps the blocks after cargo replaces that file.
+  # A macOS no-db shard grew its store to 48 GiB of a 96 GiB disk, and cargo
+  # then hit a disk I/O error. Below this floor, kache evicts store entries.
+  KACHE_AUTO_RECOVER_MIN_FREE_BYTES: 20GiB
 
 jobs:
   # Detects whether any non-docs file changed, so the build/test jobs below can
@@ -129,7 +162,7 @@ jobs:
           fi
           # Issue #1614: a docs-only change to the standalone chapter, its
           # reference or its crate still runs the `standalone-chapter` job.
-          if echo "$changed" | grep -qE '^(docs/embedding\.md|docs/getting-started/(standalone-axum|02-first-workflow)\.md|examples/standalone-quickstart/|scripts/run-standalone-chapter\.sh)'; then
+          if echo "$changed" | grep -qE '^(docs/embedding\.md|docs/getting-started/(standalone-axum|02-first-workflow)\.md|examples/standalone-quickstart/|xtask/src/dev/run_standalone_chapter\.rs)'; then
             echo "chapter=true" >> "$GITHUB_OUTPUT"
           else
             echo "chapter=false" >> "$GITHUB_OUTPUT"
@@ -162,20 +195,36 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
+      # Every gate below runs through `cargo xtask`. Its unit tests hold the
+      # self-test fixtures and the parity cases of each port. So run them
+      # first, before any gate trusts the binary. They build only xtask.
+      - name: xtask unit tests (cargo test -p xtask)
+        run: cargo test --locked -p xtask
       - name: Check default-run for multi-binary packages
         # Guards the defect class that silently broke `cargo run -p
         # quickstart` and `cargo run -p autumn-harvest-cli -- ...` (the
         # documented command in 50+ places, including the quickstart's own
         # "Step 3 — Run preflight") for weeks with fully green CI, because
         # the `quickstart`/build-only CI jobs run `cargo build`, which can't
-        # itself be ambiguous. See scripts/check-default-run.sh.
-        run: ./scripts/check-default-run.sh
+        # itself be ambiguous. See xtask/src/check/default_run.rs.
+        run: cargo xtask check default-run
       - name: Check license and policy files (issue #1990)
         # The root must hold the license and policy files. Each publishable
         # crate must ship both license texts. Cargo does not copy a root file
-        # into a crate. See scripts/check-license-files.sh.
-        run: ./scripts/check-license-files.sh
+        # into a crate. See xtask/src/check/license_files.rs.
+        run: cargo xtask check license-files
       - name: Check cargo-dev root caveat is documented
         # Guards a real, reproduced-live defect: `cargo dev` is the flagship
         # "no database, no Docker, nothing to configure" front door
@@ -185,8 +234,8 @@ jobs:
         # dev runtime's own doc comment (autumn-harvest-plugin/src/dev/postgres.rs,
         # refuse_to_run_as_root). Neither front-door doc used to say so, so a
         # newcomer in one of those environments hit an undocumented hard stop
-        # on the very first command. See scripts/check-dev-runtime-root-caveat.sh.
-        run: ./scripts/check-dev-runtime-root-caveat.sh
+        # on the very first command. See xtask/src/check/dev_runtime_root_caveat.rs.
+        run: cargo xtask check dev-runtime-root-caveat
       - name: Check HARVEST_DEV_DATABASE_URL placeholder caveat is documented
         # Guards a real, reproduced-live defect: Chapter 1 gives
         # `HARVEST_DEV_DATABASE_URL=postgres://me@localhost:5432/harvest_dev
@@ -195,8 +244,8 @@ jobs:
         # password-authenticated Postgres it fails with Postgres's own
         # "fe_sendauth: no password supplied", which names neither the env
         # var nor the doc. See
-        # scripts/check-dev-database-url-placeholder-caveat.sh.
-        run: ./scripts/check-dev-database-url-placeholder-caveat.sh
+        # xtask/src/check/dev_database_url_placeholder_caveat.rs.
+        run: cargo xtask check dev-database-url-placeholder-caveat
       - name: Check README upgrade-guide pointer is current
         # Guards a real, reproduced-live defect: README.md's own top-level
         # "Upgrading an existing deployment?" pointer is a hand-written link
@@ -204,8 +253,8 @@ jobs:
         # shipped and docs/getting-started/README.md was updated to call it
         # "the current" guide, README.md's front-door pointer still linked to
         # the superseded 0.4.0 -> 0.5.0 guide. See
-        # scripts/check-readme-upgrade-guide-current.sh.
-        run: ./scripts/check-readme-upgrade-guide-current.sh
+        # xtask/src/check/readme_upgrade_guide_current.rs.
+        run: cargo xtask check readme-upgrade-guide-current
       - name: Check search_attr query-string syntax in docs
         # Guards a real, reproduced-live defect: examples/billing-autumn-web's
         # README — the repository's own reference example for a real
@@ -216,8 +265,8 @@ jobs:
         # exact command 400s: "invalid search_attr 'tenant_id=acme'; expected
         # 'key:value'". No CI job runs this example, so nothing else catches
         # this class of drift. See
-        # scripts/check-search-attr-query-syntax.sh.
-        run: ./scripts/check-search-attr-query-syntax.sh
+        # xtask/src/check/search_attr_query_syntax.rs.
+        run: cargo xtask check search-attr-query-syntax
       - name: Check README testing-dependency version pin
         # Guards a real, reproduced-live defect: README.md's "Testing
         # workflow code changes with the replayer" section pinned
@@ -225,8 +274,8 @@ jobs:
         # a dev-dependency, four minor versions behind the `"0.6"` pin the
         # reader already added in the same manifest per Chapter 1, and
         # nothing keeps the two pins in sync as releases ship. See
-        # scripts/check-readme-testing-dep-version.sh.
-        run: ./scripts/check-readme-testing-dep-version.sh
+        # xtask/src/check/readme_testing_dep_version.rs.
+        run: cargo xtask check readme-testing-dep-version
       - name: Check for PowerShell env-var syntax in bash blocks
         # Guards a real, reproduced-live defect: examples/standalone-runner's
         # README fenced its "Run" section ```bash, matching every sibling
@@ -234,8 +283,8 @@ jobs:
         # used PowerShell's `$env:NAME = "value"` assignment instead of bash's
         # `NAME=value`. Pasted verbatim into bash, each line is silently
         # skipped ("command not found") and neither variable ends up set. See
-        # scripts/check-no-powershell-env-syntax.sh.
-        run: ./scripts/check-no-powershell-env-syntax.sh
+        # xtask/src/check/no_powershell_env_syntax.rs.
+        run: cargo xtask check no-powershell-env-syntax
       - name: Check CHANGELOG connector migration version
         # Guards a real, reproduced-live defect: CHANGELOG.md's [0.6.0]
         # "Add broker event-source connectors" entry (issue #944) cited
@@ -248,8 +297,8 @@ jobs:
         # __diesel_schema_migrations keyspace. docs/upgrading/0.6.0.md sends
         # an upgrading operator straight to this CHANGELOG.md section to
         # find 0.6.0's migrations. See
-        # scripts/check-changelog-connector-migration-version.sh.
-        run: ./scripts/check-changelog-connector-migration-version.sh
+        # xtask/src/check/changelog_connector_migration_version.rs.
+        run: cargo xtask check changelog-connector-migration-version
       - name: Check broker-connectors dead-letter-sink example
         # Guards a real, reproduced-live defect: chapter 13's "(a) record
         # into harvest -- the default mode" example -- the option for a
@@ -263,8 +312,8 @@ jobs:
         # A newcomer who copies the example gets a runtime that compiles,
         # runs, and acknowledges poison messages with no error, but never
         # durably records them: they vanish on restart. See
-        # scripts/check-broker-connector-dead-letter-sink-example.sh.
-        run: ./scripts/check-broker-connector-dead-letter-sink-example.sh
+        # xtask/src/check/broker_connector_dead_letter_sink_example.rs.
+        run: cargo xtask check broker-connector-dead-letter-sink-example
       - name: Check broker-connectors cutover example
         # Guards a real, reproduced-live defect: chapter 13's "Cutting a
         # binding over to a new cluster or a recreated topic" example called
@@ -279,8 +328,8 @@ jobs:
         # place in the chapter that tells an operator how to rotate a
         # binding's dedupe namespace during a production cutover -- copies
         # code that does not type-check. See
-        # scripts/check-broker-connector-cutover-example.sh.
-        run: ./scripts/check-broker-connector-cutover-example.sh
+        # xtask/src/check/broker_connector_cutover_example.rs.
+        run: cargo xtask check broker-connector-cutover-example
       - name: Check claude-agent-daemon runtime artifacts are git-ignored
         # Guards a real, reproduced-live defect: examples/claude-agent-daemon's
         # README tells the reader to run every `agentd` command "from the
@@ -291,12 +340,12 @@ jobs:
         # against a real API key, parks an actual conversation transcript
         # (the doc's own words: "every prompt, tool input, and tool result")
         # as an untracked file one `git add -A` away from being committed.
-        # See scripts/check-agentd-runtime-artifacts-ignored.sh.
-        run: ./scripts/check-agentd-runtime-artifacts-ignored.sh
+        # See xtask/src/check/agentd_runtime_artifacts_ignored.rs.
+        run: cargo xtask check agentd-runtime-artifacts-ignored
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check autumn-harvest-agent depends on no Autumn crate outside the engine
-        run: ./scripts/check-agent-adapter-deps.sh
+        run: cargo xtask check agent-adapter-deps
 
       # Issue #786: the `docs/performance.md` prose-vs-table guards must run on
       # DOCS-ONLY pull requests — which is the change class most likely to break
@@ -513,67 +562,67 @@ jobs:
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration sandbox_activities_docs::"
 
       # Folio corpus harness: internal link check across all of docs/ (see
-      # docs/audits/corpus-link-check.py). Same reasoning as the docs-only
+      # xtask/src/audit/corpus_link_check/mod.rs). Same reasoning as the docs-only
       # guards above — a broken link is exactly the change class a docs-only
       # PR is most likely to introduce, and the `test` matrix below skips
-      # entirely on docs-only changes. Pure Python stdlib, no deps, no
-      # network — costs a couple of seconds. Exits 1 only on a broken link
+      # entirely on docs-only changes. It reads only the filesystem and needs
+      # no network. Exits 1 only on a broken link
       # inside the reader corpus; a broken link inside docs/plans/,
       # docs/changelog.d/, docs/rnd/, docs/assays/, or docs/perf-artifacts/
       # (historical/process records, not indexed reference pages) is
       # reported but does not fail the build. Orphan pages are reported,
       # not gated — an orphan is a findability defect to triage, not a hard
       # error the way a dead link is.
-      - name: Folio corpus link check (docs/audits/corpus-link-check.py)
-        run: python3 docs/audits/corpus-link-check.py
+      - name: Folio corpus link check (cargo xtask audit corpus-link-check)
+        run: cargo xtask audit corpus-link-check
 
       # Folio corpus harness: config-key / env-var / CLI-flag drift scan (see
-      # docs/audits/config-cli-drift.py). Ground truth is extracted
+      # xtask/src/audit/config_cli_drift.rs). Ground truth is extracted
       # mechanically from autumn-harvest-plugin/src/config.rs and
       # autumn-harvest-cli/src/lib.rs, so this stays accurate as the config
-      # schema and CLI evolve without hand-maintaining a list here. Pure
-      # Python stdlib, no deps, no network. Exits 1 only on a drift hit
+      # schema and CLI evolve without hand-maintaining a list here. No
+      # network. Exits 1 only on a drift hit
       # inside the reader corpus; a hit inside docs/plans/,
       # docs/changelog.d/, docs/rnd/, docs/assays/, or docs/perf-artifacts/
       # is reported but does not fail the build, matching the link-check
       # convention above.
-      - name: Folio config/CLI drift scan (docs/audits/config-cli-drift.py)
-        run: python3 docs/audits/config-cli-drift.py
+      - name: Folio config/CLI drift scan (cargo xtask audit config-cli-drift)
+        run: cargo xtask audit config-cli-drift
 
       # Folio corpus harness: audit-catalog coverage scan (see
-      # docs/audits/audit-catalog-coverage.py). docs/audits/README.md is
+      # xtask/src/audit/audit_catalog_coverage.rs). docs/audits/README.md is
       # itself a docs page — the catalog a contributor reads to find out
-      # which audit scripts exist and whether each is wired into CI. This
-      # fails the build if a script lands in docs/audits/ without a row
-      # naming it there, so the catalog cannot silently fall behind the
-      # directory it describes. Pure Python stdlib, no deps, no network.
-      - name: Folio audit-catalog coverage (docs/audits/audit-catalog-coverage.py)
-        run: python3 docs/audits/audit-catalog-coverage.py
+      # which audit commands exist and whether each is wired into CI. This
+      # fails the build if a `cargo xtask audit` subcommand lands without a
+      # row naming it there, or a row names no subcommand, so the catalog
+      # cannot silently fall behind the commands it describes. No network.
+      - name: Folio audit-catalog coverage (cargo xtask audit audit-catalog-coverage)
+        run: cargo xtask audit audit-catalog-coverage
 
       # Issue #1831: a tracked binary or a patch leftover fails the build.
-      # The script lists the binaries that the repository needs.
-      - name: Tracked artifacts (docs/audits/tracked-artifacts.py)
+      # The command lists the binaries that the repository needs.
+      - name: Tracked artifacts (cargo xtask audit tracked-artifacts)
         run: |
-          python3 docs/audits/tracked-artifacts.py --self-test
-          python3 docs/audits/tracked-artifacts.py
+          cargo xtask audit tracked-artifacts --self-test
+          cargo xtask audit tracked-artifacts
 
       # Issue #2341: the authz.rs/tenant.rs tenant-header-validation clone
       # class is linked, not merged (2 instances, below the rule-of-three
       # merge bar). This substitutes for the abstraction the numerosity gate
       # did not clear: a fix landing in one copy and not the other fails here.
-      - name: Tenant-header-validation sync (docs/audits/tenant-header-validation-sync.py)
+      - name: Tenant-header-validation sync (cargo xtask audit tenant-header-validation-sync)
         run: |
-          python3 docs/audits/tenant-header-validation-sync.py --self-test
-          python3 docs/audits/tenant-header-validation-sync.py
+          cargo xtask audit tenant-header-validation-sync --self-test
+          cargo xtask audit tenant-header-validation-sync
 
       # Issue #2358: two copies of required_migration_versions exist, in
       # preflight.rs and shard_health.rs. Two copies are below the
       # rule-of-three merge bar, so the code links them and does not merge
       # them. This step fails when one copy changes and the other does not.
-      - name: Required-migration-versions sync (docs/audits/required-migration-versions-sync.py)
+      - name: Required-migration-versions sync (cargo xtask audit required-migration-versions-sync)
         run: |
-          python3 docs/audits/required-migration-versions-sync.py --self-test
-          python3 docs/audits/required-migration-versions-sync.py
+          cargo xtask audit required-migration-versions-sync --self-test
+          cargo xtask audit required-migration-versions-sync
 
       # Issue #2521: autumn-harvest-cli/src/lib.rs and
       # autumn-harvest-plugin/src/dev/dsn.rs each define
@@ -582,67 +631,69 @@ jobs:
       # autumn-harvest core would be a public-API change needing a human
       # call, so the code links them and does not merge them. This step
       # fails when one copy's keyword list changes and the other does not.
-      - name: Libpq-keyword sync (docs/audits/libpq-keyword-sync.py)
+      - name: Libpq-keyword sync (cargo xtask audit libpq-keyword-sync)
         run: |
-          python3 docs/audits/libpq-keyword-sync.py --self-test
-          python3 docs/audits/libpq-keyword-sync.py
+          cargo xtask audit libpq-keyword-sync --self-test
+          cargo xtask audit libpq-keyword-sync
 
       # Issue #2492: every diesel table! keeps 32 columns or fewer, so the
       # workspace and every embedder build diesel at its default tier. A wider
       # table splits over two declarations (autumn-harvest/src/table_split.rs).
-      - name: Diesel table width (docs/audits/diesel-table-width.py)
+      - name: Diesel table width (cargo xtask audit diesel-table-width)
         run: |
-          python3 docs/audits/diesel-table-width.py --self-test
-          python3 docs/audits/diesel-table-width.py
+          cargo xtask audit diesel-table-width --self-test
+          cargo xtask audit diesel-table-width
 
       # Only listed files sit at the repository root. A design record goes in
-      # docs/design/. The script lists each root file with a reason.
-      - name: Root files (docs/audits/root-files.py)
+      # docs/design/. The command lists each root file with a reason.
+      - name: Root files (cargo xtask audit root-files)
         run: |
-          python3 docs/audits/root-files.py --self-test
-          python3 docs/audits/root-files.py
+          cargo xtask audit root-files --self-test
+          cargo xtask audit root-files
 
       # Issue #2364: every function that sends SQL has a Ledger profile in
       # docs/ledger/. A new query without one, or a profile that no longer
       # matches its query, fails here. See docs/ledger/README.md.
-      - name: Ledger profiles (docs/audits/ledger-profiles.py)
+      - name: Ledger profiles (cargo xtask audit ledger-profiles)
         run: |
-          python3 docs/audits/ledger-profiles.py --self-test
-          python3 docs/audits/ledger-profiles.py
-          python3 docs/audits/ledger-census.py --self-test
+          cargo xtask audit ledger-profiles --self-test
+          cargo xtask audit ledger-profiles
+          cargo xtask audit ledger-census --self-test
 
       # Issue #1831: a doc claim that shipped code made false fails the build.
-      - name: Doc claim drift (docs/audits/doc-claim-drift.py)
+      - name: Doc claim drift (cargo xtask audit doc-claim-drift)
         run: |
-          python3 docs/audits/doc-claim-drift.py --self-test
-          python3 docs/audits/doc-claim-drift.py
+          cargo xtask audit doc-claim-drift --self-test
+          cargo xtask audit doc-claim-drift
 
       # Issue #1614: the standalone getting-started chapter shows the files of
       # examples/standalone-quickstart byte for byte, and keeps the markers
       # that the `standalone-chapter` job runs.
-      - name: Standalone chapter sync (docs/audits/standalone-chapter-sync.py)
+      # The step name names the module, not the command. The audit then finds
+      # its own wiring on a run line only, so a commented-out run fails it.
+      - name: Standalone chapter sync (xtask/src/audit/standalone_chapter_sync.rs)
         run: |
-          python3 docs/audits/standalone-chapter-sync.py --self-test
-          python3 docs/audits/standalone-chapter-sync.py
+          cargo xtask audit standalone-chapter-sync --self-test
+          cargo xtask audit standalone-chapter-sync
 
       # Folio corpus harness: Rust syntax check for every ```rust fence in
       # docs/getting-started/*.md and README.md (see
-      # docs/audits/doc-snippet-syntax.py). These are the front-door
+      # xtask/src/audit/doc_snippet_syntax.rs). These are the front-door
       # snippets — the fastest documented path promises "nothing to
       # configure", and every later chapter's fenced block is something a
       # reader on that path copies into their own editor. Uses only
-      # `rustfmt` (installed above via `components: rustfmt`), never
-      # `cargo`, so it costs a couple of seconds and needs no network or
-      # `target/`. It is a syntax check, not a compile check — see the
-      # script's own docstring for why that scope is deliberate. Exits 1
+      # `rustfmt` (installed above via `components: rustfmt`) on the
+      # snippets, never `cargo build`, so it needs no network. It is a
+      # syntax check, not a compile check — see the module's own doc
+      # comment for why that scope is deliberate. Exits 1
       # only on a block that fails to parse and is not a documented
       # fragment exception (a bare `.method(...)` continuation line, listed
-      # by name in the script).
-      - name: Folio doc-snippet syntax check (docs/audits/doc-snippet-syntax.py)
-        run: python3 docs/audits/doc-snippet-syntax.py
+      # by name in the module).
+      - name: Folio doc-snippet syntax check (cargo xtask audit doc-snippet-syntax)
+        run: cargo xtask audit doc-snippet-syntax
 
       # Comment hygiene across the Rust sources (see
-      # docs/audits/comment-hygiene.py). Two tiers, and the split is the
+      # xtask/src/audit/comment_hygiene/mod.rs). Two tiers, and the split is the
       # point: Tier A (commented-out code, an unreferenced TODO, a narrative
       # aside, a blank comment line at a block edge) is at zero and must stay
       # there; Tier B (review-round archaeology, contractions, sentences over
@@ -692,30 +743,26 @@ jobs:
           python3 -m openapi_spec_validator docs/openapi.json
           python3 -m openapi_spec_validator autumn-harvest-plugin/openapi.json
 
-      # Workflow YAML parse check (see docs/audits/workflow-yaml-parse.py).
+      # Workflow YAML parse check (see xtask/src/audit/workflow_yaml_parse/).
       # GitHub runs an unparsable workflow file as a zero-job failed run on
       # every push and never fires its triggers. chaos.yml sat in that state
-      # from its first commit, so its nightly suite never ran. Runs after
-      # `setup-python` above, which is where PyYAML can be installed. The pin
-      # keeps a PyYAML release from reddening lint.
-      - name: Workflow YAML parses (docs/audits/workflow-yaml-parse.py)
-        run: |
-          python3 -m pip install --quiet --disable-pip-version-check "PyYAML==6.0.2"
-          python3 docs/audits/workflow-yaml-parse.py
+      # from its first commit, so its nightly suite never ran. The command
+      # reads YAML as PyYAML does, and its parser is compiled in.
+      - name: Workflow YAML parses (cargo xtask audit workflow-yaml-parse)
+        run: cargo xtask audit workflow-yaml-parse
 
-      # Supply-chain pin lint (issue #1826, docs/audits/action-sha-pin.py).
+      # Supply-chain pin lint (issue #1826, xtask/src/audit/action_sha_pin.rs).
       # A tag or branch ref can move to new code. Each `uses:` must pin a
-      # commit SHA with a `# <tag>` comment. The self-test runs first. Runs
-      # after the PyYAML install above, because the script parses YAML.
-      - name: Action SHA pins (docs/audits/action-sha-pin.py)
+      # commit SHA with a `# <tag>` comment. The self-test runs first.
+      - name: Action SHA pins (cargo xtask audit action-sha-pin)
         run: |
-          python3 docs/audits/action-sha-pin.py --self-test
-          python3 docs/audits/action-sha-pin.py
+          cargo xtask audit action-sha-pin --self-test
+          cargo xtask audit action-sha-pin
 
       # Issue #1989. Lint the worker chart, then check the image contract.
       # The audit renders the chart with `helm template`. The pinned version
       # and its checksum stop a new Helm release from failing the lint job.
-      - name: Worker chart and image contract (docs/audits/worker-image-contract.py)
+      - name: Worker chart and image contract (cargo xtask audit worker-image-contract)
         env:
           HELM_VERSION: "3.21.0"
           HELM_SHA256: "0093eb572e3d2380f094df162ddb525e219249de88957afe24cfbb19632acd36"
@@ -728,68 +775,68 @@ jobs:
           tar -xzf "${RUNNER_TEMP}/helm.tar.gz" -C "${RUNNER_TEMP}/helm-bin" --strip-components=1 linux-amd64/helm
           export PATH="${RUNNER_TEMP}/helm-bin:${PATH}"
           helm lint --strict charts/autumn-harvest-worker -f charts/autumn-harvest-worker/ci/lint-values.yaml
-          python3 docs/audits/worker-image-contract.py --self-test
-          python3 docs/audits/worker-image-contract.py
+          cargo xtask audit worker-image-contract --self-test
+          cargo xtask audit worker-image-contract
 
       # Issue #1828. The rolling-deploy contract page and the
       # `mixed-version-smoke` job must both exist and name each other.
-      - name: Mixed-version contract guard (docs/audits/mixed-version-contract.py)
+      - name: Mixed-version contract guard (cargo xtask audit mixed-version-contract)
         run: |
-          python3 docs/audits/mixed-version-contract.py --self-test
-          python3 docs/audits/mixed-version-contract.py
+          cargo xtask audit mixed-version-contract --self-test
+          cargo xtask audit mixed-version-contract
       # The smoke crate is not a workspace member, so `cargo fmt --all` skips it.
       - name: Format check of the mixed-version smoke crate
         run: rustfmt --edition 2024 --check scripts/mixed-version-smoke/src/*.rs
 
       # The contract is what the OpenAPI document is generated from, so a
       # status or a mandatory field missing there is missing from every
-      # generated client. Reads api.rs and the contract, builds nothing.
-      # The self-test runs first. It runs each fixture through the checks.
-      # A change to the parser that breaks a check fails CI.
-      - name: OpenAPI contract coverage (docs/audits/openapi-response-coverage.py)
+      # generated client. Reads api.rs and the contract, and builds only the
+      # xtask crate. The self-test runs first. It runs each fixture through
+      # the checks. A change to the parser that breaks a check fails CI.
+      - name: OpenAPI contract coverage (cargo xtask audit openapi-response-coverage)
         run: |
-          python3 docs/audits/openapi-response-coverage.py --self-test
-          python3 docs/audits/openapi-response-coverage.py
+          cargo xtask audit openapi-response-coverage --self-test
+          cargo xtask audit openapi-response-coverage
 
       # Comment hygiene. A PR ratchets against its merge base. A push
       # ratchets against the commit before the push. release-pr.yml ratchets
       # the whole release against trunk, because a push run on trunk-dev can
       # be cancelled, and two clean PRs can merge into a new finding.
-      - name: Comment hygiene (docs/audits/comment-hygiene.py)
+      - name: Comment hygiene (cargo xtask audit comment-hygiene)
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
-          python3 docs/audits/comment-hygiene.py --self-test
+          cargo xtask audit comment-hygiene --self-test
           BEFORE="${{ github.event.before }}"
           if [ -n "$BASE_REF" ]; then
             git fetch --no-tags origin "$BASE_REF"
-            python3 docs/audits/comment-hygiene.py --base FETCH_HEAD
+            cargo xtask audit comment-hygiene --base FETCH_HEAD
           elif [ -n "$BEFORE" ] \
             && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
             # The whole push, not just its last commit. `HEAD~1` would let a
             # violation introduced by an earlier commit of a multi-commit push
             # through, in any file the final commit did not also touch.
-            python3 docs/audits/comment-hygiene.py --base "$BEFORE"
+            cargo xtask audit comment-hygiene --base "$BEFORE"
           else
             # A branch's first push has no before-SHA to diff against. Tier A
             # still gates; Tier B reports.
-            python3 docs/audits/comment-hygiene.py
+            cargo xtask audit comment-hygiene
           fi
 
       # Folio corpus harness: per-shard weight drift report for row-ordinal
-      # sharding (see docs/audits/shard-weight-drift.py). The coverage nightly
+      # sharding (see xtask/src/audit/shard_weight_drift.rs). The coverage nightly
       # shards that way. `test-db-linux` partitions by test hash now, so the
       # report no longer describes it. Report-only (always exits
-      # 0): the script's own docstring explains why gating now would redden
+      # 0): the module's own doc comment explains why gating now would redden
       # every open PR on a pre-existing collision this step cannot itself
-      # fix. Pure Python stdlib, no deps, no network, no cargo build.
-      - name: Shard-weight drift report (docs/audits/shard-weight-drift.py)
-        run: python3 docs/audits/shard-weight-drift.py
-      # The nightly coverage report and ratchet use this script (issue
+      # fix. No network, and no build of the workspace crates: only xtask.
+      - name: Shard-weight drift report (cargo xtask audit shard-weight-drift)
+        run: cargo xtask audit shard-weight-drift
+      # The nightly coverage report and ratchet use this command (issue
       # #1818). The self-test checks the LCOV merge, the llvm-cov JSON line
       # rule and the ratchet in seconds, so a break shows on the PR.
-      - name: Coverage script self-test (.github/ci/coverage.py)
-        run: python3 .github/ci/coverage.py --self-test
+      - name: Coverage self-test (cargo xtask ci coverage)
+        run: cargo xtask ci coverage --self-test
 
   test:
     name: Test (${{ matrix.os }})
@@ -817,7 +864,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # kache executable caching broke uplifted binaries on macOS:
+      # `target/debug/harvest` and a build-script copy failed with "cannot
+      # execute binary file". Test binaries in `deps/` ran. The CLI caches
+      # executables by default on macOS, so this turns it off before the
+      # action can start the daemon.
+      - name: Turn off kache executable caching (macOS)
+        if: runner.os == 'macOS'
+        run: echo "KACHE_CACHE_EXECUTABLES=0" >> "$GITHUB_ENV"
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: ${{ runner.os != 'macOS' }}
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Run no-db tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features
@@ -860,7 +926,7 @@ jobs:
   # `test-db-linux` below, the next-largest cost on the still-serial `test` leg
   # was the REST of its non-DB work -- ~30 individual crate/example
   # `cargo test`/`cargo build` steps plus the two manifest-driven
-  # `run-suites.sh compile` / `run-suites.sh run allos` steps -- measured on
+  # `cargo xtask ci run-suites compile` / `run allos` steps -- measured on
   # `windows-latest` (the leg that split left as the long pole) at ~38% of that
   # leg's wall time for the manifest pair alone (28.3 + 13.8 of 110.9 minutes),
   # with `Compile db-backed tests` and `Run all-features lib tests` adding
@@ -869,16 +935,25 @@ jobs:
   # OS `test` itself runs on.
   #
   # Two sharding mechanisms meet here:
-  #   * The manifest-driven steps (`compile`, `run allos`) use `run-suites.sh`'s
+  #   * The manifest-driven steps (`compile`, `run allos`) use the runner's
   #     OWN row-ordinal sharding (SEMAPHORE_SHARD_COUNT/INDEX below) -- every
   #     shard runs the SAME two steps, each processing a disjoint slice of the
-  #     manifest rows. See run-suites.sh's header comment for why a filtered,
+  #     manifest rows. See xtask/src/ci/run_suites.rs's module doc for why a filtered,
   #     already-sorted row list still batches correctly.
   #   * The ~30 individual steps carried over from `test` have no such
-  #     mechanism (each is its own crate/example, not a manifest row), so they
-  #     are round-robin assigned to one shard each via `matrix.shard == N` --
-  #     by COUNT, not by measured per-step time (no such measurement exists for
-  #     macOS/Windows), so the four shards are approximately, not exactly, even.
+  #     mechanism (each is its own crate/example, not a manifest row). Each
+  #     one runs on one shard, through `matrix.shard == N`.
+  #     The assignment balances the measured step times of trunk-dev run
+  #     41757040952 and PR run 41909196917 on all three OSes. Windows weighs
+  #     most, because it was the long pole at 110 minutes.
+  #     The manifest steps above set a different base load on each shard, so
+  #     balance the totals, not the step counts.
+  #     Shard 0 also runs `Compile db-backed tests`. That step and the
+  #     manifest compile vary by 5-12 minutes between runs, so keep shard 0
+  #     lighter than the others.
+  #     Two steps share a shard on purpose. `Run all-features lib tests` runs
+  #     on shard 0 after `Compile db-backed tests`, which builds the same lib
+  #     test binary. On another shard, it builds that binary again.
   #
   # A SEPARATE job, not a matrix dimension added to `test`, for the same reason
   # `test-db-linux` is one: `test`'s three legs are branch-protection required
@@ -900,6 +975,12 @@ jobs:
     # pushes, so every OS x shard leg still spins up and reports a conclusion;
     # `needs.changes.outputs.code` gates the actual work per step.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    env:
+      # Line tables only. A leg runs many serial builds with different
+      # feature sets, and full debug info filled the runner disk on Linux
+      # and Windows (ENOSPC, PR #2582). Backtraces keep file and line.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     strategy:
       fail-fast: false
       matrix:
@@ -914,13 +995,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Shared across a given OS's 4 shards (they build the same
-          # Cargo.lock), so a shard needing a binary another shard already
-          # built doesn't start cold -- same reasoning as `test-db-linux`'s
-          # `shared-key`, but per-OS since these three OSes don't share a cache.
-          shared-key: test-nodb-${{ matrix.os }}
       # Same disk-pressure guard as the pre-split `test` job carried
       # immediately before this step; every shard on Linux gets its own runner,
       # so it's cheap (a few seconds) to run per shard rather than build a
@@ -932,6 +1006,44 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      # Windows keeps the Cargo registry on C:, which is the small drive. A
+      # leg that unpacks the AWS SDK filled it (os error 112, PR #2582). The
+      # preinstalled Android SDK is the largest unused tree there.
+      - name: Free runner disk before heavy plugin link (Windows)
+        if: runner.os == 'Windows' && needs.changes.outputs.code == 'true'
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force C:\Android -ErrorAction SilentlyContinue
+          Get-PSDrive C | Format-Table -AutoSize
+      # kache executable caching broke uplifted binaries on macOS:
+      # `target/debug/harvest` and a build-script copy failed with "cannot
+      # execute binary file". Test binaries in `deps/` ran. The CLI caches
+      # executables by default on macOS, so this turns it off before the
+      # action can start the daemon.
+      - name: Turn off kache executable caching (macOS)
+        if: runner.os == 'macOS'
+        run: echo "KACHE_CACHE_EXECUTABLES=0" >> "$GITHUB_ENV"
+      # `warm: false` stops the startup prefetch from the build manifest.
+      # On these shards it hit nothing, on trunk-dev and on pull requests.
+      # A pull request that changes `autumn-harvest` source misses every
+      # prefetched crate, yet the prefetch still downloads them. On one such
+      # PR that was 17 GiB more than trunk-dev restored on the same shard,
+      # and it filled the disk of Ubuntu shard 1 and Windows shard 3. Hits
+      # still restore on demand.
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-dir: ${{ runner.os == 'Windows' && format('{0}/kache', runner.temp) || '' }}
+          cache-executables: ${{ runner.os != 'macOS' }}
+          pr-comment: false
+          warm: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # ── Manifest-driven, self-sharded (every shard runs both, each on its
       # own slice of the matching rows) ───────────────────────────────────
       - name: Compile plugin integration test suites (manifest, all OSes)
@@ -945,16 +1057,16 @@ jobs:
           # (os error 1455, "the paging file is too small"). Two jobs keep the
           # peak inside it. The other OSes keep the default.
           CARGO_BUILD_JOBS: ${{ runner.os == 'Windows' && '2' || 'default' }}
-        run: bash .github/ci/run-suites.sh compile
+        run: cargo xtask ci run-suites compile
       - name: Run all-OS manifest suites (no live DB)
         if: needs.changes.outputs.code == 'true'
         shell: bash
         env:
           SEMAPHORE_SHARD_COUNT: "4"
           SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
-        run: bash .github/ci/run-suites.sh run allos
-      # ── Individual crate/example steps carried over from `test`, round-robin
-      # assigned one shard each (see the job comment above) ─────────────────
+        run: cargo xtask ci run-suites run allos
+      # ── Individual crate/example steps carried over from `test`, one shard
+      # each, balanced by measured time (see the job comment above) ─────────
       # The lib test target needs about 8 GB to compile, and `integration`
       # needs about 11 GB. One `--tests` build compiles both at the same time.
       # That fills the 16 GB runner, and the runner shuts down (issue #2259).
@@ -1011,11 +1123,15 @@ jobs:
       # here is that the bench still compiles, not that it runs. No
       # `--features`: `autumn-harvest-plugin` unconditionally depends on
       # `autumn-harvest` with `db`/`testing` already enabled.
+      # One shard is enough for a compile check. With no shard condition, all
+      # four Linux shards built it, at about 11 minutes each.
       - name: Compile diagnose benchmark (issue #1194)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo bench -p autumn-harvest-plugin --bench diagnose_bench --no-run
+      # Shard 0, after `Compile db-backed tests`: that step already built this
+      # lib test binary, so this step only runs it.
       - name: Run all-features lib tests
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --all-features --lib
       - name: Run plugin lib tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
@@ -1023,9 +1139,32 @@ jobs:
       - name: Run plugin lib tests (webhooks feature, issue #618 outbound-delegate gating)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-plugin --features webhooks --lib
-      - name: Run plugin connector tests (issue #944)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
-        run: cargo test -p autumn-harvest-plugin --features connectors --lib connector
+      # Five feature-gated lib suites, each picked by a name filter, in one
+      # build. One step per feature rebuilt the plugin crate five times. Each
+      # rebuild took 3-5 minutes on Windows and ran seconds of tests.
+      # The features are additive, and no test that a filter selects is gated
+      # off by another feature in the list. So the one build runs every test
+      # that the five steps ran.
+      # - `connector` (issue #944): the connector unit tests. The doc example
+      #   check in `cargo xtask check broker-connector-cutover-example` relies
+      #   on this filter.
+      # - `aws_kms` (issue #1825): the AWS KMS binding of the AEAD codec key
+      #   provider, against a local fake KMS endpoint. It needs no AWS account.
+      # - `object_store` (issue #1983): the S3 and GCS adapters, against an
+      #   in-memory backend and a local fake GCS server. They need no cloud
+      #   account and no Docker.
+      # - `vault_transit` (issue #1981): the Vault Transit binding runs the
+      #   KMS conformance suite of AWS, against a local fake Vault server.
+      # - `oidc` (issue #1978): the OIDC unit tests and the `api_with_oidc`
+      #   builder test compile only with the feature. The MCP tool gate test
+      #   also needs `mcp`. The round-trip suite runs from the manifest
+      #   (`oidc_login`).
+      - name: Run plugin feature lib tests (connectors, KMS, object store, OIDC; issues 944, 1825, 1983, 1981, 1978)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        run: >-
+          cargo test -p autumn-harvest-plugin
+          --features connectors,aws-kms,s3,gcs,vault-transit,oidc,mcp,unified-dag-execution
+          --lib -- connector aws_kms object_store vault_transit oidc
       # Issue #1287 review: the manifest's `dev_runtime_tests` row (features
       # `dev-runtime`) and `dev_runtime_managed` row (`compileonly`, so
       # `--no-run` only) never exercise this crate's `--lib` target, so the
@@ -1045,27 +1184,6 @@ jobs:
       - name: Run plugin lib tests (redis feature, issue #1312)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-plugin --features redis --lib
-      # Issue #1825. The AWS KMS binding for the AEAD codec key provider runs
-      # against a local fake KMS endpoint, so it needs no AWS account.
-      - name: Run plugin lib tests (aws-kms feature, issue #1825)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
-        run: cargo test -p autumn-harvest-plugin --features aws-kms --lib aws_kms
-      # Issue #1983. The adapter unit tests use an in-memory backend and a
-      # local fake GCS server, so they need no cloud account and no Docker.
-      - name: Run plugin lib tests (s3 and gcs features, issue #1983)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
-        run: cargo test -p autumn-harvest-plugin --features s3,gcs --lib object_store
-      # Issue #1981. The Vault Transit binding runs the same KMS conformance
-      # suite as AWS, against a local fake Vault server.
-      - name: Run plugin lib tests (vault-transit feature, issue #1981)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
-        run: cargo test -p autumn-harvest-plugin --features vault-transit --lib vault_transit
-      # Issue #1978. The OIDC unit tests and the `api_with_oidc` builder test
-      # compile only with the feature. The MCP tool gate test also needs
-      # `mcp`. The round-trip suite runs from the manifest (`oidc_login`).
-      - name: Run plugin lib tests (oidc and mcp features, issue #1978)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
-        run: cargo test -p autumn-harvest-plugin --features oidc,mcp,unified-dag-execution --lib oidc
       # No CI step ran the plugin's doctests, so a broken `///` example landed
       # silently (issue #944 review found exactly that). These are compile-only
       # (`no_run`), so they cost seconds and need no database.
@@ -1078,8 +1196,10 @@ jobs:
       - name: Run plugin metrics scrape tests (issue #355)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-plugin --features metrics --lib --test metrics_scrape_http_tests
+      # Shard 1, beside the metrics scrape tests: both build the plugin with
+      # `metrics`, so the example reuses most of that build.
       - name: Compile plugin metrics scrape example
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo build -p autumn-harvest-plugin --example metrics_scrape_quickstart --features metrics
       # `aws-sdk-sqs` is pure Rust, so the SQS example builds on every OS.
       - name: Compile plugin SQS connector example (issue #944)
@@ -1089,7 +1209,7 @@ jobs:
       # (see tests/connector_example_budget.rs), so it must keep compiling.
       # Linux-only for the same librdkafka reason as the broker suite.
       - name: Compile plugin Kafka connector example (issue #944, Linux)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: |
           (sudo apt-get update || echo "::warning::apt-get update failed for a mirror; installing from the lists it fetched") && sudo apt-get install -y libcurl4-openssl-dev
           cargo build -p autumn-harvest-plugin --example kafka_connector_quickstart --features kafka
@@ -1097,11 +1217,24 @@ jobs:
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-macros
       - name: Run CLI tests (issue #753)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-cli
       - name: Run autumn-harvest-sqlite tests (issue #1068)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-sqlite
+      # The agent suite links about 45 test binaries of some 180 MB each, and
+      # kache copies each one into its store. The test binaries of the earlier
+      # steps of this shard are no longer needed, so this step deletes them
+      # first. Their rlibs stay, so no crate builds again. Without it the
+      # runner ran out of disk in this step, and it died with no log (issue
+      # #2380).
+      - name: Free runner disk before the agent tests (Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 3
+        run: |
+          df -h /
+          find target/debug/deps -maxdepth 1 -type f -perm -u+x \
+            ! -name '*.so' ! -name '*.d' -delete
+          df -h /
       # Issue #1973. Offline: a scripted model, no API key, no network. The
       # crash test runs its own binary as a child process. Issue #2001 adds
       # the `eval` suite.
@@ -1114,7 +1247,7 @@ jobs:
       # portable protocol, policy and capture tests.
       - name: Run sandboxed code activity tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
-        run: cargo test -p autumn-harvest --no-default-features --features sandbox-activities --lib sandbox
+        run: cargo sandbox-test
       - name: Run sandbox guest agent tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest-sandbox-guest
@@ -1139,12 +1272,12 @@ jobs:
       # hello-world), and standalone-runner's plain-Axum embedding -- but
       # nothing before this step exercised any of them beyond `cargo build`.
       # The only existing coverage was narrow grep guards for specific past
-      # docs defects (check-search-attr-query-syntax.sh,
-      # check-readme-testing-dep-version.sh, check-no-powershell-env-syntax.sh),
+      # docs defects (`cargo xtask check search-attr-query-syntax`,
+      # `readme-testing-dep-version` and `no-powershell-env-syntax`),
       # none of which touch the crates' own assertions. None need a live
       # database, so they run here rather than on `test-db-linux`.
       - name: Run saga-choreography example tests
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p saga-choreography
       - name: Run billing-autumn-web example tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
@@ -1164,6 +1297,11 @@ jobs:
       - name: "Run agent-loop-hit-rate example tests (issue #2007)"
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p agent-loop-hit-rate --bins
+      # Issue #2455. `--bins` runs the scripted sweep. A real-model run costs
+      # money and runs by hand (see the crate README).
+      - name: "Run recall-eval example tests (issue #2455)"
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p recall-eval --bins
       # Issue #2257. The unit tests and the SQLite tests run offline. The
       # Postgres target runs from its `linux` manifest row, and the
       # measurement runs by hand (see the crate README).
@@ -1277,7 +1415,7 @@ jobs:
       # which drags in wasmtime — a multi-minute build not worth paying on three
       # legs, and the macOS/Windows legs never build core examples at all.
       - name: Run wasm_activity example (issue #965)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo run -p autumn-harvest --features wasm-activities --example wasm_activity
       # Issue #794: the schema-contract gate, end to end. Generates the
       # currently-published schemas from the example registry, then diffs them
@@ -1342,7 +1480,7 @@ jobs:
   # shard 15 of a green trunk-dev run, that took 15.6 of the 22.4 minutes of
   # its suite step, and each of the 21 shards repeated it.
   #
-  # `run-suites.sh archive` explains the feature union and the debug-info
+  # `cargo xtask ci run-suites archive` explains the feature union and the debug-info
   # setting. Without the debug-info setting the archive does not fit an
   # artifact: one plugin test binary is about 1.4 GB.
   #
@@ -1359,11 +1497,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Its own key. The archive builds without debug info, so it shares
-          # no artifact with the jobs that build with it.
-          shared-key: test-db-archive
       - name: Free runner disk before heavy plugin link (Linux)
         if: needs.changes.outputs.code == 'true'
         run: |
@@ -1371,6 +1504,18 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # The shards install the same version. The archive format is internal
       # to nextest, so the two ends must agree.
       - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
@@ -1380,7 +1525,7 @@ jobs:
       - name: Build the live-DB test archive
         if: needs.changes.outputs.code == 'true'
         shell: bash
-        run: bash .github/ci/run-suites.sh archive "$RUNNER_TEMP/nextest-db.tar.zst"
+        run: cargo xtask ci run-suites archive "$RUNNER_TEMP/nextest-db.tar.zst"
       # The archive is zstd already, so the upload does not compress it again.
       # One day of retention is enough: only this run reads it.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1398,7 +1543,7 @@ jobs:
   # sampled runs. Sharded across parallel jobs here instead.
   #
   # Each shard runs a slice of the tests from the `test-db-archive` archive.
-  # `run-suites.sh nextest` takes the slice with `--partition hash:<k>/<N>`, so
+  # `cargo xtask ci run-suites nextest` takes the slice with `--partition hash:<k>/<N>`, so
   # a test lands on one shard by the hash of its name. A large suite spreads
   # over all shards, and no shard compiles. The row-ordinal sharding that the
   # comment above `matrix` analyses now runs only in the coverage nightly.
@@ -1445,7 +1590,8 @@ jobs:
       # partitioned over every shard.
       #
       # 21, not 11 (issue #1685 review; see also PR #1703's
-      # `docs/audits/shard-weight-drift.py`, a report-only harness that
+      # shard-weight-drift harness, now `cargo xtask audit shard-weight-drift`,
+      # a report-only harness that
       # independently reaches the same "no N is collision-free" finding
       # below with a more careful count -- it resolves substring-matched
       # manifest filters and plugin-crate rows this comment's own earlier
@@ -1472,7 +1618,8 @@ jobs:
       # Round 3 (Codex review) found the real bug behind both: five
       # manifest `filter` values are Cargo substring/prefix matches, not
       # filenames, so the naive per-row weight lookup silently scored them
-      # 0. Switched to PR #1703's `docs/audits/shard-weight-drift.py`, a
+      # 0. Switched to PR #1703's shard-weight-drift harness (now
+      # `cargo xtask audit shard-weight-drift`), a
       # harness that resolves plugin-crate rows and substring filters
       # correctly, and re-swept N=9-24 with it. 20 came out best in that
       # range (max 247, versus 17's true max, which is higher than round
@@ -1596,9 +1743,10 @@ jobs:
       SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # No rust-cache: a shard compiles nothing. It runs binaries from the
-      # archive. The toolchain stays, because `cargo nextest` runs through
-      # cargo.
+      # No rust-cache: a shard compiles only the small `xtask` binary. It runs
+      # the test binaries from the archive. A cache of `target` would save the
+      # unpacked archive too. The toolchain stays, because `cargo xtask` and
+      # `cargo nextest` run through cargo.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
@@ -1627,7 +1775,7 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
-          bash .github/ci/run-suites.sh extract "$RUNNER_TEMP/nextest-db.tar.zst"
+          cargo xtask ci run-suites extract "$RUNNER_TEMP/nextest-db.tar.zst"
           rm -f "$RUNNER_TEMP/nextest-db.tar.zst"
           df -h /
       # The prune above guarantees every shard pulls its testcontainer images
@@ -1638,8 +1786,8 @@ jobs:
       # the pull here, in its own step with its own budget, turns that into a
       # retried infrastructure step instead of a flaky test.
       #
-      # The script header lists each image and why the suites need it. The
-      # coverage nightly calls the same script.
+      # The module doc of xtask/src/ci/pull_test_images.rs lists each image
+      # and why the suites need it. The coverage nightly runs the same command.
       - name: Pre-pull Docker test images (retry transient pull failures)
         if: needs.changes.outputs.code == 'true'
         shell: bash
@@ -1647,7 +1795,7 @@ jobs:
           # The hash partition sends tests of each emulator suite to many
           # shards, so every shard pulls every emulator image.
           PULL_EVERY_SUITE_IMAGE: "1"
-        run: bash .github/ci/pull-test-images.sh
+        run: cargo xtask ci pull-test-images
       - name: Run Linux Docker-backed manifest suites (shard)
         if: needs.changes.outputs.code == 'true'
         shell: bash
@@ -1667,7 +1815,7 @@ jobs:
           # into a panic, so "the Redis suites stopped testing anything" is a
           # red build here rather than a silent green.
           HARVEST_TEST_REQUIRE_REDIS: "1"
-        run: bash .github/ci/run-suites.sh nextest linux
+        run: cargo xtask ci run-suites nextest linux
       # Issue #958, AC2: re-run the store/replay/retention suites against the
       # opt-in PARTITIONED `harvest_events` layout. Same suites, same
       # assertions, `HARVEST_TEST_PARTITIONED=1` -- so "per-execution event
@@ -1679,7 +1827,7 @@ jobs:
       - name: Integration suites (partitioned harvest_events layout)
         if: needs.changes.outputs.code == 'true'
         shell: bash
-        run: bash .github/ci/run-suites.sh nextest linuxpart
+        run: cargo xtask ci run-suites nextest linuxpart
 
   quickstart:
     name: Quickstart example builds and runs (clean-room, README steps)
@@ -1712,7 +1860,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Build quickstart
         run: cargo build -p quickstart
       - name: Run the exact README quickstart command and assert a workflow reaches COMPLETED
@@ -1869,7 +2028,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # One package per command. The chapter runs each with `cargo run -p`,
       # and a joint build resolves other features, so it would not be reused.
       - name: Build the chapter's crate and the CLI
@@ -1877,7 +2047,7 @@ jobs:
           cargo build -p autumn-harvest-cli
           cargo build -p standalone-quickstart
       - name: Run the bash blocks of docs/getting-started/standalone-axum.md
-        run: ./scripts/run-standalone-chapter.sh
+        run: cargo xtask dev run-standalone-chapter
       # The `docs/embedding.md` Rust fences compile as doctests. This job, not
       # `lint`, runs them, because it already builds the plugin. A filter that
       # matches nothing passes with "0 passed", so the step requires a pass.
@@ -1913,14 +2083,13 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      # Full history: the script finds the previous release by its tag.
+      # Full history: the smoke finds the previous release by its tag.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Two trees build here, so free the disk as the `test` job does.
       - name: Free runner disk before two builds
         run: |
@@ -1928,13 +2097,25 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # See docs/upgrading/README.md, "How CI proves the contract".
       - name: Run the previous release and this tree on one database
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/mvsmoke
           # No debug info: it halves the size of two debug builds.
           CARGO_PROFILE_DEV_DEBUG: "0"
-        run: ./scripts/run-mixed-version-smoke.sh
+        run: cargo xtask dev run-mixed-version-smoke
 
   openapi-client-smoke:
     name: Generated TypeScript client drives a running plugin
@@ -1969,7 +2150,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
@@ -2039,10 +2231,15 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
-      # The script retries each npm registry call once. A type or test error
+      # The build runs through `cargo xtask`, so the job needs a toolchain.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # The command retries each npm registry call once. A type or test error
       # fails at once.
       - name: Generate, type-check, test, build and pack
-        run: scripts/build-typescript-client.sh
+        run: cargo xtask dev build-typescript-client
 
   scaffold-smoke:
     name: Scaffold builds and runs (harvest new)
@@ -2078,13 +2275,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Scaffold a project with `harvest new`
         run: cargo run -p autumn-harvest-cli --bin harvest -- new demo_app --path "${RUNNER_TEMP}/scaffold"
       - name: Build the scaffolded project against the release candidates
         # Harvest 0.8 is not available on crates.io until this release lands.
-        # Patch only the two workspace crates under test; autumn-web 0.9 still
+        # Patch only the two workspace crates under test; autumn-web still
         # resolves from crates.io, just as it will for users of `harvest new`.
+        # The template names the autumn-web series of the plugin in this tree.
         run: |
           cargo build --manifest-path "${RUNNER_TEMP}/scaffold/Cargo.toml" \
             --config 'patch.crates-io.autumn-harvest.path="autumn-harvest"' \
@@ -2159,11 +2368,18 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Clippy autumn-harvest
         run: cargo clippy -p autumn-harvest --all-features --tests -- -D warnings
       # The deterministic profiles of the 0.8.0 fork, owner and entity paths.
@@ -2189,11 +2405,18 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Clippy autumn-harvest-plugin
         run: cargo clippy -p autumn-harvest-plugin --all-targets -- -D warnings
       - name: Clippy autumn-harvest-plugin (mcp feature)
@@ -2221,11 +2444,18 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # issue #525. Both tiers are linted: `dev-runtime-managed` compiles the
       # archive-download path, which `dev-runtime` alone `cfg`s out entirely.
       - name: Clippy autumn-harvest-plugin (dev-runtime feature)
@@ -2259,11 +2489,18 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Clippy autumn-harvest-plugin (sqs feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
       - name: Clippy autumn-harvest-plugin (aws-kms feature, issue #1825)
@@ -2291,29 +2528,41 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # The `sqlite` feature flips `autumn-web` to SQLite for the whole build.
       # The Postgres test binaries of this crate need a Postgres app pool, so
       # the lane builds the library and the SQLite suite only. No Postgres and
       # no Docker run here.
       #
       # `oidc` is on so the suite also runs the shared OIDC checks on a
-      # SQLite app (issue #2469). Each step uses the same features, so the
-      # lane builds the crate once.
+      # SQLite app (issue #2469). `mcp`, `webhooks` and `connectors` are on
+      # so the suite runs the MCP, webhook and connector checks (issue
+      # #2471). Each step uses the same features, so the lane builds the
+      # crate once.
       - name: Clippy autumn-harvest-plugin (sqlite feature)
-        run: cargo clippy -p autumn-harvest-plugin --features sqlite,oidc --lib --test sqlite_plugin --test sqlite_plugin_fleet --test sqlite_plugin_split -- -D warnings
-      # The same targets with no `oidc`, for the code that `oidc` turns off.
-      - name: Clippy autumn-harvest-plugin (sqlite feature, no oidc)
+        run: cargo clippy -p autumn-harvest-plugin --features sqlite,oidc,mcp,webhooks,connectors --lib --test sqlite_plugin --test sqlite_plugin_fleet --test sqlite_plugin_split -- -D warnings
+      # The same targets with no `oidc` and no trigger features, for the
+      # code that those features turn off.
+      - name: Clippy autumn-harvest-plugin (sqlite feature only)
         run: cargo clippy -p autumn-harvest-plugin --features sqlite --lib --test sqlite_plugin -- -D warnings
       - name: SQLite plugin unit tests
-        run: "cargo test -p autumn-harvest-plugin --features sqlite,oidc --lib -- sqlite:: sqlite_split_tests state::tests"
+        run: "cargo test -p autumn-harvest-plugin --features sqlite,oidc,mcp,webhooks,connectors --lib -- sqlite:: sqlite_split_tests state::tests"
       - name: SQLite plugin end-to-end suite
-        run: cargo test -p autumn-harvest-plugin --features sqlite,oidc --test sqlite_plugin
+        run: cargo test -p autumn-harvest-plugin --features sqlite,oidc,mcp,webhooks,connectors --test sqlite_plugin
       # Per-tenant Harvest in a SQLite fleet (issue #2472). No Docker.
       - name: SQLite plugin fleet suite
-        run: cargo test -p autumn-harvest-plugin --features sqlite,oidc --test sqlite_plugin_fleet
+        run: cargo test -p autumn-harvest-plugin --features sqlite,oidc,mcp,webhooks,connectors --test sqlite_plugin_fleet
 
   sqlite-plugin-split:
     name: SQLite HarvestPlugin, split mode (issue #2472)
@@ -2329,13 +2578,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # `testcontainers` retries no pull, so a registry blip would fail the
-      # suite. The script retries it.
+      # suite. The command retries it.
       - name: Pre-pull the Postgres image
-        run: bash .github/ci/pull-test-images.sh postgres:16
+        run: cargo xtask ci pull-test-images postgres:16
       # A SQLite app with a Postgres Harvest database. The test starts a
       # Postgres container, so this lane needs the runner's Docker.
       - name: SQLite app on a Postgres Harvest database
@@ -2353,11 +2611,18 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Clippy autumn-harvest-macros
         run: cargo clippy -p autumn-harvest-macros -- -D warnings
       - name: Clippy autumn-harvest-cli
@@ -2382,6 +2647,8 @@ jobs:
         run: cargo clippy -p autumn-harvest-agent --all-targets --features sandbox --no-deps -- -D warnings
       - name: Clippy autumn-harvest-agent (postgres and sqlite features, issue #2371)
         run: cargo clippy -p autumn-harvest-agent --all-targets --features postgres,sqlite --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (postgres and eval features, issue #2378)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features postgres,eval --no-deps -- -D warnings
       # Same issue #962 rule: a new workspace member needs its own step.
       # `--no-deps` for the reason of the redis step below.
       - name: Clippy autumn-harvest-sandbox-guest
@@ -2421,9 +2688,18 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Clippy --workspace (same command as release.yml validate)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -2439,11 +2715,18 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # Same issue #962 rule as every other crate on this page: a workspace
       # member gets NO clippy coverage without its own step, and these three
       # standalone example crates (each its own `examples/*/Cargo.toml`
@@ -2477,6 +2760,10 @@ jobs:
       # daemon above: it uses `autumn-harvest` with no default features.
       - name: Clippy autoresearch example
         run: cargo clippy -p autoresearch --all-targets --no-deps -- -D warnings
+      # The recall eval (issue #2455). `--no-deps` for the same reason as
+      # autoresearch, which it depends on.
+      - name: "Clippy recall-eval example (issue #2455)"
+        run: cargo clippy -p recall-eval --all-targets --no-deps -- -D warnings
       # The agent-mesh capstone (issue #2276). `--no-deps` for the same
       # reason as the autoresearch step.
       - name: "Clippy agent-mesh example (issue #2276)"
@@ -2485,7 +2772,8 @@ jobs:
   doc-snippets:
     name: Doc snippets compile
     runs-on: ubuntu-latest
-    # Each script pins a docs snippet and compiles it with `cargo check`.
+    # Each `cargo xtask check` guard pins a docs snippet and compiles it.
+    # The issue #2482 steps run `cargo test` on the agent guide doctests.
     # Plain `cargo check` shares no workspace build with clippy, so these
     # steps gain nothing from a clippy job and run on their own.
     # Draft-skip, as in `lint`. Not gated on `changes`: a docs-only PR
@@ -2497,18 +2785,25 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Check signals chapter's clean await_condition example
         # Guards two real, reproduced-live compile failures an Onramp
         # clean-room pass found in chapter 4's "Clean Declarative
         # await_condition" example (collect_approvals_clean) -- the pattern
         # the chapter explicitly recommends over the "tedious" manual loop
         # right above it. Neither is a syntax error, so
-        # docs/audits/doc-snippet-syntax.py's rustfmt-only check passed both
+        # `cargo xtask audit doc-snippet-syntax`'s rustfmt-only check passed both
         # blocks clean: (1) racing wait_for_signal against
         # await_condition_timeout with futures::future::select needs
         # #[workflow(allow_nondeterministic_apis)], or HVG010 hard-blocks
@@ -2516,11 +2811,11 @@ jobs:
         # condition closure can never also be reassigned by the loop body
         # while that borrow is live (E0506). E0506 is a borrow-checker
         # property, not a syntax shape, so this actually compiles the
-        # pinned block with `cargo check` (see the script's own docstring
+        # pinned block with `cargo check` (see the guard's own module doc
         # for why a text heuristic proved gameable in review) rather than
         # pattern-matching stand-in text. See
-        # scripts/check-signals-clean-approval-example-determinism.sh.
-        run: ./scripts/check-signals-clean-approval-example-determinism.sh
+        # xtask/src/check/signals_clean_approval_example_determinism.rs.
+        run: cargo xtask check signals-clean-approval-example-determinism
       - name: Check reliability-knobs continue_as_new checkpoint example
         # Guards a real, reproduced-live compile failure an Onramp
         # clean-room pass found in chapter 7's flagship deadline-aware
@@ -2528,7 +2823,7 @@ jobs:
         # `Result<_, String>` workflow, with no real conversion from the
         # `HarvestError` continue_as_new returns first (E0277, no
         # `From<HarvestError> for String`). Not a syntax error, so
-        # doc-snippet-syntax.py's rustfmt-only check passed it clean. The
+        # `cargo xtask audit doc-snippet-syntax` passed it clean. The
         # same broken snippet also lived, unenforced, inside
         # autumn-harvest/examples/long_lived_entity_deadline.rs's own
         # ```rust,ignore``` module-doc illustration, so this checks both.
@@ -2538,8 +2833,8 @@ jobs:
         # an `.await.map_err(|e| e)?` identity closure), so this compiles
         # each pinned snippet with `cargo check` rather than pattern-
         # matching stand-in text. See
-        # scripts/check-continue-as-new-checkpoint-example.sh.
-        run: ./scripts/check-continue-as-new-checkpoint-example.sh
+        # xtask/src/check/continue_as_new_checkpoint_example.rs.
+        run: cargo xtask check continue-as-new-checkpoint-example
       - name: Check operations chapter's preflight declared-deps example
         # Guards two real, reproduced-live compile failures an Onramp
         # clean-room pass found in chapter 10's flagship
@@ -2554,12 +2849,12 @@ jobs:
         # edition (`dependency_on_unit_never_type_fallback`), confirmed
         # live against a standalone edition-2021 crate matching chapter 1's
         # own pinned tutorial edition. Neither is a syntax error, so
-        # doc-snippet-syntax.py's rustfmt-only check passes this block
+        # `cargo xtask audit doc-snippet-syntax` passes this block
         # clean. This actually compiles the pinned block with `cargo check`
         # rather than pattern-matching stand-in text, matching the sibling
         # guards above. See
-        # scripts/check-preflight-declared-deps-example.sh.
-        run: ./scripts/check-preflight-declared-deps-example.sh
+        # xtask/src/check/preflight_declared_deps_example.rs.
+        run: cargo xtask check preflight-declared-deps-example
       - name: Check sqlite-backend guide's outcome-match example
         # Guards a real, reproduced-live compile failure in
         # docs/sqlite-backend.md's §7 "drive model" example:
@@ -2567,29 +2862,29 @@ jobs:
         # same commit (3abb5b6, issue #1348), but the guide's own
         # `match rt.outcome(exec)? { ... }` never got the new arm, so it has
         # been non-exhaustive (E0004) since the day it was written. This
-        # file is outside doc-snippet-syntax.py's corpus (getting-started/
+        # file is outside the doc-snippet-syntax corpus (getting-started/
         # and README.md only), and E0004 is a type-checker property, not a
         # syntax error, so nothing else in CI ever compiled it --
         # examples/quickstart.rs has the correct four-arm match, which is
         # why the crate's own tests stayed green throughout. This actually
         # compiles the pinned block with `cargo check` rather than counting
         # match arms textually. See
-        # scripts/check-sqlite-outcome-match-example.sh.
-        run: ./scripts/check-sqlite-outcome-match-example.sh
+        # xtask/src/check/sqlite_outcome_match_example.rs.
+        run: cargo xtask check sqlite-outcome-match-example
       - name: Check chapter 8 and 11 snippets compile
         # Guards two getting-started snippets that declared the workflow
         # input as `_: ()`. `#[workflow]` silently dropped the `_` pattern,
         # so the generated call passed one argument to a two-argument
         # function. rustc reported E0061 "takes 5 arguments" on the
-        # attribute line. See scripts/check-underscore-input-snippets.sh.
-        run: ./scripts/check-underscore-input-snippets.sh
+        # attribute line. See xtask/src/check/underscore_input_snippets.rs.
+        run: cargo xtask check underscore-input-snippets
       - name: Check README schedule and retry snippets compile
         # Guards two front-door README snippets. The cron-schedule block
         # called `.workflows(..)` and `.workflow_schedule(..)` on
         # `autumn_web::app()`, which has neither method. The retry block
         # used `Duration` without importing it. See
-        # scripts/check-readme-front-door-snippets.sh.
-        run: ./scripts/check-readme-front-door-snippets.sh
+        # xtask/src/check/readme_front_door_snippets.rs.
+        run: cargo xtask check readme-front-door-snippets
       - name: Check webhooks chapter documents the webhooks feature
         # Guards a real, reproduced-live defect an Onramp clean-room pass
         # found in chapter 12: it showed the `#[webhook]` mapping function
@@ -2608,31 +2903,40 @@ jobs:
         # required) and once with `--features webhooks` (must pass) --
         # and greps for the fix's own "Enable the feature" note landing
         # before step 3, so neither the code nor the note can regress
-        # silently. See scripts/check-webhooks-feature-example.sh.
-        run: ./scripts/check-webhooks-feature-example.sh
+        # silently. See xtask/src/check/webhooks_feature_example.rs.
+        run: cargo xtask check webhooks-feature-example
       - name: Check chapter 5 and 6 flagship examples compile
         # Guards two hard compile failures a clean-room pass found on the
         # getting-started path: chapter 5 passed a workflow id to
         # `spawn_child_workflow_raw` (E0061; the method takes name + input),
         # and chapter 6's `charge_card` used `.map_err(|e| e.to_string())?`
         # in a `HarvestResult` function (E0277; no `From<String>`).
-        # See scripts/check-child-idempotency-examples.sh.
-        run: ./scripts/check-child-idempotency-examples.sh
+        # See xtask/src/check/child_idempotency_examples.rs.
+        run: cargo xtask check child-idempotency-examples
       - name: Check chapter 3 flagship examples compile
         # Chapter 3 shows three timer workflows a reader pastes verbatim.
         # Nothing compiled them. The guard keeps them in step with the API.
-        # See scripts/check-durable-timers-examples.sh.
-        run: ./scripts/check-durable-timers-examples.sh
+        # See xtask/src/check/durable_timers_examples.rs.
+        run: cargo xtask check durable-timers-examples
       - name: Check chapter 9 worker-routing snippets compile
         # Chapter 9 shows the `requires` grammar and the `WorkerConfig` label
         # and weight builders a reader pastes verbatim. Nothing compiled them.
-        # See scripts/check-worker-routing-examples.sh.
-        run: ./scripts/check-worker-routing-examples.sh
+        # See xtask/src/check/worker_routing_examples.rs.
+        run: cargo xtask check worker-routing-examples
       - name: Check chapter 8 DAG snippets compile
         # Chapter 8 shows 15 DAG blocks a reader pastes verbatim. A syntax
         # check covered them. Nothing compiled them against the API.
-        # See scripts/check-dags-schedules-examples.sh.
-        run: ./scripts/check-dags-schedules-examples.sh
+        # See xtask/src/check/dags_schedules_examples.rs.
+        run: cargo xtask check dags-schedules-examples
+      - name: "Run agent guide snippet guards (issue #2482)"
+        # The guards refuse a Rust fence that rustdoc skips in the two agent
+        # guides. They also check the harness and the step below.
+        run: "cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox,postgres --test guide_snippets"
+      - name: "Check agent guide snippets compile (issue #2482)"
+        # Each Rust fence of docs/agent-adapter.md and docs/agent-mesh.md
+        # compiles as a doctest through `guide_snippets` in src/lib.rs. The
+        # features must match the gate of that module, or no test runs.
+        run: "cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox,postgres --doc guide_snippets"
 
   # One check for branch protection to require in place of every leg above.
   # A skipped leg (a draft PR) counts as a pass, as a skipped job does
@@ -2674,7 +2978,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.97.0"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Check MSRV compiles
         run: cargo check --workspace
       # `cargo check --workspace` builds default features only, so the
@@ -2719,7 +3034,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Run loom models
         run: cargo test -p autumn-harvest --no-default-features --test loom_models --release
 
@@ -2741,7 +3067,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Run Shuttle models (random and PCT schedulers)
         run: cargo test -p autumn-harvest --no-default-features --test shuttle_models --release
 
@@ -2758,18 +3095,22 @@ jobs:
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     # The models take about 2 minutes and the trace fixtures about 10 seconds.
-    # The runner image has Java and Python.
+    # The runner image has Java. The runners are `cargo xtask` commands.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Model-check every manifest row with TLC
-        run: scripts/check-formal-models.sh
+        run: cargo xtask check formal-models
       # Issue #2003: TLC must accept each clean fixture trace and reject
       # each red one. The chaos traces are checked in chaos.yml.
       - name: Check the trace fixtures against the TLA+ specs
-        run: scripts/check-formal-traces.sh formal/tla/trace/fixtures
+        run: cargo xtask check formal-traces formal/tla/trace/fixtures
 
-  # Kani proofs of the pure kernels (issue #1819). The script fails when Kani
+  # Kani proofs of the pure kernels (issue #1819). The command fails when Kani
   # verifies fewer proofs than the source holds, or when a cover check fails.
   kani:
     name: Kani proofs
@@ -2791,9 +3132,9 @@ jobs:
           cargo install --locked kani-verifier --version 0.68.0
           cargo kani setup
       - name: Run Kani proofs
-        run: scripts/check-kani-proofs.sh
+        run: cargo xtask check kani-proofs
 
-  # Verus proofs of the integer kernels for every input. The script pins
+  # Verus proofs of the integer kernels for every input. The command pins
   # the Verus release by SHA-256 and installs its Rust toolchain. The guard
   # suite verus_proofs_coverage.rs checks that each proved copy matches the
   # engine source. See docs/testing/formal-methods.md.
@@ -2809,8 +3150,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Verify the Verus proofs
-        run: scripts/check-verus-proofs.sh
+        run: cargo xtask check verus-proofs
 
   # Dependency ledger harness (Ballast). Runs `cargo deny check` against
   # `deny.toml`: advisories (RUSTSEC, joined against the lockfile — every
@@ -2912,9 +3257,9 @@ jobs:
       # target of `autumn-harvest`. The gate above does not see its two
       # workflows, so this step analyzes them. `-p autumn-harvest-agent` gives
       # the analyzer the agent crate's MIR, so a call into it is followed,
-      # and the agent's own two workflows are analyzed too.
+      # and the agent's own workflows are analyzed too.
       #
-      # STRICT, unlike the gates above: all four workflows prove, so an
+      # STRICT, unlike the gates above: every workflow proves, so an
       # `unknown` fails the job as well as a `nondeterminism-found`. The
       # capstone is the example that shows the analyzer at work, and a quiet
       # slide back to `unknown` would undo that. It needs no allowlist entry,
@@ -2988,7 +3333,7 @@ jobs:
   # and fuzzing needs nightly + libFuzzer. Trigger manually from the Actions tab
   # (Run workflow) when you want a quick "do the targets still build and run
   # clean" check. For a real campaign, run a single target locally with a larger
-  # -max_total_time (see docs/testing/property-and-fuzz.md and fuzz/smoke.sh).
+  # -max_total_time (see docs/testing/property-and-fuzz.md and xtask/src/dev/fuzz_smoke.rs).
   fuzz-smoke:
     name: Fuzz smoke (manual)
     if: github.event_name == 'workflow_dispatch'
