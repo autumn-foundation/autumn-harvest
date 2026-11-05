@@ -14,6 +14,10 @@ The crate owns its agent primitives: `AgentModel`, `Tool`, `ToolPolicy`,
 depends on the core engine only, with no default features.
 [ADR 0006](adr/0006-agent-adapter-framework.md) records why.
 
+Each Rust example compiles as written. A function parameter names the type
+of each value that the example does not build. CI compiles each example
+(issue #2482).
+
 ## 1. The mapping
 
 ```mermaid
@@ -55,23 +59,40 @@ answer: The note is saved.
 model calls: 1 before the restart, 1 after it
 ```
 
-The core of it:
+The core of it. `model` is the `AgentModel` of your provider:
 
 ```rust
 use std::sync::Arc;
-use autumn_harvest_agent::{AgentHarness, AgentTask, sqlite};
+use autumn_harvest_agent::{
+    AgentHarness, AgentModel, AgentTask, Approval, FnTool, Rule, ToolEffect, ToolRules, sqlite,
+};
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
-use autumn_harvest_agent::Approval;
+use serde_json::{Value, json};
 
-let mut rt = SqliteRuntime::open("agent.db")?;
-sqlite::register(&mut rt, Arc::new(harness));
-let exec = sqlite::start(&mut rt, &AgentTask::new("Save a note."))?;
+async fn save_a_note(model: Arc<dyn AgentModel>) -> Result<RunState, Box<dyn std::error::Error>> {
+    // A harness takes each tool as an `Arc<dyn Tool>`. `shared` wraps the tool.
+    let write_note = FnTool::new(
+        "write_note",
+        "Replace the note.",
+        json!({"type": "object", "properties": {"text": {"type": "string"}}}),
+        |_input: Value| async { Ok(json!({"saved": true})) },
+    )
+    .effect(ToolEffect::Write)
+    .shared();
+    let harness = AgentHarness::new(model)
+        .tool(write_note)
+        .policy(Arc::new(ToolRules::new().effect(ToolEffect::Write, Rule::Ask)));
 
-if let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await? {
-    // Show the call to a person, then send the decision.
-    sqlite::decide(&mut rt, exec, &signal, &Approval::Approve)?;
+    let mut rt = SqliteRuntime::open("agent.db")?;
+    sqlite::register(&mut rt, Arc::new(harness));
+    let exec = sqlite::start(&mut rt, &AgentTask::new("Save a note."))?;
+
+    if let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await? {
+        // Show the call to a person, then send the decision.
+        sqlite::decide(&mut rt, exec, &signal, &Approval::Approve)?;
+    }
+    Ok(rt.run_until_blocked(exec).await?)
 }
-let state = rt.run_until_blocked(exec).await?;
 ```
 
 The SQLite backend has no shared-state registry, so `sqlite::register`
@@ -84,19 +105,26 @@ Register the workflows and the activities. Install the harness as worker
 state, because the activities read it with `ActivityContext::state`:
 
 ```rust
-use autumn_harvest::builder::HarvestBuilder;
-use autumn_harvest_agent::{AgentHarness, activities, workflows};
+use std::sync::Arc;
+use autumn_harvest::builder::{BuiltHarvest, HarvestBuilder};
+use autumn_harvest_agent::{
+    AgentHarness, AgentModel, Rule, Tool, ToolEffect, ToolRules, activities, workflows,
+};
 
-let harness = AgentHarness::new(client)
-    .tool(lookup)
-    .policy(Arc::new(ToolRules::new().effect(ToolEffect::Write, Rule::Ask)));
+fn worker(client: Arc<dyn AgentModel>, lookup: Arc<dyn Tool>) -> BuiltHarvest {
+    let harness = AgentHarness::new(client)
+        .tool(lookup)
+        .policy(Arc::new(ToolRules::new().effect(ToolEffect::Write, Rule::Ask)));
 
-let built = HarvestBuilder::new()
-    .workflows(workflows())
-    .activities(activities())
-    .state(harness)
-    .build();
+    HarvestBuilder::new()
+        .workflows(workflows())
+        .activities(activities())
+        .state(harness)
+        .build()
+}
 ```
+
+`lookup` is an `Arc<dyn Tool>`, as `FnTool::shared` makes in section 2.
 
 `workflows()` returns `agent_loop`, `agent_heartbeat` and the durable
 `agent` (section 15). `activities()` returns `agent_model_turn`,
@@ -138,20 +166,28 @@ agent support/acct-42: 2 ops, 26 tokens, last answer Some("Your order ships tomo
 The core of it:
 
 ```rust
+use std::time::Duration;
+use autumn_harvest::builder::HarvestBuilder;
+use autumn_harvest::worker::DbPool;
 use autumn_harvest_agent::postgres::{self, PostgresAgents, RunState};
-use autumn_harvest_agent::{AgentTask, Approval};
+use autumn_harvest_agent::{AgentHarness, AgentTask, Approval};
 
 // On each worker:
-let builder = postgres::register(HarvestBuilder::new(), harness);
+fn worker(harness: AgentHarness) -> HarvestBuilder {
+    postgres::register(HarvestBuilder::new(), harness)
+}
 
 // In the app:
-let pg = PostgresAgents::single(pool);
-let exec = postgres::start(&pg, &AgentTask::new("Save a note.")).await?;
-if let RunState::WaitingSignal(signal) = postgres::wait_run(&pg, exec, limit).await? {
-    // Show the call to a person, then send the decision.
-    postgres::decide(&pg, exec, &signal, &Approval::Approve).await?;
+async fn save_a_note(pool: DbPool) -> Result<RunState, Box<dyn std::error::Error>> {
+    let limit = Duration::from_secs(60);
+    let pg = PostgresAgents::single(pool);
+    let exec = postgres::start(&pg, &AgentTask::new("Save a note.")).await?;
+    if let RunState::WaitingSignal(signal) = postgres::wait_run(&pg, exec, limit).await? {
+        // Show the call to a person, then send the decision.
+        postgres::decide(&pg, exec, &signal, &Approval::Approve).await?;
+    }
+    Ok(postgres::wait_run(&pg, exec, limit).await?)
 }
-let state = postgres::wait_run(&pg, exec, limit).await?;
 ```
 
 | Function | What it does |
@@ -447,20 +483,22 @@ The turn calls no model before the check passes, so the retry pays nothing.
 Declare the caps on `agent_loop`, and set the tenant on each task:
 
 ```rust
-use autumn_harvest::builder::HarvestBuilder;
+use autumn_harvest::builder::{BuiltHarvest, HarvestBuilder};
 use autumn_harvest::quota::QuotaPolicy;
-use autumn_harvest_agent::AgentTask;
 use autumn_harvest_agent::workflow::{activities, agent_loop_info};
+use autumn_harvest_agent::{AgentHarness, AgentTask};
 
-let budget = QuotaPolicy::new("tenant")
-    .with_max_run_llm_tokens(200_000)
-    .with_max_tenant_llm_cost_usd_micros(50_000_000) // 50 US dollars a day
-    .with_tenant_llm_window_secs(86_400);
-let built = HarvestBuilder::new()
-    .workflows(vec![agent_loop_info().with_quota(budget)])
-    .activities(activities())
-    .state(harness)
-    .build();
+fn worker(harness: AgentHarness) -> BuiltHarvest {
+    let budget = QuotaPolicy::new("tenant")
+        .with_max_run_llm_tokens(200_000)
+        .with_max_tenant_llm_cost_usd_micros(50_000_000) // 50 US dollars a day
+        .with_tenant_llm_window_secs(86_400);
+    HarvestBuilder::new()
+        .workflows(vec![agent_loop_info().with_quota(budget)])
+        .activities(activities())
+        .state(harness)
+        .build()
+}
 
 let task = AgentTask::new("Summarise the ticket.").tenant("acme");
 ```
@@ -609,20 +647,23 @@ minutes, because the schedule starts no new tick while one runs.
 On Postgres, register the schedule that `heartbeat::schedule` builds:
 
 ```rust
+use std::sync::Arc;
 use std::time::Duration;
-use autumn_harvest::builder::HarvestBuilder;
+use autumn_harvest::builder::{BuiltHarvest, HarvestBuilder};
 use autumn_harvest::policy::Schedule;
 use autumn_harvest_agent::heartbeat::{self, HeartbeatTask};
-use autumn_harvest_agent::{AgentHarness, activities, workflows};
+use autumn_harvest_agent::{AgentHarness, AgentModel, activities, workflows};
 
-let tick = HeartbeatTask::new().system("You watch the build queue.");
-let every_30_minutes = Schedule::Interval(Duration::from_secs(1_800));
-let built = HarvestBuilder::new()
-    .workflows(workflows())
-    .activities(activities())
-    .workflow_schedule(heartbeat::schedule(every_30_minutes, &tick)?)
-    .state(AgentHarness::new(model))
-    .build();
+fn worker(model: Arc<dyn AgentModel>) -> Result<BuiltHarvest, serde_json::Error> {
+    let tick = HeartbeatTask::new().system("You watch the build queue.");
+    let every_30_minutes = Schedule::Interval(Duration::from_secs(1_800));
+    Ok(HarvestBuilder::new()
+        .workflows(workflows())
+        .activities(activities())
+        .workflow_schedule(heartbeat::schedule(every_30_minutes, &tick)?)
+        .state(AgentHarness::new(model))
+        .build())
+}
 ```
 
 On SQLite, pass the same `heartbeat::schedule` to
@@ -816,13 +857,21 @@ request from an earlier answer. It is off by default.
 ```rust
 use std::sync::Arc;
 use std::time::Duration;
-use autumn_harvest_agent::{AgentHarness, InMemoryCacheIndex, ResponseCache};
+use autumn_harvest::builder::HarvestBuilder;
+use autumn_harvest::payload_store::PayloadStore;
+use autumn_harvest_agent::{AgentHarness, AgentModel, InMemoryCacheIndex, ResponseCache};
 
-// Add the codecs to the builder first. Clones share their keys.
-let codecs = builder.payload_codecs().clone();
-let cache = ResponseCache::new(store, Arc::new(InMemoryCacheIndex::default()), codecs)
-    .max_age(Duration::from_secs(24 * 3600));
-let harness = AgentHarness::new(model).response_cache(cache);
+fn cached(
+    builder: &HarvestBuilder,
+    store: Arc<dyn PayloadStore>,
+    model: Arc<dyn AgentModel>,
+) -> AgentHarness {
+    // Add the codecs to the builder first. Clones share their keys.
+    let codecs = builder.payload_codecs().clone();
+    let cache = ResponseCache::new(store, Arc::new(InMemoryCacheIndex::default()), codecs)
+        .max_age(Duration::from_secs(24 * 3600));
+    AgentHarness::new(model).response_cache(cache)
+}
 ```
 
 **The key.** The key is a SHA-256 hash of the model id, the output cap, the
@@ -933,16 +982,28 @@ because a custom codec can quote the answer.
 and a profile overlay (issues #2001 and #2375). It reports where the
 decisions of the two runs diverge. Turn on the `eval` feature.
 
-```rust,ignore
+```rust
+use std::sync::Arc;
+use autumn_harvest::ExecutionId;
 use autumn_harvest_agent::eval::{Candidate, evaluate};
+use autumn_harvest_agent::{AgentHarness, AgentModel, Tool};
+use autumn_harvest_sqlite::SqliteRuntime;
 
-// The source history, for example from SqliteRuntime::load_history.
-let history = rt.load_history(exec)?;
-let candidate = Candidate::new(AgentHarness::new(new_model).tools(tools))
-    .system_prompt("Answer in one sentence.");
-let evaluation = evaluate(&history, &candidate).await?;
-if let Some(turn) = evaluation.first_divergence {
-    println!("{:?}", evaluation.turns[turn]);
+async fn try_model(
+    rt: &SqliteRuntime,
+    exec: ExecutionId,
+    new_model: Arc<dyn AgentModel>,
+    tools: Vec<Arc<dyn Tool>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The source history: the events of a finished run.
+    let history = rt.load_history(exec)?;
+    let candidate = Candidate::new(AgentHarness::new(new_model).tools(tools))
+        .system_prompt("Answer in one sentence.");
+    let evaluation = evaluate(&history, &candidate).await?;
+    if let Some(turn) = evaluation.first_divergence {
+        println!("{:?}", evaluation.turns[turn]);
+    }
+    Ok(())
 }
 ```
 
@@ -994,18 +1055,25 @@ profile holds the prompt, the bounds, `read_only`, the model, the mandate,
 the tool guidance and the skills. `agent::overlay::apply` merges the overlay
 before the engine starts.
 
-```rust,ignore
+```rust
+use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::eval::{Candidate, evaluate};
-use autumn_harvest_agent::ProfileOverlay;
+use autumn_harvest_agent::{AgentHarness, ProfileOverlay};
 
-let overlay = ProfileOverlay {
-    guardrails: Some("Never refund twice.".into()),
-    max_steps: Some(4),
-    tool_guidance: [("lookup".into(), "Look up one order at a time.".into())].into(),
-    ..ProfileOverlay::default()
-};
-let evaluation = evaluate(&history, &Candidate::new(harness).overlay(overlay)).await?;
-println!("{}", evaluation.overlay_digest);
+async fn try_overlay(
+    history: &[WorkflowEvent],
+    harness: AgentHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let overlay = ProfileOverlay {
+        guardrails: Some("Never refund twice.".into()),
+        max_steps: Some(4),
+        tool_guidance: [("lookup".into(), "Look up one order at a time.".into())].into(),
+        ..ProfileOverlay::default()
+    };
+    let evaluation = evaluate(history, &Candidate::new(harness).overlay(overlay)).await?;
+    println!("{}", evaluation.overlay_digest);
+    Ok(())
+}
 ```
 
 | Part | In an evaluation |
@@ -1031,13 +1099,24 @@ plan. `eval::live_probe` runs the candidate on a Postgres fork with real
 tools (issue #2378). It runs only the tool effects that the operator
 allows. Turn on the `eval` and `postgres` features.
 
-```rust,ignore
+```rust
+use std::time::Duration;
+use autumn_harvest::ExecutionId;
 use autumn_harvest_agent::eval::live_probe;
-use autumn_harvest_agent::postgres::{self, RunState};
+use autumn_harvest_agent::postgres::{self, PostgresAgents, RunState};
+use autumn_harvest_agent::{AgentHarness, ProfileOverlay, RefinePolicy, ToolEffect};
 
-let allowed: Vec<ToolEffect> = policy.probe_effects.iter().copied().collect();
-let probe = live_probe(&pg, &harness, source, &overlay, &allowed).await?;
-let state = postgres::wait_run(&pg, probe.exec_id, Duration::from_secs(300)).await?;
+async fn probe(
+    pg: &PostgresAgents,
+    harness: &AgentHarness,
+    source: ExecutionId,
+    overlay: &ProfileOverlay,
+    policy: &RefinePolicy,
+) -> Result<RunState, Box<dyn std::error::Error>> {
+    let allowed: Vec<ToolEffect> = policy.probe_effects.iter().copied().collect();
+    let probe = live_probe(pg, harness, source, overlay, &allowed).await?;
+    Ok(postgres::wait_run(pg, probe.exec_id, Duration::from_secs(300)).await?)
+}
 ```
 
 The fork starts at event 0 with `ForkEffects::LiveQuiet`. Its input is the
@@ -1079,24 +1158,45 @@ hold a model, an overlay or both (issue #2375). It returns both evaluations,
 each with its overlay digest, and one `TurnDiff` per turn of the two
 candidates. In that diff, `recorded` holds the first candidate.
 
-```rust,ignore
-use autumn_harvest_agent::eval::{Candidate, compare};
+```rust
+use std::sync::Arc;
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest_agent::eval::{Candidate, Comparison, compare};
+use autumn_harvest_agent::{AgentHarness, AgentModel};
 
-let harness = Arc::new(AgentHarness::new(fallback).model_named("a", a).model_named("b", b));
-let first = Candidate::shared(Arc::clone(&harness)).agent_model("planner", "a");
-let second = Candidate::shared(harness).agent_model("planner", "b");
-let comparison = compare(&history, &first, &second).await?;
+async fn compare_models(
+    history: &[WorkflowEvent],
+    fallback: Arc<dyn AgentModel>,
+    a: Arc<dyn AgentModel>,
+    b: Arc<dyn AgentModel>,
+) -> Result<Comparison, Box<dyn std::error::Error>> {
+    let harness = Arc::new(AgentHarness::new(fallback).model_named("a", a).model_named("b", b));
+    let first = Candidate::shared(Arc::clone(&harness)).agent_model("planner", "a");
+    let second = Candidate::shared(harness).agent_model("planner", "b");
+    Ok(compare(history, &first, &second).await?)
+}
 ```
 
 `Candidate::model` sets the model of every turn. `Candidate::agent_model`
 sets the model of one agent of a delegation tree and wins over it. Two
 overlays compare the same way:
 
-```rust,ignore
-let first = Candidate::new(harness_a).overlay(terse);
-let second = Candidate::new(harness_b).overlay(guided);
-let comparison = compare(&history, &first, &second).await?;
-assert_ne!(comparison.first.overlay_digest, comparison.second.overlay_digest);
+```rust
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest_agent::eval::{Candidate, compare};
+use autumn_harvest_agent::{AgentHarness, ProfileOverlay};
+
+async fn compare_overlays(
+    history: &[WorkflowEvent],
+    (harness_a, terse): (AgentHarness, ProfileOverlay),
+    (harness_b, guided): (AgentHarness, ProfileOverlay),
+) -> Result<(), Box<dyn std::error::Error>> {
+    let first = Candidate::new(harness_a).overlay(terse);
+    let second = Candidate::new(harness_b).overlay(guided);
+    let comparison = compare(history, &first, &second).await?;
+    assert_ne!(comparison.first.overlay_digest, comparison.second.overlay_digest);
+    Ok(())
+}
 ```
 
 ### Score a comparison
@@ -1104,19 +1204,30 @@ assert_ne!(comparison.first.overlay_digest, comparison.second.overlay_digest);
 Divergence is not quality. `Candidate::scorer` adds a `score::Scorer`
 (issues #2441 and #2447). The report then holds a verdict for each run end.
 
-```rust,ignore
+```rust
+use std::sync::Arc;
+use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::eval::{Candidate, compare};
 use autumn_harvest_agent::score::{ExactMatch, Scorer, Verdict};
+use autumn_harvest_agent::{AgentHarness, AgentModel};
 
-let scorer: Arc<dyn Scorer> = Arc::new(ExactMatch::new("42"));
-let harness = Arc::new(AgentHarness::new(fallback).model_named("a", a).model_named("b", b));
-let first = Candidate::shared(Arc::clone(&harness)).model("a").scorer(Arc::clone(&scorer));
-let second = Candidate::shared(harness).model("b").scorer(scorer);
-let comparison = compare(&history, &first, &second).await?;
-// The source answered "41", the first candidate "42", the second "40".
-assert!(comparison.first.recorded_verdict.as_ref().is_some_and(Verdict::is_reject));
-assert_eq!(comparison.first_verdict(), Some(&Verdict::score(1.0)?));
-assert!(comparison.second_verdict().is_some_and(Verdict::is_reject));
+async fn score_models(
+    history: &[WorkflowEvent],
+    fallback: Arc<dyn AgentModel>,
+    a: Arc<dyn AgentModel>,
+    b: Arc<dyn AgentModel>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let scorer: Arc<dyn Scorer> = Arc::new(ExactMatch::new("42"));
+    let harness = Arc::new(AgentHarness::new(fallback).model_named("a", a).model_named("b", b));
+    let first = Candidate::shared(Arc::clone(&harness)).model("a").scorer(Arc::clone(&scorer));
+    let second = Candidate::shared(harness).model("b").scorer(scorer);
+    let comparison = compare(history, &first, &second).await?;
+    // The source answered "41", the first candidate "42", the second "40".
+    assert!(comparison.first.recorded_verdict.as_ref().is_some_and(Verdict::is_reject));
+    assert_eq!(comparison.first_verdict(), Some(&Verdict::score(1.0)?));
+    assert!(comparison.second_verdict().is_some_and(Verdict::is_reject));
+    Ok(())
+}
 ```
 
 | Part | In a scored evaluation |
@@ -1152,16 +1263,33 @@ issue #2000 is a separate feature.
 (issue #2376). A model that reads the report to pick a candidate then sees
 no label and no input order. Harness² does the same before selection.
 
-```rust,ignore
+```rust
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest_agent::eval::anon::AnonId;
 use autumn_harvest_agent::eval::{Candidate, compare_anonymised};
+use autumn_harvest_agent::{AgentHarness, ProfileOverlay};
 
-let pool = [
-    Candidate::new(harness_a).overlay(v7).label("triage@v7"),
-    Candidate::new(harness_b).overlay(v8).label("triage@v8"),
-];
-let report = compare_anonymised(&history, &pool, seed).await?;
-let pick = ask_a_model(&report.text).await?;          // an AnonId
-let chosen = &pool[report.resolve(&pick).ok_or("not in the pool")?.index];
+fn pool(
+    (harness_a, v7): (AgentHarness, ProfileOverlay),
+    (harness_b, v8): (AgentHarness, ProfileOverlay),
+) -> [Candidate; 2] {
+    [
+        Candidate::new(harness_a).overlay(v7).label("triage@v7"),
+        Candidate::new(harness_b).overlay(v8).label("triage@v8"),
+    ]
+}
+
+// `judge` reads the text, for example with a model, and names one id.
+async fn choose(
+    history: &[WorkflowEvent],
+    pool: &[Candidate],
+    seed: u64,
+    judge: impl AsyncFnOnce(&str) -> AnonId,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let report = compare_anonymised(history, pool, seed).await?;
+    let pick = judge(&report.text).await;
+    Ok(report.resolve(&pick).ok_or("not in the pool")?.index)
+}
 ```
 
 | Part | In an anonymised report |
@@ -1189,15 +1317,27 @@ workspace snapshot (issue #2377). A proposer or a composer then reads the
 whole run from files. Its prompt holds only the short pointer in
 `MISSION.md`, so no prompt cap cuts a long run.
 
-```rust,ignore
-use autumn_harvest_agent::eval::evidence::{EvidenceWorkspace, read_bundle, write_bundle};
+```rust
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest_agent::eval::Evaluation;
+use autumn_harvest_agent::eval::evidence::{Bundle, EvidenceWorkspace, read_bundle, write_bundle};
+use autumn_harvest_agent::{Evidence, ProfileOverlay, WorkspaceStore};
 
-let workspace = EvidenceWorkspace::new(store.clone(), "evidence:run-7", random_seed)
-    .hide("fast-model")
-    .hide(version_id);
-let written = write_bundle(&workspace, &history, &[first, second], &current).await?;
-let evidence = Evidence::Bundle(written.manifest.clone());
-let bundle = read_bundle(&store, &written.manifest).await?;
+async fn evidence(
+    store: &WorkspaceStore,
+    history: &[WorkflowEvent],
+    [first, second]: [Evaluation; 2],
+    current: &ProfileOverlay,
+    (random_seed, version_id): (u64, &str),
+) -> Result<(Evidence, Bundle), Box<dyn std::error::Error>> {
+    let workspace = EvidenceWorkspace::new(store.clone(), "evidence:run-7", random_seed)
+        .hide("fast-model")
+        .hide(version_id);
+    let written = write_bundle(&workspace, history, &[first, second], current).await?;
+    let evidence = Evidence::Bundle(written.manifest.clone());
+    let bundle = read_bundle(store, &written.manifest).await?;
+    Ok((evidence, bundle))
+}
 ```
 
 | File | Content |
@@ -1286,28 +1426,49 @@ inside a keyed entity (ADR 0006). The design is in
 | Checkpoint | Continue-as-new. The state rides in the input. |
 
 ```rust
-use autumn_harvest_agent::{AgentHarness, AgentId, AgentOp, AgentProfile, sqlite};
+use std::sync::Arc;
+use autumn_harvest_agent::{
+    AgentHarness, AgentId, AgentModel, AgentOp, AgentProfile, AgentState, Tool, sqlite,
+};
+use autumn_harvest_sqlite::SqliteRuntime;
 
-let harness = AgentHarness::new(model)
-    .tool(lookup)
-    .agent(AgentProfile::new("support").system("You answer support mail."));
-sqlite::register(&mut rt, Arc::new(harness));
+async fn support(
+    rt: &mut SqliteRuntime,
+    model: Arc<dyn AgentModel>,
+    lookup: Arc<dyn Tool>,
+) -> Result<Option<AgentState>, Box<dyn std::error::Error>> {
+    let harness = AgentHarness::new(model)
+        .tool(lookup)
+        .agent(AgentProfile::new("support").system("You answer support mail."));
+    sqlite::register(rt, Arc::new(harness));
 
-let id = AgentId::new("support", "acct-42")?;
-sqlite::send(&mut rt, &id, &AgentOp::message_with_id("Where is my order?", "m-1"), Some("m-1"))?;
-sqlite::drive(&mut rt, &id).await?;
-let state = sqlite::state(&rt, &id).await?;
+    let id = AgentId::new("support", "acct-42")?;
+    let op = AgentOp::message_with_id("Where is my order?", "m-1");
+    sqlite::send(rt, &id, &op, Some("m-1"))?;
+    sqlite::drive(rt, &id).await?;
+    Ok(sqlite::state(rt, &id).await?)
+}
 ```
 
 On Postgres, the `postgres` module has the same calls. A worker runs the
 op, so wait on the state instead of a drive:
 
 ```rust
+use std::time::Duration;
+use autumn_harvest::worker::DbPool;
 use autumn_harvest_agent::postgres::{self, PostgresAgents};
+use autumn_harvest_agent::{AgentId, AgentOp, AgentState};
 
-let pg = PostgresAgents::single(pool);
-postgres::send(&pg, &id, &AgentOp::message_with_id("Where is my order?", "m-1"), Some("m-1")).await?;
-let state = postgres::wait_for(&pg, &id, limit, |state| state.segments >= 1).await?;
+async fn support(
+    pool: DbPool,
+    id: &AgentId,
+) -> Result<Option<AgentState>, Box<dyn std::error::Error>> {
+    let limit = Duration::from_secs(60);
+    let pg = PostgresAgents::single(pool);
+    let op = AgentOp::message_with_id("Where is my order?", "m-1");
+    postgres::send(&pg, id, &op, Some("m-1")).await?;
+    Ok(postgres::wait_for(&pg, id, limit, |state| state.segments >= 1).await?)
+}
 ```
 
 `postgres::send` sends a signal-with-start to the workflow `agent`. It
@@ -1546,14 +1707,25 @@ is off by default. It needs `AgentMemory::Store` and
 `AgentHarness::episodes`. The design is in `docs/design/DESIGN-2454.md`.
 
 ```rust
-let profile = AgentProfile::new("support")
-    .memory(AgentMemory::Store)
-    .episodes(EpisodeSettings::default().every(10).max_episodes(200).model("cheap"));
-let harness = AgentHarness::new(model)
-    .memory(memory_store)
-    .episodes(episode_store)
-    .model_named("cheap", cheap_model)
-    .agent(profile);
+use std::sync::Arc;
+use autumn_harvest_agent::{
+    AgentHarness, AgentMemory, AgentModel, AgentProfile, EpisodeSettings, EpisodeStore, MemoryStore,
+};
+
+fn support(
+    (model, cheap_model): (Arc<dyn AgentModel>, Arc<dyn AgentModel>),
+    memory_store: Arc<dyn MemoryStore>,
+    episode_store: Arc<dyn EpisodeStore>,
+) -> AgentHarness {
+    let profile = AgentProfile::new("support")
+        .memory(AgentMemory::Store)
+        .episodes(EpisodeSettings::default().every(10).max_episodes(200).model("cheap"));
+    AgentHarness::new(model)
+        .memory(memory_store)
+        .episodes(episode_store)
+        .model_named("cheap", cheap_model)
+        .agent(profile)
+}
 ```
 
 - **Episode.** At the end of an op, the activity `agent_episode_append`
@@ -1611,15 +1783,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use autumn_harvest::builder::HarvestBuilder;
 use autumn_harvest::policy::Schedule;
+use autumn_harvest::worker::DbPool;
 use autumn_harvest_agent::consolidate;
 use autumn_harvest_agent::consolidate_all::ConsolidateAll;
 use autumn_harvest_agent::postgres::{self, Directory, PostgresAgents};
+use autumn_harvest_agent::AgentHarness;
 
-let pg = PostgresAgents::single(pool.clone());
-let harness = harness.directory(Arc::new(Directory::new(pg)));
-let hourly = Schedule::Interval(Duration::from_secs(3_600));
-let builder = postgres::register(HarvestBuilder::new(), harness)
-    .workflow_schedule(consolidate::schedule(hourly, &ConsolidateAll::new().max_passes(16))?);
+fn worker(pool: &DbPool, harness: AgentHarness) -> Result<HarvestBuilder, serde_json::Error> {
+    let pg = PostgresAgents::single(pool.clone());
+    let harness = harness.directory(Arc::new(Directory::new(pg)));
+    let hourly = Schedule::Interval(Duration::from_secs(3_600));
+    let passes = ConsolidateAll::new().max_passes(16);
+    Ok(postgres::register(HarvestBuilder::new(), harness)
+        .workflow_schedule(consolidate::schedule(hourly, &passes)?))
+}
 ```
 
 - **Agents.** The activity `agent_consolidate_due` reads each kind with
@@ -1685,15 +1862,29 @@ A workspace is a set of files, for example a repository checkout and notes.
 It lasts across the ops of a durable agent and across restarts. Turn it on
 for a kind, and install a store:
 
-```rust,ignore
-let store = WorkspaceStore::new(
-    Arc::new(DirWorkspaceBlobs::new("/var/lib/app/workspaces")),
-    builder.payload_codecs().clone(),
-);
-let harness = AgentHarness::new(model)
-    .tool(SandboxTool::new(sandbox).shared())
-    .workspace(store)
-    .agent(AgentProfile::new("coder").workspace());
+```rust
+use std::sync::Arc;
+use autumn_harvest::builder::HarvestBuilder;
+use autumn_harvest::sandbox::SandboxRuntime;
+use autumn_harvest_agent::sandbox::SandboxTool;
+use autumn_harvest_agent::{
+    AgentHarness, AgentModel, AgentProfile, DirWorkspaceBlobs, WorkspaceStore,
+};
+
+fn coder(
+    builder: &HarvestBuilder,
+    model: Arc<dyn AgentModel>,
+    sandbox: Arc<SandboxRuntime>,
+) -> AgentHarness {
+    let store = WorkspaceStore::new(
+        Arc::new(DirWorkspaceBlobs::new("/var/lib/app/workspaces")),
+        builder.payload_codecs().clone(),
+    );
+    AgentHarness::new(model)
+        .tool(SandboxTool::new(sandbox).shared())
+        .workspace(store)
+        .agent(AgentProfile::new("coder").workspace())
+}
 ```
 
 - **Outside history.** A snapshot of the files lives in a `WorkspaceBlobs`
@@ -1814,9 +2005,15 @@ the answer of each model turn in two layers:
 An activated overlay changes the next op only, because each op reads it
 through a recorded activity and keeps that read to its end.
 
-```rust,ignore
-let store = Arc::new(SqliteOverlayStore::open(&db, Arc::new(base.clone()))?);
-let harness = base.overlay_store(store);
+```rust
+use std::path::Path;
+use std::sync::Arc;
+use autumn_harvest_agent::{AgentHarness, SqliteOverlayStore};
+
+fn with_overlays(db: &Path, base: AgentHarness) -> Result<AgentHarness, Box<dyn std::error::Error>> {
+    let store = Arc::new(SqliteOverlayStore::open(db, Arc::new(base.clone()))?);
+    Ok(base.overlay_store(store))
+}
 ```
 
 - The run reads its profile through `agent_profile`. With a store, the
@@ -1851,7 +2048,9 @@ let harness = base.overlay_store(store);
 A profile and a task can carry two text parts. A profile overlay can set
 both. See `docs/design/DESIGN-2373.md`.
 
-```rust,ignore
+```rust
+use autumn_harvest_agent::{AgentProfile, SkillText};
+
 let profile = AgentProfile::new("support")
     .tool_guidance("lookup", "Look up an order by its id. Never guess an id.")
     .skill("refund", SkillText::new("Pay a refund.", "Check the order first. ..."));
@@ -1896,10 +2095,11 @@ Install the proposer with `AgentHarness::proposer`.
 
 ```rust
 use std::sync::Arc;
-use autumn_harvest_agent::{AgentHarness, ModelProposer};
+use autumn_harvest_agent::{AgentHarness, AgentModel, ModelProposer};
 
-let harness = AgentHarness::new(Arc::clone(&client))
-    .proposer(Arc::new(ModelProposer::new(client)));
+fn refining(client: Arc<dyn AgentModel>) -> AgentHarness {
+    AgentHarness::new(Arc::clone(&client)).proposer(Arc::new(ModelProposer::new(client)))
+}
 ```
 
 The activity `agent_refine_propose` runs one stage. Its input is a
@@ -1951,11 +2151,14 @@ the earlier one.
 
 ```rust
 use std::sync::Arc;
-use autumn_harvest_agent::{AgentHarness, ExactMatch, JsonSchema};
+use autumn_harvest_agent::{AgentHarness, AgentModel, ExactMatch, JsonSchema};
+use serde_json::Value;
 
-let harness = AgentHarness::new(client)
-    .scorer(Arc::new(ExactMatch::new("Paris")))
-    .scorer(Arc::new(JsonSchema::new(schema)));
+fn scored(client: Arc<dyn AgentModel>, schema: Value) -> AgentHarness {
+    AgentHarness::new(client)
+        .scorer(Arc::new(ExactMatch::new("Paris")))
+        .scorer(Arc::new(JsonSchema::new(schema)))
+}
 ```
 
 The activity `agent_score` takes a `ScoreRequest`: a scorer id and a

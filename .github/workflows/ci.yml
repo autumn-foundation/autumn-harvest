@@ -2878,6 +2878,15 @@ jobs:
         # check covered them. Nothing compiled them against the API.
         # See scripts/check-dags-schedules-examples.sh.
         run: ./scripts/check-dags-schedules-examples.sh
+      - name: "Run agent guide snippet guards (issue #2482)"
+        # The guards refuse a Rust fence that rustdoc skips in the two agent
+        # guides. They also check the harness and the step below.
+        run: "cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox,postgres --test guide_snippets"
+      - name: "Check agent guide snippets compile (issue #2482)"
+        # Each Rust fence of docs/agent-adapter.md and docs/agent-mesh.md
+        # compiles as a doctest through `guide_snippets` in src/lib.rs. The
+        # features must match the gate of that module, or no test runs.
+        run: "cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox,postgres --doc guide_snippets"
 
   # One check for branch protection to require in place of every leg above.
   # A skipped leg (a draft PR) counts as a pass, as a skipped job does

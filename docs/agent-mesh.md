@@ -10,6 +10,10 @@ They work on Postgres and on SQLite. The research behind them is in
 [`rnd/2026-10-13-agent-mesh-primitives.md`](rnd/2026-10-13-agent-mesh-primitives.md).
 The plan is in [`docs/design/DESIGN-agent-mesh.md`](design/DESIGN-agent-mesh.md).
 
+Each Rust example compiles as written. A function parameter names the type
+of each value that the example does not build. CI compiles each example
+(issue #2482).
+
 ## 1. The primitives
 
 | Primitive | Type | What it does |
@@ -27,23 +31,34 @@ The plan is in [`docs/design/DESIGN-agent-mesh.md`](design/DESIGN-agent-mesh.md)
 ## 2. Delegate to a peer
 
 ```rust
-use autumn_harvest_agent::{AgentHarness, AgentTask, Mandate, Peer};
+use std::sync::Arc;
+use autumn_harvest_agent::{AgentHarness, AgentModel, AgentTask, Mandate, Peer, Tool};
 
-let harness = AgentHarness::new(model)
-    .tool(web_search)
-    .tool(write_file)
-    .peer(
-        Peer::new("researcher", "Finds facts on the web.")
-            .system("You research. Cite each source.")
-            .tools(["web_search"])
-            .max_steps(6)
-            .max_total_tokens(40_000),
-    );
+fn planner(
+    model: Arc<dyn AgentModel>,
+    web_search: Arc<dyn Tool>,
+    write_file: Arc<dyn Tool>,
+) -> (AgentHarness, AgentTask) {
+    let harness = AgentHarness::new(model)
+        .tool(web_search)
+        .tool(write_file)
+        .peer(
+            Peer::new("researcher", "Finds facts on the web.")
+                .system("You research. Cite each source.")
+                .tools(["web_search"])
+                .max_steps(6)
+                .max_total_tokens(40_000),
+        );
 
-let task = AgentTask::new("Plan a trip to Lisbon.")
-    .max_total_tokens(100_000)
-    .mandate(Mandate::new("planner").peers(["researcher"]));
+    let task = AgentTask::new("Plan a trip to Lisbon.")
+        .max_total_tokens(100_000)
+        .mandate(Mandate::new("planner").peers(["researcher"]));
+    (harness, task)
+}
 ```
+
+A harness takes each tool as an `Arc<dyn Tool>`. `FnTool::shared` makes one
+from an async function, as in section 7.
 
 The planner sees one more tool, `delegate`. Its input is `agent`, one of the
 peer names, and `task`, the text for the peer. The tool description lists
@@ -203,19 +218,27 @@ inbox can exfiltrate the data. Flow rules stop that sequence.
 Give each tool its labels:
 
 ```rust
+use std::sync::Arc;
 use autumn_harvest_agent::flow::labels;
-use autumn_harvest_agent::{AgentHarness, FlowRules, FnTool, ToolEffect};
+use autumn_harvest_agent::{AgentError, AgentHarness, AgentModel, FlowRules, FnTool, Tool, ToolEffect};
+use serde_json::{Value, json};
 
-let inbox = FnTool::new("inbox", "Read mail.", schema, read_mail)
-    .effect(ToolEffect::ReadOnly)
-    .label(labels::UNTRUSTED_INPUT)
-    .label(labels::PRIVATE_DATA)
-    .shared();
+fn mail_agent(model: Arc<dyn AgentModel>, send_mail: Arc<dyn Tool>) -> AgentHarness {
+    let inbox = FnTool::new("inbox", "Read mail.", json!({"type": "object"}), read_mail)
+        .effect(ToolEffect::ReadOnly)
+        .label(labels::UNTRUSTED_INPUT)
+        .label(labels::PRIVATE_DATA)
+        .shared();
 
-let harness = AgentHarness::new(model)
-    .tool(inbox)
-    .tool(send_mail)
-    .flow_rules(FlowRules::rule_of_two());
+    AgentHarness::new(model)
+        .tool(inbox)
+        .tool(send_mail)
+        .flow_rules(FlowRules::rule_of_two())
+}
+
+async fn read_mail(_input: Value) -> Result<Value, AgentError> {
+    Ok(json!({"messages": []}))
+}
 ```
 
 Each call also carries the label of its effect: `effect:read_only`,
@@ -242,6 +265,8 @@ Set it on one rule with `forbid_with(labels, rule, recheck)`, or on every rule
 with `with_recheck(recheck)`:
 
 ```rust
+use autumn_harvest_agent::{FlowRules, Recheck};
+
 let rules = FlowRules::rule_of_two().with_recheck(Recheck::UntilApproved);
 ```
 
@@ -302,9 +327,13 @@ when the harness has flow rules. Install the same flow rules on every worker.
 A run that continues a conversation must continue its labels too:
 
 ```rust
-let next = AgentTask::new("Now reply to the sender.")
-    .history(report.messages.clone())
-    .flow_labels(report.flow_labels.clone());
+use autumn_harvest_agent::{AgentReport, AgentTask};
+
+fn reply(report: &AgentReport) -> AgentTask {
+    AgentTask::new("Now reply to the sender.")
+        .history(report.messages.clone())
+        .flow_labels(report.flow_labels.clone())
+}
 ```
 
 `HeartbeatTask::flow_labels` does the same for a heartbeat tick. The next run
@@ -418,13 +447,19 @@ and memory. A `delegate` call to it sends a message and waits for the reply.
 Inline delegation stays for short, bounded sub-tasks.
 
 ```rust
-use autumn_harvest_agent::{AgentHarness, AgentId, AgentProfile, Mandate, Peer};
+use std::sync::Arc;
+use autumn_harvest_agent::{
+    AgentHarness, AgentId, AgentIdError, AgentModel, AgentProfile, Mandate, Peer,
+};
 
-let researcher = AgentId::new("research", "r1")?;
-let harness = AgentHarness::new(model)
-    .peer(Peer::agent("researcher", "Finds facts.", &researcher))
-    .agent(AgentProfile::new("triage").mandate(Mandate::new("triage").peers(["researcher"])))
-    .agent(AgentProfile::new("research").mandate(Mandate::new("researcher")));
+fn mesh(model: Arc<dyn AgentModel>) -> Result<AgentHarness, AgentIdError> {
+    let researcher = AgentId::new("research", "r1")?;
+    let triage = Mandate::new("triage").peers(["researcher"]);
+    Ok(AgentHarness::new(model)
+        .peer(Peer::agent("researcher", "Finds facts.", &researcher))
+        .agent(AgentProfile::new("triage").mandate(triage))
+        .agent(AgentProfile::new("research").mandate(Mandate::new("researcher"))))
+}
 ```
 
 | Step | What happens |
@@ -454,13 +489,17 @@ The harness holds named models. A task, a peer, a profile or a heartbeat
 names its model. A cheap triage model can front a strong planner.
 
 ```rust
-use autumn_harvest_agent::{AgentHarness, AgentTask, DEFAULT_MODEL, Mandate, Peer};
+use std::sync::Arc;
+use autumn_harvest_agent::{AgentHarness, AgentModel, AgentTask, DEFAULT_MODEL, Mandate, Peer};
 
-let harness = AgentHarness::new(cheap)
-    .model_named("strong", strong)
-    .peer(Peer::new("planner", "Plans.").model("strong"));
-let task = AgentTask::new("triage this")
-    .mandate(Mandate::new("triage").peers(["planner"]).models([DEFAULT_MODEL, "strong"]));
+fn triage(cheap: Arc<dyn AgentModel>, strong: Arc<dyn AgentModel>) -> (AgentHarness, AgentTask) {
+    let harness = AgentHarness::new(cheap)
+        .model_named("strong", strong)
+        .peer(Peer::new("planner", "Plans.").model("strong"));
+    let mandate = Mandate::new("triage").peers(["planner"]).models([DEFAULT_MODEL, "strong"]);
+    let task = AgentTask::new("triage this").mandate(mandate);
+    (harness, task)
+}
 ```
 
 | Setter | Scope |
@@ -558,13 +597,17 @@ A mesh is a set of durable agents that share an id. A long-lived mesh needs
 controls that span time and agents.
 
 ```rust
-use autumn_harvest_agent::{AgentHarness, AgentProfile, MeshBudget, sqlite};
+use std::path::Path;
+use std::sync::Arc;
+use autumn_harvest_agent::{AgentHarness, AgentModel, AgentProfile, MeshBudget, sqlite};
 
-let harness = AgentHarness::new(model)
-    .agent(AgentProfile::new("triage").mesh("support"))
-    .agent(AgentProfile::new("research").mesh("support"))
-    .mesh_budget(MeshBudget::daily("support").max_tokens(2_000_000))
-    .mesh_spend(Arc::new(sqlite::LedgerSpend::open(&db)));
+fn support_mesh(model: Arc<dyn AgentModel>, db: &Path) -> AgentHarness {
+    AgentHarness::new(model)
+        .agent(AgentProfile::new("triage").mesh("support"))
+        .agent(AgentProfile::new("research").mesh("support"))
+        .mesh_budget(MeshBudget::daily("support").max_tokens(2_000_000))
+        .mesh_spend(Arc::new(sqlite::LedgerSpend::open(db)))
+}
 ```
 
 On Postgres, use `postgres::LedgerSpend::new(pg)` and
