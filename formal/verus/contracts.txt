@@ -152,6 +152,18 @@ pub proof fn theorem_a_stage_is_bounded(verdicts: Seq < Verdict >, max: int) req
 pub proof fn theorem_a_stage_falls_back_exactly_when_every_attempt_is_invalid(verdicts: Seq < Verdict >, max: int,) requires 1 <= max, ensures run(verdicts, max, 1).0 is FallBack <==> forall | i: int | 1 <= i <= max ==> #[trigger] verdict_at(verdicts, i) is Invalid, run(verdicts, max, 1).0 is FallBack ==> run(verdicts, max, 1).1 == max,
 pub proof fn theorem_a_stage_stops_at_the_first_valid_reply(verdicts: Seq < Verdict >, max: int) requires 1 <= max, ensures ! (run(verdicts, max, 1).0 is FallBack) ==>! (verdict_at(verdicts, run(verdicts, max, 1).1,) is Invalid), forall | i: int | 1 <= i < run(verdicts, max, 1).1 ==> #[trigger] verdict_at(verdicts, i) is Invalid, run(verdicts, max, 1).0 is Keep <==> verdict_at(verdicts, run(verdicts, max, 1).1) is Same, run(verdicts, max, 1).0 is Propose <==> verdict_at(verdicts, run(verdicts, max, 1).1,) is Differs,
 
+## formal/verus/src/agent_refine.rs
+pub fn identity_holds(planned: u64, sessions: u64, probes: u64, skipped: u64) -> (r: bool) ensures r <==> (sessions == planned && skipped <= sessions && probes == sessions - skipped),
+pub open spec fn stages_of(parallel: bool, k: int) -> int { if parallel { 2 * k + k } else { 3 * k } }
+pub open spec fn count(outcomes: Seq < bool >, n: int) -> (int, int, int) decreases n, { if n <= 0 { (0, 0, 0) } else { let before = count(outcomes, n - 1); let candidate = if n - 1 < outcomes.len() { outcomes [n - 1] } else { true }; if candidate { (before.0 + 1, before.1 + 1, before.2) } else { (before.0 + 1, before.1, before.2 + 1) } } }
+proof fn lemma_count(outcomes: Seq < bool >, n: int) requires 0 <= n, ensures count(outcomes, n).0 == n, count(outcomes, n).1 + count(outcomes, n).2 == n, 0 <= count(outcomes, n).1, 0 <= count(outcomes, n).2, decreases n,
+pub proof fn theorem_both_modes_plan_three_k(k: int) requires 0 <= k, ensures stages_of(true, k) == 3 * k, stages_of(false, k) == 3 * k,
+pub proof fn theorem_each_plan_meets_the_identity(outcomes: Seq < bool >, parallel: bool, k: u64, sources: u64,) requires k <= 8, sources <= 16, ensures ({ let c = count(outcomes, sources * stages_of(parallel, k as int)); c.0 == 3 * k * sources && c.2 <= c.0 && c.1 == c.0 - c.2 }),
+pub open spec fn holds(planned: int, sessions: int, probes: int, skipped: int) -> bool { sessions == planned && skipped <= sessions && probes == sessions - skipped }
+pub proof fn theorem_the_kernel_meets_holds(planned: u64, sessions: u64, probes: u64, skipped: u64) ensures holds(planned as int, sessions as int, probes as int, skipped as int) == (sessions == planned && skipped <= sessions && probes as int == sessions as int - skipped as int),
+pub proof fn theorem_a_wrong_probe_count_breaks_it(planned: int, skipped: int) requires 0 <= skipped <= planned, ensures ! holds(planned, planned, planned - skipped - 1, skipped), ! holds(planned, planned, planned - skipped + 1, skipped),
+pub proof fn theorem_a_short_run_breaks_it(planned: int, probes: int, skipped: int) ensures ! holds(planned, planned - 1, probes, skipped),
+
 ## formal/verus/src/agent_reset.rs
 pub open spec fn clamped(percent: int) -> int { if percent == 0 { 1 } else if percent > 100 { 100 } else { percent } }
 pub open spec fn reaches(len: int, cap: int, percent: int) -> bool { cap > 0 && len * 100 >= cap * clamped(percent) }
