@@ -1190,3 +1190,231 @@ async fn a_chosen_overlay_fits_the_registered_profile_of_the_kind() {
         assert!(error.contains("another source"), "{error}");
     }
 }
+
+/// A routed model. It answers the source run. It fails each probe with a
+/// provider error that names its route and its model id.
+#[derive(Debug)]
+struct Routed {
+    id: &'static str,
+    route: &'static str,
+}
+
+impl AgentModel for Routed {
+    fn chat<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+    ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
+        let system = system_of(request);
+        let probe = system.contains(" edit ") || system.contains("composed");
+        let (id, route) = (self.id, self.route);
+        Box::pin(async move {
+            if probe {
+                return Err(AgentError::new(
+                    autumn_harvest_agent::ErrorKind::Provider,
+                    format!("{id} on {route} is down"),
+                ));
+            }
+            Ok(ChatResponse {
+                content: vec![ContentPart::Text("done".to_owned())],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::new(10, 5),
+            })
+        })
+    }
+
+    fn model_id(&self) -> Option<&str> {
+        Some(self.id)
+    }
+}
+
+/// A composer that keeps the pool it reads, as text and as JSON.
+#[derive(Debug, Default)]
+struct Keep {
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+impl OverlayComposer for Keep {
+    fn compose<'a>(
+        &'a self,
+        context: &'a ComposeContext<'a>,
+    ) -> BoxFuture<'a, Result<ProposerReply, AgentError>> {
+        let json = serde_json::to_string(context.report).unwrap();
+        self.seen
+            .lock()
+            .unwrap()
+            .push(format!("{}\n{json}", context.text));
+        Box::pin(async { Ok(ProposerReply::Overlay(ProfileOverlay::default())) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inherited_route_and_its_model_id_are_redacted_from_the_pool() {
+    // The kind and its source name a model route. No overlay sets a model,
+    // so each probe inherits that route, and its model fails with its id.
+    let route = "route-inherited-4c2a";
+    let id = "model-inherited-id-8b1d";
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("a.db");
+    let keep = Arc::new(Keep::default());
+    let base = AgentHarness::new(Arc::new(Model::default()) as Arc<dyn AgentModel>)
+        .model_named(route, Arc::new(Routed { id, route }))
+        .agent(
+            AgentProfile::new(KIND)
+                .system(BASE)
+                .max_steps(20)
+                .model(route),
+        );
+    let store = InMemoryOverlayStore::new(Arc::new(base.clone()));
+    let harness = base
+        .overlay_store(Arc::new(store))
+        .proposer(Arc::new(Proposer::default()))
+        .composer(Arc::clone(&keep) as Arc<dyn OverlayComposer>)
+        .refine_sources(Arc::new(sqlite::Sources::open(&db)));
+    let mut rt = SqliteRuntime::open(&db).unwrap();
+    sqlite::register(&mut rt, Arc::new(harness));
+    let exec = sqlite::start(&mut rt, &task(KIND).model(route)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+
+    let report = report_of(
+        refine(
+            &mut rt,
+            &RefineInput::new(KIND, vec![exec], 1, RefineMode::Parallel, 5),
+        )
+        .await,
+    );
+
+    assert_eq!(report.ledger.probes, 2, "{report:#?}");
+    let seen = keep.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    let pool = &seen[0];
+    assert!(pool.contains("[redacted] on [redacted] is down"), "{pool}");
+    for identity in [id, route] {
+        assert!(!pool.contains(identity), "{identity} leaks: {pool}");
+    }
+}
+
+/// A model that delegates once to the peer `planner`, then answers.
+#[derive(Debug, Default)]
+struct Delegating;
+
+impl AgentModel for Delegating {
+    fn chat<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+    ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
+        let answered = request
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .any(|part| matches!(part, ContentPart::ToolResult { .. }));
+        let (content, stop) = if answered {
+            (
+                vec![ContentPart::Text("done".to_owned())],
+                StopReason::EndTurn,
+            )
+        } else {
+            (
+                vec![ContentPart::ToolCall {
+                    id: "d1".to_owned(),
+                    name: autumn_harvest_agent::mesh::DELEGATE_TOOL.to_owned(),
+                    arguments: json!({"agent": "planner", "task": "plan"}),
+                }],
+                StopReason::ToolUse,
+            )
+        };
+        Box::pin(async move {
+            Ok(ChatResponse {
+                content,
+                stop_reason: stop,
+                usage: TokenUsage::new(10, 5),
+            })
+        })
+    }
+}
+
+/// A peer model. It answers the first call, from the source run. It fails
+/// each later call with a provider error that names its route and its id.
+#[derive(Debug)]
+struct PeerModel {
+    id: &'static str,
+    route: &'static str,
+    calls: AtomicUsize,
+}
+
+impl AgentModel for PeerModel {
+    fn chat<'a>(
+        &'a self,
+        _request: &'a ChatRequest,
+    ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
+        let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+        let (id, route) = (self.id, self.route);
+        Box::pin(async move {
+            if !first {
+                return Err(AgentError::new(
+                    autumn_harvest_agent::ErrorKind::Provider,
+                    format!("{id} on {route} is down"),
+                ));
+            }
+            Ok(ChatResponse {
+                content: vec![ContentPart::Text("the plan".to_owned())],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::new(10, 5),
+            })
+        })
+    }
+
+    fn model_id(&self) -> Option<&str> {
+        Some(self.id)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recorded_peer_route_and_its_model_id_are_redacted_from_the_pool() {
+    use autumn_harvest_agent::{Mandate, Peer};
+
+    // The source delegates to a peer that names its own model route.
+    let route = "route-peer-6e1b";
+    let id = "model-peer-id-2f9c";
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("a.db");
+    let keep = Arc::new(Keep::default());
+    let peer = PeerModel {
+        id,
+        route,
+        calls: AtomicUsize::new(0),
+    };
+    let base = AgentHarness::new(Arc::new(Delegating) as Arc<dyn AgentModel>)
+        .model_named(route, Arc::new(peer))
+        .peer(Peer::new("planner", "Plans.").model(route))
+        .agent(AgentProfile::new(KIND).system(BASE).max_steps(20));
+    let store = InMemoryOverlayStore::new(Arc::new(base.clone()));
+    let harness = base
+        .overlay_store(Arc::new(store))
+        .proposer(Arc::new(Proposer::default()))
+        .composer(Arc::clone(&keep) as Arc<dyn OverlayComposer>)
+        .refine_sources(Arc::new(sqlite::Sources::open(&db)));
+    let mut rt = SqliteRuntime::open(&db).unwrap();
+    sqlite::register(&mut rt, Arc::new(harness));
+    let task = task(KIND).mandate(Mandate::new("triage").peers(["planner"]));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+
+    let report = report_of(
+        refine(
+            &mut rt,
+            &RefineInput::new(KIND, vec![exec], 1, RefineMode::Parallel, 9),
+        )
+        .await,
+    );
+
+    assert_eq!(report.ledger.probes, 2, "{report:#?}");
+    let seen = keep.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    let pool = &seen[0];
+    assert!(pool.contains("[redacted] on [redacted] is down"), "{pool}");
+    for identity in [id, route] {
+        assert!(!pool.contains(identity), "{identity} leaks: {pool}");
+    }
+}

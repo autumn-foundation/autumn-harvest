@@ -2476,9 +2476,11 @@ On Postgres, install `postgres::Sources::new(pg)` and start the workflow
   policy ceilings, as the stages do. SQLite has no fork, so the probe records
   `live re-probe skipped: SQLite has no fork` in the stage notes.
 - **Compose and select.** An `OverlayComposer` reads the probes under
-  opaque ids, with the anonymised pool of issue #2376. With a workspace
-  store, it also reads an evidence bundle. An `OverlaySelector` picks one
-  id. The rule picks in its place when no selector is installed, or when
+  opaque ids, with the anonymised pool of issue #2376. The pool redacts
+  each route that a probe asked for, with its model id. So a route that a
+  probe inherits from its source task, or the route of a recorded peer, is
+  redacted too. With a workspace store, the composer also reads an
+  evidence bundle. An `OverlaySelector` picks one id. The rule picks in its place when no selector is installed, or when
   the selector fails, times out or names an id outside the pool. The rule
   takes a completed end first, then the fewest stubbed tool calls, then
   the lowest id.

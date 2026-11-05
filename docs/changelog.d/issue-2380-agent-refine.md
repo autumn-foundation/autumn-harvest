@@ -26,7 +26,9 @@ anonymised pool of #2376, the evidence bundle of #2377, the live probe of
 - **Steps.** `agent_refine_probe` runs `eval::evaluate` and, when it stubs
   a tool call, a live re-probe through `RefineSources::live_probe`.
   `agent_refine_compose` runs an `OverlayComposer` over the probes under
-  opaque ids. `agent_refine_select` runs an `OverlaySelector`. A rule
+  opaque ids. The pool redacts each model route that a probe asked for,
+  with its model id, so an inherited or a peer route is redacted too.
+  `agent_refine_select` runs an `OverlaySelector`. A rule
   picks when no selector is installed, or when the selector fails, times
   out or names an id outside the pool.
 - **Budget identity.** Each source runs 3k sessions. Each candidate stage
@@ -44,8 +46,9 @@ anonymised pool of #2376, the evidence bundle of #2377, the live probe of
   input over the cap fails the run with `RefineStageFailed`.
 - **Additions.** `AgentTask::kind`, `RefineStatus::Chosen` and
   `RefineStatus::BudgetExhausted`, `Evaluation::candidate_usage` and
-  `Evaluation::candidate_cost_usd_micros`, `ProposeRequest::sample`, and
-  `Stage::usage` and `Stage::cost_usd_micros`. Each new field has a serde
+  `Evaluation::candidate_cost_usd_micros`, `ProposeRequest::sample`,
+  `Stage::usage` and `Stage::cost_usd_micros`, and `ProbeResult::routes`
+  and `ProbedCandidate::routes`. Each new field has a serde
   default, so a recorded value decodes as before. An older worker cannot
   decode a `ProposeRequest` with a `sample` above 1, so start a refine
   run only after every worker runs this release.

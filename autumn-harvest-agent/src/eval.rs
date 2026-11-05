@@ -803,6 +803,23 @@ pub async fn evaluate(
     Box::pin(run(&recording, task, candidate, source)).await
 }
 
+/// [`evaluate`], and each named model route that the run asked for (issue
+/// #2380). A route can come from the source task or from a recorded peer,
+/// so a pool of these runs redacts each of them.
+///
+/// # Errors
+///
+/// The errors of [`evaluate`].
+pub(crate) async fn evaluate_routed(
+    history: &[WorkflowEvent],
+    candidate: &Candidate,
+) -> Result<(Evaluation, BTreeSet<String>), EvalError> {
+    let recording = Recording::read(history)?;
+    let task = candidate.task_under_overlay(&recording.task)?;
+    let source = SourceScores::default().of(&recording, candidate).await?;
+    Box::pin(run_routed(&recording, task, candidate, source)).await
+}
+
 /// Run `candidate` on `task`, the recorded task under its overlay, and
 /// compare the run with `recording`. `source` is the score of the recorded
 /// end, or `None` with no scorer.
@@ -816,10 +833,24 @@ async fn run(
     candidate: &Candidate,
     source: Option<Scored>,
 ) -> Result<Evaluation, EvalError> {
-    let mut evaluation = run_with_routes(recording, task, candidate, source).await?.0;
+    Ok(run_routed(recording, task, candidate, source).await?.0)
+}
+
+/// [`run`], and each named model route that the run asked for.
+///
+/// # Errors
+///
+/// The errors of [`run`].
+async fn run_routed(
+    recording: &Recording,
+    task: AgentTask,
+    candidate: &Candidate,
+    source: Option<Scored>,
+) -> Result<(Evaluation, BTreeSet<String>), EvalError> {
+    let (mut evaluation, routes) = run_with_routes(recording, task, candidate, source).await?;
     evaluation.recorded_verdict = evaluation.recorded_verdict.map(cut_reason);
     evaluation.candidate_verdict = evaluation.candidate_verdict.map(cut_reason);
-    Ok(evaluation)
+    Ok((evaluation, routes.into_iter().flatten().collect()))
 }
 
 /// `verdict` with its reject reason cut to

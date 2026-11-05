@@ -142,6 +142,10 @@ pub struct ProbedCandidate {
     pub overlay: ProfileOverlay,
     /// Its probe.
     pub evaluation: Evaluation,
+    /// Each named model route that its probe asked for. The pool redacts
+    /// each one. An input recorded before this field decodes with none.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub routes: BTreeSet<String>,
 }
 
 /// The input of [`agent_refine_compose`].
@@ -192,6 +196,9 @@ pub struct Composition {
 ///
 /// Each failure text of the pool loses each overlay digest, each model
 /// route and the provider id of each route, as in `compare_anonymised`.
+/// The routes are the default route, each overlay model and each route that
+/// a probe asked for. A probe can inherit the route of its source task, or
+/// ask for the route of a recorded peer.
 fn pool_of(
     harness: &AgentHarness,
     events: &[WorkflowEvent],
@@ -208,6 +215,7 @@ fn pool_of(
     for probe in probes {
         identities.push(probe.evaluation.overlay_digest.clone());
         routes.insert(probe.overlay.model.clone());
+        routes.extend(probe.routes.iter().cloned().map(Some));
     }
     for route in routes {
         if let Ok(model) = harness.model(route.as_deref())

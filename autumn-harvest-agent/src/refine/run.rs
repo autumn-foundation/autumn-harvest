@@ -47,7 +47,7 @@ use crate::agent::overlay::{Ceilings, ProfileOverlay};
 use crate::agent::{AGENT_WORKFLOW_NAME, AgentId, AgentProfile};
 use crate::eval::anon::AnonId;
 use crate::eval::evidence::render_source;
-use crate::eval::{Candidate, Evaluation, RunEnd, check_source, evaluate, task_of};
+use crate::eval::{Candidate, Evaluation, RunEnd, check_source, evaluate_routed, task_of};
 use crate::harness::{AgentHarness, truncate};
 use crate::mesh_control::{MESH_ATTR, MeshBudget};
 use crate::message::TokenUsage;
@@ -262,6 +262,11 @@ pub struct ProbeResult {
     pub evaluation: Evaluation,
     /// The live re-probe.
     pub live: LiveReprobe,
+    /// Each named model route that the replay probe asked for, such as the
+    /// route of the source task or of a recorded peer. A pool redacts each
+    /// one. A result recorded before this field decodes with none.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub routes: BTreeSet<String>,
 }
 
 /// One probe in the report.
@@ -543,7 +548,7 @@ pub(crate) async fn run_probe(
     let candidate = Candidate::new(harness.clone())
         .overlay(request.overlay.clone())
         .ceilings(request.ceilings.clone());
-    let evaluation = Box::pin(evaluate(&events, &candidate))
+    let (evaluation, routes) = Box::pin(evaluate_routed(&events, &candidate))
         .await
         .map_err(|err| {
             ActivityFailure::non_retryable("RefineProbeFailed", format!("the probe failed: {err}"))
@@ -578,7 +583,11 @@ pub(crate) async fn run_probe(
             },
         }
     };
-    Ok(ProbeResult { evaluation, live })
+    Ok(ProbeResult {
+        evaluation,
+        live,
+        routes,
+    })
 }
 
 /// One probe, as an activity. See [`run_probe`].
@@ -891,6 +900,7 @@ impl Refine<'_> {
             self.probes[at] = Some(ProbedCandidate {
                 overlay,
                 evaluation: result.evaluation,
+                routes: result.routes,
             });
             probed.push(at);
         }

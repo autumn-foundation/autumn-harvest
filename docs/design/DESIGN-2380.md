@@ -169,7 +169,7 @@ guard.
 | A run keeps going past its budget. | The run checks the ledger before each step. |
 | A spent run still names a winner. | `BudgetExhausted` has no `chosen`. |
 | The composer learns the order of a candidate. | The pool lists opaque ids in a seeded order. No reader context holds the seed. |
-| A failure text names a model. | The pool redacts each digest, each model route and its provider id. |
+| A failure text names a model. | The pool redacts each digest, each model route and its provider id. Each probe records the routes that it asked for, so an inherited route and a peer route count too. |
 | A carried overlay does not fit a later source, such as a read-only one. | Each stage reply must apply to the profile of every source of the run. |
 | The selector names an id outside the pool. | The step ignores the id, takes the rule pick and records a note. |
 | A failed attempt hides its spend. | The failure details hold the spend of the last attempt. |
