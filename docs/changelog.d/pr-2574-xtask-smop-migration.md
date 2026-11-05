@@ -1,4 +1,4 @@
-## Tooling: every repo script runs as `cargo xtask` on smop (ADR 0015)
+## Tooling: every repo script runs as `cargo xtask` on smop (PR #2574)
 
 PR #2564 added the `xtask` crate, ADR 0015 and the `docs/xtask.md` command
 index, with one stub command per script. This entry ports all 96 scripts and
