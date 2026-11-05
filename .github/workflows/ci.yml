@@ -997,6 +997,27 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      # The Windows image has the same pressure on C:, which holds the cargo
+      # registry and the kache store. The store alone reached 27 GB, and the
+      # shard ran out of disk while it unpacked a crate. These toolchains are
+      # not used by this job. Rust, MSVC and kache stay.
+      - name: Free runner disk before heavy plugin link (Windows)
+        if: runner.os == 'Windows' && needs.changes.outputs.code == 'true'
+        shell: pwsh
+        run: |
+          $paths = @(
+            'C:\Android',
+            'C:\hostedtoolcache\windows\CodeQL',
+            'C:\hostedtoolcache\windows\go',
+            'C:\hostedtoolcache\windows\Ruby',
+            'C:\hostedtoolcache\windows\PyPy',
+            'C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk'
+          )
+          # `rmdir /s /q` removes a large tree much faster than Remove-Item.
+          foreach ($path in $paths) {
+            if (Test-Path $path) { cmd /c rmdir /s /q "$path" }
+          }
+          Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize
       # kache executable caching broke uplifted binaries on macOS:
       # `target/debug/harvest` and a build-script copy failed with "cannot
       # execute binary file". Test binaries in `deps/` ran. The CLI caches
@@ -1038,6 +1059,25 @@ jobs:
           SEMAPHORE_SHARD_COUNT: "4"
           SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
         run: bash .github/ci/run-suites.sh run allos
+      # The two manifest steps link one large test binary per suite. No later
+      # step runs them, and together they fill the runner disk. Shard 3 then
+      # ran out of disk while it linked the agent tests. So delete the test
+      # executables now. The rlibs stay, so a later step that needs a binary
+      # links it again from them.
+      - name: Free disk after the manifest suites
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          deps="${CARGO_TARGET_DIR:-target}/debug/deps"
+          if [ -d "$deps" ]; then
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              find "$deps" -maxdepth 1 -type f \( -name '*.exe' -o -name '*.pdb' \) -delete
+            else
+              find "$deps" -maxdepth 1 -type f -perm -u+x \
+                ! -name '*.so' ! -name '*.dylib' ! -name '*.rlib' ! -name '*.rmeta' -delete
+            fi
+          fi
+          df -h . || true
       # ── Individual crate/example steps carried over from `test`, one shard
       # each, balanced by measured time (see the job comment above) ─────────
       # The lib test target needs about 8 GB to compile, and `integration`
