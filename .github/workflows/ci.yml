@@ -1003,6 +1003,15 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      # Windows keeps the Cargo registry on C:, which is the small drive. A
+      # leg that unpacks the AWS SDK filled it (os error 112, PR #2582). The
+      # preinstalled Android SDK is the largest unused tree there.
+      - name: Free runner disk before heavy plugin link (Windows)
+        if: runner.os == 'Windows' && needs.changes.outputs.code == 'true'
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force C:\Android -ErrorAction SilentlyContinue
+          Get-PSDrive C | Format-Table -AutoSize
       # kache executable caching broke uplifted binaries on macOS:
       # `target/debug/harvest` and a build-script copy failed with "cannot
       # execute binary file". Test binaries in `deps/` ran. The CLI caches
