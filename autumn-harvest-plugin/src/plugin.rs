@@ -1647,7 +1647,7 @@ const fn mcp_tools_unprotected(mcp_tools_enabled: bool, has_tool_middleware: boo
 ///
 /// It must equal the `autumn-web` requirement in this crate's `Cargo.toml`.
 /// A unit test enforces that, so a dependency bump cannot leave it stale.
-pub const AUTUMN_WEB_REQUIREMENT: &str = "0.9";
+pub const AUTUMN_WEB_REQUIREMENT: &str = "0.10";
 
 /// The compatibility contract that [`HarvestPlugin`] declares to Autumn.
 ///
@@ -3470,7 +3470,7 @@ mod tests {
         use autumn_web::plugin_contract::{ContractVerdict, evaluate};
 
         let contract = harvest_plugin_contract();
-        for other in ["0.8.0", "0.10.0"] {
+        for other in ["0.9.0", "0.11.0"] {
             assert!(
                 matches!(evaluate(&contract, other), ContractVerdict::Incompatible(_)),
                 "autumn-web {other} must be outside the declared range"
@@ -4236,6 +4236,7 @@ mod tests {
                 startup: crate::config::HarvestStartupConfig::default(),
                 redis: crate::config::HarvestRedisConfig::default(),
                 retention: crate::config::HarvestRetentionConfig::default(),
+                worker: crate::config::HarvestWorkerConfig::default(),
             },
             HarvestRunnerResources::new(pool),
         )
@@ -4358,6 +4359,7 @@ mod tests {
             startup: crate::config::HarvestStartupConfig::default(),
             redis: crate::config::HarvestRedisConfig::default(),
             retention: crate::config::HarvestRetentionConfig::default(),
+            worker: crate::config::HarvestWorkerConfig::default(),
         };
 
         let harvest_pool = resolve_harvest_pool(&state, &config)

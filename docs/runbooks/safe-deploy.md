@@ -261,6 +261,14 @@ added, it becomes uncovered, and `harvest_queue_paused_too_long` alone can
 miss that combination for its full grace window. Treat a non-empty
 `excluded_paused_queues` as a pre-unpause TODO, not a false negative.
 
+**A tier can poll a subset of the declared queues** (issue #2479). Set
+`[harvest.worker] queues` or `AUTUMN_HARVEST__WORKER__QUEUES`, or a role
+`pin`. `unpolled_declared_queues` names each declared queue with no live
+poller, with or without pending work. The declared list is the code list
+of the process that serves the request. Run `harvest queue coverage
+--strict` after a topology change. It also exits `2` when that list is not
+empty. See [`process-roles.md`](../operations/process-roles.md#worker-queues-issue-2479).
+
 **This is a distinct question from build-id reachability (#171) and the
 pre-cutover handler-coverage gate immediately below (#520/#700).** Build-id
 routing asks *"can a worker running this build safely resume this

@@ -99,6 +99,78 @@ To trigger a sweep from the API, set `run_on = "all"` on the `web`
 replicas. Otherwise the next tick on a `worker` replica runs the sweep.
 Read the retention metrics of the `worker` replicas for its results.
 
+## Worker queues (issue #2479)
+
+Code declares the full set of queues with `WorkerConfig::with_queues`.
+Config can narrow the queues that the worker of one process polls. Config
+cannot add a queue.
+
+```toml
+[harvest.worker]
+queues = ["priority"]
+```
+
+Or set `AUTUMN_HARVEST__WORKER__QUEUES=priority`. Separate names with a
+comma. The variable wins over the file.
+
+- **An undeclared queue stops the boot.** The error names it and the
+  declared queues. A name matches exactly, so `Priority` is not
+  `priority`. A typo cannot make a tier that polls nothing.
+- **An empty list means "not set"**, as for `AUTUMN_JOBS__PIN`. An empty
+  variable clears a list from the file.
+- **The worker polls in code order**, not in config order.
+- **The management API keeps the declared list.** A start with no queue
+  goes to the first declared queue on each tier.
+- `[harvest.worker]` refuses an unknown key. `queue = [...]` stops the boot.
+
+### The role pin
+
+With no explicit list, Harvest reads the `pin` of a named Autumn role
+(`autumn-web` 0.10):
+
+```toml
+[roles.priority]
+base = "worker"
+pin = ["priority", "emails"]
+```
+
+Autumn job queues and Harvest queues share the pin. Harvest polls each
+declared queue that the pin names, and ignores the other names. A pin that
+names no declared queue changes nothing. Harvest then polls each declared
+queue and logs one `warn!`. The warning names the pin and the fix. An
+explicit list always wins over the pin.
+
+| Explicit list | Role pin | The worker polls |
+|---|---|---|
+| set | any | the explicit list |
+| not set | names a declared queue | the declared queues in the pin |
+| not set | names no declared queue | each declared queue, with a `warn!` |
+| not set | none | each declared queue |
+
+`formal/verus/src/worker_queues.rs` proves this table.
+
+### Coverage
+
+Each queue needs a tier that polls it. Otherwise a run on it waits.
+
+- At startup, Harvest logs one line with the declared queues, the polled
+  queues and the source: `code`, `explicit` or `role`.
+- `GET /admin/config` reports `worker.queues` (polled),
+  `worker.declared_queues` and `worker.queue_source`.
+- `GET /admin/queue-coverage` lists `unpolled_declared_queues`: each
+  declared queue with no live worker on an inspected shard.
+  `harvest queue coverage --strict` exits `2` when that list is not empty.
+- The `autumn doctor --strict` hook waits for autumn#3545. Issue #2480
+  tracks it.
+
+With the `webhooks` feature, the built-in `webhooks` queue is a declared
+queue too. Narrow it out only when another tier polls it.
+
+The SQLite backend refuses a list. Its one driver runs each queue. A
+standalone `HarvestEmbedding` reads `[harvest.worker]` and the variable. A
+plain `HarvestRunner::start` reads only the `HarvestRuntimeConfig` that its
+caller passes.
+
 ## Fly.io
 
 Each process group runs the same image. Only `AUTUMN_ROLE` differs in the

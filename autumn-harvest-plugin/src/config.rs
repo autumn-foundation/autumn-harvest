@@ -103,6 +103,65 @@ pub struct HarvestRetentionConfig {
     pub run_on: RetentionRunOn,
 }
 
+/// The `[harvest.worker]` section (issue #2479).
+///
+/// It narrows the queues that the worker of this process polls. Code
+/// declares the full set with `WorkerConfig::with_queues`. See
+/// [`crate::worker_queues`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HarvestWorkerConfig {
+    /// The queues that this process polls. Each name must be declared in
+    /// code. Empty: the role pin applies, else each declared queue.
+    pub queues: Vec<String>,
+}
+
+impl HarvestWorkerConfig {
+    /// Apply the operator settings over this code value (issue #2479).
+    ///
+    /// The sources and their precedence are those of
+    /// [`HarvestStartupConfig::with_operator_overrides`]. Only
+    /// `[harvest.worker]` and its variable are read. A source that names no
+    /// list keeps the code value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when a config file cannot be read or parsed,
+    /// or when a queue name is blank.
+    pub fn with_operator_overrides(mut self, env: &dyn Env) -> Result<Self, ConfigError> {
+        for path in operator_config_paths(env) {
+            if let Some(worker) = load_worker_section(&path)? {
+                self.apply_partial(worker);
+            }
+        }
+        self.apply_env_overrides(env);
+        self.validate()?;
+        Ok(self)
+    }
+
+    fn apply_partial(&mut self, partial: PartialHarvestWorkerConfig) {
+        if let Some(queues) = partial.queues {
+            self.queues = queues;
+        }
+    }
+
+    /// An empty value clears the list, as for `AUTUMN_JOBS__PIN`.
+    fn apply_env_overrides(&mut self, env: &dyn Env) {
+        if let Ok(queues) = env.var("AUTUMN_HARVEST__WORKER__QUEUES") {
+            self.queues = crate::worker_queues::parse_env_list(&queues);
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.queues.iter().any(|name| name.trim().is_empty()) {
+            return Err(ConfigError::Validation(format!(
+                "{} has a blank queue name",
+                crate::worker_queues::WORKER_QUEUES_KEY
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Highest accepted `harvest.redis.poll_interval_ms`.
 ///
 /// The value is the wait of one blocking read. The worker checks shutdown and
@@ -228,6 +287,8 @@ pub struct HarvestRuntimeConfig {
     pub redis: HarvestRedisConfig,
     /// Where the retention janitor runs (issue #2478).
     pub retention: HarvestRetentionConfig,
+    /// The queues that the worker polls (issue #2479).
+    pub worker: HarvestWorkerConfig,
 }
 
 impl HarvestRuntimeConfig {
@@ -342,6 +403,7 @@ impl HarvestRuntimeConfig {
         if let Some(run_on) = partial.retention.run_on {
             self.retention.run_on = run_on;
         }
+        self.worker.apply_partial(partial.worker);
     }
 
     fn apply_env_overrides(&mut self, env: &dyn Env) -> Result<(), ConfigError> {
@@ -453,6 +515,7 @@ impl HarvestRuntimeConfig {
             self.retention.run_on =
                 parse_retention_run_on("AUTUMN_HARVEST_RETENTION__RUN_ON", &run_on)?;
         }
+        self.worker.apply_env_overrides(env);
 
         Ok(())
     }
@@ -511,6 +574,7 @@ impl HarvestRuntimeConfig {
         }
 
         self.validate_redis()?;
+        self.worker.validate()?;
 
         Ok(())
     }
@@ -664,6 +728,7 @@ impl Default for HarvestRuntimeConfig {
             startup: HarvestStartupConfig::default(),
             redis: HarvestRedisConfig::default(),
             retention: HarvestRetentionConfig::default(),
+            worker: HarvestWorkerConfig::default(),
         }
     }
 }
@@ -744,6 +809,16 @@ struct PartialHarvestRuntimeConfig {
     sqlite: PartialHarvestSqliteConfig,
     #[serde(default)]
     retention: PartialHarvestRetentionConfig,
+    #[serde(default)]
+    worker: PartialHarvestWorkerConfig,
+}
+
+/// A new section, so an unknown key stops the boot. `queue = [...]` must
+/// not narrow nothing in silence.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialHarvestWorkerConfig {
+    queues: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -996,28 +1071,52 @@ struct StartupOnlyHarvest {
     startup: PartialHarvestStartupConfig,
 }
 
+/// Only the `[harvest.worker]` table of a config file.
+#[derive(Debug, Default, Deserialize)]
+struct WorkerOnlyRoot {
+    #[serde(default)]
+    harvest: WorkerOnlyHarvest,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WorkerOnlyHarvest {
+    #[serde(default)]
+    worker: PartialHarvestWorkerConfig,
+}
+
 /// Read `[harvest.startup]` from `path`. A missing file gives `None`.
+fn load_startup_section(path: &Path) -> Result<Option<PartialHarvestStartupConfig>, ConfigError> {
+    Ok(load_section::<StartupOnlyRoot>(path, "startup")?.map(|root| root.harvest.startup))
+}
+
+/// Read `[harvest.worker]` from `path`. A missing file gives `None`.
+fn load_worker_section(path: &Path) -> Result<Option<PartialHarvestWorkerConfig>, ConfigError> {
+    Ok(load_section::<WorkerOnlyRoot>(path, "worker")?.map(|root| root.harvest.worker))
+}
+
+/// Read one `[harvest.<table>]` view of `path`. A missing file gives `None`.
 ///
 /// The parse error names the file and the byte offset only. The TOML error
 /// text quotes the failing line, which can hold a password.
-fn load_startup_section(path: &Path) -> Result<Option<PartialHarvestStartupConfig>, ConfigError> {
+fn load_section<R: serde::de::DeserializeOwned>(
+    path: &Path,
+    table: &str,
+) -> Result<Option<R>, ConfigError> {
     let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(ConfigError::Io(error)),
     };
-    toml::from_str::<StartupOnlyRoot>(&contents)
-        .map(|root| Some(root.harvest.startup))
-        .map_err(|error| {
-            let offset = error
-                .span()
-                .map_or_else(String::new, |span| format!(" at byte {}", span.start));
-            ConfigError::Validation(format!(
-                "could not parse {}{offset}: the file is not valid TOML, or \
-                 [harvest.startup] holds an invalid value",
-                path.display()
-            ))
-        })
+    toml::from_str::<R>(&contents).map(Some).map_err(|error| {
+        let offset = error
+            .span()
+            .map_or_else(String::new, |span| format!(" at byte {}", span.start));
+        ConfigError::Validation(format!(
+            "could not parse {}{offset}: the file is not valid TOML, or \
+             [harvest.{table}] holds an invalid value",
+            path.display()
+        ))
+    })
 }
 
 fn resolve_profile(env: &dyn Env) -> Option<String> {
@@ -2233,5 +2332,118 @@ orphaned_workflows = "fail"
         assert_eq!(RetentionRunOn::Scheduler.as_str(), "scheduler");
         assert_eq!(RetentionRunOn::All.as_str(), "all");
         assert_eq!(RetentionRunOn::All.to_string(), "all");
+    }
+
+    fn queue_names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// Issue #2479: no setting narrows the worker by default.
+    #[test]
+    fn worker_queues_default_to_unset() {
+        let config = HarvestRuntimeConfig::load_with_env(&MockEnv::new()).expect("loads");
+        assert!(config.worker.queues.is_empty());
+        assert_eq!(HarvestWorkerConfig::default().queues, Vec::<String>::new());
+    }
+
+    /// `[harvest.worker] queues` sets the list. A profile file beats the root
+    /// file, and the environment beats both.
+    #[test]
+    fn worker_queues_from_toml_profile_and_env() {
+        let dir = unique_temp_dir("harvest-config-worker-queues");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest.worker]\nqueues = [\"priority\", \"bulk\"]\n",
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.worker.queues, queue_names(&["priority", "bulk"]));
+
+        write_file(
+            &dir.join("autumn-prod.toml"),
+            "[harvest.worker]\nqueues = [\"bulk\"]\n",
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_ENV", "prod");
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.worker.queues, queue_names(&["bulk"]));
+
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_ENV", "prod")
+            .with("AUTUMN_HARVEST__WORKER__QUEUES", "priority");
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.worker.queues, queue_names(&["priority"]));
+    }
+
+    /// The variable is comma-separated. An empty value clears the list, as
+    /// `AUTUMN_JOBS__PIN` does.
+    #[test]
+    fn worker_queues_env_is_comma_separated_and_empty_clears() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST__WORKER__QUEUES", " priority, bulk ,");
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.worker.queues, queue_names(&["priority", "bulk"]));
+
+        let dir = unique_temp_dir("harvest-config-worker-queues-clear");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest.worker]\nqueues = [\"priority\"]\n",
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST__WORKER__QUEUES", "");
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert!(config.worker.queues.is_empty());
+    }
+
+    /// A blank name or an unknown key in `[harvest.worker]` stops the boot.
+    #[test]
+    fn worker_queues_refuse_a_blank_name_and_an_unknown_key() {
+        let dir = unique_temp_dir("harvest-config-worker-queues-reject");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest.worker]\nqueues = [\"priority\", \" \"]\n",
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let error = HarvestRuntimeConfig::load_with_env(&env).expect_err("must refuse");
+        assert!(
+            error.to_string().contains("harvest.worker.queues"),
+            "{error}"
+        );
+
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest.worker]\nqueue = [\"priority\"]\n",
+        );
+        let error = HarvestRuntimeConfig::load_with_env(&env).expect_err("must refuse");
+        assert!(error.to_string().contains("queue"), "{error}");
+    }
+
+    /// A standalone embedding keeps its code list unless an operator source
+    /// names one.
+    #[test]
+    fn worker_operator_overrides_apply_over_the_code_list() {
+        let code = HarvestWorkerConfig {
+            queues: queue_names(&["default"]),
+        };
+        let kept = code
+            .clone()
+            .with_operator_overrides(&MockEnv::new())
+            .expect("loads");
+        assert_eq!(kept, code);
+
+        let dir = unique_temp_dir("harvest-config-worker-overlay");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest]\nworker_enabled = \"not a bool\"\n[harvest.worker]\nqueues = [\"bulk\"]\n",
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let from_file = code.clone().with_operator_overrides(&env).expect("loads");
+        assert_eq!(from_file.queues, queue_names(&["bulk"]));
+
+        let env = env.with("AUTUMN_HARVEST__WORKER__QUEUES", "priority");
+        let from_env = code.with_operator_overrides(&env).expect("loads");
+        assert_eq!(from_env.queues, queue_names(&["priority"]));
     }
 }

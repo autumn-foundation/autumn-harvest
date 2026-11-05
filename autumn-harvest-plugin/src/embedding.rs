@@ -36,7 +36,9 @@ use autumn_web::reexports::axum::Router;
 
 use crate::api::{HarvestApiState, StandaloneAdminAuth, harvest_api_router};
 use crate::boot::{self, AdmissionGlobalsGuard, GateRefreshRuntime};
-use crate::config::{HarvestRuntimeConfig, HarvestStartupConfig, OrphanStartupAction};
+use crate::config::{
+    HarvestRuntimeConfig, HarvestStartupConfig, HarvestWorkerConfig, OrphanStartupAction,
+};
 use crate::runner::{HarvestRunner, HarvestRunnerResources, run_startup_orphan_gate};
 use crate::ui::harvest_ui_router;
 
@@ -65,6 +67,8 @@ impl HarvestEmbedding {
     /// `config.startup` is the code default. The operator config file and
     /// the `AUTUMN_HARVEST_STARTUP__*` variables override it at start. See
     /// [`crate::config::HarvestStartupConfig::with_operator_overrides`].
+    /// `config.worker` works the same way, with `[harvest.worker]` and
+    /// `AUTUMN_HARVEST__WORKER__QUEUES` (issue #2479).
     ///
     /// Some steps belong to the plugin only, because they need an autumn-web
     /// `AppState`. This entry point does not run the outbox relay, the broker
@@ -191,7 +195,8 @@ impl HarvestEmbedding {
         Box::pin(async move {
             // Read the environment before the first await. `&dyn Env` is not
             // `Sync`, so holding it would make this future not `Send`.
-            let operator = OperatorInputs::read(self.config.startup, &OsEnv)?;
+            let operator =
+                OperatorInputs::read(self.config.startup, self.config.worker.clone(), &OsEnv)?;
             Box::pin(self.start_with(operator)).await
         })
     }
@@ -213,6 +218,7 @@ impl HarvestEmbedding {
 
         warn_if_operator_weakens_the_orphan_gate(config.startup, operator.startup);
         config.startup = operator.startup;
+        config.worker = operator.worker;
         if config.outbox.enabled {
             tracing::warn!(
                 "HarvestEmbedding does not run the workflow-start outbox relay. The relay needs \
@@ -370,17 +376,27 @@ fn mount_router(
 struct OperatorInputs {
     /// The code startup config with the operator overrides applied.
     startup: HarvestStartupConfig,
+    /// The code worker config with the operator overrides applied.
+    worker: HarvestWorkerConfig,
     /// The profile from the environment, if any.
     profile: Option<String>,
 }
 
 impl OperatorInputs {
-    fn read(code_startup: HarvestStartupConfig, env: &dyn Env) -> autumn_web::AutumnResult<Self> {
+    fn read(
+        code_startup: HarvestStartupConfig,
+        code_worker: HarvestWorkerConfig,
+        env: &dyn Env,
+    ) -> autumn_web::AutumnResult<Self> {
         let startup = code_startup
+            .with_operator_overrides(env)
+            .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+        let worker = code_worker
             .with_operator_overrides(env)
             .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
         Ok(Self {
             startup,
+            worker,
             profile: ambient_profile(env),
         })
     }

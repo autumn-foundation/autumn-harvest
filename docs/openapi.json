@@ -2668,7 +2668,7 @@
     },
     "/admin/queue-coverage": {
       "get": {
-        "description": "Fleet-wide task-queue coverage (issue #774): report task queues with >=1 PENDING task and zero live workers polling them, fanned out across every readable shard. A worker is live for coverage purposes when its heartbeat is fresh and its status is Active or Draining (only Stopped/stale workers fail to cover) -- coverage means a poller exists, not that capacity is available (a saturated queue is #531/#742's job, not this endpoint's, and worker build_id is never consulted -- that is #171's build-id reachability). A queue currently paused via the queue-pause primitive is excluded from items/uncovered (already covered by harvest_queue_paused_too_long), but a queue that is both paused AND pollerless AND has real pending work is still named in excluded_paused_queues, since the pause alert alone fires on pause duration and can miss that combination for its full grace window; a paused queue that already has a live poller is absent from excluded_paused_queues (nothing to report). Each uncovered item[] carries pending_count, a bounded (5) set of representative sample_task_ids/sample_execution_ids for drill-down, and a per-shard shard_breakdown. An unreachable shard is named in shards[] (never silently dropped) and degrades status to partial/unavailable; uncovered is authoritative only when status == complete. No new WorkflowEvent variant, no migration -- read path only.",
+        "description": "Fleet-wide task-queue coverage (issue #774): report task queues with >=1 PENDING task and zero live workers polling them, fanned out across every readable shard. A worker is live for coverage purposes when its heartbeat is fresh and its status is Active or Draining (only Stopped/stale workers fail to cover) -- coverage means a poller exists, not that capacity is available (a saturated queue is #531/#742's job, not this endpoint's, and worker build_id is never consulted -- that is #171's build-id reachability). A queue currently paused via the queue-pause primitive is excluded from items/uncovered (already covered by harvest_queue_paused_too_long), but a queue that is both paused AND pollerless AND has real pending work is still named in excluded_paused_queues, since the pause alert alone fires on pause duration and can miss that combination for its full grace window; a paused queue that already has a live poller is absent from excluded_paused_queues (nothing to report). Each uncovered item[] carries pending_count, a bounded (5) set of representative sample_task_ids/sample_execution_ids for drill-down, and a per-shard shard_breakdown. An unreachable shard is named in shards[] (never silently dropped) and degrades status to partial/unavailable; uncovered is authoritative only when status == complete. unpolled_declared_queues (issue #2479) names each declared queue that no live worker polls on an inspected shard, with or without pending work. The declared list is the code list of the process that serves the request. Config or the role pin can narrow each worker to a subset, so a name there has no worker tier. It does not change uncovered. No new WorkflowEvent variant, no migration -- read path only.",
         "operationId": "get_admin_queue_coverage",
         "parameters": [
           {
@@ -2694,7 +2694,8 @@
                     "shards": {},
                     "status": {},
                     "total_uncovered_queues": {},
-                    "uncovered": {}
+                    "uncovered": {},
+                    "unpolled_declared_queues": {}
                   },
                   "type": "object"
                 }

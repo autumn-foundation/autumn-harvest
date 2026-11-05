@@ -332,6 +332,8 @@ fn build_webhook_route(trigger: &WebhookTriggerInfo, api_state: HarvestApiState)
         // An inbound webhook endpoint is machine-to-machine and is never
         // rendered or indexed, so it carries no SEO meta (since autumn-web 0.7).
         seo: autumn_web::SeoRouteDefaults::EMPTY,
+        // The group of the plugin that registers the route (since autumn-web 0.10).
+        group: None,
     }
 }
 

@@ -104,9 +104,8 @@ serde_json = { workspace = true }
 base64 = "0.23"
 sha2 = "0.11"
 hmac = "0.13"
-# AES-256-GCM payload codec (issue #1825). `autumn-web` 0.9 keeps its own 0.10.3 in
-# the lockfile. No default features: the codec reads nonces from `rand`'s
-# `SysRng`, so `aead/getrandom` is not needed.
+# AES-256-GCM payload codec (issue #1825). No default features: the codec reads
+# nonces from `rand`'s `SysRng`, so `aead/getrandom` is not needed.
 aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc", "zeroize"] }
 # `aes-gcm`'s own `zeroize` feature clears only a temporary key. These turn on
 # `ZeroizeOnDrop` for the AES round keys and the GHASH state. All three crates

@@ -3155,6 +3155,10 @@ enum QueueCommand {
         /// Output raw JSON instead of the summary table.
         #[arg(long)]
         json: bool,
+        /// Also exit `2` when a declared queue has no live poller, with or
+        /// without pending work (issue #2479).
+        #[arg(long)]
+        strict: bool,
     },
     /// Show, set, or clear fairness key weights in a queue (issue #1976).
     #[command(subcommand)]
@@ -4285,6 +4289,14 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     if queue_coverage_should_gate(&cli) && queue_coverage_exit_code(&response) != 0 {
         return Err(CliError::QueueCoverageGate {
             context: "uncovered queue or incomplete shard report".to_string(),
+        });
+    }
+    if queue_coverage_is_strict(&cli) && !queue_coverage_unpolled(&response).is_empty() {
+        return Err(CliError::QueueCoverageGate {
+            context: format!(
+                "declared queues with no live poller: {}",
+                queue_coverage_unpolled(&response).join(", ")
+            ),
         });
     }
     if queue_mutation_should_gate(&cli) && queue_mutation_exit_code(&response) != 0 {
@@ -10161,6 +10173,39 @@ fn queue_coverage_exit_code(value: &Value) -> i32 {
     if uncovered { 2 } else { 0 }
 }
 
+/// True for `queue coverage --strict` (issue #2479).
+const fn queue_coverage_is_strict(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Queue {
+            command: QueueCommand::Coverage { strict: true, .. }
+        }
+    )
+}
+
+/// The declared queues with no live poller (issue #2479).
+fn queue_coverage_unpolled(value: &Value) -> Vec<&str> {
+    value
+        .get("unpolled_declared_queues")
+        .and_then(Value::as_array)
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// "NOTE: declared queues .." footer, or empty when each declared queue has
+/// a live poller (issue #2479).
+fn queue_coverage_unpolled_note(value: &Value) -> String {
+    let unpolled = queue_coverage_unpolled(value);
+    if unpolled.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nNOTE: declared queues with no live poller (a run on them waits; --strict exits 2): {}",
+            unpolled.join(", ")
+        )
+    }
+}
+
 /// "WARNING: unavailable shards [..]" footer, or empty when every shard was
 /// reached. Extracted so [`format_queue_coverage_table`] stays under the
 /// line-count lint.
@@ -10231,7 +10276,7 @@ fn format_queue_coverage_table(value: &Value) -> String {
     // still surface here — unpausing it without adding a worker would
     // immediately make it uncovered, and `--json` is the only other way to
     // see this list.
-    let paused_note = queue_coverage_paused_note(value);
+    let paused_note = queue_coverage_paused_note(value) + &queue_coverage_unpolled_note(value);
 
     let Some(items) = value.get("items").and_then(Value::as_array) else {
         return format!(
@@ -14940,6 +14985,39 @@ mod reuse_policy_tests {
         assert!(!queue_coverage_wants_table(&parse(&[
             "queue", "coverage", "--json"
         ])));
+    }
+
+    /// Issue #2479: the table names each declared queue with no poller.
+    #[test]
+    fn queue_coverage_table_surfaces_unpolled_declared_queues() {
+        let value = json!({
+            "status": "complete",
+            "observed_at": "2026-11-05T00:00:00Z",
+            "total_uncovered_queues": 0,
+            "uncovered": false,
+            "items": [],
+            "shards": [{ "shard_id": 0, "status": "inspected" }],
+            "excluded_paused_queues": [],
+            "unpolled_declared_queues": ["bulk", "priority"]
+        });
+        let rendered = format_queue_coverage_table(&value);
+        assert!(rendered.contains("NOTE: declared queues"), "{rendered}");
+        assert!(rendered.contains("bulk, priority"), "{rendered}");
+        assert_eq!(queue_coverage_unpolled(&value), vec!["bulk", "priority"]);
+
+        let covered = json!({ "unpolled_declared_queues": [] });
+        assert!(queue_coverage_unpolled_note(&covered).is_empty());
+        assert!(queue_coverage_unpolled(&json!({})).is_empty());
+    }
+
+    /// Issue #2479: only `--strict` gates on an unpolled declared queue.
+    #[test]
+    fn queue_coverage_strict_is_opt_in() {
+        assert!(queue_coverage_is_strict(&parse(&[
+            "queue", "coverage", "--strict"
+        ])));
+        assert!(!queue_coverage_is_strict(&parse(&["queue", "coverage"])));
+        assert!(!queue_coverage_is_strict(&parse(&["shard", "health"])));
     }
 
     #[test]

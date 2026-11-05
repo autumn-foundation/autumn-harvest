@@ -203,6 +203,14 @@ pub struct QueueCoverageReport {
     /// reported uncovered the moment it is unpaused without gaining a live
     /// poller. Empty when nothing pending is both paused and pollerless.
     pub excluded_paused_queues: Vec<String>,
+    /// Declared queues that no live worker polls on an inspected shard
+    /// (issue #2479). Sorted and deduped across shards.
+    ///
+    /// The declared list is the code list of the process that serves this
+    /// request. Config or the role pin can narrow each worker to a subset. A
+    /// name here has no worker tier, so a run on it waits. Unlike `items`,
+    /// this needs no pending task. It does not change `uncovered`.
+    pub unpolled_declared_queues: Vec<String>,
 }
 
 /// One queue with pending work and zero live pollers, aggregated across
@@ -322,25 +330,102 @@ pub async fn build_queue_coverage_report(
     let expected_shards = shard_fanout::expected_shards(api_state, &pools);
 
     let filter = query.queue_name.clone();
+    let declared = declared_queues(api_state, filter.as_deref());
 
     let futures = expected_shards
         .iter()
         .map(|shard_id| {
             let pool = pools.get(shard_id).cloned();
-            observe_shard(*shard_id, pool, filter.clone(), worker_stale_threshold)
+            observe_shard(
+                *shard_id,
+                pool,
+                filter.clone(),
+                worker_stale_threshold,
+                &declared,
+            )
         })
         .collect::<Vec<_>>();
     let results = join_all(futures).await;
-    let (observations, paused_uncovered_sets): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    let mut observations = Vec::with_capacity(results.len());
+    let mut paused_uncovered_sets = Vec::with_capacity(results.len());
+    let mut unpolled_sets = Vec::with_capacity(results.len());
+    for shard in results {
+        observations.push(shard.observation);
+        paused_uncovered_sets.push(shard.paused_uncovered);
+        unpolled_sets.push(shard.unpolled_declared);
+    }
 
     let mut report = build_report_from_observations(observed_at, filter, observations);
-    report.excluded_paused_queues = merge_excluded_paused_queues(paused_uncovered_sets);
+    report.excluded_paused_queues = merge_queue_name_sets(paused_uncovered_sets);
+    report.unpolled_declared_queues = merge_queue_name_sets(unpolled_sets);
     report
 }
 
-/// Merge per-shard "paused and would-be-uncovered" queue-name sets into one
-/// sorted, deduped list for [`QueueCoverageReport::excluded_paused_queues`].
-fn merge_excluded_paused_queues(sets: Vec<BTreeSet<String>>) -> Vec<String> {
+/// The declared queues that the report checks (issue #2479).
+///
+/// The list is the code list of the installed runtime. A `queue_name`
+/// filter narrows it to that one queue. With no runtime, the list is empty.
+fn declared_queues(api_state: &HarvestApiState, filter: Option<&str>) -> Vec<String> {
+    let declared = api_state
+        .runtime()
+        .map(|runtime| runtime.queues().to_vec())
+        .unwrap_or_default();
+    match filter {
+        Some(name) => declared.into_iter().filter(|queue| queue == name).collect(),
+        None => declared,
+    }
+}
+
+/// The declared queues that no live worker in `workers` polls on
+/// `shard_id` (issue #2479).
+fn unpolled_declared(
+    declared: &[String],
+    workers: &[WorkerRow],
+    shard_id: i32,
+) -> BTreeSet<String> {
+    declared
+        .iter()
+        .filter(|queue| {
+            !workers
+                .iter()
+                .any(|worker| worker_covers_queue(worker, queue, shard_id))
+        })
+        .cloned()
+        .collect()
+}
+
+/// What one shard reports.
+///
+/// On an error path both sets are empty, as `rows` is. Coverage cannot be
+/// determined without a read, so nothing is asserted either way.
+struct ShardCoverage {
+    observation: ShardObservation<UncoveredQueueDemand>,
+    /// Queue names excluded only because they are paused. See
+    /// [`merge_queue_name_sets`].
+    paused_uncovered: BTreeSet<String>,
+    /// Declared queues that no live worker polls on this shard.
+    unpolled_declared: BTreeSet<String>,
+}
+
+impl ShardCoverage {
+    const fn failed(shard_id: i32, error: String) -> Self {
+        Self {
+            observation: ShardObservation {
+                shard_id,
+                rows: Vec::new(),
+                error: Some(error),
+            },
+            paused_uncovered: BTreeSet::new(),
+            unpolled_declared: BTreeSet::new(),
+        }
+    }
+}
+
+/// Merge per-shard queue-name sets into one sorted, deduped list.
+///
+/// [`QueueCoverageReport::excluded_paused_queues`] and
+/// [`QueueCoverageReport::unpolled_declared_queues`] use it.
+fn merge_queue_name_sets(sets: Vec<BTreeSet<String>>) -> Vec<String> {
     sets.into_iter()
         .flatten()
         .collect::<BTreeSet<_>>()
@@ -454,88 +539,82 @@ pub(crate) async fn fetch_potentially_live_workers(
         .collect())
 }
 
-/// One shard's fully-inspected observation: the uncovered-demand rows plus
-/// the queue names that were excluded solely because they are paused (see
-/// [`merge_excluded_paused_queues`]). On any error path the second element
-/// is empty, exactly like `rows` — coverage cannot be determined without a
-/// successful read, so nothing is asserted either way.
+/// Inspect one shard.
+///
+/// The result holds the uncovered-demand rows and the paused queue names
+/// that they exclude. It also holds the declared queues with no live
+/// poller (issue #2479).
 async fn observe_shard(
     shard_id: i32,
     pool: Option<DbPool>,
     filter: Option<String>,
     worker_stale_threshold: Duration,
-) -> (ShardObservation<UncoveredQueueDemand>, BTreeSet<String>) {
+    declared: &[String],
+) -> ShardCoverage {
     let mut conn = match shard_fanout::acquire_shard_conn(shard_id, pool).await {
         Ok(conn) => conn,
-        Err(observation) => return (observation, BTreeSet::new()),
+        Err(observation) => {
+            return ShardCoverage {
+                observation,
+                paused_uncovered: BTreeSet::new(),
+                unpolled_declared: BTreeSet::new(),
+            };
+        }
     };
 
     let pending: Vec<PendingQueueDemand> =
         match queue::pending_queue_demand_by_queue_name(&mut conn, filter.as_deref()).await {
             Ok(rows) => rows,
-            Err(error) => {
-                return (
-                    ShardObservation {
-                        shard_id,
-                        rows: Vec::new(),
-                        error: Some(error.to_string()),
-                    },
-                    BTreeSet::new(),
-                );
-            }
+            Err(error) => return ShardCoverage::failed(shard_id, error.to_string()),
         };
-    // Nothing pending on this shard (optionally narrowed by `filter`) —
-    // skip the worker/pause reads entirely; there is nothing to report.
-    if pending.is_empty() {
-        return (
-            ShardObservation {
+    // Nothing pending and no declared queue to check: skip the worker and
+    // pause reads entirely. There is nothing to report.
+    if pending.is_empty() && declared.is_empty() {
+        return ShardCoverage {
+            observation: ShardObservation {
                 shard_id,
                 rows: Vec::new(),
                 error: None,
             },
-            BTreeSet::new(),
-        );
+            paused_uncovered: BTreeSet::new(),
+            unpolled_declared: BTreeSet::new(),
+        };
     }
 
     let workers = match fetch_potentially_live_workers(&mut conn, worker_stale_threshold).await {
         Ok(workers) => workers,
-        Err(error) => {
-            return (
-                ShardObservation {
-                    shard_id,
-                    rows: Vec::new(),
-                    error: Some(error.to_string()),
-                },
-                BTreeSet::new(),
-            );
-        }
+        Err(error) => return ShardCoverage::failed(shard_id, error.to_string()),
     };
+    let unpolled_declared = unpolled_declared(declared, &workers, shard_id);
+    if pending.is_empty() {
+        return ShardCoverage {
+            observation: ShardObservation {
+                shard_id,
+                rows: Vec::new(),
+                error: None,
+            },
+            paused_uncovered: BTreeSet::new(),
+            unpolled_declared,
+        };
+    }
 
     let paused: BTreeSet<String> = match queue_pause::paused_queue_names(&mut conn).await {
         Ok(names) => names.into_iter().collect(),
-        Err(error) => {
-            return (
-                ShardObservation {
-                    shard_id,
-                    rows: Vec::new(),
-                    error: Some(error.to_string()),
-                },
-                BTreeSet::new(),
-            );
-        }
+        Err(error) => return ShardCoverage::failed(shard_id, error.to_string()),
     };
 
     let (rows, paused_uncovered) =
         partition_uncovered_and_paused(pending, &workers, &paused, shard_id);
 
-    (
-        ShardObservation {
+    ShardCoverage {
+        observation: ShardObservation {
             shard_id,
             rows,
             error: None,
         },
         paused_uncovered,
-    )
+        unpolled_declared,
+    }
 }
 
 /// Partitions this shard's pending demand into uncovered rows and paused
@@ -543,7 +622,7 @@ async fn observe_shard(
 ///
 /// The first element is the genuinely-uncovered rows; the second is the set
 /// of queue names excluded solely because they are currently paused (see
-/// [`merge_excluded_paused_queues`]).
+/// [`merge_queue_name_sets`]).
 ///
 /// `pub` solely for `queue_coverage_profile` (see [`UncoveredQueueDemand`]'s
 /// doc comment) — not part of the crate's HTTP-facing API surface.
@@ -714,6 +793,7 @@ fn build_report_from_observations(
         items,
         shards,
         excluded_paused_queues: Vec::new(),
+        unpolled_declared_queues: Vec::new(),
     }
 }
 
@@ -1002,6 +1082,49 @@ mod tests {
         }
     }
 
+    /// Issue #2479: a declared queue that no live worker polls on the shard
+    /// is unpolled. A stopped worker, a stale one or one on another shard
+    /// does not poll it.
+    #[test]
+    fn unpolled_declared_names_each_queue_with_no_live_poller() {
+        let declared: Vec<String> = ["bulk", "default", "priority"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let workers = [
+            worker_row(
+                WorkerStatus::Active,
+                WorkerHealth::Healthy,
+                &[0],
+                &["priority"],
+            ),
+            worker_row(
+                WorkerStatus::Stopped,
+                WorkerHealth::Healthy,
+                &[0],
+                &["default"],
+            ),
+            worker_row(
+                WorkerStatus::Active,
+                WorkerHealth::Stale,
+                &[0],
+                &["default"],
+            ),
+            worker_row(WorkerStatus::Active, WorkerHealth::Healthy, &[1], &["bulk"]),
+        ];
+        let unpolled = unpolled_declared(&declared, &workers, 0);
+        assert_eq!(
+            unpolled.into_iter().collect::<Vec<_>>(),
+            vec!["bulk".to_owned(), "default".to_owned()]
+        );
+        let unpolled = unpolled_declared(&declared, &workers, 1);
+        assert_eq!(
+            unpolled.into_iter().collect::<Vec<_>>(),
+            vec!["default".to_owned(), "priority".to_owned()]
+        );
+        assert!(unpolled_declared(&[], &workers, 0).is_empty());
+    }
+
     #[test]
     fn active_worker_with_matching_queue_and_shard_covers() {
         let worker = worker_row(
@@ -1267,7 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_excluded_paused_queues_dedups_and_sorts_across_shards() {
+    fn merge_queue_name_sets_dedups_and_sorts_across_shards() {
         let shard0: BTreeSet<String> = ["zeta_paused", "alpha_paused"]
             .into_iter()
             .map(String::from)
@@ -1277,19 +1400,19 @@ mod tests {
             .map(String::from)
             .collect();
 
-        let merged = merge_excluded_paused_queues(vec![shard0, shard1]);
+        let merged = merge_queue_name_sets(vec![shard0, shard1]);
 
         assert_eq!(merged, vec!["alpha_paused", "beta_paused", "zeta_paused"]);
     }
 
     #[test]
-    fn merge_excluded_paused_queues_empty_input_is_empty() {
+    fn merge_queue_name_sets_empty_input_is_empty() {
         assert_eq!(
-            merge_excluded_paused_queues(Vec::new()),
+            merge_queue_name_sets(Vec::new()),
             [] as [std::string::String; 0]
         );
         assert_eq!(
-            merge_excluded_paused_queues(vec![BTreeSet::new()]),
+            merge_queue_name_sets(vec![BTreeSet::new()]),
             [] as [std::string::String; 0]
         );
     }
