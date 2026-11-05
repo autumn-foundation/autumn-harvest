@@ -783,12 +783,29 @@ let task = AgentTask::new("audit the ledger")
 - The reset reads only recorded data, so replay takes the same reset. The
   next turn after a reset goes in full, not as a delta.
 
-A tool round that passes the cap in one step still ends as `transcript_full`.
-The reset runs only before a request. Issue #2461 tracks this limit. A task with no `context_reset` field
-takes no new path, so a recorded run replays as it ran.
+- A tool round can pass the cap in one step (issue #2461). The round drops
+  the result that does not fit, as before. With a reset left, the run does
+  not end. A reset is due, with a save turn first when one fits.
+- That reset keeps the round. The new window shows the assistant turn and
+  the answer of each call: its result, `DROPPED_FULL` or `NOT_RUN_FULL`. So
+  the model sees which calls ran, and does not run a call with an effect
+  again. The round goes after the bookings and before the notes.
+- That reset runs only when its window, with the notes of that time, falls
+  under the threshold. If not, or with no reset left, the run ends as
+  `transcript_full`, as before.
+- A full round that the loop guard or an interrupt also stopped never
+  resets, so the stop holds. Such a save round ends the run too.
+- The patch marker `agent_reset_on_full_round` gates both rules. A run
+  recorded before it replays as it ran.
+
+A task with no `context_reset` field takes no new path, so a recorded run
+replays as it ran.
 `formal/verus/src/agent_reset.rs` proves that a request over the cap always
-reaches the threshold, and that no run passes `max_resets`.
-`docs/design/DESIGN-2453.md` records the design.
+reaches the threshold, and that no run passes `max_resets`. It also proves
+that the window after a full-round reset, with the notes of that time, fits
+the cap.
+`docs/design/DESIGN-2453.md` and `docs/design/DESIGN-2461.md` record the
+design.
 
 ## 11. Response cache
 
