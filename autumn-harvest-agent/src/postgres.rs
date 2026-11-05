@@ -46,6 +46,8 @@ use serde_json::Value;
 use crate::agent::{AGENT_WORKFLOW_NAME, Agent, AgentId, AgentOp, AgentState, Control, agent_info};
 use crate::agent::{INTERRUPT_SIGNAL, Interrupt};
 use crate::approval::{Approval, approval_call_id};
+use crate::consolidate::{CONSOLIDATE_WORKFLOW_NAME, CONSOLIDATION_ATTR, ConsolidateTask};
+use crate::consolidate_all::{AgentDirectory, CONSOLIDATE_ALL_WORKFLOW_NAME, ConsolidateAll};
 use crate::error::{AgentError, ErrorKind};
 use crate::harness::AgentHarness;
 use crate::heartbeat::{HEARTBEAT_WORKFLOW_NAME, HeartbeatTask};
@@ -66,8 +68,8 @@ const SIGNAL_TIMEOUT_PREFIX: &str = "__signal_timeout:";
 /// How often [`wait_for`] and [`wait_run`] read the database again.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// The page size of the mesh scan in [`pause_mesh`].
-const MESH_PAGE: u32 = 500;
+/// The page size of a search attribute scan, as in [`pause_mesh`].
+const SCAN_PAGE: u32 = 500;
 
 /// The Postgres target of the agent functions.
 ///
@@ -237,6 +239,37 @@ pub async fn start_heartbeat(
     task: &HeartbeatTask,
 ) -> HarvestResult<ExecutionId> {
     start_named(pg, HEARTBEAT_WORKFLOW_NAME, serde_json::to_value(task)?).await
+}
+
+/// Start one consolidation pass of the agent `id` (issue #2454). Returns
+/// its execution id. The Postgres form of `sqlite::consolidate`.
+///
+/// # Errors
+///
+/// Returns an error when the start cannot be recorded.
+pub async fn consolidate(pg: &PostgresAgents, id: &AgentId) -> HarvestResult<ExecutionId> {
+    let task = ConsolidateTask::new(id.clone());
+    start_named(pg, CONSOLIDATE_WORKFLOW_NAME, serde_json::to_value(task)?).await
+}
+
+/// Start one firing of the dispatcher `agent_consolidate_all` (issue
+/// #2540). Returns its execution id. The Postgres form of
+/// `sqlite::consolidate_all`. A deployment registers
+/// `consolidate::schedule` instead.
+///
+/// # Errors
+///
+/// Returns an error when the start cannot be recorded.
+pub async fn consolidate_all(
+    pg: &PostgresAgents,
+    task: &ConsolidateAll,
+) -> HarvestResult<ExecutionId> {
+    start_named(
+        pg,
+        CONSOLIDATE_ALL_WORKFLOW_NAME,
+        serde_json::to_value(task)?,
+    )
+    .await
 }
 
 /// Start the workflow `name` with `input`, under a fresh workflow id.
@@ -738,6 +771,94 @@ impl MeshSpend for LedgerSpend {
     }
 }
 
+/// The agent directory of the databases of a target (issue #2540).
+///
+/// It lists the running agents of a kind and the running passes of an
+/// agent by their search attributes. It reads each physical database once.
+/// The Postgres form of `sqlite::Directory`. Install it with
+/// `AgentHarness::directory`.
+#[derive(Debug, Clone)]
+pub struct Directory {
+    pg: PostgresAgents,
+}
+
+impl Directory {
+    /// Read the runs of the databases of `pg`.
+    #[must_use]
+    pub const fn new(pg: PostgresAgents) -> Self {
+        Self { pg }
+    }
+
+    /// The workflow ids of the running runs of `workflow_name` that carry
+    /// `attrs`, on each database.
+    async fn running(&self, workflow_name: &str, attrs: &Value) -> HarvestResult<Vec<String>> {
+        let mut ids = Vec::new();
+        for shard in self.pg.group_shards() {
+            let mut conn = self.pg.conn(shard).await?;
+            let mut after = None;
+            loop {
+                let page = list_running_with_search_attrs(
+                    &mut conn,
+                    workflow_name,
+                    attrs,
+                    after,
+                    SCAN_PAGE,
+                )
+                .await?;
+                let full = page.len() >= SCAN_PAGE as usize;
+                after = page.last().map(|(exec, _id)| *exec);
+                ids.extend(page.into_iter().map(|(_exec, id)| id));
+                if !full {
+                    break;
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Whether one database holds a running run of `workflow_name` that
+    /// carries `attrs`. Each read takes one row at most.
+    async fn any_running(&self, workflow_name: &str, attrs: &Value) -> HarvestResult<bool> {
+        for shard in self.pg.group_shards() {
+            let mut conn = self.pg.conn(shard).await?;
+            let page =
+                list_running_with_search_attrs(&mut conn, workflow_name, attrs, None, 1).await?;
+            if !page.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+impl AgentDirectory for Directory {
+    fn agents<'a>(&'a self, kind: &'a str) -> BoxFuture<'a, Result<Vec<AgentId>, AgentError>> {
+        Box::pin(async move {
+            let attrs = serde_json::json!({ "agent_kind": kind });
+            let ids = self
+                .running(AGENT_WORKFLOW_NAME, &attrs)
+                .await
+                .map_err(|err| AgentError::new(ErrorKind::Transport, err.to_string()))?;
+            let mut agents: Vec<AgentId> = ids
+                .iter()
+                .filter_map(|id| AgentId::parse(id).ok())
+                .collect();
+            agents.sort();
+            agents.dedup();
+            Ok(agents)
+        })
+    }
+
+    fn pass_runs<'a>(&'a self, agent: &'a AgentId) -> BoxFuture<'a, Result<bool, AgentError>> {
+        Box::pin(async move {
+            let attrs = serde_json::json!({ CONSOLIDATION_ATTR: agent.as_str() });
+            self.any_running(CONSOLIDATE_WORKFLOW_NAME, &attrs)
+                .await
+                .map_err(|err| AgentError::new(ErrorKind::Transport, err.to_string()))
+        })
+    }
+}
+
 /// Pause every running agent of `mesh`, and return the audit record (issue
 /// #2272).
 ///
@@ -763,10 +884,10 @@ pub async fn pause_mesh(pg: &PostgresAgents, mesh: &str, reason: &str) -> Harves
                 AGENT_WORKFLOW_NAME,
                 &attrs,
                 after,
-                MESH_PAGE,
+                SCAN_PAGE,
             )
             .await?;
-            let full = page.len() >= MESH_PAGE as usize;
+            let full = page.len() >= SCAN_PAGE as usize;
             after = page.last().map(|(exec, _id)| *exec);
             targets.extend(
                 page.into_iter()

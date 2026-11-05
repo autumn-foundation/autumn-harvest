@@ -36,6 +36,7 @@ use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentId;
+use crate::consolidate_all::{CONSOLIDATE_ALL_WORKFLOW_NAME, ConsolidateAll};
 use crate::episode::{Appended, Episode, EpisodeReset, EpisodeSettings, PassMark, fact_hash};
 use crate::error::ErrorKind;
 use crate::harness::{AgentHarness, model_failure};
@@ -69,6 +70,31 @@ pub const PASS_OUTPUT_TOKENS: u32 = 2_048;
 pub struct ConsolidateTask {
     /// The agent whose episodes the pass reads.
     pub agent: AgentId,
+    /// The dispatcher `agent_consolidate_all` started the pass (issue
+    /// #2540). Such a pass publishes [`CONSOLIDATION_ATTR`] although it is
+    /// a child run, so `harvest agents erase` finds it.
+    #[serde(default, skip_serializing_if = "crate::types::is_false")]
+    pub dispatched: bool,
+}
+
+impl ConsolidateTask {
+    /// A pass of `agent` that the app or an agent run starts.
+    #[must_use]
+    pub const fn new(agent: AgentId) -> Self {
+        Self {
+            agent,
+            dispatched: false,
+        }
+    }
+
+    /// A pass of `agent` that the dispatcher starts.
+    #[must_use]
+    pub const fn dispatched(agent: AgentId) -> Self {
+        Self {
+            agent,
+            dispatched: true,
+        }
+    }
 }
 
 /// How a pass ended.
@@ -303,26 +329,28 @@ pub fn episode_scope(id: &AgentId) -> MemoryScope {
     MemoryScope::new(format!("agent:{id}:episodes"))
 }
 
-/// An engine schedule that starts one pass of `agent` per firing.
+/// The engine schedule of every pass of the deployment (issue #2540).
 ///
-/// Register it with `HarvestBuilder::workflow_schedule` on Postgres, or
-/// with `SqliteRuntime::upsert_schedule` on SQLite. Keep the default
-/// overlap policy `skip`, so two passes of one agent never run at once.
-/// Use it with `ConsolidationTrigger::Schedule`.
+/// Each firing starts the dispatcher `agent_consolidate_all`. It starts one
+/// pass for each agent of a kind with `ConsolidationTrigger::Schedule` that
+/// has pending episodes, up to `task.max_passes`. The rest wait for the
+/// next firing. An idle agent costs no model call. An agent whose pass
+/// still runs gets no second pass.
 ///
-/// The engine keys a schedule by its workflow name. So a deployment can
-/// schedule passes for one agent only, and a second schedule replaces the
-/// first. For many agents, use `EpisodeSettings::every`, or start each
-/// pass from the app. Issue #2540 tracks a dispatcher for many agents.
+/// Register it once, with `HarvestBuilder::workflow_schedule` on Postgres
+/// or `SqliteRuntime::upsert_schedule` on SQLite. Install an agent
+/// directory with `AgentHarness::directory`. Keep one firing at a time: the
+/// default `max_active_runs` of 1, or the overlap policy `skip`. See
+/// [`consolidate_all`](crate::consolidate_all).
 ///
 /// # Errors
 ///
 /// Returns an error when the task cannot encode as JSON.
-pub fn schedule(when: Schedule, agent: &AgentId) -> Result<WorkflowSchedule, serde_json::Error> {
-    let task = ConsolidateTask {
-        agent: agent.clone(),
-    };
-    Ok(WorkflowSchedule::new(CONSOLIDATE_WORKFLOW_NAME, when)
+pub fn schedule(
+    when: Schedule,
+    task: &ConsolidateAll,
+) -> Result<WorkflowSchedule, serde_json::Error> {
+    Ok(WorkflowSchedule::new(CONSOLIDATE_ALL_WORKFLOW_NAME, when)
         .with_input(serde_json::to_value(task)?))
 }
 
@@ -340,7 +368,7 @@ pub async fn agent_consolidate(
     ctx: &WorkflowContext,
     task: ConsolidateTask,
 ) -> Result<ConsolidationReport, String> {
-    publish_pass(ctx, &task.agent);
+    publish_pass(ctx, &task);
     let read: ConsolidateRead = ctx
         .execute_activity(&agent_consolidate_read_info(), task.agent)
         .await
@@ -419,14 +447,16 @@ pub async fn agent_consolidate(
 }
 
 /// Publish the agent id of a pass that no agent run started, so `harvest
-/// agents erase` finds it. A child pass goes with the erase of its parent.
-fn publish_pass(ctx: &WorkflowContext, agent: &AgentId) {
-    if ctx.info().parent_execution_id.is_some() {
+/// agents erase` finds it. A child pass of an agent run goes with the
+/// erase of its parent. A dispatched pass publishes, so the next firing and
+/// the erase find it (issue #2540).
+fn publish_pass(ctx: &WorkflowContext, task: &ConsolidateTask) {
+    if ctx.info().parent_execution_id.is_some() && !task.dispatched {
         return;
     }
     let attr = (
         CONSOLIDATION_ATTR.to_owned(),
-        Some(serde_json::json!(agent.as_str())),
+        Some(serde_json::json!(task.agent.as_str())),
     );
     if let Err(err) = ctx.upsert_search_attrs([attr]) {
         tracing::warn!(error = %err, "the pass search attribute was not set");

@@ -221,6 +221,10 @@ name = "episodes"
 required-features = ["sqlite"]
 
 [[test]]
+name = "consolidate_all"
+required-features = ["sqlite"]
+
+[[test]]
 name = "recall"
 required-features = ["sqlite"]
 

@@ -33,9 +33,13 @@ use crate::agent::{
 };
 use crate::approval::Approval;
 use crate::consolidate::{
-    CONSOLIDATE_WORKFLOW_NAME, ConsolidateTask, agent_consolidate_info,
+    CONSOLIDATE_WORKFLOW_NAME, CONSOLIDATION_ATTR, ConsolidateTask, agent_consolidate_info,
     agent_consolidate_read_info, agent_consolidate_turn_info, agent_consolidate_write_info,
     agent_episode_append_info, agent_episode_reset_info,
+};
+use crate::consolidate_all::{
+    AgentDirectory, CONSOLIDATE_ALL_WORKFLOW_NAME, ConsolidateAll, agent_consolidate_all_info,
+    agent_consolidate_due_info,
 };
 use crate::error::{AgentError, ErrorKind};
 use crate::harness::{AgentHarness, CacheTenant};
@@ -66,6 +70,7 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     rt.register_workflow(&agent_info());
     register_sampling(rt, &harness);
     rt.register_workflow(&agent_consolidate_info());
+    rt.register_workflow(&agent_consolidate_all_info());
     register_episodes(rt, &harness);
     let h = Arc::clone(&harness);
     rt.register_activity_with_body(&agent_profile_info(), move |input| {
@@ -239,6 +244,13 @@ fn register_episodes(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
         })
     });
     let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_consolidate_due_info(), move |input| {
+        call(input, |task: ConsolidateAll| {
+            let h = Arc::clone(&h);
+            async move { crate::consolidate_all::read_due(&h, &task).await }
+        })
+    });
+    let h = Arc::clone(harness);
     rt.register_activity_with_ledger(&agent_consolidate_turn_info(), move |input, at| {
         call_with_ledger(input, |turn| {
             let h = Arc::clone(&h);
@@ -255,15 +267,26 @@ fn register_episodes(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
 /// Start one consolidation pass of the agent `id` (issue #2454). Returns
 /// its execution id. Drive it with `SqliteRuntime::run_until_blocked`.
 ///
-/// Use it with `ConsolidationTrigger::Schedule`, or pass
-/// `consolidate::schedule` to `SqliteRuntime::upsert_schedule`.
+/// For every agent of a scheduled kind, pass `consolidate::schedule` to
+/// `SqliteRuntime::upsert_schedule`, or call [`consolidate_all`].
 ///
 /// # Errors
 ///
 /// Returns an error when the runtime cannot record the start.
 pub fn consolidate(rt: &mut SqliteRuntime, id: &AgentId) -> SqliteResult<ExecutionId> {
-    let task = ConsolidateTask { agent: id.clone() };
+    let task = ConsolidateTask::new(id.clone());
     rt.start_workflow(CONSOLIDATE_WORKFLOW_NAME, serde_json::to_value(task)?)
+}
+
+/// Start one firing of the dispatcher `agent_consolidate_all` (issue
+/// #2540). Returns its execution id. `SqliteRuntime::run_until_blocked`
+/// drives it and each pass that it starts.
+///
+/// # Errors
+///
+/// Returns an error when the runtime cannot record the start.
+pub fn consolidate_all(rt: &mut SqliteRuntime, task: &ConsolidateAll) -> SqliteResult<ExecutionId> {
+    rt.start_workflow(CONSOLIDATE_ALL_WORKFLOW_NAME, serde_json::to_value(task)?)
 }
 
 /// Start one agent run. Returns its execution id.
@@ -503,6 +526,84 @@ impl MeshSpend for LedgerSpend {
         let read = self
             .read(mesh, since)
             .map_err(|err| AgentError::new(ErrorKind::Transport, err.to_string()));
+        Box::pin(std::future::ready(read))
+    }
+}
+
+/// The agent directory of a SQLite file (issue #2540).
+///
+/// It lists the running agents of a kind and the running passes of an
+/// agent by their search attributes. Each read opens its own read-only
+/// handle, so it sees what the runtime committed. Install it with
+/// `AgentHarness::directory`.
+#[derive(Debug, Clone)]
+pub struct Directory {
+    path: std::path::PathBuf,
+}
+
+impl Directory {
+    /// Read the runs of the database file at `path`.
+    #[must_use]
+    pub fn open(path: impl AsRef<std::path::Path>) -> Self {
+        Self {
+            path: path.as_ref().to_owned(),
+        }
+    }
+
+    /// The workflow ids of the running runs that `filter` matches.
+    fn running(&self, filter: &ExecutionFilter) -> SqliteResult<Vec<String>> {
+        let reader = SqliteReader::open(&self.path)?;
+        let filter = filter.clone().state("RUNNING");
+        let mut ids = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page =
+                cursor.map_or_else(|| filter.clone(), |cursor| filter.clone().before(cursor));
+            let found = reader.list_executions(&page)?;
+            ids.extend(
+                found
+                    .executions
+                    .iter()
+                    .filter_map(|summary| summary.workflow_id.value().map(ToOwned::to_owned)),
+            );
+            match found.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok(ids)
+    }
+}
+
+/// A SQLite read error as a retryable agent error.
+fn transport(err: &autumn_harvest_sqlite::SqliteError) -> AgentError {
+    AgentError::new(ErrorKind::Transport, err.to_string())
+}
+
+impl AgentDirectory for Directory {
+    fn agents<'a>(&'a self, kind: &'a str) -> BoxFuture<'a, Result<Vec<AgentId>, AgentError>> {
+        let filter = ExecutionFilter::new()
+            .workflow_name(AGENT_WORKFLOW_NAME)
+            .search_attribute("agent_kind", serde_json::json!(kind));
+        let read = self
+            .running(&filter)
+            .map_err(|err| transport(&err))
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| AgentId::parse(id).ok())
+                    .collect()
+            });
+        Box::pin(std::future::ready(read))
+    }
+
+    fn pass_runs<'a>(&'a self, agent: &'a AgentId) -> BoxFuture<'a, Result<bool, AgentError>> {
+        let filter = ExecutionFilter::new()
+            .workflow_name(CONSOLIDATE_WORKFLOW_NAME)
+            .search_attribute(CONSOLIDATION_ATTR, serde_json::json!(agent.as_str()));
+        let read = self
+            .running(&filter)
+            .map(|ids| !ids.is_empty())
+            .map_err(|err| transport(&err));
         Box::pin(std::future::ready(read))
     }
 }

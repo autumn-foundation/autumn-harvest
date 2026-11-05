@@ -9,6 +9,8 @@
 //! - `pause_mesh` pauses each running agent of one mesh, and no other.
 //! - `LedgerSpend` sums the tokens of the runs of one mesh.
 //! - A heartbeat tick runs and reports.
+//! - One consolidation firing serves each agent of a scheduled kind, and
+//!   skips an idle agent and an agent whose pass still runs.
 //! - A two-shard target finds the run on the shard that the router picked.
 //!
 //! The tests use `HARVEST_TEST_DATABASE_URL` when it is set. Point it at a
@@ -32,13 +34,17 @@ use autumn_harvest::entity_state::ProjectedSnapshot;
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{HarvestBuilder, ShardId, WorkerConfig, migrate};
+use autumn_harvest_agent::consolidate::ConsolidationStop;
+use autumn_harvest_agent::consolidate_all::{AgentDirectory, ConsolidateAll, DispatchReport};
 use autumn_harvest_agent::delivery::HEARTBEAT_OK;
+use autumn_harvest_agent::episode::{EpisodeSettings, EpisodeStore, InMemoryEpisodeStore};
 use autumn_harvest_agent::heartbeat::{HeartbeatReport, HeartbeatTask};
 use autumn_harvest_agent::mesh_control::MeshSpend;
-use autumn_harvest_agent::postgres::{self, LedgerSpend, PostgresAgents, RunState};
+use autumn_harvest_agent::postgres::{self, Directory, LedgerSpend, PostgresAgents, RunState};
 use autumn_harvest_agent::{
-    AgentHarness, AgentId, AgentModel, AgentOp, AgentProfile, AgentReport, AgentState, AgentStatus,
-    AgentTask, Approval, ChatRequest, Rule, ToolEffect, ToolRules,
+    AgentError, AgentHarness, AgentId, AgentMemory, AgentModel, AgentOp, AgentProfile, AgentReport,
+    AgentState, AgentStatus, AgentTask, Approval, ChatRequest, ContentPart, ErrorKind,
+    InMemoryMemoryStore, Rule, ToolEffect, ToolRules,
 };
 use common::{Recorder, Reply, ScriptedModel, TryFnModel, answer, calls, recorded_tool};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -447,6 +453,131 @@ async fn a_heartbeat_tick_runs_and_reports() {
     assert!(!report.skipped);
     assert!(!report.delivered, "a quiet tick delivers nothing");
     assert_eq!(model.calls(), 1);
+}
+
+/// The text of every message of `request`.
+fn request_text(request: &ChatRequest) -> String {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|part| match part {
+            ContentPart::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether `request` is the model call of a consolidation pass.
+fn is_pass(request: &ChatRequest) -> bool {
+    request_text(request).contains("<episode id=\"")
+}
+
+/// Run one dispatcher firing to its end.
+async fn fire(pg: &PostgresAgents, task: &ConsolidateAll) -> DispatchReport {
+    let exec = postgres::consolidate_all(pg, task).await.unwrap();
+    match postgres::wait_run(pg, exec, LIMIT).await.unwrap() {
+        RunState::Completed(output) => serde_json::from_value(output).unwrap(),
+        other => panic!("the dispatcher did not complete: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_consolidation_firing_serves_each_agent_of_a_scheduled_kind() {
+    let (url, _container) = database().await;
+    let queue = unique("pg-consolidate");
+    let kind = unique("desk");
+    // A pass over the episode `hold` fails with a retryable error until the
+    // test opens the gate. Its retry waits, so the pass still runs.
+    let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let gate = Arc::clone(&open);
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&passes);
+    let model = TryFnModel::new(move |request: &ChatRequest| -> Reply {
+        let text = request_text(request);
+        if !is_pass(request) {
+            let hold = if text.contains("hold") {
+                "hold"
+            } else {
+                "noted"
+            };
+            return answer(hold, 2);
+        }
+        if text.contains("hold") && !gate.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AgentError::new(ErrorKind::Unavailable, "busy"));
+        }
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        answer(r#"{"facts":[]}"#, 2)
+    });
+    let pg = PostgresAgents::single(pool(&url)).with_queue(&queue);
+    let episodes = Arc::new(InMemoryEpisodeStore::default());
+    let directory = Directory::new(pg.clone());
+    let harness = AgentHarness::new(model)
+        .memory(Arc::new(InMemoryMemoryStore::new()))
+        .episodes(episodes.clone())
+        .directory(Arc::new(directory.clone()))
+        .agent(
+            AgentProfile::new(&kind)
+                .memory(AgentMemory::Store)
+                .episodes(EpisodeSettings::default()),
+        );
+    let _worker = run_worker(&url, &queue, harness, &[ShardId::new(0)]);
+    let (a, b) = (
+        AgentId::new(&kind, "a").unwrap(),
+        AgentId::new(&kind, "b").unwrap(),
+    );
+    for id in [&a, &b] {
+        postgres::send(&pg, id, &AgentOp::message_with_id("hi", "m-1"), Some("m-1"))
+            .await
+            .unwrap();
+        settled(&pg, id, |state| state.segments >= 1).await;
+    }
+    assert_eq!(
+        directory.agents(&kind).await.unwrap(),
+        [a.clone(), b.clone()]
+    );
+
+    // Both agents get a pass on one firing.
+    let first = fire(&pg, &ConsolidateAll::default()).await;
+    assert_eq!(first.started, 2, "{first:?}");
+    for pass in &first.passes {
+        assert_eq!(pass.stop, Some(ConsolidationStop::Completed), "{pass:?}");
+    }
+    assert_eq!(passes.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    // Both are idle now: no pass and no model call.
+    let idle = fire(&pg, &ConsolidateAll::default()).await;
+    assert_eq!((idle.idle, idle.started), (2, 0), "{idle:?}");
+    assert_eq!(passes.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    // A pass of `a` still runs, so `a` gets no second pass.
+    for (id, text) in [(&a, "hold"), (&b, "again")] {
+        postgres::send(&pg, id, &AgentOp::message_with_id(text, "m-2"), Some("m-2"))
+            .await
+            .unwrap();
+        settled(&pg, id, |state| state.segments >= 2).await;
+    }
+    open.store(false, std::sync::atomic::Ordering::SeqCst);
+    let held = postgres::consolidate(&pg, &a).await.unwrap();
+    let deadline = std::time::Instant::now() + LIMIT;
+    while !directory.pass_runs(&a).await.unwrap() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pass never published"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let busy = fire(&pg, &ConsolidateAll::default()).await;
+    assert_eq!(busy.running, 1, "{busy:?}");
+    assert_eq!(busy.passes.len(), 1);
+    assert_eq!(busy.passes[0].agent, b);
+    open.store(true, std::sync::atomic::Ordering::SeqCst);
+    let RunState::Completed(_) = postgres::wait_run(&pg, held, LIMIT).await.unwrap() else {
+        panic!("the held pass should complete after its retry");
+    };
+    let scope = autumn_harvest_agent::consolidate::episode_scope(&a);
+    assert_eq!(episodes.load(&scope).await.unwrap().pending(10).len(), 0);
 }
 
 /// Put back a one-shard router when the test ends, so a later test in this

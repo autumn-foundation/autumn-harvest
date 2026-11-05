@@ -1739,7 +1739,7 @@ impl AgentRun<'_> {
         }
         // A failed pass also waits for `episodes` more appends.
         state.appends_since_pass = 0;
-        let task = ConsolidateTask { agent: id.clone() };
+        let task = ConsolidateTask::new(id.clone());
         let pass: Result<ConsolidationReport, _> = self
             .ctx
             .spawn_child_workflow(&agent_consolidate_info(), task)

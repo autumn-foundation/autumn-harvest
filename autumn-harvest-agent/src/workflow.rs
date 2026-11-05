@@ -2915,6 +2915,7 @@ pub fn workflows() -> Vec<WorkflowInfo> {
         crate::sampling::agent_draws_info(),
         crate::sampling::agent_sample_info(),
         crate::consolidate::agent_consolidate_info(),
+        crate::consolidate_all::agent_consolidate_all_info(),
     ]
 }
 
@@ -2942,6 +2943,7 @@ pub fn activities() -> Vec<ActivityInfo> {
         crate::consolidate::agent_consolidate_read_info(),
         crate::consolidate::agent_consolidate_turn_info(),
         crate::consolidate::agent_consolidate_write_info(),
+        crate::consolidate_all::agent_consolidate_due_info(),
         crate::consolidate::agent_episode_append_info(),
         crate::consolidate::agent_episode_reset_info(),
     ]

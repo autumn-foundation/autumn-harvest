@@ -15,8 +15,9 @@
 //! [`ResponseCache`] serves an identical model call across runs. The
 //! [`draw`] module gives each sample of a run its own identity, so the cache
 //! keeps the samples apart. The [`episode`] log records each op, and
-//! [`consolidate`] turns the episodes into facts (issue #2454). The
-//! [`recall`] module measures what an agent forgets across ops (issue
+//! [`consolidate`] turns the episodes into facts (issue #2454).
+//! [`consolidate_all`] starts the passes of many agents from one schedule
+//! (issue #2540). The [`recall`] module measures what an agent forgets across ops (issue
 //! #2455). The `eval` feature adds the `eval` module. That module re-drives
 //! a recorded run with a candidate model or prompt. The
 //! `sandbox` feature adds the `sandbox` module. Its `SandboxTool` runs agent
@@ -91,6 +92,7 @@ pub mod agent;
 pub mod approval;
 pub mod bounds;
 pub mod consolidate;
+pub mod consolidate_all;
 pub mod context_reset;
 pub mod delivery;
 pub mod draw;
@@ -155,6 +157,10 @@ pub use approval::Approval;
 pub use consolidate::{
     CONSOLIDATE_WORKFLOW_NAME, ConsolidateTask, ConsolidationReport, ConsolidationStop,
     agent_consolidate, agent_consolidate_info,
+};
+pub use consolidate_all::{
+    AgentDirectory, CONSOLIDATE_ALL_WORKFLOW_NAME, ConsolidateAll, DispatchReport,
+    agent_consolidate_all, agent_consolidate_all_info,
 };
 pub use context_reset::{ContextReset, ProgressNotes};
 pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
