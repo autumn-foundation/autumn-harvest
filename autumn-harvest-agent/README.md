@@ -28,7 +28,8 @@ segment, or interrupt it (issue #2265). See section 15 of
 
 An opt-in episode log (issue #2454) records each op of a durable agent. The
 workflow `agent_consolidate` turns the episodes into facts in the agent
-memory, under the LLM budget and the cost ledger.
+memory, under the LLM budget and the cost ledger. One schedule of
+`agent_consolidate_all` starts the passes of every agent (issue #2540).
 
 A run can delegate a task to a peer agent. An inline peer runs as a sub-agent
 in the same workflow. A durable peer is an `Agent` with its own history, inbox

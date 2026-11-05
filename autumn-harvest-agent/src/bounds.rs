@@ -198,6 +198,29 @@ pub const fn consolidation_due(appended: u64, every: u32) -> bool {
     every > 0 && appended >= every as u64
 }
 
+/// The most passes that one firing of `agent_consolidate_all` starts
+/// (issue #2540).
+pub const MAX_DISPATCH_PASSES: u32 = 256;
+
+/// The passes that one firing starts for `due` agents with the bound `max`
+/// (issue #2540).
+///
+/// A bound of 0 counts as 1, and the cap is [`MAX_DISPATCH_PASSES`]. A
+/// firing with a due agent starts at least one pass. The rest wait for the
+/// next firing.
+/// `formal/verus/src/agent_dispatch.rs` proves it for every input.
+#[must_use]
+pub const fn dispatch_passes(due: u64, max: u32) -> u64 {
+    let max = if max == 0 {
+        1
+    } else if max > MAX_DISPATCH_PASSES {
+        MAX_DISPATCH_PASSES
+    } else {
+        max
+    };
+    if due < max as u64 { due } else { max as u64 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +244,30 @@ mod tests {
         assert!(consolidation_due(3, 3));
         assert!(consolidation_due(4, 3));
         assert!(!consolidation_due(u64::MAX, 0));
+    }
+
+    #[test]
+    fn a_firing_starts_at_most_its_bound() {
+        assert_eq!(dispatch_passes(0, 16), 0);
+        assert_eq!(dispatch_passes(3, 16), 3);
+        assert_eq!(dispatch_passes(40, 16), 16);
+        // A bound of 0 counts as 1.
+        assert_eq!(dispatch_passes(5, 0), 1);
+        // The bound never passes the cap.
+        assert_eq!(
+            dispatch_passes(u64::MAX, u32::MAX),
+            u64::from(MAX_DISPATCH_PASSES)
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn a_firing_drains_the_queue(due in 0_u64..100_000, max in 0_u32..1_000) {
+            let started = dispatch_passes(due, max);
+            proptest::prop_assert!(started <= due);
+            proptest::prop_assert!(started <= u64::from(max.clamp(1, MAX_DISPATCH_PASSES)));
+            proptest::prop_assert!(due == 0 || started >= 1);
+        }
     }
 
     proptest::proptest! {

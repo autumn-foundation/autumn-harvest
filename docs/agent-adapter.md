@@ -1580,12 +1580,9 @@ let harness = AgentHarness::new(model)
   append since the last pass. The op waits for it. A failed pass therefore
   waits for `n` more appends, also when the log is full. A pass that
   does not write all its facts fails the op with a named error. With the
-  default `ConsolidationTrigger::Schedule`, an engine schedule starts each
-  pass: register `consolidate::schedule(when, &agent_id)`. The engine keys
-  a schedule by its workflow name, so this serves one agent per
-  deployment. A second schedule replaces the first. For many agents, use
-  `every(n)`, or start each pass from the app. Issue #2540 tracks a
-  dispatcher. On SQLite, `sqlite::consolidate` starts one pass.
+  default `ConsolidationTrigger::Schedule`, one engine schedule serves
+  every agent (issue #2540). See "Scheduled passes" below. On SQLite,
+  `sqlite::consolidate` or `postgres::consolidate` starts one pass.
 - **Report.** A pass returns a `ConsolidationReport`. Its `stop` is
   `completed`, `nothing_to_do`, `budget_exceeded`, `invalid_reply`,
   `disabled` or `reset`. A refused budget and a reply that does not parse
@@ -1602,6 +1599,70 @@ let harness = AgentHarness::new(model)
 The crate ships `InMemoryEpisodeStore`. A durable store implements
 `EpisodeStore` and calls the methods of `EpisodeLog`, so the rules are the
 same in every store.
+
+#### Scheduled passes (issue #2540)
+
+Register one schedule for the deployment. Each firing starts the
+dispatcher `agent_consolidate_all`. The design is in
+`docs/design/DESIGN-2540.md`.
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use autumn_harvest::builder::HarvestBuilder;
+use autumn_harvest::policy::Schedule;
+use autumn_harvest_agent::consolidate;
+use autumn_harvest_agent::consolidate_all::ConsolidateAll;
+use autumn_harvest_agent::postgres::{self, Directory, PostgresAgents};
+
+let pg = PostgresAgents::single(pool.clone());
+let harness = harness.directory(Arc::new(Directory::new(pg)));
+let hourly = Schedule::Interval(Duration::from_secs(3_600));
+let builder = postgres::register(HarvestBuilder::new(), harness)
+    .workflow_schedule(consolidate::schedule(hourly, &ConsolidateAll::new().max_passes(16))?);
+```
+
+- **Agents.** The activity `agent_consolidate_due` reads each kind with
+  `episodes` set and the trigger `Schedule`. It skips a kind whose pass
+  cannot run, for example when the mandate forbids the pass model. It
+  lists the running agents of each kind by the search attribute
+  `agent_kind`, with the `AgentDirectory` of the harness.
+  `postgres::Directory` and `sqlite::Directory` read the engine. With no
+  directory, the read fails as `AgentDirectoryMissing`. The read takes 8
+  agents at a time. A failed read of one agent counts as `unreadable`.
+- **Idle agents.** The read loads the episode log of each agent. An agent
+  with no pending episode gets no pass, so it costs no model call.
+- **Running passes.** An agent whose pass still runs gets no second pass.
+  The read finds the pass by `agent_consolidation_of`. The dispatcher waits
+  for its passes, and the schedule runs one firing at a time.
+- **Bound.** One firing starts at most `max_passes` passes: 16 by default,
+  at most 256. The rest wait for the next firing.
+- **Turn order.** An agent with no pass goes first. Then the agent whose
+  last pass started first, then the oldest pending episode. So a pass that
+  marks nothing, for example on a spent budget, sends its agent to the
+  back, and a stuck agent cannot starve the others.
+- **Report.** A firing returns a `DispatchReport` with the counts
+  `listed`, `idle`, `running`, `due`, `unreadable`, `started`, `waiting`
+  and `failed`, and one row for each pass. A failed pass does not stop
+  the others.
+- **Erase.** A dispatched pass sets `ConsolidateTask::dispatched`, so it
+  publishes `agent_consolidation_of`. `harvest agents erase` erases it.
+  The run of a firing keeps the agent ids and the end of each pass, but
+  no episode text. Retention removes it.
+- **Limits.** Each firing reads the episode log of each running agent of a
+  scheduled kind, in one activity of at most 15 minutes. A pass that an
+  app starts publishes its attribute at its first task, so a firing just
+  before that task can start a second pass. A long pass delays the next
+  firing for every agent. `postgres::Directory` reads every fleet of the
+  database, so give each fleet of one database its own kind names.
+- **Upgrade.** A deployment that registered the old per-agent schedule of
+  `agent_consolidate` keeps it. Delete it, or that agent gets two passes.
+- **Workers.** A worker with a hand-picked activity list must add
+  `agent_consolidate_due` and the workflow `agent_consolidate_all`.
+
+On SQLite, pass the same schedule to `SqliteRuntime::upsert_schedule`, and
+install `sqlite::Directory::open(path)`. `sqlite::consolidate_all` and
+`postgres::consolidate_all` start one firing.
 
 ### Recall eval (issue #2455)
 
