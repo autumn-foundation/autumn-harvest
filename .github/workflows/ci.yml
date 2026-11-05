@@ -169,13 +169,13 @@ jobs:
         # documented command in 50+ places, including the quickstart's own
         # "Step 3 — Run preflight") for weeks with fully green CI, because
         # the `quickstart`/build-only CI jobs run `cargo build`, which can't
-        # itself be ambiguous. See scripts/check-default-run.sh.
-        run: ./scripts/check-default-run.sh
+        # itself be ambiguous. See xtask/src/check/default_run.rs.
+        run: cargo xtask check default-run
       - name: Check license and policy files (issue #1990)
         # The root must hold the license and policy files. Each publishable
         # crate must ship both license texts. Cargo does not copy a root file
-        # into a crate. See scripts/check-license-files.sh.
-        run: ./scripts/check-license-files.sh
+        # into a crate. See xtask/src/check/license_files.rs.
+        run: cargo xtask check license-files
       - name: Check cargo-dev root caveat is documented
         # Guards a real, reproduced-live defect: `cargo dev` is the flagship
         # "no database, no Docker, nothing to configure" front door
@@ -185,8 +185,8 @@ jobs:
         # dev runtime's own doc comment (autumn-harvest-plugin/src/dev/postgres.rs,
         # refuse_to_run_as_root). Neither front-door doc used to say so, so a
         # newcomer in one of those environments hit an undocumented hard stop
-        # on the very first command. See scripts/check-dev-runtime-root-caveat.sh.
-        run: ./scripts/check-dev-runtime-root-caveat.sh
+        # on the very first command. See xtask/src/check/dev_runtime_root_caveat.rs.
+        run: cargo xtask check dev-runtime-root-caveat
       - name: Check HARVEST_DEV_DATABASE_URL placeholder caveat is documented
         # Guards a real, reproduced-live defect: Chapter 1 gives
         # `HARVEST_DEV_DATABASE_URL=postgres://me@localhost:5432/harvest_dev
@@ -195,8 +195,8 @@ jobs:
         # password-authenticated Postgres it fails with Postgres's own
         # "fe_sendauth: no password supplied", which names neither the env
         # var nor the doc. See
-        # scripts/check-dev-database-url-placeholder-caveat.sh.
-        run: ./scripts/check-dev-database-url-placeholder-caveat.sh
+        # xtask/src/check/dev_database_url_placeholder_caveat.rs.
+        run: cargo xtask check dev-database-url-placeholder-caveat
       - name: Check README upgrade-guide pointer is current
         # Guards a real, reproduced-live defect: README.md's own top-level
         # "Upgrading an existing deployment?" pointer is a hand-written link
@@ -204,8 +204,8 @@ jobs:
         # shipped and docs/getting-started/README.md was updated to call it
         # "the current" guide, README.md's front-door pointer still linked to
         # the superseded 0.4.0 -> 0.5.0 guide. See
-        # scripts/check-readme-upgrade-guide-current.sh.
-        run: ./scripts/check-readme-upgrade-guide-current.sh
+        # xtask/src/check/readme_upgrade_guide_current.rs.
+        run: cargo xtask check readme-upgrade-guide-current
       - name: Check search_attr query-string syntax in docs
         # Guards a real, reproduced-live defect: examples/billing-autumn-web's
         # README — the repository's own reference example for a real
@@ -216,8 +216,8 @@ jobs:
         # exact command 400s: "invalid search_attr 'tenant_id=acme'; expected
         # 'key:value'". No CI job runs this example, so nothing else catches
         # this class of drift. See
-        # scripts/check-search-attr-query-syntax.sh.
-        run: ./scripts/check-search-attr-query-syntax.sh
+        # xtask/src/check/search_attr_query_syntax.rs.
+        run: cargo xtask check search-attr-query-syntax
       - name: Check README testing-dependency version pin
         # Guards a real, reproduced-live defect: README.md's "Testing
         # workflow code changes with the replayer" section pinned
@@ -225,8 +225,8 @@ jobs:
         # a dev-dependency, four minor versions behind the `"0.6"` pin the
         # reader already added in the same manifest per Chapter 1, and
         # nothing keeps the two pins in sync as releases ship. See
-        # scripts/check-readme-testing-dep-version.sh.
-        run: ./scripts/check-readme-testing-dep-version.sh
+        # xtask/src/check/readme_testing_dep_version.rs.
+        run: cargo xtask check readme-testing-dep-version
       - name: Check for PowerShell env-var syntax in bash blocks
         # Guards a real, reproduced-live defect: examples/standalone-runner's
         # README fenced its "Run" section ```bash, matching every sibling
@@ -234,8 +234,8 @@ jobs:
         # used PowerShell's `$env:NAME = "value"` assignment instead of bash's
         # `NAME=value`. Pasted verbatim into bash, each line is silently
         # skipped ("command not found") and neither variable ends up set. See
-        # scripts/check-no-powershell-env-syntax.sh.
-        run: ./scripts/check-no-powershell-env-syntax.sh
+        # xtask/src/check/no_powershell_env_syntax.rs.
+        run: cargo xtask check no-powershell-env-syntax
       - name: Check CHANGELOG connector migration version
         # Guards a real, reproduced-live defect: CHANGELOG.md's [0.6.0]
         # "Add broker event-source connectors" entry (issue #944) cited
@@ -248,8 +248,8 @@ jobs:
         # __diesel_schema_migrations keyspace. docs/upgrading/0.6.0.md sends
         # an upgrading operator straight to this CHANGELOG.md section to
         # find 0.6.0's migrations. See
-        # scripts/check-changelog-connector-migration-version.sh.
-        run: ./scripts/check-changelog-connector-migration-version.sh
+        # xtask/src/check/changelog_connector_migration_version.rs.
+        run: cargo xtask check changelog-connector-migration-version
       - name: Check broker-connectors dead-letter-sink example
         # Guards a real, reproduced-live defect: chapter 13's "(a) record
         # into harvest -- the default mode" example -- the option for a
@@ -263,8 +263,8 @@ jobs:
         # A newcomer who copies the example gets a runtime that compiles,
         # runs, and acknowledges poison messages with no error, but never
         # durably records them: they vanish on restart. See
-        # scripts/check-broker-connector-dead-letter-sink-example.sh.
-        run: ./scripts/check-broker-connector-dead-letter-sink-example.sh
+        # xtask/src/check/broker_connector_dead_letter_sink_example.rs.
+        run: cargo xtask check broker-connector-dead-letter-sink-example
       - name: Check broker-connectors cutover example
         # Guards a real, reproduced-live defect: chapter 13's "Cutting a
         # binding over to a new cluster or a recreated topic" example called
@@ -279,8 +279,8 @@ jobs:
         # place in the chapter that tells an operator how to rotate a
         # binding's dedupe namespace during a production cutover -- copies
         # code that does not type-check. See
-        # scripts/check-broker-connector-cutover-example.sh.
-        run: ./scripts/check-broker-connector-cutover-example.sh
+        # xtask/src/check/broker_connector_cutover_example.rs.
+        run: cargo xtask check broker-connector-cutover-example
       - name: Check claude-agent-daemon runtime artifacts are git-ignored
         # Guards a real, reproduced-live defect: examples/claude-agent-daemon's
         # README tells the reader to run every `agentd` command "from the
@@ -291,12 +291,12 @@ jobs:
         # against a real API key, parks an actual conversation transcript
         # (the doc's own words: "every prompt, tool input, and tool result")
         # as an untracked file one `git add -A` away from being committed.
-        # See scripts/check-agentd-runtime-artifacts-ignored.sh.
-        run: ./scripts/check-agentd-runtime-artifacts-ignored.sh
+        # See xtask/src/check/agentd_runtime_artifacts_ignored.rs.
+        run: cargo xtask check agentd-runtime-artifacts-ignored
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check autumn-harvest-agent depends on no Autumn crate outside the engine
-        run: ./scripts/check-agent-adapter-deps.sh
+        run: cargo xtask check agent-adapter-deps
 
       # Issue #786: the `docs/performance.md` prose-vs-table guards must run on
       # DOCS-ONLY pull requests — which is the change class most likely to break
@@ -1139,8 +1139,8 @@ jobs:
       # hello-world), and standalone-runner's plain-Axum embedding -- but
       # nothing before this step exercised any of them beyond `cargo build`.
       # The only existing coverage was narrow grep guards for specific past
-      # docs defects (check-search-attr-query-syntax.sh,
-      # check-readme-testing-dep-version.sh, check-no-powershell-env-syntax.sh),
+      # docs defects (`cargo xtask check search-attr-query-syntax`,
+      # `readme-testing-dep-version` and `no-powershell-env-syntax`),
       # none of which touch the crates' own assertions. None need a live
       # database, so they run here rather than on `test-db-linux`.
       - name: Run saga-choreography example tests
@@ -2494,7 +2494,7 @@ jobs:
   doc-snippets:
     name: Doc snippets compile
     runs-on: ubuntu-latest
-    # Each script pins a docs snippet and compiles it with `cargo check`.
+    # Each `cargo xtask check` guard pins a docs snippet and compiles it.
     # Plain `cargo check` shares no workspace build with clippy, so these
     # steps gain nothing from a clippy job and run on their own.
     # Draft-skip, as in `lint`. Not gated on `changes`: a docs-only PR
@@ -2525,11 +2525,11 @@ jobs:
         # condition closure can never also be reassigned by the loop body
         # while that borrow is live (E0506). E0506 is a borrow-checker
         # property, not a syntax shape, so this actually compiles the
-        # pinned block with `cargo check` (see the script's own docstring
+        # pinned block with `cargo check` (see the guard's own module doc
         # for why a text heuristic proved gameable in review) rather than
         # pattern-matching stand-in text. See
-        # scripts/check-signals-clean-approval-example-determinism.sh.
-        run: ./scripts/check-signals-clean-approval-example-determinism.sh
+        # xtask/src/check/signals_clean_approval_example_determinism.rs.
+        run: cargo xtask check signals-clean-approval-example-determinism
       - name: Check reliability-knobs continue_as_new checkpoint example
         # Guards a real, reproduced-live compile failure an Onramp
         # clean-room pass found in chapter 7's flagship deadline-aware
@@ -2547,8 +2547,8 @@ jobs:
         # an `.await.map_err(|e| e)?` identity closure), so this compiles
         # each pinned snippet with `cargo check` rather than pattern-
         # matching stand-in text. See
-        # scripts/check-continue-as-new-checkpoint-example.sh.
-        run: ./scripts/check-continue-as-new-checkpoint-example.sh
+        # xtask/src/check/continue_as_new_checkpoint_example.rs.
+        run: cargo xtask check continue-as-new-checkpoint-example
       - name: Check operations chapter's preflight declared-deps example
         # Guards two real, reproduced-live compile failures an Onramp
         # clean-room pass found in chapter 10's flagship
@@ -2567,8 +2567,8 @@ jobs:
         # clean. This actually compiles the pinned block with `cargo check`
         # rather than pattern-matching stand-in text, matching the sibling
         # guards above. See
-        # scripts/check-preflight-declared-deps-example.sh.
-        run: ./scripts/check-preflight-declared-deps-example.sh
+        # xtask/src/check/preflight_declared_deps_example.rs.
+        run: cargo xtask check preflight-declared-deps-example
       - name: Check sqlite-backend guide's outcome-match example
         # Guards a real, reproduced-live compile failure in
         # docs/sqlite-backend.md's §7 "drive model" example:
@@ -2583,22 +2583,22 @@ jobs:
         # why the crate's own tests stayed green throughout. This actually
         # compiles the pinned block with `cargo check` rather than counting
         # match arms textually. See
-        # scripts/check-sqlite-outcome-match-example.sh.
-        run: ./scripts/check-sqlite-outcome-match-example.sh
+        # xtask/src/check/sqlite_outcome_match_example.rs.
+        run: cargo xtask check sqlite-outcome-match-example
       - name: Check chapter 8 and 11 snippets compile
         # Guards two getting-started snippets that declared the workflow
         # input as `_: ()`. `#[workflow]` silently dropped the `_` pattern,
         # so the generated call passed one argument to a two-argument
         # function. rustc reported E0061 "takes 5 arguments" on the
-        # attribute line. See scripts/check-underscore-input-snippets.sh.
-        run: ./scripts/check-underscore-input-snippets.sh
+        # attribute line. See xtask/src/check/underscore_input_snippets.rs.
+        run: cargo xtask check underscore-input-snippets
       - name: Check README schedule and retry snippets compile
         # Guards two front-door README snippets. The cron-schedule block
         # called `.workflows(..)` and `.workflow_schedule(..)` on
         # `autumn_web::app()`, which has neither method. The retry block
         # used `Duration` without importing it. See
-        # scripts/check-readme-front-door-snippets.sh.
-        run: ./scripts/check-readme-front-door-snippets.sh
+        # xtask/src/check/readme_front_door_snippets.rs.
+        run: cargo xtask check readme-front-door-snippets
       - name: Check webhooks chapter documents the webhooks feature
         # Guards a real, reproduced-live defect an Onramp clean-room pass
         # found in chapter 12: it showed the `#[webhook]` mapping function
@@ -2617,31 +2617,31 @@ jobs:
         # required) and once with `--features webhooks` (must pass) --
         # and greps for the fix's own "Enable the feature" note landing
         # before step 3, so neither the code nor the note can regress
-        # silently. See scripts/check-webhooks-feature-example.sh.
-        run: ./scripts/check-webhooks-feature-example.sh
+        # silently. See xtask/src/check/webhooks_feature_example.rs.
+        run: cargo xtask check webhooks-feature-example
       - name: Check chapter 5 and 6 flagship examples compile
         # Guards two hard compile failures a clean-room pass found on the
         # getting-started path: chapter 5 passed a workflow id to
         # `spawn_child_workflow_raw` (E0061; the method takes name + input),
         # and chapter 6's `charge_card` used `.map_err(|e| e.to_string())?`
         # in a `HarvestResult` function (E0277; no `From<String>`).
-        # See scripts/check-child-idempotency-examples.sh.
-        run: ./scripts/check-child-idempotency-examples.sh
+        # See xtask/src/check/child_idempotency_examples.rs.
+        run: cargo xtask check child-idempotency-examples
       - name: Check chapter 3 flagship examples compile
         # Chapter 3 shows three timer workflows a reader pastes verbatim.
         # Nothing compiled them. The guard keeps them in step with the API.
-        # See scripts/check-durable-timers-examples.sh.
-        run: ./scripts/check-durable-timers-examples.sh
+        # See xtask/src/check/durable_timers_examples.rs.
+        run: cargo xtask check durable-timers-examples
       - name: Check chapter 9 worker-routing snippets compile
         # Chapter 9 shows the `requires` grammar and the `WorkerConfig` label
         # and weight builders a reader pastes verbatim. Nothing compiled them.
-        # See scripts/check-worker-routing-examples.sh.
-        run: ./scripts/check-worker-routing-examples.sh
+        # See xtask/src/check/worker_routing_examples.rs.
+        run: cargo xtask check worker-routing-examples
       - name: Check chapter 8 DAG snippets compile
         # Chapter 8 shows 15 DAG blocks a reader pastes verbatim. A syntax
         # check covered them. Nothing compiled them against the API.
-        # See scripts/check-dags-schedules-examples.sh.
-        run: ./scripts/check-dags-schedules-examples.sh
+        # See xtask/src/check/dags_schedules_examples.rs.
+        run: cargo xtask check dags-schedules-examples
 
   # One check for branch protection to require in place of every leg above.
   # A skipped leg (a draft PR) counts as a pass, as a skipped job does
