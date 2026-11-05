@@ -4,7 +4,7 @@
 # rather than four databases on one server is not decoration: a Harvest shard is
 # a database with its own pool, and four "shards" sharing one server's buffer
 # cache, WAL writer and CPU would make a shard-count sweep a measurement of that
-# one server contending with itself. `benchmarks/run.sh` starts all four and hands
+# one server contending with itself. `cargo xtask bench run` starts all four and hands
 # the harness all four URLs; each cell of the sweep then uses the first 1, 2 or
 # 4 of them.
 #

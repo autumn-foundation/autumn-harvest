@@ -4,12 +4,13 @@
 //!
 //! Captures the REAL query cost of `GET /workflows?min_history_events=N` and
 //! `GET /workflows?history_bloat_min_events=N` through the actual axum
-//! router (`harvest_api_router`, via `tower::ServiceExt::oneshot` -- a real
-//! `Request` through the real handlers, no network port bound) -- a real
-//! public entry point, not the standalone scalar-subquery approximation
-//! (`InitPlan`) the rest of that doc's measurements use -- against a
-//! persistent, pre-seeded fixture database matching the one
-//! `history_bloat_perf_repro.sh` builds.
+//! router. The probe calls `harvest_api_router` via
+//! `tower::ServiceExt::oneshot`. A real `Request` goes through the real
+//! handlers, and no network port is bound. So it measures a real public entry
+//! point. It does not use the standalone scalar-subquery approximation
+//! (`InitPlan`) of the other measurements in that doc. It runs against a
+//! persistent, pre-seeded fixture database. That database matches the one
+//! that `cargo xtask perf history-bloat` builds.
 //!
 //! **Runs `VACUUM ANALYZE` on both touched tables before measuring.** This
 //! is load-bearing, not decorative: an un-matched Postgres visibility-map
@@ -21,9 +22,9 @@
 //! above for the full story -- this was caught and fixed during this PR's
 //! review, not a hypothetical).
 //!
-//! Run manually against a persistent, pre-seeded fixture database (create it
-//! with the same seeding SQL `history_bloat_perf_repro.sh` uses, but against
-//! a durable database rather than a script-managed ephemeral one):
+//! Run it manually against a persistent, pre-seeded fixture database. Seed
+//! that database with the SQL that `cargo xtask perf history-bloat` uses.
+//! Use a durable database, not the ephemeral one that the command manages:
 //!
 //! ```text
 //! REAL_QUERY_PERF_DB_URL=postgres://postgres:postgres@127.0.0.1:5432/harvest_realquery_perf \

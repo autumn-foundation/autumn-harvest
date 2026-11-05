@@ -99,7 +99,7 @@ SELECT gen_random_uuid(), 'bench-q-' || (i % 4), 'activity', 'noop',
 FROM generate_series(1, 2000) AS i;
 ```
 
-`autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh` seeds
+`cargo xtask perf claim-batched-seek-and-refine` seeds
 this fixture, runs `EXPLAIN (ANALYZE, BUFFERS)` for both queries at idle and
 hot-contention, runs the real end-to-end latency capture below, and
 archives every output to `docs/perf-artifacts/claim-batched-seek-and-refine/`:

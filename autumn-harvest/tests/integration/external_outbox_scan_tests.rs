@@ -895,7 +895,7 @@ async fn outbox_index_definitions(conn: &mut AsyncPgConnection) -> Vec<IndexDefi
 /// reachable Docker daemon for `claim_bench_support::db::setup_bench_db`'s
 /// testcontainer fallback.
 #[tokio::test]
-#[ignore = "seeds a 1.02M-event fixture; run via scripts/external_outbox_scan_perf_repro.sh"]
+#[ignore = "seeds a 1.02M-event fixture; run via cargo xtask perf external-outbox-scan"]
 async fn zz_capture_external_outbox_scan_evidence() {
     let bench = match claim_bench_db::setup_bench_db().await {
         Ok(b) => b,

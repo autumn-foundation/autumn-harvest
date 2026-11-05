@@ -577,7 +577,7 @@ figures throughout this page are from the corrected harness.
   output, the standalone claim-time-`UPDATE` heap-growth corroboration
   script and its output, and a `fixture-summary.txt` for both data states at
   all three depths.
-- `autumn-harvest/scripts/capability_labels_claim_perf_repro.sh` -- a
+- `cargo xtask perf capability-labels-claim` -- a
   reproduction script that re-runs the capture test.
 - This doc.
 
@@ -587,13 +587,13 @@ figures throughout this page are from the corrected harness.
 
 ```bash
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-  ./autumn-harvest/scripts/capability_labels_claim_perf_repro.sh
+  cargo xtask perf capability-labels-claim
 ```
 
 or, with only a reachable Docker daemon and no external Postgres:
 
 ```bash
-./autumn-harvest/scripts/capability_labels_claim_perf_repro.sh
+cargo xtask perf capability-labels-claim
 ```
 
 Both regenerate the `EXPLAIN` captures, `pg_stat_statements` snapshots, and

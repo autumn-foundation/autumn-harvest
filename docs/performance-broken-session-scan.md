@@ -128,7 +128,7 @@ updates are unaffected. A row leaves the index when its task turns terminal.
 
 ```sh
 HARVEST_TEST_DATABASE_URL=postgres://postgres@localhost:5432/postgres \
-  ./autumn-harvest/scripts/broken_session_scan_perf_repro.sh
+  cargo xtask perf broken-session-scan
 ```
 
 ## What this does not fix
