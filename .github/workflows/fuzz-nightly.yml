@@ -58,7 +58,7 @@ env:
   # The 1.100 nightlies that were tested (2026-09-01 and later) fail to build
   # the `db` feature: E0275, a recursion-limit error or an ICE in the diesel
   # transaction futures. Move this pin forward once a newer nightly builds
-  # the crate. `fuzz/smoke.sh` has the same default.
+  # the crate. `cargo xtask dev fuzz-smoke` has the same default.
   FUZZ_TOOLCHAIN: nightly-2026-08-14
 
 jobs:

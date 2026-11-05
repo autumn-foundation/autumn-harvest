@@ -2997,7 +2997,7 @@ jobs:
   # and fuzzing needs nightly + libFuzzer. Trigger manually from the Actions tab
   # (Run workflow) when you want a quick "do the targets still build and run
   # clean" check. For a real campaign, run a single target locally with a larger
-  # -max_total_time (see docs/testing/property-and-fuzz.md and fuzz/smoke.sh).
+  # -max_total_time (see docs/testing/property-and-fuzz.md and xtask/src/dev/fuzz_smoke.rs).
   fuzz-smoke:
     name: Fuzz smoke (manual)
     if: github.event_name == 'workflow_dispatch'

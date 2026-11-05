@@ -9,7 +9,7 @@
 //! public entry point, not the standalone scalar-subquery approximation
 //! (`InitPlan`) the rest of that doc's measurements use -- against a
 //! persistent, pre-seeded fixture database matching the one
-//! `history_bloat_perf_repro.sh` builds.
+//! `cargo xtask perf history-bloat` builds.
 //!
 //! **Runs `VACUUM ANALYZE` on both touched tables before measuring.** This
 //! is load-bearing, not decorative: an un-matched Postgres visibility-map
@@ -22,7 +22,7 @@
 //! review, not a hypothetical).
 //!
 //! Run manually against a persistent, pre-seeded fixture database (create it
-//! with the same seeding SQL `history_bloat_perf_repro.sh` uses, but against
+//! with the same seeding SQL `cargo xtask perf history-bloat` uses, but against
 //! a durable database rather than a script-managed ephemeral one):
 //!
 //! ```text

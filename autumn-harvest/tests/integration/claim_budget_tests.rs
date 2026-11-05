@@ -1776,7 +1776,7 @@ async fn a_template1_backend_blocks_create_database_but_ours_does_not() {
 /// `#[ignore]`d on purpose: this is a one-shot evidence-capture tool, not a
 /// repeatable CI assertion — its output is read by a human reviewing the PR,
 /// not asserted on. See
-/// `autumn-harvest/scripts/queue_pause_claim_perf_repro.sh`, which runs this
+/// `cargo xtask perf queue-pause-claim`, which runs this
 /// exact test twice — once against the pre-fix shape of `queue.rs`, once
 /// against the current tree — to produce the paired
 /// `docs/perf-artifacts/queue-pause-claim-anti-join/` files the PR cites.
@@ -1789,7 +1789,7 @@ async fn a_template1_backend_blocks_create_database_but_ours_does_not() {
 /// text to drift out of sync with the real function.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "evidence generator, not a CI assertion -- run via \
-            autumn-harvest/scripts/queue_pause_claim_perf_repro.sh"]
+            cargo xtask perf queue-pause-claim"]
 #[allow(clippy::too_many_lines)] // one-shot evidence capture, not a CI assertion
 async fn zz_capture_queue_pause_claim_evidence() {
     use diesel::QueryableByName;
@@ -2183,13 +2183,13 @@ async fn zz_capture_queue_pause_claim_evidence() {
 ///
 /// `#[ignore]`d on purpose: this is a one-shot evidence-capture tool, not a
 /// repeatable CI assertion. See
-/// `autumn-harvest/scripts/capability_labels_claim_perf_repro.sh`, which runs
+/// `cargo xtask perf capability-labels-claim`, which runs
 /// this test once (no git/tree toggling needed, since no code changes) to
 /// produce the `docs/perf-artifacts/capability-labels-claim-predicate/`
 /// files the doc cites.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "evidence generator, not a CI assertion -- run via \
-            autumn-harvest/scripts/capability_labels_claim_perf_repro.sh"]
+            cargo xtask perf capability-labels-claim"]
 #[allow(clippy::too_many_lines)] // one-shot evidence capture, not a CI assertion
 async fn zz_capture_capability_labels_claim_evidence() {
     use diesel::QueryableByName;
@@ -2672,13 +2672,13 @@ async fn zz_capture_capability_labels_claim_evidence() {
 ///
 /// `#[ignore]`d on purpose: this is a one-shot evidence-capture tool, not a
 /// repeatable CI assertion. See
-/// `autumn-harvest/scripts/schedule_to_close_claim_perf_repro.sh`, which runs
+/// `cargo xtask perf schedule-to-close-claim`, which runs
 /// this test once (no git/tree toggling needed, since no code changes) to
 /// produce the `docs/perf-artifacts/schedule-to-close-claim-predicate/` files
 /// the doc cites.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "evidence generator, not a CI assertion -- run via \
-            autumn-harvest/scripts/schedule_to_close_claim_perf_repro.sh"]
+            cargo xtask perf schedule-to-close-claim"]
 #[allow(clippy::too_many_lines)] // one-shot evidence capture, not a CI assertion
 async fn zz_capture_schedule_to_close_claim_evidence() {
     use diesel::QueryableByName;
@@ -3283,13 +3283,13 @@ async fn zz_capture_schedule_to_close_claim_evidence() {
 ///
 /// `#[ignore]`d on purpose: this is a one-shot evidence-capture tool, not a
 /// repeatable CI assertion. See
-/// `autumn-harvest/scripts/worker_session_claim_perf_repro.sh`, which runs
+/// `cargo xtask perf worker-session-claim`, which runs
 /// this test once (no git/tree toggling needed, since no code changes) to
 /// produce the `docs/perf-artifacts/worker-session-claim-predicate/` files
 /// the doc cites.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "evidence generator, not a CI assertion -- run via \
-            autumn-harvest/scripts/worker_session_claim_perf_repro.sh"]
+            cargo xtask perf worker-session-claim"]
 #[allow(clippy::too_many_lines)] // one-shot evidence capture, not a CI assertion
 async fn zz_capture_worker_session_claim_evidence() {
     use diesel::QueryableByName;
@@ -3899,13 +3899,13 @@ async fn zz_capture_worker_session_claim_evidence() {
 ///
 /// `#[ignore]`d on purpose: this is a one-shot evidence-capture tool, not a
 /// repeatable CI assertion. See
-/// `autumn-harvest/scripts/sticky_routing_claim_perf_repro.sh`, which runs
+/// `cargo xtask perf sticky-routing-claim`, which runs
 /// this test once (no git/tree toggling needed, since no code changes) to
 /// produce the `docs/perf-artifacts/sticky-routing-claim-predicate/` files
 /// the doc cites.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "evidence generator, not a CI assertion -- run via \
-            autumn-harvest/scripts/sticky_routing_claim_perf_repro.sh"]
+            cargo xtask perf sticky-routing-claim"]
 #[allow(clippy::too_many_lines)] // one-shot evidence capture, not a CI assertion
 async fn zz_capture_sticky_routing_claim_evidence() {
     use diesel::QueryableByName;
@@ -4496,7 +4496,7 @@ async fn zz_capture_sticky_routing_claim_evidence() {
 /// `#[ignore]`d on purpose: this is a one-shot evidence-capture tool, not a
 /// repeatable CI assertion — its output is read by a human reviewing the PR,
 /// not asserted on. See
-/// `autumn-harvest/scripts/concurrency_key_claim_perf_repro.sh`, which runs
+/// `cargo xtask perf concurrency-key-claim`, which runs
 /// this exact test twice — once against the pre-fix shape of `queue.rs`, once
 /// against the current tree — to produce the paired
 /// `docs/perf-artifacts/concurrency-key-claim-predicate/` files the PR cites.
@@ -4522,7 +4522,7 @@ async fn zz_capture_sticky_routing_claim_evidence() {
 /// of the RUNNING population sharing a candidate row's key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "evidence generator, not a CI assertion -- run via \
-            autumn-harvest/scripts/concurrency_key_claim_perf_repro.sh"]
+            cargo xtask perf concurrency-key-claim"]
 #[allow(clippy::too_many_lines)] // one-shot evidence capture, not a CI assertion
 async fn zz_capture_concurrency_key_claim_evidence() {
     use diesel::QueryableByName;
@@ -5121,7 +5121,7 @@ async fn claim_excludes_paused_rows_with_a_realistically_wide_pause_array() {
 /// pause-table scale.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "evidence generator, not a CI assertion -- run via \
-            autumn-harvest/scripts/pause_array_size_claim_perf_repro.sh"]
+            cargo xtask perf pause-array-size-claim"]
 #[allow(clippy::too_many_lines)] // one-shot evidence capture, not a CI assertion
 async fn zz_capture_pause_array_size_claim_evidence() {
     use diesel::QueryableByName;

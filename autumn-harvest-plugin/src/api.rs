@@ -43659,7 +43659,7 @@ async fn db_conn_for_dag(
 /// events pays to have all 500,000 counted merely to answer "yes, that's
 /// `>= 10,000`". Profiled on a 5.3M-row `harvest_events` fixture (5,000
 /// ordinary executions plus 15 long-running ones with 50k-450k events each;
-/// `autumn-harvest-plugin/scripts/history_bloat_perf_repro.sh`, artifacts
+/// `cargo xtask perf history-bloat`, artifacts
 /// committed under `docs/perf-artifacts/history-bloat-filter/`):
 /// `(SELECT COUNT(*) ...) >= 10000` against a 448,175-event execution reads
 /// 3,976 total buffers (`pg_stat_statements.total_buffers`, corroborated by
