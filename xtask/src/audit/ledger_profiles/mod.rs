@@ -15,10 +15,10 @@
 //! `docs/ledger/autumn-harvest/queue.toml`. See `docs/ledger/README.md` for
 //! the fields.
 //!
-//! A query site is a call that sends SQL to Postgres or SQLite: `sql_query`,
-//! the Diesel DSL (`load`, `get_result`, `execute` and the others), or a
-//! `rusqlite` call (`prepare`, `query_row`, `execute_batch` and the others).
-//! The profile belongs to the function that holds the call. Code under
+//! A query site is a call that sends SQL to Postgres or SQLite. It is a
+//! `sql_query` call, a Diesel DSL call such as `load`, `get_result` or
+//! `execute`, or a `rusqlite` call such as `prepare`, `query_row` or
+//! `execute_batch`. The profile belongs to the function that holds the call. Code under
 //! `#[cfg(test)]` and `#[test]` is out of scope.
 //!
 //! The gate reports these findings:

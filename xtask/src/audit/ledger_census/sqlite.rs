@@ -266,12 +266,100 @@ fn sqlite_message(error: &rusqlite::Error) -> String {
     }
 }
 
+/// The error that the `sqlite3` module raises for text after the first statement.
+const ONE_STATEMENT: &str = "You can only execute one statement at a time.";
+
+/// Returns the text after the `;` that ends the first statement, or `None`.
+///
+/// The scan skips the SQLite quote forms and comments, as the SQLite
+/// tokenizer does. A plannable statement has no `;` of its own, so the first
+/// `;` outside a quote or a comment ends it.
+fn tail_after_first(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b';' => return Some(&text[i + 1..]),
+            quote @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        // A doubled quote is an escaped quote inside the literal.
+                        if bytes.get(i + 1) == Some(&quote) {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            b'[' => {
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < bytes.len() && !bytes[i..].starts_with(b"*/") {
+                    i += 1;
+                }
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether `tail` holds more than whitespace and comments.
+///
+/// This is the `lstrip_sql` check of the `sqlite3` module. Any other byte,
+/// a lone `;` included, means a second statement.
+fn has_more_sql(tail: &str) -> bool {
+    let bytes = tail.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\x0c' | b'\n' | b'\r' => i += 1,
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                match bytes[i..].iter().position(|&b| b == b'\n') {
+                    Some(k) => i += k + 1,
+                    None => return false,
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => match tail[i + 2..].find("*/") {
+                Some(k) => i += k + 4,
+                None => return false,
+            },
+            _ => return true,
+        }
+    }
+    false
+}
+
 /// Runs one `EXPLAIN QUERY PLAN` and returns the detail column of each row.
 fn plan_rows(db: &Connection, text: &str, params: &Params) -> Result<Vec<String>, PlanError> {
+    // The `sqlite3` module prepares the first statement, then refuses any
+    // text after it. `rusqlite` reports an error in that text instead, so
+    // the check runs here first.
+    if let Some(tail) = tail_after_first(text)
+        && has_more_sql(tail)
+    {
+        let first = &text[..text.len() - tail.len()];
+        return Err(match db.prepare(first) {
+            Ok(_) => PlanError::Binding(ONE_STATEMENT.into()),
+            Err(error) => PlanError::Sqlite(sqlite_message(&error)),
+        });
+    }
     let mut stmt = db.prepare(text).map_err(|error| match error {
-        rusqlite::Error::MultipleStatement => {
-            PlanError::Binding("You can only execute one statement at a time.".into())
-        }
+        rusqlite::Error::MultipleStatement => PlanError::Binding(ONE_STATEMENT.into()),
         other => PlanError::Sqlite(sqlite_message(&other)),
     })?;
     let count = stmt.parameter_count();
@@ -291,9 +379,12 @@ fn plan_rows(db: &Connection, text: &str, params: &Params) -> Result<Vec<String>
                         "Binding {index} has no name, but you supplied a dictionary (which has only names)."
                     )));
                 };
-                if !names.contains(name.get(1..).unwrap_or("")) {
+                // The `sqlite3` module drops the first character of the name.
+                // It then names the parameter with a colon, so `?1` reads `:1`.
+                let bare = name.get(1..).unwrap_or("");
+                if !names.contains(bare) {
                     return Err(PlanError::Binding(format!(
-                        "You did not supply a value for binding parameter {name}."
+                        "You did not supply a value for binding parameter :{bare}."
                     )));
                 }
             }
@@ -470,6 +561,54 @@ mod tests {
         assert_eq!(upper.get("r").map(String::as_str), Some("q"));
         let lower = patterns.aliases("SELECT 1 FROM x, q as r", &tables);
         assert!(lower.is_empty(), "{lower:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_tail_starts_after_the_first_bare_semicolon() {
+        assert_eq!(tail_after_first("SELECT 1"), None);
+        assert_eq!(tail_after_first("SELECT ';' -- ;\n; x"), Some(" x"));
+        assert_eq!(
+            tail_after_first("SELECT \"a;\" /* ; */, [b;]; y"),
+            Some(" y")
+        );
+        assert_eq!(tail_after_first("SELECT 'it''s;'; z"), Some(" z"));
+        assert!(!has_more_sql(" -- note\n /* c */ \t"));
+        assert!(!has_more_sql(" -- no newline"));
+        assert!(has_more_sql(" ;"));
+        assert!(has_more_sql("\n SELECT 2"));
+    }
+
+    #[test]
+    fn a_second_statement_is_refused_as_python_refuses_it() -> Result<()> {
+        let patterns = SqlitePatterns::new()?;
+        let db = Connection::open_in_memory()?;
+        let none = BTreeSet::new();
+        for sql in [
+            "SELECT 1; garbage here",
+            "SELECT 1; SELECT 2",
+            "SELECT 1; ; -- x",
+        ] {
+            let (_, error) = patterns.explain(&db, sql, &none, &none);
+            assert_eq!(error.as_deref(), Some(ONE_STATEMENT), "{sql}");
+        }
+        let (_, error) = patterns.explain(&db, "SELECT nope FROM q; SELECT 2", &none, &none);
+        assert_eq!(error.as_deref(), Some("no such table: q"));
+        let (_, error) = patterns.explain(&db, "SELECT 1; -- note", &none, &none);
+        assert!(error.is_none(), "{error:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_name_reads_with_a_colon() -> Result<()> {
+        let patterns = SqlitePatterns::new()?;
+        let db = Connection::open_in_memory()?;
+        let none = BTreeSet::new();
+        let (_, error) = patterns.explain(&db, "SELECT ?1, @b, :a", &none, &none);
+        assert_eq!(
+            error.as_deref(),
+            Some("You did not supply a value for binding parameter :1.")
+        );
         Ok(())
     }
 

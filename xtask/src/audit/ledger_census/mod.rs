@@ -59,7 +59,36 @@ pub const PARTIAL_INDEX: &str = "full scan of partial index";
 pub const SQLITE_SECTION: &str = "Backend: SQLite.";
 
 /// The usage text, printed when the arguments name no step.
+///
+/// The Python script printed its whole docstring. This is that text, with
+/// the command names of the port.
 const USAGE: &str = "Measure the access path of each Ledger-profiled query (issue #2366).
+
+`cargo xtask audit ledger-profiles` keeps a profile for every function that
+sends SQL. Most profiles say `measured = \"unmeasured\"`. This command measures
+them in bulk, in two steps.
+
+`attribute` reads the raw census that `autumn-harvest/src/ledger_census.rs`
+writes while the DB suites run. Each line holds one statement and the source
+frames of its call stack. The command maps the innermost frame that falls in a
+profiled function to that profile. It writes the result to STATEMENTS, which
+is committed, so the second step needs no test run.
+
+`plan` runs `EXPLAIN (GENERIC_PLAN, FORMAT JSON)` for each statement on a
+migrated database, with `enable_seqscan = off`. The setting makes the planner
+take an index whenever one can serve the predicate. A `Seq Scan` that remains
+means that no index can, whatever the size of the table. So the access path
+does not depend on fixture data. The step writes one page for each source
+file under `docs/ledger/plans/`, and it sets the `plan` field of each profile
+that it measured.
+
+`plan-sqlite` does the same for SQLite statements, with `EXPLAIN QUERY PLAN`
+on an in-memory database built from the SQLite DDL that the census recorded
+(issue #2429). A `SCAN` that names no index is the finding.
+
+A plan is not a buffer count. `measured` stays for a Ledger page with real
+buffers. A `plan` page shows which index each statement uses, and which
+statements scan a table with no usable index.
 
 Usage:
     HARVEST_LEDGER_CENSUS=/var/tmp/census.jsonl \\
@@ -71,7 +100,6 @@ Usage:
 
 Leave `HARVEST_TEST_DATABASE_URL` unset, so that each suite boots a migrated
 container. The plan database needs every migration in `autumn-harvest/migrations`.
-See docs/ledger/README.md.
 ";
 
 /// Arguments of `cargo xtask audit ledger-census`.
