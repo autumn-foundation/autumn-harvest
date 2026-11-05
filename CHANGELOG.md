@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-05
+
+### Upgraded
+
+- **`autumn-web` 0.10 (issue #2479).** `autumn-harvest-plugin` now depends on `autumn-web` 0.10, which adds named roles (autumn#3543). An app that mounts `HarvestPlugin` bumps `autumn-web` to `"0.10"` in the same change. A leftover `"0.9"` builds two copies, and `HarvestPlugin` does not match the app's `AppBuilder`. Each Harvest route is in the route group `harvest`, so a `[roles.<name>] mount` list must name it. See [`docs/upgrading/0.10.0.md`](docs/upgrading/0.10.0.md) §1.1.
+
+- **MSRV 1.97 and a dependency update (PR #2523).** `wasmtime` 50 needs Rust 1.97. `reqwest` 0.13 uses the OS trust store, so an image with no CA certificates now fails TLS. An hourly cron schedule now also fires in the repeated hour at the end of DST, and an expression with a `+` prefix no longer parses. See [`docs/upgrading/0.10.0.md`](docs/upgrading/0.10.0.md) §1.2 and §1.6.
+
+### Changed
+
+- **A `web` replica runs no Harvest worker, scheduler or retention janitor (issues #2477 and #2478).** The switches follow the Autumn process role. `HarvestRuntimeConfig::worker_enabled` and `scheduler_enabled` are now `Option<bool>`, and an explicit value wins. The retention janitor runs where the scheduler runs, unless `[harvest.retention] run_on = "all"`. A fleet with only `web` replicas then claims no task, so add `worker` replicas or set both switches before the roll. See [`docs/upgrading/0.10.0.md`](docs/upgrading/0.10.0.md) §1.3 and §1.4, and [`docs/operations/process-roles.md`](docs/operations/process-roles.md).
+
+- **Breaking and behavior changes.** `HarvestRuntimeConfig` gains `retention` and `worker` (issues #2478 and #2479). `consolidate::schedule` takes `&ConsolidateAll`, and the per-agent form is gone (issue #2540). `ProfileOverlayStore::activate` takes an actor, and a store implements the log and policy methods (issues #2374 and #2394). The engine, the plugin and the agent crate gain public fields and variants. More start paths take the declared timeouts and the operator overrides (issues #2406 and #2511). Each has its own section in [`docs/upgrading/0.10.0.md`](docs/upgrading/0.10.0.md) §1.
+
+- **Turn on the new features after the roll.** A `0.9.0` process refuses the new run-default fields with a `400`, and cannot run the new agent activities. Set a new override, and turn on a new agent feature, only after every process runs `0.10.0`. See [`docs/upgrading/0.10.0.md`](docs/upgrading/0.10.0.md) §3.
+
+### Added
+
+- **Runtime overrides of four more run defaults (issues #2406, #2407, #2408 and #2409).** `PATCH /admin/workflow-types/{workflow_name}/run-defaults` takes the chain cap, the concurrency limit, the three quota admission caps and three fields of the workflow retry policy. `GET` shows each one in `code`, `override` and `effective`. A lower concurrency limit applies to the next start, and a higher one raises the cap of each live task. A retry change applies to the next failure of any run of the type. Four migrations add the columns. See [`docs/operations/run-default-overrides.md`](docs/operations/run-default-overrides.md).
+
+- **Worker queues from config and the role pin (issue #2479).** `[harvest.worker] queues` narrows the queues that the worker of one process polls. With no list, the `pin` of a named Autumn role narrows it. An undeclared queue stops the boot. `GET /admin/queue-coverage` adds `unpolled_declared_queues`, and `harvest queue coverage --strict` fails on it.
+
+- **`HarvestPlugin` on SQLite, slices 2 to 6 (epic #2466).** The SQLite plugin serves the read routes, Vantage and declarative queries (issue #2468); API tokens, roles, OIDC and audit (issue #2469); the transactional outbox (issue #2470); and schedules, retention, MCP, webhooks and connectors (issue #2471). It runs in split and external mode, and with one Harvest file per fleet tenant (issue #2472). Its routes keep the Postgres wire contract, `/result` and history paging included (issue #2489). `HarvestPlugin::workflow_schedule` adds a code schedule on both backends. See [`docs/sqlite-plugin.md`](docs/sqlite-plugin.md).
+
+- **Operate agent profile overlays (issue #2374).** `/agents/{kind}/profile` routes and `harvest agents profile list|show|diff|activate|rollback`. Each move of the pointer writes an activation row and an audit row. A rollback restores the version before the current one. Migration `20261102142302_harvest_agent_overlay_activations`.
+
+- **Operator refine policy per kind (issue #2394).** `RefinePolicy` sets auto adoption, its daily cap, probe effects, ceilings and proposal attempts. The defaults never adopt. The policy log is append-only, and only an operator writes it. Migration `20261103134706_harvest_agent_refine_policies`. ADR 0014 records the rule.
+
+- **The `agent_refine` workflow (issue #2380).** One durable run probes, composes and selects an overlay for an agent kind, in parallel or sequential mode, under a fixed budget. A crash resumes to the same report. It builds on the probe evidence bundle (issue #2377), anonymised comparison reports (issue #2376), scored evaluations (issue #2447) and the live probe on a fork (issue #2378).
+
+- **Sampling (issues #2439, #2442 and #2443).** An operator sampling policy per agent kind (migration `20261102032158_harvest_agent_policies`). `agent_sample` runs best-of-N and rejection sampling, one durable child run per draw, under one token budget. `AgentTask::answer_check` scores each final answer and retries within a cap.
+
+- **Agent memory (issues #2454, #2455 and #2540).** An episode log per durable agent and the `agent_consolidate` pass, which turns episodes into facts. One `agent_consolidate_all` schedule serves every agent. The `recall` module and the `recall-eval` example measure what an agent forgets across ops.
+
+- **Agent helpers for Postgres.** The `postgres` module of `autumn-harvest-agent` mirrors the `sqlite` module: `PostgresAgents`, `register`, `start`, `send`, `wait_for` and the mesh controls. The new example `postgres_agent` runs on Postgres.
+
+- **Agent loop and mesh.** A tool round over the cap resets the context when a reset is left (issue #2461). The harness limit governs each delegation answer, and `Peer::answer_limit` overrides it per peer (issue #2481). A fan-out names why a delegation ran alone in `DelegationRecord::serial` (issue #2483).
+
+- **History shape fingerprints.** `autumn_harvest::history_shape` returns a type histogram, a stable fingerprint of the ordered event types and the first divergence of two histories.
+
+### Fixed
+
+- **Colocated shards keep the DAG schedule row of the owner (issue #2405).** Two shards on one pool share one `harvest_schedules` table. The shard that did not own a DAG deleted the row of the owner, so the schedule did not fire.
+
+- **Completion-trigger and typed update-with-start starts take the run defaults (issue #2511).** They set no execution timeout and no chain cap before. A target type that declares an `execution_timeout` now gets it.
+
+- **Durable route: no final 500 on a chain that still moves (issue #2491).** At the step cap, the route now reads the chain tail, and answers pending while a run of the chain is live.
+
+- **`harvest-verify`: test macros no longer make types writable (issue #2545).** A `proptest!` body that named `String` made workflows that capture a `String` read as `unknown`.
+
+- **OIDC: the shortest session age is two seconds.** A one-second age could expire a session at the next clock tick and loop the user through the identity provider.
+
+### Performance
+
+- **Encode moves payload trees (issue #2499).** `PayloadCodecs::encode_event_owned` moves each encoded payload into the stored value. `payload_codec_profile` drops 19.4% of its instructions. See [`docs/performance-encode-event-payload-move.md`](docs/performance-encode-event-payload-move.md).
+
+- **Awaitables history index uses foldhash.** `awaitables_profile` drops 24.5% of its instructions. See [`docs/performance-awaitables-hasher.md`](docs/performance-awaitables-hasher.md).
+
+- **Schedule catch-up walk parses the cron once.** `schedule_plan::SlotWalker` parses a schedule once per walk. See [`docs/performance-schedule-slot-walk.md`](docs/performance-schedule-slot-walk.md).
+
+### Documentation
+
+- **0.10.0 upgrade guide.** [`docs/upgrading/0.10.0.md`](docs/upgrading/0.10.0.md) is new. The post-tag sections of the 0.9.0 guide move into it, and the 0.9.0 guide returns to the text that shipped with 0.9.0. The rolling-deploy contract lists the known limits for 0.9 and 0.10.
+
+- **The agent guide examples compile (issue #2482).** Each of the 34 Rust fences in `docs/agent-adapter.md` and `docs/agent-mesh.md` compiles as a doctest, and no fence is `ignore`.
+
+### Testing
+
+- **Conformance: exact retry backoffs (issue #2517).** The corpus retries wait their base delay, so `race_timer_wins` no longer flakes on Postgres.
+
+- **Light test path for the sandbox unit tests (issue #2487).** `cargo sandbox-test` builds 180 crates instead of 316 and fits an 8 GiB machine.
+
+### Internal
+
+- **Every repo script runs as `cargo xtask` (PRs #2564 and #2574).** The 96 scripts of the CI gates, doc guards, perf evidence generators, bench drivers and dev helpers are ported and deleted. ADR 0015 records the decision, and [`docs/xtask.md`](docs/xtask.md) lists each command.
+
+- **CI.** The live-DB test binaries build once into a cargo-nextest archive (PR #2543). The no-db shards are balanced, and five plugin lib-test builds merge into one (PR #2561).
+
 ## [0.9.0] - 2026-11-02
 
 ### Changed

@@ -59,10 +59,14 @@ Start with [Chapter 1 →](01-project-skeleton.md)
 - **Disaster recovery.** [`cross-region-dr.md`](../cross-region-dr.md) — per-shard
   cross-region replication, a fencing mechanism, a measured RPO, and the
   operator-initiated failover runbook.
-- **Upgrading.** [`upgrading/0.9.0.md`](../upgrading/0.9.0.md) is the current
-  0.8.0 → 0.9.0 upgrade guide — the `schemars` 1.x bump, the split Diesel
-  tables, four index and table migrations and the fleet rules for the new
-  agent features. [`upgrading/0.8.0.md`](../upgrading/0.8.0.md) covers the
+- **Upgrading.** [`upgrading/0.10.0.md`](../upgrading/0.10.0.md) is the
+  current 0.9.0 → 0.10.0 upgrade guide — the `autumn-web` 0.10 bump, MSRV
+  1.97, the process-role defaults for `web` replicas, seven table and column
+  migrations and the fleet rules for the new features.
+  [`upgrading/0.9.0.md`](../upgrading/0.9.0.md) covers the previous
+  0.8.0 → 0.9.0 hop: the `schemars` 1.x bump, the split Diesel tables, four
+  index and table migrations and the fleet rules for the 0.9.0 agent
+  features. [`upgrading/0.8.0.md`](../upgrading/0.8.0.md) covers the
   previous 0.7.0 → 0.8.0 hop: the `autumn-web` 0.9 bump, the `prod`
   profile's strict config check and the 0.8.0 runtime defaults.
   [`upgrading/0.7.0.md`](../upgrading/0.7.0.md) covers the
@@ -85,7 +89,16 @@ Start with [Chapter 1 →](01-project-skeleton.md)
   [`autumn-harvest-sqlite/examples/`](../../autumn-harvest-sqlite/examples/)).
 - **HarvestPlugin on SQLite.** [`sqlite-plugin.md`](../sqlite-plugin.md) runs
   `HarvestPlugin` in an Autumn app on the SQLite lane, with the `sqlite`
-  feature of `autumn-harvest-plugin`. It lists what slice 1 refuses.
+  feature of `autumn-harvest-plugin`: the management API, auth, the outbox,
+  schedules, retention, split mode and per-tenant Harvest files. It lists
+  what the SQLite backend still refuses.
+- **Process roles.** [`process-roles.md`](../operations/process-roles.md)
+  explains which Harvest runtimes a `web`, `worker` or `combined` replica
+  runs, and how `[harvest.worker] queues` narrows a worker.
+- **Run-default overrides.**
+  [`run-default-overrides.md`](../operations/run-default-overrides.md)
+  changes the timeouts, chain cap, concurrency limit, quota caps and retry
+  policy of a workflow type at runtime.
 - **Cost-aware deferral.** [`cost-deferral.md`](../cost-deferral.md) holds
   named activity types while the autumn-web cost signal is high.
 - **Runbooks.**
