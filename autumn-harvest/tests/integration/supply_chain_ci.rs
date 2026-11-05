@@ -4,8 +4,9 @@
 //!
 //! - A daily `cargo deny check advisories` scan. New RUSTSEC advisories land
 //!   with no code change, so the change-gated CI job does not see them.
-//! - A SHA pin on every `uses:`. `docs/audits/action-sha-pin.py` checks each
-//!   line in the `lint` job. This file checks that the job runs it.
+//! - A SHA pin on every `uses:`. `cargo xtask audit action-sha-pin` checks each
+//!   line in the `lint` job. This file checks that the job runs it, and that
+//!   its fixtures pass.
 //! - A Dependabot file for `cargo`, `github-actions` and `docker`.
 //! - A release that builds auditable binaries, a `CycloneDX` SBOM, a Sigstore
 //!   signature and GitHub artifact attestations.
@@ -25,7 +26,7 @@ const SCAN_SCRIPT: &str = ".github/ci/advisory-scan.sh";
 const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
 const RELEASE_WORKFLOW: &str = ".github/workflows/release.yml";
 const DEPENDABOT: &str = ".github/dependabot.yml";
-const SHA_PIN_AUDIT: &str = "docs/audits/action-sha-pin.py";
+const SHA_PIN_AUDIT: &str = "cargo xtask audit action-sha-pin";
 
 /// The alert issue title. The script finds its open alert by this exact title.
 #[cfg(target_os = "linux")]
@@ -710,13 +711,41 @@ fn lint_job_runs_the_sha_pin_audit() {
         .collect();
     let lines: Vec<&str> = runs.iter().flat_map(|r| r.lines()).map(str::trim).collect();
     assert!(
-        lines.contains(&format!("python3 {SHA_PIN_AUDIT} --self-test").as_str()),
-        "the lint job must run `python3 {SHA_PIN_AUDIT} --self-test`"
+        lines.contains(&format!("{SHA_PIN_AUDIT} --self-test").as_str()),
+        "the lint job must run `{SHA_PIN_AUDIT} --self-test`"
     );
     assert!(
-        lines.contains(&format!("python3 {SHA_PIN_AUDIT}").as_str()),
-        "the lint job must run `python3 {SHA_PIN_AUDIT}`"
+        lines.contains(&SHA_PIN_AUDIT),
+        "the lint job must run `{SHA_PIN_AUDIT}`"
     );
+}
+
+/// The pin lint decides each form as its fixtures expect, and the tree has no
+/// unpinned `uses:`. A lint that passed its CI step while broken would let a
+/// tag pin through.
+#[test]
+fn sha_pin_audit_passes_its_fixtures_and_the_tree() {
+    for args in [
+        &["audit", "action-sha-pin", "--self-test"][..],
+        &["audit", "action-sha-pin"],
+    ] {
+        let output = crate::xtask_bin::xtask()
+            .args(args)
+            .output()
+            .expect("run cargo xtask audit action-sha-pin");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "`cargo xtask {}` failed:\n{stdout}{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(", 0 wrong") || stdout.contains(", 0 unpinned"),
+            "`cargo xtask {}` printed no clean summary:\n{stdout}",
+            args.join(" ")
+        );
+    }
 }
 
 /// A SHA pin drops what a branch ref implied. `dtolnay/rust-toolchain@stable`
@@ -1178,7 +1207,7 @@ fn release_runs_every_tag_gate_before_signing() {
 
 // ── Release: worker container image (issue #1989) ───────────────────────────
 
-const IMAGE_CONTRACT_AUDIT: &str = "docs/audits/worker-image-contract.py";
+const IMAGE_CONTRACT_AUDIT: &str = "cargo xtask audit worker-image-contract";
 const CHART: &str = "charts/autumn-harvest-worker";
 
 /// The image build runs third-party `build.rs` code. It must hold no token
@@ -1316,14 +1345,30 @@ fn lint_job_runs_helm_lint_and_the_image_contract() {
         "the lint job must run `helm lint --strict` on {CHART}"
     );
     for line in [
-        format!("python3 {IMAGE_CONTRACT_AUDIT} --self-test"),
-        format!("python3 {IMAGE_CONTRACT_AUDIT}"),
+        format!("{IMAGE_CONTRACT_AUDIT} --self-test"),
+        IMAGE_CONTRACT_AUDIT.to_owned(),
     ] {
         assert!(
             lines.contains(&line.as_str()),
             "the lint job must run `{line}`"
         );
     }
+}
+
+/// The image contract decides each fixture as expected. The full audit needs
+/// `helm`, which the `lint` job installs, so this test runs the fixtures only.
+#[test]
+fn image_contract_audit_passes_its_fixtures() {
+    let output = crate::xtask_bin::xtask()
+        .args(["audit", "worker-image-contract", "--self-test"])
+        .output()
+        .expect("run cargo xtask audit worker-image-contract --self-test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains(" cases, 0 failed"),
+        "`{IMAGE_CONTRACT_AUDIT} --self-test` failed:\n{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// The Dockerfile pins each base image by digest. Dependabot keeps the

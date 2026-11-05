@@ -115,7 +115,7 @@ installs one worker Deployment. It sets:
 - a non-root, read-only security context and a PodDisruptionBudget.
 
 CI runs `helm lint --strict` on each pull request.
-`docs/audits/worker-image-contract.py` renders the chart and checks this
+`cargo xtask audit worker-image-contract` renders the chart and checks this
 list.
 
 ## Consequences

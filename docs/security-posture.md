@@ -1867,8 +1867,8 @@ quotes the scan output. To close the issue, fix each finding or add a reasoned
 ### Pinned actions and Dependabot
 
 Each `uses:` pins a commit SHA, with a `# <tag>` comment. A tag can move to new
-code, and a SHA cannot. `docs/audits/action-sha-pin.py` fails the `lint` job on
-any other form.
+code, and a SHA cannot. `cargo xtask audit action-sha-pin` fails the `lint` job
+on any other form.
 
 `.github/dependabot.yml` opens weekly update pull requests against `trunk-dev`,
 for `cargo` and `github-actions`. Dependabot changes the SHA and the comment

@@ -5,8 +5,8 @@
 # `standalone-runner`. It holds no user workflow. To ship your own worker,
 # copy your binary into this image and set `CMD`.
 #
-# Dependabot updates each digest. docs/audits/worker-image-contract.py checks
-# that the build image matches rust-toolchain.toml.
+# Dependabot updates each digest. `cargo xtask audit worker-image-contract`
+# checks that the build image matches rust-toolchain.toml.
 
 FROM rust:1.99.1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29 AS build
 # rust-toolchain.toml also asks for rustfmt and clippy. The build uses

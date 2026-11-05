@@ -53,7 +53,7 @@ An audit also needs a row in [`docs/audits/README.md`](audits/README.md).
 | `cargo xtask audit vantage-flash-live-region` | `xtask/src/audit/vantage_flash_live_region.rs` | `docs/audits/vantage-flash-live-region.py` |
 | `cargo xtask audit vantage-label-association` | `xtask/src/audit/vantage_label_association.rs` | `docs/audits/vantage-label-association.py` |
 | `cargo xtask audit worker-image-contract` | `xtask/src/audit/worker_image_contract.rs` | `docs/audits/worker-image-contract.py` |
-| `cargo xtask audit workflow-yaml-parse` | `xtask/src/audit/workflow_yaml_parse.rs` | `docs/audits/workflow-yaml-parse.py` |
+| `cargo xtask audit workflow-yaml-parse` | `xtask/src/audit/workflow_yaml_parse/mod.rs` | `docs/audits/workflow-yaml-parse.py` |
 
 ## Developer and release tooling
 
