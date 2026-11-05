@@ -26,7 +26,7 @@ attempt. This produced ~570,000 `harvest_events` rows in the committed run
 
 ```bash
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-  ./autumn-harvest/scripts/usage_report_activity_lookback_perf_repro.sh
+  cargo xtask perf usage-report-activity-lookback
 ```
 
 Two review-round corrections to the fixture generator, both real and both
@@ -336,7 +336,7 @@ cargo test -p autumn-harvest --features db,testing --test integration -- \
 
 # Full evidence capture (seeds ~560K+ rows; roughly 20-30 seconds):
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-  ./autumn-harvest/scripts/usage_report_activity_lookback_perf_repro.sh
+  cargo xtask perf usage-report-activity-lookback
 ```
 
 ## See also
@@ -345,7 +345,7 @@ HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
   measures.
 * `tests/integration/usage_report_activity_lookback_tests.rs` -- the harness
   and evidence-capture test.
-* `autumn-harvest/scripts/usage_report_activity_lookback_perf_repro.sh` --
+* `cargo xtask perf usage-report-activity-lookback` --
   regenerates the committed artifacts from a clean checkout.
 * `docs/perf-artifacts/usage-report-activity-lookback/` -- committed
   before/after `EXPLAIN` and result-set evidence.

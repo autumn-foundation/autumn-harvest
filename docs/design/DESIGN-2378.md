@@ -34,7 +34,7 @@ Its input is the source task under the overlay, with a `probe` mark.
 | SQLite | The SQLite host returns `EvalError::Unsupported`. SQLite has no fork. |
 | Rollout | An older worker cannot decode `live_quiet`, so it cannot run a probe. Start a probe only after every worker runs this release. |
 
-`agent_refine` (#2380) is not built yet. It will pass
+`agent_refine` (#2380) passes
 `RefinePolicy::probe_effects` as `allowed`.
 
 ## Brainstorm

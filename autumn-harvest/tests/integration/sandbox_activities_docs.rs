@@ -12,6 +12,8 @@
 //!   test that the evidence cites exists.
 //! * Each test command of the guide runs in CI.
 //! * Each prose sentence of both pages has 25 words or fewer.
+//! * The guest image commands of `cargo xtask sandbox` keep their
+//!   guarantees. The guards run the commands with stub inputs.
 //!
 //! Pure: no database, no async, no feature gate. Runs on every OS.
 
@@ -19,10 +21,12 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use super::docs_guard_support::{check_stanza, prose_sentences, section, step_stanza};
+#[cfg(unix)]
+use crate::xtask_bin::xtask;
 
 const GUIDE: &str = "docs/sandbox-activities.md";
-const IMAGE_SCRIPT: &str = "scripts/sandbox/build-guest-image.sh";
-const PUBLISH_SCRIPT: &str = "scripts/sandbox/publish-image.sh";
+/// The source of `cargo xtask sandbox build-guest-image`.
+const IMAGE_MODULE: &str = "xtask/src/sandbox/build_guest_image.rs";
 const DESIGN: &str = "docs/design/DESIGN-sandbox-activities.md";
 const FILTER: &str = "--test integration sandbox_activities_docs::";
 const MAX_SENTENCE_WORDS: usize = 25;
@@ -187,28 +191,35 @@ fn a_fakeroot_image_gets_root_owners_on_the_host_too() {
     // gives root the files in the image, not the image files themselves.
     let install = "sudo install -o root -g root -m 0644";
     let guide = read(GUIDE);
-    let script = read(IMAGE_SCRIPT);
+    let source = read(IMAGE_MODULE);
     assert!(guide.contains(install), "{GUIDE} must show `{install}`");
     assert!(
-        script.contains(install),
-        "build-guest-image.sh must print `{install}` after a non-root build"
+        source.contains(install),
+        "`cargo xtask sandbox build-guest-image` must print `{install}` after a non-root build"
     );
 }
 
 #[test]
 fn the_image_script_pins_its_default_kernel_by_digest() {
-    // The kernel runs untrusted code, so the script checks each download.
-    let script = read(IMAGE_SCRIPT);
-    let digest = script
-        .lines()
-        .find_map(|line| line.strip_prefix("default_kernel_sha256=\""))
-        .and_then(|rest| rest.strip_suffix('"'))
-        .unwrap_or_else(|| panic!("{IMAGE_SCRIPT} must set default_kernel_sha256"));
+    // The kernel runs untrusted code, so the command checks each download.
+    let source = read(IMAGE_MODULE);
+    let digest = source
+        .split_once("const DEFAULT_KERNEL_SHA256: &str =")
+        .and_then(|(_, rest)| rest.split('"').nth(1))
+        .unwrap_or_else(|| panic!("{IMAGE_MODULE} must set DEFAULT_KERNEL_SHA256"));
     assert_eq!(digest.len(), 64, "{digest}");
     assert!(digest.chars().all(|c| c.is_ascii_hexdigit()), "{digest}");
+    // The digest of the kernel is a plain field, so no path can skip it.
+    let kernel = source
+        .split_once("struct Kernel {")
+        .and_then(|(_, rest)| rest.split_once('}'))
+        .map_or_else(
+            || panic!("{IMAGE_MODULE} must define `struct Kernel`"),
+            |(body, _)| body,
+        );
     assert!(
-        !script.contains("if [ -n \"${KERNEL_SHA256:-}\" ]"),
-        "{IMAGE_SCRIPT} must check the kernel digest on every path"
+        kernel.contains("sha256: String,"),
+        "{IMAGE_MODULE} must check the kernel digest on every path: {kernel}"
     );
 }
 
@@ -216,14 +227,14 @@ fn the_image_script_pins_its_default_kernel_by_digest() {
 #[test]
 fn the_image_script_refuses_a_kernel_url_without_a_digest() {
     let out = std::env::temp_dir().join(format!("hsbx-image-{}", std::process::id()));
-    let result = std::process::Command::new("bash")
-        .arg(repo_root().join(IMAGE_SCRIPT))
+    let result = xtask()
+        .args(["sandbox", "build-guest-image"])
         .arg(&out)
         .env("KERNEL_URL", "file:///nonexistent/vmlinux")
         .env_remove("KERNEL_SHA256")
         .env("AGENT_BIN", "/nonexistent/harvest-guest-agent")
         .output()
-        .expect("bash runs");
+        .expect("xtask runs");
     let _ = std::fs::remove_dir_all(&out);
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(!result.status.success(), "{stderr}");
@@ -260,15 +271,15 @@ fn a_failed_image_build_keeps_the_old_image() {
         "harvest.invalid/!!".to_owned(),
     ));
     for (case, sha, base) in cases {
-        let result = std::process::Command::new("bash")
-            .arg(repo_root().join(IMAGE_SCRIPT))
+        let result = xtask()
+            .args(["sandbox", "build-guest-image"])
             .arg(&out)
             .env("KERNEL_URL", format!("file://{}", kernel.display()))
             .env("KERNEL_SHA256", sha)
             .env("BASE_IMAGE", base)
             .env("AGENT_BIN", "/nonexistent/harvest-guest-agent")
             .output()
-            .expect("bash runs");
+            .expect("xtask runs");
         assert!(!result.status.success(), "{case}: the build must fail");
         let kept = |name: &str| std::fs::read(out.join(name)).unwrap_or_default();
         assert_eq!(kept("vmlinux"), b"old kernel", "{case}");
@@ -293,12 +304,12 @@ fn a_failed_publish_puts_back_the_old_image() {
     const FILES: [&str; 3] = ["rootfs.ext4", "vmlinux", "image.sha256"];
     let scratch = std::env::temp_dir().join(format!("hsbx-publish-{}", std::process::id()));
     let publish = |stage: &Path, out: &Path| {
-        std::process::Command::new("bash")
-            .arg(repo_root().join(PUBLISH_SCRIPT))
+        xtask()
+            .args(["sandbox", "publish-image"])
             .arg(stage)
             .arg(out)
             .output()
-            .expect("bash runs")
+            .expect("xtask runs")
     };
     let setup = |case: &str, staged: &[&str]| {
         let (stage, out) = (
@@ -365,17 +376,13 @@ fn image_links_cannot_take_a_build_write_out_of_the_image() {
     let root = std::env::temp_dir().join(format!("hsbx-image-path-{}", std::process::id()));
     std::fs::create_dir_all(root.join("usr/sbin")).expect("usr/sbin");
     std::fs::create_dir_all(root.join("etc")).expect("etc");
-    let helper = repo_root().join("scripts/sandbox/image-path.sh");
     let resolve = |path: &str| {
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(". \"$1\"; image_path \"$2\" \"$3\"")
-            .arg("sh")
-            .arg(&helper)
+        xtask()
+            .args(["sandbox", "image-path"])
             .arg(&root)
             .arg(path)
             .output()
-            .expect("sh runs")
+            .expect("xtask runs")
     };
     let resolved = |path: &str| {
         let out = resolve(path);
@@ -397,14 +404,18 @@ fn image_links_cannot_take_a_build_write_out_of_the_image() {
     assert_eq!(resolved("/work"), inside("work"));
     symlink("loop", root.join("loop")).expect("loop link");
     assert!(!resolve("/loop").status.success(), "a link loop must fail");
-    // The build writes the agent and its directories through the helper.
-    let script = read("scripts/sandbox/build-guest-image.sh");
+    // The build writes the agent and its directories through `image-path`.
+    let source = read(IMAGE_MODULE);
     assert!(
-        script.contains("image_path \"${rootfs}\" /sbin"),
-        "{script}"
+        source.contains("image_path \"${rootfs}\" /sbin"),
+        "{IMAGE_MODULE} must resolve /sbin inside the image"
     );
     assert!(
-        !script.contains("install -D"),
+        source.contains("image_path() { \"${xtask}\" sandbox image-path \"$@\"; }"),
+        "{IMAGE_MODULE} must resolve image paths with `cargo xtask sandbox image-path`"
+    );
+    assert!(
+        !source.contains("install -D"),
         "install -D follows image links"
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -426,12 +437,12 @@ fn a_publish_makes_each_image_file_readable_by_the_jail() {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .expect("stage mode");
     }
-    let status = std::process::Command::new("bash")
-        .arg(repo_root().join(PUBLISH_SCRIPT))
+    let status = xtask()
+        .args(["sandbox", "publish-image"])
         .arg(&stage)
         .arg(&out)
         .status()
-        .expect("run publish-image.sh");
+        .expect("run cargo xtask sandbox publish-image");
     assert!(status.success(), "{status}");
     // The jailed VMM reads each file as the jail uid.
     for file in FILES {
@@ -471,12 +482,12 @@ fn a_publish_waits_for_a_launcher_that_pins() {
         .read_line(&mut held)
         .expect("the pin reports its lock");
     assert_eq!(held.trim(), "held");
-    let mut publish = std::process::Command::new("bash")
-        .arg(repo_root().join(PUBLISH_SCRIPT))
+    let mut publish = xtask()
+        .args(["sandbox", "publish-image"])
         .arg(&stage)
         .arg(&out)
         .spawn()
-        .expect("bash runs");
+        .expect("xtask runs");
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(
         publish.try_wait().expect("publish state").is_none(),

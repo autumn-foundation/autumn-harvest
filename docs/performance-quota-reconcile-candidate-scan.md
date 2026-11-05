@@ -62,7 +62,7 @@ agent's own admissible-evidence rules already name.
 `reconcile_quota_keys_from` runs on `worker_heartbeat_interval` cadence,
 once per assigned shard, on every worker process. Reproduce:
 `HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
-autumn-harvest/scripts/quota_reconcile_candidate_scan_perf_repro.sh`.
+cargo xtask perf quota-reconcile-candidate-scan`.
 
 ## 📈 Fixture
 
@@ -289,5 +289,5 @@ population scale.
 sudo systemctl start postgresql   # or any reachable Postgres 13+ with
                                    # pg_stat_statements preloaded
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-  autumn-harvest/scripts/quota_reconcile_candidate_scan_perf_repro.sh
+  cargo xtask perf quota-reconcile-candidate-scan
 ```

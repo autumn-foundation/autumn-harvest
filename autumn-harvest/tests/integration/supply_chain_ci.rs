@@ -4,30 +4,34 @@
 //!
 //! - A daily `cargo deny check advisories` scan. New RUSTSEC advisories land
 //!   with no code change, so the change-gated CI job does not see them.
-//! - A SHA pin on every `uses:`. `docs/audits/action-sha-pin.py` checks each
-//!   line in the `lint` job. This file checks that the job runs it.
+//! - A SHA pin on every `uses:`. `cargo xtask audit action-sha-pin` checks each
+//!   line in the `lint` job. This file checks that the job runs it, and that
+//!   its fixtures pass.
 //! - A Dependabot file for `cargo`, `github-actions` and `docker`.
 //! - A release that builds auditable binaries, a `CycloneDX` SBOM, a Sigstore
 //!   signature and GitHub artifact attestations.
 //! - A worker image that the release builds with no write token. A separate
 //!   job pushes, signs and attests it by digest (issue #1989).
 //!
-//! The scan behaviour tests run `.github/ci/advisory-scan.sh` with a stub
-//! `cargo` and a stub `gh` first on `PATH`. The script reads the stub JSON
-//! with the real `jq`, so the tests also check its filters. They run on Linux
-//! only, as the chaos watchdog tests do.
+//! The scan behaviour tests run `cargo xtask ci advisory-scan` with a stub
+//! `cargo` and a stub `gh` first on `PATH`. The command reads the stub JSON
+//! itself, so the tests also check its filters. They run on Linux only, as
+//! the chaos watchdog tests do.
 
 use super::ci_run_coverage::{parse_workflow, repo_root, workflow_crons, workflow_run_commands};
 use serde_yaml::Value;
 
 const SCAN_WORKFLOW: &str = ".github/workflows/advisory-scan.yml";
-const SCAN_SCRIPT: &str = ".github/ci/advisory-scan.sh";
+/// The module of the scan. A pull request that changes it runs the scan.
+const SCAN_MODULE: &str = "xtask/src/ci/advisory_scan.rs";
+/// The command that the scan step runs.
+const SCAN_COMMAND: &str = "cargo xtask ci advisory-scan";
 const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
 const RELEASE_WORKFLOW: &str = ".github/workflows/release.yml";
 const DEPENDABOT: &str = ".github/dependabot.yml";
-const SHA_PIN_AUDIT: &str = "docs/audits/action-sha-pin.py";
+const SHA_PIN_AUDIT: &str = "cargo xtask audit action-sha-pin";
 
-/// The alert issue title. The script finds its open alert by this exact title.
+/// The alert issue title. The scan finds its open alert by this exact title.
 #[cfg(target_os = "linux")]
 const ALERT_TITLE: &str = "Advisory scan: cargo deny check advisories failed";
 
@@ -148,7 +152,7 @@ fn advisory_scan_runs_daily_on_demand_and_on_its_own_changes() {
         .iter()
         .filter_map(Value::as_str)
         .collect();
-    for path in [SCAN_WORKFLOW, SCAN_SCRIPT, "deny.toml"] {
+    for path in [SCAN_WORKFLOW, SCAN_MODULE, "deny.toml"] {
         assert!(
             paths.contains(&path),
             "{SCAN_WORKFLOW} must run on a pull request that changes {path}; paths: {paths:?}"
@@ -156,7 +160,7 @@ fn advisory_scan_runs_daily_on_demand_and_on_its_own_changes() {
     }
 }
 
-/// The script opens issues and reads the code. It needs nothing else.
+/// The scan opens issues and reads the code. It needs nothing else.
 #[test]
 fn advisory_scan_has_least_privilege() {
     let doc = parse_workflow(SCAN_WORKFLOW);
@@ -184,19 +188,17 @@ fn advisory_scan_has_least_privilege() {
     );
 }
 
-/// The scan step runs the script. It alerts on the cron run only, so a pull
-/// request run never opens an issue. A pull request run gets no token, so
-/// its script cannot write one either.
+/// The scan step runs the xtask command. It alerts on the cron run only, so a
+/// pull request run never opens an issue. A pull request run gets no token,
+/// so its scan cannot write one either.
 #[test]
 fn advisory_scan_alerts_on_scheduled_runs_only() {
     let doc = parse_workflow(SCAN_WORKFLOW);
     let steps = job_steps(&doc, SCAN_WORKFLOW, "scan");
     let scan = steps
         .iter()
-        .find(|s| text(s, "run").is_some_and(|r| r.trim() == format!("bash {SCAN_SCRIPT}")))
-        .unwrap_or_else(|| {
-            panic!("{SCAN_WORKFLOW} must have a step that runs `bash {SCAN_SCRIPT}`")
-        });
+        .find(|s| text(s, "run").is_some_and(|r| r.trim() == SCAN_COMMAND))
+        .unwrap_or_else(|| panic!("{SCAN_WORKFLOW} must have a step that runs `{SCAN_COMMAND}`"));
     let alert = scan
         .get("env")
         .and_then(|e| text(e, "ADVISORY_ALERT"))
@@ -211,7 +213,7 @@ fn advisory_scan_alerts_on_scheduled_runs_only() {
         .unwrap_or_default();
     assert_eq!(
         token, "${{ github.event_name == 'schedule' && github.token || '' }}",
-        "only a scheduled run may hand the script a token"
+        "only a scheduled run may hand the scan a token"
     );
     assert_eq!(
         text(scan, "id"),
@@ -220,10 +222,10 @@ fn advisory_scan_alerts_on_scheduled_runs_only() {
     );
 }
 
-/// A red run that the script did not report must still reach the issue. That
+/// A red run that the scan did not report must still reach the issue. That
 /// covers a failed setup step, a step timeout and a lost `gh` call. A step
 /// timeout is a step failure, so `steps.scan.outcome` cannot tell these apart
-/// from a reported finding. The script's `reported` output can.
+/// from a reported finding. The scan's `reported` output can.
 #[test]
 fn advisory_scan_reports_an_unreported_failure() {
     let doc = parse_workflow(SCAN_WORKFLOW);
@@ -234,13 +236,41 @@ fn advisory_scan_reports_an_unreported_failure() {
         cond.contains("failure()")
             && cond.contains("github.event_name == 'schedule'")
             && cond.contains("steps.scan.outputs.reported != 'true'")
-            && run.contains(SCAN_SCRIPT)
-            && run.contains("run-failed")
+            && run.contains(&format!("{SCAN_COMMAND} run-failed"))
     });
     assert!(
         reports,
         "{SCAN_WORKFLOW} must have an `if: failure()` step for scheduled runs that runs \
-         `{SCAN_SCRIPT} run-failed` when the scan step did not report"
+         `{SCAN_COMMAND} run-failed` when the scan step did not report"
+    );
+}
+
+/// A failed build leaves no xtask binary, so the report step cannot run it.
+/// The build must be its own step, before the scan, so that failure is a red
+/// run with no report. The report step then takes its fallback.
+#[test]
+fn advisory_scan_builds_xtask_before_the_scan() {
+    let doc = parse_workflow(SCAN_WORKFLOW);
+    let steps = job_steps(&doc, SCAN_WORKFLOW, "scan");
+    let build = steps
+        .iter()
+        .position(|s| {
+            text(s, "run").is_some_and(|r| r.contains("cargo build") && r.contains("-p xtask"))
+        })
+        .unwrap_or_else(|| panic!("{SCAN_WORKFLOW} must build xtask in its own step"));
+    let scan = steps
+        .iter()
+        .position(|s| text(s, "id") == Some("scan"))
+        .expect("the scan step");
+    assert!(
+        build < scan,
+        "the build step must come before the scan step"
+    );
+    assert!(
+        steps[..build]
+            .iter()
+            .any(|s| uses(s, "dtolnay/rust-toolchain")),
+        "{SCAN_WORKFLOW} must install a toolchain before it builds xtask"
     );
 }
 
@@ -292,7 +322,7 @@ fn advisory_scan_and_ci_gate_pin_the_same_cargo_deny() {
     );
 }
 
-// ── Scan script behaviour (stub `cargo` and `gh`) ───────────────────────────
+// ── Scan behaviour (stub `cargo` and `gh`) ──────────────────────────────────
 
 /// The canned answers that the stubs give.
 #[cfg(target_os = "linux")]
@@ -305,7 +335,7 @@ struct Stub {
     issues: Option<String>,
     /// Value of `ADVISORY_ALERT`.
     alert: bool,
-    /// The script argument, if any.
+    /// The command argument, if any.
     arg: Option<&'static str>,
     /// When true, each `gh issue` write fails as an API error does.
     write_fails: bool,
@@ -340,7 +370,7 @@ impl Stub {
     }
 }
 
-/// The result of one script run against the stubs.
+/// The result of one scan run against the stubs.
 #[cfg(target_os = "linux")]
 struct Outcome {
     code: Option<i32>,
@@ -351,7 +381,7 @@ struct Outcome {
     cargo: Vec<String>,
     /// The last `--body-file` content passed to `gh`.
     body: String,
-    /// The step outputs that the script wrote to `GITHUB_OUTPUT`.
+    /// The step outputs that the scan wrote to `GITHUB_OUTPUT`.
     outputs: String,
 }
 
@@ -367,15 +397,27 @@ impl Outcome {
             .any(|p| self.called(p))
     }
 
-    /// True when the script told the workflow that it reported this run.
+    /// True when the scan told the workflow that it reported this run.
     fn reported(&self) -> bool {
         self.outputs.lines().any(|l| l == "reported=true")
     }
 }
 
-/// Runs the scan script with stub `cargo` and `gh` first on `PATH`.
+/// Runs the scan command with stub `cargo` and `gh` first on `PATH`.
 #[cfg(target_os = "linux")]
 fn run_scan(stub: &Stub) -> Outcome {
+    let mut cmd = crate::xtask_bin::xtask();
+    cmd.args(["ci", "advisory-scan"]);
+    if let Some(arg) = stub.arg {
+        cmd.arg(arg);
+    }
+    run_stubbed(stub, cmd)
+}
+
+/// Runs `cmd` with stub `cargo` and `gh` first on `PATH` and the runner
+/// variables set.
+#[cfg(target_os = "linux")]
+fn run_stubbed(stub: &Stub, mut cmd: std::process::Command) -> Outcome {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -414,11 +456,6 @@ if [ "$1" = issue ] && [ "$STUB_WRITE_FAIL" = 1 ]; then echo "HTTP 502" >&2; exi
 "#,
     );
 
-    let mut cmd = std::process::Command::new("bash");
-    cmd.arg(repo_root().join(SCAN_SCRIPT));
-    if let Some(arg) = stub.arg {
-        cmd.arg(arg);
-    }
     let path = format!(
         "{}:{}",
         dir.path().display(),
@@ -440,7 +477,7 @@ if [ "$1" = issue ] && [ "$STUB_WRITE_FAIL" = 1 ]; then echo "HTTP 502" >&2; exi
         .env("STUB_WRITE_FAIL", if stub.write_fails { "1" } else { "0" })
         .env("GITHUB_OUTPUT", dir.path().join("outputs.txt"))
         .output()
-        .expect("run bash");
+        .expect("run the scan");
     let lines = |name: &str| -> Vec<String> {
         std::fs::read_to_string(dir.path().join(name))
             .unwrap_or_default()
@@ -458,7 +495,7 @@ if [ "$1" = issue ] && [ "$STUB_WRITE_FAIL" = 1 ]; then echo "HTTP 502" >&2; exi
     }
 }
 
-/// The script runs the same command as the CI gate, scoped to advisories.
+/// The scan runs the same command as the CI gate, scoped to advisories.
 #[cfg(target_os = "linux")]
 #[test]
 fn scan_runs_cargo_deny_check_advisories() {
@@ -467,7 +504,7 @@ fn scan_runs_cargo_deny_check_advisories() {
     assert_eq!(
         out.cargo,
         vec!["deny --all-features --color never check advisories".to_string()],
-        "the script must run exactly one cargo deny scan"
+        "the scan must run exactly one cargo deny scan"
     );
     assert!(
         out.stdout.contains("advisories ok"),
@@ -486,7 +523,7 @@ fn scan_is_silent_when_clean_and_no_alert_is_open() {
 }
 
 /// The lookup reads every page and counts only issues that this workflow
-/// opened. A person can open an issue with the same title, and the script
+/// opened. A person can open an issue with the same title, and the scan
 /// must not comment on it or close it.
 #[cfg(target_os = "linux")]
 #[test]
@@ -653,8 +690,8 @@ fn scan_rejects_an_unknown_argument() {
     assert!(out.gh.is_empty(), "no gh call: {:?}", out.gh);
 }
 
-/// GitHub caps an issue body at 65536 characters. The script quotes the tail
-/// of a long scan, so the alert still posts.
+/// GitHub caps an issue body at 65536 characters. The scan quotes the tail
+/// of a long scan output, so the alert still posts.
 #[cfg(target_os = "linux")]
 #[test]
 fn scan_truncates_a_long_report() {
@@ -673,7 +710,7 @@ fn scan_truncates_a_long_report() {
     );
 }
 
-/// In `run-failed` mode the script reports a red run on the alert issue.
+/// In `run-failed` mode the command reports a red run on the alert issue.
 /// It does not scan, because the scan or its setup is what failed.
 #[cfg(target_os = "linux")]
 #[test]
@@ -697,6 +734,53 @@ fn scan_run_failed_mode_reports_the_run() {
     assert!(out.called("issue comment 31"), "gh: {:?}", out.gh);
 }
 
+/// The `run:` text of the scan job's `if: failure()` step.
+#[cfg(target_os = "linux")]
+fn report_step_run() -> String {
+    let doc = parse_workflow(SCAN_WORKFLOW);
+    job_steps(&doc, SCAN_WORKFLOW, "scan")
+        .iter()
+        .filter(|step| text(step, "if").is_some_and(|cond| cond.contains("failure()")))
+        .find_map(|step| text(step, "run"))
+        .expect("an `if: failure()` step with a `run:`")
+        .to_string()
+}
+
+/// Runs the report step in an empty directory, as after a failed checkout.
+/// The shell options are the ones that GitHub Actions gives a `run:` step.
+#[cfg(target_os = "linux")]
+fn run_report_step_without_checkout(stub: &Stub) -> Outcome {
+    let empty = tempfile::tempdir().expect("tempdir");
+    let mut cmd = std::process::Command::new("bash");
+    cmd.args(["--noprofile", "--norc", "-eo", "pipefail", "-c"])
+        .arg(report_step_run())
+        .current_dir(empty.path());
+    run_stubbed(stub, cmd)
+}
+
+/// With no checkout there is no xtask binary. The report step must still
+/// post the red run on the alert issue, without a duplicate.
+#[cfg(target_os = "linux")]
+#[test]
+fn advisory_scan_report_step_works_without_checkout() {
+    let out = run_report_step_without_checkout(&Stub::scheduled(0));
+    assert_eq!(out.code, Some(0), "gh: {:?}", out.gh);
+    assert!(out.cargo.is_empty(), "no scan: {:?}", out.cargo);
+    let create = out
+        .gh
+        .iter()
+        .find(|c| c.starts_with("issue create"))
+        .unwrap_or_else(|| panic!("no issue opened; gh: {:?}", out.gh));
+    assert!(
+        create.contains(ALERT_TITLE) && create.contains("actions/runs/4242"),
+        "the issue must use the alert title and link the run: {create}"
+    );
+
+    let out = run_report_step_without_checkout(&Stub::scheduled(0).with_issue(31, ALERT_TITLE));
+    assert!(out.called("issue comment 31"), "gh: {:?}", out.gh);
+    assert!(!out.called("issue create"), "gh: {:?}", out.gh);
+}
+
 // ── SHA pins ────────────────────────────────────────────────────────────────
 
 /// The pin lint is the enforcement of "every `uses:` references a SHA". The
@@ -710,13 +794,41 @@ fn lint_job_runs_the_sha_pin_audit() {
         .collect();
     let lines: Vec<&str> = runs.iter().flat_map(|r| r.lines()).map(str::trim).collect();
     assert!(
-        lines.contains(&format!("python3 {SHA_PIN_AUDIT} --self-test").as_str()),
-        "the lint job must run `python3 {SHA_PIN_AUDIT} --self-test`"
+        lines.contains(&format!("{SHA_PIN_AUDIT} --self-test").as_str()),
+        "the lint job must run `{SHA_PIN_AUDIT} --self-test`"
     );
     assert!(
-        lines.contains(&format!("python3 {SHA_PIN_AUDIT}").as_str()),
-        "the lint job must run `python3 {SHA_PIN_AUDIT}`"
+        lines.contains(&SHA_PIN_AUDIT),
+        "the lint job must run `{SHA_PIN_AUDIT}`"
     );
+}
+
+/// The pin lint decides each form as its fixtures expect, and the tree has no
+/// unpinned `uses:`. A lint that passed its CI step while broken would let a
+/// tag pin through.
+#[test]
+fn sha_pin_audit_passes_its_fixtures_and_the_tree() {
+    for args in [
+        &["audit", "action-sha-pin", "--self-test"][..],
+        &["audit", "action-sha-pin"],
+    ] {
+        let output = crate::xtask_bin::xtask()
+            .args(args)
+            .output()
+            .expect("run cargo xtask audit action-sha-pin");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "`cargo xtask {}` failed:\n{stdout}{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(", 0 wrong") || stdout.contains(", 0 unpinned"),
+            "`cargo xtask {}` printed no clean summary:\n{stdout}",
+            args.join(" ")
+        );
+    }
 }
 
 /// A SHA pin drops what a branch ref implied. `dtolnay/rust-toolchain@stable`
@@ -1047,7 +1159,7 @@ fn release_builds_the_client_without_a_write_token() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        runs.contains("scripts/build-typescript-client.sh"),
+        runs.contains("cargo xtask dev build-typescript-client"),
         "{runs}"
     );
 }
@@ -1178,7 +1290,7 @@ fn release_runs_every_tag_gate_before_signing() {
 
 // ── Release: worker container image (issue #1989) ───────────────────────────
 
-const IMAGE_CONTRACT_AUDIT: &str = "docs/audits/worker-image-contract.py";
+const IMAGE_CONTRACT_AUDIT: &str = "cargo xtask audit worker-image-contract";
 const CHART: &str = "charts/autumn-harvest-worker";
 
 /// The image build runs third-party `build.rs` code. It must hold no token
@@ -1316,14 +1428,30 @@ fn lint_job_runs_helm_lint_and_the_image_contract() {
         "the lint job must run `helm lint --strict` on {CHART}"
     );
     for line in [
-        format!("python3 {IMAGE_CONTRACT_AUDIT} --self-test"),
-        format!("python3 {IMAGE_CONTRACT_AUDIT}"),
+        format!("{IMAGE_CONTRACT_AUDIT} --self-test"),
+        IMAGE_CONTRACT_AUDIT.to_owned(),
     ] {
         assert!(
             lines.contains(&line.as_str()),
             "the lint job must run `{line}`"
         );
     }
+}
+
+/// The image contract decides each fixture as expected. The full audit needs
+/// `helm`, which the `lint` job installs, so this test runs the fixtures only.
+#[test]
+fn image_contract_audit_passes_its_fixtures() {
+    let output = crate::xtask_bin::xtask()
+        .args(["audit", "worker-image-contract", "--self-test"])
+        .output()
+        .expect("run cargo xtask audit worker-image-contract --self-test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains(" cases, 0 failed"),
+        "`{IMAGE_CONTRACT_AUDIT} --self-test` failed:\n{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// The Dockerfile pins each base image by digest. Dependabot keeps the

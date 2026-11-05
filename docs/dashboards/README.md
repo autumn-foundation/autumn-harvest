@@ -233,7 +233,7 @@ the merged file — by which point both PRs are already in.
 Get a collision-resistant id instead:
 
 ```sh
-python3 docs/dashboards/next-panel-id.py
+cargo xtask dev next-panel-id
 ```
 
 It draws from a wide, mostly-empty range, so two branches picking one at

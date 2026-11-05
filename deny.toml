@@ -311,6 +311,25 @@ ignore = [
     # also corrects that count. Neither correction changes the dependency
     # graph or the advisory verdict.
     { id = "RUSTSEC-2024-0449", reason = "unmaintained, not a vulnerability: unsafe-libyaml arrives only through the deprecated serde_yaml, which only our own dev-dependency pulls in since autumn-web 0.9.0 moved to serde-saphyr. It parses checked-in CI workflow YAML in 11 integration-test modules. Revisit: those guards move to a maintained parser." },
+
+    # RUSTSEC-2026-0440: `astral-tokio-tar` 0.6.4 is unmaintained. It is not
+    # a vulnerability. Astral ended maintenance on 2026-11-03, and the
+    # advisory names no safe upgrade. Only testcontainers 0.27.3 pulls it in.
+    # Each user is a dev-dependency, or the `test-support` feature of
+    # autumn-web, which only a dev-dependency of autumn-harvest-plugin
+    # turns on. No code here calls the crate. Revisit: testcontainers moves
+    # to another tar crate, or a maintained fork appears.
+    { id = "RUSTSEC-2026-0440", reason = "unmaintained, not a vulnerability, no safe upgrade: astral-tokio-tar arrives only through testcontainers, a test dependency. No code here calls it. Revisit: testcontainers drops it." },
+
+    # RUSTSEC-2026-0441: `pin-utils` 0.1.1 is unmaintained. It is not a
+    # vulnerability. Its repository was archived on 2026-10-01, and the
+    # advisory names no safe upgrade. Three paths pull it in: the AWS SDK
+    # crates (aws-smithy-http, -runtime and -types) of the optional sqs,
+    # aws-kms and object-store features, loom (only under `--cfg loom`), and
+    # wasmtimer through postgresql_archive (only `dev-runtime-managed`). No
+    # code here calls the crate. Revisit: the AWS SDK, loom and wasmtimer
+    # move to `core::pin::pin!` or pin-project-lite.
+    { id = "RUSTSEC-2026-0441", reason = "unmaintained, not a vulnerability, no safe upgrade: pin-utils arrives only through the AWS SDK crates of optional features, loom under --cfg loom, and wasmtimer under dev-runtime-managed. No code here calls it. Revisit: those crates drop it." },
 ]
 
 # ---------------------------------------------------------------------------

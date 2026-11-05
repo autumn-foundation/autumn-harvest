@@ -140,7 +140,7 @@ The pin is `env.FUZZ_TOOLCHAIN` in `.github/workflows/fuzz-nightly.yml`.
 The 1.100 nightlies that were tested (2026-09-01 and later) fail to build the
 `db` feature: E0275, a recursion-limit error or an ICE in the diesel
 transaction futures. Move the pin forward, in the workflow and in
-`fuzz/smoke.sh`, once a newer nightly compiles the crate. The guard
+`xtask/src/dev/fuzz_smoke.rs`, once a newer nightly compiles the crate. The guard
 `fuzz_toolchain_pins_agree` keeps the two pins equal.
 
 The harness lives in `fuzz/` — a crate deliberately **excluded** from the root
@@ -245,9 +245,9 @@ cargo +nightly-2026-08-14 fuzz run fuzz_replay path/to/crash-<hash>
 cargo +nightly-2026-08-14 fuzz run fuzz_det_check_source -- -max_total_time=300
 
 # Quick smoke of every target (~15s each) — the manual/local helper:
-./fuzz/smoke.sh
+cargo xtask dev fuzz-smoke
 # ...or override the per-target budget:
-MAX_TOTAL_TIME=60 ./fuzz/smoke.sh
+MAX_TOTAL_TIME=60 cargo xtask dev fuzz-smoke
 ```
 
 ### CI
@@ -279,7 +279,7 @@ seconds, one job per target (issue #1835).
   so a narrower filter would miss a replayer change. A draft PR skips it.
 
 The guard `fuzz_nightly_wiring.rs` keeps the target lists of
-`fuzz/Cargo.toml`, `fuzz/smoke.sh` and the workflow equal. It also checks
+`fuzz/Cargo.toml`, `xtask/src/dev/fuzz_smoke.rs` and the workflow equal. It also checks
 the cron, the corpus cycle and the alert job.
 
 ---

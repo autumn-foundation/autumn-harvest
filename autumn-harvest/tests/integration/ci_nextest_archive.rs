@@ -6,8 +6,9 @@
 //! no test fails. These tests read the manifest and compare it with what the
 //! runner executes. They need no DB and no feature.
 //!
-//! The runner tests start `bash`, so they run on Unix only. The workflow tests
-//! parse YAML and run on every OS.
+//! The runner tests run `cargo xtask ci run-suites` and the workflow tests
+//! parse YAML, so both run on every OS. The image pre-pull tests put a `bash`
+//! stub of `docker` on `PATH`, so they run on Unix only.
 
 use std::collections::BTreeSet;
 
@@ -75,23 +76,18 @@ fn expected_term(row: &Row) -> String {
 
 // ── The runner, run with DRY_RUN=1 ──────────────────────────────────────────
 
-#[cfg(unix)]
 mod runner {
-    use std::process::{Command, Output};
+    use std::process::Output;
 
-    use super::repo_root;
-
-    const RUNNER: &str = ".github/ci/run-suites.sh";
-
-    /// Runs the runner with `DRY_RUN=1` and the given extra environment.
+    /// Runs `cargo xtask ci run-suites` with `DRY_RUN=1` and the given extra
+    /// environment.
     ///
     /// The shard variables and `SUITES_MANIFEST` are cleared first, so the
     /// environment of the test process cannot change the result.
     pub fn run(args: &[&str], env: &[(&str, &str)]) -> Output {
-        let mut cmd = Command::new("bash");
-        cmd.arg(repo_root().join(RUNNER))
+        let mut cmd = crate::xtask_bin::xtask();
+        cmd.args(["ci", "run-suites"])
             .args(args)
-            .current_dir(repo_root())
             .env("DRY_RUN", "1")
             .env_remove("SEMAPHORE_SHARD_COUNT")
             .env_remove("SEMAPHORE_SHARD_INDEX")
@@ -103,7 +99,7 @@ mod runner {
         for (key, value) in env {
             cmd.env(key, value);
         }
-        cmd.output().expect("start bash")
+        cmd.output().expect("start the xtask runner")
     }
 
     /// The command that `DRY_RUN=1` prints on its `+ ` line.
@@ -129,7 +125,6 @@ mod runner {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn archive_holds_every_live_db_crate_target_and_feature() {
     let command = runner::printed(&runner::run(&["archive", "/tmp/a.tar.zst"], &[]));
@@ -172,7 +167,6 @@ fn archive_holds_every_live_db_crate_target_and_feature() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn filterset_has_one_term_per_row() {
     for class in ["linux", "linuxpart"] {
@@ -190,7 +184,6 @@ fn filterset_has_one_term_per_row() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn nextest_partition_is_the_shard_index_plus_one() {
     for (index, partition) in [("0", "hash:1/21"), ("20", "hash:21/21")] {
@@ -213,7 +206,6 @@ fn nextest_partition_is_the_shard_index_plus_one() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn nextest_runs_serially_from_the_extracted_archive() {
     for class in ["linux", "linuxpart"] {
@@ -233,7 +225,6 @@ fn nextest_runs_serially_from_the_extracted_archive() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn only_linuxpart_runs_with_the_partitioned_layout() {
     let part = runner::printed(&runner::run(&["nextest", "linuxpart"], &[]));
@@ -248,7 +239,6 @@ fn only_linuxpart_runs_with_the_partitioned_layout() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn extract_unpacks_into_the_checkout() {
     let command = runner::printed(&runner::run(&["extract", "/tmp/a.tar.zst"], &[]));
@@ -259,7 +249,6 @@ fn extract_unpacks_into_the_checkout() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_filter_outside_the_safe_charset_is_refused() {
     let dir = tempfile::tempdir().expect("make a temp dir");
@@ -319,7 +308,7 @@ fn the_archive_job_builds_and_uploads_the_archive() {
     let ci = parse_workflow(".github/workflows/ci.yml");
     let job = &ci["jobs"]["test-db-archive"];
     assert_eq!(
-        steps_running(job, "run-suites.sh archive").len(),
+        steps_running(job, "xtask ci run-suites archive").len(),
         1,
         "`test-db-archive` must build the archive once"
     );
@@ -341,13 +330,13 @@ fn every_shard_runs_both_live_db_classes_from_the_archive() {
         moves_the_artifact(shard, "actions/download-artifact@"),
         "`test-db-linux` must download the `{ARTIFACT}` artifact"
     );
-    assert_eq!(steps_running(shard, "run-suites.sh extract").len(), 1);
+    assert_eq!(steps_running(shard, "xtask ci run-suites extract").len(), 1);
 
     // An exact `run` line, because `nextest linux` is a prefix of
     // `nextest linuxpart`. Every shard runs both. A shard gate such as
     // `matrix.shard == 0` would drop the other slices of the partition.
     for class in ["linux", "linuxpart"] {
-        let run = format!("bash .github/ci/run-suites.sh nextest {class}");
+        let run = format!("cargo xtask ci run-suites nextest {class}");
         let matching: Vec<_> = steps(shard)
             .into_iter()
             .filter(|s| str_at(s, &["run"]).trim() == run)
@@ -364,7 +353,7 @@ fn every_shard_runs_both_live_db_classes_from_the_archive() {
         );
     }
     assert!(
-        steps_running(shard, "run-suites.sh run linux").is_empty(),
+        steps_running(shard, "xtask ci run-suites run linux").is_empty(),
         "a shard must not compile its rows again with `run linux`"
     );
 }
@@ -389,12 +378,12 @@ const EMULATORS: &[&str] = &[
 ];
 
 /// A hash partition sends the tests of each emulator suite to many shards.
-/// The row plan of `pull-test-images.sh` cannot name those shards, so each
-/// shard must pull every emulator.
+/// The row plan of `cargo xtask ci pull-test-images` cannot name those
+/// shards, so each shard must pull every emulator.
 #[test]
 fn every_shard_pulls_every_emulator_image() {
     let ci = parse_workflow(".github/workflows/ci.yml");
-    let pulls = steps_running(&ci["jobs"]["test-db-linux"], "pull-test-images.sh");
+    let pulls = steps_running(&ci["jobs"]["test-db-linux"], "xtask ci pull-test-images");
     assert_eq!(pulls.len(), 1, "`test-db-linux` must pre-pull its images");
     assert_eq!(
         str_at(pulls[0], &["env", "PULL_EVERY_SUITE_IMAGE"]),
@@ -403,7 +392,8 @@ fn every_shard_pulls_every_emulator_image() {
     );
 }
 
-/// Runs `pull-test-images.sh` with a `docker` stub that prints each pull.
+/// Runs `cargo xtask ci pull-test-images` with a `docker` stub that prints
+/// each pull.
 #[cfg(unix)]
 fn pulled_images(env: &[(&str, &str)]) -> String {
     use std::os::unix::fs::PermissionsExt;
@@ -422,17 +412,17 @@ fn pulled_images(env: &[(&str, &str)]) -> String {
         dir.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let mut cmd = std::process::Command::new("bash");
-    cmd.arg(repo_root().join(".github/ci/pull-test-images.sh"))
-        .current_dir(repo_root())
+    let mut cmd = crate::xtask_bin::xtask();
+    cmd.args(["ci", "pull-test-images"])
         .env("PATH", path)
+        .env_remove("SUITES_MANIFEST")
         .env_remove("PULL_EVERY_SUITE_IMAGE")
         .env_remove("SEMAPHORE_SHARD_COUNT")
         .env_remove("SEMAPHORE_SHARD_INDEX");
     for (key, value) in env {
         cmd.env(key, value);
     }
-    let out = cmd.output().expect("start bash");
+    let out = cmd.output().expect("start the xtask pre-pull");
     assert!(
         out.status.success(),
         "the pre-pull failed: {}",

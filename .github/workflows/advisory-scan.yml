@@ -7,8 +7,9 @@
 # A scheduled run that finds an advisory opens an issue, or comments on the
 # open one. A clean scheduled run closes it. A pull request that changes the
 # scan runs it too, with no issue write and no token. The logic is in
-# .github/ci/advisory-scan.sh. The supply_chain_ci tests in
-# autumn-harvest/tests/integration run it against a stub `gh`.
+# `cargo xtask ci advisory-scan` (xtask/src/ci/advisory_scan.rs). The
+# supply_chain_ci tests in autumn-harvest/tests/integration run it against a
+# stub `gh`.
 name: Advisory scan
 
 on:
@@ -20,7 +21,7 @@ on:
     branches: [trunk, trunk-dev]
     paths:
       - .github/workflows/advisory-scan.yml
-      - .github/ci/advisory-scan.sh
+      - xtask/src/ci/advisory_scan.rs
       - deny.toml
 
 # One run at a time, so two runs cannot both open an alert issue. Queue, do
@@ -40,9 +41,17 @@ jobs:
     # A job timeout cancels the job, and then the report step does not run. A
     # step timeout is a step failure, so the step timeouts sum to less than
     # this.
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 2
+      # The scan runs through `cargo xtask`, so the job needs a toolchain.
+      # `rust-toolchain.toml` picks the release.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        timeout-minutes: 3
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         timeout-minutes: 2
       # The same cargo-deny version as the `dependency-audit` gate in ci.yml.
       # A test checks that the two agree.
@@ -50,33 +59,40 @@ jobs:
         timeout-minutes: 3
         with:
           tool: cargo-deny@0.20.2
+      # A separate step, so a failed build is a red run with no report. The
+      # report step below then posts it.
+      - name: Build the xtask binary
+        timeout-minutes: 5
+        run: cargo build --quiet --locked -p xtask
       - name: Scan for advisories
         id: scan
         timeout-minutes: 10
         env:
           # Only a scheduled run gets a token. A pull request run writes no
-          # issue, so its script needs none.
+          # issue, so its scan needs none.
           GH_TOKEN: ${{ github.event_name == 'schedule' && github.token || '' }}
           ADVISORY_ALERT: ${{ github.event_name == 'schedule' }}
-        run: bash .github/ci/advisory-scan.sh
-      # The script sets `reported=true` after it writes its result. A red run
+        run: cargo xtask ci advisory-scan
+      # The scan sets `reported=true` after it writes its result. A red run
       # without it failed in setup, timed out, or lost a `gh` call. This step
       # reports it.
       - name: Report an unreported failure on the alert issue
         if: failure() && github.event_name == 'schedule' && steps.scan.outputs.reported != 'true'
-        timeout-minutes: 2
+        timeout-minutes: 4
         env:
           GH_TOKEN: ${{ github.token }}
-        # If checkout failed, the script is not on disk. Then comment on the
-        # open issue, or open one, directly. The title and the lookup match
-        # the script.
+        # The xtask binary reports the run when it builds. A failed checkout,
+        # toolchain or build leaves no binary. Then comment on the open issue,
+        # or open one, directly. The build has a bound, so this fallback
+        # always gets its turn. The title and the lookup match
+        # xtask/src/ci/advisory_scan.rs.
         run: |
-          if [ -f .github/ci/advisory-scan.sh ]; then
-            bash .github/ci/advisory-scan.sh run-failed
+          if [ -f Cargo.toml ] && timeout 150 cargo build --quiet --locked -p xtask; then
+            cargo xtask ci advisory-scan run-failed
             exit 0
           fi
           title="Advisory scan: cargo deny check advisories failed"
-          body="The advisory scan failed before checkout: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body="The advisory scan failed before it could report: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           issue="$(gh api --paginate -X GET "repos/$GITHUB_REPOSITORY/issues" \
             -f state=open -f per_page=100 -f "creator=github-actions[bot]" \
             | jq -rs --arg title "$title" \

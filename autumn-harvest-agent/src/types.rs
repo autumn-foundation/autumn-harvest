@@ -297,6 +297,10 @@ pub struct AgentTask {
     /// [`Probe`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<Probe>,
+    /// The agent kind of the run (issue #2380). A refine run of a kind
+    /// takes only source runs of that kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 impl Serialize for AgentTask {
@@ -371,6 +375,7 @@ impl AgentTask {
             draw: None,
             answer_check: None,
             probe: None,
+            kind: None,
         }
     }
 
@@ -387,6 +392,13 @@ impl AgentTask {
     #[must_use]
     pub const fn context_reset(mut self, setting: ContextReset) -> Self {
         self.context_reset = Some(setting);
+        self
+    }
+
+    /// Name the agent kind of the run (issue #2380).
+    #[must_use]
+    pub fn kind(mut self, kind: impl Into<String>) -> Self {
+        self.kind = Some(kind.into());
         self
     }
 

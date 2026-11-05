@@ -80,8 +80,8 @@ response fields of other routes are `unknown`. Narrow them in your code. See [`d
 ## Build it
 
 ```sh
-scripts/build-typescript-client.sh   # from the repository root
+cargo xtask dev build-typescript-client   # from the repository
 ```
 
-The script generates, type-checks, tests, builds and packs the client. Its
-last line is the tarball path.
+The command generates, type-checks, tests, builds and packs the client. Its
+only line on stdout is the tarball path.

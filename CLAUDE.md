@@ -18,13 +18,22 @@
 - Open pull requests as ready for review by default.
 - Create a draft PR only when the user explicitly asks for a draft.
 - Never change an existing PR between draft and ready-for-review unless the user explicitly requests that state change.
+## Repository Automation
+
+Every CI gate, doc guard and perf evidence generator runs through
+`cargo xtask` ([ADR 0015](docs/adr/0015-xtask-workspace-automation.md)).
+[`docs/xtask.md`](docs/xtask.md) lists each command and its module. Do not
+add a shell or Python script. Add a command to the `xtask` crate. Three trees
+keep their scripts: `examples/autoresearch/lab/`, `docs/assays/apparatus/`
+and `docs/perf-artifacts/`.
+
 ## Comment Hygiene
 
-`docs/audits/comment-hygiene.py` gates every `*.rs` comment in CI's `lint`
+`cargo xtask audit comment-hygiene` gates every `*.rs` comment in CI's `lint`
 job. Run it before you push:
 
 ```sh
-python3 docs/audits/comment-hygiene.py --base origin/trunk-dev
+cargo xtask audit comment-hygiene --base origin/trunk-dev
 ```
 
 The `--base` matters. Without it the Tier B rules below are report-only, so
@@ -269,7 +278,7 @@ implements its traits per tuple size, and a cargo feature sets the largest
 size. One column over a tier forces the next tier on every crate that builds
 diesel, embedders included. The 128 tier does not compile in 8 GB.
 
-`docs/audits/diesel-table-width.py` runs in CI's `lint` job. It fails on a
+`cargo xtask audit diesel-table-width` runs in CI's `lint` job. It fails on a
 `table!` over 32 columns, and on a manifest that enables a wider tier. A
 table that needs more columns splits over a core and an extension
 declaration. Read `autumn-harvest/src/table_split.rs` before you add a column
@@ -280,7 +289,7 @@ of the core table with `SetExt`.
 ## Ledger Profiles
 
 Every function that sends SQL needs a Ledger profile in `docs/ledger/`
-(issue #2364). CI's `lint` job runs `docs/audits/ledger-profiles.py`. It
+(issue #2364). CI's `lint` job runs `cargo xtask audit ledger-profiles`. It
 fails on a query with no profile, and on a profile that no longer matches
 its query. When you add, rename or change a query, run the gate. Print a stub
 with `--scaffold`, then choose its `driver`. When Ledger measures a query,
@@ -318,7 +327,7 @@ have homes:
 ### Never write a document at the repository root
 
 A design record goes in `docs/design/`, not the root. So does any other
-planning or scratch document. `docs/audits/root-files.py` fails the `lint`
+planning or scratch document. `cargo xtask audit root-files` fails the `lint`
 job on a root file that is not in its allow list. Do not add an entry to
 make a document pass. Move the document.
 

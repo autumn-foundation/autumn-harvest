@@ -31,17 +31,17 @@ An audit also needs a row in [`docs/audits/README.md`](audits/README.md).
 | `cargo xtask audit action-sha-pin` | `xtask/src/audit/action_sha_pin.rs` | `docs/audits/action-sha-pin.py` |
 | `cargo xtask audit audit-catalog-coverage` | `xtask/src/audit/audit_catalog_coverage.rs` | `docs/audits/audit-catalog-coverage.py` |
 | `cargo xtask audit cli-flag-coverage` | `xtask/src/audit/cli_flag_coverage.rs` | `docs/audits/cli-flag-coverage.py` |
-| `cargo xtask audit comment-hygiene` | `xtask/src/audit/comment_hygiene.rs` | `docs/audits/comment-hygiene.py` |
+| `cargo xtask audit comment-hygiene` | `xtask/src/audit/comment_hygiene/mod.rs` | `docs/audits/comment-hygiene.py` |
 | `cargo xtask audit config-cli-drift` | `xtask/src/audit/config_cli_drift.rs` | `docs/audits/config-cli-drift.py` |
-| `cargo xtask audit corpus-link-check` | `xtask/src/audit/corpus_link_check.rs` | `docs/audits/corpus-link-check.py` |
+| `cargo xtask audit corpus-link-check` | `xtask/src/audit/corpus_link_check/mod.rs` | `docs/audits/corpus-link-check.py` |
 | `cargo xtask audit diesel-table-width` | `xtask/src/audit/diesel_table_width.rs` | `docs/audits/diesel-table-width.py` |
 | `cargo xtask audit doc-claim-drift` | `xtask/src/audit/doc_claim_drift.rs` | `docs/audits/doc-claim-drift.py` |
 | `cargo xtask audit doc-snippet-syntax` | `xtask/src/audit/doc_snippet_syntax.rs` | `docs/audits/doc-snippet-syntax.py` |
-| `cargo xtask audit ledger-census` | `xtask/src/audit/ledger_census.rs` | `docs/audits/ledger-census.py` |
-| `cargo xtask audit ledger-profiles` | `xtask/src/audit/ledger_profiles.rs` | `docs/audits/ledger-profiles.py` |
+| `cargo xtask audit ledger-census` | `xtask/src/audit/ledger_census/mod.rs` | `docs/audits/ledger-census.py` |
+| `cargo xtask audit ledger-profiles` | `xtask/src/audit/ledger_profiles/mod.rs` | `docs/audits/ledger-profiles.py` |
 | `cargo xtask audit libpq-keyword-sync` | `xtask/src/audit/libpq_keyword_sync.rs` | `docs/audits/libpq-keyword-sync.py` |
 | `cargo xtask audit mixed-version-contract` | `xtask/src/audit/mixed_version_contract.rs` | `docs/audits/mixed-version-contract.py` |
-| `cargo xtask audit openapi-response-coverage` | `xtask/src/audit/openapi_response_coverage.rs` | `docs/audits/openapi-response-coverage.py` |
+| `cargo xtask audit openapi-response-coverage` | `xtask/src/audit/openapi_response_coverage/mod.rs` | `docs/audits/openapi-response-coverage.py` |
 | `cargo xtask audit required-migration-versions-sync` | `xtask/src/audit/required_migration_versions_sync.rs` | `docs/audits/required-migration-versions-sync.py` |
 | `cargo xtask audit root-files` | `xtask/src/audit/root_files.rs` | `docs/audits/root-files.py` |
 | `cargo xtask audit shard-weight-drift` | `xtask/src/audit/shard_weight_drift.rs` | `docs/audits/shard-weight-drift.py` |
@@ -53,7 +53,7 @@ An audit also needs a row in [`docs/audits/README.md`](audits/README.md).
 | `cargo xtask audit vantage-flash-live-region` | `xtask/src/audit/vantage_flash_live_region.rs` | `docs/audits/vantage-flash-live-region.py` |
 | `cargo xtask audit vantage-label-association` | `xtask/src/audit/vantage_label_association.rs` | `docs/audits/vantage-label-association.py` |
 | `cargo xtask audit worker-image-contract` | `xtask/src/audit/worker_image_contract.rs` | `docs/audits/worker-image-contract.py` |
-| `cargo xtask audit workflow-yaml-parse` | `xtask/src/audit/workflow_yaml_parse.rs` | `docs/audits/workflow-yaml-parse.py` |
+| `cargo xtask audit workflow-yaml-parse` | `xtask/src/audit/workflow_yaml_parse/mod.rs` | `docs/audits/workflow-yaml-parse.py` |
 
 ## Developer and release tooling
 
@@ -75,7 +75,7 @@ An audit also needs a row in [`docs/audits/README.md`](audits/README.md).
 |---|---|---|
 | `cargo xtask ci advisory-scan` | `xtask/src/ci/advisory_scan.rs` | `.github/ci/advisory-scan.sh` |
 | `cargo xtask ci chaos-watchdog` | `xtask/src/ci/chaos_watchdog.rs` | `.github/ci/chaos-watchdog.sh` |
-| `cargo xtask ci coverage` | `xtask/src/ci/coverage.rs` | `.github/ci/coverage.py` |
+| `cargo xtask ci coverage` | `xtask/src/ci/coverage/mod.rs` | `.github/ci/coverage.py` |
 | `cargo xtask ci pull-test-images` | `xtask/src/ci/pull_test_images.rs` | `.github/ci/pull-test-images.sh` |
 | `cargo xtask ci run-suites` | `xtask/src/ci/run_suites.rs` | `.github/ci/run-suites.sh` |
 

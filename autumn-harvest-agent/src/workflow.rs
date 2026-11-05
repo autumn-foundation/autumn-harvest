@@ -3014,6 +3014,8 @@ fn child_task(
         answer_check: None,
         // A child of a probe is a probe with the same effects (issue #2378).
         probe: task.probe,
+        // A peer is another agent, so it is not of the kind of the parent.
+        kind: None,
     }
 }
 
@@ -3299,9 +3301,13 @@ pub async fn agent_discover_peers(
 /// The workflows to register on a `HarvestBuilder`: `agent_loop`,
 /// `agent_heartbeat`, the durable `agent`, the strategy runs `agent_draws`
 /// and `agent_sample`, and the pass `agent_consolidate`.
+///
+/// With the `eval` feature, it also holds the refine run `agent_refine`
+/// (issue #2380).
 #[must_use]
 pub fn workflows() -> Vec<WorkflowInfo> {
-    vec![
+    #[allow(unused_mut)]
+    let mut list = vec![
         agent_loop_info(),
         agent_heartbeat_info(),
         agent_info(),
@@ -3309,13 +3315,17 @@ pub fn workflows() -> Vec<WorkflowInfo> {
         crate::sampling::agent_sample_info(),
         crate::consolidate::agent_consolidate_info(),
         crate::consolidate_all::agent_consolidate_all_info(),
-    ]
+    ];
+    #[cfg(feature = "eval")]
+    list.push(crate::refine::agent_refine_info());
+    list
 }
 
 /// The activities to register on a `HarvestBuilder`.
 #[must_use]
 pub fn activities() -> Vec<ActivityInfo> {
-    vec![
+    #[allow(unused_mut)]
+    let mut list = vec![
         agent_model_turn_info(),
         agent_tool_call_info(),
         agent_memory_snapshot_info(),
@@ -3340,7 +3350,15 @@ pub fn activities() -> Vec<ActivityInfo> {
         crate::consolidate_all::agent_consolidate_due_info(),
         crate::consolidate::agent_episode_append_info(),
         crate::consolidate::agent_episode_reset_info(),
-    ]
+    ];
+    #[cfg(feature = "eval")]
+    list.extend([
+        crate::refine::agent_refine_start_info(),
+        crate::refine::agent_refine_probe_info(),
+        crate::refine::agent_refine_compose_info(),
+        crate::refine::agent_refine_select_info(),
+    ]);
+    list
 }
 
 #[cfg(test)]

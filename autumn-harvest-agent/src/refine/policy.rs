@@ -1097,6 +1097,8 @@ mod tests {
             current: ProfileOverlay::default(),
             ceilings: Ceilings::from_profile(&profile),
             attempts: ProposalAttempts::default(),
+            sample: 1,
+            others: Vec::new(),
         };
         let good = serde_json::to_value(&request).expect("encode");
         assert!(serde_json::from_value::<crate::refine::ProposeRequest>(good.clone()).is_ok());

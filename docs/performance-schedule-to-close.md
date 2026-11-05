@@ -934,7 +934,7 @@ a correctness difference.
   per-row PL/pgSQL loop, both snapshotting the partial index separately
   from the heap and seeding the same per-row-varied deadline expression)
   and their output, and a `fixture-summary.txt`.
-- `autumn-harvest/scripts/schedule_to_close_claim_perf_repro.sh` -- a
+- `cargo xtask perf schedule-to-close-claim` -- a
   reproduction script that re-runs the capture test.
 - This doc.
 
@@ -944,13 +944,13 @@ a correctness difference.
 
 ```bash
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-  ./autumn-harvest/scripts/schedule_to_close_claim_perf_repro.sh
+  cargo xtask perf schedule-to-close-claim
 ```
 
 or, with only a reachable Docker daemon and no external Postgres:
 
 ```bash
-./autumn-harvest/scripts/schedule_to_close_claim_perf_repro.sh
+cargo xtask perf schedule-to-close-claim
 ```
 
 Both regenerate the `EXPLAIN` captures, `pg_stat_statements` snapshots,

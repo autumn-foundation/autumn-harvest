@@ -1,8 +1,8 @@
 # Mixed-version smoke worker (issue #1828).
 #
-# `scripts/run-mixed-version-smoke.sh` copies this crate into the `target/`
-# directory of each tree and builds it there. The path dependencies then
-# resolve to the current tree or to the previous release. The script also
+# `cargo xtask dev run-mixed-version-smoke` copies this crate into the
+# `target/` directory of each tree and builds it there. The path dependencies
+# then resolve to the current tree or to the previous release. The command also
 # copies the Cargo.lock of that tree, so each build uses the versions that
 # its release shipped with.
 #
@@ -18,7 +18,7 @@ name = "mixed-version-smoke"
 path = "src/main.rs"
 
 [features]
-# Adapters for the API of an older release. The script selects one by tag.
+# Adapters for the API of an older release. The smoke selects one by tag.
 v0_6 = []
 
 [dependencies]

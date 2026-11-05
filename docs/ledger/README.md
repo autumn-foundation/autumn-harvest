@@ -3,8 +3,9 @@
 Every function that sends SQL to Postgres or SQLite has a Ledger profile.
 A profile records what the query touches, what makes it run, and whether
 Ledger has measured its cost. The gate
-[`docs/audits/ledger-profiles.py`](../audits/ledger-profiles.py) fails CI's
-`lint` job when a query has no profile, or when a profile no longer matches
+`cargo xtask audit ledger-profiles`
+([`xtask/src/audit/ledger_profiles/mod.rs`](../../xtask/src/audit/ledger_profiles/mod.rs))
+fails CI's `lint` job when a query has no profile, or when a profile no longer matches
 its query.
 
 Ledger is the query-cost pass of this repository. It measures shared
@@ -49,7 +50,7 @@ source file, and then they conflict on that source file too.
 | `kind` | `read`, `write`, `ddl` | the scan, at least |
 | `tables` | table names | the scan, at least |
 | `measured` | a `docs/` page, or `unmeasured` | the author |
-| `plan` | a page under `docs/ledger/plans/` (optional) | `ledger-census.py plan` |
+| `plan` | a page under `docs/ledger/plans/` (optional) | `cargo xtask audit ledger-census plan` |
 
 `driver` says what makes the query run, and so how often it runs:
 
@@ -84,13 +85,13 @@ grep -rB5 'measured = "unmeasured"' docs/ledger | grep -B4 'per_task'
 1. Run the gate:
 
    ```sh
-   python3 docs/audits/ledger-profiles.py
+   cargo xtask audit ledger-profiles
    ```
 
 2. For a missing profile, print a stub and paste it into the catalog file:
 
    ```sh
-   python3 docs/audits/ledger-profiles.py --scaffold
+   cargo xtask audit ledger-profiles --scaffold
    ```
 
    The stub has `driver = "CHOOSE"`. Choose a driver. The gate refuses any
@@ -123,7 +124,7 @@ covers the forms that it must get right: comments, strings, raw strings,
 lifetimes, atomics, `impl` blocks, macros and test modules.
 
 ```sh
-python3 docs/audits/ledger-profiles.py --self-test
+cargo xtask audit ledger-profiles --self-test
 ```
 
 ## How the first catalog was written
@@ -149,7 +150,8 @@ The census has two steps:
    the hook writes each statement, its bind values and the source frames of
    its call stack. The module exists only with the `ledger-census` feature,
    and the variable is unset in every ordinary run.
-2. [`docs/audits/ledger-census.py`](../audits/ledger-census.py) maps each
+2. `cargo xtask audit ledger-census`
+   ([`xtask/src/audit/ledger_census/mod.rs`](../../xtask/src/audit/ledger_census/mod.rs)) maps each
    statement to the profile of the innermost profiled frame. It then runs
    `EXPLAIN (GENERIC_PLAN, FORMAT JSON)` for each statement on a migrated
    database, with `enable_seqscan = off`.
@@ -178,8 +180,8 @@ cargo test --target x86_64-unknown-linux-gnu -p autumn-harvest \
     --features ledger-census --test integration -- --test-threads=6
 cargo test --target x86_64-unknown-linux-gnu -p autumn-harvest-plugin \
     --features autumn-harvest/ledger-census --tests -- --test-threads=1
-python3 docs/audits/ledger-census.py attribute /var/tmp/census.jsonl
-python3 docs/audits/ledger-census.py plan postgres://postgres@127.0.0.1/ledger_plan --driver per_tick
+cargo xtask audit ledger-census attribute /var/tmp/census.jsonl
+cargo xtask audit ledger-census plan postgres://postgres@127.0.0.1/ledger_plan --driver per_tick
 ```
 
 The hook installs itself from `.init_array`, before `main`. The `-u` flag
@@ -214,8 +216,8 @@ cargo test --target x86_64-unknown-linux-gnu -p autumn-harvest-sqlite \
     --features autumn-harvest/ledger-census
 cargo test --target x86_64-unknown-linux-gnu -p autumn-harvest \
     --features ledger-census,owner-disk-cache --lib -- owner_disk_cache entity_sql
-python3 docs/audits/ledger-census.py attribute /var/tmp/census.jsonl
-python3 docs/audits/ledger-census.py plan-sqlite
+cargo xtask audit ledger-census attribute /var/tmp/census.jsonl
+cargo xtask audit ledger-census plan-sqlite
 ```
 
 A profile whose statements are only DDL or pragmas, such as the schema

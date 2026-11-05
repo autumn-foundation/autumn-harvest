@@ -139,6 +139,10 @@ name = "evidence"
 required-features = ["eval", "sqlite"]
 
 [[test]]
+name = "refine_run"
+required-features = ["eval", "sqlite"]
+
+[[test]]
 name = "transcript_delta"
 required-features = ["sqlite", "eval"]
 

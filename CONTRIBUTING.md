@@ -28,10 +28,10 @@ human contributors and to agents. Read them before you start.
 cargo fmt --all -- --check
 cargo clippy -p <crate> --all-targets -- -D warnings
 cargo test -p <crate>
-python3 docs/audits/comment-hygiene.py --base origin/trunk-dev
+cargo xtask audit comment-hygiene --base origin/trunk-dev
 ```
 
-CI also runs each `scripts/check-*.sh` script. It runs each audit that
+CI also runs each `cargo xtask check` guard. It runs each audit that
 [`docs/audits/README.md`](docs/audits/README.md) marks as wired into CI. Run the
 ones that apply to your change.
 

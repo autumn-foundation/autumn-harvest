@@ -18,7 +18,7 @@ cargo build --release --target x86_64-unknown-linux-musl \
   -p autumn-harvest-sandbox-guest
 ```
 
-`scripts/sandbox/build-guest-image.sh` builds a complete image. See
+`cargo xtask sandbox build-guest-image` builds a complete image. See
 `docs/sandbox-activities.md`.
 
 For a test on a host without KVM, `harvest-guest-agent --listen-unix <path>`

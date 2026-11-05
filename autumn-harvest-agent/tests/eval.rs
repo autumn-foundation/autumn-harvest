@@ -2513,6 +2513,9 @@ async fn the_report_keeps_every_field_that_is_not_an_identity() {
             recorded_verdict,
             candidate_verdict,
             scorer_usage,
+            candidate_usage,
+            // A price names a model, so the cost is an identity.
+            candidate_cost_usd_micros: _,
         } = alone;
         let kept = report
             .pool
@@ -2531,6 +2534,7 @@ async fn the_report_keeps_every_field_that_is_not_an_identity() {
         assert_eq!(kept.recorded_verdict, recorded_verdict);
         assert_eq!(kept.candidate_verdict, candidate_verdict);
         assert_eq!(kept.scorer_usage, scorer_usage);
+        assert_eq!(kept.candidate_usage, candidate_usage);
     }
     let beta = report
         .pool
@@ -2907,6 +2911,23 @@ async fn with_no_scorer_the_report_keeps_its_json() {
         .expect("the source report has a run id")
         .to_owned();
     with_run_id(&mut value, GOLDEN_RUN_ID);
+    // Issue #2380 adds the spend of the candidate. The golden is older, so
+    // the test takes the two fields out before it compares.
+    let spend = value.as_object_mut().unwrap();
+    assert_eq!(
+        spend.remove("candidate_usage"),
+        Some(json!({
+            "input_tokens": 12,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0
+        }))
+    );
+    assert_eq!(
+        spend.remove("candidate_cost_usd_micros"),
+        None,
+        "an unpriced model"
+    );
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(NO_SCORER_GOLDEN);
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
         let text = serde_json::to_string_pretty(&value).unwrap();
@@ -2914,10 +2935,13 @@ async fn with_no_scorer_the_report_keeps_its_json() {
     }
     let mut golden: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(value, golden, "the JSON of a report with no scorer changed");
-    // The JSON from before issue #2447 decodes to the same report.
+    // The JSON from before issues #2447 and #2380 decodes to the same
+    // report, with no spend.
     with_run_id(&mut golden, &run_id);
     let decoded: Evaluation = serde_json::from_value(golden).unwrap();
-    assert_eq!(decoded, evaluation);
+    let mut expected = evaluation;
+    expected.candidate_usage = autumn_harvest_agent::TokenUsage::default();
+    assert_eq!(decoded, expected);
 }
 
 /// A source run that answers `text` with no tool call.

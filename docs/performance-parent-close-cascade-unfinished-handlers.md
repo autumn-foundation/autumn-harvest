@@ -90,7 +90,7 @@ Eighteen call sites carried this loop, across `worker.rs`, `timeout.rs`,
 
 ```bash
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-  ./autumn-harvest/scripts/parent_close_cascade_unfinished_handlers_perf_repro.sh
+  cargo xtask perf parent-close-cascade-unfinished-handlers
 ```
 
 `HARVEST_TEST_DATABASE_URL` is treated as an **admin** URL by

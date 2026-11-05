@@ -4,13 +4,6 @@
 //! runs through this binary. The alias in `.cargo/config.toml` maps
 //! `cargo xtask <group> <command>` to `cargo run -p xtask -- <group> <command>`.
 //! `docs/xtask.md` lists each command and the script it replaced.
-// The stub modules trip these lints until each port lands.
-// The commit that wires the last port removes this attribute.
-#![allow(
-    dead_code,
-    clippy::needless_pass_by_value,
-    clippy::missing_const_for_fn
-)]
 
 use std::process::ExitCode;
 
@@ -21,6 +14,7 @@ mod bench;
 mod check;
 mod ci;
 mod dev;
+mod interrupt;
 mod perf;
 mod sandbox;
 mod util;
@@ -61,6 +55,10 @@ enum Group {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // The perf and bench commands hold cleanup guards for their whole run:
+    // containers, scratch databases and moved source files. So a signal must
+    // unwind them, not kill them. See `perf::support::stop_on_interrupt`.
+    let guard = matches!(cli.group, Group::Bench(_) | Group::Perf(_)).then(interrupt::install);
     let outcome = match cli.group {
         Group::Audit(command) => audit::run(command),
         Group::Bench(command) => bench::run(command),
@@ -70,6 +68,11 @@ fn main() -> ExitCode {
         Group::Perf(command) => perf::run(command),
         Group::Sandbox(command) => sandbox::run(command),
     };
+    if guard.is_some() && interrupt::requested() {
+        eprintln!("interrupted");
+        return ExitCode::from(interrupt::EXIT_CODE);
+    }
+    drop(guard);
     match outcome {
         Ok(code) => code,
         Err(error) => {

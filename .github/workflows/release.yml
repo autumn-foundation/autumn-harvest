@@ -313,6 +313,12 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
+      # The build runs through `cargo xtask`, so the job needs a toolchain.
+      # No build cache. A release build must not read a cache that another
+      # run wrote.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
       - name: Build the TypeScript client
         id: client
         run: |
@@ -322,8 +328,8 @@ jobs:
             echo "::error::clients/typescript/package.json is ${version}, the tag is ${GITHUB_REF_NAME}"
             exit 1
           fi
-          # The script logs to stderr. Its stdout is the tarball path only.
-          tarball="$(scripts/build-typescript-client.sh)"
+          # The command logs to stderr. Its stdout is the tarball path only.
+          tarball="$(cargo xtask dev build-typescript-client)"
           if [ "$(basename "${tarball}")" != "autumn-harvest-client-${version}.tgz" ]; then
             echo "::error::the client packed as $(basename "${tarball}"), not autumn-harvest-client-${version}.tgz"
             exit 1
