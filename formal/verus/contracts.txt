@@ -341,6 +341,22 @@ pub proof fn theorem_a_worker_or_combined_role_runs_both_by_default(role: Proces
 pub proof fn theorem_no_role_keeps_the_old_default() ensures spec_switch_value(None, spec_role_default(None)),
 pub proof fn theorem_an_explicit_value_wins(value: bool, role: Option < ProcessRole >) ensures spec_switch_value(Some(value), spec_role_default(role)) == value,
 pub proof fn theorem_a_warning_marks_each_override(explicit: Option < bool >, role: Option < ProcessRole >,) ensures role.is_some() ==> (spec_contradicts(explicit, role) <==> spec_switch_value(explicit, spec_role_default(role),) != spec_role_default(role)), role.is_none() ==>! spec_contradicts(explicit, role),
+pub enum RetentionRunOn { Scheduler, All, }
+impl Clone for RetentionRunOn {
+fn clone(& self) -> (r: Self) ensures r ==* self,
+}
+impl Copy for RetentionRunOn {
+}
+pub open spec fn spec_retention_placed(run_on: RetentionRunOn, scheduler: bool) -> bool { match run_on { RetentionRunOn::Scheduler => scheduler, RetentionRunOn::All => true, } }
+pub open spec fn spec_runs_retention(enabled: bool, run_on: RetentionRunOn, scheduler: bool,) -> bool { enabled && spec_retention_placed(run_on, scheduler) }
+pub fn retention_placed(run_on: RetentionRunOn, scheduler: bool) -> (r: bool) ensures r == spec_retention_placed(run_on, scheduler),
+pub fn runs_retention(enabled: bool, run_on: RetentionRunOn, scheduler: bool) -> (r: bool) ensures r == spec_runs_retention(enabled, run_on, scheduler),
+pub proof fn theorem_retention_follows_the_scheduler(enabled: bool, scheduler: bool) ensures spec_runs_retention(enabled, RetentionRunOn::Scheduler, scheduler) == (enabled && scheduler),
+pub proof fn theorem_a_web_role_runs_no_retention_by_default(enabled: bool) ensures ! spec_runs_retention(enabled, RetentionRunOn::Scheduler, spec_switch_value(None, spec_role_default(Some(ProcessRole::Web))),),
+pub proof fn theorem_other_roles_run_retention_by_default(role: Option < ProcessRole >) requires role != Some(ProcessRole::Web), ensures spec_runs_retention(true, RetentionRunOn::Scheduler, spec_switch_value(None, spec_role_default(role)),),
+pub proof fn theorem_an_explicit_scheduler_moves_retention(enabled: bool, scheduler: bool, role: Option < ProcessRole >,) ensures spec_runs_retention(enabled, RetentionRunOn::Scheduler, spec_switch_value(Some(scheduler), spec_role_default(role)),) == (enabled && scheduler),
+pub proof fn theorem_run_on_all_runs_retention_everywhere(enabled: bool, scheduler: bool) ensures spec_runs_retention(enabled, RetentionRunOn::All, scheduler) == enabled,
+pub proof fn theorem_disabled_retention_never_runs(run_on: RetentionRunOn, scheduler: bool) ensures ! spec_runs_retention(false, run_on, scheduler),
 
 ## formal/verus/src/refine_policy.rs
 pub enum AdoptDecision { Adopt, Unchanged, NeedsApproval, CapReached, }
