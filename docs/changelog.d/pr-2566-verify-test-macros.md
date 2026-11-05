@@ -1,7 +1,7 @@
 ## Phase X.Y — `harvest-verify`: test macros no longer make types writable (issue #2545)
 
-A `proptest!` body that named `String` made `String` writable for the whole
-analysis. Workflows that capture a `String` then read as `unknown`.
+A `proptest!` body that named `String` made `String` opaque, and so writable, for
+the whole analysis. Workflows that capture a `String` then read as `unknown`.
 
 - **Fix.** `proptest`, `prop_assert`, `prop_assert_eq`, `prop_assert_ne`,
   `prop_assume`, `prop_compose` and `prop_oneof` join `TYPE_FREE_MACROS`.

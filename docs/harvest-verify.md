@@ -597,7 +597,8 @@ The ones you are most likely to meet:
   index reads every file, `#[cfg(test)]` code too. A macro call with no
   `macro_rules!` body marks each type it names as able to write. That is
   sound, because the macro can declare any type. The std, logging and
-  `proptest` macros are exempt: they declare no type. A `proptest!` body
+  `proptest` macros are exempt: they declare no type outside a function body.
+  The index matches the last path segment of the macro name. A `proptest!` body
   therefore changes no verdict. Another test-only macro that names a common
   type, as `String`, can still make it writable for the whole analysis.
   Keep such a macro body free of type names (issue #2545).

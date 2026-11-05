@@ -268,8 +268,8 @@ impl SourceIndex {
     ///
     /// A macro with no definition here, as a dependency or procedural
     /// macro, can declare any type. Each type its call declares, and each
-    /// bare type name it takes, is opaque. The std macros that declare no
-    /// type are exempt.
+    /// bare type name it takes, is opaque. The std, logging and
+    /// `proptest` macros that declare no type are exempt.
     fn expand_macros(&mut self) {
         for call in &self.macro_calls {
             let Some(facts) = self.macro_facts.get(&call.name) else {
