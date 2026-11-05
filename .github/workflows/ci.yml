@@ -972,6 +972,12 @@ jobs:
     # pushes, so every OS x shard leg still spins up and reports a conclusion;
     # `needs.changes.outputs.code` gates the actual work per step.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    env:
+      # Line tables only. A leg runs many serial builds with different
+      # feature sets, and full debug info filled the runner disk on Linux
+      # and Windows (ENOSPC, PR #2582). Backtraces keep file and line.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     strategy:
       fail-fast: false
       matrix:
@@ -997,6 +1003,15 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      # Windows keeps the Cargo registry on C:, which is the small drive. A
+      # leg that unpacks the AWS SDK filled it (os error 112, PR #2582). The
+      # preinstalled Android SDK is the largest unused tree there.
+      - name: Free runner disk before heavy plugin link (Windows)
+        if: runner.os == 'Windows' && needs.changes.outputs.code == 'true'
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force C:\Android -ErrorAction SilentlyContinue
+          Get-PSDrive C | Format-Table -AutoSize
       # kache executable caching broke uplifted binaries on macOS:
       # `target/debug/harvest` and a build-script copy failed with "cannot
       # execute binary file". Test binaries in `deps/` ran. The CLI caches
@@ -2262,8 +2277,9 @@ jobs:
         run: cargo run -p autumn-harvest-cli --bin harvest -- new demo_app --path "${RUNNER_TEMP}/scaffold"
       - name: Build the scaffolded project against the release candidates
         # Harvest 0.8 is not available on crates.io until this release lands.
-        # Patch only the two workspace crates under test; autumn-web 0.9 still
+        # Patch only the two workspace crates under test; autumn-web still
         # resolves from crates.io, just as it will for users of `harvest new`.
+        # The template names the autumn-web series of the plugin in this tree.
         run: |
           cargo build --manifest-path "${RUNNER_TEMP}/scaffold/Cargo.toml" \
             --config 'patch.crates-io.autumn-harvest.path="autumn-harvest"' \
@@ -2743,6 +2759,7 @@ jobs:
     name: Doc snippets compile
     runs-on: ubuntu-latest
     # Each script pins a docs snippet and compiles it with `cargo check`.
+    # The issue #2482 steps run `cargo test` on the agent guide doctests.
     # Plain `cargo check` shares no workspace build with clippy, so these
     # steps gain nothing from a clippy job and run on their own.
     # Draft-skip, as in `lint`. Not gated on `changes`: a docs-only PR
@@ -2897,6 +2914,15 @@ jobs:
         # check covered them. Nothing compiled them against the API.
         # See scripts/check-dags-schedules-examples.sh.
         run: ./scripts/check-dags-schedules-examples.sh
+      - name: "Run agent guide snippet guards (issue #2482)"
+        # The guards refuse a Rust fence that rustdoc skips in the two agent
+        # guides. They also check the harness and the step below.
+        run: "cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox,postgres --test guide_snippets"
+      - name: "Check agent guide snippets compile (issue #2482)"
+        # Each Rust fence of docs/agent-adapter.md and docs/agent-mesh.md
+        # compiles as a doctest through `guide_snippets` in src/lib.rs. The
+        # features must match the gate of that module, or no test runs.
+        run: "cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox,postgres --doc guide_snippets"
 
   # One check for branch protection to require in place of every leg above.
   # A skipped leg (a draft PR) counts as a pass, as a skipped job does

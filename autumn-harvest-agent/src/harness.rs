@@ -43,7 +43,8 @@ use crate::transcript::{InMemoryTranscriptStore, PREFIX_MISSING, TranscriptStore
 use crate::types::{ModelTurn, ModelTurnRequest, SkillLookup, ToolCallRequest, ToolOutcome};
 use crate::workspace::{WorkspaceHandle, WorkspaceMount, WorkspaceRef, WorkspaceStore};
 
-/// The default cap on one tool result, in characters.
+/// The default cap on one tool result and on one delegation answer, in
+/// characters. [`AgentHarness::tool_output_limit`] changes it.
 pub const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 8_000;
 
 /// The name of the model that [`AgentHarness::new`] takes (issue #2271).
@@ -107,7 +108,7 @@ pub const DEFAULT_BUDGET_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTCOME_ENVELOPE_BYTES: u64 = 64;
 
 /// The mark at the end of a cut result.
-const TRUNCATED: &str = "…[truncated]";
+pub(crate) const TRUNCATED: &str = "…[truncated]";
 
 /// The model, the tools, and the policy behind the two agent activities.
 ///
@@ -235,7 +236,12 @@ impl AgentHarness {
         self
     }
 
-    /// Set the cap on one tool result, in characters.
+    /// Set the cap on one tool result and on one delegation answer, in
+    /// characters.
+    ///
+    /// [`Peer::answer_limit`] overrides it for one peer. The delegation
+    /// result marks a cut answer with `"truncated": true` (issue #2481). A
+    /// byte share of the request cap also cuts a delegation answer.
     #[must_use]
     pub const fn tool_output_limit(mut self, limit: usize) -> Self {
         self.tool_output_limit = limit;
@@ -818,7 +824,11 @@ impl AgentHarness {
             .filter(|peer| wanted.contains(&peer.name))
         {
             if valid_name(&peer.name) {
-                found.insert(peer.name.clone(), peer.clone());
+                // History records the resolved limit, so replay cuts each
+                // answer as the live run did (issue #2481).
+                let mut peer = peer.clone();
+                peer.answer_limit.get_or_insert(self.tool_output_limit);
+                found.insert(peer.name.clone(), peer);
             } else {
                 tracing::warn!(peer = %peer.name, "a peer with an invalid name is left out");
             }
@@ -2127,9 +2137,15 @@ pub(crate) fn fit_turn(mut turn: ModelTurn, cap: u64) -> ModelTurn {
 
 /// Cut `text` to `limit` characters and mark the cut.
 pub(crate) fn truncate(text: &str, limit: usize) -> String {
+    truncate_flagged(text, limit).0
+}
+
+/// Cut `text` to `limit` characters and mark the cut. The flag is `true`
+/// when the cut drops a character (issue #2481).
+pub(crate) fn truncate_flagged(text: &str, limit: usize) -> (String, bool) {
     match text.char_indices().nth(limit) {
-        None => text.to_owned(),
-        Some((end, _)) => format!("{}{TRUNCATED}", &text[..end]),
+        None => (text.to_owned(), false),
+        Some((end, _)) => (format!("{}{TRUNCATED}", &text[..end]), true),
     }
 }
 
@@ -2475,5 +2491,38 @@ mod tests {
         assert_eq!(truncate("abc", 3), "abc");
         assert_eq!(truncate("ééé", 2), "éé…[truncated]");
         assert_eq!(truncate("", 0), "");
+    }
+
+    // Issue #2481: the flag counts characters. It does not compare text.
+    #[test]
+    fn a_text_that_ends_with_the_mark_still_reads_as_cut() {
+        let text = format!("ab{TRUNCATED}");
+        assert_eq!(truncate_flagged(&text, 2), (text.clone(), true));
+        assert_eq!(truncate_flagged(&text, 14), (text, false));
+    }
+
+    /// The first `n` characters of `text`. It is outside `proptest!` for
+    /// the reason above `no_content`.
+    fn first_chars(text: &str, n: usize) -> String {
+        text.chars().take(n).collect()
+    }
+
+    proptest::proptest! {
+        // Issue #2481: the flag is set exactly when characters drop.
+        #[test]
+        fn the_cut_flag_matches_the_character_count(
+            text in "\\PC{0,64}",
+            limit in 0_usize..80,
+        ) {
+            let (shown, cut) = truncate_flagged(&text, limit);
+            proptest::prop_assert_eq!(cut, text.chars().count() > limit);
+            let want = if cut {
+                format!("{}{TRUNCATED}", first_chars(&text, limit))
+            } else {
+                text.clone()
+            };
+            proptest::prop_assert_eq!(&shown, &want);
+            proptest::prop_assert_eq!(shown, truncate(&text, limit));
+        }
     }
 }

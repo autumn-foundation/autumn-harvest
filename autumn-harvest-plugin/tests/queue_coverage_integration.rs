@@ -448,6 +448,72 @@ async fn fully_covered_queue_reports_no_uncovered_items() {
     );
 }
 
+/// Issue #2479: a declared queue with no live poller is named, with or
+/// without pending work. It does not change `uncovered`. A `queue_name`
+/// filter narrows the list.
+#[tokio::test]
+async fn a_declared_queue_with_no_poller_is_named_unpolled() {
+    let (database_url, _container) = setup_db_env_or_container().await;
+    scrub(&database_url).await;
+    insert_worker(
+        &database_url,
+        "priority-tier",
+        &["priority"],
+        &[0],
+        WorkerStatus::Active,
+    )
+    .await;
+    insert_worker(
+        &database_url,
+        "stopped-tier",
+        &["bulk"],
+        &[0],
+        WorkerStatus::Stopped,
+    )
+    .await;
+
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::single(build_test_pool(&database_url)));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(HandlerRegistry::new(Vec::new(), vec![])),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::<WorkflowSchedule>::new()),
+        None,
+        vec![
+            "default".to_string(),
+            "priority".to_string(),
+            "bulk".to_string(),
+        ],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        single_shard_router(),
+    ));
+    let app = harvest_api_router(api_state);
+
+    let (status, report) = get_json(&app, "/admin/queue-coverage").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(report.get("uncovered"), Some(&json!(false)), "{report}");
+    assert_eq!(
+        report.get("unpolled_declared_queues"),
+        Some(&json!(["bulk", "default"])),
+        "{report}"
+    );
+
+    let (_, filtered) = get_json(&app, "/admin/queue-coverage?queue_name=priority").await;
+    assert_eq!(
+        filtered.get("unpolled_declared_queues"),
+        Some(&json!([])),
+        "{filtered}"
+    );
+    let (_, filtered) = get_json(&app, "/admin/queue-coverage?queue_name=bulk").await;
+    assert_eq!(
+        filtered.get("unpolled_declared_queues"),
+        Some(&json!(["bulk"])),
+        "{filtered}"
+    );
+}
+
 #[tokio::test]
 async fn queue_with_no_workers_is_reported_uncovered() {
     // AC1/AC4: a queue with pending work and zero live workers is uncovered,

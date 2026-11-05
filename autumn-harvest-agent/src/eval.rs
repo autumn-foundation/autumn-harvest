@@ -2396,6 +2396,7 @@ mod tests {
             steps_used: 0,
             tool_calls: 0,
             resets: 0,
+            answer_truncated: false,
             serial: None,
         };
         report.delegations = vec![child("e1:d1"), child("e10"), child("x")];

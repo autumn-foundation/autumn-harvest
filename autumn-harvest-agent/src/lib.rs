@@ -230,3 +230,25 @@ pub use workspace::{
     DirWorkspaceBlobs, InMemoryWorkspaceBlobs, Workspace, WorkspaceBlobs, WorkspaceFile,
     WorkspaceHandle, WorkspaceMount, WorkspaceRef, WorkspaceStore,
 };
+
+/// Compiles each Rust fence in the two agent guides as a doctest (issue #2482).
+///
+/// A fence that drifts from the public API fails `cargo test --doc`. Each
+/// fence must compile, so a reader can copy it as written. The guard suite
+/// `tests/guide_snippets.rs` refuses a fence that rustdoc skips. A failure
+/// names the guide and the line of the fence. The `doc-snippets` job in CI
+/// runs these doctests, also on a docs-only change.
+#[cfg(all(
+    doctest,
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "eval",
+    feature = "sandbox"
+))]
+mod guide_snippets {
+    #[doc = include_str!("../../docs/agent-adapter.md")]
+    struct AgentAdapterGuide;
+
+    #[doc = include_str!("../../docs/agent-mesh.md")]
+    struct AgentMeshGuide;
+}

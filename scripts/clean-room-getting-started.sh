@@ -108,10 +108,13 @@ ex=$?
 if [ "$ex" = 0 ] && [ "$mode" = checkout ]; then
   # A `[patch]` entry only adds a resolver candidate. Cargo still picks a newer
   # crates.io release over the checkout, so rewrite the two direct dependencies
-  # to paths and patch the macro crate that the engine pulls in.
+  # to paths and patch the macro crate that the engine pulls in. The checkout
+  # can need a newer `autumn-web` than the release, so take its requirement.
+  autumn_web=$(sed -n -E 's/^autumn-web = "([^"]*)"$/\1/p' "$repo/autumn-harvest-plugin/Cargo.toml")
   sed -i -E \
     -e "s|^(autumn-harvest) = \"[^\"]*\"|\1 = { path = \"$repo/autumn-harvest\" }|" \
     -e "s|^(autumn-harvest-plugin) = \"[^\"]*\"|\1 = { path = \"$repo/autumn-harvest-plugin\" }|" \
+    -e "s|^(autumn-web) = \"[^\"]*\"|\1 = \"$autumn_web\"|" \
     "$work/crate/Cargo.toml"
   {
     echo

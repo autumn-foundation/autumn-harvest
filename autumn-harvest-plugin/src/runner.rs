@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api::{HarvestApiRuntime, HarvestRetentionRuntime};
 use crate::config::{HarvestRedisConfig, HarvestRuntimeConfig, OrphanStartupAction};
 use crate::state::{AppDbPool, HarvestDbPool};
+use crate::worker_queues::WorkerQueues;
 use crate::workflow_reachability::{
     ReachabilityReportStatus, ReachabilityVerdict, StartupOrphanDecision,
     build_reachability_report_for_shards, startup_orphan_decision,
@@ -85,7 +86,17 @@ impl HarvestRunnerResources {
     /// `None` when no app state is set, as in a standalone runner.
     #[must_use]
     pub fn process_role(&self) -> Option<autumn_web::config::ProcessRole> {
-        self.app_state.as_ref().map(AppState::role)
+        self.app_state.as_ref().map(|state| state.role().base())
+    }
+
+    /// The queue pin of the Autumn role of the app state (issue #2479).
+    ///
+    /// `None` with no app state, or with a role that pins no queue.
+    #[must_use]
+    pub fn role_pin(&self) -> Option<Vec<String>> {
+        self.app_state
+            .as_ref()
+            .and_then(|state| crate::worker_queues::role_pin(state.role()))
     }
 
     /// Inject the application/business database role for workflow code that
@@ -1001,6 +1012,45 @@ impl PreparedHarvestRuntime {
     }
 }
 
+/// Resolve the queues that the worker polls (issue #2479).
+///
+/// It reads no database and sets no global. The plugin and
+/// `HarvestEmbedding` call it before their first I/O, so a typo stops the
+/// boot first. `HarvestRunner::start` calls it again for a direct caller.
+///
+/// # Errors
+///
+/// Returns a 503 error that names each undeclared queue.
+pub(crate) fn resolve_worker_queues(
+    declared: &[String],
+    config: &HarvestRuntimeConfig,
+    pin: Option<&[String]>,
+) -> autumn_web::AutumnResult<WorkerQueues> {
+    WorkerQueues::resolve(declared, &config.worker.queues, pin)
+        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))
+}
+
+impl PreparedHarvestRuntime {
+    /// Point the worker at the resolved queues (issue #2479).
+    ///
+    /// A weight of a queue that the worker does not poll is dropped.
+    /// `WorkerRuntimeConfig::validate` warns about such a weight otherwise.
+    /// `GET /admin/config` reports both lists and the source.
+    fn narrow_worker_queues(&mut self, queues: &WorkerQueues) {
+        let polled = queues.polled();
+        let runtime = &mut self.worker_runtime_config;
+        runtime.queues = polled.to_vec();
+        runtime
+            .queue_weights
+            .retain(|queue, _| polled.contains(queue));
+        let view = &mut self.effective_config.worker;
+        view.queues = polled.to_vec();
+        view.queue_weights.retain(|queue, _| polled.contains(queue));
+        view.declared_queues = queues.declared().to_vec();
+        view.queue_source = queues.source().as_str();
+    }
+}
+
 /// How long [`HarvestRunner::stop`] waits for each notify sender to drain.
 const NOTIFY_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -1203,6 +1253,14 @@ impl HarvestRunner {
         // process global, so a build that can never boot is rejected with the
         // error that actually names its problem (see `reject_classic_dags`).
         reject_classic_dags(&built)?;
+        // Issue #2479: config and the role pin narrow the declared queues.
+        // This is pure validation too, so an undeclared queue stops the boot
+        // before any I/O.
+        let worker_queues = resolve_worker_queues(
+            &built.worker_config().queues,
+            config,
+            resources.role_pin().as_deref(),
+        )?;
 
         // Issue #1128: the boot-time orphaned-workflow-type gate, on the
         // STANDALONE path. It runs HERE — the first act of `start`, before
@@ -1225,6 +1283,9 @@ impl HarvestRunner {
         // runner with no app state has no role and keeps both switches on.
         let switches = config.process_switches(resources.process_role());
         switches.log();
+        if let Some(state) = resources.app_state.as_ref() {
+            crate::process_role::warn_preset_overrides(state.role());
+        }
         let plan = SpawnPlan::new(
             switches,
             config.retention.run_on,
@@ -1232,13 +1293,17 @@ impl HarvestRunner {
         );
         let worker_enabled = plan.worker;
         let scheduler_enabled = plan.scheduler;
+        worker_queues.log(worker_enabled);
 
         let completion_triggers = built.completion_triggers().to_vec();
         let mut prepared = PreparedHarvestRuntime::build(built, resources, worker_enabled)?;
         let registry = Arc::clone(&prepared.registry);
         let dag_catalog = Arc::clone(&prepared.dag_catalog);
         let workflow_schedules = Arc::clone(&prepared.workflow_schedules);
+        // The API keeps the declared list, so a start with no queue still goes
+        // to the first declared queue. Only the worker polls the subset.
         let queues = prepared.worker_runtime_config.queues.clone();
+        prepared.narrow_worker_queues(&worker_queues);
         let harvest_pool = prepared.storage_pool.clone_inner();
         let shard_router = prepared.shard_router.clone();
         autumn_harvest::shard::install_global_router(shard_router.clone());
@@ -1338,11 +1403,10 @@ impl HarvestRunner {
         // owns no worker but still publishes references for the fleet, so
         // the install cannot sit inside the `worker_enabled` branch.
         let dispatch_shards = prepared.storage_pool.sharded_pool().shard_ids();
-        reject_dispatch_queue_names(
-            config.redis.url.is_some(),
-            &prepared.worker_runtime_config.queues,
-        )
-        .map_err(AutumnError::service_unavailable_msg)?;
+        // The process publishes for each declared queue, so each one must be
+        // a valid channel name.
+        reject_dispatch_queue_names(config.redis.url.is_some(), &queues)
+            .map_err(AutumnError::service_unavailable_msg)?;
         // A span of one shard (or none) installs the single-shard channel,
         // named by that one shard's key family. A wider span installs one
         // channel per shard instead (issue #1429). `Worker::new` requires
@@ -3329,6 +3393,16 @@ mod tests {
             with_state.process_role(),
             Some(autumn_web::config::ProcessRole::Combined)
         );
+    }
+
+    /// Issue #2479: a built-in role pins no queue, so the runner reads no
+    /// pin. `worker_queues.rs` tests the pin of a `[roles.<name>]` preset.
+    #[test]
+    fn the_resources_give_the_pin_of_their_role() {
+        let bare = HarvestRunnerResources::new(tagged_pool(1));
+        assert_eq!(bare.role_pin(), None);
+        let with_state = bare.with_app_state(autumn_web::AppState::for_test());
+        assert_eq!(with_state.role_pin(), None);
     }
 
     /// The opt-out a caller that has ALREADY run the gate sets (the plugin boot
