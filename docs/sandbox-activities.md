@@ -545,6 +545,9 @@ Cargo drops the flag of the alias when `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`
 or a `rustflags` entry for the target triple is set. The build then compiles
 the heavy crates again. Unset these settings before you run the alias.
 
+The alias uses its own flag set, so it shares no build cache with `cargo test`.
+Pass a test filter after `--`, for example `cargo sandbox-test -- exec`.
+
 ```sh
 cargo sandbox-test
 cargo test -p autumn-harvest-sandbox-guest
