@@ -429,3 +429,21 @@ pub fn first_live(next:& mut [usize], from: usize, is_dead: impl Fn(usize) -> bo
 pub proof fn theorem_a_new_list_is_sound(next: Seq < usize >, dead: Set < int >) requires next.len() > 0, forall | k: int | 0 <= k < next.len() ==> #[trigger] next [k] == k, ensures links(next, dead),
 pub proof fn theorem_an_added_entry_keeps_the_links(next: Seq < usize >, dead: Set < int >) requires links(next, dead), next.len() < usize::MAX, ensures links(next.push(next.len() as usize), dead),
 pub proof fn theorem_more_dead_entries_keep_the_links(next: Seq < usize >, dead: Set < int >, more: Set < int >,) requires links(next, dead), dead.subset_of(more), ensures links(next, more),
+
+## formal/verus/src/worker_queues.rs
+pub enum QueueSource { Code, Explicit, Role, }
+impl Clone for QueueSource {
+fn clone(& self) -> (r: Self) ensures r ==* self,
+}
+impl Copy for QueueSource {
+}
+pub open spec fn spec_queue_source(explicit: bool, pin_hits: bool) -> QueueSource { if explicit { QueueSource::Explicit } else if pin_hits { QueueSource::Role } else { QueueSource::Code } }
+pub open spec fn spec_pin_misses(explicit: bool, pin_set: bool, pin_hits: bool) -> bool { ! explicit && pin_set &&! pin_hits }
+pub fn queue_source(explicit: bool, pin_hits: bool) -> (r: QueueSource) ensures r == spec_queue_source(explicit, pin_hits),
+pub fn pin_misses(explicit: bool, pin_set: bool, pin_hits: bool) -> (r: bool) ensures r == spec_pin_misses(explicit, pin_set, pin_hits),
+pub proof fn theorem_an_explicit_list_wins(pin_hits: bool) ensures spec_queue_source(true, pin_hits) == QueueSource::Explicit,
+pub proof fn theorem_a_hitting_pin_applies() ensures spec_queue_source(false, true) == QueueSource::Role,
+pub proof fn theorem_no_selection_keeps_the_code_set() ensures spec_queue_source(false, false) == QueueSource::Code,
+pub proof fn theorem_the_role_applies_only_below_config(explicit: bool, pin_hits: bool) ensures (spec_queue_source(explicit, pin_hits) == QueueSource::Role) <==> (! explicit && pin_hits),
+pub proof fn theorem_a_miss_keeps_the_code_set(explicit: bool, pin_set: bool, pin_hits: bool) ensures spec_pin_misses(explicit, pin_set, pin_hits) ==> spec_queue_source(explicit, pin_hits) == QueueSource::Code,
+pub proof fn theorem_no_pin_or_config_never_warns(explicit: bool, pin_set: bool, pin_hits: bool) ensures (! pin_set || explicit) ==>! spec_pin_misses(explicit, pin_set, pin_hits),
