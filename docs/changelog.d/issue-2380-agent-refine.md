@@ -20,8 +20,9 @@ anonymised pool of #2376, the evidence bundle of #2377, the live probe of
   `agent` run has no replay probe yet, so it gets
   `RefineSourceNotReplayable`. Each stage of a source checks its replies
   against the profile of that source, as its probe does. A reply must
-  also apply to each other source, so a carried overlay fits each later
-  source.
+  also apply to each other source and to the registered profile of the
+  kind. So a carried overlay fits each later source, and the kind can take
+  the chosen overlay.
 - **Steps.** `agent_refine_probe` runs `eval::evaluate` and, when it stubs
   a tool call, a live re-probe through `RefineSources::live_probe`.
   `agent_refine_compose` runs an `OverlayComposer` over the probes under

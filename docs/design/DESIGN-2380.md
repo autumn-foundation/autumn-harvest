@@ -49,7 +49,9 @@ pub struct RefineInput {
    active overlay and, for each source, its profile and evidence text.
    Each stage of a source checks its replies against the source profile,
    as its probe does. A reply must also apply to the profile of each other
-   source, so the run can carry it to any later source.
+   source, so the run can carry it to any later source. It must apply to
+   the registered profile of the kind too, so the kind can take the chosen
+   overlay.
 3. The loop runs each source in input order. The overlay that a source
    chooses is the current overlay of the next source.
 4. The run checks the ledger before each step that can spend. A spend at

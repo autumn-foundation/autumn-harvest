@@ -164,8 +164,8 @@ pub struct ComposeRequest {
     pub seed: u64,
     /// The probes of the round.
     pub probes: Vec<ProbedCandidate>,
-    /// The profiles of the other sources of the run. A valid reply applies
-    /// to each of them too.
+    /// The profiles of the other sources of the run, and the profile of the
+    /// kind. A valid reply applies to each of them too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub others: Vec<AgentProfile>,
 }

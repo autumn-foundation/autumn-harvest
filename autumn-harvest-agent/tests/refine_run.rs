@@ -199,6 +199,22 @@ struct Fixture {
 }
 
 fn fixture(db: &Path, proposer: Proposer, composer: Composer, model: Model) -> Fixture {
+    fixture_with(
+        db,
+        proposer,
+        composer,
+        model,
+        AgentProfile::new(KIND).system(BASE).max_steps(20),
+    )
+}
+
+fn fixture_with(
+    db: &Path,
+    proposer: Proposer,
+    composer: Composer,
+    model: Model,
+    profile: AgentProfile,
+) -> Fixture {
     let proposer = Arc::new(proposer);
     let composer = Arc::new(composer);
     let model = Arc::new(model);
@@ -211,7 +227,7 @@ fn fixture(db: &Path, proposer: Proposer, composer: Composer, model: Model) -> F
     .effect(ToolEffect::ReadOnly)
     .shared();
     let base = AgentHarness::new(Arc::clone(&model) as Arc<dyn AgentModel>)
-        .agent(AgentProfile::new(KIND).system(BASE).max_steps(20))
+        .agent(profile)
         .tool(lookup);
     let store = InMemoryOverlayStore::new(Arc::new(base.clone()));
     let harness = base
@@ -1134,5 +1150,43 @@ async fn a_carried_overlay_fits_each_later_source() {
                 assert!(error.contains("another source"), "{error}");
             }
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chosen_overlay_fits_the_registered_profile_of_the_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    // The sources ran writable, but the kind is read-only now.
+    let mut f = fixture_with(
+        &dir.path().join("a.db"),
+        Proposer {
+            clear_read_only: true,
+            ..Proposer::default()
+        },
+        Composer {
+            clear_read_only: true,
+            ..Composer::default()
+        },
+        Model::default(),
+        AgentProfile::new(KIND)
+            .system(BASE)
+            .max_steps(20)
+            .read_only(),
+    );
+    let run = source(&mut f.rt, KIND).await;
+    let input = RefineInput::new(KIND, vec![run], 1, RefineMode::Parallel, 3);
+    let report = report_of(refine(&mut f.rt, &input).await);
+    // Each reply clears `read_only`, which the kind refuses, so none is a
+    // candidate and nothing is chosen.
+    assert_eq!(report.ledger.sessions, 3);
+    assert_eq!(report.ledger.fell_back, 3);
+    assert_eq!(report.ledger.probes, 0);
+    assert_eq!(report.status, RefineStatus::Unchanged);
+    assert!(report.chosen.is_none());
+    for stage in &report.stages {
+        let StageOutcome::FellBack { error } = &stage.outcome else {
+            panic!("{stage:?}");
+        };
+        assert!(error.contains("another source"), "{error}");
     }
 }

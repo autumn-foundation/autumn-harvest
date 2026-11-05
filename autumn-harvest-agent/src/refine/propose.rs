@@ -281,8 +281,8 @@ pub struct ProposeRequest {
     /// The sample number of the stage, from 1 (issue #2380).
     #[serde(default = "first_sample", skip_serializing_if = "is_first_sample")]
     pub sample: u32,
-    /// The profiles of the other sources of a refine run (issue #2380). A
-    /// valid reply applies to each of them too.
+    /// The profiles of the other sources of a refine run, and the profile of
+    /// the kind (issue #2380). A valid reply applies to each of them too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub others: Vec<AgentProfile>,
 }
@@ -423,8 +423,8 @@ pub(crate) struct Edit<'a> {
     pub ceilings: &'a Ceilings,
     /// The number of attempts.
     pub attempts: ProposalAttempts,
-    /// The profiles of the other sources of the run. A reply must apply to
-    /// each of them too, so a carried overlay fits each later source.
+    /// The profiles of the other sources of the run, and the profile of the
+    /// kind. A reply must apply to each of them too.
     pub others: &'a [AgentProfile],
 }
 
@@ -719,7 +719,7 @@ impl Check<'_> {
             .map_err(|err| format!("the overlay is refused: {err}"))?;
         for other in self.others {
             overlay::apply(other, &overlay, self.ceilings, self.registry).map_err(|err| {
-                format!("the overlay is refused for another source of the run: {err}")
+                format!("the overlay is refused for another source of the run or the kind: {err}")
             })?;
         }
         if with_named_model(applied) == self.base {

@@ -623,6 +623,8 @@ struct Refine<'a> {
     input: &'a RefineInput,
     /// Every source of the run, in input order.
     sources: &'a [SourceBrief],
+    /// The registered profile of the kind.
+    kind_profile: &'a AgentProfile,
     ceilings: Ceilings,
     attempts: ProposalAttempts,
     effects: BTreeSet<ToolEffect>,
@@ -825,13 +827,16 @@ impl Refine<'_> {
         }))
     }
 
-    /// The profiles of each source other than `source`. A stage reply must
-    /// apply to each of them, so the run can carry it to any source.
+    /// The profiles of each source other than `source`, and the registered
+    /// profile of the kind. A stage reply must apply to each of them. So the
+    /// run can carry it to any source, and the kind can take the chosen
+    /// overlay.
     fn others(&self, source: &SourceBrief) -> Vec<AgentProfile> {
         self.sources
             .iter()
             .filter(|other| other.run != source.run)
             .map(|other| other.profile.clone())
+            .chain(std::iter::once(self.kind_profile.clone()))
             .collect()
     }
 
@@ -1067,6 +1072,7 @@ pub async fn agent_refine(
         ctx,
         input: &input,
         sources: &start.sources,
+        kind_profile: &start.profile,
         ceilings: start.ceilings.clone(),
         attempts: policy.proposal_attempts,
         effects: policy.probe_effects.clone(),
