@@ -419,6 +419,17 @@ pub proof fn theorem_an_explicit_scheduler_moves_retention(enabled: bool, schedu
 pub proof fn theorem_run_on_all_runs_retention_everywhere(enabled: bool, scheduler: bool) ensures spec_runs_retention(enabled, RetentionRunOn::All, scheduler) == enabled,
 pub proof fn theorem_disabled_retention_never_runs(run_on: RetentionRunOn, scheduler: bool) ensures ! spec_runs_retention(false, run_on, scheduler),
 
+## formal/verus/src/refine_gate.rs
+pub enum GateEvent { Deadline, Unreadable, Reject, Activated, Refused, Conflict, }
+pub enum GateStep { Wait, Adopted, Rejected, TimedOut, Superseded, }
+pub open spec fn spec_gate_step(event: GateEvent) -> GateStep { match event { GateEvent::Deadline => GateStep::TimedOut, GateEvent::Unreadable => GateStep::Wait, GateEvent::Reject => GateStep::Rejected, GateEvent::Activated => GateStep::Adopted, GateEvent::Refused => GateStep::Wait, GateEvent::Conflict => GateStep::Superseded, } }
+pub fn gate_step(event: GateEvent) -> (r: GateStep) ensures r == spec_gate_step(event), r is Adopted <==> event is Activated, r is Wait <==> (event is Unreadable || event is Refused),
+pub open spec fn spec_gate(events: Seq < GateEvent >) -> GateStep decreases events.len(), { if events.len() == 0 { GateStep::Wait } else if spec_gate_step(events [0]) is Wait { spec_gate(events.subrange(1, events.len() as int)) } else { spec_gate_step(events [0]) } }
+pub proof fn theorem_only_an_activation_adopts(events: Seq < GateEvent >) requires spec_gate(events) is Adopted, ensures exists | i: int | 0 <= i < events.len() && events [i] is Activated && forall | j: int | 0 <= j < i ==> #[trigger] spec_gate_step(events [j]) is Wait, decreases events.len(),
+pub proof fn theorem_no_activation_never_adopts(events: Seq < GateEvent >) requires forall | i: int | 0 <= i < events.len() ==>! (#[trigger] events [i] is Activated), ensures ! (spec_gate(events) is Adopted),
+pub proof fn theorem_an_end_is_final(events: Seq < GateEvent >, more: Seq < GateEvent >) requires ! (spec_gate(events) is Wait), ensures spec_gate(events + more) == spec_gate(events), decreases events.len(),
+pub proof fn theorem_a_deadline_never_adopts() ensures spec_gate_step(GateEvent::Deadline) is TimedOut,
+
 ## formal/verus/src/refine_policy.rs
 pub enum AdoptDecision { Adopt, Unchanged, NeedsApproval, CapReached, }
 pub open spec fn spec_parts_allowed(changed: u8, allowed: u8) -> bool { changed &! allowed == 0 }

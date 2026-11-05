@@ -21,7 +21,7 @@ holds the policy log of each kind. A missing policy means every default.
 |---|---|---|---|
 | `auto_adopt.parts` | `[]`, so every overlay waits | `ProfileOverlayStore::auto_adopt`, through `refine::adopt` (#2381) | Yes, in the store |
 | `auto_adopt.max_per_day` | `1` | `ProfileOverlayStore::auto_adopt` (#2381) | Yes, in the store |
-| `approval_timeout` | `7d` | `RefinePolicy::gate_state` (#2381) | No. The gate of #2381 will call it. |
+| `approval_timeout` | `7d` | `RefinePolicy::gate_state` (#2381) | Yes, in the gate of `agent_refine`. See [DESIGN-2381](DESIGN-2381.md). |
 | `probe_effects` | `[read_only]` | `eval::live_probe` (#2378) | Yes, in the tool-call activity of the probe. `agent_refine` (#2380) passes it. |
 | `ceilings` | the profile values and model | the store validator and the op read (#2370, #2372) | Yes |
 | `proposal_attempts` | `2` | `ProposeRequest::attempts` (#2379) | No. The workflow of #2380 copies it. |

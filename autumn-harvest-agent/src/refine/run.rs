@@ -17,6 +17,8 @@
 //!    [`RefineStatus::BudgetExhausted`], with no chosen overlay.
 //! 5. A run that ran its whole plan checks its counts with
 //!    [`RefineLedger::check`].
+//! 6. A run that chose an overlay runs the adoption gate of
+//!    [`gate`](super::gate). A dry run ends before it.
 //!
 //! Each stage, probe and selection is one recorded activity. A crash
 //! re-runs only the step in flight.
@@ -35,6 +37,7 @@ use super::compose::{
     ComposeRequest, Composition, ProbedCandidate, SelectRequest, SelectedBy, Selection,
     agent_refine_compose_info, agent_refine_select_info, source_events,
 };
+use super::gate::{Gate, GateRecord, set_status};
 use super::ledger::{MAX_REFINE_K, MAX_SOURCE_RUNS, RefineError, RefineLedger, RefineMode};
 use super::policy::{PolicyCeilings, RefinePolicy};
 use super::policy_read::read_refine_policy;
@@ -44,6 +47,7 @@ use super::propose::{
 };
 use super::sources::{LiveEnd, LiveProbeError, LiveRequest};
 use crate::agent::overlay::{Ceilings, ProfileOverlay};
+use crate::agent::overlay_store::{OverlayVersion, StoredOverlay};
 use crate::agent::{AGENT_WORKFLOW_NAME, AgentId, AgentProfile};
 use crate::eval::anon::AnonId;
 use crate::eval::evidence::render_source;
@@ -92,6 +96,10 @@ pub struct RefineInput {
     /// The cap on the spend of the run. `None` sets no cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<MeshBudget>,
+    /// End after the loop with the chosen overlay. A dry run stores no
+    /// version and opens no gate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
 }
 
 impl RefineInput {
@@ -111,7 +119,16 @@ impl RefineInput {
             mode,
             seed,
             budget: None,
+            dry_run: false,
         }
+    }
+
+    /// Make the run a dry run. It ends with the chosen overlay, stores no
+    /// version and opens no gate.
+    #[must_use]
+    pub const fn dry_run(mut self) -> Self {
+        self.dry_run = true;
+        self
     }
 
     /// Cap the spend of the run with `budget`.
@@ -196,6 +213,10 @@ pub struct RefineStart {
     pub selector: bool,
     /// The policy ceilings, resolved against the base profile.
     pub ceilings: Ceilings,
+    /// The version that was active at the start. An approval of the gate
+    /// expects it. A record with no field decodes as an unset pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<OverlayVersion>,
 }
 
 /// The part of the loop that a stage plays.
@@ -372,8 +393,9 @@ pub struct RefineReport {
     pub seed: u64,
     /// The source runs, in input order.
     pub source_runs: Vec<ExecutionId>,
-    /// How the run ended: [`RefineStatus::Chosen`],
-    /// [`RefineStatus::Unchanged`] or [`RefineStatus::BudgetExhausted`].
+    /// How the run ended. The loop gives [`RefineStatus::Unchanged`] or
+    /// [`RefineStatus::BudgetExhausted`]. A dry run gives
+    /// [`RefineStatus::Chosen`]. The gate gives each other status.
     pub status: RefineStatus,
     /// The chosen overlay. `None` when the run changed nothing or spent its
     /// budget.
@@ -384,6 +406,10 @@ pub struct RefineReport {
     pub selections: Vec<SelectionRecord>,
     /// The counts and the spend.
     pub ledger: RefineLedger,
+    /// The adoption gate. `None` when the run chose no overlay, when the
+    /// store found no change, and for a dry run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateRecord>,
 }
 
 /// A failure payload of `err` with its name.
@@ -403,6 +429,17 @@ fn kind_of(record: &super::sources::SourceRecord) -> Result<Option<String>, Stri
     task_of(&record.events)
         .map(|task| task.kind)
         .map_err(|err| err.to_string())
+}
+
+/// The active version of `kind`, or `None` with no store.
+async fn active_of(harness: &AgentHarness, kind: &str) -> Result<Option<StoredOverlay>, String> {
+    match harness.overlays() {
+        None => Ok(None),
+        Some(store) => store
+            .active(kind)
+            .await
+            .map_err(|err| format!("the overlay store failed: {err}")),
+    }
 }
 
 /// Check every source of `input`, then read the base profile, the active
@@ -487,15 +524,11 @@ pub(crate) async fn run_start(
         )))
     })?;
     let ceilings = ceilings.resolve(&profile);
-    let current = match harness.overlays() {
-        None => ProfileOverlay::default(),
-        Some(store) => store
-            .active(&input.kind)
-            .await
-            .map_err(|err| format!("the overlay store failed: {err}"))?
-            .map(|stored| stored.overlay().clone())
-            .unwrap_or_default(),
-    };
+    let active = active_of(harness, &input.kind).await?;
+    let current = active
+        .as_ref()
+        .map(|stored| stored.overlay().clone())
+        .unwrap_or_default();
     // Each stage and probe of a source starts from `current` on the source
     // profile. A source that the ceilings refuse would fail its first stage
     // after earlier sources spent, so the start step refuses it now.
@@ -514,6 +547,7 @@ pub(crate) async fn run_start(
         sources: briefs,
         selector: harness.overlay_selector().is_some(),
         ceilings,
+        active: active.as_ref().map(StoredOverlay::version),
     })
 }
 
@@ -1123,6 +1157,22 @@ pub async fn agent_refine(
             (RefineStatus::Chosen, Some(run.current.clone()))
         }
     };
+    let (status, gate) = match &chosen {
+        Some(overlay) if status == RefineStatus::Chosen && !input.dry_run => {
+            Gate {
+                ctx,
+                kind: &input.kind,
+                chosen: overlay,
+                expected: start.active,
+                policy: &policy,
+                ceilings: &start.ceilings,
+            }
+            .run()
+            .await?
+        }
+        _ => (status, None),
+    };
+    set_status(ctx, &input.kind, status);
     Ok(RefineReport {
         kind: input.kind.clone(),
         mode: input.mode,
@@ -1134,6 +1184,7 @@ pub async fn agent_refine(
         stages: run.stages,
         selections: run.selections,
         ledger: run.ledger,
+        gate,
     })
 }
 

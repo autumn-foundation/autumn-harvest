@@ -5,7 +5,7 @@
 //! [`decide_adoption`](super::policy::decide_adoption) against the active
 //! version. It puts and activates the version in one transaction, under
 //! the daily cap. Any other candidate is put as `refine:<run>`. It waits
-//! for the adoption gate of issue #2381.
+//! for the adoption gate of [`gate`](super::gate).
 
 use std::collections::BTreeSet;
 
@@ -23,15 +23,19 @@ use crate::mesh::MAX_NAME_LEN;
 
 /// The status of a refine run.
 ///
-/// `agent_refine` ends as `Chosen`, `Unchanged` or `BudgetExhausted`
-/// (issue #2380). The adoption step gives the other values.
+/// The loop of `agent_refine` gives `Chosen`, `Unchanged` or
+/// `BudgetExhausted`. The adoption step and the gate give the other values.
+/// [`RefineStatus::as_str`] is the value of the search attribute
+/// `refine_status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum RefineStatus {
     /// The candidate went live without a person.
     AutoAdopted,
-    /// The candidate waits for a person.
+    /// The candidate waits for a person. Its name is `waiting_approval`.
+    /// A value written as `awaiting_approval` still decodes.
+    #[serde(rename = "waiting_approval", alias = "awaiting_approval")]
     AwaitingApproval,
     /// The candidate changes no part. Nothing was stored.
     Unchanged,
@@ -44,6 +48,32 @@ pub enum RefineStatus {
     /// The refine run spent its budget before its plan ended (issue
     /// #2380). It chose no overlay.
     BudgetExhausted,
+    /// A person approved the candidate, or an edit of it, and it went live.
+    Adopted,
+    /// A person rejected the candidate. It stays stored and inactive.
+    Rejected,
+    /// The active version moved after refine start, so the approval
+    /// activated nothing.
+    Superseded,
+}
+
+impl RefineStatus {
+    /// The name of the status: the value of the search attribute
+    /// `refine_status`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AutoAdopted => "auto_adopted",
+            Self::AwaitingApproval => "waiting_approval",
+            Self::Unchanged => "unchanged",
+            Self::TimedOut => "timed_out",
+            Self::Chosen => "chosen",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::Adopted => "adopted",
+            Self::Rejected => "rejected",
+            Self::Superseded => "superseded",
+        }
+    }
 }
 
 /// Why a candidate waits for a person.
@@ -110,7 +140,9 @@ pub struct Adoption {
 ///
 /// A retry after a lost reply finds its own `auto:<run>` version, and
 /// reports it as adopted with no move. The version need not be active, so
-/// a retry never undoes a rollback or a later adoption.
+/// a retry never undoes a rollback or a later adoption. A retry also finds
+/// its own `refine:<run>` version of the same overlay, so it puts no second
+/// version.
 ///
 /// # Errors
 ///
@@ -124,12 +156,8 @@ pub async fn adopt(
     policy: &RefinePolicy,
 ) -> Result<Adoption, OverlayStoreError> {
     let own = Provenance::auto(run);
-    if let Some(done) = store
-        .list(kind)
-        .await?
-        .iter()
-        .find(|stored| stored.provenance() == &own)
-    {
+    let versions = store.list(kind).await?;
+    if let Some(done) = versions.iter().find(|stored| stored.provenance() == &own) {
         return Ok(Adoption {
             refine_status: RefineStatus::AutoAdopted,
             version: Some(done.version()),
@@ -169,7 +197,15 @@ pub async fn adopt(
             "a refined overlay waits: the auto adoption cap is reached"
         );
     }
-    let version = store.put(kind, candidate, Provenance::refine(run)).await?;
+    let waits = Provenance::refine(run);
+    let earlier = versions
+        .iter()
+        .find(|stored| stored.provenance() == &waits && stored.overlay() == candidate)
+        .map(StoredOverlay::version);
+    let version = match earlier {
+        Some(version) => version,
+        None => store.put(kind, candidate, waits).await?,
+    };
     Ok(Adoption {
         refine_status: RefineStatus::AwaitingApproval,
         version: Some(version),

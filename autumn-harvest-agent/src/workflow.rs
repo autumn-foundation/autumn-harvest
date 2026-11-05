@@ -3357,6 +3357,8 @@ pub fn activities() -> Vec<ActivityInfo> {
         crate::refine::agent_refine_probe_info(),
         crate::refine::agent_refine_compose_info(),
         crate::refine::agent_refine_select_info(),
+        crate::refine::agent_refine_adopt_info(),
+        crate::refine::agent_refine_decide_info(),
     ]);
     list
 }

@@ -14,6 +14,10 @@
 //! | `policy <kind> set` | the `show` route, then `PUT /agents/{kind}/profile/policy` |
 //! | `policy <kind> reset` | `POST /agents/{kind}/profile/policy/reset` |
 //! | `policy <kind> history` | `GET /agents/{kind}/profile/policy/changes` |
+//! | `pending <kind>` | `GET /workflows` with a `filter` on the refine search attributes |
+//! | `approve <run>` | `POST /workflows/{run}/signal/refine_approval:{run}` |
+//! | `reject <run>` | the `approve` route, with a `reject` verdict |
+//! | `edit <run> --file <overlay>` | the `approve` route, with an `edit` verdict |
 //!
 //! `activate` sends a compare-and-swap. Without `--expected`, it reads the
 //! active version first. A `409` then names the version that won.
@@ -21,6 +25,10 @@
 //! `policy set` (issue #2394) reads the policy, changes only the keys that
 //! its flags name, and sends the result over the revision that it read. A
 //! `409` means that another operator changed the policy in between.
+//!
+//! `pending` lists the refine runs of a kind that wait for a person.
+//! `approve`, `reject` and `edit` send the decision to one of them. A run
+//! drops a decision that arrives before its wait opens, so list it first.
 
 use clap::{Args, Subcommand};
 use serde_json::{Value, json};
@@ -69,6 +77,34 @@ pub enum ProfileCommand {
     Rollback {
         /// The agent kind.
         kind: String,
+    },
+    /// List the refine runs of a kind that wait for a person.
+    Pending {
+        /// The agent kind.
+        kind: String,
+    },
+    /// Approve the overlay that a waiting refine run stored.
+    Approve {
+        /// The execution id of the refine run.
+        run: String,
+    },
+    /// Reject the overlay that a waiting refine run stored. It stays
+    /// stored and inactive.
+    Reject {
+        /// The execution id of the refine run.
+        run: String,
+        /// Why, for the report of the run.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Activate an edited overlay instead. The run checks it against the
+    /// ceilings, and keeps its wait when they refuse it.
+    Edit {
+        /// The execution id of the refine run.
+        run: String,
+        /// The overlay as a JSON file, or `-` for stdin.
+        #[arg(long)]
+        file: std::path::PathBuf,
     },
     /// Show, set or reset the refine policy of a kind (issue #2394). Only
     /// the operator role sets or resets it.
@@ -139,6 +175,43 @@ pub struct PolicySet {
     /// the command uses the revision that it reads.
     #[arg(long)]
     pub expected: Option<String>,
+}
+
+/// The workflow name of a refine run. It is
+/// `autumn_harvest_agent::refine::REFINE_WORKFLOW_NAME`.
+pub const REFINE_WORKFLOW: &str = "agent_refine";
+
+/// The signal prefix of the adoption gate. It is
+/// `autumn_harvest_agent::refine::SIGNAL_REFINE_APPROVAL`.
+pub const REFINE_APPROVAL_SIGNAL: &str = "refine_approval";
+
+/// The page size of `pending`.
+const PENDING_PAGE_SIZE: i64 = 50;
+
+/// The `GET /workflows` path of the refine runs of `kind` that wait.
+fn pending_path(kind: &str) -> String {
+    let expr = format!(
+        "workflow_name = {} AND attrs.refine_kind = {} AND attrs.refine_status = 'waiting_approval'",
+        crate::agents::literal(REFINE_WORKFLOW),
+        crate::agents::literal(kind)
+    );
+    format!(
+        "/workflows?state=RUNNING&filter={}&page_size={PENDING_PAGE_SIZE}",
+        query_encode(&expr)
+    )
+}
+
+/// The decision `payload` for the gate of the refine run `run`.
+fn decision(run: &str, payload: Value) -> ApiRequest {
+    let run = run.trim();
+    ApiRequest::post(
+        format!(
+            "/workflows/{}/signal/{}",
+            path_segment(run),
+            path_segment(&format!("{REFINE_APPROVAL_SIGNAL}:{run}"))
+        ),
+        Some(payload),
+    )
 }
 
 /// The base path of the overlay routes of `kind`.
@@ -218,6 +291,25 @@ pub fn profile_request(command: &ProfileCommand) -> Result<ApiRequest, CliError>
             format!("{}/rollback", base(kind)),
             Some(json!({})),
         )),
+        ProfileCommand::Pending { kind } => Ok(ApiRequest::get(pending_path(kind))),
+        ProfileCommand::Approve { run } => Ok(decision(run, json!({"verdict": "approve"}))),
+        ProfileCommand::Reject { run, reason } => Ok(decision(
+            run,
+            json!({"verdict": "reject", "reason": reason.as_deref().unwrap_or_default()}),
+        )),
+        ProfileCommand::Edit { run, file } => {
+            let overlay = crate::parse_json_source(None, Some(file), "overlay")?
+                .ok_or_else(|| CliError::InvalidInput("the overlay file is empty".to_owned()))?;
+            if !overlay.is_object() {
+                return Err(CliError::InvalidInput(
+                    "the overlay must be a JSON object".to_owned(),
+                ));
+            }
+            Ok(decision(
+                run,
+                json!({"verdict": "edit", "overlay": overlay}),
+            ))
+        }
         ProfileCommand::Policy { kind, action } => match action {
             PolicyAction::Show => Ok(ApiRequest::get(format!("{}/policy", base(kind)))),
             PolicyAction::Reset => Ok(ApiRequest::post(
@@ -685,5 +777,74 @@ mod tests {
         assert_eq!(active_of(&json!({"active": null})).ok(), Some(None));
         assert!(active_of(&json!({})).is_err());
         assert!(active_of(&json!({"active": 0})).is_err());
+    }
+
+    #[test]
+    fn pending_filters_the_waiting_refine_runs_of_a_kind() {
+        let request = profile_request(&ProfileCommand::Pending {
+            kind: "support".to_owned(),
+        })
+        .expect("one request");
+        assert_eq!(request.method, ApiMethod::Get);
+        let decoded = request
+            .path
+            .replace("%20", " ")
+            .replace("%3D", "=")
+            .replace("%27", "'");
+        assert!(
+            decoded.starts_with("/workflows?state=RUNNING&filter="),
+            "{decoded}"
+        );
+        for part in [
+            "workflow_name = 'agent_refine'",
+            "attrs.refine_kind = 'support'",
+            "attrs.refine_status = 'waiting_approval'",
+        ] {
+            assert!(decoded.contains(part), "{part} in {decoded}");
+        }
+    }
+
+    #[test]
+    fn each_decision_signals_the_gate_of_its_run() {
+        let run = "0190a5a0-0000-7000-8000-000000000001";
+        let signal = format!("/workflows/{run}/signal/refine_approval:{run}");
+        let approve = profile_request(&ProfileCommand::Approve {
+            run: run.to_owned(),
+        })
+        .unwrap();
+        assert_eq!(approve.method, ApiMethod::Post);
+        assert_eq!(approve.path, signal);
+        assert_eq!(approve.body, Some(json!({"verdict": "approve"})));
+        let reject = profile_request(&ProfileCommand::Reject {
+            run: run.to_owned(),
+            reason: Some("too long".to_owned()),
+        })
+        .unwrap();
+        assert_eq!(reject.path, signal);
+        assert_eq!(
+            reject.body,
+            Some(json!({"verdict": "reject", "reason": "too long"}))
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("overlay.json");
+        std::fs::write(&file, r#"{"system": "Be brief."}"#).unwrap();
+        let edit = profile_request(&ProfileCommand::Edit {
+            run: run.to_owned(),
+            file: file.clone(),
+        })
+        .unwrap();
+        assert_eq!(edit.path, signal);
+        assert_eq!(
+            edit.body,
+            Some(json!({"verdict": "edit", "overlay": {"system": "Be brief."}}))
+        );
+        std::fs::write(&file, "[1]").unwrap();
+        assert!(
+            profile_request(&ProfileCommand::Edit {
+                run: run.to_owned(),
+                file,
+            })
+            .is_err()
+        );
     }
 }

@@ -369,7 +369,7 @@ fn list_path(filter: &ListFilter<'_>, page_size: i64, cursor: Option<&str>) -> S
 
 /// A quoted string of the `filter` grammar. A backslash escapes the next
 /// character.
-fn literal(value: &str) -> String {
+pub fn literal(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 

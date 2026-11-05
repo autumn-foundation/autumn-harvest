@@ -325,6 +325,28 @@ pub async fn decide(
     Ok(())
 }
 
+/// Send a decision of a person to the adoption gate of the refine run
+/// `exec`.
+///
+/// The gate drops a decision that arrives before its wait opens. List the
+/// runs with `refine_status = waiting_approval` first.
+///
+/// # Errors
+///
+/// Returns an error when the run does not exist or has ended, or when the
+/// engine cannot record the signal.
+pub async fn decide_refine(
+    pg: &PostgresAgents,
+    exec: ExecutionId,
+    decision: &crate::refine::RefineDecision,
+) -> HarvestResult<()> {
+    let mut conn = pg.conn(pg.shard_of(exec).await?).await?;
+    let payload = serde_json::to_value(decision)?;
+    let signal = crate::refine::refine_approval_signal(exec);
+    send_signal_idempotent_with_codecs(&mut conn, exec, &signal, payload, None, &pg.codecs).await?;
+    Ok(())
+}
+
 /// Send `op` to the durable agent `id`. Start the agent when it has no run.
 ///
 /// A worker then runs the op. Pass the message id as `idempotency_key`, so a
