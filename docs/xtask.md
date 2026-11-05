@@ -75,7 +75,7 @@ An audit also needs a row in [`docs/audits/README.md`](audits/README.md).
 |---|---|---|
 | `cargo xtask ci advisory-scan` | `xtask/src/ci/advisory_scan.rs` | `.github/ci/advisory-scan.sh` |
 | `cargo xtask ci chaos-watchdog` | `xtask/src/ci/chaos_watchdog.rs` | `.github/ci/chaos-watchdog.sh` |
-| `cargo xtask ci coverage` | `xtask/src/ci/coverage.rs` | `.github/ci/coverage.py` |
+| `cargo xtask ci coverage` | `xtask/src/ci/coverage/mod.rs` | `.github/ci/coverage.py` |
 | `cargo xtask ci pull-test-images` | `xtask/src/ci/pull_test_images.rs` | `.github/ci/pull-test-images.sh` |
 | `cargo xtask ci run-suites` | `xtask/src/ci/run_suites.rs` | `.github/ci/run-suites.sh` |
 

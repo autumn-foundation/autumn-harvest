@@ -36,7 +36,7 @@
 # CI integration-suite manifest — the single source of truth for which
 # Columns (whitespace-separated; `-` = none/absent):
 # `--test-threads=1` and `--no-run` are DERIVED from `osclass` by the runner and
-# `.github/ci/run-suites.sh` (which the `test` job invokes) and cross-checked
+# `cargo xtask ci run-suites` (which the `test` job invokes) and cross-checked
 # `manifest_is_sorted_and_unique`, fixed with:
 # are never written here — this is what keeps the `--test-threads=1`-after-`--`
 # by `autumn-harvest/tests/integration/ci_run_coverage.rs`.

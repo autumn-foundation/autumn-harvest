@@ -829,11 +829,11 @@ jobs:
       # fix. Pure Python stdlib, no deps, no network, no cargo build.
       - name: Shard-weight drift report (docs/audits/shard-weight-drift.py)
         run: python3 docs/audits/shard-weight-drift.py
-      # The nightly coverage report and ratchet use this script (issue
+      # The nightly coverage report and ratchet use this command (issue
       # #1818). The self-test checks the LCOV merge, the llvm-cov JSON line
       # rule and the ratchet in seconds, so a break shows on the PR.
-      - name: Coverage script self-test (.github/ci/coverage.py)
-        run: python3 .github/ci/coverage.py --self-test
+      - name: Coverage self-test (cargo xtask ci coverage)
+        run: cargo xtask ci coverage --self-test
 
   test:
     name: Test (${{ matrix.os }})
@@ -923,7 +923,7 @@ jobs:
   # `test-db-linux` below, the next-largest cost on the still-serial `test` leg
   # was the REST of its non-DB work -- ~30 individual crate/example
   # `cargo test`/`cargo build` steps plus the two manifest-driven
-  # `run-suites.sh compile` / `run-suites.sh run allos` steps -- measured on
+  # `cargo xtask ci run-suites compile` / `run allos` steps -- measured on
   # `windows-latest` (the leg that split left as the long pole) at ~38% of that
   # leg's wall time for the manifest pair alone (28.3 + 13.8 of 110.9 minutes),
   # with `Compile db-backed tests` and `Run all-features lib tests` adding
@@ -932,10 +932,10 @@ jobs:
   # OS `test` itself runs on.
   #
   # Two sharding mechanisms meet here:
-  #   * The manifest-driven steps (`compile`, `run allos`) use `run-suites.sh`'s
+  #   * The manifest-driven steps (`compile`, `run allos`) use the runner's
   #     OWN row-ordinal sharding (SEMAPHORE_SHARD_COUNT/INDEX below) -- every
   #     shard runs the SAME two steps, each processing a disjoint slice of the
-  #     manifest rows. See run-suites.sh's header comment for why a filtered,
+  #     manifest rows. See xtask/src/ci/run_suites.rs's module doc for why a filtered,
   #     already-sorted row list still batches correctly.
   #   * The ~30 individual steps carried over from `test` have no such
   #     mechanism (each is its own crate/example, not a manifest row). Each
@@ -1030,14 +1030,14 @@ jobs:
           # (os error 1455, "the paging file is too small"). Two jobs keep the
           # peak inside it. The other OSes keep the default.
           CARGO_BUILD_JOBS: ${{ runner.os == 'Windows' && '2' || 'default' }}
-        run: bash .github/ci/run-suites.sh compile
+        run: cargo xtask ci run-suites compile
       - name: Run all-OS manifest suites (no live DB)
         if: needs.changes.outputs.code == 'true'
         shell: bash
         env:
           SEMAPHORE_SHARD_COUNT: "4"
           SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
-        run: bash .github/ci/run-suites.sh run allos
+        run: cargo xtask ci run-suites run allos
       # ── Individual crate/example steps carried over from `test`, one shard
       # each, balanced by measured time (see the job comment above) ─────────
       # The lib test target needs about 8 GB to compile, and `integration`
@@ -1440,7 +1440,7 @@ jobs:
   # shard 15 of a green trunk-dev run, that took 15.6 of the 22.4 minutes of
   # its suite step, and each of the 21 shards repeated it.
   #
-  # `run-suites.sh archive` explains the feature union and the debug-info
+  # `cargo xtask ci run-suites archive` explains the feature union and the debug-info
   # setting. Without the debug-info setting the archive does not fit an
   # artifact: one plugin test binary is about 1.4 GB.
   #
@@ -1485,7 +1485,7 @@ jobs:
       - name: Build the live-DB test archive
         if: needs.changes.outputs.code == 'true'
         shell: bash
-        run: bash .github/ci/run-suites.sh archive "$RUNNER_TEMP/nextest-db.tar.zst"
+        run: cargo xtask ci run-suites archive "$RUNNER_TEMP/nextest-db.tar.zst"
       # The archive is zstd already, so the upload does not compress it again.
       # One day of retention is enough: only this run reads it.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1503,7 +1503,7 @@ jobs:
   # sampled runs. Sharded across parallel jobs here instead.
   #
   # Each shard runs a slice of the tests from the `test-db-archive` archive.
-  # `run-suites.sh nextest` takes the slice with `--partition hash:<k>/<N>`, so
+  # `cargo xtask ci run-suites nextest` takes the slice with `--partition hash:<k>/<N>`, so
   # a test lands on one shard by the hash of its name. A large suite spreads
   # over all shards, and no shard compiles. The row-ordinal sharding that the
   # comment above `matrix` analyses now runs only in the coverage nightly.
@@ -1701,9 +1701,10 @@ jobs:
       SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # No rust-cache: a shard compiles nothing. It runs binaries from the
-      # archive. The toolchain stays, because `cargo nextest` runs through
-      # cargo.
+      # No rust-cache: a shard compiles only the small `xtask` binary. It runs
+      # the test binaries from the archive. A cache of `target` would save the
+      # unpacked archive too. The toolchain stays, because `cargo xtask` and
+      # `cargo nextest` run through cargo.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
@@ -1732,7 +1733,7 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
-          bash .github/ci/run-suites.sh extract "$RUNNER_TEMP/nextest-db.tar.zst"
+          cargo xtask ci run-suites extract "$RUNNER_TEMP/nextest-db.tar.zst"
           rm -f "$RUNNER_TEMP/nextest-db.tar.zst"
           df -h /
       # The prune above guarantees every shard pulls its testcontainer images
@@ -1743,8 +1744,8 @@ jobs:
       # the pull here, in its own step with its own budget, turns that into a
       # retried infrastructure step instead of a flaky test.
       #
-      # The script header lists each image and why the suites need it. The
-      # coverage nightly calls the same script.
+      # The module doc of xtask/src/ci/pull_test_images.rs lists each image
+      # and why the suites need it. The coverage nightly runs the same command.
       - name: Pre-pull Docker test images (retry transient pull failures)
         if: needs.changes.outputs.code == 'true'
         shell: bash
@@ -1752,7 +1753,7 @@ jobs:
           # The hash partition sends tests of each emulator suite to many
           # shards, so every shard pulls every emulator image.
           PULL_EVERY_SUITE_IMAGE: "1"
-        run: bash .github/ci/pull-test-images.sh
+        run: cargo xtask ci pull-test-images
       - name: Run Linux Docker-backed manifest suites (shard)
         if: needs.changes.outputs.code == 'true'
         shell: bash
@@ -1772,7 +1773,7 @@ jobs:
           # into a panic, so "the Redis suites stopped testing anything" is a
           # red build here rather than a silent green.
           HARVEST_TEST_REQUIRE_REDIS: "1"
-        run: bash .github/ci/run-suites.sh nextest linux
+        run: cargo xtask ci run-suites nextest linux
       # Issue #958, AC2: re-run the store/replay/retention suites against the
       # opt-in PARTITIONED `harvest_events` layout. Same suites, same
       # assertions, `HARVEST_TEST_PARTITIONED=1` -- so "per-execution event
@@ -1784,7 +1785,7 @@ jobs:
       - name: Integration suites (partitioned harvest_events layout)
         if: needs.changes.outputs.code == 'true'
         shell: bash
-        run: bash .github/ci/run-suites.sh nextest linuxpart
+        run: cargo xtask ci run-suites nextest linuxpart
 
   quickstart:
     name: Quickstart example builds and runs (clean-room, README steps)
@@ -2542,9 +2543,9 @@ jobs:
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # `testcontainers` retries no pull, so a registry blip would fail the
-      # suite. The script retries it.
+      # suite. The command retries it.
       - name: Pre-pull the Postgres image
-        run: bash .github/ci/pull-test-images.sh postgres:16
+        run: cargo xtask ci pull-test-images postgres:16
       # A SQLite app with a Postgres Harvest database. The test starts a
       # Postgres container, so this lane needs the runner's Docker.
       - name: SQLite app on a Postgres Harvest database

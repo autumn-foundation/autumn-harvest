@@ -7,10 +7,8 @@
 # `LC_ALL=C sort -u` fix. See docs/changelog.d and the manifest header.
 .github/ci/integration-suites.txt merge=union text eol=lf
 
-# The manifest and runner script are checked out with LF on every OS (the runner
-# is executed by Git Bash on the Windows CI leg; a CRLF-corrupted `.sh` would
-# fail to parse).
-.github/ci/run-suites.sh          text eol=lf
+# Shell scripts are checked out with LF on every OS. Git Bash runs them on the
+# Windows CI leg, and a CRLF-corrupted `.sh` would fail to parse.
 *.sh                              text eol=lf
 
 # The generated OpenAPI document is compiled into the plugin with `include_str!`
