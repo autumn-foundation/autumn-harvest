@@ -157,8 +157,8 @@ pub use api::{
 };
 pub use config::{
     HarvestBatchConfig, HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig,
-    HarvestReadinessConfig, HarvestRedisConfig, HarvestRuntimeConfig, HarvestStartupConfig,
-    OrphanStartupAction,
+    HarvestReadinessConfig, HarvestRedisConfig, HarvestRetentionConfig, HarvestRuntimeConfig,
+    HarvestStartupConfig, OrphanStartupAction, RetentionRunOn,
 };
 pub use embedding::{HarvestEmbedding, HarvestEmbeddingRuntime};
 pub use outbox::{

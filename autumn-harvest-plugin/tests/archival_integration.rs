@@ -218,6 +218,10 @@ async fn archival_hook_executes_successfully_and_preserves_on_failure() {
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
             redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
+            // Both switches are off, so retention needs `all` (issue #2478).
+            retention: autumn_harvest_plugin::HarvestRetentionConfig {
+                run_on: autumn_harvest_plugin::RetentionRunOn::All,
+            },
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -375,6 +379,10 @@ async fn archival_hook_fires_for_override_deleted_row() {
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
             redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
+            // Both switches are off, so retention needs `all` (issue #2478).
+            retention: autumn_harvest_plugin::HarvestRetentionConfig {
+                run_on: autumn_harvest_plugin::RetentionRunOn::All,
+            },
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -489,6 +497,10 @@ async fn archival_hook_times_out_and_preserves_execution() {
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
             redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
+            // Both switches are off, so retention needs `all` (issue #2478).
+            retention: autumn_harvest_plugin::HarvestRetentionConfig {
+                run_on: autumn_harvest_plugin::RetentionRunOn::All,
+            },
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -576,6 +588,10 @@ async fn retention_preserves_a_failed_callback_delivery_and_its_dead_letter() {
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
             redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
+            // Both switches are off, so retention needs `all` (issue #2478).
+            retention: autumn_harvest_plugin::HarvestRetentionConfig {
+                run_on: autumn_harvest_plugin::RetentionRunOn::All,
+            },
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -782,6 +798,10 @@ async fn retention_reclaims_an_orphaned_delivered_completion_delivery() {
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
             redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
+            // Both switches are off, so retention needs `all` (issue #2478).
+            retention: autumn_harvest_plugin::HarvestRetentionConfig {
+                run_on: autumn_harvest_plugin::RetentionRunOn::All,
+            },
         },
         HarvestRunnerResources::new(pool.clone()),
     )

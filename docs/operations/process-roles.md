@@ -40,6 +40,65 @@ shared `autumn.toml`:
 backend = "postgres"
 ```
 
+## Background runtimes (issue #2478)
+
+Each role runs these Harvest runtimes. No switch is set, and retention
+is on.
+
+| Runtime | `web` | `worker`, `combined`, no role |
+|---|---|---|
+| Worker | off | on |
+| Scheduler | off | on |
+| Batch executor | off | on |
+| Retention janitor | off | on |
+| Dispatch-metrics sampler | on | off: the worker samples |
+| Post-commit notify sender | on | on |
+| Codec key refresh | on | off: the worker refreshes |
+
+The test `each_role_places_each_runtime` in `runner.rs` pins this table.
+
+- **Retention runs where the scheduler runs.** That is the default,
+  `run_on = "scheduler"`. An explicit `scheduler_enabled` moves retention
+  with it.
+- **`run_on = "all"` runs retention on each process**, as before issue
+  #2478. Row leases keep concurrent janitors correct. Set it in
+  `autumn.toml`, or with `AUTUMN_HARVEST_RETENTION__RUN_ON=all`:
+
+  ```toml
+  [harvest.retention]
+  run_on = "all"
+  ```
+
+  An unknown value stops the boot.
+- **The notify sender runs on each process.** A `web` replica writes rows
+  too, so it sends the notifications that wake the waiters.
+- **The dispatch-metrics sampler runs only with no worker.** A worker
+  runs its own copy. Two copies would emit each gauge twice.
+- A process with retention on but not placed logs one `info!` at
+  startup. The line names `run_on` and the fix.
+- A typo in `run_on` stops the boot on the SQLite backend too, though
+  SQLite ignores the value.
+- The SQLite backend runs retention in its driver on every role. It
+  ignores `run_on`.
+- A standalone runner, `HarvestEmbedding` included, reads no
+  `[harvest.retention]`. It takes `run_on` from the `HarvestRuntimeConfig`
+  that its caller passes. With no role and the scheduler off, it logs a
+  `warn!`, because its retention may run nowhere.
+
+**The retention API on a `web` replica.** `GET /admin/retention` and
+`POST /admin/retention/run-now` read the janitor of the process that
+serves them. A `worker` replica serves no app routes, so on a split fleet
+the API reaches no janitor by default:
+
+- `GET /admin/retention` shows the config, no shard results and
+  `placed_elsewhere: true`.
+- `POST /admin/retention/run-now`, and `harvest retention run-now`,
+  return 503. The message names `run_on = "all"`.
+
+To trigger a sweep from the API, set `run_on = "all"` on the `web`
+replicas. Otherwise the next tick on a `worker` replica runs the sweep.
+Read the retention metrics of the `worker` replicas for its results.
+
 ## Fly.io
 
 Each process group runs the same image. Only `AUTUMN_ROLE` differs in the
@@ -191,3 +250,8 @@ Harvest now logs a warning for that override. To remove the warning, set
 - The Harvest scheduler also stops on those replicas.
 - Autumn's own `#[job]` workers and cron tasks stop on those replicas too.
 - Autumn refuses the boot with no shared jobs backend. See [Rules](#rules).
+
+Issue #2478 moves the retention janitor off `web` replicas. A fleet with
+`worker` replicas keeps retention. A fleet that turns the scheduler off on
+every process runs no retention. Set `run_on = "all"` on one group, or
+turn the scheduler on. See [Background runtimes](#background-runtimes-issue-2478).
