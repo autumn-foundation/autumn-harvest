@@ -10,7 +10,8 @@
 //! Issue #2478 adds the retention placement. With `run_on = "scheduler"`,
 //! retention runs exactly where the resolved scheduler runs. So a `web` role
 //! with no explicit value runs no retention. With `run_on = "all"`, retention
-//! runs on each process, as it did before. Retention that is off never runs.
+//! runs on each process, as before issue #2478. Retention that is off never
+//! runs.
 
 use vstd::prelude::*;
 
@@ -234,6 +235,22 @@ pub proof fn theorem_other_roles_run_retention_by_default(role: Option<ProcessRo
             RetentionRunOn::Scheduler,
             spec_switch_value(None, spec_role_default(role)),
         ),
+{
+}
+
+/// An explicit scheduler value wins over the role, and retention follows
+/// it. So `scheduler_enabled = true` on a `web` role runs retention.
+pub proof fn theorem_an_explicit_scheduler_moves_retention(
+    enabled: bool,
+    scheduler: bool,
+    role: Option<ProcessRole>,
+)
+    ensures
+        spec_runs_retention(
+            enabled,
+            RetentionRunOn::Scheduler,
+            spec_switch_value(Some(scheduler), spec_role_default(role)),
+        ) == (enabled && scheduler),
 {
 }
 

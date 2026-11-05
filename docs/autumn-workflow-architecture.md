@@ -1010,7 +1010,7 @@ The terminal-task janitor deletes `harvest_task_queue` rows in `COMPLETED`, `FAI
 
 The management API exposes retention introspection and control via `GET /admin/retention` and `POST /admin/retention/run-now`.
 
-The janitor runs where the scheduler runs, unless `[harvest.retention] run_on = "all"` (issue #2478). Both routes read the janitor of the process that serves them. On a process with no janitor, `run-now` returns 503.
+The janitor runs where the scheduler runs, unless `[harvest.retention] run_on = "all"` (issue #2478). Both routes read the janitor of the process that serves them. On a process with no janitor, `GET` adds `placed_elsewhere: true` and `run-now` returns 503.
 
 ---
 
@@ -1459,7 +1459,7 @@ reconcile_interval_ms = 1000      # default: 1000 — interval of the reconcile 
 
 An unset `worker_enabled` or `scheduler_enabled` follows the Autumn process role. A `web` role turns both off. A `worker` or `combined` role, or no role, turns both on. An explicit value wins and logs a warning when it contradicts the role. See [`docs/operations/process-roles.md`](operations/process-roles.md).
 
-`harvest.retention.run_on` places the retention janitor. `scheduler` runs it where the resolved scheduler runs, so a `web` role runs none. `all` runs it on each process. The retention policy itself stays Rust-only. See [`docs/operations/process-roles.md`](operations/process-roles.md#background-runtimes-issue-2478).
+`harvest.retention.run_on` places the retention janitor. `scheduler` runs it where the resolved scheduler runs, so a `web` role runs none by default. `all` runs it on each process. The retention policy itself stays Rust-only. See [`docs/operations/process-roles.md`](operations/process-roles.md#background-runtimes-issue-2478).
 
 Setting `harvest.redis.url` needs the `redis` cargo feature of `autumn-harvest-plugin`. A build without that feature carries no channel implementation, so it rejects the URL at load rather than ignoring it. Validation also rejects an empty `key_prefix` or `consumer_group`, a `poll_interval_ms` outside 1 to 5000, and a `visibility_timeout_ms` below 1000. See [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md).
 

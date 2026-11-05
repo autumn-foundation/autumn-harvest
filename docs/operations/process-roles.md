@@ -76,17 +76,22 @@ The test `each_role_places_each_runtime` in `runner.rs` pins this table.
   runs its own copy. Two copies would emit each gauge twice.
 - A process with retention on but not placed logs one `info!` at
   startup. The line names `run_on` and the fix.
+- A typo in `run_on` stops the boot on the SQLite backend too, though
+  SQLite ignores the value.
 - The SQLite backend runs retention in its driver on every role. It
   ignores `run_on`.
-- A standalone runner has no role and no `[harvest]` load. It takes
-  `run_on` from the `HarvestRuntimeConfig` that it is given.
+- A standalone runner, `HarvestEmbedding` included, reads no
+  `[harvest.retention]`. It takes `run_on` from the `HarvestRuntimeConfig`
+  that its caller passes. With no role and the scheduler off, it logs a
+  `warn!`, because its retention may run nowhere.
 
 **The retention API on a `web` replica.** `GET /admin/retention` and
 `POST /admin/retention/run-now` read the janitor of the process that
 serves them. A `worker` replica serves no app routes, so on a split fleet
-the API never reaches a janitor:
+the API reaches no janitor by default:
 
-- `GET /admin/retention` shows the config and no shard results.
+- `GET /admin/retention` shows the config, no shard results and
+  `placed_elsewhere: true`.
 - `POST /admin/retention/run-now`, and `harvest retention run-now`,
   return 503. The message names `run_on = "all"`.
 

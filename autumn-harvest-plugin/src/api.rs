@@ -164,7 +164,7 @@ pub struct HarvestRetentionRuntime {
     monitor: Option<RetentionMonitor>,
     trigger: Option<tokio::sync::mpsc::Sender<()>>,
     /// Retention is on, but `run_on` places it on other processes (issue
-    /// #2478). `run-now` then names the fix.
+    /// #2478). The status says so, and `run-now` names the fix.
     placed_elsewhere: bool,
 }
 
@@ -191,8 +191,9 @@ impl HarvestRetentionRuntime {
     /// Retention is on, but this process does not run it (issue #2478).
     ///
     /// `harvest.retention.run_on = "scheduler"` places the janitor on the
-    /// processes that run the scheduler. `run-now` then returns a 503 that
-    /// names `run_on = "all"`.
+    /// processes that run the scheduler. `GET /admin/retention` then reports
+    /// `placed_elsewhere: true`. `run-now` returns a 503 that names
+    /// `run_on = "all"`.
     #[must_use]
     pub const fn placed_elsewhere(config: RetentionConfig) -> Self {
         let mut runtime = Self::new(config, None, None);
@@ -35866,9 +35867,23 @@ async fn bulk_discard_dead_letters_for_selector(
     Ok(result)
 }
 
+/// The body of `GET /admin/retention`.
+///
+/// `placed_elsewhere` is in the body only when it is `true` (issue #2478).
+/// So every other body is the plain `RetentionStatus`, as before.
+#[derive(serde::Serialize)]
+struct RetentionStatusBody {
+    #[serde(flatten)]
+    status: RetentionStatus,
+    /// Retention is on, but this process does not run the janitor. An
+    /// empty `per_shard` then means "not here", not "idle".
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    placed_elsewhere: bool,
+}
+
 async fn retention_status(
     Extension(api_state): Extension<HarvestApiState>,
-) -> Result<Json<RetentionStatus>, AutumnError> {
+) -> Result<Json<RetentionStatusBody>, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let status = runtime.retention.monitor.as_ref().map_or_else(
         || RetentionStatus {
@@ -35877,7 +35892,10 @@ async fn retention_status(
         },
         RetentionMonitor::snapshot,
     );
-    Ok(Json(status))
+    Ok(Json(RetentionStatusBody {
+        status,
+        placed_elsewhere: runtime.retention.placed_elsewhere,
+    }))
 }
 
 /// The 503 of `run-now` on a process with no placed janitor (issue #2478).

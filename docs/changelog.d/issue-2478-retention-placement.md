@@ -3,7 +3,7 @@
 **Behaviour change on `web` replicas.** The retention janitor now runs
 where the scheduler runs. An `AUTUMN_ROLE=web` replica runs no scheduler,
 so it runs no retention sweep. A `worker` or `combined` replica, or a
-standalone runner, still runs it. Set `[harvest.retention] run_on = "all"`
+standalone runner with the scheduler on, still runs it. Set `[harvest.retention] run_on = "all"`
 or `AUTUMN_HARVEST_RETENTION__RUN_ON=all` to keep the old behaviour.
 
 - New config: `HarvestRuntimeConfig::retention`, a `HarvestRetentionConfig`
@@ -19,8 +19,12 @@ or `AUTUMN_HARVEST_RETENTION__RUN_ON=all` to keep the old behaviour.
 - `POST /admin/retention/run-now` on a process with no placed janitor
   returns 503. The message names `run_on = "all"`. On a split fleet the
   `web` replicas serve the API, so `harvest retention run-now` returns 503
-  there by default. `GET /admin/retention` shows the config and no shard
-  results.
+  there by default.
+- `GET /admin/retention` on such a process adds `placed_elsewhere: true`.
+  An empty `per_shard` then means "not here", not "idle". Every other
+  body is unchanged.
+- A runner with no role and the scheduler off logs a `warn!`, not an
+  `info!`. Its retention may then run nowhere.
 - `SpawnPlan` also decides the dispatch-metrics sampler (only with no
   worker) and the post-commit notify sender (each process). The test
   `each_role_places_each_runtime` pins each runtime on each role. The

@@ -16,7 +16,8 @@ use autumn_harvest::scheduler::{
     register_workflow_schedules, tick_once, tick_once_sharded,
 };
 use autumn_harvest::schema::{
-    harvest_dead_letters, harvest_schedules, harvest_task_queue, harvest_workflow_executions,
+    harvest_audit_log, harvest_dead_letters, harvest_schedules, harvest_task_queue,
+    harvest_workflow_executions,
 };
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::store;
@@ -3847,7 +3848,7 @@ async fn wait_for_sweep(database_url: &str, exec_id: uuid::Uuid) -> bool {
 }
 
 /// Issue #2478: retention runs where the scheduler runs. A `web` placement
-/// runs no sweep, and `run-now` names the fix. A `worker` placement sweeps.
+/// runs no sweep, and `run-now` names the fix. A `combined` role sweeps.
 /// `run_on = "all"` sweeps on a `web` placement, as before the change.
 #[tokio::test]
 async fn retention_follows_the_scheduler_placement() {
@@ -3856,7 +3857,7 @@ async fn retention_follows_the_scheduler_placement() {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("connect");
-    let start = async |config: HarvestRuntimeConfig| {
+    let start = async |config: HarvestRuntimeConfig, resources: HarvestRunnerResources| {
         let built = autumn_harvest::HarvestBuilder::new()
             .retention(RetentionConfig {
                 max_age_secs: Some(7 * 24 * 60 * 60),
@@ -3864,19 +3865,19 @@ async fn retention_follows_the_scheduler_placement() {
                 ..Default::default()
             })
             .build();
-        HarvestRunner::start(built, &config, HarvestRunnerResources::new(pool.clone())).await
+        HarvestRunner::start(built, &config, resources).await
     };
+    let resources = || HarvestRunnerResources::new(pool.clone());
     let expired = || "NOW() - INTERVAL '10 days'";
 
     // A `web` placement. Retention is on, but no sweep runs.
     let web_exec = uuid::Uuid::new_v4();
     insert_retention_fixture_execution(&mut conn, web_exec, "placed-web", "COMPLETED", expired())
         .await;
-    let runner = start(placement_config(
-        &database_url,
-        false,
-        RetentionRunOn::Scheduler,
-    ))
+    let runner = start(
+        placement_config(&database_url, false, RetentionRunOn::Scheduler),
+        resources(),
+    )
     .await
     .expect("web placement starts");
     let api_state = HarvestApiState::new();
@@ -3886,25 +3887,52 @@ async fn retention_follows_the_scheduler_placement() {
     let app = harvest_api_router(api_state);
     let (status, body) = post_json(&app, "/admin/retention/run-now", json!({})).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(body.to_string().contains("run_on"), "{body}");
+    assert!(
+        body.to_string()
+            .contains(r#"Set harvest.retention.run_on = \"all\" to run retention here"#),
+        "the 503 names the fix: {body}"
+    );
+    let summary: Option<String> = harvest_audit_log::table
+        .filter(harvest_audit_log::operation.eq("retention.run_now"))
+        .select(harvest_audit_log::error_summary)
+        .order(harvest_audit_log::id.desc())
+        .first(&mut conn)
+        .await
+        .expect("run-now writes an audit row");
+    assert_eq!(
+        summary.as_deref(),
+        Some("retention not placed on this process")
+    );
     let (_, retention) = get_json(&app, "/admin/retention").await;
     assert_eq!(retention["per_shard"], json!([]), "{retention}");
-    // Three ticks of a placed janitor would have deleted the row.
+    assert_eq!(retention["placed_elsewhere"], json!(true), "{retention}");
+    // A back-up check. The 503 and the status above decide the test.
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(count_execution_rows(&mut conn, web_exec).await, 1);
     runner.stop().await;
 
-    // A `worker` placement sweeps the same row on its own tick.
-    let runner = start(placement_config(
-        &database_url,
-        true,
-        RetentionRunOn::Scheduler,
-    ))
+    // A `combined` role with no switch set sweeps the row on its own tick.
+    // This goes through the role resolve of the runner.
+    let runner = start(
+        HarvestRuntimeConfig {
+            worker_enabled: None,
+            scheduler_enabled: None,
+            ..placement_config(&database_url, true, RetentionRunOn::Scheduler)
+        },
+        resources().with_app_state(autumn_web::AppState::for_test()),
+    )
     .await
-    .expect("worker placement starts");
+    .expect("combined role starts");
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(runner.storage_pool());
+    api_state.install(runner.api_runtime());
+    let app = harvest_api_router(api_state);
+    let (_, retention) = get_json(&app, "/admin/retention").await;
+    assert_eq!(retention.get("placed_elsewhere"), None, "{retention}");
     assert!(
         wait_for_sweep(&database_url, web_exec).await,
-        "a worker placement must sweep"
+        "a combined role must sweep"
     );
     runner.stop().await;
 
@@ -3912,9 +3940,12 @@ async fn retention_follows_the_scheduler_placement() {
     let all_exec = uuid::Uuid::new_v4();
     insert_retention_fixture_execution(&mut conn, all_exec, "placed-all", "COMPLETED", expired())
         .await;
-    let runner = start(placement_config(&database_url, false, RetentionRunOn::All))
-        .await
-        .expect("web placement with run_on = all starts");
+    let runner = start(
+        placement_config(&database_url, false, RetentionRunOn::All),
+        resources(),
+    )
+    .await
+    .expect("web placement with run_on = all starts");
     assert!(
         wait_for_sweep(&database_url, all_exec).await,
         "run_on = all must sweep on a web placement"

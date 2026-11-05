@@ -2215,13 +2215,19 @@ orphaned_workflows = "fail"
         let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
         let error = HarvestRuntimeConfig::load_with_env(&env).expect_err("must refuse");
         let message = error.to_string();
-        assert!(
-            message.contains("everywhere") || message.contains("run_on"),
-            "{message}"
+        assert!(message.contains("everywhere"), "{message}");
+
+        // A TOML value must be lowercase, as for `orphaned_workflows`.
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest.retention]\nrun_on = \"All\"\n",
         );
+        let error = HarvestRuntimeConfig::load_with_env(&env).expect_err("must refuse");
+        assert!(error.to_string().contains("All"), "{error}");
     }
 
-    /// The labels are the config values, so a log line can be pasted back.
+    /// The labels are the config values, so an operator can paste a log
+    /// line back.
     #[test]
     fn retention_run_on_labels_are_the_config_values() {
         assert_eq!(RetentionRunOn::Scheduler.as_str(), "scheduler");
