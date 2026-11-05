@@ -25,7 +25,17 @@
 //! Exit code: 0 when every step passes, 1 otherwise, 2 for a usage error.
 //!
 //! For a pristine container, mount the checkout read-only into `rust:latest`.
-//! Then run `cargo xtask dev clean-room-getting-started` there.
+//! The xtask build needs a writable target directory there:
+//!
+//! ```sh
+//! docker run --rm -v "$PWD":/src:ro -w /src -e CARGO_TARGET_DIR=/tmp/xtask \
+//!   rust:latest cargo xtask dev clean-room-getting-started
+//! ```
+//!
+//! The steps run with the default toolchain, as the steps of the old script
+//! did. The rustup proxy of `cargo xtask` sets `RUSTUP_TOOLCHAIN` to the pin
+//! of this repository. The steps drop that value, because a newcomer has no
+//! such pin.
 
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
@@ -72,7 +82,10 @@ fn parse(args: &[String]) -> Result<Options, String> {
         match arg.as_str() {
             "--checkout" => options.checkout = true,
             "--log" => match args.next() {
-                Some(file) if !file.starts_with("--") => options.log = Some(file.clone()),
+                // An empty path gives the default log, as `${log:-...}` did.
+                Some(file) if !file.starts_with("--") => {
+                    options.log = Some(file.clone()).filter(|file| !file.is_empty());
+                }
                 _ => return Err("--log needs a file path".to_owned()),
             },
             other => return Err(format!("unknown argument: {other}")),
@@ -197,6 +210,45 @@ pub fn registry_packages(metadata: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Returns the channel that `rust-toolchain.toml` of the repository pins.
+fn pinned_channel(repo: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(repo.join("rust-toolchain.toml")).ok()?;
+    let table: toml::Table = text.parse().ok()?;
+    table
+        .get("toolchain")?
+        .get("channel")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Reports whether `value` of `RUSTUP_TOOLCHAIN` names the pinned channel.
+///
+/// The rustup proxy writes the full name, such as
+/// `1.99.1-x86_64-unknown-linux-gnu`, for a pin of `1.99.1`.
+fn names_pin(value: &str, channel: &str) -> bool {
+    value == channel
+        || value
+            .strip_prefix(channel)
+            .is_some_and(|rest| rest.starts_with('-'))
+}
+
+/// Returns a `cargo` command for a step in `krate`.
+///
+/// The command drops a `RUSTUP_TOOLCHAIN` that names the pin of this
+/// repository. The rustup proxy of `cargo xtask` sets it, and the old
+/// script never saw it. A value that names another toolchain stays.
+fn step_cargo(repo: &Path, krate: &Path) -> Command {
+    let mut command = Command::new("cargo");
+    command.current_dir(krate);
+    let inherited = std::env::var("RUSTUP_TOOLCHAIN").ok();
+    if let (Some(value), Some(channel)) = (inherited, pinned_channel(repo))
+        && names_pin(&value, &channel)
+    {
+        command.env_remove("RUSTUP_TOOLCHAIN");
+    }
+    command
+}
+
 /// Runs `cargo xtask dev clean-room-getting-started`.
 pub fn run(args: Args) -> Result<ExitCode> {
     let options = match parse(&args.rest) {
@@ -261,9 +313,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
     if ex {
         steps.command(
             "cargo-check",
-            Command::new("cargo")
-                .args(["check", "--quiet", "--message-format=short"])
-                .current_dir(&krate),
+            step_cargo(&repo, &krate).args(["check", "--quiet", "--message-format=short"]),
         )?;
     }
 
@@ -274,9 +324,8 @@ pub fn run(args: Args) -> Result<ExitCode> {
             "cargo metadata --format-version=1",
             |out| {
                 // The output of cargo goes to the step output, as in the old step.
-                let output = Command::new("cargo")
+                let output = step_cargo(&repo, &krate)
                     .args(["metadata", "--format-version=1"])
-                    .current_dir(&krate)
                     .stderr(out.try_clone().context("cannot share the step output")?)
                     .output()
                     .context("cannot run cargo metadata")?;
@@ -489,6 +538,17 @@ HarvestPlugin::new()
             parse(&strings(&["-x"])).unwrap_err(),
             "unknown argument: -x"
         );
+        // An empty path keeps the default log.
+        assert_eq!(parse(&strings(&["--log", ""])).unwrap().log, None);
+    }
+
+    #[test]
+    fn only_the_pinned_toolchain_is_dropped() {
+        assert!(names_pin("1.99.1-x86_64-unknown-linux-gnu", "1.99.1"));
+        assert!(names_pin("1.99.1", "1.99.1"));
+        assert!(!names_pin("1.99.10-x86_64-unknown-linux-gnu", "1.99.1"));
+        assert!(!names_pin("nightly", "1.99.1"));
+        assert!(pinned_channel(&repo_root()).is_some());
     }
 
     #[test]

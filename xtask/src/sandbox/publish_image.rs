@@ -19,6 +19,7 @@
 //!
 //! The exit code is 0 on a publish and 1 on any failure.
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -36,9 +37,15 @@ const LOCK_WAIT: Duration = Duration::from_secs(60);
 #[derive(Debug, Args)]
 pub struct Args {
     /// The directory that holds the new image files.
-    pub stage: Option<PathBuf>,
+    pub stage: Option<OsString>,
     /// The directory that holds the published image.
-    pub out: Option<PathBuf>,
+    pub out: Option<OsString>,
+}
+
+/// Returns a path argument. An empty value counts as missing, as in
+/// `${1:?}` of the old script.
+pub fn path_arg(arg: Option<OsString>) -> Option<PathBuf> {
+    arg.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
 /// Runs `cargo xtask sandbox publish-image`.
@@ -46,7 +53,7 @@ pub struct Args {
 /// The group dispatcher fixes the `Result` return type.
 #[allow(clippy::unnecessary_wraps)]
 pub fn run(args: Args) -> Result<ExitCode> {
-    let (Some(stage), Some(out)) = (args.stage, args.out) else {
+    let (Some(stage), Some(out)) = (path_arg(args.stage), path_arg(args.out)) else {
         eprintln!("usage: cargo xtask sandbox publish-image STAGE_DIR OUT_DIR");
         return Ok(ExitCode::FAILURE);
     };
@@ -261,6 +268,13 @@ mod tests {
             assert_eq!(content(&out, file), format!("old {file}"));
         }
         assert_eq!(names(&out), ["image.sha256", "rootfs.ext4", "vmlinux"]);
+    }
+
+    #[test]
+    fn an_empty_path_argument_counts_as_missing() {
+        assert_eq!(path_arg(None), None);
+        assert_eq!(path_arg(Some(OsString::new())), None);
+        assert_eq!(path_arg(Some("out".into())), Some(PathBuf::from("out")));
     }
 
     #[test]

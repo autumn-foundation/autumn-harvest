@@ -31,7 +31,9 @@
 //! cargo xtask dev run-standalone-chapter
 //! ```
 //!
-//! `CHAPTER_HEALTH_TIMEOUT_SECS` sets the health wait (default 180).
+//! `CHAPTER_HEALTH_TIMEOUT_SECS` sets the health wait (default 180). The
+//! wait counts its probes as `seq 1 VALUE` does. A value that is not a
+//! number gives no probe, so the wait fails at once.
 //! Each failure exits with 1.
 
 use std::fs::File;
@@ -54,6 +56,27 @@ const STOP_LOG: &str = "Harvest stopped";
 
 /// The default health wait, in seconds.
 const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 180;
+
+/// Returns the number of health probes for a timeout value, as
+/// `seq 1 VALUE` counts them.
+///
+/// `seq` takes a decimal or a hex number, and a fraction rounds down. A
+/// value that `seq` refuses gives no probe, so the wait times out at once.
+// The value is a whole number of at least 1 before the cast. The cast
+// saturates, so an infinite value waits as long as `seq` does.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn health_probes(value: &str) -> Option<u64> {
+    let text = value.trim_start();
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    let number = text.parse::<f64>().ok().filter(|number| !number.is_nan())?;
+    Some(if number < 1.0 {
+        0
+    } else {
+        number.floor() as u64
+    })
+}
 
 /// How long the server has to drain after Ctrl-C, in seconds.
 const STOP_WAIT_SECS: u64 = 60;
@@ -167,12 +190,10 @@ pub fn run(args: Args) -> Result<ExitCode> {
         eprintln!("{DOC}: not found");
         return Ok(ExitCode::FAILURE);
     }
-    let timeout = match std::env::var("CHAPTER_HEALTH_TIMEOUT_SECS") {
-        Ok(value) if !value.is_empty() => value.parse().with_context(|| {
-            format!("CHAPTER_HEALTH_TIMEOUT_SECS must be a whole number, not {value:?}")
-        })?,
-        _ => DEFAULT_HEALTH_TIMEOUT_SECS,
-    };
+    let timeout = std::env::var("CHAPTER_HEALTH_TIMEOUT_SECS")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_HEALTH_TIMEOUT_SECS.to_string());
     let mut session = Session {
         work: smop::fs::temp_dir()?,
         serve: None,
@@ -187,7 +208,9 @@ pub fn run(args: Args) -> Result<ExitCode> {
 struct Session {
     work: smop::fs::TempDir,
     serve: Option<Child>,
-    timeout: u64,
+    /// The raw value of `CHAPTER_HEALTH_TIMEOUT_SECS`. The timeout message
+    /// names it as given.
+    timeout: String,
 }
 
 impl Session {
@@ -249,7 +272,7 @@ impl Session {
     fn run_block(&mut self, kind: &str, path: &Path) -> Result<bool> {
         match classify(kind) {
             Kind::Serve => {
-                if curl(&["-s", "-o", "/dev/null", HEALTH_URL])? {
+                if curl(&["-s", "-o", "/dev/null", HEALTH_URL]) {
                     eprintln!("::error::a server already answers on {HEALTH_URL}");
                     return Ok(false);
                 }
@@ -257,15 +280,23 @@ impl Session {
                 let err = log.try_clone().context("cannot share serve.log")?;
                 // The serve block runs in its own process group. The cleanup
                 // stops cargo and the app together.
-                let child = Command::new("setsid")
+                let spawned = Command::new("setsid")
                     .arg("bash")
                     .arg(path)
                     .stdin(Stdio::null())
                     .stdout(log)
                     .stderr(err)
-                    .spawn()
-                    .context("cannot start the serve block with setsid")?;
-                self.serve = Some(child);
+                    .spawn();
+                match spawned {
+                    Ok(child) => self.serve = Some(child),
+                    Err(err) => {
+                        // A background job that cannot start writes its error
+                        // to its log. The wait then sees a server that exited.
+                        std::fs::write(self.serve_log(), format!("setsid: {err}\n"))
+                            .context("cannot write serve.log")?;
+                        self.serve = None;
+                    }
+                }
                 self.wait_for_health()
             }
             Kind::Expect(want) => {
@@ -310,8 +341,15 @@ impl Session {
     /// Waits until the health route answers. Returns `false` on a timeout
     /// or when the server exits first.
     fn wait_for_health(&mut self) -> Result<bool> {
-        for second in 1..=self.timeout {
-            if curl(&["-sf", "-o", "/dev/null", HEALTH_URL])? {
+        let probes = health_probes(&self.timeout).unwrap_or_else(|| {
+            eprintln!(
+                "run-standalone-chapter: CHAPTER_HEALTH_TIMEOUT_SECS is not a number: '{}'",
+                self.timeout
+            );
+            0
+        });
+        for second in 1..=probes {
+            if curl(&["-sf", "-o", "/dev/null", HEALTH_URL]) {
                 println!("healthy after {second}s");
                 return Ok(true);
             }
@@ -350,8 +388,23 @@ impl Session {
 }
 
 /// Runs `curl` with `args` and reports whether it exited 0.
-fn curl(args: &[&str]) -> Result<bool> {
-    sh::cmd("curl").args(args).success()
+///
+/// A `curl` that cannot start counts as a failed probe, as in the old
+/// script. The wait then times out.
+fn curl(args: &[&str]) -> bool {
+    let status = Command::new("curl")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match status {
+        Ok(status) => status.success(),
+        Err(err) => {
+            eprintln!("run-standalone-chapter: curl: {err}");
+            false
+        }
+    }
 }
 
 /// Sends `signal` to the process group that `pid` leads, as
@@ -487,6 +540,21 @@ cargo run -p app
         assert_eq!(classify("skip CI runs it"), Kind::Skip("CI runs it"));
         assert_eq!(classify("expect"), Kind::Unknown);
         assert_eq!(classify("serve now"), Kind::Unknown);
+    }
+
+    #[test]
+    fn the_health_wait_counts_probes_as_seq_does() {
+        assert_eq!(health_probes("180"), Some(180));
+        assert_eq!(health_probes("0"), Some(0));
+        assert_eq!(health_probes("-5"), Some(0));
+        assert_eq!(health_probes("3.5"), Some(3));
+        assert_eq!(health_probes("1e1"), Some(10));
+        assert_eq!(health_probes(" 4"), Some(4));
+        assert_eq!(health_probes("0x3"), Some(3));
+        // `seq` refuses these, so the wait gets no probe.
+        assert_eq!(health_probes("abc"), None);
+        assert_eq!(health_probes("4 "), None);
+        assert_eq!(health_probes("nan"), None);
     }
 
     #[test]

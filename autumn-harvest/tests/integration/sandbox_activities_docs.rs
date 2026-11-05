@@ -21,6 +21,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use super::docs_guard_support::{check_stanza, prose_sentences, section, step_stanza};
+#[cfg(unix)]
 use crate::xtask_bin::xtask;
 
 const GUIDE: &str = "docs/sandbox-activities.md";

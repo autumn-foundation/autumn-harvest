@@ -388,14 +388,25 @@ impl Smoke {
         let log = self.work.join("logs").join(format!("{prefix}-{label}.log"));
         let out = File::create(&log).with_context(|| format!("cannot create {}", log.display()))?;
         let err = out.try_clone().context("cannot share the worker log")?;
-        let child = spawn(
-            self.bin(label)
-                .arg("worker")
-                .env("MV_SMOKE_LABEL", label)
-                .stdin(Stdio::null())
-                .stdout(out)
-                .stderr(err),
-        )?;
+        let spawned = self
+            .bin(label)
+            .arg("worker")
+            .env("MV_SMOKE_LABEL", label)
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(err)
+            .spawn();
+        let child = match spawned {
+            Ok(child) => child,
+            Err(err) => {
+                // A background job that cannot start writes its error to its
+                // log, and the wait sees a worker that exited.
+                std::fs::write(&log, format!("{label}: {err}\n"))
+                    .with_context(|| format!("cannot write {}", log.display()))?;
+                eprintln!("the {label} worker exited before it was ready");
+                return Err(StepFailed(1).into());
+            }
+        };
         let pid = child.id();
         self.workers.push(Worker {
             label: label.to_owned(),

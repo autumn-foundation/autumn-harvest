@@ -101,7 +101,7 @@ const ROOTFS_SCRIPT: &str = r#"
 #[derive(Debug, Args)]
 pub struct Args {
     /// The directory that receives `vmlinux`, `rootfs.ext4` and `image.sha256`.
-    pub out: Option<PathBuf>,
+    pub out: Option<std::ffi::OsString>,
 }
 
 /// A step failed. The build exits with this code, as `set -e` does.
@@ -152,7 +152,7 @@ fn env_var(name: &str) -> Option<String> {
 /// The group dispatcher fixes the `Result` return type.
 #[allow(clippy::unnecessary_wraps)]
 pub fn run(args: Args) -> Result<ExitCode> {
-    let Some(out) = args.out else {
+    let Some(out) = publish_image::path_arg(args.out) else {
         eprintln!("usage: cargo xtask sandbox build-guest-image OUT_DIR");
         return Ok(ExitCode::FAILURE);
     };
