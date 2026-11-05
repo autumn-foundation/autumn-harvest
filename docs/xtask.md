@@ -33,7 +33,7 @@ An audit also needs a row in [`docs/audits/README.md`](audits/README.md).
 | `cargo xtask audit cli-flag-coverage` | `xtask/src/audit/cli_flag_coverage.rs` | `docs/audits/cli-flag-coverage.py` |
 | `cargo xtask audit comment-hygiene` | `xtask/src/audit/comment_hygiene.rs` | `docs/audits/comment-hygiene.py` |
 | `cargo xtask audit config-cli-drift` | `xtask/src/audit/config_cli_drift.rs` | `docs/audits/config-cli-drift.py` |
-| `cargo xtask audit corpus-link-check` | `xtask/src/audit/corpus_link_check.rs` | `docs/audits/corpus-link-check.py` |
+| `cargo xtask audit corpus-link-check` | `xtask/src/audit/corpus_link_check/mod.rs` | `docs/audits/corpus-link-check.py` |
 | `cargo xtask audit diesel-table-width` | `xtask/src/audit/diesel_table_width.rs` | `docs/audits/diesel-table-width.py` |
 | `cargo xtask audit doc-claim-drift` | `xtask/src/audit/doc_claim_drift.rs` | `docs/audits/doc-claim-drift.py` |
 | `cargo xtask audit doc-snippet-syntax` | `xtask/src/audit/doc_snippet_syntax.rs` | `docs/audits/doc-snippet-syntax.py` |
